@@ -234,6 +234,8 @@ export interface WorkflowCreationTestState {
   at?: string;
 }
 export interface WorkflowDetail {
+  /** Stable catalog identity; name may be a human-readable display label. */
+  slug?: string;
   name: string;
   description?: string;
   enabled?: boolean;

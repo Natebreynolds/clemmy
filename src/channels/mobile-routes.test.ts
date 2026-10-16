@@ -3688,9 +3688,9 @@ test('workspace chat from the phone: space-<slug> session id binds workspace met
     const res = await fetch(`${h.url}/m/api/chat/send`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-space-chat-key' },
-      body: JSON.stringify({ message: 'what changed in this workspace today', sessionId: 'space-test-pipeline', async: true }),
+      body: JSON.stringify({ message: 'what changed in this workspace today', sessionId: 'space-test-pipeline' }),
     });
-    assert.equal(res.status, 202);
+    assert.equal(res.status, 200);
     const ack = await res.json() as { sessionId: string };
     assert.equal(ack.sessionId, 'space-test-pipeline', 'the stable workspace thread id is honored');
     const session = getHarnessSessionForTest('space-test-pipeline');
@@ -3705,9 +3705,9 @@ test('workspace chat from the phone: space-<slug> session id binds workspace met
     const plain = await fetch(`${h.url}/m/api/chat/send`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-plain-chat-key' },
-      body: JSON.stringify({ message: 'hello there', async: true }),
+      body: JSON.stringify({ message: 'hello there' }),
     });
-    assert.equal(plain.status, 202);
+    assert.equal(plain.status, 200);
     const plainAck = await plain.json() as { sessionId: string };
     const plainSession = getHarnessSessionForTest(plainAck.sessionId);
     assert.equal(((plainSession!.metadata ?? {}) as Record<string, unknown>).source, 'mobile');
@@ -3719,6 +3719,96 @@ test('workspace chat from the phone: space-<slug> session id binds workspace met
     else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacyFallback;
     await h.close();
   }
+});
+
+test('workflow conversation on mobile keeps exact saved scope across desktop principal split and replay', async () => {
+  resetEventLog(); _clearIdempotencyForTests(); _clearMobileChatInFlightForTests();
+  const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
+  const { composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
+  const slug = 'mobile-workflow-conversation';
+  writeWorkflow(slug, { name: 'Mobile conversation fixture', description: 'Controlled workflow conversation.', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only.', sideEffect: 'read' }] });
+  const rootId = workflowConversationSessionId(slug)!;
+  const binding = { version: 1, rootSessionId: rootId, workflowSlug: slug };
+  createHarnessSession({ id: rootId, kind: 'chat', channel: 'desktop', userId: 'desktop',
+    metadata: { source: 'desktop', ingressProvider: 'desktop', channelId: rootId, userId: 'desktop', __workflow_conversation: binding } });
+  const previousHarnessFlag = process.env.CLEMMY_HARNESS_WEBHOOK;
+  const previousLegacy = process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  const previousAuth = process.env.AUTH_MODE;
+  process.env.CLEMMY_HARNESS_WEBHOOK = 'on'; delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK;
+  process.env.AUTH_MODE = 'api_key';
+  const seen: Array<{ sessionId: string; message: string }> = [];
+  const contextScope = await import('../runtime/harness/source-session-context-scope.js');
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (request: { sessionId: string; input: string; sourceUserSeq: number }) => {
+      const context = contextScope.currentSourceSessionContext(request.sessionId);
+      assert.equal(context?.sourceUserSeq, request.sourceUserSeq, 'the actual bridge owns this exact accepted source');
+      assert.equal(context?.mount.workflowConversation?.workflowSlug, slug);
+      assert.equal(listEvents(request.sessionId, { types: ['user_input_received'] })
+        .find(event => event.seq === request.sourceUserSeq)?.data.text, request.input);
+      seen.push({ sessionId: request.sessionId, message: request.input });
+      return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'The controlled workflow has one read step.', summary: 'Scoped question answered.', done: true, nextAction: 'completed' } };
+    }) as never });
+  const assistant = { respond: async () => { throw new Error('workflow chat must use the accepted harness path'); } } as Parameters<typeof createMobileRouter>[0]['assistant'];
+  const h = await startHarness({ assistant });
+  try {
+    const cookie = await loginMobile(h, 'Workflow conversation phone');
+    const detail = await fetch(`${h.url}/m/api/workflows/${slug}`, { headers: { cookie } });
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json() as { slug: string }).slug, slug);
+    const input = 'Explain this workflow without running it.';
+    const send = () => fetch(`${h.url}/m/api/chat/send`, { method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-workflow-conversation-key' },
+      body: JSON.stringify({ sessionId: rootId, message: input }) });
+    const first = await send();
+    assert.equal(first.status, 200);
+    const ack = await first.json() as { sessionId: string; runId: string };
+    assert.notEqual(ack.sessionId, rootId, 'phone receives its own continuity principal without editing the desktop owner');
+    assert.equal(getHarnessSessionForTest(ack.sessionId)?.kind, 'chat');
+    assert.deepEqual(getHarnessSessionForTest(ack.sessionId)?.metadata.__workflow_conversation, binding);
+    assert.equal(composeSessionFromStore(ack.sessionId).workflowConversation?.workflowSlug, slug);
+    assert.deepEqual(seen, [{ sessionId: ack.sessionId, message: input }]);
+    const { deleteWorkflow } = await import('../memory/workflow-store.js');
+    deleteWorkflow(slug);
+    _clearIdempotencyForTests();
+    const replay = await send();
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json() as { sessionId: string }).sessionId, ack.sessionId);
+    assert.equal(seen.length, 1, 'same accepted request is delivered once');
+    const stop = await fetch(`${h.url}/m/api/chat/send`, { method: 'POST',
+      headers: { 'content-type': 'application/json', cookie, 'idempotency-key': 'mobile-workflow-deleted-stop' },
+      body: JSON.stringify({ sessionId: ack.sessionId, message: '/cancel' }) });
+    assert.equal(stop.status, 200, 'the phone can still stop its exact conversation after deletion');
+    assert.equal(seen.length, 1, 'Stop is not a fresh model turn');
+    assert.equal(getHarnessSessionForTest(rootId)?.userId, 'desktop');
+  } finally {
+    _setBridgeImplsForTests({});
+    if (previousHarnessFlag === undefined) delete process.env.CLEMMY_HARNESS_WEBHOOK; else process.env.CLEMMY_HARNESS_WEBHOOK = previousHarnessFlag;
+    if (previousLegacy === undefined) delete process.env.CLEMMY_LEGACY_RESPOND_FALLBACK; else process.env.CLEMMY_LEGACY_RESPOND_FALLBACK = previousLegacy;
+    if (previousAuth === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = previousAuth;
+    await h.close();
+  }
+});
+
+test('mobile workflow conversation refuses deleted and malformed targets without starting a turn', async () => {
+  resetEventLog(); _clearIdempotencyForTests(); _clearMobileChatInFlightForTests();
+  const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
+  let calls = 0;
+  const h = await startHarness({ assistant: { respond: async () => { calls++; throw new Error('must not dispatch'); } } as never });
+  try {
+    const cookie = await loginMobile(h, 'Missing workflow phone');
+    for (const [index, sessionId] of [workflowConversationSessionId('mobile-workflow-not-present')!, 'workflow-edit:%2e%2e%2foutside'].entries()) {
+      const response = await fetch(`${h.url}/m/api/chat/send`, { method: 'POST',
+        headers: { 'content-type': 'application/json', cookie, 'idempotency-key': `mobile-workflow-missing-${index}` },
+        body: JSON.stringify({ sessionId, message: 'Explain this workflow.' }) });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json() as { error: string }).error, 'WORKFLOW_CONVERSATION_UNAVAILABLE');
+      assert.equal(getHarnessSessionForTest(sessionId), null);
+    }
+    assert.equal(calls, 0);
+  } finally { await h.close(); }
 });
 
 test('workflow detail route is wired and session-gated', async () => {

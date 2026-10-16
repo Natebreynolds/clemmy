@@ -36,6 +36,7 @@ import { SourceControlsPanel } from '@/components/workspaces/SourceControlsPanel
 import { WorkspaceFrame, type WorkspaceFrameControl } from '@/components/workspaces/WorkspaceFrame';
 import { describeSpaceShape, spaceBuildState } from '@/lib/space-build';
 import { getWorkflowsHome, runWorkflow } from '@/lib/automate';
+import './workspace-layout.css';
 
 function statusTone(status: SpaceStatus): Tone {
   if (status === 'active') return 'success';
@@ -78,6 +79,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   const pendingReloadRef = useRef(false);
   const seededRef = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const openConversationRef = useRef<HTMLButtonElement>(null);
 
   // Auto-reload the board when its file OR its data changes — keyed on both
   // mtimes, so it catches ANY edit (Clem's space_edit_view, a write_file
@@ -135,6 +137,15 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   // The conversation is a COLUMN beside the canvas, open by default — the
   // build is watched from it (owner-approved Spaces mockup, 2026-09-08).
   const [dockOpen, setDockOpen] = useState(true);
+  useEffect(() => {
+    if (!dockOpen) return;
+    const frame = requestAnimationFrame(() => composerRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(frame);
+  }, [dockOpen]);
+  const closeConversation = () => {
+    setDockOpen(false);
+    requestAnimationFrame(() => openConversationRef.current?.focus({ preventScroll: true }));
+  };
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [tab, setTab] = useState<DetailTab>('health');
   const [error, setError] = useState<string | null>(null);
@@ -341,9 +352,8 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
   const building = buildState === 'building';
   const firstVersionPending = building && (space.revisions?.length ?? 0) === 0;
   return (
-    <div className="flex h-full">
-      {dockOpen && (
-        <aside className="flex w-[400px] shrink-0 flex-col border-r border-border bg-subtle" aria-label="Conversation with Clementine">
+    <div className="workspace-layout flex h-full min-w-0" data-conversation-open={dockOpen ? 'true' : 'false'}>
+        <aside className="workspace-conversation flex shrink-0 flex-col border-r border-border bg-subtle" hidden={!dockOpen} aria-label="Conversation with Clementine">
           <div className="flex items-center gap-2 px-3 pb-2 pt-3">
             <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
               <ArrowLeft className="h-4 w-4" aria-hidden />
@@ -352,8 +362,9 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
               <p className="truncate text-body font-semibold text-fg">{space.title}</p>
               <p className="truncate text-caption text-faint">with Clementine · {describeSpaceShape(space)}</p>
             </div>
-            <Button variant="ghost" size="icon" aria-label="Hide the conversation" onClick={() => setDockOpen(false)}>
+            <Button variant="ghost" size="icon" className="workspace-conversation-toggle" aria-label="View Space" onClick={closeConversation}>
               <PanelLeftClose className="h-4 w-4" aria-hidden />
+              <span className="workspace-show-space-label">View Space</span>
             </Button>
           </div>
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3">
@@ -390,21 +401,20 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
             <Composer inputRef={composerRef} sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={chat.send} onStop={chat.stop} placeholder="Ask a question or describe a change…" />
           </div>
         </aside>
-      )}
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="workspace-content flex min-w-0 flex-1 flex-col">
       {/* Toolbar */}
-      <div className="relative flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
+      <div className="workspace-toolbar relative flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
         {!dockOpen && (
           <>
             <Button variant="ghost" size="sm" onClick={() => navigate('/workspaces')} aria-label="Back to Spaces">
               <ArrowLeft className="h-4 w-4" aria-hidden />
             </Button>
-            <Button variant="secondary" size="sm" onClick={() => { setDockOpen(true); composerRef.current?.focus(); }}>
+            <Button ref={openConversationRef} variant="secondary" size="sm" onClick={() => setDockOpen(true)}>
               <MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem
             </Button>
           </>
         )}
-        <h2 className="truncate text-h3 text-fg">{space.title}</h2>
+        <h2 className="workspace-toolbar-title truncate text-h3 text-fg">{space.title}</h2>
         {building
           ? <StatusPill tone="live">building</StatusPill>
           : <StatusPill tone={statusTone(space.status)}>{space.status}</StatusPill>}
@@ -431,7 +441,7 @@ function WorkspaceViewLoaded({ id, conversationTurns }: { id: string; conversati
             {runningWorkflows.get(wf.name)?.inFlightStepId && <span className="text-primary">· {runningWorkflows.get(wf.name)?.inFlightStepId}</span>}
           </button>
         ))}
-        <div className="ml-auto flex items-center gap-1.5">
+        <div className="workspace-toolbar-actions ml-auto flex items-center gap-1.5">
           {(space.dataSources.length > 0 || feedList.some((feed) => feed.enabled)) && (
             <Button
               variant="secondary"

@@ -13,6 +13,7 @@
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-compaction-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -672,7 +673,8 @@ test('a mid-turn collapse keeps the schemas its searches found; a provider field
   ]) {
     assert.equal(result.applied, true);
     const ledger = ledgerOf(result.nextItems);
-    assert.match(ledger, /input schemas found by search earlier in this turn/);
+    assert.match(ledger, /retained input schema disclosures/);
+    assert.doesNotMatch(ledger, /still current for this turn/);
     assert.ok(
       ledger.includes(`- space_save (call with work_call, requirement_id cap:local:space_save:reversible): ${JSON.stringify(spaceSaveSchema)}`),
       'the newest disclosure of the schema is kept verbatim with how to call it',
@@ -683,7 +685,7 @@ test('a mid-turn collapse keeps the schemas its searches found; a provider field
 
   const betweenTurns = collapseOldCompletedToolPairs(items, 2, sess.id);
   assert.ok(betweenTurns.collapsed > 0);
-  assert.doesNotMatch(ledgerOf(betweenTurns.nextItems), /input schemas found by search/);
+  assert.doesNotMatch(ledgerOf(betweenTurns.nextItems), /retained input schema disclosures/);
 });
 
 test('a collapsed search keeps a full-size schema, names a schema reread by its handle, and points an oversized one at its reread cursor', () => {
@@ -696,7 +698,8 @@ test('a collapsed search keeps a full-size schema, names a schema reread by its 
   const planTask = { type: 'object', properties: { requirements: { type: 'array' } } };
   assert.ok(JSON.stringify(workflowUpdate).length > 13_000 && JSON.stringify(workflowUpdate).length < 20_000);
   assert.ok(JSON.stringify(oversized).length > 20_000);
-  const handle = (name: string, ref: string) => ({ schema_ref: ref, cursor: `tool_search_schema:v1:${ref.slice(7)}:0` });
+  const ref = (schema: unknown) => `sha256:${createHash('sha256').update(JSON.stringify(schema)).digest('hex')}`;
+  const handle = (schema: unknown) => ({ schema_ref: ref(schema), cursor: `tool_search_schema:v1:${ref(schema).slice(7)}:0` });
   const items: AgentInputItem[] = [userMessage('update the workflow and plan it')];
   const add = (callId: string, name: string, output: string) => {
     items.push(toolCall(callId, name, '{}'));
@@ -704,12 +707,12 @@ test('a collapsed search keeps a full-size schema, names a schema reread by its 
     writeToolOutput({ sessionId: sess.id, callId, tool: name, output });
   };
   add('s_update', 'tool_search', JSON.stringify({ query: 'workflow_update', results: [{ name: 'workflow_update', carrier: 'call_tool' }],
-    schemas: { workflow_update: workflowUpdate }, schema_handles: { workflow_update: handle('workflow_update', 'sha256:aaaa') } }));
+    schemas: { workflow_update: workflowUpdate }, schema_handles: { workflow_update: handle(workflowUpdate) } }));
   add('s_big', 'tool_search', JSON.stringify({ query: 'space_save', results: [{ name: 'space_save' }],
-    schemas: { space_save: oversized }, schema_handles: { space_save: handle('space_save', 'sha256:bbbb') } }));
+    schemas: { space_save: oversized }, schema_handles: { space_save: handle(oversized) } }));
   add('s_plan', 'tool_search', JSON.stringify({ kind: 'host_structural_control_lookup_v1', results: [{ name: 'plan_task' }], schemas: {},
-    schema_handles: { plan_task: handle('plan_task', 'sha256:cccc') } }));
-  add('s_plan_reread', 'tool_search', JSON.stringify({ kind: 'tool_search_schema', schema_ref: 'sha256:cccc', complete: true, schema: planTask, pad: 'p'.repeat(3000) }));
+    schema_handles: { plan_task: handle(planTask) } }));
+  add('s_plan_reread', 'tool_search', JSON.stringify({ kind: 'tool_search_schema', schema_ref: ref(planTask), sha256: ref(planTask).slice(7), complete: true, schema: planTask, pad: 'p'.repeat(3000) }));
   for (let i = 0; i < 3; i++) add(`work_${i}`, 'space_get', `space ${i} ${'w'.repeat(3000)}`);
 
   const result = compactInFlightToolContextStable(items, createInFlightCompactionState(), sess.id,
@@ -719,7 +722,366 @@ test('a collapsed search keeps a full-size schema, names a schema reread by its 
     .includes('summary of older completed tool activity')) as { content: string }).content;
   assert.ok(ledger.includes(`- workflow_update (call with call_tool): ${JSON.stringify(workflowUpdate)}`), 'a 13-20k schema is kept whole');
   assert.ok(ledger.includes(`- plan_task: ${JSON.stringify(planTask)}`), 'a schema reread is named by the search that issued its handle');
-  assert.match(ledger, /- space_save: reopen its exact schema with tool_search \{"query":"space_save","cursor":"tool_search_schema:v1:bbbb:0"\}/);
+  assert.ok(ledger.includes(`- space_save: reopen its complete schema with tool_search ${JSON.stringify({ query: 'space_save', cursor: handle(oversized).cursor })}`));
+});
+
+test('actual tool_search previews require exact reread, whose full schema keeps the issuing provider wrapper and account contract', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { registerToolSearchTool } = await import('../../tools/tool-search-tool.js');
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  const { DEFAULT_TOOL_RESULT_MAX_CHARS } = await import('./tool-output-format.js');
+  type Search = (input: { query: string; limit?: number; cursor?: string }) => Promise<{ content: Array<{ text: string }> }>;
+  let search!: Search;
+  let sourceCalls = 0;
+  const name = 'CONTROLLED_CONTRACT_READ';
+  const capabilityRef = 'cap:fixture:controlled-contract-read';
+  const invocation = { name: 'composio_execute_tool', fixedArgs: { tool_slug: name }, payloadField: 'arguments' };
+  const schema = { type: 'object', description: 'D'.repeat(Math.floor(DEFAULT_TOOL_RESULT_MAX_CHARS * 0.55)),
+    properties: { payload: { type: 'object', required: ['description'], additionalProperties: false,
+      properties: { description: { type: 'string', description: 'Exact provider payload instruction.' } } } },
+    required: ['payload'], additionalProperties: false };
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, handler: Search) { search = handler; } } as never, {
+    allowedNames: new Set(['tool_search']),
+    candidateSources: [{ kind: 'authorized_composio', async search() {
+      sourceCalls++;
+      return [{ name, schema, summary: 'Controlled read contract.', carrier: 'work_call', invocation,
+        guidance: 'G'.repeat(Math.floor(DEFAULT_TOOL_RESULT_MAX_CHARS * 0.70)) }];
+    } }],
+    discloseForPlanning: () => ({ [name]: capabilityRef }),
+  });
+  const invoke = (cursor?: string) => withToolOutputContext({ sessionId: sess.id }, () => search({ query: name, limit: 1, ...(cursor ? { cursor } : {}) }));
+  const first = await invoke();
+  const firstText = first.content[0]!.text;
+  const page = JSON.parse(firstText);
+  assert.ok(page.schemas[name], 'the actual producer supplies a structural preview');
+  assert.ok(page.schema_read_required.includes(name), "Expected compaction invariant: page.schema_read_required.includes(name)");
+  assert.notDeepEqual(page.schemas[name], schema);
+  assert.deepEqual(page.results[0].invocation, invocation);
+  const cursor = page.schema_handles[name].cursor as string;
+  const items: AgentInputItem[] = [userMessage('Read the controlled account with the required provider wrapper.')];
+  const add = (callId: string, tool: string, output: string) => {
+    items.push(toolCall(callId, tool), toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool, output });
+  };
+  add('actual_search', 'tool_search', firstText);
+  for (let i = 0; i < 4; i++) add(`before_${i}`, 'read_file', `record ${i} ${'x'.repeat(4000)}`);
+  const opts = { resultTriggerTokens: 1_000, retainedResultBudgetTokens: 500, minRetainPairs: 1, maxRetainPairs: 1 };
+  const state = createInFlightCompactionState();
+  const ledgers = (history: AgentInputItem[]) => history.map(item => String((item as { content?: unknown }).content ?? ''))
+    .filter(content => content.startsWith('[summary of older completed tool activity]')).join('\n');
+  const preview = compactInFlightToolContextStable([...items], state, sess.id, opts);
+  const previewLedger = ledgers(preview.nextItems);
+  assert.ok(previewLedger.includes(`tool_search ${JSON.stringify({ query: name, cursor })}`), "Expected compaction invariant: previewLedger.includes(`tool_search ${JSON.stringify({ query: name, cursor })}`)");
+  assert.ok(previewLedger.includes('actual_search'), 'the exact issuing invocation/account result remains recallable');
+  assert.ok(!previewLedger.includes(`- ${name} (call with work_call, requirement_id ${capabilityRef}): ${JSON.stringify(page.schemas[name])}`),
+    'a partial preview must never be promoted to a complete input contract');
+  const callsBeforeReread = sourceCalls;
+  const reread = await invoke(cursor);
+  const whole = JSON.parse(reread.content[0]!.text);
+  assert.equal(whole.kind, 'tool_search_schema');
+  assert.deepEqual(whole.schema, schema);
+  assert.equal(sourceCalls, callsBeforeReread, 'exact schema redemption repeats no provider discovery');
+  add('actual_reread', 'tool_search', reread.content[0]!.text);
+  for (let i = 0; i < 6; i++) add(`after_${i}`, 'read_file', `record later ${i} ${'y'.repeat(4000)}`);
+  const before = JSON.stringify(items);
+  const complete = compactInFlightToolContextStable([...items], state, sess.id, opts);
+  const completeLedger = ledgers(complete.nextItems);
+  assert.ok(completeLedger.includes(`- ${name} (call with work_call, requirement_id ${capabilityRef}): ${JSON.stringify(schema)}`), "Expected compaction invariant: completeLedger.includes(`- ${name} (call with work_call, requirement_id ${capabilityRef}): ${JSON.stringify(schema)}`)");
+  assert.ok(completeLedger.includes(JSON.stringify(page.results[0])), 'retain the complete original wrapper/example/status row');
+  assert.ok(completeLedger.includes(JSON.stringify(page.guidance[name])), 'retain original executable guidance without clipping');
+  assert.equal(JSON.stringify(items), before, 'model-only projection never rewrites retained source history');
+});
+
+test('newer schema disclosure metadata supersedes older routes without losing already-known exact schema bytes', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const name = 'controlled.read';
+  const schema = { type: 'object', properties: { fixture: { type: 'string' } }, required: ['fixture'], additionalProperties: false };
+  const sha256 = createHash('sha256').update(JSON.stringify(schema)).digest('hex');
+  const handle = { schema_ref: `sha256:${sha256}`, cursor: `tool_search_schema:v1:${sha256}:0` };
+  const items: AgentInputItem[] = [userMessage('Use the current controlled account.')];
+  const add = (id: string, body: unknown) => {
+    const output = typeof body === 'string' ? body : JSON.stringify(body);
+    items.push(toolCall(id, id.startsWith('read') ? 'read_file' : 'tool_search'), toolResult(id, output));
+    writeToolOutput({ sessionId: sess.id, callId: id, tool: id.startsWith('read') ? 'read_file' : 'tool_search', output });
+  };
+  add('old', { results: [{ name, carrier: 'work_call', capabilityRef: 'cap:old' }], schemas: { [name]: schema }, schema_handles: { [name]: handle } });
+  add('current_preview', { results: [{ name, carrier: 'call_tool', capabilityRef: 'cap:current' }], schemas: { [name]: { type: 'object' } },
+    schema_handles: { [name]: handle }, schema_read_required: [name] });
+  for (let i = 0; i < 4; i++) add(`read_${i}`, `${i} ${'z'.repeat(5000)}`);
+  const opts = { resultTriggerTokens: 500, retainedResultBudgetTokens: 100, minRetainPairs: 1, maxRetainPairs: 1 };
+  const card = (history: AgentInputItem[]) => history.map(item => String((item as { content?: unknown }).content ?? ''))
+    .join('\n').split('[retained input schema disclosures')[1] ?? '';
+  const known = card(compactInFlightToolContext(items, sess.id, opts).nextItems);
+  assert.ok(known.includes(`- ${name} (call with call_tool, requirement_id cap:current): ${JSON.stringify(schema)}`), "Expected compaction invariant: known.includes(`- ${name} (call with call_tool, requirement_id cap:current): ${JSON.stringify(schema)}`)");
+  assert.ok(!known.includes('cap:old'), 'schema byte reuse never restores an old capability/account route');
+  add('blocked', { results: [{ name, carrier: 'work_call', planningRefStatus: 'account_selection_required', accountChoices: ['fixture-b'] }], schemas: {} });
+  for (let i = 4; i < 7; i++) add(`read_${i}`, `${i} ${'z'.repeat(5000)}`);
+  const blocked = card(compactInFlightToolContext(items, sess.id, opts).nextItems);
+  assert.ok(blocked.includes('blocked'), 'the latest row-only blocker is the exact issuing result to recover');
+  assert.ok(!blocked.includes('cap:current') && !blocked.includes('cap:old'), "Expected compaction invariant: !blocked.includes('cap:current') && !blocked.includes('cap:old')");
+  assert.ok(!blocked.includes(JSON.stringify(schema)), 'an older executable-looking contract cannot replace a newer blocker');
+});
+
+test('schema cards use actual occurrence bytes rather than a reused call id longest-wins payload', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const oldPage = JSON.stringify({ results: [{ name: 'controlled.read', carrier: 'work_call', capabilityRef: 'cap:stale' }],
+    schemas: { 'controlled.read': { type: 'object', properties: { stale: { const: 'wrong occurrence' } } } }, padding: 'old'.repeat(4000) });
+  const currentSchema = { type: 'object', description: 'current contract '.repeat(60), properties: { current: { const: 'current occurrence' } } };
+  const currentPage = JSON.stringify({ results: [{ name: 'controlled.read', carrier: 'call_tool', capabilityRef: 'cap:current' }],
+    schemas: { 'controlled.read': currentSchema } });
+  writeToolOutput({ sessionId: sess.id, callId: 'reused-search', tool: 'tool_search', output: oldPage });
+  writeToolOutput({ sessionId: sess.id, callId: 'reused-search', tool: 'tool_search', output: currentPage });
+  assert.equal(getToolOutput(sess.id, 'reused-search')!.output, oldPage, 'controlled legacy canonical storage retains longer prior bytes');
+  const items: AgentInputItem[] = [userMessage('Use the current controlled contract.'),
+    toolCall('reused-search', 'tool_search'), toolResult('reused-search', currentPage)];
+  for (let i = 0; i < 4; i++) {
+    const output = `${i} ${'p'.repeat(5000)}`;
+    items.push(toolCall(`read_${i}`, 'read_file'), toolResult(`read_${i}`, output));
+    writeToolOutput({ sessionId: sess.id, callId: `read_${i}`, tool: 'read_file', output });
+  }
+  const opts = { resultTriggerTokens: 500, retainedResultBudgetTokens: 100, minRetainPairs: 1, maxRetainPairs: 1 };
+  const cards = (input: AgentInputItem[], capacityPressure = false) => compactInFlightToolContext(input, sess.id, { ...opts, capacityPressure });
+  for (const capacityPressure of [false, true]) {
+    const current = cards(items, capacityPressure);
+    assert.ok(current.nextItems.includes(items[2]!), 'unproved current occurrence stays visible instead of pointing at longer old bytes');
+    const disclosures = current.nextItems.map(item => String((item as { content?: unknown }).content ?? ''))
+      .join('\n').split('[retained input schema disclosures')[1] ?? '';
+    assert.ok(!disclosures.includes('cap:stale') && !disclosures.includes('wrong occurrence'), "Expected compaction invariant: !disclosures.includes('cap:stale') && !disclosures.includes('wrong occurrence')");
+  }
+  const clipped = [...items];
+  clipped[2] = toolResult('reused-search', '[clipped output: recall the exact occurrence]');
+  const clippedProjection = cards(clipped);
+  assert.ok(clippedProjection.nextItems.includes(clipped[2]!), "Expected compaction invariant: clippedProjection.nextItems.includes(clipped[2]!)");
+  assert.ok(!clippedProjection.nextItems.some(item => String((item as { content?: unknown }).content ?? '').includes('[retained input schema disclosures')),
+    'unproven clipped storage cannot promote another occurrence to an inline contract');
+  const layer1 = [...items];
+  clipOldToolResults(layer1, 1, undefined, sess.id);
+  assert.deepEqual((layer1[2] as { output: unknown }).output, { type: 'text', text: currentPage },
+    'Layer 1 cannot replace this occurrence with a pointer to different longest-wins bytes either');
+});
+
+test('duplicate and durably ambiguous call ids preserve every occurrence across pressure and old checkpoint replay', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { resolveToolOutputForQuery } = await import('./eventlog.js');
+  const items: AgentInputItem[] = [userMessage('Preserve both controlled observations.')];
+  const old = JSON.stringify({ schemas: { 'controlled.read': { type: 'object', description: 'old'.repeat(4000) } } });
+  const fresh = JSON.stringify({ schemas: { 'controlled.read': { type: 'object', properties: { current: { const: true } } } } });
+  const occurrence = (output: string, turn: number) => {
+    const called = appendEvent({ sessionId: sess.id, turn, role: 'Clem', type: 'tool_called',
+      data: { callId: 'reused', tool: 'tool_search', effect: 'read' } });
+    writeToolOutput({ sessionId: sess.id, callId: 'reused', tool: 'tool_search', output });
+    appendEvent({ sessionId: sess.id, turn, role: 'Clem', type: 'tool_returned', parentEventId: called.id,
+      data: { callId: 'reused', tool: 'tool_search', effect: 'read' } });
+    return [toolCall('reused', 'tool_search'), toolResult('reused', output)];
+  };
+  const first = occurrence(old, 1);
+  items.push(...first);
+  for (let i = 0; i < 4; i++) {
+    const output = `${i} ${'p'.repeat(5000)}`;
+    items.push(toolCall(`ordinary_${i}`, 'read_file'), toolResult(`ordinary_${i}`, output));
+    writeToolOutput({ sessionId: sess.id, callId: `ordinary_${i}`, tool: 'read_file', output });
+  }
+  const opts = { resultTriggerTokens: 500, retainedResultBudgetTokens: 100, minRetainPairs: 1, maxRetainPairs: 1 };
+  const state = createInFlightCompactionState();
+  assert.ok(compactInFlightToolContextStable([...items], state, sess.id, opts).callIds.includes('reused'), "Expected compaction invariant: compactInFlightToolContextStable([...items], state, sess.id, opts).callIds.includes('reused')");
+  const beforeReuse = [...items];
+  const frozenBeforeReuse = { checkpoints: state.checkpoints.map(checkpoint => ({ ...checkpoint, callIds: new Set(checkpoint.callIds) })) };
+  const reopenedCall = toolCall('reused', 'tool_search', '{"query":"a new occurrence is still running"}');
+  const openOnly = compactInFlightToolContextStable([items[0]!, reopenedCall],
+    { checkpoints: frozenBeforeReuse.checkpoints.map(checkpoint => ({ ...checkpoint, callIds: new Set(checkpoint.callIds) })) }, sess.id, opts);
+  assert.ok(openOnly.nextItems.includes(reopenedCall), 'a checkpoint cannot replace a present open same-id call with old settled work');
+  const current = occurrence(fresh, 2);
+  items.push(...current);
+  const latest = 'Latest controlled observation.';
+  items.push(toolCall('latest', 'read_file'), toolResult('latest', latest));
+  writeToolOutput({ sessionId: sess.id, callId: 'latest', tool: 'read_file', output: latest });
+  assert.equal(resolveToolOutputForQuery(sess.id, 'reused').status, 'ambiguous');
+  const replayedAfterDurableReuse = compactInFlightToolContextStable([...beforeReuse, ...items.slice(-2)], frozenBeforeReuse, sess.id,
+    { ...opts, capacityPressure: true });
+  assert.ok(replayedAfterDurableReuse.nextItems.includes(first[1]!),
+    'a frozen checkpoint rechecks retained ambiguity even if the second occurrence is outside this raw frame');
+  for (const result of [compactInFlightToolContext([...items], sess.id, { ...opts, capacityPressure: true }),
+    compactInFlightToolContextStable([...items], state, sess.id, { ...opts, capacityPressure: true })]) {
+    for (const frame of [...first, ...current]) assert.ok(result.nextItems.includes(frame), "Expected compaction invariant: result.nextItems.includes(frame)");
+    assert.equal(result.nextItems.filter(item => (item as { callId?: string }).callId === 'reused').length, 4);
+    assert.ok(!result.callIds.includes('reused'), "Expected compaction invariant: !result.callIds.includes('reused')");
+  }
+  const priorAmbiguous = items.filter(item => !first.includes(item));
+  const onlyCurrent = compactInFlightToolContext(priorAmbiguous, sess.id, { ...opts, capacityPressure: true });
+  assert.ok(onlyCurrent.nextItems.includes(current[1]!), 'prior retained ambiguity is still relevant with only one occurrence in the current input');
+  const clipped = [...items];
+  clipOldToolResults(clipped, 1, undefined, sess.id);
+  for (const frame of [...first, ...current]) assert.ok(clipped.includes(frame), "Expected compaction invariant: clipped.includes(frame)");
+  assert.deepEqual((current[1] as { output: unknown }).output, { type: 'text', text: fresh });
+});
+
+test('retirement preserves readable failure and legacy data but requires a host-resolved nonce for compact exact receipts', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  const { formatRecallableToolText } = await import('./tool-output-format.js');
+  const { resolveToolOutputForQuery } = await import('./eventlog.js');
+  const nonce = '11111111-1111-4111-8111-111111111111';
+  const full = 'controlled exact output '.repeat(1000);
+  const compact = withToolOutputContext({ sessionId: sess.id, callId: 'exact', toolName: 'read_file', settlementNonce: nonce },
+    () => formatRecallableToolText(full, { maxChars: 1000 }));
+  assert.match(compact, new RegExp(nonce));
+  const exact = resolveToolOutputForQuery(sess.id, 'exact');
+  assert.equal(exact.status, 'ok');
+  if (exact.status !== 'ok') return;
+  assert.equal(exact.record.invocationNonce, nonce, 'expected nonce comes from host invocation resolution');
+  const failure = '{"ok":false,"error":"controlled failure remains readable"}';
+  const legacy = 'controlled legacy bytes '.repeat(500);
+  writeToolOutput({ sessionId: sess.id, callId: 'failure', tool: 'controlled.read', output: failure });
+  writeToolOutput({ sessionId: sess.id, callId: 'legacy', tool: 'read_file', output: legacy });
+  const items: AgentInputItem[] = [userMessage('Keep the exact controlled evidence.'),
+    toolCall('failure', 'controlled.read'), toolResult('failure', failure),
+    toolCall('legacy', 'read_file'), toolResult('legacy', legacy),
+    toolCall('exact', 'read_file'), toolResult('exact', compact)];
+  const olderCanonical = 'older canonical output '.repeat(1000);
+  const newerExact = 'newer exact occurrence '.repeat(40);
+  writeToolOutput({ sessionId: sess.id, callId: 'canonical_conflict', tool: 'read_file', output: olderCanonical });
+  writeToolOutput({ sessionId: sess.id, callId: 'canonical_conflict', invocationNonce: '33333333-3333-4333-8333-333333333333',
+    tool: 'read_file', output: newerExact });
+  const differentQueryBytes = resolveToolOutputForQuery(sess.id, 'canonical_conflict');
+  assert.equal(differentQueryBytes.status, 'ok');
+  if (differentQueryBytes.status !== 'ok') return;
+  assert.equal(differentQueryBytes.record.output, newerExact);
+  assert.equal(getToolOutput(sess.id, 'canonical_conflict')!.output, olderCanonical);
+  const conflict = toolResult('canonical_conflict', newerExact);
+  items.push(toolCall('canonical_conflict', 'read_file'), conflict);
+  const tail = 'latest '.repeat(1000);
+  writeToolOutput({ sessionId: sess.id, callId: 'latest', tool: 'read_file', output: tail });
+  items.push(toolCall('latest', 'read_file'), toolResult('latest', tail));
+  const pressure = { resultTriggerTokens: 1, retainedResultBudgetTokens: 100, minRetainPairs: 1, maxRetainPairs: 1, capacityPressure: true };
+  const valid = compactInFlightToolContext([...items], sess.id, pressure);
+  for (const callId of ['failure', 'legacy', 'exact']) assert.ok(valid.callIds.includes(callId), "Expected compaction invariant: valid.callIds.includes(callId)");
+  assert.ok(valid.nextItems.includes(conflict), 'bare advertised recall must not silently switch to a different canonical payload');
+  const forged = [...items];
+  forged[6] = toolResult('exact', compact.replace(nonce, '22222222-2222-4222-8222-222222222222'));
+  const rejected = compactInFlightToolContext(forged, sess.id, pressure);
+  assert.ok(rejected.nextItems.includes(forged[6]!), 'a payload-nominated different nonce is not host occurrence proof');
+  assert.ok(!rejected.callIds.includes('exact'), "Expected compaction invariant: !rejected.callIds.includes('exact')");
+});
+
+test('capacity pressure rebases frozen schema cards and refetched results while preserving exact task and effect evidence', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const { capacityAwareCompactionThresholds } = await import('./context-capacity-policy.js');
+  const shadow = await import('../graph/turn-graph-shadow.js');
+  const dispatch = await import('./dispatch-ledger.js');
+  const identities = await import('./attempt-identity.js');
+  const outcomes = await import('./attempt-outcome.js');
+  const settlements = await import('./logical-call-settlement-store.js');
+  const objective = userMessage('Prepare the controlled board; keep all requirements and do not send it.');
+  const standing = systemMessage('Standing instruction: retain the selected account and never repeat a settled write.');
+  const contrary = assistantMessage('Contrary evidence: earlier populated rows do not prove the last refresh worked.');
+  const visual = { role: 'user', content: [{ type: 'input_text', text: 'The supplied image is contrary evidence.' },
+    { type: 'input_image', image: 'data:image/png;base64,controlled-visual-frame' }] } as unknown as AgentInputItem;
+  const source = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Prepare the controlled board; keep all requirements and do not send it.' } });
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 } }), "Expected compaction invariant: shadow.recordTurnGraphShadow({ identity: { sessionId: sess.id, sourceUserSeq: source.seq, turn: 1 } })");
+  const task = { sessionId: sess.id, sourceUserSeq: source.seq, acceptedTaskId: identities.acceptedTaskIdFor(sess.id, source.seq) };
+  const writeArgs = { path: 'controlled-board.json', content: 'controlled value', mode: 'create' };
+  const started = dispatch.beginPhysicalDispatch({ identity: { ...task, logicalToolCallId: 'settled_write', physicalDispatchId: 'settled_write:1', ordinal: 0 },
+    tool: 'write_file', args: writeArgs });
+  assert.equal(started.status, 'inserted');
+  if (started.status !== 'inserted') return;
+  assert.equal(dispatch.settlePhysicalDispatch({ identity: started.identity, tool: 'write_file', outcome: 'returned' }).status, 'inserted');
+  const writeResult = JSON.stringify({ ok: true, committed: true, path: writeArgs.path });
+  assert.equal(settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId: 'settled_write' },
+    contract: { toolName: 'write_file', args: writeArgs }, execution: { kind: 'provider_execution' },
+    result: { payload: writeResult }, outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: true }),
+    recovery: { businessCall: true, mutating: true }, observer: { lane: 'composio', callId: 'settled_write', turn: 1 } }).status, 'committed');
+  const items: AgentInputItem[] = [objective, standing, contrary, visual];
+  const add = (id: string, name: string, output: string, args = '{}', park = true) => {
+    items.push(toolCall(id, name, args), toolResult(id, output));
+    if (park) writeToolOutput({ sessionId: sess.id, callId: id, tool: name, output });
+  };
+  const schema = { type: 'object', description: 'schema instructions '.repeat(600), properties: { fixture: { type: 'string' } }, required: ['fixture'] };
+  const sha256 = createHash('sha256').update(JSON.stringify(schema)).digest('hex');
+  add('issued_schema', 'tool_search', JSON.stringify({ results: [{ name: 'controlled.read', carrier: 'call_tool' }],
+    schemas: { 'controlled.read': schema }, schema_handles: { 'controlled.read': { schema_ref: `sha256:${sha256}`, cursor: `tool_search_schema:v1:${sha256}:0` } },
+    padding: 'p'.repeat(16000) }));
+  add('settled_write', 'write_file', writeResult, JSON.stringify(writeArgs));
+  const uncertain = JSON.stringify({ status: 'uncertain', detail: 'The provider may have begun. Reconcile this exact occurrence before retry.' });
+  add('uncertain_write', 'controlled.write', uncertain, '{"fixture":"uncertain"}');
+  const playbook = 'Reusable controlled procedure '.repeat(500);
+  add('playbook_first', 'skill_read', playbook, '{"name":"controlled-playbook"}');
+  add('playbook_refetched', 'skill_read', playbook, '{"name":"controlled-playbook"}');
+  for (let i = 0; i < 3; i++) add(`ordinary_${i}`, 'read_file', `${i} ${'x'.repeat(5000)}`);
+  const open = toolCall('open_call', 'controlled.read', '{"fixture":"still running"}');
+  items.push(open);
+  add('unrecallable', 'controlled.read', 'unparked observation '.repeat(40), '{}', false);
+  add('latest_failed', 'controlled.read', '{"ok":false,"error":"Newest refresh failed; old rows are not fresh acceptance."}', '{"fixture":"latest"}');
+  const before = JSON.stringify(items);
+  const normal = { resultTriggerTokens: 2000, retainedResultBudgetTokens: 1000, minRetainPairs: 1, maxRetainPairs: 2, checkpointed: true };
+  const state = createInFlightCompactionState();
+  const first = compactInFlightToolContextStable([...items], state, sess.id, normal);
+  const textOf = (input: AgentInputItem[]) => input.map(item => String((item as { content?: unknown }).content ?? '')).join('\n');
+  assert.ok(first.checkpointCreated, "Expected compaction invariant: first.checkpointCreated");
+  assert.ok(textOf(first.nextItems).includes(JSON.stringify(schema)), 'normal cached checkpoints retain the full issued schema');
+  assert.ok(first.nextItems.some(item => (item as { callId?: string }).callId === 'playbook_refetched'), "Expected compaction invariant: first.nextItems.some(item => (item as { callId?: string }).callId === 'playbook_refetched')");
+  const overhead = 1000;
+  const contextWindow = estimateInputTokens(first.nextItems) + overhead;
+  const policy = capacityAwareCompactionThresholds(normal, contextWindow, estimateInputTokens(first.nextItems) + overhead);
+  assert.equal(policy.capacityPressure, true, 'use the actual caller capacity policy, including instruction/tool overhead');
+  const pressure = { ...policy.thresholds, capacityPressure: policy.capacityPressure };
+  for (const result of [compactInFlightToolContext([...items], sess.id, pressure),
+    compactInFlightToolContextStable([...items], state, sess.id, pressure)]) {
+    assert.ok(result.afterTokens + overhead <= Math.floor(contextWindow * 0.9), 'this reducible controlled request recovers its output headroom');
+    for (const frame of [objective, standing, contrary, visual, open]) assert.ok(result.nextItems.includes(frame), "Expected compaction invariant: result.nextItems.includes(frame)");
+    assert.deepEqual(result.nextItems.slice(-2), items.slice(-2), 'the newest contrary observation stays exact and in order');
+    assert.ok(result.nextItems.some(item => (item as { callId?: string }).callId === 'unrecallable'), "Expected compaction invariant: result.nextItems.some(item => (item as { callId?: string }).callId === 'unrecallable')");
+    assert.ok(!result.nextItems.some(item => (item as { callId?: string }).callId === 'playbook_refetched'), "Expected compaction invariant: !result.nextItems.some(item => (item as { callId?: string }).callId === 'playbook_refetched')");
+    const sent = textOf(result.nextItems);
+    assert.ok(!sent.includes(JSON.stringify(schema)), 'old frozen inline cards are not exempt from capacity reduction');
+    assert.ok(!sent.includes('[retained input schema disclosures'), 'hard pressure omits optional full and fallback schema cards');
+    assert.ok(sent.includes('issued_schema') && sent.includes('recall_tool_result'), 'the common complete call-id ledger retains the exact issuing recovery path');
+    assert.ok(sent.includes('[Durable completed writes — already done]') && sent.includes(JSON.stringify(writeArgs)), "Expected compaction invariant: sent.includes('[Durable completed writes — already done]') && sent.includes(JSON.stringify(writeArgs))");
+    assert.ok(sent.includes('uncertain_write') && sent.includes('uncertain'), "Expected compaction invariant: sent.includes('uncertain_write') && sent.includes('uncertain')");
+    assert.equal(getToolOutput(sess.id, 'uncertain_write')!.output, uncertain);
+    assert.equal(getToolOutput(sess.id, 'playbook_refetched')!.output, playbook);
+  }
+  assert.equal(state.checkpoints.length, 1, 'hard pressure replaces old copied-card checkpoints with one exact-reference ledger');
+  assert.equal(JSON.stringify(items), before, 'all original request, schema, observation and effect bytes remain lossless');
+});
+
+test('schema card fallback references share the total card cap without losing the complete call-id index', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const items: AgentInputItem[] = [userMessage('Keep the controlled tool disclosures addressable.')];
+  const ids: string[] = [];
+  for (let i = 0; i < 240; i++) {
+    const name = `controlled_${i}_${'n'.repeat(80)}`;
+    const callId = `search_${i}_${'c'.repeat(100)}`;
+    ids.push(callId);
+    const sha256 = createHash('sha256').update(JSON.stringify({ name })).digest('hex');
+    const output = JSON.stringify({ results: [{ name, carrier: 'work_call', capabilityRef: `cap:${name}` }],
+      schemas: { [name]: { type: 'object' } }, schema_read_required: [name],
+      schema_handles: { [name]: { schema_ref: `sha256:${sha256}`, cursor: `tool_search_schema:v1:${sha256}:0` } } });
+    items.push(toolCall(callId, 'tool_search'), toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool: 'tool_search', output });
+  }
+  items.push(toolCall('latest', 'read_file'), toolResult('latest', 'Latest observation.'));
+  writeToolOutput({ sessionId: sess.id, callId: 'latest', tool: 'read_file', output: 'Latest observation.' });
+  const result = compactInFlightToolContext(items, sess.id,
+    { resultTriggerTokens: 500, retainedResultBudgetTokens: 100, minRetainPairs: 1, maxRetainPairs: 1 });
+  assert.ok(result.applied, "Expected compaction invariant: result.applied");
+  const ledger = String((result.nextItems.find(item => String((item as { content?: unknown }).content ?? '')
+    .startsWith('[summary of older completed tool activity]')) as { content: string }).content);
+  const start = ledger.indexOf('[retained input schema disclosures');
+  assert.ok(start >= 0, "Expected compaction invariant: start >= 0");
+  const cards = ledger.slice(start);
+  assert.ok(cards.length <= 48_000, `all cards and fallback lines use one cap, got ${cards.length}`);
+  assert.ok(cards.includes('Additional schema disclosures remain'), "Expected compaction invariant: cards.includes('Additional schema disclosures remain')");
+  const completeIndex = /\[complete collapsed call-id index JSON\] (\[[^\n]+\])/.exec(ledger);
+  assert.ok(completeIndex, "Expected compaction invariant: completeIndex");
+  assert.deepEqual(JSON.parse(completeIndex[1]!), ids, 'no exact result identity is dropped when optional cards stop fitting');
 });
 
 test('a result fetched again after a collapse stays verbatim for the rest of the turn; the rest still collapses', () => {

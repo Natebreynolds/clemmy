@@ -61,6 +61,9 @@ test('steering is scoped to human chat surfaces — agent/cron sessions never in
   assert.equal(sessionSupportsSteering('sess-desktop-abc'), true);
   assert.equal(sessionSupportsSteering('space-crm-dash'), true);
   assert.equal(sessionSupportsSteering('discord-123'), true);
+  assert.equal(sessionSupportsSteering('workflow-edit:controlled-workflow'), true);
+  assert.equal(sessionSupportsSteering('workflow-edit:%2e%2e%2foutside'), false);
+  assert.equal(sessionSupportsSteering('workflow-edit:%'), false);
   assert.equal(sessionSupportsSteering('agent:clementine'), false);
   assert.equal(sessionSupportsSteering('workflow:trigger-x:main'), false);
   assert.equal(sessionSupportsSteering(undefined), false);
@@ -76,6 +79,16 @@ test('the injected block carries the user words verbatim and the context-not-aut
   assert.match(block, /does not replace it unless it clearly says so/i);
   assert.match(block, /normal approval path/i, 'a note never becomes a side-door around effect gates');
   assert.equal(formatSteerBlock([]), '');
+});
+
+test('a canonical workflow conversation receives steering once without using workflow run namespace', () => {
+  const session = createSession({ id: 'workflow-edit:controlled-steering', kind: 'chat' });
+  appendSteerNote(session.id, 'Only change the wording; keep its schedule.');
+  assert.deepEqual(takeUndeliveredSteerNotes(session.id).map(note => note.text), ['Only change the wording; keep its schedule.']);
+  assert.deepEqual(takeUndeliveredSteerNotes(session.id), []);
+  assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 0,
+    'steering does not create a new execution source');
+  assert.equal(steerBlockForToolBoundary('workflow:controlled-run:step'), '');
 });
 
 test('boundary composition: one call takes, formats, and marks — empty when quiet', () => {

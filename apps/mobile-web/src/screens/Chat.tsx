@@ -78,6 +78,7 @@ import {
   hiddenCardDecision,
   editableApprovalField,
   ApprovalDecisionGate,
+  workflowConversationSlugFromSessionId,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -86,7 +87,6 @@ import {
   cancelChatTurn,
   createChatStreamTransport,
   freshIdempotencyKey,
-  getChatSession,
   getChatRunControl,
   listAgents,
   rejectPlanProposal,
@@ -122,6 +122,7 @@ import { RunControl, delegatedRunControlForExpandedWork } from '../components/Ru
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
 import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileConversationDraftOwner, mobileDrafts, newMobileDraftScope, prepareSelectedFile, reconcileDraftChoice, settleDraftChoice, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
+import { loadMobileChatHistory } from '../lib/chat-history';
 
 interface Props {
   initialComposeMode?: ComposeMode;
@@ -157,6 +158,12 @@ interface Props {
 
 export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, initialFileContext, draftScope, initialAttachments, initialAutoSend, initialComposeMode, agentId: initialAgentId, agentName: initialAgentName, projectId: initialProjectId, projectName: initialProjectName, onOpenRun, onOpenNeedsYou, onOpenSettings, onSessionCreated, onBack }: Props) {
   useMobileDetailHeader();
+  // The route's root owns scope even when Stop/Continue advances execution to
+  // a physical successor whose ordinary session id has no workflow prefix.
+  const workflowScoped = workflowConversationSlugFromSessionId(initialSessionId ?? '') !== null;
+  const scopedRoot = workflowScoped || (initialSessionId ?? '').startsWith('space-');
+  const [workflowHistoryReady, setWorkflowHistoryReady] = useState(!workflowScoped);
+  const retryHistory = useRef<(() => void) | null>(null);
   const widgetNavigation = widgetNavigationFromSearch(window.location.search);
   useEffect(() => { if (initialComposeMode) reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode }); }, [initialComposeMode, widgetNavigation]);
   const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
@@ -190,10 +197,10 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // A new conversation opens inside it; after that a change is applied just
   // before the next message (see sendMessage).
   const [agent, setAgent] = useState<{ id: string; name: string } | null>(
-    savedChoices.agentChoice ? savedChoices.agentChoice.value : initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
+    scopedRoot ? null : savedChoices.agentChoice ? savedChoices.agentChoice.value : initialAgentId ? { id: initialAgentId, name: initialAgentName ?? '' } : null,
   );
   /** The agent the daemon has for this conversation, so a send only reports a real change. */
-  const sessionAgentId = useRef<string | null>(initialAgentId ?? null);
+  const sessionAgentId = useRef<string | null>(scopedRoot ? null : initialAgentId ?? null);
   // The agent a NEW conversation is created in. Frozen once a session exists:
   // the engine is rebuilt when it changes, which must never drop a thread.
   const [openingAgentId, setOpeningAgentId] = useState<string | null>(initialSessionId ? null : agent?.id ?? null);
@@ -201,20 +208,21 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const agentPickOpen = conversationPanel === 'agent';
   const [agentChoices, setAgentChoices] = useState<MobileAgent[] | null>(null);
   useEffect(() => {
+    if (scopedRoot) { setAgentChoices([]); return; }
     let cancelled = false;
     listAgents()
       .then((result) => { if (!cancelled) setAgentChoices(result.agents); })
       .catch(() => { if (!cancelled) setAgentChoices([]); });
     return () => { cancelled = true; };
-  }, [agentPickOpen]);
+  }, [agentPickOpen, scopedRoot]);
   // Which project the next message works in: changeable at any time, like
   // who answers. A new conversation opens inside it; after that a change is
   // applied just before the next message (see sendMessage).
   const [project, setProject] = useState<{ id: string; name: string } | null>(
-    savedChoices.projectChoice ? savedChoices.projectChoice.value : initialProjectId ? { id: initialProjectId, name: initialProjectName ?? '' } : null,
+    scopedRoot ? null : savedChoices.projectChoice ? savedChoices.projectChoice.value : initialProjectId ? { id: initialProjectId, name: initialProjectName ?? '' } : null,
   );
   /** The project the daemon has for this conversation, so a send only reports a real change. */
-  const sessionProjectId = useRef<string | null>(initialSessionId ? initialProjectId ?? null : null);
+  const sessionProjectId = useRef<string | null>(!scopedRoot && initialSessionId ? initialProjectId ?? null : null);
   /** Read by the engine's send when it creates the conversation. */
   const projectRef = useRef(project);
   projectRef.current = project;
@@ -223,15 +231,15 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const projectPickOpen = conversationPanel === 'project';
   const [projectChoices, setProjectChoices] = useState<ProjectSummary[] | null>(null);
   useEffect(() => {
-    // A Space dock works in its Space, never in a project: it asks for none.
-    if ((initialSessionId ?? '').startsWith('space-')) { setProjectChoices([]); return; }
+    // Scoped conversations work in their saved object, never in a project.
+    if (scopedRoot) { setProjectChoices([]); return; }
     let cancelled = false;
     listProjects()
       .then((result) => { if (!cancelled) setProjectChoices(result.projects.filter((row) => row.status === 'active')); })
       // A Mac that does not know projects yet simply offers none.
       .catch(() => { if (!cancelled) setProjectChoices([]); });
     return () => { cancelled = true; };
-  }, [projectPickOpen]);
+  }, [projectPickOpen, scopedRoot]);
   const [title, setTitle] = useState(initialTitle ?? '');
   const [draft, setDraftState] = useState(() => mobileDrafts.read(draftOwner.current, initialDraft).text);
   const [fileContext, setFileContext] = useState<SelectedFileContext | null>(() => initialFileContext
@@ -323,29 +331,21 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         return { sessionId: result.sessionId, accepted: result.accepted, steered: result.steered, noteSeq: result.noteSeq };
       },
       loadSession: async (sessionId) => {
-        try {
-          const result = await getChatSession(sessionId);
-          if (!ownsDraftGeneration() || !activeDraftOwner.current) return { events: result.events, latestSeq: result.latestSeq };
-          draftConversationId.current = result.session.id;
-          const saved = mobileDrafts.read(draftOwner.current);
-          const agentChoice = reconcileDraftChoice(saved.agentChoice, result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
-          const projectChoice = reconcileDraftChoice(saved.projectChoice, result.session.projectId ? { id: result.session.projectId, name: result.session.projectName ?? '' } : null);
-          rememberDraft({ agentChoice, projectChoice });
-          setTitle(result.session.title);
-          setAgent(agentChoice.value);
-          sessionAgentId.current = result.session.agentId ?? null;
-          setProject(projectChoice.value);
-          sessionProjectId.current = result.session.projectId ?? null;
-          return { events: result.events, latestSeq: result.latestSeq,
-            executionSessionId: result.session.executionSessionId, history: result.history };
-        } catch (err) {
-          // Workspace threads use a STABLE session id (space-<slug>) that may
-          // not exist until the first message — an empty thread, not an error.
-          if ((err as { status?: number }).status === 404 && /^space-/.test(sessionId)) {
-            return { events: [], latestSeq: 0 };
-          }
-          throw err;
-        }
+        const result = await loadMobileChatHistory(sessionId);
+        if (!result) return { events: [], latestSeq: 0 };
+        if (!ownsDraftGeneration() || !activeDraftOwner.current) return { events: result.events, latestSeq: result.latestSeq };
+        draftConversationId.current = workflowScoped ? initialSessionId! : result.session.id;
+        const saved = mobileDrafts.read(draftOwner.current);
+        const agentChoice = scopedRoot ? { value: null, pending: false } : reconcileDraftChoice(saved.agentChoice, result.session.agentId ? { id: result.session.agentId, name: result.session.agentName ?? '' } : null);
+        const projectChoice = scopedRoot ? { value: null, pending: false } : reconcileDraftChoice(saved.projectChoice, result.session.projectId ? { id: result.session.projectId, name: result.session.projectName ?? '' } : null);
+        rememberDraft({ agentChoice, projectChoice });
+        setTitle(workflowScoped ? initialTitle ?? 'Workflow conversation' : result.session.title);
+        setAgent(agentChoice.value);
+        sessionAgentId.current = scopedRoot ? null : result.session.agentId ?? null;
+        setProject(projectChoice.value);
+        sessionProjectId.current = scopedRoot ? null : result.session.projectId ?? null;
+        return { events: result.events, latestSeq: result.latestSeq,
+          executionSessionId: result.session.executionSessionId, history: result.history };
       },
     },
     newIdempotencyKey: freshIdempotencyKey,
@@ -358,22 +358,38 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
 
   useEffect(() => {
     const unsubscribe = engine.subscribe(setSnapshot);
-    if (initialSessionId) {
-      engine.open().catch((err) => setError((err as Error).message ?? 'Failed to load transcript'));
-    }
+    let active = true;
+    let loaded = !initialSessionId;
+    let opening: Promise<void> | null = null;
+    if (workflowScoped) setWorkflowHistoryReady(false);
+    const openHistory = (): void => {
+      if (opening || !active) return;
+      const attempt = engine.open().then(() => {
+        if (!active) return;
+        loaded = true;
+        if (workflowScoped) { setWorkflowHistoryReady(true); setError(null); }
+      }).catch((err) => {
+        if (active) setError((err as Error).message ?? 'Failed to load transcript');
+      }).finally(() => { if (opening === attempt) opening = null; });
+      opening = attempt;
+    };
+    retryHistory.current = openHistory;
+    if (initialSessionId) openHistory();
     // Recovery triggers: the webview waking up (screen unlock, app switch
     // back), the network returning, and the shell's pull-to-refresh. Each is
     // cheap and idempotent — the engine polls a cursor catch-up and only
     // reconnects when the stream is actually gone.
     const onVisible = (): void => {
-      if (document.visibilityState === 'visible') engine.resume();
+      if (document.visibilityState === 'visible') onWake();
     };
-    const onWake = (): void => engine.resume();
+    const onWake = (): void => { if (workflowScoped && !loaded) openHistory(); else engine.resume(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('pageshow', onWake);
     window.addEventListener('online', onWake);
     window.addEventListener(REFRESH_EVENT, onWake);
     return () => {
+      active = false;
+      if (retryHistory.current === openHistory) retryHistory.current = null;
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('pageshow', onWake);
       window.removeEventListener('online', onWake);
@@ -386,7 +402,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   useEffect(() => {
     const text = initialDraft?.trim() ?? '';
     const files = initialAttachments ?? [];
-    if (initialFileContext || !initialAutoSend || (!text && files.length === 0) || autoSent.current) return;
+    if (workflowScoped || initialFileContext || !initialAutoSend || (!text && files.length === 0) || autoSent.current) return;
     autoSent.current = true;
     setDraft('');
     haptic('light');
@@ -394,7 +410,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       .catch(error => setError(error instanceof Error ? error.message : 'Could not send.'));
   }, [engine, initialAutoSend, initialDraft, initialAttachments]);
 
-  const messages = snapshot?.messages ?? [];
+  const messages = workflowScoped && !workflowHistoryReady ? [] : snapshot?.messages ?? [];
   const busy = snapshot?.busy ?? false;
   useEffect(() => {
     if (!snapshot?.sessionId || !ownsDraftGeneration()) return;
@@ -415,8 +431,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const cancelKey = snapshot?.cancelKey ?? null;
   const activeSourceUserSeq = snapshot?.activeSourceUserSeq ?? null;
   const canStop = busy && Boolean(snapshot?.sessionId);
-  // A Space dock takes no agent; everything else can switch at any time.
-  const takesAgent = !(snapshot?.sessionId ?? initialSessionId ?? '').startsWith('space-');
+  // Saved-object scope survives a successor session; general choices cannot
+  // silently turn a Workflow or Space conversation into a different task.
+  const takesAgent = !scopedRoot && !(snapshot?.sessionId ?? '').startsWith('space-');
   const agentLabel = agent?.name || (agent ? 'Agent' : 'Clem');
   // An agent pinned to a model answers on it: the model chip
   // names it, read again whenever the agent, the conversation or the brain changes.
@@ -484,6 +501,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   );
 
   function pickProject(next: { id: string; name: string } | null) {
+    if (!takesAgent) return;
     haptic('light');
     rememberDraft({ projectChoice: { value: next, pending: true } });
     setProject(next);
@@ -491,6 +509,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }
 
   function pickAgent(next: { id: string; name: string } | null) {
+    if (!takesAgent) return;
     haptic('light');
     rememberDraft({ agentChoice: { value: next, pending: true } });
     setAgent(next);
@@ -517,6 +536,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   /** Send a new message to whoever the chip names. A message sent while a
    *  reply runs steers that reply; the choice waits for the next one. */
   async function sendMessage(text: string, mode: TaskMode | undefined, attachments: ChatAttachment[] = [], stillCurrent: () => boolean = () => true, voice = false) {
+    if (workflowScoped && !workflowHistoryReady) throw new Error('Load this workflow conversation before sending. Try again above.');
     const current = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine && stillCurrent();
     assertDraftCurrent(current);
     if (attachments.length && engine.snapshot().busy) throw new Error('Files can be sent after Clem finishes this turn.');
@@ -677,7 +697,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   }
 
   async function submitDraft(text: string, attachments: ChatAttachment[]): Promise<boolean> {
-    if (executing || preparingContext) return false;
+    if (executing || preparingContext || (workflowScoped && !workflowHistoryReady)) return false;
     const selected = contextRef.current;
     const owner = draftOwner.current;
     const current = () => ownsDraftGeneration() && activeDraftOwner.current && engineOwner.current === engine && (contextRef.current === selected
@@ -826,7 +846,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           </> : null}
           <button type="button" class="chat-option" onClick={() => setConversationPanel('model')}><span>Model</span><strong>{modelDisplayName(brainLabel)}</strong></button>
           <button type="button" class="chat-option" disabled={busy} aria-pressed={planning} onClick={() => { haptic('light'); setComposerMode(planning ? 'normal' : 'plan'); }}><span>Plan before acting</span><strong>{executing ? 'Executing approved plan' : planning ? 'On' : 'Off'}</strong></button>
-          <p class="chat-options-note">Plan investigates first and asks before execution. Changing the agent or project applies to your next message.</p>
+          <p class="chat-options-note">Plan investigates first and asks before execution.{takesAgent ? ' Changing the agent or project applies to your next message.' : ''}</p>
           {snapshot?.sessionId || initialSessionId ? <button type="button" class="chat-option" onClick={() => {
             setConversationPanel(null);
             // Let the options sheet release focus before opening the browser.
@@ -908,10 +928,11 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         onTouchStart={releaseTail}
         onWheel={releaseTail}
       >
-        {error ? <div class="global-error">{error}</div> : null}
-        {messages.length === 0 ? (
+        {error ? <div class="global-error">{error}{workflowScoped && !workflowHistoryReady ? <button type="button" class="btn-quiet" onClick={() => retryHistory.current?.()}>Try again</button> : null}</div> : null}
+        {(workflowScoped && !workflowHistoryReady) || messages.length === 0 ? (
           <div class="inbox-empty">
-            {initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.'
+            {workflowScoped ? !workflowHistoryReady ? error ? 'The conversation could not be loaded.' : 'Loading conversation…' : 'Ask a question or describe a change to this workflow.'
+              : initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.'
               : agent?.name ? `Type a message to start a chat with ${agent.name}.` : 'Type a message to start a new chat.'}
           </div>
         ) : null}
@@ -986,16 +1007,16 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           onActiveChange={setVoiceActive}
           clearErrorRequest={voiceErrorReset}
           disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
-          disabled={dictationActive || preparingContext || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
+          disabled={dictationActive || preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
         />
         <Composer
           value={draft}
           onChange={setDraft}
           textareaRef={textareaRef}
-          placeholder={busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : `Message ${agent?.name || 'Clem'}…`}
+          placeholder={busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : workflowScoped ? 'Ask about or change this workflow…' : `Message ${agent?.name || 'Clem'}…`}
           ariaLabel={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
           upload={uploadChatAttachment}
-          disabled={executing}
+          disabled={executing || (workflowScoped && !workflowHistoryReady)}
           voiceActive={voiceActive}
           onDictationActiveChange={setDictationActive}
           onDictationStart={() => setVoiceErrorReset(value => value + 1)}

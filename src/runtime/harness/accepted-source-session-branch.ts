@@ -24,6 +24,8 @@ import {
 } from './cancelled-successor-retained-read.js';
 import { measureProjectionRead, type ProjectionReadObserver } from '../../dashboard/projection-read-metrics.js';
 import { prepareCached } from '../sqlite-statement-cache.js';
+import { normalizedWorkflowConversationBinding, workflowConversationSlugFromSessionId,
+  type WorkflowConversationBinding } from '../../shared/workflow-conversation.js';
 
 const BRANCH_META = '__accepted_source_branch';
 const MOUNT_META = '__session_mount';
@@ -51,6 +53,8 @@ export type AcceptedSourceSessionSelectionInput = {
   /** Closed authority supplied by a workspace-aware ingress. Never inferred
    * from arbitrary parent metadata during a split. */
   validatedMount?: AcceptedSourceValidatedMount;
+  /** Exact definition conversation, validated by its ingress; not a run mount. */
+  workflowConversation?: WorkflowConversationBinding;
 } & (
   | { kind: 'ordinary'; /** Refuse competing work instead of branching away from it. */ requireIdle?: boolean }
   | { kind: 'bound_control'; targetSessionId: string }
@@ -86,6 +90,7 @@ export interface ClaimedAcceptedSourceSession {
 export interface AcceptedSourceIngressLineage {
   conversationId: string;
   validatedMount?: AcceptedSourceValidatedMount;
+  workflowConversation?: WorkflowConversationBinding;
 }
 
 export interface AcceptedSourceConversationProjection {
@@ -384,6 +389,22 @@ function stringField(record: Record<string, unknown>, key: string): string | nul
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function assertWorkflowConversationRow(row: RawSession, expected: WorkflowConversationBinding | null): void {
+  if (!expected) return;
+  const metadata = parseMetadata(row.metadata_json);
+  const raw = metadata.__workflow_conversation;
+  const retained = raw === undefined ? null : normalizedWorkflowConversationBinding(raw);
+  const direct = workflowConversationSlugFromSessionId(row.id);
+  const canonicalRoot = workflowConversationSlugFromSessionId(rootSessionIdFor(row));
+  const actual = retained ?? (direct ? { version: 1, rootSessionId: row.id, workflowSlug: direct } : null);
+  if (row.kind !== 'chat' || (raw !== undefined && !retained)
+    || !actual || actual.rootSessionId !== expected.rootSessionId || actual.workflowSlug !== expected.workflowSlug
+    || (direct !== null && direct !== expected.workflowSlug)
+    || (canonicalRoot !== null && canonicalRoot !== expected.workflowSlug)) {
+    throw new Error('The conversation is bound to a different workflow. Open the workflow again.');
+  }
+}
+
 function sessionRow(db: Database.Database, sessionId: string): RawSession {
   const row = db.prepare(`
     SELECT id, kind, channel, user_id, status, metadata_json
@@ -476,7 +497,12 @@ export function resolveAcceptedSourceIngressLineage(input: {
       }
     }
   }
-  return { conversationId, ...(validatedMount ? { validatedMount } : {}) };
+  const rawWorkflowConversation = metadata.__workflow_conversation;
+  const workflowConversation = rawWorkflowConversation === undefined ? null
+    : normalizedWorkflowConversationBinding(rawWorkflowConversation);
+  if (rawWorkflowConversation !== undefined && !workflowConversation) return null;
+  return { conversationId, ...(validatedMount ? { validatedMount } : {}),
+    ...(workflowConversation ? { workflowConversation } : {}) };
 }
 
 /** Bound controls need more than a caller-selected session id. Any durable
@@ -538,6 +564,7 @@ function independentPrincipalRootFor(
   parentSessionId: string,
   continuity: string,
   workspaceSlug: string | null,
+  workflowSlug: string | null,
 ): string | null {
   // A row with unreadable metadata is not a candidate (json_extract would
   // throw on it); a mounted request continues only a root with the same
@@ -551,9 +578,10 @@ function independentPrincipalRootFor(
        AND json_extract(metadata_json, '$.${BRANCH_META}.continuityDigest') = ?
        AND json_extract(metadata_json, '$.${BRANCH_META}.rootSessionId') = id
        AND COALESCE(json_extract(metadata_json, '$.spaceSlug'), '') = ?
+       AND COALESCE(json_extract(metadata_json, '$.__workflow_conversation.workflowSlug'), '') = ?
      ORDER BY created_at DESC, id DESC
      LIMIT 1
-  `).get(POINTER_PROTOCOL, parentSessionId, continuity, workspaceSlug ?? '') as { id: string } | undefined;
+  `).get(POINTER_PROTOCOL, parentSessionId, continuity, workspaceSlug ?? '', workflowSlug ?? '') as { id: string } | undefined;
   return row?.id ?? null;
 }
 
@@ -712,6 +740,7 @@ function safeChildMetadata(input: {
   continuityDigest: string;
   continuity: AcceptedSourceContinuityIdentity;
   validatedMount?: AcceptedSourceValidatedMount;
+  workflowConversation?: WorkflowConversationBinding;
   now: string;
 }): Record<string, unknown> {
   const mount = input.validatedMount;
@@ -755,6 +784,7 @@ function safeChildMetadata(input: {
     ...(input.continuity.scopeId ? { guildId: input.continuity.scopeId } : {}),
     ...(mount ? { spaceSlug: mount.workspaceSlug } : {}),
     ...(mount ? { [MOUNT_META]: mount } : {}),
+    ...(input.workflowConversation ? { __workflow_conversation: input.workflowConversation } : {}),
     ...(parentAgent ?? {}),
     [BRANCH_META]: {
       version: POINTER_PROTOCOL,
@@ -789,6 +819,7 @@ function insertChildSession(
     sourceDigest: string;
     independentPrincipalRoot?: boolean;
     validatedMount?: AcceptedSourceValidatedMount;
+    workflowConversation?: WorkflowConversationBinding;
     now: string;
   },
 ): { row: RawSession; event: EventRow; rootSessionId: string } {
@@ -917,6 +948,9 @@ function selectInTransaction(
 ): TransactionSelection {
   const continuity = normalizedContinuity(input.continuity);
   const validatedMount = normalizedValidatedMount(input.validatedMount);
+  const workflowConversation = input.workflowConversation
+    ? normalizedWorkflowConversationBinding(input.workflowConversation) : null;
+  if (input.workflowConversation && !workflowConversation) throw new Error('Invalid workflow conversation binding.');
   const continuityKey = continuityDigest(continuity);
   const sourceKey = durableSourceDigest(continuity.provider, input.durableSourceId);
   const prior = existingBinding(db, sourceKey);
@@ -924,7 +958,7 @@ function selectInTransaction(
     if (prior.continuity_digest !== continuityKey) {
       throw new Error('durable source is already bound to a different continuity principal');
     }
-    sessionRow(db, prior.session_id);
+    assertWorkflowConversationRow(sessionRow(db, prior.session_id), workflowConversation);
     const pointer = readPointer(db, prior.root_session_id, continuityKey)
       ?? ensurePointer(
         db,
@@ -948,6 +982,7 @@ function selectInTransaction(
 
   if (input.kind === 'bound_control') {
     const target = sessionRow(db, input.targetSessionId);
+    assertWorkflowConversationRow(target, workflowConversation);
     assertBoundControlTarget(target, continuity);
     const rootSessionId = rootSessionIdFor(target);
     const pointer = ensurePointer(db, rootSessionId, continuityKey, target.id, now);
@@ -984,13 +1019,15 @@ function selectInTransaction(
     // mirror of a desktop session: five roots in a day, the fifth asked
     // "which event?" with no history). The continuity's own root is resolved
     // from the entry first; the ordinary reuse/branch path then continues it.
-    const owned = independentPrincipalRootFor(db, entry.id, continuityKey, validatedMount?.workspaceSlug ?? null);
+    const owned = independentPrincipalRootFor(db, entry.id, continuityKey, validatedMount?.workspaceSlug ?? null,
+      workflowConversation?.workflowSlug ?? null);
     if (owned) {
       rootSessionId = owned;
       pointer = readPointer(db, rootSessionId, continuityKey);
     }
   }
   const head = pointer ? sessionRow(db, pointer.head_session_id) : entry;
+  assertWorkflowConversationRow(head, workflowConversation);
   const identitySplit = !sessionAudienceMatches(head, continuity);
   if (identitySplit) {
     const child = insertChildSession(db, {
@@ -1001,6 +1038,7 @@ function selectInTransaction(
       sourceDigest: sourceKey,
       independentPrincipalRoot: true,
       validatedMount,
+      ...(workflowConversation ? { workflowConversation } : {}),
       now,
     });
     rootSessionId = child.rootSessionId;
@@ -1043,6 +1081,7 @@ function selectInTransaction(
       continuityDigest: continuityKey,
       sourceDigest: sourceKey,
       validatedMount,
+      ...(workflowConversation ? { workflowConversation } : {}),
       now,
     });
     selected = child.row;
@@ -1165,6 +1204,10 @@ export function claimSessionForAcceptedSource(
       const sourceKey = durableSourceDigest(continuity.provider, input.durableSourceId);
       const binding = existingBinding(db, sourceKey);
       const receiptSession = sessionRow(db, prior.sessionId);
+      const workflowConversation = input.workflowConversation
+        ? normalizedWorkflowConversationBinding(input.workflowConversation) : null;
+      if (input.workflowConversation && !workflowConversation) throw new Error('Invalid workflow conversation binding.');
+      assertWorkflowConversationRow(receiptSession, workflowConversation);
       if (binding) {
         if (
           binding.continuity_digest !== continuityKey

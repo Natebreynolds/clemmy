@@ -6,6 +6,7 @@ import { getAgentRecord } from '../../agents/agent-record.js';
 import { agentScopeKey, type MemoryScope } from '../../memory/memory-scope.js';
 import { readRecoveryActivation } from './recovery-activation.js';
 import { ensureSourceSessionContextStore } from './retained-session-proof-schema.js';
+import type { WorkflowConversationBinding } from '../../shared/workflow-conversation.js';
 import { currentSourceSessionContext, withSourceSessionContext,
   type SourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
@@ -17,6 +18,7 @@ interface SourceSessionIdentity {
   mountKind: SessionMount['kind'];
   workspaceSlug: string | null;
   workflow: SessionMount['workflow'];
+  workflowConversation?: WorkflowConversationBinding;
   delegatedTaskId: string | null;
   agent: { id: string; createdAt: string | null; digest: string } | null;
   project: { id: string; revision: string } | null;
@@ -41,6 +43,7 @@ function agentIdentity(mount: SessionMount): SourceSessionIdentity['agent'] {
 }
 function mountDigest(mount: SessionMount): string {
   return hash({ kind: mount.kind, workspaceSlug: mount.workspaceSlug, workflow: mount.workflow,
+    ...(mount.workflowConversation ? { workflowConversation: mount.workflowConversation } : {}),
     primers: mount.primers, pinnedTools: mount.pinnedTools, hotTools: mount.hotTools,
     agent: agentIdentity(mount), project: mount.project ? { id: mount.project.project.id, revision: mount.project.revision } : null });
 }
@@ -73,6 +76,7 @@ function reopen(identity: SourceSessionIdentity, digest: string): SourceSessionC
         workspaceSlug: identity.workspaceSlug, rootSessionId: `space-${identity.workspaceSlug}` } } : {}),
       ...(identity.workflow ? { workflowName: identity.workflow.name, workflowRunId: identity.workflow.runId,
         stepId: identity.workflow.stepId } : {}),
+      ...(identity.workflowConversation ? { __workflow_conversation: identity.workflowConversation } : {}),
     } });
   if (mount.kind !== identity.mountKind || mountDigest(mount) !== identity.mountDigest) {
     throw new Error('The original task agent, project, skills or workspace context changed.');
@@ -136,6 +140,7 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
       projectId: mount.project?.project.id ?? null, agentKey: mount.agent ? agentScopeKey(mount.agent.agent) : null };
     const identity: SourceSessionIdentity = { version: 1, ...input, sessionKind: row.kind,
       mountKind: mount.kind, workspaceSlug: mount.workspaceSlug, workflow: mount.workflow,
+      ...(mount.workflowConversation ? { workflowConversation: mount.workflowConversation } : {}),
       delegatedTaskId: typeof row.metadata?.delegatedTaskId === 'string' ? row.metadata.delegatedTaskId : null,
       agent: agentIdentity(mount), project: mount.project ? { id: mount.project.project.id, revision: mount.project.revision } : null,
       mountDigest: mountDigest(mount), memoryScope,

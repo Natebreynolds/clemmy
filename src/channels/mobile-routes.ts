@@ -30,6 +30,7 @@ import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { updateEnvKey } from '../tools/shared.js';
 import { claimPlanExecutionIngress, inspectPlanExecutionIngress, preflightPlanExecutionIngress } from '../runtime/harness/plan-execution-ingress.js';
 import { parseTaskMode, taskModeFields, type TaskMode } from '../runtime/harness/task-mode.js';
+import { workflowConversationBindingForSession, requireWorkflowConversationTarget } from '../execution/workflow-conversation.js';
 /**
  * Mobile PWA auth router — mounted at `/m` on the webhook server.
  *
@@ -4399,12 +4400,35 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     const spaceSlug = requestedSessionId && /^space-[a-z0-9][a-z0-9-]*$/.test(requestedSessionId)
       ? requestedSessionId.slice('space-'.length)
       : null;
+    let workflowConversation: ReturnType<typeof workflowConversationBindingForSession> = null;
+    try {
+      const existing = requestedSessionId ? harnessGetSession(requestedSessionId) : null;
+      workflowConversation = requestedSessionId
+        ? workflowConversationBindingForSession(requestedSessionId, existing?.metadata) : null;
+      if (workflowConversation) {
+        if (existing && existing.kind !== 'chat') throw new Error('This is not an editable workflow conversation. Open the workflow again.');
+      }
+    } catch (error) {
+      res.status(409).json({ error: 'WORKFLOW_CONVERSATION_UNAVAILABLE',
+        message: error instanceof Error ? error.message : 'Open the workflow again to continue.' });
+      return;
+    }
 
     try {
       // The receipt has a session FK, so create the deterministic session first
       // only on a genuinely new key. Replays recover its original durable id.
       const priorReceipt = getHarnessChatRequestReceipt(requestId);
       if (priorReceipt) {
+        if (workflowConversation) {
+          const retainedSession = harnessGetSession(priorReceipt.sessionId);
+          const retained = workflowConversationBindingForSession(priorReceipt.sessionId, retainedSession?.metadata);
+          if (!retained || retained.rootSessionId !== workflowConversation.rootSessionId
+            || retained.workflowSlug !== workflowConversation.workflowSlug) {
+            res.status(409).json({ error: 'WORKFLOW_CONVERSATION_UNAVAILABLE',
+              message: 'This request belongs to a different workflow conversation. Open the workflow again.' });
+            return;
+          }
+        }
         if (priorReceipt.inputHash !== inputHash || priorReceipt.runId !== runId) {
           res.status(409).json({ error: 'IDEMPOTENCY_KEY_CONFLICT' }); return;
         }
@@ -4657,6 +4681,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         }
       }
 
+      if (workflowConversation && !priorReceipt && !typedControl && !connectionContext) {
+        try { requireWorkflowConversationTarget(workflowConversation); }
+        catch (error) {
+          res.status(409).json({ error: 'WORKFLOW_CONVERSATION_UNAVAILABLE',
+            message: error instanceof Error ? error.message : 'Open the workflow again to continue.' });
+          return;
+        }
+      }
+
       if (!typedControl && !priorReceipt && !harnessGetSession(proposedSessionId)) {
         createHarnessChatSession({
           id: proposedSessionId,
@@ -4671,6 +4704,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
             userId: ctx.record.deviceId,
             ...(spaceSlug ? { spaceSlug } : {}),
             ...(validatedMount ? { __session_mount: validatedMount } : {}),
+            ...(workflowConversation ? { __workflow_conversation: workflowConversation } : {}),
             ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
             ...(requestedProject
               ? { projectId: requestedProject.id, projectName: requestedProject.name, projectIds: [requestedProject.id], projectSetBy: 'owner' }
@@ -4732,6 +4766,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
                 audienceId: ctx.record.deviceId,
               },
               ...(validatedMount ? { validatedMount } : {}),
+              ...(workflowConversation ? { workflowConversation } : {}),
               receipt: { requestId, runId, inputHash },
             });
             requestClaim = selectedClaim;
@@ -4811,12 +4846,18 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         const started = prepareAndDispatchMobileChat({
           requestId: requestClaim.receipt.requestId,
           prepare: async () => {
+            // A durable request replays its original owner/result, even when
+            // today's workflow definition has since been removed.
+            if (workflowConversation && priorReceipt) return;
             // Session composition seeds identity primers onto the Codex snapshot so
             // a phone dock and a desktop dock mount the same live workspace.
             try {
               const { applySessionMountPrimers, composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
               applySessionMountPrimers(sessionId, composeSessionFromStore(sessionId));
-            } catch { /* best-effort primer */ }
+            } catch (error) {
+              if (workflowConversation) throw error;
+              /* Legacy unscoped/workspace primers remain best effort. */
+            }
 
           },
           dispatch: () => {
@@ -5419,6 +5460,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const succeeded = settled.filter((run) => run.terminalOutcome === 'succeeded').length;
       const certSteps = (certification as { steps?: unknown } | null)?.steps;
       res.json({
+        slug: entry.name,
         name: entry.data.name,
         description: entry.data.description ?? '',
         enabled: entry.data.enabled !== false,

@@ -33,6 +33,7 @@ export * from './project-presentation.js';
 export * from './turn-progress.js';
 export * from './live-work.js';
 export * from './workflow-name.js';
+export * from './workflow-conversation.js';
 export * from './memory-work.js';
 
 export * from "./approval-review.js";
