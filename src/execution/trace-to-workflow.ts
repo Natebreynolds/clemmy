@@ -19,10 +19,12 @@
  * test). The `notes` make those follow-ups explicit so a draft is never
  * mistaken for a finished, trusted workflow.
  */
-import { listEvents, resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
+import { getLatestEventSeq, listEvents, openEventLog, resolveToolOutputForAuthority } from '../runtime/harness/eventlog.js';
 import {
   pairTransportMirrorToolCalls,
   projectCanonicalTopLevelToolEvents,
+  unwrapRuntimeEffectiveToolIdentity,
+  canonicalRuntimeEffectiveToolName,
 } from '../runtime/harness/tool-effect.js';
 import { WORKFLOW_STEP_BLOCKED_TOOL_NAMES } from '../agents/workflow-step-agent.js';
 import type { WorkflowStepCall, WorkflowStepOutputContract } from '../memory/workflow-store.js';
@@ -81,7 +83,7 @@ export interface WorkflowDraft {
  */
 const PROMOTION_PLUMBING_TOOLS = new Set<string>([
   'composio_search_tools', 'composio_status',
-  'skill_list', 'skill_read', 'tool_choice_forget',
+  'skill_list', 'skill_read', 'skill_distill', 'tool_choice_forget',
   'workflow_get', 'workflow_list', 'workflow_run_status', 'workflow_import_status',
   'workflow_from_session',
 ]);
@@ -436,11 +438,51 @@ export function traceToWorkflowDraft(
  * run and a successful task are the same thing, an executed tool sequence, so
  * both read from this single substrate seam.
  */
-export function readSessionTrace(sessionId: string): TraceToolCall[] {
+interface SessionTraceOptions { throughSeq?: number }
+
+function boundedTraceOptions(options?: SessionTraceOptions): SessionTraceOptions {
+  if (options?.throughSeq !== undefined && (!Number.isSafeInteger(options.throughSeq) || options.throughSeq < 0)) {
+    throw new Error('trace frontier must be a non-negative event sequence');
+  }
+  return options?.throughSeq === undefined ? {} : { throughSeq: options.throughSeq };
+}
+
+function isSkillDistillationCall(event: { data: Record<string, unknown> }): boolean {
+  // Host accounting captured this before raw carrier arguments were clipped.
+  if (typeof event.data.effectiveTool === 'string') {
+    const effective = canonicalRuntimeEffectiveToolName(event.data.effectiveTool);
+    if (effective) return effective === 'skill_distill';
+  }
+  const tool = typeof event.data.tool === 'string' ? event.data.tool : null;
+  const effective = unwrapRuntimeEffectiveToolIdentity(tool, event.data.arguments ?? event.data.args ?? {});
+  return canonicalRuntimeEffectiveToolName(effective.toolName) === 'skill_distill';
+}
+
+export interface SessionTraceSnapshot {
+  readonly sessionId: string;
+  readonly throughSeq: number;
+  readonly calls: readonly Readonly<TraceToolCall>[];
+  readonly returns: readonly (readonly [string, string])[];
+}
+
+/** Manual learning freezes both events and redeemed lossless output together.
+ * Sequence bounds alone cannot freeze the mutable side store or prevent its
+ * resolver from selecting a later non-replay occurrence of a reused call id. */
+export function captureSessionTraceSnapshot(sessionId: string): SessionTraceSnapshot {
+  return openEventLog().transaction(() => {
+    const throughSeq = getLatestEventSeq(sessionId);
+    const calls = Object.freeze(readSessionTrace(sessionId, { throughSeq }).map(call => Object.freeze({ ...call })));
+    const returns = Object.freeze([...readSessionToolReturns(sessionId, { throughSeq })]
+      .map(([id, value]) => Object.freeze([id, value] as const)));
+    return Object.freeze({ sessionId, throughSeq, calls, returns });
+  })();
+}
+
+export function readSessionTrace(sessionId: string, options?: SessionTraceOptions): TraceToolCall[] {
   const events = projectCanonicalTopLevelToolEvents(
-    listEvents(sessionId, { types: ['tool_called'] }),
+    listEvents(sessionId, { types: ['tool_called'], ...boundedTraceOptions(options) }),
     'tool_called',
-  );
+  ).filter(event => !isSkillDistillationCall(event));
   return events
     .map((e) => {
       const tool = typeof e.data.tool === 'string' ? e.data.tool : '';
@@ -459,11 +501,13 @@ export function readSessionTrace(sessionId: string): TraceToolCall[] {
  * distiller's recovery-tip path (Lane D) to see WHICH call failed and how it was
  * corrected. Prefer the durable provider-call output when present; otherwise
  * use the canonical event's bounded result/error/preview evidence. */
-export function readSessionToolReturns(sessionId: string): Map<string, string> {
+export function readSessionToolReturns(sessionId: string, options?: SessionTraceOptions): Map<string, string> {
   const out = new Map<string, string>();
-  const calls = listEvents(sessionId, { types: ['tool_called'] });
-  const returns = listEvents(sessionId, { types: ['tool_returned'] });
-  const canonicalCalls = projectCanonicalTopLevelToolEvents(calls, 'tool_called');
+  const frontier = boundedTraceOptions(options);
+  const calls = listEvents(sessionId, { types: ['tool_called'], ...frontier });
+  const returns = listEvents(sessionId, { types: ['tool_returned'], ...frontier });
+  const canonicalCalls = projectCanonicalTopLevelToolEvents(calls, 'tool_called')
+    .filter(event => !isSkillDistillationCall(event));
   const canonicalReturns = new Map(
     projectCanonicalTopLevelToolEvents(returns, 'tool_returned')
       .map((event) => [String(event.data.callId ?? ''), event] as const),
@@ -503,6 +547,12 @@ export function readSessionToolReturns(sessionId: string): Map<string, string> {
   for (const call of canonicalCalls) {
     const callId = typeof call.data.callId === 'string' ? call.data.callId : '';
     if (!callId) continue;
+    const canonicalReturn = canonicalReturns.get(callId);
+    const mirrorReturn = allReturns.get(pairs.canonicalToMirrorCallId.get(callId) ?? '');
+    // A parked result is mutable across awaits. Bounded manual learning needs
+    // a canonical or exactly paired mirror settlement inside its frozen prefix
+    // before redeeming the side store; a late return cannot move the frontier.
+    if (frontier.throughSeq !== undefined && !canonicalReturn && !mirrorReturn) continue;
     const resolution = resolveToolOutputForAuthority(sessionId, callId);
     // A promoted workflow or recovery skill must never learn from whichever
     // output happened to win a reused call-id slot. Exact ambiguity or failure
@@ -510,8 +560,6 @@ export function readSessionToolReturns(sessionId: string): Map<string, string> {
     // its bounded canonical event preview below for legacy traces.
     if (resolution.status === 'ambiguous' || resolution.status === 'failed') continue;
     const parked = resolution.status === 'ok' ? resolution.record.output : '';
-    const canonicalReturn = canonicalReturns.get(callId);
-    const mirrorReturn = allReturns.get(pairs.canonicalToMirrorCallId.get(callId) ?? '');
     if (
       resolution.status === 'missing'
       && (eventExplicitlyFailed(canonicalReturn) || eventExplicitlyFailed(mirrorReturn))

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   evaluateLearningCandidate,
+  issueManualSkillDraftRequestReceipt,
   isValidLearningReceipt,
   type LearningCandidateInput,
 } from './learning-receipt.js';
@@ -99,4 +100,36 @@ test('persisted receipts reject mismatched source identity', () => {
   const receipt = evaluateLearningCandidate(candidate()).receipt!;
   assert.equal(isValidLearningReceipt(receipt, { sourceId: 'different-goal' }), false);
   assert.equal(isValidLearningReceipt(receipt, { target: 'strategy' }), false);
+});
+
+test('manual draft request records exact consent without asserting execution or artifact success', () => {
+  const receipt = issueManualSkillDraftRequestReceipt({ sessionId: 'manual-session', sourceId: 'accepted-event-A', explicitUserRequest: true });
+  assert.ok(receipt);
+  assert.equal(receipt.authority, 'manual_user_request');
+  assert.deepEqual(receipt.evidence, ['explicit_user_request', 'manual_draft_request']);
+  assert.equal(isValidLearningReceipt(receipt, { target: 'skill', sessionId: 'manual-session', sourceId: 'accepted-event-A' }), true);
+  assert.equal(isValidLearningReceipt(receipt, { sourceId: 'accepted-event-B' }), false);
+  assert.equal(isValidLearningReceipt({ ...receipt, authority: 'independent_completion_judge' }), false);
+  assert.equal(isValidLearningReceipt({ ...receipt, evidence: [...receipt.evidence, 'terminal_success'] }), false);
+  assert.equal(isValidLearningReceipt({ ...receipt, target: 'strategy' }), false);
+});
+
+test('manual request receipt cannot be issued without exact identities and explicit opt-in', () => {
+  for (const input of [
+    { sessionId: 'manual-session', sourceId: 'event', explicitUserRequest: false },
+    { sessionId: '', sourceId: 'event', explicitUserRequest: true },
+    { sessionId: 'manual-session', sourceId: '', explicitUserRequest: true },
+    { sessionId: ' manual-session ', sourceId: 'event', explicitUserRequest: true },
+    { sessionId: 'manual-session', sourceId: ' event ', explicitUserRequest: true },
+  ]) assert.equal(issueManualSkillDraftRequestReceipt(input), null);
+});
+
+test('new manual proof leaves automatic completion floors and legacy manual receipts intact', () => {
+  const legacyManual = evaluateLearningCandidate(candidate({ authority: 'manual_user_request', explicitUserRequest: true })).receipt!;
+  assert.equal(isValidLearningReceipt(legacyManual), true);
+  for (const patch of [{ terminalSuccess: false }, { failedOpen: true }, { artifactVerificationPending: 1 }, { ambiguousExternalWrites: 1 }]) {
+    assert.equal(evaluateLearningCandidate(candidate(patch)).eligible, false);
+  }
+  const automatic = evaluateLearningCandidate(candidate()).receipt!;
+  assert.equal(isValidLearningReceipt({ ...automatic, evidence: ['independent_validation'] }), false);
 });

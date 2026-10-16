@@ -10,11 +10,15 @@ import {
 } from '../memory/skill-store.js';
 import { checkSkillPreconditions } from '../runtime/capability-preconditions.js';
 import { textResult } from './shared.js';
+import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
+import { issueManualSkillDraftRequestReceipt } from '../memory/learning-receipt.js';
+import { captureManualSkillDistillAuthority, userDeclinedSkillDistillation } from './manual-skill-distill-authority.js';
 
 /** Runtime check for the model-facing manual distillation authority. A tool
  * choice alone is not proof that the user asked Clementine to remember a
- * procedure; the latest real user turn must carry that intent. */
+ * procedure; the exact accepted human source must carry that intent. */
 export function userRequestedSkillDistillation(text: string): boolean {
+  if (userDeclinedSkillDistillation(text)) return false;
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) return false;
   return /\b(?:remember|save|distill|capture|learn)\b[^.!?\n]{0,120}\b(?:this|that|how|procedure|process|workflow|skill|playbook|approach)\b/i.test(normalized)
@@ -91,11 +95,14 @@ export function registerSkillTools(server: McpServer): void {
       }
       const lines = skills.map((s) => {
         const evidence = skillLearningEvidenceStatus(s);
+        const manualDraft = s.frontmatter.tier === 'draft' && latestSkillLearningReceipt(s)?.authority === 'manual_user_request';
         const label = evidence === 'legacy_unverified'
           ? ' [legacy draft — not eligible for automatic recall]'
-          : evidence === 'verified'
-            ? ' [evidence-backed draft]'
-            : '';
+          : manualDraft
+            ? ' [user-requested draft — unreviewed]'
+            : evidence === 'verified'
+              ? ' [evidence-backed draft]'
+              : '';
         return `- ${s.name}${label}: ${s.frontmatter.description || '(no description)'}`;
       });
       return textResult(`${skills.length} installed skill${skills.length === 1 ? '' : 's'}:\n${lines.join('\n')}\n\nUse skill_read("<name>") to load the full instructions.`);
@@ -141,7 +148,7 @@ export function registerSkillTools(server: McpServer): void {
             'Do not treat its tool slugs, arguments, or completion claims as established. Use it only when the user explicitly selected it or for inspection, and independently verify every result.',
             '',
           ].join('\n')
-        : learningReceipt?.authority === 'manual_user_request'
+        : skill.frontmatter.tier === 'draft' && learningReceipt?.authority === 'manual_user_request'
           ? [
               '📝 USER-REQUESTED DRAFT — the user explicitly asked Clementine to preserve this procedure, but that request is not independent execution proof.',
               'Treat the sequence and prose as unreviewed and verify every output.',
@@ -208,51 +215,41 @@ export function registerSkillTools(server: McpServer): void {
       'Distill the work you just did in THIS conversation into a reusable DRAFT skill, so the capability compounds and you do not have to re-figure it out next time.',
       'Use only when the user explicitly says "remember how to do this", "save this as a skill/playbook", or otherwise directly asks you to preserve the procedure.',
       'Do not call this autonomously after ordinary work; verified automatic learning is handled by the runtime.',
-      'Captures the proven tool sequence + argument shapes; writes a draft skill the user can approve from the Skills panel.',
+      'Captures the observed tool sequence and argument shapes as an unreviewed draft the user can review from the Skills panel.',
     ].join('\n'),
     {
       objective: z.string().min(4).max(300).describe('One line: what capability this skill captures (e.g. "audit a law firm site and write the SEO brief").'),
     },
     async ({ objective }) => {
-      const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
-      const sessionId = harnessRunContextStorage.getStore()?.sessionId;
-      if (!sessionId) {
-        return textResult('I can only distill a skill from inside an active conversation with a recorded tool trace.');
-      }
-      const { listEvents } = await import('../runtime/harness/eventlog.js');
-      const latestUserText = listEvents(sessionId, {
-        types: ['user_input_received'],
-        desc: true,
-        limit: 20,
-      }).find((event) => event.role === 'user' && typeof event.data.text === 'string')
-        ?.data.text as string | undefined;
-      if (!latestUserText || !userRequestedSkillDistillation(latestUserText)) {
+      const authority = captureManualSkillDistillAuthority(harnessRunContextStorage.getStore(), userRequestedSkillDistillation);
+      if (!authority) {
         return textResult(
-          'I did not distill a skill because the latest user message did not explicitly ask me to preserve this procedure. Verified automatic learning is handled by the runtime after a clean execution.',
+          'I did not distill a skill because I could not verify an explicit preservation request for this active run. No draft was changed; verified automatic learning remains separate.',
         );
       }
-      const { evaluateLearningCandidate } = await import('../memory/learning-receipt.js');
-      const learningReceipt = evaluateLearningCandidate({
-        target: 'skill',
-        authority: 'manual_user_request',
+      const { sessionId } = authority;
+      const learningReceipt = issueManualSkillDraftRequestReceipt({
         sessionId,
-        sourceId: sessionId,
-        terminalSuccess: true,
+        sourceId: authority.consentEventId,
         explicitUserRequest: true,
-      }).receipt;
+      });
       if (!learningReceipt) {
         return textResult('I could not establish explicit user authority to distill this procedure.');
       }
       const { distillSkillFromSession } = await import('../memory/skill-distiller.js');
       const result = await distillSkillFromSession(sessionId, {
         objective,
-        origin: { kind: 'manual', sourceId: sessionId },
+        origin: { kind: 'manual', sourceId: authority.consentEventId },
         learningReceipt,
         force: true,
+        throughSeq: authority.throughSeq,
+        traceSnapshot: authority.traceSnapshot,
+        currentAuthority: authority.currentAuthority,
+        abortSignal: authority.abortSignal,
       });
       switch (result.status) {
         case 'written':
-          return textResult(`Distilled a draft skill: \`${result.name}\`. It's usable now (marked draft) — the user can approve or discard it from the Skills panel.`);
+          return textResult(`Saved the requested draft skill: \`${result.name}\`. Its procedure is unreviewed; review or discard it from the Skills panel.`);
         case 'skipped_duplicate':
           return textResult(`This already matches an existing skill (\`${result.name}\`), so I didn't create a duplicate.`);
         case 'skipped_disabled':

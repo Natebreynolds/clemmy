@@ -8,7 +8,7 @@ process.env.CLEMENTINE_HOME = home;
 mkdirSync(path.join(home, 'state'), { recursive: true });
 const { createSession, listSessions } = await import('../runtime/harness/eventlog.js');
 const { writeDistilledSkill } = await import('./skill-store.js');
-const { evaluateLearningCandidate } = await import('./learning-receipt.js');
+const { evaluateLearningCandidate, issueManualSkillDraftRequestReceipt } = await import('./learning-receipt.js');
 const { publishLearnedSkillOffer } = await import('./skill-proactive-offer.js');
 const { dismissProactiveOffer } = await import('../runtime/proactive-offers.js');
 
@@ -30,4 +30,18 @@ test('unverified drafts and missing skills do not generate inferred offers', () 
   writeDistilledSkill({ name: 'legacy-fixture', description: 'Unverified procedure', body: 'Do work', origin: { kind: 'chat' } });
   assert.equal(publishLearnedSkillOffer('legacy-fixture'), null);
   assert.equal(publishLearnedSkillOffer('missing-fixture'), null);
+});
+
+test('a requested manual draft offers review without claiming successful or verified execution', () => {
+  const session = createSession({ kind: 'chat', userId: 'manual-owner' });
+  const learningReceipt = issueManualSkillDraftRequestReceipt({ sessionId: session.id,
+    sourceId: 'exact-manual-consent-event', explicitUserRequest: true })!;
+  writeDistilledSkill({ name: 'requested-review', description: 'Preserve a controlled procedure', body: 'Review this draft.',
+    origin: { kind: 'manual', sourceId: learningReceipt.sourceId }, learningReceipt });
+  const offer = publishLearnedSkillOffer('requested-review')!;
+  assert.ok(offer);
+  assert.match(offer.summary, /draft procedure you requested/);
+  assert.match(offer.whyNow, /unreviewed/);
+  assert.doesNotMatch(`${offer.summary} ${offer.whyNow}`, /successful work|completed work|verified learning receipt/);
+  assert.ok(offer.evidenceRefs.includes('learning-source:exact-manual-consent-event'));
 });

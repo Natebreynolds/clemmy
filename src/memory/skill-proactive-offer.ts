@@ -14,13 +14,18 @@ export function publishLearnedSkillOffer(name: string): ProactiveOffer | null {
   const origin = getSession(receipt.sessionId);
   if (!origin || origin.kind !== 'chat' || !origin.userId) return null;
   const identity = createHash('sha256').update(JSON.stringify([origin.userId, name])).digest('hex');
+  const manual = receipt.authority === 'manual_user_request';
   return publishProactiveOffer({
     id: `learned-skill-${identity}`,
     userId: origin.userId,
     kind: 'skill',
     title: `Review the ${name} skill`.slice(0, 200),
-    summary: `I saved a draft skill from successful work: ${skill.frontmatter.description}`.slice(0, 4000),
-    whyNow: 'The completed work produced a reusable procedure with a verified learning receipt. You can refine where it should apply.',
+    summary: (manual
+      ? `I saved the draft procedure you requested: ${skill.frontmatter.description}`
+      : `I saved a draft skill from successful work: ${skill.frontmatter.description}`).slice(0, 4000),
+    whyNow: manual
+      ? 'You asked me to preserve this procedure. Its prose and execution claims are unreviewed; review where it should apply.'
+      : 'The completed work produced a reusable procedure with a verified learning receipt. You can refine where it should apply.',
     evidenceRefs: [`skill:${name}`, `learning-source:${receipt.sourceId}`, `session:${receipt.sessionId}`],
     contextQuestion: 'Should this approach be a general preference, or stay specific to this work?',
     originSessionId: origin.id,

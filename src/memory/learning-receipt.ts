@@ -1,10 +1,9 @@
 import { appendEvent } from '../runtime/harness/eventlog.js';
 
 /**
- * A compact, runtime-owned receipt proving that an execution boundary accepted
- * a candidate as safe to learn from. The receipt does not judge the procedure's
- * prose; it only prevents paused, degraded, ambiguous, or incomplete runs from
- * silently becoming procedural memory.
+ * A compact runtime-owned record of learning authority. Execution receipts
+ * require their completion evidence; an explicit manual draft request records
+ * consent without claiming execution success or judging the procedure's prose.
  */
 export const LEARNING_RECEIPT_VERSION = 1 as const;
 
@@ -66,6 +65,28 @@ export interface LearningDecision {
   eligible: boolean;
   reasons: string[];
   receipt?: LearningReceipt;
+}
+
+/** The manual tool has already bound consent to an exact live human request.
+ * Record that permission as an unreviewed draft request, never as a successful
+ * execution, artifact check, or independent completion verdict. */
+export function issueManualSkillDraftRequestReceipt(input: {
+  sessionId: string;
+  sourceId: string;
+  explicitUserRequest: boolean;
+}): LearningReceipt | null {
+  if (input.explicitUserRequest !== true || typeof input.sessionId !== 'string' || !input.sessionId
+    || typeof input.sourceId !== 'string' || !input.sourceId
+    || input.sessionId !== input.sessionId.trim() || input.sourceId !== input.sourceId.trim()) return null;
+  return {
+    version: LEARNING_RECEIPT_VERSION,
+    target: 'skill',
+    authority: 'manual_user_request',
+    sessionId: input.sessionId,
+    sourceId: input.sourceId,
+    verifiedAt: new Date().toISOString(),
+    evidence: ['explicit_user_request', 'manual_draft_request'],
+  };
 }
 
 const AUTHORITIES = new Set<LearningAuthority>([
@@ -203,7 +224,14 @@ export function isValidLearningReceipt(
   if (typeof receipt.sessionId !== 'string' || !receipt.sessionId.trim()) return false;
   if (typeof receipt.sourceId !== 'string' || !receipt.sourceId.trim()) return false;
   if (typeof receipt.verifiedAt !== 'string' || !Number.isFinite(Date.parse(receipt.verifiedAt))) return false;
-  if (!Array.isArray(receipt.evidence) || !receipt.evidence.includes('terminal_success')) return false;
+  if (!Array.isArray(receipt.evidence)) return false;
+  const manualDraftRequest = receipt.evidence.includes('manual_draft_request');
+  if (manualDraftRequest) {
+    // This new proof kind has no success/clearance claims. Legacy manual
+    // receipts retain the terminal-success format below for read compatibility.
+    if (receipt.authority !== 'manual_user_request' || receipt.target !== 'skill'
+      || receipt.evidence.length !== 2 || !receipt.evidence.includes('explicit_user_request')) return false;
+  } else if (!receipt.evidence.includes('terminal_success')) return false;
   const requiredAuthorityEvidence = receipt.authority === 'goal_validation'
     || receipt.authority === 'independent_completion_judge'
     ? 'independent_validation'

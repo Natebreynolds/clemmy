@@ -23,7 +23,7 @@ import { getRuntimeEnv } from '../config.js';
 import { withFileLock } from '../runtime/atomic-json.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isPackageRunnerMaterializationFailure } from '../runtime/shell-execution-outcome.js';
-import { readSessionTrace, readSessionToolReturns, type TraceToolCall } from '../execution/trace-to-workflow.js';
+import { readSessionTrace, readSessionToolReturns, type SessionTraceSnapshot, type TraceToolCall } from '../execution/trace-to-workflow.js';
 import {
   SKILLS_DIR, ensureSkillsDir, loadSkill, writeDistilledSkill, isSafeSkillName,
   updateSkillFrontmatter, appendSkillPitfall, findDistilledSkillByCapabilityTask,
@@ -433,14 +433,18 @@ export type DistilledSkill = z.infer<typeof DistilledSchema>;
 
 /** The distiller runs on the "Keeps your memory" route: the owner's pick when
  *  one is chosen, else today's fast-tier model string. */
-function buildDistillerAgent(model: Model | string): Agent<unknown> {
+function buildDistillerAgent(model: Model | string, manualDraft = false): Agent<unknown> {
   return new Agent({
     name: 'SkillDistiller',
     model,
     modelSettings: { reasoning: { effort: 'low' } },
     instructions: [
-      'You distill a REUSABLE skill from a successful run. Output a SKILL.md draft that lets the agent repeat this capability next time without re-discovering it.',
-      'Generalize: strip one-off specifics (this client, this date), keep the transferable procedure + the PROVEN tool slugs and argument SHAPES.',
+      manualDraft
+        ? 'Prepare a USER-REQUESTED, UNREVIEWED reusable draft from an observed tool trace. Completion and successful execution have not been established.'
+        : 'You distill a REUSABLE skill from a successful run. Output a SKILL.md draft that lets the agent repeat this capability next time without re-discovering it.',
+      manualDraft
+        ? 'Generalize the observed procedure and argument shapes. The provenTools field may include only calls supported by supplied evidence; attempted or failed calls are not proof of success. Keep uncertainty explicit for review.'
+        : 'Generalize: strip one-off specifics (this client, this date), keep the transferable procedure + the PROVEN tool slugs and argument SHAPES.',
       'Never include secret values (tokens, full emails/PII) — only argument keys/shapes.',
       'requires: list real prerequisites (mcp:/cli:/secret:) the procedure depends on. Empty array if none.',
       'Be concrete and short. This is a procedure to execute, not an essay.',
@@ -557,17 +561,35 @@ function renderDistillerPrompt(input: {
   objective: string;
   evidence: string;
   calls: TraceToolCall[];
+  manualDraft?: boolean;
 }): string {
   const seq = input.calls
     .slice(0, 40)
     .map((c, i) => `${i + 1}. ${c.slug ?? c.tool}  args=${c.args.slice(0, 300)}`)
     .join('\n');
   return [
-    `OBJECTIVE that was accomplished:\n${input.objective}`,
+    input.manualDraft
+      ? `USER-REQUESTED CAPABILITY (completion is unverified):\n${input.objective}`
+      : `OBJECTIVE that was accomplished:\n${input.objective}`,
     input.evidence ? `\nEVIDENCE / RESULT:\n${input.evidence.slice(0, 1500)}` : '',
-    `\nTOOL SEQUENCE that was executed (in order):\n${seq}`,
-    '\nDistill the reusable skill.',
+    input.manualDraft
+      ? `\nOBSERVED TOOL CALLS (recorded order, not proof of success):\n${seq}`
+      : `\nTOOL SEQUENCE that was executed (in order):\n${seq}`,
+    input.manualDraft ? '\nDraft the requested procedure for review; preserve uncertain outcomes.' : '\nDistill the reusable skill.',
   ].filter(Boolean).join('\n');
+}
+
+function isManualDraftRequest(receipt: LearningReceipt): boolean {
+  return receipt.authority === 'manual_user_request' && receipt.evidence.includes('manual_draft_request');
+}
+
+/** Inspect the actual agent instructions and user prompt without a model call. */
+export function _testOnly_distillerPrompts(input: {
+  objective: string; evidence: string; calls: TraceToolCall[]; learningReceipt: LearningReceipt;
+}): { instructions: string; prompt: string } {
+  const manualDraft = isManualDraftRequest(input.learningReceipt);
+  const agent = buildDistillerAgent('controlled-no-provider', manualDraft);
+  return { instructions: String(agent.instructions), prompt: renderDistillerPrompt({ ...input, manualDraft }) };
 }
 
 /** Never overwrite an unrelated same-named skill. The fingerprint suffix is
@@ -598,6 +620,22 @@ interface SkillDistillContext {
   origin: { kind: 'chat' | 'workflow' | 'manual'; sourceId?: string };
   learningReceipt?: LearningReceipt;
   force?: boolean;
+  /** Optional stable manual trace frontier; automatic callers keep full-session defaults. */
+  throughSeq?: number;
+  /** Host-owned live consent/attempt guard, never a model argument or receipt. */
+  currentAuthority?: () => boolean;
+  abortSignal?: AbortSignal;
+  /** Manual front door's immutable pre-await database snapshot; never a model input. */
+  traceSnapshot?: SessionTraceSnapshot;
+}
+
+class DistillationAuthorityLostError extends Error {
+  readonly code = 'MANUAL_SKILL_AUTHORITY_LOST';
+  constructor() { super('manual skill distillation no longer owns the active request'); }
+}
+
+function assertCurrentDistillationAuthority(currentAuthority?: () => boolean): void {
+  if (currentAuthority && !currentAuthority()) throw new DistillationAuthorityLostError();
 }
 
 /** Every caller supplies a receipt issued by its execution boundary. The
@@ -646,11 +684,16 @@ async function reuseExistingCapabilityLocked(
   objective: string,
   origin?: Omit<SkillOrigin, 'distilledAt'>,
   learningReceipt?: LearningReceipt,
+  currentAuthority?: () => boolean,
 ): Promise<DistillResult | null> {
+  assertCurrentDistillationAuthority(currentAuthority);
   ensureSkillsDir();
   return withFileLock(
     CAPABILITY_CLAIM_LOCK_FILE,
-    () => reuseExistingCapability(objective, origin, learningReceipt),
+    () => {
+      assertCurrentDistillationAuthority(currentAuthority);
+      return reuseExistingCapability(objective, origin, learningReceipt);
+    },
   );
 }
 
@@ -662,6 +705,7 @@ interface DistilledCapabilityClaim {
   origin: Omit<SkillOrigin, 'distilledAt'>;
   applicability: { toolFamilies: string[]; entitySlots: string[] };
   learningReceipt: LearningReceipt;
+  currentAuthority?: () => boolean;
 }
 
 /**
@@ -671,8 +715,10 @@ interface DistilledCapabilityClaim {
  * one daemon and distillers running in separate Clementine processes.
  */
 async function claimDistilledCapability(input: DistilledCapabilityClaim): Promise<DistillResult> {
+  assertCurrentDistillationAuthority(input.currentAuthority);
   ensureSkillsDir();
   return withFileLock(CAPABILITY_CLAIM_LOCK_FILE, () => {
+    assertCurrentDistillationAuthority(input.currentAuthority);
     const duplicate = reuseExistingCapability(input.objective, input.origin, input.learningReceipt);
     if (duplicate) return duplicate;
 
@@ -727,6 +773,17 @@ export async function distillSkillFromSession(
 ): Promise<DistillResult> {
   if (!distillerEnabled()) return { status: 'skipped_disabled' };
   try {
+    assertCurrentDistillationAuthority(context.currentAuthority);
+    // Validate the host snapshot binding before even the duplicate path: a
+    // duplicate lookup can persist lineage/receipts and return without reading
+    // the trace, so checking only below that await is already too late.
+    if (context.throughSeq !== undefined && (!Number.isSafeInteger(context.throughSeq) || context.throughSeq < 0)) {
+      throw new Error('manual learning trace frontier must be a non-negative event sequence');
+    }
+    if (context.traceSnapshot !== undefined && (!context.traceSnapshot || typeof context.traceSnapshot !== 'object'
+      || Array.isArray(context.traceSnapshot) || !Number.isSafeInteger(context.traceSnapshot.throughSeq)
+      || context.traceSnapshot.throughSeq < 0 || context.traceSnapshot.sessionId !== sessionId
+      || context.traceSnapshot.throughSeq !== context.throughSeq)) throw new Error('manual learning trace snapshot binding changed');
     const learningReceipt = resolveLearningReceipt(sessionId, context);
     if (!learningReceipt) {
       return {
@@ -739,10 +796,13 @@ export async function distillSkillFromSession(
       context.objective,
       context.origin,
       learningReceipt,
+      context.currentAuthority,
     );
     if (existing) return existing;
-    const calls = readSessionTrace(sessionId);
-    const returnsByCallId = readSessionToolReturns(sessionId);
+    assertCurrentDistillationAuthority(context.currentAuthority);
+    const frontier = context.throughSeq === undefined ? undefined : { throughSeq: context.throughSeq };
+    const calls = context.traceSnapshot ? context.traceSnapshot.calls.map(call => ({ ...call })) : readSessionTrace(sessionId, frontier);
+    const returnsByCallId = context.traceSnapshot ? new Map(context.traceSnapshot.returns) : readSessionToolReturns(sessionId, frontier);
     if (!context.force) {
       const novelty = assessNovelty(calls, returnsByCallId);
       if (!novelty.novel) return { status: 'skipped_not_novel', detail: novelty.reason };
@@ -781,6 +841,7 @@ async function distillFromCalls(
   returnsByCallId: Map<string, string> = new Map(),
   source: MemoryWorkSource | null = null,
 ): Promise<DistillResult> {
+  assertCurrentDistillationAuthority(context.currentAuthority);
   if (calls.length === 0) return { status: 'skipped_not_novel', detail: 'no tool calls in trace' };
   return runMemoryModelJob('skills', { source }, () => distillSkillDraft(calls, context, returnsByCallId), skillsOutcome);
 }
@@ -791,16 +852,20 @@ async function distillSkillDraft(
   returnsByCallId: Map<string, string>,
 ): Promise<DistillResult> {
   try {
+    assertCurrentDistillationAuthority(context.currentAuthority);
     // A chosen memory model that cannot be served skips this run; nothing
     // stands in for it.
     const route = memoryJobRoute('skills');
     if (!route) return { status: 'failed', detail: 'the memory model is unavailable right now' };
     const runner = new Runner({ workflowName: 'clementine-skill-distiller' });
+    const manualDraft = isManualDraftRequest(context.learningReceipt);
+    assertCurrentDistillationAuthority(context.currentAuthority);
     const result = await runner.run(
-      buildDistillerAgent(route.model),
-      renderDistillerPrompt({ objective: context.objective, evidence: context.evidence ?? '', calls }),
-      { maxTurns: 1 },
+      buildDistillerAgent(route.model, manualDraft),
+      renderDistillerPrompt({ objective: context.objective, evidence: context.evidence ?? '', calls, manualDraft }),
+      { maxTurns: 1, ...(context.abortSignal ? { signal: context.abortSignal } : {}) },
     );
+    assertCurrentDistillationAuthority(context.currentAuthority);
     const draft = sanitizeDistilledSkillOutput((result as { finalOutput?: unknown }).finalOutput);
     if (!draft) return { status: 'failed', detail: 'distiller output did not parse' };
     if (!isSafeSkillName(draft.name)) return { status: 'failed', detail: `unsafe skill name: ${draft.name}` };
@@ -829,6 +894,7 @@ async function distillSkillDraft(
       origin: context.origin,
       applicability,
       learningReceipt: context.learningReceipt,
+      currentAuthority: context.currentAuthority,
     });
     if (claim.status !== 'written' || !claim.name) return claim;
     const name = claim.name;
@@ -842,7 +908,9 @@ async function distillSkillDraft(
         id: `skill-draft-${name}`,
         kind: 'system',
         title: `New draft skill: ${name}`,
-        body: `I distilled a reusable skill from a successful run: ${draft.description}. It's usable now (marked draft); approve or discard from the Skills panel.`,
+        body: context.learningReceipt.authority === 'manual_user_request'
+          ? `I saved the procedure you asked me to preserve as an unreviewed draft: ${draft.description}. Review or discard it from the Skills panel.`
+          : `I distilled a reusable skill from a successful run: ${draft.description}. It's usable now (marked draft); approve or discard from the Skills panel.`,
         createdAt: new Date().toISOString(),
         read: false,
         metadata: { skillName: name, tier: 'draft', origin: context.origin.kind, ...(proactiveOfferId ? { proactiveOfferId } : {}) },
@@ -852,7 +920,11 @@ async function distillSkillDraft(
     logger.info({ name, origin: context.origin.kind }, 'distilled a draft skill');
     return { status: 'written', name };
   } catch (err) {
-    noteMemoryModelFailure(err);
+    // A host Stop/timeout/ownership refusal is not evidence the selected model
+    // or provider failed. Adapter usage remains attributable as before.
+    const authorityLost = err instanceof DistillationAuthorityLostError || context.abortSignal?.aborted
+      || context.currentAuthority && !context.currentAuthority();
+    if (!authorityLost) noteMemoryModelFailure(err);
     logger.warn({ err: err instanceof Error ? err.message : err, origin: context.origin.kind }, 'skill distillation failed');
     return { status: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
@@ -928,7 +1000,7 @@ export async function reinforceDraftSkills(
   const verifiedSuccessReceipt = isValidLearningReceipt(learningReceipt, {
     target: 'skill',
     ...(sessionId ? { sessionId } : {}),
-  })
+  }) && learningReceipt.evidence.includes('terminal_success')
     ? learningReceipt
     : null;
   if (outcome === 'success' && !verifiedSuccessReceipt) return;
