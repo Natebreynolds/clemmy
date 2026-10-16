@@ -191,10 +191,13 @@ const GOLDEN = {
   // successes without replay. Full exact Stop policy remains context-bound.
   // 2026-10-15: exact skill reuse within accepted scope, evidence-only source
   // recovery, and settled/uncertain effect continuity in the rollback rubric.
-  instructions: { len: 33485, sha16: '150f4d586d4d5938' },
-  native: { len: 32592, sha16: 'ee5ef1318873009c' },
-  claudeBrain: { len: 11138, sha16: 'a39b0a56e5c2d61f' },
-  lean: { len: 13143, sha16: '6dad16d104c60ae1' },
+  // 2026-10-16: EVIDENCE, NOT ASSUMPTION — facts about the owner's world come
+  // from a tool result or verified memory, never a name or pattern (a site's
+  // host was built from its repository name). The lean lanes carry a short form.
+  instructions: { len: 34163, sha16: '27e23e1398876f97' },
+  native: { len: 33270, sha16: '3797cca1f0291254' },
+  claudeBrain: { len: 11347, sha16: '8f81c064e985ce31' },
+  lean: { len: 13352, sha16: 'aaff06aa4efb985b' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -545,7 +548,9 @@ test('budget guard: rubric token estimate stays within 5% of the Phase-0 baselin
   // Preserve the previous 5% drift allowance plus only the 118-character
   // settlement/retry distinction (30 chars/4 heuristic units). This
   // heuristic is not measured tokenizer usage or an efficiency improvement.
-  const BASELINE_TOK = 8011;
+  // 2026-10-16: +530 for the evidence-not-assumption rule (an intended rule,
+  // not bloat).
+  const BASELINE_TOK = 8541;
   const actual = TOK(ORCHESTRATOR_INSTRUCTIONS.length);
   const drift = Math.abs(actual - BASELINE_TOK) / BASELINE_TOK;
   assert.ok(

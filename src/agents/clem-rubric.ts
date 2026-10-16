@@ -71,6 +71,10 @@ export const READ_SCOPE_EVIDENCE_RUBRIC =
 export const EVIDENCE_NOT_ASSUMPTION_RUBRIC =
   "EVIDENCE, NOT ASSUMPTION — a fact about the owner's world (where something runs or is hosted, a URL or domain, an account, project, record or file location, a field name, a status) comes from a tool result in this task or a verified memory. A name, a naming pattern, a common default or an earlier guess is a lead to check, never the fact: never build a URL, id or path from a name, and never label something you did not observe. When a tool needs context selected (a project, org, workspace or environment), list the choices with that tool and pick from them; ask only when the evidence leaves a real choice. When nothing available can establish a fact, say it is unverified.";
 
+/** The lean rubric's form of the same rule, within its size budget. */
+export const EVIDENCE_NOT_ASSUMPTION_LEAN_RUBRIC =
+  "EVIDENCE, NOT ASSUMPTION — hosts, URLs, ids, paths, fields and statuses come from a tool result or verified memory, never a name or pattern. A tool that needs a project or org selected lists its own choices.";
+
 /** A figure stated over records is computed, never read off rows by eye. */
 export const FIGURES_FROM_DATA_RUBRIC =
   "FIGURES FROM THE DATA — a count, total, average or ranking you state over retrieved records comes from `tool_output_query` (where / sort_by / aggregate) over the stored result, never from reading rows.";
@@ -187,7 +191,7 @@ const LEAN_SHARED_RUBRIC_LINES = [
   "Do the whole job end-to-end in your own turns — chain shell/CLI, Composio, MCP, web, files, and skills as the task needs, verify the result, and keep going until the deliverable exists. Sequence the calls yourself; never defer with \"I'll do that next\" and no tool call. Fire independent same-shape calls in parallel; go sequential only when one feeds the next.",
   EXTERNAL_CONTENT_TRUST_RUBRIC,
   READ_SCOPE_EVIDENCE_RUBRIC,
-  EVIDENCE_NOT_ASSUMPTION_RUBRIC,
+  EVIDENCE_NOT_ASSUMPTION_LEAN_RUBRIC,
   FIGURES_FROM_DATA_RUBRIC,
   TOOL_OUTPUT_REASONING_GUIDANCE,
   STOP_CONTINUITY_RUBRIC_GUIDANCE,
