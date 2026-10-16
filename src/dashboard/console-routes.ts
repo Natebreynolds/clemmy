@@ -192,6 +192,7 @@ import {
   type WorkflowRunLaunchReadinessOverlay,
   type WorkflowRunRecoveryIntentOverlay,
 } from './workflow-run-overlay.js';
+import { buildWorkflowRunTrace } from './workflow-run-trace.js';
 import type {
   WorkflowToolReadiness,
   WorkflowToolReadinessEvidence,
@@ -7423,6 +7424,40 @@ export function registerConsoleRoutes(
    * workflow graph. This is deliberately derived on read from events.jsonl so
    * the visualizer never becomes a second workflow state machine.
    */
+  /**
+   * What Clem did in one run, step by step: each step's prompt, every tool
+   * call with its arguments, result and settled outcome, the model and token
+   * use, how each attempt ended, and the definition hash the run executed.
+   * Derived on read from the run record, its event log and each step's own
+   * session (workflow-run-trace.ts); read-only.
+   */
+  app.get('/api/console/workflows/:name/runs/:runId/trace', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const target = req.params.name;
+    const runId = req.params.runId;
+    const filePath = workflowRunRecordPathForConsole(runId);
+    if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (refuseReservedProjectCatalogRead(res, raw)) return;
+      const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
+      if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
+      if (raw.workflow !== entry.data.name && raw.workflow !== entry.name) {
+        res.status(404).json({ error: 'workflow run does not belong to this workflow' });
+        return;
+      }
+      res.json(buildWorkflowRunTrace({
+        runId,
+        workflow: entry.data.name,
+        record: raw,
+        events: readWorkflowEvents(entry.name, runId),
+        stepIds: entry.data.steps.map((step) => step.id),
+      }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/console/workflows/:name/runs/:runId/graph-overlay', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
