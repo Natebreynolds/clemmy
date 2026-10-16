@@ -21,6 +21,18 @@ import { readStepOutputArtifact } from './workflow-run-workspace.js';
 import type { CompletionEvidenceRow } from '../runtime/harness/objective-judge.js';
 import { readWorkflowCompletionStakes, type WorkflowCompletionStakesProof } from './workflow-completion-stakes.js';
 
+/** The connected account a call named in its outer wrapper selector, which
+ * the host validates as account authority and executes with. Never a value
+ * inside the provider arguments. */
+function calledAccountSelector(argumentsJson: string | null | undefined): string {
+  if (!argumentsJson) return '';
+  try {
+    const args = JSON.parse(argumentsJson) as { connected_account_id?: unknown };
+    const id = args && typeof args === 'object' ? args.connected_account_id : undefined;
+    return typeof id === 'string' && /^ca_[A-Za-z0-9_-]{4,64}$/.test(id) ? id : '';
+  } catch { return ''; }
+}
+
 export interface WorkflowTargetEvidence {
   available: boolean;
   summary: string;
@@ -147,7 +159,7 @@ export function readWorkflowTargetEvidence(
       executionKind: string; requirementId: string | null;
     }>;
     const called = db.prepare(`
-      SELECT json_extract(data_json, '$.tool') AS tool
+      SELECT json_extract(data_json, '$.tool') AS tool, json_extract(data_json, '$.arguments') AS arguments
         FROM events WHERE session_id = ? AND type = 'tool_called'
          AND json_extract(data_json, '$.sourceUserSeq') = ?
          AND json_extract(data_json, '$.accounting') = 'top_level'
@@ -189,7 +201,7 @@ export function readWorkflowTargetEvidence(
     for (const row of rows) {
       ordinal += 1;
       const source = `${row.sessionId}#${row.sourceUserSeq}`;
-      const invocation = called.get(row.sessionId, row.sourceUserSeq, row.callId) as { tool: string } | undefined;
+      const invocation = called.get(row.sessionId, row.sourceUserSeq, row.callId) as { tool: string; arguments: string | null } | undefined;
       const label = compact
         ? `#${ordinal} ${invocation?.tool ?? row.toolName} -> ${row.toolName} [call=${row.callId}; outcome=${row.outcome}; ${row.mutating ? 'WRITE' : 'read'}]`
         : `${invocation?.tool ?? row.toolName} -> ${row.toolName} [source=${source}; logicalCall=${row.callId}; outcome=${row.outcome}; mutating=${row.mutating}]`;
@@ -255,9 +267,18 @@ export function readWorkflowTargetEvidence(
       // and the mailbox that account was observed to belong to. A reviewer
       // asked to confirm "the Scorpion mailbox" could not tell which account
       // a read used (live 2026-10-16).
-      const accountId = request.ok && request.authority.logicalCallId === row.callId ? request.authority.accountId : '';
+      // A read dispatched without a sealed authority (a workflow step on a
+      // bring-your-own model) ran through the account its call named in the
+      // outer account selector, which the host executes with; show that
+      // selector, labelled as such (live 2026-10-16: a standup on one model was
+      // refused three times because its calendar read showed no account).
+      const sealedAccount = request.ok && request.authority.logicalCallId === row.callId ? request.authority.accountId : '';
+      const selectedAccount = sealedAccount ? '' : calledAccountSelector(invocation?.arguments);
+      const accountId = sealedAccount || selectedAccount;
       const accountEmail = accountId ? cachedIdentityEmail(accountId) : undefined;
-      const accountLine = accountId ? `account ${accountId}${accountEmail ? ` (mailbox ${accountEmail})` : ''}` : '';
+      const accountLine = accountId
+        ? `account ${accountId}${accountEmail ? ` (mailbox ${accountEmail})` : ''}${selectedAccount ? ', named by the call\'s connected_account_id' : ''}`
+        : '';
       if (requestArgs !== undefined) {
         if (compact) {
           blocks.push(`${label}${accountLine ? `\n  ${accountLine}` : ''}\n  request (sealed): ${present(`request:${source}:${row.callId}`, JSON.stringify(requestArgs))}`);
