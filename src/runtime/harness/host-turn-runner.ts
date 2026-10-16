@@ -730,6 +730,7 @@ import {
 import {
   catalogOperationIdentitiesEqual,
   isPlainOrClementineLocalTool,
+  isTrustedComposioGateway,
 } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
 import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead, registeredToolReadRevision } from '../../tools/tool-registry.js';
@@ -1281,6 +1282,13 @@ export function hostNoProgressRecoveryToolNames(
     // or bypass its exact schema, source, effect, account or mode checks.
     if (hasUnavailableRepairName
       && (bare === 'tool_search' || bare === 'call_tool' || bare === 'work_call')) return true;
+    // A repair that names a connected-app operation names what the gateway
+    // carries, not a tool of its own. The gateway is the door that operation
+    // runs through; without it the model could only rebuild the call through
+    // a wrapper (live 2026-10-16: a refused send was corrected with the
+    // missing sender, then refused again as outside the recovery surface, and
+    // the run ended without the email). Every dispatch check still applies.
+    if (hasUnavailableRepairName && isTrustedComposioGateway(name)) return true;
     return isRegistryDeclaredRead(bare)
       || provenReads.includes(name)
       || (provenReads.length > 0 && (bare === 'call_tool' || bare === 'work_call'));
