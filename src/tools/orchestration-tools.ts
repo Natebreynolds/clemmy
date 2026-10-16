@@ -2844,7 +2844,9 @@ export function registerOrchestrationTools(server: McpServer): void {
 
 // ─── creation-test settlement receipt ─────────────────────────────────────────
 
-const CREATION_TEST_STEP_OK = new Set(['ok', 'previewed', 'unverifiable']);
+// A step that did not run (something above it is outstanding) is not a
+// defect to repair; its cause is the step that is flagged.
+const CREATION_TEST_STEP_OK = new Set(['ok', 'previewed', 'unverifiable', 'not_run']);
 
 /** The step as the author may resend it: only authorable fields, the prompt
  *  clipped, the host's own bindings (call.account) left out. */

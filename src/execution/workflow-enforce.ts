@@ -1,4 +1,5 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
+import { savedStepEffect } from './workflow-step-effect-reading.js';
 import { forEachSourceStepId } from './workflow-foreach-source.js';
 import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
@@ -127,11 +128,14 @@ const EXTERNAL_WRITE_RE =
  * irreversible send, or a write-verb-near-external-noun all count; a pure
  * read/fetch/query step does not.
  */
-export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string } }): boolean {
+export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; requiresApproval?: boolean; requires_approval?: boolean; call?: { tool?: string }; usesSkill?: string; forEach?: string; allowedTools?: string[] }): boolean {
   if (step.call?.tool && structuredCallSideEffectClass(step) !== 'read') return true;
   if (step.sideEffect === 'read') return false;
   if (step.sideEffect === 'write' || step.sideEffect === 'send') return true;
   if (step.requiresApproval === true || step.requires_approval === true) return true;
+  // An unmarked step read once for its exact current form; wording only when unread.
+  const reading = savedStepEffect(step);
+  if (reading) return reading !== 'read';
   const p = step.prompt ?? '';
   return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
 }
@@ -188,6 +192,8 @@ export function classifyStepSideEffect(step: {
   }
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
   if (step.call?.tool) return structuredCallSideEffectClass(step);
+  const reading = savedStepEffect(step);
+  if (reading) return reading;
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
   if (stepLooksMutating(step)) return 'write';
   if ((step.allowedTools?.length ?? 0) > 0 || step.usesSkill || step.forEach) return 'read';

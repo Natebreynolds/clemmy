@@ -424,7 +424,7 @@ test('an unanswered account choice during authoring is a QUESTION, and its depen
   assert.match(query?.detail ?? '', /account-b/);
   // The dependent stopped because of the question, not because it is broken.
   const dependent = result.steps.find((step) => step.stepId === 'build_batch');
-  assert.equal(dependent?.status, 'unverifiable', `expected no cascade failure, got ${JSON.stringify(dependent)}`);
+  assert.equal(dependent?.status, 'not_run', `a required step that never ran is said so, not failed: ${JSON.stringify(dependent)}`);
   assert.equal(result.steps.some((step) => step.status === 'error' || step.status === 'failed'), false,
     `nothing is reported broken: ${JSON.stringify(result.steps)}`);
 });
@@ -453,7 +453,7 @@ test('a step naming an app this setup has not connected is a dependency to conne
   const pull = result.steps.find((step) => step.stepId === 'pull_leads');
   assert.equal(pull?.status, 'needs_connection', JSON.stringify(result.steps));
   assert.match(pull?.detail ?? '', /connected here/);
-  assert.equal(result.steps.find((step) => step.stepId === 'summarize')?.status, 'unverifiable');
+  assert.equal(result.steps.find((step) => step.stepId === 'summarize')?.status, 'not_run');
   const lines = runner.creationTestStepLines(result.steps).join('\n');
   assert.doesNotMatch(lines, /needs your answer|hit an error|failed/);
   assert.match(lines, /connected here/);
@@ -603,4 +603,23 @@ test('a rehearsal compiles a previewed write call through the run\'s path: an ap
   const lead = result.steps.find((step) => step.stepId === 'create_lead');
   assert.notEqual(lead?.status, 'previewed', `a write the run cannot compile is not a clean preview: ${JSON.stringify(result.steps)}`);
   assert.equal(result.pass, false);
+});
+
+test('a rehearsal tells a required step that never ran from verification deferred until after a previewed write', async () => {
+  const saved = workflows.writeWorkflow('rehearsed-deferred-vs-not-run', {
+    name: 'Rehearsed deferred vs not run', description: 'Saves a note, then reads it back.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'save_note', sideEffect: 'write', call: { tool: 'write_file', args: { path: 'notes/deferred.md', content: 'hello', mode: 'overwrite' } } },
+      { id: 'read_back', sideEffect: 'read', dependsOn: ['save_note'], call: { tool: 'read_file', args: { path: 'notes/deferred.md' } } },
+    ],
+  });
+  const result = await runner.runCreationTest(saved.data, saved.name, 'creation-deferred-vs-not-run', {},
+    { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
+  const readBack = result.steps.find((step) => step.stepId === 'read_back');
+  assert.equal(readBack?.status, 'unverifiable', JSON.stringify(result.steps));
+  assert.equal(result.pass, true, 'verification deferred by design does not fail the rehearsal');
+  const lines = runner.creationTestStepLines(result.steps).join('\n');
+  assert.match(lines, /Read back — checked on the first real run/i);
+  assert.doesNotMatch(lines, /did not run/);
 });

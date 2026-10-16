@@ -1,4 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
+import { ensureWorkflowStepEffectsRead } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
@@ -14384,8 +14385,12 @@ export interface CreationTestStepResult {
    * make write-then-verify workflows permanently un-enablable. That shape
    * (append a row, read it back; upsert a record, confirm it) is the exact
    * pattern the evidence architecture asks users to build.
+   *
+   * 'not_run' is a required step that never ran in the rehearsal (an answer,
+   * a connection or a provider definition above it is still outstanding). It
+   * is not verification deferred by design, so it never counts as a pass.
    */
-  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'needs_choice' | 'needs_connection';
+  status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'not_run' | 'needs_choice' | 'needs_connection';
   detail?: string;
   /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
    * creation test can PARK on it like any run instead of only describing it. */
@@ -14443,7 +14448,8 @@ export function creationTestStepLines(steps: readonly CreationTestStepResult[]):
     if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it${s.detail ? ` (${s.detail})` : ''}`;
     // Unverifiable is honest, not alarming: it names WHY the check could
     // not run so the report never implies a broken step.
-    if (s.status === 'unverifiable') return `- ${name} — not checked: ${s.detail ?? 'it verifies a change the test only previewed'}`;
+    if (s.status === 'unverifiable') return `- ${name} — checked on the first real run: ${s.detail ?? 'it verifies a change the test only previewed'}`;
+    if (s.status === 'not_run') return `- ${name} — did not run: ${s.detail ?? 'something above it is still outstanding'}`;
     const word = s.status === 'empty' ? 'returned nothing' : s.status === 'failed' ? 'failed' : 'hit an error';
     return `- ${name} — ${word}${s.detail ? `: ${s.detail}` : ''}`;
   });
@@ -14629,7 +14635,7 @@ async function rehearseWriteCall(step: WorkflowStepInput, ctx: StepExecutionCont
       return { stepId: step.id, status: 'needs_connection', detail: `needs ${capabilityAppName(err.toolkit)} connected here (it names ${err.tool}); nothing ran`, block: err };
     }
     if (err instanceof WorkflowCapabilityBlockedError && workflowCapabilityBlockIsRecoverable(err.reason)) {
-      return { stepId: step.id, status: 'unverifiable', detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not check it; a run waits for it and retries` };
+      return { stepId: step.id, status: 'not_run', detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not check it; test again once it has` };
     }
     const reason = err instanceof WorkflowHarnessBlockedSignal ? err.reason : err instanceof Error ? err.message : String(err);
     const said = /^[a-z0-9_]+: ([\s\S]+)$/.exec(reason)?.[1]?.trim() || reason;
@@ -14648,6 +14654,7 @@ export async function runCreationTest(
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
+  try { await ensureWorkflowStepEffectsRead(workflow); } catch { /* wording fallback */ }
   // A creation test rehearses the run: it compiles and materializes the same
   // graph every run executes, so a rule the run enforces fails here, before
   // the workflow is turned on, never on its first real run. Running only the
@@ -14710,7 +14717,7 @@ export async function runCreationTest(
         stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on could not run yet' };
         results.push({
           stepId: step.id,
-          status: 'unverifiable',
+          status: 'not_run',
           detail: 'waits on a step above that could not run yet',
         });
       } else if (dependsOnPreview(step)) {
@@ -14767,8 +14774,8 @@ export async function runCreationTest(
             stepOutputs[step.id] = { blocked: true, reason: 'provider definition not settled' };
             results.push({
               stepId: step.id,
-              status: 'unverifiable',
-              detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not run it; a run waits for it and retries`,
+              status: 'not_run',
+              detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not run it; test again once it has`,
             });
           } else {
             stepOutputs[step.id] = { blocked: true, reason: 'creation-test error' };
@@ -15559,6 +15566,10 @@ async function processOneRunFile(
       });
       return;
     }
+    // An unmarked prompt step is read once per exact version (prompt, skill,
+    // tools); an unchanged rerun reads nothing. A failed reading keeps the
+    // wording fallback. Never permission: each call is still checked.
+    try { await ensureWorkflowStepEffectsRead(workflow.data); } catch { /* wording fallback */ }
     // DRY-RUN: a safe, side-effect-free runnability preflight (the dashboard
     // DRY-RUN button + auto-smoke-test on promotion). Works on a DISABLED
     // draft (it's exactly what you dry-run), executes NOTHING, and reports a
@@ -15807,7 +15818,7 @@ async function processOneRunFile(
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
             : `The creation test passed for the version I checked, but I left "${workflow.data.name}" as it was because ${activationBlockedReason}. Run a fresh creation test on the newer version before turning it on.\n\n${lines.join('\n')}`
         : result.steps.some((s) => s.status === 'needs_connection')
-          && result.steps.every((s) => ['ok', 'previewed', 'unverifiable', 'needs_connection', 'needs_choice'].includes(s.status))
+          && result.steps.every((s) => ['ok', 'previewed', 'unverifiable', 'not_run', 'needs_connection', 'needs_choice'].includes(s.status))
           // NOT a broken workflow: an app it names is not connected in this
           // setup. Say which, and what connecting it leads to.
           ? `"${workflow.data.name}" is ready except it needs ${missingConnectionApps(result.steps)} connected here, so it stays off.\n\n${lines.join('\n')}\n\nConnect ${missingConnectionApps(result.steps)} and I'll test it again${activateAfterCreationTest ? ' and turn it on if it passes' : ''}.`
