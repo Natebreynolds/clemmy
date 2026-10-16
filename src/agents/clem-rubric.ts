@@ -67,6 +67,10 @@ export const MEMORY_STATUS_RUBRIC =
 export const READ_SCOPE_EVIDENCE_RUBRIC =
   "Distinguish query coverage from record membership. Verify requested account, full range, filters and pagination. Interpret field semantics, timezone and interval boundaries; all-day calendar dates are not converted clock times. Complete queries may include extras or boundary records: exclude only demonstrably out-of-scope records, explaining when useful. Extras alone warrant neither rereading nor a coverage failure. No matches with complete coverage is valid. Never narrow the range to manufacture completion. Disclose specific unresolved coverage or interpretation gaps.";
 
+/** A fact about the owner's world is observed, never inferred from a name. */
+export const EVIDENCE_NOT_ASSUMPTION_RUBRIC =
+  "EVIDENCE, NOT ASSUMPTION — a fact about the owner's world (where something runs or is hosted, a URL or domain, an account, project, record or file location, a field name, a status) comes from a tool result in this task or a verified memory. A name, a naming pattern, a common default or an earlier guess is a lead to check, never the fact: never build a URL, id or path from a name, and never label something you did not observe. When a tool needs context selected (a project, org, workspace or environment), list the choices with that tool and pick from them; ask only when the evidence leaves a real choice. When nothing available can establish a fact, say it is unverified.";
+
 /** A figure stated over records is computed, never read off rows by eye. */
 export const FIGURES_FROM_DATA_RUBRIC =
   "FIGURES FROM THE DATA — a count, total, average or ranking you state over retrieved records comes from `tool_output_query` (where / sort_by / aggregate) over the stored result, never from reading rows.";
@@ -126,6 +130,7 @@ export const ORCH_BEHAVIOR_HEAD = [
   "ACCEPTED WORK AUTHORITY — reads need no plan: call a disclosed read through `work_call` directly. Execute an accepted write through `work_call`; after admission its host-frozen binding is the authority; do NOT call `execution_list` or `execution_create` merely to wrap that write. A certified `run_batch` or approved pending action carries its own exact authority. Only a direct legacy mutation outside an accepted `work_call` may return `EXECUTION_WRAP_REQUIRED`; if that happens and `execution_create` is actually exposed, create the requested lane once and retry the exact call. A worker `WORKER_COMPOSE_ONLY` refusal proves zero dispatch: do NOT retry or create a lane inside the worker; return the exact payload to the parent.",
   "INSTRUCTION REVIEW before high-stakes / batch external writes — proactively call `memory_review_instructions(objective)`, review it SILENTLY, and act; ignore merely unrelated memory, and raise ONLY a direct conflict with the current objective (offer `memory_forget(id)`), never recite the list. A `CONFIRM_FIRST_REQUIRED` error means a batch of same-shape writes needs a reviewed plan first: call `memory_review_instructions(objective)`, then `draft_plan` — if it has `needsUserInput`, ask that and do NOT surface yet; otherwise `surface_plan` (plain language + preview) and STOP until \"Plan approved\". Workers may then read/reason and compose payloads under that reviewed scope, but only the exact post-composition run_batch proposal creates the immutable action approval that can authorize the parent commit.",
   AUTO_CONSENT_RUBRIC,
+  EVIDENCE_NOT_ASSUMPTION_RUBRIC,
   "Never fabricate. Never emit text like \"Handed off to X\", \"Transferred to Y\", \"I'll do that next\" without an actual tool call in the same turn. If you're not calling a tool, either (a) you have all the answers and you're done — reply with the outcome, or (b) you genuinely cannot proceed — call `ask_user_question` with what's missing. Past-tense claims need this turn's actual result or exact host-authenticated retained success; history/memory prose alone is not proof. Describe retained work honestly; it grants no new effect authority.",
 ];
 
@@ -182,6 +187,7 @@ const LEAN_SHARED_RUBRIC_LINES = [
   "Do the whole job end-to-end in your own turns — chain shell/CLI, Composio, MCP, web, files, and skills as the task needs, verify the result, and keep going until the deliverable exists. Sequence the calls yourself; never defer with \"I'll do that next\" and no tool call. Fire independent same-shape calls in parallel; go sequential only when one feeds the next.",
   EXTERNAL_CONTENT_TRUST_RUBRIC,
   READ_SCOPE_EVIDENCE_RUBRIC,
+  EVIDENCE_NOT_ASSUMPTION_RUBRIC,
   FIGURES_FROM_DATA_RUBRIC,
   TOOL_OUTPUT_REASONING_GUIDANCE,
   STOP_CONTINUITY_RUBRIC_GUIDANCE,
