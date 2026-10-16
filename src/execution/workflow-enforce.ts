@@ -1,5 +1,5 @@
 import type { WorkflowDefinition, WorkflowInputDef, WorkflowStepInput } from '../memory/workflow-store.js';
-import { savedStepEffect } from './workflow-step-effect-reading.js';
+import { currentStepEffectForExecution } from './workflow-step-effect-reading.js';
 import { forEachSourceStepId } from './workflow-foreach-source.js';
 import { structuredCallSideEffectClass } from './workflow-step-effect.js';
 import {
@@ -134,7 +134,7 @@ export function stepLooksMutating(step: { prompt?: string; sideEffect?: string; 
   if (step.sideEffect === 'write' || step.sideEffect === 'send') return true;
   if (step.requiresApproval === true || step.requires_approval === true) return true;
   // An unmarked step read once for its exact current form; wording only when unread.
-  const reading = savedStepEffect(step);
+  const reading = currentStepEffectForExecution(step);
   if (reading) return reading !== 'read';
   const p = step.prompt ?? '';
   return stepLooksLikeIrreversibleSend(p) || EXTERNAL_WRITE_RE.test(p);
@@ -192,7 +192,7 @@ export function classifyStepSideEffect(step: {
   }
   if (step.sideEffect === 'read' || step.sideEffect === 'write' || step.sideEffect === 'send') return step.sideEffect;
   if (step.call?.tool) return structuredCallSideEffectClass(step);
-  const reading = savedStepEffect(step);
+  const reading = currentStepEffectForExecution(step);
   if (reading) return reading;
   if (stepLooksLikeIrreversibleSend(step.prompt ?? '')) return 'send';
   if (stepLooksMutating(step)) return 'write';

@@ -1,5 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
-import { ensureWorkflowStepEffectsRead } from './workflow-step-effect-reading.js';
+import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
@@ -4949,6 +4949,20 @@ function registerActiveWorkflowStepAttempt(
 ): () => void {
   return registerWorkflowCancellationTarget(workflowRunId, attempt.attemptId,
     () => requestKill(sessionId, 'Workflow run cancelled by user.', attempt));
+}
+
+/** Preparation belongs to the same exact Stop owner as its eventual steps.
+ * No child attempt or execution permission is created for a semantic read. */
+async function prepareWorkflowStepEffects(workflow: WorkflowDefinition, runId: string): Promise<void> {
+  throwIfWorkflowRunCancelled(runId);
+  const controller = new AbortController();
+  const unregister = registerWorkflowCancellationTarget(runId, `preparation:${randomUUID()}`,
+    () => controller.abort(new WorkflowRunCancelledError()));
+  try {
+    await ensureWorkflowStepEffectsRead(workflow, createWorkflowStepEffectPreparation({ signal: controller.signal,
+      checkActive: () => throwIfWorkflowRunCancelled(runId) }));
+    throwIfWorkflowRunCancelled(runId);
+  } finally { unregister(); }
 }
 
 // 24h aligns with approval-registry's DEFAULT_APPROVAL_TTL_MS so the workflow
@@ -14287,6 +14301,37 @@ function finishWorkflowActivityRun(
   } catch { /* run-events is best-effort; never block the workflow lane */ }
 }
 
+/** Settle a pre-step preparation/admission stop through the same terminal
+ * committer as execution. Keep partial progress and an already-winning Stop. */
+function settleWorkflowPreparationFailure(filePath: string, run: QueuedRunRecord, error: unknown): void {
+  const current = readRunRecord(filePath) ?? run;
+  const cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
+  const message = cancelled
+    ? 'Workflow run cancelled during preparation. No new step ran.'
+    : error instanceof Error ? error.message : 'Workflow preparation is unavailable; test the saved version again.';
+  const report = { workflowName: run.workflow, outcome: 'failed' as const, detail: message };
+  const terminal = writeRunRecord(filePath, { ...current, status: cancelled ? 'cancelled' : 'error',
+    finishedAt: new Date().toISOString(), error: message,
+    ...(cancelled ? {} : { needsAttention: true, blockedSteps: [{ stepId: '(preparation)', reason: message }] }) },
+  cancelled ? undefined : report);
+  if (terminal.record.status === 'cancelled') {
+    // The cancellation owner provides the Stop report; do not also publish a
+    // failed-preparation narrative for the same terminal source.
+    notifyCancelledRunOnce(filePath, terminal.record);
+    finishWorkflowActivityRun(run.id, { status: 'cancelled', message: terminal.record.error ?? message });
+    return;
+  }
+  if (terminal.record.status !== 'error') return;
+  if (terminal.publishedTerminal) {
+    addNotification({ id: `workflow-${run.id}-error`, kind: 'workflow', title: `Workflow needs attention: ${run.workflow}`,
+      body: message, createdAt: new Date().toISOString(), read: false,
+      metadata: { workflow: run.workflow, runId: run.id, status: 'error' } });
+    markRunNotified(filePath);
+    finishWorkflowActivityRun(run.id, { status: 'failed', message });
+  }
+  recordAndAttemptWorkflowRunReportBack(filePath, report);
+}
+
 /** Evidence the validator judges: the final deliverable + a truncated
  *  per-step ledger (so a criterion about an intermediate step is checkable). */
 function compactEvidencePreview(value: unknown, maxChars: number): string {
@@ -14651,10 +14696,16 @@ export async function runCreationTest(
   assistant: ClementineAssistant,
   options: { capabilityResume?: WorkflowCapabilityBlockState } = {},
 ): Promise<CreationTestResult> {
+  return withWorkflowStepEffectExecutionContext(() => workflow, async () => {
   const stepOutputs: Record<string, unknown> = {};
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
-  try { await ensureWorkflowStepEffectsRead(workflow); } catch { /* wording fallback */ }
+  try { await prepareWorkflowStepEffects(workflow, runId); }
+  catch (error) {
+    throwIfWorkflowRunCancelled(runId);
+    if (!(error instanceof WorkflowStepEffectUnavailableError)) throw error;
+    return { pass: false, steps: workflow.steps.map(step => ({ stepId: step.id, status: 'not_run', detail: error.message })) };
+  }
   // A creation test rehearses the run: it compiles and materializes the same
   // graph every run executes, so a rule the run enforces fails here, before
   // the workflow is turned on, never on its first real run. Running only the
@@ -14789,6 +14840,7 @@ export async function runCreationTest(
   const pass = forEachFailures.length === 0
     && results.every((r) => r.status === 'ok' || r.status === 'previewed' || r.status === 'unverifiable');
   return { pass, steps: results };
+  });
 }
 
 type WorkflowCatalogEntry = ReturnType<typeof listWorkflows>[number];
@@ -15566,10 +15618,11 @@ async function processOneRunFile(
       });
       return;
     }
-    // An unmarked prompt step is read once per exact version (prompt, skill,
-    // tools); an unchanged rerun reads nothing. A failed reading keeps the
-    // wording fallback. Never permission: each call is still checked.
-    try { await ensureWorkflowStepEffectsRead(workflow.data); } catch { /* wording fallback */ }
+    return withWorkflowStepEffectExecutionContext(() => workflow.data, async () => {
+    try {
+    // Creation testing owns this same preparation inside runCreationTest.
+    // Never spend another reading on a failed outer/inner preparation pair.
+    if (run.status !== 'creation_test') await prepareWorkflowStepEffects(workflow.data, run.id);
     // DRY-RUN: a safe, side-effect-free runnability preflight (the dashboard
     // DRY-RUN button + auto-smoke-test on promotion). Works on a DISABLED
     // draft (it's exactly what you dry-run), executes NOTHING, and reports a
@@ -15649,6 +15702,7 @@ async function processOneRunFile(
           ...(creationTestResume ? { capabilityResume: creationTestResume } : {}),
         });
       } catch (err) {
+        if (err instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id)) throw err;
         result = { pass: false, steps: [{ stepId: '(run)', status: 'error', detail: err instanceof Error ? err.message : String(err) }] };
       }
       // An unanswered account question is a PAUSE of this creation test, not
@@ -18107,6 +18161,15 @@ async function processOneRunFile(
     } finally {
       stopHeartbeat();
     }
+    } catch (error) {
+      // Preparation and admission precede the execution lifecycle. Their
+      // unavailable/Stop result must settle this exact queued run once too.
+      if (!(error instanceof WorkflowStepEffectUnavailableError)
+        && !(error instanceof WorkflowRunCancelledError)
+        && !isWorkflowRunCancelled(run.id)) throw error;
+      settleWorkflowPreparationFailure(filePath, run, error);
+    }
+    });
 }
 
 /**
