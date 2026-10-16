@@ -24,7 +24,7 @@ A Workspace has five parts. Decide all five before writing anything:
 - For a view-only edit that does not change data interpretation, use `space_get` with `metadata_only: true` to check the exact saved sources, accounts, schedules and actions without pulling dataset records. Read records when you need their shape or content.
 - Look at the real records before writing any rule. `space_get` with `source_id` pages through one source's records (`limit`, `offset`). Never guess a field path or what a record looks like.
 - Resolve identities with tools, never by guessing: the user's own handle in a chat tool, their mailbox, their team's record owners. For example, look up the user's chat account by their own email address before filtering messages "to me".
-- Find where a site or service runs from evidence, never from its name: the repository's deployments, environments and homepage, the hosting tool's own project list (a hosting CLI lists projects without a linked folder), and the domains those report. Never build a URL from a repository or project name. When the evidence names no host, ask which one; when a hosting tool needs a project selected, select it in a working folder for this Workspace rather than asking.
+- Everything the Workspace shows as fact (a link, a host, a status, a label) is something a tool returned, never something inferred from a name (EVIDENCE, NOT ASSUMPTION).
 
 ## 2. Attach data (no model after this)
 
