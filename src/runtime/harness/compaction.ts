@@ -150,6 +150,11 @@ export function dropPriorTurnReasoning(items: AgentInputItem[]): { nextItems: Ag
   return { nextItems: dropped > 0 ? nextItems : items, dropped };
 }
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
+/** Schemas a collapsed mid-turn search disclosed, kept beside the ledger. */
+const COLLAPSED_SCHEMA_CARDS_MAX_CHARS = 24_000;
+const COLLAPSED_SCHEMA_CARD_MAX_CHARS = 12_000;
+/** The host's discovery door; only its own result shape is read for schemas. */
+const SCHEMA_DISCLOSING_TOOL = 'tool_search';
 const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
 const DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS = 20_000;
 const DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS = 3;
@@ -810,7 +815,63 @@ function completedWriteLines(pairs: CompletedToolPair[], sessionId?: string): st
   }
 }
 
-function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[], sessionId?: string): AgentInputItem {
+/**
+ * THE SCHEMAS A SEARCH FOUND OUTLIVE THE SEARCH RESULT.
+ *
+ * A tool found by search mid-turn is not added to the tools block while the
+ * cached prefix is warm, so its exact input schema lives only in that search
+ * result. Collapsing the result took the schema with it, and the model searched
+ * for the same tool again before every call (live 2026-10-16: one Workspace
+ * build searched space_save three times and space_set_data twice, each result
+ * 4-6k tokens). Each disclosed schema is kept verbatim, newest disclosure per
+ * tool, bounded; one too large to keep points at its exact recall.
+ *
+ * Only the host's own discovery result is read, and only its structured
+ * `schemas`, `results[].carrier` and `results[].capabilityRef` fields: a
+ * provider reply with a field of the same name never reaches this card.
+ */
+function collapsedSchemaCardLines(pairs: CompletedToolPair[]): string[] {
+  const cards = new Map<string, string>();
+  for (let i = pairs.length - 1; i >= 0; i -= 1) {
+    const pair = pairs[i]!;
+    if (pair.name !== SCHEMA_DISCLOSING_TOOL) continue;
+    let page: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(pair.storedResultText ?? pair.resultText) as unknown;
+      page = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+    } catch { page = null; }
+    const schemas = page?.schemas;
+    if (!schemas || typeof schemas !== 'object' || Array.isArray(schemas)) continue;
+    const rows = Array.isArray(page?.results) ? page.results as Array<Record<string, unknown>> : [];
+    for (const [name, schema] of Object.entries(schemas as Record<string, unknown>)) {
+      if (cards.has(name) || !/^[A-Za-z0-9_.:-]{1,128}$/.test(name) || !schema || typeof schema !== 'object') continue;
+      const row = rows.find((candidate) => candidate && candidate.name === name);
+      const route = [
+        typeof row?.carrier === 'string' ? `call with ${row.carrier}` : null,
+        typeof row?.capabilityRef === 'string' ? `requirement_id ${row.capabilityRef}` : null,
+      ].filter(Boolean).join(', ');
+      const text = JSON.stringify(schema);
+      cards.set(name, text.length <= COLLAPSED_SCHEMA_CARD_MAX_CHARS
+        ? `- ${name}${route ? ` (${route})` : ''}: ${text}`
+        : `- ${name}${route ? ` (${route})` : ''}: schema too large to keep here; ${toolCallHint('recall_tool_result', { call_id: pair.callId })}`);
+    }
+  }
+  if (cards.size === 0) return [];
+  const lines = ['[input schemas found by search earlier in this turn — exact, still current for this turn; call these tools with them instead of searching again]'];
+  let chars = lines[0]!.length;
+  for (const line of cards.values()) {
+    if (chars + line.length + 1 > COLLAPSED_SCHEMA_CARDS_MAX_CHARS) continue;
+    lines.push(line);
+    chars += line.length + 1;
+  }
+  return lines.length > 1 ? lines : [];
+}
+
+function buildCollapsedToolPairsSummary(
+  pairs: CompletedToolPair[],
+  sessionId?: string,
+  keepSchemaCards = false,
+): AgentInputItem {
   const completeCallIdIndex = `[complete collapsed call-id index JSON] ${JSON.stringify(pairs.map((pair) => pair.callId))}`;
   const lines: string[] = [
     '[summary of older completed tool activity]',
@@ -845,6 +906,10 @@ function buildCollapsedToolPairsSummary(pairs: CompletedToolPair[], sessionId?: 
   if (omitted > 0) {
     lines.push(`- ${omitted} additional older completed tool calls were also collapsed; use the visible recent context first, then ask for a specific recall if needed.`);
   }
+  if (keepSchemaCards) {
+    const cards = collapsedSchemaCardLines(pairs);
+    if (cards.length > 0) lines.push('', ...cards);
+  }
   const writes = completedWriteLines(pairs, sessionId);
   if (writes.length > 0) {
     lines.push('', '[Durable completed writes — already done]',
@@ -878,6 +943,8 @@ export function collapseOldCompletedToolPairs(
   items: AgentInputItem[],
   retainPairs: number = DEFAULT_LAYER1_RETAIN_TOOL_PAIRS,
   sessionId?: string,
+  /** Mid-turn only: keep the schemas collapsed searches disclosed. */
+  keepSchemaCards = false,
 ): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[]; summary?: AgentInputItem } {
   if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
@@ -899,7 +966,7 @@ export function collapseOldCompletedToolPairs(
   if (pairs.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const collapseIds = new Set(pairs.map((pair) => pair.callId));
-  const summary = buildCollapsedToolPairsSummary(pairs, sessionId);
+  const summary = buildCollapsedToolPairsSummary(pairs, sessionId, keepSchemaCards);
   const nextItems: AgentInputItem[] = [];
   let desiredIndex = -1;
 
@@ -1106,7 +1173,7 @@ export function compactInFlightToolContext(
 
   const retainedPairs = retainedPairCount(completedResults, retainedBudget, minRetain, maxRetain);
 
-  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId);
+  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId, true);
   if (collapsed.collapsed === 0 || estimateInputTokens(collapsed.nextItems) >= beforeTokens) return unchanged();
   return {
     nextItems: collapsed.nextItems,
@@ -1192,7 +1259,7 @@ export function compactInFlightToolContextStable(
   }
 
   const retainedPairs = retainedPairCount(uncovered, retainedBudget, minRetain, maxRetain);
-  const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId);
+  const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId, true);
   if (collapsed.collapsed === 0 || !collapsed.summary
     || estimateInputTokens(collapsed.nextItems) >= estimateInputTokens(current)) {
     return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });
