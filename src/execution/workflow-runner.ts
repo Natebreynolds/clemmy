@@ -9977,6 +9977,24 @@ export function settlementGuardedStepOutput(input: {
     // the same way default chat audit already does.
     requireEveryBusinessReadToSettle: sideEffect !== 'read' || !outputSatisfiesDeclaredContract,
   });
+  // A SEND step's deliverable is the send. Successful reads make the audit
+  // clean, so a step that gathered everything, composed the message and
+  // finished without sending was reported completed (live 2026-10-16, after
+  // the "nothing to change" exemption was closed for sends). Without one
+  // confirmed or possibly-landed write, a send step is not done.
+  if (
+    sideEffect === 'send'
+    && input.continuesLandedWork !== true
+    && audit.facts.confirmedWrites + (audit.facts.uncertainWrites ?? 0) === 0
+  ) {
+    const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
+    return {
+      blocked: true,
+      reason: refusals.count > 0
+        ? noEffectStepReason({ stepId: input.step.id, effectClass: 'send', refusals })
+        : `Step "${input.step.id}" is a send step but sent nothing: it gathered what it needed and finished without sending, so nothing was delivered. Run it again; it is done when the send goes out.`,
+    };
+  }
   if (audit.status === 'clean') return input.output;
   // A declared write/send step that LOOKED and found nothing to change is
   // complete: it settled at least one successful read, attempted no mutation
