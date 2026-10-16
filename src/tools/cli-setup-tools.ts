@@ -28,11 +28,14 @@ const ACTION = z.enum(['status', 'install', 'auth', 'remember', 'job_status', 'r
 
 export function registerCliSetupTools(server: McpServer): void {
   server.tool('cli_inspect',
-    'Read CLI health, signed-in account and its public connection origin (instance URL / hostname), available repairs, or a managed job. Does not start or repeat any operation.',
-    { action: z.enum(['status', 'repairs', 'job_status']), catalogId: z.string().max(60).optional(),
+    'Read CLI health, signed-in account and its public connection origin (instance URL / hostname), the commands the CLI itself lists (its own --help, optionally for one subcommand), available repairs, or a managed job. Does not start or repeat any operation.',
+    { action: z.enum(['status', 'commands', 'repairs', 'job_status']), catalogId: z.string().max(60).optional(),
+      subcommand: z.string().max(40).optional()
+        .describe('commands only: one subcommand word to list its own options (for example "list" or "service").'),
       jobId: z.string().max(120).optional() },
-    async ({ action, catalogId, jobId }) => {
+    async ({ action, catalogId, subcommand, jobId }) => {
       if (action === 'status') return statusAction(catalogId);
+      if (action === 'commands') return commandsAction(catalogId, subcommand);
       if (action === 'repairs') return repairsAction(catalogId);
       return jobStatusAction(jobId);
     });
@@ -41,7 +44,7 @@ export function registerCliSetupTools(server: McpServer): void {
     'cli_setup',
     [
       'Install, remember or re-authenticate a local CLI for the user, via the approved local paths. Actions:',
-      '- For read-only diagnostics prefer cli_inspect (status | repairs | job_status).',
+      '- For read-only diagnostics prefer cli_inspect (status | commands | repairs | job_status).',
       '- status: auth/install state of catalogId, or the connected/saved roster when catalogId is omitted.',
       `- install: install a CLI. Pass catalogId (preferred — e.g. "railway", "github") OR a raw command, which must match the install allowlist (npm install -g / ${process.platform === 'win32' ? '' : 'brew install / '}uv tool install / pipx install / pip install --user / git clone https).`,
       '- remember: add an ALREADY installed CLI to Connect → Command-line tools without reinstalling it. Pass only command, a bare executable name (no paths, arguments or shell). This checks safe executable resolution and saves its name; authentication remains unverified and no command is executed.',
@@ -139,9 +142,55 @@ async function statusAction(catalogId?: string): Promise<ReturnType<typeof textR
         : '';
       const connection = h.authStatus === 'ok' && !h.staleSince && h.username && h.connectionOrigin
         ? `; connection origin for this account: ${h.connectionOrigin}` : '';
-      return `${h.id} (${h.command}): ${state}${connection}${fix}`;
+      const commands = h.installed && h.binaryPath
+        ? ` — its commands: cli_inspect {"action":"commands","catalogId":"${h.id}"}` : '';
+      return `${h.id} (${h.command}): ${state}${connection}${fix}${commands}`;
     });
   return textResult(`CLI roster (${roster.length}):\n${lines.join('\n')}`);
+}
+
+const COMMANDS_HELP_MAX_CHARS = 6_000;
+const COMMANDS_HELP_TTL_MS = 24 * 60 * 60_000;
+const commandsHelpCache = new Map<string, { at: number; text: string }>();
+
+/**
+ * What a connected CLI can do, in its own words. A model that knows only the
+ * command it already tried keeps retrying it: live 2026-10-16 a signed-in
+ * hosting CLI answered "no linked project" twice and the owner was asked to
+ * link one, while the same CLI's own project listing needed no link at all.
+ * Runs the verified executable's `--help` (or `<subcommand> --help`) with no
+ * shell; help changes nothing.
+ */
+async function commandsAction(catalogId?: string, subcommand?: string): Promise<ReturnType<typeof textResult>> {
+  const requested = catalogId?.trim();
+  if (!requested) return textResult('commands needs a catalogId; cli_inspect status lists them.');
+  const sub = subcommand?.trim();
+  if (sub && !/^[A-Za-z0-9][A-Za-z0-9:_-]{0,39}$/.test(sub)) {
+    return textResult('subcommand must be one plain word (letters, digits, ":", "_" or "-").');
+  }
+  const { getCliHealth, resolveCliHealthId } = await import('../integrations/cli-catalog/auth-health.js');
+  const id = resolveCliHealthId(requested);
+  if (!id) return textResult(`Unknown or ambiguous CLI scope ${JSON.stringify(requested)}.`);
+  const health = await getCliHealth(id);
+  if (!health.installed || !health.binaryPath) {
+    return textResult(`${id} is not installed with a verified executable, so its commands cannot be listed.`);
+  }
+  const argv = sub ? [sub, '--help'] : ['--help'];
+  const key = `${health.binaryPath}\u0000${argv.join(' ')}`;
+  const cached = commandsHelpCache.get(key);
+  if (cached && Date.now() - cached.at < COMMANDS_HELP_TTL_MS) return textResult(cached.text);
+  const { execFile } = await import('node:child_process');
+  const output = await new Promise<string>((resolve) => {
+    execFile(health.binaryPath!, argv, { timeout: 8_000, maxBuffer: 256 * 1024, windowsHide: true },
+      (_error, stdout, stderr) => resolve(`${String(stdout ?? '')}${stderr ? `\n${String(stderr)}` : ''}`.trim()));
+  });
+  if (!output) return textResult(`\`${health.command} ${argv.join(' ')}\` printed nothing.`);
+  const clipped = output.length > COMMANDS_HELP_MAX_CHARS
+    ? `${output.slice(0, COMMANDS_HELP_MAX_CHARS)}\n[help clipped at ${COMMANDS_HELP_MAX_CHARS} characters; ask for one subcommand]`
+    : output;
+  const text = `\`${health.command} ${argv.join(' ')}\`:\n${clipped}`;
+  commandsHelpCache.set(key, { at: Date.now(), text });
+  return textResult(text);
 }
 
 async function installAction(
