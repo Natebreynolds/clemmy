@@ -150,9 +150,13 @@ export function dropPriorTurnReasoning(items: AgentInputItem[]): { nextItems: Ag
   return { nextItems: dropped > 0 ? nextItems : items, dropped };
 }
 const COLLAPSED_TOOL_SUMMARY_MAX_CHARS = 12_000;
-/** Schemas a collapsed mid-turn search disclosed, kept beside the ledger. */
-const COLLAPSED_SCHEMA_CARDS_MAX_CHARS = 24_000;
-const COLLAPSED_SCHEMA_CARD_MAX_CHARS = 12_000;
+/** Schemas a collapsed mid-turn search disclosed, kept beside the ledger.
+ *  Workspace and workflow schemas run 12-16k characters. */
+const COLLAPSED_SCHEMA_CARDS_MAX_CHARS = 48_000;
+const COLLAPSED_SCHEMA_CARD_MAX_CHARS = 20_000;
+/** Results the model fetched again after a collapse stay verbatim, up to this. */
+const IN_FLIGHT_REFETCHED_BUDGET_TOKENS = 24_000;
+const REFETCH_MIN_RESULT_CHARS = 500;
 /** The host's discovery door; only its own result shape is read for schemas. */
 const SCHEMA_DISCLOSING_TOOL = 'tool_search';
 const DEFAULT_IN_FLIGHT_RESULT_TRIGGER_TOKENS = 32_000;
@@ -822,55 +826,155 @@ function completedWriteLines(pairs: CompletedToolPair[], sessionId?: string): st
  * cached prefix is warm, so its exact input schema lives only in that search
  * result. Collapsing the result took the schema with it, and the model searched
  * for the same tool again before every call (live 2026-10-16: one Workspace
- * build searched space_save three times and space_set_data twice, each result
- * 4-6k tokens). Each disclosed schema is kept verbatim, newest disclosure per
- * tool, bounded; one too large to keep points at its exact recall.
+ * build searched space_save three times, workflow_update four times). Each
+ * disclosed schema is kept verbatim, newest disclosure per tool, bounded; one
+ * that does not fit points at its exact schema reread, never a new search.
  *
- * Only the host's own discovery result is read, and only its structured
- * `schemas`, `results[].carrier` and `results[].capabilityRef` fields: a
- * provider reply with a field of the same name never reaches this card.
+ * Only the host's own discovery results are read, and only their structured
+ * fields (`schemas`, `schema_handles`, `results[].carrier|capabilityRef`, and
+ * a schema reread page's `schema`): a provider reply with a field of the same
+ * name never reaches this card. `named` is every completed search in the
+ * history, so a reread page is named by the search that issued its handle.
  */
-function collapsedSchemaCardLines(pairs: CompletedToolPair[]): string[] {
-  const cards = new Map<string, string>();
+function parsedSearchPage(pair: CompletedToolPair): Record<string, unknown> | null {
+  if (pair.name !== SCHEMA_DISCLOSING_TOOL) return null;
+  try {
+    const parsed = JSON.parse(pair.storedResultText ?? pair.resultText) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function collapsedSchemaCardLines(pairs: CompletedToolPair[], named: CompletedToolPair[]): string[] {
+  const handles = new Map<string, { name: string; cursor: string | null }>();
+  const cursors = new Map<string, string>();
+  for (const pair of named) {
+    const handleMap = parsedSearchPage(pair)?.schema_handles;
+    if (!handleMap || typeof handleMap !== 'object' || Array.isArray(handleMap)) continue;
+    for (const [name, handle] of Object.entries(handleMap as Record<string, unknown>)) {
+      const h = handle && typeof handle === 'object' ? handle as Record<string, unknown> : null;
+      const ref = typeof h?.schema_ref === 'string' ? h.schema_ref : null;
+      const cursor = typeof h?.cursor === 'string' ? h.cursor : null;
+      if (ref) handles.set(ref, { name, cursor });
+      if (cursor) cursors.set(name, cursor);
+    }
+  }
+  const disclosed = new Map<string, { schema: object; route: string; callId: string }>();
   for (let i = pairs.length - 1; i >= 0; i -= 1) {
     const pair = pairs[i]!;
-    if (pair.name !== SCHEMA_DISCLOSING_TOOL) continue;
-    let page: Record<string, unknown> | null = null;
-    try {
-      const parsed = JSON.parse(pair.storedResultText ?? pair.resultText) as unknown;
-      page = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
-    } catch { page = null; }
-    const schemas = page?.schemas;
+    const page = parsedSearchPage(pair);
+    if (!page) continue;
+    if (page.kind === 'tool_search_schema') {
+      const named = typeof page.schema_ref === 'string' ? handles.get(page.schema_ref) : undefined;
+      if (named && page.complete === true && page.schema && typeof page.schema === 'object'
+        && !disclosed.has(named.name)) {
+        disclosed.set(named.name, { schema: page.schema as object, route: '', callId: pair.callId });
+      }
+      continue;
+    }
+    const schemas = page.schemas;
     if (!schemas || typeof schemas !== 'object' || Array.isArray(schemas)) continue;
-    const rows = Array.isArray(page?.results) ? page.results as Array<Record<string, unknown>> : [];
+    const rows = Array.isArray(page.results) ? page.results as Array<Record<string, unknown>> : [];
     for (const [name, schema] of Object.entries(schemas as Record<string, unknown>)) {
-      if (cards.has(name) || !/^[A-Za-z0-9_.:-]{1,128}$/.test(name) || !schema || typeof schema !== 'object') continue;
+      if (disclosed.has(name) || !schema || typeof schema !== 'object') continue;
       const row = rows.find((candidate) => candidate && candidate.name === name);
       const route = [
         typeof row?.carrier === 'string' ? `call with ${row.carrier}` : null,
         typeof row?.capabilityRef === 'string' ? `requirement_id ${row.capabilityRef}` : null,
       ].filter(Boolean).join(', ');
-      const text = JSON.stringify(schema);
-      cards.set(name, text.length <= COLLAPSED_SCHEMA_CARD_MAX_CHARS
-        ? `- ${name}${route ? ` (${route})` : ''}: ${text}`
-        : `- ${name}${route ? ` (${route})` : ''}: schema too large to keep here; ${toolCallHint('recall_tool_result', { call_id: pair.callId })}`);
+      disclosed.set(name, { schema, route, callId: pair.callId });
     }
   }
-  if (cards.size === 0) return [];
+  if (disclosed.size === 0) return [];
   const lines = ['[input schemas found by search earlier in this turn — exact, still current for this turn; call these tools with them instead of searching again]'];
   let chars = lines[0]!.length;
-  for (const line of cards.values()) {
-    if (chars + line.length + 1 > COLLAPSED_SCHEMA_CARDS_MAX_CHARS) continue;
+  for (const [name, card] of disclosed) {
+    if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(name)) continue;
+    const label = `- ${name}${card.route ? ` (${card.route})` : ''}`;
+    const text = JSON.stringify(card.schema);
+    const full = `${label}: ${text}`;
+    const cursor = cursors.get(name);
+    const line = text.length <= COLLAPSED_SCHEMA_CARD_MAX_CHARS && chars + full.length + 1 <= COLLAPSED_SCHEMA_CARDS_MAX_CHARS
+      ? full
+      : cursor
+        ? `${label}: reopen its exact schema with tool_search ${JSON.stringify({ query: name, cursor })} (a reread, not a new search)`
+        : `${label}: ${toolCallHint('recall_tool_result', { call_id: card.callId })}`;
     lines.push(line);
     chars += line.length + 1;
   }
   return lines.length > 1 ? lines : [];
 }
 
+/**
+ * A RESULT FETCHED AGAIN IS WORKING SET.
+ *
+ * The in-flight collapse keeps the newest few results. A build whose working
+ * set is larger than that (a skill playbook, a Workspace view, a workflow and
+ * the schemas it is editing) thrashed: each collapse dropped something the
+ * model still needed, it fetched it again, and the next collapse dropped
+ * something else (live 2026-10-16: one turn re-read the same skill three times
+ * and the same Workspace four times, and wrote once in 67 calls). The same
+ * call (operation and arguments, through any carrier) returning the same bytes
+ * as an earlier one in this history is the model saying it still needs them;
+ * that result stays verbatim for the rest of the turn, newest first within a
+ * bounded budget. Different calls that happen to return equal bytes (parallel
+ * searches, sibling partitions) are separate observations, not a re-fetch.
+ */
+/** The operation and arguments a call asked for, whatever carried it; an
+ *  omitted optional argument and an explicit null ask for the same thing. */
+function refetchCallIdentity(pair: CompletedToolPair): string {
+  let args: unknown = pair.args;
+  try { args = JSON.parse(pair.args); } catch { /* unparseable arguments keep their exact text */ }
+  const effective = unwrapRuntimeEffectiveToolIdentity(pair.name, args);
+  let inner: unknown = effective.toolName ? effective.args : args;
+  if (typeof inner === 'string') {
+    try { inner = JSON.parse(inner); } catch { /* exact text */ }
+  }
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .filter(([, field]) => field !== null && field !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, field]) => [key, canonical(field)]));
+    }
+    return value;
+  };
+  return JSON.stringify([effective.toolName ?? pair.name, canonical(inner)]);
+}
+
+export function refetchedWorkingSetCallIds(
+  items: AgentInputItem[],
+  sessionId?: string,
+  budgetTokens: number = IN_FLIGHT_REFETCHED_BUDGET_TOKENS,
+): Set<string> {
+  const pairs = completedToolPairs(items, sessionId, false);
+  const seen = new Set<string>();
+  const refetched: CompletedToolPair[] = [];
+  for (const pair of pairs) {
+    const bytes = pair.storedResultText ?? pair.resultText;
+    if (bytes.length < REFETCH_MIN_RESULT_CHARS) continue;
+    const digest = sha256Text(`${refetchCallIdentity(pair)}\u0000${sha256Text(bytes)}`);
+    if (seen.has(digest)) refetched.push(pair);
+    else seen.add(digest);
+  }
+  const kept = new Set<string>();
+  let tokens = 0;
+  for (let i = refetched.length - 1; i >= 0; i -= 1) {
+    const pair = refetched[i]!;
+    const cost = estimateInputTokens([{ role: 'user', content: pair.resultText } as unknown as AgentInputItem]);
+    if (tokens + cost > budgetTokens) continue;
+    kept.add(pair.callId);
+    tokens += cost;
+  }
+  return kept;
+}
+
 function buildCollapsedToolPairsSummary(
   pairs: CompletedToolPair[],
   sessionId?: string,
-  keepSchemaCards = false,
+  schemaCardsFrom: CompletedToolPair[] | null = null,
 ): AgentInputItem {
   const completeCallIdIndex = `[complete collapsed call-id index JSON] ${JSON.stringify(pairs.map((pair) => pair.callId))}`;
   const lines: string[] = [
@@ -906,8 +1010,8 @@ function buildCollapsedToolPairsSummary(
   if (omitted > 0) {
     lines.push(`- ${omitted} additional older completed tool calls were also collapsed; use the visible recent context first, then ask for a specific recall if needed.`);
   }
-  if (keepSchemaCards) {
-    const cards = collapsedSchemaCardLines(pairs);
+  if (schemaCardsFrom) {
+    const cards = collapsedSchemaCardLines(pairs, schemaCardsFrom);
     if (cards.length > 0) lines.push('', ...cards);
   }
   const writes = completedWriteLines(pairs, sessionId);
@@ -943,13 +1047,19 @@ export function collapseOldCompletedToolPairs(
   items: AgentInputItem[],
   retainPairs: number = DEFAULT_LAYER1_RETAIN_TOOL_PAIRS,
   sessionId?: string,
-  /** Mid-turn only: keep the schemas collapsed searches disclosed. */
-  keepSchemaCards = false,
+  inFlight: {
+    /** Keep the schemas collapsed searches disclosed (every completed pair of
+     *  the raw history, so a reread page is named by its search). */
+    schemaCardsFrom?: CompletedToolPair[];
+    /** Results that stay verbatim and do not count against the retained tail. */
+    protectedCallIds?: ReadonlySet<string>;
+  } = {},
 ): { nextItems: AgentInputItem[]; collapsed: number; callIds: string[]; summary?: AgentInputItem } {
   if (items.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const normalizedRetain = Math.max(0, Math.floor(retainPairs));
-  const completed = completedToolPairs(items, sessionId, false);
+  const completed = completedToolPairs(items, sessionId, false)
+    .filter((pair) => !inFlight.protectedCallIds?.has(pair.callId));
   const completedIds = completed.map((pair) => pair.callId);
   if (completedIds.length <= normalizedRetain) {
     return { nextItems: items, collapsed: 0, callIds: [] };
@@ -966,7 +1076,7 @@ export function collapseOldCompletedToolPairs(
   if (pairs.length === 0) return { nextItems: items, collapsed: 0, callIds: [] };
 
   const collapseIds = new Set(pairs.map((pair) => pair.callId));
-  const summary = buildCollapsedToolPairsSummary(pairs, sessionId, keepSchemaCards);
+  const summary = buildCollapsedToolPairsSummary(pairs, sessionId, inFlight.schemaCardsFrom ?? null);
   const nextItems: AgentInputItem[] = [];
   let desiredIndex = -1;
 
@@ -1168,12 +1278,17 @@ export function compactInFlightToolContext(
   // pre-read message as the conversation tail and cause another identical
   // read (live workflow UPDATE, source 134776). Below pressure preserve the
   // exact frame; above pressure collapse only older pairs, retaining the tail.
-  const completedResults = originalCompletedResults;
-  if (resultTokensBefore <= triggerTokens || completedResults.length <= minRetain) return unchanged();
+  const workingSet = refetchedWorkingSetCallIds(items, sessionId);
+  const completedResults = originalCompletedResults.filter((pair) => !workingSet.has(pair.callId));
+  const collapsibleTokens = completedResults.reduce((sum, pair) => sum + pair.tokens, 0);
+  if (collapsibleTokens <= triggerTokens || completedResults.length <= minRetain) return unchanged();
 
   const retainedPairs = retainedPairCount(completedResults, retainedBudget, minRetain, maxRetain);
 
-  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId, true);
+  const collapsed = collapseOldCompletedToolPairs(items, retainedPairs, sessionId, {
+    schemaCardsFrom: completedToolPairs(items, sessionId, false),
+    protectedCallIds: workingSet,
+  });
   if (collapsed.collapsed === 0 || estimateInputTokens(collapsed.nextItems) >= beforeTokens) return unchanged();
   return {
     nextItems: collapsed.nextItems,
@@ -1252,14 +1367,18 @@ export function compactInFlightToolContextStable(
     checkpoints: state.checkpoints.length,
   });
 
-  const uncovered = completedResultTokenPairs(current);
+  const workingSet = refetchedWorkingSetCallIds(items, sessionId);
+  const uncovered = completedResultTokenPairs(current).filter((pair) => !workingSet.has(pair.callId));
   const uncoveredTokens = uncovered.reduce((sum, pair) => sum + pair.tokens, 0);
   if (uncoveredTokens <= triggerTokens || uncovered.length <= minRetain) {
     return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });
   }
 
   const retainedPairs = retainedPairCount(uncovered, retainedBudget, minRetain, maxRetain);
-  const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId, true);
+  const collapsed = collapseOldCompletedToolPairs(current, retainedPairs, sessionId, {
+    schemaCardsFrom: completedToolPairs(items, sessionId, false),
+    protectedCallIds: workingSet,
+  });
   if (collapsed.collapsed === 0 || !collapsed.summary
     || estimateInputTokens(collapsed.nextItems) >= estimateInputTokens(current)) {
     return outcome(current, { retainedPairs: uncovered.length, checkpointCreated: false });

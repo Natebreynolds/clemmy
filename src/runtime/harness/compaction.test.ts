@@ -33,6 +33,7 @@ const {
   compactInFlightToolContext,
   compactInFlightToolContextStable,
   createInFlightCompactionState,
+  refetchedWorkingSetCallIds,
   compactSessionIfNeeded,
   summarizeOlderMessages,
   validateCallIdReferences,
@@ -683,6 +684,80 @@ test('a mid-turn collapse keeps the schemas its searches found; a provider field
   const betweenTurns = collapseOldCompletedToolPairs(items, 2, sess.id);
   assert.ok(betweenTurns.collapsed > 0);
   assert.doesNotMatch(ledgerOf(betweenTurns.nextItems), /input schemas found by search/);
+});
+
+test('a collapsed search keeps a full-size schema, names a schema reread by its handle, and points an oversized one at its reread cursor', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const bigProperties = (prefix: string, count: number) => Object.fromEntries(Array.from({ length: count }, (_, i) =>
+    [`${prefix}_${i}`, { type: 'string', description: `field ${i} ${'d'.repeat(120)}` }]));
+  const workflowUpdate = { type: 'object', properties: bigProperties('w', 100) };
+  const oversized = { type: 'object', properties: bigProperties('o', 200) };
+  const planTask = { type: 'object', properties: { requirements: { type: 'array' } } };
+  assert.ok(JSON.stringify(workflowUpdate).length > 13_000 && JSON.stringify(workflowUpdate).length < 20_000);
+  assert.ok(JSON.stringify(oversized).length > 20_000);
+  const handle = (name: string, ref: string) => ({ schema_ref: ref, cursor: `tool_search_schema:v1:${ref.slice(7)}:0` });
+  const items: AgentInputItem[] = [userMessage('update the workflow and plan it')];
+  const add = (callId: string, name: string, output: string) => {
+    items.push(toolCall(callId, name, '{}'));
+    items.push(toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool: name, output });
+  };
+  add('s_update', 'tool_search', JSON.stringify({ query: 'workflow_update', results: [{ name: 'workflow_update', carrier: 'call_tool' }],
+    schemas: { workflow_update: workflowUpdate }, schema_handles: { workflow_update: handle('workflow_update', 'sha256:aaaa') } }));
+  add('s_big', 'tool_search', JSON.stringify({ query: 'space_save', results: [{ name: 'space_save' }],
+    schemas: { space_save: oversized }, schema_handles: { space_save: handle('space_save', 'sha256:bbbb') } }));
+  add('s_plan', 'tool_search', JSON.stringify({ kind: 'host_structural_control_lookup_v1', results: [{ name: 'plan_task' }], schemas: {},
+    schema_handles: { plan_task: handle('plan_task', 'sha256:cccc') } }));
+  add('s_plan_reread', 'tool_search', JSON.stringify({ kind: 'tool_search_schema', schema_ref: 'sha256:cccc', complete: true, schema: planTask, pad: 'p'.repeat(3000) }));
+  for (let i = 0; i < 3; i++) add(`work_${i}`, 'space_get', `space ${i} ${'w'.repeat(3000)}`);
+
+  const result = compactInFlightToolContextStable(items, createInFlightCompactionState(), sess.id,
+    { resultTriggerTokens: 1_000, retainedResultBudgetTokens: 500, minRetainPairs: 1, maxRetainPairs: 1 });
+  assert.equal(result.applied, true);
+  const ledger = (result.nextItems.find((item) => String((item as { content?: unknown }).content ?? '')
+    .includes('summary of older completed tool activity')) as { content: string }).content;
+  assert.ok(ledger.includes(`- workflow_update (call with call_tool): ${JSON.stringify(workflowUpdate)}`), 'a 13-20k schema is kept whole');
+  assert.ok(ledger.includes(`- plan_task: ${JSON.stringify(planTask)}`), 'a schema reread is named by the search that issued its handle');
+  assert.match(ledger, /- space_save: reopen its exact schema with tool_search \{"query":"space_save","cursor":"tool_search_schema:v1:bbbb:0"\}/);
+});
+
+test('a result fetched again after a collapse stays verbatim for the rest of the turn; the rest still collapses', () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const playbook = `playbook ${'k'.repeat(6000)}`;
+  const items: AgentInputItem[] = [userMessage('build the workspace')];
+  const add = (callId: string, name: string, output: string) => {
+    items.push(toolCall(callId, name, '{}'));
+    items.push(toolResult(callId, output));
+    writeToolOutput({ sessionId: sess.id, callId, tool: name, output });
+  };
+  items.push(toolCall('skill_1', 'skill_read', '{"name":"workspace-builder"}'));
+  items.push(toolResult('skill_1', playbook));
+  writeToolOutput({ sessionId: sess.id, callId: 'skill_1', tool: 'skill_read', output: playbook });
+  for (let i = 0; i < 4; i++) add(`read_${i}`, 'space_get', `space ${i} ${'r'.repeat(4000)}`);
+  const opts = { resultTriggerTokens: 2_000, retainedResultBudgetTokens: 1_000, minRetainPairs: 1, maxRetainPairs: 2 };
+  const state = createInFlightCompactionState();
+  const first = compactInFlightToolContextStable([...items], state, sess.id, opts);
+  assert.ok(first.callIds.includes('skill_1'), 'the first copy collapses like any old result');
+
+  items.push(toolCall('skill_2', 'skill_read', '{"name":"workspace-builder"}'));
+  items.push(toolResult('skill_2', playbook));
+  writeToolOutput({ sessionId: sess.id, callId: 'skill_2', tool: 'skill_read', output: playbook });
+  for (let i = 4; i < 9; i++) add(`read_${i}`, 'space_get', `space ${i} ${'r'.repeat(4000)}`);
+  // The same read through a carrier, with an explicit null, is the same call.
+  items.push(toolCall('skill_3', 'call_tool', JSON.stringify({ name: 'skill_read', args_json: '{"name":"workspace-builder","section":null}' })));
+  items.push(toolResult('skill_3', playbook));
+  writeToolOutput({ sessionId: sess.id, callId: 'skill_3', tool: 'call_tool', output: playbook });
+  assert.deepEqual([...refetchedWorkingSetCallIds(items, sess.id)].sort(), ['skill_2', 'skill_3']);
+  const later = compactInFlightToolContextStable([...items], state, sess.id, opts);
+  const sent = JSON.stringify(later.nextItems);
+  assert.ok(later.checkpoints! >= 2, 'pressure still takes new checkpoints');
+  assert.match(sent, /"callId":"skill_2"/, 'the re-fetched playbook is still in front of the model');
+  assert.doesNotMatch(sent, /"callId":"read_4"/, 'other old results still collapse');
+
+  const sliding = compactInFlightToolContext([...items], sess.id, opts);
+  assert.match(JSON.stringify(sliding.nextItems), /"callId":"skill_2"/);
 });
 
 test('compactSessionIfNeeded — applies pair collapse during layer 1 preflight', async () => {
