@@ -464,3 +464,18 @@ test('the owner-facing report says what got done and what is next, without raw t
   assert.match(model, /Last concrete tool failure \(file_query\)/);
   assert.match(model, /Retained work/);
 });
+
+test('a finished run\'s public report shows what was written, not the write tool\'s machine receipt', () => {
+  const summary = [
+    'Committed file at /home/user/.clementine-next/files/notes/out.md (268 chars). [clementine:host-local-write-commit:v1] {"version":1,"createdId":"file-1","handle":"state/local-file-revisions/1/current.json","contentDigest":"abc"}',
+    'artifactId: local-file-receipt:v1:W2NsZW1lbnRpbmU6',
+    'handle: state/local-file-revisions/1/current.json',
+    'contentDigest: abc',
+    'receipt: [clementine:host-local-write-commit:v1] {"version":1}',
+    'path: /home/user/.clementine-next/files/notes/out.md',
+  ].join('\n');
+  const owner = renderPublicOutcomeText({ status: 'done', summary, resumable: false }, ctx({ sourceId: 'wf-receipt' }));
+  assert.match(owner, /^Committed file at \/home\/user\/\.clementine-next\/files\/notes\/out\.md \(268 chars\)\./);
+  assert.match(owner, /path: \/home\/user\/\.clementine-next\/files\/notes\/out\.md/);
+  assert.doesNotMatch(owner, /clementine:host-local-write-commit|artifactId|contentDigest|createdId/);
+});

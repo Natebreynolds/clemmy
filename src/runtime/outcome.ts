@@ -17,6 +17,7 @@
  * outcome for the same source id, so a parked background task can still report
  * completion after the user answers.
  */
+import { withoutHostReceiptLines } from './host-receipt-lines.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
@@ -224,7 +225,7 @@ function renderOutcomeEvidence(evidence: OutcomeEvidence | undefined, audience: 
 /** Owner-facing words from a run's report text: the retained-work handle
  * listing is for the model that resumes the work, not for the owner. */
 function ownerFacingText(text: string | undefined): string {
-  const trimmed = (text ?? '').trim();
+  const trimmed = withoutHostReceiptLines(text ?? '').trim();
   const cut = trimmed.indexOf(RETAINED_WORK_TERMINAL_HEADER);
   return (cut >= 0 ? trimmed.slice(0, cut) : trimmed).trim();
 }

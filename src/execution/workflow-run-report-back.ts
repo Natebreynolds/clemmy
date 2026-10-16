@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { withoutHostReceiptLines } from '../runtime/host-receipt-lines.js';
 import { readWorkflowSettlementEvidence } from './workflow-settlement-evidence.js';
 import { isWorkflowParentTerminalIdentity } from './workflow-parent-terminal-proof.js';
 import { humanizeStepOutput } from './workflow-diagnosis.js';
@@ -1356,24 +1357,6 @@ export function humanReportDetail(detail: string): string {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return text;
   const rendered = humanizeStepOutput(parsed).trim();
   return rendered.length > 0 ? rendered : text;
-}
-
-const HOST_RECEIPT_MARKER = /\[clementine:[a-z0-9-]+:v\d+\]\s*(?:\{[^\n]*\})?/g;
-const HOST_RECEIPT_FIELD_LINE = /^\s*(?:artifactId|handle|contentDigest|receipt|createdId):\s.*$/gm;
-
-/**
- * A step that wrote something hands back the tool's proof of the write: a
- * machine marker with its JSON facts and the artifact fields beside it. Those
- * are the host's evidence, kept on the run record; a person reading the report
- * gets the sentence that says what was written.
- */
-function withoutHostReceiptLines(detail: string): string {
-  if (!/\[clementine:[a-z0-9-]+:v\d+\]/.test(detail)) return detail;
-  return detail
-    .replace(HOST_RECEIPT_MARKER, '')
-    .replace(HOST_RECEIPT_FIELD_LINE, '')
-    .replace(/[ \t]+$/gm, '')
-    .replace(/\n{3,}/g, '\n\n');
 }
 
 export function recordAndAttemptWorkflowRunReportBack(
