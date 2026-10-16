@@ -216,7 +216,11 @@ function modelsByAttempt(sessionId: string, attempts: readonly WorkflowRunTraceA
         const accepted = str(record(row?.trace)?.acceptedSource);
         const model = str(row?.model);
         if (!accepted || !model || !accepted.startsWith(`${sessionId}:`)) continue;
-        const source = Number(accepted.slice(sessionId.length + 1));
+        // Exactly `<session>:<request>`: a longer session id that merely
+        // starts with this one never lends its calls to this attempt.
+        const tail = accepted.slice(sessionId.length + 1);
+        if (!/^[1-9][0-9]{0,15}$/.test(tail)) continue;
+        const source = Number(tail);
         if (!Number.isSafeInteger(source)) continue;
         const models = out.get(source) ?? [];
         if (!models.includes(model)) models.push(model);

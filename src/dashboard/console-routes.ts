@@ -2413,6 +2413,9 @@ function hasCompiledProjectWorkflowRunMarkers(raw: Record<string, unknown>): boo
   return isReservedProjectWorkflowRunRecord(raw);
 }
 
+/** A run id as the runner mints it; never a path segment such as `..`. */
+const WORKFLOW_RUN_TRACE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
+
 function workflowRunRecordPathForConsole(runId: string): string | null {
   const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
   return safe && safe === runId
@@ -7435,10 +7438,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const target = req.params.name;
     const runId = req.params.runId;
-    const filePath = workflowRunRecordPathForConsole(runId);
+    // One exact run: a run id names its own record, and the record says it is
+    // that run. Steps' sessions and usage are then matched on this id alone.
+    const filePath = WORKFLOW_RUN_TRACE_ID.test(runId) ? workflowRunRecordPathForConsole(runId) : null;
     if (!filePath || !fs.existsSync(filePath)) { res.status(404).json({ error: 'workflow run not found' }); return; }
     try {
       const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      if (raw.id !== runId) { res.status(404).json({ error: 'workflow run not found' }); return; }
       if (refuseReservedProjectCatalogRead(res, raw)) return;
       const entry = listWorkflows().find((e) => e.data.name === target || e.name === target);
       if (!entry) { res.status(404).json({ error: 'workflow not found' }); return; }
