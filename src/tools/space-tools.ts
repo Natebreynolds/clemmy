@@ -71,6 +71,7 @@ import {
   HOST_LOCAL_WORKSPACE_COMMIT_BASENAME,
   hostLocalWriteCommitResultIsProven,
   withHostLocalWriteCommitFromFile,
+  parseHostLocalWriteCommitFacts, readCommittedArtifactContent,
 } from '../runtime/harness/host-local-write-commit.js';
 import {
   WORKSPACE_SET_DATA_TOOL_PARAMETERS,
@@ -780,6 +781,15 @@ export function registerSpaceTools(server: McpServer): void {
         const replayAdvisories = (prep.repairs.length > 0 || prep.warnings.length > 0)
           ? `\n\nHeads up (the workspace was saved):\n- ${[...prep.repairs, ...prep.warnings].join('\n- ')}`
           : '';
+        // Canonical call replay retains the original result before this
+        // handler. A raw artifact rejoin must not invent or rerun a review;
+        // make its qualification explicit for the current request instead.
+        const { renderWorkspaceDeliverables, unavailableWorkspaceDeliverables } = await import('../spaces/workspace-deliverables-check.js');
+        const replayContext = getToolOutputContext();
+        const replayAssessment = unavailableWorkspaceDeliverables(
+          replayContext?.sessionId && Number.isSafeInteger(replayContext.sourceUserSeq)
+            ? 'prior_check_unavailable' : 'request_unavailable',
+        );
         const replayResult = renderSpaceSaveResult({
           verb: 'Created',
           record: existing,
@@ -789,7 +799,7 @@ export function registerSpaceTools(server: McpServer): void {
           advisories: replayAdvisories,
           smokeNote: '',
           gapQuestions: renderSpaceGapQuestions(replayGaps),
-        });
+        }) + renderWorkspaceDeliverables(replayAssessment);
         try {
           const replayed = withHostLocalWriteCommitFromFile({
             createdId: slug,
@@ -977,23 +987,47 @@ export function registerSpaceTools(server: McpServer): void {
       // A created or redesigned Workspace is checked against what the owner
       // asked for, so a thin page is built out in the same turn.
       let deliverablesNote = '';
-      const deliverablesContext = getToolOutputContext();
-      const deliverablesSeq = deliverablesContext?.sourceUserSeq;
-      if (authoredView?.ok && deliverablesContext?.sessionId && Number.isSafeInteger(deliverablesSeq) && deliverablesSeq! > 0) {
+      let deliverablesSnapshot: { revision: string; dataSha256: string | null } | undefined;
+      if (authoredView?.ok) {
+        const { readWorkspaceDeliverables, renderWorkspaceDeliverables, unavailableWorkspaceDeliverables } = await import('../spaces/workspace-deliverables-check.js');
+        let assessment = unavailableWorkspaceDeliverables('request_unavailable');
+        const deliverablesContext = getToolOutputContext();
+        const deliverablesSeq = deliverablesContext?.sourceUserSeq;
         try {
-          const accepted = listEvents(deliverablesContext.sessionId, {
-            types: ['user_input_received'], sinceSeq: deliverablesSeq! - 1, limit: 1,
-          }).find((event) => event.seq === deliverablesSeq);
-          const request = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
-          if (request) {
-            const { feedLinksForSpace } = await import('../spaces/workflow-feeds.js');
-            const { readWorkspaceDeliverables, renderWorkspaceDeliverables } = await import('../spaces/workspace-deliverables-check.js');
-            const feeds = await feedLinksForSpace(slug).catch(() => []);
-            deliverablesNote = renderWorkspaceDeliverables(await readWorkspaceDeliverables({
-              request, record, viewHtml: authoredView.content, feeds,
-            }));
+          if (deliverablesContext?.sessionId && Number.isSafeInteger(deliverablesSeq) && deliverablesSeq! > 0) {
+            const accepted = listEvents(deliverablesContext.sessionId, {
+              types: ['user_input_received'], sinceSeq: deliverablesSeq! - 1, limit: 1,
+            }).find((event) => event.seq === deliverablesSeq);
+            const request = typeof accepted?.data.text === 'string' ? accepted.data.text : '';
+            if (request.trim()) {
+              const { currentToolAbortSignal, currentToolAbortDeadlineAt } = await import('../runtime/tool-abort-context.js');
+              const { currentDispatchLease, assertDispatchLeaseCurrent } = await import('../runtime/harness/dispatch-lease.js');
+              const lease = currentDispatchLease();
+              const { effectiveTurnObjective } = await import('../runtime/harness/turn-control.js');
+              assessment = await readWorkspaceDeliverables({
+                request, effectiveObjective: effectiveTurnObjective(deliverablesContext.sessionId, request, deliverablesSeq),
+                record, viewHtml: authoredView.content, feeds: [],
+                requestIdentity: {
+                  sessionId: deliverablesContext.sessionId, sourceUserSeq: deliverablesSeq!,
+                  runScopeId: deliverablesContext.runScopeId, callId: deliverablesContext.callId,
+                  settlementNonce: deliverablesContext.settlementNonce, runAttemptId: lease?.runAttemptId,
+                },
+              }, {
+                signal: currentToolAbortSignal(), deadlineAt: currentToolAbortDeadlineAt(),
+                checkActive: () => assertDispatchLeaseCurrent(lease),
+                captureEvidence: async () => {
+                  const { feedLinksForSpace } = await import('../spaces/workflow-feeds.js');
+                  const { captureWorkspaceDeliverablesEvidence } = await import('../spaces/workspace-deliverables-evidence.js');
+                  return captureWorkspaceDeliverablesEvidence(record, authoredView.content, await feedLinksForSpace(slug));
+                },
+              });
+            }
           }
-        } catch { /* the check informs; it never blocks or fails a save */ }
+        } catch {
+          assessment = unavailableWorkspaceDeliverables('evidence_unavailable');
+        }
+        deliverablesNote = renderWorkspaceDeliverables(assessment);
+        if (assessment.status === 'checked') deliverablesSnapshot = assessment.evidenceSnapshot;
       }
       const result = renderSpaceSaveResult({
         verb,
@@ -1005,12 +1039,27 @@ export function registerSpaceTools(server: McpServer): void {
         gapQuestions,
       }) + deliverablesNote;
       if (initialData) {
-        const committed = withHostLocalWriteCommitFromFile({
-          createdId: slug,
-          committedPath: resolveInSpace(slug, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME),
-          result,
-        });
-        if (!hostLocalWriteCommitResultIsProven(committed)) {
+        // Preserve the original compound static-create descriptor. Certifying
+        // it and the advisory snapshot shares one synchronous owner; never
+        // rewrite it through the ordinary-save proof helper.
+        const { withWorkspaceSnapshotRead } = await import('../spaces/workspace-snapshot.js');
+        let committed: string | null = null;
+        try {
+          committed = withWorkspaceSnapshotRead(slug, () => {
+            if (deliverablesSnapshot) {
+              const snapshot = spaceStore.snapshot(slug);
+              const dataPath = resolveInSpace(slug, 'data.json');
+              const dataSha256 = existsSync(dataPath) ? createHash('sha256').update(readFileSync(dataPath)).digest('hex') : null;
+              if (!snapshot || snapshot.revision !== deliverablesSnapshot.revision || dataSha256 !== deliverablesSnapshot.dataSha256) return null;
+            }
+            const stamped = withHostLocalWriteCommitFromFile({
+              createdId: slug, committedPath: resolveInSpace(slug, HOST_LOCAL_WORKSPACE_COMMIT_BASENAME), result,
+            });
+            const facts = parseHostLocalWriteCommitFacts(stamped);
+            return facts && readCommittedArtifactContent(facts).verified ? stamped : null;
+          });
+        } catch { /* the durable save remains; no stale completion proof */ }
+        if (!committed || !hostLocalWriteCommitResultIsProven(committed)) {
           return textResult(
             `Workspace "${slug}" was created, but one of its committed components changed before delivery proof. `
             + 'No completion receipt was issued; inspect the current Workspace before retrying.',
@@ -1030,6 +1079,7 @@ export function registerSpaceTools(server: McpServer): void {
             }
             : savedAuthoringRecord,
           ...(authoredView?.ok ? { expectedView: authoredView.content } : {}),
+          ...(deliverablesSnapshot ? { expectedEvidenceSnapshot: deliverablesSnapshot } : {}),
           result,
         }));
       } catch (error) {

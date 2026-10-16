@@ -59,6 +59,8 @@ import { NoticingAnswerWireV1Schema } from '../../agents/noticing.js';
 import { ClarificationRevisionV1Schema } from './clarification-revision.js';
 import { retainClarificationFailureDiagnostic, type ClarificationFailureDiagnostic } from './clarification-failure-diagnostic.js';
 import pino from 'pino';
+import { WorkspaceDeliverablesV2Schema } from '../../spaces/workspace-deliverables-contract.js';
+export { WorkspaceDeliverablesV2Schema } from '../../spaces/workspace-deliverables-contract.js';
 
 const logger = pino({ name: 'configured-brain-semantic-port' });
 
@@ -95,7 +97,7 @@ export interface ConfiguredBrainSemanticComplete {
     signal?: AbortSignal;
     deadlineAt?: number;
     checkActive?: () => void;
-    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1';
+    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
   }): Promise<{
     raw: unknown;
     modelIdentity: string;
@@ -772,7 +774,7 @@ export async function completeViaConfiguredBrain(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
   checkActive?: () => void;
-  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1';
+  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -812,6 +814,8 @@ export async function completeViaConfiguredBrain(input: {
       ? McpToolEffectLabelsV1Schema
       : input.schemaName === 'WorkflowStepEffectV1'
       ? WorkflowStepEffectV1Schema
+      : input.schemaName === 'WorkspaceDeliverablesV2'
+      ? WorkspaceDeliverablesV2Schema
       : input.schemaName === 'WorkspaceDeliverablesV1'
       ? WorkspaceDeliverablesV1Schema
       : input.schemaName === 'RequestEffectJudgeV1'

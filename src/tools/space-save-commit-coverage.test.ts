@@ -381,3 +381,101 @@ test('host upkeep after a save (a refresh, a visit) does not read as drift; auth
   writeFileSync(viewPath, '<html>foreign</html>');
   assert.equal(proof.readCommittedArtifactContent(saved.facts).verified, false, 'the view stays exact');
 });
+
+
+test('delivery proof keeps the reviewed data snapshot exact, including absent versus empty data', async () => {
+  for (const change of ['replace', 'absent-to-empty'] as const) {
+    const slug = `evidence-race-${change}`;
+    await tools.space_save({ slug, title: 'Evidence board', view_html: html });
+    if (change === 'replace') writeFileSync(store.resolveInSpace(slug, 'data.json'), '{"rows":[{"id":1}]}');
+    const snapshot = store.spaceStore.snapshot(slug); assert.ok(snapshot);
+    const dataFile = store.resolveInSpace(slug, 'data.json');
+    const expectedDataHash = existsSync(dataFile) ? digest(readFileSync(dataFile)) : null;
+    const input = {
+      expectedRecord: snapshot.record, expectedView: snapshot.view, result: 'Saved board.',
+      expectedEvidenceSnapshot: { revision: snapshot.revision, dataSha256: expectedDataHash },
+    };
+    assert.ok(proof.parseHostLocalWriteCommitFacts(store.spaceStore.commitSaveResult(input)), 'unchanged reviewed snapshot can be certified');
+    writeFileSync(dataFile, change === 'replace' ? '{"rows":[{"id":2}]}' : '{}');
+    assert.throws(() => store.spaceStore.commitSaveResult(input), /evidence snapshot changed/,
+      'dataset drift cannot certify a verdict about an older snapshot');
+  }
+});
+
+test('an actual authored save passes exact source, criteria and safe destinations to one checker', async () => {
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { _setWorkspaceDeliverablesReaderForTests } = await import('../spaces/workspace-deliverables-check.js');
+  const session = eventlog.createSession({ id: 'workspace-evidence-save', kind: 'chat' });
+  const request = 'Create a bookmark directory for these two projects. Keep the saved criteria.';
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: request } });
+  let calls = 0; let packet: any;
+  _setWorkspaceDeliverablesReaderForTests(async (_system, user) => {
+    calls++; packet = JSON.parse(user);
+    return { bindingDigest: packet.bindingDigest, assessmentComplete: true,
+      assessedCriteriaIds: ['criterion-1'], deliverables: [{ deliverable: 'Requested bookmark directory', status: 'covered',
+        requiredEvidence: 'saved_content', evidenceIds: ['saved-links'], gap: '' }] };
+  });
+  try {
+    const result = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq, callId: 'save-bookmarks', runScopeId: 'fixture-run' }, () => tools.space_save({
+      slug: 'evidence-bookmarks', title: 'Bookmarks', objective: 'Keep two resource links', success_criteria: ['Both requested links are present'],
+      view_html: '<html><body><h1>Bookmarks</h1><a href="https://one.example.test/site?token=omit">Site</a><a href="https://two.example.test/repo">Repo</a></body></html>',
+    }));
+    checked(result);
+    assert.equal(calls, 1, text(result).match(/Workspace saved;[^\n]+/)?.[0] ?? 'checker was not invoked');
+    assert.equal(packet.request, request); assert.equal(packet.effectiveObjective, request);
+    assert.equal(packet.requestIdentity.sourceUserSeq, source.seq);
+    assert.equal(packet.workspace.successCriteria[0].text, 'Both requested links are present');
+    const links = packet.evidence.facts.find((fact: any) => fact.id === 'saved-links').detail.links;
+    assert.deepEqual(links, [{ destination: 'https://one.example.test/site' }, { destination: 'https://two.example.test/repo' }]);
+    assert.doesNotMatch(text(result), /not yet verified|Not built yet/);
+  } finally { _setWorkspaceDeliverablesReaderForTests(null); }
+});
+
+test('Stop at the post-save check preserves a settled static artifact without a checker call', async () => {
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { runWithToolAbortSignal } = await import('../runtime/tool-abort-context.js');
+  const { _setWorkspaceDeliverablesReaderForTests } = await import('../spaces/workspace-deliverables-check.js');
+  const session = eventlog.createSession({ id: 'workspace-evidence-stopped', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Save this static report.' } });
+  const controller = new AbortController(); let calls = 0;
+  const originalSave = store.spaceStore.save.bind(store.spaceStore);
+  store.spaceStore.save = input => { const saved = originalSave(input); controller.abort(); return saved; };
+  _setWorkspaceDeliverablesReaderForTests(async () => { calls++; throw new Error('must not run'); });
+  try {
+    const result = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq, callId: 'save-stopped' }, () => runWithToolAbortSignal(controller.signal, () => tools.space_save({
+      slug: 'evidence-static-stopped', title: 'Kept static report', view_html: html, initial_data_json: '{"count":1}',
+    })));
+    assert.equal(calls, 0);
+    assert.match(text(result), /Workspace saved; requested outcomes are not yet verified because the check was stopped/);
+    assert.ok(proof.readCommittedArtifactContent(proof.parseHostLocalWriteCommitFacts(text(result))!).verified);
+    assert.equal(store.spaceStore.get('evidence-static-stopped')?.title, 'Kept static report');
+  } finally { store.spaceStore.save = originalSave; _setWorkspaceDeliverablesReaderForTests(null); }
+});
+
+test('raw static artifact recovery executes no new check and does not reuse an unbound assessment', async () => {
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const { _setWorkspaceDeliverablesReaderForTests } = await import('../spaces/workspace-deliverables-check.js');
+  const session = eventlog.createSession({ id: 'workspace-evidence-rejoin', kind: 'chat' });
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Save a static report with a preview.' } });
+  let calls = 0;
+  _setWorkspaceDeliverablesReaderForTests(async (_system, user) => {
+    calls++; const packet = JSON.parse(user);
+    return { bindingDigest: packet.bindingDigest, assessmentComplete: true, assessedCriteriaIds: [], deliverables: [
+      { deliverable: 'Preview section', status: 'missing', requiredEvidence: 'saved_content', evidenceIds: ['saved-view'], gap: 'Add the requested preview.' },
+    ] };
+  });
+  const args = { slug: 'evidence-static-rejoin', title: 'Report', view_html: html, initial_data_json: '{"count":1}' };
+  const context = { sessionId: session.id, sourceUserSeq: source.seq, callId: 'raw-rejoin' };
+  try {
+    const first = await withToolOutputContext(context, () => tools.space_save(args));
+    assert.match(text(first), /Not built yet/);
+    const before = ['space.json', 'view/index.html', 'data.json', '.clementine-workspace-commit.json']
+      .map(file => digest(readFileSync(store.resolveInSpace(args.slug, file))));
+    const replayed = await withToolOutputContext(context, () => tools.space_save(args));
+    assert.match(text(replayed), /rejoined without re-running or reusing an unbound prior assessment/);
+    assert.equal(calls, 1);
+    assert.equal(proof.parseHostLocalWriteCommitFacts(text(replayed))?.contentDigest, proof.parseHostLocalWriteCommitFacts(text(first))?.contentDigest);
+    assert.deepEqual(['space.json', 'view/index.html', 'data.json', '.clementine-workspace-commit.json']
+      .map(file => digest(readFileSync(store.resolveInSpace(args.slug, file)))), before);
+  } finally { _setWorkspaceDeliverablesReaderForTests(null); }
+});
