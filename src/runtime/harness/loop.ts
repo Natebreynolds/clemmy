@@ -409,6 +409,7 @@ import {
   toOrchestratorDecision,
   evaluateStructuredDecisionStall,
   evaluateProgress,
+  RUN_STOPPED_UNFINISHED_TEXT,
   type StallInfo,
 } from './turn-decision.js';
 import {
@@ -6431,10 +6432,49 @@ const activeHostConversations = new Map<string, Promise<RunConversationResult>>(
  * owner across daemon restart. Each activation re-proves that exact state
  * before it can adopt history or run another model step.
  */
+/** Consecutive activations that throw before a held turn's recovery stops
+ *  rescheduling and publishes its stop. A turn that is waiting (held) is not
+ *  counted; only an activation that cannot even start is. */
+const MAX_THROWN_RECOVERY_ACTIVATIONS = 6;
+
+/**
+ * A person stopped a held turn while its recovery owned it. Clear only this
+ * source's checkpoint, publish the stop once, finish the attempt, and consume
+ * the exact stop latch, as a running turn does when it is killed.
+ */
+function endStoppedHeldTurn(options: RunConversationOptions, sourceUserSeq: number, recoveryBlob?: string): void {
+  try {
+    const session = HarnessSession.load(options.sessionId);
+    if (session && recoveryBlob) session.clearRecoveryState(recoveryBlob);
+    session?.markStatus('cancelled');
+    const answered = listEvents(options.sessionId, { types: ['conversation_completed'], sinceSeq: sourceUserSeq })
+      .some((event) => event.data.sourceUserSeq === sourceUserSeq);
+    if (!answered) {
+      const accepted = acceptedUserEvent(options.sessionId, sourceUserSeq);
+      const identity = standardTurnIdentity({ sessionId: options.sessionId, turn: accepted.turn, sourceUserSeq });
+      const presentation = commitStopSettlingRevokedCalls({ status: 'cancelled', identity }, () => commitStandardCancelledTerminal({
+        sessionId: options.sessionId,
+        sourceUserSeq,
+        turn: accepted.turn,
+        text: RUN_STOPPED_UNFINISHED_TEXT,
+        legacyReason: 'cancelled',
+        metadata: { cancelledReason: 'held_turn_stopped' },
+      }));
+      emitRuntimeTerminalEvent(options.sessionId, { sessionId: options.sessionId, status: 'killed', steps: 0,
+        lastTurn: accepted.turn, publicPresentation: presentation });
+    }
+    clearRunInFlightAfterTerminal(options.sessionId, options.runAttemptId, sourceUserSeq);
+    consumeObservedKill(options.sessionId, { sourceUserSeq });
+  } catch (error) {
+    logger.warn({ err: error, sessionId: options.sessionId, sourceUserSeq }, 'stopped held turn could not publish its stop');
+  }
+}
+
 function scheduleHostCheckpointRecovery(
   options: RunConversationOptions,
   sourceUserSeq: number,
   attempt = 0,
+  thrown = 0,
 ): void {
   if (options.runRunner !== undefined) return;
   const key = `${options.sessionId}:${sourceUserSeq}`;
@@ -6448,16 +6488,26 @@ function scheduleHostCheckpointRecovery(
     void (async () => {
       let retry = false;
       let failed = false;
+      let threw = false;
+      let stopped = false;
+      let gaveUp = false;
+      let seenRecoveryBlob: string | undefined;
       let publicationTicket: HeldStopPublicationTicket | null = null;
       try {
         const session = HarnessSession.load(options.sessionId);
         const recoveryBlob = session?.loadRecoveryState();
         if (!session || !recoveryBlob) return;
+        seenRecoveryBlob = recoveryBlob;
         let recovery: HostRecoveryState;
         try { recovery = HostRecoveryState.fromString(recoveryBlob); } catch { return; }
         const continuationOwner = readRecoveryActivation(options.sessionId);
         if (recovery.sessionId !== options.sessionId || (recovery.sourceUserSeq !== sourceUserSeq
           && continuationOwner?.sourceUserSeq !== sourceUserSeq)) return;
+        // A person's stop wins over recovery: never re-activate a turn they stopped.
+        if (isKillRequested(options.sessionId, { sourceUserSeq })) {
+          stopped = true;
+          return;
+        }
         publicationTicket = observeHeldStopPublicationOwner({ sessionId: options.sessionId, sourceUserSeq, runAttemptId: options.runAttemptId });
         const source = acceptedUserEvent(options.sessionId, sourceUserSeq);
         const sourceText = typeof source.data.text === 'string' ? source.data.text : options.input;
@@ -6479,6 +6529,7 @@ function scheduleHostCheckpointRecovery(
         logger.warn({ err: error, sessionId: options.sessionId, sourceUserSeq, attempt },
           'held turn recovery activation threw');
         failed = true;
+        threw = true;
         // Retry only while this exact source still owns a readable checkpoint.
         retry = true;
         if (options.connectionExecutionLeaseOwner && options.runAttemptId) {
@@ -6487,7 +6538,24 @@ function scheduleHostCheckpointRecovery(
               attemptId: options.runAttemptId, leaseOwner: options.connectionExecutionLeaseOwner });
           } catch { retry = false; failed = false; /* a new executor must acquire its own lease */ }
         }
+        try {
+          if (isKillRequested(options.sessionId, { sourceUserSeq })) { stopped = true; retry = false; failed = false; }
+        } catch { /* an unreadable latch is not a stop */ }
+        // An activation that cannot even start keeps failing the same way;
+        // re-trying it forever spends a model call each time and answers no one.
+        if (retry && thrown + 1 >= MAX_THROWN_RECOVERY_ACTIVATIONS) { retry = false; gaveUp = true; }
       } finally {
+        if (stopped) {
+          if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
+          endStoppedHeldTurn(options, sourceUserSeq, seenRecoveryBlob);
+          return;
+        }
+        if (gaveUp && seenRecoveryBlob) {
+          // The stop publication waits for the checkpoint to be gone.
+          try { HarnessSession.load(options.sessionId)?.clearRecoveryState(seenRecoveryBlob); } catch { /* publication retries */ }
+          logger.warn({ sessionId: options.sessionId, sourceUserSeq, thrown: thrown + 1 },
+            'held turn recovery gave up after repeated activation failures');
+        }
         let rescheduled = false;
         if (retry) {
           try {
@@ -6496,7 +6564,7 @@ function scheduleHostCheckpointRecovery(
             if (held?.sessionId === options.sessionId && (held.sourceUserSeq === sourceUserSeq
               || readRecoveryActivation(options.sessionId)?.sourceUserSeq === sourceUserSeq)) {
               if (scheduledHostRecoveries.get(key) === scheduled) scheduledHostRecoveries.delete(key);
-              scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1);
+              scheduleHostCheckpointRecovery(options, sourceUserSeq, attempt + 1, threw ? thrown + 1 : 0);
               rescheduled = true;
             }
           } catch { /* unreadable private state is not wake authority */ }

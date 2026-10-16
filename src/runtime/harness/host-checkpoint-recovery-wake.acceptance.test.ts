@@ -278,6 +278,68 @@ test('the in-process recovery timer privately finalizes, adopts, and continues a
   }).length, 0);
 });
 
+test('a person\'s stop wins over the recovery timer: the held turn ends stopped and is never re-activated', async () => {
+  const session = eventlog.createSession({ id: 'host-checkpoint-timer-stopped', kind: 'chat' });
+  const callId = 'timer-stopped-read';
+  let bodies = 0;
+  const configuredTool = brackets.wrapToolForHarness({
+    type: 'function',
+    name: 'task_list',
+    description: 'Return one exact local task record.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    needsApproval: async () => false,
+    invoke: async () => {
+      bodies += 1;
+      return { records: [{ id: 'task-1', title: 'Stop me' }] };
+    },
+  });
+  const model = recordingModel([
+    [functionCall(callId, 'task_list', {})],
+    [textMessage('This continuation must never run.')],
+  ]);
+  const agent = { model, instructions: 'Use the exact configured tool.', tools: [configuredTool] };
+  bindSurface(session.id, agent, [configuredTool]);
+  const db = eventlog.openEventLog();
+  db.exec(`
+    CREATE TEMP TRIGGER reject_stopped_projection_receipt
+    BEFORE INSERT ON logical_model_result_projection_receipts
+    WHEN NEW.session_id = '${session.id}' AND NEW.call_id = '${callId}'
+    BEGIN
+      SELECT RAISE(ABORT, 'fixture timer projection receipt unavailable');
+    END
+  `);
+  let held: Awaited<ReturnType<typeof runConversation>>;
+  try {
+    held = await runConversation({
+      sessionId: session.id,
+      input: 'List the one exact local task and report it back.',
+      turnEngine: 'host_v1',
+      judgeCompletion: false,
+      agent: agent as never,
+      makeRunner: () => throwingRunner() as never,
+      maxTurns: 4,
+      maxSteps: 2,
+      suppressMemoryCapture: true,
+    });
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS reject_stopped_projection_receipt');
+  }
+  assert.equal(held.status, 'held', JSON.stringify(held));
+  // The person stops the turn before its recovery timer fires.
+  eventlog.requestKill(session.id, 'stopped by the person');
+
+  await waitFor(
+    () => HarnessSession.load(session.id)?.loadRecoveryState() === null
+      && eventlog.listEvents(session.id, { types: ['conversation_completed'] }).length === 1,
+    'the stopped held turn to clear its checkpoint and publish its stop',
+  );
+  assert.equal(model.calls(), 1, 'a stopped turn is never re-activated');
+  assert.equal(bodies, 1);
+  const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] })[0];
+  assert.equal((terminal?.data.presentation as { kind?: string } | undefined)?.kind, 'stopped', JSON.stringify(terminal?.data));
+  assert.equal(eventlog.isKillRequested(session.id), false, 'the stop latch is consumed');
+});
+
 test('a real focus_set stays host-only through production host_v1 and reaches the next model once', async () => {
   const session = eventlog.createSession({
     id: 'host-only-focus-set-lifecycle',
