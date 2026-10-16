@@ -2401,7 +2401,9 @@ export function registerOrchestrationTools(server: McpServer): void {
       if (!result.ok) {
         // Structured, NON-silent failure (change #4): the user AND the model see
         // the edit did not land and exactly what to do next — never a quiet no-op.
-        return textResult(
+        // Nothing was written, so this settles as no effect: a write the
+        // completion review would otherwise wait on a file receipt for.
+        return nonWriteTextResult('edit_not_applied',
           `Edit NOT applied to "${displayName}" step "${step_id}".\n${resultMessage}`
             + (result.errors?.length ? `\n- ${result.errors.join('\n- ')}` : ''),
         );

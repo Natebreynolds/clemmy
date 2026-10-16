@@ -1158,6 +1158,22 @@ test('workflow_set_enabled requires smoke inputs before approving external-read 
   assert.equal(readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).length, 1);
 });
 
+test('a workflow_edit_step that changes nothing settles as no write, so no file receipt is owed', async () => {
+  resetState();
+  writeWorkflow('noop-edit-draft', {
+    name: 'noop-edit-draft', description: 'A draft whose step is already as asked.', enabled: false, trigger: { manual: true },
+    steps: [{ id: 'save', call: { tool: 'write_file', args: { path: 'notes/out.md', content: 'hello', mode: 'overwrite' } }, sideEffect: 'write' }],
+  });
+  const before = readFileSync(path.join(WORKFLOWS_DIR, 'noop-edit-draft', 'SKILL.md'), 'utf-8');
+  const result = await workflowEditStep()({
+    name: 'noop-edit-draft', step_id: 'save',
+    patch: JSON.stringify({ call: { tool: 'write_file', args: { path: 'notes/out.md', content: 'hello', mode: 'overwrite' } } }),
+  });
+  assert.match(resultText(result), /Edit NOT applied/);
+  assert.equal(localNonWriteStatus(result), 'edit_not_applied');
+  assert.equal(readFileSync(path.join(WORKFLOWS_DIR, 'noop-edit-draft', 'SKILL.md'), 'utf-8'), before, 'nothing was written');
+});
+
 test('workflow_edit_step patch fixes one call argument on a disabled draft without the step graph', async () => {
   writeWorkflow('digest-check', {
     name: 'Digest check',
