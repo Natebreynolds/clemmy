@@ -116,7 +116,7 @@ export function releaseInlineCreationTestWait(runId: string): void {
   if (!RUN.test(runId)) return;
   try { withWorkflowRunRecordLock(runFile(runId), () => {
     const run = readWorkflowRunRecordUnlocked(runFile(runId)), lease = ambientOwner();
-    const i = run && intentOf(run);
+    const i = object(run) ? intentOf(run) : null;
     if (!run || !i || i.releasedAt || !lease || lease.scopeId !== i.lease.scopeId || lease.leaseId !== i.lease.leaseId) return;
     writeWorkflowRunRecordDurablyUnlocked(runFile(runId), { ...run, inlineCreationTestDelivery: { ...i, releasedAt: new Date().toISOString() } });
   }); } catch { /* deadline/owner checks still release a failed waiter */ }
