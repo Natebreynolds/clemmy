@@ -10578,8 +10578,15 @@ const runHostTurnBody = async (
             const row = entry as unknown as Record<string, unknown>;
             if (row.type !== 'function_call') return [];
             const argumentsJson = row.arguments;
+            let operation: string | null = null;
+            try {
+              operation = typeof row.name === 'string'
+                ? unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName
+                : null;
+            } catch { operation = null; }
             return [{
               name: typeof row.name === 'string' ? row.name : null,
+              operation,
               callId: typeof row.callId === 'string' ? row.callId : null,
               argumentsJson: typeof argumentsJson === 'string' ? argumentsJson.slice(0, 1000) : null,
             }];

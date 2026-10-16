@@ -229,7 +229,7 @@ function modelsByAttempt(sessionId: string, attempts: readonly WorkflowRunTraceA
 
 const SESSION_TRACE_TYPES = [
   'user_input_received', 'turn_model_routed', 'tool_called', 'tool_returned',
-  'tool_attempt_settled', 'conversation_completed',
+  'tool_attempt_settled', 'conversation_completed', 'guardrail_tripped',
 ];
 
 function attemptsForSession(db: Database.Database, sessionId: string, usageDir: string): WorkflowRunTraceAttempt[] {
@@ -280,6 +280,38 @@ function attemptsForSession(db: Database.Database, sessionId: string, usageDir: 
         blockedDetail: str(data.blockedDetail),
         text: bounded(presentation?.text, OUTCOME_TEXT_MAX),
       };
+      continue;
+    }
+    // A step whose every call was refused before it ran leaves its calls and
+    // the refusal here, and often nothing else: a write a reviewer refused
+    // never becomes a tool call (dispatch-streak.ts).
+    if (row.type === 'guardrail_tripped') {
+      if (data.kind !== 'no_dispatch_step' || !Array.isArray(data.calls)) continue;
+      for (const raw of data.calls) {
+        const entry = record(raw);
+        const refusedCallId = str(entry?.callId);
+        if (!refusedCallId || byCall.has(refusedCallId)) continue;
+        let tool = str(entry?.name) ?? '';
+        let carrier: string | null = null;
+        const operation = str(entry?.operation);
+        if (operation && operation !== tool) { carrier = tool; tool = operation; }
+        else try {
+          const parsed = record(JSON.parse(str(entry?.argumentsJson) ?? '{}'));
+          const inner = str(parsed?.name) ?? str(parsed?.tool_slug)
+            ?? str(record(parsed?.args_json)?.tool_slug);
+          if (inner && inner !== tool) { carrier = tool; tool = inner; }
+        } catch {
+          // The record keeps a bounded prefix of the arguments; name the
+          // carried operation from it for display when it is legible there.
+          const named = /"(?:tool_slug|name)"\s*:\s*"([A-Za-z0-9_.:-]{1,128})"/.exec(str(entry?.argumentsJson) ?? '')?.[1];
+          if (named && named !== tool) { carrier = tool; tool = named; }
+        }
+        byCall.set(refusedCallId, {
+          callId: refusedCallId, tool, carrier, at: row.created_at, finishedAt: row.created_at, durationMs: null,
+          arguments: bounded(entry?.argumentsJson, ARGUMENTS_MAX), ok: false, result: null,
+          error: str(data.refusalDetail)?.slice(0, RESULT_MAX) ?? null, refusedBeforeRunning: true, outcome: null,
+        });
+      }
       continue;
     }
     const callId = str(data.callId) ?? str(data.logicalToolCallId);
@@ -362,7 +394,9 @@ export function buildWorkflowRunTrace(input: {
   const stepOutputs = record(run.stepOutputs) ?? {};
   const orderedStepIds = [...input.stepIds];
   for (const event of input.events) {
-    if (event.stepId && event.stepId !== '(workflow)' && !orderedStepIds.includes(event.stepId)) orderedStepIds.push(event.stepId);
+    // Run-level records use parenthesised ids ("(workflow)", "(run goal)");
+    // they are not steps.
+    if (event.stepId && !/^\(.*\)$/.test(event.stepId) && !orderedStepIds.includes(event.stepId)) orderedStepIds.push(event.stepId);
   }
   const sessions = stepSessions(db, input.runId);
   const steps: WorkflowRunTraceStep[] = orderedStepIds.map((stepId) => {
