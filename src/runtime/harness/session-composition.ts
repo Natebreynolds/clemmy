@@ -26,6 +26,10 @@ import { resolveAgentBinding, type AgentBinding } from '../../agents/agent-bindi
 import { resolveProjectBinding, type ProjectBinding } from '../../projects/project-binding.js';
 import { sessionProjectState } from '../../projects/session-project-state.js';
 import { currentSourceSessionContext } from './source-session-context-scope.js';
+import { workflowConversationBindingForSession, workflowConversationPrimer,
+  WORKFLOW_CONVERSATION_CONTEXT_PREFIX, WORKFLOW_CONVERSATION_TOOLS,
+  WORKFLOW_CONVERSATION_HOT_TOOLS } from '../../execution/workflow-conversation.js';
+import type { WorkflowConversationBinding } from '../../shared/workflow-conversation.js';
 
 export const WORKSPACE_CONTEXT_PRIMER_PREFIX = '[workspace-context]';
 
@@ -49,6 +53,8 @@ export interface SessionMount {
   sessionKind: SessionKind;
   workspaceSlug: string | null;
   workflow: SessionWorkflowIdentity | null;
+  /** A human conversation editing one saved definition; never run authority. */
+  workflowConversation?: WorkflowConversationBinding;
   memory: { readonly inject: true; readonly grantsReachability: false };
   primers: readonly SessionPrimer[];
   /** Survive JIT pruning when the name is already reachable this turn. */
@@ -211,6 +217,8 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
       ? givenKind
       : 'chat';
   const toolAllowlist = freezeNames(input.toolAllowlist);
+  const workflowConversation = kind === 'chat'
+    ? workflowConversationBindingForSession(sessionId, input.metadata) : null;
 
   if (kind === 'workspace' && workspaceSlug) {
     return {
@@ -251,10 +259,12 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
     sessionKind,
     workspaceSlug: null,
     workflow,
+    ...(workflowConversation ? { workflowConversation } : {}),
     memory: MEMORY,
-    primers: [],
-    pinnedTools: agentTools,
-    hotTools: agentTools,
+    primers: workflowConversation ? [{ prefix: WORKFLOW_CONVERSATION_CONTEXT_PREFIX,
+      text: workflowConversationPrimer(workflowConversation) }] : [],
+    pinnedTools: workflowConversation ? [...agentTools, ...WORKFLOW_CONVERSATION_TOOLS] : agentTools,
+    hotTools: workflowConversation ? [...agentTools, ...WORKFLOW_CONVERSATION_HOT_TOOLS] : agentTools,
     toolAllowlist,
     agent,
     project,

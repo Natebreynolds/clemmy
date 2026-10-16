@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { workflowCaption, workflowDisplayName } from '@clem/chat-engine';
+import { workflowCaption, workflowConversationSessionId, workflowDisplayName } from '@clem/chat-engine';
 import { workflowRowStatus } from '../lib/workflow-status';
 import { useBackGesture } from '../lib/back-gesture';
 import { renderMarkdown } from '@clem/chat-engine';
@@ -25,6 +25,7 @@ import { buildWorkflowRunDetail } from '../lib/workflow-run-detail';
 import { whenLabel } from '../lib/schedule-label';
 import { usePendingCommit } from '../lib/pending-commit';
 import { workflowRunFailure, workflowRunNotice } from '../lib/workflow-run-receipt';
+import { Chat } from './Chat';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -100,20 +101,34 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const [runNotice, setRunNotice] = useState<string | null>(null);
   const commit = usePendingCommit(workflow.name);
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
-  useMobileDetailHeader(selectedRun === null);
+  const [conversation, setConversation] = useState<{ sessionId: string; draft?: string } | null>(null);
+  const [definitionRead, setDefinitionRead] = useState(0);
+  useMobileDetailHeader(selectedRun === null && conversation === null);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
     () => listWorkflowRuns(workflow.name, 20),
-    { intervalMs: 8_000, disabled: selectedRun !== null },
+    { intervalMs: 8_000, disabled: selectedRun !== null || conversation !== null },
   );
   const runs = data?.runs ?? [];
   // The FULL workflow — plain-English summary, certified steps, inputs
-  // schema. Loaded once (no interval): definitions don't change mid-view and
-  // certification is real work on the daemon.
-  const { data: info, error: infoError, offline: infoOffline, refresh: reloadInfo } = useScreenData(
+  // schema. Read on entry and after the conversation closes so a saved edit
+  // is reflected by the daemon, rather than inferred from a chat reply.
+  const { data: info, refreshing: infoRefreshing, stale: infoStale, error: infoError, offline: infoOffline, refresh: reloadInfo } = useScreenData(
     () => getWorkflowDetail(workflow.name),
-    { disabled: selectedRun !== null },
+    { disabled: conversation !== null, resourceKey: `workflow:${workflow.name}:${definitionRead}` },
   );
+  const conversationSessionId = info?.slug && !infoStale ? workflowConversationSessionId(info.slug) : null;
+  const description = info?.description ?? workflow.description;
+  const enabled = info?.enabled ?? workflow.enabled;
+  function closeConversation() {
+    setConversation(null);
+    // A pre-chat in-flight read must not satisfy the post-edit refresh.
+    setDefinitionRead(read => read + 1);
+  }
+  useBackGesture(conversation !== null, closeConversation);
+  function askClem(draft?: string) {
+    if (conversationSessionId) setConversation({ sessionId: conversationSessionId, ...(draft ? { draft } : {}) });
+  }
   const requiredMissing = (info?.inputs ?? [])
     .filter((input) => input.required && !(inputValues[input.key] ?? '').trim())
     .map((input) => input.key);
@@ -147,11 +162,22 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     }
   }
 
+  if (conversation) {
+    return <Chat
+      key={conversation.sessionId}
+      sessionId={conversation.sessionId}
+      initialTitle={workflowDisplayName(workflow.name, description)}
+      initialDraft={conversation.draft}
+      onBack={closeConversation}
+    />;
+  }
+
   if (selectedRun) {
     return (
       <WorkflowRunEvents
         workflowName={workflow.name}
         run={selectedRun}
+        onAsk={conversationSessionId ? () => askClem(`What happened in run ${selectedRun.id} of this workflow?`) : undefined}
         onBack={() => { setSelectedRun(null); void refresh(); }}
       />
     );
@@ -161,13 +187,14 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     <div class="workflow-detail">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
-        <h2 class="chat-title">{workflowDisplayName(workflow.name, workflow.description)}</h2>
+        <h2 class="chat-title">{workflowDisplayName(workflow.name, description)}</h2>
         <NavigationMenuButton />
       </div>
       <div class="workflow-detail-body">
-        {workflowCaption(workflow.name, workflow.description) ? <div class="workflow-row-slug">{workflow.name}</div> : null}
-        {workflow.description ? <p class="workflow-desc">{workflow.description}</p> : null}
+        {workflowCaption(workflow.name, description) ? <div class="workflow-row-slug">{workflow.name}</div> : null}
+        {description ? <p class="workflow-desc">{description}</p> : null}
         <ScreenNotice error={infoError} offline={infoOffline} onRetry={() => void reloadInfo()} hasData={Boolean(info)} />
+        {infoRefreshing ? <p class="muted" role="status">Loading the latest saved workflow…</p> : null}
 
         {/* The strategic read, before any mechanics: what it touches, whether
             it can be trusted, and what "good" means for it. Deciding to run
@@ -228,6 +255,8 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
                         {step.effect === 'external' ? <span class="wf-chip wf-chip-effect">writes outside</span> : null}
                         {step.gated ? <span class="wf-chip wf-chip-gated">needs approval</span> : null}
                       </span>
+                      <button type="button" class="btn-quiet" disabled={!conversationSessionId}
+                        onClick={() => askClem(`Help me understand or change step ${step.stepId} (${step.label || step.stepId}) in this workflow.`)}>Ask Clem</button>
                     </li>
                   ))}
                 </ol>
@@ -267,16 +296,21 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         <div class="workflow-actions">
           <button
             class="btn"
-            disabled={triggering || !workflow.enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
+            disabled={triggering || !info || infoStale || infoRefreshing || !enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
             onClick={trigger}
           >
             {triggering ? 'Queuing…'
-              : !workflow.enabled ? 'Disabled'
+              : infoError || infoOffline ? 'Workflow unavailable'
+              : !info || infoRefreshing ? 'Loading workflow…'
+              : infoStale ? 'Workflow unavailable'
+              : !enabled ? 'Disabled'
                 : bindingGaps.length > 0 ? 'Needs a binding (set it on your computer)'
                 : requiredMissing.length > 0 ? `Needs: ${requiredMissing.join(', ')}`
                   : 'Run now'}
           </button>
+          <button type="button" class="btn-quiet" disabled={!conversationSessionId} onClick={() => askClem()}>Ask Clem</button>
         </div>
+        <p class="muted">Ask about this workflow or describe a change to its saved steps. Runs already in progress keep their own controls.</p>
         {actionError ? <div class="global-error">{actionError}</div> : null}
         {runNotice ? <p class="muted" role="status">{runNotice}</p> : null}
         <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />
@@ -318,9 +352,10 @@ interface WorkflowRunEventsProps {
   workflowName: string;
   run: WorkflowRunSummary;
   onBack: () => void;
+  onAsk?: () => void;
 }
 
-function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps) {
+function WorkflowRunEvents({ workflowName, run, onBack, onAsk }: WorkflowRunEventsProps) {
   useMobileDetailHeader();
   const { data, loading, error, offline, refresh } = useScreenData(
     () => getWorkflowRunEventsFull(workflowName, run.id, 500),
@@ -347,6 +382,7 @@ function WorkflowRunEvents({ workflowName, run, onBack }: WorkflowRunEventsProps
             : null}
         </div>
         {detail.summary?.because ? <p class="wf-because">{detail.summary.because}</p> : null}
+        {onAsk ? <button type="button" class="btn-quiet" onClick={onAsk}>Ask Clem about this run</button> : null}
 
         {loading && events.length === 0 ? <div class="skeleton-stack" aria-hidden="true"><i /></div> : null}
         {!loading && !error && !offline && events.length === 0 ? <p class="muted">No steps recorded yet.</p> : null}

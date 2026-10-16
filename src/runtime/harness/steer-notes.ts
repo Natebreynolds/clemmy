@@ -1,4 +1,5 @@
 import { isExecutionSourceBoundary } from './accepted-source-kind.js';
+import { workflowConversationSlugFromSessionId } from '../../shared/workflow-conversation.js';
 /**
  * Mid-run steering (2026-08-07) — user messages reach a RUNNING turn without
  * stopping it.
@@ -376,7 +377,8 @@ export interface SteerNote {
 /** Sessions whose runs a user can steer from a chat surface. Background/cron
  *  agent sessions have no live human typing into them. */
 export function sessionSupportsSteering(sessionId: string | undefined): boolean {
-  return typeof sessionId === 'string' && /^(?:sess-|space-|discord-)/.test(sessionId);
+  return typeof sessionId === 'string' && (/^(?:sess-|space-|discord-)/.test(sessionId)
+    || workflowConversationSlugFromSessionId(sessionId) !== null);
 }
 
 export function appendSteerNote(

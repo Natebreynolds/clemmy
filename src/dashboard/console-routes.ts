@@ -122,6 +122,7 @@ import {
   type WorkflowGoal,
 } from '../memory/workflow-store.js';
 import { subscribeWorkflowChanges } from '../memory/workflow-change-bus.js';
+import { workflowConversationBindingForSession, requireWorkflowConversationTarget } from '../execution/workflow-conversation.js';
 import { extractArchitectDiff } from './architect-diff.js';
 import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import { appendWorkflowEvent, listFinalFailedItems, listPendingRuns, readWorkflowEvents, reconstructWorkflowRunQueue, type WorkflowEvent } from '../execution/workflow-events.js';
@@ -6053,6 +6054,7 @@ export function registerConsoleRoutes(
       const executionPlan = certification.dryRun.plan;
       const resourceBinding = await buildWorkflowResourceBindingReportFromRuntime(entry.data);
       res.json({
+        slug: entry.name,
         name: entry.data.name,
         file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
         description: entry.data.description,
@@ -17308,6 +17310,31 @@ export function registerConsoleRoutes(
       : deterministicSessionId
         ? getHarnessSession(deterministicSessionId)
         : null;
+    let workflowConversation: ReturnType<typeof workflowConversationBindingForSession> = null;
+    try {
+      workflowConversation = existingId
+        ? workflowConversationBindingForSession(existingId, session?.metadata) : null;
+      const requestedWorkflowRoot = requestedSessionId
+        ? workflowConversationBindingForSession(requestedSessionId) : null;
+      if (requestedWorkflowRoot && (!workflowConversation || workflowConversation.rootSessionId !== requestedWorkflowRoot.rootSessionId
+        || workflowConversation.workflowSlug !== requestedWorkflowRoot.workflowSlug)) {
+        throw new Error('This request belongs to a different workflow conversation. Open the workflow again.');
+      }
+      if (workflowConversation) {
+        if (session && session.kind !== 'chat') throw new Error('This is not an editable workflow conversation. Open the workflow again.');
+        if (!session) requireWorkflowConversationTarget(workflowConversation);
+      }
+    } catch (error) {
+      res.status(409).json({ code: 'WORKFLOW_CONVERSATION_UNAVAILABLE',
+        error: error instanceof Error ? error.message : 'Open the workflow again to continue.' });
+      return;
+    }
+    if (existingId && !session && workflowConversation) {
+      session = createHarnessSession({ id: existingId, kind: 'chat', channel: 'desktop', userId: 'desktop',
+        title: input.length > 80 ? `${input.slice(0, 77)}...` : input,
+        metadata: { source: 'desktop', ingressProvider: 'desktop', channelId: existingId,
+          userId: 'desktop', __workflow_conversation: workflowConversation } });
+    }
     // A Workspace's floating dock binds a STABLE per-workspace session id
     // (space-<slug>) so the dock + re-engage share one continuous thread — but
     // that session may not exist until the first message. Create it with the
@@ -17649,6 +17676,14 @@ export function registerConsoleRoutes(
     // continuation directive when the session's last completion was
     // a limit/continue completion. Falls through to the
     // normal turn path with the rewritten input.
+    if (workflowConversation && !priorReceipt && !proposedEarlyRoute && !intent && !command && !connectionContext) {
+      try { requireWorkflowConversationTarget(workflowConversation); }
+      catch (error) {
+        res.status(409).json({ code: 'WORKFLOW_CONVERSATION_UNAVAILABLE',
+          error: error instanceof Error ? error.message : 'Open the workflow again to continue.' });
+        return;
+      }
+    }
     let turnInput = input;
     if (command === 'continue') {
       const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
@@ -17805,6 +17840,7 @@ export function registerConsoleRoutes(
               audienceId: 'desktop',
             },
             ...(validatedMount ? { validatedMount } : {}),
+            ...(workflowConversation ? { workflowConversation } : {}),
             receipt: {
               requestId: requestIdentity.requestId,
               runId: proposedRunId,

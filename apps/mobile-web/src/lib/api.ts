@@ -1092,12 +1092,22 @@ async function drainChatHistoryPage(initial: ChatHistoryPage): Promise<{ events:
   return { events, latestSeq };
 }
 
+const missingChatSessionRoots = new WeakMap<object, string>();
+
+/** A missing continuation page is not a missing conversation. */
+export function isMissingChatSessionRoot(error: unknown, sessionId: string): boolean {
+  return typeof error === 'object' && error !== null && missingChatSessionRoots.get(error) === sessionId;
+}
+
 export async function getChatSession(id: string): Promise<{
   session: ChatSession; events: ChatEvent[]; latestSeq: number;
   history?: Array<{ sessionId: string; events: ChatEvent[] }>;
 }> {
   const initial = await api<{ session: ChatSession; events: ChatEvent[]; latestSeq: number;
-    page?: ReplayPayload['page']; history?: ChatHistoryPage[] }>(`/m/api/chat/sessions/${encodeURIComponent(id)}`);
+    page?: ReplayPayload['page']; history?: ChatHistoryPage[] }>(`/m/api/chat/sessions/${encodeURIComponent(id)}`).catch(error => {
+      if (error && typeof error === 'object' && (error as ApiError).status === 404) missingChatSessionRoots.set(error, id);
+      throw error;
+    });
   const headId = initial.session.executionSessionId ?? id;
   const head = await drainChatHistoryPage({ ...initial, sessionId: headId });
   const seen = new Set([headId]);
@@ -1551,6 +1561,8 @@ export async function runWorkflow(name: string, inputs?: Record<string, string>)
 /** The FULL workflow: plain-English summary, certified steps, inputs schema. */
 export interface WorkflowDetailInfo {
   name: string;
+  /** Canonical saved identity, separate from the displayed name. */
+  slug?: string;
   description: string;
   enabled: boolean;
   schedule: string | null;

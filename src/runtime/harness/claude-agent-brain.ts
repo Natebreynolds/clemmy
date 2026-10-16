@@ -1060,7 +1060,7 @@ export function renderClaudeAgentBrainSystemAppend(
         partition: 'all',
         includeSessionActions: false,
       });
-  const compositionPrimers = renderSessionMountPrimers(composeSession({ sessionId: request.sessionId }));
+  const compositionPrimers = renderSessionMountPrimers(composeSessionFromStore(request.sessionId));
   // Visibility into THIS session's completed irreversible actions. The text
   // transcript doesn't carry tool results, so without this the brain is blind to
   // its own prior sends and can re-run them (the 2026-06-29 double-send). Gated by

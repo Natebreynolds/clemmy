@@ -284,6 +284,149 @@ async function waitUntil(
   assert.fail(message);
 }
 
+test('workflow conversation HTTP keeps exact text, one replay owner and its definition after Stop successor', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  const { writeWorkflow, readWorkflow, deleteWorkflow } = await import('../memory/workflow-store.js');
+  const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
+  const slug = 'http-workflow-conversation';
+  const entry = writeWorkflow(slug, { name: 'An editable workflow', description: 'Controlled workflow chat.', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read the fixture.', sideEffect: 'read' }] });
+  const rootId = workflowConversationSessionId(slug)!;
+  const seen: Array<{ sessionId: string; input: string; workflowSlug: string | undefined }> = [];
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: (async (request: { sessionId: string; input: string }) => {
+      const current = contextScope.currentSourceSessionContext(request.sessionId);
+      seen.push({ sessionId: request.sessionId, input: request.input, workflowSlug: current?.mount.workflowConversation?.workflowSlug });
+      if (seen.length === 1) await held;
+      return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { reply: 'The controlled workflow has one read step.', done: true, nextAction: 'completed' } };
+    }) as never });
+  const h = await boot();
+  const post = (input: string, clientRequestId: string) => fetch(`${h.url}/api/harness/chat`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: rootId, input, clientRequestId }) });
+  try {
+    const detail = await fetch(`${h.url}/api/console/workflows/${slug}`);
+    assert.equal(detail.status, 200);
+    assert.equal((await detail.json() as { slug: string }).slug, slug);
+    const input = 'Explain this step; do not run or change anything.';
+    const first = await post(input, 'workflow-conversation-first');
+    assert.equal(first.status, 202);
+    const accepted = await first.json() as { sessionId: string; runId: string; cancelEndpoint: string };
+    await waitUntil(() => seen.length === 1, 'scoped workflow chat did not dispatch');
+    assert.equal(accepted.sessionId, rootId);
+    assert.equal(getSession(rootId)?.kind, 'chat');
+    assert.equal(getSession(rootId)?.metadata.source, 'desktop');
+    assert.deepEqual(seen[0], { sessionId: rootId, input, workflowSlug: slug });
+    deleteWorkflow(slug);
+    const replay = await post(input, 'workflow-conversation-first');
+    assert.equal(replay.status, 202);
+    assert.equal((await replay.json() as { runId: string }).runId, accepted.runId);
+    assert.equal(seen.length, 1);
+    const { armHostReadOnlyCallAuthority } = await import('../runtime/harness/accepted-turn-call-authority.js');
+    const source = listEvents(rootId, { types: ['user_input_received'] })[0]!;
+    const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    assert.equal(armHostReadOnlyCallAuthority({ sessionId: rootId, sourceUserSeq: source.seq,
+      surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: sha('workflow-conversation-catalog'),
+      bindingRevisionDigest: sha('workflow-conversation-binding'), maxLogicalCalls: 8, maxParallelCalls: 4 }).status, 'armed');
+    const freshWhileMissing = await post('Explain the new saved definition.', 'workflow-conversation-missing-new');
+    assert.equal(freshWhileMissing.status, 200, 'a message during existing work remains a steer, even after definition deletion');
+    const stop = await post('/cancel', 'workflow-conversation-typed-stop');
+    assert.equal(stop.status, 202, 'exact existing Stop remains available after the definition is deleted');
+    const stopped = await stop.json() as { sessionId: string; runId: string };
+    release();
+    await waitUntil(() => !!getLatestRunAttemptByRunId(rootId, accepted.runId)?.finishedAt, 'Stop did not settle the exact attempt');
+    await waitUntil(() => !!getLatestRunAttemptByRunId(stopped.sessionId, stopped.runId)?.finishedAt, 'typed Stop did not finish its control turn');
+    const missingNew = await post('Explain the saved definition now.', 'workflow-conversation-missing-idle');
+    assert.equal(missingNew.status, 409, 'a new ordinary task still requires its exact definition');
+    assert.equal(getHarnessChatRequestReceipt('workflow-conversation-missing-idle'), null);
+    writeWorkflow(slug, entry.data);
+    const afterStop = await post('Now explain it more briefly.', 'workflow-conversation-after-stop');
+    assert.equal(afterStop.status, 202);
+    const next = await afterStop.json() as { sessionId: string; runId: string };
+    await waitUntil(() => seen.length === 2, 'successor did not enter the shared chat path');
+    assert.notEqual(next.sessionId, rootId);
+    assert.deepEqual(seen[1], { sessionId: next.sessionId, input: 'Now explain it more briefly.', workflowSlug: slug });
+    assert.equal(getSession(next.sessionId)?.kind, 'chat');
+    assert.deepEqual(readWorkflow(slug)?.data, entry.data, 'questions and Stop do not edit or execute the saved workflow');
+    assert.equal(listEvents(rootId, { types: ['user_input_received'] }).filter(event => event.data.text === input).length, 1);
+    await waitUntil(() => !!getLatestRunAttemptByRunId(next.sessionId, next.runId)?.finishedAt, 'successor callback did not finish');
+  } finally { release(); _setBridgeImplsForTests({}); await h.close(); }
+});
+
+test('workflow conversation HTTP refuses missing, malformed and conflicting exact targets before acceptance', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  const { writeWorkflow, deleteWorkflow } = await import('../memory/workflow-store.js');
+  const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
+  writeWorkflow('http-conversation-deleted', { name: 'Shared title', description: 'Controlled deletion fixture.', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only.', sideEffect: 'read' }] });
+  writeWorkflow('http-conversation-other', { name: 'Shared title', description: 'Never substitute this workflow.', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only.', sideEffect: 'read' }] });
+  deleteWorkflow('http-conversation-deleted');
+  const conflict = workflowConversationSessionId('http-conversation-other')!;
+  createSession({ id: conflict, kind: 'chat', metadata: { __workflow_conversation: {
+    version: 1, rootSessionId: workflowConversationSessionId('http-conversation-deleted'), workflowSlug: 'http-conversation-deleted' } } });
+  let calls = 0;
+  const unexpected = async () => { calls++; throw new Error('refused conversation must not reach a model'); };
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: unexpected as never, claudeAgentBrain: unexpected as never });
+  const h = await boot();
+  try {
+    for (const [index, sessionId] of [workflowConversationSessionId('http-conversation-deleted')!,
+      workflowConversationSessionId('http-conversation-missing')!, 'workflow-edit:%2e%2e%2foutside', conflict].entries()) {
+      const requestId = `workflow-conversation-invalid-${index}`;
+      const response = await fetch(`${h.url}/api/harness/chat`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, input: 'Explain this workflow.', clientRequestId: requestId }) });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json() as { code: string }).code, 'WORKFLOW_CONVERSATION_UNAVAILABLE');
+      assert.equal(getHarnessChatRequestReceipt(requestId), null);
+      assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 0);
+    }
+    assert.equal(calls, 0);
+  } finally { _setBridgeImplsForTests({}); await h.close(); }
+});
+
+test('workflow conversation HTTP replay cannot capture a foreign definition after its receipt but before source acceptance', async () => {
+  resetEventLog(); resetHarnessRuntimeConfig();
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
+  const { claimSessionForAcceptedSource } = await import('../runtime/harness/accepted-source-session-branch.js');
+  const { HarnessSession } = await import('../runtime/harness/session.js');
+  for (const slug of ['http-preaccepted-a', 'http-preaccepted-b']) writeWorkflow(slug, {
+    name: slug, description: 'Controlled preaccepted receipt.', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read only.', sideEffect: 'read' }] });
+  const a = { version: 1 as const, rootSessionId: workflowConversationSessionId('http-preaccepted-a')!, workflowSlug: 'http-preaccepted-a' };
+  const b = { version: 1 as const, rootSessionId: workflowConversationSessionId('http-preaccepted-b')!, workflowSlug: 'http-preaccepted-b' };
+  const root = createSession({ id: a.rootSessionId, kind: 'chat', channel: 'desktop', userId: 'desktop', metadata: {
+    source: 'desktop', ingressProvider: 'desktop', channelId: a.rootSessionId, userId: 'desktop', __workflow_conversation: a } });
+  HarnessSession.load(root.id)!.markStatus('completed');
+  const input = 'Explain this workflow.', clientRequestId = 'http-preaccepted-replay';
+  const runId = `desktop:${createHash('sha256').update(clientRequestId).digest('hex').slice(0, 40)}`;
+  const inputHash = createHash('sha256').update(JSON.stringify({ input, attachmentIds: [] })).digest('hex');
+  const admitted = claimSessionForAcceptedSource({ kind: 'ordinary', entrySessionId: root.id, durableSourceId: runId,
+    workflowConversation: a, continuity: { provider: 'desktop', scopeId: null, conversationId: root.id, audienceId: 'desktop' },
+    receipt: { requestId: clientRequestId, runId, inputHash } });
+  const child = admitted.receipt.sessionId;
+  openEventLog().prepare("UPDATE sessions SET metadata_json = json_set(metadata_json, '$.__workflow_conversation', json(?)) WHERE id = ?")
+    .run(JSON.stringify(b), child);
+  let calls = 0;
+  const unexpected = async () => { calls++; throw new Error('foreign scope cannot reach a model'); };
+  _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+    runConversation: unexpected as never, claudeAgentBrain: unexpected as never });
+  const h = await boot();
+  try {
+    const response = await fetch(`${h.url}/api/harness/chat`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: root.id, input, clientRequestId }) });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json() as { code: string }).code, 'WORKFLOW_CONVERSATION_UNAVAILABLE');
+    assert.equal(getHarnessChatRequestReceipt(clientRequestId)?.sessionId, child, 'the prior receipt remains unchanged');
+    assert.equal(listEvents(child, { types: ['user_input_received'] }).length, 0);
+    assert.equal(getLatestRunAttemptByRunId(child, runId), null);
+    assert.equal(calls, 0);
+  } finally { _setBridgeImplsForTests({}); await h.close(); }
+});
+
 test('automatic-learning exclusion is exact-source durable, request-id bound, and never a public ancestry override', async () => {
   resetEventLog();
   resetHarnessRuntimeConfig();

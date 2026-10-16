@@ -7,8 +7,8 @@
  * daemon compiles from the steps (GET /api/console/workflows/:name → graph);
  * rewiring saves back through the same PATCH `stepEdits` the form screens
  * use, and the step panel reads the stored step and the dry-run trace. The
- * panel is read-only in this slice: changing a step still goes through
- * Clementine, and "Ask Clementine" opens that conversation with the step named.
+ * changing a step through Clementine stays in this workflow's conversation,
+ * with step and run questions prepared in its composer.
  *
  * Placement is shared: the daemon keeps a sidecar beside the definition, so
  * the shape you arranged here is the shape the phone and the next machine
@@ -49,6 +49,8 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { ScheduleEditor } from '@/components/automate/ScheduleEditor';
 import { WorkflowEnginePanel } from '@/components/automate/WorkflowDrawer';
 import { WorkflowCanvasNode, type WorkflowCanvasFlowNode, type WorkflowCanvasNodeRun } from '@/components/automate/WorkflowCanvasNode';
+import { WorkflowConversation } from '@/components/automate/WorkflowConversation';
+import type { WorkflowConversationQuestion } from '@/lib/workflow-conversation';
 import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { usePoll } from '@/lib/poll';
 import { usePendingCommit, type PendingCommit } from '@/lib/pending-commit';
@@ -135,6 +137,15 @@ function WorkflowView({ name }: { name: string }) {
     queryFn: () => getWorkflow(name),
   });
   const detail = detailQuery.data ?? null;
+  const workflowSlug = detail?.slug ?? name;
+  const [conversationOpen, setConversationOpen] = useState(() => typeof window !== 'undefined'
+    && window.matchMedia('(min-width: 1024px)').matches);
+  const [conversationQuestion, setConversationQuestion] = useState<WorkflowConversationQuestion | null>(null);
+  const questionId = useRef(0);
+  const askInWorkflow = (text: string) => {
+    setConversationQuestion({ workflowSlug, id: ++questionId.current, text });
+    setConversationOpen(true);
+  };
 
   /* ---------- the graph ---------- */
   const [nodes, setNodes, onNodesChange] = useNodesState<WorkflowCanvasFlowNode>([]);
@@ -487,6 +498,17 @@ function WorkflowView({ name }: { name: string }) {
   const enabled = detail.enabled === true;
 
   return (
+    <div className="flex h-full min-h-0">
+      <aside id="workflow-conversation" aria-label="Workflow conversation with Clementine"
+        className={cn('min-h-0 w-full shrink-0 flex-col border-r border-border bg-subtle lg:w-[380px]', conversationOpen ? 'flex' : 'hidden')}>
+        <WorkflowConversation key={workflowSlug} workflowSlug={workflowSlug} title={detail.name}
+          question={conversationQuestion} unsavedChanges={dirty}
+          onClose={() => {
+            setConversationOpen(false);
+            requestAnimationFrame(() => document.getElementById('workflow-conversation-toggle')?.focus());
+          }} />
+      </aside>
+      <div className={cn('min-w-0 flex-1 overflow-y-auto', conversationOpen && 'hidden lg:block')}>
     <Page
       title={detail.name}
       actions={
@@ -497,6 +519,14 @@ function WorkflowView({ name }: { name: string }) {
               Automate
             </Button>
           </Link>
+          <Button id="workflow-conversation-toggle" variant="secondary" size="sm"
+            aria-expanded={conversationOpen} aria-controls="workflow-conversation"
+            onClick={() => {
+              setConversationOpen(true);
+              requestAnimationFrame(() => document.getElementById('workflow-conversation')?.querySelector('textarea')?.focus());
+            }}>
+            <MessageSquare size={16} aria-hidden /> Ask Clem
+          </Button>
           {primary && primary.kind !== 'run' ? (
             <Button size="sm" onClick={runPrimary} disabled={busy !== null} title={detail.certification?.summary}>
               {busy === 'enable' ? <Loader2 size={16} className="animate-spin" aria-hidden /> : primary.kind === 'enable' ? <ShieldCheck size={16} aria-hidden /> : null}
@@ -570,7 +600,8 @@ function WorkflowView({ name }: { name: string }) {
       ) : null}
 
       {/* The graph and the step panel */}
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div className={cn('grid gap-4', conversationOpen
+        ? '2xl:grid-cols-[minmax(0,1fr)_320px]' : 'lg:grid-cols-[minmax(0,1fr)_320px]')}>
         <Card className="flex min-h-[460px] flex-col overflow-hidden p-0 h-[min(70vh,760px)]">
           <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
             <div role="tablist" aria-label="Graph view" className="mr-auto inline-flex rounded-full bg-subtle p-0.5">
@@ -626,9 +657,9 @@ function WorkflowView({ name }: { name: string }) {
                     <Link to={`/automate?workflow=${encodeURIComponent(detail.name)}&run=${encodeURIComponent(shownRun.id)}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
                       Open run <ExternalLink size={12} aria-hidden />
                     </Link>
-                    <Link to={`/chat?prompt=${encodeURIComponent(askAboutRunPrompt(detail.name, shownRun.id))}`} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
+                    <button type="button" onClick={() => askInWorkflow(askAboutRunPrompt(workflowSlug, shownRun.id))} className="inline-flex items-center gap-1 text-small text-muted underline-offset-2 hover:text-fg hover:underline">
                       Ask Clementine about this run
-                    </Link>
+                    </button>
                   </>
                 ) : null}
               </>
@@ -704,6 +735,7 @@ function WorkflowView({ name }: { name: string }) {
               onGraphPending={setSaving}
               onChanged={afterStepChange}
               onTestQueued={followCreationTest}
+              onAsk={() => askInWorkflow(askAboutStepPrompt(workflowSlug, selectedNode.id))}
             />
           ) : (
             <ShapePanel graph={canvasGraph} certification={detail.certification} />
@@ -738,6 +770,8 @@ function WorkflowView({ name }: { name: string }) {
         </div>
       </details>
     </Page>
+      </div>
+    </div>
   );
 }
 
@@ -788,7 +822,7 @@ const RUN_ICON: Record<ReturnType<typeof describeStepRun>['kind'], LucideIcon> =
   model: Bot, skill: Puzzle, script: ScrollText, call: Zap,
 };
 
-function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, graphCommit, graphSaving, onGraphPending, onChanged, onTestQueued }: {
+function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, graphCommit, graphSaving, onGraphPending, onChanged, onTestQueued, onAsk }: {
   workflowName: string;
   node: CanvasGraphNode;
   step?: WorkflowStep;
@@ -804,6 +838,7 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   onChanged: (token?: symbol) => Promise<void>;
   /** A save turned the workflow off and queued its test; the page follows it. */
   onTestQueued: () => Promise<void>;
+  onAsk: () => void;
 }) {
   const queryClient = useQueryClient();
   const stepCommit = usePendingCommit(`${workflowName}:${node.id}`);
@@ -829,7 +864,6 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
   const reads = trace?.reads ?? [];
   const effect = node.meta?.sideEffect;
   const verdict = node.verdict;
-  const askHref = `/chat?prompt=${encodeURIComponent(askAboutStepPrompt(workflowName, node.id))}`;
 
   /* ---- the everyday four, as a draft against the stored step ---- */
   const base = useMemo(() => stepDraftFrom(node, step), [node, step]);
@@ -1098,12 +1132,10 @@ function StepPanel({ workflowName, node, step, trace, graph, isNew, workflowOn, 
       </div>
 
       <div className="border-t border-border px-4 py-3">
-        <Link to={askHref}>
-          <Button variant="secondary" size="sm" className="w-full">
+          <Button variant="secondary" size="sm" className="w-full" onClick={onAsk}>
             <MessageSquare size={16} aria-hidden />
             Ask Clementine about this step
           </Button>
-        </Link>
         <p className="mt-2 text-caption text-faint">Tools, model and output shape change through Clementine or Advanced.</p>
       </div>
     </>
