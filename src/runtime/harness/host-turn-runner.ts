@@ -1,3 +1,4 @@
+import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT } from './dispatch-streak.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
 import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
@@ -4423,6 +4424,10 @@ const runHostTurnBody = async (
     throw error;
   };
   let consecutiveFrameRefusals = 0;
+  // Steps in a row whose every call was refused before it ran (see
+  // dispatch-streak.ts); observed in every phase, plan active or not.
+  let consecutiveStepsWithoutDispatch = 0;
+  let dispatchStreakCursor = history.length;
   const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
     if (!hostProduction) return;
     try {
@@ -10544,6 +10549,50 @@ const runHostTurnBody = async (
     const pendingDirectiveForStep = pendingHostModelDirective;
     let modelInputDirective = pendingDirectiveForStep;
     let writingNoProgressRecoveryDirective = false;
+    if (!consumingRecoveredFrame && hostProduction && dispatchStreakCursor < history.length) {
+      const streakIdentity = exactHostIdentity();
+      const streakDelta = history.slice(dispatchStreakCursor);
+      dispatchStreakCursor = history.length;
+      const stepDispatch = classifyStepDispatch({
+        sessionId: streakIdentity.sessionId,
+        sourceUserSeq: streakIdentity.sourceUserSeq,
+        delta: streakDelta,
+        refusedByMarker: (item) => hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch',
+      });
+      if (stepDispatch === 'dispatched') consecutiveStepsWithoutDispatch = 0;
+      if (stepDispatch === 'none_dispatched') {
+        consecutiveStepsWithoutDispatch += 1;
+        const refusalDetail = lastHostRefusalDetail(history);
+        journalHostGuide('no_dispatch_step', {
+          streak: consecutiveStepsWithoutDispatch,
+          refusalDetail: refusalDetail?.slice(0, 1000) ?? null,
+          calls: streakDelta.flatMap((entry) => {
+            const row = entry as unknown as Record<string, unknown>;
+            if (row.type !== 'function_call') return [];
+            const argumentsJson = row.arguments;
+            return [{
+              name: typeof row.name === 'string' ? row.name : null,
+              callId: typeof row.callId === 'string' ? row.callId : null,
+              argumentsJson: typeof argumentsJson === 'string' ? argumentsJson.slice(0, 1000) : null,
+            }];
+          }).slice(0, 8),
+        });
+        if (consecutiveStepsWithoutDispatch >= HOST_NO_DISPATCH_STREAK_LIMIT) {
+          return blockedOutcome(
+            hostNoProgressBlockedText(
+              noProgressState,
+              'refused_before_dispatch',
+              admissibleRecoveryToolNames,
+              refusalDetail ?? lastConcreteToolError(),
+              turnIsPlanMode(),
+            ),
+            'control_no_progress_exhausted',
+            true,
+            `refused_before_dispatch:${consecutiveStepsWithoutDispatch}`,
+          );
+        }
+      }
+    }
     if (!consumingRecoveredFrame) {
       if (
         hostProduction

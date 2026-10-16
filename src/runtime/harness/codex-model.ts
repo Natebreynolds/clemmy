@@ -1005,7 +1005,7 @@ export class CodexResponsesModel implements Model {
         // timeout case is detected inside the streaming generator below.
         res = await fetch(CODEX_URL, {
           method: 'POST',
-          headers: buildCodexHeaders(token, accountId),
+          headers: buildCodexHeaders(token, accountId, codexConversationKeyOf(bodyJson)),
           body: bodyJson,
           signal: request.signal,
           dispatcher: codexDispatcher,
@@ -1242,8 +1242,19 @@ interface CodexRequestBody {
  * - Across sessions the key is the same, so a new conversation starts on the
  *   node that already holds this role's instructions and tool schemas.
  */
-function codexPromptCacheKey(instructions: string): string {
+function codexPromptCacheKey(instructions: string, sessionId?: string): string {
   const role = createHash('sha256').update(instructions, 'utf8').digest('hex').slice(0, 12);
+  // ONE CONVERSATION, ONE KEY. Keyed by role alone, every Clem conversation
+  // shared one key, and the backend cached at most the instructions and tool
+  // block: live 2026-10-16 a ten-minute build's brain calls read 0, 6,400 or
+  // 21,504 cached tokens of 25k-85k prompts, back-to-back calls with the same
+  // growing history included, while another provider on the same machine
+  // cached 30k of 36k. The Codex client keys each conversation by its own id;
+  // a conversation's growing history only caches on the node that keeps it.
+  if (sessionId) {
+    const conversation = createHash('sha256').update(sessionId, 'utf8').digest('hex').slice(0, 16);
+    return `clem:${role}:${conversation}`;
+  }
   return `clem:${role}`;
 }
 
@@ -1313,7 +1324,10 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   // Route every call of this prompt role to the node holding its prefix, so
   // the (large, stable) tool-schema block actually hits. See codexPromptCacheKey().
   const shapeKey = codexPromptShapeKey(body.instructions ?? '', tools ?? []);
-  const cacheKey = codexPromptCacheKey(split.cacheKeySource || body.instructions || '');
+  const cacheKey = codexPromptCacheKey(
+    split.cacheKeySource || body.instructions || '',
+    harnessRunContextStorage.getStore()?.sessionId,
+  );
   body.prompt_cache_key = cacheKey;
   // THE CACHE PREFIX HAS NEVER BEEN OBSERVABLE FROM OUTSIDE.
   //
@@ -1653,8 +1667,23 @@ function serializeTools(
 // Headers + auth
 // ----------------------------------------------------------------------
 
-function buildCodexHeaders(token: string, accountId: string): Headers {
+function codexConversationKeyOf(bodyJson: string): string | undefined {
+  try {
+    const key = (JSON.parse(bodyJson) as { prompt_cache_key?: unknown }).prompt_cache_key;
+    return typeof key === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(key) ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildCodexHeaders(token: string, accountId: string, conversationKey?: string): Headers {
   const h = new Headers();
+  // The Codex client names its conversation in these headers as well as in
+  // prompt_cache_key; the backend routes a conversation's calls by them.
+  if (conversationKey) {
+    h.set('session_id', conversationKey);
+    h.set('conversation_id', conversationKey);
+  }
   h.set('Authorization', `Bearer ${token}`);
   h.set('Content-Type', 'application/json');
   h.set('Accept', 'text/event-stream');

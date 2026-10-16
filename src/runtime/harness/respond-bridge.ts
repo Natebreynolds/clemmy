@@ -363,6 +363,7 @@ function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
 // The owner's completion-review switch has one reader; surfaces combine it
 // with their own posture below (`judgeCompletion`), never restate it.
 import { completionReviewEnabled } from './completion-review-setting.js';
+import { releaseConnectionDependenciesCoveredByCli } from './dependency-request.js';
 export { completionReviewEnabled };
 
 const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judgeCompletion: boolean; honorModel?: boolean }> = {
@@ -1726,6 +1727,9 @@ export async function respondViaHarness(
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
   const prepareContinuity = async () => {
+    // A question parked on a connection that a freshly signed-in CLI now
+    // reaches no longer holds the session; this message goes to the brain.
+    if (!resumesExecutionCheckpoint) releaseConnectionDependenciesCoveredByCli(request.sessionId);
     if (hostOwnsTurn && !resumesExecutionCheckpoint) {
       await prepareCheckedHostClarificationAnswer({
         sessionId: request.sessionId,
