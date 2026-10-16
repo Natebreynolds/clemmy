@@ -256,6 +256,13 @@ function withConnectedCliBin(pathValue: string): string {
   return [dir, ...rest].join(path.delimiter);
 }
 
+/** Nonsecret executable lookup shared by interactive and scrubbed children.
+ * This projects only the host-maintained binary directory, never CLI env
+ * declarations or the daemon's credential-bearing environment. */
+export function childExecutablePath(inheritedPath: string | undefined): string {
+  return withConnectedCliBin(augmentPath(inheritedPath));
+}
+
 export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -272,7 +279,7 @@ export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<strin
       if (key.toLowerCase() === 'path' && key !== pathKey) delete env[key];
     }
   }
-  env[pathKey] = withConnectedCliBin(augmentPath(currentPath));
+  env[pathKey] = childExecutablePath(currentPath);
   // Consider per-call overrides before choosing a default, otherwise a lowercase
   // `extra.npm_config_cache` would coexist with (and potentially lose to) our
   // uppercase default.

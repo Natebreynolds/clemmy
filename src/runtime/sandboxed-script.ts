@@ -21,7 +21,7 @@ import { existsSync, realpathSync, statSync, accessSync, constants as fsConstant
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { augmentPath } from './spawn-env.js';
+import { childExecutablePath } from './spawn-env.js';
 import { stopWindowsProcessTree, type ProcessTreeStopResult } from './windows-process-tree.js';
 
 export const SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE =
@@ -103,7 +103,7 @@ export function scrubbedChildEnv(extra: Record<string, string> = {}): Record<str
   const tmp = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? os.tmpdir();
   const inheritedPath = process.env.PATH ?? process.env.Path;
   const base: Record<string, string> = {
-    PATH: augmentPath(inheritedPath),
+    PATH: childExecutablePath(inheritedPath),
     HOME: home,
     TMPDIR: tmp,
     TEMP: process.env.TEMP ?? tmp,

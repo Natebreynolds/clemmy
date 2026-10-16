@@ -31,7 +31,7 @@ const decoy = fakeCli(path.join(TMP_HOME, 'node-bin'), 'decoy');
 const verified = fakeCli(path.join(TMP_HOME, 'brew-bin'), 'verified');
 recordConnectedCli(CLI_CATALOG.find((entry) => entry.id === 'github')!);
 
-function health(authStatus: 'ok' | 'signed_out', binaryPath = verified) {
+function health(authStatus: 'ok' | 'signed_out' | 'unknown', binaryPath = verified) {
   return { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath, checkedAt: new Date().toISOString() } };
 }
 
@@ -58,6 +58,24 @@ test('a signed-out CLI loses its link and the shell falls back to PATH order', {
 test('a recorded binary that is gone gets no link', { skip: process.platform === 'win32' }, () => {
   syncConnectedCliBin(health('ok', path.join(TMP_HOME, 'missing', 'gh')));
   assert.equal(existsSync(path.join(connectedCliBinDir()!, 'gh')), false);
+});
+
+test('a transient on an unverified binary cannot replace a previously verified link', { skip: process.platform === 'win32' }, () => {
+  syncConnectedCliBin(health('ok'));
+  const candidate = health('unknown', decoy);
+  syncConnectedCliBin({ github: { ...candidate.github,
+    lastProbeError: { exitCode: null, timedOut: true, stderrHead: '' },
+  } });
+  assert.equal(existsSync(path.join(connectedCliBinDir()!, 'gh')), false,
+    'unknown candidate B is not installed as if A account had verified it');
+});
+
+test('a stale ok verdict for the same executable keeps the exact verified link', { skip: process.platform === 'win32' }, () => {
+  const known = health('ok');
+  syncConnectedCliBin({ github: { ...known.github, staleSince: known.github.checkedAt,
+    lastProbeError: { exitCode: null, timedOut: true, stderrHead: '' },
+  } });
+  assert.equal(runGh(), 'verified', 'a transient is not an instruction to sign in again or choose another binary');
 });
 
 test('a CLI that is not connected gets no link', { skip: process.platform === 'win32' }, () => {

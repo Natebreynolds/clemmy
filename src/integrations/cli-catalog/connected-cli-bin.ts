@@ -31,6 +31,9 @@ export function syncConnectedCliBin(entries: Record<string, CliHealth>): void {
   for (const health of Object.values(entries)) {
     const binary = health.binaryPath;
     if (!connected[health.id] || !health.installed || health.authStatus === 'signed_out') continue;
+    // A transient on an unverified/different executable is inventory, not a
+    // healthy binding. Same-executable stale ok retains its existing link.
+    if (health.lastProbeError && health.authStatus !== 'ok') continue;
     if (!binary || !path.isAbsolute(binary) || binary.startsWith(dir + path.sep)) continue;
     if (!COMMAND_NAME.test(health.command) || !executable(binary)) continue;
     wanted.set(health.command, binary);

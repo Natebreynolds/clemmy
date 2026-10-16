@@ -266,9 +266,11 @@ async function delegatedHealth(item: RosterItem): Promise<CliHealth | null> {
   const checkedAt = new Date().toISOString();
   try {
     if (item.id === 'github') {
-      const { findGitHubCli, getGitHubCliStatus } = await import('../github-cli.js');
+      const { getGitHubCliStatus } = await import('../github-cli.js');
       const status = await getGitHubCliStatus();
-      const binaryPath = status.installed ? findGitHubCli() : null;
+      // Keep the executable returned with the probe, not a second PATH lookup
+      // after its asynchronous work. That lookup could select another binary.
+      const binaryPath = status.installed ? status.path : null;
       return {
         id: item.id,
         command: item.command,
@@ -361,23 +363,44 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
 /**
  * A probe that produced no verdict must not overwrite one that did. Only the
  * signed-out pattern flips a login to signed_out; a timeout or an unexplained
- * non-zero exit keeps the previous 'ok' (or 'signed_out') standing and marks it
- * stale, and a first-ever probe with nothing to keep stays 'unknown' — never
- * 'error', which every surface renders as an auth failure the user must fix.
+ * non-zero exit keeps the previous verdict only for that same known executable
+ * and marks it stale. A different/unknown executable has no verdict to keep and
+ * stays 'unknown', never an invented auth failure requiring a fresh login.
  */
+/** Path identity of the executable the host actually selected. This is not a
+ * content signature or an account/operation grant. Missing/relative paths
+ * cannot establish sameness; Windows spelling alone does not change a path. */
+export function cliHealthExecutableIdentity(binaryPath: string | undefined, platform: NodeJS.Platform = process.platform): string | null {
+  if (!binaryPath || binaryPath !== binaryPath.trim() || /[\u0000-\u001f\u007f]/.test(binaryPath)) return null;
+  if (platform === 'win32') {
+    const normalized = path.win32.normalize(binaryPath);
+    // isAbsolute also accepts \rooted paths, whose drive is still ambient.
+    // Only an explicit drive or complete UNC share establishes an identity.
+    const fullyQualified = /^[A-Za-z]:\\/.test(normalized)
+      || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(normalized);
+    return fullyQualified ? normalized.toLowerCase() : null;
+  }
+  return path.posix.isAbsolute(binaryPath) ? binaryPath : null;
+}
+
 function settleTransientProbe(next: CliHealth, previous: CliHealth | undefined): CliHealth {
   if (!next.lastProbeError) return next;
-  const kept = previous?.authStatus === 'ok' || previous?.authStatus === 'signed_out'
+  const nextBinary = cliHealthExecutableIdentity(next.binaryPath);
+  const previousBinary = cliHealthExecutableIdentity(previous?.binaryPath);
+  const sameExecutable = next.installed && nextBinary !== null && nextBinary === previousBinary;
+  const kept = sameExecutable && (previous?.authStatus === 'ok' || previous?.authStatus === 'signed_out')
     ? previous.authStatus
     : 'unknown';
-  const staleSince = previous ? (previous.staleSince ?? previous.checkedAt) : undefined;
+  const staleSince = kept !== 'unknown' && previous ? (previous.staleSince ?? previous.checkedAt) : undefined;
   const settled: CliHealth = {
     id: next.id,
     command: next.command,
     installed: next.installed,
     authStatus: kept,
     ...(kept === 'ok' && previous?.username ? { username: previous.username } : {}),
-    ...((next.binaryPath ?? previous?.binaryPath) ? { binaryPath: next.binaryPath ?? previous?.binaryPath } : {}),
+    // A failed probe may expose its own candidate path, but never a previous
+    // executable's account under a different or missing path.
+    ...(next.binaryPath ? { binaryPath: next.binaryPath } : {}),
     checkedAt: next.checkedAt,
     ...(staleSince ? { staleSince } : {}),
     lastProbeError: next.lastProbeError,

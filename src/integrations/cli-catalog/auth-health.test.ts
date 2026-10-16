@@ -362,6 +362,106 @@ test('classifyProbeOutput is unchanged: the pure classifier still says error for
   assert.equal(classifyProbeOutput(railway, { exitCode: 1, output: 'connect ETIMEDOUT', timedOut: false }).authStatus, 'error');
 });
 
+test('a transient probe of binary B cannot inherit binary A account or healthy verdict', async () => {
+  const { getCliHealth, readPersistedHealth } = await import('./auth-health.js');
+  const binaryA = path.join(TMP_HOME, 'binary-a', 'railway');
+  const binaryB = path.join(TMP_HOME, 'binary-b', 'railway');
+  let selected = binaryA;
+  _testOnly_setCommandResolver(command => ({ skipped: false, command, path: selected }));
+  _testOnly_setProbeExec(async binary => {
+    assert.equal(binary, selected, 'the verdict is about the exact resolved executable');
+    return { exitCode: 0, output: 'Logged in as account-a@example.test', timedOut: false };
+  });
+  const good = await getCliHealth('railway', { force: true });
+  assert.equal(good.authStatus, 'ok');
+  selected = binaryB;
+  _testOnly_setProbeExec(async binary => {
+    assert.equal(binary, binaryB);
+    return { exitCode: null, output: '', timedOut: true };
+  });
+  const failedB = await getCliHealth('railway', { force: true });
+  assert.equal(failedB.authStatus, 'unknown');
+  assert.equal(failedB.binaryPath, binaryB, 'inventory may retain the candidate, without A account');
+  assert.equal(failedB.username, undefined);
+  assert.equal(failedB.connectionOrigin, undefined);
+  assert.equal(failedB.staleSince, undefined, 'no B verdict was retained');
+  assert.equal(readPersistedHealth().railway?.username, undefined);
+  assert.equal((await getCliHealth('railway')).authStatus, 'unknown', 'memo cannot resurrect the previous account');
+  const failedAgain = await getCliHealth('railway', { force: true });
+  assert.equal(failedAgain.authStatus, 'unknown');
+  assert.equal(failedAgain.staleSince, undefined, 'repeated unknown probes are not stale successful checks');
+  _testOnly_setProbeExec(async () => ({ exitCode: 0, output: 'Logged in as account-b@example.test', timedOut: false }));
+  const recovered = await getCliHealth('railway', { force: true });
+  assert.equal(recovered.authStatus, 'ok');
+  assert.equal(recovered.username, 'account-b@example.test');
+  assert.equal(recovered.binaryPath, binaryB);
+  assert.equal(recovered.lastProbeError, undefined);
+});
+
+test('missing or relative executable identities cannot retain account evidence on a failed refresh', async () => {
+  const { getCliHealth } = await import('./auth-health.js');
+  stubInstalled();
+  _testOnly_setProbeExec(async () => ({ exitCode: 0, output: 'Logged in as retained@example.test', timedOut: false }));
+  await getCliHealth('railway', { force: true });
+  _testOnly_setCommandResolver(() => null);
+  const missing = await getCliHealth('railway', { force: true });
+  assert.equal(missing.installed, false);
+  assert.equal(missing.authStatus, 'unknown');
+  assert.equal(missing.binaryPath, undefined);
+  assert.equal(missing.username, undefined);
+  _testOnly_setCommandResolver(command => ({ skipped: false, command, path: 'relative-cli' }));
+  const relativeSuccess = await getCliHealth('railway', { force: true });
+  assert.equal(relativeSuccess.username, 'retained@example.test');
+  _testOnly_setProbeExec(async () => ({ exitCode: 1, output: 'transient', timedOut: false }));
+  const relativeFailed = await getCliHealth('railway', { force: true });
+  assert.equal(relativeFailed.authStatus, 'unknown', 'two matching relative names do not establish executable identity');
+  assert.equal(relativeFailed.username, undefined);
+  assert.equal(relativeFailed.staleSince, undefined);
+});
+
+test('a different executable cannot inherit a signed-out verdict and demand another login', async () => {
+  const { getCliHealth } = await import('./auth-health.js');
+  let selected = path.join(TMP_HOME, 'signed-out-a', 'railway');
+  _testOnly_setCommandResolver(command => ({ skipped: false, command, path: selected }));
+  _testOnly_setProbeExec(async () => ({ exitCode: 1, output: 'Unauthorized. Please login with `railway login`', timedOut: false }));
+  assert.equal((await getCliHealth('railway', { force: true })).authStatus, 'signed_out');
+  selected = path.join(TMP_HOME, 'unknown-b', 'railway');
+  _testOnly_setProbeExec(async () => ({ exitCode: null, output: '', timedOut: true }));
+  const unknown = await getCliHealth('railway', { force: true });
+  assert.equal(unknown.authStatus, 'unknown');
+  assert.equal(unknown.username, undefined);
+  assert.equal(unknown.staleSince, undefined);
+});
+
+test('same executable may retain its stale account but never stale connection origin', async () => {
+  const { getCliHealth } = await import('./auth-health.js');
+  stubInstalled();
+  const output = JSON.stringify({ result: { username: 'same@example.test', instanceUrl: 'https://tenant.example.test' } });
+  _testOnly_setProbeExec(async () => ({ exitCode: 0, output, timedOut: false }));
+  const good = await getCliHealth('salesforce', { force: true });
+  assert.equal(good.connectionOrigin, 'https://tenant.example.test');
+  _testOnly_setProbeExec(async () => ({ exitCode: null, output: '', timedOut: true }));
+  const stale = await getCliHealth('salesforce', { force: true });
+  assert.equal(stale.authStatus, 'ok');
+  assert.equal(stale.username, 'same@example.test');
+  assert.equal(stale.binaryPath, good.binaryPath);
+  assert.equal(stale.staleSince, good.checkedAt);
+  assert.equal(stale.connectionOrigin, undefined, 'current connection metadata requires a completed successful check');
+});
+
+test('executable path identity handles Windows spelling without equating missing paths or relative names', async () => {
+  const { cliHealthExecutableIdentity: identity } = await import('./auth-health.js');
+  assert.equal(identity('C:\\Tools\\CLI.exe', 'win32'), identity('c:/tools/cli.exe', 'win32'));
+  assert.equal(identity('\\\\SERVER\\Share\\CLI.cmd', 'win32'), identity('\\\\server\\share\\cli.cmd', 'win32'));
+  assert.notEqual(identity('C:\\One\\cli.exe', 'win32'), identity('C:\\Two\\cli.exe', 'win32'));
+  for (const missing of [undefined, '', 'cli', 'C:cli.exe', '\\Tools\\cli.exe', '/Tools/cli.exe', '\\\\server']) {
+    assert.equal(identity(missing, 'win32'), null, `${missing ?? 'missing'} has no fully qualified executable identity`);
+  }
+  assert.equal(identity(undefined, 'darwin'), null);
+  assert.equal(identity('cli', 'darwin'), null);
+  assert.notEqual(identity('/Applications/CLI', 'darwin'), identity('/applications/cli', 'darwin'), 'POSIX paths must not assume a case-insensitive filesystem');
+});
+
 for (const failure of ['No default environment found', 'security: SecKeychainItemCreateFromContent: passphrase is not correct']) {
   test(`a verified recovery from ${failure} wakes parked work exactly once`, async () => {
     const health = await import('./auth-health.js');
