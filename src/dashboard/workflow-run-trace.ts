@@ -415,6 +415,13 @@ export function buildWorkflowRunTrace(input: {
       if (event.kind === 'step_completed' && event.output !== undefined) {
         const artifact = str(record(event.meta)?.stepOutputArtifact);
         output = { ...bounded(event.output, OUTPUT_MAX)!, artifact };
+        // The runner records a step its settlement guard blocked as a
+        // completion whose output says so; it did not complete.
+        const blocked = record(event.output);
+        if (blocked?.blocked === true) {
+          status = 'blocked';
+          error = str(blocked.reason) ?? error;
+        }
       }
     }
     if (!output && stepOutputs[stepId] !== undefined) output = { ...bounded(stepOutputs[stepId], OUTPUT_MAX)!, artifact: null };
