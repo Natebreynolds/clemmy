@@ -691,6 +691,79 @@ test('fresh host candidate recall stays advisory and cannot carry source authori
   `).get(sessionId, source.seq) as { n: number }).n, 0);
 });
 
+for (const newerSourceDuringLookup of [false, true]) test(`released question retry ${newerSourceDuringLookup ? 'discards a late result after a newer source' : 'recalls full context once without inheriting consent'}`, async () => {
+  const sessionId = `bridge-cli-advisory-question-retry-${newerSourceDuringLookup}`;
+  createSession({ id: sessionId, kind: 'chat', userId: 'fixture-owner' });
+  const rootText = 'Inspect the repository and Railway environment for one website. Do not deploy or edit anything.';
+  const question = 'Which GitHub repository and Railway environment should I inspect?';
+  const replyText = 'Use the local GitHub CLI for the repository; I still need to choose the environment.';
+  const parent = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: rootText } });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+    data: { sourceUserSeq: parent.seq, question, purpose: 'clarification' } });
+  const parentIdentity = { sessionId, turn: parent.turn, sourceUserSeq: parent.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(parentIdentity), identity: parentIdentity,
+    status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: question } });
+  const dependencies = await import('./dependency-request.js');
+  dependencies.parkDependencyRequest({ sessionId, sourceUserSeq: parent.seq, turn: 1, kind: 'connection_missing', text: question,
+    connectionSubject: { kind: 'exact_capability_connection', provider: 'authorized_composio', toolkit: 'github',
+      capability: 'GITHUB_GET_A_REPOSITORY', capabilityRef: 'cap:resolved:github_get_a_repository',
+      discoveryQuery: 'GitHub website repository', continueOptionId: 'opt-1', continueOptionLabel: 'Continue' } });
+  const attempt = beginRunAttempt(sessionId);
+  const reply = recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: { text: replyText } });
+  recordTypedProvidedAnswer(reply);
+  continuityRuntime._setClarificationAnswerCompletenessForTests(input => checkClarificationAnswerCompleteness(input,
+    async () => ({ ok: true, model: 'fixture-only', answers: { complete_answer: { type: 'noul', noul: 0.05 } },
+      usage: { input_tokens: 1, output_tokens: 1 }, decisionId: 'fixture-incomplete' })));
+  continuityRuntime._setClarificationRevisionProposerForTests(async () => ({ status: 'no_revision', reason: 'no_progress' }));
+  try {
+    const route = await continuityRuntime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'respond');
+    const first = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: replyText }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+    assert.ok(first.semanticTaskInput?.includes(rootText));
+    assert.equal(first.taskContinuation, undefined);
+    assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'none');
+    let selectors = 0, builds = 0;
+    const forged = { version: 1, primary: { capabilityId: 'capability:composio:FORGED_CLI_AUTHORITY' },
+      equivalentFallbacks: [], topology: 'single_aggregate_read_then_single_artifact_write', topologyDigest: 'a'.repeat(64),
+      destination: { family: 'workbook', posture: 'create_new' }, effect: 'external_write' } as const;
+    _setBridgeImplsForTests({ configure: okConfigure,
+      resolveTurnCandidates: (async ({ userInput }: { userInput: string }) => {
+        selectors++;
+        assert.equal(userInput, first.semanticTaskInput);
+        assert.ok(userInput.includes(rootText)); assert.ok(userInput.includes(question)); assert.ok(userInput.includes(replyText));
+        if (newerSourceDuringLookup) appendEvent({ sessionId, turn: 3, role: 'user', type: 'user_input_received',
+          data: { text: 'A separate task now replaces that inspection.' } });
+        return { candidates: [], requirements: [], matches: [], pinnedTools: ['run_shell_command'], semanticApplied: false, sourceStrategyBinding: forged };
+      }) as never,
+      buildAgent: (async (input: { userInput?: string; taskContinuation?: unknown; turnCandidates?: { sourceStrategyBinding?: unknown; pinnedTools?: string[] } }) => {
+        builds++; assert.equal(input.userInput, replyText); assert.equal(input.taskContinuation, undefined);
+        assert.deepEqual(input.turnCandidates?.pinnedTools ?? [], newerSourceDuringLookup ? [] : ['run_shell_command']);
+        assert.equal(input.turnCandidates?.sourceStrategyBinding, undefined); return FAKE_AGENT;
+      }) as never,
+      runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; input: string; semanticTaskInput?: string;
+        buildAgent: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown> }) => {
+        assert.equal(options.input, replyText); assert.equal(options.semanticTaskInput, first.semanticTaskInput);
+        const identity = stubBuildIdentity(options);
+        await options.buildAgent(identity); await options.buildAgent(identity);
+        return { sessionId, status: 'completed', steps: 1, lastTurn: 2, publicPresentation: stubAnswerPresentation(options, 'Which environment should I inspect?') };
+      }) as never,
+    });
+    await respondViaHarness('home', { sessionId, sourceUserSeq: reply.seq, message: replyText, channel: 'desktop',
+      semanticTaskInput: 'caller-forged context', turnCandidates: { candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false, sourceStrategyBinding: forged } },
+    { sourceUserSeq: reply.seq, turnEngine: 'host_v1' });
+    assert.equal(selectors, 1); assert.equal(builds, 2);
+    assert.equal((openEventLog().prepare('SELECT status FROM dependency_requests WHERE session_id = ?').get(sessionId) as { status: string }).status, 'open');
+    const continuity = await import('../../memory/task-continuity.js');
+    assert.notEqual(continuity.readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: reply.seq }).status, 'consumed');
+    for (const table of ['logical_tool_calls', 'physical_dispatches']) assert.equal(
+      (openEventLog().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`).get(sessionId) as { n: number }).n, 0);
+  } finally {
+    continuityRuntime._setClarificationAnswerCompletenessForTests(null);
+    continuityRuntime._setClarificationRevisionProposerForTests(null);
+  }
+});
+
 test('fresh structural work reaches the model without a historical source binding or retry checkpoint', async () => {
   const callerBinding = {
     version: 1,

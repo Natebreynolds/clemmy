@@ -2674,7 +2674,7 @@ test('a partial answer whose checked revision is unavailable goes to the brain w
       assert.deepEqual(await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }), route, 'replay reads the record');
       assert.equal(revisions, 1, 'one proposal per accepted source');
       const again = await runtime.enrichAcceptedRequestWithTaskContinuity(request, reply.seq, options);
-      assert.equal(again.semanticTaskInput, undefined, 'the released question is not steered twice');
+      assert.equal(again.semanticTaskInput, steer, 'the exact source can rehydrate its advisory context after release');
       assert.equal(again.taskContinuation, undefined);
       assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
       assert.equal(eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] })
@@ -2812,5 +2812,118 @@ test('a go-ahead the quick model is unsure of still goes to the brain with the g
   } finally {
     runtime._setOpenQuestionReplyClassifierForTests(null);
     runtime._setClarificationRevisionProposerForTests(null);
+  }
+});
+
+async function releasedAdvisoryFixture(suffix: string, reading = 'amend_goal', partialAnswer = true) {
+  const sessionId = `continuity-advisory-${suffix}`;
+  const rootText = 'Plan the repository lookup.\n  Keep the requested account and do not publish anything.';
+  const origin = accepted(sessionId, rootText, 'chat', { taskMode: { version: 1, kind: 'plan' } });
+  const question = 'Connect the requested provider, or explain an alternative?';
+  const options = ['Reconnect the same provider', 'Explain the available route'];
+  commitClarification({ sessionId, sourceSeq: origin.seq, question, options });
+  const before = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(before.status, 'available');
+  if (before.status !== 'available') throw new Error('fixture packet missing');
+  const reply = accepted(sessionId, 'Can the configured CLI help with this same lookup?', 'chat',
+    { taskMode: { version: 1, kind: 'normal' } });
+  const record = eventlog.appendEvent({ sessionId, turn: reply.turn, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'open_question_reply_classified', sourceUserSeq: reply.seq, parentPacketId: before.packet.packetId,
+      parentSlot: before.packet.pause.slot ?? null, route: 'respond', reading,
+      ...(partialAnswer ? { partialAnswer: true } : {}) } });
+  const request = { sessionId, message: String(reply.data.text), sourceUserSeq: reply.seq };
+  const enrichOptions = { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true as const } };
+  const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity(request, reply.seq, enrichOptions);
+  const proof = eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .find(row => row.data.kind === continuity.TASK_CONTINUITY_ADVISORY_RELEASE_KIND);
+  assert.ok(proof, 'host release stores a durable proof');
+  return { sessionId, rootText, origin, question, options, packet: before.packet, reply, record, request,
+    enrichOptions, enriched, proof: proof! };
+}
+
+test('released advisory replies retain exact A/Q/B and task modes across enrichment replay and database reopen without consent', async () => {
+  for (const [lane, reading, partialAnswer] of [
+    ['question', 'side_conversation', false], ['partial', 'checked_residual_answer', true],
+    ['go', 'affirms', true], ['amend', 'amend_goal', true],
+  ] as const) {
+    const fixture = await releasedAdvisoryFixture(`replay-${lane}`, reading, partialAnswer);
+    const { sessionId, reply, request, enrichOptions, enriched } = fixture;
+    const text = enriched.semanticTaskInput;
+    assert.ok(text?.includes(`[root-task]\n${fixture.rootText}`));
+    assert.ok(text?.includes(`[current-question]\n${fixture.question}`));
+    assert.ok(text?.includes(`[visible-options]\n${JSON.stringify(fixture.options)}`));
+    assert.ok(text?.includes(`[user-reply]\n${reply.data.text}`));
+    assert.ok(text?.includes('[root-task-mode]\n{"version":1,"kind":"plan"}'));
+    assert.equal(enriched.message, reply.data.text);
+    assert.equal(enriched.taskContinuation, undefined);
+    assert.equal(enriched.turnCandidates?.sourceStrategyBinding, undefined);
+    assert.equal(continuity.readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: reply.seq }).status, 'none');
+    assert.equal(runtime.readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: reply.seq }), text);
+    eventlog.closeEventLog();
+    assert.equal(runtime.readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: reply.seq }), text);
+    const replay = await runtime.enrichAcceptedRequestWithTaskContinuity(request, reply.seq, enrichOptions);
+    assert.equal(replay.semanticTaskInput, text);
+    assert.equal(replay.taskContinuation, undefined);
+    assert.equal(eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === continuity.TASK_CONTINUITY_ADVISORY_RELEASE_KIND).length, 1);
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  }
+});
+
+test('advisory context refuses changed source, task mode, public question, options, packet or proof bytes', async () => {
+  const mutations: Array<[string, (fixture: Awaited<ReturnType<typeof releasedAdvisoryFixture>>) => void]> = [
+    ['reply', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.reply.data, text: 'A different accepted reply.' }), fixture.reply.id)],
+    ['root-mode', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.origin.data, taskMode: { version: 1, kind: 'normal' } }), fixture.origin.id)],
+    ['reply-mode', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.reply.data, taskMode: { version: 1, kind: 'plan' } }), fixture.reply.id)],
+    ['packet', fixture => eventlog.openEventLog().prepare('UPDATE task_continuity_packets SET pause_question = ? WHERE packet_id = ?')
+      .run('Changed question.', fixture.packet.packetId)],
+    ['public-options', fixture => {
+      const awaiting = eventlog.listEvents(fixture.sessionId, { types: ['awaiting_user_input'] })[0]!;
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+        .run(JSON.stringify({ ...awaiting.data, options: ['Different route'] }), awaiting.id);
+    }],
+    ['record', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.record.data, reading: 'affirms' }), fixture.record.id)],
+    ['proof-role', fixture => eventlog.openEventLog().prepare('UPDATE events SET role = ? WHERE id = ?')
+      .run('Clem', fixture.proof.id)],
+    ['proof-input-with-new-hash', fixture => {
+      const advisoryInput = 'Forged input that omits the original task.';
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify({
+        ...fixture.proof.data, advisoryInput, inputDigest: createHash('sha256').update(advisoryInput).digest('hex'),
+      }), fixture.proof.id);
+    }],
+    ['dismiss-reason', fixture => eventlog.openEventLog().prepare('UPDATE task_continuity_packets SET dismissed_reason = ? WHERE packet_id = ?')
+      .run('topic_changed', fixture.packet.packetId)],
+  ];
+  for (const [label, mutate] of mutations) {
+    const fixture = await releasedAdvisoryFixture(`mutation-${label}`);
+    mutate(fixture);
+    assert.equal(runtime.readVerifiedAdvisoryContinuationInput({ sessionId: fixture.sessionId, sourceUserSeq: fixture.reply.seq }), null, label);
+  }
+});
+
+test('advisory context cannot revive a stopped, completed, superseded, later-source or fresh-topic task', async () => {
+  for (const mode of ['stop', 'completed', 'new-source', 'fresh-topic', 'new-question', 'wrong-source'] as const) {
+    const fixture = await releasedAdvisoryFixture(`retired-${mode}`);
+    const identity = { sessionId: fixture.sessionId, sourceUserSeq: fixture.reply.seq };
+    if (mode === 'stop') eventlog.requestKill(fixture.sessionId, 'fixture stop', { sourceUserSeq: fixture.reply.seq });
+    if (mode === 'completed') {
+      const outcome = { version: 2, id: turnOutcomeId({ ...identity, turn: fixture.reply.turn }),
+        identity: { ...identity, turn: fixture.reply.turn }, status: 'done', resumable: false,
+        presentation: { kind: 'answer', text: 'The inspection is complete.' } } as const;
+      eventlog.appendEvent({ sessionId: fixture.sessionId, turn: fixture.reply.turn, role: 'system',
+        type: 'conversation_completed', data: completionDataForTurnOutcome(outcome) });
+    }
+    if (mode === 'new-source') accepted(fixture.sessionId, 'A new request.');
+    if (mode === 'fresh-topic') seedSemanticReading(fixture.sessionId, fixture.reply.seq, 'admitted',
+      { version: 1, relation: 'new_goal', targetGoal: null, goal: { summary: 'A different task' }, work: null,
+        slotAnswers: [], rationale: 'fixture topic replacement' });
+    if (mode === 'new-question') commitClarification({ sessionId: fixture.sessionId, sourceSeq: fixture.reply.seq,
+      question: 'Which account is intended?' });
+    if (mode === 'wrong-source') identity.sourceUserSeq = fixture.origin.seq;
+    assert.equal(runtime.readVerifiedAdvisoryContinuationInput(identity), null, mode);
   }
 });

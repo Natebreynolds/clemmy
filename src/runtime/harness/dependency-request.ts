@@ -6,7 +6,6 @@
  * compiler failure, and author timeout are not connection_missing.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { connectedCliCoveringApp } from '../../integrations/cli-catalog/connected-cli-coverage.js';
 import {
   appendEvent,
   getEvent,
@@ -17,11 +16,7 @@ import {
   listEvents,
   openEventLog,
 } from './eventlog.js';
-import {
-  dismissTaskContinuityPacket,
-  peekTaskContinuityPacket,
-  readConsumedTaskContinuityPacket,
-} from '../../memory/task-continuity.js';
+import { readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import { listCachedToolkits } from '../../integrations/composio/client.js';
 import { renderTypedControlState } from './typed-control-state.js';
 import { completionEvidenceSource } from './recovery-activation.js';
@@ -644,8 +639,9 @@ function observedConnectionPresentationForSource(input: {
         || !capability.startsWith(`${toolkit.toUpperCase()}_`)
         || capabilityRef !== `cap:resolved:${capability.toLowerCase()}`
       ) continue;
-      // A connected CLI reaches this app now, so the app is not missing.
-      if (connectedCliCoveringApp(toolkit)) continue;
+      // CLI authentication is a separate candidate, not evidence that this
+      // exact provider operation/account is connected. Keep the host-observed
+      // missing subject available while the brain investigates alternatives.
       // Another provider's result can answer a generic search, so it
       // disproves the gap; a search that names the app asked for that app,
       // and only the app's own result disproves it.
@@ -705,38 +701,6 @@ export function parkObservedConnectionDependencyForSource(input: {
     // dependency. Model prose is intentionally ignored here.
     text: presentation.question,
   });
-}
-
-/**
- * A parked connection gap is over once a connected CLI reaches that app: the
- * work can run now. Satisfy the dependency and dismiss the open question that
- * parked it, so the next message reaches the brain as a request instead of
- * being read as an answer to a question whose premise no longer holds.
- */
-export function releaseConnectionDependenciesCoveredByCli(sessionId: string): boolean {
-  const current = peekTaskContinuityPacket({ sessionId });
-  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return false;
-  const rootSourceUserSeq = current.packet.rootSourceUserSeq ?? current.packet.originatingSourceUserSeq;
-  ensureTable();
-  const db = openEventLog();
-  const open = db.prepare(`
-    SELECT request_id, subject_toolkit
-      FROM dependency_requests
-     WHERE session_id = ? AND source_user_seq = ?
-       AND kind = 'connection_missing' AND status = 'open'
-  `).all(sessionId, rootSourceUserSeq) as Array<{ request_id: string; subject_toolkit: string | null }>;
-  if (open.length === 0) return false;
-  if (!open.every((row) => row.subject_toolkit && connectedCliCoveringApp(row.subject_toolkit))) return false;
-  const now = new Date().toISOString();
-  const satisfy = db.prepare(`
-    UPDATE dependency_requests SET status = 'satisfied', satisfied_at = ?
-     WHERE request_id = ? AND session_id = ? AND status = 'open'
-  `);
-  db.transaction(() => {
-    for (const row of open) satisfy.run(now, row.request_id, sessionId);
-  }).immediate();
-  dismissTaskContinuityPacket({ sessionId, reason: 'no_longer_needed' });
-  return true;
 }
 
 export function satisfyOpenDependency(input: {

@@ -28,6 +28,8 @@ export const DEFAULT_TASK_CONTINUITY_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 export const MAX_TASK_CONTINUITY_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 export const MAX_CLARIFICATION_SOURCE_CHAIN_PACKETS = 16;
 export const MAX_CLARIFICATION_SOURCE_CHAIN_CHARS = 32_000;
+/** A released reply may retain discovery context, never consumed authority. */
+export const TASK_CONTINUITY_ADVISORY_RELEASE_KIND = 'task_continuation_advisory_released';
 
 export type TaskContinuityPauseKind = 'clarification' | 'approval' | 'recovery';
 export type TaskContinuityEffectClass = 'read' | 'write' | 'unknown';
@@ -247,12 +249,17 @@ export interface ReadTaskContinuityClarificationSourcesInput {
    * Mutually exclusive with consumingSourceUserSeq. A later human source makes
    * this edge stale rather than authority to replay an earlier answer. */
   nextReplySourceUserSeq?: number;
+  /** Exact host-released reply only. The proof must be atomically paired with
+   * no_longer_needed dismissal; this never opens arbitrary retired history. */
+  advisoryReply?: { sourceUserSeq: number; releaseEventId: string };
 }
 
 export type TaskContinuityClarificationSourcesResult =
   | {
       readonly status: 'verified';
       readonly packetId: string;
+      /** Digest of every packet and literal/public source in this snapshot. */
+      readonly sourceDigest: string;
       readonly root: TaskContinuityClarificationSource;
       /** In human-source order, including the current packet's originating
        * reply. The final answer that has not created a packet is not included. */
@@ -1302,6 +1309,8 @@ function clarificationSourcesResult(
     { status: 'refused' }>['reason']): TaskContinuityClarificationSourcesResult => ({ status: 'refused', reason });
   let proofTime = nowMs;
   let consumedLiteral: TaskContinuityClarificationSource | undefined;
+  let advisoryProof: RawSourceRow | null = null;
+  let advisoryData: Record<string, unknown> | null = null;
   if (input.consumingSourceUserSeq !== undefined) {
     const consumed = consumedLookupResult(db, input.sessionId, input.consumingSourceUserSeq);
     if (consumed.status !== 'consumed' || consumed.packet.packetId !== input.packetId) return refuse('consumed_leaf_mismatch');
@@ -1319,6 +1328,37 @@ function clarificationSourcesResult(
     if (!consumer || !data || typeof data.text !== 'string' || !data.text.trim()) return refuse('consumed_leaf_mismatch');
     consumedLiteral = Object.freeze({ sourceUserSeq: consumer.seq, sourceEventId: consumer.eventId,
       text: data.text, dataHash: consumer.dataHash });
+  } else if (input.advisoryReply) {
+    advisoryProof = rawEventById(db, input.sessionId, input.advisoryReply.releaseEventId);
+    advisoryData = parsedEventData(advisoryProof);
+    const keys = ['kind', 'version', 'sourceUserSeq', 'sourceEventId', 'parentPacketId',
+      'sourceDigest', 'advisoryInput', 'inputDigest', 'replyEventId', 'replyEventDigest'];
+    const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    if (!advisoryProof || advisoryProof.role !== 'system' || advisoryProof.type !== 'guardrail_tripped'
+      || advisoryProof.seq <= input.advisoryReply.sourceUserSeq || !advisoryData
+      || Object.keys(advisoryData).sort().join('\0') !== keys.sort().join('\0')
+      || advisoryData.kind !== TASK_CONTINUITY_ADVISORY_RELEASE_KIND || advisoryData.version !== 1
+      || advisoryData.sourceUserSeq !== input.advisoryReply.sourceUserSeq
+      || advisoryData.parentPacketId !== input.packetId || typeof advisoryData.sourceEventId !== 'string'
+      || !digest(advisoryData.sourceDigest) || !digest(advisoryData.inputDigest)
+      || !digest(advisoryData.replyEventDigest) || typeof advisoryData.replyEventId !== 'string'
+      || typeof advisoryData.advisoryInput !== 'string' || !advisoryData.advisoryInput
+      || advisoryData.advisoryInput.length > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS + 8_192
+      || createHash('sha256').update(advisoryData.advisoryInput).digest('hex') !== advisoryData.inputDigest) {
+      return refuse('retired_hop');
+    }
+    const reading = rawEventById(db, input.sessionId, advisoryData.replyEventId);
+    const readingData = parsedEventData(reading);
+    if (!reading || reading.role !== 'system' || reading.type !== 'guardrail_tripped'
+      || reading.seq <= input.advisoryReply.sourceUserSeq || reading.seq >= advisoryProof.seq
+      || readingData?.kind !== 'open_question_reply_classified' || readingData.route !== 'respond'
+      || readingData.sourceUserSeq !== input.advisoryReply.sourceUserSeq
+      || readingData.parentPacketId !== input.packetId
+      || createHash('sha256').update(JSON.stringify(readingData)).digest('hex') !== advisoryData.replyEventDigest) {
+      return refuse('retired_hop');
+    }
+    proofTime = canonicalIso(advisoryProof.created_at, 'advisory proof time').ms;
+    if (proofTime > nowMs || openPacketRows(db, input.sessionId).length !== 0) return refuse('retired_hop');
   } else {
     const open = openPacketRows(db, input.sessionId);
     if (open.length !== 1 || open[0]!.packet_id !== input.packetId) {
@@ -1342,10 +1382,16 @@ function clarificationSourcesResult(
     if (!row) return refuse('unknown_packet');
     if (row.pause_kind !== 'clarification') return refuse('nonclarification_hop');
     const exactConsumedLeaf = rows.length === 0 && input.consumingSourceUserSeq !== undefined;
+    const exactAdvisoryLeaf = rows.length === 0 && advisoryProof !== null;
     if ((!exactConsumedLeaf && row.consumed_at !== null)
-      || row.expired_at !== null || row.dismissed_at !== null) return refuse('retired_hop');
+      || row.expired_at !== null
+      || (exactAdvisoryLeaf
+        ? row.dismissed_at !== advisoryProof!.created_at || row.dismissed_reason !== 'no_longer_needed'
+        : row.dismissed_at !== null)) return refuse('retired_hop');
     const packet = rowToPacket(db, row);
     if (!packet) return refuse('malformed_chain');
+    if (exactAdvisoryLeaf && (proofTime < Date.parse(packet.createdAt)
+      || proofTime >= Date.parse(packet.expiresAt))) return refuse('expired_hop');
     if ((row.pause_slot_json !== null && !packet.pause.slot)
       || (packet.pause.slot && packet.pause.slot.revision < 0)) return refuse('malformed_chain');
     if (Date.parse(packet.expiresAt) <= proofTime) return refuse('expired_hop');
@@ -1408,15 +1454,18 @@ function clarificationSourcesResult(
     replies.push(reply);
   }
   let nextReply: TaskContinuityClarificationReplySource | undefined;
-  if (input.nextReplySourceUserSeq !== undefined) {
+  const nextReplySourceUserSeq = input.nextReplySourceUserSeq ?? input.advisoryReply?.sourceUserSeq;
+  if (nextReplySourceUserSeq !== undefined) {
     const leaf = packets[0]!;
-    const candidate = acceptedSource(db, input.sessionId, input.nextReplySourceUserSeq);
+    const candidate = acceptedSource(db, input.sessionId, nextReplySourceUserSeq);
     const adjacent = nextAcceptedSource(db, input.sessionId, leaf.originatingSourceUserSeq);
     const leafOrigin = acceptedSource(db, input.sessionId, leaf.originatingSourceUserSeq);
     const rootOrigin = acceptedSource(db, input.sessionId, root.sourceUserSeq);
     if (!candidate || adjacent?.seq !== candidate.seq || adjacent.eventId !== candidate.eventId
       || !leafOrigin || !rootOrigin || !sameAcceptedAudience(leafOrigin, candidate)
       || !sameAcceptedAudience(rootOrigin, candidate)) return refuse('next_reply_mismatch');
+    if (advisoryData && (candidate.eventId !== advisoryData.sourceEventId
+      || proofTime < Date.parse(candidate.createdAt))) return refuse('next_reply_mismatch');
     // An exact earlier source is not the current incoming edge once another
     // non-synthetic human source exists. Malformed later rows also fail closed.
     const later = db.prepare(`SELECT 1 FROM events
@@ -1444,9 +1493,12 @@ function clarificationSourcesResult(
       + consumedReply.previousDeliveredOptions.reduce((total, option) => total + option.length, 0);
     if (chars > MAX_CLARIFICATION_SOURCE_CHAIN_CHARS) return refuse('source_chain_limit');
   }
-  return Object.freeze({ status: 'verified', packetId: input.packetId, root,
+  const evidence = { packetId: input.packetId, root,
     replies: Object.freeze(replies), packetIds: Object.freeze(packets.map(packet => packet.packetId).reverse()),
-    ...(nextReply ? { nextReply } : {}), ...(consumedReply ? { consumedReply } : {}) });
+    ...(nextReply ? { nextReply } : {}), ...(consumedReply ? { consumedReply } : {}) };
+  const sourceDigest = createHash('sha256').update(JSON.stringify({ packets, evidence })).digest('hex');
+  if (advisoryData && sourceDigest !== advisoryData.sourceDigest) return refuse('malformed_chain');
+  return Object.freeze({ status: 'verified', ...evidence, sourceDigest });
 }
 
 function isClarificationControlSource(data: Record<string, unknown> | null): boolean {
@@ -1470,6 +1522,7 @@ export class TaskContinuityStore {
     let nowMs: number;
     let consumingSourceUserSeq: number | undefined;
     let nextReplySourceUserSeq: number | undefined;
+    let advisoryReply: ReadTaskContinuityClarificationSourcesInput['advisoryReply'];
     try {
       sessionId = normalizedSessionId(input.sessionId);
       packetId = boundedString(input.packetId, 'packetId', 128);
@@ -1481,12 +1534,23 @@ export class TaskContinuityStore {
         if (input.consumingSourceUserSeq !== undefined) throw new Error('clarification source modes are exclusive');
         nextReplySourceUserSeq = positiveSeq(input.nextReplySourceUserSeq, 'nextReplySourceUserSeq');
       }
+      if (input.advisoryReply !== undefined) {
+        if (input.consumingSourceUserSeq !== undefined || input.nextReplySourceUserSeq !== undefined
+          || !input.advisoryReply || Object.keys(input.advisoryReply).sort().join('\0') !== 'releaseEventId\0sourceUserSeq') {
+          throw new Error('clarification source modes are exclusive');
+        }
+        advisoryReply = {
+          sourceUserSeq: positiveSeq(input.advisoryReply.sourceUserSeq, 'advisory reply source'),
+          releaseEventId: boundedString(input.advisoryReply.releaseEventId, 'advisory release event', 128),
+        };
+      }
     } catch { return { status: 'refused', reason: 'invalid_input' }; }
     try {
       const db = this.databaseProvider();
       return db.transaction(() => clarificationSourcesResult(db, { sessionId, packetId,
         ...(consumingSourceUserSeq !== undefined ? { consumingSourceUserSeq } : {}),
-        ...(nextReplySourceUserSeq !== undefined ? { nextReplySourceUserSeq } : {}) }, nowMs))();
+        ...(nextReplySourceUserSeq !== undefined ? { nextReplySourceUserSeq } : {}),
+        ...(advisoryReply ? { advisoryReply } : {}) }, nowMs))();
     } catch { return { status: 'refused', reason: 'unavailable' }; }
   }
 

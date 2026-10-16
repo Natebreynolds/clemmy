@@ -1229,8 +1229,8 @@ export function registerToolSearchTool(
         // Registry one-liners are display summaries, sometimes clipped in the
         // middle of a word. Retrieval needs the actual registered operation's
         // meaning just as provider rows use their full discovery metadata.
-        // The command runner also carries the connected CLIs it can reach, so
-        // a search naming that vendor finds it instead of an unconnected app.
+        // Include connected CLI candidates and their observation states in
+        // command-runner recall, alongside exact provider connection options.
           oneLiner: [metadata?.description || entry.oneLiner,
             ...(cliRunnerText && runsLocalCommandLines(entry.name) ? [cliRunnerText] : []),
             ...Object.keys(properties ?? {})].join('\n'),

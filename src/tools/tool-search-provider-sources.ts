@@ -93,7 +93,6 @@ import {
 } from '../runtime/harness/production-live-read-acquisition-registry.js';
 import { listReviewedCliReadDescriptors } from '../runtime/harness/reviewed-cli-read-config.js';
 import { CLI_CATALOG, readConnectedClis } from '../integrations/cli-catalog/catalog.js';
-import { connectedCliCoveringApp } from '../integrations/cli-catalog/connected-cli-coverage.js';
 import {
   AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
   issueAuthorizedLiveReadPlanningAuthority,
@@ -2755,13 +2754,10 @@ export function buildAuthorizedToolSearchCandidateSources(
       const connected = new Set(observation
         .filter((connection) => /active|enabled|initiat/i.test(connection.status ?? ''))
         .map((connection) => connection.slug.trim().toLowerCase()));
-      // An app a connected CLI reaches is not missing: the command runner
-      // carries it, so offering to connect the app would block work that can
-      // run now.
+      // A same-vendor CLI is another candidate. It does not establish this
+      // provider's current operation or account, so retain reconnect options.
       const unconnected = named.filter(toolkit => (
         !connected.has(toolkit.slug.trim().toLowerCase())
-        && !connectedCliCoveringApp(toolkit.slug)
-        && !connectedCliCoveringApp(toolkit.name)
       )).slice(0, 2);
       if (unconnected.length === 0) return [];
       const outcome = await awaitBounded({

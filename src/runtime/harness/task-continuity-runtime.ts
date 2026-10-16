@@ -3,6 +3,7 @@ import { clarificationReferenceDigest, renderClarificationUnavailable,
   type ClarificationUnavailableAnnotationV1 } from './clarification-public-annotation.js';
 import {
   CUSTOMIZATION_SLOT_KEY,
+  TASK_CONTINUITY_ADVISORY_RELEASE_KIND,
   consumeTaskContinuityPacket,
   createTaskContinuityPacket,
   customizationQuestionId,
@@ -37,6 +38,8 @@ import {
   appendEvent,
   getSession,
   getEvent,
+  getRunAttemptBySourceUserSeq,
+  isKillRequested,
   openEventLog,
   withEventPublicationTransaction,
   getTurnGraphEventForSource,
@@ -87,6 +90,7 @@ import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
 import { validatedClarificationFailureDiagnostic } from '../semantic-boundary/clarification-failure-diagnostic.js';
 import { validatedClarificationStructuralDiagnostic } from '../semantic-boundary/clarification-structural-diagnostic.js';
+import { parseTaskMode } from './task-mode.js';
 import {
   proposeClarificationRevision,
   validatedClarificationRevision,
@@ -1746,80 +1750,137 @@ function verifiedMetaContinuationInput(input: {
   ].join('\n');
 }
 
-/** The checked steer for a reply the brain answers: the root task, the open
- * question exactly as asked, and the reply. The pending step stays on hold.
- * The stored question is then released: while it stays open, planning refuses
- * the turn, so the brain could never answer. Clem asks again in her own words,
- * and that question opens anew with the transcript behind it. */
-function repliedOpenQuestionContinuationInput(input: {
-  sessionId: string;
-  sourceUserSeq: number;
-}): string | null {
-  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
-  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
-  if (!repliedOpenQuestionPacket(input.sessionId, input.sourceUserSeq, current.packet)) return null;
-  if (!nextRealSourceIs({
-    sessionId: input.sessionId,
-    originatingSourceUserSeq: current.packet.originatingSourceUserSeq,
-    consumingSourceUserSeq: input.sourceUserSeq,
-  })) return null;
-  const rootSourceUserSeq = current.packet.rootSourceUserSeq
-    ?? current.packet.originatingSourceUserSeq;
-  const rootInput = normalized(realAcceptedSource(input.sessionId, rootSourceUserSeq)?.data.text);
-  const reply = realAcceptedSource(input.sessionId, input.sourceUserSeq)?.data.text;
-  if (!rootInput || typeof reply !== 'string' || !reply.trim()) return null;
-  const steer = [
-    '[task-continuation-question:v1]',
-    '[root-task]',
-    rootInput,
-    '[current-question]',
-    current.packet.pause.question,
-    '[user-reply]',
-    reply.trim(),
-    '[host-directive]',
-    'The user replied to your open question with something other than a decision, usually a question back. Answer them from what you know or can read without changing anything. The pending step stays on hold: do not write, send, publish, or delete anything for it until they decide. Then ask for their decision again in your own words.',
-  ].join('\n');
-  dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'no_longer_needed' });
-  return steer;
+type AdvisoryContinuationSource = { sessionId: string; sourceUserSeq: number };
+type VerifiedClarificationSources = Extract<ReturnType<typeof readTaskContinuityClarificationSources>, { status: 'verified' }>;
+
+function advisoryContinuationSourceIsCurrent(input: AdvisoryContinuationSource): boolean {
+  const source = realAcceptedSource(input.sessionId, input.sourceUserSeq);
+  if (!source || currentInputSuppressesPriorTask(String(source.data.text ?? ''),
+    taskRelationFromLastInterpretation(input.sessionId, input.sourceUserSeq))) return false;
+  const later = openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ? AND seq > ?
+    AND type = 'user_input_received' AND role = 'user'
+    AND CASE WHEN json_valid(data_json) THEN json_type(data_json, '$.synthetic') IS NOT 'true' ELSE 1 END LIMIT 1`)
+    .get(input.sessionId, input.sourceUserSeq);
+  if (later) return false;
+  const attempt = getRunAttemptBySourceUserSeq(input.sessionId, input.sourceUserSeq);
+  if (attempt && ['cancelled', 'failed', 'superseded', 'completed'].includes(attempt.status)) return false;
+  if (isKillRequested(input.sessionId, { sourceUserSeq: input.sourceUserSeq })) return false;
+  return !listEvents(input.sessionId, { sinceSeq: input.sourceUserSeq, types: ['conversation_completed'] })
+    .some(event => event.data.sourceUserSeq === input.sourceUserSeq
+      || presentationEventFromCompletionData(event.data)?.identity.sourceUserSeq === input.sourceUserSeq);
 }
 
-/** The brain's input for a reply to an open question when the host could not
- * produce a checked revision. For a reply that settled part of the question,
- * Clem writes the follow-up herself: keep what was supplied, change nothing,
- * ask only for the rest. For an answer, an amendment or a continuation, she
- * carries the work on from the exact text under the root task's own hold.
- * Like a question back, the stored question is released so the brain can
- * plan; her own re-ask opens a new one. */
-function partialAnswerContinuationInput(input: {
-  sessionId: string;
-  sourceUserSeq: number;
-}): string | null {
-  const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
-  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return null;
-  const recorded = openQuestionReplyRouteFor(input.sessionId, input.sourceUserSeq);
-  if (recorded?.route !== 'respond' || !recorded.partialAnswer || recorded.parentPacketId !== current.packet.packetId) return null;
-  const edge = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
-  if (!edge) return null;
+function advisoryReplyRecord(input: AdvisoryContinuationSource): EventRow | null {
+  const rows = openEventLog().prepare(`SELECT id FROM events WHERE session_id = ? AND seq > ?
+    AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') = ?
+    AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq`)
+    .all(input.sessionId, input.sourceUserSeq, OPEN_QUESTION_REPLY_RECORD, input.sourceUserSeq) as Array<{ id: string }>;
+  if (rows.length !== 1) return null;
+  const record = getEvent(rows[0]!.id);
+  const source = realAcceptedSource(input.sessionId, input.sourceUserSeq);
+  return record?.role === 'system' && record.turn === source?.turn && record.data.route === 'respond'
+    && typeof record.data.parentPacketId === 'string' ? record : null;
+}
+
+function renderAdvisoryContinuationInput(chain: VerifiedClarificationSources, record: EventRow): string | null {
+  const rootTask = clarificationParentInputFromVerifiedChain(chain);
+  const reply = chain.nextReply;
+  const root = realAcceptedSource(record.sessionId, chain.root.sourceUserSeq);
+  const source = reply && realAcceptedSource(record.sessionId, reply.sourceUserSeq);
+  if (!rootTask || !reply || !root || !source) return null;
+  const edge = { rootTask, deliveredQuestion: reply.previousReferenceQuestion ?? reply.previousDeliveredQuestion,
+    deliveredOptions: [...reply.previousDeliveredOptions], acceptedReply: reply.text };
+  const recorded = { partialAnswer: record.data.partialAnswer === true, replyReading: record.data.reading };
   const affirmed = recorded.replyReading === 'affirms';
-  const partial = !affirmed && (recorded.replyReading === undefined || recorded.replyReading === 'checked_residual_answer');
-  const steer = [
-    affirmed ? '[task-continuation-go-ahead:v1]' : partial ? '[task-continuation-partial-answer:v1]' : '[task-continuation-reply:v1]',
+  const partial = recorded.partialAnswer && !affirmed
+    && (recorded.replyReading === undefined || recorded.replyReading === 'checked_residual_answer');
+  return [
+    !recorded.partialAnswer ? '[task-continuation-question:v1]'
+      : affirmed ? '[task-continuation-go-ahead:v1]' : partial ? '[task-continuation-partial-answer:v1]' : '[task-continuation-reply:v1]',
     '[root-task]',
     edge.rootTask,
+    '[root-task-mode]', JSON.stringify(parseTaskMode(root.data.taskMode) ?? null),
+    '[reply-task-mode]', JSON.stringify(parseTaskMode(source.data.taskMode) ?? null),
     '[current-question]',
     edge.deliveredQuestion,
     ...(edge.deliveredOptions.length > 0 ? ['[visible-options]', JSON.stringify(edge.deliveredOptions)] : []),
     '[user-reply]',
     edge.acceptedReply,
     '[host-directive]',
-    affirmed
+    !recorded.partialAnswer
+      ? 'The user replied to your open question with something other than a decision, usually a question back. Answer them from what you know or can read without changing anything. The pending step stays on hold: do not write, send, publish, or delete anything for it until they decide. Then ask for their decision again in your own words.'
+      : affirmed
       ? 'The user told you to go ahead, or left the choice you asked about to you. That settles the question: do not ask it again and do not argue for it. Carry the work on from the root task under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan); for anything the reply did not pick, choose a sensible default yourself, do the work, and say in one line what you assumed. Ask again only if something truly blocks the work.'
       : partial
       ? 'The user answered part of your open question and may have changed something you proposed; an independent check found that not every decision is settled yet. Keep every answer and change they gave exactly as they stated it, including ranges. The pending step stays on hold: do not create, change, write, send, publish or delete anything for it, and do not treat a general "approved" as supplying a missing fact. Acknowledge what they supplied, then ask only for what is still missing, in your own words.'
       : 'The user replied to your open question. No checked reading of how the reply changes the question is available, so read it yourself from the exact text above. If it answers or approves, the question is settled: carry the work on from the root task plus that answer, under whatever hold the root task itself set (a task that says to plan and not do it yet stays a plan); for anything your question left open that the reply did not pick, choose a sensible default and say what you assumed rather than asking again. If it changes what you proposed, apply the change exactly as stated and show the result in the form you were asked for. If it truly does not answer, ask again in your own words. Never say the reply was recorded but could not be verified.',
   ].join('\n');
-  dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'no_longer_needed' });
-  return steer;
+}
+
+/** SELECT-only, exact-source discovery context. A released clarification is
+ * not a consumed answer, a source-strategy choice, or capability authority. */
+export function readVerifiedAdvisoryContinuationInput(input: AdvisoryContinuationSource): string | null {
+  try {
+    if (!advisoryContinuationSourceIsCurrent(input)) return null;
+    const proofs = openEventLog().prepare(`SELECT id FROM events WHERE session_id = ? AND seq > ?
+      AND type = 'guardrail_tripped' AND json_extract(data_json, '$.kind') = ?
+      AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq`)
+      .all(input.sessionId, input.sourceUserSeq, TASK_CONTINUITY_ADVISORY_RELEASE_KIND,
+        input.sourceUserSeq) as Array<{ id: string }>;
+    if (proofs.length !== 1) return null;
+    const proof = getEvent(proofs[0]!.id);
+    const record = advisoryReplyRecord(input);
+    if (!proof || !record || proof.data.replyEventId !== record.id
+      || proof.data.parentPacketId !== record.data.parentPacketId) return null;
+    const chain = readTaskContinuityClarificationSources({ sessionId: input.sessionId,
+      packetId: record.data.parentPacketId as string,
+      advisoryReply: { sourceUserSeq: input.sourceUserSeq, releaseEventId: proof.id } });
+    if (chain.status !== 'verified') return null;
+    const rendered = renderAdvisoryContinuationInput(chain, record);
+    return rendered && rendered === proof.data.advisoryInput ? rendered : null;
+  } catch { return null; }
+}
+
+/** Freeze the checked literal/public snapshot and release only its planning
+ * question in the same transaction. The original connection dependency is
+ * untouched, and no selection or capability evidence is inherited. */
+function releaseAdvisoryContinuationInput(input: AdvisoryContinuationSource, partialAnswer: boolean): string | null {
+  try {
+    return withEventPublicationTransaction(() => {
+      const replay = readVerifiedAdvisoryContinuationInput(input);
+      if (replay) return replay;
+      if (!advisoryContinuationSourceIsCurrent(input)) return null;
+      const current = peekTaskContinuityPacket({ sessionId: input.sessionId });
+      const record = advisoryReplyRecord(input);
+      if (current.status !== 'available' || current.packet.pause.kind !== 'clarification' || !record
+        || record.data.parentPacketId !== current.packet.packetId
+        || (record.data.partialAnswer === true) !== partialAnswer) return null;
+      const chain = readTaskContinuityClarificationSources({ sessionId: input.sessionId,
+        packetId: current.packet.packetId, nextReplySourceUserSeq: input.sourceUserSeq });
+      if (chain.status !== 'verified' || !chain.nextReply) return null;
+      const advisoryInput = renderAdvisoryContinuationInput(chain, record);
+      if (!advisoryInput) return null;
+      const proof = appendEvent({ sessionId: input.sessionId, turn: record.turn, role: 'system', type: 'guardrail_tripped',
+        data: { kind: TASK_CONTINUITY_ADVISORY_RELEASE_KIND, version: 1,
+          sourceUserSeq: input.sourceUserSeq, sourceEventId: chain.nextReply.sourceEventId,
+          parentPacketId: current.packet.packetId, sourceDigest: chain.sourceDigest, advisoryInput,
+          inputDigest: createHash('sha256').update(advisoryInput).digest('hex'),
+          replyEventId: record.id, replyEventDigest: createHash('sha256').update(JSON.stringify(record.data)).digest('hex') } });
+      const dismissed = dismissTaskContinuityPacket({ sessionId: input.sessionId, reason: 'no_longer_needed' }, { now: proof.createdAt });
+      if (dismissed.status !== 'dismissed' || dismissed.packetId !== current.packet.packetId) throw new Error('advisory release lost its exact packet');
+      const verified = readVerifiedAdvisoryContinuationInput(input);
+      if (!verified) throw new Error('advisory release proof is invalid');
+      return verified;
+    });
+  } catch { return null; }
+}
+
+function repliedOpenQuestionContinuationInput(input: AdvisoryContinuationSource): string | null {
+  return releaseAdvisoryContinuationInput(input, false);
+}
+
+function partialAnswerContinuationInput(input: AdvisoryContinuationSource): string | null {
+  return releaseAdvisoryContinuationInput(input, true);
 }
 
 function accountEvidenceStillFits(row: TaskContinuityCapabilityEvidence): boolean {
@@ -2697,6 +2758,15 @@ export async function enrichAcceptedRequestWithTaskContinuity(
       turnCandidates: resolved,
     };
   }
+  const replayAdvisoryInput = readVerifiedAdvisoryContinuationInput({ sessionId: request.sessionId, sourceUserSeq });
+  if (replayAdvisoryInput) {
+    const { semanticTaskInput: _semantic, taskContinuation: _context, turnCandidates, ...safe } = request;
+    const advisoryCandidates = turnCandidates
+      ? (({ sourceStrategyBinding: _binding, ...rest }) => rest)(turnCandidates)
+      : undefined;
+    return { ...safe, semanticTaskInput: replayAdvisoryInput, taskContinuationResolved: true,
+      ...(advisoryCandidates ? { turnCandidates: advisoryCandidates } : {}) };
+  }
   const pendingReplyRoute = openQuestionReplyRouteFor(request.sessionId, sourceUserSeq);
   if (pendingReplyRoute && (pendingReplyRoute.route === 'reask' || pendingReplyRoute.route === 'revise')) {
     // A display revision cannot turn an amendment into an execution graph or
@@ -2709,9 +2779,13 @@ export async function enrichAcceptedRequestWithTaskContinuity(
     // A partial answer never consumes the pending edge into executing work;
     // the brain gets the exact question and reply with the hold spelled out.
     const steer = partialAnswerContinuationInput({ sessionId: request.sessionId, sourceUserSeq });
-    const { semanticTaskInput: _semantic, taskContinuation: _context, ...safe } = request;
+    const { semanticTaskInput: _semantic, taskContinuation: _context, turnCandidates, ...safe } = request;
+    const advisoryCandidates = turnCandidates
+      ? (({ sourceStrategyBinding: _binding, ...rest }) => rest)(turnCandidates)
+      : undefined;
     return steer
-      ? { ...safe, semanticTaskInput: steer, taskContinuationResolved: true }
+      ? { ...safe, semanticTaskInput: steer, taskContinuationResolved: true,
+          ...(advisoryCandidates ? { turnCandidates: advisoryCandidates } : {}) }
       : { ...safe, taskContinuationResolved: true };
   }
   if (options.typedClassification && 'keepOpen' in options.typedClassification) {
@@ -2723,10 +2797,15 @@ export async function enrichAcceptedRequestWithTaskContinuity(
     const {
       semanticTaskInput: _semantic,
       taskContinuation: _context,
+      turnCandidates,
       ...safe
     } = request;
+    const advisoryCandidates = turnCandidates
+      ? (({ sourceStrategyBinding: _binding, ...rest }) => rest)(turnCandidates)
+      : undefined;
     return metaInput
-      ? { ...safe, semanticTaskInput: metaInput, taskContinuationResolved: true }
+      ? { ...safe, semanticTaskInput: metaInput, taskContinuationResolved: true,
+          ...(advisoryCandidates ? { turnCandidates: advisoryCandidates } : {}) }
       : { ...safe, taskContinuationResolved: true };
   }
   const context = consumeContinuationContext({

@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -696,9 +697,13 @@ test('exact consumed leaf rehydrates literal chain after restart and TTL without
     packetId: fixture.leaf.packetId, consumingSourceUserSeq: final.seq },
   { now: new Date(fixture.base + 200_000).toISOString() });
   assert.equal(replay.status, 'verified');
-  if (replay.status !== 'verified') return;
-  const { consumedReply, ...replayedOpen } = replay;
-  assert.deepEqual(replayedOpen, open, 'expiry cannot erase exact already-consumed audit history');
+  if (replay.status !== 'verified' || open.status !== 'verified') return;
+  const { consumedReply, sourceDigest: replayDigest, ...replayedOpen } = replay;
+  const { sourceDigest: openDigest, ...openEvidence } = open;
+  assert.deepEqual(replayedOpen, openEvidence, 'expiry cannot erase exact already-consumed audit history');
+  assert.match(replayDigest, /^[a-f0-9]{64}$/);
+  assert.match(openDigest, /^[a-f0-9]{64}$/);
+  assert.notEqual(replayDigest, openDigest, 'the consumed reply joins the exact snapshot digest');
   assert.ok(consumedReply && Object.isFrozen(consumedReply) && Object.isFrozen(consumedReply.previousDeliveredOptions));
   assert.equal(consumedReply.sourceUserSeq, final.seq);
   assert.equal(consumedReply.sourceEventId, final.id);
@@ -796,8 +801,12 @@ test('public question cadence and options remain literal with the accepted amend
     consumingSourceUserSeq: final.seq }, { now: new Date(base + 200_000_000).toISOString() });
   assert.equal(replay.status, 'verified');
   if (replay.status !== 'verified') return;
-  const { consumedReply, ...replayedOpen } = replay;
-  assert.deepEqual(replayedOpen, open);
+  const { consumedReply, sourceDigest: replayDigest, ...replayedOpen } = replay;
+  const { sourceDigest: openDigest, ...openEvidence } = open;
+  assert.deepEqual(replayedOpen, openEvidence);
+  assert.match(replayDigest, /^[a-f0-9]{64}$/);
+  assert.match(openDigest, /^[a-f0-9]{64}$/);
+  assert.notEqual(replayDigest, openDigest, 'the exact final reply changes the snapshot digest');
   assert.equal(consumedReply?.text, final.data.text);
   assert.equal(consumedReply?.previousDeliveredQuestion, residual);
 });
@@ -1083,6 +1092,83 @@ test('read-only clarification source lookup never installs missing schema', asyn
       { status: 'refused', reason: 'unavailable' });
     assert.deepEqual(db.prepare('SELECT name FROM sqlite_master WHERE type = ?').all('table'), []);
   } finally { db.close(); }
+});
+
+function releasedAdvisoryChain(suffix: string) {
+  const owner = session(`advisory-reader-${suffix}`);
+  const root = accepted(owner.id, 'Inspect this request.\n  Keep this exact account.', false,
+    { taskMode: { version: 1, kind: 'plan' }, userId: 'fixture-owner', conversationKey: 'fixture-thread' });
+  const question = 'Which available route should I inspect?';
+  const options = ['Inspect the CLI', 'Reconnect the requested provider'];
+  const delivery = deliveredQuestion(owner.id, root.seq, question, options);
+  const packet = continuity.createTaskContinuityPacket({ sessionId: owner.id, originatingSourceUserSeq: root.seq,
+    pause: { kind: 'clarification', question, options }, publicDeliveryBinding: delivery });
+  const reply = accepted(owner.id, 'Can the CLI help?', false,
+    { userId: 'fixture-owner', conversationKey: 'fixture-thread' });
+  const edge = continuity.readTaskContinuityClarificationSources({ sessionId: owner.id, packetId: packet.packetId,
+    nextReplySourceUserSeq: reply.seq });
+  assert.equal(edge.status, 'verified');
+  if (edge.status !== 'verified') throw new Error('fixture source edge missing');
+  const reading = eventlog.appendEvent({ sessionId: owner.id, turn: 1, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'open_question_reply_classified', sourceUserSeq: reply.seq, parentPacketId: packet.packetId,
+      route: 'respond', reading: 'continue_goal', partialAnswer: true } });
+  const advisoryInput = 'Fixture advisory bytes; the runtime separately reconstructs these.';
+  const proof = eventlog.appendEvent({ sessionId: owner.id, turn: 1, role: 'system', type: 'guardrail_tripped',
+    data: { kind: continuity.TASK_CONTINUITY_ADVISORY_RELEASE_KIND, version: 1,
+      sourceUserSeq: reply.seq, sourceEventId: reply.id, parentPacketId: packet.packetId,
+      sourceDigest: edge.sourceDigest, advisoryInput, inputDigest: createHash('sha256').update(advisoryInput).digest('hex'),
+      replyEventId: reading.id, replyEventDigest: createHash('sha256').update(JSON.stringify(reading.data)).digest('hex') } });
+  continuity.dismissTaskContinuityPacket({ sessionId: owner.id, reason: 'no_longer_needed' }, { now: proof.createdAt });
+  const input = { sessionId: owner.id, packetId: packet.packetId,
+    advisoryReply: { sourceUserSeq: reply.seq, releaseEventId: proof.id } };
+  return { owner, root, packet, reply, proof, reading, input, edge, delivery };
+}
+
+test('only the exact host-proven dismissed advisory edge can replay without consumed authority', () => {
+  const fixture = releasedAdvisoryChain('exact');
+  const changes = eventlog.openEventLog().prepare('SELECT total_changes() AS total').get();
+  const replay = continuity.readTaskContinuityClarificationSources(fixture.input);
+  assert.deepEqual(replay, fixture.edge);
+  assert.deepEqual(eventlog.openEventLog().prepare('SELECT total_changes() AS total').get(), changes);
+  assert.equal(continuity.readTaskContinuityClarificationSources({ sessionId: fixture.owner.id,
+    packetId: fixture.packet.packetId, nextReplySourceUserSeq: fixture.reply.seq }).status, 'refused');
+  assert.equal(continuity.readConsumedTaskContinuityPacket({ sessionId: fixture.owner.id,
+    consumingSourceUserSeq: fixture.reply.seq }).status, 'none');
+  eventlog.closeEventLog();
+  assert.deepEqual(continuity.readTaskContinuityClarificationSources(fixture.input), fixture.edge);
+  assert.equal(continuity.readTaskContinuityClarificationSources({ ...fixture.input,
+    nextReplySourceUserSeq: fixture.reply.seq }).status, 'refused', 'reader modes remain exclusive');
+});
+
+test('advisory reader refuses forged proof, changed task/account/public bytes, wrong retirement and newer sources', () => {
+  const mutations: Array<[string, (fixture: ReturnType<typeof releasedAdvisoryChain>) => void]> = [
+    ['proof-role', fixture => eventlog.openEventLog().prepare('UPDATE events SET role = ? WHERE id = ?').run('user', fixture.proof.id)],
+    ['proof-digest', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.proof.data, sourceDigest: '0'.repeat(64) }), fixture.proof.id)],
+    ['proof-extra', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.proof.data, selectedOption: 'opt-1' }), fixture.proof.id)],
+    ['root-task-mode', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.root.data, taskMode: { version: 1, kind: 'normal' } }), fixture.root.id)],
+    ['reply-audience', fixture => eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...fixture.reply.data, userId: 'different-owner' }), fixture.reply.id)],
+    ['public-question', fixture => {
+      const terminal = eventlog.getEvent(fixture.delivery.terminalEventId)!;
+      eventlog.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+        .run(JSON.stringify({ ...terminal.data, reply: 'Changed question.',
+          presentation: { ...(terminal.data.presentation as object), text: 'Changed question.' } }), terminal.id);
+    }],
+    ['dismiss-reason', fixture => eventlog.openEventLog().prepare('UPDATE task_continuity_packets SET dismissed_reason = ? WHERE packet_id = ?')
+      .run('invalidated', fixture.packet.packetId)],
+    ['dismiss-time', fixture => eventlog.openEventLog().prepare('UPDATE task_continuity_packets SET dismissed_at = ? WHERE packet_id = ?')
+      .run(new Date(Date.parse(fixture.proof.createdAt) + 1).toISOString(), fixture.packet.packetId)],
+    ['wrong-reading-role', fixture => eventlog.openEventLog().prepare('UPDATE events SET role = ? WHERE id = ?').run('Clem', fixture.reading.id)],
+    ['later-source', fixture => { accepted(fixture.owner.id, 'A later request.'); }],
+  ];
+  for (const [label, mutate] of mutations) {
+    const fixture = releasedAdvisoryChain(label);
+    mutate(fixture);
+    assert.equal(continuity.readTaskContinuityClarificationSources(fixture.input).status, 'refused', label);
+  }
 });
 
 test('a synthetic input reads as having consumed nothing, never as an invalid consumer', () => {

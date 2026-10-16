@@ -1,13 +1,12 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/harness/dependency-request-cli-coverage.test.ts
  *
- * A question parked on a missing connection stops holding the session once a
- * connected, signed-in CLI reaches that app.
+ * CLI metadata must not satisfy an exact provider operation/account gap.
  */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-dependency-cli-coverage-'));
 process.env.CLEMENTINE_HOME = HOME;
@@ -17,6 +16,7 @@ const eventlog = await import('./eventlog.js');
 const dependencies = await import('./dependency-request.js');
 const continuity = await import('../../memory/task-continuity.js');
 const { CLI_CATALOG, recordConnectedCli } = await import('../../integrations/cli-catalog/catalog.js');
+const { connectedCliCandidatesForApp } = await import('../../integrations/cli-catalog/connected-cli-coverage.js');
 
 const QUESTION = 'GitHub needs to be connected before I can continue this task. Connect it in Clementine, or pause to change the request.';
 const OPTIONS = ['I’ve connected GitHub — continue this same task', 'Pause so I can change this request'];
@@ -24,7 +24,7 @@ const OPTIONS = ['I’ve connected GitHub — continue this same task', 'Pause s
 function health(authStatus: 'ok' | 'signed_out'): void {
   writeFileSync(path.join(HOME, 'state', 'cli-auth-health.json'), JSON.stringify({
     version: 'v1',
-    entries: { github: { id: 'github', command: 'gh', installed: true, authStatus, checkedAt: new Date().toISOString() } },
+    entries: { github: { id: 'github', command: 'gh', installed: true, authStatus, binaryPath: '/controlled/bin/gh', username: 'fixture-owner', checkedAt: new Date().toISOString() } },
   }));
 }
 
@@ -76,22 +76,35 @@ function dependencyStatus(sessionId: string, sourceUserSeq: number): string | un
 
 recordConnectedCli(CLI_CATALOG.find((entry) => entry.id === 'github')!);
 
-test('a signed-in CLI that reaches the app satisfies the gap and releases its question', () => {
-  health('ok');
-  const sessionId = 'sess-cli-covers-connection';
-  const parent = parkedConnectionQuestion(sessionId);
-  assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
-  assert.equal(dependencies.releaseConnectionDependenciesCoveredByCli(sessionId), true);
-  assert.equal(dependencyStatus(sessionId, parent), 'satisfied');
-  assert.notEqual(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
-  assert.equal(dependencies.releaseConnectionDependenciesCoveredByCli(sessionId), false, 'nothing left to release');
-});
+after(() => { eventlog.closeEventLog(); rmSync(HOME, { recursive: true, force: true }); });
 
-test('a CLI found signed out leaves the gap and its question open', () => {
-  health('signed_out');
-  const sessionId = 'sess-cli-signed-out';
+for (const status of ['ok', 'signed_out'] as const) test(`a ${status} same-vendor CLI remains a candidate without satisfying the exact dependency`, () => {
+  health(status);
+  const sessionId = `sess-cli-does-not-prove-provider-${status}`;
   const parent = parkedConnectionQuestion(sessionId);
-  assert.equal(dependencies.releaseConnectionDependenciesCoveredByCli(sessionId), false);
+  const before = continuity.peekTaskContinuityPacket({ sessionId });
+  const candidates = connectedCliCandidatesForApp('github');
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.authentication.state, status === 'ok' ? 'confirmed' : 'signed_out');
+  assert.equal(candidates[0]?.operationReadiness, 'unverified');
+  assert.equal(candidates[0]?.intendedAccount, 'unverified');
+  const query = 'site repository on GitHub';
+  const output = JSON.stringify({ query, brokerCoverage: 'authorized_external_v1', results: [], unavailable: [{
+    source: 'authorized_composio', code: 'no_connections', dependencySubject: {
+      version: 1, kind: 'exact_capability_connection', source: 'authorized_composio', query,
+      toolkit: 'github', capability: 'GITHUB_GET_A_REPOSITORY', capabilityRef: 'cap:resolved:github_get_a_repository',
+    },
+  }] });
+  const callId = `search-${status}`;
+  eventlog.writeToolOutput({ sessionId, callId, tool: 'tool_search', output });
+  eventlog.appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned',
+    data: { sourceUserSeq: parent, tool: 'tool_search', callId, accounting: 'top_level', topologyRole: 'control', result: output } });
+  const missing = dependencies.observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq: parent });
+  assert.equal(missing?.subject.kind, 'exact_capability_connection');
+  assert.equal(missing?.subject.provider, 'authorized_composio');
+  const parked = dependencies.parkObservedConnectionDependencyForSource({ sessionId, sourceUserSeq: parent, turn: 1 });
+  assert.equal(parked?.status, 'open');
   assert.equal(dependencyStatus(sessionId, parent), 'open');
-  assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+  assert.deepEqual(continuity.peekTaskContinuityPacket({ sessionId }), before, 'discovery cannot dismiss the held task capsule');
+  assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
 });
