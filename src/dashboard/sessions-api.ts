@@ -808,6 +808,17 @@ function appendPendingPlanProposalTurns(sessionId: string, turns: UnifiedSession
  */
 function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn[]): void {
   try {
+    // A verified decision-only receipt belongs on its original card on reopen,
+    // just as it did live. Old results and unrelated resolved cards retain
+    // their existing history until they carry this exact receipt.
+    const receipts = new Map<string, 'approved' | 'declined'>();
+    for (const turn of turns) {
+      const ack = turn.terminal?.approvalDecisionAck as Record<string, unknown> | undefined;
+      if (ack?.version === 1 && typeof ack.approvalId === 'string'
+        && (ack.decision === 'approve' || ack.decision === 'reject')) {
+        receipts.set(ack.approvalId, ack.decision === 'approve' ? 'approved' : 'declined');
+      }
+    }
     const cardEvents = listHarnessEvents(sessionId, { types: ['approval_requested'] });
     if (cardEvents.length === 0) return;
     const seen = new Set<string>();
@@ -819,7 +830,8 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
       const rowNow = approvalRegistry.get(approvalId);
       if (!rowNow) continue;
       const expiredUnanswered = rowNow.status === 'expired' && rowNow.resolution === 'expired';
-      if (rowNow.status !== 'pending' && !expiredUnanswered) continue;
+      const decided = rowNow.status === 'resolved' ? receipts.get(approvalId) : undefined;
+      if (rowNow.status !== 'pending' && !expiredUnanswered && !decided) continue;
       if (!approvalRegistry.isFormalApprovalSurface(rowNow)) {
         if (rowNow.status !== 'pending') continue;
         turns.push({
@@ -852,6 +864,7 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
           // they were), so the reopened chat draws it as the live one did.
           ...(approvalRevisionProjection(d.revises) ?? {}),
           ...(expiredUnanswered ? { resolution: 'expired' as const } : {}),
+          ...(decided ? { resolution: decided } : {}),
         },
       });
     }

@@ -21,12 +21,12 @@ test('a card tap is read only from the host record of the message', () => {
   assert.equal(cardDecisionOf({ source: 'mobile_approval', approvalId: 'apr-card', decision: 'maybe' }), null);
 });
 
-test('a card tap and its reply stay out of the transcript, and the card reads as decided', () => {
+test('a card tap stays out of the transcript while an unverified legacy answer remains visible', () => {
   for (const decision of ['approve', 'reject'] as const) {
     const resolved = event(8, 'approval_resolved', { approvalId: 'apr-card', decision });
     const rows = foldTranscript([card, tap(decision), reply('done'), resolved], 'chat');
     const shown = rows.filter((row) => !hiddenCardDecision(row));
-    assert.equal(shown.length, 1, 'only the card itself remains');
+    assert.equal(shown.length, 2, 'an approval id in old prose is not exact receipt proof');
     assert.equal(shown[0]!.approval?.resolution, decision === 'approve' ? 'approved' : 'declined');
   }
 });
@@ -114,7 +114,7 @@ test('after a card tap, the work it resumes shows as working until Clem answers'
   } finally { engine.dispose(); }
 });
 
-test('a card decision notice stays out of sight, but a stop of the work the tap resumed does not', () => {
+test('a notice alone cannot hide an unverified decision or a stop of the resumed work', () => {
   const noticed = (code: 'card_decision' | 'stopped', status: 'done' | 'cancelled') => event(7, 'conversation_completed', {
     sourceUserSeq: 6, reply: code === 'card_decision' ? 'Approved.' : 'Stopped.',
     presentation: { identity: { sessionId: 'chat', sourceUserSeq: 6 }, status, kind: 'answer', text: 'App wording.', resumable: false },
@@ -123,7 +123,7 @@ test('a card decision notice stays out of sight, but a stop of the work the tap 
   const decided = foldTranscript([card, tap('approve'), noticed('card_decision', 'done')], 'chat')
     .filter((row) => row.role === 'assistant' && !row.approval);
   assert.equal(decided.length, 1);
-  assert.equal(hiddenCardDecision(decided[0]!), true);
+  assert.equal(hiddenCardDecision(decided[0]!), false);
   const stopped = foldTranscript([card, tap('approve'), noticed('stopped', 'cancelled')], 'chat')
     .filter((row) => row.role === 'assistant' && !row.approval);
   assert.equal(stopped.length, 1);
@@ -152,5 +152,5 @@ test('a wordless typed terminal after a tap is the resumed work, not the tap’s
   }
   const echoed = foldTranscript([card, tap('approve'), wordless('done', 'Approved apr-card.')], 'chat')
     .filter((row) => row.role === 'assistant' && !row.approval);
-  assert.equal(hiddenCardDecision(echoed[0]!), true, 'a finished turn quoting the card’s own id is still its echo');
+  assert.equal(hiddenCardDecision(echoed[0]!), false, 'quoting a card id is not an exact receipt classifier');
 });

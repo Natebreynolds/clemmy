@@ -2,7 +2,7 @@ import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
-import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
@@ -188,6 +188,9 @@ export interface ChatMessage {
   checkIn?: boolean;
   /** Durable ownership; never inferred from the currently streaming reply. */
   acceptedSource?: AcceptedChatSource;
+  /** The accepted HTTP request's decision-only source, for presentation closeout
+   * only. It is never an executor or a source of Stop/Background authority. */
+  approvalControlSource?: { sessionId: string; sourceUserSeq: number };
   /** Bounded client ordering for retry progress; never a delivered reply. */
   modelRetryProgress?: {
     sourceUserSeq: number;
@@ -410,6 +413,8 @@ export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: 
   messages = steered;
   const d = event.data ?? {};
   if (event.type === 'approval_resolved') return applyApprovalResolution(messages, d);
+  const decisionAck = reconcileApprovalDecisionAck(messages, event, sessionId);
+  if (decisionAck) return decisionAck;
   const confirm = event.type === 'awaiting_user_input' ? approvalConfirmFromEvent(d) : null;
   if (confirm) return attachApprovalConfirm(messages, confirm.approvalId, confirm.confirm);
   if (!observeReply || readLiveApprovalControl(event)) return messages as ChatMessage[];
@@ -441,6 +446,48 @@ export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: 
     workflowLive: undefined, workflowWork: undefined,
     ...(message.workflowDispatchSeq ? { workflowTerminalSeq: event.seq,
       activity: settleTerminalActivity(message.activity ?? EMPTY_ACTIVITY, activityTerminalOutcomeForMessageStatus(presentation.status)) } : {}) } : message);
+}
+
+/** A verified host decision is already visible on its exact card. Retire only
+ * that source's reply; another live answer, Stop target or steering row stays. */
+export function reconcileApprovalDecisionAck(messages: readonly ChatMessage[], event: HarnessEvent, sessionId: string): ChatMessage[] | null {
+  const ack = readApprovalDecisionAck(sharedEvent(event), sessionId);
+  if (!ack) return null;
+  const resolution = applyApprovalDecisionAck(messages, ack);
+  const next = resolution.messages.filter(message => !(message.role === 'assistant' && !message.approval && !message.checkIn
+    && !message.workflowDispatchSeq && ((message.acceptedSource?.sessionId === sessionId
+      && message.acceptedSource.sourceUserSeq === ack.sourceUserSeq) || (message.approvalControlSource?.sessionId === sessionId
+      && message.approvalControlSource.sourceUserSeq === ack.sourceUserSeq))));
+  if (resolution.matched || next.some(message => message.id === `approval-decision-${event.seq}`)) return next;
+  return [...next, { id: `approval-decision-${event.seq}`, role: 'assistant', text: approvalDecisionFallback(ack), status: 'complete' }];
+}
+
+/** A control POST has no execution lease. Its exact accepted request identity
+ * may bind the empty local reply for closeout without adopting its owner. */
+export function acceptedApprovalControlResponse(response: ChatPostResult & { sourceUserSeq?: unknown },
+  requestId: string, sessionId: string): { sessionId: string; sourceUserSeq: number } | null {
+  if (response.mode !== 'approval-control' || response.status !== 'completed' || !requestId
+    || response.clientRequestId !== requestId || response.sessionId !== sessionId
+    || !Number.isSafeInteger(response.sourceUserSeq) || Number(response.sourceUserSeq) <= 0
+    || !Number.isSafeInteger(response.sinceSeq) || Number(response.sinceSeq) < 0
+    || Number(response.sourceUserSeq) <= Number(response.sinceSeq)) return null;
+  return { sessionId, sourceUserSeq: Number(response.sourceUserSeq) };
+}
+
+/** Close only the local decision watch whose accepted POST named this source.
+ * A decision receipt cannot release an original or newer execution owner. */
+export function settleApprovalDecisionControl(event: HarnessEvent, owner: {
+  sessionId: string | null; activeAssistantId: string | null; callbackAssistantId: string;
+  control: { assistantId: string; sessionId: string; sourceUserSeq: number } | null;
+  executionAssistantId?: string;
+}, settleLocal: () => void): boolean {
+  const ack = readApprovalDecisionAck(sharedEvent(event), owner.sessionId);
+  const control = owner.control;
+  if (!ack || !control || owner.activeAssistantId !== owner.callbackAssistantId
+    || control.assistantId !== owner.callbackAssistantId || control.sessionId !== owner.sessionId
+    || control.sourceUserSeq !== ack.sourceUserSeq || owner.executionAssistantId === control.assistantId) return false;
+  settleLocal();
+  return true;
 }
 
 /** One own-session recovery observation can update both admission and the
@@ -1677,6 +1724,7 @@ export function useChat(options?: UseChatOptions) {
   /** Host dispatch ends the foreground stream; keep watching for the later origin terminal. */
   const awaitingWorkflowReportRef = useRef<{ assistantId: string; source: AcceptedChatSource } | null>(null);
   const acceptedStreamSourceRef = useRef<{ assistantId: string; source: AcceptedChatSource } | null>(null);
+  const approvalControlRef = useRef<{ assistantId: string; sessionId: string; sourceUserSeq: number } | null>(null);
 
   // Rises each time a task this conversation delegated changed state. The
   // event is a nudge: whoever shows the task re-reads its record.
@@ -2001,6 +2049,22 @@ export function useChat(options?: UseChatOptions) {
       }
       setMessages(previous => bindAcceptedChatSource(previous, ev, assistantId, sourceBoundary));
     }
+    const decisionAck = readApprovalDecisionAck(sharedEvent(ev), sessionIdRef.current);
+    if (decisionAck) {
+      setMessages(previous => reconcileApprovalDecisionAck(previous, ev, sessionIdRef.current ?? '') ?? previous);
+      settleApprovalDecisionControl(ev, { sessionId: sessionIdRef.current, activeAssistantId: activeAssistantId.current,
+        callbackAssistantId: assistantId, control: approvalControlRef.current,
+        executionAssistantId: acceptedStreamSourceRef.current?.assistantId }, () => {
+        approvalControlRef.current = null;
+        activeAssistantId.current = null;
+        activeRunRef.current = null;
+        const localStream = streamRef.current;
+        streamRef.current = null;
+        setBusy(false);
+        localStream?.stop();
+      });
+      return;
+    }
     if (readLiveApprovalControl(ev)) {
       if (ev.sessionId && ev.sessionId !== sessionIdRef.current) return;
       if (ev.type === 'conversation_completed') setMessages(previous => {
@@ -2030,6 +2094,7 @@ export function useChat(options?: UseChatOptions) {
     const patchAssistant = (fields: Partial<ChatMessage>) => updateMessages(previous =>
       previous.map(message => message.id === assistantId ? { ...message, ...fields } : message));
     if (ev.type === 'approval_resolved') {
+      if (ev.sessionId && ev.sessionId !== owner.sessionId) return;
       updateMessages((prev) => applyApprovalResolution(prev, ev.data as Record<string, unknown>));
     }
     if (ev.type === 'stream_token' || ev.type === 'model_resilience_observed') {
@@ -2136,7 +2201,7 @@ export function useChat(options?: UseChatOptions) {
       setMessages(previous => previous.map(message => message.id === assistantId
         ? applyChatProgressEvent(message, ev, owner) : message));
     }
-  }, [noteDelegatedTask, observePendingSteerReceipt, settleRecoveredTerminal]);
+  }, [noteDelegatedTask, observePendingSteerReceipt, settleRecoveredTerminal, setBusy]);
 
   const handoffAcceptedRun = useCallback(async (
     accepted: ChatPostResult,
@@ -2233,6 +2298,7 @@ export function useChat(options?: UseChatOptions) {
     lateWatchRef.current = null;
     awaitingWorkflowReportRef.current = null;
     acceptedStreamSourceRef.current = null;
+    approvalControlRef.current = null;
     // Do not carry a reusable session's prior attempt into this turn. If Stop
     // wins before the new 202 arrives, onLateAccepted will cancel the exact
     // attempt from that acknowledgement instead of guessing by session id.
@@ -2297,6 +2363,12 @@ export function useChat(options?: UseChatOptions) {
       if (options?.rememberAsLastSession) rememberLastChatSession(unifiedChatSessionId(identity.conversationSessionId));
       input.onAccepted?.();
       activeRunRef.current = body;
+      const controlSource = acceptedApprovalControlResponse(body, pending.clientRequestId, identity.executionSessionId);
+      if (controlSource) {
+        approvalControlRef.current = { assistantId, ...controlSource };
+        setMessages(previous => previous.map(message => message.id === assistantId && !message.acceptedSource
+          ? { ...message, approvalControlSource: controlSource } : message));
+      }
       // The background button is available immediately for responsiveness,
       // but authority arrives only in the 202. Queue an early click and apply
       // it to THIS acknowledgement rather than guessing from the session id.

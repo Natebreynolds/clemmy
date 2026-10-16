@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
+import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -9,7 +9,27 @@ let seedSeq = 0;
  * the chat UI. Durable plan and approval identities survive navigation; plain
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
-  return turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWork(turn) }));
+  const suppressed = new Set<string>();
+  let messages = turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWork(turn) }));
+  for (let index = 0; index < turns.length; index += 1) {
+    const turn = turns[index]!;
+    const terminal = turn.terminal as Record<string, unknown> | undefined;
+    if (turn.role !== 'assistant' || !terminal || turn.files?.length || turn.workflows?.length || turn.planArtifactRef) continue;
+    const presentation = terminal.presentation as { identity?: { sessionId?: unknown } } | undefined;
+    const sessionId = presentation?.identity?.sessionId;
+    if (typeof sessionId !== 'string' || typeof terminal.terminalSeq !== 'number') continue;
+    const ack = readApprovalDecisionAck({ seq: terminal.terminalSeq, type: 'conversation_completed', sessionId,
+      data: terminal }, sessionId);
+    if (!ack) continue;
+    const id = messages[index]?.id;
+    const resolution = applyApprovalDecisionAck(messages, ack);
+    messages = resolution.messages.map(message => message.id === id
+      ? { ...message, text: resolution.matched ? '' : approvalDecisionFallback(ack),
+        ...(resolution.matched ? { status: undefined } : { status: 'complete' as const }), terminal: undefined } : message);
+    // Preserve indices until every exact terminal has been inspected.
+    if (resolution.matched && id) suppressed.add(id);
+  }
+  return messages.filter(message => !suppressed.has(message.id));
 }
 
 /** The workflows and files the reply saved, as the receipt-only rows the live card is
@@ -80,7 +100,8 @@ function historyMessage(turn: Turn): ChatMessage {
         ...(approvalPreviewFrom(turn.approval.preview) ? { preview: approvalPreviewFrom(turn.approval.preview) } : {}),
         // A reopened chat draws the change on the card as the live one did.
         ...(approvalRevisionFrom(turn.approval.revises) ? { revises: approvalRevisionFrom(turn.approval.revises) } : {}),
-        ...(turn.approval.resolution === 'expired' ? { resolution: 'expired' as const } : {}),
+        ...(['approved', 'declined', 'changed', 'expired'].includes(String(turn.approval.resolution))
+          ? { resolution: turn.approval.resolution as 'approved' | 'declined' | 'changed' | 'expired' } : {}),
       },
     };
   }

@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, cardDecisionNoticeOnly, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -245,8 +245,8 @@ function ApprovalOutcomePill({ resolution }: { resolution: ApprovalResolution })
     : resolution === 'changed' ? 'bg-info-tint text-info'
       : resolution === 'expired' ? 'bg-warning-tint text-warning'
         : 'bg-subtle text-muted';
-  const label = resolution === 'approved' ? 'Done · you said yes'
-    : resolution === 'declined' ? 'Skipped · nothing ran'
+  const label = resolution === 'approved' ? 'Approved'
+    : resolution === 'declined' ? 'Declined'
       : resolution === 'changed' ? 'Changed · the revised version is below'
         : 'Expired · it did not run';
   return (
@@ -513,11 +513,17 @@ export function ChatBubble({
 
   // A card tap sent from the phone and the host's reply to it belong to the
   // card, not the conversation; only one that failed to land is shown. A
-  // decided card has done its job and leaves the conversation.
+  // decided card keeps its own receipt, without claiming its work finished.
   if (hiddenCardDecision(message)) return null;
-  if (cardDecisionNoticeOnly(message)) return null;
   if (message.status === 'awaiting-approval'
-    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return null;
+    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return (
+    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-4 py-3" role="status">
+      <span className="text-body text-muted">{message.approval.subject}</span>
+      <StatusPill tone="neutral" icon={message.approval.resolution === 'approved' ? Check : X}>
+        {message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}
+      </StatusPill>
+    </div>
+  );
 
   if (isUser) {
     return (

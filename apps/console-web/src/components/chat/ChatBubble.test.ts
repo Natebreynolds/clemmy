@@ -64,7 +64,7 @@ test('a notice is the app’s status line with its action, and pills carry what 
   assert.match(SOURCE, /to="\/settings#who-does-what"[^>]*>\{NOTICE_ACTION_LABEL\.change_model\}/);
   assert.match(SOURCE, /to="\/settings#accounts"/);
   assert.match(SOURCE, /onAnswer\(NOTICE_ACTION_LABEL\.try_again\)/);
-  assert.match(SOURCE, /if \(cardDecisionNoticeOnly\(message\)\) return null;/);
+  assert.doesNotMatch(SOURCE, /cardDecisionNoticeOnly/, 'only the exact engine receipt fold may suppress an acknowledgment');
   // The old hand-written typed pills are gone from this file.
   assert.doesNotMatch(SOURCE, /Stopped here — your work is kept/);
 });
@@ -99,8 +99,9 @@ test('the card\'s question asked back is drawn on the card with the owner\'s wor
   assert.match(SOURCE, /message\.approval\?\.confirm && !resolved && !message\.approval\.resolution && \(/);
   assert.match(SOURCE, /Or say it another way below\. Nothing runs until you answer\./);
   assert.match(SOURCE, /function ApprovalOutcomePill/);
-  assert.match(SOURCE, /Done · you said yes/);
-  assert.match(SOURCE, /Skipped · nothing ran/);
+  assert.match(SOURCE, /resolution === 'approved' \? 'Approved'/);
+  assert.match(SOURCE, /resolution === 'declined' \? 'Declined'/);
+  assert.doesNotMatch(SOURCE, /Done · you said yes|Skipped · nothing ran/);
   assert.doesNotMatch(SOURCE, /function approvalResolutionText/, 'the old resolution sentence is gone');
 });
 

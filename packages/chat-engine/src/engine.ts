@@ -2,6 +2,8 @@ import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
 import { readQuestionOptions } from './question-options.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import { readBackgroundOutcomeReport } from './background-outcome-report.js';
+import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck } from './approval-card-resolution.js';
+export { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck } from './approval-card-resolution.js';
 import type { PendingMessageStore } from './pending-request.js';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode } from './task-mode.js';
 /**
@@ -17,7 +19,7 @@ import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type
 import type { ApprovalConfirm, ChatAttachment,
   ChatMessage, ConnectionState, EngineSnapshot, HarnessEvent, MessageStatus,
 } from './types.js';
-import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionEcho, cardDecisionOf, type CardDecision } from './types.js';
+import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, cardDecisionOf, type CardDecision } from './types.js';
 import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
@@ -158,18 +160,6 @@ function withApprovalConfirmation(message: ChatMessage, confirm: ApprovalConfirm
   return { ...message, approval: { ...message.approval!, confirm } };
 }
 
-/** A notice is the app's status for the work the tap resumed (a stop, a
- *  refusal), never the tap's echo, unless it is the card decision itself. A
- *  typed terminal with no words is not an echo either: it is drawn as its pill
- *  (what was kept, the reply prompt, a question's answers), so only a finished
- *  turn quoting the card's own id is. Legacy events keep the text rule. */
-function cardDecisionReplyEcho(message: Pick<ChatMessage, 'text' | 'terminal'>, decision: CardDecision): boolean {
-  const terminal = message.terminal;
-  if (!terminal) return cardDecisionEcho(message.text, decision);
-  if (terminal.notice) return terminal.notice.code === 'card_decision';
-  return terminal.status === 'done' && (message.text ?? '').includes(decision.approvalId);
-}
-
 /** Only the typed question for this exact card/source is already rendered.
  * Ordinary questions, failures and later results keep their own bubbles. */
 function isApprovalConfirmationTerminal(messages: readonly ChatMessage[], event: HarnessEvent, sessionId?: string | null): boolean {
@@ -215,8 +205,6 @@ export class ChatEngine {
   private connection: ConnectionState = 'idle';
   private stream: ChatStreamHandle | null = null;
   private activeAssistantId: string | null = null;
-  /** Card taps seen in this session, by their accepted source. */
-  private readonly cardDecisionsBySource = new Map<number, CardDecision>();
   private listeners = new Set<(snapshot: EngineSnapshot) => void>();
   private disposed = false;
   private cursor = 0;
@@ -730,6 +718,27 @@ export class ChatEngine {
       // approval, queued steering, cancellation key, or busy state.
       return;
     }
+    const decisionAck = readApprovalDecisionAck(event, this.sessionId);
+    if (decisionAck) {
+      const resolution = applyApprovalDecisionAck(this.messages, decisionAck);
+      this.messages = resolution.messages;
+      // A live control never owns the original executor's placeholder. An
+      // ordinary decision-only source may retire only its own empty reply.
+      if (!readLiveApprovalControl(event) && this.activeSourceUserSeq === decisionAck.sourceUserSeq) {
+        const placeholder = this.activeAssistantId;
+        this.messages = this.messages.filter(message => message.id !== placeholder);
+        this.busy = false;
+        this.activeAssistantId = null;
+      }
+      if (!resolution.matched) {
+        const id = `approval-decision-${event.seq}`;
+        if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
+          id, role: 'assistant', text: approvalDecisionFallback(decisionAck), status: 'complete',
+        }];
+      }
+      this.emit();
+      return;
+    }
     if (readLiveApprovalControl(event)) {
       if (event.sessionId && event.sessionId !== this.sessionId) return;
       if (event.type === 'conversation_completed') {
@@ -826,9 +835,6 @@ export class ChatEngine {
           this.messages.find(message => message.approval?.approvalId === approvalId)?.approval?.approvalId);
         const text = resumeSource ? '' : userVisibleText(d);
         const cardDecision = cardDecisionOf(d);
-        if (cardDecision) {
-          this.cardDecisionsBySource.set(event.seq, cardDecision);
-        }
         if (!text && !resumeSource) return;
         const acceptedSource = resumeSource ?? acceptedConversationSource(event, this.sessionId);
         let adoptedSource = false;
@@ -910,6 +916,7 @@ export class ChatEngine {
         break;
       }
       case 'approval_resolved': {
+        if (event.sessionId && event.sessionId !== this.sessionId) return;
         const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
         const resolution = approvalResolutionFrom(d);
         if (!approvalId || !resolution) break;
@@ -1080,23 +1087,7 @@ export class ChatEngine {
         });
       }
     }
-    if (event.type === 'conversation_completed') this.tagCardDecisionReply(event);
     this.emit();
-  }
-
-  /** The host's echo of a card tap from another surface is the tap's too.
-   *  Clem's own answer to the tap is not: it stays in the conversation. */
-  private tagCardDecisionReply(event: HarnessEvent): void {
-    const source = sourceUserSeqOf(event);
-    const cardDecision = source === null ? undefined : this.cardDecisionsBySource.get(source);
-    if (!cardDecision) return;
-    this.messages = this.messages.map((message) => (
-      message.role === 'assistant' && !message.cardDecision
-        && (message.acceptedSource?.sourceUserSeq === source || message.id === `a-${event.seq}`)
-        && cardDecisionReplyEcho(message, cardDecision)
-        ? { ...message, cardDecision }
-        : message
-    ));
   }
 
   /** The active reply's own text. A live answer draft is never read as it. */
@@ -1177,7 +1168,6 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   let modelRetryDraft: { text: string; answerDraft?: ChatMessage['answerDraft'] } = { text: '' };
   const taskModesBySource = new Map<number, TaskMode>();
   const planRefsBySource = new Map<number, NonNullable<ChatMessage['planArtifactRef']>>();
-  const cardDecisionsBySource = new Map<number, CardDecision>();
   for (const event of events) {
     messages = applySteerReceiptEvent(messages, event, sessionId);
     if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') continue;
@@ -1190,6 +1180,21 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         });
       }
       // Retain the foreground's source, opening, activity and pending question.
+      continue;
+    }
+    const decisionAck = readApprovalDecisionAck(event, sessionId);
+    if (decisionAck) {
+      const resolution = applyApprovalDecisionAck(messages, decisionAck);
+      messages = resolution.messages;
+      if (!resolution.matched && !messages.some(message => message.id === `approval-decision-${event.seq}`)) messages.push({
+        id: `approval-decision-${event.seq}`, role: 'assistant', text: approvalDecisionFallback(decisionAck), status: 'complete',
+      });
+      if (!readLiveApprovalControl(event) && currentSourceUserSeq === decisionAck.sourceUserSeq) {
+        activity = [];
+        opening = '';
+        pendingAwaitingMessageIndex = null;
+        modelRetrySourceClosed = true;
+      }
       continue;
     }
     if ((event.type === 'conversation_completed' || event.type === 'run_failed') && sessionId
@@ -1267,9 +1272,6 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           && (event.role === undefined || event.role === 'user')
           && (!sessionId || !event.sessionId || event.sessionId === sessionId)) acceptedWorkflowSources.add(event.seq);
         const cardDecision = cardDecisionOf(d);
-        if (cardDecision) {
-          cardDecisionsBySource.set(event.seq, cardDecision);
-        }
         if (text) messages.push({ id: `u-${event.seq}`, role: 'user', text, taskMode: readTaskMode(d.taskMode),
           ...(d.voice === true ? { voice: true } : {}),
           acceptedSource: acceptedConversationSource(event, sessionId), ...(cardDecision ? { cardDecision } : {}) });
@@ -1324,8 +1326,6 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const awaitingMessage = awaitingIndex === undefined
           ? undefined
           : messages[awaitingIndex];
-        const tappedDecision = sourceUserSeq === null ? undefined : cardDecisionsBySource.get(sourceUserSeq);
-        const cardDecision = tappedDecision && cardDecisionReplyEcho(presentation, tappedDecision) ? tappedDecision : undefined;
         const terminalMessage: ChatMessage = {
           id: delegatedMessage?.id ?? awaitingMessage?.id ?? `a-${event.seq}`,
           role: 'assistant',
@@ -1335,7 +1335,6 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           // chip as it did live; without its typed facts a notice reopened
           // as an empty reply.
           ...(presentation.terminal ? { terminal: presentation.terminal } : {}),
-          ...(cardDecision ? { cardDecision } : {}),
           taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
           planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),
           ...(planProposalId ? {
@@ -1481,6 +1480,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         break;
       }
       case 'approval_resolved': {
+        if (sessionId && event.sessionId && event.sessionId !== sessionId) break;
         const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
         const resolution = approvalResolutionFrom(d);
         if (!approvalId || !resolution) break;
