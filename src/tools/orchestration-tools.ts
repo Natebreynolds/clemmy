@@ -1,3 +1,4 @@
+import { inlineCreationTestReceiptForSettlement } from '../execution/inline-creation-test-delivery.js';
 import { withWorkflowDispatchCommit } from '../runtime/harness/workflow-dispatch-commit.js';
 import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { workflowProjectCreationErrors } from '../execution/workflow-project-preflight.js';
@@ -1395,7 +1396,9 @@ export function registerOrchestrationTools(server: McpServer): void {
           ? await awaitWorkflowCreationTestSettlement(queued.id, name)
           : null;
         if (settled) {
-          const headline = settled.pass
+          const headline = settled.terminalStatus
+            ? `Created workflow "${name}" — its creation test ${settled.terminalStatus === 'cancelled' ? 'was cancelled' : 'failed'}; the workflow is ${settled.enabled ? 'ENABLED' : 'DISABLED'}.`
+            : settled.pass
             ? (settled.enabled
               ? `Created workflow "${name}" — creation test PASSED and it is ENABLED.`
               : `Created workflow "${name}" — creation test PASSED; it stays DISABLED${enabled === false ? ' as requested' : ` (${settled.activationCompatible ? 'not enabled' : 'the saved definition changed during the test; re-test before enabling'})`}.`)
@@ -1915,7 +1918,7 @@ export function registerOrchestrationTools(server: McpServer): void {
         return textResult(`Rehearsing "${name}" (run ${queued.id ?? 'not queued'}); it stays ${entry.data.enabled ? 'on' : 'off'} either way, and the result arrives as a notification.`);
       }
       return textResult(
-        `${settled.pass ? 'Rehearsal passed' : 'Rehearsal found issues'} for "${name}"; it is ${state}.\n\n`
+        `${settled.terminalStatus === 'cancelled' ? 'Rehearsal cancelled' : settled.terminalStatus === 'failed' ? 'Rehearsal failed' : settled.pass ? 'Rehearsal passed' : 'Rehearsal found issues'} for "${name}"; it is ${state}.\n\n`
         + renderCreationTestSettlementReceipt(settled, readWorkflow(entry.name)?.data ?? entry.data, name),
       );
     },
@@ -2002,7 +2005,9 @@ export function registerOrchestrationTools(server: McpServer): void {
             ? await awaitWorkflowCreationTestSettlement(queued.id, entry.name)
             : null;
           if (settled) {
-            const headline = settled.pass
+            const headline = settled.terminalStatus
+              ? `Workflow "${name}" creation test ${settled.terminalStatus === 'cancelled' ? 'was cancelled' : 'failed'}; it is ${settled.enabled ? 'ENABLED' : 'DISABLED'}.`
+              : settled.pass
               ? (settled.enabled
                 ? `Workflow "${name}" passed its creation test and is now ENABLED.`
                 : `Workflow "${name}" passed its creation test but stays DISABLED (${settled.activationCompatible ? 'not enabled' : 'the saved definition changed during the test; enable it again to re-test'}).`)
@@ -2880,11 +2885,13 @@ export function renderCreationTestSettlementReceipt(
   def: WorkflowDefinition | undefined,
   displayName: string,
 ): string {
+  const inlineReceipt = inlineCreationTestReceiptForSettlement(settled);
   const lines = [
+    ...(inlineReceipt ? [inlineReceipt.trimEnd()] : []),
     `Creation test (run ${settled.runId}, settled after ${Math.round(settled.waitedMs / 1000)} s):`,
     settled.body.trim(),
   ];
-  if (settled.pass) return lines.join('\n');
+  if (settled.pass || settled.terminalStatus) return lines.join('\n');
   const flagged = settled.steps.filter((row) => !CREATION_TEST_STEP_OK.has(row.status));
   const choices = flagged.filter((row) => row.status === 'needs_choice');
   const connections = flagged.filter((row) => row.status === 'needs_connection');

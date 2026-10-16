@@ -21,6 +21,10 @@ import {
 import path from 'node:path';
 
 import { BASE_DIR } from '../../config.js';
+import { CLI_CATALOG, catalogReviewedReadsOf } from '../../integrations/cli-catalog/catalog.js';
+import { cliHealthExecutableIdentity } from '../../integrations/cli-catalog/cli-executable-identity.js';
+import { readConnectedCliExecutableSelection, reviewedCliExecutablePathIsSupported, reviewedCliExecutableFileIsSupported }
+  from '../../integrations/cli-catalog/connected-cli-executable-selection.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { atomicJsonMutate } from '../atomic-json.js';
 import {
@@ -378,7 +382,7 @@ export function observeReviewedCliExecutable(
   try {
     fd = openSync(real, 'r');
     const before = fstatSync(fd, { bigint: true });
-    if (!before.isFile() || (before.mode & 0o111n) === 0n) return null;
+    if (!reviewedCliExecutableFileIsSupported({ executablePath: real, isFile: before.isFile(), mode: before.mode })) return null;
     const binarySha256 = hashOpenFile(fd);
     const after = fstatSync(fd, { bigint: true });
     const pathAfter = realpathSync(real);
@@ -421,12 +425,29 @@ export function currentReviewedCliDescriptor(
 ): ReviewedCliReadDescriptorV1 | null {
   const closed = closeReviewedCliReadDescriptor(descriptor);
   if (!closed) return null;
+  const catalog = CLI_CATALOG.find(entry => catalogReviewedReadsOf(entry)
+    .some(contract => contract.descriptorId === closed.descriptorId));
+  const selection = catalog ? readConnectedCliExecutableSelection(catalog) : null;
+  if (selection?.status === 'blocked') return null;
+  const selectedPathMatches = (): boolean => {
+    if (selection?.status !== 'selected') return true;
+    try {
+      const real = realpathSync(selection.executablePath);
+      return reviewedCliExecutablePathIsSupported(real)
+        && cliHealthExecutableIdentity(real) === cliHealthExecutableIdentity(closed.executableRealpath);
+    } catch { return false; }
+  };
+  if (!selectedPathMatches()) return null;
   const executable = observeReviewedCliExecutable(closed.executableRealpath);
   if (
     !executable
     || executable.executableRealpath !== closed.executableRealpath
     || executable.binarySha256 !== closed.binarySha256
   ) return null;
+  // A different process may replace executable-selection metadata while the
+  // file is being checked. Authentication/account fields are never inherited.
+  if (catalog && (JSON.stringify(readConnectedCliExecutableSelection(catalog)) !== JSON.stringify(selection)
+    || !selectedPathMatches())) return null;
   return closed;
 }
 
@@ -506,9 +527,12 @@ export async function provisionReviewedCliReadDescriptor(
 
 export async function removeReviewedCliReadDescriptor(
   descriptorId: string,
-  options: { filePath?: string } = {},
+  options: { filePath?: string; expectedDescriptorDigest?: string } = {},
 ): Promise<boolean> {
   if (!boundedText(descriptorId)) throw new TypeError('reviewed CLI descriptor id is invalid');
+  if (options.expectedDescriptorDigest !== undefined && !/^[a-f0-9]{64}$/.test(options.expectedDescriptorDigest)) {
+    throw new TypeError('reviewed CLI expected descriptor digest is invalid');
+  }
   const filePath = options.filePath ?? reviewedCliReadConfigPath();
   let removed = false;
   await atomicJsonMutate<ReviewedCliReadConfigFileV1>(
@@ -516,13 +540,16 @@ export async function removeReviewedCliReadDescriptor(
     (raw) => {
       const current = closeConfigFile(raw);
       if (!current) throw new Error('reviewed CLI descriptor registry is not closed reviewed data');
+      const existing = current.descriptors.find(entry => entry.descriptor.descriptorId === descriptorId);
+      if (!existing || (options.expectedDescriptorDigest !== undefined
+        && reviewedCliDescriptorDigest(existing.descriptor) !== options.expectedDescriptorDigest)) return undefined;
       const descriptors = current.descriptors.filter((entry) => entry.descriptor.descriptorId !== descriptorId);
       removed = descriptors.length !== current.descriptors.length;
       return { version: REVIEWED_CLI_READ_CONFIG_VERSION, descriptors };
     },
     { version: REVIEWED_CLI_READ_CONFIG_VERSION, descriptors: [] },
   );
-  chmodSync(filePath, 0o600);
+  if (removed) chmodSync(filePath, 0o600);
   return removed;
 }
 

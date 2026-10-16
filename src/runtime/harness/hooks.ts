@@ -1,6 +1,7 @@
+import { inlineCreationTestReturnedMetadata, notifyInlineCreationTestReturned } from '../../execution/inline-creation-test-delivery.js';
 import type { Runner } from '@openai/agents';
 import { randomUUID } from 'node:crypto';
-import { appendEvent, writeToolOutput, type EventRow } from './eventlog.js';
+import { appendEvent, writeToolOutput, withEventPublicationTransaction, type EventRow } from './eventlog.js';
 import { cliBinaryFromCommand } from '../../memory/authoritative-sources.js';
 import { autoInvalidateOnFailure } from './auto-invalidate.js';
 import { autoRememberOnSuccess } from './auto-remember.js';
@@ -614,64 +615,72 @@ export function attachEventLogHooks(
     if (key) callIdToWorkerItem.delete(key);
     let returnedEvent: EventRow | null = null;
     try {
-      returnedEvent = appendEvent({
-        sessionId,
-        turn: getTurn(runContext),
-        role: agent?.name ?? 'agent',
-        type: 'tool_returned',
-        data: {
-          ...sourceAttribution,
-          tool: tool?.name ?? null,
-          callId: callId ?? null,
-          canonicalCallId: callId ?? null,
-          ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
-          accounting: 'top_level',
-          topologyRole,
-          effect: accounting.effect,
-          ...(connectionObservationNonce ? { invocationNonce: connectionObservationNonce } : {}),
-          // Preserve a negative result before its diagnostic text is clipped.
-          // Absence of failure does not manufacture positive business proof.
-          ...(!toolOutputLooksSuccessful(resultStr) ? { ok: false } : {}),
-          ...(effectiveToolTail(tool?.name ?? '') === 'tool_search'
-            ? { ok: pairedAdmittedStart && toolOutputLooksSuccessful(resultStr) }
-            : {}),
-          ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
-          ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
-          ...(pairedAdmittedStart
-            && topologyRole === 'control'
-            && accounting.effectiveTool
-            && accounting.effect === 'local_write'
-            && registeredToolSideEffect(accounting.effectiveTool) === 'write'
-            && hostLocalWriteCommitResultIsProven(resultStr)
-            && terminalAuthoringReceiptBodyLooksSuccessful(resultStr)
-            ? { successfulAuthoringResult: true }
-            : {}),
-          ...(settledReadReplay ? {
-            providerDispatched: false,
-            replayedFromCallId: settledReadReplay.sourceCallId,
-            replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
-          } : {}),
-          // The revision of the resource this read observed, so a later
-          // identical read in the same request can prove nothing outside the
-          // request moved it before its settled bytes are reused.
-          ...(accounting.effect === 'read' && !settledReadReplay && replayReadIdentity
-            ? (() => {
-                const revision = readResourceRevision(replayReadIdentity, replayReadArguments);
-                return revision ? { resourceRevision: revision } : {};
-              })()
-            : {}),
-          result: clipToolResult(
-            resultStr,
-            maxResultChars,
-            callId,
-            tool?.name,
-          ),
-        },
-        parentEventId,
+      returnedEvent = withEventPublicationTransaction(() => {
+        const inlineMetadata = pairedAdmittedStart && lease && currentPhysicalAttemptIsAuthoritative() && callId && typeof sourceAttribution.sourceUserSeq === 'number'
+          ? inlineCreationTestReturnedMetadata({ sessionId, sourceUserSeq: sourceAttribution.sourceUserSeq, callId,
+              toolName: tool?.name ?? '', result: resultStr, authoritativeReturn: true, dispatchLease: lease })
+          : {};
+        return appendEvent({
+            sessionId,
+            turn: getTurn(runContext),
+            role: agent?.name ?? 'agent',
+            type: 'tool_returned',
+            data: {
+              ...sourceAttribution,
+              ...inlineMetadata,
+              tool: tool?.name ?? null,
+              callId: callId ?? null,
+              canonicalCallId: callId ?? null,
+              ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
+              accounting: 'top_level',
+              topologyRole,
+              effect: accounting.effect,
+              ...(connectionObservationNonce ? { invocationNonce: connectionObservationNonce } : {}),
+              // Preserve a negative result before its diagnostic text is clipped.
+              // Absence of failure does not manufacture positive business proof.
+              ...(!toolOutputLooksSuccessful(resultStr) ? { ok: false } : {}),
+              ...(effectiveToolTail(tool?.name ?? '') === 'tool_search'
+                ? { ok: pairedAdmittedStart && toolOutputLooksSuccessful(resultStr) }
+                : {}),
+              ...(accounting.effectiveTool ? { effectiveTool: accounting.effectiveTool } : {}),
+              ...(accounting.toolSlug ? { toolSlug: accounting.toolSlug } : {}),
+              ...(pairedAdmittedStart
+                && topologyRole === 'control'
+                && accounting.effectiveTool
+                && accounting.effect === 'local_write'
+                && registeredToolSideEffect(accounting.effectiveTool) === 'write'
+                && hostLocalWriteCommitResultIsProven(resultStr)
+                && terminalAuthoringReceiptBodyLooksSuccessful(resultStr)
+                ? { successfulAuthoringResult: true }
+                : {}),
+              ...(settledReadReplay ? {
+                providerDispatched: false,
+                replayedFromCallId: settledReadReplay.sourceCallId,
+                replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
+              } : {}),
+              // The revision of the resource this read observed, so a later
+              // identical read in the same request can prove nothing outside the
+              // request moved it before its settled bytes are reused.
+              ...(accounting.effect === 'read' && !settledReadReplay && replayReadIdentity
+                ? (() => {
+                    const revision = readResourceRevision(replayReadIdentity, replayReadArguments);
+                    return revision ? { resourceRevision: revision } : {};
+                  })()
+                : {}),
+              result: clipToolResult(
+                resultStr,
+                maxResultChars,
+                callId,
+                tool?.name,
+              ),
+            },
+            parentEventId,
+          });
       });
     } catch {
       // see onToolStart
     }
+    if (returnedEvent?.data.inlineCreationTestDelivery) notifyInlineCreationTestReturned(returnedEvent.id);
     // What Clem sent anywhere shows up on the first-party surfaces: one
     // in-app item per successful irreversible external send, chat or step.
     if (pairedAdmittedStart) {

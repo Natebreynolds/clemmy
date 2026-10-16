@@ -23,6 +23,8 @@ const {
   searchCapabilityOperations,
   listCapabilityOperationsForCarrier,
   deactivateCapabilityCarrier,
+  deactivateCapabilityOperation,
+  capabilityIndexDatabase,
   capabilityIndexStats,
   indexedCapabilityCarriers,
 } = await import('./capability-index.js');
@@ -148,4 +150,35 @@ test('a hostile description cannot break FTS retrieval', () => {
   assert.doesNotThrow(() => searchCapabilityOperations('OR AND NOT * "quotes" (parens)'));
   const hits = searchCapabilityOperations('quoted weird');
   assert.ok(hits.some((hit) => hit.identifier === 'WEIRD_TOOL'));
+});
+
+test('exact operation retirement preserves sibling accounts, manual operations, history and no-op repeats', () => {
+  const operation = {
+    identifier: 'fixture_reviewed_read', carrierKind: 'cli' as const, carrier: 'reviewed-cli-config',
+    displayName: 'Reviewed fixture read', description: 'Read fixture rows.',
+    effectClass: 'read' as const, effectProvenance: 'curated' as const,
+    accountIdentity: 'reviewed_cli:host', parentIdentifier: 'fixture.read',
+  };
+  recordCapabilityOperations([
+    operation,
+    { ...operation, accountIdentity: 'reviewed_cli:other' },
+    { ...operation, identifier: 'fixture_manual_read', parentIdentifier: 'manual.read' },
+  ]);
+  const database = capabilityIndexDatabase();
+  const before = database.prepare(`SELECT * FROM capability_operations
+    WHERE identifier = ? AND account_identity = ?`).get(operation.identifier, operation.accountIdentity) as Record<string, unknown>;
+  assert.equal(deactivateCapabilityOperation({ ...operation, carrier: 'wrong-carrier' }), 0);
+  assert.equal(deactivateCapabilityOperation({ ...operation, carrierKind: 'mcp' }), 0);
+  assert.equal(deactivateCapabilityOperation({ ...operation, parentIdentifier: 'manual.read' }), 0);
+  assert.equal(deactivateCapabilityOperation(operation), 1);
+  const after = database.prepare(`SELECT * FROM capability_operations
+    WHERE identifier = ? AND account_identity = ?`).get(operation.identifier, operation.accountIdentity) as Record<string, unknown>;
+  assert.deepEqual(after, { ...before, active: 0 }, 'retirement preserves every retained identity and provenance field');
+  const visible = listCapabilityOperationsForCarrier('cli', 'reviewed-cli-config');
+  assert.ok(visible.some(row => row.identifier === operation.identifier && row.accountIdentity === 'reviewed_cli:other'));
+  assert.ok(visible.some(row => row.identifier === 'fixture_manual_read'));
+  assert.ok(!visible.some(row => row.identifier === operation.identifier && row.accountIdentity === operation.accountIdentity));
+  const changes = (database.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes;
+  assert.equal(deactivateCapabilityOperation(operation), 0);
+  assert.equal((database.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes, changes);
 });

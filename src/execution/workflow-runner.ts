@@ -1,5 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
-import { claimInlineCreationTestDelivery } from './inline-creation-test-delivery.js';
+import type { InlineCreationTestDeliveryIntent } from './inline-creation-test-delivery.js';
 import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
@@ -939,6 +939,7 @@ export interface QueuedRunRecord {
   sourceUserSeq?: number;
   /** Original authoring call that queued this creation test. */
   verificationRunId?: string;
+  inlineCreationTestDelivery?: InlineCreationTestDeliveryIntent;
   creationTestSource?: { sessionId: string; sourceUserSeq: number; logicalToolCallId: string };
   /** Explicit draft creation keeps verification separate from activation. */
   activateAfterCreationTest?: boolean;
@@ -2095,6 +2096,7 @@ function writeRunRecord(
     // Report envelopes/acks have their own locked coordinator. Never let a
     // runner snapshot overwrite a newer acknowledgement generation.
     const {
+      inlineCreationTestDelivery: _staleInlineCreationTestDelivery,
       reportBack: _staleReportBack,
       reportBackRetry: _staleReportBackRetry,
       reportBackAcknowledgedAt: _staleReportBackAcknowledgedAt,
@@ -2155,6 +2157,8 @@ function writeRunRecord(
     } else {
       delete nextRecord.workflowDefinitionSnapshot;
     }
+    if (current?.inlineCreationTestDelivery !== undefined) nextRecord.inlineCreationTestDelivery = current.inlineCreationTestDelivery;
+    else delete nextRecord.inlineCreationTestDelivery;
     if (current?.reportBack !== undefined) nextRecord.reportBack = current.reportBack;
     else delete nextRecord.reportBack;
     if (current?.reportBackRetry !== undefined) nextRecord.reportBackRetry = current.reportBackRetry;
@@ -15970,9 +15974,9 @@ async function processOneRunFile(
         outputPreview: body,
         needsAttention: !ready,
       });
-      // A tool call waiting on this test hands the result to the brain; a
-      // chat report would post the same result again in the runner's words.
-      if (!claimInlineCreationTestDelivery(run.id)) recordAndAttemptWorkflowRunReportBack(filePath, report);
+      // Report delivery coordinates the durable exact inline waiter and every
+      // other origin separately; execution never owns a process-local claim.
+      recordAndAttemptWorkflowRunReportBack(filePath, report);
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're

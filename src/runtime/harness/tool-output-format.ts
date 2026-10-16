@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { compactResultProvesExactToolOutput, exactOutputSha256 } from './exact-output-receipt.js';
+export { compactResultProvesExactToolOutput } from './exact-output-receipt.js';
 import { getToolOutputForInvocation, writeToolOutput } from './eventlog.js';
 import { retainedResultWayThrough } from './retained-result-routes.js';
 import { getToolOutputContext } from './tool-output-context.js';
@@ -244,12 +245,6 @@ export interface RecallableToolTextOptions {
   verifiedProjectionMaxChars?: number;
 }
 
-const EXACT_OUTPUT_RECEIPT_RE = /\[exact-output-receipt:v1 nonce=([0-9a-f-]{36}) sha256=([0-9a-f]{64})\]/ig;
-
-function exactOutputSha256(text: string): string {
-  return createHash('sha256').update(text).digest('hex');
-}
-
 /** Host-authored typed result for an invocation whose exact output could not
  * be persisted losslessly. This is an execution outcome, not provider prose:
  * callers may narrow/page and retry, but no consumer may treat the stored
@@ -273,20 +268,6 @@ export function truncatedToolOutputResult(
   contentBytes: number,
 ): TruncatedToolOutputResult {
   return new TruncatedToolOutputResult(callId, contentBytes);
-}
-
-/** Verify that the compact result returned by THIS invocation names the exact
- * bytes in the lossless store. The nonce is minted outside provider code and
- * inherited through nested tool-output contexts; call ids alone are reusable. */
-export function compactResultProvesExactToolOutput(
-  compactResult: unknown,
-  exactOutput: string,
-  expectedNonce: string | undefined,
-): boolean {
-  if (!expectedNonce || typeof compactResult !== 'string') return false;
-  const expectedHash = exactOutputSha256(exactOutput);
-  return [...compactResult.matchAll(EXACT_OUTPUT_RECEIPT_RE)].some((match) =>
-    match[1] === expectedNonce && match[2]?.toLowerCase() === expectedHash);
 }
 
 /** Resolve model-facing compact output back to the exact bytes parked by this

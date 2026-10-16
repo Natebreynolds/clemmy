@@ -7,6 +7,8 @@ import { findSafeCliCommand } from '../../runtime/cli-discovery.js';
 import { mergedSpawnEnv } from '../../runtime/spawn-env.js';
 import { syncConnectedCliBin } from './connected-cli-bin.js';
 import { runCliProbeProcess } from '../../runtime/cli-probe-process.js';
+import { cliHealthExecutableIdentity } from './cli-executable-identity.js';
+export { cliHealthExecutableIdentity } from './cli-executable-identity.js';
 import { getSavedClis } from '../../runtime/saved-clis.js';
 import {
   CLI_CATALOG,
@@ -367,22 +369,6 @@ async function probeHealth(item: RosterItem): Promise<CliHealth> {
  * and marks it stale. A different/unknown executable has no verdict to keep and
  * stays 'unknown', never an invented auth failure requiring a fresh login.
  */
-/** Path identity of the executable the host actually selected. This is not a
- * content signature or an account/operation grant. Missing/relative paths
- * cannot establish sameness; Windows spelling alone does not change a path. */
-export function cliHealthExecutableIdentity(binaryPath: string | undefined, platform: NodeJS.Platform = process.platform): string | null {
-  if (!binaryPath || binaryPath !== binaryPath.trim() || /[\u0000-\u001f\u007f]/.test(binaryPath)) return null;
-  if (platform === 'win32') {
-    const normalized = path.win32.normalize(binaryPath);
-    // isAbsolute also accepts \rooted paths, whose drive is still ambient.
-    // Only an explicit drive or complete UNC share establishes an identity.
-    const fullyQualified = /^[A-Za-z]:\\/.test(normalized)
-      || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(normalized);
-    return fullyQualified ? normalized.toLowerCase() : null;
-  }
-  return path.posix.isAbsolute(binaryPath) ? binaryPath : null;
-}
-
 function settleTransientProbe(next: CliHealth, previous: CliHealth | undefined): CliHealth {
   if (!next.lastProbeError) return next;
   const nextBinary = cliHealthExecutableIdentity(next.binaryPath);

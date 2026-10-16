@@ -681,6 +681,7 @@ test('agentic schema-on-demand keeps local-runtime-only tools deferred even when
     name: 'workspace_roots',
     args_json: '{}',
   });
+  assert.notEqual(called.isError, true, 'the modern MCP handler retains the bound session context');
   assert.doesNotMatch(called.content[0].text, /requires_readmission|not_reachable/i);
   const acquired = await boundClementineMcpCapabilityRevision(local.instance);
   assert.equal(acquired?.revision, 2);
@@ -2477,6 +2478,92 @@ function initOnlyMessage(): any {
 function successResultMessage(text: string): any {
   return { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: text, duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] };
 }
+
+test('Claude inline-result delivery binds an owned query and actual retained return without a fabricated call lease', async () => {
+  const { createHash, randomUUID } = await import('node:crypto');
+  const inline = await import('../../execution/inline-creation-test-delivery.js');
+  const { withHarnessRunContext, ToolCallsCounter } = await import('./brackets.js');
+  const { withToolOutputContext } = await import('./tool-output-context.js');
+  const runDir = path.join(TMP_HOME, 'workflows', 'runs');
+  mkdirSync(runDir, { recursive: true });
+  for (const mode of ['current', 'revoked', 'stopped', 'new-source', 'foreign-token'] as const) {
+    const session = eventlog.createSession({ kind: 'chat' });
+    const attempt = eventlog.beginRunAttempt(session.id);
+    const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+      data: { text: 'Read the controlled creation-test result.' } });
+    const lease = dispatchLease.activateDispatchLease({ sessionId: session.id, scopeId: `${session.id}:inline-adapter-fixture`, runAttemptId: attempt.attemptId });
+    const callId = `inline-adapter-${mode}`;
+    const runId = `run-${randomUUID()}`;
+    let output = '';
+    let ownedRun: Record<string, unknown> | undefined;
+    let ownerScopeId: string | undefined;
+    setClaudeAgentSdkQueryForTest((() => stubsFor((async function* () {
+      yield { type: 'assistant', session_id: 'fixture', uuid: 'inline-use', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id: callId, name: 'mcp__fixture__read_inline_creation_report', input: {} }] } } as any;
+      // Read the actual child generation created by runClaudeAgentSdk. This is
+      // the unbound query lease that real MCP context carries, with no invented
+      // per-call lease, global ALS lease, call id or settlement nonce.
+      const rows = eventlog.openEventLog().prepare(`SELECT scope_id, lease_id, run_attempt_id FROM run_dispatch_leases
+        WHERE session_id = ? AND parent_scope_id = ? AND parent_lease_id = ? AND revoked_at IS NULL`)
+        .all(session.id, lease.scopeId, lease.leaseId) as Array<{ scope_id: string; lease_id: string; run_attempt_id: string }>;
+      assert.equal(rows.length, 1);
+      const row = rows[0]!;
+      const owner = { sessionId: session.id, scopeId: row.scope_id, leaseId: row.lease_id,
+        runAttemptId: row.run_attempt_id, parentScopeId: lease.scopeId, parentLeaseId: lease.leaseId };
+      ownerScopeId = owner.scopeId;
+      const owned = <T>(work: () => T) => withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq,
+        dispatchLease: owner, runAttemptId: attempt.attemptId, counter: new ToolCallsCounter(10) },
+      () => withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq, toolName: 'workflow_create' }, work)) as T;
+      const intent = owned(() => inline.createInlineCreationTestDeliveryIntent(runId, session.id));
+      assert.ok(intent, 'real query context owns delivery without per-call authority fabrication');
+      const detail = 'Controlled canonical creation-test report.';
+      ownedRun = { id: runId, workflow: 'fixture', status: 'creation_test', finishedAt: new Date().toISOString(),
+        originSessionId: session.id, inlineCreationTestDelivery: intent,
+        reportBack: { version: 1, workflowName: 'fixture', outcome: 'done', detail, acknowledgedOriginSessionIds: [] } };
+      writeFileSync(path.join(runDir, `${runId}.json`), JSON.stringify(ownedRun));
+      output = owned(() => inline.inlineCreationTestReceiptForSettlement({ runId, body: detail })) + detail;
+      assert.match(output, /clementine:inline-creation-test:v1/);
+      if (mode === 'foreign-token') output = output.replace(intent.token, '0'.repeat(64));
+      if (mode === 'revoked') dispatchLease.revokeDispatchLease(lease);
+      if (mode === 'stopped') eventlog.requestKill(session.id, 'fixture Stop before late return', attempt);
+      if (mode === 'new-source') eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+        data: { text: 'A separate request supersedes that result.' } });
+      yield { type: 'user', session_id: 'fixture', uuid: 'inline-result', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: callId, content: output }] } } as any;
+      yield successResultMessage('Fixture report retained.');
+    })())) as any);
+    try {
+      let cancelled = false;
+      try {
+        await runClaudeAgentSdk({ prompt: 'Read the controlled creation-test result.', sessionId: session.id,
+          sourceUserSeq: source.seq, modelId: 'claude-sonnet-4-6', agentic: true,
+          dispatchLease: lease, allowedLocalMcpTools: [], mcpToolAllowlist: ['read_inline_creation_report'] });
+      } catch (error) {
+        if (mode === 'current' || mode === 'foreign-token') throw error;
+        assert.equal((error as Error).name, 'AgentRuntimeCancelledError', `${mode}: only expected cancellation is accepted`);
+        cancelled = true;
+      }
+      const returned = eventlog.listEvents(session.id, { types: ['tool_returned'] }).find(row => row.data.callId === callId);
+      if (mode === 'current' || mode === 'foreign-token') assert.ok(returned, 'the fixture adapter result has a canonical audit return');
+      else assert.ok(returned || cancelled, `${mode}: the result is either audit-only or already cancelled`);
+      const projection = returned?.data.inlineCreationTestDelivery as { invocationNonce?: string; outputSha256?: string;
+        ownerScopeId?: string; ownerAttemptId?: string; receipts?: Array<{runId: string}> } | undefined;
+      assert.ok(ownedRun);
+      if (mode !== 'current') {
+        assert.equal(projection, undefined, `${mode}: invalid ownership cannot acknowledge delivery`);
+        assert.notEqual(inline.inlineCreationTestOriginDisposition(ownedRun, session.id), 'acknowledged');
+      } else {
+        assert.equal(projection?.invocationNonce, returned!.data.invocationNonce);
+        assert.equal(projection?.outputSha256, createHash('sha256').update(output).digest('hex'));
+        assert.equal(projection?.ownerScopeId, ownerScopeId);
+        assert.equal(projection?.ownerAttemptId, attempt.attemptId);
+        assert.deepEqual(projection?.receipts?.map(receipt => receipt.runId), [runId]);
+        assert.equal(inline.inlineCreationTestOriginDisposition(ownedRun, session.id), 'acknowledged',
+          'timely exact delivery repairs after SDK child-query revocation without a second report');
+      }
+    } finally { dispatchLease.revokeDispatchLease(lease); setClaudeAgentSdkQueryForTest(null); }
+  }
+});
 
 test('dispatch_background_task is terminal in the SDK lane', async () => {
   let interrupted = false;

@@ -19,7 +19,7 @@ mkdirSync(path.join(TMP, 'state'), { recursive: true });
 const { awaitWorkflowCreationTestSettlement } = await import('./workflow-run-queue.js');
 const { renderCreationTestSettlementReceipt, authorableStepShape } = await import('./orchestration-tools.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
-const { addNotification } = await import('../runtime/notifications.js');
+const { addNotification, getNotification } = await import('../runtime/notifications.js');
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
 const def = {
@@ -59,7 +59,7 @@ test('the settlement carries the structured step verdicts the daemon recorded', 
       ],
     },
   });
-  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'Digest check', status: 'creation_test', notifiedAt: new Date().toISOString() }));
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'Digest check', status: 'creation_test', finishedAt: new Date().toISOString(), rehearsal: { passed: false, definitionKey: 'controlled-fixture' }, reportBack: { version: 1, workflowName: 'Digest check', outcome: 'blocked', detail: getNotification(`workflow-${runId}-creationtest`)!.body, acknowledgedOriginSessionIds: [] } }));
   const settled = await awaitWorkflowCreationTestSettlement(runId, 'Digest check', { drainRegistered: () => true, pollMs: 20, boundMs: 2_000 });
   assert.ok(settled);
   assert.equal(settled.pass, false);

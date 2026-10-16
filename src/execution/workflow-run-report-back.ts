@@ -1,3 +1,4 @@
+import { inlineCreationTestOriginDisposition, registerInlineCreationTestDeliveryReconciler } from './inline-creation-test-delivery.js';
 import { createHash } from 'node:crypto';
 import { withoutHostReceiptLines } from '../runtime/host-receipt-lines.js';
 import { readWorkflowSettlementEvidence } from './workflow-settlement-evidence.js';
@@ -883,8 +884,10 @@ function deliverToOrigins(
   acknowledgedObserverSettlements: Record<string, WorkflowRunOriginObserverSettlementProjection>;
   complete: boolean;
   corruptEvidence: boolean;
+  pendingInline: boolean;
   errors: string[];
 } {
+  let pendingInline = false;
   const resolved = workflowRunReportBackRecipients(run);
   const acknowledgedSessions = new Set(uniqueStrings(envelope.acknowledgedOriginSessionIds));
   // Per-run observer ids are only projections. Rebuild this set from the
@@ -1178,6 +1181,9 @@ function deliverToOrigins(
   for (const originSessionId of resolved.legacyOriginSessionIds) {
     if (acknowledgedSessions.has(originSessionId)) continue;
     if (onlyOrigins && !onlyOrigins.has(originSessionId)) continue;
+    const inline = inlineCreationTestOriginDisposition(run as unknown as Record<string, unknown>, originSessionId);
+    if (inline === 'acknowledged') { acknowledgedSessions.add(originSessionId); continue; }
+    if (inline === 'pending') { pendingInline = true; continue; }
     try {
       const result = deliverOutcomeImpl(
         { status: envelope.outcome, detail: envelope.detail },
@@ -1195,6 +1201,7 @@ function deliverToOrigins(
     acknowledgedObserverSettlements,
     complete: resolved.complete && exactEvidenceComplete,
     corruptEvidence,
+    pendingInline,
     errors,
   };
 }
@@ -1293,6 +1300,11 @@ function attemptWorkflowRunReportBackInternal(
       };
       if (allAcknowledged) {
         next.reportBackAcknowledgedAt = current.reportBackAcknowledgedAt ?? new Date(now).toISOString();
+        delete next.reportBackRetry;
+      } else if (delivered.pendingInline && delivered.errors.length === 0 && delivered.complete && finalOrigins.complete) {
+        // Waiting for one bounded inline owner is not a failed delivery and
+        // must not consume retry/quarantine attempts before its return.
+        delete next.reportBackAcknowledgedAt;
         delete next.reportBackRetry;
       } else {
         delete next.reportBackAcknowledgedAt;
@@ -1478,3 +1490,9 @@ export function deliverWorkflowRunOutcome(
   });
   return acknowledged;
 }
+
+// A retained paired result nudges the existing locked ACK coordinator. The
+// durable event also repairs a process death before this best-effort nudge.
+registerInlineCreationTestDeliveryReconciler((runId) => {
+  attemptWorkflowRunReportBackInternal(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), Date.now(), true);
+});
