@@ -11,6 +11,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -26,6 +27,16 @@ process.env.CLEMMY_AUTHORITY_SEAL_KEY = 'c7'.repeat(32);
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
 
+// The real production port executes pinned emitted bytes, including its own
+// reviewed-CLI leaf. Emit this source tree before any module pins a generation;
+// the replay child must inherit the exact same disposable artifact root.
+const previousArtifactRoot = process.env.CLEMMY_IMPLEMENTATION_ARTIFACT_ROOT;
+const artifactRoot = path.join(TEST_HOME, 'implementation-artifacts');
+process.env.CLEMMY_IMPLEMENTATION_ARTIFACT_ROOT = artifactRoot;
+const implementations = await import('./shipped-implementation-identity.js');
+implementations.emitShippedImplementationArtifacts(artifactRoot);
+implementations.installImplementationArtifactRoot(artifactRoot);
+
 const config = await import('./reviewed-cli-read-config.js');
 const acquisition = await import('./production-live-read-acquisition-registry.js');
 const eventlog = await import('./eventlog.js');
@@ -38,12 +49,15 @@ const observations = await import('./independent-capability-observation.js');
 const manifests = await import('./capability-manifest.js');
 const capabilityIndex = await import('../../memory/capability-index.js');
 const transport = await import('./reviewed-cli-read-transport.js');
+const { mergedSpawnEnv } = await import('../spawn-env.js');
 
 test.after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
   ports.clearProductionCapabilityPorts();
   observations.clearIndependentCapabilityObservations();
   eventlog.closeEventLog();
+  if (previousArtifactRoot === undefined) delete process.env.CLEMMY_IMPLEMENTATION_ARTIFACT_ROOT;
+  else process.env.CLEMMY_IMPLEMENTATION_ARTIFACT_ROOT = previousArtifactRoot;
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
@@ -514,4 +528,114 @@ test('a reviewed-CLI observation is re-read at every crossing, so freshness is n
     observations.observationIsFresh(second, later + observations.INDEPENDENT_OBSERVATION_FRESHNESS_MS - 1),
     true,
   );
+});
+
+test('the pinned reviewed process receives current host CLI declarations without account or model-env authority', async () => {
+  const descriptorId = `environment-${nonce}`;
+  const environmentOperation = `read_environment_${nonce}`;
+  const environmentObjective = 'inspect environment context';
+  const profileKey = `CLEMMY_REVIEWED_PROFILE_${nonce.toUpperCase()}`;
+  const caseKey = `CLEMMY_REVIEWED_CASE_${nonce.toUpperCase()}`;
+  const inheritedKey = `CLEMMY_REVIEWED_INHERITED_${nonce.toUpperCase()}`;
+  const privateKey = `CLEMMY_REVIEWED_PRIVATE_${nonce.toUpperCase()}`;
+  const keys = [profileKey, caseKey, caseKey.toLowerCase(), inheritedKey, privateKey];
+  const previousEnv = new Map<string, string | undefined>(keys.map(key => [key, process.env[key]]));
+  const cliEnvFile = path.join(TEST_HOME, 'state', 'cli-env.json');
+  const daemonEnvFile = path.join(TEST_HOME, '.env');
+  const previousCliEnv = existsSync(cliEnvFile) ? readFileSync(cliEnvFile) : undefined;
+  const previousDaemonEnv = existsSync(daemonEnvFile) ? readFileSync(daemonEnvFile) : undefined;
+  const environmentCounter = path.join(TEST_HOME, `environment-counter-${nonce}`);
+  const literal = 'literal value ; $() | *';
+  // Seal the complete controlled program in argv, using the actual native
+  // Node executable on each platform rather than a shebang or shell launcher.
+  const program = [
+    "const fs = require('node:fs');",
+    `const counter = ${JSON.stringify(environmentCounter)};`,
+    "const n = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;",
+    "fs.writeFileSync(counter, String(n));",
+    `process.stdout.write(JSON.stringify({ profile: process.env[${JSON.stringify(profileKey)}],`,
+    `caseUpper: process.env[${JSON.stringify(caseKey)}], caseLower: process.env[${JSON.stringify(caseKey.toLowerCase())}],`,
+    `caseKeys: Object.keys(process.env).filter(key => key.toUpperCase() === ${JSON.stringify(caseKey)}).length,`,
+    `inherited: process.env[${JSON.stringify(inheritedKey)}], privateDaemon: process.env[${JSON.stringify(privateKey)}] ?? null,`,
+    "argv: process.argv.slice(1), n }));",
+  ].join('\n');
+  let declarationRevision = 0;
+  const declareProfile = (profile: string): void => {
+    writeFileSync(cliEnvFile, JSON.stringify({ [profileKey]: profile, [caseKey.toLowerCase()]: 'declared-case' }));
+    // The declaration reader caches by mtime; make both controlled snapshots
+    // distinct even on filesystems whose ordinary write timestamp is coarse.
+    const stamp = new Date(Date.now() + ++declarationRevision * 1_000);
+    utimesSync(cliEnvFile, stamp, stamp);
+  };
+  try {
+    process.env[profileKey] = 'inherited-profile';
+    delete process.env[caseKey.toLowerCase()];
+    process.env[caseKey] = 'inherited-case';
+    process.env[inheritedKey] = 'synthetic-inherited-credential';
+    delete process.env[privateKey];
+    writeFileSync(daemonEnvFile, `${privateKey}=synthetic-private-daemon-value\n`);
+    declareProfile('declared-profile-a');
+    const healthStyleSnapshot = mergedSpawnEnv();
+    assert.equal(healthStyleSnapshot[profileKey], 'declared-profile-a');
+    const descriptor = await config.provisionReviewedCliReadDescriptor({
+      version: 1, descriptorId, operationId: environmentOperation,
+      displayName: environmentObjective, description: environmentObjective,
+      effect: 'read', accountId: 'reviewed_cli:host', executablePath: process.execPath,
+      argvPrefix: ['--eval', program, '--'],
+      arguments: [{ name: fieldName, kind: 'option', token: optionToken, valueType: 'string', required: true }],
+      limits: { timeoutMs: 2_000, maxStdoutBytes: 16_384, maxStderrBytes: 4_096, maxArgumentBytes: 4_096 },
+    });
+    const installed = await acquisition.createProductionLiveReadAcquisitionRegistry().acquire({
+      requirementId: `environment-requirement-${nonce}`, objective: environmentObjective, effect: 'read',
+    });
+    assert.equal(installed.status, 'installed', JSON.stringify(installed));
+    if (installed.status !== 'installed') return;
+    assert.equal(installed.manifest.accountId, 'reviewed_cli:host');
+    assert.equal(installed.manifest.providerIdentity, realpathSync(process.execPath));
+    const readContext = async (label: string) => {
+      const value = await invokeInstalled(installed.manifest, { [fieldName]: literal }, label) as {
+        complete: boolean; result: { executableRealpath: string; argv: string[]; stdout: string };
+      };
+      assert.equal(value.complete, true);
+      assert.equal(value.result.executableRealpath, descriptor.executableRealpath);
+      assert.deepEqual(value.result.argv, ['--eval', program, '--', optionToken, literal]);
+      return JSON.parse(value.result.stdout) as {
+        profile: string; caseUpper: string; caseLower: string; caseKeys: number;
+        inherited: string; privateDaemon: string | null; argv: string[]; n: number;
+      };
+    };
+    const first = await readContext('environment-first');
+    assert.equal(first.profile, healthStyleSnapshot[profileKey], 'health and execution use the same host environment policy');
+    assert.equal(first.inherited, 'synthetic-inherited-credential', 'this existing CLI seam remains unsandboxed');
+    assert.equal(first.privateDaemon, null, 'the private daemon env file is not copied into CLI children');
+    assert.deepEqual(first.argv, [optionToken, literal], 'environment parity adds no shell interpretation');
+    assert.equal(first.n, 1);
+    if (process.platform === 'win32') {
+      assert.equal(first.caseUpper, 'declared-case');
+      assert.equal(first.caseLower, 'declared-case');
+      assert.equal(first.caseKeys, 1, 'native Windows receives one winning case-insensitive key');
+    } else {
+      assert.equal(first.caseUpper, 'inherited-case');
+      assert.equal(first.caseLower, 'declared-case');
+      assert.equal(first.caseKeys, 2, 'POSIX names remain distinct');
+    }
+    declareProfile('declared-profile-b');
+    const second = await readContext('environment-changed');
+    assert.equal(second.profile, 'declared-profile-b', 'dispatch captures current declarations rather than replaying a health-time snapshot');
+    assert.equal(healthStyleSnapshot[profileKey], 'declared-profile-a');
+    assert.equal(second.n, 2);
+    assert.equal(installed.manifest.accountId, 'reviewed_cli:host', 'environment parity is not upstream-account authentication');
+    assert.equal(transport.observeReviewedCliReadTransport(environmentOperation, 'unverified-upstream-account'), null);
+    await assert.rejects(invokeInstalled(installed.manifest,
+      { [fieldName]: literal, env: { [profileKey]: 'model-supplied-profile' } }, 'environment-model-override'),
+    /closed structured-argv schema/);
+    assert.equal(readFileSync(environmentCounter, 'utf8'), '2', 'model environment arguments cannot start a third process');
+  } finally {
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    if (previousCliEnv === undefined) rmSync(cliEnvFile, { force: true }); else writeFileSync(cliEnvFile, previousCliEnv);
+    if (previousDaemonEnv === undefined) rmSync(daemonEnvFile, { force: true }); else writeFileSync(daemonEnvFile, previousDaemonEnv);
+    await config.removeReviewedCliReadDescriptor(descriptorId);
+  }
 });

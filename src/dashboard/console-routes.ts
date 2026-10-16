@@ -170,7 +170,7 @@ import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type 
 import { resolveWorkflowRunConcurrency } from '../execution/workflow-run-concurrency.js';
 import { certifyWorkflow, type WorkflowCertification } from '../execution/workflow-certification.js';
 import { rehearsalVerdictFromRunRecord, workflowRehearsalKey } from '../execution/workflow-run-definition.js';
-import { workflowRunInventory, workflowRunInventorySignature } from '../execution/workflow-run-inventory.js';
+import { captureWorkflowRunInventory, workflowRunInventory, type WorkflowRunInventoryEntry } from '../execution/workflow-run-inventory.js';
 import { workflowCodeRevisionFingerprint } from '../execution/workflow-code-certification.js';
 import { buildWorkflowResourceBindingReportFromRuntime } from '../execution/workflow-resource-binding.js';
 import { applyLearnedQualityCriteria, workflowQualityCriteria } from '../execution/workflow-quality-contract.js';
@@ -1049,10 +1049,10 @@ function latestRehearsalPassed(
 // route that was 25 workflows × certification = ~11s of SYNCHRONOUS work per
 // GET (measured live 2026-07-07), which not only made the Automate screen
 // crawl but blocked the event loop so EVERY other request queued behind it.
-// Certification + proof are pure functions of (definition, this workflow's
-// run history), so memoize per workflow keyed on a cheap content hash + the
-// latest run id. A definition edit or a new run changes the key; everything
-// else is a hit.
+// Certification + proof reuse the definition and this workflow's run history.
+// Derive both the records and their generation key from one request snapshot:
+// rescanning here both multiplies metadata I/O and can label old records with
+// a newer generation's key.
 const workflowListMemo = new Map<string, { key: string; proof: unknown; certification: ReturnType<typeof workflowCertificationFor> }>();
 
 function djb2(text: string): string {
@@ -1065,14 +1065,14 @@ function memoizedWorkflowListDerivations(
   entry: { name: string; data: WorkflowDefinition },
   runRecords: WorkflowRunRecordSummary[],
   lastRunId: string | null,
+  runsKey: string,
 ): { proof: unknown; certification: ReturnType<typeof workflowCertificationFor> } {
   // Plan settings are live-readable. Include the effective values in the memo
   // identity so Console truth changes with runtime truth instead of waiting for
   // a workflow edit, new run, or daemon restart to invalidate certification.
   const planOptionsKey = JSON.stringify(workflowExecutionPlanOptions());
-  // Every run of this workflow, as it stands now: a run that finishes or
-  // changes moves the key, not only a newer run arriving.
-  const runsKey = workflowRunInventorySignature([entry.name, entry.data.name]);
+  // The caller's captured generation covers every run of this workflow, not
+  // only a new id. Never consult mutable inventory state after reading records.
   const key = `${djb2(JSON.stringify(entry.data))}::${workflowCodeRevisionFingerprint(entry.data, entry.name)}::${lastRunId ?? 'none'}::${runsKey}::${planOptionsKey}`;
   const hit = workflowListMemo.get(entry.name);
   if (hit && hit.key === key) return { proof: hit.proof, certification: hit.certification };
@@ -1093,7 +1093,8 @@ function armWorkflowListMemoWarm(): void {
   workflowMemoWarmArmed = true;
   const timer = setTimeout(() => {
     try {
-      const runRecords = readWorkflowRunRecords();
+      const inventory = captureWorkflowRunInventory();
+      const runRecords = readWorkflowRunRecords(inventory.entries);
       const latestByWorkflow = new Map<string, string>();
       for (const run of runRecords) {
         if (!latestByWorkflow.has(run.workflow)) latestByWorkflow.set(run.workflow, run.id);
@@ -1103,7 +1104,9 @@ function armWorkflowListMemoWarm(): void {
         if (index >= entries.length) return;
         const entry = entries[index];
         try {
-          memoizedWorkflowListDerivations(entry, runRecords, latestByWorkflow.get(entry.data.name) ?? latestByWorkflow.get(entry.name) ?? null);
+          memoizedWorkflowListDerivations(entry, runRecords,
+            latestByWorkflow.get(entry.data.name) ?? latestByWorkflow.get(entry.name) ?? null,
+            inventory.signatureFor([entry.name, entry.data.name]));
         } catch { /* per-entry warm is best-effort */ }
         setImmediate(() => warmNext(index + 1));
       };
@@ -2787,11 +2790,11 @@ function readWorkflowRunRecoveryIntent(runId: string, workflowNames: string[]): 
   }
 }
 
-function readWorkflowRunRecords(): WorkflowRunRecordSummary[] {
+function readWorkflowRunRecords(inventory: readonly WorkflowRunInventoryEntry[] = workflowRunInventory()): WorkflowRunRecordSummary[] {
   // The shared inventory re-reads only run files that changed and carries no
   // step outputs or definition snapshot; it arrives newest first.
   const records: WorkflowRunRecordSummary[] = [];
-  for (const entry of workflowRunInventory()) {
+  for (const entry of inventory) {
     const raw = entry.record as Record<string, unknown>;
     if (isCompiledProjectWorkflowRunRecord(raw)) continue;
     const normalized = normalizeWorkflowRunRecord(raw);
@@ -5729,7 +5732,8 @@ export function registerConsoleRoutes(
     try {
       // Latest run per workflow (records are newest-first) → a status dot
       // in the list so you can scan health at a glance.
-      const runRecords = readWorkflowRunRecords();
+      const inventory = captureWorkflowRunInventory();
+      const runRecords = readWorkflowRunRecords(inventory.entries);
       const latestRunByWorkflow = new Map<string, WorkflowRunRecordSummary>();
       for (const run of runRecords) {
         if (!latestRunByWorkflow.has(run.workflow)) latestRunByWorkflow.set(run.workflow, run);
@@ -5741,7 +5745,8 @@ export function registerConsoleRoutes(
           const lastRun = latestRunByWorkflow.get(entry.data.name) ?? latestRunByWorkflow.get(entry.name) ?? null;
           const lastRunFailedItems = lastRun ? listFinalFailedItems(entry.name, lastRun.id) : [];
           const lastRunFailedItemStepIds = Array.from(new Set(lastRunFailedItems.map((item) => item.stepId)));
-          const { proof, certification } = memoizedWorkflowListDerivations(entry, runRecords, lastRun?.id ?? null);
+          const { proof, certification } = memoizedWorkflowListDerivations(entry, runRecords, lastRun?.id ?? null,
+            inventory.signatureFor([entry.name, entry.data.name]));
           return {
           name: entry.data.name,
           file: entry.layout === 'directory' ? `${entry.name}/SKILL.md` : `${entry.name}.md`,
@@ -5797,7 +5802,8 @@ export function registerConsoleRoutes(
       // Workflow Home is a catalog surface. Orphaned named records and
       // run-scoped compiled projects remain available in generic Tasks and
       // activity, but cannot become phantom saved workflows here.
-      const runRecords = readWorkflowRunRecords()
+      const inventory = captureWorkflowRunInventory();
+      const runRecords = readWorkflowRunRecords(inventory.entries)
         .filter((run) => workflowByIdentity.has(run.workflow));
       const pending = listPendingRuns()
         .filter((run) => workflowByIdentity.has(run.workflowName));
@@ -5860,7 +5866,8 @@ export function registerConsoleRoutes(
         // slug), so either screen warms the other instead of recertifying
         // every workflow on each visit.
         const memoRun = runs.find((run) => run.workflow === entry.data.name) ?? runs[0] ?? null;
-        const { proof, certification: certified } = memoizedWorkflowListDerivations(entry, runRecords, memoRun?.id ?? null);
+        const { proof, certification: certified } = memoizedWorkflowListDerivations(entry, runRecords, memoRun?.id ?? null,
+          inventory.signatureFor([entry.name, entry.data.name]));
         const certification = workflowCertificationSummary(certified);
         return {
           name: entry.data.name,

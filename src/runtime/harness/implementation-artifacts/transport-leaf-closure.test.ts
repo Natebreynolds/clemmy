@@ -53,10 +53,18 @@ async function bundle(entryPoint: string) {
   });
   const output = result.outputFiles?.[0];
   assert.ok(output);
+  const outputMeta = Object.values(result.metafile?.outputs ?? {})[0];
+  assert.ok(outputMeta);
   return {
     bytes: output!.contents,
     source: output!.text,
-    inputs: Object.keys(result.metafile?.inputs ?? {}),
+    // The parsed graph also includes modules removed by tree shaking. Guard
+    // the bytes shipped to the child, as the invoke/reconcile closure pin does.
+    inputs: Object.entries(outputMeta!.inputs)
+      .filter(([, input]) => input.bytesInOutput > 0)
+      .map(([file]) => file),
+    externalRequires: [...new Set(output!.text.match(/require\("[^"]+"\)/g) ?? [])]
+      .filter(entry => !entry.startsWith('require("node:')).sort(),
   };
 }
 
@@ -169,10 +177,15 @@ test('both sealed transport metafiles exclude the host event-log and native DB g
   ]);
   assertTransportOnlyClosure('transport', production);
   assertTransportOnlyClosure('transportIsolated', isolated);
+  assert.deepEqual(production.externalRequires, ['require("zod")'], 'only the existing closed-schema package may remain external');
+  assert.deepEqual(isolated.externalRequires, [], 'the isolated transport remains Node-builtins-only');
   assert.match(production.source, /reviewed local execution identity changed before dispatch/);
   assert.doesNotMatch(isolated.source, /reviewed local execution identity changed before dispatch/);
-  assert.ok(production.bytes.byteLength < 300_000, `unexpected transport closure: ${production.bytes.byteLength}`);
-  assert.ok(isolated.bytes.byteLength < 100_000, `unexpected isolated closure: ${isolated.bytes.byteLength}`);
+  // Exact preceding source was 302641/118297 bytes, already above the old
+  // caps. Shared child-env policy adds under 10 KB per leaf. Keep tight bounds
+  // alongside the retained-module, dependency and actual packaged-child pins.
+  assert.ok(production.bytes.byteLength < 320_000, `unexpected transport closure: ${production.bytes.byteLength}`);
+  assert.ok(isolated.bytes.byteLength < 135_000, `unexpected isolated closure: ${isolated.bytes.byteLength}`);
 });
 
 function runPackagedChild(input: {

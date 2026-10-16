@@ -11,6 +11,7 @@ import { redactSensitiveText } from '../security.js';
 import { execFile, type ExecFileException } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
+import { mergedSpawnEnv } from '../spawn-env.js';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { stableJsonFingerprint } from '../../shared/stable-json-digest.js';
 import type {
@@ -316,6 +317,10 @@ export async function executeReviewedCliRead(
   }
   const argv = compileReviewedCliArgv(descriptor, call.args);
   if (!argv) throw new Error('reviewed CLI arguments exceed the closed structured-argv schema');
+  // Use the same host-owned environment policy as CLI health checks. This is
+  // the current dispatch snapshot, not proof of any upstream account or auth.
+  // No invocation argument or reviewed descriptor may supply environment keys.
+  const childEnv = mergedSpawnEnv();
   const before = observeReviewedCliExecutable(descriptor.executableRealpath);
   if (!before || before.binarySha256 !== descriptor.binarySha256) {
     throw new Error('reviewed CLI executable changed before dispatch');
@@ -326,6 +331,7 @@ export async function executeReviewedCliRead(
       descriptor!.executableRealpath,
       [...argv],
       {
+        env: childEnv,
         encoding: 'utf8',
         timeout: descriptor!.limits.timeoutMs,
         maxBuffer: Math.max(

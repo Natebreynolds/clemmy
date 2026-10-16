@@ -29,6 +29,13 @@ export interface WorkflowRunInventoryEntry {
   readonly record: Readonly<Record<string, unknown>>;
 }
 
+export interface WorkflowRunInventorySnapshot {
+  /** The light projections from one metadata scan, newest first. */
+  readonly entries: readonly WorkflowRunInventoryEntry[];
+  /** Pure over this capture: no later filesystem or shared-cache lookups. */
+  signatureFor(workflowNames: readonly string[]): string;
+}
+
 const HEAVY_FIELDS = new Set(['stepOutputs', 'workflowDefinitionSnapshot', 'output', 'reportBack', 'mutationContractSnapshot']);
 const SNAPSHOT_IDENTITY_FIELDS = ['version', 'scope', 'compilerId', 'definitionHash', 'workflowSlug', 'codeRevision'];
 
@@ -139,15 +146,38 @@ export function workflowRunInventory(): readonly WorkflowRunInventoryEntry[] {
     .sort((a, b) => createdKey(b).localeCompare(createdKey(a)) || b.file.localeCompare(a.file));
 }
 
+/**
+ * Capture once per status/history request. The records and their memo identity
+ * must describe the same scan, even when another reader refreshes the shared
+ * cache while this capture is still in use. Group each workflow's generations
+ * once so deriving W workflow signatures does not scan R runs W times.
+ * This is a display projection, never execution or mutation authority.
+ */
+export function captureWorkflowRunInventory(): WorkflowRunInventorySnapshot {
+  const entries = Object.freeze([...workflowRunInventory()]);
+  const grouped = new Map<string, ReturnType<typeof createHash>>();
+  for (const entry of entries) {
+    const workflow = String(entry.record.workflow ?? '');
+    let hash = grouped.get(workflow);
+    if (!hash) { hash = createHash('sha256'); grouped.set(workflow, hash); }
+    hash.update(JSON.stringify([entry.file, cache.get(entry.file)!.generation]));
+  }
+  const groupDigests = new Map([...grouped].map(([workflow, hash]) => [workflow, hash.digest('hex')]));
+  return Object.freeze({
+    entries,
+    signatureFor(workflowNames: readonly string[]): string {
+      const hash = createHash('sha256').update('workflow-run-inventory:v2\0');
+      for (const workflow of [...new Set(workflowNames)].sort()) {
+        hash.update(JSON.stringify([workflow, groupDigests.get(workflow) ?? null]));
+      }
+      return `v2:${hash.digest('hex').slice(0, 24)}`;
+    },
+  });
+}
+
 /** Changes whenever any run of these workflow names is added, changes or goes away. */
 export function workflowRunInventorySignature(workflowNames: readonly string[]): string {
-  const names = new Set(workflowNames);
-  const hash = createHash('sha256');
-  for (const entry of workflowRunInventory()) {
-    if (!names.has(String(entry.record.workflow ?? ''))) continue;
-    hash.update(`${entry.file}\0${cache.get(entry.file)!.generation}\n`);
-  }
-  return hash.digest('hex').slice(0, 24);
+  return captureWorkflowRunInventory().signatureFor(workflowNames);
 }
 
 /** Tests only. */

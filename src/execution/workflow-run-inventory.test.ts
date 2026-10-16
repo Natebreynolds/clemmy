@@ -167,3 +167,69 @@ test('exact-run lookup rejects paths without touching storage', (t) => {
   assert.equal(stats.mock.calls.length, 0);
   assert.equal(listings.mock.calls.length, 0);
 });
+
+test('one captured inventory derives every workflow signature without rescanning metadata or parsing records', (t) => {
+  for (let i = 0; i < 24; i++) write(`capture-${i}`, {
+    workflow: `workflow-${i % 4}`, status: 'running', createdAt: `2026-10-16T01:00:${String(i).padStart(2, '0')}.000Z`,
+    stepOutputs: { read: 'heavy'.repeat(4_000) },
+  });
+  const reads = t.mock.method(fs, 'readFileSync');
+  const stats = t.mock.method(fs, 'statSync');
+  const listings = t.mock.method(fs, 'readdirSync');
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const first = inventory.captureWorkflowRunInventory();
+  assert.equal(first.entries.length, 24);
+  assert.equal(reads.mock.calls.length, 24);
+  assert.equal(stats.mock.calls.length, 48, 'cold records each have stable before/after metadata');
+  assert.equal(listings.mock.calls.length, 1);
+  for (let i = 0; i < 4; i++) {
+    assert.match(first.signatureFor([`workflow-${i}`]), /^v2:[a-f0-9]{24}$/);
+    assert.equal(first.signatureFor([`workflow-${i}`, 'missing', `workflow-${i}`]), first.signatureFor(['missing', `workflow-${i}`]));
+  }
+  assert.equal(reads.mock.calls.length, 24);
+  assert.equal(stats.mock.calls.length, 48, 'per-workflow memo identities do not rescan the corpus');
+  assert.equal(listings.mock.calls.length, 1);
+  const warm = inventory.captureWorkflowRunInventory();
+  assert.equal(reads.mock.calls.length, 24, 'a new unchanged request parses no heavy records');
+  assert.equal(stats.mock.calls.length, 72, 'a new request checks each generation exactly once');
+  assert.equal(listings.mock.calls.length, 2);
+  assert.equal(warm.signatureFor(['workflow-0', 'workflow-1']), first.signatureFor(['workflow-1', 'workflow-0']));
+});
+
+test('captured records and signatures remain coherent after exact refresh, atomic replacement, deletion and cache reset', () => {
+  write('captured', { workflow: 'captured-flow', status: 'queued' });
+  write('independent', { workflow: 'another-flow', status: 'running' });
+  const file = path.join(WORKFLOW_RUNS_DIR, 'captured.json');
+  const fixed = new Date('2026-10-16T01:00:00.000Z');
+  utimesSync(file, fixed, fixed);
+  const beforeStat = statSync(file);
+  const original = inventory.captureWorkflowRunInventory();
+  const originalKey = original.signatureFor(['captured-flow']);
+  const independentKey = original.signatureFor(['another-flow']);
+  assert.ok(Object.isFrozen(original));
+  assert.ok(Object.isFrozen(original.entries));
+  const replacement = `${file}.replacement`;
+  writeFileSync(replacement, JSON.stringify({ id: 'captured', workflow: 'captured-flow', status: 'failed' }));
+  utimesSync(replacement, fixed, fixed);
+  renameSync(replacement, file);
+  assert.equal(statSync(file).size, beforeStat.size);
+  assert.equal(statSync(file).mtimeMs, beforeStat.mtimeMs);
+  assert.equal(inventory.workflowRunInventoryEntry('captured')?.record.status, 'failed', 'another reader refreshes the shared cache');
+  assert.equal(original.entries.find(entry => entry.record.id === 'captured')?.record.status, 'queued');
+  assert.equal(original.signatureFor(['captured-flow']), originalKey, 'old proof cannot acquire a newer memo identity');
+  const refreshed = inventory.captureWorkflowRunInventory();
+  assert.equal(refreshed.entries.find(entry => entry.record.id === 'captured')?.record.status, 'failed');
+  assert.notEqual(refreshed.signatureFor(['captured-flow']), originalKey);
+  assert.equal(refreshed.signatureFor(['another-flow']), independentKey, 'unrelated workflow groups remain stable');
+  assert.equal(inventory.workflowRunInventorySignature(['captured-flow']), refreshed.signatureFor(['captured-flow']), 'legacy signature wrapper uses the same opaque identity');
+  unlinkSync(file);
+  assert.equal(inventory.workflowRunInventoryEntry('captured'), null);
+  assert.equal(refreshed.entries.find(entry => entry.record.id === 'captured')?.record.status, 'failed');
+  const afterDeletion = inventory.captureWorkflowRunInventory();
+  assert.equal(afterDeletion.entries.some(entry => entry.record.id === 'captured'), false);
+  assert.notEqual(afterDeletion.signatureFor(['captured-flow']), refreshed.signatureFor(['captured-flow']));
+  inventory._resetWorkflowRunInventoryForTests();
+  assert.equal(original.signatureFor(['captured-flow']), originalKey, 'signature derivation no longer consults global cache');
+  assert.equal(original.entries.find(entry => entry.record.id === 'captured')?.record.status, 'queued');
+});
