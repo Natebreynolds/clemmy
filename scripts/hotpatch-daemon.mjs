@@ -1030,7 +1030,10 @@ function inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, f
   const statePath = path.join(shipIt, 'ShipItState.plist');
   const state = flatJSONObject(statePath, fileOps);
   const expectedKeys = ['bundleIdentifier', 'launchAfterInstallation', 'targetBundleURL', 'updateBundleURL', 'useUpdateBundleName'];
-  if (Object.keys(state).sort().join('|') !== expectedKeys.sort().join('|') || state.bundleIdentifier !== bundleId || state.launchAfterInstallation !== true || state.useUpdateBundleName !== true) guardRefusal('unrecognized consumed installer request');
+  // Restart-to-update asks the installer to relaunch; an update staged to
+  // install on quit does not. Either way the request was consumed, and the
+  // checks below prove the installed bundle is that verified download.
+  if (Object.keys(state).sort().join('|') !== expectedKeys.sort().join('|') || state.bundleIdentifier !== bundleId || typeof state.launchAfterInstallation !== 'boolean' || state.useUpdateBundleName !== true) guardRefusal('unrecognized consumed installer request');
   const exactFileURL = (value) => {
     const url = new URL(value);
     if (url.protocol !== 'file:' || url.host || url.search || url.hash) guardRefusal('unexpected installer request URL');

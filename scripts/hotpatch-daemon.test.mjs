@@ -430,6 +430,20 @@ test('verified applied native update permits retained consumed state and active/
   assert.deepEqual(g.capture(), evidence, 'all cache, request and native bytes remain identical');
 });
 
+test('an update the installer applied on quit is the same consumed request; any other value is refused', async t => {
+  await t.test('applied on quit', t => {
+    const g = appliedUpdateFixture(t);
+    fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, launchAfterInstallation: false }));
+    const evidence = g.capture();
+    assert.doesNotThrow(() => g.proveApplied(evidence));
+  });
+  await t.test('not a boolean', t => {
+    const g = appliedUpdateFixture(t);
+    fs.writeFileSync(g.statePath, JSON.stringify({ ...g.state, launchAfterInstallation: 'yes' }));
+    assert.throws(() => g.capture(), /unrecognized consumed installer request/);
+  });
+});
+
 test('matching retained archives alone cannot bypass a failed complete native signature or forge a prior proof', t => {
   const g = appliedUpdateFixture(t); const evidence = g.capture();
   assert.throws(() => g.capture(() => { throw new Error('signature failed'); }), /signature failed/);
