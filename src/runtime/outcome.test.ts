@@ -333,92 +333,90 @@ test('deliverOutcome: an active goal on the origin session gets a ledger line', 
   );
 });
 
-test('proactive report on a BUSY chat defers durably, then fires once idle', async () => {
-  const { processDeferredProactiveReports, setProactiveReportFireForTest } = await import('./outcome.js');
-  const { readFileSync, writeFileSync } = await import('node:fs');
-  const queueFile = path.join(TMP_HOME, 'state', 'deferred-proactive-reports.json');
-
-  createSession({ id: 'sess-defer', kind: 'chat' });
-  // A fresh (non-synthetic) event makes the session look mid-conversation.
-  appendEvent({ sessionId: 'sess-defer', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'hi' } });
-
-  const fired: string[] = [];
-  setProactiveReportFireForTest(async (sessionId, outcome) => { fired.push(`${sessionId}:${outcome.status}`); });
+test('publication survives an acknowledgement crash gap without publishing the result twice', async () => {
+  const { openEventLog } = await import('./harness/eventlog.js');
+  const { processDeferredProactiveReports } = await import('./outcome.js');
+  const sessionId = 'sess-report-ack-gap';
+  createSession({ id: sessionId, kind: 'chat' });
+  const db = openEventLog();
+  const context = ctx({ originSessionId: sessionId, sourceId: 'ack-gap', deliveryId: 'delivery-ack-gap', proactiveTurn: true });
+  const outcome = { status: 'done' as const, detail: 'The artifact is ready.' };
+  db.exec(`CREATE TRIGGER fixture_report_ack_gap BEFORE DELETE ON outcome_reports_pending_v1
+    WHEN OLD.session_id = 'sess-report-ack-gap' BEGIN SELECT RAISE(ABORT, 'controlled acknowledgement gap'); END;`);
   try {
-    deliverOutcome(
-      { status: 'done', detail: 'verification passed' },
-      ctx({ originSessionId: 'sess-defer', sourceId: 'wf-defer-1', sourceLabel: 'workflow run', proactiveTurn: true }),
-    );
-    // maybeScheduleProactiveReport is fire-and-forget; give it a beat to enqueue.
-    await new Promise((r) => setTimeout(r, 150));
-    assert.equal(fired.length, 0, 'busy chat must not speak immediately');
-    const queued = JSON.parse(readFileSync(queueFile, 'utf8'));
-    assert.equal(queued.length, 1, 'deferred entry is durably queued');
-    assert.equal(queued[0].sessionId, 'sess-defer');
-    assert.equal(queued[0].ctx.sourceId, 'wf-defer-1');
-
-    // Still busy → tick keeps it queued (attempts increments).
-    await processDeferredProactiveReports();
-    assert.equal(fired.length, 0);
-    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 1);
-
-    // Simulate idleness by backdating the entry's session activity: rewrite the
-    // gate input by aging the queue entry is not possible, so instead wait via
-    // the injected clock — here we fake idle by clearing recent events through
-    // a fresh session with no events.
-    const entries = JSON.parse(readFileSync(queueFile, 'utf8'));
-    createSession({ id: 'sess-defer-idle', kind: 'chat' });
-    entries[0].sessionId = 'sess-defer-idle';
-    writeFileSync(queueFile, JSON.stringify(entries));
-    await processDeferredProactiveReports();
-    assert.deepEqual(fired, ['sess-defer-idle:done'], 'fires exactly once when the chat is idle');
-    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 0, 'queue drained after firing');
-  } finally {
-    setProactiveReportFireForTest(null);
-  }
+    const ack = deliverOutcomeWithAcknowledgement(outcome, context);
+    assert.equal(ack.acknowledged, false, 'producer retries until the durable acknowledgement is safe');
+    assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1, 'the result already exists');
+    assert.equal((db.prepare('SELECT COUNT(*) n FROM outcome_reports_pending_v1 WHERE session_id = ?').get(sessionId) as { n: number }).n, 1);
+  } finally { db.exec('DROP TRIGGER fixture_report_ack_gap'); }
+  await processDeferredProactiveReports();
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.deepEqual(deliverOutcomeWithAcknowledgement(outcome, context), { acknowledged: true, written: false, disposition: 'already_delivered' });
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal((db.prepare('SELECT COUNT(*) n FROM outcome_reports_pending_v1 WHERE session_id = ?').get(sessionId) as { n: number }).n, 0);
 });
 
-test('a deferred proactive report past the age bound is dropped, not spoken', async () => {
-  const { processDeferredProactiveReports, setProactiveReportFireForTest } = await import('./outcome.js');
-  const { writeFileSync, readFileSync } = await import('node:fs');
+test('a report reaches a busy chat immediately without waiting for another model turn', () => {
+  const sessionId = 'sess-report-busy';
+  createSession({ id: sessionId, kind: 'chat' });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Keep working.' } });
+  const report = ctx({ originSessionId: sessionId, sourceId: 'wf-ready', proactiveTurn: true });
+  assert.deepEqual(deliverOutcomeWithAcknowledgement({ status: 'done', detail: 'Verification passed.' }, report),
+    { acknowledged: true, written: true, disposition: 'delivered' });
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(listEvents(sessionId).filter(e => e.type === 'model_request_started' || e.type === 'tool_called').length, 0);
+});
+
+test('an old deferred result migrates into canonical delivery instead of silently expiring', async () => {
+  const { processDeferredProactiveReports } = await import('./outcome.js');
+  const { writeFileSync, existsSync } = await import('node:fs');
   const queueFile = path.join(TMP_HOME, 'state', 'deferred-proactive-reports.json');
-  createSession({ id: 'sess-defer-old', kind: 'chat' });
+  const sessionId = 'sess-defer-old';
+  createSession({ id: sessionId, kind: 'chat' });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Still here.' } });
   writeFileSync(queueFile, JSON.stringify([{
-    sessionId: 'sess-defer-old',
-    outcome: { status: 'done', detail: 'stale' },
+    sessionId, outcome: { status: 'done', detail: 'The saved result is ready.' },
     ctx: { sourceLabel: 'workflow run', sourceId: 'wf-old' },
-    createdAt: new Date(Date.now() - 31 * 60_000).toISOString(),
-    attempts: 5,
+    createdAt: new Date(Date.now() - 31 * 60_000).toISOString(), attempts: 5,
   }]));
-  const fired: string[] = [];
-  setProactiveReportFireForTest(async (sessionId) => { fired.push(sessionId); });
-  try {
-    await processDeferredProactiveReports();
-    assert.equal(fired.length, 0, 'aged-out entry never speaks');
-    assert.equal(JSON.parse(readFileSync(queueFile, 'utf8')).length, 0, 'aged-out entry is dropped');
-  } finally {
-    setProactiveReportFireForTest(null);
-  }
+  await processDeferredProactiveReports();
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(existsSync(queueFile), false, 'the legacy owner is removed after replacement intent commits');
+  await processDeferredProactiveReports();
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1, 'migration replay does not duplicate results');
 });
 
-test('a needs_input outcome FIRES into a busy chat — a blocking question never defers (2026-07-22 stranded-user class)', async () => {
-  const { setProactiveReportFireForTest } = await import('./outcome.js');
-  createSession({ id: 'sess-question-busy', kind: 'chat' });
-  // Mid-conversation: a fresh user event inside the idle window.
-  appendEvent({ sessionId: 'sess-question-busy', turn: 0, role: 'user', type: 'user_input_received', data: { text: 'hey how is it going' } });
+test('a missing legacy destination cannot starve another saved result on migration or replay', async () => {
+  const { processDeferredProactiveReports } = await import('./outcome.js');
+  const { writeFileSync, existsSync } = await import('node:fs');
+  const queueFile = path.join(TMP_HOME, 'state', 'deferred-proactive-reports.json');
+  const sessionId = 'sess-defer-mixed';
+  createSession({ id: sessionId, kind: 'chat' });
+  const legacy = (id: string) => ({ sessionId: id, outcome: { status: 'done', detail: 'Saved migration result.' },
+    ctx: { sourceLabel: 'workflow run', sourceId: 'mixed-legacy' }, createdAt: '2000-01-01T00:00:00.000Z', attempts: 99 });
+  writeFileSync(queueFile, JSON.stringify([legacy('missing-legacy-destination'), legacy(sessionId)]));
+  await processDeferredProactiveReports();
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1);
+  assert.equal(existsSync(queueFile), true, 'unresolved delivery keeps its old durable owner');
+  for (let n = 0; n < 205; n++) appendEvent({ sessionId, turn: n + 1, role: 'user', type: 'user_input_received', data: { text: `Later ${n}` } });
+  await processDeferredProactiveReports();
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] }).length, 1, 'valid sibling remains exactly once beyond recent history');
+  // The controlled missing destination becomes retained later, like restored
+  // archived history. Both original delivery intents can now acknowledge.
+  createSession({ id: 'missing-legacy-destination', kind: 'chat' });
+  await processDeferredProactiveReports();
+  assert.equal(listEvents('missing-legacy-destination', { types: ['conversation_completed'] }).length, 1);
+  assert.equal(existsSync(queueFile), false);
+});
 
-  const fired: string[] = [];
-  setProactiveReportFireForTest(async (sessionId, outcome) => { fired.push(`${sessionId}:${outcome.status}`); });
-  try {
-    deliverOutcome(
-      { status: 'needs_input', detail: 'Which report marks a Market Leader?' },
-      ctx({ originSessionId: 'sess-question-busy', sourceId: 'bg-q1', sourceLabel: 'background task', proactiveTurn: true }),
-    );
-    await new Promise((r) => setTimeout(r, 150));
-    assert.deepEqual(fired, ['sess-question-busy:needs_input'], 'the question interrupts — it IS the conversation now');
-  } finally {
-    setProactiveReportFireForTest(null);
-  }
+test('a needs_input outcome publishes its exact question in a busy chat', () => {
+  const sessionId = 'sess-question-busy';
+  createSession({ id: sessionId, kind: 'chat' });
+  appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'How is it going?' } });
+  const detail = 'Which report marks a Market Leader?';
+  assert.equal(deliverOutcomeWithAcknowledgement({ status: 'needs_input', detail },
+    ctx({ originSessionId: sessionId, sourceId: 'bg-q1', proactiveTurn: true })).acknowledged, true);
+  assert.equal(listEvents(sessionId, { types: ['conversation_completed'] })[0].data.reply, detail);
 });
 
 test('deliverOutcome: a source resumed after a stop that stops again reports again; a replay of a stop does not', () => {

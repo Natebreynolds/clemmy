@@ -11562,6 +11562,21 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     },
   },
+  {
+    version: 95,
+    // The passive result and its visible-publication intent commit together.
+    // Only undelivered identities are scanned on daemon ticks; no transcript
+    // scan, model turn, external send or task replay is needed for delivery.
+    sql: `CREATE TABLE IF NOT EXISTS outcome_reports_pending_v1 (
+      source_event_id TEXT PRIMARY KEY NOT NULL REFERENCES events(id) ON DELETE RESTRICT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+      created_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+    );
+    CREATE INDEX IF NOT EXISTS outcome_reports_pending_order_v1
+      ON outcome_reports_pending_v1(attempts, created_at);
+    CREATE INDEX IF NOT EXISTS outcome_reports_pending_session_v1 ON outcome_reports_pending_v1(session_id);`,
+  },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

@@ -1,4 +1,4 @@
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 /**
  * Read a harness eventlog session back into a clean user/assistant
  * transcript for display in the desktop Conversations UI.
@@ -176,7 +176,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
   // Text-only catalog previews keep their original bounded event surface.
   const steerBySource = new Map<string, UnifiedSessionTurn[]>();
   const receiptBatches = new Map<string, ReturnType<typeof publicSteerReceiptsForSource>>();
-  const steeringSources = [...sources.values()].filter(source => !isLiveApprovalAcknowledgement(source.event));
+  const steeringSources = [...sources.values()].filter(source => isExecutionSourceBoundary(source.event));
   for (const event of events) {
     if (event.type !== 'user_steer_note' || event.role !== 'user') continue;
     const source = steeringSources.filter(source => source.event.sessionId === event.sessionId && source.event.seq < event.seq).at(-1);

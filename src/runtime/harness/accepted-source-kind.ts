@@ -1,5 +1,17 @@
 import type { EventRow } from './eventlog.js';
 
+/** A worker's retained result is context and presentation, never a new human
+ * assignment or executor. Match only the internal closed delivery source. */
+export function isBackgroundOutcomeSource(event: EventRow): boolean {
+  const data = event.data;
+  const bounded = (value: unknown, max: number) => typeof value === 'string'
+    && value.trim().length > 0 && value === value.trim() && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+  return event.type === 'user_input_received' && event.role === 'user'
+    && data.synthetic === true && data.source === 'outcome'
+    && (data.deliveryPhase === 'passive' || data.deliveryPhase === 'report')
+    && bounded(data.sourceLabel, 256) && bounded(data.sourceId, 4096);
+}
+
 /** An in-place approval acknowledgement belongs to existing or historical
  * exact card owners. Paused-card and card-set inquiry markers grant no execution
  * or lease authority. Their public reply is durable but replaces no owned job.
@@ -29,4 +41,11 @@ export function isLiveApprovalAcknowledgement(event: EventRow): boolean {
     && typeof control.ownerAttemptId === 'string' && !!control.ownerAttemptId.trim()
     && Number.isSafeInteger(control.ownerSourceUserSeq)
     && Number(control.ownerSourceUserSeq) > 0 && Number(control.ownerSourceUserSeq) < event.seq;
+}
+
+/** Boundaries between user assignments exclude control acknowledgements and
+ * settled-result delivery; those must not cut off instructions or evidence. */
+export function isExecutionSourceBoundary(event: EventRow): boolean {
+  return event.type === 'user_input_received' && !isLiveApprovalAcknowledgement(event)
+    && !isBackgroundOutcomeSource(event);
 }

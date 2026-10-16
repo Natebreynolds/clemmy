@@ -4553,6 +4553,10 @@ export function acceptUserInputForRun(
                   FROM events
                  WHERE events.session_id = sessions.id
                    AND events.type = 'user_input_received'
+                   AND NOT (events.role = 'user' AND json_valid(events.data_json)
+                     AND COALESCE(json_extract(events.data_json, '$.synthetic'), 0) = 1
+                     AND COALESCE(json_extract(events.data_json, '$.source'), '') = 'outcome'
+                     AND COALESCE(json_extract(events.data_json, '$.deliveryPhase'), '') IN ('passive', 'report'))
               )`,
         ).run(now, owner, now, input.sessionId, sourceUserSeq);
         return;
@@ -4641,7 +4645,8 @@ export function recordRunAttemptUserInput(
       // upgraded to this exact physical attempt for the SAME source without
       // changing its original timestamp. A strictly newer accepted source may
       // replace an older valid owner, but only while it is still the newest
-      // durable user input for this session. That max-source CAS lets an
+      // durable execution input for this session. A worker's retained result
+      // does not supersede the human assignment. That max-source CAS lets an
       // overlapping turn take restart ownership without allowing a late stale
       // continuation to steal it back. A boot-interrupted physical owner may
       // also transfer to the active attempt for its SAME accepted source.
@@ -4696,6 +4701,10 @@ export function recordRunAttemptUserInput(
                 FROM events
                WHERE events.session_id = sessions.id
                  AND events.type = 'user_input_received'
+                 AND NOT (events.role = 'user' AND json_valid(events.data_json)
+                   AND COALESCE(json_extract(events.data_json, '$.synthetic'), 0) = 1
+                   AND COALESCE(json_extract(events.data_json, '$.source'), '') = 'outcome'
+                   AND COALESCE(json_extract(events.data_json, '$.deliveryPhase'), '') IN ('passive', 'report'))
             )
             AND (
               json_type(metadata_json, '$.__run_in_flight_owner') IS NULL

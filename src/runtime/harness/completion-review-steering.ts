@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { actionBus } from '../action-bus.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import { isDispatchLeaseCurrent } from './dispatch-lease.js';
 import { listActiveRunAttemptOwnership, listEvents, openEventLog } from './eventlog.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -58,7 +58,7 @@ export async function reviewWithOwnerSteering<T>(
         || !hasUndeliveredSteerNotes(owner.sessionId, owner.sourceUserSeq)) return;
       const notes = listEvents(owner.sessionId, { sinceSeq: owner.sourceUserSeq,
         types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'] });
-      const next = notes.find(row => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row))?.seq ?? Number.MAX_SAFE_INTEGER;
+      const next = notes.find(isExecutionSourceBoundary)?.seq ?? Number.MAX_SAFE_INTEGER;
       const delivered = new Set(notes.flatMap(row => row.type === 'user_steer_note_delivered'
         && Array.isArray(row.data.noteSeqs) ? row.data.noteSeqs : []));
       if (!notes.some(row => row.type === 'user_steer_note' && row.role === 'user'

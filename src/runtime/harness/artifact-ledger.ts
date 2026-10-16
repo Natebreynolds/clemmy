@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getSession, listEvents, openEventLog, resolveToolOutputForAuthority } from './eventlog.js';
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import {
   exactProviderDataEnvelopeAcknowledged,
   exactProviderDataPayload,
@@ -684,7 +684,7 @@ export function resolveArtifactRunScopeId(
       desc: false,
     });
     const users = events.filter((event) => event.type === 'user_input_received');
-    const controlSources = new Set(users.filter(isLiveApprovalAcknowledgement).map((event) => event.seq));
+    const controlSources = new Set(users.filter((event) => !isExecutionSourceBoundary(event)).map((event) => event.seq));
     const executionSources = users.filter((event) => !controlSources.has(event.seq));
     const latestUser = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? users.find((event) => event.seq === sourceUserSeq)

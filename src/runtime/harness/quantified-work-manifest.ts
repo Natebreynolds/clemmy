@@ -1,4 +1,4 @@
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import { detectMultiItemIntentFromConversation } from './multi-item-intent.js';
 import {
   appendEvent,
@@ -282,7 +282,7 @@ function manifestTouchedByRequest(
     types: ['user_input_received', 'work_manifest_declared'],
   });
   const nextUserSeq = events.find((event) => (
-    event.type === 'user_input_received' && !isLiveApprovalAcknowledgement(event) && event.seq > sourceUserSeq
+    isExecutionSourceBoundary(event) && event.seq > sourceUserSeq
   ))?.seq;
   return events.some((event) => {
     if (event.type !== 'work_manifest_declared') return false;

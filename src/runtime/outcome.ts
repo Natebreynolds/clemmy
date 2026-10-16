@@ -22,13 +22,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionStore } from '../memory/session-store.js';
 import { HarnessSession } from './harness/session.js';
-import { appendEvent, getEvent, getSession as getHarnessSession, listEvents, openEventLog, type EventRow } from './harness/eventlog.js';
+import { appendEvent, getEvent, getSession as getHarnessSession, listEvents, openEventLog, withEventPublicationTransaction, type EventRow } from './harness/eventlog.js';
 import { appendGoalLedgerForSession } from '../agents/plan-proposals.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
+import { isBackgroundOutcomeSource } from './harness/accepted-source-kind.js';
 import pino from 'pino';
 import { createHash } from 'node:crypto';
 import { commitTurnOutcome } from './harness/delivery-committer.js';
-import { turnOutcomeId, type TurnOutcome } from './harness/turn-outcome.js';
+import { presentationEventFromCompletionData, turnOutcomeId, type TurnOutcome } from './harness/turn-outcome.js';
 import { RETAINED_WORK_TERMINAL_HEADER } from './harness/retained-work-checkpoint.js';
 
 const logger = pino({ name: 'clementine-next.outcome' });
@@ -111,11 +112,10 @@ export interface DeliverContext {
   /** Detail truncation cap. */
   maxDetailChars?: number;
   /**
-   * When true and the origin is an idle chat, publish the worker-authored
-   * outcome through the canonical presentation committer immediately.
-   * No additional model turn or new work assignment is needed.
-   * Falls back to the passive synthetic-turn staging whenever the session is
-   * busy, non-chat, or anything errors. Best-effort by construction.
+   * Publish the settled worker result immediately in its origin chat, even
+   * during foreground work. This is presentation only: no extra model turn,
+   * task execution or external send. Publication failure retains a durable
+   * retry intent; acknowledgement waits for the exact visible terminal.
    */
   proactiveTurn?: boolean;
 }
@@ -307,8 +307,17 @@ function retainedPassiveOutcome(sessionId: string, outcome: Outcome, ctx: Delive
       .get(sessionId, ctx.sourceLabel, ctx.sourceId, outcome.status, ctx.deliveryId ?? ctx.stopId) as { id: string } | undefined;
     return row ? getEvent(row.id) ?? undefined : undefined;
   }
-  return listEvents(sessionId, { types: ['user_input_received'], desc: true, limit: 200 })
-    .find(event => typeof event.data.text === 'string' && isDuplicateOutcomeText(event.data.text, outcome, ctx, text));
+  // Identity must survive long chats and restart recovery, not just the last
+  // 200 inputs. Read only matching passive rows, never the full transcript.
+  const row = openEventLog().prepare(`SELECT id FROM events
+    WHERE session_id = ? AND type = 'user_input_received' AND role = 'user' AND json_valid(data_json)
+      AND json_extract(data_json, '$.synthetic') = 1 AND json_extract(data_json, '$.source') = 'outcome'
+      AND json_extract(data_json, '$.sourceLabel') = ? AND json_extract(data_json, '$.sourceId') = ?
+      AND json_extract(data_json, '$.deliveryPhase') = 'passive'
+      AND ((? = 'needs_input' AND json_extract(data_json, '$.status') = 'needs_input' AND json_extract(data_json, '$.text') = ?)
+        OR (? != 'needs_input' AND json_extract(data_json, '$.status') IN ('done', 'blocked', 'failed')))
+    ORDER BY seq ASC LIMIT 1`).get(sessionId, ctx.sourceLabel, ctx.sourceId, outcome.status, text, outcome.status) as { id: string } | undefined;
+  return row ? getEvent(row.id) ?? undefined : undefined;
 }
 
 function stageOutcomeSnapshot(sessionId: string, outcome: Outcome, ctx: DeliverContext, text: string): void {
@@ -327,7 +336,8 @@ function hasExactOutcomeDelivery(sessionId: string, outcome: Outcome, ctx: Deliv
   if (row.session_id !== sessionId || data.synthetic !== true || data.source !== 'outcome'
     || data.sourceLabel !== ctx.sourceLabel || data.sourceId !== ctx.sourceId
     || data.status !== outcome.status || data.deliveryPhase !== 'passive' || data.text !== text
-    || (ctx.stopId !== undefined && data.outcomeStopId !== ctx.stopId)) {
+    || data.publicReportText !== renderPublicOutcomeText(outcome, ctx)
+    || (data.resumable === true) !== (outcome.resumable === true) || data.outcomeStopId !== ctx.stopId) {
     throw new Error('Outcome delivery identity conflicts with its retained destination or content.');
   }
   return true;
@@ -372,81 +382,88 @@ export function proactiveReportLastEventAgeMs(
   return latestMs === null ? null : Math.max(0, nowMs - latestMs);
 }
 
-function maybeScheduleProactiveReport(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
-  if (!ctx.proactiveTurn) return;
-  // Fire-and-forget: a proactive relay failure must never affect the run
-  // or the passive staging above (which remains the guaranteed baseline).
-  void (async () => {
-    try {
-      const hs = HarnessSession.load(sessionId);
-      if (!hs) return;
-      const { listEvents } = await import('./harness/eventlog.js');
-      const recentEvents = listEvents(sessionId, { limit: 20, desc: true });
-      const ageMs = proactiveReportLastEventAgeMs(recentEvents, ctx);
-      // A needs_input outcome is a BLOCKING QUESTION, not a report — the
-      // idle gate exists so finished-work reports don't interrupt, but a
-      // question IS the conversation now. Deferring it strands the user
-      // staring at "waiting for your input" with no question in the chat
-      // (live 2026-07-22: a user chatted "how is it going" while his own
-      // parked question sat in the defer queue). Chat origins fire the
-      // question immediately, busy or not.
-      const blockingQuestion = outcome.status === 'needs_input' && hs.sessionRow.kind === 'chat';
-      if (!blockingQuestion && !shouldProactivelyReport(hs.sessionRow.kind, ageMs)) {
-        // A non-chat origin never speaks — skip for good. A BUSY chat must
-        // not be skipped: quick runs routinely finish inside the 60s window
-        // after their own dispatch, which made every desktop report-back
-        // silently vanish (live 2026-07-21). Defer and re-check until idle.
-        if (hs.sessionRow.kind === 'chat' && proactiveReportDeferEnabled()) {
-          enqueueDeferredProactiveReport(sessionId, outcome, ctx);
-          logger.info(
-            { sourceId: ctx.sourceId, sessionId, ageMs, status: outcome.status },
-            'proactive report deferred — origin chat is mid-conversation; will speak once idle',
-          );
-        } else {
-          logger.info(
-            { sourceId: ctx.sourceId, sessionId, kind: hs.sessionRow.kind, status: outcome.status },
-            'proactive report skipped (non-chat origin; passive staging remains)',
-          );
-        }
-        return;
-      }
-      await fireProactiveReportTurnImpl(sessionId, outcome, ctx);
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId },
-        'proactive report-back turn failed (passive staging + notification remain)',
-      );
-    }
-  })();
+function reportDigest(outcome: Outcome, ctx: DeliverContext, text: string): string {
+  return createHash('sha256').update(JSON.stringify({
+    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status,
+    ...(ctx.stopId ? { stopId: ctx.stopId } : ctx.deliveryId ? { deliveryId: ctx.deliveryId } : { text }),
+  })).digest('hex');
 }
 
-/** The worker has already authored and settled the result. Relay that exact
- * outcome through the public committer, without asking a new agent to restate
- * it or treating a machine-authored notification as a human clarification.
- * The synthetic source is delivery identity only; it grants no tool authority. */
-async function fireProactiveReportTurn(sessionId: string, outcome: Outcome, ctx: DeliverContext): Promise<void> {
-  publishProactiveOutcome(sessionId, outcome, ctx);
+function reportSource(sessionId: string, digest: string): EventRow | undefined {
+  const row = openEventLog().prepare(`SELECT id FROM events WHERE session_id = ?
+    AND type = 'user_input_received' AND json_valid(data_json)
+    AND json_extract(data_json, '$.synthetic') = 1 AND json_extract(data_json, '$.source') = 'outcome'
+    AND json_extract(data_json, '$.deliveryPhase') = 'report'
+    AND json_extract(data_json, '$.outcomeDigest') = ? ORDER BY seq LIMIT 1`)
+    .get(sessionId, digest) as { id: string } | undefined;
+  return row ? getEvent(row.id) ?? undefined : undefined;
 }
 
+function retainedReportInput(passive: EventRow): { outcome: Outcome; ctx: DeliverContext } {
+  if (!isBackgroundOutcomeSource(passive) || passive.data.deliveryPhase !== 'passive'
+    || !['done', 'blocked', 'failed', 'needs_input'].includes(String(passive.data.status))
+    || typeof passive.data.publicReportText !== 'string') throw new Error('Retained outcome is not a publishable result.');
+  return { outcome: { status: passive.data.status as OutcomeStatus, resumable: passive.data.resumable === true },
+    ctx: { originSessionId: passive.sessionId, sourceLabel: passive.data.sourceLabel as string,
+      sourceId: passive.data.sourceId as string, proactiveTurn: true,
+      ...(typeof passive.data.outcomeStopId === 'string' ? { stopId: passive.data.outcomeStopId } : {}),
+      ...(typeof passive.data.outcomeDeliveryId === 'string' ? { deliveryId: passive.data.outcomeDeliveryId } : {}) } };
+}
+
+function reportIsPublished(passive: EventRow): boolean {
+  const { outcome, ctx } = retainedReportInput(passive);
+  const source = reportSource(passive.sessionId, reportDigest(outcome, ctx, passive.data.publicReportText as string));
+  if (!source) return false;
+  const row = openEventLog().prepare(`SELECT data_json FROM events WHERE session_id = ?
+    AND type = 'conversation_completed' AND json_valid(data_json)
+    AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq LIMIT 1`)
+    .get(passive.sessionId, source.seq) as { data_json: string } | undefined;
+  if (!row) return false;
+  const presentation = presentationEventFromCompletionData(JSON.parse(row.data_json));
+  return presentation?.identity.sessionId === passive.sessionId
+    && presentation.identity.sourceUserSeq === source.seq && presentation.status === outcome.status
+    && presentation.text === source.data.text;
+}
+
+/** A display retry only reads the immutable accepted result. Its pending row
+ * is deleted after the exact canonical terminal exists, including recovery
+ * after a crash between publication and acknowledgement. */
+function publishPendingReport(passive: EventRow): boolean {
+  const { outcome, ctx } = retainedReportInput(passive);
+  if (!reportIsPublished(passive)) {
+    const result = fireProactiveReportTurnImpl
+      ? fireProactiveReportTurnImpl(passive.sessionId, outcome, ctx)
+      : publishOutcomeSource(passive.sessionId, outcome, ctx, passive);
+    // Compatibility seam for tests that deliberately observe passive staging.
+    // An async callback is never itself proof of public delivery.
+    if (result && typeof result.then === 'function') void result.catch(() => {});
+  }
+  if (!reportIsPublished(passive)) return false;
+  openEventLog().prepare('DELETE FROM outcome_reports_pending_v1 WHERE source_event_id = ? AND session_id = ?')
+    .run(passive.id, passive.sessionId);
+  return true;
+}
+
+/** The worker has already authored and settled the result. Relay its exact
+ * words through the public committer. The separate source is delivery identity
+ * only and grants no execution, review, approval or external-send authority. */
 export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
-  const passive = ctx.stopId ? retainedPassiveOutcome(sessionId, outcome, ctx, renderOutcomeText(outcome, ctx)) : undefined;
+  const text = renderOutcomeText(outcome, ctx);
+  if (ctx.deliveryId) hasExactOutcomeDelivery(sessionId, outcome, ctx, text);
+  publishOutcomeSource(sessionId, outcome, ctx, retainedPassiveOutcome(sessionId, outcome, ctx, text));
+}
+
+function publishOutcomeSource(sessionId: string, outcome: Outcome, ctx: DeliverContext, passive?: EventRow): void {
   const renderedText = typeof passive?.data.publicReportText === 'string'
     ? passive.data.publicReportText : renderPublicOutcomeText(outcome, ctx);
-  const digest = createHash('sha256').update(JSON.stringify({
-    sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId, status: outcome.status,
-    ...(ctx.stopId ? { stopId: ctx.stopId } : { text: renderedText }),
-  })).digest('hex');
-  // A crash between acceptance and publication reuses the same identity. The
-  // committer is idempotent; another status or another question is a new report.
-  const source = openEventLog().transaction(() => listEvents(sessionId, { types: ['user_input_received'] }).find((event) => (
-    event.data.synthetic === true && event.data.source === 'outcome'
-    && event.data.deliveryPhase === 'report' && event.data.outcomeDigest === digest
-  )) ?? appendEvent({
+  const digest = reportDigest(outcome, ctx, renderedText);
+  // A crash between acceptance and publication reuses this exact identity.
+  const source = withEventPublicationTransaction(() => reportSource(sessionId, digest) ?? appendEvent({
     sessionId, turn: 0, role: 'user', type: 'user_input_received',
     data: { text: renderedText, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel,
       sourceId: ctx.sourceId, status: outcome.status, deliveryPhase: 'report', outcomeDigest: digest,
       ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}), resumable: passive ? passive.data.resumable === true : outcome.resumable === true },
-  })).immediate();
+  }));
   // The first accepted report owns presentation as well as identity. Wording
   // changes on replay must not conflict with its already committed terminal.
   const text = source.data.text as string;
@@ -460,7 +477,9 @@ export function publishProactiveOutcome(sessionId: string, outcome: Outcome, ctx
       : outcome.status === 'blocked'
         ? { ...base, status: 'blocked', resumable, presentation: { kind: 'blocked', text } }
         : { ...base, status: 'failed', resumable: false, presentation: { kind: 'error', text } };
-  commitTurnOutcome(terminal);
+  const published = commitTurnOutcome(terminal);
+  if (published.presentation.identity.sourceUserSeq !== source.seq || published.presentation.text !== text
+    || published.presentation.status !== outcome.status) throw new Error('Outcome publication is not yet certified.');
 }
 
 /** Public result, without runtime instructions or a second truncation pass.
@@ -481,19 +500,14 @@ export function renderPublicOutcomeText(outcome: Outcome, ctx: DeliverContext): 
   return parts.join('\n\n') || `${ctx.title || ctx.sourceLabel}: ${DEFAULT_HEAD_WORDS[outcome.status]}.`;
 }
 
-let fireProactiveReportTurnImpl: typeof fireProactiveReportTurn = fireProactiveReportTurn;
-export function setProactiveReportFireForTest(fn: typeof fireProactiveReportTurn | null): void {
-  fireProactiveReportTurnImpl = fn ?? fireProactiveReportTurn;
+type ProactiveReportFire = (sessionId: string, outcome: Outcome, ctx: DeliverContext) => void | Promise<void>;
+let fireProactiveReportTurnImpl: ProactiveReportFire | null = null;
+export function setProactiveReportFireForTest(fn: ProactiveReportFire | null): void {
+  fireProactiveReportTurnImpl = fn;
 }
 
-// ---------------------------------------------------------------------------
-// Deferred proactive reports (2026-07-21): a proactive report that finds its
-// origin chat mid-conversation is DEFERRED (durable, restart-safe) and re-fired
-// by the daemon tick once the chat goes idle — never silently skipped. The
-// passive staged turn above remains the guaranteed baseline either way; this
-// queue only upgrades delivery from "on your next message" to "spoken now".
-// Same durable-due-marker pattern as goal-resume.ts (no bare setTimeout).
-
+// Older builds kept busy-chat deferrals in this file. Drain them into the same
+// durable delivery path on upgrade; age is not evidence that a result arrived.
 interface DeferredProactiveReport {
   sessionId: string;
   outcome: Outcome;
@@ -501,97 +515,87 @@ interface DeferredProactiveReport {
   createdAt: string;
   attempts: number;
 }
-
 const DEFERRED_REPORTS_FILE = path.join(BASE_DIR, 'state', 'deferred-proactive-reports.json');
-/** Past this age the user has plainly moved on — the passive turn covers it. */
-const DEFERRED_REPORT_MAX_AGE_MS = 30 * 60_000;
 
-function proactiveReportDeferEnabled(): boolean {
-  return (getRuntimeEnv('CLEMMY_PROACTIVE_REPORT_DEFER', 'on') || 'on').trim().toLowerCase() !== 'off';
-}
-
-function loadDeferredReports(): DeferredProactiveReport[] {
-  try {
-    const raw = fs.readFileSync(DEFERRED_REPORTS_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((e) => e && typeof e.sessionId === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveDeferredReports(entries: DeferredProactiveReport[]): void {
-  try {
-    fs.mkdirSync(path.dirname(DEFERRED_REPORTS_FILE), { recursive: true });
-    fs.writeFileSync(DEFERRED_REPORTS_FILE, JSON.stringify(entries, null, 1));
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err }, 'deferred proactive report save failed');
-  }
-}
-
-function enqueueDeferredProactiveReport(sessionId: string, outcome: Outcome, ctx: DeliverContext): void {
-  try {
-    const { proactiveTurn: _drop, ...serializableCtx } = ctx;
-    const entries = loadDeferredReports().filter(
-      // One live deferral per source: a newer outcome for the same work replaces
-      // the older one (a needs_input superseded by done must not speak twice).
-      (e) => !(e.sessionId === sessionId && e.ctx.sourceLabel === ctx.sourceLabel && e.ctx.sourceId === ctx.sourceId),
-    );
-    entries.push({ sessionId, outcome, ctx: serializableCtx, createdAt: new Date().toISOString(), attempts: 0 });
-    saveDeferredReports(entries);
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId }, 'deferred proactive report enqueue failed');
-  }
-}
-
-/**
- * Daemon tick: fire every deferred proactive report whose origin chat has gone
- * idle; drop entries past the age bound (the passive turn already covers them).
- * At-most-once per entry: an entry is removed from the queue before its turn
- * runs, so a crash mid-turn costs the upgrade, never a duplicate.
- */
-export async function processDeferredProactiveReports(): Promise<void> {
-  if (!proactiveReportDeferEnabled()) return;
-  const entries = loadDeferredReports();
-  if (entries.length === 0) return;
-  const keep: DeferredProactiveReport[] = [];
-  const fire: DeferredProactiveReport[] = [];
+function migrateDeferredReports(): void {
+  if (!fs.existsSync(DEFERRED_REPORTS_FILE)) return;
+  // Each replacement intent serializes with other publishers. Remove the
+  // file only after every entry is retained in the SQLite outbox. If a crash leaves
+  // the file behind, exact delivery identity makes re-reading it harmless.
+  const retainedBytes = fs.readFileSync(DEFERRED_REPORTS_FILE, 'utf8');
+  const entries: DeferredProactiveReport[] = JSON.parse(retainedBytes);
+  if (!Array.isArray(entries)) throw new Error('Invalid deferred outcome report file.');
+  let allRetained = true;
   for (const entry of entries) {
-    const ageMs = Date.now() - Date.parse(entry.createdAt);
-    if (!Number.isFinite(ageMs) || ageMs > DEFERRED_REPORT_MAX_AGE_MS) {
-      logger.info(
-        { sourceId: entry.ctx.sourceId, sessionId: entry.sessionId, attempts: entry.attempts },
-        'deferred proactive report aged out (passive staging already delivered it)',
-      );
-      continue;
-    }
     try {
-      const hs = HarnessSession.load(entry.sessionId);
-      if (!hs) continue;
-      const recentEvents = listEvents(entry.sessionId, { limit: 20, desc: true });
-      const idleAgeMs = proactiveReportLastEventAgeMs(recentEvents, entry.ctx);
-      if (shouldProactivelyReport(hs.sessionRow.kind, idleAgeMs)) fire.push(entry);
-      else if (hs.sessionRow.kind === 'chat') keep.push({ ...entry, attempts: entry.attempts + 1 });
-      // non-chat: drop silently — it can never qualify.
-    } catch {
-      keep.push({ ...entry, attempts: entry.attempts + 1 });
-    }
+      if (!entry || typeof entry.sessionId !== 'string' || !entry.outcome || !entry.ctx) {
+        throw new Error('Invalid deferred outcome report entry.');
+      }
+      // Each entry commits independently. A missing destination cannot prevent
+      // other saved results from reaching their own conversations.
+      if (!retainHarnessOutcome(entry.outcome,
+        { ...entry.ctx, originSessionId: entry.sessionId, proactiveTurn: true })) {
+        throw new Error('Deferred outcome destination is not retained.');
+      }
+    } catch { allRetained = false; }
   }
-  saveDeferredReports(keep);
-  for (const entry of fire) {
+  // Never delete the legacy owner before all replacement intents commit. Valid
+  // entries are idempotent if an invalid sibling keeps this file for recovery.
+  if (allRetained && fs.existsSync(DEFERRED_REPORTS_FILE)
+    && fs.readFileSync(DEFERRED_REPORTS_FILE, 'utf8') === retainedBytes) fs.unlinkSync(DEFERRED_REPORTS_FILE);
+}
+
+/** Daemon tick: retry at most 50 retained display intents, oldest/least tried
+ * first. No quiet-chat gate, expiration, model call or re-execution of work. */
+export async function processDeferredProactiveReports(): Promise<void> {
+  if ((getRuntimeEnv('CLEMMY_PROACTIVE_REPORT_DEFER', 'on') || 'on').trim().toLowerCase() === 'off') return;
+  try { migrateDeferredReports(); }
+  catch (err) { logger.warn({ err: err instanceof Error ? err.message : err }, 'deferred report migration remains pending'); }
+  const db = openEventLog();
+  const entries = db.prepare('SELECT source_event_id, session_id FROM outcome_reports_pending_v1 ORDER BY attempts, created_at LIMIT 50')
+    .all() as Array<{ source_event_id: string; session_id: string }>;
+  for (const entry of entries) {
     try {
-      logger.info(
-        { sourceId: entry.ctx.sourceId, sessionId: entry.sessionId, attempts: entry.attempts },
-        'deferred proactive report firing — origin chat is idle now',
-      );
-      await fireProactiveReportTurnImpl(entry.sessionId, entry.outcome, { ...entry.ctx, proactiveTurn: true });
+      db.prepare('UPDATE outcome_reports_pending_v1 SET attempts = attempts + 1 WHERE source_event_id = ?').run(entry.source_event_id);
+      const passive = getEvent(entry.source_event_id);
+      if (!passive || passive.sessionId !== entry.session_id || getHarnessSession(entry.session_id)?.kind !== 'chat') continue;
+      publishPendingReport(passive);
     } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : err, sourceId: entry.ctx.sourceId },
-        'deferred proactive report turn failed (passive staging remains)',
-      );
+      logger.warn({ err: err instanceof Error ? err.message : err, sessionId: entry.session_id }, 'outcome display remains pending');
     }
   }
+}
+
+/** Retain immutable content and its publication intent in one transaction.
+ * Non-chat destinations retain passive context only, as before. */
+function retainHarnessOutcome(outcome: Outcome, ctx: DeliverContext): { written: boolean; event: EventRow; proactive: boolean } | null {
+  const sessionId = ctx.originSessionId;
+  if (!sessionId) return null;
+  const harnessRow = getHarnessSession(sessionId);
+  if (!harnessRow) return null;
+  const text = renderOutcomeText(outcome, ctx);
+  return withEventPublicationTransaction(() => {
+    if (ctx.deliveryId) hasExactOutcomeDelivery(sessionId, outcome, ctx, text);
+    const retained = retainedPassiveOutcome(sessionId, outcome, ctx, text);
+    const event = retained ?? appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: {
+      text, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId,
+      status: outcome.status, deliveryPhase: 'passive', publicReportText: renderPublicOutcomeText(outcome, ctx),
+      ...(ctx.deliveryId ? { outcomeDeliveryId: ctx.deliveryId } : {}),
+      ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}),
+      ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
+      ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
+      ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),
+      ...(outcome.resumable !== undefined ? { resumable: outcome.resumable } : {}),
+    } });
+    const proactive = ctx.proactiveTurn === true && harnessRow.kind === 'chat';
+    if (proactive) {
+      // Validate before accepting an immediate-publication obligation.
+      retainedReportInput(event);
+      openEventLog().prepare(`INSERT INTO outcome_reports_pending_v1 (source_event_id, session_id, created_at)
+        VALUES (?, ?, ?) ON CONFLICT(source_event_id) DO NOTHING`).run(event.id, sessionId, event.createdAt);
+    }
+    return { written: !retained, event, proactive };
+  });
 }
 
 /**
@@ -621,33 +625,19 @@ export function deliverOutcomeWithAcknowledgement(
     // Harness chats are the canonical desktop/Discord conversation store. Writing
     // their report-backs to sessions.json creates a same-raw-id "desktop:" ghost
     // that loses the original harness transcript on reopen.
-    const harnessRow = getHarnessSession(sessionId);
-    if (harnessRow) {
-      const delivery = openEventLog().transaction(() => {
-        if (ctx.deliveryId) hasExactOutcomeDelivery(sessionId, outcome, ctx, text);
-        const retained = retainedPassiveOutcome(sessionId, outcome, ctx, text);
-        if (retained) return { written: false, text: retained.data.text as string };
-        appendEvent({ sessionId, turn: 0, role: 'user', type: 'user_input_received', data: {
-          text, synthetic: true, source: 'outcome', sourceLabel: ctx.sourceLabel, sourceId: ctx.sourceId,
-          status: outcome.status, deliveryPhase: 'passive', publicReportText: renderPublicOutcomeText(outcome, ctx),
-          ...(ctx.deliveryId ? { outcomeDeliveryId: ctx.deliveryId } : {}),
-          ...(ctx.stopId ? { outcomeStopId: ctx.stopId } : {}),
-          ...(outcome.evidence ? { evidence: outcome.evidence } : {}),
-          ...(outcome.blocker ? { blocker: outcome.blocker } : {}),
-          ...(outcome.nextAction ? { nextAction: outcome.nextAction } : {}),
-          ...(outcome.resumable !== undefined ? { resumable: outcome.resumable } : {}),
-        } });
-        return { written: true, text };
-      }).immediate();
-      stageOutcomeSnapshot(sessionId, outcome, ctx, delivery.text);
-      if (!delivery.written) {
-        if (ctx.stopId || ctx.deliveryId) maybeScheduleProactiveReport(sessionId, outcome, ctx);
-        return { acknowledged: true, written: false, disposition: 'already_delivered' };
+    const delivery = retainHarnessOutcome(outcome, ctx);
+    if (delivery) {
+      stageOutcomeSnapshot(sessionId, outcome, ctx, delivery.event.data.text as string);
+      if (delivery.written) appendGoalEvidence(sessionId, outcome, ctx);
+      let acknowledged = !delivery.proactive;
+      if (delivery.proactive) {
+        try { acknowledged = publishPendingReport(delivery.event); }
+        catch (err) {
+          logger.warn({ err: err instanceof Error ? err.message : err, sourceId: ctx.sourceId }, 'outcome display remains pending');
+        }
       }
-      logger.info({ sourceId: ctx.sourceId, sessionId, status: outcome.status, store: 'harness' }, 'Outcome delivered to origin session');
-      appendGoalEvidence(sessionId, outcome, ctx);
-      maybeScheduleProactiveReport(sessionId, outcome, ctx);
-      return { acknowledged: true, written: true, disposition: 'delivered' };
+      return { acknowledged, written: delivery.written,
+        disposition: acknowledged ? delivery.written ? 'delivered' : 'already_delivered' : 'failed' };
     }
 
     // A durable outbox must not create a legacy ghost after its canonical
@@ -670,7 +660,6 @@ export function deliverOutcomeWithAcknowledgement(
     // session with an active goal becomes goal evidence — one ledger line so
     // the goal's progress timeline reflects sub-work it dispatched. Best-effort.
     appendGoalEvidence(sessionId, outcome, ctx);
-    maybeScheduleProactiveReport(sessionId, outcome, ctx);
     return { acknowledged: true, written: true, disposition: 'delivered' };
   } catch (err) {
     logger.warn(

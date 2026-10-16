@@ -109,6 +109,8 @@ function dependencyEdges(db: Database.Database): string[] {
 /** Called inside the existing fixed-point reaper. Only narrows eligibility. */
 export function pruneRetainedProofSessionOwners(db: Database.Database): number {
   let pruned = 0;
+  if (exists(db, 'outcome_reports_pending_v1')) pruned += db.prepare(`DELETE FROM reap_doomed_session_ids
+    WHERE id IN (SELECT session_id FROM outcome_reports_pending_v1)`).run().changes;
   const edges = dependencyEdges(db);
   if (edges.length) pruned += db.prepare(`WITH edges AS (${edges.join(' UNION ALL ')})
     DELETE FROM reap_doomed_session_ids WHERE id IN (
@@ -127,6 +129,9 @@ export function pruneRetainedProofSessionOwners(db: Database.Database): number {
 
 /** Hard-delete surfaces archive rather than breaking a remaining consumer. */
 export function sessionHasRetainedProofConsumer(db: Database.Database, sessionId: string): boolean {
+  if (exists(db, 'outcome_reports_pending_v1') && db.prepare(
+    'SELECT 1 FROM outcome_reports_pending_v1 WHERE session_id = ? LIMIT 1',
+  ).get(sessionId)) return true;
   const edges = dependencyEdges(db);
   return edges.length > 0 && Boolean(db.prepare(`WITH edges AS (${edges.join(' UNION ALL ')})
     SELECT 1 FROM edges WHERE owner = ? AND consumer != owner LIMIT 1`).get(sessionId));

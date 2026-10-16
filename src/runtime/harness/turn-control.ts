@@ -1,4 +1,4 @@
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
 /**
  * TURN-CONTROL SPINE — the lane-agnostic deterministic controls, in ONE place.
@@ -951,7 +951,7 @@ function decisionForSource(
 
 function latestUserSeq(rows: ReturnType<typeof listEvents>): number {
   return rows
-    .filter((row) => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row))
+    .filter(isExecutionSourceBoundary)
     .reduce((max, row) => Math.max(max, row.seq), 0);
 }
 

@@ -1,6 +1,7 @@
 import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
 import { readQuestionOptions } from './question-options.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
+import { readBackgroundOutcomeReport } from './background-outcome-report.js';
 import type { PendingMessageStore } from './pending-request.js';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode } from './task-mode.js';
 /**
@@ -612,6 +613,9 @@ export class ChatEngine {
    * the new stream.
    */
   private terminalOwnsActiveTurn(event: HarnessEvent): boolean {
+    // A result displayed alongside the conversation never closes the stream
+    // owned by the person's still-running request.
+    if (readBackgroundOutcomeReport(event, this.sessionId)) return false;
     const sourceUserSeq = sourceUserSeqOf(event);
     if (sourceUserSeq !== null) {
       if (event.sessionId && event.sessionId !== this.sessionId
@@ -714,6 +718,18 @@ export class ChatEngine {
     }
     this.messages = applySteerReceiptEvent(this.messages, event, this.sessionId);
     if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') { this.emit(); return; }
+    if (readBackgroundOutcomeReport(event, this.sessionId)) {
+      if (event.type === 'conversation_completed') {
+        const id = `background-report-${event.seq}`;
+        if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
+          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        }];
+        this.emit();
+      }
+      // Machine delivery cannot adopt a human source or alter its activity,
+      // approval, queued steering, cancellation key, or busy state.
+      return;
+    }
     if (readLiveApprovalControl(event)) {
       if (event.sessionId && event.sessionId !== this.sessionId) return;
       if (event.type === 'conversation_completed') {
@@ -1107,6 +1123,7 @@ export class ChatEngine {
 export function inFlightTurnSince(events: readonly HarnessEvent[]): number | null {
   let lastUserSeq: number | null = null;
   for (const event of events) {
+    if (readBackgroundOutcomeReport(event)) continue;
     if (readLiveApprovalControl(event)) continue;
     if (event.type === 'user_input_received') {
       lastUserSeq = event.seq;
@@ -1165,6 +1182,16 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
     messages = applySteerReceiptEvent(messages, event, sessionId);
     if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') continue;
     const d = (event.data ?? {}) as Record<string, unknown>;
+    if (readBackgroundOutcomeReport(event, sessionId)) {
+      if (event.type === 'conversation_completed') {
+        const id = `background-report-${event.seq}`;
+        if (!messages.some(message => message.id === id)) messages.push({
+          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        });
+      }
+      // Retain the foreground's source, opening, activity and pending question.
+      continue;
+    }
     if ((event.type === 'conversation_completed' || event.type === 'run_failed') && sessionId
       && event.sessionId && event.sessionId !== sessionId && sourceUserSeqOf(event) !== null
       && delegatedMessageIndexBySource.has(sourceUserSeqOf(event)!)) continue;

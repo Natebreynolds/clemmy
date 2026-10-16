@@ -17,9 +17,10 @@
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
 import { withoutHostReceiptLines } from '../host-receipt-lines.js';
-import { getRunAttemptSourceUserEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
+import { isDeepStrictEqual } from 'node:util';
+import { getEvent, getRunAttemptSourceUserEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { BoundaryError } from '../boundary-error.js';
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isBackgroundOutcomeSource, isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
 import {
   parseNarratedEnvelope,
   publicReplyFromNarratedEnvelope,
@@ -1171,6 +1172,32 @@ function publicLiveApprovalControl(event: EventRow): PublicLiveApprovalControl |
   } catch { return null; }
 }
 
+/** Presentation-only: derive the relationship from the retained source, never
+ * from terminal metadata supplied by a model or client. It grants no authority
+ * to finish, resume, approve or stop the foreground executor. */
+function publicBackgroundOutcomeReport(event: EventRow): Record<string, unknown> | null {
+  try {
+    if (event.type !== 'conversation_completed' && !isBackgroundOutcomeSource(event)) return null;
+    const retained = getEvent(event.id);
+    if (!retained || retained.seq !== event.seq || retained.sessionId !== event.sessionId
+      || retained.type !== event.type || retained.role !== event.role || retained.parentEventId !== event.parentEventId
+      || !isDeepStrictEqual(retained.data, event.data)) return null;
+    let source = retained;
+    if (event.type === 'conversation_completed') {
+      const presentation = validTypedCompletionPresentation(event.data, event.sessionId);
+      if (!presentation) return null;
+      const seq = presentation.identity.sourceUserSeq;
+      const accepted = listEvents(event.sessionId, { types: ['user_input_received'], sinceSeq: seq - 1, limit: 1 })[0];
+      if (!accepted || accepted.seq !== seq || accepted.seq >= event.seq
+        || accepted.data.deliveryPhase !== 'report') return null;
+      source = accepted;
+    }
+    if (!isBackgroundOutcomeSource(source)) return null;
+    return { version: 1, sourceUserSeq: source.seq, sourceLabel: source.data.sourceLabel,
+      sourceId: source.data.sourceId, phase: source.data.deliveryPhase };
+  } catch { return null; }
+}
+
 /** A confirmation identifies a displayed card, never its payload or executor.
  * Reopen the accepted control and earlier card carrier so copied metadata
  * cannot attach a question to another source/card. A later card resolution
@@ -1236,7 +1263,9 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       }
       if (data.synthetic === true) {
         if (data.source !== 'outcome') return null;
-        return selected(data, ['synthetic', 'source', 'sourceId', 'sourceLabel', 'deliveryPhase']);
+        const backgroundOutcomeReport = publicBackgroundOutcomeReport(event);
+        return { ...selected(data, ['synthetic', 'source', 'sourceId', 'sourceLabel', 'deliveryPhase']),
+          ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
       }
       const input = publicUserInputText(data);
       const taskMode = publicTaskMode(data.taskMode);
@@ -1323,7 +1352,9 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     }
     case 'conversation_completed': {
       const liveApprovalControl = publicLiveApprovalControl(event);
-      return { ...terminalData(data, event.sessionId), ...(liveApprovalControl ? { liveApprovalControl } : {}) };
+      const backgroundOutcomeReport = publicBackgroundOutcomeReport(event);
+      return { ...terminalData(data, event.sessionId), ...(liveApprovalControl ? { liveApprovalControl } : {}),
+        ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
     }
     case 'conversation_preamble':
       // The dedicated eventlog CAS writer binds this event to its exact real
@@ -1677,7 +1708,7 @@ export function publicSteerReceiptsForSource(sessionId: string, sourceSeq: numbe
       .all(sessionId, sourceSeq) as Array<{ seq: number }>;
     const next = following.find(row => {
       const source = listEvents(sessionId, { sinceSeq: row.seq - 1, throughSeq: row.seq, limit: 1 })[0];
-      return source && !isLiveApprovalAcknowledgement(source);
+      return source && !isLiveApprovalAcknowledgement(source) && !isBackgroundOutcomeSource(source);
     });
     if (!next && following.length === 32) return [];
     const rows = listEvents(sessionId, { sinceSeq: sourceSeq, throughSeq: Math.min(throughSeq, next ? next.seq - 1 : Number.MAX_SAFE_INTEGER),
@@ -1687,7 +1718,7 @@ export function publicSteerReceiptsForSource(sessionId: string, sourceSeq: numbe
     const receipts = new Map<number, PublicSteerReceipt>();
     let terminalSeq: number | undefined;
     for (const row of rows) {
-      if (row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row)) break;
+      if (row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row) && !isBackgroundOutcomeSource(row)) break;
       if (row.type === 'user_steer_note' && row.role === 'user' && !terminalSeq) {
         const clientRequestId = publicSteerRequestId(row.data.clientRequestId);
         const clientEchoId = publicSteerRequestId(row.data.clientEchoId);
@@ -1729,7 +1760,7 @@ export function publicSteerReceipt(note: EventRow, throughSeq?: number): PublicS
       .all(note.sessionId, note.seq) as Array<{ seq: number }>;
     for (const candidate of candidates) {
       const source = listEvents(note.sessionId, { sinceSeq: candidate.seq - 1, throughSeq: candidate.seq, limit: 1 })[0];
-      if (!source || isLiveApprovalAcknowledgement(source)) continue;
+      if (!source || isLiveApprovalAcknowledgement(source) || isBackgroundOutcomeSource(source)) continue;
       return publicSteerReceiptsForSource(note.sessionId, source.seq, throughSeq).find(receipt => receipt.noteSeq === note.seq) ?? null;
     }
     return null;

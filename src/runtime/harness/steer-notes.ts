@@ -1,4 +1,4 @@
-import { isLiveApprovalAcknowledgement } from './accepted-source-kind.js';
+import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 /**
  * Mid-run steering (2026-08-07) — user messages reach a RUNNING turn without
  * stopping it.
@@ -454,7 +454,7 @@ export function adoptedSteerNotesForSource(input: {
       types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'],
     });
     const nextSource = rows.find(
-      (row) => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row) && row.seq > input.sourceUserSeq,
+      (row) => isExecutionSourceBoundary(row) && row.seq > input.sourceUserSeq,
     )?.seq ?? Number.MAX_SAFE_INTEGER;
     const delivered = new Set<number>();
     for (const row of rows) {
@@ -548,7 +548,7 @@ export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceU
       types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'],
     });
     const nextSourceSeq = sourceUserSeq === undefined ? Number.MAX_SAFE_INTEGER
-      : rows.find((row) => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row)
+      : rows.find((row) => isExecutionSourceBoundary(row)
         && row.seq > sourceUserSeq)?.seq ?? Number.MAX_SAFE_INTEGER;
     const delivered = new Set<number>();
     for (const row of rows) {
@@ -586,7 +586,7 @@ export function hasUndeliveredSteerNotes(sessionId: string, sourceUserSeq: numbe
   if (!sessionSupportsSteering(sessionId)) return false;
   const rows = listEvents(sessionId, { sinceSeq: sourceUserSeq,
     types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'] });
-  const next = rows.find(row => row.type === 'user_input_received' && !isLiveApprovalAcknowledgement(row))?.seq
+  const next = rows.find(isExecutionSourceBoundary)?.seq
     ?? Number.MAX_SAFE_INTEGER;
   const delivered = new Set(rows.flatMap(row => row.type === 'user_steer_note_delivered'
     && Array.isArray(row.data.noteSeqs) ? row.data.noteSeqs : []));
