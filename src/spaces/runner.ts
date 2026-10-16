@@ -431,6 +431,37 @@ async function runSpaceDataSourceRead(
   };
 }
 
+/**
+ * A workflow button starts one run of a saved, turned-on workflow with the
+ * merged args as its inputs, through the same path as the workflow page's Run.
+ * The workflow can use any tool; each call inside it is admitted by that
+ * workflow's rules (an approved workflow runs end to end, a human checkpoint
+ * still asks). What it produces reaches the Space through space_set_data.
+ */
+async function runSpaceWorkflowAction(
+  slug: string,
+  workflow: string,
+  args: Record<string, unknown>,
+): Promise<RunSourceResult> {
+  const { resumeWorkflowRun } = await import('../tools/workflow-run-queue.js');
+  const inputs: Record<string, string> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (value === undefined || value === null) continue;
+    inputs[key] = typeof value === 'string' ? value : JSON.stringify(value);
+  }
+  const queued = resumeWorkflowRun(workflow, inputs, { source: `space_action:${slug}` });
+  if (queued.status === 'queued' || queued.status === 'duplicate' || queued.status === 'held') {
+    return { ok: true, data: { workflow, runId: queued.id ?? null, status: queued.status, message: queued.message } };
+  }
+  return {
+    ok: false,
+    error: queued.status === 'disabled'
+      ? `Workflow "${workflow}" is off. Turn it on (it runs its creation test first), then this button can run it.`
+      : queued.message,
+    provenNoDispatch: true,
+  };
+}
+
 /** Execute one declared action with caller-supplied args merged over its template. */
 export async function runSpaceAction(
   slug: string,
@@ -439,6 +470,7 @@ export async function runSpaceAction(
   opts: SpaceActionRunOptions = {},
 ): Promise<RunSourceResult> {
   const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
+  if (action.workflow?.trim()) return runSpaceWorkflowAction(slug, action.workflow.trim(), args);
   const requestedApprovalId = opts.approvalId?.trim() ?? '';
   const requiresApproval = workspaceActionRequiresApproval(action);
   const authority = requestedApprovalId

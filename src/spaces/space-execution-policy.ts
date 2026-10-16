@@ -51,6 +51,9 @@ export function workspaceDataSourceSafetyError(source: SpaceDataSource): string 
 
 /** Opaque code and every non-proven-read provider operation require approval. */
 export function workspaceActionRequiresApproval(action: SpaceAction): boolean {
+  // The owner's click starts a workflow they turned on; each call inside it is
+  // admitted by that workflow's own rules, so the click takes no second card.
+  if (action.workflow?.trim()) return false;
   if (action.confirm === true) return true;
   if (action.runner?.trim()) return true;
   const slug = action.composioSlug?.trim();

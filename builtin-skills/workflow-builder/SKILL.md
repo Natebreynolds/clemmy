@@ -33,6 +33,8 @@ Decide these before calling `workflow_create`:
 
 Find tools before you name them. Use `tool_search` to get the exact operation names this setup has, then put them in the step's `call.tool` or `allowedTools`. Never invent an operation name.
 
+**A workflow connected to a Space writes into it.** When the workflow feeds a Space (its drafts, its findings, its status), its last step is a `space_set_data` call that writes the shaped rows into that Space under a named source, from a transform step's output. Never leave the result only in the run's output; the Space is where the owner sees and acts on it. For work the owner reviews first, write each item with `status: "draft"` and its full content, and build the matching Approve workflow (the Space's button runs it) that publishes that exact item and sets its status. The workspace-builder skill describes the review queue.
+
 A monitor ("only the new ones since last time") keeps its own memory with `workflow_state` under its own workflow name:
 
 - `filter_unprocessed` returns the items not handled yet.

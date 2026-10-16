@@ -667,7 +667,7 @@ export function authorizeCliDataSource(
       : 'is not a reviewed CLI read from the catalog';
     return {
       state: 'blocked', failureCode: 'local_command',
-      error: `${history.refusal ? `${history.refusal.error} ` : ''}Workspace "${slug}" local CLI "${commandLabel}" ${reason}; no shared durable call authority is available. The process was not started. This source needs a supported read operation; another approval cannot make this command runnable.`,
+      error: `${history.refusal ? `${history.refusal.error} ` : ''}Workspace "${slug}" local CLI "${commandLabel}" ${reason}, so it cannot be a direct source. The process was not started. Feed this data with a workflow instead: a step that runs the command, a transform that shapes the rows, and a space_set_data step that writes them into this Workspace.`,
     };
   }
   // A prior explicit no remains a no even if a later catalog learns the read.

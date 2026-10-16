@@ -253,7 +253,7 @@ test('ERROR: source with no backend blocks the save', () => {
   });
   assert.equal(prep.ok, false);
   // The corrective must name all THREE supported backends, not two.
-  assert.match(prep.errors.join(' '), /declares no backend/);
+  assert.match(prep.errors.join(' '), /declares nothing to read.*feed it from a workflow/);
   assert.match(prep.errors.join(' '), /cli_argv/);
 });
 
@@ -355,7 +355,7 @@ test('ERROR: action with no backend blocks the save', () => {
     slug: 'noact', dataSources: [], actions: [{ id: 'x', label: 'Do thing' }],
   });
   assert.equal(prep.ok, false);
-  assert.match(prep.errors.join(' '), /neither a composio_slug nor a runner/);
+  assert.match(prep.errors.join(' '), /declares nothing to run.*workflow/);
 });
 
 // --- cli_argv schema/runtime parity ------------------------------------------
@@ -402,5 +402,5 @@ test('an ACTION still cannot be cli_argv-backed (no runtime can execute one)', (
     actions: [{ id: 'send', cliArgv: ['sf', 'data', 'create'] } as never],
   });
   assert.equal(prep.ok, false, 'actions have no cli_argv runtime; admitting one would be unrunnable');
-  assert.match(prep.errors.join(' '), /Action "send" declares neither/);
+  assert.match(prep.errors.join(' '), /Action "send" declares nothing to run/);
 });

@@ -84,7 +84,8 @@ export type ConfiguredSemanticPurpose =
   | 'clem_reply'
   | 'mcp_tool_effect_labels'
   | 'mcp_tool_effect_labels_second'
-  | 'workflow_step_effect';
+  | 'workflow_step_effect'
+  | 'workspace_deliverables';
 
 export interface ConfiguredBrainSemanticComplete {
   (input: {
@@ -94,7 +95,7 @@ export interface ConfiguredBrainSemanticComplete {
     signal?: AbortSignal;
     deadlineAt?: number;
     checkActive?: () => void;
-    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1';
+    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1';
   }): Promise<{
     raw: unknown;
     modelIdentity: string;
@@ -189,6 +190,15 @@ export const MCP_TOOL_EFFECT_LABELS_SYSTEM = [
 /** One reading of what an unmarked workflow step does. */
 export const WorkflowStepEffectV1Schema = z.object({
   effect: z.enum(['read', 'write', 'send']),
+}).strict();
+
+/** What a just-saved Workspace delivers of what the owner asked for. */
+export const WorkspaceDeliverablesV1Schema = z.object({
+  deliverables: z.array(z.object({
+    deliverable: z.string().min(1).max(200),
+    covered: z.boolean(),
+    gap: z.string().max(400),
+  }).strict()).max(8),
 }).strict();
 
 /** Structural wire schema; the confidence range is checked in code. */
@@ -762,7 +772,7 @@ export async function completeViaConfiguredBrain(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
   checkActive?: () => void;
-  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1';
+  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1';
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -802,6 +812,8 @@ export async function completeViaConfiguredBrain(input: {
       ? McpToolEffectLabelsV1Schema
       : input.schemaName === 'WorkflowStepEffectV1'
       ? WorkflowStepEffectV1Schema
+      : input.schemaName === 'WorkspaceDeliverablesV1'
+      ? WorkspaceDeliverablesV1Schema
       : input.schemaName === 'RequestEffectJudgeV1'
       ? RequestEffectJudgeV1Schema
       : input.schemaName === 'OperationVariantReadJudgeV1'

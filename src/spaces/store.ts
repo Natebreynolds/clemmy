@@ -220,6 +220,10 @@ export interface SpaceAction {
   composioSlug?: string;
   /** OR a runner script under data/ that performs the side effect. */
   runner?: string;
+  /** OR the exact name of a saved, turned-on workflow. A click runs it once with
+   *  the merged args as its inputs, so the button can use any tool the workflow
+   *  uses, under that workflow's own approval and human-checkpoint rules. */
+  workflow?: string;
   /** Base args merged under the caller-supplied args (caller fills/overrides). */
   argsTemplate?: Record<string, unknown>;
   /** Hint to the view that it should confirm before firing (advisory). */

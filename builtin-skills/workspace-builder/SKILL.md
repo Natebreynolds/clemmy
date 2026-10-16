@@ -27,7 +27,12 @@ A Workspace has five parts. Decide all five before writing anything:
 
 ## 2. Attach data (no model after this)
 
-Declare sources on `space_save` as `data_sources`:
+Any tool can feed a Workspace. Pick the route by what reads the data:
+
+- **One connected-app read** is a direct source (below).
+- **Anything else** (a CLI such as `gh` or `railway`, an MCP server, a built-in tool, or several steps joined together) is a **feed workflow**: its steps read with that tool, a transform shapes the rows, and a final `space_set_data` step writes them into this Workspace under a source id. Schedule it to keep the data current; Refresh on the Workspace runs it. Build the feed in the same turn as the Workspace, run it once, and check the rows landed before you call the Workspace done.
+
+Declare direct sources on `space_save` as `data_sources`:
 
 - **Connected-app read**: `{ id, composio_slug, composio_args_json, schedule, timezone }`. Use a read operation (list, get, search, fetch, query). Find the exact operation name with `tool_search` first. The save prepares each operation against its current definition before judging it, and refuses anything that is not a read.
 - **Local command-line read**: `{ id, cli_argv, schedule, timezone }` where `cli_argv` is a reviewed read from the CLI catalog, frozen as an argument array with no shell. For Salesforce: `["sf","data","query","--query","SELECT Id, Name FROM Opportunity WHERE IsClosed = false","--json"]`. Only the options the reviewed read declares are carried (`--query`, `--target-org`); any other option is refused by name.
@@ -53,13 +58,23 @@ Every save runs each changed source once and reports what came back. A source th
 
 ## 4. Wire actions
 
-- Declare `actions: [{ id, label, composio_slug, args_template_json }]`. The template holds fixed arguments; the view passes the per-click ones.
+- Declare `actions: [{ id, label, composio_slug, args_template_json }]` for one connected-app operation. The template holds fixed arguments; the view passes the per-click ones.
+- **Any other tool is a workflow action:** `{ id, label, workflow: "<exact saved workflow name>", args_template_json }`. One click runs that workflow once with the merged args as its inputs, so a button can run a CLI command, an MCP tool, a built-in, or several steps. The workflow's own rules govern each call inside it: an approved workflow runs end to end, and a human checkpoint step still asks. Build and turn on the workflow first, then name it on the button. The click returns `{ ok: true, result: { runId, status } }`; show the run as started, and let the workflow's `space_set_data` step update the page when it finishes.
 - Call from the view: `const result = await clem.action("draft_reply", { message_id: row.id, mail_folder_id: row.parentFolderId, comment: text })`. Per-click arguments merge over the template.
 - **Required inputs are checked at save.** The save reads each action operation's input schema without calling it. When a required input is set by neither the template nor the literal `clem.action` call, the save is refused and names the input. Fix it in the template or pass it from the view.
 - Handle all three outcomes. `{ pending: true, approvalId }` means the action waits for one approval: show `clem.ui.pending()` and never say it happened. `{ ok: true, result }` means it ran. A thrown error means it failed: show `clem.ui.error(message)`.
 - Sends take one approval. Drafts and ordinary reversible writes run directly.
 - Disable a button while its action is in flight, and put the row id in a data attribute rather than rebuilding it from text.
 - Never prove a button works by performing a write on the user's real data. The save's input check and the operation's own validation cover wiring. When a live check truly matters, tell the user exactly what one click will do and let them click it.
+
+## 4b. Review queues: preview, then approve
+
+When the owner reviews work before it goes out (blog posts, emails, social posts, proposals, pull requests), build a review queue, not a link list.
+
+- **The producing workflow writes the queue.** Each item is a row in a source such as `drafts`: a stable `id`, `title`, `status` (`draft`, `approved`, `published`, `rejected`), `created_at`, and the full content to preview (`body_markdown` or `body_html`, plus whatever the destination shows: SEO title, description, slug, image).
+- **Show the preview, not a summary.** Render the item the way it will appear, with its metadata, so the owner can judge it on the page. Long content opens in place.
+- **Approve and Reject are buttons on the item.** Approve is a workflow action that publishes that exact item (for example, commit the post and open a pull request, or send the email); Reject records the decision. Both update the item's `status` through `space_set_data`, so the queue shows what happened.
+- **Keep the history.** Published and rejected items stay visible in their own sections with when and what happened (a pull request link, a sent time).
 
 ## 5. Make it useful before making it pretty
 
@@ -124,6 +139,8 @@ Every served view already carries a stylesheet and a helper kit. Spend your byte
 - After changing a source, run `space_refresh` so the open Workspace shows the new data. Use `space_history` and `space_diff` to see what changed between refreshes.
 
 ## 8. Verify before saying it is done
+
+- **Cover what was asked.** List every deliverable the owner named ("manage the site and its backend", "blog approvals with previews") and check the Workspace does each with live data and working buttons. A page of links to other tools covers none of them. When one is missing, build it before you finish.
 
 - **Look at it.** `space_preview` renders the Workspace exactly as the desktop shows it, with its real data, and returns an image. Preview after every create or redesign, and after any visual change. Check the image against sections 5 and 6: is the attention list short and real, is text decoded, does the page fill the frame, is anything cluttered, empty, or broken? Fix what you see and preview again. Check dark theme and a 390-pixel width once before you finish.
 - Read the whole save result. Fix every gap-test item it names; the save refuses until they are fixed.

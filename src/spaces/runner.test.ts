@@ -347,7 +347,8 @@ test('unsupported frozen CLI sources never ask for trust, including drift and mi
     assert.equal(result.code, 'local_command');
     assert.equal(result.provenNoDispatch, true);
     assert.equal(result.pendingApprovalId, undefined);
-    assert.match(result.error, /another approval cannot/i);
+    assert.match(result.error, /cannot be a direct source/i);
+    assert.match(result.error, /Feed this data with a workflow/);
     assert.equal(approvalRegistry.listPending({ sessionId: `space-${slug}`, status: 'any' }).length, 0);
   }
   const tampered = await runner.runSpaceDataSource(slug, source);

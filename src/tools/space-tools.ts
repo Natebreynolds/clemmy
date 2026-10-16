@@ -243,7 +243,8 @@ const dataSourceShape = z.object({
 const actionShape = z.object({
   id: z.string().min(1).max(60).describe('Stable id for this action, e.g. "send_followup".'),
   label: z.string().max(80).nullish().describe('Button label shown in the view, e.g. "Send follow-up".'),
-  composio_slug: z.string().max(120).nullish().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner.'),
+  workflow: z.string().max(200).nullish().describe('The exact name of a saved workflow this button runs once per click, with the merged args as its inputs. Use it for any tool: a CLI, an MCP server, a built-in, a connected app, or several steps. The workflow\'s own approvals apply; the click takes no extra card. Mutually exclusive with composio_slug and runner.'),
+  composio_slug: z.string().max(120).nullish().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner and workflow.'),
   runner: z.string().max(120).nullish().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
   runner_path: z.string().max(1000).nullish().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
   args_template_json: jsonObjectArgument().nullish().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
@@ -305,6 +306,7 @@ function toAction(
   const a: SpaceAction = { id: raw.id.trim() };
   if (raw.label && raw.label.trim()) a.label = raw.label.trim();
   if (raw.composio_slug && raw.composio_slug.trim()) a.composioSlug = raw.composio_slug.trim();
+  if (raw.workflow && raw.workflow.trim()) a.workflow = raw.workflow.trim();
   const runner = declaredRunner(raw.runner, raw.runner_path, `Action "${a.id}"`, errors, staged);
   if (runner) a.runner = runner;
   const argsTemplate = parseJsonObjectField(raw.args_template_json, `Action "${a.id}" args_template_json`, errors);
@@ -464,7 +466,7 @@ export function registerSpaceTools(server: McpServer): void {
       'Render the initial dataset synchronously from window.__SPACE_DATA__. For updated data use await clem.data() or clem.refresh(sourceId?), which returns {results,data}; access exact declared source IDs. Template placeholders are not expanded. The bridge also provides history/diff/note/compose/action. For an external action, handle {pending:true,approvalId}; report sent only after confirmed execution.',
       `Static creation: pass initial_data_json (max ${SPACE_INITIAL_DATA_MAX_BYTES} UTF-8 bytes) with top-level _mobile in the same commit; cannot combine with data_sources. Static edits: read space_get, then submit replacement_data_json with expected_revision and optional updated view_html. The complete root document, phone content and view commit together. Preserve unrelated content. space_set_data instead edits one named source.`,
       'Phone content comes from data, never desktop HTML. Use _mobile: {headline:[{label,value}], breakdowns:[{label,entries:[{label,value}]}], records:{label,total,items:[{primary,fields:[{label,value}],body?,links?:[{label,url}]}]}}. Preformat display values; roughly 6 tiles/40 records; body max 4000 characters and http(s) links only. For refreshing sources put _mobile inside each source output so refresh preserves it; malformed/missing blocks fall back to inference.',
-      'New data_sources must be provably read-only Composio operations (discover exact operation first), or frozen read-only cli_argv approved once by the owner; prefer JSON output. Unknown/mutating operations and new arbitrary runner scripts are refused. Existing runner sources may retain the same id/filename: first refresh or entrypoint change requires time-bounded approval bound to entrypoint hash and schedule. Helpers/dependencies remain live, not sandboxed. Action runners require per-invocation approval. Prefer read-only Composio when migrating.',
+      'Any tool can feed and drive a Workspace. A single connected-app read can be a direct data_source (composio_slug). Data from anything else (a CLI such as gh or railway, an MCP server, a built-in, several steps) comes from a feed workflow: its steps read with any tool, a transform shapes the rows, and a space_set_data step writes them into this Workspace; Refresh runs it and its schedule keeps it current. A button that does work with any tool is a workflow action ({id,label,workflow,args_template_json}): one click runs that saved workflow with the args as inputs. Direct cli_argv sources accept only catalog-reviewed reads; new runner scripts are refused.',
       'Changed Composio sources refresh on save and return row counts. Legacy runner edits preserve prior data until approved. Optional threshold re-engagement on scheduled sources deduplicates persistent conditions.',
       'Persist the agreed objective, success_criteria and invariants; omit on updates to preserve them. Preserve all content outside the requested change; explanations belong in chat. Returns URL and summary; prior views are snapshotted for revert.',
     ].join('\n'),
@@ -972,6 +974,27 @@ export function registerSpaceTools(server: McpServer): void {
       const gapQuestions = renderSpaceGapQuestions(gaps);
       const contractListsDropped =
         !record.contract && ((success_criteria?.length ?? 0) > 0 || (invariants?.length ?? 0) > 0);
+      // A created or redesigned Workspace is checked against what the owner
+      // asked for, so a thin page is built out in the same turn.
+      let deliverablesNote = '';
+      const deliverablesContext = getToolOutputContext();
+      const deliverablesSeq = deliverablesContext?.sourceUserSeq;
+      if (authoredView?.ok && deliverablesContext?.sessionId && Number.isSafeInteger(deliverablesSeq) && deliverablesSeq! > 0) {
+        try {
+          const accepted = listEvents(deliverablesContext.sessionId, {
+            types: ['user_input_received'], sinceSeq: deliverablesSeq! - 1, limit: 1,
+          }).find((event) => event.seq === deliverablesSeq);
+          const request = typeof accepted?.data.text === 'string' ? accepted.data.text.trim() : '';
+          if (request) {
+            const { feedLinksForSpace } = await import('../spaces/workflow-feeds.js');
+            const { readWorkspaceDeliverables, renderWorkspaceDeliverables } = await import('../spaces/workspace-deliverables-check.js');
+            const feeds = await feedLinksForSpace(slug).catch(() => []);
+            deliverablesNote = renderWorkspaceDeliverables(await readWorkspaceDeliverables({
+              request, record, viewHtml: authoredView.content, feeds,
+            }));
+          }
+        } catch { /* the check informs; it never blocks or fails a save */ }
+      }
       const result = renderSpaceSaveResult({
         verb,
         record,
@@ -980,7 +1003,7 @@ export function registerSpaceTools(server: McpServer): void {
         advisories,
         smokeNote,
         gapQuestions,
-      });
+      }) + deliverablesNote;
       if (initialData) {
         const committed = withHostLocalWriteCommitFromFile({
           createdId: slug,
@@ -1056,6 +1079,26 @@ export function registerSpaceTools(server: McpServer): void {
         return textResult(
           `Workspace "${slug}" has no declared action "${action_id}". Nothing was prepared or run.`,
         );
+      }
+      if (action.workflow?.trim()) {
+        let workflowArgs: Record<string, unknown> = {};
+        const workflowArgsText = jsonArgumentText(args_json);
+        if (workflowArgsText?.trim()) {
+          try {
+            const parsed = JSON.parse(workflowArgsText) as unknown;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              return textResult('Error: args_json must be one JSON object. Nothing was run.');
+            }
+            workflowArgs = parsed as Record<string, unknown>;
+          } catch (err) {
+            return textResult(`Error: args_json is not valid JSON: ${(err as Error).message}. Nothing was run.`);
+          }
+        }
+        const { runSpaceAction } = await import('../spaces/runner.js');
+        const ran = await runSpaceAction(rec.id, action, workflowArgs);
+        return textResult(ran.ok
+          ? `Started workflow "${action.workflow}" for "${action.label ?? action.id}": ${JSON.stringify(ran.data)}. Its result lands in the Space when it writes there.`
+          : `"${action.label ?? action.id}" did not start: ${ran.error}`);
       }
       if (!spaceActionNeedsApproval(action)) {
         return textResult(

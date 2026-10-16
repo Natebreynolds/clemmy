@@ -19,6 +19,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { validateCronExpression } from '../shared/cron.js';
+import { listWorkflows } from '../memory/workflow-store.js';
 import {
   resolveInSpace,
   runnerFilenameError,
@@ -59,8 +60,16 @@ function dataSourceHasBackend(source: SpaceDataSource): boolean {
  * admit an action that can never run. Keep the two predicates separate rather
  * than widening one shared shape.
  */
+/** A workflow button names one saved workflow exactly. */
+function workspaceActionWorkflowError(name: string): string | null {
+  let saved: ReturnType<typeof listWorkflows>;
+  try { saved = listWorkflows(); } catch { return null; }
+  if (saved.some((entry) => entry.data.name === name)) return null;
+  return `names workflow "${name}", which is not saved. Build that workflow first (workflow_create), then name it here exactly.`;
+}
+
 function actionHasBackend(action: SpaceAction): boolean {
-  return nonEmpty(action.runner) || nonEmpty(action.composioSlug);
+  return nonEmpty(action.runner) || nonEmpty(action.composioSlug) || nonEmpty(action.workflow);
 }
 
 function runnerDeclarationKey(source: Pick<SpaceDataSource, 'id' | 'runner'>): string | null {
@@ -144,7 +153,7 @@ export function checkSpaceForWrite(
 
   for (const s of dataSources ?? []) {
     if (!dataSourceHasBackend(s)) {
-      errors.push(`Data source "${s.id}" declares no backend — it can't return anything. Give it a frozen cli_argv (a bare command plus fixed args), a provably read-only composio_slug, or a runner script under data/.`);
+      errors.push(`Data source "${s.id}" declares nothing to read. Give it a read-only connected-app operation (composio_slug) or a catalog-reviewed command (cli_argv), or feed it from a workflow that reads with any tool and writes the rows here with space_set_data.`);
       continue;
     }
     if (s.runner && s.runner.trim()) {
@@ -177,7 +186,16 @@ export function checkSpaceForWrite(
 
   for (const a of actions ?? []) {
     if (!actionHasBackend(a)) {
-      errors.push(`Action "${a.id}" declares neither a composio_slug nor a runner — it can't do anything. Give it the Composio tool slug to call (discover it with composio_search_tools) or a runner script.`);
+      errors.push(`Action "${a.id}" declares nothing to run. Give it a workflow (any tool: build a workflow that does the work, then name it here) or a connected-app operation as composio_slug.`);
+      continue;
+    }
+    if (nonEmpty(a.workflow)) {
+      if (nonEmpty(a.composioSlug) || nonEmpty(a.runner)) {
+        errors.push(`Action "${a.id}" names a workflow and also a composio_slug or runner. Give it one: the workflow.`);
+        continue;
+      }
+      const workflowError = workspaceActionWorkflowError(a.workflow!.trim());
+      if (workflowError) errors.push(`Action "${a.id}" ${workflowError}`);
       continue;
     }
     if (a.runner && a.runner.trim()) {
