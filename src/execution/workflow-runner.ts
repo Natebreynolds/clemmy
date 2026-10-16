@@ -12022,6 +12022,11 @@ async function executeWorkflow(
       // endpoint even after the brain was switched to Codex.
       model: claudeIsActiveWorkflowBrain() ? getClaudeBrainModel() : defaultForRole('brain'),
       maxTurns: 8,
+      // The runner's own read-only pass over completed outputs, never a saved
+      // step: it has no saved effect reading to find, so it says what it does.
+      // Live 2026-10-16 an unmarked synthesis was refused by the pre-run
+      // effect check and every report fell back to the raw step rollup.
+      sideEffect: 'read',
     };
     const synthesisMessage = [
       'Workflow synthesis pass. Produce the final user-facing result from the completed step outputs.',
