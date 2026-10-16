@@ -84,9 +84,10 @@ test('a freshly authenticated same-vendor CLI does not hide the missing provider
   const entry = { id: 'quillboard', name: 'Quillboard', vendor: 'Quillboard', command: 'quillboard',
     description: 'Fixture CLI', tags: ['quillboard'], installCommand: 'npm install -g fixture-quillboard',
     installSource: 'npm' as const, authDocsUrl: 'https://example.invalid/auth' };
-  cliCatalog.recordConnectedCli(entry);
+  const connection = cliCatalog.recordConnectedCli(entry);
   writeFileSync(path.join(home, 'state/cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
     quillboard: { id: 'quillboard', command: 'quillboard', installed: true, authStatus: 'ok',
+      connectionRevision: connection.connectionRevision,
       binaryPath: '/controlled/bin/quillboard', checkedAt: new Date().toISOString(), username: 'fixture-owner' },
   } }));
   try {
