@@ -1,0 +1,65 @@
+/* A dock can be narrow inside a wide window. Reflow the controls against the
+   composer's own width, keeping every action and its keyboard order. */
+.chat-composer {
+  container: chat-composer / inline-size;
+}
+
+.composer-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.composer-toolbar-start,
+.composer-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.composer-toolbar-start > *,
+.composer-toolbar-actions > * {
+  flex-shrink: 0;
+}
+
+.composer-toolbar-models {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.composer-toolbar-models > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+@container chat-composer (max-width: 30rem) {
+  .composer-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 8px;
+  }
+
+  .composer-toolbar-start {
+    grid-column: 1 / -1;
+  }
+
+  .composer-toolbar-models {
+    justify-content: flex-start;
+  }
+}
+
+@container chat-composer (max-width: 22rem) {
+  .composer-toolbar-models,
+  .composer-toolbar-actions {
+    grid-column: 1 / -1;
+  }
+
+  .composer-toolbar-actions {
+    justify-content: flex-end;
+  }
+}

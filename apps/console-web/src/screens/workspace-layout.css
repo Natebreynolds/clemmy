@@ -1,0 +1,52 @@
+.workspace-layout {
+  container: workspace-view / inline-size;
+}
+
+.workspace-conversation {
+  width: 400px;
+  min-width: 0;
+}
+
+.workspace-conversation[hidden],
+.workspace-show-space-label {
+  display: none;
+}
+
+/* Both panes stay mounted: changing the visible pane preserves the chat's
+   drafts and the Space view's own scroll, filters and unfinished fields. */
+@container workspace-view (max-width: 56rem) {
+  .workspace-conversation {
+    width: 100%;
+    flex: 1 1 100%;
+    border-right: 0;
+  }
+
+  .workspace-layout[data-conversation-open='true'] > .workspace-content {
+    display: none;
+  }
+
+  .workspace-conversation .workspace-conversation-toggle {
+    width: auto;
+    flex-shrink: 0;
+    padding-inline: 8px;
+  }
+
+  .workspace-show-space-label {
+    display: inline;
+  }
+
+  .workspace-toolbar,
+  .workspace-toolbar-actions {
+    flex-wrap: wrap;
+  }
+
+  .workspace-toolbar-title {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .workspace-toolbar-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}

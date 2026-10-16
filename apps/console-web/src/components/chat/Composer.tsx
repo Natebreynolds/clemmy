@@ -15,6 +15,7 @@ import { useFileDock } from '@/components/chat/FileDock';
 import { seedProjectToolsComposerDraft } from '@/lib/project-tools-draft';
 import { seedConnectionSetupComposerDraft } from '@/lib/connection-setup-draft';
 import { COMPOSER_EXAMPLES, seedComposerExample } from '@/lib/composer-examples';
+import './composer.css';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 
@@ -344,7 +345,7 @@ export function Composer({
       : busy ? 'Anything you send now reaches her at her next step.' : 'Act does it now. Plan shows you the steps first.';
 
   return (
-    <div>
+    <div className="chat-composer min-w-0 max-w-full">
     {showStartGuidance && <section className="mb-7" aria-labelledby="conversation-start-heading">
       <h2 id="conversation-start-heading" className="text-h1 text-fg">What would you like to get done?</h2>
       <p className="mt-3 max-w-prose text-body text-muted">Describe your goal in your own words. Add a file if it helps.</p>
@@ -445,7 +446,8 @@ export function Composer({
         className="block max-h-[220px] min-h-[52px] w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-body-lg text-fg outline-none placeholder:text-faint"
       />
 
-      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-1">
+      <div className="composer-toolbar px-2.5 pb-2.5 pt-1">
+        <div className="composer-toolbar-start">
         <Button
           variant="ghost"
           size="icon"
@@ -469,12 +471,14 @@ export function Composer({
             Plan
           </button>
         </div>
-
-        <div className="ml-auto flex min-w-0 items-center gap-1.5">
-          {agentSlot}
-          <ModelPicker sessionId={sessionId} agentId={agentId} applyAgent={applyAgent} />
         </div>
 
+        <div className="composer-toolbar-models">
+          {agentSlot}
+          <ModelPicker sessionId={sessionId} agentId={agentId} applyAgent={applyAgent} className="min-w-0 max-w-full [&>button]:max-w-full [&>button>span]:min-w-0" />
+        </div>
+
+        <div className="composer-toolbar-actions">
         {/* Offered only where this computer can record the microphone; the
             words are transcribed on this computer (use-dictation.ts). */}
         {dictation && !voiceHere && (
@@ -493,10 +497,6 @@ export function Composer({
               : <Mic className={cn('h-[18px] w-[18px]', listening && 'animate-breathe text-primary', dictationError && 'text-danger')} aria-hidden />}
           </Button>
         )}
-        {dictationError && !listening && !transcribing && (
-          <span role="status" className="max-w-56 truncate text-caption text-danger" title={dictationError}>{dictationError}</span>
-        )}
-
         {busy ? (
           <>
             {onBackground && (
@@ -558,7 +558,11 @@ export function Composer({
             <ArrowUp className="h-[18px] w-[18px]" strokeWidth={2.25} aria-hidden />
           </button>
         )}
+        </div>
       </div>
+      {dictationError && !listening && !transcribing && (
+        <p role="status" className="break-words px-3 pb-2 text-caption text-danger">{dictationError}</p>
+      )}
     </div>
     {voiceHere ? (
       <p className="mt-2 flex items-center justify-center gap-2 text-center text-caption text-muted" role="status">
