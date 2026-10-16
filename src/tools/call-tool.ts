@@ -58,7 +58,9 @@ import {
   isMcpNamespacedTool,
 } from './inner-dispatch.js';
 import { deriveOrchestratorDiscoveryNames, isEffectDecidedPerCall, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
-import { recordToolHit } from '../agents/tool-hotset.js';
+import { forgetToolHit, recordToolHit } from '../agents/tool-hotset.js';
+import { HostLocalExecutionFailureResult, HostLocalNonWriteResult } from '../runtime/harness/attempt-settlement.js';
+import { deriveResultHandleFactsFromRaw } from '../runtime/harness/result-facts.js';
 import { resolveCallToolAlias } from './call-tool-alias.js';
 import { provenComposioSlugForTurn } from '../runtime/harness/capability-resolution.js';
 import {
@@ -1560,8 +1562,19 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       // a successful acquisition. Keep its useful corrective without promotion.
       if (out instanceof ExactCatalogBindingRefusalResult) return out as unknown as string;
 
-      // 5. Promote the reached tool into the session hot-set.
-      recordToolHit(sessionId, target);
+      // 5. A tool that worked is carried into the next turn; one that failed
+      // stops being carried.
+      {
+        const run = harnessRunContextStorage.getStore();
+        const succeeded = !(out instanceof HostLocalExecutionFailureResult)
+          && !(out instanceof HostLocalNonWriteResult)
+          && deriveResultHandleFactsFromRaw(out).success;
+        if (succeeded) {
+          recordToolHit(sessionId, target, run?.sessionId === sessionId ? run?.sourceUserSeq : undefined);
+        } else {
+          forgetToolHit(sessionId, target);
+        }
+      }
       // An inner result that carries an image stays content blocks, so the
       // host delivers the image to the model instead of its base64 text.
       if (isToolMediaContent(out)) return out as unknown as string;

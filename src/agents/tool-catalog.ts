@@ -18,7 +18,7 @@ import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { browserBackendOffered } from '../tools/browser-backend.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
 import { queryExplicitlyNamesTool, recallPinnedBuiltinTools } from './tool-jit.js';
-import { getHotSet } from './tool-hotset.js';
+import { getHotSet, liveHotSetSources } from './tool-hotset.js';
 import { cosine, embedQuery, embedTexts, isEmbeddingsEnabled } from '../memory/embeddings.js';
 import {
   requestsWorkflowExecution,
@@ -218,42 +218,23 @@ const MAX_SESSION_PROMOTIONS = 3;
 const MAX_RECALL_PROMOTIONS = 3;
 
 /**
- * KEEP THE TOOL LIST STEADY WITHIN A CONVERSATION.
- *
- * Every tool schema the model sees is part of the prompt prefix a provider
- * caches. A tool promoted on one turn and dropped on the next re-bills the
- * whole prefix after it, so a list that changes turn to turn loses the cache
- * on every frame. A tool promoted earlier in a conversation stays promoted
- * while the turn's own policy allows it, in the order it first appeared, at
- * most STICKY_PROMOTIONS of them; past that a new promotion is this turn's only,
- * as before. Discovery doors are never kept (they stay deferred unless named).
+ * The promoted set for this build. A tool is carried into a later turn only
+ * through the session hot set, which holds tools that succeeded in this
+ * request or the one before it; nothing is re-added merely because it was
+ * promoted once. A sticky ledger used to keep up to eight such names for the
+ * whole conversation so the cached prefix held, which carried tools that had
+ * failed or gone unused into every later request (live 2026-10-16: a web read
+ * that returned 404 rode a chat's tool block and its schema failed every
+ * later request). Losing a tool from the block costs one less-cached call;
+ * carrying one costs every request.
  * Schema visibility only: what may be called is decided elsewhere.
  */
-const STICKY_PROMOTIONS = 8;
-const STICKY_SESSIONS = 200;
-const stickyBySession = new Map<string, string[]>();
-
 export function steadySessionPromotions(
-  sessionId: string | undefined | null,
+  _sessionId: string | undefined | null,
   promoted: ReadonlySet<string>,
   allowed: (name: string) => boolean,
 ): Set<string> {
-  const result = new Set(promoted);
-  if (!sessionId) return result;
-  const ledger = stickyBySession.get(sessionId) ?? [];
-  for (const name of promoted) {
-    if (ledger.length >= STICKY_PROMOTIONS) break;
-    if (TOOL_SEARCH_ALWAYS_LOADED.has(name) || DISCOVERY_SIBLING_DOORS.has(name) || ledger.includes(name)) continue;
-    ledger.push(name);
-  }
-  stickyBySession.delete(sessionId);
-  stickyBySession.set(sessionId, ledger);
-  if (stickyBySession.size > STICKY_SESSIONS) {
-    const oldest = stickyBySession.keys().next().value;
-    if (oldest !== undefined) stickyBySession.delete(oldest);
-  }
-  for (const name of ledger) if (allowed(name)) result.add(name);
-  return result;
+  return new Set([...promoted].filter(allowed));
 }
 
 /**
@@ -277,8 +258,8 @@ export function holdNewPromotions(
   return { promoted: kept, held };
 }
 
-/** Test seam: forget every conversation's steady promotions. */
-export function _resetSteadySessionPromotionsForTests(): void { stickyBySession.clear(); }
+/** Test seam kept for callers; there is no conversation-wide ledger now. */
+export function _resetSteadySessionPromotionsForTests(): void { /* nothing retained */ }
 
 /** Every registry tool name (the reachable built-in universe). */
 export function allRegistryNames(): Set<string> {
@@ -395,7 +376,7 @@ export function resolveHotSetParts(
       session: started.parts.session.filter(keep),
     };
   }
-  const parts = currentHotSetParts(sessionId, userInput, keep);
+  const parts = currentHotSetParts(sessionId, userInput, keep, source);
   if (sid && source !== null) {
     turnStartHotSets.delete(sid);
     turnStartHotSets.set(sid, { sourceUserSeq: source, parts });
@@ -414,6 +395,7 @@ function currentHotSetParts(
   sessionId: string | undefined | null,
   userInput: string | undefined | null,
   keep: (name: string) => boolean,
+  sourceUserSeq: number | null = null,
 ): HotSetParts {
   const universe = allRegistryNames();
 
@@ -443,8 +425,11 @@ function currentHotSetParts(
   for (const name of recallPinnedBuiltinTools(userInput).slice(0, MAX_RECALL_PROMOTIONS)) {
     if (keepFirstClass(name)) request.add(name);
   }
+  // Carried from earlier turns: only tools that succeeded in this request or
+  // the one before it (tool-hotset.ts). A failed or unused tool drops off.
   const session = new Set<string>();
-  for (const name of getHotSet(sessionId).slice(0, MAX_SESSION_PROMOTIONS)) {
+  const liveSources = liveHotSetSources(sessionId, sourceUserSeq);
+  for (const name of getHotSet(sessionId, liveSources ?? undefined).slice(0, MAX_SESSION_PROMOTIONS)) {
     if (keepFirstClass(name)) session.add(name);
   }
   return { kernel: [...kernel], request: [...request], session: [...session] };

@@ -3843,8 +3843,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         lane: 'chat',
         availableNames,
         excludeNames: excludes,
-        // Steady within the conversation, so the cached prompt prefix holds
-        // from turn to turn (tool-catalog.ts steadySessionPromotions).
+        // This turn's promotions plus tools that succeeded in this request or
+        // the one before it (tool-catalog.ts steadySessionPromotions).
         promotedNames: (() => {
           const steady = steadySessionPromotions(options.sessionId, hot, (name) => policyAllowed.has(name));
           let warm: WarmPromptPrefix | null = null;
