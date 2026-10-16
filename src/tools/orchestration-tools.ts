@@ -748,14 +748,20 @@ export function renderWorkflowRunStepOutput(record: Record<string, unknown>, run
  * actually did and improve the workflow from it.
  */
 export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
-  const entry = listWorkflows().find((candidate) => candidate.data.name === workflow || candidate.name === workflow);
-  const names = new Set([workflow, ...(entry ? [entry.name, entry.data.name] : [])]);
+  // The same name resolution workflow_get uses (case and spacing do not
+  // matter): live 2026-10-16 a lowercased name read "has no runs yet" for a
+  // workflow with three runs, and Clem built her question on that.
+  const entry = listWorkflows().find((candidate) => workflowNamesEqual(candidate.data.name, workflow)
+    || workflowNamesEqual(candidate.name, workflow));
+  const names = [workflow, ...(entry ? [entry.name, entry.data.name] : [])];
   const displayName = entry?.data.name ?? workflow;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return `"${displayName}" has no runs yet.`;
   const lines: string[] = [];
   for (const { record: r } of workflowRunInventory()) {
     if (lines.length >= limit) break;
-    if (typeof r.id !== 'string' || typeof r.workflow !== 'string' || !names.has(r.workflow)) continue;
+    if (typeof r.id !== 'string' || typeof r.workflow !== 'string') continue;
+    const runWorkflow = r.workflow;
+    if (!names.some((name) => workflowNamesEqual(name, runWorkflow))) continue;
     const terminalOutcome = deriveWorkflowTerminalOutcome({
       status: r.status,
       finishedAt: r.finishedAt,
