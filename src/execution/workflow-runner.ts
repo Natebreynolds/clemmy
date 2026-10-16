@@ -2861,7 +2861,6 @@ function projectContextValue(project: WorkflowStepProjectContext | undefined, ke
 // shift it. A relative window ("the next 24 hours") is therefore an exact
 // call: {{now}} .. {{now+24h}}, and a scheduled read never needs a model step
 // to compute its own dates.
-const TIME_TOKEN_RE = /\{\{\s*((?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}/g;
 const TIME_TOKEN_EXACT_RE = /^(now|date)(?:([+-])(\d{1,5})([mhd]))?$/;
 
 export function resolveTimeToken(token: string, at: Date = new Date()): string | null {
@@ -2873,6 +2872,13 @@ export function resolveTimeToken(token: string, at: Date = new Date()): string |
   return m[1] === 'now' ? shifted.toISOString() : shifted.toISOString().slice(0, 10);
 }
 
+// One grammar for a template reference wherever it appears: a whole tool
+// argument, text inside one, or a step prompt, with or without spaces inside
+// the braces. A form outside it (a mail-merge "{{first_name}}") stays as
+// written.
+const TEMPLATE_REFERENCE = String.raw`(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|(?:now|date)(?:[+-]\d{1,5}[mhd])?)`;
+const TEMPLATE_REFERENCE_RE = new RegExp(String.raw`\{\{\s*${TEMPLATE_REFERENCE}\s*\}\}`, 'g');
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
@@ -2880,42 +2886,20 @@ function renderTemplate(
   item?: unknown,
   project?: WorkflowStepProjectContext,
 ): string {
-  return template
-    .replace(TIME_TOKEN_RE, (_m, token: string) => resolveTimeToken(token) ?? '')
-    .replace(/\{\{project\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => {
-      const value = projectContextValue(project, key);
-      return value === undefined || value === null ? '' : String(value);
-    })
-    .replace(/\{\{input\.([a-zA-Z0-9_-]+)\}\}/g, (_m, key: string) => inputs[key] ?? '')
-    .replace(/\{\{steps\.([a-zA-Z0-9_-]+)\.output(?:\.([a-zA-Z0-9_.-]+))?\}\}/g, (_m, key: string, field?: string) => {
-      // A field of a step's output ("{{steps.x.output.title}}") fills in
-      // inside text the same way it does as a whole argument.
-      const out = field ? pathGet(stepOutputs[key], field) : stepOutputs[key];
-      if (out === undefined || out === null) return '';
-      return typeof out === 'string' ? out : JSON.stringify(out, null, 2);
-    })
-    .replace(/\{\{item\}\}/g, () => {
-      if (item === undefined || item === null) return '';
-      return typeof item === 'string' ? item : JSON.stringify(item);
-    })
-    .replace(/\{\{item\.([a-zA-Z0-9_.-]+)\}\}/g, (_m, pathStr: string) => {
-      if (!item || typeof item !== 'object') return '';
-      const parts = pathStr.split('.');
-      let cursor: unknown = item;
-      for (const p of parts) {
-        if (!cursor || typeof cursor !== 'object') return '';
-        cursor = (cursor as Record<string, unknown>)[p];
-      }
-      if (cursor === undefined || cursor === null) return '';
-      return typeof cursor === 'string' ? cursor : JSON.stringify(cursor);
-    });
+  return template.replace(TEMPLATE_REFERENCE_RE, (_m, token: string) => {
+    const value = resolveCallToken(token, inputs, stepOutputs, item, project);
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'string') return value;
+    // A whole step output reads best indented; a field or an item stays compact.
+    return /^steps\.[a-zA-Z0-9_-]+\.output$/.test(token) ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+  });
 }
 
 // ── CALL-1: structured tool-call argument rendering ──────────────────────────
 // A call arg value that is EXACTLY one template token resolves to the RAW
 // upstream value (object/array preserved, so a whole step output can be handed
 // to a tool). An embedded token ("prefix {{input.x}}") renders as a string.
-const CALL_FULL_TOKEN_RE = /^\s*\{\{\s*(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|(?:now|date)(?:[+-]\d{1,5}[mhd])?)\s*\}\}\s*$/;
+const CALL_FULL_TOKEN_RE = new RegExp(String.raw`^\s*\{\{\s*${TEMPLATE_REFERENCE}\s*\}\}\s*$`);
 
 function pathGet(value: unknown, dotted: string): unknown {
   if (!dotted) return value;
@@ -2934,22 +2918,98 @@ function parseJsonObjectText(text: string): unknown {
   try { return JSON.parse(trimmed) as unknown; } catch { return undefined; }
 }
 
-/** Field references ("{{steps.x.output.title}}") in a step's arguments that
- *  name a field the referenced step's real output does not have. */
-function missingStepOutputFields(value: unknown, stepOutputs: Record<string, unknown>, found: string[] = []): string[] {
+/**
+ * References in a step's arguments whose data is not there: a step output
+ * never produced, a field a step's real output does not have, or an input the
+ * workflow never declares. A declared input left empty, an empty value, and
+ * an item field (items vary) are data, not gaps. A step output that only a
+ * real run produces (a previewed change) is reported separately.
+ */
+function workflowArgumentReferenceGaps(
+  value: unknown,
+  ctx: { stepOutputs: Record<string, unknown>; inputs: Record<string, string>; declaredInputs: ReadonlySet<string> },
+  found: { missing: string[]; previewOnly: string[] } = { missing: [], previewOnly: [] },
+): { missing: string[]; previewOnly: string[] } {
   if (typeof value === 'string') {
-    for (const match of value.matchAll(/\{\{\s*steps\.([a-zA-Z0-9_-]+)\.output\.([a-zA-Z0-9_.-]+)\s*\}\}/g)) {
-      const [, stepId, field] = match;
-      const out = stepOutputs[stepId!];
-      const previewed = !!out && typeof out === 'object' && (out as { previewed?: unknown }).previewed === true;
-      if (out !== undefined && !previewed && pathGet(out, field!) === undefined) found.push(`steps.${stepId}.output.${field}`);
+    for (const match of value.matchAll(TEMPLATE_REFERENCE_RE)) {
+      const token = match[1]!;
+      const step = /^steps\.([a-zA-Z0-9_-]+)\.output(?:\.(.+))?$/.exec(token);
+      if (step) {
+        const out = ctx.stepOutputs[step[1]!];
+        const stub = out && typeof out === 'object' && !Array.isArray(out) ? out as { previewed?: unknown; blocked?: unknown } : null;
+        if (stub?.previewed === true) found.previewOnly.push(`{{${token}}}`);
+        else if (out === undefined) found.missing.push(`{{${token}}} (step "${step[1]}" has produced no output)`);
+        else if (stub?.blocked === true) found.missing.push(`{{${token}}} (step "${step[1]}" produced no data)`);
+        else if (step[2] && pathGet(out, step[2]) === undefined) found.missing.push(`{{${token}}} (step "${step[1]}"'s output has no "${step[2]}")`);
+        continue;
+      }
+      const input = /^input\.(.+)$/.exec(token);
+      if (input && ctx.inputs[input[1]!] === undefined && !ctx.declaredInputs.has(input[1]!)) {
+        found.missing.push(`{{${token}}} (the workflow has no input "${input[1]}")`);
+      }
     }
   } else if (Array.isArray(value)) {
-    for (const entry of value) missingStepOutputFields(entry, stepOutputs, found);
+    for (const entry of value) workflowArgumentReferenceGaps(entry, ctx, found);
   } else if (value && typeof value === 'object') {
-    for (const entry of Object.values(value)) missingStepOutputFields(entry, stepOutputs, found);
+    for (const entry of Object.values(value)) workflowArgumentReferenceGaps(entry, ctx, found);
   }
   return found;
+}
+
+export type WorkflowCallArgumentPreparation =
+  | { status: 'ready'; args: Record<string, unknown> }
+  | { status: 'missing_data'; detail: string }
+  | { status: 'needs_real_write'; detail: string }
+  | { status: 'refused'; reason: string; detail: string };
+
+/**
+ * The one preparation a structured call's arguments get, in a rehearsal and
+ * in a run: references resolved by one grammar, values kept as the types
+ * they are, missing data told apart from empty data and from data only a real
+ * run produces, then the tool's own argument check. A run goes on to compile
+ * and dispatch; a rehearsal stops before dispatch with the same verdict.
+ */
+export async function prepareWorkflowCallArguments(
+  step: WorkflowStepInput,
+  ctx: { workflow: WorkflowDefinition; inputs: Record<string, string>; stepOutputs: Record<string, unknown> },
+  item?: unknown,
+): Promise<WorkflowCallArgumentPreparation> {
+  const call = step.call!;
+  const gaps = workflowArgumentReferenceGaps(call.args, {
+    stepOutputs: ctx.stepOutputs,
+    inputs: ctx.inputs,
+    declaredInputs: new Set(Object.keys(ctx.workflow.inputs ?? {})),
+  });
+  if (gaps.previewOnly.length > 0) {
+    return {
+      status: 'needs_real_write',
+      detail: `its arguments use ${[...new Set(gaps.previewOnly)].join(', ')}, which only a real run produces`,
+    };
+  }
+  if (gaps.missing.length > 0) {
+    return { status: 'missing_data', detail: `its arguments refer to data that is not there: ${[...new Set(gaps.missing)].join('; ')}` };
+  }
+  let args: Record<string, unknown>;
+  try {
+    args = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(
+      call.args,
+      ctx.inputs,
+      ctx.stepOutputs,
+      item,
+      resolveWorkflowStepProjectContext(step, ctx.workflow),
+    ));
+  } catch (error) {
+    return { status: 'refused', reason: 'workflow_call_arguments_unrenderable', detail: error instanceof Error ? error.message : String(error) };
+  }
+  const reviewed = ensureReviewedLocalWorkflowCapability({ operationId: call.tool, args });
+  if (!reviewed.ok && reviewed.reason !== 'not_reviewed') {
+    return {
+      status: 'refused',
+      reason: `workflow_reviewed_local_capability_${reviewed.reason}`,
+      detail: await reviewedLocalRefusalDetail(call.tool, args, reviewed),
+    };
+  }
+  return { status: 'ready', args };
 }
 
 function resolveCallToken(token: string, inputs: Record<string, string>, stepOutputs: Record<string, unknown>, item: unknown, project?: WorkflowStepProjectContext): unknown {
@@ -3814,25 +3874,65 @@ async function executeWorkflowCallNode(
         );
       }
     }
-    const renderedArgs = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(
-      call.args,
-      ctx.inputs,
-      ctx.stepOutputs,
-      partition?.item,
-      resolveWorkflowStepProjectContext(step, ctx.workflow),
-    ));
-    const reviewedLocal = ensureReviewedLocalWorkflowCapability({
-      operationId: call.tool,
-      args: renderedArgs,
-    });
-    if (!reviewedLocal.ok && reviewedLocal.reason !== 'not_reviewed') {
+    const prepared = await prepareWorkflowCallArguments(step, ctx, partition?.item);
+    if (prepared.status !== 'ready') {
       throw new WorkflowHarnessBlockedSignal({
         stepId: step.id,
         sessionId: callSessionId,
-        reason: `workflow_reviewed_local_capability_${reviewedLocal.reason}: `
-          + await reviewedLocalRefusalDetail(call.tool, renderedArgs, reviewedLocal),
+        reason: prepared.status === 'refused'
+          ? `${prepared.reason}: ${prepared.detail}`
+          : `workflow_call_arguments_${prepared.status}: ${prepared.detail}`,
       });
     }
+    const renderedArgs = prepared.args;
+    const compiled = await compileWorkflowBareCall(step, ctx, renderedArgs, callSessionId, { persistRoutedAccount: true });
+    const exactResult = await executeExactWorkflowV3CallNode(
+      step,
+      ctx,
+      compiled.plan,
+      renderedArgs,
+      (sessionId, prepared, proof) => resolveWorkflowBareCallV3Consent(step, ctx, sessionId, prepared, proof),
+      renderedArgs,
+      partition,
+    );
+    if (!partition && !step.requiresApproval && structuredCallSideEffectClass(step) === 'send') {
+      const redeemed = redeemWorkflowV3ScheduledSendOutput(
+        { workflowSlug: ctx.workflowSlug, runId: ctx.runId, stepId: step.id },
+        call.tool,
+        renderedArgs,
+        exactResult,
+      );
+      if (!redeemed.ok) {
+        throw new WorkflowHarnessBlockedSignal({
+          stepId: step.id,
+          sessionId: callSessionId,
+          reason: `workflow_exact_send_settlement_unredeemable: ${redeemed.reason}`,
+        });
+      }
+      return redeemed.output;
+    }
+    return exactResult;
+  }
+  return executeAuthoredWorkflowCallPlan(step, ctx, callSessionId, partition);
+}
+
+/**
+ * The compile a structured call gets after its arguments are prepared, the
+ * same in a rehearsal and a run: the operation warmed and observed, the exact
+ * account chosen (saved, routed from the run's origin, or asked), and the
+ * plan compiled against the live catalog. Only a run saves a routed account
+ * on the step; a rehearsal leaves the definition it is testing unchanged.
+ * Throws the run's own capability block or harness refusal.
+ */
+async function compileWorkflowBareCall(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  renderedArgs: Record<string, unknown>,
+  callSessionId: string,
+  options: { persistRoutedAccount: boolean },
+) {
+  const call = step.call!;
+  {
     const runLevelAccountSelection = (
       ctx.capabilityResume?.state === 'retrying'
       && ctx.capabilityResume.reason === 'ambiguous-account'
@@ -3905,13 +4005,15 @@ async function executeWorkflowCallNode(
         });
         if (recompiled.ok) {
           compiled = recompiled;
-          try {
-            persistStepAccountBinding(ctx.workflowSlug, {
-              stepId: step.id,
-              tool: call.tool,
-              accountSelection: { ...routed, selectedAt: new Date().toISOString(), selectedBy: 'host-origin-routing' },
-            });
-          } catch { /* the routed choice already governs this run */ }
+          if (options.persistRoutedAccount) {
+            try {
+              persistStepAccountBinding(ctx.workflowSlug, {
+                stepId: step.id,
+                tool: call.tool,
+                accountSelection: { ...routed, selectedAt: new Date().toISOString(), selectedBy: 'host-origin-routing' },
+              });
+            } catch { /* the routed choice already governs this run */ }
+          }
           logger.info(
             { workflow: ctx.workflowSlug, stepId: step.id, tool: call.tool, accountId: routed.accountId },
             'workflow call step account routed from the run origin',
@@ -3936,33 +4038,18 @@ async function executeWorkflowCallNode(
         reason: `workflow_bare_call_plan_uncompilable: ${compiled.message}`,
       });
     }
-    const exactResult = await executeExactWorkflowV3CallNode(
-      step,
-      ctx,
-      compiled.plan,
-      renderedArgs,
-      (sessionId, prepared, proof) => resolveWorkflowBareCallV3Consent(step, ctx, sessionId, prepared, proof),
-      renderedArgs,
-      partition,
-    );
-    if (!partition && !step.requiresApproval && structuredCallSideEffectClass(step) === 'send') {
-      const redeemed = redeemWorkflowV3ScheduledSendOutput(
-        { workflowSlug: ctx.workflowSlug, runId: ctx.runId, stepId: step.id },
-        call.tool,
-        renderedArgs,
-        exactResult,
-      );
-      if (!redeemed.ok) {
-        throw new WorkflowHarnessBlockedSignal({
-          stepId: step.id,
-          sessionId: callSessionId,
-          reason: `workflow_exact_send_settlement_unredeemable: ${redeemed.reason}`,
-        });
-      }
-      return redeemed.output;
-    }
-    return exactResult;
+    return compiled;
   }
+}
+
+/** An authored exact invocation plan: its own argument sources, its own
+ *  authorization; no bare-call preparation. */
+async function executeAuthoredWorkflowCallPlan(
+  step: WorkflowStepInput,
+  ctx: StepExecutionContext,
+  callSessionId: string,
+  partition: WorkflowExactCallPartitionV1 | undefined,
+): Promise<unknown> {
   if (partition) {
     throw new WorkflowHarnessBlockedSignal({
       stepId: step.id,
@@ -14348,7 +14435,7 @@ export function creationTestStepLines(steps: readonly CreationTestStepResult[]):
       return [`- ${name} — needs your answer`, ...(s.detail ?? '').split('\n').map((line) => `    ${line}`)].join('\n');
     }
     if (s.status === 'needs_connection') return `- ${name} — ${s.detail ?? 'needs an app connected here'}`;
-    if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it`;
+    if (s.status === 'previewed') return `- ${name} — previewed; it makes a change, so the test didn't run it${s.detail ? ` (${s.detail})` : ''}`;
     // Unverifiable is honest, not alarming: it names WHY the check could
     // not run so the report never implies a broken step.
     if (s.status === 'unverifiable') return `- ${name} — not checked: ${s.detail ?? 'it verifies a change the test only previewed'}`;
@@ -14510,36 +14597,39 @@ async function reviewedLocalRefusalDetail(
 }
 
 /**
- * What would stop a write step the rehearsal only previews, checked the way
- * the run checks it: its arguments filled from the rehearsal's real upstream
- * output and validated by the tool, with nothing dispatched. A run must never
- * be the first to find out a step's own arguments are wrong.
+ * A write step the rehearsal previews: everything the run does before it
+ * makes the change, with nothing dispatched. Its arguments are prepared and
+ * its call compiled through the run's own path, so the verdict is the run's:
+ * ready (previewed), data only a real run produces (previewed, said so), a
+ * question or a missing connection, or the exact reason the run would stop.
  */
-async function rehearsedCallArgumentProblem(
-  step: WorkflowStepInput,
-  ctx: { workflow: WorkflowDefinition; inputs: Record<string, string>; stepOutputs: Record<string, unknown> },
-): Promise<string | null> {
-  const call = step.call;
-  if (!call?.tool || step.forEach || step.invocationPlan) return null;
-  const missing = [...new Set(missingStepOutputFields(call.args, ctx.stepOutputs))];
-  if (missing.length > 0) {
-    return `its arguments refer to ${missing.map((ref) => `{{${ref}}}`).join(', ')}, which the step's real output does not have, so the run would write them empty`;
+async function rehearseWriteCall(step: WorkflowStepInput, ctx: StepExecutionContext): Promise<CreationTestStepResult> {
+  if (!step.call?.tool || step.forEach || step.invocationPlan) return { stepId: step.id, status: 'previewed' };
+  const prepared = await prepareWorkflowCallArguments(step, ctx);
+  if (prepared.status === 'needs_real_write') {
+    return { stepId: step.id, status: 'previewed', detail: `${prepared.detail}; it is checked on the first real run` };
   }
-  let rendered: Record<string, unknown>;
+  if (prepared.status !== 'ready') {
+    return { stepId: step.id, status: 'error', detail: `the run would stop here before making the change: ${prepared.detail}`.slice(0, 800) };
+  }
   try {
-    rendered = normalizeReviewedLocalWorkflowArguments(call.tool, renderCallArgs(
-      call.args,
-      ctx.inputs,
-      ctx.stepOutputs,
-      undefined,
-      resolveWorkflowStepProjectContext(step, ctx.workflow),
-    ));
-  } catch (error) {
-    return `its arguments could not be filled in: ${error instanceof Error ? error.message : String(error)}`;
+    await compileWorkflowBareCall(step, ctx, prepared.args, `workflow:${ctx.runId}:${step.id}`, { persistRoutedAccount: false });
+    return { stepId: step.id, status: 'previewed' };
+  } catch (err) {
+    if (err instanceof WorkflowCapabilityBlockedError && err.reason === 'ambiguous-account' && err.accountChoiceSet) {
+      return { stepId: step.id, status: 'needs_choice', detail: creationTestCapabilityQuestion(ctx.workflow.name, err), block: err };
+    }
+    if (err instanceof WorkflowCapabilityBlockedError
+      && (err.reason === 'not-connected' || err.reason === 'identity-absent' || err.reason === 'suppressed')) {
+      return { stepId: step.id, status: 'needs_connection', detail: `needs ${capabilityAppName(err.toolkit)} connected here (it names ${err.tool}); nothing ran`, block: err };
+    }
+    if (err instanceof WorkflowCapabilityBlockedError && workflowCapabilityBlockIsRecoverable(err.reason)) {
+      return { stepId: step.id, status: 'unverifiable', detail: `${capabilityAppName(err.toolkit)} is connected, but the exact definition of ${err.tool} has not settled, so the test could not check it; a run waits for it and retries` };
+    }
+    const reason = err instanceof WorkflowHarnessBlockedSignal ? err.reason : err instanceof Error ? err.message : String(err);
+    const said = /^[a-z0-9_]+: ([\s\S]+)$/.exec(reason)?.[1]?.trim() || reason;
+    return { stepId: step.id, status: 'error', detail: `the run would stop here before making the change: ${said}`.slice(0, 800) };
   }
-  const reviewed = ensureReviewedLocalWorkflowCapability({ operationId: call.tool, args: rendered });
-  if (reviewed.ok || reviewed.reason === 'not_reviewed') return null;
-  return reviewedLocalRefusalDetail(call.tool, rendered, reviewed);
 }
 
 export async function runCreationTest(
@@ -14602,13 +14692,13 @@ export async function runCreationTest(
         // Never execute a send/write while authoring — preview it. Downstream
         // read-only steps still get a stub so they can run. A preview still
         // fills in and checks the step's arguments the way the run will.
-        const problem = dependsOnPreview(step)
-          ? null
-          : await rehearsedCallArgumentProblem(step, { workflow, inputs, stepOutputs });
+        results.push(await rehearseWriteCall(step, {
+          workflow, workflowSlug, runId, inputs, stepOutputs,
+          assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
+          creationTest: true,
+          ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
+        }));
         stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
-        results.push(problem
-          ? { stepId: step.id, status: 'error', detail: `the run would stop here before making the change: ${problem}`.slice(0, 600) }
-          : { stepId: step.id, status: 'previewed' });
         previewTainted.add(step.id);
       } else if (dependsOnChoiceBlock(step)) {
         choiceBlocked.add(step.id);

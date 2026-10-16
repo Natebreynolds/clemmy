@@ -538,3 +538,69 @@ test('a field of a step\'s output fills in inside text, and a field the real out
     runner._setWorkflowCallNodeForTests();
   }
 });
+
+test('one reference grammar: spaced references fill in inside text, whole references keep their type, and other braces stay', () => {
+  const outputs = { gather: { title: 'Care', tips: ['water weekly', 'bright light'], count: 2, empty: '' } };
+  const filled = runner.renderCallArgs({
+    sentence: 'Title: {{ steps.gather.output.title }} / First: {{steps.gather.output.tips.0}}',
+    whole: '{{ steps.gather.output.tips }}',
+    number: '{{ steps.gather.output.count }}',
+    empty: '{{ steps.gather.output.empty }}',
+    merge: 'Hi {{first_name}}, {{ input.greeting }}',
+  }, { greeting: 'welcome' }, outputs);
+  assert.equal(filled.sentence, 'Title: Care / First: water weekly');
+  assert.deepEqual(filled.whole, ['water weekly', 'bright light'], 'a whole reference keeps the value\'s type');
+  assert.equal(filled.number, 2);
+  assert.equal(filled.empty, '', 'an empty value is data');
+  assert.equal(filled.merge, 'Hi {{first_name}}, welcome', 'a form outside the grammar is left as written');
+});
+
+test('preparation tells missing data from empty data and from data only a real run produces', async () => {
+  const workflow = {
+    name: 'Prep outcomes', description: 'x', enabled: false, trigger: { manual: true as const },
+    inputs: { note: { type: 'string', description: 'optional note' } },
+    steps: [] as never[],
+  };
+  const step = (content: string) => ({ id: 'save', sideEffect: 'write' as const,
+    call: { tool: 'write_file', args: { path: 'notes/prep.md', content, mode: 'overwrite' } } });
+  const prepare = (content: string, stepOutputs: Record<string, unknown>, inputs: Record<string, string> = {}) => (
+    runner.prepareWorkflowCallArguments(step(content) as never, { workflow: workflow as never, inputs, stepOutputs }));
+
+  const ready = await prepare('{{ steps.gather.output.title }} {{ input.note }}', { gather: { title: 'Care' } });
+  assert.equal(ready.status, 'ready', JSON.stringify(ready));
+  if (ready.status === 'ready') assert.equal(ready.args.content, 'Care ', 'a declared input left empty is empty, not missing');
+
+  const field = await prepare('{{ steps.gather.output.headline }}', { gather: { title: 'Care' } });
+  assert.equal(field.status, 'missing_data');
+  if (field.status === 'missing_data') assert.match(field.detail, /"gather"'s output has no "headline"/);
+
+  const noStep = await prepare('{{ steps.never_ran.output }}', {});
+  assert.equal(noStep.status, 'missing_data');
+
+  const undeclared = await prepare('{{ input.unknown_key }}', {});
+  assert.equal(undeclared.status, 'missing_data');
+  if (undeclared.status === 'missing_data') assert.match(undeclared.detail, /no input "unknown_key"/);
+
+  const previewOnly = await prepare('{{ steps.draft.output.id }}', { draft: { previewed: true, reason: 'previewed' } });
+  assert.equal(previewOnly.status, 'needs_real_write');
+
+  const refused = await runner.prepareWorkflowCallArguments({ id: 'save', sideEffect: 'write',
+    call: { tool: 'write_file', args: { path: { not: 'a path' }, content: 'x', mode: 'overwrite' } } } as never,
+  { workflow: workflow as never, inputs: {}, stepOutputs: {} });
+  assert.equal(refused.status, 'refused');
+});
+
+test('a rehearsal compiles a previewed write call through the run\'s path: an app not connected here is named before the run', async () => {
+  const saved = workflows.writeWorkflow('rehearsed-write-unconnected', {
+    name: 'Rehearsed write unconnected', description: 'Creates a lead in an app this setup has not connected.',
+    enabled: false, trigger: { manual: true },
+    steps: [
+      { id: 'create_lead', sideEffect: 'write', call: { tool: 'ACMECRM_CREATE_LEAD', args: { name: 'Fixture lead' } } },
+    ],
+  });
+  const result = await runner.runCreationTest(saved.data, saved.name, 'creation-rehearsed-write-unconnected', {},
+    { respond: async () => { throw new Error('no model runs in this rehearsal'); } } as never);
+  const lead = result.steps.find((step) => step.stepId === 'create_lead');
+  assert.notEqual(lead?.status, 'previewed', `a write the run cannot compile is not a clean preview: ${JSON.stringify(result.steps)}`);
+  assert.equal(result.pass, false);
+});
