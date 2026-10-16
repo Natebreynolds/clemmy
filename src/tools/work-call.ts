@@ -7,6 +7,7 @@
  * deterministic-retrieve turns do not register this schema.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import { isToolMediaContent } from '../runtime/harness/tool-media-content.js';
 import type { HostCapabilityDescriptorV1 } from '../runtime/semantic-boundary/turn-semantic-proposal.js';
 import { tool, type Tool } from '@openai/agents';
@@ -29,6 +30,7 @@ import {
   type ExpectedWorkUniverseSelectorV1,
 } from '../runtime/harness/expected-work-admission.js';
 import { attestToolLocalInputInvalidity, harnessRunContextStorage, ToolGuardrailEscalated } from '../runtime/harness/brackets.js';
+import { jsonArgumentText, jsonObjectArgument } from './json-argument.js';
 import {
   loadExpectedWorkContract,
   prepareActionExpectedWorkContract,
@@ -46,6 +48,7 @@ import {
   withLogicalToolCall,
 } from '../runtime/harness/attempt-identity.js';
 import {
+  InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchRefusal,
   type SettleToolAttemptInput,
 } from '../runtime/harness/attempt-settlement.js';
@@ -197,7 +200,7 @@ export const WorkCallInputSchema = z.object({
       'Under a typed source-evidence contract only: the exact source record ids chosen from the nominated result (canonical URLs for articles); else null.',
     ),
   name: z.string().min(1).describe('Exact inner tool name from tool_search, the catalog, or the proven-operation note.'),
-  args_json: z.string().describe('JSON object string matching the inner tool schema.'),
+  args_json: jsonObjectArgument().describe('The target arguments as a JSON object matching its exact schema; JSON-object text is also accepted. Use {} for no arguments.'),
 }).strict();
 
 /** Foreground plan_task already owns topology. The execution envelope is
@@ -261,7 +264,7 @@ export function workCallInputFromHostPlan(input: HostPlannedWorkCallInput): Work
     source_call_ids: input.source_call_ids ?? null,
     source_record_ids: input.source_record_ids ?? null,
     name: input.name,
-    args_json: input.args_json,
+    args_json: jsonArgumentText(input.args_json)!,
   };
 }
 
@@ -1286,7 +1289,7 @@ function workCallReadyLines(
     shapes.push({
       requirement_id: 'cap:local:<name>:<variant>',
       name: '<name>',
-      args_json: '{"<arg>":"<value>"}',
+      args_json: { '<arg>': '<value>' },
       universe_item_id: null,
       universe_selector: null,
       seal_amendment: null,
@@ -1298,7 +1301,7 @@ function workCallReadyLines(
     shapes.push({
       requirement_id: 'cap:resolved:<operation>',
       name: 'composio_execute_tool',
-      args_json: '{"tool_slug":"<OPERATION>","arguments":{"<argument>":"<value>"}}',
+      args_json: { tool_slug: '<OPERATION>', arguments: { '<argument>': '<value>' } },
       universe_item_id: null,
       universe_selector: null,
       seal_amendment: null,
@@ -1308,7 +1311,7 @@ function workCallReadyLines(
   }
   return [
     `Operations already disclosed for this request and callable ${where} now: ${JSON.stringify(ready)}. \`name\` is the exact callable name. For a direct call without a frozen requirement, use \`capability_selector\` as requirement_id. Once a plan is active, use that plan's exact requirement id instead. Neither identifier substitutes for the callable name.`,
-    `Invocation shape for a direct call: ${JSON.stringify(shapes.length === 1 ? shapes[0] : shapes)}. args_json is a JSON STRING, not an object. There is no proposal field on this call.`,
+    `Invocation shape for a direct call: ${JSON.stringify(shapes.length === 1 ? shapes[0] : shapes)}. Supply args_json as the target's JSON object; JSON-object text also works. There is no proposal field on this call.`,
     'Use the exact argument schema already provided. If it is missing, call tool_search with the exact operation name before invoking. Do not guess argument names and learn them from a refusal.',
     'Ordinary native work, including contextual reads, one authorized reversible write and its readback, may proceed directly through these operations without plan_task. Planning stays required for coordinated business dependencies, each/set, admin, destructive or unknown-effect work, and the explicit desktop/mobile Plan review path is unchanged.',
   ];
@@ -2033,7 +2036,10 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     preparation = false,
   ): Promise<{ frame: WorkCallFrame; output: unknown }> => {
     const frame: WorkCallFrame = {
-      input: normalizedInput,
+      // The permission/accepted-call seams retain the original wire input.
+      // Only the internal dispatch frame uses JSON text, so every existing
+      // target schema, digest, consent and recovery check sees the same args.
+      input: { ...normalizedInput, args_json: jsonArgumentText(normalizedInput.args_json)! },
       ...(preparation ? { preparation: {} } : {}),
     };
     const output = await workCallStorage.run(frame, () => dispatcher.invoke(
@@ -2050,6 +2056,7 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
   // re-sealed a changed envelope and the immutable host root refused it as
   // `authority_conflict` (live 2026-09-09, the second activation of a planned
   // 50-draft batch). Same marker plan_task carries for the same reason.
+  const inputSchema = requireHostPlan ? HostPlannedWorkCallInputSchema : WorkCallInputSchema;
   const built = Object.assign(tool({
     name: 'work_call',
     description: [
@@ -2086,9 +2093,12 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         ? null
         : 'Invoke a runtime-resolved inner name/schema directly. When a requirement is unresolved, use tool_search once for that requirement; when only an exact schema is missing, describe that exact tool once instead of broad-searching. Ask the user naturally if the intended work itself is ambiguous.',
     ].filter(Boolean).join(' '),
-    parameters: (requireHostPlan
-      ? HostPlannedWorkCallInputSchema
-      : WorkCallInputSchema) as typeof WorkCallInputSchema,
+    // A generic carrier must preserve heterogeneous target JSON. Provider
+    // strict conversion cannot express an open object and would narrow its
+    // contents or reject registration. The exact outer parser below and the
+    // ordinary inner schema/authority checks remain mandatory on every lane.
+    parameters: z.toJSONSchema(inputSchema, { io: 'input', unrepresentable: 'any' }) as never,
+    strict: false,
     isEnabled: async () => {
       if (!requireHostPlan) return true;
       const context = harnessRunContextStorage.getStore();
@@ -2118,9 +2128,23 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
       return refusalResult('work_contract_invalid', detail) as unknown as string;
     },
     execute: async (input, runContext, details): Promise<string> => {
+      const parsed = inputSchema.safeParse(input);
+      if (!parsed.success) {
+        const paths = [...new Set(parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
+          ? issue.keys.map((key) => [...issue.path, key].join('.'))
+          : [issue.path.join('.') || '(root)']))].sort();
+        return new InvalidArgumentsPreDispatchResult(JSON.stringify({
+          error: 'work_contract_invalid',
+          dispatch_state: 'not_started',
+          detail: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '),
+          repair: requireHostPlan
+            ? 'Correct the invalid carrier fields using this current schema and retry the same intended call with its exact requirement_id. No proposal or schema search is needed.'
+            : 'Correct the invalid carrier fields using this current schema and retry the same intended call. Preserve the accepted work and its requirement_id; do not rediscover the operation.',
+        }), true, createHash('sha256').update(JSON.stringify(paths)).digest('hex').slice(0, 32)) as unknown as string;
+      }
       const normalizedInput = requireHostPlan
-        ? workCallInputFromHostPlan(input as HostPlannedWorkCallInput)
-        : input as WorkCallInput;
+        ? workCallInputFromHostPlan(parsed.data as HostPlannedWorkCallInput)
+        : parsed.data as WorkCallInput;
       const { frame, output } = await invokeResolvedCarrier(
         normalizedInput,
         runContext,

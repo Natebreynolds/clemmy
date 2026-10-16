@@ -11,7 +11,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { execFileSync, type spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {
@@ -99,6 +99,37 @@ test('scrubbedChildEnv carries NO daemon secrets, but DOES carry an augmented PA
     if (prevKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
     if (prevTok === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevTok;
   }
+});
+
+test('Windows scrubbed children keep OS essentials and explicit overrides without inheriting credentials or CLI declarations', () => {
+  const home = mkdtempSync(path.join(tmp, 'scrubbed-env-'));
+  mkdirSync(path.join(home, 'state'), { recursive: true });
+  writeFileSync(path.join(home, 'state', 'cli-env.json'), JSON.stringify({ CLI_PROFILE: 'must-not-forward-declaration' }));
+  const inherited = Object.freeze({
+    CLEMENTINE_HOME: home, PATH: 'inherited-path', userprofile: 'C:\\ControlledUser',
+    SYSTEMROOT: 'C:\\Windows', WINDIR: 'C:\\Windows', systemdrive: 'C:',
+    pathext: '.EXE;.CMD', COMSPEC: 'C:\\Windows\\System32\\cmd.exe',
+    TEMP: 'C:\\OldTemp', OPENAI_API_KEY: 'synthetic-private', CLI_PROFILE: 'must-not-forward-inherited',
+  });
+  const env = scrubbedChildEnv({ Path: 'C:\\ExplicitBin', temp: 'C:\\NewTemp', CLEMENTINE_SPACE_SLUG: 'controlled' },
+    { inherited, platform: 'win32' });
+  assert.equal(env.PATH, 'C:\\ExplicitBin');
+  assert.equal(env.temp, 'C:\\NewTemp');
+  assert.equal(env.TEMP, undefined);
+  assert.equal(env.SystemRoot, 'C:\\Windows');
+  assert.equal(env.windir, 'C:\\Windows');
+  assert.equal(env.SystemDrive, 'C:');
+  assert.equal(env.PATHEXT, '.EXE;.CMD');
+  assert.equal(env.ComSpec, 'C:\\Windows\\System32\\cmd.exe');
+  assert.equal(env.USERPROFILE, 'C:\\ControlledUser');
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.CLI_PROFILE, undefined);
+  assert.equal(env.CLEMENTINE_SPACE_SLUG, 'controlled');
+  assert.equal(new Set(Object.keys(env).map(key => key.toUpperCase())).size, Object.keys(env).length);
+  assert.equal(inherited.TEMP, 'C:\\OldTemp');
+  const posix = scrubbedChildEnv({}, { inherited, platform: 'linux' });
+  assert.equal(posix.SystemRoot, undefined, 'the extra OS allowlist applies only on Windows');
+  assert.equal(posix.PATHEXT, undefined);
 });
 
 test('electronNodeEnv sets the flag ONLY for the node/Electron binary', () => {

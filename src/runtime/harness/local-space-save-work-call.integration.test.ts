@@ -158,7 +158,17 @@ function indexedFileFacts(workspaceId: string): Array<{
   `).all(workspaceId) as Array<{ rel_path: string; content_hash: string; version: number }>;
 }
 
-test('accepted inline space_save reaches its body once and frozen-work replay crosses zero times', async () => {
+/** One real local planning/dispatch fixture, shared by the authority proof
+ * and argument-byte regression. Only model output is scripted. */
+async function runInlineSpaceSave(options: {
+  sessionId: string;
+  slug: string;
+  title: string;
+  html: string;
+  initialData: Record<string, unknown>;
+  objectArguments?: boolean;
+  objectInitialData?: boolean;
+}) {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(
     capabilityCatalogs.createHostCapabilityCatalogFactory(),
@@ -167,18 +177,18 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     capabilityManifestStores.createCapabilityManifestStore(),
   );
 
-  const session = eventlog.createSession({ id: 'space-save-work-call', kind: 'chat' });
+  const session = eventlog.createSession({ id: options.sessionId, kind: 'chat' });
   const source = eventlog.appendEvent({
     sessionId: session.id,
     turn: 1,
     role: 'user',
     type: 'user_input_received',
-    data: { text: 'Create one simple Workspace called Inline Proof.' },
+    data: { text: `Create one simple Workspace called ${options.title}.` },
   });
   const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
   const primed = await semantic.primePrimaryModelPlanningCatalog(identity);
   assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
-  if (!primed.ok) return;
+  if (!primed.ok) throw new Error(primed.reason);
 
   const search = buildScopedLocalToolSearch(
     new Set(['space_save']),
@@ -213,17 +223,8 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   }) as never);
   assert.equal(workCallTools.isHostPlanRequiredWorkCall(workCall), true);
 
-  const html = '<html><body><h1>Inline Proof</h1><p>One authoritative save.</p></body></html>';
-  const initialData = {
-    _mobile: {
-      records: {
-        items: [{
-          primary: 'One complete authored artifact',
-          body: 'This full body is committed with the view and manifest.',
-        }],
-      },
-    },
-  };
+  const { html, initialData, slug, title } = options;
+  const reply = `Created the ${title} Workspace.`;
   const planArgs = {
     preamble: 'I’ll create the requested Workspace now.',
     draft: {
@@ -253,14 +254,14 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     },
   };
   const saveArgs = {
-    slug: 'inline-proof',
-    title: 'Inline Proof',
+    slug,
+    title,
     objective: null,
     success_criteria: null,
     invariants: null,
     view_html: html,
     view_path: null,
-    initial_data_json: JSON.stringify(initialData),
+    initial_data_json: options.objectInitialData ? initialData : JSON.stringify(initialData),
     data_sources: null,
     actions: null,
     reengage_triggers: null,
@@ -273,13 +274,16 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     universe_selector: null,
     seal_amendment: null,
     name: 'space_save',
-    args_json: JSON.stringify(saveArgs),
+    args_json: options.objectArguments ? saveArgs : JSON.stringify(saveArgs),
   };
+  const replayArgs = options.objectArguments
+    ? { ...workArgs, args_json: JSON.stringify({ ...saveArgs, initial_data_json: JSON.stringify(initialData) }) }
+    : workArgs;
   const model = stubModel([
     [toolCall('plan-inline-workspace', 'plan_task', planArgs)],
     [toolCall('save-inline-workspace', 'work_call', workArgs)],
-    [toolCall('replay-inline-workspace', 'work_call', workArgs)],
-    [textMessage('Created the Inline Proof Workspace.')],
+    [toolCall('replay-inline-workspace', 'work_call', replayArgs)],
+    [textMessage(reply)],
   ]);
   const agent = { model, tools: [planTask, workCall] };
   const tools = [planTask, workCall];
@@ -296,7 +300,7 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     },
   });
   assert.equal(sealed.ok, true, JSON.stringify(sealed));
-  if (!sealed.ok) return;
+  if (!sealed.ok) throw new Error(JSON.stringify(sealed));
   capabilityEnvelopes.bindAgentCapabilityEnvelope(agent, sealed.envelope);
   capabilityEnvelopes.bindAgentCapabilityRevision(agent, sealed.revision);
 
@@ -310,7 +314,7 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
   const outcome = await brackets.withHarnessRunContext(parent, () => hostRunRunner(
     throwingRunner() as never,
     agent as never,
-    [{ type: 'message', role: 'user', content: 'Create one simple Workspace called Inline Proof.' }] as never,
+    [{ type: 'message', role: 'user', content: `Create one simple Workspace called ${title}.` }] as never,
     {
       maxTurns: 5,
       hostTurnEngine: 'host_v1',
@@ -318,6 +322,25 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     } as never,
   ));
 
+  return { session, source, identity, capabilityRef, model, outcome, saveArgs, workArgs, replayArgs };
+}
+
+test('accepted inline space_save reaches its body once and frozen-work replay crosses zero times', async () => {
+  const html = '<html><body><h1>Inline Proof</h1><p>One authoritative save.</p></body></html>';
+  const initialData = {
+    _mobile: {
+      records: {
+        items: [{
+          primary: 'One complete authored artifact',
+          body: 'This full body is committed with the view and manifest.',
+        }],
+      },
+    },
+  };
+  const fixture = await runInlineSpaceSave({
+    sessionId: 'space-save-work-call', slug: 'inline-proof', title: 'Inline Proof', html, initialData,
+  });
+  const { session, source, identity, capabilityRef, model, outcome } = fixture;
   assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
   assert.equal(outcome.finalOutput, 'Created the Inline Proof Workspace.');
   assert.equal(model.calls(), 4);
@@ -596,6 +619,100 @@ test('accepted inline space_save reaches its body once and frozen-work replay cr
     SELECT approval_id, status, resolution, consumed_at, resend_consumed_at
       FROM pending_approvals ORDER BY approval_id
   `).all(), approvalsBefore, 'planning neither inherits nor consumes an old approval');
+});
+
+test('native object space_save preserves large escaped HTML and nested data from its accepted frame, and legacy replay executes nothing', async () => {
+  const title = 'Native Argument Proof';
+  const slug = 'native-argument-proof';
+  const literal = String.raw`"double quotes", 'single quotes', C:\fixtures\one\two, literal \n and \t, braces {"ok":true}, café é 東京 🧭`;
+  const rows = Array.from({ length: 96 }, (_, index) =>
+    `<tr data-row="${index}"><td>${index}</td><td>${literal}</td><td>€${index}.00 &amp; ready</td></tr>`).join('\n');
+  const html = [
+    '<!doctype html>', '<html lang="en"><head><meta charset="utf-8">',
+    '<style>body{font-family:system-ui}td::after{content:"quoted \\\\ path"}</style></head>',
+    `<body><main><h1>${title}</h1><table><tbody>${rows}</tbody></table>`,
+    '<pre id="control-characters">An actual newline follows:\nthen a tab:\tend.</pre>',
+    `<script type="application/json">${JSON.stringify({ literal, unicode: '\u2028\u2029', quoted: '"kept"' })}</script>`,
+    '</main></body></html>',
+  ].join('\n');
+  // Parse this own key as JSON data, not JavaScript's object-literal
+  // prototype setter. Every carrier/parser must retain it unchanged.
+  const initialData = JSON.parse('{"__proto__":{"fixture":"opaque JSON data"},' + JSON.stringify({
+    metadata: { literal, controls: 'first\nsecond\tthird', composed: 'é', decomposed: 'é', empty: '', present: null },
+    records: Array.from({ length: 32 }, (_, index) => ({
+      id: `record-${index}`, enabled: index % 2 === 0, count: index, literal,
+      detail: { values: [null, false, 0, '', { nested: ['東京', '🧭', { path: String.raw`C:\fixtures\${index}` }] }] },
+    })),
+    _mobile: { records: { items: [{ primary: title, body: literal, fields: [{ label: 'Stage', value: 'Ready' }] }] } },
+  }).slice(1)) as Record<string, unknown>;
+  assert.ok(Object.hasOwn(initialData, '__proto__'));
+  assert.ok(Buffer.byteLength(html, 'utf8') > 16_000 && Buffer.byteLength(html, 'utf8') <= 24_000,
+    'fixture is substantial while respecting the actual Workspace view byte limit');
+  const { session, source, model, outcome, saveArgs, workArgs, replayArgs } = await runInlineSpaceSave({
+    sessionId: 'space-save-native-argument-proof', slug, title, html, initialData,
+    objectArguments: true, objectInitialData: true,
+  });
+  assert.equal(outcome.terminal, undefined, JSON.stringify(outcome));
+  assert.equal(outcome.finalOutput, `Created the ${title} Workspace.`);
+  assert.equal(model.calls(), 4, 'no argument-repair round is needed for the complete native object payload');
+  const record = store.spaceStore.get(slug);
+  assert.ok(record, JSON.stringify({ callResults: outcome.history.filter(item =>
+    (item as { type?: string }).type === 'function_call_result') }));
+  assert.equal(record.version, 1, 'alternate carrier replay creates no second Workspace generation');
+  const view = readFileSync(store.resolveInSpace(slug, 'view/index.html'));
+  assert.ok(view.equals(Buffer.from(html, 'utf8')), 'quotes, backslashes and Unicode reach the saved view byte for byte');
+  const savedData = dataStore.readData(slug);
+  assert.deepEqual(savedData, initialData, 'nested native JSON preserves scalar types, controls, Unicode and own __proto__ data');
+  assert.ok(Object.hasOwn(savedData, '__proto__'));
+  assert.ok(readFileSync(store.resolveInSpace(slug, 'data.json')).equals(Buffer.from(JSON.stringify(initialData), 'utf8')),
+    'the saved complete JSON document retains the exact once-serialized authored bytes');
+
+  const db = eventlog.openEventLog();
+  const physical = db.prepare(`SELECT tool_name, state FROM physical_dispatches
+    WHERE session_id = ? AND source_user_seq = ? ORDER BY rowid`).all(session.id, source.seq) as Array<{
+      tool_name: string; state: string;
+    }>;
+  assert.equal(physical.filter(row => row.tool_name === 'space_save' && row.state === 'returned').length, 1,
+    JSON.stringify(physical));
+  const settlements = db.prepare(`SELECT logical_tool_call_id, execution_kind, outcome_kind, physical_crossing_count
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
+    ORDER BY settled_at, logical_tool_call_id`).all(session.id, source.seq) as Array<{
+      logical_tool_call_id: string; execution_kind: string; outcome_kind: string; physical_crossing_count: number;
+    }>;
+  assert.deepEqual(settlements.map(row => ({ id: row.logical_tool_call_id, outcome: row.outcome_kind })), [
+    { id: 'save-inline-workspace', outcome: 'succeeded' },
+    { id: 'replay-inline-workspace', outcome: 'policy_denial' },
+  ], 'the same once-only requirement cannot execute again through legacy JSON text');
+  assert.equal(settlements[1]!.execution_kind, 'refused_pre_dispatch');
+  assert.equal(settlements[1]!.physical_crossing_count, 0);
+
+  // Read the immutable accepted frame, not a later handler reconstruction or
+  // the writable Workspace. The readable view verifies compressed histories.
+  const admitted = db.prepare(`SELECT frame_history_json FROM accepted_model_batch_admissions_readable_v1
+    WHERE session_id = ? AND source_user_seq = ? ORDER BY batch_ordinal`).all(session.id, source.seq) as Array<{
+      frame_history_json: string;
+    }>;
+  const acceptedCalls = admitted.flatMap(row => JSON.parse(row.frame_history_json) as Array<{
+    type?: string; callId?: string; name?: string; arguments?: string;
+  }>).filter(row => row.type === 'function_call');
+  const authored = acceptedCalls.filter(row => row.callId === 'save-inline-workspace');
+  const replayed = acceptedCalls.filter(row => row.callId === 'replay-inline-workspace');
+  assert.equal(authored.length, 1);
+  assert.equal(replayed.length, 1);
+  assert.equal(authored[0]!.arguments, JSON.stringify(workArgs), 'admission retains the original object carrier frame');
+  assert.equal(replayed[0]!.arguments, JSON.stringify(replayArgs), 'legacy replay retains its original string carrier frame');
+  const rawSave = JSON.parse(authored[0]!.arguments!) as { args_json: Record<string, unknown> };
+  assert.equal(typeof rawSave.args_json, 'object');
+  assert.equal(typeof rawSave.args_json.initial_data_json, 'object');
+  assert.deepEqual(rawSave.args_json, saveArgs);
+  assert.ok(view.equals(Buffer.from(rawSave.args_json.view_html as string, 'utf8')),
+    'physical saved bytes derive from the exact accepted native frame');
+  assert.deepEqual(dataStore.readData(slug), rawSave.args_json.initial_data_json,
+    'saved data derives from the exact accepted nested object, without stringify drift');
+  const prepared = terminalPreparation.prepareAcceptedTaskTerminal({
+    sessionId: session.id, sourceUserSeq: source.seq, proposedReply: `Created the ${title} Workspace.`,
+  });
+  assert.equal(prepared.status, 'ready', JSON.stringify(prepared));
 });
 
 test('accepted space_edit_view snapshots V1, commits and indexes V2 once, and terminal replay adds zero', async () => {

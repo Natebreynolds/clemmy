@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -51,6 +52,8 @@ const ports = await import('./production-capability-ports.js');
 const observations = await import('./independent-capability-observation.js');
 const instructions = await import('../../assistant/instructions.js');
 const capabilityIndex = await import('../../memory/capability-index.js');
+const runtimeConfig = await import('../../config.js');
+const { withFileLock } = await import('../atomic-json.js');
 
 test.after(() => {
   catalogs.installHostCapabilityCatalogFactory(null);
@@ -334,4 +337,226 @@ test("a CLI's own diagnosis read is provisioned beside its query, and the query 
   if (installed.status === 'installed') {
     assert.equal(installed.manifest.operationId, 'salesforce_sf_soql_query');
   }
+});
+
+const healthFile = path.join(TEST_HOME, 'state', 'cli-auth-health.json');
+const connectedFile = path.join(TEST_HOME, 'state', 'connected-clis.json');
+function selectedSf(name: string): string {
+  const directory = path.join(TEST_HOME, name);
+  mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, process.platform === 'win32' ? 'sf.exe' : 'sf');
+  writeFileSync(file, `#!${process.execPath}\n// ${name} - metadata-only fixture; never execute\n`);
+  chmodSync(file, 0o700);
+  return file;
+}
+function selectSf(binaryPath: string, patch: Record<string, unknown> = {}): void {
+  writeFileSync(healthFile, JSON.stringify({ version: 'v1', entries: {
+    salesforce: { id: 'salesforce', command: 'sf', installed: true, authStatus: 'unknown',
+      connectionRevision: catalog.readConnectedClis().salesforce?.connectionRevision,
+      binaryPath, checkedAt: new Date().toISOString(), ...patch },
+  } }));
+}
+async function restoreBootstrapSf(): Promise<void> {
+  rmSync(healthFile, { force: true });
+  catalog.recordConnectedCli(salesforce);
+  await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+}
+
+test('connected executable A wins over independent PATH B and an old A descriptor immediately rejects selected B',
+  { skip: process.platform === 'win32' }, async () => {
+  const first = selectedSf('selected-A');
+  const second = selectedSf('selected-B');
+  catalog.recordConnectedCli(salesforce);
+  try {
+    selectSf(first, { username: 'not-an-intended-account-proof' });
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const before = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    assert.equal(before.executableRealpath, realpathSync(first));
+    assert.notEqual(before.executableRealpath, realpathSync(fakeSf), 'PATH B must not substitute for the selected file');
+    assert.equal(before.effect, 'read');
+    assert.equal(before.accountId, 'reviewed_cli:host');
+    assert.ok(config.currentReviewedCliDescriptor(before));
+    selectSf(second);
+    assert.equal(config.currentReviewedCliDescriptor(before), null, 'physical admission rejects old A before another reconcile');
+    await reconcile.reconcileCatalogReviewedCliReads();
+    const after = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    assert.equal(after.executableRealpath, realpathSync(second));
+    assert.ok(config.currentReviewedCliDescriptor(after));
+  } finally { await restoreBootstrapSf(); }
+});
+
+test('missing selected A retires only its catalog descriptors/index rows without PATH fallback or repeated writes',
+  { skip: process.platform === 'win32' }, async () => {
+  const first = selectedSf('selected-missing');
+  catalog.recordConnectedCli(salesforce);
+  try {
+    selectSf(first);
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const before = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    const manual = await config.provisionReviewedCliReadDescriptor({
+      version: 1, descriptorId: 'fixture.manual', operationId: 'fixture_manual_read', displayName: 'Manual read',
+      description: 'Controlled manual descriptor.', effect: 'read', accountId: 'reviewed_cli:host',
+      executablePath: fakeSf, argvPrefix: [], arguments: [], limits: { ...before.limits },
+    });
+    capabilityIndex.recordCapabilityOperations([{ identifier: manual.operationId, carrierKind: 'cli', carrier: 'reviewed-cli-config',
+      displayName: manual.displayName, description: manual.description, effectClass: 'read', effectProvenance: 'curated',
+      accountIdentity: manual.accountId, parentIdentifier: manual.descriptorId }]);
+    rmSync(first);
+    assert.equal(config.currentReviewedCliDescriptor(before), null);
+    const result = await reconcile.reconcileCatalogReviewedCliReads();
+    assert.ok(result.removed.includes('salesforce.data.query'));
+    assert.ok(!config.listReviewedCliReadDescriptors().some(row => row.descriptorId === before.descriptorId));
+    assert.ok(!capabilityIndex.listCapabilityOperationsForCarrier('cli', 'reviewed-cli-config')
+      .some(row => row.identifier === before.operationId && row.accountIdentity === before.accountId));
+    assert.ok(config.currentReviewedCliDescriptor(manual), 'manual noncatalog descriptor is unaffected by connected selection');
+    assert.ok(capabilityIndex.listCapabilityOperationsForCarrier('cli', 'reviewed-cli-config')
+      .some(row => row.identifier === manual.operationId));
+    const registry = readFileSync(config.reviewedCliReadConfigPath());
+    const changes = capabilityTotalChanges();
+    assert.equal((await reconcile.reconcileCatalogReviewedCliReads()).removed.length, 0);
+    assert.ok(readFileSync(config.reviewedCliReadConfigPath()).equals(registry));
+    assert.equal(capabilityTotalChanges(), changes, 'repeat unavailable reconciliation is a storage no-op');
+  } finally { await restoreBootstrapSf(); }
+});
+
+test('present invalid selected observations remove catalog descriptors instead of rediscovering PATH B',
+  { skip: process.platform === 'win32' }, async () => {
+  const first = selectedSf('selected-invalid');
+  catalog.recordConnectedCli(salesforce);
+  try {
+    for (const patch of [{ command: ' sf ' }, { id: 'other' }, { installed: false }, { binaryPath: 'sf' }, { binaryPath: undefined }]) {
+      selectSf(first);
+      await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+      const before = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+      assert.ok(before);
+      selectSf(first, patch);
+      assert.equal(config.currentReviewedCliDescriptor(before), null);
+      await reconcile.reconcileCatalogReviewedCliReads();
+      assert.ok(!config.listReviewedCliReadDescriptors().some(row => row.descriptorId === before.descriptorId));
+    }
+  } finally { await restoreBootstrapSf(); }
+});
+
+test('saved-only catalog CLI keeps bootstrap PATH behavior when no connected executable binding exists',
+  { skip: process.platform === 'win32' }, async () => {
+  const rosterBytes = readFileSync(connectedFile);
+  const saved = process.env.CLEMMY_SAVED_CLIS;
+  try {
+    writeFileSync(connectedFile, JSON.stringify({ version: 'v1', entries: {} }));
+    rmSync(healthFile, { force: true });
+    process.env.CLEMMY_SAVED_CLIS = 'sf';
+    runtimeConfig.invalidateRuntimeConfigSnapshot();
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const current = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    assert.equal(current.executableRealpath, realpathSync(fakeSf));
+    assert.ok(config.currentReviewedCliDescriptor(current));
+  } finally {
+    if (saved === undefined) delete process.env.CLEMMY_SAVED_CLIS; else process.env.CLEMMY_SAVED_CLIS = saved;
+    runtimeConfig.invalidateRuntimeConfigSnapshot();
+    writeFileSync(connectedFile, rosterBytes);
+    await restoreBootstrapSf();
+  }
+});
+
+test('selection changes across an awaited provision cannot publish A, and queued reconciliation retains B',
+  { skip: process.platform === 'win32' }, async () => {
+  const first = selectedSf('selected-await-A');
+  const second = selectedSf('selected-await-B');
+  catalog.recordConnectedCli(salesforce);
+  try {
+    for (const descriptor of config.listReviewedCliReadDescriptors().filter(row => row.descriptorId.startsWith('salesforce.'))) {
+      await config.removeReviewedCliReadDescriptor(descriptor.descriptorId);
+    }
+    selectSf(first);
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+    const releasePromise = new Promise<void>(resolve => { release = resolve; });
+    const held = withFileLock(config.reviewedCliReadConfigPath(), async () => { entered(); await releasePromise; });
+    await enteredPromise;
+    const pendingA = reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const pendingB = reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    selectSf(second);
+    release();
+    await held;
+    const [resultA] = await Promise.all([pendingA, pendingB]);
+    assert.ok(resultA.removed.includes('salesforce.data.query'), 'A is removed after its async save observes changed selection');
+    const current = config.listReviewedCliReadDescriptors().filter(row => row.descriptorId.startsWith('salesforce.'));
+    assert.ok(current.length > 0);
+    assert.ok(current.every(row => row.executableRealpath === realpathSync(second)));
+    assert.ok(current.every(row => config.currentReviewedCliDescriptor(row) !== null));
+  } finally { await restoreBootstrapSf(); }
+});
+
+test('digest-conditional removal cannot delete another writer\'s newer descriptor',
+  { skip: process.platform === 'win32' }, async () => {
+  const first = selectedSf('selected-CAS-A');
+  const second = selectedSf('selected-CAS-B');
+  catalog.recordConnectedCli(salesforce);
+  try {
+    selectSf(first);
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const before = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    selectSf(second);
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const retained = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === before.descriptorId)!;
+    const registry = readFileSync(config.reviewedCliReadConfigPath());
+    assert.equal(await config.removeReviewedCliReadDescriptor(before.descriptorId,
+      { expectedDescriptorDigest: config.reviewedCliDescriptorDigest(before) }), false);
+    assert.ok(readFileSync(config.reviewedCliReadConfigPath()).equals(registry), 'a lost CAS does not rewrite the newer registry');
+    assert.ok(config.currentReviewedCliDescriptor(retained));
+  } finally { await restoreBootstrapSf(); }
+});
+
+test('an unchanged catalog descriptor repairs its exact index row despite another account or parent match',
+  { skip: process.platform === 'win32' }, async () => {
+  catalog.recordConnectedCli(salesforce);
+  await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+  const descriptor = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+  const other = {
+    identifier: descriptor.operationId, carrierKind: 'cli' as const, carrier: 'reviewed-cli-config',
+    displayName: 'Other account fixture', description: 'Independent indexed operation.',
+    effectClass: 'read' as const, effectProvenance: 'curated' as const,
+    accountIdentity: 'reviewed_cli:other', parentIdentifier: 'fixture.other-parent',
+  };
+  capabilityIndex.recordCapabilityOperations([other]);
+  const database = capabilityIndex.capabilityIndexDatabase();
+  const otherRow = () => database.prepare(`SELECT * FROM capability_operations
+    WHERE identifier = ? AND account_identity = ?`).get(other.identifier, other.accountIdentity);
+  const retainedOther = otherRow();
+  assert.equal(capabilityIndex.deactivateCapabilityOperation({ identifier: descriptor.operationId,
+    accountIdentity: descriptor.accountId, carrierKind: 'cli', carrier: 'reviewed-cli-config',
+    parentIdentifier: descriptor.descriptorId }), 1);
+  await reconcile.reconcileCatalogReviewedCliReads();
+  assert.equal(salesforceCapabilityRow()?.active, 1, 'another account cannot stand in for the missing exact catalog row');
+  assert.equal(salesforceCapabilityRow()?.parent_identifier, descriptor.descriptorId);
+  assert.deepEqual(otherRow(), retainedOther, 'repair must not refresh or change the other account row');
+
+  capabilityIndex.recordCapabilityOperations([{ ...other, accountIdentity: descriptor.accountId }]);
+  assert.equal(salesforceCapabilityRow()?.parent_identifier, other.parentIdentifier);
+  await reconcile.reconcileCatalogReviewedCliReads();
+  assert.equal(salesforceCapabilityRow()?.parent_identifier, descriptor.descriptorId,
+    'the same account with a different parent is not the exact catalog publication');
+  assert.deepEqual(otherRow(), retainedOther);
+  const changes = capabilityTotalChanges();
+  await reconcile.reconcileCatalogReviewedCliReads();
+  assert.equal(capabilityTotalChanges(), changes, 'a fully repaired catalog/index pair remains a no-op');
+});
+
+test('native Windows selected .exe is admitted without treating a .cmd path as the same launch contract',
+  { skip: process.platform !== 'win32' }, async () => {
+  catalog.recordConnectedCli(salesforce);
+  try {
+    selectSf(process.execPath);
+    await reconcile.reconcileCatalogReviewedCliReads({ rehash: true });
+    const before = config.listReviewedCliReadDescriptors().find(row => row.descriptorId === 'salesforce.data.query')!;
+    assert.ok(before);
+    assert.equal(before.executableRealpath, realpathSync(process.execPath));
+    assert.ok(config.currentReviewedCliDescriptor(before));
+    selectSf(path.join(TEST_HOME, 'selected', 'sf.cmd'));
+    assert.equal(config.currentReviewedCliDescriptor(before), null);
+    await reconcile.reconcileCatalogReviewedCliReads();
+    assert.ok(!config.listReviewedCliReadDescriptors().some(row => row.descriptorId === before.descriptorId));
+  } finally { rmSync(healthFile, { force: true }); }
 });

@@ -1601,6 +1601,9 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       tool: 'space_trust_data_runner',
       args: { spaceSlug: 'sales', sourceId: 'weekly' },
     });
+    appendEvent({ sessionId: session.id, turn: originalSource.turn, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: workspaceRunner.approvalId, tool: workspaceRunner.tool,
+        args: workspaceRunner.args, sourceUserSeq: originalSource.seq } });
     await postDecision(`approve ${workspaceRunner.approvalId}`, 'approval-workspace-runner');
     await waitFor(() => approvalRegistry.get(workspaceRunner.approvalId)?.status === 'resolved');
     const workspaceSource = listEvents(session.id, { types: ['user_input_received'] })
@@ -1609,12 +1612,19 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
       .find((event) => event.data.sourceUserSeq === workspaceSource?.seq);
     const workspaceText = String((workspaceAck?.data.presentation as { text?: string } | undefined)?.text ?? '');
     assert.ok(workspaceSource && workspaceAck, 'Workspace approval is one source-bound typed terminal');
-    assert.match(workspaceText, /refresh will resume.*saved execution/i);
+    const { publicApprovalDecisionAck } = await import('../runtime/harness/approval-decision-ack.js');
+    assert.equal(approvalRegistry.get(workspaceRunner.approvalId)?.resolution, 'approved');
+    assert.deepEqual(publicApprovalDecisionAck(workspaceAck), { version: 1, sourceUserSeq: workspaceSource.seq,
+      approvalId: workspaceRunner.approvalId, decision: 'approve' }, 'the exact card receipt owns the resolution');
+    assert.equal(workspaceText, 'Approved.', 'a decision acknowledgement does not promise unobserved execution');
     assert.doesNotMatch(workspaceText, /continuing/i);
     const savedSourceScope = approvalRegistry.register({
       sessionId: session.id, channel: 'desktop', subject: 'Allow a saved source on its exact schedule',
       tool: 'workspace_source_script_consent', args: { workspaceId: 'sales', sourceId: 'weekly' },
     });
+    appendEvent({ sessionId: session.id, turn: originalSource.turn, role: 'Clem', type: 'approval_requested',
+      data: { approvalId: savedSourceScope.approvalId, tool: savedSourceScope.tool,
+        args: savedSourceScope.args, sourceUserSeq: originalSource.seq } });
     await postDecision(`approve ${savedSourceScope.approvalId}`, 'approval-saved-source-scope');
     await waitFor(() => approvalRegistry.get(savedSourceScope.approvalId)?.status === 'resolved');
     const scopeSource = listEvents(session.id, { types: ['user_input_received'] })
@@ -1622,7 +1632,10 @@ test('desktop chat approval buttons resolve one exact card; bare decisions never
     const scopeAck = listEvents(session.id, { types: ['conversation_completed'] })
       .find(event => event.data.sourceUserSeq === scopeSource?.seq);
     assert.ok(scopeSource && scopeAck, 'saved source consent finishes its exact control turn');
-    assert.match(String((scopeAck.data.presentation as { text?: string })?.text), /refresh will resume.*saved execution/i);
+    assert.equal(approvalRegistry.get(savedSourceScope.approvalId)?.resolution, 'approved');
+    assert.deepEqual(publicApprovalDecisionAck(scopeAck), { version: 1, sourceUserSeq: scopeSource.seq,
+      approvalId: savedSourceScope.approvalId, decision: 'approve' });
+    assert.equal(String((scopeAck.data.presentation as { text?: string })?.text), 'Approved.');
     assert.equal(listEvents(session.id, { types: ['conversation_completed'] })
       .filter(event => event.data.sourceUserSeq === scopeSource.seq).length, 1);
     const { steerBlockForToolBoundary, adoptedSteerNotesForSource } = await import('../runtime/harness/steer-notes.js');

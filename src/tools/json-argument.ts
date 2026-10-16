@@ -14,12 +14,23 @@
  * string form keeps working.
  */
 import { z } from 'zod';
+import { preserveDeferredJsonParser } from '../runtime/schema-normalizer.js';
+
+/** Validate without copying a record: Zod's record parser discards an own
+ * `__proto__` key. In a JSON document that key is data, and silently removing
+ * it would change the payload between permission/admission and execution.
+ * The metadata advertises the same open object as the runtime predicate. */
+const jsonObject = () => preserveDeferredJsonParser(z.unknown().refine((value) => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}, 'Expected a JSON object').meta({ type: 'object', additionalProperties: {} }) as z.ZodType<Record<string, unknown>>);
 
 /** A JSON object, either as its text or as the object. */
-export const jsonObjectArgument = () => z.union([z.string(), z.record(z.string(), z.unknown())]);
+export const jsonObjectArgument = () => z.union([z.string(), jsonObject()]);
 
 /** A JSON value of any shape (object or array), either as its text or as the value. */
-export const jsonValueArgument = () => z.union([z.string(), z.record(z.string(), z.unknown()), z.array(z.unknown())]);
+export const jsonValueArgument = () => z.union([z.string(), jsonObject(), preserveDeferredJsonParser(z.array(z.unknown()))]);
 
 export type JsonArgument = string | Record<string, unknown> | unknown[] | null | undefined;
 

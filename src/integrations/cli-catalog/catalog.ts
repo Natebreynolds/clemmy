@@ -1,7 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { BASE_DIR } from '../../config.js';
 import { resolveSafeCliProbe } from '../../runtime/cli-discovery.js';
+import { retireConnectedCliPin } from './connected-cli-bin.js';
+import { readCliHealthEntries, readConnectedCliState, withConnectedCliStateLock,
+  writeCliHealthEntries, writeConnectedCliState } from './connected-cli-state.js';
 
 /**
  * Curated catalog of installable CLIs that Clementine knows how to:
@@ -656,14 +659,14 @@ export function statusForSearchResults(query: string): Array<CatalogEntryStatus 
 
 // ─── Connected-CLI record (links to the agent) ──────────────────────
 
-const CONNECTED_FILE = path.join(BASE_DIR, 'state', 'connected-clis.json');
-
 export interface ConnectedCliRecord {
   id: string;
   command: string;
   vendor: string;
   name: string;
   installedAt: string;
+  /** Host connection incarnation, never an authentication/account grant. */
+  connectionRevision?: string;
   authDocsUrl: string;
   authCommand?: string;
   /** Denormalized from the catalog at record time (same as authCommand). */
@@ -671,49 +674,15 @@ export interface ConnectedCliRecord {
   authHeadless?: boolean;
 }
 
-interface ConnectedClisFile {
-  version: 'v1';
-  entries: Record<string, ConnectedCliRecord>;
-  /**
-   * Catalog ids the user EXPLICITLY chose to disconnect. We track this
-   * so autoPromoteInstalledClis() doesn't immediately re-promote a CLI
-   * the user just told us to forget. Empty/absent on fresh installs.
-   * Cleared per-id when the user clicks Reconnect.
-   */
-  forgotten?: string[];
-}
-
 export function readConnectedClis(): Record<string, ConnectedCliRecord> {
-  if (!existsSync(CONNECTED_FILE)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(CONNECTED_FILE, 'utf-8')) as ConnectedClisFile;
-    if (parsed && parsed.entries) return parsed.entries;
-  } catch { /* fall through */ }
-  return {};
+  return readConnectedCliState().entries;
 }
 
 /** Same file as readConnectedClis but returns the forgotten ids list.
  *  Kept as a separate function so callers don't have to know about the
  *  full file shape. Returns [] when file is missing or malformed. */
 export function readForgottenCliIds(): string[] {
-  if (!existsSync(CONNECTED_FILE)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(CONNECTED_FILE, 'utf-8')) as ConnectedClisFile;
-    return Array.isArray(parsed.forgotten) ? parsed.forgotten : [];
-  } catch { return []; }
-}
-
-function writeConnectedClis(entries: Record<string, ConnectedCliRecord>, forgotten?: string[]): void {
-  mkdirSync(path.dirname(CONNECTED_FILE), { recursive: true });
-  const tmp = `${CONNECTED_FILE}.${process.pid}.tmp`;
-  // Preserve forgotten[] from disk if not explicitly passed in. That way
-  // callers that only need to update entries (recordConnectedCli) don't
-  // have to know about the forgotten list.
-  const finalForgotten = forgotten ?? readForgottenCliIds();
-  const payload: ConnectedClisFile = { version: 'v1', entries };
-  if (finalForgotten.length > 0) payload.forgotten = finalForgotten;
-  writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
-  renameSync(tmp, CONNECTED_FILE);
+  return readConnectedCliState().forgotten;
 }
 
 /**
@@ -722,20 +691,34 @@ function writeConnectedClis(entries: Record<string, ConnectedCliRecord>, forgott
  * installedAt to "now".
  */
 export function recordConnectedCli(entry: CliCatalogEntry): ConnectedCliRecord {
-  const current = readConnectedClis();
+  return withConnectedCliStateLock(() => recordConnectedCliLocked(entry, false));
+}
+
+function recordConnectedCliLocked(entry: CliCatalogEntry, reconnect: boolean): ConnectedCliRecord {
+  const state = readConnectedCliState();
+  const health = readCliHealthEntries();
+  const previous = state.entries[entry.id];
   const record: ConnectedCliRecord = {
     id: entry.id,
     command: entry.command,
     vendor: entry.vendor,
     name: entry.name,
     installedAt: new Date().toISOString(),
+    connectionRevision: randomUUID(),
     authDocsUrl: entry.authDocsUrl,
     authCommand: entry.authCommand,
     ...(entry.authProbe ? { authProbe: entry.authProbe } : {}),
     ...(entry.authHeadless !== undefined ? { authHeadless: entry.authHeadless } : {}),
   };
-  current[entry.id] = record;
-  writeConnectedClis(current);
+  // Retire only this old observation, not credentials or another CLI's pin.
+  retireConnectedCliPin(previous, health[entry.id]);
+  if (Object.hasOwn(health, entry.id)) {
+    delete health[entry.id];
+    writeCliHealthEntries(health);
+  }
+  state.entries[entry.id] = record;
+  if (reconnect) state.forgotten = state.forgotten.filter(id => id !== entry.id);
+  writeConnectedCliState(state);
   return record;
 }
 
@@ -746,14 +729,23 @@ export function recordConnectedCli(entry: CliCatalogEntry): ConnectedCliRecord {
  * Clementine's note that the user wants this surfaced as connected.
  */
 export function forgetConnectedCli(id: string): void {
-  const current = readConnectedClis();
-  const forgotten = readForgottenCliIds();
-  const hadEntry = id in current;
-  if (hadEntry) delete current[id];
-  // Idempotent: add to forgotten if not already there.
-  const nextForgotten = forgotten.includes(id) ? forgotten : [...forgotten, id];
-  if (!hadEntry && nextForgotten.length === forgotten.length) return; // nothing to write
-  writeConnectedClis(current, nextForgotten);
+  withConnectedCliStateLock(() => {
+    const state = readConnectedCliState();
+    const health = readCliHealthEntries();
+    const previous = state.entries[id];
+    const hadEntry = Object.hasOwn(state.entries, id);
+    if (hadEntry) delete state.entries[id];
+    const alreadyForgotten = state.forgotten.includes(id);
+    if (!alreadyForgotten) state.forgotten.push(id);
+    // Keep old ownership available if unlink fails. All cooperative writers
+    // share this lock; no old sync can interleave with retirement/publication.
+    retireConnectedCliPin(previous, health[id]);
+    if (Object.hasOwn(health, id)) {
+      delete health[id];
+      writeCliHealthEntries(health);
+    }
+    if (hadEntry || !alreadyForgotten) writeConnectedCliState(state);
+  });
 }
 
 /**
@@ -765,22 +757,7 @@ export function forgetConnectedCli(id: string): void {
 export function reconnectCli(id: string): ConnectedCliRecord | null {
   const entry = findCatalogEntry(id);
   if (!entry) return null;
-  const forgotten = readForgottenCliIds().filter((x) => x !== id);
-  const current = readConnectedClis();
-  const record: ConnectedCliRecord = {
-    id: entry.id,
-    command: entry.command,
-    vendor: entry.vendor,
-    name: entry.name,
-    installedAt: new Date().toISOString(),
-    authDocsUrl: entry.authDocsUrl,
-    authCommand: entry.authCommand,
-    ...(entry.authProbe ? { authProbe: entry.authProbe } : {}),
-    ...(entry.authHeadless !== undefined ? { authHeadless: entry.authHeadless } : {}),
-  };
-  current[entry.id] = record;
-  writeConnectedClis(current, forgotten);
-  return record;
+  return withConnectedCliStateLock(() => recordConnectedCliLocked(entry, true));
 }
 
 /**
@@ -816,8 +793,15 @@ export function autoPromoteInstalledClis(): { promoted: string[]; skipped: strin
     const safe = resolveSafeCliProbe(entry.command, resolved);
     if (!safe || safe.skipped) continue;
     // Installed AND eligible — promote.
-    recordConnectedCli(entry);
-    promoted.push(entry.id);
+    const outcome = withConnectedCliStateLock(() => {
+      const latest = readConnectedCliState();
+      if (latest.forgotten.includes(entry.id)) return 'forgotten';
+      if (Object.hasOwn(latest.entries, entry.id)) return 'connected';
+      recordConnectedCliLocked(entry, false);
+      return 'promoted';
+    });
+    if (outcome === 'promoted') promoted.push(entry.id);
+    if (outcome === 'forgotten') skipped.push(entry.id);
   }
   return { promoted, skipped };
 }

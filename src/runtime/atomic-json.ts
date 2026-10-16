@@ -594,9 +594,9 @@ function tryAcquireFileLock(filePath: string): FileLockLease | null {
 
 /** True when the canonical lock no longer carries this lease; false when the
  * deletion guard never came free and the lease is still in place. */
-function releaseFileLockOwned(filePath: string, lease: FileLockLease): boolean {
+function releaseFileLockOwned(filePath: string, lease: FileLockLease, timeoutMs: number): boolean {
   const lockPath = lockFilePath(filePath);
-  const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     const current = readFileLockSnapshot(lockPath);
     if (
@@ -608,7 +608,7 @@ function releaseFileLockOwned(filePath: string, lease: FileLockLease): boolean {
     const guard = tryAcquireDeletionGuard(lockPath);
     if (!guard) {
       if (Date.now() >= deadline) return false;
-      sleepSync(LOCK_RETRY_MS);
+      sleepSync(Math.min(LOCK_RETRY_MS, Math.max(0, deadline - Date.now())));
       continue;
     }
     try {
@@ -632,10 +632,10 @@ function releaseFileLockOwned(filePath: string, lease: FileLockLease): boolean {
   }
 }
 
-function releaseFileLock(filePath: string, lease: FileLockLease): void {
+function releaseFileLock(filePath: string, lease: FileLockLease, timeoutMs = LOCK_MAX_WAIT_MS): void {
   let released = false;
   try {
-    released = releaseFileLockOwned(filePath, lease);
+    released = releaseFileLockOwned(filePath, lease, timeoutMs);
   } catch {
     // The critical section may already have durably committed. Reporting that
     // operation as failed solely because post-commit lock cleanup hit an
@@ -736,8 +736,21 @@ export function withFileLockSync<T>(filePath: string, work: () => T): T {
  * Fail-closed synchronous lock for durable commitments. Unlike the hot-path
  * best-effort variant above, this never runs the mutation without ownership:
  * a timeout is surfaced so callers can retry without risking a lost update.
+ * Short synchronous control paths may select a smaller acquisition/cleanup
+ * wait. Zero attempts acquisition once and never parks waiting for a peer.
  */
-export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
+export function withFileLockSyncStrict<T>(
+  filePath: string,
+  work: () => T,
+  options: { timeoutMs?: number } = {},
+): T {
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    throw new TypeError('withFileLockSyncStrict options must be an object');
+  }
+  const timeoutMs = options.timeoutMs === undefined ? LOCK_MAX_WAIT_MS : options.timeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > LOCK_MAX_WAIT_MS) {
+    throw new TypeError(`withFileLockSyncStrict timeoutMs must be an integer between 0 and ${LOCK_MAX_WAIT_MS}`);
+  }
   assertFileLockIsNotReentrant(filePath);
   const startedAt = Date.now();
   let lease = tryAcquireFileLock(filePath);
@@ -752,24 +765,24 @@ export function withFileLockSyncStrict<T>(filePath: string, work: () => T): T {
     });
   }
   while (!lease) {
-    if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
+    if (Date.now() - startedAt >= timeoutMs) {
       noteSlowSyncLockWait(filePath, Date.now() - startedAt, 'timed_out');
       throw new BoundaryError({
         kind: 'state.write_failed',
         retryable: true,
-        userMessage: `Couldn't get a write lock on ${path.basename(filePath)} — another process may be stuck. Try again.`,
-        operatorMessage: `withFileLockSyncStrict timeout after ${LOCK_MAX_WAIT_MS}ms on ${filePath}`,
-        context: { filePath, waitedMs: Date.now() - startedAt },
+        userMessage: `Couldn't get a write lock on ${path.basename(filePath)} — ${timeoutMs === 0 ? 'it is busy' : 'another process may be stuck'}. Try again.`,
+        operatorMessage: `withFileLockSyncStrict timeout after ${timeoutMs}ms on ${filePath}`,
+        context: { filePath, waitedMs: Date.now() - startedAt, timeoutMs },
       });
     }
-    sleepSync(LOCK_RETRY_MS);
+    sleepSync(Math.min(LOCK_RETRY_MS, timeoutMs - (Date.now() - startedAt)));
     lease = tryAcquireFileLock(filePath);
   }
   noteSlowSyncLockWait(filePath, Date.now() - startedAt, 'acquired');
   try {
     return runWithHeldFileLockSync(filePath, work);
   } finally {
-    releaseFileLock(filePath, lease);
+    releaseFileLock(filePath, lease, timeoutMs);
   }
 }
 

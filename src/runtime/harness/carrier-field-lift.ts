@@ -82,7 +82,7 @@ export function liftNestedCarrierFields(argumentsJson: string): LiftedCarrierFie
   const target = outerName || innerName;
   if (!target) return null;
   const changes: string[] = [...strayChange, ...(sentAsObject
-    ? ['encoded args_json once; it takes the target\'s arguments as one JSON string, not the object itself']
+    ? ['encoded args_json once for internal dispatch; a JSON object and JSON-object text are both supported']
     : [])];
   if (nested.length === 0) {
     return { argumentsJson: JSON.stringify({ ...outer, args_json: JSON.stringify(inner) }), target, changes };

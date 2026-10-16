@@ -22,6 +22,8 @@ const search = await import('./tool-search-tool.js');
 const schemas = await import('./composio-schema-cache.js');
 const index = await import('../memory/capability-index.js');
 const events = await import('../runtime/harness/eventlog.js');
+const cliCatalog = await import('../integrations/cli-catalog/catalog.js');
+const cliCoverage = await import('../integrations/cli-catalog/connected-cli-coverage.js');
 const query = 'quillboard sentinel pages';
 const operation = 'QUILLBOARD_GET_SENTINEL_PAGE';
 const schema = { type: 'object', properties: { page: { type: 'string' } } };
@@ -76,6 +78,26 @@ test('a confirmed empty registry still exposes the named app as setup-only metad
   assert.match(found[0]!.guidance!, /cannot run yet/);
   assert.equal(found[0]!.planningAuthority, undefined);
   assert.equal(definitions, 1); assert.equal(business, 0);
+});
+
+test('a freshly authenticated same-vendor CLI does not hide the missing provider alternative', async () => {
+  const entry = { id: 'quillboard', name: 'Quillboard', vendor: 'Quillboard', command: 'quillboard',
+    description: 'Fixture CLI', tags: ['quillboard'], installCommand: 'npm install -g fixture-quillboard',
+    installSource: 'npm' as const, authDocsUrl: 'https://example.invalid/auth' };
+  cliCatalog.recordConnectedCli(entry);
+  writeFileSync(path.join(home, 'state/cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
+    quillboard: { id: 'quillboard', command: 'quillboard', installed: true, authStatus: 'ok',
+      binaryPath: '/controlled/bin/quillboard', checkedAt: new Date().toISOString(), username: 'fixture-owner' },
+  } }));
+  try {
+    assert.equal(cliCoverage.connectedCliCandidatesForApp('quillboard')[0]?.authentication.state, 'confirmed');
+    composio.__test__.setConnectedAccountsLoader(async () => []); installProvider();
+    const found = await source().search({ query, limit: 8 });
+    assert.deepEqual(found.map(candidate => candidate.connectionRequired), [{ toolkit: 'quillboard', app: 'Quillboard' }]);
+    assert.equal(found[0]?.planningAuthority, undefined, 'neither candidate inventory nor authentication grants provider dispatch');
+    assert.equal(definitions, 1);
+    assert.equal(business, 0);
+  } finally { cliCatalog.forgetConnectedCli('quillboard'); }
 });
 
 for (const lastGood of [false, true]) test(`unknown/error registry cannot prove disconnection${lastGood ? ' from an older empty snapshot' : ''}`, async () => {

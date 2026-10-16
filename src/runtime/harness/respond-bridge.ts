@@ -65,6 +65,7 @@ import {
   mergeTurnCapabilityCandidates,
   prepareCheckedHostClarificationAnswer,
   prepareMaterialSourceVariantRecovery,
+  readVerifiedAdvisoryContinuationInput,
 } from './task-continuity-runtime.js';
 import {
   materiallyVariantSourceStrategyDecision,
@@ -362,7 +363,6 @@ function harnessCanEnforceExcludes(names: string[] | undefined): boolean {
 // The owner's completion-review switch has one reader; surfaces combine it
 // with their own posture below (`judgeCompletion`), never restate it.
 import { completionReviewEnabled } from './completion-review-setting.js';
-import { releaseConnectionDependenciesCoveredByCli } from './dependency-request.js';
 export { completionReviewEnabled };
 
 const SURFACE_CONFIG: Record<HarnessSurface, { kind: 'chat' | 'execution'; judgeCompletion: boolean; honorModel?: boolean }> = {
@@ -1726,9 +1726,6 @@ export async function respondViaHarness(
   const hostOwnsTurn = Boolean(opts.turnEngine && isHostTurnEngine(opts.turnEngine));
   const callerSourceStrategyBinding = request.turnCandidates?.sourceStrategyBinding;
   const prepareContinuity = async () => {
-    // A question parked on a connection that a connected CLI now reaches no
-    // longer holds the session; this message goes to the brain.
-    if (!resumesExecutionCheckpoint) releaseConnectionDependenciesCoveredByCli(request.sessionId);
     if (hostOwnsTurn && !resumesExecutionCheckpoint) {
       await prepareCheckedHostClarificationAnswer({
         sessionId: request.sessionId,
@@ -1916,18 +1913,30 @@ export async function respondViaHarness(
   // fallover rebuild. A retrieval failure remains advisory-only: existing
   // caller/continuation candidates survive, while no candidate ever grants
   // dispatch authority.
+  const advisoryContinuationInput = !resumesExecutionCheckpoint
+    ? readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: sourceUserEvent.seq })
+    : null;
   const resolveFreshHostCandidates = hostOwnsTurn && !resumesExecutionCheckpoint
     && request.taskContinuation === undefined
-    && !(typedClassification && 'keepOpen' in typedClassification);
+    && (advisoryContinuationInput !== null || !(typedClassification && 'keepOpen' in typedClassification));
   if (resolveFreshHostCandidates && request.turnCandidates?.sourceStrategyBinding) {
     const { sourceStrategyBinding: _callerBinding, ...withoutCallerBinding } = request.turnCandidates;
     request = { ...request, turnCandidates: withoutCallerBinding };
   }
+  const advisoryBaseCandidates = request.turnCandidates;
   let acceptedTurnCandidatesPromise: Promise<TurnCapabilityCandidates | undefined> | undefined;
   const candidatesForAcceptedBuild = (): Promise<TurnCapabilityCandidates | undefined> => {
     if (!resolveFreshHostCandidates) return Promise.resolve(request.turnCandidates);
+    if (advisoryContinuationInput !== null
+      && readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: sourceUserEvent.seq }) !== advisoryContinuationInput) {
+      return Promise.resolve(advisoryBaseCandidates);
+    }
     if (!acceptedTurnCandidatesPromise) {
       acceptedTurnCandidatesPromise = (async () => {
+        const currentAdvisoryInput = readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: sourceUserEvent.seq });
+        if (advisoryContinuationInput !== null && currentAdvisoryInput !== advisoryContinuationInput) {
+          return advisoryBaseCandidates;
+        }
         const acceptedText = typeof sourceUserEvent.data.text === 'string'
           ? sourceUserEvent.data.text
           : '';
@@ -1940,11 +1949,18 @@ export async function respondViaHarness(
         };
         try {
           resolved = await resolveTurnCandidatesImpl({
-            userInput: acceptedText,
+            // A released planning question is not selected consent. Its
+            // exact host-verified root/Q/B capsule still guides advisory
+            // discovery, including retry; bare "continue" loses the task.
+            userInput: currentAdvisoryInput ?? acceptedText,
           });
         } catch {
           // Candidate recall is context, never execution authority. A broken
           // advisory tier must not fail or broaden the accepted turn.
+        }
+        if (advisoryContinuationInput !== null
+          && readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: sourceUserEvent.seq }) !== advisoryContinuationInput) {
+          return advisoryBaseCandidates;
         }
         // Candidate recall is advisory context. Fresh turns cannot acquire a
         // durable source strategy (or historical arguments) from this tier;

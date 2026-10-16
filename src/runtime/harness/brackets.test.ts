@@ -30,7 +30,7 @@ const { resetEventLog, createSession, requestKill, appendEvent, writeToolOutput,
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const capabilityCatalogs = await import('./host-capability-catalog-factory.js');
 const capabilityManifests = await import('./capability-manifest.js');
-const { HostLocalExecutionFailureResult } = await import('./attempt-settlement.js');
+const { HostLocalExecutionFailureResult, InvalidArgumentsPreDispatchResult } = await import('./attempt-settlement.js');
 const { formatRecallableToolText } = await import('./tool-output-format.js');
 const { getToolOutputContext } = await import('./tool-output-context.js');
 const {
@@ -3877,6 +3877,65 @@ test('a gateway payload with unreadable inner arguments refuses one call, not th
   );
   assert.match(String(good), /successful/, 'the next gateway call in the same task still dispatches');
   assert.ok(dispatches >= 1);
+});
+
+test('carrier object arguments retain the inner logical identity while invalid carrier values dispatch nothing', async () => {
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  const accepted = anchorAcceptedTask(session.id, 'Read the current task list.');
+  const schema = z.object({
+    name: z.literal('task_list'),
+    args_json: z.union([z.string(), z.record(z.string(), z.unknown())]),
+  }).strict();
+  const received: unknown[] = [];
+  const carrier = tool({
+    name: 'call_tool',
+    description: 'Controlled carrier bracket and SDK-parser boundary.',
+    parameters: z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }) as never,
+    strict: false,
+    execute: async (input): Promise<string> => {
+      const parsed = schema.safeParse(input);
+      if (!parsed.success) {
+        return new InvalidArgumentsPreDispatchResult(JSON.stringify({
+          error: 'invalid_arguments', dispatch_state: 'not_started',
+        })) as unknown as string;
+      }
+      const { args_json } = parsed.data;
+      received.push(typeof args_json === 'string' ? JSON.parse(args_json) : args_json);
+      return JSON.stringify({ tasks: [] });
+    },
+  });
+  const { attestToolLocalInputInvalidity } = await import('./brackets.js');
+  attestToolLocalInputInvalidity(carrier, ({ rawInput, parsedInput }) =>
+    typeof rawInput === 'string' && !schema.safeParse(parsedInput).success ? 'invalid' : 'unproven');
+  const wrapped = wrapToolForHarness(carrier);
+  const counter = new ToolCallsCounter(20);
+  const invoke = (args: unknown, callId: string) => withHarnessRunContext({
+    sessionId: session.id, sourceUserSeq: accepted.sourceUserSeq, turn: accepted.turn, counter,
+  }, () => (wrapped as unknown as {
+    invoke: (context: unknown, input: string, details?: unknown) => Promise<unknown>;
+  }).invoke(undefined, JSON.stringify({ name: 'task_list', args_json: args }), { toolCall: { callId } }));
+  const args = { status: null, priority: null, project: null, since: null, limit: 10 };
+  await invoke(args, 'structured-carrier');
+  await invoke(JSON.stringify(args), 'text-carrier');
+  assert.deepEqual(received, [args, args], 'transport spelling does not alter the target arguments');
+  const rows = openEventLog().prepare(`SELECT logical_tool_call_id, tool_name, argument_digest
+    FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?
+      AND logical_tool_call_id IN ('structured-carrier', 'text-carrier')
+    ORDER BY logical_tool_call_id`).all(session.id, accepted.sourceUserSeq) as Array<{
+      logical_tool_call_id: string; tool_name: string; argument_digest: string;
+    }>;
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((row) => row.tool_name === 'task_list'), 'a valid structured carrier is never admitted as an outer malformed marker');
+  assert.equal(rows[0]!.argument_digest, rows[1]!.argument_digest, 'equivalent object and text share the same exact logical contract');
+
+  for (const [index, invalid] of [null, [], 3, true].entries()) {
+    const result = await invoke(invalid, `invalid-carrier-${index}`);
+    assert.match(String(result), /invalid|error/i);
+    assert.equal(received.length, 2, 'invalid outer argument values never enter the carrier body');
+  }
+  await invoke(args, 'structured-after-invalid');
+  assert.equal(received.length, 3, 'invalid siblings do not poison the accepted source');
 });
 
 test('a provider request echo is not artifact readback evidence', async () => {

@@ -7,7 +7,7 @@
  * catalog rows are removed. Operator-provisioned non-catalog descriptors are
  * left untouched.
  */
-import { realpathSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -15,19 +15,22 @@ import {
   CLI_CATALOG,
   catalogReviewedReadsOf,
   readConnectedClis,
-  readForgottenCliIds,
   type CatalogReviewedReadV1,
   type CliCatalogEntry,
 } from '../../integrations/cli-catalog/catalog.js';
-import { findSafeCliCommand } from '../cli-discovery.js';
+import { readConnectedCliExecutableSelection, reviewedCliExecutablePathIsSupported, reviewedCliExecutableFileIsSupported }
+  from '../../integrations/cli-catalog/connected-cli-executable-selection.js';
+import { findSafeCliCommand, resolveSafeCliProbe } from '../cli-discovery.js';
 import { getSavedClis } from '../saved-clis.js';
-import { listCapabilityOperationsForCarrier, recordCapabilityOperations } from '../../memory/capability-index.js';
+import { deactivateCapabilityOperation, listCapabilityOperationsForCarrier, recordCapabilityOperations }
+  from '../../memory/capability-index.js';
 import {
   currentReviewedCliDescriptor,
   REVIEWED_CLI_READ_ACCOUNT,
   REVIEWED_CLI_READ_CARRIER,
   listReviewedCliReadDescriptors,
   provisionReviewedCliReadDescriptor,
+  reviewedCliDescriptorDigest,
   removeReviewedCliReadDescriptor,
   type ReviewedCliReadDescriptorV1,
 } from './reviewed-cli-read-config.js';
@@ -72,10 +75,12 @@ function userConfirmedCliCommands(): ReadonlySet<string> {
 
 function entryIsUserConfirmed(
   entry: CliCatalogEntry,
-  connected: Readonly<Record<string, unknown>>,
+  connected: unknown,
   saved: ReadonlySet<string>,
 ): boolean {
-  return Boolean(connected[entry.id]) || saved.has(entry.command.trim().toLowerCase());
+  const hasConnectedRecord = connected !== null && typeof connected === 'object' && !Array.isArray(connected)
+    && Object.hasOwn(connected, entry.id);
+  return hasConnectedRecord || saved.has(entry.command.trim().toLowerCase());
 }
 
 function sameClosedContract(
@@ -124,43 +129,92 @@ function indexReviewedRead(descriptor: ReviewedCliReadDescriptorV1): void {
  * @param rehash When true (daemon boot), replace a same-path descriptor whose
  * executable bytes changed. Dashboard polls skip that hash.
  */
-export async function reconcileCatalogReviewedCliReads(
+let reconciliationTail: Promise<void> = Promise.resolve();
+
+export function reconcileCatalogReviewedCliReads(
   options: { rehash?: boolean } = {},
 ): Promise<ReconcileCatalogReviewedCliReadsResult> {
   const rehash = options.rehash === true;
-  const connected = readConnectedClis();
-  const saved = userConfirmedCliCommands();
-  const forgotten = new Set(readForgottenCliIds());
+  const pending = reconciliationTail.then(() => reconcileCatalogReviewedCliReadsOnce({ rehash }));
+  reconciliationTail = pending.then(() => undefined, () => undefined);
+  return pending;
+}
+
+async function reconcileCatalogReviewedCliReadsOnce(
+  options: { rehash: boolean },
+): Promise<ReconcileCatalogReviewedCliReadsResult> {
+  const rehash = options.rehash === true;
   const provisioned: string[] = [];
   const removed: string[] = [];
   const skipped: string[] = [];
   const catalogByDescriptor = new Map(
     catalogReviewedReads().map((row) => [row.contract.descriptorId, row.entry] as const),
   );
+  const selectionFor = (entry: CliCatalogEntry) => readConnectedCliExecutableSelection(entry);
+  const entryIsConfirmedNow = (entry: CliCatalogEntry) => entryIsUserConfirmed(entry, readConnectedClis(), userConfirmedCliCommands());
+  const removeCatalogDescriptor = async (descriptorId: string, operationId: string, expectedDigest?: string): Promise<void> => {
+    // Avoid rewriting a missing descriptor on every poll; the exact index
+    // retirement also repairs a crash between descriptor removal and indexing.
+    const existing = listReviewedCliReadDescriptors().find(row => row.descriptorId === descriptorId);
+    if (existing) {
+      const digest = reviewedCliDescriptorDigest(existing);
+      if (expectedDigest !== undefined && digest !== expectedDigest) return;
+      const dropped = await removeReviewedCliReadDescriptor(descriptorId, { expectedDescriptorDigest: digest });
+      if (!dropped) return; // Another process's newer descriptor is not ours to retire.
+      removed.push(descriptorId);
+    } else if (expectedDigest !== undefined) {
+      return;
+    }
+    // A different process can publish its replacement after our CAS removal.
+    // Its descriptor/index identity must not be retired by this older cleanup.
+    if (listReviewedCliReadDescriptors().some(row => row.descriptorId === descriptorId)) return;
+    deactivateCapabilityOperation({ identifier: operationId, accountIdentity: REVIEWED_CLI_READ_ACCOUNT,
+      carrierKind: 'cli', carrier: REVIEWED_CLI_READ_CARRIER, parentIdentifier: descriptorId });
+  };
 
   for (const existing of listReviewedCliReadDescriptors()) {
     const catalog = catalogByDescriptor.get(existing.descriptorId);
     if (!catalog) continue;
-    if (!entryIsUserConfirmed(catalog, connected, saved) || forgotten.has(catalog.id)) {
-      const dropped = await removeReviewedCliReadDescriptor(existing.descriptorId);
-      if (dropped) removed.push(existing.descriptorId);
+    if (!entryIsConfirmedNow(catalog) || selectionFor(catalog).status === 'blocked') {
+      await removeCatalogDescriptor(existing.descriptorId, existing.operationId, reviewedCliDescriptorDigest(existing));
     }
   }
 
   for (const { entry, contract } of catalogReviewedReads()) {
-    if (!entryIsUserConfirmed(entry, connected, saved) || forgotten.has(entry.id)) {
+    const selection = selectionFor(entry);
+    if (!entryIsConfirmedNow(entry) || selection.status === 'blocked') {
+      await removeCatalogDescriptor(contract.descriptorId, contract.operationId);
       skipped.push(entry.id);
       continue;
     }
-    const safe = findSafeCliCommand(entry.command);
+    // A known executable observation selects that exact path even when its
+    // sign-in is unknown/stale. The catalog contract, not auth health, supplies
+    // the read effect. Only missing observations use bootstrap PATH discovery.
+    const safe = selection.status === 'selected'
+      ? resolveSafeCliProbe(entry.command, selection.executablePath)
+      : findSafeCliCommand(entry.command);
     if (!safe || safe.skipped || !path.isAbsolute(safe.path)) {
+      await removeCatalogDescriptor(contract.descriptorId, contract.operationId);
       skipped.push(entry.id);
       continue;
     }
     let executableRealpath: string;
+    let provisionedDigest: string | undefined;
     try {
       executableRealpath = realpathSync(safe.path);
+      if (selection.status === 'selected') {
+        const file = statSync(executableRealpath);
+        if (!reviewedCliExecutableFileIsSupported({ executablePath: executableRealpath, isFile: file.isFile(), mode: file.mode })) {
+          throw new Error('selected CLI is not executable');
+        }
+      }
     } catch {
+      await removeCatalogDescriptor(contract.descriptorId, contract.operationId);
+      skipped.push(entry.id);
+      continue;
+    }
+    if (!reviewedCliExecutablePathIsSupported(executableRealpath)) {
+      await removeCatalogDescriptor(contract.descriptorId, contract.operationId);
       skipped.push(entry.id);
       continue;
     }
@@ -177,7 +231,9 @@ export async function reconcileCatalogReviewedCliReads(
       // offers. Restore it only when it is missing or retired, so an ordinary
       // rehash still changes nothing.
       const findable = listCapabilityOperationsForCarrier('cli', REVIEWED_CLI_READ_CARRIER, 200)
-        .some((row) => row.identifier === existing.operationId);
+        .some((row) => row.identifier === existing.operationId
+          && row.accountIdentity === existing.accountId
+          && row.parentIdentifier === existing.descriptorId);
       if (!findable) indexReviewedRead(existing);
       skipped.push(entry.id);
       continue;
@@ -202,9 +258,25 @@ export async function reconcileCatalogReviewedCliReads(
         })),
         limits: { ...contract.limits },
       });
+      const digest = reviewedCliDescriptorDigest(descriptor);
+      provisionedDigest = digest;
+      if (!entryIsConfirmedNow(entry) || JSON.stringify(selectionFor(entry)) !== JSON.stringify(selection)) {
+        await removeCatalogDescriptor(descriptor.descriptorId, descriptor.operationId, digest);
+        skipped.push(entry.id);
+        continue;
+      }
+      const retained = listReviewedCliReadDescriptors().find(row => row.descriptorId === descriptor.descriptorId);
+      if (!retained || reviewedCliDescriptorDigest(retained) !== digest) {
+        skipped.push(entry.id);
+        continue;
+      }
       indexReviewedRead(descriptor);
       provisioned.push(entry.id);
     } catch (error) {
+      if (provisionedDigest !== undefined || existing) {
+        await removeCatalogDescriptor(contract.descriptorId, contract.operationId,
+          provisionedDigest ?? reviewedCliDescriptorDigest(existing!));
+      }
       skipped.push(entry.id);
       logger.warn(
         { err: error instanceof Error ? error.message : String(error), cli: entry.id },

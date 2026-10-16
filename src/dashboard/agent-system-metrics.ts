@@ -7,13 +7,13 @@ import { HOST_AGENT_ID } from '../agents/agent-record.js';
 import { readDurableBindings } from '../runtime/harness/model-roles.js';
 import { listSessions, listEvents, type EventRow } from '../runtime/harness/eventlog.js';
 import { readWorkflowEvents, type WorkflowEvent } from '../execution/workflow-events.js';
+import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { listRecallableWorkflowPatterns } from '../memory/workflow-pattern-store.js';
 import {
   AGENT_INBOX_DIR,
   AGENT_STATE_DIR,
   TEAM_COMMS_LOG,
-  WORKFLOW_RUNS_DIR,
   loadTeamAgents,
 } from '../tools/shared.js';
 
@@ -931,13 +931,17 @@ function collectAgentScorecards(input: {
 }
 
 function readWorkflowRunRecords(limit = 120): RawWorkflowRunRecord[] {
-  if (!existsSync(WORKFLOW_RUNS_DIR)) return [];
-  return readdirSync(WORKFLOW_RUNS_DIR)
-    .filter((entry) => entry.endsWith('.json'))
-    .map((entry) => readJsonFile<RawWorkflowRunRecord>(path.join(WORKFLOW_RUNS_DIR, entry)))
-    .filter((row): row is RawWorkflowRunRecord => !!row && typeof row.id === 'string')
-    .sort((left, right) => String(right.finishedAt ?? right.startedAt ?? right.createdAt ?? '').localeCompare(String(left.finishedAt ?? left.startedAt ?? left.createdAt ?? '')))
-    .slice(0, limit);
+  // Metrics consume summary fields only. Reuse the shared inventory rather
+  // than parsing every retained definition and step output on each poll.
+  // The inventory's creation order is not the metrics' completion order:
+  // finish sorting before applying the existing 120-run window.
+  return workflowRunInventory()
+    .filter(({ record }) => typeof record.id === 'string')
+    .sort((left, right) => String(right.record.finishedAt ?? right.record.startedAt ?? right.record.createdAt ?? '')
+      .localeCompare(String(left.record.finishedAt ?? left.record.startedAt ?? left.record.createdAt ?? ''))
+      || left.file.localeCompare(right.file))
+    .slice(0, limit)
+    .map(({ record }) => record as RawWorkflowRunRecord);
 }
 
 function workflowEventLogNames(): Map<string, string[]> {

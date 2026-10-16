@@ -5,6 +5,7 @@ import { MCPServerSSE, MCPServerStdio, MCPServerStreamableHttp, type MCPServer }
 import { BASE_DIR, LOCAL_MCP_ENABLED, PKG_DIR, getRuntimeEnv } from '../config.js';
 import { discoverMcpServers } from './mcp-config.js';
 import { mergedSpawnEnv } from './spawn-env.js';
+import { childEnvValue, mergeChildEnvLayers } from './child-env-layers.js';
 import { type McpNamespaceShim, createMcpNamespaceShim, parseNamespacedTool, slugifyServerName } from './mcp-namespace-shim.js';
 import { filterMcpToolsForScope } from './mcp-tool-filter.js';
 import {
@@ -64,10 +65,13 @@ function isNpxCommand(command: string): boolean {
   return base === 'npx' || base === 'npx.cmd' || base === 'npx.ps1';
 }
 
-function explicitServerEnvValue(server: ManagedMcpServer, keys: string[]): string | undefined {
+function explicitServerEnvValue(declared: Record<string, string>, keys: string[],
+  platform: NodeJS.Platform): string | undefined {
   for (const key of keys) {
-    const value = server.env?.[key];
-    if (typeof value === 'string' && value.length > 0) return value;
+    const value = childEnvValue(declared, key, platform);
+    // MCP blank declarations are passthrough/default requests, unlike the
+    // literal empty overrides accepted by the general child-env layer API.
+    if (value !== undefined && value.length > 0) return value;
   }
   return undefined;
 }
@@ -78,12 +82,13 @@ function mcpNpxCacheDir(serverName: string): string {
 
 function applyNpmConfigPair(
   env: Record<string, string>,
-  server: ManagedMcpServer,
+  declared: Record<string, string>,
   lowerKey: string,
   upperKey: string,
   fallback: string,
+  platform: NodeJS.Platform,
 ): void {
-  const explicit = explicitServerEnvValue(server, [lowerKey, upperKey]);
+  const explicit = explicitServerEnvValue(declared, [lowerKey, upperKey], platform);
   const value = explicit ?? fallback;
   env[lowerKey] = value;
   env[upperKey] = value;
@@ -105,34 +110,27 @@ function stdioLaunchArgs(server: ManagedMcpServer, sources?: McpServerEnvSources
     (match, key: string) => Object.hasOwn(declared, key) ? declared[key]! : match));
 }
 
-/** The MCP SDK prepends an uppercase PATH before spreading its supplied env.
- * Windows children accept only one case-insensitive spelling; publish PATH
- * after all overrides so a stale SDK default cannot shadow our augmentation.
+/** The MCP SDK prepends uppercase PATH/USERPROFILE/SYSTEMROOT and other OS
+ * defaults before spreading its supplied env. Publish uppercase Windows names
+ * after all overrides so a stale SDK default cannot shadow the effective value.
  * A declared server override wins over merged values. If a configuration has
  * conflicting spellings, exact PATH wins, then the last own case variant. */
 function stdioTransportEnv(env: Record<string, string>, declared: Record<string, string>,
   platform: NodeJS.Platform): Record<string, string> {
   if (platform !== 'win32') return env;
-  const pathValue = (values: Record<string, string>): string | undefined => {
-    const key = Object.hasOwn(values, 'PATH') ? 'PATH'
-      : Object.keys(values).reverse().find(name => name.toUpperCase() === 'PATH');
-    return key === undefined ? undefined : values[key];
-  };
-  const value = pathValue(declared) ?? pathValue(env);
-  const canonical = Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== 'PATH'));
-  if (value !== undefined) canonical.PATH = value;
-  return canonical;
+  return Object.fromEntries(Object.entries(mergeChildEnvLayers([env, declared], platform))
+    .map(([key, value]) => [key.toUpperCase(), value]));
 }
 
 function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
   merge: typeof mergedEnv = mergedEnv, platform: NodeJS.Platform = process.platform): Record<string, string> {
   const declared = declaredServerEnv(server, sources, platform);
-  const env = { ...merge(declared) };
-  if (!server.command || !isNpxCommand(server.command)) return stdioTransportEnv(env, declared, platform);
-  if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return stdioTransportEnv(env, declared, platform);
+  const env = { ...stdioTransportEnv(merge(declared), declared, platform) };
+  if (!server.command || !isNpxCommand(server.command)) return env;
+  if (!runtimeFlagEnabled('CLEMMY_MCP_NPX_ISOLATED_CACHE', true)) return env;
 
   const ownedCacheDir = mcpNpxCacheDir(server.name);
-  const cacheDir = explicitServerEnvValue(server, ['npm_config_cache', 'NPM_CONFIG_CACHE'])
+  const cacheDir = explicitServerEnvValue(declared, ['npm_config_cache', 'NPM_CONFIG_CACHE'], platform)
     ?? ownedCacheDir;
   try {
     mkdirSync(cacheDir, { recursive: true });
@@ -152,12 +150,14 @@ function stdioLaunchEnv(server: ManagedMcpServer, sources?: McpServerEnvSources,
     // npm will report the real launch failure if the cache path is unusable.
   }
 
-  applyNpmConfigPair(env, server, 'npm_config_cache', 'NPM_CONFIG_CACHE', cacheDir);
-  applyNpmConfigPair(env, server, 'npm_config_update_notifier', 'NPM_CONFIG_UPDATE_NOTIFIER', 'false');
-  applyNpmConfigPair(env, server, 'npm_config_audit', 'NPM_CONFIG_AUDIT', 'false');
-  applyNpmConfigPair(env, server, 'npm_config_fund', 'NPM_CONFIG_FUND', 'false');
-  applyNpmConfigPair(env, server, 'npm_config_yes', 'NPM_CONFIG_YES', 'true');
-  return stdioTransportEnv(env, declared, platform);
+  applyNpmConfigPair(env, declared, 'npm_config_cache', 'NPM_CONFIG_CACHE', cacheDir, platform);
+  applyNpmConfigPair(env, declared, 'npm_config_update_notifier', 'NPM_CONFIG_UPDATE_NOTIFIER', 'false', platform);
+  applyNpmConfigPair(env, declared, 'npm_config_audit', 'NPM_CONFIG_AUDIT', 'false', platform);
+  applyNpmConfigPair(env, declared, 'npm_config_fund', 'NPM_CONFIG_FUND', 'false', platform);
+  applyNpmConfigPair(env, declared, 'npm_config_yes', 'NPM_CONFIG_YES', 'true', platform);
+  // Deduplicate host-owned npm aliases only after their policy is applied;
+  // replaying the declaration layer here would undo those defaults.
+  return stdioTransportEnv(env, {}, platform);
 }
 
 function localNodeCommand(): string {

@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
+import {
+  inlineCreationTestReturnedMetadata,
+  notifyInlineCreationTestReturned,
+} from '../../execution/inline-creation-test-delivery.js';
 import { query as claudeQuery } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentInputItem } from '@openai/agents-core';
 import type {
@@ -43,7 +47,7 @@ import {
   type ModelRouteMetricsContext,
 } from '../model-route-metrics.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import { appendEvent, listEvents, listToolOutputInvocationNonces, writeToolOutput } from './eventlog.js';
+import { appendEvent, listEvents, listToolOutputInvocationNonces, withEventPublicationTransaction, writeToolOutput } from './eventlog.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { assertConversationProtocolAtProviderBoundary } from './conversation-protocol-boundary.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
@@ -104,6 +108,7 @@ import {
 import {
   activateDispatchLease,
   assertDispatchLeaseCurrent,
+  isDispatchLeaseCurrent,
   revokeDispatchLeaseBeforeRecovery,
   serializeDispatchLease,
   type DispatchLeaseRef,
@@ -913,11 +918,13 @@ function appendSdkTopLevelToolEvent(
     successful?: boolean;
     output?: unknown;
     invocationNonce?: string;
+    /** Host observation only; late audit rows cannot acknowledge delivery. */
+    authoritativeReturn?: boolean;
     providerDispatched?: boolean;
     replayedFromCallId?: string;
   },
   parentEventId?: string,
-  attribution?: { sourceUserSeq?: number; runScopeId?: string; attemptId?: string },
+  attribution?: { sourceUserSeq?: number; runScopeId?: string; attemptId?: string; dispatchLease?: DispatchLeaseRef },
 ): string | undefined {
   if (!sessionId) return undefined;
   try {
@@ -939,63 +946,86 @@ function appendSdkTopLevelToolEvent(
       && !detectStructuredToolFailure(result.output).failed
       ? sdkToolResultText(result.output)
       : null;
-    const event = appendEvent({
-      sessionId,
-      turn: 0,
-      role: type === 'tool_called' ? 'Clem' : 'tool',
-      type,
-      ...(type === 'tool_returned' && parentEventId ? { parentEventId } : {}),
-      data: {
-        ...(attribution?.sourceUserSeq ? { sourceUserSeq: attribution.sourceUserSeq } : {}),
-        ...(attribution?.runScopeId ? { runScopeId: attribution.runScopeId } : {}),
-        ...(attribution?.attemptId ? { attemptId: attribution.attemptId } : {}),
-        tool: toolName || undefined,
-        callId,
-        canonicalCallId: callId,
-        accounting: 'top_level',
-        topologyRole,
-        ...(type === 'tool_called' ? {
-          correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
-        } : {}),
-        effect: metadata.effect,
-        ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
-        ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
-        ...(metadata.reversibility ? { reversibility: metadata.reversibility } : {}),
-        ...(metadata.recoverySemantics ? { recoverySemantics: metadata.recoverySemantics } : {}),
-        ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
-        ...(type === 'tool_returned' ? {
-          ok: !result?.isError,
-          successfulBusinessResult: result?.successful === true && topologyRole === 'business',
-          ...(result?.successful === true
-            && topologyRole === 'control'
-            && metadata.effectiveTool
-            && metadata.effect === 'local_write'
-            && registeredToolSideEffect(metadata.effectiveTool) === 'write'
-            && hostLocalWriteCommitResultIsProven(result.output)
-            ? { successfulAuthoringResult: true }
-            : {}),
-          ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
-          // Keep the canonical row independently useful to semantic readers.
-          // The full payload still lives in tool_outputs; this matches the
-          // existing bounded transport preview without duplicating the body.
-          ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
-          ...(result?.output !== undefined && isClaudeLocalComposioSdkTool(name)
-            ? { result: sdkToolResultText(result.output) }
-            : {}),
-          ...(successfulWorkflowGetResult !== null
-            ? { result: successfulWorkflowGetResult }
-            : {}),
-          ...(result?.providerDispatched === false ? {
-            providerDispatched: false,
-            ...(result.replayedFromCallId ? { replayedFromCallId: result.replayedFromCallId } : {}),
-            replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
+    let inlineDeliveryMetadata: ReturnType<typeof inlineCreationTestReturnedMetadata> = {};
+    const event = withEventPublicationTransaction(() => {
+      inlineDeliveryMetadata = (() => {
+        if (type !== 'tool_returned' || typeof attribution?.sourceUserSeq !== 'number'
+          || result?.output === undefined || result.authoritativeReturn !== true
+          || result.isError || result.providerDispatched === false
+          || !attribution.dispatchLease || !isDispatchLeaseCurrent(attribution.dispatchLease)) return {};
+        try { return inlineCreationTestReturnedMetadata({
+            sessionId,
+            sourceUserSeq: attribution.sourceUserSeq,
+            callId,
+            toolName,
+            result: result.output,
+            invocationNonce: result.invocationNonce,
+            authoritativeReturn: true,
+            dispatchLease: attribution.dispatchLease,
+          }); } catch { return {}; }
+      })();
+      return appendEvent({
+        sessionId,
+        turn: 0,
+        role: type === 'tool_called' ? 'Clem' : 'tool',
+        type,
+        ...(type === 'tool_returned' && parentEventId ? { parentEventId } : {}),
+        data: {
+          ...(attribution?.sourceUserSeq ? { sourceUserSeq: attribution.sourceUserSeq } : {}),
+          ...(attribution?.runScopeId ? { runScopeId: attribution.runScopeId } : {}),
+          ...(attribution?.attemptId ? { attemptId: attribution.attemptId } : {}),
+          tool: toolName || undefined,
+          callId,
+          canonicalCallId: callId,
+          accounting: 'top_level',
+          topologyRole,
+          ...(type === 'tool_called' ? {
+            correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
           } : {}),
-          ...(!result?.isError && result?.output !== undefined
-            ? (() => { const g = sdkToolResultGlimpse(result.output); return g ? { glimpse: g } : {}; })()
-            : {}),
-        } : {}),
-      },
+          effect: metadata.effect,
+          ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
+          ...(metadata.toolSlug ? { toolSlug: metadata.toolSlug } : {}),
+          ...(metadata.reversibility ? { reversibility: metadata.reversibility } : {}),
+          ...(metadata.recoverySemantics ? { recoverySemantics: metadata.recoverySemantics } : {}),
+          ...(type === 'tool_called' ? { arguments: sdkToolArgumentsPreview(source?.input) } : {}),
+          ...(type === 'tool_returned' ? {
+            ok: !result?.isError,
+            successfulBusinessResult: result?.successful === true && topologyRole === 'business',
+            ...(result?.successful === true
+              && topologyRole === 'control'
+              && metadata.effectiveTool
+              && metadata.effect === 'local_write'
+              && registeredToolSideEffect(metadata.effectiveTool) === 'write'
+              && hostLocalWriteCommitResultIsProven(result.output)
+              ? { successfulAuthoringResult: true }
+              : {}),
+            ...(result?.invocationNonce ? { invocationNonce: result.invocationNonce } : {}),
+            ...inlineDeliveryMetadata,
+            // Keep the canonical row independently useful to semantic readers.
+            // The full payload still lives in tool_outputs; this matches the
+            // existing bounded transport preview without duplicating the body.
+            ...(result?.output !== undefined ? { preview: sdkToolResultPreview(result.output) } : {}),
+            ...(result?.output !== undefined && isClaudeLocalComposioSdkTool(name)
+              ? { result: sdkToolResultText(result.output) }
+              : {}),
+            ...(successfulWorkflowGetResult !== null
+              ? { result: successfulWorkflowGetResult }
+              : {}),
+            ...(result?.providerDispatched === false ? {
+              providerDispatched: false,
+              ...(result.replayedFromCallId ? { replayedFromCallId: result.replayedFromCallId } : {}),
+              replayKind: SETTLED_READ_REPEAT_REPLAY_KIND,
+            } : {}),
+            ...(!result?.isError && result?.output !== undefined
+              ? (() => { const g = sdkToolResultGlimpse(result.output); return g ? { glimpse: g } : {}; })()
+              : {}),
+          } : {}),
+        },
+      });
     });
+    if (inlineDeliveryMetadata.inlineCreationTestDelivery) {
+      try { notifyInlineCreationTestReturned(event.id); } catch { /* durable retry owns repair */ }
+    }
     return event.id;
   } catch { /* progress/accounting must never break the stream */ }
   return undefined;
@@ -3761,6 +3791,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               successful: resultLooksSuccessful,
               output: tr.output,
               invocationNonce,
+              authoritativeReturn: Boolean(queryDispatchLease)
+                && !queryDispatchRevoked
+                && isDispatchLeaseCurrent(queryDispatchLease),
               ...(settledReadReplay ? {
                 providerDispatched: false,
                 replayedFromCallId: settledReadReplay.sourceCallId,
@@ -3771,6 +3804,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
               sourceUserSeq: options.sourceUserSeq,
               runScopeId: trackerScopeId,
               attemptId: options.dispatchLease?.runAttemptId,
+              dispatchLease: queryDispatchLease,
             },
           );
           if (

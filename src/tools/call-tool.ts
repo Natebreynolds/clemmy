@@ -4,7 +4,7 @@
  * When CLEMMY_CODEX_TOOL_SEARCH is on, most built-in tools leave the first-class
  * schema surface and live only in the catalog text. call_tool is how the model
  * reaches one of those catalog-only tools THIS turn: it names the tool + passes a
- * JSON args string, and call_tool dispatches it through the exact same gate battery
+ * JSON args object or legacy string, and call_tool dispatches it through the same gate battery
  * a first-class call would hit.
  *
  * Safety mechanics (from the plan):
@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { jsonArgumentText, jsonObjectArgument } from './json-argument.js';
 import type { RuntimeContextValue } from '../types.js';
 import { getToolOutputContext, sessionIdFromRunContext } from '../runtime/harness/tool-output-context.js';
 import { mcpTransportPresentationMaxChars } from '../runtime/harness/tool-output-format.js';
@@ -399,16 +400,25 @@ async function invokeCurrentCatalogProductionPort(input: {
 }
 
 const DESCRIPTION = [
-  'Invoke a catalog built-in that is not one of your first-class tools: exact `name` (from the catalog / tool_search) plus `args_json`, a JSON object string of its arguments ("{}" for none).',
+  'Invoke a catalog built-in that is not one of your first-class tools: exact `name` (from the catalog / tool_search) plus `args_json`, the arguments as a JSON object ({} for none). A legacy JSON object string is also accepted.',
   'call_tool never prompts on its own — the target\'s own classification decides: a read runs immediately; a write/send/irreversible target gates exactly as if called directly. http_read is a dedicated bounded read-only HTTP GET tool. Legacy http_fetch, web_fetch, web_fetch_simple and fetch_url aliases require the allowed curl path.',
   'Arguments that miss the schema make NO change and return the schema — fix and retry without broad discovery; call tool_search once only for an unresolved capability.',
 ].join(' ');
 
 const CONTROL_ONLY_DESCRIPTION = [
-  'Invoke an available native control, recovery, or READ tool: exact `name` plus `args_json` (a JSON object string). Prefer a tool\'s direct callable when its schema is already loaded.',
+  'Invoke an available native control, recovery, or READ tool: exact `name` plus `args_json`, the arguments as a JSON object; a legacy JSON object string is also accepted. Prefer a tool\'s direct callable when its schema is already loaded.',
   'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
   'Invalid arguments dispatch nothing and return the exact schema. Correct the arguments using that schema; use tool_search only when the capability or schema is still missing.',
 ].join(' ');
+
+function callToolInputSchema(controlOnlyBuiltins = false) {
+  return z.object({
+    name: z.string().min(1).describe(controlOnlyBuiltins
+      ? 'Exact control/recovery tool name returned by tool_search.'
+      : 'Exact built-in name from the catalog, or a connected external MCP tool as <server>__<tool>.'),
+    args_json: jsonObjectArgument().describe('The target\'s arguments as a JSON object ({} for none). A legacy JSON object string is also accepted.'),
+  }).strict();
+}
 
 /** Lazily-built, memoized name → Zod schema map for local runtime tools. Dynamic
  *  imported so this module (imported by the orchestrator) never forms an eval-time
@@ -879,16 +889,16 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       ? ` The confirmed source name was approximated. Retry through work_call with exactly one bound inner name: ${exactNames.map((name) => `"${name}"`).join(', ')}; do not rediscover or switch provider families.`
       : '';
   };
-  const parameters = z.object({
-    name: z.string().min(1).describe(options.controlOnlyBuiltins
-      ? 'Exact control/recovery tool name returned by tool_search.'
-      : 'Exact built-in name from the catalog, or a connected external MCP tool as <server>__<tool>.'),
-    args_json: z.string().describe('JSON object string of the target\'s arguments ("{}" for none).'),
-  });
+  const parameters = callToolInputSchema(options.controlOnlyBuiltins);
+  const advertisedParameters = z.toJSONSchema(parameters, { io: 'input' });
   const configured = tool({
     name: 'call_tool',
     description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
-    parameters,
+    // Generic argument objects have caller-selected keys and JSON values.
+    // Provider-strict conversion cannot express that shape; the exact outer
+    // Zod schema below still validates every invocation before inner dispatch.
+    parameters: advertisedParameters as any,
+    strict: false,
     isEnabled: async () => options.modelVisibility
       ? Boolean(await options.modelVisibility())
       : true,
@@ -915,10 +925,42 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
     // needsApproval intentionally omitted → false. Gate decisions come from the
     // INNER tool via dispatchBatchItemTool (see file header). Do NOT set this true.
     execute: async (
-      { name, args_json }: { name: string; args_json: string },
+      input: unknown,
       runContext: unknown,
       details: { toolCall?: { callId?: string; id?: string } } | undefined,
     ): Promise<string> => {
+      const chargeRefusedAttempt = (): void => {
+        const accountingContext = harnessRunContextStorage.getStore();
+        const counter = accountingContext?.counter;
+        if (counter && !hostOwnsLogicalCallAccounting(accountingContext!.sessionId, details?.toolCall?.callId ?? details?.toolCall?.id)) {
+          if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
+          counter.increment();
+        }
+      };
+      const parsed = parameters.safeParse(input);
+      if (!parsed.success) {
+        // The harness's exact local-invalidity attestation charges this outer
+        // refusal before invoke. No inner call starts, so execute must not
+        // charge it a second time.
+        const guidance = describeInvalidToolInput(
+          { name: 'InvalidToolInputError', originalError: parsed.error },
+          'call_tool',
+          { inputSchema: advertisedParameters },
+        );
+        const base = 'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool';
+        const violations = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
+          ? issue.keys.map((key) => [...issue.path, key].join('.'))
+          : [issue.path.join('.') || '(root)']);
+        return new InvalidArgumentsPreDispatchResult(
+          guidance ? `${base}\n${guidance}` : base,
+          true,
+          carrierRepairKeyFor({ violations }),
+        ) as unknown as string;
+      }
+      const name = parsed.data.name;
+      // This is the only added serialization: legacy strings stay exact, and
+      // object arguments become the existing internal JSON-string transport.
+      const args_json = jsonArgumentText(parsed.data.args_json) as string;
       let resolvedRefusalTarget: ResolvedCarrierTarget | undefined;
       // Exactly-once budget contract: the harness wrapper exempts call_tool
       // from the per-turn counter on the legacy lane (the INNER wrapper charges it on the
@@ -965,14 +1007,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         payload: Record<string, unknown>,
         classification: 'invalid_arguments' | 'policy_denial' = 'invalid_arguments',
       ): string => {
-        const accountingContext = harnessRunContextStorage.getStore();
-        const counter = accountingContext?.counter;
-        if (counter && !hostOwnsLogicalCallAccounting(accountingContext!.sessionId, details?.toolCall?.callId ?? details?.toolCall?.id)) {
-          // The ceiling is terminal for this turn. Returning another nominal
-          // refusal here would cost zero calls and let the model retry forever.
-          if (counter.willExceed()) throw new ToolCallsLimitExceeded(counter.limit);
-          counter.increment();
-        }
+        // The ceiling is terminal for this turn. A refusal must not cost zero
+        // calls and let the model retry forever.
+        chargeRefusedAttempt();
         // Preserve the exact JSON corrective for the model while retaining a
         // nominal, local-only proof for the surrounding effect ledger. A
         // provider-returned object or marker can never manufacture this class.
@@ -1576,18 +1613,19 @@ export function registerCallToolMcp(
       details?: { toolCall?: { callId?: string; id?: string } },
     ) => Promise<unknown>;
   };
-  server.tool(
+  server.registerTool(
     'call_tool',
-    options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
     {
-      name: z.string().min(1).describe('Exact built-in tool name returned by tool_search.'),
-      args_json: z.string().describe('JSON object string matching that tool\'s returned schema. Use "{}" for no args.'),
+      description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
+      inputSchema: callToolInputSchema(options.controlOnlyBuiltins),
     },
-    async ({ name, args_json }: { name: string; args_json: string }) => {
+    async (input) => {
       const sessionId = getToolOutputContext()?.sessionId ?? '';
       const output = await dispatcher.invoke(
         { context: { sessionId } },
-        JSON.stringify({ name, args_json }),
+        // Keep the MCP input in its original representation. The dispatcher
+        // validates it before serializing any structured inner arguments.
+        JSON.stringify(input),
       );
       // TRUTH AT THE TRANSPORT. Every deferred built-in reaches the Claude lane
       // through here, so this is where a harness refusal stops looking like an
@@ -1603,7 +1641,7 @@ export function registerCallToolMcp(
         isError: isHarnessRefusalText(rendered),
         maxChars: mcpTransportPresentationMaxChars({
           toolName: 'call_tool',
-          args: { name, args_json },
+          args: input,
           routedModelId: harnessRunContextStorage.getStore()?.routedModelId,
         }),
       });

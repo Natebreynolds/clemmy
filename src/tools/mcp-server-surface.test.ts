@@ -17,6 +17,8 @@ const { harnessRunContextStorage } = await import('../runtime/harness/brackets.j
 const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
+const { z } = await import('zod');
+const { toolSchemaFingerprint } = await import('../agents/capability-envelope.js');
 const {
   activateDispatchLease,
   revokeDispatchLease,
@@ -288,4 +290,106 @@ test('in-process MCP refuses a superseded SDK attempt before entering its handle
     (err: unknown) => err instanceof StaleDispatchLeaseError,
   );
   assert.equal(handlerCalls, 1, 'stale call was rejected before handler bookkeeping/work');
+});
+
+test('modern MCP registration preserves original arguments and exact lease/session/source/run context', async () => {
+  const anchor = anchoredSession('inspect a controlled modern tool context');
+  const lease = activateDispatchLease({ sessionId: anchor.sessionId, scopeId: `${anchor.sessionId}::modern-query` });
+  const runScopeId = `${anchor.sessionId}::run`;
+  const observed: string[] = [];
+  const server = createClementineMcpServer({
+    ...anchor, dispatchLease: lease, runScopeId, workerScope: true, directOrchestrator: false,
+    workflowRunId: 'fixture-workflow-run', workflowName: 'fixture-workflow', stepId: 'fixture-step',
+    mcpToolScope: null, allowedTools: ['modern_context_probe'], onToolRegistered: name => observed.push(name),
+  });
+  const payload = { args_json: JSON.parse('{"__proto__":{"retained":true},"literal":"unchanged"}') };
+  const extra = { requestId: 'fixture-request' };
+  let calls = 0;
+  let bodyCounter: { calls: number } | undefined;
+  server.registerTool('modern_context_probe', {
+    description: 'Read the controlled context.', inputSchema: z.strictObject({ args_json: z.unknown() }),
+  }, async (input, receivedExtra) => {
+    calls += 1;
+    assert.equal(input, payload, 'registration wrapper never copies/parses the invocation input');
+    assert.equal(input.args_json, payload.args_json);
+    assert.ok(Object.hasOwn(input.args_json as object, '__proto__'));
+    assert.equal(receivedExtra, extra, 'SDK callback extras remain untouched');
+    const ctx = harnessRunContextStorage.getStore();
+    assert.ok(ctx);
+    assert.equal(ctx.sessionId, anchor.sessionId);
+    assert.equal(ctx.sourceUserSeq, anchor.sourceUserSeq);
+    assert.equal(ctx.behaviorScopeId, runScopeId);
+    assert.equal(ctx.dispatchLease, lease);
+    assert.equal(ctx.runAttemptId, lease.runAttemptId);
+    assert.equal(ctx.workerScope, true);
+    assert.equal(ctx.directOrchestrator, false);
+    assert.equal(ctx.mcpToolScope, null);
+    assert.equal(ctx.counter.calls, 0);
+    ctx.counter.increment();
+    bodyCounter = ctx.counter;
+    assert.deepEqual(getToolOutputContext(), { sessionId: anchor.sessionId, sourceUserSeq: anchor.sourceUserSeq,
+      runScopeId, toolName: 'modern_context_probe', workflowRunId: 'fixture-workflow-run',
+      workflowName: 'fixture-workflow', stepId: 'fixture-step' });
+    return { content: [{ type: 'text' as const, text: 'controlled context received' }] };
+  });
+  const registered = (server as any)._registeredTools;
+  await registered.modern_context_probe.handler(payload, extra);
+  assert.equal(calls, 1);
+  assert.equal(bodyCounter?.calls, 1);
+  assert.equal(observed.filter(name => name === 'modern_context_probe').length, 1);
+  revokeDispatchLease(lease);
+  await assert.rejects(registered.modern_context_probe.handler(payload, extra), StaleDispatchLeaseError);
+  assert.equal(calls, 1, 'stale modern callback must fail before body observations/counter work');
+  assert.equal(bodyCounter?.calls, 1);
+});
+
+test('modern and legacy registrations share filtering, exact schema observation and additive always-load metadata', async () => {
+  const observed: string[] = [];
+  const server = createClementineMcpServer({
+    sessionId: 'fixture-modern-registration',
+    allowedTools: ['modern_allowed', 'legacy_allowed', 'tool_search', 'call_tool'],
+    alwaysLoadTools: ['modern_allowed'], deferredTools: ['workspace_roots'],
+    onToolRegistered: name => observed.push(name),
+  });
+  const schema = z.strictObject({ literal: z.string() });
+  const description = 'Return a controlled literal.';
+  server.registerTool('modern_allowed', { description, inputSchema: schema, _meta: { fixture: 'retained' } },
+    async () => ({ content: [{ type: 'text' as const, text: 'ok' }] }));
+  server.tool('legacy_allowed', 'A legacy control.', {}, async () => ({ content: [{ type: 'text' as const, text: 'ok' }] }));
+  const refused = server.registerTool('modern_denied', { inputSchema: schema },
+    async () => { throw new Error('filtered handler must never register'); });
+  const registered = (server as any)._registeredTools;
+  assert.equal(refused, undefined);
+  assert.equal(registered.modern_denied, undefined);
+  assert.equal(observed.filter(name => name === 'modern_denied').length, 0);
+  assert.equal(observed.filter(name => name === 'modern_allowed').length, 1);
+  assert.equal(observed.filter(name => name === 'legacy_allowed').length, 1);
+  assert.equal(registered.modern_allowed.inputSchema, schema, 'full strict schema is preserved for the SDK');
+  assert.deepEqual(registered.modern_allowed._meta, { fixture: 'retained', 'anthropic/alwaysLoad': true });
+  assert.equal(registered.legacy_allowed._meta?.['anthropic/alwaysLoad'], undefined);
+  assert.equal(await initializeClementineMcpCapabilityAuthority(server), true);
+  const envelope = await boundClementineMcpCapabilityEnvelope(server);
+  assert.equal(envelope?.capabilities.find(capability => capability.name === 'modern_allowed')?.schemaFingerprint,
+    toolSchemaFingerprint({ name: 'modern_allowed', description, parameters: z.toJSONSchema(schema) }),
+    'sealed callable schema must come from config.inputSchema, not the registration config wrapper');
+  assert.equal(envelope?.capabilities.some(capability => capability.name === 'modern_denied'), false);
+});
+
+test('modern deferred carrier admits during its exact lease and cannot acquire after that lease is revoked', async () => {
+  const anchor = anchoredSession('list the workspace roots using a controlled deferred carrier');
+  const lease = activateDispatchLease({ sessionId: anchor.sessionId, scopeId: `${anchor.sessionId}::deferred-query` });
+  const server = createClementineMcpServer({ ...anchor, dispatchLease: lease,
+    allowedTools: ['tool_search', 'call_tool'], deferredTools: ['workspace_roots'] });
+  assert.equal(await initializeClementineMcpCapabilityAuthority(server), true);
+  assert.equal((await boundClementineMcpCapabilityRevision(server))?.revision, 1);
+  const registered = (server as any)._registeredTools;
+  const output = await registered.call_tool.handler({ name: 'workspace_roots', args_json: {} });
+  assert.doesNotMatch(output.content[0].text, /requires_readmission|not_reachable|missing_session_context|arg_validation/i);
+  assert.match(output.content[0].text, /clementine-next|clemmy-mcp-surface/i);
+  assert.equal((await boundClementineMcpCapabilityRevision(server))?.revision, 2);
+  assert.equal((await boundClementineMcpCapabilityRevision(server))?.bound.includes('workspace_roots'), true);
+  revokeDispatchLease(lease);
+  await assert.rejects(registered.call_tool.handler({ name: 'workspace_roots', args_json: {} }), StaleDispatchLeaseError);
+  assert.equal((await boundClementineMcpCapabilityRevision(server))?.revision, 2,
+    'a stale physical server cannot mutate the sealed revision chain');
 });

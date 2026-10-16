@@ -1,5 +1,6 @@
 import { matchingPendingWorkflowVerification, disabledWorkflowRunMessage } from './workflow-verification-state.js';
-import { awaitCreationTestInline, releaseCreationTestInline } from '../execution/inline-creation-test-delivery.js';
+import { createInlineCreationTestDeliveryIntent, releaseInlineCreationTestWait, INLINE_CREATION_TEST_WAIT_MS } from '../execution/inline-creation-test-delivery.js';
+import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
 import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { currentDispatchLease } from '../runtime/harness/dispatch-lease.js';
 import {
@@ -3088,23 +3089,27 @@ export function queueWorkflowCreationTest(
   const origins = normalizeOriginSessionIds(opts?.originSessionId, opts?.originSessionIds);
   const origin = origins[0];
   const source = normalizedOptionalString(opts?.source);
-  const { id } = installFreshRandomRunRecord(opts?.idPrefix, (runId) => ({
-    id: runId,
-    workflow: name,
-    inputs: normalizedInputs,
-    status: 'creation_test',
-    ...(opts?.activateAfterCreationTest === false ? { activateAfterCreationTest: false } : {}),
-    ...(creationTestSource ? { creationTestSource } : {}),
-    mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
-    ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
-    ...(typeof opts?.autoRetestDepth === 'number' && opts.autoRetestDepth > 0
-      ? { autoRetestDepth: Math.trunc(opts.autoRetestDepth) }
-      : {}),
-    createdAt,
-    ...(source ? { source } : {}),
-    ...(origin ? { originSessionId: origin } : {}),
-    ...(origins.length > 1 ? { originSessionIds: origins } : {}),
-  }));
+  const { id } = installFreshRandomRunRecord(opts?.idPrefix, (runId) => {
+    const inlineCreationTestDelivery = createInlineCreationTestDeliveryIntent(runId, origin);
+    return {
+      id: runId,
+      workflow: name,
+      inputs: normalizedInputs,
+      status: 'creation_test',
+      ...(opts?.activateAfterCreationTest === false ? { activateAfterCreationTest: false } : {}),
+      ...(creationTestSource ? { creationTestSource } : {}),
+      ...(inlineCreationTestDelivery ? { inlineCreationTestDelivery } : {}),
+      mutationReceiptProtocolVersion: WORKFLOW_MUTATION_RECEIPT_PROTOCOL_VERSION,
+      ...(workflowDefinitionSnapshot ? { workflowDefinitionSnapshot } : {}),
+      ...(typeof opts?.autoRetestDepth === 'number' && opts.autoRetestDepth > 0
+        ? { autoRetestDepth: Math.trunc(opts.autoRetestDepth) }
+        : {}),
+      createdAt,
+      ...(source ? { source } : {}),
+      ...(origin ? { originSessionId: origin } : {}),
+      ...(origins.length > 1 ? { originSessionIds: origins } : {}),
+    };
+  });
   return {
     status: 'queued',
     id,
@@ -3124,6 +3129,8 @@ export interface WorkflowCreationTestSettlement {
   pass: boolean;
   activationCompatible: boolean;
   enabled: boolean;
+  /** Canonical terminal failure/cancellation of the test, rather than a rehearsal verdict. */
+  terminalStatus?: 'cancelled' | 'failed';
   /** The creation-test report the daemon wrote (step lines, what to fix). */
   body: string;
   /** Per-step verdicts as the test recorded them (structured; may be empty for
@@ -3155,7 +3162,7 @@ function creationTestStepVerdicts(raw: unknown): WorkflowCreationTestStepVerdict
 /** Longest a creation test is awaited inside the authoring tool. Below the
  * tool's own externalApi budget so a slow test returns the queued message
  * instead of a timeout. */
-export const CREATION_TEST_AWAIT_MS = 240_000;
+export const CREATION_TEST_AWAIT_MS = INLINE_CREATION_TEST_WAIT_MS;
 const CREATION_TEST_POLL_MS = 1_500;
 
 /**
@@ -3169,47 +3176,68 @@ const CREATION_TEST_POLL_MS = 1_500;
 export async function awaitWorkflowCreationTestSettlement(
   runId: string,
   workflowName: string,
-  options: { boundMs?: number; pollMs?: number; drainRegistered?: () => boolean } = {},
+  options: { boundMs?: number; pollMs?: number; drainRegistered?: () => boolean; signal?: AbortSignal } = {},
 ): Promise<WorkflowCreationTestSettlement | null> {
+  const signal = options.signal ?? currentToolAbortSignal();
   const registered = options.drainRegistered ?? workflowRunDrainKickRegistered;
-  if (!registered()) return null;
+  if (!registered() || signal?.aborted) { releaseInlineCreationTestWait(runId); return null; }
   const boundMs = options.boundMs ?? CREATION_TEST_AWAIT_MS;
   const pollMs = options.pollMs ?? CREATION_TEST_POLL_MS;
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const started = Date.now();
+  let handedOff = false;
   const settledNow = (): WorkflowCreationTestSettlement | null => {
-    let record: { notifiedAt?: unknown; completedAt?: unknown } | null = null;
-    try {
-      record = JSON.parse(readFileSync(file, 'utf8')) as { notifiedAt?: unknown; completedAt?: unknown };
-    } catch { /* not written yet or being rewritten; poll again */ }
-    if (!record || (typeof record.notifiedAt !== 'string' && typeof record.completedAt !== 'string')) return null;
+    let record: Record<string, unknown>;
+    try { record = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; } catch { return null; }
+    if (record.id !== runId || record.workflow !== workflowName) return null;
+    const report = record.reportBack as { version?: unknown; detail?: unknown } | undefined;
+    const rehearsal = rehearsalVerdictFromRunRecord(record);
+    const finished = typeof record.finishedAt === 'string' && Number.isFinite(Date.parse(record.finishedAt));
+    const terminalStatus = record.status === 'cancelled' ? 'cancelled' as const
+      : ['error', 'failed', 'blocked'].includes(String(record.status)) ? 'failed' as const
+      : record.status === 'creation_test' && finished && (!rehearsal || report?.version !== 1 || typeof report.detail !== 'string' || !report.detail.trim()) ? 'failed' as const : undefined;
+    if (terminalStatus) {
+      const canonicalDetail = report?.version === 1 && typeof report.detail === 'string' && report.detail.trim() ? report.detail
+        : typeof record.error === 'string' && record.error.trim() ? record.error
+        : terminalStatus === 'cancelled' ? 'This creation test was cancelled. No passed rehearsal was recorded.'
+        : 'This creation test ended without a recorded rehearsal verdict. Check this saved run before testing again.';
+      return { runId, pass: false, activationCompatible: false, enabled: readWorkflow(workflowName)?.data.enabled === true,
+        terminalStatus, body: canonicalDetail, steps: [], waitedMs: Date.now() - started };
+    }
+    if (record.status !== 'creation_test' || !finished || report?.version !== 1
+      || typeof report.detail !== 'string' || !report.detail.trim() || !rehearsal) return null;
+    // Notifications add step hints only when they describe this exact canonical
+    // report. A missing card never fabricates a test/activation verdict.
     const notification = getNotification(`workflow-${runId}-creationtest`);
-    const enabled = readWorkflow(workflowName)?.data.enabled === true;
+    const matchingNotification = notification?.metadata?.runId === runId && notification.body === report.detail ? notification : undefined;
+    const workflow = readWorkflow(workflowName)?.data;
     return {
       runId,
-      pass: notification?.metadata?.pass === true,
-      activationCompatible: notification?.metadata?.activationCompatible !== false,
-      enabled,
-      body: notification?.body ?? '',
-      steps: creationTestStepVerdicts(notification?.metadata?.steps),
+      pass: rehearsal.passed,
+      activationCompatible: workflow !== undefined && workflowRehearsalKey(workflow) === rehearsal.definitionKey,
+      enabled: workflow?.enabled === true,
+      body: report.detail,
+      steps: creationTestStepVerdicts(matchingNotification?.metadata?.steps),
       waitedMs: Date.now() - started,
     };
   };
-  // While this call waits, it is the one that delivers the result.
-  awaitCreationTestInline(runId);
-  let claimedByRunner = false;
   try {
-    while (Date.now() - started < boundMs) {
+    while (!signal?.aborted && Date.now() - started < boundMs) {
       const settled = settledNow();
-      if (settled) return settled;
-      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      if (settled) { handedOff = true; return settled; }
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, Math.min(pollMs, Math.max(0, boundMs - (Date.now() - started))));
+        signal?.addEventListener('abort', done, { once: true });
+        if (signal?.aborted) done();
+      });
     }
+    return null;
   } finally {
-    claimedByRunner = releaseCreationTestInline(runId);
+    // Handing bytes to the caller is not a delivery ACK. Only retained output
+    // plus the authoritative paired return can close the matching origin.
+    if (!handedOff) releaseInlineCreationTestWait(runId);
   }
-  // The runner settled it for this call at the deadline and sent no report,
-  // so the result must still come back here.
-  return claimedByRunner ? settledNow() : null;
 }
 
 /** Read-only lifecycle evidence; never grants execution authority. */

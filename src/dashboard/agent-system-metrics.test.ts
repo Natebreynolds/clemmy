@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -426,5 +427,62 @@ test('old team-agent errors and inbox items, hub-only rosters and unset routing 
   } finally {
     if (priorRoles === undefined) delete process.env.CLEMMY_MODEL_ROLES;
     else process.env.CLEMMY_MODEL_ROLES = priorRoles;
+  }
+});
+
+
+test('metrics reuse unchanged run summaries and keep completion ordering before the 120-run window', async (t) => {
+  const inventory = await import('../execution/workflow-run-inventory.js');
+  const runDir = path.join(TMP_HOME, 'workflows', 'runs');
+  const prior = fs.existsSync(runDir) ? fs.readdirSync(runDir).map(name => ({ name, bytes: fs.readFileSync(path.join(runDir, name)) })) : [];
+  const originalRead = fs.readFileSync;
+  let runReads = 0;
+  try {
+    fs.rmSync(runDir, { recursive: true, force: true });
+    fs.mkdirSync(runDir, { recursive: true });
+    inventory._resetWorkflowRunInventoryForTests();
+    const heavy = 'controlled retained output '.repeat(1_000);
+    for (let i = 0; i < 125; i += 1) writeWorkflowRun({
+      id: `poll-fixture-${String(i).padStart(3, '0')}`, workflow: 'poll-fixture', status: 'completed',
+      createdAt: new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString(),
+      startedAt: '2026-10-01T03:00:00.000Z', finishedAt: '2026-10-01T04:00:00.000Z',
+      goalOutcome: 'satisfied', stepOutputs: { fixture: heavy }, output: heavy,
+      workflowDefinitionSnapshot: { version: 1, definition: { retained: heavy } },
+    });
+    const oldRun = { id: 'old-created-newly-finished', workflow: 'poll-fixture', status: 'error',
+      createdAt: '2020-01-01T00:00:00.000Z', startedAt: '2026-10-01T03:00:00.000Z',
+      finishedAt: '2030-01-01T00:00:00.000Z', needsAttention: true, goalOutcome: 'escalate',
+      error: 'Controlled fixture failure', stepOutputs: { fixture: heavy } };
+    writeWorkflowRun(oldRun);
+    t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const file = String(args[0]);
+      if (file.startsWith(runDir + path.sep) && file.endsWith('.json')) runReads += 1;
+      return Reflect.apply(originalRead, fs, args);
+    });
+    syncBuiltinESMExports();
+    const cold = collectAgentSystemMetrics();
+    assert.equal(runReads, 126);
+    assert.equal(cold.loops.workflowRuns.total, 120);
+    assert.equal(cold.loops.workflowRuns.failed, 1, 'an older-created run that just finished stays inside the completion window');
+    assert.equal(cold.loops.workflowRuns.clean, 119);
+    assert.equal(cold.loops.goalEscalated, 1);
+    runReads = 0;
+    const warm = collectAgentSystemMetrics();
+    assert.equal(runReads, 0, 'a repeated metrics poll does not reread unchanged heavy run JSON');
+    assert.deepEqual(warm.loops.workflowRuns, cold.loops.workflowRuns);
+    writeWorkflowRun({ ...oldRun, status: 'completed', needsAttention: false, goalOutcome: 'satisfied', error: undefined });
+    runReads = 0;
+    const changed = collectAgentSystemMetrics();
+    assert.equal(runReads, 1, 'only the changed run is reparsed');
+    assert.equal(changed.loops.workflowRuns.total, 120);
+    assert.equal(changed.loops.workflowRuns.failed, 0);
+    assert.equal(changed.loops.workflowRuns.clean, 120);
+    assert.equal(changed.loops.goalEscalated, 0);
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    fs.rmSync(runDir, { recursive: true, force: true });
+    fs.mkdirSync(runDir, { recursive: true });
+    for (const entry of prior) fs.writeFileSync(path.join(runDir, entry.name), entry.bytes);
+    inventory._resetWorkflowRunInventoryForTests();
   }
 });

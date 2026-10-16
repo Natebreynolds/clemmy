@@ -39,6 +39,15 @@
 
 import { z } from 'zod';
 
+// Only host-constructed opaque-document validators retain their exact parser
+// on the deferred JSON lane. Metadata or a caller's lookalike cannot opt in.
+const deferredJsonParsers = new WeakSet<z.ZodTypeAny>();
+
+export function preserveDeferredJsonParser<T extends z.ZodTypeAny>(schema: T): T {
+  deferredJsonParsers.add(schema);
+  return schema;
+}
+
 function withDescription(source: z.ZodTypeAny, target: z.ZodTypeAny): z.ZodTypeAny {
   return source.description ? target.describe(source.description) : target;
 }
@@ -145,6 +154,7 @@ export function normalizeShapeForCodexStrict(shape: z.ZodRawShape): z.ZodRawShap
  * dozens of meaningless nested nulls.
  */
 export function normalizeZodForDeferredJson(schema: z.ZodTypeAny): z.ZodTypeAny {
+  if (deferredJsonParsers.has(schema)) return schema;
   const def = (schema as unknown as { _def: { type?: string; [key: string]: unknown } })._def;
 
   switch (def?.type) {

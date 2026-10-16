@@ -155,11 +155,40 @@ type McpCapabilityController = {
 const MCP_CAPABILITY_CONTROLLERS = new WeakMap<McpServer, McpCapabilityController>();
 let coreCapabilityDescriptorsPromise: Promise<Map<string, SealableToolLike>> | null = null;
 
-function registrationDescriptor(args: readonly unknown[]): SealableToolLike | null {
+type ToolRegistrationMethod = 'tool' | 'registerTool';
+type ToolRegistrationCall = (...args: any[]) => unknown;
+
+/** Both public SDK methods currently create their registered tool directly.
+ * Intercept both so modern registrations cannot bypass the same host seams.
+ * The same-name guard also avoids duplicate wrappers/observations if an SDK
+ * version delegates the legacy method to the modern method internally. */
+function wrapToolRegistrations(server: McpServer, around: (
+  method: ToolRegistrationMethod, args: any[], register: () => unknown,
+) => unknown): void {
+  const surface = server as unknown as Record<ToolRegistrationMethod, ToolRegistrationCall>;
+  const registering = new Set<unknown>();
+  for (const method of ['tool', 'registerTool'] as const) {
+    const original = surface[method].bind(server);
+    surface[method] = (...args: any[]) => {
+      const name = args[0];
+      if (registering.has(name)) return original(...args);
+      registering.add(name);
+      try { return around(method, args, () => original(...args)); }
+      finally { registering.delete(name); }
+    };
+  }
+}
+
+function registrationDescriptor(args: readonly unknown[], method: ToolRegistrationMethod = 'tool'): SealableToolLike | null {
   const name = typeof args[0] === 'string' ? args[0].trim() : '';
   if (!name) return null;
-  const description = typeof args[1] === 'string' ? args[1] : '';
-  const schemaInput = typeof args[1] === 'string' ? args[2] : args[1];
+  const config = method === 'registerTool' && args[1] && typeof args[1] === 'object'
+    ? args[1] as Record<string, unknown> : undefined;
+  const description = method === 'registerTool'
+    ? typeof config?.description === 'string' ? config.description : ''
+    : typeof args[1] === 'string' ? args[1] : '';
+  const schemaInput = method === 'registerTool'
+    ? config?.inputSchema : typeof args[1] === 'string' ? args[2] : args[1];
   let parameters: unknown = null;
   if (schemaInput && typeof schemaInput === 'object') {
     try {
@@ -339,8 +368,7 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
     ?? (process.env.CLEMENTINE_MCP_DIRECT_ORCHESTRATOR ?? '').trim().toLowerCase() === 'on';
   const workerScope = opts.workerScope
     ?? (process.env.CLEMENTINE_MCP_WORKER_SCOPE ?? '').trim().toLowerCase() === 'on';
-  const originalTool = server.tool.bind(server) as (...args: any[]) => unknown;
-  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+  wrapToolRegistrations(server, (_method, args, register) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
     const last = args.length - 1;
     const handler = args[last];
@@ -386,8 +414,8 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
         );
       };
     }
-    return originalTool(...args);
-  };
+    return register();
+  });
 }
 
 // JIT tool-RAG for the Claude Agent SDK lane (Phase 1, Claude-brain port). When the
@@ -444,18 +472,17 @@ function installToolAllowlistFilter(
   // blob and asking the user to authorize a second search (live 2026-08-18
   // session-fixture-remap-a: "No such tool available: mcp__clementine-local__file_query").
   const FLOOR = new Set(['ping', 'file_query']);
-  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
-  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+  wrapToolRegistrations(server, (method, args, register) => {
     if (onConsidered) {
-      const descriptor = registrationDescriptor(args);
+      const descriptor = registrationDescriptor(args, method);
       if (descriptor) onConsidered(descriptor);
     }
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
     if (filtering && toolName && !allowed.has(toolName) && !FLOOR.has(toolName)) {
       return undefined; // not in the JIT set → don't advertise it (schema not sent)
     }
-    return wrapped(...args);
-  };
+    return register();
+  });
 }
 
 function installToolRegistrationObserver(
@@ -463,14 +490,13 @@ function installToolRegistrationObserver(
   observer?: (name: string, descriptor: SealableToolLike | null) => void,
 ): void {
   if (!observer) return;
-  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
-  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
-    const result = wrapped(...args);
+  wrapToolRegistrations(server, (method, args, register) => {
+    const result = register();
     if (result !== undefined && typeof args[0] === 'string') {
-      observer(args[0], registrationDescriptor(args));
+      observer(args[0], registrationDescriptor(args, method));
     }
     return result;
-  };
+  });
 }
 
 /** Mark only the recovery/hot subset as first-class for Claude's native MCP
@@ -480,15 +506,14 @@ function installToolRegistrationObserver(
 function installAlwaysLoadMetadata(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
   const alwaysLoad = new Set(resolvedAlwaysLoadTools(opts));
   if (alwaysLoad.size === 0) return;
-  const wrapped = server.tool.bind(server) as (...args: any[]) => unknown;
-  (server as unknown as { tool: (...args: any[]) => unknown }).tool = (...args: any[]) => {
+  wrapToolRegistrations(server, (_method, args, register) => {
     const toolName = typeof args[0] === 'string' ? args[0] : undefined;
-    const result = wrapped(...args) as { _meta?: Record<string, unknown>; update?: (value: { _meta?: Record<string, unknown> }) => void } | undefined;
+    const result = register() as { _meta?: Record<string, unknown>; update?: (value: { _meta?: Record<string, unknown> }) => void } | undefined;
     if (result && toolName && alwaysLoad.has(toolName) && typeof result.update === 'function') {
       result.update({ _meta: { ...(result._meta ?? {}), 'anthropic/alwaysLoad': true } });
     }
     return result;
-  };
+  });
 }
 
 export function createClementineMcpServer(opts: ClementineMcpServerOptions = {}): McpServer {

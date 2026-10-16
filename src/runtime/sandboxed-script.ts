@@ -21,7 +21,8 @@ import { existsSync, realpathSync, statSync, accessSync, constants as fsConstant
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { augmentPath } from './spawn-env.js';
+import { childExecutablePath } from './spawn-env.js';
+import { childEnvValue, mergeChildEnvLayers, type ChildEnvLayer } from './child-env-layers.js';
 import { stopWindowsProcessTree, type ProcessTreeStopResult } from './windows-process-tree.js';
 
 export const SANDBOXED_SCRIPT_UNCONFIRMED_STOP_GUIDANCE =
@@ -98,35 +99,45 @@ export function interpreterFor(
  * Clementine identity. None of these is a secret. `extra` keys are layered on
  * top (the caller's surface-specific vars + the ELECTRON_RUN_AS_NODE flag).
  */
-export function scrubbedChildEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir() ?? '';
-  const tmp = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? os.tmpdir();
-  const inheritedPath = process.env.PATH ?? process.env.Path;
+export function scrubbedChildEnv(extra: Record<string, string> = {}, options: {
+  inherited?: ChildEnvLayer; platform?: NodeJS.Platform;
+} = {}): Record<string, string> {
+  const platform = options.platform ?? process.platform;
+  const inherited = options.inherited ?? process.env;
+  const read = (key: string): string | undefined => childEnvValue(inherited, key, platform);
+  const home = read('HOME') ?? read('USERPROFILE') ?? os.homedir() ?? '';
+  const tmp = read('TMPDIR') ?? read('TEMP') ?? read('TMP') ?? os.tmpdir();
   const base: Record<string, string> = {
-    PATH: augmentPath(inheritedPath),
+    PATH: childExecutablePath(read('PATH')),
     HOME: home,
     TMPDIR: tmp,
-    TEMP: process.env.TEMP ?? tmp,
-    TMP: process.env.TMP ?? tmp,
-    SHELL: process.env.SHELL ?? process.env.ComSpec ?? (process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'),
-    USER: process.env.USER ?? process.env.USERNAME ?? process.env.LOGNAME ?? '',
-    USERNAME: process.env.USERNAME ?? process.env.USER ?? '',
-    LOGNAME: process.env.LOGNAME ?? process.env.USER ?? process.env.USERNAME ?? '',
-    USERPROFILE: process.env.USERPROFILE ?? home,
-    LANG: process.env.LANG ?? 'en_US.UTF-8',
-    LC_ALL: process.env.LC_ALL ?? 'en_US.UTF-8',
+    TEMP: read('TEMP') ?? tmp,
+    TMP: read('TMP') ?? tmp,
+    SHELL: read('SHELL') ?? read('ComSpec') ?? (platform === 'win32' ? 'cmd.exe' : '/bin/bash'),
+    USER: read('USER') ?? read('USERNAME') ?? read('LOGNAME') ?? '',
+    USERNAME: read('USERNAME') ?? read('USER') ?? '',
+    LOGNAME: read('LOGNAME') ?? read('USER') ?? read('USERNAME') ?? '',
+    USERPROFILE: read('USERPROFILE') ?? home,
+    LANG: read('LANG') ?? 'en_US.UTF-8',
+    LC_ALL: read('LC_ALL') ?? 'en_US.UTF-8',
     PYTHONIOENCODING: 'utf-8',
     PYTHONUNBUFFERED: '1',
     NO_COLOR: '1',
-    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? (home ? path.join(home, '.config') : ''),
-    XDG_CACHE_HOME: process.env.XDG_CACHE_HOME ?? (home ? path.join(home, '.cache') : ''),
-    XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? (home ? path.join(home, '.local', 'share') : ''),
-    APPDATA: process.env.APPDATA ?? '',
-    LOCALAPPDATA: process.env.LOCALAPPDATA ?? '',
-    ComSpec: process.env.ComSpec ?? '',
-    CLEMENTINE_HOME: process.env.CLEMENTINE_HOME ?? '',
+    XDG_CONFIG_HOME: read('XDG_CONFIG_HOME') ?? (home ? path.join(home, '.config') : ''),
+    XDG_CACHE_HOME: read('XDG_CACHE_HOME') ?? (home ? path.join(home, '.cache') : ''),
+    XDG_DATA_HOME: read('XDG_DATA_HOME') ?? (home ? path.join(home, '.local', 'share') : ''),
+    APPDATA: read('APPDATA') ?? '',
+    LOCALAPPDATA: read('LOCALAPPDATA') ?? '',
+    ComSpec: read('ComSpec') ?? '',
+    CLEMENTINE_HOME: read('CLEMENTINE_HOME') ?? '',
   };
-  return { ...base, ...extra };
+  // Native Windows loading/command lookup needs these OS values. This is a
+  // fixed nonsecret allowlist, never the daemon or user CLI environment.
+  if (platform === 'win32') for (const key of ['SystemRoot', 'windir', 'SystemDrive', 'PATHEXT']) {
+    const value = read(key);
+    if (value !== undefined) base[key] = value;
+  }
+  return mergeChildEnvLayers([base, extra], platform);
 }
 
 /** Set ELECTRON_RUN_AS_NODE only when the command IS the Electron/Node binary

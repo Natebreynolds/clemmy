@@ -7,7 +7,7 @@
  * the self-improvement helpers, and the novelty gate that decides whether a
  * session is even worth distilling.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -22,8 +22,8 @@ const {
   writeDistilledSkill, loadSkill, listSkills, renderSkillsIndex, findRelevantSkills,
   updateSkillFrontmatter, appendSkillPitfall, skillLearningEvidenceStatus, SKILLS_DIR,
 } = await import('./skill-store.js');
-const { assessNovelty, reinforceDraftSkills, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
-const { evaluateLearningCandidate } = await import('./learning-receipt.js');
+const { assessNovelty, reinforceDraftSkills, distillSkillFromSession, _testOnly_distillerPrompts, _testOnly_sanitizeDistilledSkillOutput } = await import('./skill-distiller.js');
+const { evaluateLearningCandidate, issueManualSkillDraftRequestReceipt } = await import('./learning-receipt.js');
 const { searchFactsByText } = await import('./facts.js');
 const { getFactEvidence } = await import('./temporal-memory.js');
 import type { TraceToolCall } from '../execution/trace-to-workflow.js';
@@ -160,6 +160,65 @@ test('updateSkillFrontmatter promotes a draft to approved; appendSkillPitfall re
 });
 
 // ─── C2: novelty gate ────────────────────────────────────────────────────────
+
+test('manual draft request receipts do not count as validated successes or promote a draft', async () => {
+  const first = issueManualSkillDraftRequestReceipt({ sessionId: 'manual-only-session', sourceId: 'manual-source-a', explicitUserRequest: true })!;
+  const second = issueManualSkillDraftRequestReceipt({ sessionId: 'manual-only-session', sourceId: 'manual-source-b', explicitUserRequest: true })!;
+  writeDistilledSkill({ name: 'manual-no-success', description: 'A requested procedure', body: 'Review the unproved procedure.',
+    origin: { kind: 'manual', sourceId: first.sourceId }, learningReceipt: first });
+  await reinforceDraftSkills(['manual-no-success'], 'success', undefined, first.sessionId, first);
+  await reinforceDraftSkills(['manual-no-success'], 'success', undefined, second.sessionId, second);
+  const skill = loadSkill('manual-no-success')!;
+  assert.equal(skill.frontmatter.tier, 'draft');
+  assert.equal(skill.frontmatter.useCount, 0);
+  assert.equal(skill.frontmatter.learningReceipts?.length, 1);
+});
+
+test('invalid trace session/frontier bindings cannot mutate an existing duplicate receipt or origin', async () => {
+  const objective = 'Read controlled fixture input and prepare a reusable summary';
+  const sessionId = 'controlled-snapshot-binding-session';
+  const receipt = evaluateLearningCandidate({ target: 'skill', authority: 'goal_validation', sessionId,
+    sourceId: 'new-verified-source', terminalSuccess: true, independentValidation: true }).receipt!;
+  writeDistilledSkill({ name: 'snapshot-binding-duplicate', description: objective, capabilityTask: objective,
+    body: 'Keep the original controlled procedure.', origin: { kind: 'chat', sourceId: 'prior-source' } });
+  const file = loadSkill('snapshot-binding-duplicate')!.skillPath;
+  const before = readFileSync(file, 'utf8');
+  const patches: Array<Record<string, unknown>> = [
+    { throughSeq: 12, traceSnapshot: { sessionId: 'different-session', throughSeq: 12, calls: [], returns: [] } },
+    { throughSeq: 12, traceSnapshot: { sessionId, throughSeq: 11, calls: [], returns: [] } },
+    { traceSnapshot: { sessionId, calls: [], returns: [] } },
+    { traceSnapshot: { sessionId, throughSeq: undefined, calls: [], returns: [] } },
+    { throughSeq: 12, traceSnapshot: { sessionId, throughSeq: NaN, calls: [], returns: [] } },
+    { traceSnapshot: null },
+    ...[-1, NaN, Infinity, 1.5, '12'].map(throughSeq => ({ throughSeq })),
+  ];
+  for (const patch of patches) {
+    const context = { objective, origin: { kind: 'chat' as const, sourceId: receipt.sourceId },
+      learningReceipt: receipt, ...patch } as Parameters<typeof distillSkillFromSession>[1];
+    const result = await distillSkillFromSession(sessionId, context);
+    assert.equal(result.status, 'failed');
+    assert.equal(readFileSync(file, 'utf8'), before, 'invalid binding must fail before duplicate lineage or receipt writes');
+    const skill = loadSkill('snapshot-binding-duplicate')!;
+    assert.equal(skill.frontmatter.capabilityOrigins?.length, 1);
+    assert.equal(skill.frontmatter.learningReceipts, undefined);
+  }
+});
+
+test('the actual distiller agent and prompt keep requested manual drafts separate from completed execution', () => {
+  const objective = 'Read controlled input and prepare a reusable summary';
+  const calls = [{ tool: 'read_file', callId: 'controlled-read', args: '{"path":"fixture.txt"}' }];
+  const manual = issueManualSkillDraftRequestReceipt({ sessionId: 'manual-prompt-session', sourceId: 'exact-consent', explicitUserRequest: true })!;
+  const requested = _testOnly_distillerPrompts({ objective, evidence: '', calls, learningReceipt: manual });
+  assert.match(requested.instructions, /USER-REQUESTED, UNREVIEWED/);
+  assert.match(requested.instructions, /attempted or failed calls are not proof of success/);
+  assert.match(requested.prompt, /completion is unverified/);
+  assert.match(requested.prompt, /read_file/);
+  assert.doesNotMatch(`${requested.instructions}\n${requested.prompt}`, /from a successful run|OBJECTIVE that was accomplished/);
+  const automatic = _testOnly_distillerPrompts({ objective, evidence: 'verified fixture result', calls,
+    learningReceipt: successReceipt('automatic-prompt') });
+  assert.match(automatic.instructions, /from a successful run/);
+  assert.match(automatic.prompt, /OBJECTIVE that was accomplished/);
+});
 
 function call(tool: string, args = '{}', slug?: string): TraceToolCall {
   return { tool, args, callId: `c${Math.random()}`, slug };

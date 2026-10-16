@@ -1,6 +1,8 @@
 import path from 'node:path';
 import os from 'node:os';
-import { accessSync, mkdirSync, readdirSync, readFileSync, statSync, constants as fsConstants } from 'node:fs';
+import { accessSync, closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync,
+  constants as fsConstants, type BigIntStats } from 'node:fs';
+import { childEnvValue, mergeChildEnvLayers, type ChildEnvLayer } from './child-env-layers.js';
 
 function existingDirectory(candidate: string): boolean {
   try {
@@ -71,10 +73,11 @@ export function userManagedExecutableDirs(home: string): string[] {
   return [...new Set(candidates.filter(existingDirectory))];
 }
 
-function isolatedNpmCache(env: Record<string, string>): string | undefined {
+function isolatedNpmCache(env: Record<string, string>, platform: NodeJS.Platform): string | undefined {
   // An explicit user/operator override is authoritative, including the lowercase
   // spelling npm itself supports.
-  if (env.NPM_CONFIG_CACHE?.trim() || env.npm_config_cache?.trim()) return undefined;
+  if (childEnvValue(env, 'NPM_CONFIG_CACHE', platform) !== undefined
+    || childEnvValue(env, 'npm_config_cache', platform) !== undefined) return undefined;
   let base: string;
   try {
     base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
@@ -188,7 +191,40 @@ export function augmentPath(existing: string | undefined): string {
  * exists to prevent.
  */
 const CLI_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-let cliEnvCache: { file: string; mtimeMs: number; values: Record<string, string> } | undefined;
+let cliEnvCache: { file: string; generation: string; values: Readonly<Record<string, string>> } | undefined;
+
+function cliEnvGeneration(stat: BigIntStats): string {
+  return `${stat.dev}\0${stat.ino}\0${stat.ctimeNs}\0${stat.mtimeNs}\0${stat.size}`;
+}
+
+/** Read one stable file generation while preserving the existing support for
+ * user-owned symlinks. File-handle checks bind the bytes, and the final path
+ * check rejects a replacement or retarget that happened during the read. */
+function readCliEnvValues(file: string, before: BigIntStats): Record<string, string> {
+  const generation = cliEnvGeneration(before);
+  const fd = openSync(file, 'r');
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || cliEnvGeneration(opened) !== generation) throw new Error('CLI environment changed before read');
+    const text = readFileSync(fd, 'utf8');
+    const afterRead = fstatSync(fd, { bigint: true });
+    const afterPath = statSync(file, { bigint: true });
+    if (!afterRead.isFile() || !afterPath.isFile()
+      || cliEnvGeneration(afterRead) !== generation || cliEnvGeneration(afterPath) !== generation) {
+      throw new Error('CLI environment changed during read');
+    }
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('CLI environment is not an object');
+    return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).flatMap(([key, value]) => {
+      if (!CLI_ENV_KEY.test(key) || key.toUpperCase() === 'PATH') return [];
+      if (typeof value === 'string') return [[key, value]];
+      if (typeof value === 'number' || typeof value === 'boolean') return [[key, String(value)]];
+      return [];
+    }));
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function userDeclaredCliEnv(): Record<string, string> {
   let file: string;
@@ -196,36 +232,27 @@ export function userDeclaredCliEnv(): Record<string, string> {
     const base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
     file = path.join(base, 'state', 'cli-env.json');
   } catch {
-    return {};
-  }
-  let mtimeMs: number;
-  try {
-    mtimeMs = statSync(file).mtimeMs;
-  } catch {
     cliEnvCache = undefined;
     return {};
   }
-  // Keyed on path AND mtime: CLEMENTINE_HOME moves between runs (and in tests),
-  // so an mtime-only key can serve one home's values to another.
-  if (cliEnvCache?.file === file && cliEnvCache.mtimeMs === mtimeMs) return cliEnvCache.values;
-  const values: Record<string, string> = {};
   try {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (!CLI_ENV_KEY.test(key)) continue;
-        if (key.toUpperCase() === 'PATH') continue;
-        if (typeof value === 'string') values[key] = value;
-        else if (typeof value === 'number' || typeof value === 'boolean') values[key] = String(value);
-      }
+    const before = statSync(file, { bigint: true });
+    if (!before.isFile()) throw new Error('CLI environment is not a file');
+    const generation = cliEnvGeneration(before);
+    // Atomic replacement and restored mtime must invalidate the old settings.
+    // Keep the path too: tests and separate homes must never share declarations.
+    if (cliEnvCache?.file === file && cliEnvCache.generation === generation) {
+      return Object.fromEntries(Object.entries(cliEnvCache.values));
     }
+    const values = Object.freeze(readCliEnvValues(file, before));
+    cliEnvCache = { file, generation, values };
+    return Object.fromEntries(Object.entries(values));
   } catch {
-    // A malformed file must not make every CLI spawn fail. It is ignored, and
-    // the user still sees the underlying command's own error.
+    // Missing, malformed, unreadable or raced settings never retain a previous
+    // generation. A later call can observe a recovered file normally.
+    cliEnvCache = undefined;
     return {};
   }
-  cliEnvCache = { file, mtimeMs, values };
-  return values;
 }
 
 /**
@@ -256,29 +283,26 @@ function withConnectedCliBin(pathValue: string): string {
   return [dir, ...rest].join(path.delimiter);
 }
 
-export function mergedSpawnEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string') {
-      env[key] = value;
-    }
-  }
-  const pathKey = process.platform === 'win32'
-    ? Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'Path'
-    : 'PATH';
-  const currentPath = env[pathKey] ?? env.PATH;
-  if (process.platform === 'win32') {
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === 'path' && key !== pathKey) delete env[key];
-    }
-  }
-  env[pathKey] = withConnectedCliBin(augmentPath(currentPath));
-  // Consider per-call overrides before choosing a default, otherwise a lowercase
-  // `extra.npm_config_cache` would coexist with (and potentially lose to) our
-  // uppercase default.
-  const npmCache = isolatedNpmCache({ ...env, ...extra });
-  if (npmCache) env.NPM_CONFIG_CACHE = npmCache;
+/** Nonsecret executable lookup shared by interactive and scrubbed children.
+ * This projects only the host-maintained binary directory, never CLI env
+ * declarations or the daemon's credential-bearing environment. */
+export function childExecutablePath(inheritedPath: string | undefined): string {
+  return withConnectedCliBin(augmentPath(inheritedPath));
+}
+
+export function mergedSpawnEnv(extra: Record<string, string> = {}, options: {
+  inherited?: ChildEnvLayer; platform?: NodeJS.Platform;
+} = {}): Record<string, string> {
+  const platform = options.platform ?? process.platform;
+  const inherited = options.inherited ?? process.env;
+  const env = mergeChildEnvLayers([inherited,
+    { PATH: childExecutablePath(childEnvValue(inherited, 'PATH', platform)) }], platform);
   // User declarations win over the inherited environment (that is the point of
-  // declaring them) but never over an explicit per-call override.
-  return { ...env, ...userDeclaredCliEnv(), ...extra };
+  // declaring them) but never over an explicit per-call override. An explicit
+  // per-call PATH remains verbatim, even empty; declarations cannot set PATH.
+  const merged = mergeChildEnvLayers([env, userDeclaredCliEnv(), extra], platform);
+  // Evaluate the effective declarations first: an explicit empty cache setting
+  // is still an override, not permission to synthesize a second alias.
+  const npmCache = isolatedNpmCache(merged, platform);
+  return npmCache ? mergeChildEnvLayers([merged, { NPM_CONFIG_CACHE: npmCache }], platform) : merged;
 }

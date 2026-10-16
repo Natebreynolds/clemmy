@@ -12,4 +12,6 @@ test('ordinary completion and generic memory language do not mint manual skill a
   assert.equal(userRequestedSkillDistillation('The deployment is complete.'), false);
   assert.equal(userRequestedSkillDistillation('Remember my favorite color is orange.'), false);
   assert.equal(userRequestedSkillDistillation('You should learn from every run automatically.'), false);
+  assert.equal(userRequestedSkillDistillation('Do not save this workflow.'), false);
+  assert.equal(userRequestedSkillDistillation('Use fixture A, but don’t save this as a skill.'), false);
 });

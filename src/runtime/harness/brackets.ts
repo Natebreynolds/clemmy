@@ -606,7 +606,10 @@ function nestedDispatchCarrierInputIsStructurallyValid(
     carrier
     && typeof carrier.name === 'string'
     && carrier.name.length > 0
-    && typeof carrier.args_json === 'string'
+    && (typeof carrier.args_json === 'string'
+      || (carrier.args_json !== null
+        && typeof carrier.args_json === 'object'
+        && !Array.isArray(carrier.args_json)))
     && (
       isPlainOrClementineLocalTool(toolName, 'call_tool')
       || (
@@ -4360,7 +4363,7 @@ export function wrapToolForHarness<T extends WrappableTool>(
         ? durableLogicalCallContract(attestation.acceptedTaskId, tool.name, parsedInput)
         : null;
       // A host can identify a read in an otherwise invalid carrier envelope
-      // (e.g. args_json is an object instead of its required JSON string).
+      // (e.g. a carrier is missing a required outer field).
       // The exact SDK parser still refuses before execute, but replacing this
       // already-admitted identity with an OUTER unknown-effect marker would
       // poison the root before the parser can return its corrective. Preserve

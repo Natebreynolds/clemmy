@@ -419,13 +419,13 @@ test('unknown deferred arguments are rejected instead of silently stripped befor
   assert.match(out.guidance, /clem\.data\(\)/, 'the correction includes the selected tool contract, not only its arguments');
   assert.match(
     out.guidance,
-    /new arbitrary runner scripts are refused/i,
+    /new (?:arbitrary )?runner scripts are refused/i,
     'the direct stale-schema correction refuses unsafe new data-source runners',
   );
   assert.match(
     out.guidance,
-    /Action runners require per-invocation approval/i,
-    'the direct stale-schema correction carries the exact current action-runner contract',
+    /workflow action.*one click runs that saved workflow/i,
+    'the direct stale-schema correction carries the exact current workflow-action contract',
   );
   assert.ok(!getHotSet('sess-stale-workspace-schema').includes('space_save'), 'unknown fields must prevent dispatch and promotion');
 });

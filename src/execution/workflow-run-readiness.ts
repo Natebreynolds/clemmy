@@ -117,6 +117,16 @@ export function checkWorkflowRunReadiness(
 ): WorkflowRunReadinessCheck {
   const { targetStepId, ...planOptions } = options;
   const plan = buildWorkflowExecutionPlanWithReadiness(def, workflowSlug, planOptions);
+  return evaluateWorkflowPlanReadiness(def, plan, targetStepId);
+}
+
+/** Pure projection used by host-owned display captures. Execution callers use
+ * checkWorkflowRunReadiness above, which always builds a fresh local inventory. */
+export function evaluateWorkflowPlanReadiness(
+  def: WorkflowDefinition,
+  plan: WorkflowExecutionPlan,
+  targetStepId?: string,
+): WorkflowRunReadinessCheck {
   const capabilityReadiness = partitionWorkflowReadiness(plan.toolReadiness.items, targetStepId);
   // An owner-authored runner is ready when its script is present under the
   // workflow's own scripts/ (the plan's 'script' items check that) and the

@@ -116,10 +116,15 @@ export function registerClaudeActionWorkCall(
   if (typeof base.invoke !== 'function') return false;
   const wrapped = wrapToolForHarness(base as never) as InvokableWorkCall;
 
-  const registered = server.tool(
+  const registered = server.registerTool(
     'work_call',
-    base.description ?? 'Invoke one plan-selected local read or business tool under the exact frozen semantic work contract.',
-    WorkCallInputSchema.shape,
+    {
+      description: base.description ?? 'Invoke one plan-selected local read or business tool under the exact frozen semantic work contract.',
+      // Keep the strict outer object, including its unknown-field refusal.
+      // Passing only .shape would let the MCP SDK strip fields before the
+      // permission bridge correlates this call against its original input.
+      inputSchema: WorkCallInputSchema,
+    },
     async (input: WorkCallInput) => {
       const claim = claimClaudeLocalPermissionAdmission({
         sessionId,

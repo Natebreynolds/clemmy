@@ -194,6 +194,13 @@ export class WorkflowRunAlreadyTerminalError extends Error {
   }
 }
 
+export class WorkflowRunIdentityMismatchError extends Error {
+  constructor() {
+    super('The saved workflow run identity cannot be verified; no cancellation was recorded.');
+    this.name = 'WorkflowRunIdentityMismatchError';
+  }
+}
+
 /**
  * Install immutable cancellation authority. If a canonical run record exists,
  * the terminal-state check and receipt install share the same lock as runner
@@ -208,6 +215,9 @@ export function requestWorkflowRunCancellation(
   const file = runFile(runId);
   return withWorkflowRunRecordLock(file, () => {
     const current = readWorkflowRunRecordUnlocked<WorkflowRunProjection>(file);
+    // A pre-admission Stop may legitimately precede the run file. Once a file
+    // exists, its exact retained identity must agree before installing authority.
+    if (current && current.id !== runId) throw new WorkflowRunIdentityMismatchError();
     const currentStatus = terminalStatus(current);
     if (currentStatus && currentStatus !== 'cancelled') {
       throw new WorkflowRunAlreadyTerminalError(currentStatus);
@@ -240,6 +250,9 @@ export function cancelWorkflowRunAtBoundary(input: {
   const result = withWorkflowRunRecordLock<CancelWorkflowRunResult>(file, () => {
     const current = readWorkflowRunRecordUnlocked<WorkflowRunProjection>(file);
     if (!current) return { status: 'not_found' };
+    // Check under the terminal lock, before treating even a finished record as
+    // ours: a stale route/preflight must not cancel or settle replacement bytes.
+    if (current.id !== input.runId) return { status: 'refused', reason: 'ownership_unproved', run: current };
     if (input.expectedWorkflow !== undefined && current.workflow !== input.expectedWorkflow) {
       return { status: 'workflow_mismatch', run: current };
     }

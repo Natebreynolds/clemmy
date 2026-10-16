@@ -25,7 +25,7 @@
  * Pure persistence layer — no Express, no agent loop, no focus/workflow deps.
  */
 import { WORKSPACE_OPERATIONAL_MANIFEST_KEYS, workspaceManifestAuthoringFields } from './workspace-manifest-authoring.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { parseSpaceSourceTransforms, type SpaceSourceTransform } from './source-transforms.js';
 import {
   existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
@@ -1466,7 +1466,11 @@ export class SpaceStore {
   /** Certify the final ordinary-save snapshot without rebinding another
    * author's edit. Smoke/visits may advance operational timestamps; every
    * authoring field, including status/version/contract, remains exact. */
-  commitSaveResult(input: { expectedRecord: SpaceRecord; expectedView?: string; result: string }): string {
+  commitSaveResult(input: {
+    expectedRecord: SpaceRecord; expectedView?: string; result: string;
+    /** A saved-evidence advisory must not be attached to a newer dataset. */
+    expectedEvidenceSnapshot?: { revision: string; dataSha256: string | null };
+  }): string {
     const expected = input.expectedRecord;
     if (!isValidSpaceSlug(expected.id)) throw new Error('Invalid Workspace save identity');
     const authoringFields = (value: Record<string, unknown>): string =>
@@ -1490,6 +1494,13 @@ export class SpaceStore {
         }
         if (expected.contentMode === 'static_snapshot' && data === null) {
           throw new Error('Workspace static data is missing before delivery proof');
+        }
+        if (input.expectedEvidenceSnapshot) {
+          const revision = workspaceSnapshotRevision({ manifest: manifest.toString('utf8'), view: view.toString('utf8'), data: data?.toString('utf8') ?? '{}' });
+          const dataSha256 = data === null ? null : createHash('sha256').update(data).digest('hex');
+          if (revision !== input.expectedEvidenceSnapshot.revision || dataSha256 !== input.expectedEvidenceSnapshot.dataSha256) {
+            throw new Error('Workspace evidence snapshot changed before delivery proof');
+          }
         }
       },
     }));

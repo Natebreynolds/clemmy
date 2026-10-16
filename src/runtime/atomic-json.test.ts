@@ -550,3 +550,77 @@ test('a sync strict lock held by async work on this thread fails fast instead of
   // Once released, the strict lock is ordinary again.
   assert.equal(withFileLockSyncStrict(target, () => 'acquired'), 'acquired');
 });
+
+test('zero-wait strict contention preserves the live lease and never runs the mutation', () => {
+  const target = path.join(TMP, 'zero-wait-contended.json');
+  const lockPath = `${target}.lock`;
+  const owner = `${process.pid}:${Date.now()}:${randomUUID()}`;
+  writeFileSync(lockPath, owner);
+  let mutations = 0;
+  const startedAt = performance.now();
+  try {
+    assert.throws(() => withFileLockSyncStrict(target, () => { mutations++; }, { timeoutMs: 0 }),
+      (err: unknown) => err instanceof BoundaryError && err.retryable
+        && err.context.timeoutMs === 0);
+    assert.ok(performance.now() - startedAt < 500, 'a busy control path must not park for the default timeout');
+    assert.equal(mutations, 0);
+    assert.equal(readFileSync(lockPath, 'utf-8'), owner, 'another live generation remains owned');
+    assert.equal(existsSync(target), false);
+  } finally {
+    unlinkSync(lockPath);
+  }
+});
+
+test('zero-wait strict work retains recursion refusal and exception cleanup', () => {
+  const target = path.join(TMP, 'zero-wait-acquired.json');
+  let mutations = 0;
+  assert.throws(() => withFileLockSyncStrict(target, () => {
+    mutations++;
+    assert.throws(() => withFileLockSyncStrict(target, () => { mutations++; }, { timeoutMs: 0 }),
+      (err: unknown) => err instanceof BoundaryError && err.context.reason === 'non_reentrant_lock');
+    throw new Error('controlled work failure');
+  }, { timeoutMs: 0 }), /controlled work failure/);
+  assert.equal(mutations, 1);
+  assert.equal(existsSync(`${target}.lock`), false);
+  assert.equal(withFileLockSyncStrict(target, () => 'recovered', { timeoutMs: 0 }), 'recovered');
+});
+
+test('invalid strict wait options are rejected before acquisition or mutation', () => {
+  const target = path.join(TMP, 'invalid-wait-options.json');
+  let mutations = 0;
+  const invalidOptions: unknown[] = [null, [], '0', 0, { timeoutMs: null }, { timeoutMs: '0' },
+    { timeoutMs: -1 }, { timeoutMs: 0.5 }, { timeoutMs: NaN }, { timeoutMs: Infinity },
+    { timeoutMs: 10_001 }, { timeoutMs: Number.MAX_SAFE_INTEGER }];
+  for (const options of invalidOptions) {
+    assert.throws(() => withFileLockSyncStrict(target, () => { mutations++; },
+      options as { timeoutMs?: number }), TypeError);
+    assert.equal(existsSync(`${target}.lock`), false, 'invalid configuration must not acquire a lease');
+  }
+  assert.equal(mutations, 0);
+});
+
+test('zero-wait release does not freeze on a live deletion guard and safely reclaims later', () => {
+  const target = path.join(TMP, 'zero-wait-cleanup.json');
+  const lockPath = `${target}.lock`;
+  const guardPath = `${lockPath}.reclaim-choose.${process.pid}.${Date.now()}.${randomUUID()}`;
+  const startedAt = performance.now();
+  try {
+    const value = withFileLockSyncStrict(target, () => {
+      writeFileSync(target, 'committed once');
+      writeFileSync(guardPath, '');
+      return 'committed';
+    }, { timeoutMs: 0 });
+    assert.equal(value, 'committed', 'post-commit cleanup must not invite a repeated write');
+    assert.ok(performance.now() - startedAt < 500, 'cleanup must also avoid parking the control path');
+    assert.equal(readFileSync(target, 'utf-8'), 'committed once');
+    assert.equal(existsSync(lockPath), true, 'leave the live canonical lease in place under guard contention');
+    assert.equal(existsSync(guardPath), true, 'never remove the foreign live guard');
+    unlinkSync(guardPath);
+    assert.equal(withFileLockSyncStrict(target, () => 'next', { timeoutMs: 0 }), 'next');
+    assert.equal(existsSync(lockPath), false, 'the same isolate can reclaim its abandoned exact generation');
+    assert.deepEqual(deletionGuardMarkerNames(target), []);
+  } finally {
+    rmSync(guardPath, { force: true });
+    rmSync(lockPath, { force: true });
+  }
+});

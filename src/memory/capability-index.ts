@@ -377,6 +377,26 @@ export function deactivateCapabilityCarrier(
   return result.changes;
 }
 
+/** Retire one exact advisory operation without changing sibling carriers,
+ * accounts, or retained descriptive/provenance history. This index never
+ * supplies dispatch authority; absence still requires live discovery. */
+export function deactivateCapabilityOperation(input: {
+  identifier: string;
+  accountIdentity: string;
+  carrierKind: CapabilityCarrierKind;
+  carrier: string;
+  parentIdentifier: string;
+}): number {
+  const identifier = input.identifier.trim();
+  const carrier = input.carrier.trim().toLowerCase();
+  if (!identifier || !carrier) return 0;
+  return db().prepare(`
+    UPDATE capability_operations SET active = 0
+     WHERE identifier = ? AND account_identity = ?
+       AND carrier_kind = ? AND carrier = ? AND parent_identifier = ? AND active = 1
+  `).run(identifier, input.accountIdentity, input.carrierKind, carrier, input.parentIdentifier).changes;
+}
+
 function rowToOperation(row: Record<string, unknown>): CapabilityOperationRow {
   const account = String(row.account_identity ?? '');
   return {
