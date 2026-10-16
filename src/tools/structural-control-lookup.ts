@@ -30,6 +30,11 @@ export function isHostStructuralPlanningControlLookup(query: string): boolean {
     'me', 'model', 'of', 'or', 'orchestration', 'planning', 'schema', 'schemas',
     'search', 'should', 'show', 'structural', 'the', 'tool', 'tools', 'usage',
     'use', 'we',
+    // How a model describes wanting the plan control itself.
+    'action', 'actions', 'business', 'call', 'calls', 'coordinate', 'coordinated',
+    'create', 'dag', 'dependencies', 'dependency', 'execute', 'execution', 'freeze',
+    'graph', 'multi', 'operation', 'operations', 'plan', 'requirement',
+    'requirements', 'sealed', 'step', 'steps', 'topology', 'work',
   ]);
   const explicitControlOnlyLookup = explicitlyNamesControl
     && withoutRolePrefix
