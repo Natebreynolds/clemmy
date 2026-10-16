@@ -182,7 +182,11 @@ export function composioSlugEffectEvidence(slug: string | null | undefined): Com
   // it open (learned-operation-effect.ts). The name is only a fallback until
   // a definition has been seen; it guesses, and it guesses wrong for names
   // such as GET_SCHEDULE or GET_DUPLICATE_TAGS.
-  const learned = learnedComposioOperationEffect(String(slug ?? '').trim().toUpperCase());
+  const upper = String(slug ?? '').trim().toUpperCase();
+  // A documented write is affirmative mutation evidence for a noun-shaped
+  // name, and no later reading may downgrade it.
+  if (upper && documentedComposioOperationSemantic(upper)?.effect === 'write') return 'write';
+  const learned = learnedComposioOperationEffect(upper);
   if (learned) return learned.effect;
   return composioSlugVerbEvidence(slug);
 }
