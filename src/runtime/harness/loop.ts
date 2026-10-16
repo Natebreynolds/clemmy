@@ -12613,7 +12613,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
             routedModelIdForBudget,
           );
           const workingInput = normalThresholds.checkpointed
-            ? projectInFlightCompactionCheckpoints(value.input, inFlightCompaction)
+            ? projectInFlightCompactionCheckpoints(value.input, inFlightCompaction, options.sessionId)
             : value.input;
           const outgoingInputTokens = estimateInputTokens(workingInput)
             + estimateTokens(value.instructions)
@@ -12622,8 +12622,8 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
             normalThresholds, turnInputBudgetTokens, outgoingInputTokens,
           );
           const compacted = thresholds.checkpointed
-            ? compactInFlightToolContextStable(value.input, inFlightCompaction, options.sessionId, thresholds)
-            : compactInFlightToolContext(value.input, options.sessionId, thresholds);
+            ? compactInFlightToolContextStable(value.input, inFlightCompaction, options.sessionId, { ...thresholds, capacityPressure })
+            : compactInFlightToolContext(value.input, options.sessionId, { ...thresholds, capacityPressure });
           if (compacted.applied) {
             value = {
               ...value,

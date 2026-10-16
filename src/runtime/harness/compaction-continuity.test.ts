@@ -112,7 +112,12 @@ test('an approved plan, a user correction, a pending approval and a completed-wr
   const writeVisible = nextItems.some((item) => (item as { callId?: string }).callId === 'write-q3' && (item as { type?: string }).type === 'function_call_result')
     || /Durable completed writes — already done[\s\S]*write-q3/.test(text);
   assert.ok(writeVisible, `the completed write stays visible either verbatim or as an already-done ledger entry: ${text.slice(0, 2000)}`);
-  assert.doesNotMatch(text, /notes section 3 nnnn/, 'older read bodies were actually reduced');
+  // A collapsed ledger may retain a short excerpt. The full older pair must
+  // leave the model history while its original bytes remain recallable.
+  assert.ok(!nextItems.some(item => (item as { callId?: string }).callId === 'read-3'),
+    'the older read pair is retired rather than replayed in full');
+  assert.equal(eventlog.getToolOutput(session.id, 'read-3')?.output,
+    `notes section 3 ${'n'.repeat(1200)}`, 'the retired result remains exactly recallable');
 
   // Reopen storage: the reduced history is what the next turn and a restart see.
   session.updateConversationSnapshot(nextItems);
