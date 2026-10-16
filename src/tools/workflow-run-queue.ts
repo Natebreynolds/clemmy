@@ -1,4 +1,5 @@
 import { matchingPendingWorkflowVerification, disabledWorkflowRunMessage } from './workflow-verification-state.js';
+import { awaitCreationTestInline, releaseCreationTestInline } from '../execution/inline-creation-test-delivery.js';
 import { workflowRunInventory } from '../execution/workflow-run-inventory.js';
 import { currentDispatchLease } from '../runtime/harness/dispatch-lease.js';
 import {
@@ -3176,27 +3177,39 @@ export async function awaitWorkflowCreationTestSettlement(
   const pollMs = options.pollMs ?? CREATION_TEST_POLL_MS;
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const started = Date.now();
-  while (Date.now() - started < boundMs) {
+  const settledNow = (): WorkflowCreationTestSettlement | null => {
     let record: { notifiedAt?: unknown; completedAt?: unknown } | null = null;
     try {
       record = JSON.parse(readFileSync(file, 'utf8')) as { notifiedAt?: unknown; completedAt?: unknown };
     } catch { /* not written yet or being rewritten; poll again */ }
-    if (record && (typeof record.notifiedAt === 'string' || typeof record.completedAt === 'string')) {
-      const notification = getNotification(`workflow-${runId}-creationtest`);
-      const enabled = readWorkflow(workflowName)?.data.enabled === true;
-      return {
-        runId,
-        pass: notification?.metadata?.pass === true,
-        activationCompatible: notification?.metadata?.activationCompatible !== false,
-        enabled,
-        body: notification?.body ?? '',
-        steps: creationTestStepVerdicts(notification?.metadata?.steps),
-        waitedMs: Date.now() - started,
-      };
+    if (!record || (typeof record.notifiedAt !== 'string' && typeof record.completedAt !== 'string')) return null;
+    const notification = getNotification(`workflow-${runId}-creationtest`);
+    const enabled = readWorkflow(workflowName)?.data.enabled === true;
+    return {
+      runId,
+      pass: notification?.metadata?.pass === true,
+      activationCompatible: notification?.metadata?.activationCompatible !== false,
+      enabled,
+      body: notification?.body ?? '',
+      steps: creationTestStepVerdicts(notification?.metadata?.steps),
+      waitedMs: Date.now() - started,
+    };
+  };
+  // While this call waits, it is the one that delivers the result.
+  awaitCreationTestInline(runId);
+  let claimedByRunner = false;
+  try {
+    while (Date.now() - started < boundMs) {
+      const settled = settledNow();
+      if (settled) return settled;
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  } finally {
+    claimedByRunner = releaseCreationTestInline(runId);
   }
-  return null;
+  // The runner settled it for this call at the deadline and sent no report,
+  // so the result must still come back here.
+  return claimedByRunner ? settledNow() : null;
 }
 
 /** Read-only lifecycle evidence; never grants execution authority. */

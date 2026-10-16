@@ -1,4 +1,5 @@
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
+import { claimInlineCreationTestDelivery } from './inline-creation-test-delivery.js';
 import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
@@ -15866,7 +15867,7 @@ async function processOneRunFile(
           ? activation && !activation.activated
             ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
             : `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.${realRunChecks}`
-          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It stays off, as you asked.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
+          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It is still off.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
         : result.pass
           ? autoRetestRunId
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
@@ -15969,7 +15970,9 @@ async function processOneRunFile(
         outputPreview: body,
         needsAttention: !ready,
       });
-      recordAndAttemptWorkflowRunReportBack(filePath, report);
+      // A tool call waiting on this test hands the result to the brain; a
+      // chat report would post the same result again in the runner's words.
+      if (!claimInlineCreationTestDelivery(run.id)) recordAndAttemptWorkflowRunReportBack(filePath, report);
       return;
     }
     // TRY (single-step) runs bypass the workflow enabled gate — they're
