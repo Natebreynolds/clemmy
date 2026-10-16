@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ModelRequest } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
-import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel, CodexModelProvider, transparentCodexRetryBudget } from './codex-model.js';
+import { buildCodexRequestBody, splitCodexInstructions, CodexResponsesModel, CodexModelProvider, transparentCodexRetryBudget, strictWireParameters } from './codex-model.js';
 import { INSTRUCTION_CACHE_DELIM, resolveProvider } from './model-wire-registry.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -91,6 +91,31 @@ test('prompt roles shard apart; one role keeps its key as its tool list grows', 
   const other = String(run('AGENT ONE RUBRIC', [], 'another-session').prompt_cache_key);
   assert.notEqual(other, a.prompt_cache_key, 'another conversation of the same role keeps its own key');
   assert.equal(other.split(':')[1], String(a.prompt_cache_key).split(':')[1], 'with the same role part');
+});
+
+test('the strict wire drops an unsupported format keyword and never touches literal data', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      url: { type: 'string', format: 'uri' },
+      when: { type: 'string', format: 'date-time' },
+      // A property may be named like a keyword; its schema is still cleaned.
+      format: { type: 'string', format: 'uri', default: 'csv' },
+      default: { type: 'object', properties: { link: { type: 'string', format: 'uri' } }, default: { format: 'uri' } },
+      mode: { type: 'string', enum: ['uri', 'csv'], const: 'uri' },
+      shape: { type: 'object', default: { format: 'csv', nested: { format: 'uri' } }, examples: [{ format: 'uri' }] },
+    },
+    required: ['url', 'format'],
+  };
+  const wire = strictWireParameters(schema) as typeof schema;
+  assert.equal('format' in wire.properties.url, false, 'unsupported format is dropped');
+  assert.equal(wire.properties.when.format, 'date-time', 'supported format is kept');
+  assert.deepEqual(wire.properties.format, { type: 'string', default: 'csv' }, 'a property named format keeps its default');
+  assert.deepEqual(wire.properties.default.default, { format: 'uri' }, 'a default object is data');
+  assert.equal('format' in wire.properties.default.properties.link, false, 'a property named default is still a schema');
+  assert.deepEqual(wire.properties.mode, schema.properties.mode, 'enum and const keep every value');
+  assert.deepEqual(wire.properties.shape, schema.properties.shape, 'nested defaults and examples keep every byte');
+  assert.deepEqual(wire.required, ['url', 'format']);
 });
 
 function requestWithInstructions(systemInstructions: string, input: ModelRequest['input'] = [{ role: 'user', content: 'hi' }]): ModelRequest {

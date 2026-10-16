@@ -1626,6 +1626,8 @@ function normalizeContentPart(part: unknown): unknown {
 const STRICT_SCHEMA_FORMATS = new Set([
   'date-time', 'time', 'date', 'duration', 'email', 'hostname', 'ipv4', 'ipv6', 'uuid',
 ]);
+const STRICT_SCHEMA_LITERAL_KEYWORDS = new Set(['default', 'const', 'enum', 'examples', 'example']);
+const STRICT_SCHEMA_MAP_KEYWORDS = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']);
 
 /**
  * A strict function schema with a string `format` the provider does not
@@ -1641,6 +1643,16 @@ export function strictWireParameters(schema: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
     if (key === 'format' && typeof value === 'string' && !STRICT_SCHEMA_FORMATS.has(value)) continue;
+    // A literal is data, never a schema: a default, const, enum or example
+    // keeps every byte, including a field that happens to be named format.
+    if (STRICT_SCHEMA_LITERAL_KEYWORDS.has(key)) { out[key] = value; continue; }
+    // A map of names to schemas: the names are data (a property may be named
+    // default or enum), each value is a schema.
+    if (STRICT_SCHEMA_MAP_KEYWORDS.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
+      out[key] = Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .map(([name, child]) => [name, strictWireParameters(child)]));
+      continue;
+    }
     out[key] = strictWireParameters(value);
   }
   return out;
