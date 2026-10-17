@@ -908,11 +908,14 @@
         "src/projects/project-binding.ts": {
           "bytes": 9031
         },
+        "src/memory/workflow-watch.ts": {
+          "bytes": 1390
+        },
         "src/memory/workflow-change-bus.ts": {
           "bytes": 1112
         },
         "src/memory/workflow-store.ts": {
-          "bytes": 69401
+          "bytes": 70022
         },
         "src/execution/workflow-conversation.ts": {
           "bytes": 4796
@@ -1467,7 +1470,7 @@
           "bytes": 10254
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 71554
+          "bytes": 72275
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 16947
@@ -3044,6 +3047,9 @@
         "src/execution/workflow-dead-occurrences.ts": {
           "bytes": 7574
         },
+        "src/agents/watches.ts": {
+          "bytes": 15682
+        },
         "src/execution/workflow-contract-evidence-store.ts": {
           "bytes": 8597
         },
@@ -3150,10 +3156,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 868769
+          "bytes": 869830
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 179979
+          "bytes": 182363
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -4811,11 +4817,14 @@
         "src/projects/project-binding.ts": {
           "bytes": 9031
         },
+        "src/memory/workflow-watch.ts": {
+          "bytes": 1390
+        },
         "src/memory/workflow-change-bus.ts": {
           "bytes": 1112
         },
         "src/memory/workflow-store.ts": {
-          "bytes": 69401
+          "bytes": 70022
         },
         "src/execution/workflow-conversation.ts": {
           "bytes": 4796
@@ -5370,7 +5379,7 @@
           "bytes": 10254
         },
         "src/execution/workflow-validator.ts": {
-          "bytes": 71554
+          "bytes": 72275
         },
         "src/execution/workflow-objective-judge.ts": {
           "bytes": 16947
@@ -6947,6 +6956,9 @@
         "src/execution/workflow-dead-occurrences.ts": {
           "bytes": 7574
         },
+        "src/agents/watches.ts": {
+          "bytes": 15682
+        },
         "src/execution/workflow-contract-evidence-store.ts": {
           "bytes": 8597
         },
@@ -7053,10 +7065,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 868769
+          "bytes": 869830
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 179979
+          "bytes": 182363
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
