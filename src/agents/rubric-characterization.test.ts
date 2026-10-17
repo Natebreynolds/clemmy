@@ -197,10 +197,14 @@ const GOLDEN = {
   // host was built from its repository name). The lean lanes carry a short form.
   // 2026-10-17: report only requested/relevant evidence; optional history or
   // causal claims do not create a new investigation after the work succeeds.
-  instructions: { len: 34221, sha16: 'dbf1f484f1880a3b' },
-  native: { len: 33328, sha16: '17a64a4bf5329fb4' },
-  claudeBrain: { len: 11405, sha16: 'e3e01128126381d0' },
-  lean: { len: 13410, sha16: '59b195bb1c9d715d' },
+  // 2026-10-17: FINAL REPORT names the claims completion reviews rejected in
+  // every live regression turn (absence beyond what was checked, unmarked
+  // estimates, unmeasured cost/time/rigor asides); the toolset line drops a
+  // stale "mutating pauses for approval" and two duplicated list items.
+  instructions: { len: 34348, sha16: '8686b59b5c2ad6ac' },
+  native: { len: 33455, sha16: 'f849533e0c04dd53' },
+  claudeBrain: { len: 11433, sha16: 'f7894fd682752772' },
+  lean: { len: 13438, sha16: '7b41f151f92cbcab' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

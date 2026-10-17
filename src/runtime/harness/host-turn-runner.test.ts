@@ -11325,7 +11325,7 @@ test('production host retains completion feedback in request projection without 
     assert.match(second, /Fix supported findings; refute an unsupported or contradicted premise/);
     assert.match(second, /Keep unaffected sentences unchanged/);
     assert.match(second, /Do not replay settled work/);
-    assert.match(second, /Recompute a figure from the retained results/);
+    assert.match(second, /Recompute required figures from the retained results/);
     assert.equal(JSON.stringify(outcome.history).includes('RETAINED COMPLETION REVIEW'), false, 'review feedback does not alter accepted-batch history');
     assert.doesNotMatch(JSON.stringify(outcome.history), /Done: posted the summary/, 'the rejected draft is never an uncheckpointed canonical edge');
     assert.match(second, /Done: posted the summary/, 'the model still receives its exact rejected draft');

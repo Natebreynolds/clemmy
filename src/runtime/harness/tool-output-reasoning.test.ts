@@ -22,7 +22,10 @@ test('ordinary fully shown results are distinguished from missing bytes, coverag
 test('fresh action keeps its budget and the inline/missing-detail cue without claiming retained execution authority', () => {
   // 6_077 → 6_691 (2026-10-16): the SKILL USE rule (use matching skills within
   // the accepted scope, read exact names directly) joined the action lane.
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 6_691, 'the lean action prompt does not grow');
+  // 6_691 → 6_878 (2026-10-17): the FINAL REPORT rule joined the action lane
+  // and names the claims completion reviews reject (absence beyond what was
+  // checked, unmarked estimates, unmeasured asides).
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 6_878, 'the lean action prompt does not grow');
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /honor constraints; verify stale\/conflicting claims/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /Use inline results; recall missing detail by exact full call_id\/handle/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /exact host-authenticated retained success/);

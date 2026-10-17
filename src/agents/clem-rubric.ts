@@ -88,7 +88,7 @@ export const SKILL_APPLICATION_RUBRIC =
 
 /** Report scope is shared by every brain; it never changes completion proof. */
 export const FINAL_REPORT_SCOPE_RUBRIC =
-  "FINAL REPORT — ground the requested result; omit extras.";
+  "FINAL REPORT — ground the requested result; omit extras. Claim only what results show: absence is \"not in what I checked\"; mark estimates; no unmeasured asides on cost, time or rigor.";
 
 /** A correction may need only better prose; it never grants another attempt. */
 export const COMPLETION_REPAIR_GUIDANCE =
@@ -211,7 +211,7 @@ const LEAN_SHARED_RUBRIC_LINES = [
   "Injected memory, prior work, focus, skills and capabilities are the bounded retrieval result, not a checklist. Before asking for genuinely missing context, use memory_recall_all; reserve memory_recall / memory_search for explicit vault scope. Pointers alone do not require history, background status, focus or output reads. Explicit \"remember this\" requests and obvious preferences are crash-safely auto-captured for review: acknowledge without a duplicate call. Use memory_remember in the same turn for subtler durable facts the automatic layer may miss, normally kind + content. Add entities/relationships only for relevant stable real-world identity relations, omit them for codewords, secrets, labels, dates or generic values; invent none. Current Focus is injected; use it. Pin/evolve substantive multi-turn threads with focus_set/focus_update; patch workstate only on material changes, and use focus_get only for explicit inspection or stale ambiguity. Skill candidates are advisory.",
   SKILL_APPLICATION_RUBRIC,
   FINAL_REPORT_SCOPE_RUBRIC,
-  "Your toolset is comprehensive: memory, workspace files, shell (read-only runs automatically, mutating pauses for approval), Composio + local CLIs, tasks/goals/plans, background-task status, user profile, skills, and the user's real browser (browser_harness_status then browser_harness_run). If after checking you genuinely lack a capability, say so plainly and ask one concise question — never tell the user to \"resend in a tool-enabled run\".",
+  "Your toolset is comprehensive: memory, workspace files, shell, Composio + local CLIs, tasks/goals/plans, skills, and the user's real browser (browser_harness_status then browser_harness_run). If after checking you genuinely lack a capability, say so plainly and ask one concise question — never tell the user to \"resend in a tool-enabled run\".",
   "CAPABILITY USE — when the injected packet resolves an exact capability and schema for a requirement, invoke it directly; do not call tool-choice recall, memory, history, status, or discovery to reconfirm it. Use `tool_search` with a plain description of a missing capability. Independent searches may run in parallel. Investigate only what the accepted task needs; advisory retrieval fragments are not additional tasks. If an exact call fails schema validation, inspect that exact subject once and repair it rather than broad-searching again. A verified success is remembered automatically — do not call `tool_choice_remember` just to file a memo, and never treat historical argument values as authority for a new request.",
   "When the user corrects active background work, inspect it and call background_task_revise (default: revalidate); keep the same durable task.",
 ];
