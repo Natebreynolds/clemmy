@@ -2015,6 +2015,56 @@ test('ask_user_question preserves exact source provenance and a single typed cla
   assert.equal(events[0].data.sourceUserSeq, 41);
 });
 
+function recordFixtureSearch(sessionId: string, sourceUserSeq: number, callId: string, query: string, gapToolkit?: string): void {
+  const output = JSON.stringify({ query, brokerCoverage: 'authorized_external_v1', results: [], unavailable: gapToolkit ? [{
+    source: 'authorized_composio', code: 'no_connections', dependencySubject: {
+      version: 1, kind: 'exact_capability_connection', source: 'authorized_composio', query,
+      toolkit: gapToolkit, capability: `${gapToolkit.toUpperCase()}_SEARCH`, capabilityRef: `cap:resolved:${gapToolkit}_search`,
+    },
+  }] : [] });
+  writeToolOutput({ sessionId, callId, tool: 'tool_search', output });
+  appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned',
+    data: { sourceUserSeq, tool: 'tool_search', callId, accounting: 'top_level', topologyRole: 'control', result: output } });
+}
+
+test('a connection gap an earlier search found, that Clem moved past, never replaces her own question', async () => {
+  // Live 2026-10-16: a side search for a contact found an app that was not
+  // connected; she searched on and asked who the reviewer was, and the host
+  // replaced her question with "connect Contacts+".
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Summarize the fixture runs to a note, then send it to the fixture reviewer.' } });
+  recordFixtureSearch(sess.id, parent.seq, 'search-contacts', 'find the fixture reviewer contact', 'fixturecontacts');
+  recordFixtureSearch(sess.id, parent.seq, 'search-files', 'write a local note file');
+  const { terminal } = await invokeAskWithArbitration(
+    buildAskUserQuestionTool(),
+    { question: 'Who is the fixture reviewer?', options: ['Use my manager', 'I will give you the address'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
+  );
+  assert.equal(terminal.finalOutput, '[clementine:awaiting-user-input:final]\nWho is the fixture reviewer?');
+  const asked = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1);
+  assert.equal(asked?.data.question, 'Who is the fixture reviewer?');
+  assert.deepEqual(asked?.data.options, ['Use my manager', 'I will give you the address']);
+  assert.equal(asked?.data.source, undefined, 'the host did not speak for her');
+});
+
+test('a connection gap the latest search found still takes over the connection question', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Pull the latest news into a note.' } });
+  recordFixtureSearch(sess.id, parent.seq, 'search-news', 'scrape the latest news', 'fixturenews');
+  await invokeAskWithArbitration(
+    buildAskUserQuestionTool(),
+    { question: 'Le service n’est pas prêt… [ouvrir](/m/?tab=settings&toolkit=wrong_app)', options: ['Continuer'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
+  );
+  const asked = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1);
+  assert.equal(asked?.data.source, 'host_connection_dependency_projection');
+  assert.doesNotMatch(String(asked?.data.question), /wrong_app|Le service/, 'model prose with a wrong link never becomes the connection control');
+});
+
 test('a unique tool_search account-selection write asks instead of continuing to plan', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

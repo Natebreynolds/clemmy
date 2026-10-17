@@ -1110,6 +1110,13 @@ export function userChoiceToolUseBehavior(
     seenCandidates.add(key);
     candidates.push(candidate);
   }
+  // Clem asked in her own words this batch. The host's connection question
+  // replaces hers only when the turn's latest search is the one that found
+  // the missing connection (its prose may carry a wrong link, so the host owns
+  // that control); a gap an earlier search found, that she moved past with
+  // another search, is not the task's (live 2026-10-16 a side search for a
+  // contact turned her question about the reviewer into "connect Contacts+").
+  const clemAsked = candidates.length > 0;
   if (candidates.length === 0 && haltContext.actionExpectedWork !== false) {
     // Which connected account is a fact only the user has, but an incidental
     // provider row is not proof that this task needs that fact. Keep the fast
@@ -1184,7 +1191,7 @@ export function userChoiceToolUseBehavior(
       };
     }
     const connectionProjection = sourceUserSeq
-      ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq })
+      ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq, latestDiscoveryOnly: clemAsked })
       : null;
     const publicAsk = connectionProjection
       ? { question: connectionProjection.question, options: [...connectionProjection.options] }

@@ -546,6 +546,9 @@ function connectionPresentationForSubject(
 function observedConnectionPresentationForSource(input: {
   sessionId: string;
   sourceUserSeq: number;
+  /** Only the turn's latest discovery counts: a gap an earlier search found,
+   * that the work then moved past with another search, is not the task's. */
+  latestDiscoveryOnly?: boolean;
 }): ConnectionDependencyPresentation | null {
   let returned: ReturnType<typeof listEvents>;
   try {
@@ -560,7 +563,7 @@ function observedConnectionPresentationForSource(input: {
   } catch {
     return null;
   }
-  for (const event of returned) {
+  for (const event of input.latestDiscoveryOnly ? returned.slice(0, 1) : returned) {
     const callId = typeof event.data.callId === 'string' ? event.data.callId.trim() : '';
     const durable = (() => {
       if (!callId) return null;
@@ -676,6 +679,7 @@ function observedConnectionPresentationForSource(input: {
 export function observedConnectionDependencyPresentationForSource(input: {
   sessionId: string;
   sourceUserSeq: number;
+  latestDiscoveryOnly?: boolean;
 }): ConnectionDependencyPresentation | null {
   if (!Number.isSafeInteger(input.sourceUserSeq) || input.sourceUserSeq <= 0) return null;
   return observedConnectionPresentationForSource(input);
