@@ -27,6 +27,10 @@ export interface NoticingThinking {
   summary: string;
   error?: string;
 }
+export interface ProposalCoverage {
+  availability: 'complete' | 'partial' | 'unavailable';
+  omitted: number;
+}
 export interface NoticingStatus {
   enabled: boolean;
   cadenceMinutes: number;
@@ -40,6 +44,7 @@ export interface NoticingStatus {
   recentlyRetired: NoticingProposal[];
   thinking: NoticingThinking[];
   standingAnswers: Array<{ text: string; about: string; at: string }>;
+  proposalCoverage?: ProposalCoverage;
 }
 
 export const getNoticing = () => apiGet<{ noticing: NoticingStatus }>('/api/console/noticing');
@@ -136,7 +141,7 @@ export interface MyGoalPatch {
   blockers?: string[];
   reviewFrequency?: MyGoal['reviewFrequency'];
 }
-export const listMyGoals = () => apiGet<{ goals: MyGoal[]; unassignedProposals: Array<{ id: string; title: string; why: string; createdAt: string }> }>('/api/console/my-goals');
+export const listMyGoals = () => apiGet<{ goals: MyGoal[]; proposalCoverage?: ProposalCoverage; unassignedProposals: Array<{ id: string; title: string; why: string; createdAt: string }> }>('/api/console/my-goals');
 export const upsertMyGoal = (patch: MyGoalPatch) => apiPost<{ goal: MyGoal; created: boolean }>('/api/console/my-goals', patch);
 
 export const OUTCOME_WORDS: Record<NoticingThinking['considered'][number]['outcome'], string> = {

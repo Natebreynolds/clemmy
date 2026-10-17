@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pino from 'pino';
@@ -557,6 +557,101 @@ export interface ListPlanProposalsFilter {
   /** Read-only proof consumers must not establish uniqueness from a partial
    * registry. Ordinary presentation retains its legacy best-effort behavior. */
   strictRead?: boolean;
+}
+
+/** Fresh read-only inventory. File identity is retained separately so a valid
+ * explicit pin can survive an unrelated corrupt file, while a partial scan
+ * can never prove that a legacy run/session has only one matching contract. */
+export interface PlanProposalSnapshot {
+  entries: Array<{ fileId: string; proposal: PlanProposal; canonical: boolean }>;
+  unavailableIds: string[];
+  duplicateIds: string[];
+  complete: boolean;
+}
+
+const proposalSnapshotRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+const proposalSnapshotId = (value: unknown): value is string => typeof value === 'string'
+  && value.length > 0 && value.length <= 256 && value.trim() === value
+  && value !== '.' && value !== '..' && !/[\\/\u0000-\u001f\u007f]/.test(value);
+
+function proposalSnapshotValue(value: unknown): value is PlanProposal {
+  if (!proposalSnapshotRecord(value) || !proposalSnapshotId(value.id)
+    || typeof value.proposedAt !== 'string' || !Number.isFinite(Date.parse(value.proposedAt))
+    || typeof value.status !== 'string'
+    || !['pending', 'approved', 'rejected', 'superseded', 'active', 'satisfied', 'expired'].includes(value.status)) return false;
+  const plan = (candidate: unknown): boolean => proposalSnapshotRecord(candidate)
+    && typeof candidate.objective === 'string' && Array.isArray(candidate.successCriteria)
+    && candidate.successCriteria.every(criterion => typeof criterion === 'string');
+  return plan(value.plan) && (value.approvedPlan === undefined || plan(value.approvedPlan))
+    && (value.sessionId === undefined || typeof value.sessionId === 'string')
+    && (value.resolvedAt === undefined || (typeof value.resolvedAt === 'string' && Number.isFinite(Date.parse(value.resolvedAt))))
+    && (value.origin === undefined || (proposalSnapshotRecord(value.origin)
+      && typeof value.origin.kind === 'string' && ['chat', 'workflow', 'background'].includes(value.origin.kind)
+      && (value.origin.runId === undefined || typeof value.origin.runId === 'string')));
+}
+
+export function readPlanProposalSnapshot(): PlanProposalSnapshot {
+  const snapshot: PlanProposalSnapshot = { entries: [], unavailableIds: [], duplicateIds: [], complete: true };
+  let entries: string[];
+  try { entries = readdirSync(PROPOSALS_DIR); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') snapshot.complete = false;
+    return snapshot;
+  }
+  const unavailable = new Set<string>();
+  const generations = new Map<string, string>();
+  const retainedIds = new Map<string, string>();
+  const generation = (entry: string): string => {
+    const stat = lstatSync(path.join(PROPOSALS_DIR, entry), { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Not a direct proposal file.');
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  };
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const fileId = entry.slice(0, -5);
+    let value: unknown;
+    try {
+      generations.set(entry, generation(entry));
+      value = JSON.parse(readFileSync(path.join(PROPOSALS_DIR, entry), 'utf8')) as unknown;
+      if (proposalSnapshotRecord(value) && proposalSnapshotId(value.id)) retainedIds.set(entry, value.id);
+      if (!proposalSnapshotValue(value)) throw new Error('Invalid proposal projection.');
+      const canonical = proposalSnapshotId(fileId) && value.id === fileId;
+      snapshot.entries.push({ fileId, proposal: value, canonical });
+      if (!canonical) snapshot.complete = false;
+    } catch {
+      snapshot.complete = false;
+      if (proposalSnapshotId(fileId)) unavailable.add(fileId);
+      if (proposalSnapshotRecord(value) && proposalSnapshotId(value.id)) unavailable.add(value.id);
+    }
+  }
+  // Atomic file replacement is the writer's visibility boundary. Recheck its
+  // generation and directory membership without reading any file twice; a
+  // concurrent change cannot turn a mixed capture into a legacy uniqueness
+  // proof. Named pins also refuse their changed generation.
+  for (const [entry, before] of generations) {
+    try { if (generation(entry) === before) continue; } catch { /* changed/unreadable */ }
+    snapshot.complete = false;
+    unavailable.add(entry.slice(0, -5));
+    const retainedId = retainedIds.get(entry);
+    if (retainedId) unavailable.add(retainedId);
+  }
+  try {
+    const after = readdirSync(PROPOSALS_DIR).filter(entry => entry.endsWith('.json')).sort();
+    if (JSON.stringify(after) !== JSON.stringify(entries.filter(entry => entry.endsWith('.json')).sort())) {
+      snapshot.complete = false;
+      for (const { proposal } of snapshot.entries) unavailable.add(proposal.id);
+    }
+  } catch {
+    snapshot.complete = false;
+    for (const { proposal } of snapshot.entries) unavailable.add(proposal.id);
+  }
+  snapshot.unavailableIds = [...unavailable];
+  const counts = new Map<string, number>();
+  for (const { proposal } of snapshot.entries) counts.set(proposal.id, (counts.get(proposal.id) ?? 0) + 1);
+  snapshot.duplicateIds = [...counts].filter(([, count]) => count > 1).map(([id]) => id);
+  if (snapshot.duplicateIds.length) snapshot.complete = false;
+  return snapshot;
 }
 
 export function listPlanProposals(filter: ListPlanProposalsFilter = {}): PlanProposal[] {

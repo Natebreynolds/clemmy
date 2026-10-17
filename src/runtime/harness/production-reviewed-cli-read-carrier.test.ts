@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import {
   chmodSync,
   existsSync,
@@ -652,4 +653,235 @@ test('the pinned reviewed process receives current host CLI declarations without
     if (previousDaemonEnv === undefined) rmSync(daemonEnvFile, { force: true }); else writeFileSync(daemonEnvFile, previousDaemonEnv);
     await config.removeReviewedCliReadDescriptor(descriptorId);
   }
+});
+
+/** A real local process and production host/judge; only the author model and
+ * Jev's HTTP transport answer deterministically. No judge function is replaced. */
+async function reviewedCliAnswer(label: string, mode: 'records' | 'empty_records' | 'nonzero' | 'missing_stdout' | 'truncated',
+  review: 'done' | 'repair' | 'unavailable' = 'done') {
+  const { runConversation } = await import('./loop.js');
+  const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+  const jev = await import('../jev/client.js');
+  const completion = await import('./host-completion-work.js');
+  const handles = await import('./result-handle.js');
+  const identities = await import('./attempt-identity.js');
+  const terminals = await import('./accepted-source-terminal.js');
+  const marker = `controlled_${label}_${nonce}`;
+  const operation = `read_${marker}`;
+  const descriptorId = `descriptor-${marker}`;
+  const bodyLog = path.join(TEST_HOME, `${marker}.body.jsonl`);
+  const stdout = mode === 'empty_records'
+    ? JSON.stringify({ status: 0, result: { records: [], done: true, totalSize: 0 } })
+    : JSON.stringify({ status: 0, result: { records: [{ marker, total: 17 }], done: true, totalSize: 1 } });
+  const program = [
+    "const fs = require('node:fs');",
+    `fs.appendFileSync(${JSON.stringify(bodyLog)}, JSON.stringify({ argv: process.argv.slice(1) }) + '\\n');`,
+    mode === 'missing_stdout' ? '' : mode === 'truncated'
+      ? "process.stdout.write('x'.repeat(64_000));"
+      : `process.stdout.write(${JSON.stringify(stdout)});`,
+    ...(mode === 'nonzero' ? ['process.exitCode = 7;'] : []),
+  ].filter(Boolean).join('\n');
+  const request = `Use ${operation} to read the controlled fixture and report only its returned marker and total, or say that it returned no records. Do not create, edit or send anything.`;
+  const env = { AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', CLEMMY_MODEL_ROLES: '[]',
+    HARNESS_TOOL_BRACKETS: 'on', CLEMMY_COMPLETION_REVIEW: 'on', CLEMMY_TOOL_JIT: 'on',
+    CLEMMY_CODEX_TOOL_SEARCH: 'on', CLEMMY_UNIFIED_RECALL: 'off', CLEMMY_UNIFIED_TURN_PRIMER: 'off',
+    CLEMMY_SEMANTIC_RECALL: 'off', CLEMMY_DEBATE_MODE: 'off', CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off' };
+  const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  const previousFetch = globalThis.fetch;
+  let unexpectedNetwork = 0;
+  const payloads: Array<{ state: Record<string, unknown>; questions: Record<string, { type: string; criteria?: Record<string, unknown> }> }> = [];
+  const frames: unknown[] = [];
+  Object.assign(process.env, env);
+  globalThis.fetch = async () => { unexpectedNetwork++; throw new Error('No unmocked network is allowed in the CLI answer fixture'); };
+  try {
+    await config.provisionReviewedCliReadDescriptor({ version: 1, descriptorId, operationId: operation,
+      displayName: operation, description: request, effect: 'read', accountId: 'reviewed_cli:host',
+      executablePath: process.execPath, argvPrefix: ['--eval', program, '--'], arguments: [],
+      limits: { timeoutMs: 2_000, maxStdoutBytes: 16_384, maxStderrBytes: 4_096, maxArgumentBytes: 4_096 } });
+    const installed = await acquisition.createProductionLiveReadAcquisitionRegistry().acquire({ requirementId: `requirement-${marker}`,
+      // This controlled request already names the exact operation. Asking the
+      // registry for the full prose would also nominate the file's earlier
+      // descriptor through its shared fixture nonce and correctly be ambiguous.
+      objective: operation, effect: 'read' });
+    assert.equal(installed.status, 'installed', installed.status === 'blocked'
+      ? `The real registry refused the controlled CLI: ${installed.reason}: ${installed.detail}`
+      : 'the real registry must acquire the reviewed CLI before answering');
+    if (installed.status !== 'installed') throw new Error('Controlled reviewed CLI acquisition was not installed');
+    const capabilityId = installed.manifest.manifestId;
+    const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: marker });
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `run-${marker}` });
+    const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+      text: request, taskMode: { version: 1, kind: 'normal' },
+    } }, { armRunInFlight: true });
+    const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+    const completionPayloads: typeof payloads = [];
+    jev._setTypesafeKeyForTests('ts_controlled_cli_answer');
+    jev._setSystemOneFetchForTests(async (_url, init) => {
+      const body = JSON.parse(String(init.body)) as typeof payloads[number];
+      payloads.push(body);
+      if (!body.questions.delivered) {
+        // Other existing advisory questions get no positive nomination. They
+        // cannot select an account, execution path or task completion here.
+        return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+          answers: Object.fromEntries(Object.entries(body.questions).map(([id, question]) => [id, question.type === 'choice'
+            ? { type: 'choice', choice: 'none', confidence: 0, probabilities: { none: 0 } }
+            : { type: 'noul', noul: 0 }])), usage: { input_tokens: 20, output_tokens: 5 } }) };
+      }
+      completionPayloads.push(body);
+      if (review === 'unavailable') throw new Error('Controlled Jev transport unavailable');
+      const failedRead = mode === 'nonzero' || mode === 'missing_stdout' || mode === 'truncated';
+      const repairFirst = review === 'repair' && completionPayloads.length === 1;
+      const scores = { delivered: failedRead || repairFirst ? 0.05 : 0.95,
+        unaddressed: repairFirst ? 0.95 : 0.05, unsupported: failedRead || repairFirst ? 0.95 : 0.03,
+        computed: 0.03, asksUser: 0.03, cannotFinish: failedRead ? 0.95 : 0.03 };
+      return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+        answers: Object.fromEntries(Object.entries(scores).map(([id, noul]) => [id, { type: 'noul', noul }])),
+        usage: { input_tokens: 20, output_tokens: 5 } }) };
+    });
+    const finalReply = mode === 'empty_records' ? 'The controlled fixture returned no records.' : `Marker ${marker}; total 17.`;
+    let calls = 0;
+    const model = {
+      async getResponse(raw: unknown) {
+        frames.push(raw); calls++;
+        const owned = authority.acceptedTurnCallAuthorityFor(session.id, source.seq);
+        assert.equal(owned.status, 'ok', 'the production host arms exact call authority before the author model runs');
+        if (owned.status === 'ok') {
+          assert.equal(owned.authority.authorityKind, 'host_v1');
+          assert.equal(owned.authority.sourceEventId, source.id);
+          assert.equal(owned.authority.identity.sourceUserSeq, source.seq);
+        }
+        const output = calls === 1 ? [{ type: 'function_call', callId: `${marker}-read`, name: 'work_call',
+          arguments: JSON.stringify({ requirement_id: capabilityId, name: operation, args_json: {},
+            universe_item_id: null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null }) }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
+            text: review === 'repair' && calls === 2 ? `${finalReply} This was also yesterday’s total.` : finalReply }] }];
+        return { responseId: `${marker}-${calls}`, output,
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] } };
+      },
+      async *getStreamedResponse(raw: unknown) {
+        const response = await this.getResponse(raw);
+        yield { type: 'response_started' } as never;
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } } as never;
+      },
+    };
+    const result = await runConversation({ ...identity, input: request, reuseRecordedUserInput: true, runAttemptId: attempt.attemptId,
+      turnEngine: 'host_v1', maxSteps: 1, maxTurns: 6, toolCallsPerTurn: 4, judgeCompletion: true, suppressMemoryCapture: true,
+      buildAgent: async context => buildOrchestratorAgent({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
+        hostFreshPlanning: context.hostFreshPlanning, userInput: request, allowToolJit: true, model: model as never }),
+      makeRunner: () => Object.assign(new EventEmitter(), { run() { throw new Error('The legacy runner must not execute'); } }) as never });
+    const evidence = completion.sourceSettledReadEvidence(identity);
+    const verdicts = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] })
+      .filter(row => row.data.kind === 'completion');
+    const terminal = terminals.resolveExactTerminalForAcceptedSource(source);
+    const read = evidence.results.find(row => row.toolName === operation);
+    const retained = read?.logicalToolCallId ? handles.redeemSuccessfulSettlementResultForHost({ ...identity,
+      acceptedTaskId: identities.acceptedTaskIdFor(session.id, source.seq), logicalToolCallId: read.logicalToolCallId }) : null;
+    const bodyLines = existsSync(bodyLog) ? readFileSync(bodyLog, 'utf8').trim().split('\n').filter(Boolean) : [];
+    const settlements = eventlog.openEventLog().prepare(`SELECT outcome_kind, mutating FROM logical_call_settlements
+      WHERE session_id = ? AND source_user_seq = ?`).all(session.id, source.seq) as Array<{ outcome_kind: string; mutating: number }>;
+    return { request, finalReply, marker, operation, identity, attempt, source, result, frames, calls,
+      evidence, read, retained, verdicts, terminal, completionPayloads, bodyLines, settlements, unexpectedNetwork };
+  } finally {
+    jev._setSystemOneFetchForTests(undefined); jev._setTypesafeKeyForTests(undefined);
+    globalThis.fetch = previousFetch;
+    for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await config.removeReviewedCliReadDescriptor(descriptorId);
+  }
+}
+
+function assertCliReadReviewBinding(run: Awaited<ReturnType<typeof reviewedCliAnswer>>): void {
+  assert.ok(run.read?.logicalToolCallId, 'the source retains this exact CLI read attempt');
+  for (const verdict of run.verdicts) {
+    assert.equal(verdict.data.sourceUserSeq, run.source.seq);
+    const judged = verdict.data.judgedReadResults as Array<{ toolName?: string; logicalToolCallId?: string; outcome?: string }>;
+    assert.ok(Array.isArray(judged) && judged.some(row => row.toolName === run.operation
+      && row.logicalToolCallId === run.read!.logicalToolCallId && row.outcome === run.read!.outcome),
+    'the actual verdict must include this source’s exact successful or failed CLI read identity');
+  }
+}
+
+test('reviewed CLI answer reaches the production host and actual completion judge with its own retained stdout', async t => {
+  for (const mode of ['records', 'empty_records'] as const) await t.test(mode, async () => {
+    const run = await reviewedCliAnswer(`answer_${mode}`, mode);
+    assert.equal(run.bodyLines.length, 1, 'one real subprocess body ran');
+    assert.equal(run.unexpectedNetwork, 0, 'no provider or second-model network transport was used');
+    assert.equal(run.result.publicPresentation?.text, run.finalReply);
+    assert.equal(run.terminal.kind, 'terminal');
+    if (run.terminal.kind === 'terminal') {
+      assert.equal(run.terminal.presentation.status, 'done');
+      assert.equal(run.terminal.presentation.text, run.finalReply);
+    }
+    assert.equal(run.calls, 2);
+    assert.equal(run.read?.status, 'verified'); assert.equal(run.read?.contentComplete, true);
+    assert.equal(run.retained?.status, 'ok');
+    if (run.retained?.status === 'ok') {
+      const payload = run.retained.value.rawPayload as { result?: { stdout?: string } };
+      const data = JSON.parse(payload.result?.stdout ?? '') as { status: number; result: { records: unknown[]; totalSize: number } };
+      assert.equal(data.status, 0); assert.equal(data.result.totalSize, mode === 'records' ? 1 : 0);
+      assert.equal(data.result.records.length, mode === 'records' ? 1 : 0);
+    }
+    assert.equal(run.completionPayloads.length, 1, 'one actual Jev completion read for the candidate');
+    const payload = run.completionPayloads[0]!.state;
+    assert.equal(payload.request, run.request); assert.equal(payload.response, run.finalReply);
+    assert.ok(JSON.stringify(payload).includes(mode === 'records' ? run.marker : 'totalSize'));
+    assert.equal(run.verdicts.length, 1); assert.equal(run.verdicts[0]!.data.fulfills, true);
+    assertCliReadReviewBinding(run);
+    assert.notEqual(run.verdicts[0]!.data.failedOpen, true);
+    assert.equal((run.verdicts[0]!.data.jevAttempt as { reviewerStarted?: boolean })?.reviewerStarted, false);
+    assert.ok(run.settlements.length > 0 && run.settlements.every(row => row.mutating === 0));
+  });
+  await t.test('claim repair retains the read without redispatch', async () => {
+    const run = await reviewedCliAnswer('answer_repair', 'records', 'repair');
+    assert.equal(run.bodyLines.length, 1); assert.equal(run.calls, 3); assert.equal(run.unexpectedNetwork, 0);
+    assert.equal(run.result.publicPresentation?.text, run.finalReply);
+    assert.equal(run.completionPayloads.length, 2, 'one review of each changed candidate, no confirmation of the old candidate');
+    assert.deepEqual(run.verdicts.map(row => row.data.fulfills), [false, true]);
+    assertCliReadReviewBinding(run);
+    assert.ok(run.verdicts.every(row => row.data.failedOpen !== true
+      && (row.data.jevAttempt as { reviewerStarted?: boolean })?.reviewerStarted === false));
+    const repairedFrame = JSON.stringify(run.frames[2]);
+    assert.ok(repairedFrame.includes(run.marker) && repairedFrame.includes('17'), 'the repair keeps the exact settled read');
+    assert.ok(repairedFrame.includes(run.request), 'the whole owner objective remains in the repair');
+    assert.ok(run.completionPayloads.every(payload => JSON.stringify(payload.state).includes(run.marker)));
+  });
+  for (const mode of ['nonzero', 'missing_stdout', 'truncated'] as const) await t.test(mode, async () => {
+    const run = await reviewedCliAnswer(`answer_${mode}`, mode);
+    assert.equal(run.bodyLines.length, 1); assert.equal(run.unexpectedNetwork, 0);
+    if (mode === 'missing_stdout') {
+      // Complete means all captured bytes were shown, including an empty
+      // stream. It does not prove that the requested information was returned.
+      assert.equal(run.read?.contentComplete, true);
+      assert.equal(run.retained?.status, 'ok');
+      if (run.retained?.status === 'ok') {
+        const payload = run.retained.value.rawPayload as { result?: { stdout?: string; stdoutTruncated?: boolean } };
+        assert.equal(payload.result?.stdout, ''); assert.equal(payload.result?.stdoutTruncated, false);
+      }
+      assert.ok(run.completionPayloads.length > 0, 'the actual judge must see and reject the empty captured stream');
+      assert.ok(run.verdicts.length > 0 && run.verdicts.every(row => row.data.fulfills === false && row.data.failedOpen !== true),
+        'zero captured stdout is not the structured zero-record result proved by the successful empty_records case');
+    } else {
+      assert.equal(run.evidence.results.some(row => row.status === 'verified' && row.outcome === 'succeeded' && row.contentComplete === true), false,
+        'a failed or truncated process result cannot become a complete successful read');
+    }
+    assert.equal(run.verdicts.some(row => row.data.fulfills === true && row.data.failedOpen !== true), false);
+    const blockedBeforeReview = run.terminal.kind === 'terminal' && run.terminal.presentation.status === 'blocked';
+    assert.ok(run.verdicts.length > 0 || blockedBeforeReview,
+      'an absent review is acceptable only when this exact source has an explicit canonical blocked terminal');
+    assert.equal(run.terminal.kind, 'terminal', 'the full loop must retain its exact source terminal');
+    if (run.terminal.kind === 'terminal') assert.notEqual(run.terminal.presentation.status, 'done',
+      'failed, missing or truncated read output cannot silently become a success terminal');
+    if (run.verdicts.length) {
+      assert.ok(run.completionPayloads.length > 0, 'retained review rows must come from the actual Jev transport');
+      assertCliReadReviewBinding(run);
+    }
+    assert.ok(run.settlements.length > 0, 'the exact unsuccessful attempt is retained rather than silently omitted');
+  });
+  await t.test('unavailable Jev is recorded as unreviewed', async () => {
+    const run = await reviewedCliAnswer('answer_jev_unavailable', 'records', 'unavailable');
+    assert.equal(run.bodyLines.length, 1); assert.equal(run.unexpectedNetwork, 0);
+    assert.equal(run.read?.contentComplete, true); assert.equal(run.completionPayloads.length, 1);
+    assert.equal(run.verdicts.length, 1); assert.equal(run.verdicts[0]!.data.failedOpen, true);
+    assert.equal(run.verdicts[0]!.data.reviewFailure, 'unavailable');
+    assert.equal(run.verdicts.some(row => row.data.fulfills === true && row.data.failedOpen !== true), false);
+  });
 });

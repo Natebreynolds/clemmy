@@ -36,11 +36,14 @@ import {
   emptyNoticingState,
   compactGoalOutcomeProgressForNoticing,
   publicNoticingAnswer,
+  projectNoticingProposalSnapshot,
   recordNoticingAnswer,
   runNoticingTick,
   type NoticingDecision,
   type NoticingObservation,
   type NoticingProposalRecord,
+  type NoticingProposalSnapshot,
+  type NoticingProposalCoverage,
   type NoticingState,
   type NoticingThinking,
   type NoticingTickResult,
@@ -76,6 +79,13 @@ export function readNoticingStateStrict(): { present: boolean; state: NoticingSt
 export function loadNoticingState(): NoticingState {
   try { return readNoticingStateStrict().state; }
   catch { return emptyNoticingState(); }
+}
+
+/** Fresh read-only proposal view. An absent store is empty; an unreadable
+ * store is unknown, without changing the authority reader or persisted bytes. */
+export function readNoticingProposalSnapshot(): NoticingProposalSnapshot {
+  try { return projectNoticingProposalSnapshot(readNoticingStateStrict().state.proposals); }
+  catch { return projectNoticingProposalSnapshot(null); }
 }
 function readNoticingRulesStrict(): { present: boolean; rules: string[] } {
   const read = readOptionalJson(path.join(BASE_DIR, 'state', 'heartbeats.json'));
@@ -171,9 +181,10 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
   const since = new Date(now - 3 * 24 * 60 * 60_000).toISOString();
   const retainedGoals = listGoalRecords().filter((g) => g.status === 'active' || g.status === 'blocked');
   const { readGoalOutcomeProgress, unavailableGoalOutcomeProgress } = await import('./goal-outcome-progress.js');
+  const proposalSnapshot = readNoticingProposalSnapshot();
   const outcomeProgress = (() => {
     try {
-      return readGoalOutcomeProgress({ goals: retainedGoals, proposals: Object.values(readNoticingStateStrict().state.proposals) });
+      return readGoalOutcomeProgress({ goals: retainedGoals, proposals: proposalSnapshot.proposals, proposalSnapshot });
     } catch {
       return Object.fromEntries(retainedGoals.map((goal) => [goal.id, unavailableGoalOutcomeProgress()]));
     }
@@ -613,15 +624,24 @@ export interface NoticingStatus {
   recentlyRetired: NoticingProposalRecord[];
   thinking: NoticingThinking[];
   standingAnswers: NoticingState['standingAnswers'];
+  proposalCoverage: NoticingProposalCoverage;
 }
 export function noticingStatus(nowMs = Date.now()): NoticingStatus {
   const policy = noticingPolicy();
-  const state = loadNoticingState();
+  let state: NoticingState;
+  let proposalSnapshot: NoticingProposalSnapshot;
+  try {
+    state = readNoticingStateStrict().state;
+    proposalSnapshot = projectNoticingProposalSnapshot(state.proposals);
+  } catch {
+    state = emptyNoticingState();
+    proposalSnapshot = projectNoticingProposalSnapshot(null);
+  }
   const due = isNoticingDue(nowMs);
-  const proposals = Object.values(state.proposals).map(proposal => {
+  const proposals = proposalSnapshot.proposals.map(proposal => {
     const answer = publicNoticingAnswer(proposal.answer);
     return answer ? { ...proposal, answer } : proposal;
-  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  });
   const latest = state.thinking[0];
   return {
     id: NOTICING_ID,
@@ -641,6 +661,7 @@ export function noticingStatus(nowMs = Date.now()): NoticingStatus {
     recentlyRetired: proposals.filter((p) => p.status !== 'open' && (!p.handoff || p.handoff.state === 'settled')).slice(0, 20),
     thinking: state.thinking.map(({ modelAccountingJobId: _accounting, ...thinking }) => thinking),
     standingAnswers: state.standingAnswers,
+    proposalCoverage: proposalSnapshot.coverage,
   };
 }
 export { NOTICING_SESSION_ID };

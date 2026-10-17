@@ -70,6 +70,9 @@ import {
   isClaudeLocalCorrelatableSdkTool,
   isClaudeLocalComposioSdkTool,
   recordClaudeLocalPermissionAdmission,
+  claudeLocalSpaceWriteInputDigest,
+  claudeLocalSpaceWriteRefusal,
+  isClaudeLocalSpaceWriteSdkTool,
 } from './claude-local-tool-correlation.js';
 import { actionExpectedWorkCarrierRequired } from './action-expected-work-boundary.js';
 import {
@@ -592,6 +595,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
         type: 'sdk',
         name: 'clementine-local',
         instance: createClementineMcpServer({
+          claudeSpaceCallIdentity: true,
           sessionId,
           runScopeId: attribution?.runScopeId,
           sourceUserSeq: attribution?.sourceUserSeq,
@@ -613,6 +617,7 @@ export function buildClaudeAgentSdkLocalMcpServers(
   }
   const env = mergedSpawnEnv({
     CLEMENTINE_HOME: BASE_DIR,
+    CLEMENTINE_MCP_CLAUDE_SPACE_CALL_IDENTITY: 'on',
     ...(sessionId?.trim() ? { CLEMENTINE_MCP_SESSION_ID: sessionId.trim() } : {}),
     ...(attribution?.runScopeId?.trim() ? { CLEMENTINE_MCP_RUN_SCOPE_ID: attribution.runScopeId.trim() } : {}),
     ...(Number.isSafeInteger(attribution?.sourceUserSeq) && (attribution?.sourceUserSeq ?? 0) > 0
@@ -981,6 +986,8 @@ function appendSdkTopLevelToolEvent(
           topologyRole,
           ...(type === 'tool_called' ? {
             correlationFingerprint: toolCallCorrelationFingerprint(name ? mcpToolTail(name) : '', source?.input),
+            ...(isClaudeLocalSpaceWriteSdkTool(name, source?.input)
+              ? { exactInputDigest: claudeLocalSpaceWriteInputDigest(name, source?.input) } : {}),
           } : {}),
           effect: metadata.effect,
           ...(metadata.effectiveTool ? { effectiveTool: metadata.effectiveTool } : {}),
@@ -2345,6 +2352,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const isActionWorkCall = actionExpectedWork
       && isClaudeLocalCorrelatableSdkTool(toolName)
       && mcpToolTail(toolName) === 'work_call';
+    const isSpaceWrite = isClaudeLocalSpaceWriteSdkTool(toolName, input);
     const actionWorkCallRefusal = (
       error: 'work_contract_invalid' | 'work_authority_unavailable',
       detail: string,
@@ -2469,6 +2477,9 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           // cannot settle against the original physical assertion.
           if (cached.result?.behavior === 'allow' && claudeParentDiscovery) {
             return denyClaudeDiscoveryPermissionReplay();
+          }
+          if (cached.result?.behavior === 'allow' && isSpaceWrite) {
+            return { behavior: 'deny', interrupt: false, message: claudeLocalSpaceWriteRefusal() } as PermissionResult;
           }
           // A repeated permission callback for a read or a denial can safely
           // reuse the first verdict. Replaying an ALLOW for a native mutation
@@ -2831,7 +2842,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           // canonical occurrence. A legacy Composio read can tolerate a missed
           // correlation marker; action work_call cannot — the marker is part of
           // its dispatch authority and therefore fails closed before ALLOW.
-          if (permission.behavior === 'allow' && isClaudeLocalCorrelatableSdkTool(toolName)) {
+          if (permission.behavior === 'allow' && isClaudeLocalCorrelatableSdkTool(toolName, input)) {
             const localPermissionAdmission = options.sessionId
               && options.sourceUserSeq
               && trackerScopeId
@@ -2848,6 +2859,11 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
                   dispatchLease,
                 })
               : null;
+            if (isSpaceWrite && !localPermissionAdmission) {
+              const corrective = claudeLocalSpaceWriteRefusal();
+              settleRefusedPreDispatchCall(mcpToolTail(toolName), corrective);
+              return { behavior: 'deny', interrupt: false, message: corrective } as PermissionResult;
+            }
             if (isActionWorkCall && !localPermissionAdmission) {
               const corrective = actionWorkCallRefusal(
                 'work_authority_unavailable',
@@ -3170,6 +3186,10 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
   };
   const topLevelToolOccurrences = new Map<string, TopLevelToolOccurrence[]>();
   let nextTopLevelToolOrder = 0;
+  const useFingerprintFor = (name: string, input: unknown): string => {
+    const writeDigest = claudeLocalSpaceWriteInputDigest(name, input);
+    return writeDigest ? `${name}\0${writeDigest}` : toolCallCorrelationFingerprint(name, input);
+  };
   const startTopLevelToolOccurrence = (
     callId: string,
     source: { name: string; input: unknown } | undefined,
@@ -3177,7 +3197,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
     const occurrence: TopLevelToolOccurrence = {
       source,
       useFingerprint: source
-        ? toolCallCorrelationFingerprint(source.name, source.input)
+        ? useFingerprintFor(source.name, source.input)
         : '',
       calledEventId: undefined,
       preauthoredLocalCanonical: false,
@@ -3547,7 +3567,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
         // on BOTH lanes (chat brain + workflow step share this runner). Fail-open.
         for (const use of extractToolUseIds(message)) {
           const source = { name: use.name, input: use.input };
-          const useFingerprint = toolCallCorrelationFingerprint(use.name, use.input);
+          const useFingerprint = useFingerprintFor(use.name, use.input);
           const occurrences = topLevelToolOccurrences.get(use.id) ?? [];
           // An identical assistant block may be replayed before or after its
           // result. A later differing result promotes itself to a new occurrence
@@ -3648,7 +3668,7 @@ export async function runClaudeAgentSdk(options: ClaudeAgentSdkRunOptions): Prom
           const locallyParkedInvocationNonces = options.sessionId
             && locallyCorrelatedCanonical
             && source
-            && isClaudeLocalCorrelatableSdkTool(source.name)
+            && isClaudeLocalCorrelatableSdkTool(source.name, source.input)
             ? (() => {
                 try { return listToolOutputInvocationNonces(options.sessionId as string, tr.callId, 2); }
                 catch { return []; }

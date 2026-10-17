@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -15,7 +15,7 @@ const {
 } = await import('./mcp-server.js');
 const { harnessRunContextStorage } = await import('../runtime/harness/brackets.js');
 const { getToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
-const { appendEvent, createSession } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, beginRunAttempt, createSession, listEvents, openEventLog, recordRunAttemptUserInput } = await import('../runtime/harness/eventlog.js');
 const { recordTurnGraphShadow } = await import('../runtime/graph/turn-graph-shadow.js');
 const { z } = await import('zod');
 const { toolSchemaFingerprint } = await import('../agents/capability-envelope.js');
@@ -392,4 +392,180 @@ test('modern deferred carrier admits during its exact lease and cannot acquire a
   await assert.rejects(registered.call_tool.handler({ name: 'workspace_roots', args_json: {} }), StaleDispatchLeaseError);
   assert.equal((await boundClementineMcpCapabilityRevision(server))?.revision, 2,
     'a stale physical server cannot mutate the sealed revision chain');
+});
+
+const claudeCorrelation = await import('../runtime/harness/claude-local-tool-correlation.js');
+const spaceStore = await import('../spaces/store.js');
+const spaceCommit = await import('../runtime/harness/host-local-write-commit.js');
+const { _setWorkspaceDeliverablesReaderForTests } = await import('../spaces/workspace-deliverables-check.js');
+const wireExtra = (id: string) => ({ requestId: `rpc-${id}`, _meta: { 'claudecode/toolUseId': id } });
+const mcpText = (value: any): string => value.content[0].text;
+let spaceFixtureFetch: typeof fetch | undefined;
+let unmockedSpaceFetches = 0;
+test.beforeEach(context => {
+  if (!context.name.startsWith('Claude Space') && !context.name.startsWith('Claude metadata id')) return;
+  spaceFixtureFetch = globalThis.fetch;
+  unmockedSpaceFetches = 0;
+  globalThis.fetch = (async () => { unmockedSpaceFetches++; throw new Error('Unexpected provider/network transport in controlled Space identity fixture.'); }) as typeof fetch;
+  _setWorkspaceDeliverablesReaderForTests(async (_system, user) => {
+    const packet = JSON.parse(user);
+    return { bindingDigest: packet.bindingDigest, assessmentComplete: false,
+      assessedCriteriaIds: packet.workspace.successCriteria.map((item: { id: string }) => item.id),
+      deliverables: [{ deliverable: 'Semantic and visual review are outside this call identity control.',
+        status: 'unverified', requiredEvidence: 'render_readback', evidenceIds: [], gap: 'This fixture proves call identity and saved bytes only.' }] };
+  });
+});
+test.afterEach(context => {
+  if (!context.name.startsWith('Claude Space') && !context.name.startsWith('Claude metadata id')) return;
+  _setWorkspaceDeliverablesReaderForTests(null);
+  if (spaceFixtureFetch) globalThis.fetch = spaceFixtureFetch;
+  spaceFixtureFetch = undefined;
+  assert.equal(unmockedSpaceFetches, 0, 'no unmocked provider/network attempt');
+});
+
+function spaceIdentityFixture(route: 'direct' | 'carrier', suffix: string) {
+  const session = createSession({ kind: 'chat' });
+  const attempt = beginRunAttempt(session.id, { runId: `space-proof-${suffix}` });
+  const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: 'Create and edit only the controlled call identity Workspace.' } });
+  assert.ok(recordTurnGraphShadow({ identity: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq } }));
+  const anchor = { sessionId: session.id, sourceUserSeq: source.seq };
+  const runScopeId = `${anchor.sessionId}::space-identity`;
+  const lease = activateDispatchLease({ sessionId: anchor.sessionId, scopeId: `${runScopeId}::query`, runAttemptId: attempt.attemptId });
+  const server = createClementineMcpServer({ ...anchor, runScopeId, dispatchLease: lease,
+    claudeSpaceCallIdentity: true, workerScope: true, directOrchestrator: false,
+    allowedTools: route === 'direct' ? ['space_save', 'space_get'] : ['tool_search', 'call_tool'],
+    ...(route === 'carrier' ? { deferredTools: ['space_save', 'space_get'] } : {}),
+  });
+  const registered = (server as any)._registeredTools;
+  const toolName = route === 'direct' ? 'space_save' : 'call_tool';
+  const args = { slug: `identity-${suffix}`, title: 'Controlled identity', objective: null,
+    view_html: '<html><body><p>Literal null, {"one":null} and &lt;tag&gt;.</p></body></html>',
+    initial_data_json: JSON.parse('{"__proto__":{"literal":true},"nullable":null,"_mobile":{"records":{"items":[{"primary":"Controlled","body":"Complete"}]}}}'),
+  };
+  const wire = (value: unknown) => route === 'direct' ? value : { name: 'space_save', args_json: value };
+  const admit = (id: string, value: unknown = wire(args), overrides: Record<string, unknown> = {}) => {
+    const admission = claudeCorrelation.recordClaudeLocalPermissionAdmission({ ...anchor, runScopeId,
+      dispatchLease: lease, directOrchestrator: false, providerCallId: id,
+      sdkToolName: `mcp__clementine-local__${toolName}`, input: value, ...overrides,
+    });
+    assert.ok(admission, 'controlled final permission was durably admitted');
+    return admission;
+  };
+  return { ...anchor, runScopeId, lease, registered, toolName, args, wire, admit,
+    invoke: (value: unknown, extra?: unknown) => registered[toolName].handler(value, extra) };
+}
+
+for (const route of ['direct', 'carrier'] as const) {
+  test(`Claude Space ${route} binds real saved bytes and settlement to the exact metadata id; A replay cannot steal pending B`, async () => {
+    const f = spaceIdentityFixture(route, `positive-${route}`);
+    const idA = `space-${route}-A`;
+    f.admit(idA);
+    const originalWire = JSON.stringify(f.wire(f.args));
+    const first = await f.invoke(f.wire(f.args), wireExtra(idA));
+    const proof = spaceCommit.parseHostLocalWriteCommitFacts(mcpText(first));
+    assert.ok(proof, mcpText(first));
+    assert.equal(spaceCommit.readCommittedArtifactContent(proof).verified, true);
+    assert.equal(readFileSync(spaceStore.resolveInSpace(f.args.slug, 'view/index.html'), 'utf8'), f.args.view_html);
+    const data = JSON.parse(readFileSync(spaceStore.resolveInSpace(f.args.slug, 'data.json'), 'utf8'));
+    assert.equal(Object.hasOwn(data, '__proto__'), true);
+    assert.equal(data.nullable, null);
+    assert.equal(JSON.stringify(f.wire(f.args)), originalWire, 'no argument rewriting at the metadata bridge');
+    const ledger = () => openEventLog().prepare(`SELECT logical_tool_call_id, state, tool_name
+      FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?`).all(f.sessionId, f.sourceUserSeq) as any[];
+    assert.deepEqual(ledger().map(row => [row.logical_tool_call_id, row.state, row.tool_name]), [[idA, 'settled', 'space_save']]);
+    assert.equal((openEventLog().prepare(`SELECT outcome_kind FROM logical_call_settlements
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(f.sessionId, f.sourceUserSeq, idA) as any)?.outcome_kind, 'succeeded');
+    const canonical = listEvents(f.sessionId, { types: ['tool_called'] }).filter(event => event.data.accounting === 'top_level');
+    assert.deepEqual(canonical.map(event => event.data.callId), [idA]);
+
+    // Same-payload B is a distinct pending permission. Replayed A must not be
+    // guessed to be B just because B is the sole remaining unclaimed marker.
+    const idB = `space-${route}-B`;
+    const markerB = f.admit(idB);
+    const saved = spaceStore.spaceStore.snapshot(f.args.slug);
+    assert.ok(saved);
+    const replay = await f.invoke(f.wire(f.args), wireExtra(idA));
+    assert.equal(replay.isError, true);
+    assert.match(mcpText(replay), /already claimed|uncertain/);
+    assert.equal(spaceStore.spaceStore.snapshot(f.args.slug)?.revision, saved.revision);
+    assert.equal(ledger().length, 1, 'replayed A opens no second inner call');
+    assert.equal(listEvents(f.sessionId, { types: ['tool_called'] }).some(event =>
+      event.data.claudePermissionAdmissionEventId === markerB.id), false, 'B permission was not consumed by A replay');
+    const second = await f.invoke(f.wire(f.args), wireExtra(idB));
+    assert.ok(spaceCommit.parseHostLocalWriteCommitFacts(mcpText(second)), mcpText(second));
+    assert.deepEqual(ledger().map(row => row.logical_tool_call_id).sort(), [idA, idB].sort());
+
+    const updated = { slug: f.args.slug, title: 'Independent change' };
+    const idC = `space-${route}-C`;
+    f.admit(idC, f.wire(updated));
+    assert.ok(spaceCommit.parseHostLocalWriteCommitFacts(mcpText(await f.invoke(f.wire(updated), wireExtra(idC)))));
+    assert.equal(spaceStore.spaceStore.get(f.args.slug)?.title, 'Independent change');
+    assert.equal(ledger().length, 3, 'independent exact metadata identity owns its own settled operation');
+    revokeDispatchLease(f.lease);
+  });
+
+  test(`Claude Space ${route} refuses missing, foreign, changed, duplicate, source/scope/lease metadata before the producer`, async () => {
+    for (const mode of ['missing', 'foreign-id', 'null-removed', 'literal-changed', 'proto-removed', 'duplicate', 'source', 'scope', 'lease'] as const) {
+      const f = spaceIdentityFixture(route, `${route}-${mode}`);
+      const id = `space-${route}-${mode}`;
+      let invoke = f.invoke;
+      if (mode === 'source') {
+        // A valid final ALLOW for A cannot be donated to another source row.
+        f.admit(id);
+        const other = appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Separate controlled request.' } });
+        assert.equal(claudeCorrelation.claimClaudeLocalPermissionAdmission({ sessionId: f.sessionId,
+          sourceUserSeq: other.seq, runScopeId: f.runScopeId, toolName: f.toolName, rawInput: f.wire(f.args),
+          directOrchestrator: false, dispatchLease: f.lease, providerCallId: id }), null);
+        const otherServer = createClementineMcpServer({ sessionId: f.sessionId, sourceUserSeq: other.seq,
+          runScopeId: f.runScopeId, dispatchLease: f.lease, claudeSpaceCallIdentity: true,
+          allowedTools: route === 'direct' ? ['space_save'] : ['tool_search', 'call_tool'],
+          ...(route === 'carrier' ? { deferredTools: ['space_save'] } : {}),
+        });
+        invoke = (value, extra) => (otherServer as any)._registeredTools[f.toolName].handler(value, extra);
+      } else if (mode === 'scope') f.admit(id, f.wire(f.args), { runScopeId: `${f.runScopeId}:other` });
+      else if (mode === 'lease') {
+        const other = activateDispatchLease({ sessionId: f.sessionId, scopeId: `${f.runScopeId}:other-query`, runAttemptId: f.lease.runAttemptId });
+        f.admit(id, f.wire(f.args), { dispatchLease: other });
+        revokeDispatchLease(other);
+      } else f.admit(id);
+      if (mode === 'duplicate') f.admit(id);
+      const changed = JSON.parse(JSON.stringify(f.args));
+      if (mode === 'null-removed') delete changed.initial_data_json.nullable;
+      if (mode === 'literal-changed') changed.view_html = changed.view_html.replace('null', 'changed');
+      if (mode === 'proto-removed') delete changed.initial_data_json.__proto__;
+      const out = await invoke(f.wire(changed), mode === 'missing' ? { requestId: id }
+        : wireExtra(mode === 'foreign-id' ? `${id}:foreign` : id));
+      assert.equal(out.isError, true, mode);
+      assert.equal(spaceStore.spaceStore.get(f.args.slug), undefined, `no saved artifact for ${mode}`);
+      assert.equal((openEventLog().prepare('SELECT COUNT(*) AS n FROM logical_tool_calls WHERE session_id = ?').get(f.sessionId) as any)?.n, 0,
+        `no bracket/producer crossing for ${mode}`);
+      revokeDispatchLease(f.lease);
+    }
+  });
+}
+
+test('Claude metadata id is transport-only own data, and reads retain their ordinary no-marker path', async () => {
+  for (const extra of [undefined, {}, { _meta: {} }, { _meta: { 'claudecode/toolUseId': ['forged'] } },
+    { _meta: { 'claudecode/toolUseId': ' leading' } }, Object.create({ _meta: { 'claudecode/toolUseId': 'inherited' } }),
+    { _meta: Object.create({ 'claudecode/toolUseId': 'inherited' }) }]) {
+    assert.equal(claudeCorrelation.claudeLocalMcpProviderCallId(extra), undefined);
+  }
+  assert.equal(claudeCorrelation.claudeLocalMcpProviderCallId(wireExtra('exact-id')), 'exact-id');
+  const f = spaceIdentityFixture('direct', 'read-compatible');
+  const result = await f.registered.space_get.handler({ slug: 'does-not-exist', metadata_only: true });
+  assert.doesNotMatch(mcpText(result), /space_call_identity_unavailable/);
+  revokeDispatchLease(f.lease);
+});
+
+test('Claude Space revoked query refuses before the producer while non-Claude MCP retains its existing route', async () => {
+  const f = spaceIdentityFixture('direct', 'revoked-query');
+  f.admit('revoked-space');
+  revokeDispatchLease(f.lease);
+  await assert.rejects(f.invoke(f.wire(f.args), wireExtra('revoked-space')), StaleDispatchLeaseError);
+  assert.equal(spaceStore.spaceStore.get(f.args.slug), undefined);
+  const server = createClementineMcpServer({ allowedTools: ['space_save'], claudeSpaceCallIdentity: false });
+  const output = await (server as any)._registeredTools.space_save.handler({ slug: 'non-claude-compatible',
+    title: 'Existing transport', view_html: '<html><body><p>Controlled compatibility.</p></body></html>' });
+  assert.ok(spaceCommit.parseHostLocalWriteCommitFacts(mcpText(output)), mcpText(output));
 });

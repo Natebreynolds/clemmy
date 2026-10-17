@@ -144,6 +144,61 @@ export interface NoticingProposalRecord extends NoticingProposalV1 {
   };
 }
 
+export interface NoticingProposalCoverage {
+  availability: 'complete' | 'partial' | 'unavailable';
+  omitted: number;
+}
+export interface NoticingProposalSnapshot {
+  proposals: NoticingProposalRecord[];
+  coverage: NoticingProposalCoverage;
+  unavailableGoalIds: string[];
+  unknownGoalAssociation: boolean;
+}
+
+const retainedTime = z.string().refine(value => Number.isFinite(Date.parse(value)));
+const retainedId = z.string().min(1).max(256);
+const NoticingProposalProjectionSchema = NoticingProposalV1Schema.extend({
+  id: retainedId, shapeKey: z.string().min(1), createdAt: retainedTime,
+  checkInId: retainedId.optional(), notificationId: retainedId.optional(),
+  status: z.enum(['open', 'answered', 'expired', 'retired']),
+  retiredReason: z.string().optional(),
+  answer: z.object({ text: z.string(), decision: z.enum(['do_it', 'not_now', 'never', 'unclear']),
+    at: retainedTime, instruction: z.string().optional(), modelAccountingJobId: z.string().optional() }).optional(),
+  handoff: z.object({ version: z.literal(1), answerDigest: z.string().min(1),
+    state: z.enum(['not_started', 'dispatched', 'needs_attention', 'settled']), updatedAt: retainedTime,
+    sessionId: retainedId.optional(), sourceUserSeq: z.number().int().positive().optional(),
+    requestId: retainedId.optional(), reason: z.string().optional() }).optional(),
+});
+
+/** Presentation and relationship inventory only. Never repairs stored state,
+ * closes a question, accepts an answer, or grants task/execution authority. */
+export function projectNoticingProposalSnapshot(value: unknown): NoticingProposalSnapshot {
+  const snapshot: NoticingProposalSnapshot = { proposals: [], coverage: { availability: 'complete', omitted: 0 },
+    unavailableGoalIds: [], unknownGoalAssociation: false };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    snapshot.coverage.availability = 'unavailable'; snapshot.unknownGoalAssociation = true;
+    return snapshot;
+  }
+  const unavailableGoals = new Set<string>();
+  for (const [key, candidate] of Object.entries(value)) {
+    const parsed = NoticingProposalProjectionSchema.safeParse(candidate);
+    if (parsed.success && parsed.data.id === key) {
+      // The validator's parsed projection keeps only declared fields; callers
+      // separately whitelist public answers, retaining accounting in storage.
+      snapshot.proposals.push(parsed.data);
+      continue;
+    }
+    snapshot.coverage.availability = 'partial'; snapshot.coverage.omitted += 1;
+    const goalId = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+      ? (candidate as Record<string, unknown>).goalId : undefined;
+    if (typeof goalId === 'string' && goalId.length > 0) unavailableGoals.add(goalId);
+    else if (goalId !== null) snapshot.unknownGoalAssociation = true;
+  }
+  snapshot.unavailableGoalIds = [...unavailableGoals];
+  snapshot.proposals.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
+  return snapshot;
+}
+
 export interface PublicNoticingAnswer {
   text: string;
   decision: NoticingDecision;

@@ -123,6 +123,12 @@ import { currentHostCallAttestation } from '../runtime/harness/accepted-turn-cal
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import {
+  claudeLocalMcpProviderCallId,
+  claudeLocalSpaceWriteRefusal,
+  claudeLocalSpaceWriteTarget,
+  claimClaudeLocalPermissionAdmission,
+} from '../runtime/harness/claude-local-tool-correlation.js';
+import {
   hostCallCapabilityBindingMatchesAttestation,
   loadHostCallCapabilityBinding,
 } from '../runtime/harness/host-call-capability-binding.js';
@@ -1618,6 +1624,10 @@ function missingRequiredNextAction(
 export function registerCallToolMcp(
   server: McpServer,
   options: BuildCallToolOptions,
+  transport: {
+    claudeSpaceCallIdentity?: boolean;
+    isSelectedLocalPlanningCapability?: (name: string, sessionId: string, sourceUserSeq: number) => boolean;
+  } = {},
 ): void {
   const dispatcher = buildCallTool(options) as unknown as {
     invoke: (
@@ -1632,13 +1642,27 @@ export function registerCallToolMcp(
       description: options.controlOnlyBuiltins ? CONTROL_ONLY_DESCRIPTION : DESCRIPTION,
       inputSchema: callToolInputSchema(options.controlOnlyBuiltins),
     },
-    async (input) => {
-      const sessionId = getToolOutputContext()?.sessionId ?? '';
+    async (input, extra) => {
+      const outputContext = getToolOutputContext();
+      const sessionId = outputContext?.sessionId ?? '';
+      const sourceUserSeq = outputContext?.sourceUserSeq;
+      const run = harnessRunContextStorage.getStore();
+      const spaceWrite = transport.claudeSpaceCallIdentity
+        ? claudeLocalSpaceWriteTarget('call_tool', input) : null;
+      const claim = spaceWrite && sourceUserSeq
+        && !transport.isSelectedLocalPlanningCapability?.(spaceWrite, sessionId, sourceUserSeq)
+        ? claimClaudeLocalPermissionAdmission({ sessionId, sourceUserSeq,
+          runScopeId: outputContext?.runScopeId ?? '', toolName: 'call_tool', rawInput: input,
+          directOrchestrator: run?.directOrchestrator === true, dispatchLease: run?.dispatchLease,
+          providerCallId: claudeLocalMcpProviderCallId(extra),
+        }) : null;
+      if (spaceWrite && !claim) return textResult(claudeLocalSpaceWriteRefusal(), { isError: true });
       const output = await dispatcher.invoke(
-        { context: { sessionId } },
+        { context: { sessionId, ...(sourceUserSeq ? { sourceUserSeq } : {}) } },
         // Keep the MCP input in its original representation. The dispatcher
         // validates it before serializing any structured inner arguments.
         JSON.stringify(input),
+        claim ? { toolCall: { callId: claim.providerCallId } } : undefined,
       );
       // TRUTH AT THE TRANSPORT. Every deferred built-in reaches the Claude lane
       // through here, so this is where a harness refusal stops looking like an

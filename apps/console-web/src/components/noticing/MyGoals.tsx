@@ -222,6 +222,7 @@ export function MyGoals() {
         </Card>
       ) : null}
       <div className="mt-3 grid gap-3">
+        {q.data?.proposalCoverage && q.data.proposalCoverage.availability !== 'complete' && <p role="status" className="text-small text-warning">Some suggestions couldn’t be loaded. The work shown below may be incomplete.</p>}
         {q.isError && q.data && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 text-small text-warning"><span>Showing the last loaded goals. Work evidence could not be refreshed.</span><Button variant="secondary" size="sm" onClick={() => { void q.refetch(); }}>Retry</Button></div>}
         {q.isLoading && goals.length === 0 ? <p className="text-small text-muted">Loading…</p>
           : q.isError && !q.data ? <QueryUnavailable title="Goals could not be loaded" description="This is not an empty list. Retry to see your goals and linked work." onRetry={() => { void q.refetch(); }} />

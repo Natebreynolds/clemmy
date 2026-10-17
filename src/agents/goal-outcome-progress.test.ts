@@ -3,6 +3,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { mock } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import type { GoalRecord } from '../memory/goals-list.js';
 import type { NoticingProposalRecord } from './noticing.js';
 import type { NoticingApprovedTaskPacket } from '../runtime/harness/noticing-approved-task.js';
@@ -503,16 +506,25 @@ test('goal outcome preserves known bad artifact bytes beside an uncovered retain
 });
 
 test('goal outcome cannot establish a unique contract from a partial plan registry', () => {
-  const f = accepted(); const w = workflow(f);
+  const f = accepted(); const w = workflow(f, 'healthy-pin', { pinContract: true });
+  const legacy = accepted(f.goal); workflow(legacy, 'legacy-unpinned');
   const registry = path.join(home, 'state', 'plan-proposals');
   const unknown = path.join(registry, `unreadable-${w.contract.id}.json`);
   assert.equal(f.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied');
-  for (const variant of ['malformed', 'unreadable-entry', 'null', 'array', 'scalar'] as const) {
+  for (const variant of ['malformed', 'unreadable-entry', 'null', 'array', 'scalar', 'status-array', 'kind-array'] as const) {
     try {
       if (variant === 'unreadable-entry') mkdirSync(unknown);
+      else if (variant === 'status-array' || variant === 'kind-array') writeFileSync(unknown, JSON.stringify({
+        ...w.contract, id: path.basename(unknown, '.json'),
+        ...(variant === 'status-array' ? { status: ['active'] } : { origin: { ...w.contract.origin, kind: ['workflow'] } }),
+      }));
       else writeFileSync(unknown, variant === 'malformed' ? '{"origin":' : variant === 'array' ? '[]' : variant === 'null' ? 'null' : '42');
-      assert.throws(() => plans.listPlanProposals({ status: 'all', strictRead: true }), variant);
-      assert.equal(f.project().availability, 'unavailable', variant);
+      if (variant !== 'status-array' && variant !== 'kind-array') {
+        assert.throws(() => plans.listPlanProposals({ status: 'all', strictRead: true }), variant);
+      }
+      assert.equal(f.project().availability, 'available', variant);
+      assert.equal(f.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied', 'an exact canonical pin survives unrelated corruption');
+      assert.equal(legacy.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable', 'legacy uniqueness needs the whole registry');
       if (variant === 'malformed' || variant === 'unreadable-entry') {
         assert.ok(plans.listPlanProposals({ status: 'all' }).some(contract => contract.id === w.contract.id),
           'legacy callers still skip unreadable entries; only proof captures opt into strict reads');
@@ -520,4 +532,30 @@ test('goal outcome cannot establish a unique contract from a partial plan regist
     } finally { rmSync(unknown, { recursive: true, force: true }); }
   }
   assert.equal(f.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+  assert.equal(legacy.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+});
+
+test('goal outcome shares one fresh proposal capture across multiple goals', () => {
+  const a = accepted(); workflow(a, 'capture-a', { pinContract: true });
+  const b = accepted(); workflow(b, 'capture-b', { pinContract: true });
+  const registry = path.join(home, 'state', 'plan-proposals');
+  const read = fs.readFileSync, list = fs.readdirSync;
+  const reads = new Map<string, number>(); let lists = 0;
+  const readSpy = mock.method(fs, 'readFileSync', (...args: any[]) => {
+    if (String(args[0]).startsWith(registry + path.sep)) reads.set(String(args[0]), (reads.get(String(args[0])) ?? 0) + 1);
+    return Reflect.apply(read, fs, args);
+  });
+  const listSpy = mock.method(fs, 'readdirSync', (...args: any[]) => {
+    if (String(args[0]) === registry) lists += 1;
+    return Reflect.apply(list, fs, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const projected = progress.readGoalOutcomeProgress({ goals: [a.goal, b.goal], proposals: [a.proposal, b.proposal] });
+    assert.equal(projected[a.goal.id]?.linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+    assert.equal(projected[b.goal.id]?.linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+    assert.equal(lists, 2, 'one directory capture plus one freshness recheck, independent of goal count');
+    assert.ok(reads.size >= 2);
+    assert.ok([...reads.values()].every(count => count === 1), 'each registry file is parsed only once per projection');
+  } finally { readSpy.mock.restore(); listSpy.mock.restore(); syncBuiltinESMExports(); }
 });
