@@ -253,7 +253,8 @@ export function readSourceRefreshStreaks(raw: unknown): Record<string, SourceRef
 }
 
 /** What the source reads, as its own declaration names it. */
-function declaredRead(source: SpaceDataSource): { read: string; through: 'app' | 'command' } {
+function declaredRead(source: SpaceDataSource): { read: string; through: 'app' | 'command' | 'file' } {
+  if (source.filePath?.trim()) return { read: source.filePath.trim(), through: 'file' };
   if (source.runner?.trim()) return { read: source.runner.trim(), through: 'command' };
   if (source.cliArgv?.length) return { read: source.cliArgv.join(' '), through: 'command' };
   return { read: source.composioSlug?.trim() ?? '', through: 'app' };
@@ -266,7 +267,7 @@ interface PlainReason {
   detail: boolean;
 }
 
-function plainReason(code: SourceStreakCode, declared: { read: string; through: 'app' | 'command' }): PlainReason {
+function plainReason(code: SourceStreakCode, declared: { read: string; through: 'app' | 'command' | 'file' }): PlainReason {
   const { read } = declared;
   switch (code) {
     case 'local_runner':
@@ -306,6 +307,13 @@ function plainReason(code: SourceStreakCode, declared: { read: string; through: 
         detail: true,
       };
     case 'provider_error':
+      if (declared.through === 'file') {
+        return {
+          why: `The file${read ? ` (${read})` : ''} could not be read.`,
+          fix: 'Check that the file is still there and readable, or ask Clem to point the source at its new place.',
+          detail: true,
+        };
+      }
       return declared.through === 'command'
         ? {
           why: `The command${read ? ` (${read})` : ''} returned an error.`,

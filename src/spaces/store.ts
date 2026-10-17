@@ -190,6 +190,10 @@ export interface SpaceDataSource {
    * after that, scheduled and manual refreshes run it unattended. Any argv or
    * schedule change voids the grant and re-asks. */
   cliArgv?: string[];
+  /** OR a local file the host reads on each refresh (no model, no process):
+   * a .json file is its parsed document, a .csv/.tsv file its rows as
+   * objects keyed by the header, anything else `{ text }`. */
+  filePath?: string;
   /** OR a stored Composio op + frozen args (creds resolve server-side). */
   composioSlug?: string;
   composioArgs?: Record<string, unknown>;
@@ -581,6 +585,11 @@ function normDataSource(raw: unknown, manifestErrors: string[], index: number): 
     if (runner) manifestErrors.push(`${label} declares both a runner and cli_argv; declare exactly one execution mode.`);
   }
   const cs = asStr(d.composioSlug) ?? asStr(d.composio_slug); if (cs) ds.composioSlug = cs;
+  const filePath = asStr(d.filePath) ?? asStr(d.file_path);
+  if (filePath) {
+    ds.filePath = filePath;
+    if (runner || cliArgvRaw != null || cs) manifestErrors.push(`${label} declares file_path with another execution mode; declare exactly one.`);
+  }
   const account = asStr(d.composioAccountId) ?? asStr(d.composio_account_id);
   if (account) ds.composioAccountId = account;
   const transforms = d.transforms ?? d.transforms_json;
@@ -707,6 +716,9 @@ function declaredRunnerErrors(
       if (cliErr) errors.push(`${label} ${cliErr}.`);
       if (src.runner !== undefined) errors.push(`${label} declares both a runner and cli_argv; declare exactly one execution mode.`);
       if (src.composioSlug?.trim()) errors.push(`${label} declares both cli_argv and a composio_slug; declare exactly one execution mode.`);
+    }
+    if (src.filePath !== undefined && (src.runner !== undefined || src.cliArgv !== undefined || src.composioSlug?.trim())) {
+      errors.push(`${label} declares file_path with another execution mode; declare exactly one.`);
     }
     if (src.runner === undefined) continue;
     const err = runnerFilenameError(src.runner);

@@ -42,6 +42,7 @@ import {
 import { compileReviewedCliArgv } from '../runtime/harness/reviewed-cli-shell-match.js';
 import { readHostCliEnvelope } from '../runtime/harness/json-repair.js';
 import { parseSpaceSourceTransforms, transformSpaceSourceData } from './source-transforms.js';
+import { readWorkspaceFileSource } from './file-source.js';
 
 export interface RunSourceOk { ok: true; data: unknown }
 
@@ -416,6 +417,12 @@ async function runSpaceDataSourceRead(
     }
     return runCliSource(slug, trust.cliArgv);
   }
+  if (source.filePath?.trim()) {
+    const read = readWorkspaceFileSource(source.id, source.filePath);
+    return read.ok
+      ? { ok: true, data: read.data }
+      : { ok: false, error: read.error, code: read.code, ...(read.code === 'definition' ? { provenNoDispatch: true as const } : {}) };
+  }
   const safetyError = workspaceDataSourceSafetyError(source);
   if (safetyError) return { ok: false, error: safetyError, provenNoDispatch: true, code: 'definition' };
   if (source.composioSlug && source.composioSlug.trim()) {
@@ -433,7 +440,7 @@ async function runSpaceDataSourceRead(
   }
   return {
     ok: false,
-    error: `data source "${source.id}" declares no execution mode (runner, cli_argv, or composio_slug)`,
+    error: `data source "${source.id}" declares no execution mode (file_path, cli_argv, or composio_slug)`,
     code: 'definition',
   };
 }
@@ -748,6 +755,8 @@ async function refreshSpaceDataLocked(slug: string, sourceId?: string, opts: Ref
           .digest('hex'),
         ...(source.schedule ? { schedule: source.schedule } : {}),
       }
+      : source.filePath?.trim()
+      ? { adapter: 'local_file', path: source.filePath.trim(), ...(source.schedule ? { schedule: source.schedule } : {}) }
       : {
         adapter: source.runner?.trim() ? 'workspace_script' : 'legacy_runner',
         ...(source.runner ? { runner: source.runner } : {}),

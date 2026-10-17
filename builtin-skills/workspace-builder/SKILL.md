@@ -31,12 +31,13 @@ A Workspace has five parts. Decide all five before writing anything:
 
 Any tool can feed a Workspace. Pick the route by what reads the data:
 
-- **One connected-app read** is a direct source (below).
+- **One connected-app read** or **a local file** is a direct source (below).
 - **Several steps or reasoning** use a **feed workflow**: its steps read with the exact tools, a transform shapes the rows, and a final `space_set_data` step writes them into this Workspace under a source id. A catalog-reviewed CLI read can instead use the direct source below. Save the Workspace's required inputs first, create the feed, then bind it to the Workspace. Honor manual-only, disabled and no-schedule instructions; run or schedule it only within the user's requested scope. Verify actual saved results before claiming the feed works; a rehearsal previews writes and does not populate the Workspace.
 
 Declare direct sources on `space_save` as `data_sources`:
 
 - **Connected-app read**: `{ id, composio_slug, composio_args_json, schedule, timezone }`. Use a read operation (list, get, search, fetch, query). Find the exact operation name with `tool_search` first. The save prepares each operation against its current definition before judging it, and refuses anything that is not a read.
+- **Local file**: `{ id, file_path, schedule, timezone }` with an absolute or `~/` path. Every refresh reads the file with no model and no process: a `.json` file becomes its document, a `.csv`/`.tsv` file its rows as objects keyed by the header (values are text; convert in the view or with `transforms_json`), anything else `{ text }`. Use it when the data already lives in a file instead of a feed workflow or a static snapshot.
 - **Local command-line read**: `{ id, cli_argv, schedule, timezone }` where `cli_argv` is a reviewed read from the CLI catalog, frozen as an argument array with no shell. For Salesforce: `["sf","data","query","--query","SELECT Id, Name FROM Opportunity WHERE IsClosed = false","--json"]`. Only the options the reviewed read declares are carried (`--query`, `--target-org`); any other option is refused by name.
 - **Schedules**: five-field cron plus an IANA timezone, for example `"0 7,13 * * 1-5"` with `"America/Los_Angeles"`.
 - **Shape a read without a model**: add `transforms_json`, a JSON array of `{id,transform:{version:1,expression:<workflow transform>}}` steps. `steps.read.output` is this source's successful read result (CLI stdout is already parsed); later steps can read `steps.<earlier-id>.output`. `input.observed_at` is the host's read timestamp. The last step becomes the source dataset for desktop and phone. This uses the same pure operations as workflow transforms, with at most 16 steps and 64 KiB of definitions. A shaping error preserves the prior dataset and reports a failed refresh. Keep the existing output shape when migrating a source. No calls, code, or other source access are available inside these steps.

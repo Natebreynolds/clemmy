@@ -1,0 +1,80 @@
+/**
+ * Run: node scripts/run-tests-isolated.mjs src/spaces/file-source.test.ts
+ *
+ * A Workspace source can be a local file the host reads on every refresh,
+ * with no model and no process.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-file-source-'));
+process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
+process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
+mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
+
+const { parseDelimitedRows, readWorkspaceFileSource } = await import('./file-source.js');
+const spaces = await import('./store.js');
+const { refreshSpaceData } = await import('./runner.js');
+
+const FIXTURES = mkdtempSync(path.join(os.tmpdir(), 'clem-file-source-data-'));
+
+test('CSV rows keep quoted commas, quotes and line breaks, across CRLF and a BOM', () => {
+  const rows = parseDelimitedRows('﻿title,price\r\n"Sapiens: A Brief History, Vol 1",£54.23\r\n"He said ""hi""\nthen left",£1\r\n\r\n', ',');
+  assert.deepEqual(rows, [['title', 'price'], ['Sapiens: A Brief History, Vol 1', '£54.23'], ['He said "hi"\nthen left', '£1']]);
+});
+
+test('a CSV becomes rows keyed by its header, JSON its document, other text { text }', () => {
+  const csv = path.join(FIXTURES, 'books.csv');
+  writeFileSync(csv, 'title,price,star_rating\nA Light in the Attic,£51.77,Three\nSoumission,£50.10,One\n');
+  assert.deepEqual(readWorkspaceFileSource('books', csv), { ok: true, data: [
+    { title: 'A Light in the Attic', price: '£51.77', star_rating: 'Three' },
+    { title: 'Soumission', price: '£50.10', star_rating: 'One' },
+  ] });
+  const json = path.join(FIXTURES, 'stats.json');
+  writeFileSync(json, '{"count":2}');
+  assert.deepEqual(readWorkspaceFileSource('stats', json), { ok: true, data: { count: 2 } });
+  const notes = path.join(FIXTURES, 'notes.md');
+  writeFileSync(notes, '# Notes');
+  assert.deepEqual(readWorkspaceFileSource('notes', notes), { ok: true, data: { text: '# Notes' } });
+});
+
+test('credentials, Clementine state, relative paths and missing files are refused with a reason', () => {
+  const secret = path.join(FIXTURES, '.env');
+  writeFileSync(secret, 'TOKEN=x');
+  const refused = readWorkspaceFileSource('env', secret);
+  assert.equal(refused.ok, false);
+  assert.match(refused.ok ? '' : refused.error, /credentials or Clementine's own state/);
+  const internal = path.join(TMP_HOME, 'state', 'harness-notes.json');
+  writeFileSync(internal, '{}');
+  assert.equal(readWorkspaceFileSource('internal', internal).ok, false);
+  const relative = readWorkspaceFileSource('rel', 'books.csv');
+  assert.match(relative.ok ? '' : relative.error, /absolute or ~\/ path/);
+  const missing = readWorkspaceFileSource('gone', path.join(FIXTURES, 'gone.csv'));
+  assert.equal(missing.ok ? '' : missing.code, 'provider_error');
+});
+
+test('a refresh reads the file into the Space with no model, and picks up a change to the file', async () => {
+  const csv = path.join(FIXTURES, 'shelf.csv');
+  writeFileSync(csv, 'title,price\nThirst,£17.27\n');
+  spaces.spaceStore.save({
+    id: 'framework-test-file-shelf',
+    title: 'FRAMEWORK-TEST file shelf',
+    status: 'active',
+    viewEntry: 'view/index.html',
+    viewContent: '<!doctype html><title>Shelf</title>',
+    dataSources: [{ id: 'books', filePath: csv }],
+    actions: [],
+  });
+  const first = await refreshSpaceData('framework-test-file-shelf');
+  assert.equal(first[0]?.ok, true, JSON.stringify(first));
+  const read = () => (JSON.parse(readFileSync(spaces.resolveInSpace('framework-test-file-shelf', 'data.json'), 'utf8')) as Record<string, unknown>).books;
+  assert.deepEqual(read(), [{ title: 'Thirst', price: '£17.27' }]);
+  writeFileSync(csv, 'title,price\nThirst,£17.27\nSet Me Free,£17.46\n');
+  const second = await refreshSpaceData('framework-test-file-shelf');
+  assert.equal(second[0]?.ok, true, JSON.stringify(second));
+  assert.equal((read() as unknown[]).length, 2);
+});
