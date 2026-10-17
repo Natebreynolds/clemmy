@@ -14,6 +14,7 @@ export interface RecallStatus {
   credential?: { status?: string; source?: string; hasValue?: boolean };
   /** windowId of the Recall meeting currently recording, if any — used to key
    *  the live scratchpad during a Zoom/Meet/Teams call. */
+  activeMeetingId?: string;
   activeWindowId?: string;
   /** startedAt of that active recording, so notes can be timestamped. */
   activeStartedAt?: string;

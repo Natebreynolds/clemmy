@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -56,6 +57,7 @@ test('local meeting routes require auth and complete the start → ingest → hi
     authorized.value = true;
     assert.equal((await fetch(`${harness.url}/api/console/meetings/local/retry`, json('POST', {}))).status, 400);
     assert.equal((await fetch(`${harness.url}/api/console/meetings/recall/missing/retry-transcript`, json('POST'))).status, 404);
+    recall.noteRecallMeetingDetected({ windowId: 'route-recall-ready', status: 'recording' });
     recall.appendRecallTranscriptSegment({
       windowId: 'route-recall-ready',
       event: 'transcript.data',
@@ -146,4 +148,52 @@ test('local meeting routes require auth and complete the start → ingest → hi
   } finally {
     await harness.close();
   }
+});
+
+
+test('Recall final ingress acknowledges only exact persisted events, even if optional assistance is corrupt', async () => {
+  const harness = await boot({ value: true });
+  const record = recall.noteRecallMeetingDetected({ windowId: 'controlled-final-route-window', sdkUploadId: 'controlled-final-route-upload', status: 'recording' });
+  const assistanceDirectory = path.join(TMP_HOME, 'state', 'meeting-capture', 'assistance');
+  mkdirSync(assistanceDirectory, { recursive: true });
+  const statePath = path.join(assistanceDirectory, `${createHash('sha256').update(JSON.stringify(record.id)).digest('hex')}.json`);
+  writeFileSync(statePath, '{ controlled corrupt optional state');
+  const payload = { windowId: record.windowId, sdkUploadId: record.sdkUploadId, eventId: `recall-final-${'d'.repeat(64)}`, eventIdentity: 'sdk',
+    event: 'transcript.data', text: 'Controlled final persisted content', isFinal: true };
+  try {
+    const send = () => fetch(`${harness.url}/api/console/meetings/recall/transcript-event`, json('POST', payload));
+    const accepted = await send(); assert.equal(accepted.status, 200);
+    const ack = await accepted.json() as Record<string, unknown>;
+    assert.equal(ack.status, 'accepted'); assert.equal(ack.meetingId, record.id); assert.equal(ack.segmentCount, 1);
+    assert.equal('record' in ack, false); assert.equal(JSON.stringify(ack).includes(payload.text), false);
+    const repeated = await send(); assert.equal((await repeated.json() as { status: string }).status, 'duplicate');
+    assert.equal(recall.loadRecallMeetingById(record.id)!.segments.length, 1);
+    const unknown = await fetch(`${harness.url}/api/console/meetings/recall/transcript-event`, json('POST', { ...payload, sdkUploadId: 'foreign-upload' }));
+    assert.equal((await unknown.json() as { status: string }).status, 'ignored');
+    assert.equal(readFileSync(statePath, 'utf8'), '{ controlled corrupt optional state');
+  } finally { await harness.close(); }
+});
+
+test('delivery status updates are authenticated exact-capture metadata and never restart a completed meeting', async () => {
+  const auth = { value: false }; const harness = await boot(auth);
+  const record = recall.noteRecallMeetingDetected({ windowId: 'controlled-delivery-route', sdkUploadId: 'controlled-delivery-upload', status: 'recording' });
+  const payload = { windowId: record.windowId, sdkUploadId: record.sdkUploadId, unresolvedFinalCount: 1 };
+  const route = `${harness.url}/api/console/meetings/recall/transcript-delivery-status`;
+  try {
+    assert.equal((await fetch(route, json('POST', payload))).status, 401); auth.value = true;
+    for (const invalid of [{ ...payload, unresolvedFinalCount: -1 }, { ...payload, unresolvedFinalCount: 1.5 }, { ...payload, text: 'not accepted' }]) {
+      assert.equal((await fetch(route, json('POST', invalid))).status, 400);
+    }
+    recall.finalizeRecallMeeting({ windowId: record.windowId, sdkUploadId: record.sdkUploadId, retentionMode: 'zero', canonicalBackfill: false });
+    const changed = await fetch(route, json('POST', payload));
+    assert.equal(changed.status, 200); const ack = await changed.json() as Record<string, unknown>;
+    assert.equal(ack.status, 'updated'); assert.equal('record' in ack, false);
+    assert.deepEqual(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery, { status: 'incomplete', failedFinalCount: 1 });
+    assert.equal(recall.loadRecallMeetingById(record.id)!.status, 'completed');
+    const foreign = await fetch(route, json('POST', { ...payload, windowId: 'foreign-window', unresolvedFinalCount: 0 }));
+    assert.equal((await foreign.json() as { status: string }).status, 'ignored');
+    assert.equal(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery!.failedFinalCount, 1);
+    await fetch(route, json('POST', { ...payload, unresolvedFinalCount: 0 }));
+    assert.equal(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery, undefined);
+  } finally { await harness.close(); }
 });

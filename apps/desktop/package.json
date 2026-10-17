@@ -262,7 +262,7 @@
     ]
   },
   "optionalDependencies": {
-    "@recallai/desktop-sdk": "2.0.25"
+    "@recallai/desktop-sdk": "2.0.39"
   },
   "engines": {
     "node": ">=22.15.0"

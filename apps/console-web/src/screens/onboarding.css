@@ -1,0 +1,56 @@
+.clem-setup { min-height: 100dvh; background: var(--bg-canvas); color: var(--text); overflow-wrap: anywhere; }
+.clem-setup-header { max-width: 1160px; margin: 0 auto; padding: 28px 40px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.clem-setup-brand { display: inline-flex; align-items: center; gap: 10px; font-size: 21px; font-weight: 750; text-decoration: none; color: var(--text); }
+.clem-setup-layout { max-width: 1080px; margin: 38px auto 0; padding: 0 40px 60px; display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 74px; align-items: start; }
+.clem-setup-progress { padding-top: 10px; position: sticky; top: 32px; }
+.clem-setup-progress ol { display: flex; flex-direction: column; gap: 22px; }
+.clem-setup-progress button { display: flex; align-items: center; text-align: left; gap: 12px; color: var(--text-muted); font-size: 15px; min-height: 44px; }
+.clem-setup-progress button:disabled { cursor: default; }
+.clem-setup-progress button[aria-current] { color: var(--text); font-weight: 700; }
+.clem-setup-step-mark { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border: 1px solid var(--border-strong); border-radius: 50%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.clem-setup-progress [aria-current] .clem-setup-step-mark { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
+.clem-setup-progress small { display: block; font-weight: 400; font-size: 12px; margin-top: 2px; }
+.clem-setup-progress > p { font-size: 14px; color: var(--text-muted); line-height: 1.65; margin-top: 56px; }
+.clem-setup-main { min-width: 0; }
+.clem-setup-intro { margin-bottom: 40px; }
+.clem-setup-intro h1 { font-size: clamp(30px, 4.2vw, 46px); line-height: 1.16; letter-spacing: -.035em; font-weight: 750; max-width: 19ch; text-wrap: balance; }
+.clem-setup-intro h1:focus { outline: none; }
+.clem-setup-intro > p { color: var(--text-muted); font-size: 17px; line-height: 1.75; margin-top: 18px; max-width: 65ch; }
+.clem-setup-main [hidden] { display: none !important; }
+.clem-setup-main input, .clem-setup-main select { min-width: 0; max-width: 100%; }
+.clem-setup-main button { max-width: 100%; white-space: normal; height: auto; min-height: 44px; padding-top: 8px; padding-bottom: 8px; }
+.clem-setup-main a { overflow-wrap: anywhere; }
+.clem-setup-extra { display: flex; flex-direction: column; align-items: stretch; gap: 24px; max-width: 65ch; }
+.clem-setup-lead { font-size: 19px; line-height: 1.65; }
+.clem-setup-link { display: inline-flex; align-items: center; gap: 8px; align-self: flex-start; color: var(--primary-ink); text-decoration: underline; text-underline-offset: 4px; }
+.clem-setup-saved { display: flex; align-items: center; gap: 8px; color: var(--success); }
+.clem-setup-ready dl > div { display: flex; justify-content: space-between; align-items: start; gap: 24px; padding: 17px 0; border-bottom: 1px solid var(--border); font-size: 15px; }
+.clem-setup-ready dt { color: var(--text-muted); flex-shrink: 0; }
+.clem-setup-ready dd { text-align: right; }
+.clem-setup-ready dl + p { margin-top: 18px; }
+.clem-setup-first-task { margin: 32px 0; padding: 24px; border-radius: 14px; background: var(--bg-subtle); }
+.clem-setup-first-task h2 { font-size: 16px; font-weight: 700; margin-bottom: 10px; }
+.clem-setup-first-task p { line-height: 1.75; }
+.clem-setup-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--border); }
+.clem-setup-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+.clem-setup-error { color: var(--danger); margin-top: 24px; line-height: 1.65; }
+.clem-setup ::selection { background: var(--primary-tint); color: var(--text); }
+.clem-setup input { caret-color: var(--primary-ink); }
+.clem-setup a:focus-visible, .clem-setup button:focus-visible { outline: 2px solid var(--primary-ink); outline-offset: 4px; border-radius: 5px; }
+@media (prefers-reduced-motion: no-preference) { .clem-setup-brand img { animation: clem-setup-hello 650ms cubic-bezier(.16,1,.3,1); } }
+@keyframes clem-setup-hello { 0% { transform: rotate(-8deg) translateY(3px); } 65% { transform: rotate(4deg); } 100% { transform: rotate(0); } }
+@media (max-width: 740px) {
+  .clem-setup-header { padding: 20px 22px; }
+  .clem-setup-header > span { display: none; }
+  .clem-setup-layout { display: block; margin-top: 4px; padding: 0 22px 40px; }
+  .clem-setup-progress { position: static; padding: 14px 0 30px; }
+  .clem-setup-progress ol { flex-direction: row; justify-content: space-between; gap: 8px; }
+  .clem-setup-progress button { flex-direction: column; gap: 7px; font-size: 12px; text-align: center; }
+  .clem-setup-progress small, .clem-setup-progress > p { display: none; }
+  .clem-setup-intro { margin-bottom: 30px; }
+  .clem-setup-intro > p { font-size: 16px; }
+  .clem-setup-footer { flex-wrap: wrap; }
+  .clem-setup-footer > div:empty { display: none; }
+  .clem-setup-actions { flex: 1 1 210px; }
+  .clem-setup-ready dl > div { gap: 12px; font-size: 14px; }
+}

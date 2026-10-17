@@ -16,7 +16,7 @@ import { getSettings, beginClaudeLogin, completeClaudeLogin } from '@/lib/settin
  * dropdown above (Models & routing) — there is no separate "run on Claude"
  * toggle here. Mirrors CodexLoginForm so the two subscription logins read alike.
  */
-export function ClaudeLoginForm({ embedded = false }: { embedded?: boolean } = {}) {
+export function ClaudeLoginForm({ embedded = false, onboarding = false }: { embedded?: boolean; onboarding?: boolean } = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const claude = settings.data?.claudeAuth;
@@ -85,7 +85,7 @@ export function ClaudeLoginForm({ embedded = false }: { embedded?: boolean } = {
       </div>
 
       <div className="mt-2 space-y-1">
-        {done && <p className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Signed in. Give Claude a job under Who does what — no restart.</p>}
+        {done && <p className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> {onboarding ? 'Signed in. Choose your main model below.' : 'Signed in. Give Claude a job under Who does what — no restart.'}</p>}
         {error && <p className="inline-flex items-center gap-1 text-small text-danger"><AlertTriangle className="h-4 w-4" aria-hidden /> {error}</p>}
       </div>
     </>

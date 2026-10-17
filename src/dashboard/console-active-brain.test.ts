@@ -279,6 +279,151 @@ test('Claude switch fails closed before changing the live or persisted brain whe
   }
 });
 
+async function withPrimaryRouteFixture(values: Record<string, string>, action: () => Promise<void>): Promise<void> {
+  const initial: Record<string, string> = {
+    AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '',
+    BYO_MODEL_ID: '', BYO_MODEL_JUDGE_ID: '', BYO_MODEL_PROVIDER: '', BYO_BRAIN_MODEL_ID: '', BYO_PROVIDERS: '',
+    BYO_PROVIDER_CONTROLLED_API_KEY: '', BYO_PROVIDER_OTHER_API_KEY: '', BYO_PROVIDER_XAI_API_KEY: '',
+    OPENAI_MODEL_PRIMARY: 'gpt-5.6-terra', OPENAI_MODEL_WORKER: 'gpt-5.6-luna', CLAUDE_MODEL: 'claude-sonnet-5',
+    CLEMMY_MODEL_ROLES: '[]', CLEMMY_BRAIN_BACKUPS: '["gpt-5.6-sol"]',
+    ...values,
+  };
+  const saved = Object.fromEntries(Object.keys(initial).map(key => [key, process.env[key]]));
+  const envFile = path.join(TMP_HOME, '.env');
+  let savedFile: Buffer | null = null;
+  try { savedFile = readFileSync(envFile); } catch { /* absent isolated fixture file */ }
+  let savedAuth: Buffer | null = null;
+  try { savedAuth = readFileSync(CODEX_AUTH_FILE); } catch { /* no grant is also a valid controlled fixture */ }
+  Object.assign(process.env, initial);
+  const runtime = await import('../runtime/harness/codex-client.js');
+  runtime.resetHarnessRuntimeConfig();
+  try { await action(); }
+  finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    if (savedFile === null) rmSync(envFile, { force: true }); else writeFileSync(envFile, savedFile);
+    if (savedAuth === null) rmSync(CODEX_AUTH_FILE, { force: true }); else writeFileSync(CODEX_AUTH_FILE, savedAuth);
+    claudeOauth.__test__.setVaultTokenReaderForTests(null);
+    claudeOauth.__test__.setRawCredentialReaderForTests(null);
+    claudeOauth.__test__.setRefreshClaudeTokensForTests(null);
+    runtime.resetHarnessRuntimeConfig();
+  }
+}
+
+for (const provider of ['controlled', 'xai'] as const) {
+  test(`an explicit ${provider} model is a functional primary without an unrelated legacy default backend`, async () => {
+    const modelId = provider === 'xai' ? 'grok-controlled-primary' : 'controlled/primary';
+    const baseURL = `https://${provider}.example.test/v1`;
+    await withPrimaryRouteFixture({
+      BYO_PROVIDERS: JSON.stringify([{ id: provider, label: 'Controlled provider', baseURL, modelIds: [modelId] }]),
+      ...(provider === 'controlled' ? { BYO_PROVIDER_CONTROLLED_API_KEY: 'controlled-fixture-key' } : {}),
+    }, async () => {
+      const auth = await import('../runtime/auth-store.js');
+      if (provider === 'xai') auth.saveXaiOAuthTokens({ accessToken: 'controlled-xai-access', refreshToken: 'controlled-xai-refresh',
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString() });
+      const harness = await boot();
+      try {
+        const backups = process.env.CLEMMY_BRAIN_BACKUPS;
+        const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId });
+        assert.equal(selected.response.status, 200, selected.body.error);
+        assert.equal(process.env.BYO_MODEL_BASE_URL, '', 'no default endpoint is invented');
+        assert.equal(process.env.BYO_MODEL_API_KEY, '', 'no credential is copied to the default account');
+        assert.equal(process.env.BYO_BRAIN_MODEL_ID, modelId);
+        assert.equal(process.env.CLEMMY_BRAIN_BACKUPS, backups, 'explicit backup order is unchanged');
+        assert.equal(resolveRoleModel('brain').modelId, modelId);
+        assert.equal(resolveRoleModel('brain').provider, 'byo');
+        assert.equal(resolveRoleModel('quick').modelId, modelId);
+        const options = await import('../runtime/harness/model-role-options.js');
+        assert.equal(options.effectiveBrain(), 'api_key');
+        assert.equal(options.effectiveBrainValue(), `api_key:${modelId}`);
+        assert.equal(options.brainOptions().filter(row => row.value === options.effectiveBrainValue() && row.available).length, 1);
+        const runtime = await import('../runtime/harness/codex-client.js');
+        runtime.resetHarnessRuntimeConfig();
+        assert.deepEqual(await runtime.configureHarnessRuntime(), { ok: true }, 'the actual runtime configuration accepts the exact selected owner');
+        const { routedPrimaryModel } = await import('../runtime/harness/router-model.js');
+        const routed = routedPrimaryModel(resolveRoleModel('brain').modelId);
+        assert.equal(routed.provider, 'byo');
+        assert.equal(routed.modelId, modelId);
+        assert.equal(routed.backend?.providerId, provider);
+        assert.equal(routed.backend?.baseURL, baseURL);
+        assert.equal(routed.backend?.apiKey, provider === 'xai' ? 'controlled-xai-access' : 'controlled-fixture-key');
+      } finally { await harness.close(); }
+    });
+  });
+}
+
+test('a missing or multiply-owned API pick cannot change the current route or borrow another configured account', async () => {
+  await withPrimaryRouteFixture({
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'controlled', label: 'Controlled A', baseURL: 'https://a.example.test/v1', modelIds: ['shared-controlled-model'] },
+      { id: 'other', label: 'Controlled B', baseURL: 'https://b.example.test/v1', modelIds: ['shared-controlled-model'] },
+    ]), BYO_PROVIDER_CONTROLLED_API_KEY: 'controlled-a', BYO_PROVIDER_OTHER_API_KEY: 'controlled-b',
+  }, async () => {
+    const harness = await boot();
+    const before = { auth: process.env.AUTH_MODE, mode: process.env.MODEL_ROUTING_MODE, pin: process.env.BYO_BRAIN_MODEL_ID };
+    try {
+      for (const modelId of ['shared-controlled-model', 'unconnected-controlled-model']) {
+        const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId });
+        assert.equal(selected.response.status, 400);
+        assert.deepEqual({ auth: process.env.AUTH_MODE, mode: process.env.MODEL_ROUTING_MODE, pin: process.env.BYO_BRAIN_MODEL_ID }, before);
+      }
+    } finally { await harness.close(); }
+  });
+});
+
+test('an unavailable saved API primary refuses runtime setup even when another legacy account and Claude are connected', async () => {
+  await withPrimaryRouteFixture({ AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'all_in',
+    BYO_BRAIN_MODEL_ID: 'missing-controlled-selection', BYO_MODEL_BASE_URL: 'https://other.example.test/v1',
+    BYO_MODEL_API_KEY: 'other-fixture-key', BYO_MODEL_ID: 'other-controlled-model',
+  }, async () => {
+    claudeOauth.__test__.setRawCredentialReaderForTests(() => null);
+    claudeOauth.__test__.setVaultTokenReaderForTests(() => ({ accessToken: 'sk-ant-oat01-controlled-other',
+      expiresAt: Date.now() + 60 * 60_000, source: 'vault' }));
+    const { getSelectedByoBrainBackendConfig } = await import('../runtime/harness/byo-providers.js');
+    assert.equal(getSelectedByoBrainBackendConfig().configured, false);
+    assert.equal(getSelectedByoBrainBackendConfig().apiKey, '', 'another backend cannot donate its key');
+    assert.equal(effectiveBrainValue(), 'api_key:missing-controlled-selection');
+    const runtime = await import('../runtime/harness/codex-client.js');
+    runtime.resetHarnessRuntimeConfig();
+    const configured = await runtime.configureHarnessRuntime();
+    assert.equal(configured.ok, false, 'neither the legacy provider nor Claude substitutes for the missing exact API choice');
+  });
+});
+
+test('failed Claude account/model preflight preserves an existing API primary and every persisted route byte', async () => {
+  await withPrimaryRouteFixture({ AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_BRAIN_MODEL_ID: 'controlled/primary',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'controlled', label: 'Controlled', baseURL: 'https://controlled.example.test/v1', modelIds: ['controlled/primary'] }]),
+    BYO_PROVIDER_CONTROLLED_API_KEY: 'controlled-key',
+  }, async () => {
+    const { updateEnvKey } = await import('../tools/shared.js');
+    for (const key of ['AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_BRAIN_MODEL_ID', 'CLAUDE_MODEL', 'OPENAI_MODEL_WORKER']) {
+      updateEnvKey(key, process.env[key]!);
+    }
+    const envFile = path.join(TMP_HOME, '.env');
+    const before = readFileSync(envFile, 'utf8');
+    const route = Object.fromEntries(['AUTH_MODE', 'MODEL_ROUTING_MODE', 'BYO_BRAIN_MODEL_ID', 'CLAUDE_MODEL', 'OPENAI_MODEL_WORKER']
+      .map(key => [key, process.env[key]]));
+    claudeOauth.__test__.setRawCredentialReaderForTests(() => null);
+    const harness = await boot();
+    try {
+      for (const failure of ['missing', 'unavailable-model', 'refresh'] as const) {
+        claudeOauth.__test__.setVaultTokenReaderForTests(() => failure === 'missing' ? null : {
+          accessToken: 'sk-ant-oat01-controlled', expiresAt: failure === 'refresh' ? 1 : Date.now() + 60 * 60_000,
+          refreshToken: 'controlled-refresh', source: 'vault',
+        });
+        claudeOauth.__test__.setRefreshClaudeTokensForTests(async () => { throw new Error('Controlled refresh refusal'); });
+        const selected = await patchActiveBrain(harness.url, { brain: 'claude_oauth',
+          modelId: failure === 'unavailable-model' ? 'claude-controlled-unavailable-model' : 'claude-sonnet-5' });
+        assert.equal(selected.response.status, failure === 'unavailable-model' ? 400 : 409);
+        assert.equal(readFileSync(envFile, 'utf8'), before, failure);
+        assert.deepEqual(Object.fromEntries(Object.keys(route).map(key => [key, process.env[key]])), route, failure);
+        assert.equal(resolveRoleModel('brain').modelId, 'controlled/primary', failure);
+      }
+    } finally { await harness.close(); }
+  });
+});
+
 test('worker role PATCH survives a route restart and clear removes the live and durable binding', async () => {
   rmSync(path.join(TMP_HOME, '.env'), { force: true });
   const previous = {

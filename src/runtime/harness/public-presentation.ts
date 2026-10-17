@@ -17,6 +17,7 @@
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
 import { withoutHostReceiptLines } from '../host-receipt-lines.js';
+import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { getEvent, getRunAttemptSourceUserEvent, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -476,11 +477,59 @@ export function publicUserInputText(value: unknown): string {
   return text(data.displayText) || text(data.text ?? data.message);
 }
 
+/** Display metadata issued only after the owner's exact meeting choice was
+ * verified. It is never input, an objective, or permission to run/replay work. */
+export interface MeetingLookupOwnerPresentation {
+  version: 1;
+  kind: 'meeting_lookup';
+  meetingId: string;
+  offerId: string;
+  offerDigest: string;
+  sourceDigest: string;
+  clientRequestId: string;
+  privateOriginSessionId: string;
+  inputHash: string;
+  question: string;
+}
+
+function meetingLookupOwnerQuestion(value: unknown, sessionId?: string): string | null {
+  if (!sessionId || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const data = value as Record<string, unknown>;
+  const candidate = data.meetingLookupPresentation;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate) || data.synthetic === true) return null;
+  const shown = candidate as Record<string, unknown>;
+  const keys = ['version', 'kind', 'meetingId', 'offerId', 'offerDigest', 'sourceDigest',
+    'clientRequestId', 'privateOriginSessionId', 'inputHash', 'question'];
+  if (Object.keys(shown).length !== keys.length || Object.keys(shown).some(key => !keys.includes(key))
+    || shown.version !== 1 || shown.kind !== 'meeting_lookup'
+    || typeof shown.meetingId !== 'string' || !shown.meetingId.trim() || shown.meetingId.length > 512
+    || typeof shown.offerId !== 'string' || !shown.offerId.trim() || shown.offerId.length > 80
+    || typeof shown.question !== 'string' || !shown.question.trim() || shown.question.length > 500 || shown.question.includes('\0')
+    || !['offerDigest', 'sourceDigest', 'inputHash'].every(key => typeof shown[key] === 'string' && /^[a-f0-9]{64}$/.test(shown[key] as string))
+    || typeof shown.clientRequestId !== 'string' || !/^meeting-lookup-[a-f0-9]{64}$/.test(shown.clientRequestId)
+    || shown.privateOriginSessionId !== sessionId
+    || data.requestId !== shown.clientRequestId || data.clientRequestId !== shown.clientRequestId
+    || typeof data.displayText !== 'string' || data.displayText.length > 6_000) return null;
+  const digest = (input: string) => createHash('sha256').update(input).digest('hex');
+  if (shown.clientRequestId !== `meeting-lookup-${digest(JSON.stringify([shown.meetingId, shown.offerId, shown.offerDigest]))}`
+    || sessionId !== `sess-desktop-${digest(shown.clientRequestId).slice(0, 24)}`
+    // The private lookup front door excludes attachments, modes and bindings;
+    // this is its existing canonical raw-input hash, not new work authority.
+    || shown.inputHash !== digest(JSON.stringify({ input: data.displayText, attachmentIds: [] }))) return null;
+  try {
+    const packet = JSON.parse(data.displayText.slice(data.displayText.lastIndexOf('\n') + 1)) as Record<string, unknown>;
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet)
+      || packet.meetingId !== shown.meetingId || packet.offerId !== shown.offerId
+      || packet.sourceDigest !== shown.sourceDigest || packet.question !== shown.question) return null;
+  } catch { return null; }
+  return shown.question;
+}
+
 /** The owner's message as a reopened conversation shows it. Display only —
  *  replay and resume compare the recorded text through publicUserInputText.
  *  A card answer (a button, not written words) reads as the owner's answer;
  *  a written change keeps the owner's own words. */
-export function ownerBubbleText(value: unknown): string {
+export function ownerBubbleText(value: unknown, sessionId?: string): string {
   if (value && typeof value === 'object' && !Array.isArray(value)) {
     const data = value as Record<string, unknown>;
     if (typeof data.approvalId === 'string' && data.changeRequested !== true) {
@@ -488,7 +537,7 @@ export function ownerBubbleText(value: unknown): string {
       if (data.decision === 'reject') return APPROVAL_ANSWER_WORDS.reject;
     }
   }
-  return publicUserInputText(value);
+  return meetingLookupOwnerQuestion(value, sessionId) ?? publicUserInputText(value);
 }
 
 function compactKey(value: string): string {
@@ -1250,7 +1299,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // An answer to a card is shown as the owner's words ("Yes, go ahead."),
       // read from the recorded decision; `text` stays exact for the parser.
       const answerWords = (input: string) => {
-        const shown = ownerBubbleText(data);
+        const shown = ownerBubbleText(data, event.sessionId);
         return shown && shown !== input ? { displayText: shown } : {};
       };
       const liveApprovalControl = publicLiveApprovalControl(event);
@@ -1274,7 +1323,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         return { ...selected(data, ['synthetic', 'source', 'sourceId', 'sourceLabel', 'deliveryPhase']),
           ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
       }
-      const input = publicUserInputText(data);
+      const input = meetingLookupOwnerQuestion(data, event.sessionId) ?? publicUserInputText(data);
       const taskMode = publicTaskMode(data.taskMode);
       return input ? { text: input, ...answerWords(input), ...(taskMode ? { taskMode } : {}) } : null;
     }

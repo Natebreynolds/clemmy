@@ -447,13 +447,13 @@
           "bytes": 5820
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 70780
+          "bytes": 70906
         },
         "src/runtime/harness/review-input-observation.ts": {
           "bytes": 36332
         },
         "src/runtime/harness/model-transport-observation.ts": {
-          "bytes": 26137
+          "bytes": 26195
         },
         "src/shared/provider-internal-generation.ts": {
           "bytes": 953
@@ -468,7 +468,7 @@
           "bytes": 28634
         },
         "src/runtime/harness/byo-providers.ts": {
-          "bytes": 37139
+          "bytes": 37796
         },
         "src/runtime/harness/model-discovery.ts": {
           "bytes": 22488
@@ -942,7 +942,7 @@
           "bytes": 21404
         },
         "src/runtime/harness/model-roles.ts": {
-          "bytes": 34356
+          "bytes": 34678
         },
         "src/runtime/harness/pinned-worker-model.ts": {
           "bytes": 468
@@ -953,8 +953,11 @@
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
         },
+        "src/integrations/recall/meeting-opportunity.ts": {
+          "bytes": 1789
+        },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 68405
+          "bytes": 69070
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 31707
@@ -1842,7 +1845,7 @@
           "bytes": 1322
         },
         "src/runtime/harness/codex-client.ts": {
-          "bytes": 19098
+          "bytes": 19198
         },
         "src/runtime/harness/compaction.ts": {
           "bytes": 93103
@@ -3521,8 +3524,11 @@
         "src/tools/recall-tools.ts": {
           "bytes": 49969
         },
+        "src/integrations/recall/meeting-record-inventory.ts": {
+          "bytes": 8039
+        },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 79413
+          "bytes": 90509
         },
         "src/tools/meeting-analysis-tools.ts": {
           "bytes": 3302
@@ -3864,7 +3870,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27571
+          "bytes": 27814
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444
@@ -3873,7 +3879,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 95107
+          "bytes": 98350
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823
@@ -4356,13 +4362,13 @@
           "bytes": 5820
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 70780
+          "bytes": 70906
         },
         "src/runtime/harness/review-input-observation.ts": {
           "bytes": 36332
         },
         "src/runtime/harness/model-transport-observation.ts": {
-          "bytes": 26137
+          "bytes": 26195
         },
         "src/shared/provider-internal-generation.ts": {
           "bytes": 953
@@ -4377,7 +4383,7 @@
           "bytes": 28634
         },
         "src/runtime/harness/byo-providers.ts": {
-          "bytes": 37139
+          "bytes": 37796
         },
         "src/runtime/harness/model-discovery.ts": {
           "bytes": 22488
@@ -4851,7 +4857,7 @@
           "bytes": 21404
         },
         "src/runtime/harness/model-roles.ts": {
-          "bytes": 34356
+          "bytes": 34678
         },
         "src/runtime/harness/pinned-worker-model.ts": {
           "bytes": 468
@@ -4862,8 +4868,11 @@
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
         },
+        "src/integrations/recall/meeting-opportunity.ts": {
+          "bytes": 1789
+        },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 68405
+          "bytes": 69070
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 31707
@@ -5751,7 +5760,7 @@
           "bytes": 1322
         },
         "src/runtime/harness/codex-client.ts": {
-          "bytes": 19098
+          "bytes": 19198
         },
         "src/runtime/harness/compaction.ts": {
           "bytes": 93103
@@ -7430,8 +7439,11 @@
         "src/tools/recall-tools.ts": {
           "bytes": 49969
         },
+        "src/integrations/recall/meeting-record-inventory.ts": {
+          "bytes": 8039
+        },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 79413
+          "bytes": 90509
         },
         "src/tools/meeting-analysis-tools.ts": {
           "bytes": 3302
@@ -7773,7 +7785,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27571
+          "bytes": 27814
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444
@@ -7782,7 +7794,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 95107
+          "bytes": 98350
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823

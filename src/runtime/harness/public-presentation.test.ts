@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import type { EventRow, EventType } from './eventlog.js';
 import {
   approvalPreviewProjection,
@@ -8,11 +9,14 @@ import {
   publicAsyncWorkDispatchedData,
   publicCompletionText,
   publicReplyText,
+  ownerBubbleText,
+  publicUserInputText,
   PUBLIC_RUN_FAILURE_TEXT,
   PUBLIC_MODEL_EMPTY_COMPLETION_TEXT,
   PUBLIC_CODEX_AUTH_EXPIRED_TEXT,
   publicRunFailureKind,
   publicRunFailureText,
+  type MeetingLookupOwnerPresentation,
 } from './public-presentation.js';
 import { BoundaryError } from '../boundary-error.js';
 import { __setToolkitCatalogForTests } from '../../integrations/composio/toolkit-identity.js';
@@ -84,6 +88,42 @@ function event(type: EventType, data: Record<string, unknown> = {}): EventRow {
     createdAt: '2026-07-31T00:00:00.000Z',
   };
 }
+
+test('meeting lookup display rejects untyped, foreign and tampered presentation without changing accepted input', () => {
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const meetingId = 'controlled-meeting'; const offerId = 'controlled-offer';
+  const offerDigest = 'a'.repeat(64); const sourceDigest = 'b'.repeat(64);
+  const question = 'Which fixture proposal is current?';
+  const input = 'Private lookup instructions stay in the accepted source.\n' + JSON.stringify({ meetingId, offerId, sourceDigest, question });
+  const clientRequestId = `meeting-lookup-${digest(JSON.stringify([meetingId, offerId, offerDigest]))}`;
+  const sessionId = `sess-desktop-${digest(clientRequestId).slice(0, 24)}`;
+  const presentation: MeetingLookupOwnerPresentation = { version: 1, kind: 'meeting_lookup', meetingId, offerId,
+    offerDigest, sourceDigest, question, clientRequestId, privateOriginSessionId: sessionId,
+    inputHash: digest(JSON.stringify({ input, attachmentIds: [] })) };
+  const data = { text: `${input}\nModel-facing enrichment`, displayText: input, requestId: clientRequestId,
+    clientRequestId, meetingLookupPresentation: presentation };
+  const original = structuredClone(data);
+  assert.equal(ownerBubbleText(data, sessionId), question);
+  assert.equal(publicUserInputText(data), input);
+  assert.equal(ownerBubbleText(data, 'foreign-session'), input);
+  assert.equal(ownerBubbleText(data), input, 'no owner session scope means no alternate presentation');
+  for (const changed of [undefined, null, [], { question }, { ...presentation, version: 2 },
+    { ...presentation, kind: 'other' }, { ...presentation, extra: true },
+    { ...presentation, question: 'A different question?' }, { ...presentation, question: 'x'.repeat(501) },
+    { ...presentation, offerId: 'different-offer' }, { ...presentation, sourceDigest: 'c'.repeat(64) },
+    { ...presentation, clientRequestId: `meeting-lookup-${'0'.repeat(64)}` },
+    { ...presentation, inputHash: '0'.repeat(64) }, { ...presentation, privateOriginSessionId: 'foreign-session' },
+  ]) {
+    const altered = { ...data, meetingLookupPresentation: changed };
+    assert.equal(ownerBubbleText(altered, sessionId), input);
+    const projected = projectHarnessEventForPublic({ ...event('user_input_received', altered), sessionId, role: 'user' });
+    assert.equal(projected?.data.text, input);
+  }
+  assert.equal(ownerBubbleText({ ...data, requestId: 'other-request' }, sessionId), input);
+  const projected = projectHarnessEventForPublic({ ...event('user_input_received', data), sessionId, role: 'user' });
+  assert.deepEqual(projected?.data, { text: question }, 'the live DTO contains the friendly question and no private packet or presentation binding');
+  assert.deepEqual(data, original, 'presentation never rewrites the durable input');
+});
 
 test('approval projection preserves exact consent facts without publishing private authority', () => {
   const consentCall = { effect: 'external_write', accountId: 'account:exact-owner',

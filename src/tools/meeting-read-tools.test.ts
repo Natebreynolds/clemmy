@@ -16,8 +16,11 @@ const { closeEventLog } = await import('../runtime/harness/eventlog.js');
 after(() => { closeMemoryDb(); closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
 function seed(windowId: string, provider: 'recall' | 'local' = 'recall') {
-  meetings.noteRecallMeetingDetected({ windowId, provider, title: 'Launch planning', status: 'recording', startedAt: '2026-09-28T18:00:00.000Z' });
-  for (const text of ['Launch is Friday.', 'The preview needs review.', 'Do not send the draft yet.']) {
+  const captured = meetings.noteRecallMeetingDetected({ windowId, provider, title: 'Launch planning', status: 'recording', startedAt: '2026-09-28T18:00:00.000Z' });
+  const lines = ['Launch is Friday.', 'The preview needs review.', 'Do not send the draft yet.'];
+  if (provider === 'local') return meetings.applyLocalMeetingTranscript({ meetingId: captured.id, text: lines.join(' '), model: 'controlled-local',
+    segments: lines.map((text, index) => ({ text, speaker: 'Pat', startSeconds: index })) }).record;
+  for (const text of lines) {
     meetings.appendRecallTranscriptSegment({ windowId, event: 'transcript.data', speaker: 'Pat', text });
   }
   return meetings.finalizeRecallMeeting({ windowId }).record;

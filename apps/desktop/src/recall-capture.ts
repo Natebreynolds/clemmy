@@ -1,3 +1,5 @@
+import { recallFinalEventIdentity, recallFinalMetadata } from './recall-final-event.js';
+
 export type RecallRegion = 'us-west-2' | 'us-east-1' | 'eu-central-1' | 'ap-northeast-1';
 
 export interface RecallCaptureSettings {
@@ -152,6 +154,8 @@ interface RecallSdkWindow {
 }
 
 interface RecallRealtimeEvent {
+  id?: string;
+  event_id?: string;
   window?: RecallSdkWindow;
   event?: string;
   data?: unknown;
@@ -266,6 +270,7 @@ function extractTranscript(event: RecallRealtimeEvent): {
   text: string;
   speaker?: string;
   recordingId?: string;
+  sdkUploadId?: string;
   isFinal: boolean;
 } | null {
   // recallai_streaming (mode: prioritize_low_latency) emits interim
@@ -309,7 +314,8 @@ function extractTranscript(event: RecallRealtimeEvent): {
   const recordingId = getNestedString(data, ['recording_id'])
     ?? getNestedString(data, ['recordingId'])
     ?? getNestedString(data, ['data', 'recording_id']);
-  return { text, speaker, recordingId, isFinal };
+  const sdkUploadId = getNestedString(data, ['sdk_upload_id']) ?? getNestedString(data, ['data', 'sdk_upload_id']);
+  return { text, speaker, recordingId, sdkUploadId, isFinal };
 }
 
 interface RecallNotchStartIntent {
@@ -393,6 +399,9 @@ export class RecallDesktopCapture {
   private shuttingDown = false;
   private completedRecordingKeys = new Set<string>();
   private completionPromises = new Map<string, Promise<Record<string, unknown>>>();
+  private finalDeliveries = new Map<string, Map<string, { payload: Readonly<Record<string, unknown>>; promise: Promise<'persisted' | 'ignored' | 'failed'> }>>();
+  private failedFinalDeliveries = new Map<string, Map<string, Readonly<Record<string, unknown>>>>();
+  private endingRecordingContexts = new Map<string, RecallRecordingContext>();
   private networkStatus: RecallCaptureStatus['networkStatus'];
   private mediaCaptureStatuses = new Map<string, { audio?: boolean; video?: boolean }>();
   private complianceMessageStatuses = new Map<string, 'sent' | 'timeout' | 'cancelled'>();
@@ -1334,6 +1343,13 @@ export class RecallDesktopCapture {
     });
 
     try {
+      // The daemon must know this exact upload before the SDK can synchronously
+      // deliver its first final or end event. Failed native starts remain
+      // detected placeholders rather than phantom recording sessions.
+      await this.postDaemon('/api/console/meetings/recall/detected', {
+        windowId, sdkUploadId, sdkUploadRegion, recallRetentionMode, recallRetentionHours,
+        platform: meta.platform, title: meta.title, status: 'detected',
+      }, 'POST', signal);
       await sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
     } catch (error) {
       const ownsContext = this.currentWindowId === windowId
@@ -1659,22 +1675,44 @@ export class RecallDesktopCapture {
     const transcript = extractTranscript(event);
     const windowId = event.window?.id ?? this.currentWindowId ?? this.manualStopContext?.windowId;
     if (!transcript || !windowId) return;
+    const metadata = recallFinalMetadata(event.data, event.event_id ?? event.id);
+    const ownsFailedFinal = (context: RecallRecordingContext): boolean => Boolean(transcript.isFinal && context.sdkUploadId
+      && this.failedFinalDeliveries.get(context.sdkUploadId)?.has(recallFinalEventIdentity(context.sdkUploadId, metadata).eventId));
+    const endingCandidates = [...this.endingRecordingContexts.values()].filter((context) => context.windowId === windowId
+      && (transcript.sdkUploadId ? context.sdkUploadId === transcript.sdkUploadId
+        : ownsFailedFinal(context) ? true : transcript.recordingId && context.recordingId ? context.recordingId === transcript.recordingId
+          : this.currentWindowId !== windowId && this.manualStopContext?.windowId !== windowId));
+    const ending = endingCandidates.length === 1 ? endingCandidates[0] : undefined;
+    const manual = this.manualStopContext?.windowId === windowId ? this.manualStopContext : undefined;
+    const current = this.currentWindowId === windowId && (!ending || ending.sdkUploadId === this.currentSdkUploadId);
+    const sdkUploadId = ending?.sdkUploadId ?? (current ? this.currentSdkUploadId : manual?.sdkUploadId);
+    const knownRecordingId = ending?.recordingId ?? (current ? this.currentRecordingId : manual?.recordingId);
+    if (!sdkUploadId || (transcript.sdkUploadId && transcript.sdkUploadId !== sdkUploadId)
+      || (transcript.recordingId && knownRecordingId && transcript.recordingId !== knownRecordingId)) {
+      this.emit('transcript-ignored', { windowId, reason: 'unknown-or-mismatched-capture' });
+      return;
+    }
+    const identity = recallFinalEventIdentity(sdkUploadId, metadata);
+    const failedPayload = transcript.isFinal ? this.failedFinalDeliveries.get(sdkUploadId)?.get(identity.eventId) : undefined;
+    if (current && this.completedRecordingKeys.has(`window:${windowId}`)
+      && transcript.sdkUploadId !== sdkUploadId
+      && !(transcript.recordingId && knownRecordingId === transcript.recordingId) && !failedPayload) {
+      this.emit('transcript-ignored', { windowId, reason: 'ambiguous-reused-window' });
+      return;
+    }
+    if (!failedPayload && (this.completedRecordingKeys.has(`sdk-upload:${sdkUploadId}`)
+      || (transcript.recordingId && this.completedRecordingKeys.has(`recording:${transcript.recordingId}`)))) {
+      this.emit('transcript-ignored', { windowId, reason: 'unknown-or-mismatched-capture' });
+      return;
+    }
     if (transcript.recordingId) {
-      if (this.currentWindowId === windowId) {
+      if (current) {
         this.currentRecordingId = transcript.recordingId;
       }
-      if (this.manualStopContext?.windowId === windowId) {
-        this.manualStopContext.recordingId = transcript.recordingId;
-      }
+      if (manual && manual.sdkUploadId === sdkUploadId) manual.recordingId = transcript.recordingId;
+      if (ending) ending.recordingId = transcript.recordingId;
     }
-    const contextualRecordingId = transcript.recordingId
-      ?? (this.currentWindowId === windowId ? this.currentRecordingId : undefined)
-      ?? (this.manualStopContext?.windowId === windowId ? this.manualStopContext.recordingId : undefined);
-    const contextualSdkUploadId = this.currentWindowId === windowId
-      ? this.currentSdkUploadId
-      : this.manualStopContext?.windowId === windowId
-        ? this.manualStopContext.sdkUploadId
-        : undefined;
+    const contextualRecordingId = transcript.recordingId ?? knownRecordingId;
 
     // Interim (partial) segments drive the live UI only — emit them as a
     // transient `transcript-partial` so the live card can show a rolling
@@ -1683,23 +1721,133 @@ export class RecallDesktopCapture {
     // near-duplicate fragments and waste tokens in the post-meeting
     // analyzer. Only finalized `transcript.data` is written to disk.
     if (!transcript.isFinal) {
-      this.emit('transcript-partial', { windowId, speaker: transcript.speaker, text: transcript.text });
+      this.emit('transcript-partial', {
+        windowId, sdkUploadId, recordingId: contextualRecordingId,
+        participantId: metadata.participantId, speaker: transcript.speaker, text: transcript.text,
+      });
       return;
     }
 
-    await this.postDaemon('/api/console/meetings/recall/transcript-event', {
+    const payload = Object.freeze({
       windowId,
-      sdkUploadId: contextualSdkUploadId,
+      sdkUploadId,
       recordingId: contextualRecordingId,
       event: event.event,
       speaker: transcript.speaker,
       text: transcript.text,
       isFinal: transcript.isFinal,
       timestamp: new Date().toISOString(),
-    }).catch((error) => {
-      this.emit('transcript-store-failed', { error: error instanceof Error ? error.message : String(error) });
+      ...identity,
+      participantId: metadata.participantId,
+      sourceStartSeconds: metadata.sourceStartSeconds,
+      sourceEndSeconds: metadata.sourceEndSeconds,
     });
-    this.emit('transcript', { windowId, speaker: transcript.speaker, text: transcript.text });
+    let deliveries = this.finalDeliveries.get(sdkUploadId);
+    if (!deliveries) {
+      deliveries = new Map();
+      this.finalDeliveries.set(sdkUploadId, deliveries);
+    }
+    const existing = deliveries.get(identity.eventId);
+    if (existing || failedPayload) {
+      const semanticPayload = (value: Readonly<Record<string, unknown>>) => JSON.stringify({ ...value, timestamp: undefined, recordingId: undefined });
+      if (semanticPayload(existing?.payload ?? failedPayload!) !== semanticPayload(payload)) {
+        this.emit('transcript-store-failed', { windowId, eventId: identity.eventId, error: 'Recall reused a final event identity with different content.' });
+        return;
+      }
+      if (existing) { await existing.promise; return; }
+    }
+    const retainedPayload = failedPayload ?? payload;
+    const generation = deliveries;
+    const promise: Promise<'persisted' | 'ignored' | 'failed'> = this.deliverFinalTranscript(retainedPayload).then(async (result) => {
+      if (result === 'failed') {
+        let failed = this.failedFinalDeliveries.get(sdkUploadId);
+        if (!failed) { failed = new Map(); this.failedFinalDeliveries.set(sdkUploadId, failed); }
+        failed.set(identity.eventId, retainedPayload);
+        if (generation.get(identity.eventId)?.promise === promise) generation.delete(identity.eventId);
+      } else {
+        const failed = this.failedFinalDeliveries.get(sdkUploadId);
+        failed?.delete(identity.eventId);
+        if (failed?.size === 0) this.failedFinalDeliveries.delete(sdkUploadId);
+        if (this.completedRecordingKeys.has(`sdk-upload:${sdkUploadId}`)) {
+          generation.delete(identity.eventId);
+          if (generation.size === 0) this.finalDeliveries.delete(sdkUploadId);
+          const completedContext = this.endingRecordingContexts.get(sdkUploadId);
+          if (completedContext && result === 'persisted') {
+            await this.drainFinalTranscripts(sdkUploadId);
+            await this.syncFinalTranscriptDeliveryStatus(completedContext);
+          }
+          if (!this.failedFinalDeliveries.has(sdkUploadId)) this.endingRecordingContexts.delete(sdkUploadId);
+        }
+      }
+      return result;
+    });
+    deliveries.set(identity.eventId, { payload: retainedPayload, promise });
+    await promise;
+  }
+
+  private async deliverFinalTranscript(payload: Readonly<Record<string, unknown>>): Promise<'persisted' | 'ignored' | 'failed'> {
+    // Retry only this frozen, exactly identified final. A new callback without
+    // an SDK identity is a distinct utterance, even if its words are identical.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const ack = await this.postDaemon('/api/console/meetings/recall/transcript-event', payload, 'POST', AbortSignal.timeout(10_000));
+        if (ack.status === 'ignored') {
+          if (ack.reason === 'capture_inventory_unavailable' || ack.reason === 'capture_generation_changed') {
+            throw new Error('Meeting capture identity is temporarily unavailable.');
+          }
+          this.emit('transcript-ignored', { windowId: payload.windowId, eventId: payload.eventId, reason: ack.reason });
+          return 'ignored';
+        }
+        // Older daemons return the persisted record instead of a typed ack.
+        // That is a qualified legacy acknowledgement, never assumed from 2xx.
+        const legacyRecord = ack.record && typeof ack.record === 'object' ? ack.record as Record<string, unknown> : undefined;
+        const legacyAck = typeof legacyRecord?.id === 'string' && legacyRecord.windowId === payload.windowId
+          && legacyRecord.sdkUploadId === payload.sdkUploadId;
+        if (ack.status !== 'accepted' && ack.status !== 'duplicate' && !legacyAck) {
+          throw new Error('Transcript persistence was not acknowledged.');
+        }
+        if (ack.status !== 'duplicate') this.emit('transcript', {
+          windowId: payload.windowId, sdkUploadId: payload.sdkUploadId, recordingId: payload.recordingId,
+          speaker: payload.speaker, text: payload.text,
+          eventId: payload.eventId, meetingId: ack.meetingId ?? legacyRecord?.id, segmentId: ack.segmentId,
+          ...(ack.status === undefined ? { acknowledgement: 'legacy' } : {}),
+        });
+        return 'persisted';
+      } catch { /* Keep the frozen event available for a later exact SDK replay. */ }
+    }
+    const error = 'Meeting transcript could not be saved. Recall can retry this final without changing its identity.';
+    this.lastError = error;
+    this.emit('transcript-store-failed', { windowId: payload.windowId, eventId: payload.eventId, error });
+    return 'failed';
+  }
+
+  private async drainFinalTranscripts(sdkUploadId?: string): Promise<void> {
+    if (!sdkUploadId) return;
+    // A final can arrive while an earlier POST is settling. Re-read until the
+    // tracked generation is stable before submitting capture completion.
+    for (;;) {
+      const deliveries = this.finalDeliveries.get(sdkUploadId);
+      if (!deliveries) return;
+      const observed = new Set([...deliveries.values()].map(({ promise }) => promise));
+      await Promise.all(observed);
+      if ([...deliveries.values()].every(({ promise }) => observed.has(promise))) return;
+    }
+  }
+
+  private async syncFinalTranscriptDeliveryStatus(context: RecallRecordingContext): Promise<boolean> {
+    if (!context.sdkUploadId) return false;
+    try {
+      await this.postDaemon('/api/console/meetings/recall/transcript-delivery-status', {
+        windowId: context.windowId, sdkUploadId: context.sdkUploadId, recordingId: context.recordingId,
+        unresolvedFinalCount: this.failedFinalDeliveries.get(context.sdkUploadId)?.size ?? 0,
+      }, 'POST', AbortSignal.timeout(10_000));
+      return true;
+    } catch {
+      const error = 'The recording ended, but its transcript delivery status could not be confirmed.';
+      this.lastError = error;
+      this.emit('transcript-store-failed', { windowId: context.windowId, error });
+      return false;
+    }
   }
 
   private async completeRecording(input: {
@@ -1729,24 +1877,33 @@ export class RecallDesktopCapture {
       return { skipped: true, duplicate: true, pending: true };
     }
 
-    const completePromise = this.postDaemon<Record<string, unknown>>('/api/console/meetings/recall/complete', {
-      windowId: input.windowId,
-      sdkUploadId: input.sdkUploadId,
-      sdkUploadRegion: input.sdkUploadRegion,
-      recallRetentionMode: input.recallRetentionMode,
-      recallRetentionHours: input.recallRetentionHours,
-      recordingId: input.recordingId,
-      platform: input.platform,
-      title: input.title,
-      startedAt: input.startedAt,
-    });
+    const endingContext: RecallRecordingContext = { ...input, startedAt: input.startedAt ?? new Date().toISOString() };
+    if (input.sdkUploadId) this.endingRecordingContexts.set(input.sdkUploadId, endingContext);
+    const completePromise = (async () => {
+      await this.drainFinalTranscripts(input.sdkUploadId);
+      const unresolvedFinalCount = input.sdkUploadId ? this.failedFinalDeliveries.get(input.sdkUploadId)?.size ?? 0 : 0;
+      const result = await this.postDaemon<Record<string, unknown>>('/api/console/meetings/recall/complete', {
+        ...endingContext,
+        unresolvedFinalCount,
+      });
+      await this.drainFinalTranscripts(input.sdkUploadId);
+      const afterDrainCount = input.sdkUploadId ? this.failedFinalDeliveries.get(input.sdkUploadId)?.size ?? 0 : 0;
+      if (afterDrainCount !== unresolvedFinalCount && !await this.syncFinalTranscriptDeliveryStatus(endingContext)) {
+        return { ...result, transcriptDelivery: { status: 'incomplete', failedFinalCount: Math.max(unresolvedFinalCount, afterDrainCount), statusUpdatePending: true } };
+      }
+      return result;
+    })();
     const ownedKeys = Array.from(new Set([...sessionKeys, windowKey]));
     for (const key of ownedKeys) this.completionPromises.set(key, completePromise);
     try {
       const complete = await completePromise;
       for (const key of ownedKeys) this.completedRecordingKeys.add(key);
-      return complete;
+      if (endingContext.recordingId) this.completedRecordingKeys.add(`recording:${endingContext.recordingId}`);
+      if (input.sdkUploadId) this.finalDeliveries.delete(input.sdkUploadId);
+      const failedFinalCount = input.sdkUploadId ? this.failedFinalDeliveries.get(input.sdkUploadId)?.size ?? 0 : 0;
+      return failedFinalCount && !complete.transcriptDelivery ? { ...complete, transcriptDelivery: { status: 'incomplete', failedFinalCount } } : complete;
     } finally {
+      if (input.sdkUploadId && !this.failedFinalDeliveries.get(input.sdkUploadId)?.size) this.endingRecordingContexts.delete(input.sdkUploadId);
       for (const key of ownedKeys) {
         if (this.completionPromises.get(key) === completePromise) {
           this.completionPromises.delete(key);

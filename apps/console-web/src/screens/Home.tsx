@@ -2,14 +2,15 @@
  * Home — the owner's own page, in the style they chose (the Tune panel):
  * Briefing (decisions first, each Space a wide row) or Dashboard (Today,
  * Needs you and what came back side by side, Spaces in a grid). Each Space
- * shows as its summary or its full page, per Space. Clem's running work is one
- * live band under the greeting that leads to the board (/tasks), which owns
- * the detail. A send from here hands off to the conversation the moment the
+ * shows as its summary or its full page, per Space. The shared header owns
+ * live work; Home brings retained watch reports and From Clem into view.
+ * A send from here hands off to the conversation the moment the
  * daemon acknowledges it.
  */
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
+import { DogMark } from '@/components/DogMark';
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { HomeBuilder } from '@/components/home/HomeBuilder';
 import { SpaceTile } from '@/components/home/SpaceTile';
@@ -54,10 +55,14 @@ import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { TodayPane } from '@/components/home/TodayPane';
 import { FromClemPane } from '@/components/home/FromClemPane';
+import { HomeWatchOverview } from '@/components/home/HomeWatchOverview';
+import { buildWatchOverview } from '@/components/home/watch-overview-model';
+import { buildHomeContentLayout } from '@/components/home/home-content-layout';
+import { listWatches } from '@/lib/watches';
 import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
-import { cn } from '@/lib/cn';
+import '@/components/home/home-presence.css';
 
 export function Home() {
   const [params] = useSearchParams();
@@ -105,6 +110,10 @@ function LiveHome() {
   // What the heartbeats brought the owner leads Home, once; the other lists
   // leave those items out so nothing shows twice.
   const fromClem = useFromClem();
+  const watches = usePoll(['watches'], listWatches, 30_000);
+  const watchOverview = buildWatchOverview({ watches: watches.data?.watches ?? [],
+    state: watches.isError ? 'error' : watches.isLoading ? 'loading' : 'loaded',
+    dataUpdatedAt: watches.dataUpdatedAt, nowMs: Date.now() });
 
   const needsYou = withoutFromClem((cc.data?.needsYou ?? []) as HomeFeedItem[], fromClem.data?.covers);
   const recent = withoutFromClem((cc.data?.recentCompleted ?? []) as HomeFeedItem[], fromClem.data?.covers);
@@ -223,7 +232,8 @@ function LiveHome() {
 
   // Nothing placed, building, waiting or chosen — and we actually KNOW that.
   const homeIsBare = immediateSettled && !daemonUnreachable && !layout.isLoading && Boolean(layout.data)
-    && tiles.length === 0 && liveBuilds.length === 0 && !showNeeds && !showRecent && !showToday && lowerPanes.length === 0;
+    && tiles.length === 0 && liveBuilds.length === 0 && !showNeeds && !showRecent && !showToday && lowerPanes.length === 0
+    && !(shown('quick_actions') && prefs.quickActions.length > 0);
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
   const servingCached = (cc.isError && Boolean(cc.data)) || (workingNow.isError && Boolean(workingNow.data));
@@ -322,55 +332,38 @@ function LiveHome() {
     ? 'col-span-12'
     : t.width === 'small' ? 'col-span-12 md:col-span-6 xl:col-span-4' : 'col-span-12 md:col-span-6';
 
-  const briefing = (
-    <>
-      {showNeeds && needsPane('strip', 3)}
-      <section aria-labelledby="home-spaces" className="flex min-w-0 flex-col gap-3">
-        {spacesHeader}
-        {buildCards}
-        {layout.isLoading ? <Skeleton className="h-40 w-full" />
-          : tiles.length > 0 && layout.data ? <div className="flex flex-col gap-4">{tiles.map((t) => <div key={t.spaceId}>{tile(t, 'row')}</div>)}</div>
-          : spacesEmpty}
-      </section>
-      {(showToday || showRecent) && (
-        <div className={cn('grid items-start gap-6', showToday && showRecent && 'lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]')}>
-          {showToday && todayPane}
-          {showRecent && recentPane('timeline')}
-        </div>
-      )}
-    </>
-  );
-
-  const top = [showToday && todayPane, showNeeds && needsPane('list', 2), showRecent && recentPane('list')].filter(Boolean) as ReactNode[];
-  const dashboard = (
-    <>
-      {top.length > 0 && (
-        <div className={cn('grid items-start gap-5', top.length === 2 && 'lg:grid-cols-2', top.length >= 3 && 'lg:grid-cols-2 2xl:grid-cols-3')}>
-          {top.map((pane, i) => <div key={i} className="min-w-0">{pane}</div>)}
-        </div>
-      )}
-      <section aria-labelledby="home-spaces" className="flex min-w-0 flex-col gap-3">
-        {spacesHeader}
-        {buildCards}
-        {layout.isLoading ? <Skeleton className="h-40 w-full" />
-          : tiles.length > 0 && layout.data ? (
-            <div className="grid grid-cols-12 items-start gap-5">
-              {tiles.map((t) => <div key={t.spaceId} className={tileWidth(t)}>{tile(t, 'tile')}</div>)}
-            </div>
-          ) : spacesEmpty}
-      </section>
-    </>
-  );
+  const spacesPane = <section aria-labelledby="home-spaces" className="flex min-w-0 flex-col gap-3">
+    {spacesHeader}
+    {buildCards}
+    {layout.isLoading ? <Skeleton className="h-40 w-full" />
+      : tiles.length > 0 && layout.data ? prefs.style === 'briefing'
+        ? <div className="flex flex-col gap-4">{tiles.map(t => <div key={t.spaceId}>{tile(t, 'row')}</div>)}</div>
+        : <div className="grid grid-cols-12 items-start gap-5">{tiles.map(t => <div key={t.spaceId} className={tileWidth(t)}>{tile(t, 'tile')}</div>)}</div>
+        : spacesEmpty}
+  </section>;
+  const quickActions = shown('quick_actions') && prefs.quickActions.length > 0 ? <QuickActions
+    actions={prefs.quickActions} disabled={opening || chat.busy}
+    onPrompt={text => { void sendAndOpen({ text, attachmentIds: [], attachmentNames: [] }).catch(error => setNotice({ tone: 'error', text: error instanceof Error ? error.message : 'That didn’t send. Try again.' })); }}
+  /> : null;
+  const paneContent = new Map<HomePaneId, ReactNode>([
+    ['needs_you', showNeeds ? needsPane(prefs.style === 'briefing' ? 'strip' : 'list', prefs.style === 'briefing' ? 3 : 2) : null],
+    ['today', showToday ? todayPane : null],
+    ['while_away', showRecent ? recentPane(prefs.style === 'briefing' ? 'timeline' : 'list') : null],
+    ['quick_actions', quickActions],
+    ...lowerPanes.map(id => [id, renderLower(id)] as [HomePaneId, ReactNode]),
+  ]);
+  const contentLayout = buildHomeContentLayout(panes.filter(id => Boolean(paneContent.get(id))), prefs.style);
 
   return (
-    <div className="mx-auto flex w-full max-w-[1240px] flex-col gap-6 px-5 py-6 animate-fade-in sm:px-10 sm:py-8">
+    <div className="clem-home mx-auto flex w-full max-w-[1240px] flex-col gap-7 px-5 py-6 sm:px-10 sm:py-8">
       <section className="flex flex-col gap-4" aria-label="Ask Clementine">
         <div className="flex flex-wrap items-end justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
-            <h1 className="text-h1 text-fg text-balance">{greeting}</h1>
+          <div className="clem-home-greeting">
+            <span aria-hidden><DogMark size={56} /></span>
+            <div className="clem-home-greeting-copy"><h1 className="text-h1 text-fg text-balance">{greeting}</h1>
             {presence === null
               ? <Skeleton className="h-4 w-64" />
-              : <p className="text-body text-muted" aria-live="polite">{presence}</p>}
+              : <p className="text-body text-muted" aria-live="polite">{presence}</p>}</div>
           </div>
           <Button variant="ghost" size="sm" onClick={openCustomizeHome} title="Which stacks show, in what style"><SlidersHorizontal className="h-4 w-4" aria-hidden /> Arrange</Button>
         </div>
@@ -387,16 +380,9 @@ function LiveHome() {
           onStop={chat.stop}
           voiceMessages={chat.messages}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
-          placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : undefined}
+          placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : 'What can we move forward?'}
           agentId={agentChoice.chosen?.id ?? null}
         />
-        {shown('quick_actions') && (
-          <QuickActions
-            actions={prefs.quickActions}
-            disabled={opening || chat.busy}
-            onPrompt={(text) => { void sendAndOpen({ text, attachmentIds: [], attachmentNames: [] }).catch(error => setNotice({ tone: 'error', text: error instanceof Error ? error.message : 'That didn’t send. Try again.' })); }}
-          />
-        )}
         {opening && !notice && <p role="status" className="text-small text-faint">Opening your conversation…</p>}
         {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
       </section>
@@ -415,6 +401,7 @@ function LiveHome() {
         <HomeNotice notice={{ tone: 'error', text: 'That change to your Home didn’t save. Try it again.' }} onDismiss={() => savePrefs.reset()} />
       )}
 
+      <div className="clem-home-insights">
       {!daemonUnreachable && (
         <FromClemPane
           headingId="home-from-clem"
@@ -424,6 +411,8 @@ function LiveHome() {
           onRetry={() => { void fromClem.refetch(); }}
         />
       )}
+      <HomeWatchOverview overview={watchOverview} refreshing={watches.isFetching} onRetry={() => { void watches.refetch(); }} animate={prefs.liveStatus === 'animated'} />
+      </div>
 
       {homeIsBare ? (
         <section className="flex flex-col items-center gap-4 px-4 py-12 text-center" aria-label="Build your Home">
@@ -437,11 +426,9 @@ function LiveHome() {
             <Button variant="secondary" onClick={() => composerRef.current?.focus()}>Ask Clem</Button>
           </div>
         </section>
-      ) : prefs.style === 'briefing' ? briefing : dashboard}
-
-      {!homeIsBare && lowerPanes.length > 0 && (
-        <div className="flex flex-col gap-6">{lowerPanes.map(renderLower)}</div>
-      )}
+      ) : contentLayout.map((block, index) => block.kind === 'spaces'
+        ? <Fragment key="spaces">{spacesPane}</Fragment>
+        : <div key={block.panes.join(':') + index} className="clem-home-pane-grid" data-columns={block.panes.length}>{block.panes.map(id => <Fragment key={id}>{paneContent.get(id)}</Fragment>)}</div>)}
       {building && layout.data && (
         <HomeBuilder
           layout={layout.data}

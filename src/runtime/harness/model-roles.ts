@@ -44,6 +44,7 @@ import {
   resolveByoProviderForModel,
   isByoModelNotServed,
   captureByoRoutingSnapshot,
+  getSelectedByoBrainBackendConfig,
 } from './byo-providers.js';
 import { slugifyIntent } from '../../memory/tool-choice-store.js';
 import { modelUsageAttributionStorage } from '../usage-log.js';
@@ -425,7 +426,7 @@ function memoryAutomaticModelReader(): string | null {
 export function unavailableSavedBrain(): { modelId: string; provider: ModelProviderClass } | null {
   const savedAuthMode = (getRuntimeEnv('AUTH_MODE', '') || '').trim();
   const savedApiKeyBrain = savedAuthMode === 'api_key' || getModelRoutingMode() === 'all_in';
-  if (!savedApiKeyBrain || getByoBackendConfig().configured) return null;
+  if (!savedApiKeyBrain || getSelectedByoBrainBackendConfig().configured) return null;
   const modelId = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim() || (getRuntimeEnv('BYO_MODEL_ID', '') || '').trim();
   return modelId ? { modelId, provider: 'byo' } : null;
 }
@@ -443,7 +444,10 @@ export function defaultForRole(role: ModelRole): string {
     } catch { /* an unresolvable automatic route reads as the checker default */ }
     return defaultForRole('judge');
   }
-  const byo = getByoBackendConfig();
+  const legacyByo = getByoBackendConfig();
+  // Keep existing legacy defaults when present; an extra-only install uses
+  // the exact selected provider for its unbound role defaults.
+  const byo = legacyByo.configured ? legacyByo : getSelectedByoBrainBackendConfig();
   const mode = getModelRoutingMode();
 
   // Automatic Quick follows the effective brain's backend. An extra BYO
@@ -457,8 +461,8 @@ export function defaultForRole(role: ModelRole): string {
       // Extra backends do not declare a separate fast tier. Keep the chosen
       // brain there rather than borrowing the default backend's model/key.
       // A default backend may supply its own explicitly configured judge.
-      const candidate = owner?.baseURL === byo.baseURL && owner?.apiKey === byo.apiKey
-        ? byo.judgeId || brain : brain;
+      const candidate = legacyByo.configured && owner?.baseURL === legacyByo.baseURL && owner?.apiKey === legacyByo.apiKey
+        ? legacyByo.judgeId || brain : brain;
       return isByoModelNotServed(candidate) ? brain : candidate;
     }
     if (activeBrain.provider === 'claude') return boundaryClaudeJudgeModel();

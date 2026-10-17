@@ -39,8 +39,8 @@ const SDK_PACKAGE_FILES = [
   'setup.js',
 ];
 
-export const RECALL_SDK_VERSION = '2.0.25';
-export const RECALL_SDK_COMMIT = '90d670e842200a4d546cbe36cc0b9c48fbe6a204';
+export const RECALL_SDK_VERSION = '2.0.39';
+export const RECALL_SDK_COMMIT = '537d82df7142fd8a613616ba3f12e70c3c79f3ab';
 export const RECALL_NATIVE_MANIFEST = 'clementine-native-manifest.json';
 
 const NATIVE_BASE_URL = 'https://recallai-desktop-sdk-releases.s3.us-east-1.amazonaws.com';
@@ -52,8 +52,8 @@ export const RECALL_NATIVE_SPECS = Object.freeze({
   darwin: Object.freeze({
     platform: 'darwin',
     archiveName: 'desktop_sdk_macos.tar',
-    archiveBytes: 50_971_984,
-    archiveSha256: 'e3125c49cdf6d54593e6334024df2ecbed99e0c6b1d2e410a4187ab19421433b',
+    archiveBytes: 52_689_730,
+    archiveSha256: 'b360882d13344f8406849cffa82e93bb0c14955428fc84374d5dadbb9c9b1d18',
     maxExtractedBytes: 512 * 1024 * 1024,
     requiredPaths: [
       'desktop_sdk_macos_exe',
@@ -70,8 +70,8 @@ export const RECALL_NATIVE_SPECS = Object.freeze({
   win32: Object.freeze({
     platform: 'win32',
     archiveName: 'desktop_sdk_win32.tar',
-    archiveBytes: 39_218_499,
-    archiveSha256: 'c761d9dd3c82ab77d7eaf3a3c303c354bc92dbe2946244bb54689bb53322b5ba',
+    archiveBytes: 41_431_019,
+    archiveSha256: 'c3d0ef6e3c2271622eeadc9a8ed5ec03c1805423526520ceacf789b32745d126',
     maxExtractedBytes: 384 * 1024 * 1024,
     requiredPaths: [
       'agent-windows.exe',
@@ -192,6 +192,32 @@ export function validateNativePayload(root, platform) {
     if (platform === 'darwin') assertMachOArm64(candidate);
     else assertPeX64(candidate);
   }
+}
+
+/** Shared release gate: package provenance and native architecture use the
+ * exact same allowlist as download/install, without loading the SDK itself. */
+export function validatePackagedRecallNative(root, platform) {
+  const spec = RECALL_NATIVE_SPECS[platform];
+  if (!spec) throw new Error(`Recall native payload is unsupported on ${platform}.`);
+  const sdkPackage = readJson(path.join(root, 'package.json'));
+  if (sdkPackage.version !== RECALL_SDK_VERSION || sdkPackage.commit_sha !== RECALL_SDK_COMMIT) {
+    throw new Error('Packaged Recall SDK provenance does not match the pinned release.');
+  }
+  const manifest = readJson(path.join(root, RECALL_NATIVE_MANIFEST));
+  const expected = {
+    schemaVersion: 1,
+    sdkVersion: RECALL_SDK_VERSION,
+    sdkCommit: RECALL_SDK_COMMIT,
+    platform,
+    archiveName: spec.archiveName,
+    archiveBytes: spec.archiveBytes,
+    archiveSha256: spec.archiveSha256,
+    sourceUrl: archiveUrl(spec),
+  };
+  if (Object.entries(expected).some(([key, value]) => manifest[key] !== value)) {
+    throw new Error('Packaged Recall native manifest does not match the pinned release.');
+  }
+  validateNativePayload(root, platform);
 }
 
 async function inspectArchive(archivePath, spec) {
@@ -342,7 +368,7 @@ export async function vendorRecallNative(platform = process.platform, options = 
       sourceUrl: url,
     }, null, 2)}\n`, { mode: 0o644 });
     installAtomically(stagedSdk, sdkRoot);
-    validateNativePayload(sdkRoot, platform);
+    validatePackagedRecallNative(sdkRoot, platform);
     console.log(`✓ verified and installed Recall native payload for ${platform}`);
     return { skipped: false, platform, sdkRoot, archiveSha256: spec.archiveSha256 };
   } finally {

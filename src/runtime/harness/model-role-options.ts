@@ -25,6 +25,7 @@ import {
   resolveEffectiveProviderForModelFromSnapshot,
   type ByoProviderSnapshot,
   type ByoRoutingSnapshot,
+  getSelectedByoBrainBackendConfig,
 } from './byo-providers.js';
 import { discoveredModels, labelForModelId, modelDiscoveryStatus, type DiscoveredModel, type ModelDiscoveryPhase } from './model-discovery.js';
 import { readJudgeFallbackSetting } from './judge-fallback-policy.js';
@@ -601,8 +602,11 @@ export function effectiveBrainValue(): string {
   // the highlighted option is ALWAYS the real brain — never a bare, unmatchable
   // 'api_key' nor a BYO model that isn't actually orchestrating.
   const brainModelId = defaultForRole('brain');
-  if (getModelRoutingMode() === 'all_in' && getByoBackendConfig().configured) {
-    return `api_key:${brainModelId}`;
+  if (getModelRoutingMode() === 'all_in') {
+    const selected = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
+    // Preserve an unavailable explicit pick in the picker. A connected default
+    // or subscription must not impersonate that missing selection.
+    return `api_key:${selected || getSelectedByoBrainBackendConfig().primaryId || brainModelId}`;
   }
   const provider = resolveProvider(brainModelId);
   // claude → the SPECIFIC model value so the picker highlights the right Claude
@@ -618,13 +622,13 @@ export function effectiveBrainValue(): string {
 
 /** The brain the wire actually uses, for the picker's selected value: all-in BYO
  *  routing means the BYO model is the brain regardless of the stored AUTH_MODE.
- *  Never returns a value the brain picker has no option for: 'api_key' is only a
- *  real brain when a BYO backend is configured (brainOptions gates it the same
- *  way) — otherwise getActiveAuthMode()'s default-'api_key' (unset AUTH_MODE, the
- *  common Codex-only case) is clamped to Codex so the Select value stays in-list. */
+ *  Explicit all-in keeps its API class even when unavailable, so another
+ *  connected subscription cannot impersonate the saved choice. Outside all-in,
+ *  an unset/unconfigured API default retains the Codex compatibility fallback.
+ *  Availability is the exact picker row's separate fact. */
 export function effectiveBrain(): BrainChoice {
-  const byoConfigured = getByoBackendConfig().configured;
-  if (getModelRoutingMode() === 'all_in' && byoConfigured) return 'api_key';
+  const byoConfigured = getSelectedByoBrainBackendConfig().configured;
+  if (getModelRoutingMode() === 'all_in') return 'api_key';
   const mode = getActiveAuthMode();
   if (mode === 'api_key' && !byoConfigured) return 'codex_oauth';
   return mode;

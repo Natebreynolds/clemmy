@@ -30,6 +30,7 @@ import {
 import { DaemonSupervisor, locateDaemonProjectRoot, type SupervisorEvent } from './daemon-supervisor.js';
 import { needsSetup, hasCompletedSetup, writeSetupComplete, type SetupConfiguredSummary } from './setup-state.js';
 import { createSetupWindow } from './setup-window.js';
+import { completeNativeOnboarding, initialDesktopDashboardUrl, isCurrentOnboardingMainFrame } from './onboarding.js';
 import { RecallDesktopCapture, type RecallCaptureSettings } from './recall-capture.js';
 import {
   LocalMeetingRecorder,
@@ -512,7 +513,7 @@ function revealWindow(win: BrowserWindow | null): void {
 function revealMainWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
     if (dashboardUrl) {
-      mainWindow = createMainWindow(dashboardUrl);
+      mainWindow = createMainWindow(initialDesktopDashboardUrl(dashboardUrl, needsSetup()));
     } else {
       return;
     }
@@ -562,7 +563,8 @@ function repointDashboardToLiveDaemon(): void {
   // instead of orphaning it (belt: did-start-navigation catches this too, but
   // awaiting here guarantees the stop lands before the page is torn down).
   pendingDashboardUrl = nextUrl;
-  void finalizeOrphanedLocalCapture('the daemon restarted').then(() => win.loadURL(nextUrl)).then(() => {
+  void finalizeOrphanedLocalCapture('the daemon restarted')
+    .then(() => win.loadURL(initialDesktopDashboardUrl(nextUrl, needsSetup()))).then(() => {
     if (dashboardNavigationGeneration !== navigationGeneration) return;
     dashboardUrl = nextUrl;
     pendingDashboardUrl = '';
@@ -2246,13 +2248,10 @@ function clementineLivePreloadPath(): string {
 
 /**
  * Boot flow:
- *   1. If first-run (no credentials, no setup-complete marker) →
- *      open setup wizard window. Don't start the daemon yet — the
- *      wizard writes credentials BEFORE the daemon reads them.
- *   2. Otherwise → splash → daemon → dashboard window.
- *
- * The setup wizard's "complete" handler kicks off step 2 by calling
- * launchDaemon() once credentials are persisted.
+ * Start the daemon first, then show first-run onboarding inside the console
+ * until its completion marker exists. The same canonical model connection
+ * APIs work during onboarding and later in Settings. Existing installations
+ * retain their normal dashboard route and saved model choices.
  */
 async function boot(): Promise<void> {
   // Make sure a WEBHOOK_SECRET exists before anything else — both the
@@ -2282,11 +2281,7 @@ async function boot(): Promise<void> {
     }
   }
 
-  if (needsSetup()) {
-    openSetupWindow();
-  } else {
-    await launchDaemon();
-  }
+  await launchDaemon();
 }
 
 /**
@@ -2443,7 +2438,7 @@ async function launchDaemon(): Promise<void> {
     await syncRecallCaptureFromDaemon().catch((error) => {
       console.error('[recall] initial sync failed:', error instanceof Error ? error.message : error);
     });
-    mainWindow = createMainWindow(dashboardUrl);
+    mainWindow = createMainWindow(initialDesktopDashboardUrl(dashboardUrl, needsSetup()));
     mainWindow.once('ready-to-show', () => {
       revealWindow(mainWindow);
       ensureClementineLiveWindow();
@@ -3542,6 +3537,21 @@ function sendUpdaterEvent(status: ReturnType<typeof getUpdaterStatus>): void {
 }
 
 // ─── Setup wizard IPC handlers ─────────────────────────────────────
+
+ipcMain.handle('clemmy:onboarding-complete', async (evt: IpcMainInvokeEvent, payload: unknown) => {
+  assertIpcSender(evt, ['dashboard']);
+  const win = mainWindow;
+  if (!isCurrentOnboardingMainFrame({ senderId: evt.sender.id,
+    senderFrameRoutingId: evt.senderFrame?.routingId ?? null,
+  }, win && !win.isDestroyed() ? { webContentsId: win.webContents.id,
+    mainFrameRoutingId: win.webContents.mainFrame.routingId,
+  } : null)) throw new Error('Onboarding can only finish from the current main window.');
+  return completeNativeOnboarding(payload, {
+    hasCompletedSetup,
+    readSettings: () => fetchDaemonJson('/api/console/settings', { signal: AbortSignal.timeout(8_000) }),
+    writeSetupComplete,
+  });
+});
 
 ipcMain.handle('clemmy:setup-status', async (evt: IpcMainInvokeEvent) => {
   assertIpcSender(evt, ['setup']);

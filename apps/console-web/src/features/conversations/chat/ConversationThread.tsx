@@ -247,8 +247,9 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
   );
 }
 
-export function ConversationThread() {
-  const { sessionId } = useParams();
+export function ConversationThread({ sessionIdOverride }: { sessionIdOverride?: string } = {}) {
+  const params = useParams();
+  const sessionId = sessionIdOverride ?? params.sessionId;
   const detail = useSession(sessionId);
 
   // useChat seeds its local transcript once. A cached partial history must

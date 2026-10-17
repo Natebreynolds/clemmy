@@ -16,6 +16,7 @@ import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { brainOptions, effectiveBrainValue } from '../runtime/harness/model-role-options.js';
 import { pinSessionBrain, resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
+import { resolveDeclaredByoProviderForModel } from '../runtime/harness/byo-providers.js';
 import { removeEnvKey, updateEnvKey } from '../tools/shared.js';
 
 export type ActiveBrainClass = 'codex_oauth' | 'claude_oauth' | 'api_key';
@@ -60,21 +61,52 @@ export async function switchActiveBrain(input: {
       }
     }
 
+    let byoWorkerDefault = '';
+    if (brain === 'api_key') {
+      const legacy = getByoBackendConfig();
+      const selectedId = brainModelId || legacy.primaryId;
+      const options = brainOptions().filter(o => o.id === 'api_key' && o.modelId === selectedId);
+      if (options.length !== 1 || options[0]!.available !== true) {
+        return { ok: false, status: brainModelId ? 400 : 409, body: {
+          error: 'Choose a connected API model under Settings → Models first.', needsLogin: true,
+        } };
+      }
+      const owner = resolveDeclaredByoProviderForModel(selectedId);
+      if (!owner?.configured) return { ok: false, status: 409, body: {
+        error: 'The selected API model is no longer connected. Reconnect it before switching.', needsLogin: true,
+      } };
+      byoWorkerDefault = legacy.configured && legacy.primaryId ? legacy.primaryId : selectedId;
+    }
+
+    if (brain === 'claude_oauth') {
+      if (brainModelId && resolveProvider(brainModelId) !== 'claude') {
+        return { ok: false, status: 400, body: { error: `Model "${brainModelId}" is not a Claude model.` } };
+      }
+      // Validate/refresh the selected account before changing ANY existing
+      // API route, model pin or routing mode. A failed switch keeps them all.
+      try { await loadFreshClaudeAccessToken(); }
+      catch (err) {
+        const kind = err instanceof ClaudeAuthError ? err.kind : 'missing';
+        return { ok: false, status: 409, body: {
+          error: err instanceof Error ? err.message : 'Claude subscription auth is not ready.', kind, needsLogin: true,
+        } };
+      }
+      if (brainModelId) {
+        const eligible = brainOptions().filter(o => o.id === 'claude_oauth' && o.modelId === brainModelId);
+        if (eligible.length !== 1 || eligible[0]!.available !== true) {
+          return { ok: false, status: 400, body: { error: `Model "${brainModelId}" is not a connected Claude model.` } };
+        }
+      }
+    }
+
     // A BYO brain runs all-in (every role on the BYO backend unless a role is
     // bound elsewhere); a Codex/Claude brain cannot coexist with all-in, so step
     // it down to 'off' (BYO providers stay connected and routable via role pins).
     if (brain === 'api_key') {
-      if (!getByoBackendConfig().configured) {
-        return { ok: false, status: 409, body: { error: 'No BYO model is configured. Add one under Settings → Models → Connected models first.', needsLogin: true } };
-      }
       // Pin the chosen model as the brain. Validate it against the eligible set
       // (every connected, configured BYO model) so a stale/unknown id can't be
       // written. Empty modelId → clear the override (default slot is the brain).
       if (brainModelId) {
-        const eligible = brainOptions().some((o) => o.id === 'api_key' && o.modelId === brainModelId);
-        if (!eligible) {
-          return { ok: false, status: 400, body: { error: `Model "${brainModelId}" is not a connected BYO model. Add it to a provider in Settings → Models first.` } };
-        }
         updateEnvKey('BYO_BRAIN_MODEL_ID', brainModelId);
       } else {
         removeEnvKey('BYO_BRAIN_MODEL_ID');
@@ -86,7 +118,7 @@ export async function switchActiveBrain(input: {
       // Without this sync, switching brains through the newer picker could
       // leave gpt-* here and spend a whole failed fan-out wave probing a
       // single-family BYO endpoint before the runtime self-healed.
-      updateEnvKey('OPENAI_MODEL_WORKER', getByoBackendConfig().primaryId);
+      updateEnvKey('OPENAI_MODEL_WORKER', byoWorkerDefault);
       updateEnvKey('MODEL_ROUTING_MODE', 'all_in');
     } else {
       // Switching to a Codex/Claude brain: drop the BYO brain-model override so a
@@ -98,32 +130,7 @@ export async function switchActiveBrain(input: {
       }
     }
 
-    if (brain === 'claude_oauth') {
-      // A Claude brain orchestrates with a specific Claude model. Honor an
-      // explicit pick (value `claude_oauth:<id>` → brainModelId) by persisting
-      // CLAUDE_MODEL, which getClaudeBrainModel() reads. Validate it's a real
-      // Claude model so a stale/unknown id can't be written; an empty/non-Claude
-      // id leaves the current CLAUDE_MODEL untouched.
-      if (brainModelId && resolveProvider(brainModelId) === 'claude') {
-        const eligible = brainOptions().some((o) => o.id === 'claude_oauth' && o.modelId === brainModelId);
-        if (!eligible) {
-          return { ok: false, status: 400, body: { error: `Model "${brainModelId}" is not a connected Claude model.` } };
-        }
-        updateEnvKey('CLAUDE_MODEL', brainModelId);
-      }
-      // Preflight BEFORE persisting; refresh a near-expiry vault token so the
-      // harness' own sync check at configure-time also passes next turn.
-      try {
-        await loadFreshClaudeAccessToken();
-      } catch (err) {
-        const kind = err instanceof ClaudeAuthError ? err.kind : 'missing';
-        return { ok: false, status: 409, body: {
-          error: err instanceof Error ? err.message : 'Claude subscription auth is not ready.',
-          kind,
-          needsLogin: true,
-        } };
-      }
-    }
+    if (brain === 'claude_oauth' && brainModelId) updateEnvKey('CLAUDE_MODEL', brainModelId);
 
     updateEnvKey('AUTH_MODE', brain);
 

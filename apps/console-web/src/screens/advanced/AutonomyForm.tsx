@@ -155,10 +155,10 @@ const WATCH_KIND_LABEL: Record<string, string> = {
  */
 function WatchesPanel() {
   const qc = useQueryClient();
-  const watches = usePoll(['watches'], getWatches, 30_000);
+  const watches = usePoll(['legacy-heartbeat-watches'], getWatches, 30_000);
   const [busy, setBusy] = useState<string | null>(null);
   const [lastTick, setLastTick] = useState<string | null>(null);
-  const refresh = () => { void qc.invalidateQueries({ queryKey: ['watches'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); };
+  const refresh = () => { void qc.invalidateQueries({ queryKey: ['legacy-heartbeat-watches'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); };
   const toggle = async (w: WatchStatus, enabled: boolean) => {
     setBusy(w.id);
     try { await patchWatch(w.id, { enabled }); refresh(); } finally { setBusy(null); }

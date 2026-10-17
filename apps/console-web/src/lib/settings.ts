@@ -471,11 +471,12 @@ export interface WatchStatus {
   openItems: WatchItem[];
   recentlyRetired: WatchItem[];
 }
-export const getWatches = () => apiGet<{ watches: WatchStatus[] }>('/api/console/watches');
+// System-heartbeat compatibility DTO; workflow watches use lib/watches.ts.
+export const getWatches = () => apiGet<{ watches: WatchStatus[] }>('/api/console/legacy-heartbeat-watches');
 export const patchWatch = (id: string, p: { enabled?: boolean; cadenceMinutes?: number }) =>
-  patch<{ watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}`, p);
+  patch<{ watch: WatchStatus }>(`/api/console/legacy-heartbeat-watches/${encodeURIComponent(id)}`, p);
 export const tickWatch = (id: string) =>
-  apiPost<{ tick: WatchFinding & { judged: number; duplicatesSuppressed: number }; watch: WatchStatus }>(`/api/console/watches/${encodeURIComponent(id)}/tick`, {});
+  apiPost<{ tick: WatchFinding & { judged: number; duplicatesSuppressed: number }; watch: WatchStatus }>(`/api/console/legacy-heartbeat-watches/${encodeURIComponent(id)}/tick`, {});
 
 // Computer access: the owner's one-time choice of what Clem may reach on this
 // computer, and the operating system's own gates for it.
