@@ -104,7 +104,12 @@ const api = {
     return () => window.removeEventListener('supervisor', handler as EventListener);
   },
 
-  // ─── Setup wizard (only used by the first-run window) ──────────
+  /** Finish daemon-backed onboarding without restarting the daemon or
+   * changing any model/account selection. Main validates current settings. */
+  onboardingComplete: (payload: { exploreWithoutModel?: boolean }) =>
+    ipcRenderer.invoke('clemmy:onboarding-complete', payload) as Promise<{ ok: true }>,
+
+  // ─── Legacy setup wizard compatibility ────────────────────────
   /** First-run state — { needsSetup, hasKeychain }. */
   setupStatus: () => ipcRenderer.invoke('clemmy:setup-status') as Promise<{ needsSetup: boolean; hasKeychain: boolean }>,
   /** Per-credential listing for the dashboard / wizard. */

@@ -12,6 +12,8 @@ export interface UpdaterEvent {
 }
 
 interface ClemmyBridge {
+  /** First-run completion persists only the native setup marker. */
+  onboardingComplete?: (payload: { exploreWithoutModel?: boolean }) => Promise<{ ok: true }>;
   /** Cloud browser providers whose live view this desktop shell may embed.
    *  Absent in shells that predate it, which embed Browserbase only. */
   browserViewerProviders?: readonly string[];

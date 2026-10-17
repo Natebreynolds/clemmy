@@ -35,6 +35,7 @@ import {
   refreshStoredNativeOAuth,
 } from '../auth-store.js';
 import { RouterModelProvider } from './router-model.js';
+import { getSelectedByoBrainBackendConfig } from './byo-providers.js';
 import { reviveDeadBrains } from './fallback-model.js';
 import { maybeWrapDebate } from './debate-model.js';
 import { loadFreshClaudeAccessToken, claudeVaultFallbackReady } from '../claude-oauth.js';
@@ -272,7 +273,7 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
   if (configured) return { ok: true };
 
   const mode = getModelRoutingMode();
-  const byo = getByoBackendConfig();
+  const byo = getSelectedByoBrainBackendConfig();
 
   // All-in (BYO brain) takes PRECEDENCE over the stored AUTH_MODE. When a user
   // has explicitly enabled all_in with a configured BYO backend, EVERY role —
@@ -287,6 +288,12 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
     setDefaultModelProvider(maybeWrapDebate(new RouterModelProvider()));
     configured = true;
     return { ok: true };
+  }
+
+  // An explicit API brain with no current exact owner is unavailable. A stale
+  // AUTH_MODE must not silently move this request onto another subscription.
+  if (mode === 'all_in') {
+    return { ok: false, reason: 'The selected API model is not connected. Reconnect it or choose a connected model in Settings → Models.' };
   }
 
   // Claude brain (subscription OAuth) — when AUTH_MODE=claude_oauth (and not the
@@ -314,16 +321,6 @@ export async function configureHarnessRuntime(): Promise<ConfigureResult> {
             : ' Automatic provider switching is off; reconnect Claude in Settings → Models or explicitly enable brain fallover.'),
       };
     }
-  }
-
-  // all_in requested but no BYO backend configured → clear, actionable error.
-  if (mode === 'all_in') {
-    return {
-      ok: false,
-      reason:
-        'all_in mode is enabled but no BYO backend is configured. ' +
-        'Set a backend (e.g., DeepSeek, MiniMax) in Settings → Model backend.',
-    };
   }
 
   const tokens = getStoredCodexOAuthTokens();

@@ -39,7 +39,7 @@ export interface SetupCompleteRecord {
   completedAt: string;
   version: 'v1';
   configured: {
-    auth: 'openai' | 'codex' | 'skipped';
+    auth: 'openai' | 'codex' | 'connected' | 'skipped';
     discord: boolean;
     composio: boolean;
     workspaceCount: number;
@@ -184,12 +184,13 @@ interface SetupPaths {
   computerAccessFile: string;
 }
 
-function setupPathsFor(homeDir: string): SetupPaths {
-  const stateDir = path.join(homeDir, '.clementine-next', 'state');
+function setupPathsFor(homeDir: string, clementineHome?: string): SetupPaths {
+  const baseDir = clementineHome || path.join(homeDir, '.clementine-next');
+  const stateDir = path.join(baseDir, 'state');
   return {
     vaultFile: path.join(stateDir, 'secrets-vault.json'),
     localAuthFile: path.join(stateDir, 'auth.json'),
-    homeEnv: path.join(homeDir, '.clementine-next', '.env'),
+    homeEnv: path.join(baseDir, '.env'),
     codexAuth: path.join(homeDir, '.codex', 'auth.json'),
     profileFile: path.join(stateDir, 'user-profile.json'),
     computerAccessFile: path.join(stateDir, 'computer-access.json'),
@@ -238,7 +239,7 @@ function vaultHas(vault: Record<string, any> | null, name: string): boolean {
 export function detectExistingConfiguration(opts: { homeDir?: string; env?: NodeJS.ProcessEnv } = {}): ExistingConfiguration {
   const homeDir = opts.homeDir ?? HOME;
   const env = opts.env ?? process.env;
-  const paths = setupPathsFor(homeDir);
+  const paths = setupPathsFor(homeDir, env.CLEMENTINE_HOME);
 
   const vault = readJson(paths.vaultFile);
   const homeEnv = readEnvPairs(paths.homeEnv);

@@ -134,6 +134,24 @@ test('the home .env supplies workspaces, Discord and Composio', () => {
   assert.equal(found.composio, true);
 });
 
+test('a selected Clementine home supplies its own settings without inheriting another home\'s profile or credentials', () => {
+  const home = fakeHome();
+  home.vault({ openai_api_key: 'sk-unselected-fixture' });
+  home.env('WORKSPACE_DIRS=/unselected/fixture\n');
+  home.profile({ preferredName: 'Unselected fixture', timezone: 'UTC' });
+  const selected = path.join(home.dir, 'selected-clem-home');
+  mkdirSync(path.join(selected, 'state'), { recursive: true });
+  assert.deepEqual(detect(home, { CLEMENTINE_HOME: selected }), nothingConfigured);
+  writeFileSync(path.join(selected, 'state', 'secrets-vault.json'), JSON.stringify({ entries: { openai_api_key: 'sk-selected-fixture' } }));
+  writeFileSync(path.join(selected, 'state', 'user-profile.json'), JSON.stringify({ preferredName: 'Selected fixture', timezone: 'Europe/Berlin' }));
+  writeFileSync(path.join(selected, '.env'), 'WORKSPACE_DIRS=/selected/fixture\n');
+  const found = detect(home, { CLEMENTINE_HOME: selected });
+  assert.equal(found.auth, 'openai');
+  assert.equal(found.profile.preferredName, 'Selected fixture');
+  assert.equal(found.profile.timezone, 'Europe/Berlin');
+  assert.deepEqual(found.workspaces, ['/selected/fixture']);
+});
+
 test('an empty WORKSPACE_DIRS is no workspaces', () => {
   const home = fakeHome();
   home.env('WORKSPACE_DIRS=\n');

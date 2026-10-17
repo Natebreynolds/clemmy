@@ -41,9 +41,11 @@ test('no lazy screen is rendered without a Suspense boundary', () => {
     + 'Wrap each route element in deferred(...), or give it its own Suspense boundary.');
 });
 
-test('every deferred screen except the design mock is fetched in the background after start', () => {
+test('everyday screens prefetch while first-run and the companion window stay lean', () => {
   // A busy daemon made tabs look dead: navigation waits for a screen's code.
   assert.match(app, /SCREEN_LOADERS\.push\(loader\)/);
   assert.match(app, /lazyNamed\(\(\) => import\('\.\/screens\/HomeMock'\), 'HomeMock', \{ prefetch: false \}\)/);
-  assert.match(app, /useEffect\(\(\) => \(window\.location\.pathname\.includes\('\/notch'\) \? undefined : prefetchScreens\(\)\), \[\]\)/);
+  assert.match(app, /lazyNamed\(\(\) => import\('\.\/screens\/Onboarding'\), 'Onboarding', \{ prefetch: false \}\)/);
+  assert.ok(app.includes('/\\/(notch|onboarding)(\\/|$)/.test(window.location.pathname) ? undefined : prefetchScreens()'),
+    'first-run must not download every dashboard screen while the user is connecting a model');
 });

@@ -52,6 +52,7 @@ function prefetchScreens(): () => void {
 // It was statically imported here AND in Home.tsx, so it rode the main chunk on
 // every cold start.
 const HomeMock = lazyNamed(() => import('./screens/HomeMock'), 'HomeMock', { prefetch: false });
+const Onboarding = lazyNamed(() => import('./screens/Onboarding'), 'Onboarding', { prefetch: false });
 const Chat = lazyNamed(() => import('./screens/Chat'), 'Chat');
 const Inbox = lazyNamed(() => import('./screens/Inbox'), 'Inbox');
 const BackgroundTasks = lazyNamed(() => import('./screens/BackgroundTasks'), 'BackgroundTasks');
@@ -223,11 +224,12 @@ function ChatIndex() {
 
 export function App() {
   // The notch is its own small window and never opens these screens.
-  useEffect(() => (window.location.pathname.includes('/notch') ? undefined : prefetchScreens()), []);
+  useEffect(() => (/\/(notch|onboarding)(\/|$)/.test(window.location.pathname) ? undefined : prefetchScreens()), []);
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename="/console">
         <Routes>
+          <Route path="/onboarding" element={deferred(<Onboarding />)} />
           {/* Transparent companion surface: deliberately outside AppShell so
               the native notch helper never inherits dashboard chrome. */}
           <Route path="/notch" element={<NotchSurface />} />

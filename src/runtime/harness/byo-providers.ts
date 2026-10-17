@@ -580,6 +580,18 @@ export function resolveDeclaredByoProviderForModel(modelId: string): ByoBackendC
   return backend ? { ...backend } : undefined;
 }
 
+/** The explicitly selected API brain may belong to an extra provider with no
+ * legacy default backend. Selection never borrows another provider's key or
+ * substitutes its first model when the selected owner is missing/ambiguous. */
+export function getSelectedByoBrainBackendConfig(): ByoBackendConfig {
+  const selected = (getRuntimeEnv('BYO_BRAIN_MODEL_ID', '') || '').trim();
+  if (!selected) return getByoBackendConfig();
+  const backend = resolveDeclaredByoProviderForModel(selected);
+  return backend?.configured ? { ...backend } : {
+    configured: false, baseURL: '', apiKey: '', primaryId: selected, judgeId: selected, providerLabel: '',
+  };
+}
+
 export function resolveDeclaredByoProviderForModelFromSnapshot(
   modelId: string,
   snapshot: ByoRoutingSnapshot,

@@ -102,17 +102,20 @@ function useCatalogPicker(initial: string) {
 }
 
 /** Add an API-key provider, then offer the new model a job. */
-export function AddModelForm({ onClose }: { onClose: () => void }) {
+export function AddModelForm({ onClose, presentation = 'settings' }: {
+  onClose: () => void; presentation?: 'settings' | 'onboarding';
+}) {
   const qc = useQueryClient();
   const first = PROVIDER_PRESETS[0];
-  const [presetId, setPresetId] = useState(first.id);
-  const [label, setLabel] = useState(first.label);
-  const [baseURL, setBaseURL] = useState(first.baseURL);
+  const onboarding = presentation === 'onboarding';
+  const [presetId, setPresetId] = useState(onboarding ? '' : first.id);
+  const [label, setLabel] = useState(onboarding ? '' : first.label);
+  const [baseURL, setBaseURL] = useState(onboarding ? '' : first.baseURL);
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState<{ label: string; modelIds: string[] } | null>(null);
-  const picker = useCatalogPicker(first.workerModel);
+  const picker = useCatalogPicker(onboarding ? '' : first.workerModel);
 
   const applyPreset = (id: string) => {
     const p = PROVIDER_PRESETS.find((x) => x.id === id);
@@ -147,15 +150,19 @@ export function AddModelForm({ onClose }: { onClose: () => void }) {
     } finally { setBusy(false); }
   };
 
-  if (connected) return <UseItFor connected={connected} onDone={onClose} />;
+  if (connected) return onboarding ? <div className="space-y-3">
+    <p role="status" className="text-small text-success">Connected {connected.label}. Choose your main model below.</p>
+    <Button variant="link" size="sm" onClick={() => setConnected(null)}>Connect another API-key provider</Button>
+  </div> : <UseItFor connected={connected} onDone={onClose} />;
 
   const preset = PROVIDER_PRESETS.find((p) => p.id === presetId);
   return (
-    <div className="rounded-lg border border-border bg-canvas p-4">
-      <div className="mb-2 text-label text-fg">Add a model</div>
+    <div className={onboarding ? '' : 'rounded-lg border border-border bg-canvas p-4'}>
+      {!onboarding && <div className="mb-2 text-label text-fg">Add a model</div>}
       <div className="grid gap-x-4 sm:grid-cols-2">
         <Field label="Provider" hint="Pre-fills the endpoint + a default model.">{(id) => (
           <Select id={id} value={presetId} onChange={(e) => applyPreset(e.target.value)}>
+            {onboarding && <option value="" disabled>Choose a provider</option>}
             {PROVIDER_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
           </Select>
         )}</Field>
@@ -186,7 +193,7 @@ export function AddModelForm({ onClose }: { onClose: () => void }) {
       {picker.checklist()}
       <div className="mt-3 flex items-center gap-2">
         <Button onClick={() => void onAdd()} disabled={busy}>{busy ? 'Connecting…' : 'Connect'}</Button>
-        <Button variant="secondary" size="sm" onClick={onClose}>Cancel</Button>
+        <Button variant="secondary" size="sm" onClick={onClose}>{onboarding ? 'Close' : 'Cancel'}</Button>
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
     </div>

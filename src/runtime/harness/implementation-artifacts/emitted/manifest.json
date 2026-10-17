@@ -468,7 +468,7 @@
           "bytes": 28634
         },
         "src/runtime/harness/byo-providers.ts": {
-          "bytes": 37139
+          "bytes": 37796
         },
         "src/runtime/harness/model-discovery.ts": {
           "bytes": 22488
@@ -939,7 +939,7 @@
           "bytes": 21404
         },
         "src/runtime/harness/model-roles.ts": {
-          "bytes": 34356
+          "bytes": 34678
         },
         "src/runtime/harness/pinned-worker-model.ts": {
           "bytes": 468
@@ -1839,7 +1839,7 @@
           "bytes": 1322
         },
         "src/runtime/harness/codex-client.ts": {
-          "bytes": 19098
+          "bytes": 19198
         },
         "src/runtime/harness/compaction.ts": {
           "bytes": 93103
@@ -3858,7 +3858,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27571
+          "bytes": 27814
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444
@@ -4371,7 +4371,7 @@
           "bytes": 28634
         },
         "src/runtime/harness/byo-providers.ts": {
-          "bytes": 37139
+          "bytes": 37796
         },
         "src/runtime/harness/model-discovery.ts": {
           "bytes": 22488
@@ -4842,7 +4842,7 @@
           "bytes": 21404
         },
         "src/runtime/harness/model-roles.ts": {
-          "bytes": 34356
+          "bytes": 34678
         },
         "src/runtime/harness/pinned-worker-model.ts": {
           "bytes": 468
@@ -5742,7 +5742,7 @@
           "bytes": 1322
         },
         "src/runtime/harness/codex-client.ts": {
-          "bytes": 19098
+          "bytes": 19198
         },
         "src/runtime/harness/compaction.ts": {
           "bytes": 93103
@@ -7761,7 +7761,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27571
+          "bytes": 27814
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444
