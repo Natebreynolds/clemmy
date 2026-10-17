@@ -474,6 +474,8 @@ export interface WorkflowRunRecord {
     message?: string;
     retryAt?: string;
     retryCount?: number;
+    /** False once the automatic tries are spent: retryAt is then no promise. */
+    automaticRetryPending?: boolean;
     state?: 'blocked' | 'retrying' | 'consumed';
   };
 }

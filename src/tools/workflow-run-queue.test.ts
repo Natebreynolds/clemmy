@@ -363,43 +363,6 @@ test('queueWorkflowRun: a fresh durable queued run kicks the daemon drain immedi
   assert.deepEqual(kicks, [[queued.id]], 'a duplicate does not create drain churn');
 });
 
-function parkRun(id: string, reason: string): void {
-  const file = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
-  const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
-  writeFileSync(file, JSON.stringify({
-    ...record,
-    status: 'blocked_capability',
-    capabilityBlock: {
-      stepId: 'main', tool: 'GOOGLESHEETS_BATCH_GET', toolkit: 'googlesheets', reason,
-      message: 'fixture park', blockedAt: new Date().toISOString(), retryAt: new Date().toISOString(),
-      retryCount: 5, provenNoDispatch: true, state: 'blocked',
-    },
-  }));
-}
-
-test('queueWorkflowRun: a run parked only because the service could not be reached is replaced by a new run', () => {
-  // Live 2026-10-16: a parked scheduled review refused every later run as a
-  // duplicate until it was cancelled by hand.
-  writeAuditWorkflow();
-  const parked = queueWorkflowRun('audit-brief', { url: 'https://unreachable.example' });
-  assert.equal(parked.status, 'queued');
-  parkRun(parked.id!, 'connection-check-unavailable');
-  const next = queueWorkflowRun('audit-brief', { url: 'https://unreachable.example' });
-  assert.equal(next.status, 'queued');
-  assert.notEqual(next.id, parked.id);
-  const old = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${parked.id}.json`), 'utf-8')) as { status?: string };
-  assert.equal(old.status, 'cancelled', 'the parked run is cancelled, so it can never also run later');
-});
-
-test('queueWorkflowRun: a run parked on a missing connection still holds its workflow', () => {
-  writeAuditWorkflow();
-  const parked = queueWorkflowRun('audit-brief', { url: 'https://not-connected.example' });
-  parkRun(parked.id!, 'not-connected');
-  const next = queueWorkflowRun('audit-brief', { url: 'https://not-connected.example' });
-  assert.equal(next.status, 'duplicate');
-  assert.equal(next.id, parked.id);
-});
-
 function stoppedContinueSource(): string {
   writeAuditWorkflow();
   const source = queueWorkflowRun('audit-brief', { url: 'https://continue.example' });

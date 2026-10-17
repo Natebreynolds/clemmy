@@ -629,6 +629,8 @@ import {
   resolveWorkflowCapabilityAccountChoice,
   recordWorkflowGateChangeRequest,
   resolveWorkflowCapabilityRetry,
+  workflowCapabilityAutomaticRetryPending,
+  type WorkflowCapabilityBlockReason,
 } from '../execution/workflow-runner.js';
 import { requestWorkflowRunDrainKick } from '../execution/workflow-origin-group.js';
 import {
@@ -2597,6 +2599,14 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
   // consumers act on (safe to resume this same run), so the projection must
   // carry it. Strict === true: the projector never invents the claim.
   if (row.provenNoDispatch === true) out.provenNoDispatch = true;
+  // Whether a retryAt is still a promise: once the automatic tries are spent
+  // the time stays on the record but nothing will happen at it.
+  if (out.reason === 'connection-check-unavailable' && typeof out.retryCount === 'number') {
+    out.automaticRetryPending = workflowCapabilityAutomaticRetryPending({
+      reason: out.reason as WorkflowCapabilityBlockReason,
+      retryCount: out.retryCount,
+    });
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

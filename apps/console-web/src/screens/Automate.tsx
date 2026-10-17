@@ -26,7 +26,7 @@ import { cn } from '@/lib/cn';
 import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
-  listWorkflows, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
+  listWorkflows, resumeWorkflowCapability, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
   listSkills, installSkill, checkSkillUpdates, getSkill, deleteSkill, updateSkill,
   type RunWorkspace, type SkillRow, type WorkflowRow, type WorkflowRunRecord,
   getWorkflowsHome,
@@ -35,6 +35,11 @@ import {
 import { getAgentSystemMetrics } from '@/lib/advanced';
 
 type Tab = 'workflows' | 'skills';
+
+function capabilityAppLabel(toolkit: string | undefined): string {
+  const name = (toolkit ?? '').trim();
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : 'The service';
+}
 type WorkflowFilter = 'all' | 'scheduled' | 'manual';
 
 
@@ -436,6 +441,8 @@ function RunWorkspaceDrawer({
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [showAllCriteria, setShowAllCriteria] = useState(false);
+  const [retryingCheck, setRetryingCheck] = useState(false);
+  const [retryCheckError, setRetryCheckError] = useState<string | null>(null);
   const runsQ = useQuery({
     queryKey: ['wf-runs', workflow],
     queryFn: () => listWorkflowRuns(workflow, 25),
@@ -470,6 +477,21 @@ function RunWorkspaceDrawer({
     ? `Running${stepNow ? ` · ${stepNow}` : ''}${runDetail.steps.length ? ` · ${doneSteps} of ${runDetail.steps.length} steps` : ''}`
     : undefined;
 
+  // A service that did not answer the connection check: the same run tries
+  // again now, from the step it stopped at.
+  const retryCheckNow = async () => {
+    if (!selectedRunId) return;
+    setRetryingCheck(true);
+    setRetryCheckError(null);
+    try {
+      await resumeWorkflowCapability(workflow, selectedRunId);
+      void qc.invalidateQueries({ queryKey: ['wf-runs', workflow] });
+    } catch (e) {
+      setRetryCheckError((e instanceof Error ? e.message : String(e)).slice(0, 160) || 'unknown error');
+    } finally {
+      setRetryingCheck(false);
+    }
+  };
   const runChecker = async () => {
     if (!selectedRunId) return;
     setChecking(true);
@@ -549,7 +571,7 @@ function RunWorkspaceDrawer({
                           onClick={() => navigate(`/inbox?tab=needs&select=${encodeURIComponent(`workflow-${selectedRun.id}-capability-${(selectedRun.capabilityBlock?.toolkit || 'tool').toLowerCase()}`)}`)}
                         >
                           <ArrowRight className="h-4 w-4" aria-hidden />
-                          Open exact Needs You gate
+                          Open in Needs you
                         </Button>
                       )}
                       <Button size="sm" variant="secondary" onClick={runChecker} disabled={checking || !workspace}>
@@ -574,12 +596,33 @@ function RunWorkspaceDrawer({
                             ? 'Exact action metadata needs review'
                             : 'Connection needs attention'}
                       </div>
+                      {selectedRun.capabilityBlock.reason === 'connection-check-unavailable' ? (
+                        <>
+                          <p className="text-body text-fg">
+                            {capabilityAppLabel(selectedRun.capabilityBlock.toolkit)} didn’t answer when Clem checked the connection, so step “{selectedRun.capabilityBlock.stepId}” hasn’t run yet. Your connection is fine.
+                          </p>
+                          <p className="mt-1 text-caption text-muted">
+                            Nothing was sent and finished steps are kept.
+                            {selectedRun.capabilityBlock.automaticRetryPending === false
+                              ? ' Clem tried several times; retry when the service is answering again.'
+                              : selectedRun.capabilityBlock.retryAt
+                                ? ` Clem checks again around ${new Date(selectedRun.capabilityBlock.retryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.`
+                                : ''}
+                          </p>
+                          <Button className="mt-3" size="sm" variant="secondary" onClick={retryCheckNow} disabled={retryingCheck}>
+                            {retryingCheck ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
+                            {retryingCheck ? 'Retrying…' : 'Retry now'}
+                          </Button>
+                          {retryCheckError && <p role="alert" className="mt-2 text-caption text-danger">Couldn’t retry: {retryCheckError}</p>}
+                        </>
+                      ) : (
+                      <>
                       <p className="text-body text-fg">
                         {selectedRun.capabilityBlock.message
                           || `${selectedRun.capabilityBlock.toolkit || selectedRun.capabilityBlock.tool || 'This tool'} must be connected before the run can continue.`}
                       </p>
                       <p className="mt-1 text-caption text-muted">
-                        No provider dispatch occurred and completed work is preserved. Open the exact Needs You gate
+                        No provider dispatch occurred and completed work is preserved. Open it in Needs you
                         {selectedRun.capabilityBlock.reason === 'ambiguous-account'
                           ? ' to choose one of its current bounded account IDs'
                           : selectedRun.capabilityBlock.reason === 'exact_schema_refresh_unavailable'
@@ -597,6 +640,8 @@ function RunWorkspaceDrawer({
                             Open Connections
                           </Button>
                         )}
+                      </>
+                      )}
                     </section>
                   )}
 

@@ -65,9 +65,12 @@ function occurrenceAt(record: Record<string, unknown>): number {
 }
 
 /** Did this occurrence produce any work: a completed step or a step output. */
-function occurrenceWorked(record: Record<string, unknown>, slug: string, runId: string): boolean {
+/** Did this run produce any step work: an output, a completed step, or a
+ *  completed step in its event history. Unreadable history counts as work. */
+export function workflowRunProducedWork(record: Record<string, unknown>, slug: string, runId: string): boolean {
   const outputs = asObject(record.stepOutputs);
   if (outputs && Object.keys(outputs).length > 0) return true;
+  if (Array.isArray(record.stepsCompleted) && record.stepsCompleted.length > 0) return true;
   const eventsPath = path.join(WORKFLOWS_DIR, slug, 'runs', runId, 'events.jsonl');
   if (!existsSync(eventsPath)) return false;
   try {
@@ -107,7 +110,7 @@ export function readOccurrenceViews(runsDir = WORKFLOW_RUNS_DIR): OccurrenceView
       workflowSlug,
       at,
       status,
-      worked: DEAD_OCCURRENCE_WAITING_STATUSES.has(status) ? occurrenceWorked(record, workflowSlug, runId) : true,
+      worked: DEAD_OCCURRENCE_WAITING_STATUSES.has(status) ? workflowRunProducedWork(record, workflowSlug, runId) : true,
     });
   }
   return views;

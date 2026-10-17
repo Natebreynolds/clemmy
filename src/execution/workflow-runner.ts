@@ -229,6 +229,7 @@ import {
   readWorkflowRunCancellation,
   workflowRunCancellationRequested,
 } from './workflow-run-cancellation.js';
+import { workflowRunProducedWork } from './workflow-dead-occurrences.js';
 import {
   checkWorkflowForWrite,
   classifyStepSideEffect,
@@ -1614,20 +1615,21 @@ export function catalogPreparationRefusalToCapabilityBlock(
 ): WorkflowCapabilityBlockedError {
   const tool = (refusal.operationId ?? '').trim();
   const why = [refusal.reason, refusal.detail].filter(Boolean).join(': ');
-  // The check itself could not complete (the provider did not answer while
-  // the connection or definition was re-verified). That is neither a missing
-  // connection nor a definition mismatch, and a prompt step has no exact-
-  // schema proof to resume from: live 2026-10-16 a network blip parked two
-  // scheduled workflows as "not connected" and as an unretryable "definition
-  // mismatch", and the second held every later run until it was cancelled.
-  if (/refresh_unavailable/.test(why)) {
+  // The connection list could not be fetched while the step's connection was
+  // re-verified. That is neither a missing connection nor a definition
+  // mismatch, and a prompt step has no exact-schema proof to resume from:
+  // live 2026-10-16 a network blip parked two scheduled workflows as "not
+  // connected" and as an unretryable "definition mismatch", and the second
+  // held every later run until it was cancelled. A definition the provider
+  // would not describe is NOT this: it may be a missing or changed operation.
+  if (CONNECTION_CHECK_UNAVAILABLE_CODE.test(why)) {
     return new WorkflowCapabilityBlockedError({
       stepId: step.id,
       tool: tool || `(${refusal.reason})`,
       toolkit: tool ? exactSchemaToolkitLabel(tool) : 'provider',
       reason: 'connection-check-unavailable',
       message: `Step "${step.id}" names ${tool || 'an operation'}, but the check with ${tool ? exactSchemaToolkitLabel(tool) : 'the provider'} could not complete (${why}). `
-        + 'No provider dispatch occurred; the run retries on its own, and a new run of this workflow replaces it.',
+        + 'No provider dispatch occurred; the run retries on its own.',
     });
   }
   // A definition DRIFT that the successor path could not settle is not a
@@ -1748,8 +1750,25 @@ function currentAccountChoiceSetForOperation(operationId: string): WorkflowCapab
  * inventing new state. `exact_schema_refresh_unavailable` has had its own
  * honest branch for a while; this is the same courtesy for the others.
  */
+/** The connection list itself could not be fetched (the revalidation call
+ * threw), so nothing is known about the connection. */
+const CONNECTION_CHECK_UNAVAILABLE_CODE = /\bselected_connection_refresh_unavailable\b/;
+
 function capabilityPauseCouldNotCheck(block: WorkflowCapabilityBlockState): boolean {
-  return typeof block.message === 'string' && /refresh_unavailable/.test(block.message);
+  return block.reason === 'connection-check-unavailable'
+    || (typeof block.message === 'string' && CONNECTION_CHECK_UNAVAILABLE_CODE.test(block.message));
+}
+
+/** Its automatic retries are spent; only the person (or the next run) moves it. */
+function capabilityPauseRetriesSpent(block: Pick<WorkflowCapabilityBlockState, 'reason' | 'retryCount'>): boolean {
+  return (block.retryCount ?? 0) > workflowCapabilityAutomaticRetryLimit(block.reason);
+}
+
+/** For surfaces: whether the block's retryAt is still an automatic retry. */
+export function workflowCapabilityAutomaticRetryPending(
+  block: Pick<WorkflowCapabilityBlockState, 'reason' | 'retryCount'>,
+): boolean {
+  return !capabilityPauseRetriesSpent(block);
 }
 
 function capabilityPauseNeedsAccountChoice(block: WorkflowCapabilityBlockState): boolean {
@@ -12812,7 +12831,10 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
     // ONE free automatic attempt, then it is the owner's call. An unbounded
     // ladder kept a run alive for ten hours over a transient check failure and
     // silently held every later occurrence of that workflow behind it.
-    if ((run.capabilityBlock.retryCount ?? 0) > workflowCapabilityAutomaticRetryLimit(run.capabilityBlock.reason)) continue;
+    if (capabilityPauseRetriesSpent(run.capabilityBlock)) {
+      if (run.capabilityBlock.reason === 'connection-check-unavailable') stopUnreachableRunThatDidNoWork(filePath, run);
+      continue;
+    }
     const retryAtMs = Date.parse(run.capabilityBlock.retryAt);
     if (!Number.isFinite(retryAtMs) || retryAtMs > nowMs) continue;
     if (readmitCapabilityBlockedRun(filePath, run, new Date(nowMs).toISOString(), 'automatic-retry')) {
@@ -12820,6 +12842,60 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
     }
   }
   return resumed;
+}
+
+/**
+ * A run that could not reach the service on any of its automatic tries, and
+ * that did no work at all, stops instead of holding its workflow: nothing was
+ * sent, so the next run starts clean (live 2026-10-16 a network blip parked a
+ * scheduled review that then refused every later run as a duplicate until it
+ * was cancelled by hand). A run that already did work keeps waiting for the
+ * person, since stopping it would throw that work away.
+ */
+function stopUnreachableRunThatDidNoWork(filePath: string, run: QueuedRunRecord): boolean {
+  const block = run.capabilityBlock;
+  if (!block) return false;
+  const snapshotSlug = (run.workflowDefinitionSnapshot as { workflowSlug?: unknown } | undefined)?.workflowSlug;
+  const slug = run.workflowSlug ?? (typeof snapshotSlug === 'string' ? snapshotSlug : run.workflow);
+  const didWork = (current: Readonly<Record<string, unknown>>): boolean => (
+    workflowRunProducedWork(current as Record<string, unknown>, slug, run.id)
+  );
+  if (didWork(run as unknown as Record<string, unknown>)) return false;
+  const app = capabilityAppName(block.toolkit);
+  const reason = `I couldn't reach ${app} on any of ${block.retryCount} tries, so this run stopped before doing anything. Nothing was sent, and the next run starts fresh.`;
+  let result: ReturnType<typeof cancelWorkflowRunAtBoundary>;
+  try {
+    result = cancelWorkflowRunAtBoundary({
+      runId: run.id,
+      reason,
+      source: 'capability-retries-spent',
+      expectedWorkflow: run.workflow,
+      precondition: (current) => {
+        const currentBlock = (current as { capabilityBlock?: Partial<WorkflowCapabilityBlockState> }).capabilityBlock;
+        return current.status === 'blocked_capability'
+          && currentBlock?.state === 'blocked'
+          && currentBlock.reason === 'connection-check-unavailable'
+          && currentBlock.provenNoDispatch === true
+          && currentBlock.retryCount === block.retryCount
+          && !didWork(current as Record<string, unknown>)
+          ? 'allow'
+          : 'ownership_unproved';
+      },
+    });
+  } catch (error) {
+    logger.warn({ runId: run.id, error: error instanceof Error ? error.message : String(error) },
+      'Unreachable-service park could not be stopped; it keeps waiting for the person');
+    return false;
+  }
+  if (result.status !== 'cancelled') return false;
+  appendWorkflowEvent(slug, run.id, {
+    kind: 'run_cancelled',
+    error: reason,
+    meta: { source: 'capability-retries-spent', capabilityReason: block.reason, retryCount: block.retryCount, provenNoDispatch: true },
+  });
+  notifyCancelledRunOnce(filePath, result.run as QueuedRunRecord);
+  finishWorkflowActivityRun(run.id, { status: 'cancelled', message: reason });
+  return true;
 }
 
 /** Operator/UI affordance: retry a capability-blocked run immediately after
@@ -15397,7 +15473,9 @@ export function workflowCapabilityNotificationPresentation(
       : exactSchemaBlock
         ? `Retry it from Needs you${retry ? `, or I'll try again ${retry}` : ''}. Retrying only re-checks this action; it doesn't run anything else.`
         : couldNotCheck
-          ? `Nothing to do — I'll try again ${retry || 'shortly'}. Reconnecting ${app} wouldn't change it; if this keeps happening, ${app} is having trouble, not your account.`
+          ? capabilityPauseRetriesSpent(block)
+            ? `I tried ${block.retryCount} times and couldn't reach ${app}. Retry from Needs you when it's answering again. Reconnecting ${app} wouldn't change it; ${app} is having trouble, not your account.`
+            : `Nothing to do — I'll try again ${retry || 'shortly'}. Reconnecting ${app} wouldn't change it; if this keeps happening, ${app} is having trouble, not your account.`
           : needsAccountChoice
             ? `Pick the ${app} account for this step in Needs you and I'll resume this same run. Reconnecting ${app} won't help — the connection is fine.`
             : `Connect ${app} on the Connect page, then retry from Needs you${retry ? ` — I'll also try again ${retry}` : ''}.`,
@@ -15527,6 +15605,11 @@ function parkWorkflowCapabilityBlockedRun(input: {
     detail,
     resolution,
   } = presentation;
+  // The service did not answer the check: the run retries on its own, so it
+  // asks nothing of the person until those retries are spent.
+  const couldNotCheck = !exactSchemaBlock && !accountChoiceBlock && capabilityPauseCouldNotCheck(capabilityBlock);
+  const retriesSpent = capabilityPauseRetriesSpent(capabilityBlock);
+  const app = capabilityAppName(error.toolkit);
   try {
     ensureWorkflowCapabilityBlockedNotification(blockedRecord, workflow.data.name);
   } catch { /* durable run state remains visible */ }
@@ -15546,9 +15629,13 @@ function parkWorkflowCapabilityBlockedRun(input: {
         ? `Waiting for an exact ${error.toolkit} account choice at step ${error.stepId}; completed work is preserved.`
         : exactSchemaBlock
         ? `Waiting for exact action metadata at step ${error.stepId}; completed work is preserved.`
+        : couldNotCheck
+        ? retriesSpent
+          ? `Couldn't reach ${app} at step ${error.stepId} after ${retryCount} tries; completed work is preserved.`
+          : `Couldn't reach ${app} at step ${error.stepId}; retrying on its own. Completed work is preserved.`
         : `Waiting for ${error.toolkit} connection at step ${error.stepId}; completed work is preserved.`,
       outputPreview: detail,
-      needsAttention: true,
+      needsAttention: !couldNotCheck || retriesSpent,
       pendingInput: {
         kind: 'capability_dependency',
         dependencyId: `workflow:${run.id}:${error.stepId}:${error.tool}`,
@@ -15568,14 +15655,23 @@ function parkWorkflowCapabilityBlockedRun(input: {
           ? choiceQuestion
           : exactSchemaBlock
             ? 'Retry it from Needs you; everything before this step is kept.'
-            : `Connect ${capabilityAppName(error.toolkit)} on the Connect page, then retry it from Needs you; everything before this step is kept.`,
+            : couldNotCheck
+              ? retriesSpent
+                ? `Retry it from Needs you when ${app} is answering again; everything before this step is kept.`
+                : 'Nothing to do: it retries on its own. Retry now from Needs you if you like.'
+              : `Connect ${app} on the Connect page, then retry it from Needs you; everything before this step is kept.`,
         resolution,
         retryAt,
         provenNoDispatch: true,
       },
     });
   } catch { /* Activity is best-effort */ }
-  for (const originSessionId of workflowRunOriginSessionIds(run)) {
+  // A run that will stop on its own when its retries are spent (it did no
+  // work) reports once through that stop; one that is still retrying reports
+  // nothing yet. Each retry used to post another chat turn.
+  const speaksNow = !couldNotCheck
+    || (retriesSpent && workflowRunProducedWork(blockedRecord as unknown as Record<string, unknown>, workflow.name, run.id));
+  for (const originSessionId of speaksNow ? workflowRunOriginSessionIds(run) : []) {
     deliverOutcome(
       { status: 'needs_input', detail },
       {

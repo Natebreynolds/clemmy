@@ -123,3 +123,28 @@ test('a check that could not complete offers a retry, never "open Connections"',
   assert.equal(presentation.resolution.kind, 'retry_check');
   assert.match(presentation.detail, /could not reach/i);
 });
+
+test('a definition the provider would not describe is not called an unreachable service', () => {
+  // It may be a missing or changed operation; a retry would never fix it.
+  const block = catalogPreparationRefusalToCapabilityBlock(
+    { id: 'main' },
+    { reason: 'selected_definition_revalidation_refused', operationId: 'GOOGLESHEETS_BATCH_GET',
+      detail: 'selected_definition_exact_refresh_unavailable' },
+  );
+  assert.notEqual(block.reason, 'connection-check-unavailable');
+});
+
+test('once the automatic tries are spent the notice stops promising another try', () => {
+  const block = catalogPreparationRefusalToCapabilityBlock(
+    { id: 'main' },
+    { reason: 'selected_definition_revalidation_refused', operationId: 'GOOGLESHEETS_BATCH_GET',
+      detail: 'selected_connection_refresh_unavailable' },
+  );
+  const presentation = workflowCapabilityNotificationPresentation('Fixture review', {
+    stepId: block.stepId, tool: block.tool, toolkit: block.toolkit, reason: block.reason, message: block.message,
+    blockedAt: new Date().toISOString(), retryAt: new Date(Date.now() + 60_000).toISOString(), retryCount: 5,
+    provenNoDispatch: true, state: 'blocked',
+  } as never);
+  assert.match(presentation.detail, /tried 5 times/);
+  assert.doesNotMatch(presentation.detail, /I'll try again/);
+});
