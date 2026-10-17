@@ -26,7 +26,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import { memoryJobChannel, type MemoryJobId } from './memory-jobs.js';
+import { memoryJobChannel, memoryJobUsesMemoryModel, type MemoryJobId } from './memory-jobs.js';
 import type {
   MemoryModelProblem,
   MemoryWorkOutcome,
@@ -321,6 +321,7 @@ function memoryJobAttribution(job: MemoryJobId, runId: string): ModelUsageAttrib
     sessionId: '',
     sourceUserSeq: 0,
     usageJobId: `memory:${job}:${runId}`,
+    ...(memoryJobUsesMemoryModel(job) ? { waitForOwnModel: true as const } : {}),
     memoryAccountingOrigin: retained ?? createMemoryAccountingOrigin(parent),
     ...(parent ? { usageParentTurn: parent } : {}),
     channel,

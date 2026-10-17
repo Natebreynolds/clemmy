@@ -15,7 +15,9 @@ process.env.EMBEDDINGS_DISABLED = 'true';
 
 const journal = await import('./memory-work-journal.js');
 const telemetry = await import('../runtime/operational-telemetry.js');
-const { recordModelUsage, readUsageEventsForDate, withOwnModelRequestAttribution, withModelUsageAttribution, modelUsageAttributionStorage } = await import('../runtime/usage-log.js');
+const { recordModelUsage, readUsageEventsForDate, withOwnModelRequestAttribution, withModelUsageAttribution, modelUsageAttributionStorage,
+  captureModelUsageProvenance, capturedModelUsageAttribution, createStandaloneModelAccountingJob, withStandaloneModelAccountingJob,
+  standaloneModelAccountingJobBinding } = await import('../runtime/usage-log.js');
 const { withModelRouteMetrics } = await import('../runtime/model-route-metrics.js');
 const { BoundaryError } = await import('../runtime/boundary-error.js');
 const { buildTransportTimeoutError } = await import('../runtime/codex-dispatcher.js');
@@ -122,6 +124,49 @@ test('model calls inside a job carry its channel and the memory role, even insid
   assert.notEqual(learn?.sessionId, 'sess-chat', 'memory tokens are never charged to the conversation');
   assert.equal((standing?.payload as { channel?: string }).channel, 'memory:verify');
   assert.equal((standing?.payload as { role?: string }).role, 'reviewer', 'the checker jobs keep their own role');
+});
+
+test('only memory-owned model jobs explicitly wait for their own model through request and immutable capture scopes', async () => {
+  for (const job of ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing', 'verify', 'index', 'tidy'] as const) {
+    const expected = ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing'].includes(job) ? true : undefined;
+    await runMemoryJob(job, {}, async () => {
+      const scope = modelUsageAttributionStorage.getStore()!;
+      assert.equal(scope.waitForOwnModel, expected, job);
+      assert.ok(scope.usageJobId?.startsWith(`memory:${job}:`), 'job accounting remains independent');
+      await withOwnModelRequestAttribution({ role: 'reviewer', channel: 'judge:controlled-memory' }, async () => {
+        assert.equal(modelUsageAttributionStorage.getStore()?.waitForOwnModel, expected, job);
+        const captured = capturedModelUsageAttribution(captureModelUsageProvenance())!;
+        assert.equal(captured.waitForOwnModel, expected, job);
+        assert.ok(Object.isFrozen(captured));
+        if (expected) {
+          const current = modelUsageAttributionStorage.getStore()!;
+          delete current.waitForOwnModel;
+          assert.equal(captured.waitForOwnModel, true, 'later scope mutation cannot erase captured routing intent');
+          current.waitForOwnModel = true;
+        }
+      });
+    }, () => ({ outcome: 'nothing_new' }));
+  }
+});
+
+test('nested checker and standalone Noticing jobs cannot inherit a memory routing pin', async () => {
+  await runMemoryJob('learn', {}, async () => {
+    assert.equal(modelUsageAttributionStorage.getStore()?.waitForOwnModel, true);
+    await runMemoryJob('verify', {}, async () => {
+      assert.equal(modelUsageAttributionStorage.getStore()?.waitForOwnModel, undefined);
+    }, () => ({ outcome: 'nothing_new' }));
+    const job = createStandaloneModelAccountingJob({ operation: 'noticing_answer', operationId: 'controlled-answer', revisionDigest: 'a'.repeat(64) });
+    await withStandaloneModelAccountingJob(job, () => withOwnModelRequestAttribution({ role: 'brain' }, async () => {
+      const scope = modelUsageAttributionStorage.getStore()!;
+      assert.equal(scope.waitForOwnModel, undefined);
+      assert.equal(scope.usageJobId, standaloneModelAccountingJobBinding(job)?.usageJobId);
+      const mixed = { ...scope, waitForOwnModel: true as const };
+      const captured = withModelUsageAttribution(mixed, () => capturedModelUsageAttribution(captureModelUsageProvenance()))!;
+      assert.equal(captured.waitForOwnModel, undefined, 'standalone capture cannot adopt a foreign memory pin');
+      assert.equal(captured.usageJobId, scope.usageJobId);
+    }));
+    assert.equal(modelUsageAttributionStorage.getStore()?.waitForOwnModel, true, 'nested accounting does not alter its memory parent');
+  }, () => ({ outcome: 'nothing_new' }));
 });
 
 test('a job\'s scope names whose thinking it is, so a route recorded as the brain\'s still books the job\'s role', async () => {

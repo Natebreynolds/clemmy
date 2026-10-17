@@ -243,6 +243,7 @@ export class RouterModelProvider implements ModelProvider {
     const requested = typeof modelName === 'string' && modelName.trim().length > 0 ? modelName.trim() : MODELS.primary;
     const runContext = harnessRunContextStorage.getStore();
     const sessionId = runContext?.sessionId;
+    const waitForOwnModel = modelUsageAttributionStorage.getStore()?.waitForOwnModel === true;
     const backups = exactWorker ? null : this.brainBackupTargets(modelName, primary.label);
     const primarySource = routeSourceForModelName(modelName);
     const primaryMetricsContext: ModelRouteMetricsContext = {
@@ -279,7 +280,7 @@ export class RouterModelProvider implements ModelProvider {
         },
       }),
     }));
-    const workerRescue = !exactWorker && backups === null && brainFalloverEnabled() && workerScoped(runContext);
+    const workerRescue = !exactWorker && !waitForOwnModel && backups === null && brainFalloverEnabled() && workerScoped(runContext);
     let resolved: Model;
     if (exactWorker || (!backups?.length && !workerRescue)) {
       // No backup: the lone primary still sits behind the same graph boundary
@@ -343,6 +344,7 @@ export class RouterModelProvider implements ModelProvider {
       codexAvailable: this.codexAvailable,
     });
     const allowOverloadFallback = harnessRunContextStorage.getStore()?.workerScope !== true
+      && modelUsageAttributionStorage.getStore()?.waitForOwnModel !== true
       && !(typeof modelName === 'string' && isPinnedWorkerModel(modelName));
     switch (routed.provider) {
       case 'claude':
@@ -386,14 +388,14 @@ export class RouterModelProvider implements ModelProvider {
    * The owner's backup brains for a brain request, in their order; null when
    * this is not a brain request. A brain request is one the chosen brain
    * serves — the default model, the brain of the turn's conversation, or a
-   * brain in an outage — outside a worker and outside a background job (a
-   * memory job keeps waiting for its own model). Lazy: an unreached backup is
+   * brain in an outage — outside a worker or an explicitly pinned memory job.
+   * Accounting job identity alone does not change routing. An unreached backup is
    * never built.
    */
   private brainBackupTargets(modelName: string | undefined, primaryLabel: string): FallbackTarget[] | null {
     const runContext = harnessRunContextStorage.getStore();
     if (workerScoped(runContext)) return null;
-    if (modelUsageAttributionStorage.getStore()?.usageJobId) return null;
+    if (modelUsageAttributionStorage.getStore()?.waitForOwnModel === true) return null;
     const explicit = typeof modelName === 'string' && modelName.trim().length > 0;
     if (explicit && !isBrainModel(primaryLabel, runContext?.sessionId)) return null;
     return brainBackupModelIds(primaryLabel).map((modelId) => ({

@@ -11,9 +11,11 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
+import type { TurnSemanticModelPort } from '../semantic-boundary/turn-semantic-model-port.js';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-router-backups-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { RouterModelProvider } = await import('./router-model.js');
@@ -22,7 +24,9 @@ const { BoundaryError } = await import('../boundary-error.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('./brackets.js');
 const { listOperationalEvents, closeOperationalTelemetryDb } = await import('../operational-telemetry.js');
 const { openModelRouteMetricsDb, closeModelRouteMetricsDb } = await import('../model-route-metrics.js');
-const { modelUsageAttributionStorage } = await import('../usage-log.js');
+const { modelUsageAttributionStorage, withOwnModelRequestAttribution, standaloneModelAccountingJobBinding,
+  recordModelUsage, readUsageEventsForDate } = await import('../usage-log.js');
+const { runMemoryJob } = await import('../../memory/memory-work-journal.js');
 const backups = await import('./brain-backups.js');
 
 const BACKUP = 'gpt-5.6-luna';
@@ -135,17 +139,84 @@ test('with no backup listed, the chosen brain is the only model asked, connected
   assert.deepEqual(requested, [], 'no built-in rescue is asked');
 });
 
-test('a memory job on the brain\'s own model keeps waiting for it', async () => {
+test('an actual Noticing owner-answer job falls from a primary 429 to the first owner-listed backup without losing accounting', async () => {
+  allInBrain('glm-noticing-answer-429');
+  const second = 'gpt-6.1-sol';
+  backups.__brainBackupsTest__.setOptions(() => [
+    { id: 'codex_oauth', value: `codex_oauth:${BACKUP}`, label: 'First controlled backup', available: true, modelId: BACKUP },
+    { id: 'codex_oauth', value: `codex_oauth:${second}`, label: 'Second controlled backup', available: true, modelId: second },
+  ]);
+  process.env[backups.BRAIN_BACKUPS_ENV] = JSON.stringify([BACKUP, second]);
+  const noticing = await import('../../agents/noticing-runtime.js');
+  const ports = await import('../semantic-boundary/turn-semantic-port-registry.js');
+  const requested: string[] = [], observedJobs: string[] = [];
+  let primaryCalls = 0, backupCalls = 0;
+  const observeJob = () => {
+    const context = modelUsageAttributionStorage.getStore()!;
+    assert.equal(context.waitForOwnModel, undefined, 'accounting identity is not a memory routing pin');
+    const binding = standaloneModelAccountingJobBinding(context.standaloneAccountingJob!)!;
+    assert.equal(binding.operation, 'noticing_answer'); assert.equal(binding.operationId, 'controlled-owner-answer');
+    observedJobs.push(binding.usageJobId);
+  };
+  const router = routerWith(model({ getResponse: async () => {
+    primaryCalls++; observeJob(); throw Object.assign(new Error('Controlled primary rate limit.'), { statusCode: 429 });
+  } }), requested, model({ getResponse: async () => {
+    backupCalls++; observeJob();
+    recordModelUsage({ sessionId: 'unknown', model: BACKUP, inputTokens: 11, outputTokens: 2, cacheDialect: 'inclusive',
+      responseId: 'controlled-noticing-backup-response', trace: { modelCallId: 'controlled-noticing-backup-call' } });
+    return response('do_it');
+  } }));
+  ports.installTurnSemanticModelPort({ readNoticingAnswer: async input => {
+    const answer = await withOwnModelRequestAttribution({ role: 'brain', channel: 'noticing:answer' },
+      () => router.getModel('glm-noticing-answer-429').getResponse(request()));
+    assert.equal((answer.output[0] as { content?: string }).content, 'do_it');
+    assert.equal(fallbackRouteResolution(answer)?.resolvedLabel, BACKUP);
+    return { decision: 'do_it', evidenceDigest: input.evidenceDigest, modelIdentity: BACKUP };
+  } } as TurnSemanticModelPort);
+  try {
+    const reply = await noticing.readNoticingAnswer({ title: 'Controlled local draft', action: 'Prepare the controlled local draft.' }, 'Do it.',
+      { checkInId: 'controlled-owner-answer', answerDigest: 'a'.repeat(64), capture: () => {} });
+    assert.equal(reply.status, 'read'); assert.equal(reply.decision, 'do_it');
+    assert.equal(primaryCalls, 1); assert.equal(backupCalls, 1);
+    assert.deepEqual(requested, [BACKUP], 'the second listed backup remains lazy and unused');
+    assert.equal(new Set(observedJobs).size, 1); assert.equal(reply.modelAccountingJobId, observedJobs[0]);
+    const rows = readUsageEventsForDate().filter(row => row.model === BACKUP && row.trace?.modelCallId === 'controlled-noticing-backup-call');
+    assert.equal(rows.length, 1); assert.equal(rows[0]!.source, reply.modelAccountingJobId);
+    assert.equal(rows[0]!.trace?.acceptedSource, undefined); assert.equal(rows[0]!.trace?.attemptId, undefined);
+  } finally { ports.installTurnSemanticModelPort(null); }
+});
+
+test('a memory-owned job explicitly keeps waiting for its own brain model', async () => {
   allInBrain('glm-5.4');
   process.env[backups.BRAIN_BACKUPS_ENV] = JSON.stringify([BACKUP]);
   const requested: string[] = [];
   const router = routerWith(model({ getResponse: async () => { throw timeout(); } }), requested,
     model({ getResponse: async () => response('must not answer') }));
-  await assert.rejects(modelUsageAttributionStorage.run(
-    { sessionId: 'memory', sourceUserSeq: 0, role: 'memory', usageJobId: 'memory:learn:test' },
-    async () => router.getModel('glm-5.4').getResponse(request()),
-  ));
+  await assert.rejects(runMemoryJob('learn', {}, () => withOwnModelRequestAttribution({ role: 'reviewer' }, async () => {
+    assert.equal(modelUsageAttributionStorage.getStore()?.waitForOwnModel, true);
+    return router.getModel('glm-5.4').getResponse(request());
+  }), () => ({ outcome: 'nothing_new' })));
   assert.deepEqual(requested, []);
+});
+
+test('memory-owned jobs cannot acquire worker rescue from an enclosing worker context', async () => {
+  allInBrain('glm-memory-worker-429'); process.env.MODEL_ROUTING_MODE = 'off';
+  process.env.CLEMMY_BRAIN_FALLOVER = 'on';
+  const requested: string[] = [];
+  const router = routerWith(model({ getResponse: async () => { throw Object.assign(new Error('Controlled 429.'), { statusCode: 429 }); } }),
+    requested, model({ getResponse: async () => response('must not serve memory') }));
+  await assert.rejects(withHarnessRunContext({ sessionId: 'controlled-foreign-worker', workerScope: true, counter: new ToolCallsCounter(8) },
+    () => runMemoryJob('skills', {}, () => withOwnModelRequestAttribution({ role: 'memory' },
+      () => router.getModel('glm-memory-worker-429').getResponse(request())), () => ({ outcome: 'nothing_new' }))));
+  assert.deepEqual(requested, [], 'the worker rescue chain cannot substitute for memory\'s own model');
+});
+
+test('an explicit memory wait also disables the Claude adapter\'s internal overload substitute', async () => {
+  const options: unknown[] = [];
+  const router = new RouterModelProvider({ resolveEffectiveProvider: () => 'claude', codexAvailable: () => true,
+    claude: { getModel: (_id, config) => { options.push(config); return model({}); } } });
+  await runMemoryJob('skills', {}, async () => { router.getModel('claude-controlled-memory'); }, () => ({ outcome: 'nothing_new' }));
+  assert.deepEqual(options, [{ allowOverloadFallback: false }]);
 });
 
 test('the router applies the absolute pre-actionable wall only to an interactive foreground context', async () => {

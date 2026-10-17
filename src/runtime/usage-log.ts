@@ -467,6 +467,9 @@ export interface ModelUsageAttributionContext {
   memoryAccountingOrigin?: MemoryAccountingOrigin;
   /** Unique autonomous job identity, also present on its operational receipt. */
   usageJobId?: string;
+  /** Host-declared memory routing constraint, independent of job accounting.
+   * Other accounted jobs retain the owner's ordinary brain backup list. */
+  waitForOwnModel?: true;
   /** Request-local estimates override ambient parent prompt measurements. */
   promptComponents?: Record<string, number>;
   sessionId: string;
@@ -592,6 +595,7 @@ function captureUsageAttribution(value: unknown): ModelUsageAttributionContext |
     result.role = row.role as UsageRequestRole;
   }
   if (typeof row.ownRequest === 'boolean') result.ownRequest = row.ownRequest;
+  if (row.waitForOwnModel === true) result.waitForOwnModel = true;
   const origin = memoryAccountingOriginFromContext(value);
   if (origin) result.memoryAccountingOrigin = origin;
   if (row.usageParentTurn !== undefined) {
@@ -616,6 +620,7 @@ function captureUsageAttribution(value: unknown): ModelUsageAttributionContext |
     result.standaloneAccountingJob = standalone;
     result.sessionId = ''; result.sourceUserSeq = 0;
     delete result.attemptId; delete result.usageParentTurn; delete result.memoryAccountingOrigin;
+    delete result.waitForOwnModel;
     if (binding) result.usageJobId = binding.usageJobId; else delete result.usageJobId;
   }
   return Object.freeze(result);
@@ -735,6 +740,7 @@ export function withOwnModelRequestAttribution<T>(
     ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
     ...(inherited?.usageParentTurn ? { usageParentTurn: inherited.usageParentTurn } : {}),
     ...(inherited?.usageJobId ? { usageJobId: inherited.usageJobId } : {}),
+    ...(inherited?.waitForOwnModel === true ? { waitForOwnModel: true as const } : {}),
     ...(() => { const job = standaloneModelAccountingJobFromContext(inherited); return job ? { standaloneAccountingJob: job } : {}; })(),
     ...(() => { const origin = memoryAccountingOriginFromContext(inherited); return origin ? { memoryAccountingOrigin: origin } : {}; })(),
     ...(role ? { role } : {}),
