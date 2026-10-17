@@ -1221,7 +1221,7 @@
           "bytes": 43351
         },
         "src/runtime/harness/skill-execution.ts": {
-          "bytes": 22430
+          "bytes": 22565
         },
         "src/memory/fact-observation.ts": {
           "bytes": 4174
@@ -1362,7 +1362,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 180284
+          "bytes": 180653
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -1794,7 +1794,7 @@
           "bytes": 7092
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 136519
+          "bytes": 138040
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 6989
@@ -2829,7 +2829,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 725766
+          "bytes": 725923
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3357,7 +3357,7 @@
           "bytes": 9824
         },
         "src/tools/skill-tools.ts": {
-          "bytes": 16201
+          "bytes": 16295
         },
         "src/tools/workflow-schedule-tools.ts": {
           "bytes": 16088
@@ -5130,7 +5130,7 @@
           "bytes": 43351
         },
         "src/runtime/harness/skill-execution.ts": {
-          "bytes": 22430
+          "bytes": 22565
         },
         "src/memory/fact-observation.ts": {
           "bytes": 4174
@@ -5271,7 +5271,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 180284
+          "bytes": 180653
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -5703,7 +5703,7 @@
           "bytes": 7092
         },
         "src/tools/tool-search-tool.ts": {
-          "bytes": 136519
+          "bytes": 138040
         },
         "src/runtime/harness/approval-card.ts": {
           "bytes": 6989
@@ -6738,7 +6738,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 725766
+          "bytes": 725923
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7266,7 +7266,7 @@
           "bytes": 9824
         },
         "src/tools/skill-tools.ts": {
-          "bytes": 16201
+          "bytes": 16295
         },
         "src/tools/workflow-schedule-tools.ts": {
           "bytes": 16088
