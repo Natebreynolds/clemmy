@@ -8494,7 +8494,11 @@ const runHostTurnBody = async (
       continuationReason: input.continuationReason,
       ...(input.continuationReason || input.retired || input.disposition === 'effect_unknown'
         ? {}
-        : { nextEdge: input.diagnostic && isOffMachineCallNeedsCardRepair(input.diagnostic)
+        : { nextEdge: input.diagnostic && input.diagnostic.includes(HOST_SIBLING_NOT_RUN_SENTENCE)
+          // Nothing is wrong with this call; a sibling held the batch back.
+          ? nextEdge({ tool: innerTool, change: 'reissue_unstarted',
+            say: 'Send this call again unchanged with a fresh call ID, in the same step as the corrected call.' })
+          : input.diagnostic && isOffMachineCallNeedsCardRepair(input.diagnostic)
           // The call was right; only the owner's decision is missing. The
           // edge is the queue, never a repair of the arguments.
           ? nextEdge({ tool: 'pending_action_queue', change: 'queue_for_approval' })
@@ -12669,6 +12673,25 @@ const runHostTurnBody = async (
       }
     }
     if (preApprovalRefused) {
+      // A batch is prepared as a whole and runs only when every call is ready,
+      // so one call that needs a fix keeps its siblings from running too. Say
+      // so to each sibling, instead of the generic "correct this call" (live
+      // 2026-10-16 a calendar read and a task read were told to fix arguments
+      // that were fine, because a mail search beside them was malformed).
+      const needingFix = canonicalCalls.filter((call) => preApprovalRepairDiagnostics.has(call.callId));
+      if (needingFix.length > 0) {
+        const fixNames = [...new Set(needingFix.map((call) => edgeToolName(call.name, parsedArgs(call.argumentsJson))))].join(', ');
+        const prepared = new Set(pendingBatch.map((pending) => pending.callId));
+        for (const call of canonicalCalls) {
+          if (preApprovalRepairDiagnostics.has(call.callId)) continue;
+          preApprovalRepairDiagnostics.set(call.callId, {
+            diagnostic: `This call ${HOST_SIBLING_NOT_RUN_SENTENCE} (${fixNames}); nothing in the batch ran. `
+              + (prepared.has(call.callId)
+                ? 'Its own arguments passed their checks: send it again unchanged, together with the corrected call.'
+                : 'It was not checked yet: send it again with the corrected call.'),
+          });
+        }
+      }
       const refusalProgress = aggregateHostPreparationRefusalProgress(
         [...preApprovalTypedRefusals].map(([callId, recovery]) => ({ callId, recovery })),
       );
@@ -12980,6 +13003,9 @@ let hostJitLiveReadAcquirer: HostJitLiveReadAcquirer = productionHostJitLiveRead
 export function _setHostJitLiveReadAcquirerForTests(acquirer: HostJitLiveReadAcquirer | null): void {
   hostJitLiveReadAcquirer = acquirer ?? productionHostJitLiveReadAcquirer;
 }
+/** The sentence a sibling of a call that needs a fix is refused with. */
+const HOST_SIBLING_NOT_RUN_SENTENCE = 'did not run because another call in this same batch needs a fix first';
+
 export const HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX = 'literal_workflow_operation_not_frozen:';
 
 export function literalOperationNotFrozenReason(operationId: string): string {
