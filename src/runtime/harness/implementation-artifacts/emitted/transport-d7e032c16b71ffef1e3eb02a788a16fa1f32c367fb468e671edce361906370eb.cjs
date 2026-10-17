@@ -6,9 +6,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __export = (target, all) => {
+var __export = (target3, all) => {
   for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
+    __defProp(target3, name, { get: all[name], enumerable: true });
 };
 var __copyProps = (to, from, except, desc) => {
   if (from && typeof from === "object" || typeof from === "function") {
@@ -18,12 +18,12 @@ var __copyProps = (to, from, except, desc) => {
   }
   return to;
 };
-var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+var __toESM = (mod, isNodeMode, target3) => (target3 = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
   // If the importer is in node compatibility mode or this is not an ESM
   // file that has been converted to a CommonJS file using a Babel-
   // compatible transform (i.e. "__esModule" has not been set), then set
   // "default" to the CommonJS "module.exports" for node compatibility.
-  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target3, "default", { value: mod, enumerable: true }) : target3,
   mod
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
@@ -42,22 +42,22 @@ __export(transport_entry_exports, {
 });
 module.exports = __toCommonJS(transport_entry_exports);
 var import_node_module = require("node:module");
-var import_node_fs5 = require("node:fs");
-var import_node_path7 = __toESM(require("node:path"), 1);
-var import_node_url2 = require("node:url");
+var import_node_fs11 = require("node:fs");
+var import_node_path13 = __toESM(require("node:path"), 1);
+var import_node_url3 = require("node:url");
 
 // src/integrations/composio/provider-definition-identity.ts
-var import_node_crypto2 = require("node:crypto");
+var import_node_crypto4 = require("node:crypto");
 
 // src/tools/tool-contract-store.ts
-var import_node_path3 = __toESM(require("node:path"), 1);
+var import_node_path5 = __toESM(require("node:path"), 1);
 
 // src/config.ts
 var import_node_async_hooks = require("node:async_hooks");
-var import_node_fs = require("node:fs");
+var import_node_fs4 = require("node:fs");
 var import_node_os = __toESM(require("node:os"), 1);
-var import_node_path = __toESM(require("node:path"), 1);
-var import_node_url = require("node:url");
+var import_node_path3 = __toESM(require("node:path"), 1);
+var import_node_url2 = require("node:url");
 
 // src/runtime/security.ts
 function isPlaceholderSecret(value) {
@@ -111,10 +111,449 @@ function redactSensitiveText(input) {
   return text;
 }
 
+// src/runtime/credential-private-filesystem.ts
+var import_node_crypto2 = require("node:crypto");
+var import_node_fs3 = require("node:fs");
+var import_node_path2 = __toESM(require("node:path"), 1);
+
+// src/runtime/windows-private-filesystem.ts
+var import_node_child_process = require("node:child_process");
+var import_node_crypto = require("node:crypto");
+var import_node_fs = require("node:fs");
+var import_node_path = __toESM(require("node:path"), 1);
+var import_node_url = require("node:url");
+
+// src/runtime/ascii-json.ts
+function asciiJson(value) {
+  return JSON.stringify(value).replace(/[\u007f-￿]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+// src/runtime/windows-private-filesystem.ts
+var WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE = String.raw`
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+public static class ClemPrivateAcl {
+  [StructLayout(LayoutKind.Sequential)] struct Info {
+    public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh;
+    public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern SafeFileHandle CreateFileW(string p,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(SafeFileHandle h,out Info i);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern uint GetFinalPathNameByHandleW(SafeFileHandle h,StringBuilder p,uint size,uint flags);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeInformationByHandleW(SafeFileHandle h,StringBuilder name,uint size,out uint serial,out uint component,out uint flags,StringBuilder fs,uint fsSize);
+  [DllImport("advapi32.dll")] static extern uint GetSecurityInfo(SafeFileHandle h,int type,uint information,out IntPtr owner,out IntPtr group,out IntPtr dacl,out IntPtr sacl,out IntPtr descriptor);
+  [DllImport("advapi32.dll")] static extern uint SetSecurityInfo(SafeFileHandle h,int type,uint information,IntPtr owner,IntPtr group,IntPtr dacl,IntPtr sacl);
+  [DllImport("advapi32.dll")] static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetSecurityDescriptorDacl(IntPtr descriptor,out bool present,out IntPtr dacl,out bool defaulted);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  static void Require(bool ok,string stage="acl_policy") { if(!ok) throw new InvalidOperationException("private ACL "+stage+" failed"); }
+  static RawSecurityDescriptor Read(SafeFileHandle h) {
+    IntPtr owner,group,dacl,sacl,sd;
+    Require(GetSecurityInfo(h,1,5,out owner,out group,out dacl,out sacl,out sd)==0);
+    try {
+      uint count=GetSecurityDescriptorLength(sd); Require(count>0 && count<=65536);
+      byte[] bytes=new byte[count]; Marshal.Copy(sd,bytes,0,(int)count);
+      return new RawSecurityDescriptor(bytes,0);
+    } finally { LocalFree(sd); }
+  }
+  static bool Trusted(SecurityIdentifier sid, SecurityIdentifier user) {
+    return sid!=null && (sid.Equals(user) || sid.Value=="S-1-5-18" || sid.Value=="S-1-5-32-544");
+  }
+  static void Verify(RawSecurityDescriptor sd,SecurityIdentifier user,bool directory,bool allowInheritedPrivate) {
+    Require(Trusted(sd.Owner,user));
+    Require((allowInheritedPrivate || (sd.ControlFlags & ControlFlags.DiscretionaryAclProtected)!=0) && sd.DiscretionaryAcl!=null);
+    Require(sd.DiscretionaryAcl.Count>0 && sd.DiscretionaryAcl.Count<=3);
+    bool own=false; var seen=new System.Collections.Generic.HashSet<string>();
+    AceFlags flags=directory ? AceFlags.ContainerInherit|AceFlags.ObjectInherit : AceFlags.None;
+    foreach(GenericAce raw in sd.DiscretionaryAcl) {
+      CommonAce ace=raw as CommonAce;
+      Require(ace!=null && !ace.IsCallback && ace.AceQualifier==AceQualifier.AccessAllowed);
+      Require(Trusted(ace.SecurityIdentifier,user) && seen.Add(ace.SecurityIdentifier.Value));
+      // Credential-only legacy admission inspects the CURRENT effective ACL.
+      // It never repairs an inherited ACL or accepts an inherit-only, callback,
+      // deny, duplicate or untrusted rule. Strict stores retain exact flags.
+      AceFlags allowed=flags|AceFlags.Inherited;
+      Require((allowInheritedPrivate ? (ace.AceFlags & ~allowed)==0 : ace.AceFlags==flags) && ace.AccessMask==0x1f01ff);
+      if(ace.SecurityIdentifier.Equals(user)) own=true;
+    }
+    Require(own);
+  }
+  static void Harden(SafeFileHandle h,RawSecurityDescriptor old,SecurityIdentifier user,bool directory) {
+    Require(Trusted(old.Owner,user));
+    RawAcl acl=new RawAcl(2,3);
+    AceFlags flags=directory ? AceFlags.ContainerInherit|AceFlags.ObjectInherit : AceFlags.None;
+    foreach(string sid in new[]{user.Value,"S-1-5-18","S-1-5-32-544"})
+      acl.InsertAce(acl.Count,new CommonAce(flags,AceQualifier.AccessAllowed,0x1f01ff,new SecurityIdentifier(sid),false,null));
+    var sd=new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent|ControlFlags.DiscretionaryAclProtected,old.Owner,old.Group,null,acl);
+    byte[] bytes=new byte[sd.BinaryLength]; sd.GetBinaryForm(bytes,0);
+    GCHandle pinned=GCHandle.Alloc(bytes,GCHandleType.Pinned);
+    try {
+      bool present,defaulted; IntPtr dacl;
+      Require(GetSecurityDescriptorDacl(pinned.AddrOfPinnedObject(),out present,out dacl,out defaulted) && present && dacl!=IntPtr.Zero);
+      Require(SetSecurityInfo(h,1,0x80000004,IntPtr.Zero,IntPtr.Zero,dacl,IntPtr.Zero)==0);
+    } finally { pinned.Free(); }
+  }
+  public static void Apply(string target,ulong volume,ulong inode,ulong links,bool directory,bool harden,bool allowInheritedPrivate) {
+    Require(!String.IsNullOrEmpty(target) && target.Length<=16000 && Path.IsPathRooted(target));
+    using(var h=CreateFileW(target,0x20080u|(harden?0x40000u:0u),3,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
+      Require(!h.IsInvalid,"open_handle");
+      Info info; Require(GetFileInformationByHandle(h,out info));
+      Require(info.Volume==volume && (((ulong)info.IndexHigh<<32)|info.IndexLow)==inode && inode!=0,"identity");
+      Require(info.Links==links && (!harden || directory || links==1));
+      Require((info.Attributes&0x400)==0 && ((info.Attributes&0x10)!=0)==directory);
+      var canonical=new StringBuilder(32768);
+      uint count=GetFinalPathNameByHandleW(h,canonical,32768,0); Require(count>0 && count<32768);
+      string observed=canonical.ToString(); if(observed.StartsWith(@"\\?\")) observed=observed.Substring(4);
+      Require(String.Equals(observed,Path.GetFullPath(target),StringComparison.OrdinalIgnoreCase),"canonical_path");
+      uint serial,component,flags; var fs=new StringBuilder(32);
+      Require(GetVolumeInformationByHandleW(h,null,0,out serial,out component,out flags,fs,32) && fs.ToString()=="NTFS","ntfs_volume");
+      var user=WindowsIdentity.GetCurrent().User; Require(user!=null);
+      var sd=Read(h);
+      if(harden) { Harden(h,sd,user,directory); sd=Read(h); }
+      Verify(sd,user,directory,!harden && allowInheritedPrivate);
+      Info after; Require(GetFileInformationByHandle(h,out after));
+      Require(after.Volume==info.Volume && after.IndexHigh==info.IndexHigh && after.IndexLow==info.IndexLow && after.Links==info.Links);
+    }
+  }
+}
+`;
+var ACL_PROGRAM = String.raw`
+$ErrorActionPreference = 'Stop'
+try {
+# The request is ASCII-only JSON (asciiJson), readable in any console code page.
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false, $true) } catch { }
+$p = [Console]::In.ReadToEnd() | ConvertFrom-Json
+Add-Type -TypeDefinition @'
+` + WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE + String.raw`
+'@
+if($p.version -ne 2) { throw 'unsupported private ACL protocol' }
+[ClemPrivateAcl]::Apply($p.path,[UInt64]::Parse($p.dev),[UInt64]::Parse($p.ino),[UInt64]::Parse($p.nlink),[bool]$p.directory,[bool]$p.harden,[bool]$p.allowInheritedPrivate)
+[Console]::Out.Write('private-acl-ok-v2')
+} catch {
+  if($p.syntheticDiagnostic -eq $true) { [Console]::Error.Write($_.ToString()) }
+  else { [Console]::Error.Write('private-acl-refused-v1') }
+  exit 1
+}
+`;
+var WindowsPrivateFilesystemError = class extends Error {
+  constructor(cause) {
+    super("Windows private filesystem ACL could not be verified. Check NTFS folder access and the Clementine native helper installation, then retry. Development fallback also requires PowerShell access.", cause === void 0 ? void 0 : { cause });
+    this.name = "WindowsPrivateFilesystemError";
+  }
+};
+function windowsPrivateFilesystemProbeLocation() {
+  const filename = typeof __filename === "string" ? __filename : (0, import_node_url.fileURLToPath)(import_meta_url);
+  const directory = import_node_path.default.dirname(filename);
+  for (let ancestor = directory; ; ancestor = import_node_path.default.dirname(ancestor)) {
+    if (import_node_path.default.basename(ancestor).toLowerCase() === "daemon" && (0, import_node_fs.existsSync)(import_node_path.default.join(import_node_path.default.dirname(ancestor), "windows-private-filesystem"))) {
+      return { directory: import_node_path.default.join(import_node_path.default.dirname(ancestor), "windows-private-filesystem"), packaged: true };
+    }
+    if (import_node_path.default.dirname(ancestor) === ancestor) break;
+  }
+  const packageRoot = import_node_path.default.resolve(directory, "../..");
+  if (import_node_path.default.basename(packageRoot).toLowerCase() === "daemon") {
+    return { directory: import_node_path.default.join(import_node_path.default.dirname(packageRoot), "windows-private-filesystem"), packaged: true };
+  }
+  const asarIndex = filename.toLowerCase().indexOf(`${import_node_path.default.sep}app.asar${import_node_path.default.sep}`);
+  if (asarIndex >= 0) {
+    const resources = filename.slice(0, asarIndex);
+    if (!import_node_path.default.isAbsolute(resources)) throw new WindowsPrivateFilesystemError();
+    return { directory: import_node_path.default.join(resources, "windows-private-filesystem"), packaged: true };
+  }
+  const repoRoot = import_node_path.default.basename(import_node_path.default.dirname(directory)) === "desktop" ? import_node_path.default.resolve(directory, "../../..") : packageRoot;
+  return { directory: import_node_path.default.join(repoRoot, "output", "windows-private-filesystem"), packaged: false };
+}
+function windowsPrivateFilesystemClassSourceSha256() {
+  return (0, import_node_crypto.createHash)("sha256").update(WINDOWS_PRIVATE_FILESYSTEM_ACL_SOURCE).digest("hex");
+}
+function readStableBuildArtifact(target3) {
+  const before = (0, import_node_fs.lstatSync)(target3, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n || before.ino === 0n || before.size > 16n * 1024n * 1024n) throw new WindowsPrivateFilesystemError();
+  const bytes = (0, import_node_fs.readFileSync)(target3);
+  const after = (0, import_node_fs.lstatSync)(target3, { bigint: true });
+  if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink || after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) throw new WindowsPrivateFilesystemError();
+  return bytes;
+}
+function qualifiedNativeProbe() {
+  const location = windowsPrivateFilesystemProbeLocation();
+  const probe = import_node_path.default.join(location.directory, "windows-private-filesystem-probe.exe");
+  const manifestFile = import_node_path.default.join(location.directory, "manifest.json");
+  if (!(0, import_node_fs.existsSync)(probe) && !(0, import_node_fs.existsSync)(manifestFile) && !location.packaged) return null;
+  try {
+    const manifest = JSON.parse(readStableBuildArtifact(manifestFile).toString("utf8"));
+    if (manifest.version !== 2 || manifest.classSourceSha256 !== windowsPrivateFilesystemClassSourceSha256() || typeof manifest.probeSha256 !== "string" || !/^[0-9a-f]{64}$/.test(manifest.probeSha256)) throw new WindowsPrivateFilesystemError();
+    if ((0, import_node_crypto.createHash)("sha256").update(readStableBuildArtifact(probe)).digest("hex") !== manifest.probeSha256) throw new WindowsPrivateFilesystemError();
+    return probe;
+  } catch (cause) {
+    throw new WindowsPrivateFilesystemError(cause);
+  }
+}
+function assertWindowsPrivateFilesystem(target3, identity, kind, harden = false, options = {}) {
+  if (process.platform !== "win32") throw new Error("Windows private ACL verification called on another platform");
+  if (!import_node_path.default.isAbsolute(target3) || target3.length > 16e3 || /\0/.test(target3)) throw new Error("private ACL target is invalid");
+  const syntheticHome = process.env.CLEMENTINE_HOME ?? "";
+  const relative = import_node_path.default.relative(syntheticHome, target3);
+  const syntheticDiagnostic = process.env.CLEMMY_TEST_ISOLATED_HOME === "1" && process.env.CLEMMY_TEST_PRIVATE_ACL_DIAGNOSTICS === "1" && /^clem-private-ntfs-test-/.test(import_node_path.default.basename(syntheticHome)) && !relative.startsWith("..") && !import_node_path.default.isAbsolute(relative);
+  const allowInheritedPrivate = !harden && options.allowInheritedPrivate === true;
+  const input = asciiJson({ version: 2, path: target3, dev: String(identity.dev), ino: String(identity.ino), nlink: String(identity.nlink), directory: kind === "directory", harden, allowInheritedPrivate, syntheticDiagnostic });
+  const native = qualifiedNativeProbe();
+  const systemRoot = Object.entries(process.env).find(([key, value]) => key.toLowerCase() === "systemroot" && value)?.[1] ?? "C:\\Windows";
+  if (!import_node_path.default.isAbsolute(systemRoot)) throw new WindowsPrivateFilesystemError();
+  const command = native ?? import_node_path.default.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const args = native ? [] : ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(ACL_PROGRAM, "utf16le").toString("base64")];
+  const env2 = native ? Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== void 0 && /^(?:systemroot|windir|systemdrive|comspec|pathext|temp|tmp)$/i.test(key))) : process.env;
+  const result = (0, import_node_child_process.spawnSync)(command, args, {
+    input,
+    env: env2,
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: native ? 15e3 : 1e4,
+    maxBuffer: 4096
+  });
+  if (result.error || result.status !== 0 || result.stdout !== "private-acl-ok-v2") {
+    throw new WindowsPrivateFilesystemError(syntheticDiagnostic ? String(result.stderr || result.error?.message || "no ACL receipt").slice(0, 4096) : void 0);
+  }
+  return { backend: native ? "native" : "powershell-development", policy: allowInheritedPrivate ? "credential-inherited-private-v1" : "strict" };
+}
+
+// src/runtime/sync-directory.ts
+var import_node_fs2 = require("node:fs");
+var nativeIo = {
+  open: (directory, flags) => (0, import_node_fs2.openSync)(directory, flags),
+  sync: import_node_fs2.fsyncSync,
+  close: import_node_fs2.closeSync
+};
+function syncDirectoryMetadata(directory, options = {}) {
+  if ((options.platform ?? process.platform) === "win32") return "unsupported_on_windows";
+  const io = options.io ?? nativeIo;
+  const fd = io.open(directory, options.flags ?? "r");
+  try {
+    io.sync(fd);
+  } finally {
+    io.close(fd);
+  }
+  return "synced";
+}
+
+// src/runtime/credential-private-filesystem.ts
+var MAX_CREDENTIAL_BYTES = 8 * 1024 * 1024;
+var MESSAGE = "Credential storage privacy or integrity could not be verified. Check NTFS folder permissions and the Clementine installation, then retry; no other credential source was selected. A write may require verification before retrying.";
+var CredentialStoragePrivacyError = class extends Error {
+  constructor(_cause) {
+    super(MESSAGE);
+    this.name = "CredentialStoragePrivacyError";
+  }
+};
+function isCredentialStoragePrivacyError(error) {
+  return error instanceof Error && error.name === "CredentialStoragePrivacyError";
+}
+var regular = (stat) => stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n && stat.ino !== 0n;
+var same = (left, right) => left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+var CREDENTIAL_ACL_REUSE_MS = 3e4;
+function createCredentialFilePolicy(dependencies = {}) {
+  const windows = (dependencies.platform ?? process.platform) === "win32";
+  const observeAcl = dependencies.checkAcl ?? assertWindowsPrivateFilesystem;
+  const now = dependencies.now ?? (() => performance.now());
+  const verified = /* @__PURE__ */ new Map();
+  const checkAcl = (target3, stat, kind, harden = false, options) => {
+    const key = `${kind}\0${options?.allowInheritedPrivate === true}\0${target3}`;
+    const prior = verified.get(key);
+    verified.delete(key);
+    if (!harden && prior && now() - prior.at < CREDENTIAL_ACL_REUSE_MS && prior.stat.dev === stat.dev && prior.stat.ino === stat.ino && (kind === "directory" || same(prior.stat, stat))) {
+      verified.set(key, prior);
+      return;
+    }
+    observeAcl(target3, stat, kind, harden, options);
+    if (!harden) verified.set(key, { at: now(), stat });
+  };
+  const assertMissingPathParents = (directory, verifyNearestPrivate = true) => {
+    let current = directory;
+    let nearestObserved = false;
+    while (true) {
+      try {
+        const stat = (0, import_node_fs3.lstatSync)(current, { bigint: true });
+        if (!stat.isDirectory() || stat.isSymbolicLink() || stat.ino === 0n) throw new CredentialStoragePrivacyError();
+        if (!nearestObserved) {
+          if (verifyNearestPrivate) privateDirectory(current);
+          nearestObserved = true;
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const parent = import_node_path2.default.dirname(current);
+      if (parent === current) return;
+      current = parent;
+    }
+  };
+  const privateDirectory = (directory, harden = false) => {
+    const before = (0, import_node_fs3.lstatSync)(directory, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || before.ino === 0n) throw new CredentialStoragePrivacyError();
+    checkAcl(directory, before, "directory", harden, { allowInheritedPrivate: !harden });
+    const after = (0, import_node_fs3.lstatSync)(directory, { bigint: true });
+    if (after.dev !== before.dev || after.ino !== before.ino || after.isSymbolicLink() || !after.isDirectory()) throw new CredentialStoragePrivacyError();
+  };
+  const ensureDirectory = (directory) => {
+    try {
+      (0, import_node_fs3.lstatSync)(directory);
+      privateDirectory(directory);
+      return;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const parent = import_node_path2.default.dirname(directory);
+    if (parent === directory) throw new CredentialStoragePrivacyError();
+    ensureDirectory(parent);
+    (0, import_node_fs3.mkdirSync)(directory, { mode: 448 });
+    privateDirectory(directory, true);
+  };
+  const read = (target3, optionalExternalSource = false) => {
+    if (!windows) return (0, import_node_fs3.existsSync)(target3) ? (0, import_node_fs3.readFileSync)(target3, "utf8") : void 0;
+    let fd;
+    try {
+      const directory = import_node_path2.default.dirname(target3);
+      if (!import_node_path2.default.isAbsolute(target3) || target3.includes("\0")) throw new CredentialStoragePrivacyError();
+      let entry;
+      try {
+        entry = (0, import_node_fs3.lstatSync)(target3, { bigint: true });
+      } catch (error) {
+        if (error.code === "ENOENT") {
+          assertMissingPathParents(directory, !optionalExternalSource);
+          return void 0;
+        }
+        throw error;
+      }
+      if (!regular(entry) || entry.size > BigInt(MAX_CREDENTIAL_BYTES)) throw new CredentialStoragePrivacyError();
+      privateDirectory(directory);
+      fd = (0, import_node_fs3.openSync)(target3, import_node_fs3.constants.O_RDONLY | (import_node_fs3.constants.O_NOFOLLOW ?? 0));
+      const before = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+      if (!regular(before) || !same(entry, before)) throw new CredentialStoragePrivacyError();
+      checkAcl(target3, before, "file", false, { allowInheritedPrivate: true });
+      const raw = (0, import_node_fs3.readFileSync)(fd, "utf8");
+      const after = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+      if (!regular(after) || !same(before, after) || !same(after, (0, import_node_fs3.lstatSync)(target3, { bigint: true }))) throw new CredentialStoragePrivacyError();
+      checkAcl(target3, after, "file", false, { allowInheritedPrivate: true });
+      privateDirectory(directory);
+      if (!same(after, (0, import_node_fs3.fstatSync)(fd, { bigint: true })) || !same(after, (0, import_node_fs3.lstatSync)(target3, { bigint: true }))) throw new CredentialStoragePrivacyError();
+      return raw;
+    } catch (cause) {
+      throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+    } finally {
+      if (fd !== void 0) (0, import_node_fs3.closeSync)(fd);
+    }
+  };
+  const write = (target3, content, format, options) => {
+    const pinsPrior = format === "text" && options !== void 0 && Object.hasOwn(options, "expectedPrior");
+    const assertExpectedPrior = (observed2) => {
+      if (pinsPrior && observed2 !== options.expectedPrior) throw new CredentialStoragePrivacyError();
+    };
+    if (!windows) {
+      if (pinsPrior) {
+        try {
+          assertExpectedPrior(read(target3));
+        } catch (cause) {
+          throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+        }
+      }
+      (0, import_node_fs3.mkdirSync)(import_node_path2.default.dirname(target3), { recursive: true });
+      const temporary2 = `${target3}.${process.pid}.${(0, import_node_crypto2.randomUUID)()}.tmp`;
+      try {
+        (0, import_node_fs3.writeFileSync)(temporary2, content, { encoding: "utf8", mode: 384 });
+        if (pinsPrior) assertExpectedPrior(read(target3));
+        (0, import_node_fs3.renameSync)(temporary2, target3);
+        try {
+          (0, import_node_fs3.chmodSync)(target3, 384);
+        } catch {
+        }
+      } catch (cause) {
+        if (pinsPrior) throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+        throw cause;
+      } finally {
+        try {
+          (0, import_node_fs3.unlinkSync)(temporary2);
+        } catch {
+        }
+      }
+      return;
+    }
+    let fd;
+    let temporary;
+    let temporaryIdentity;
+    try {
+      if (Buffer.byteLength(content) > MAX_CREDENTIAL_BYTES) throw new CredentialStoragePrivacyError();
+      const prior = read(target3);
+      assertExpectedPrior(prior);
+      if (prior !== void 0 && format === "json-object") {
+        const parsed = JSON.parse(prior);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new CredentialStoragePrivacyError();
+      }
+      const priorIdentity = prior === void 0 ? null : (0, import_node_fs3.lstatSync)(target3, { bigint: true });
+      const directory = import_node_path2.default.dirname(target3);
+      ensureDirectory(directory);
+      temporary = import_node_path2.default.join(directory, `.${import_node_path2.default.basename(target3)}.${process.pid}.${(0, import_node_crypto2.randomUUID)()}.tmp`);
+      fd = (0, import_node_fs3.openSync)(temporary, import_node_fs3.constants.O_CREAT | import_node_fs3.constants.O_EXCL | import_node_fs3.constants.O_WRONLY | (import_node_fs3.constants.O_NOFOLLOW ?? 0), 384);
+      const empty = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+      temporaryIdentity = empty;
+      if (!regular(empty) || empty.size !== 0n) throw new CredentialStoragePrivacyError();
+      checkAcl(temporary, empty, "file", true);
+      (0, import_node_fs3.writeFileSync)(fd, content, "utf8");
+      (0, import_node_fs3.fsyncSync)(fd);
+      const written = (0, import_node_fs3.fstatSync)(fd, { bigint: true });
+      if (!regular(written) || written.dev !== empty.dev || written.ino !== empty.ino || !same(written, (0, import_node_fs3.lstatSync)(temporary, { bigint: true }))) throw new CredentialStoragePrivacyError();
+      checkAcl(temporary, written, "file");
+      privateDirectory(directory);
+      const current = read(target3);
+      assertExpectedPrior(current);
+      if (current !== prior || priorIdentity && !same(priorIdentity, (0, import_node_fs3.lstatSync)(target3, { bigint: true }))) throw new CredentialStoragePrivacyError();
+      (0, import_node_fs3.closeSync)(fd);
+      fd = void 0;
+      (0, import_node_fs3.renameSync)(temporary, target3);
+      temporary = void 0;
+      syncDirectoryMetadata(directory);
+      if (read(target3) !== content) throw new CredentialStoragePrivacyError();
+    } catch (cause) {
+      throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
+    } finally {
+      if (fd !== void 0) (0, import_node_fs3.closeSync)(fd);
+      if (temporary && temporaryIdentity) {
+        try {
+          const current = (0, import_node_fs3.lstatSync)(temporary, { bigint: true });
+          if (regular(current) && current.dev === temporaryIdentity.dev && current.ino === temporaryIdentity.ino) (0, import_node_fs3.unlinkSync)(temporary);
+        } catch {
+        }
+      }
+    }
+  };
+  return {
+    readCredentialFileSync: (target3) => read(target3),
+    // Optional external .env/CLI files are never hardened. Safe absent files
+    // need no private ACL on public package/cwd parents. Present files use the
+    // same current parent/file ACL, no-follow and exact identity checks.
+    readCredentialSourceFileSync: (target3) => read(target3, true),
+    writeCredentialFileSync: (target3, content) => write(target3, content, "json-object"),
+    /** Optional exact prior bytes bind a caller's read-modify-write composition.
+     * An own expectedPrior:undefined requires absence; omitting it pins nothing. */
+    writeCredentialTextFileSync: (target3, content, options) => write(target3, content, "text", options),
+    assertCredentialFileReadable: (target3) => {
+      read(target3);
+    }
+  };
+}
+var policy = createCredentialFilePolicy();
+var readCredentialFileSync = policy.readCredentialFileSync;
+var readCredentialSourceFileSync = policy.readCredentialSourceFileSync;
+var writeCredentialFileSync = policy.writeCredentialFileSync;
+var writeCredentialTextFileSync = policy.writeCredentialTextFileSync;
+var assertCredentialFileReadable = policy.assertCredentialFileReadable;
+
 // src/config.ts
-var __filename = (0, import_node_url.fileURLToPath)(import_meta_url);
-var __dirname = import_node_path.default.dirname(__filename);
-var PKG_DIR = import_node_path.default.resolve(__dirname, "..");
+var __filename2 = (0, import_node_url2.fileURLToPath)(import_meta_url);
+var __dirname = import_node_path3.default.dirname(__filename2);
+var PKG_DIR = import_node_path3.default.resolve(__dirname, "..");
 function realUserHome() {
   try {
     return import_node_os.default.userInfo().homedir;
@@ -123,23 +562,22 @@ function realUserHome() {
   }
 }
 var REAL_USER_HOME = process.env.CLEMMY_REAL_USER_HOME || realUserHome();
-var REAL_DEFAULT_CLEMENTINE_HOME = import_node_path.default.resolve(import_node_path.default.join(REAL_USER_HOME, ".clementine-next"));
+var REAL_DEFAULT_CLEMENTINE_HOME = import_node_path3.default.resolve(import_node_path3.default.join(REAL_USER_HOME, ".clementine-next"));
 var DEFAULT_BASE_DIR = process.env.CLEMENTINE_HOME || REAL_DEFAULT_CLEMENTINE_HOME;
 function isTestProcess() {
   return Boolean(
     process.env.NODE_TEST_CONTEXT || process.env.CLEMMY_TEST_ISOLATED_HOME === "1" || process.argv.includes("--test")
   );
 }
-if (isTestProcess() && import_node_path.default.resolve(DEFAULT_BASE_DIR) === REAL_DEFAULT_CLEMENTINE_HOME && process.env.CLEMMY_ALLOW_LIVE_HOME_TESTS !== "1") {
+if (isTestProcess() && import_node_path3.default.resolve(DEFAULT_BASE_DIR) === REAL_DEFAULT_CLEMENTINE_HOME && process.env.CLEMMY_ALLOW_LIVE_HOME_TESTS !== "1") {
   throw new Error(
     "Refusing to bind BASE_DIR to the live Clementine home from a test process. Set CLEMENTINE_HOME to a unique temp directory before importing config, or set CLEMMY_ALLOW_LIVE_HOME_TESTS=1 for an explicit destructive test."
   );
 }
 var BASE_DIR = DEFAULT_BASE_DIR;
-function parseEnvFile(envPath) {
-  if (!(0, import_node_fs.existsSync)(envPath)) return {};
+function parseEnvText(text) {
   const result = {};
-  for (const rawLine of (0, import_node_fs.readFileSync)(envPath, "utf-8").split("\n")) {
+  for (const rawLine of text.split("\n")) {
     const line = rawLine.replace(/^\s+|\r+$/g, "");
     if (!line || line.startsWith("#")) continue;
     const eqIndex = line.indexOf("=");
@@ -155,16 +593,28 @@ function parseEnvFile(envPath) {
 }
 function envSearchPaths() {
   if (process.env.CLEMMY_TEST_ISOLATED_HOME === "1") {
-    return [import_node_path.default.join(BASE_DIR, ".env")];
+    return [import_node_path3.default.join(BASE_DIR, ".env")];
   }
   return [
-    import_node_path.default.join(PKG_DIR, ".env"),
-    import_node_path.default.join(process.cwd(), ".env"),
-    import_node_path.default.join(BASE_DIR, ".env")
+    import_node_path3.default.join(PKG_DIR, ".env"),
+    import_node_path3.default.join(process.cwd(), ".env"),
+    import_node_path3.default.join(BASE_DIR, ".env")
   ];
 }
-var ACTIVE_ENV_FILES = envSearchPaths().filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
-var env = Object.assign({}, ...ACTIVE_ENV_FILES.map((filePath) => parseEnvFile(filePath)));
+function captureEnvFiles() {
+  const files = [];
+  const environment = {};
+  for (const filePath of [...new Set(envSearchPaths())]) {
+    const raw = process.platform === "win32" ? readCredentialSourceFileSync(filePath) : (0, import_node_fs4.existsSync)(filePath) ? (0, import_node_fs4.readFileSync)(filePath, "utf-8") : void 0;
+    if (raw === void 0) continue;
+    files.push(filePath);
+    Object.assign(environment, parseEnvText(raw));
+  }
+  return { files, environment };
+}
+var initialEnvFiles = captureEnvFiles();
+var ACTIVE_ENV_FILES = initialEnvFiles.files;
+var env = initialEnvFiles.environment;
 function getEnv(key, fallback = "") {
   return process.env[key] ?? env[key] ?? fallback;
 }
@@ -179,22 +629,24 @@ function normalizeWebhookHost(value) {
   if (/^[A-Za-z0-9.-]+$/.test(trimmed) || /^[0-9a-f:.]+$/i.test(trimmed)) return trimmed;
   return "127.0.0.1";
 }
-var runtimeEnvReadObserverForTest;
 var runtimeConfigCaptureObserverForTest;
-function captureRuntimeEnvironment() {
-  const activeEnvFiles = envSearchPaths().filter((filePath, index, items) => (0, import_node_fs.existsSync)(filePath) && items.indexOf(filePath) === index);
-  const currentEnv = Object.assign({}, ...activeEnvFiles.map((filePath) => parseEnvFile(filePath)));
-  runtimeConfigCaptureObserverForTest?.("environment");
-  return Object.freeze(currentEnv);
-}
 function captureSecretVault() {
-  const vaultPath = import_node_path.default.join(BASE_DIR, "state", "secrets-vault.json");
+  const vaultPath = import_node_path3.default.join(BASE_DIR, "state", "secrets-vault.json");
   let entries = {};
-  if ((0, import_node_fs.existsSync)(vaultPath)) {
+  if (process.platform === "win32" || (0, import_node_fs4.existsSync)(vaultPath)) {
     try {
-      const parsed = JSON.parse((0, import_node_fs.readFileSync)(vaultPath, "utf-8"));
-      if (parsed.version === "v1" && parsed.entries) entries = { ...parsed.entries };
-    } catch {
+      const raw = process.platform === "win32" ? readCredentialFileSync(vaultPath) : (0, import_node_fs4.readFileSync)(vaultPath, "utf-8");
+      if (raw === void 0) {
+        runtimeConfigCaptureObserverForTest?.("secret_vault");
+        return Object.freeze(entries);
+      }
+      const parsed = JSON.parse(raw);
+      if (parsed.version === "v1" && parsed.entries) {
+        if (process.platform === "win32" && (typeof parsed.entries !== "object" || Array.isArray(parsed.entries) || Object.values(parsed.entries).some((value) => typeof value !== "string"))) throw new CredentialStoragePrivacyError();
+        entries = { ...parsed.entries };
+      } else if (process.platform === "win32") throw new CredentialStoragePrivacyError();
+    } catch (cause) {
+      if (process.platform === "win32") throw isCredentialStoragePrivacyError(cause) ? cause : new CredentialStoragePrivacyError(cause);
       entries = {};
     }
   }
@@ -202,24 +654,10 @@ function captureSecretVault() {
   return Object.freeze(entries);
 }
 var runtimeConfigRequestStorage = new import_node_async_hooks.AsyncLocalStorage();
-function getRuntimeEnv(key, fallback = "") {
-  runtimeEnvReadObserverForTest?.(key);
-  const requestSnapshot = runtimeConfigRequestStorage.getStore();
-  if (requestSnapshot) {
-    return process.env[key] ?? requestSnapshot.environmentValue(key) ?? fallback;
-  }
-  return process.env[key] ?? captureRuntimeEnvironment()[key] ?? fallback;
-}
 function readSecretFromFileVaultSync(name) {
   const requestSnapshot = runtimeConfigRequestStorage.getStore();
   const value = requestSnapshot ? requestSnapshot.secretValue(name) : captureSecretVault()[name];
   return value && value.length > 0 ? value : void 0;
-}
-function getOpenAiApiKey() {
-  const fromFile = readSecretFromFileVaultSync("openai_api_key");
-  if (fromFile) return fromFile;
-  const fromEnv = getRuntimeEnv("OPENAI_API_KEY", "");
-  return fromEnv ?? "";
 }
 function resolveOpenAiAgentsTracingDisabled(configuredValue, apiKey) {
   const configured = configuredValue?.trim().toLowerCase() ?? "";
@@ -229,7 +667,7 @@ function resolveOpenAiAgentsTracingDisabled(configuredValue, apiKey) {
 }
 var agentsTracingDisabled = resolveOpenAiAgentsTracingDisabled(
   getEnv("OPENAI_AGENTS_DISABLE_TRACING", ""),
-  getOpenAiApiKey()
+  process.env.OPENAI_API_KEY ?? ""
 );
 if (agentsTracingDisabled) process.env.OPENAI_AGENTS_DISABLE_TRACING = agentsTracingDisabled;
 var ASSISTANT_NAME = getEnv("ASSISTANT_NAME", "Clementine");
@@ -241,12 +679,12 @@ var AUTH_MODE = (() => {
   if (raw === "claude_oauth") return "claude_oauth";
   return "api_key";
 })();
-var CODEX_AUTH_SOURCE_FILE = getEnv("CODEX_AUTH_SOURCE_FILE", import_node_path.default.join(import_node_os.default.homedir(), ".codex", "auth.json"));
+var CODEX_AUTH_SOURCE_FILE = getEnv("CODEX_AUTH_SOURCE_FILE", import_node_path3.default.join(import_node_os.default.homedir(), ".codex", "auth.json"));
 var CODEX_EXECUTABLE = getEnv("CODEX_EXECUTABLE", "codex");
 var CODEX_INSTALL_PACKAGE = getEnv("CODEX_INSTALL_PACKAGE", "@openai/codex");
 var CODEX_SANDBOX_MODE = getEnv("CODEX_SANDBOX_MODE", "workspace-write");
 var CODEX_USE_FULL_AUTO = getEnv("CODEX_USE_FULL_AUTO", "true").toLowerCase() === "true";
-var VAULT_DIR = import_node_path.default.join(BASE_DIR, "vault");
+var VAULT_DIR = import_node_path3.default.join(BASE_DIR, "vault");
 var WEBHOOK_ENABLED = getEnv("WEBHOOK_ENABLED", "false").toLowerCase() === "true";
 var WEBHOOK_PORT = parseInt(getEnv("WEBHOOK_PORT", "8420"), 10);
 var WEBHOOK_HOST = normalizeWebhookHost(getEnv("WEBHOOK_HOST", "127.0.0.1"));
@@ -289,16 +727,16 @@ var SLACK_ALLOWED_CHANNELS = parseCsvEnv(getEnv("SLACK_ALLOWED_CHANNELS", ""));
 var SLACK_PROACTIVE_CHANNEL = getEnv("SLACK_PROACTIVE_CHANNEL", "").trim();
 var LOCAL_MCP_ENABLED = getEnv("LOCAL_MCP_ENABLED", "true").toLowerCase() === "true";
 var MCP_AUTO_IMPORT_ENABLED = getEnv("MCP_AUTO_IMPORT_ENABLED", "false").toLowerCase() === "true";
-var MCP_SERVERS_FILE = import_node_path.default.join(BASE_DIR, "mcp", "servers.json");
+var MCP_SERVERS_FILE = import_node_path3.default.join(BASE_DIR, "mcp", "servers.json");
 var COMPOSIO_API_KEY = getEnv("COMPOSIO_API_KEY", "");
 var COMPOSIO_USER_ID = getEnv("COMPOSIO_USER_ID", "");
 
 // src/runtime/machine-id.ts
-var import_node_path2 = __toESM(require("node:path"), 1);
-var MACHINE_ID_FILE = import_node_path2.default.join(BASE_DIR, "state", "machine-id");
+var import_node_path4 = __toESM(require("node:path"), 1);
+var MACHINE_ID_FILE = import_node_path4.default.join(BASE_DIR, "state", "machine-id");
 
 // src/shared/stable-json-digest.ts
-var import_node_crypto = require("node:crypto");
+var import_node_crypto3 = require("node:crypto");
 function stableJsonStringify(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(",")}]`;
@@ -306,14 +744,14 @@ function stableJsonStringify(value) {
   return `{${entries.map(([key, nested]) => `${JSON.stringify(key)}:${stableJsonStringify(nested)}`).join(",")}}`;
 }
 function stableJsonDigest(value) {
-  return (0, import_node_crypto.createHash)("sha256").update(stableJsonStringify(value)).digest("hex");
+  return (0, import_node_crypto3.createHash)("sha256").update(stableJsonStringify(value)).digest("hex");
 }
 function stableJsonFingerprint(value) {
   return stableJsonDigest(value).slice(0, 32);
 }
 
 // src/tools/tool-contract-store.ts
-var CONTRACTS_ROOT = import_node_path3.default.join(BASE_DIR, "memory", "tool-contracts");
+var CONTRACTS_ROOT = import_node_path5.default.join(BASE_DIR, "memory", "tool-contracts");
 var CONTRACT_TTL_MS = 30 * 24 * 60 * 6e4;
 var MAX_CONTRACT_CACHE_BYTES = 64 * 1024 * 1024;
 function digestSchema(schema) {
@@ -337,7 +775,7 @@ function fingerprintComposioProviderDefinition(input) {
   }
   if (input.outputSchema === void 0) return null;
   if (input.outputSchema !== null && (!input.outputSchema || typeof input.outputSchema !== "object" || Array.isArray(input.outputSchema))) return null;
-  return (0, import_node_crypto2.createHash)("sha256").update(JSON.stringify({
+  return (0, import_node_crypto4.createHash)("sha256").update(JSON.stringify({
     domain: "composio-prepared-provider-definition",
     version: 1,
     providerIdentity: "composio",
@@ -351,49 +789,289 @@ function fingerprintComposioProviderDefinition(input) {
   }), "utf8").digest("hex");
 }
 
-// src/spaces/workspace-script-contract.ts
+// src/tools/cloud-browser-contract.ts
+var import_zod2 = require("zod");
+
+// src/tools/browser-operation-contract.ts
 var import_zod = require("zod");
-var digest = import_zod.z.string().regex(/^[a-f0-9]{64}$/);
+var session = import_zod.z.string().regex(/^[A-Za-z0-9_-]{1,48}$/).nullable().optional().describe("Optional task label echoed in the receipt. Browser identity is the returned browser_id, not this label.");
+var target = import_zod.z.string().min(1).max(128).describe("Exact target_id returned by browser_tabs or browser_open. Never a tab position or page title.");
+var browser = import_zod.z.string().regex(/^[a-f0-9]{64}$/).describe("Exact browser_id returned by browser_tabs or browser_open. Refuses a restarted/replaced browser; never silently reattaches.");
+var BROWSER_HTTP_URL = import_zod.z.string().max(8e3).refine((value) => {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}, "Use an http(s) URL without embedded username or password.");
+var BROWSER_OPERATION_PARAMETERS = {
+  browser_tabs: { session_name: session },
+  browser_open: { session_name: session },
+  browser_read: {
+    target_id: target,
+    browser_id: browser,
+    session_name: session,
+    max_chars: import_zod.z.number().int().min(100).max(16e3).nullable().optional().describe("Bounded visible page text, default 8000 characters.")
+  },
+  browser_navigate: { target_id: target, browser_id: browser, session_name: session, url: BROWSER_HTTP_URL }
+};
+function browserOperationName(value) {
+  return Object.hasOwn(BROWSER_OPERATION_PARAMETERS, value);
+}
+function parseBrowserOperationArguments(name, args) {
+  const parsed = import_zod.z.strictObject(BROWSER_OPERATION_PARAMETERS[name]).parse(args);
+  if (name === "browser_navigate") parsed.url = BROWSER_HTTP_URL.parse(new URL(String(parsed.url)).href);
+  return parsed;
+}
+
+// src/tools/cloud-browser-contract.ts
+var resource = import_zod2.z.string().min(1).max(128).describe("Exact task-owned cloud browser resource id. Never a provider URL or a local browser id.");
+var version = import_zod2.z.number().int().min(0).describe("Current controlVersion from a fresh receipt. Old versions cannot act after a human handoff.");
+var target2 = import_zod2.z.string().min(1).max(128).describe("Exact targetId from this resource's current pages or tabs receipt.");
+var CLOUD_BROWSER_PARAMETERS = {
+  // Recording is an explicit owner choice in the authenticated UI, never a
+  // model-selected option on a routine browsing request.
+  cloud_browser_start: { url: BROWSER_HTTP_URL.nullable().optional().describe("A website to open in the browser's first page, so no separate open or navigate call is needed.") },
+  cloud_browser_resources: {},
+  // Without a resource id the status is the listing: this task's browsers
+  // and the browser the owner chose for this machine.
+  cloud_browser_status: { resource_id: resource.nullable().optional() },
+  cloud_browser_tabs: { resource_id: resource, expected_version: version },
+  cloud_browser_read: {
+    resource_id: resource,
+    expected_version: version,
+    target_id: target2,
+    max_chars: import_zod2.z.number().int().min(100).max(16e3).nullable().optional()
+  },
+  cloud_browser_open: { resource_id: resource, expected_version: version },
+  cloud_browser_navigate: { resource_id: resource, expected_version: version, target_id: target2, url: BROWSER_HTTP_URL }
+};
+function cloudBrowserOperationName(value) {
+  return Object.hasOwn(CLOUD_BROWSER_PARAMETERS, value);
+}
+function parseCloudBrowserArguments(name, args) {
+  const parsed = import_zod2.z.strictObject(CLOUD_BROWSER_PARAMETERS[name]).parse(args);
+  if (name === "cloud_browser_navigate" || name === "cloud_browser_start" && parsed.url != null) parsed.url = BROWSER_HTTP_URL.parse(new URL(String(parsed.url)).href);
+  return parsed;
+}
+
+// src/spaces/workspace-script-contract.ts
+var import_zod3 = require("zod");
+var digest = import_zod3.z.string().regex(/^[a-f0-9]{64}$/);
 var WORKSPACE_SCRIPT_PARAMETERS = {
-  slug: import_zod.z.string().regex(/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/),
-  source_id: import_zod.z.string().min(1).max(256),
+  slug: import_zod3.z.string().regex(/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/),
+  source_id: import_zod3.z.string().min(1).max(256),
   source_digest: digest,
   script_sha256: digest,
-  occurrence_id: import_zod.z.string().min(1).max(128),
-  cause: import_zod.z.enum(["manual", "scheduled"])
+  occurrence_id: import_zod3.z.string().min(1).max(128),
+  cause: import_zod3.z.enum(["manual", "scheduled"])
 };
-var workspaceScriptArguments = import_zod.z.strictObject(WORKSPACE_SCRIPT_PARAMETERS);
+var workspaceScriptArguments = import_zod3.z.strictObject(WORKSPACE_SCRIPT_PARAMETERS);
 
 // src/tools/local-file-read-contract.ts
-var import_zod2 = require("zod");
+var import_zod4 = require("zod");
 var READ_FILE_PARAMS = {
-  path: import_zod2.z.string().min(1),
-  max_chars: import_zod2.z.number().int().min(1).nullable()
+  path: import_zod4.z.string().min(1),
+  max_chars: import_zod4.z.number().int().min(1).nullable()
 };
 
+// src/spaces/workspace-read-contract.ts
+var import_zod6 = require("zod");
+
+// src/spaces/workspace-set-data-contract.ts
+var import_node_crypto5 = require("node:crypto");
+var import_zod5 = require("zod");
+var WORKSPACE_SET_DATA_MAX_BYTES = 5 * 1024 * 1024;
+var WORKSPACE_SET_DATA_MAX_SOURCE_CHARS = 120;
+var WORKSPACE_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
+var SOURCE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+var ARTIFACT_PREFIX = "workspace-dataset:v1";
+var REFRESH_PREFIX = "workspace-set-data:v1";
+var MAX_JSON_NODES = 2e5;
+var MAX_JSON_DEPTH = 64;
+var WORKSPACE_SET_DATA_TOOL_PARAMETERS = {
+  slug: import_zod5.z.string().min(2).max(63).regex(WORKSPACE_SLUG_RE).describe("The existing active workspace slug."),
+  source_id: import_zod5.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_SOURCE_CHARS).describe("The canonical non-reserved source id to replace."),
+  data_json: import_zod5.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_BYTES).describe("A complete JSON object or array encoded as JSON text for this source id. From a structured upstream workflow result, use a zero-model transform with jsonStringify(value) and bind its string output here.")
+};
+var WorkspaceSetDataContractError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "WorkspaceSetDataContractError";
+  }
+  code;
+};
+function sha256(value) {
+  return (0, import_node_crypto5.createHash)("sha256").update(value, "utf8").digest("hex");
+}
+function utf8(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function canonicalWorkspaceJson(value) {
+  let nodes = 0;
+  const visit = (input, depth) => {
+    nodes += 1;
+    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) {
+      throw new WorkspaceSetDataContractError(
+        "json_limit_exceeded",
+        "data_json exceeds the reviewed JSON traversal limit"
+      );
+    }
+    if (input === null || typeof input === "string" || typeof input === "boolean") {
+      return JSON.stringify(input);
+    }
+    if (typeof input === "number" && Number.isFinite(input)) return JSON.stringify(input);
+    if (Array.isArray(input)) {
+      return `[${input.map((entry) => visit(entry, depth + 1)).join(",")}]`;
+    }
+    if (input && typeof input === "object") {
+      const object = input;
+      return `{${Object.keys(object).sort().map(
+        (key) => `${JSON.stringify(key)}:${visit(object[key], depth + 1)}`
+      ).join(",")}}`;
+    }
+    throw new WorkspaceSetDataContractError(
+      "invalid_json",
+      "data_json contains a value outside the JSON domain"
+    );
+  };
+  const canonical2 = visit(value, 0);
+  if (utf8(canonical2) > WORKSPACE_SET_DATA_MAX_BYTES) {
+    throw new WorkspaceSetDataContractError(
+      "json_limit_exceeded",
+      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
+    );
+  }
+  return canonical2;
+}
+function exactArguments(value) {
+  const parsed = import_zod5.z.strictObject(WORKSPACE_SET_DATA_TOOL_PARAMETERS).safeParse(value);
+  if (!parsed.success) {
+    const record5 = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    if (typeof record5.slug === "string" && !WORKSPACE_SLUG_RE.test(record5.slug)) {
+      throw new WorkspaceSetDataContractError("invalid_slug", `invalid workspace slug "${record5.slug}"`);
+    }
+    throw new WorkspaceSetDataContractError(
+      "arguments_invalid",
+      "space_set_data arguments do not match the closed reviewed schema"
+    );
+  }
+  return parsed.data;
+}
+function workspaceSetDataIdentityProblem(slug, sourceId) {
+  if (!WORKSPACE_SLUG_RE.test(slug)) return { code: "invalid_slug", message: `invalid workspace slug "${slug}"` };
+  if (sourceId !== sourceId.trim() || sourceId.length === 0 || sourceId.length > WORKSPACE_SET_DATA_MAX_SOURCE_CHARS || SOURCE_CONTROL_RE.test(sourceId)) {
+    return { code: "invalid_source", message: "source_id must already be canonical, bounded, and free of control characters" };
+  }
+  if (sourceId === "_meta") return { code: "reserved_source", message: '"_meta" is a reserved Workspace source key' };
+  return null;
+}
+function prepareWorkspaceSetData(value) {
+  const args = exactArguments(value);
+  const sourceId = args.source_id;
+  const problem = workspaceSetDataIdentityProblem(args.slug, sourceId);
+  if (problem) throw new WorkspaceSetDataContractError(problem.code, problem.message);
+  if (utf8(args.data_json) > WORKSPACE_SET_DATA_MAX_BYTES) {
+    throw new WorkspaceSetDataContractError(
+      "json_limit_exceeded",
+      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
+    );
+  }
+  let data;
+  try {
+    data = JSON.parse(args.data_json);
+  } catch (error) {
+    throw new WorkspaceSetDataContractError(
+      "invalid_json",
+      `data_json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!data || typeof data !== "object") {
+    throw new WorkspaceSetDataContractError(
+      "invalid_json_root",
+      "data_json must contain one complete JSON object or array"
+    );
+  }
+  const canonicalData = canonicalWorkspaceJson(data);
+  const contentDigest = sha256(canonicalData);
+  const argsDigest = sha256([
+    `${ARTIFACT_PREFIX}\0`,
+    args.slug,
+    "\0",
+    sourceId,
+    "\0",
+    canonicalData
+  ].join(""));
+  return Object.freeze({
+    args: Object.freeze({ ...args }),
+    slug: args.slug,
+    sourceId,
+    data,
+    canonicalData,
+    contentDigest,
+    argsDigest,
+    refreshId: `${REFRESH_PREFIX}:${argsDigest}`
+  });
+}
+
+// src/spaces/workspace-read-contract.ts
+var WORKSPACE_GET_TOOL_PARAMETERS = {
+  slug: import_zod6.z.string().min(2).max(63).describe("The exact saved Workspace slug."),
+  source_id: import_zod6.z.string().max(120).nullish().describe("Optional exact source key. A workflow call returns its complete saved value; omit for the full document."),
+  metadata_only: import_zod6.z.boolean().nullish().describe("Return saved manifest configuration without dataset values. Cannot combine with source_id. Exact workflow reads return scope:metadata and a separate metadata_revision, without reading the dataset."),
+  limit: import_zod6.z.number().int().min(1).max(60).nullish().describe("Record page size. Native chat defaults to 20 trimmed records; an exact workflow call pages only when limit or offset is supplied."),
+  offset: import_zod6.z.number().int().min(0).nullish().describe("Record-page offset within the selected source."),
+  expected_revision: import_zod6.z.string().regex(/^[a-f0-9]{64}$/).nullish().describe("Optional exact saved data/view snapshot revision from a prior read. A changed Workspace is refused; omit to read its current saved snapshot. Exact workflow metadata_only reads use a separate metadata_revision and do not accept this data revision fence.")
+};
+var WorkspaceReadContractError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "WorkspaceReadContractError";
+  }
+  code;
+};
+function prepareWorkspaceGet(value) {
+  const parsed = import_zod6.z.strictObject(WORKSPACE_GET_TOOL_PARAMETERS).safeParse(value);
+  if (parsed.success && parsed.data.metadata_only && parsed.data.expected_revision != null) {
+    throw new WorkspaceReadContractError("invalid_arguments", "metadata_only returns a manifest-only metadata_revision. Omit expected_revision, or request a data/view snapshot to use that revision fence.");
+  }
+  if (!parsed.success || !/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/.test(parsed.data.slug) || parsed.data.metadata_only && parsed.data.source_id?.trim() || parsed.data.source_id != null && (!parsed.data.source_id.trim() || /[\u0000-\u001f\u007f-\u009f]/.test(parsed.data.source_id)) || (parsed.data.limit != null || parsed.data.offset != null) && !parsed.data.source_id?.trim()) {
+    throw new WorkspaceReadContractError("invalid_arguments", "space_get requires one exact Workspace/source read and valid optional revision.");
+  }
+  return parsed.data;
+}
+
 // src/runtime/harness/reviewed-local-tool-transport.ts
-var import_zod7 = require("zod");
+var import_zod10 = require("zod");
 
 // src/tools/local-file-write-contract.ts
-var import_zod3 = require("zod");
+var import_zod7 = require("zod");
 var WRITE_FILE_PARAMS = {
-  path: import_zod3.z.string().min(1),
-  content: import_zod3.z.string(),
-  mode: import_zod3.z.enum(["create", "append", "overwrite"]).nullable(),
+  path: import_zod7.z.string().min(1),
+  content: import_zod7.z.string(),
+  mode: import_zod7.z.enum(["create", "append", "overwrite", "replace"]).nullable(),
   // Chunked-by-construction: append:true appends (creating if absent) — the
   // continuation call for a large file. append:false starts the file fresh
   // (overwrite). Omitted/null → fall back to `mode` (backward compatible — a
   // caller that never sends `append` behaves exactly as before, so it is OPTIONAL,
   // unlike the always-present `mode`).
-  append: import_zod3.z.boolean().nullable().optional()
+  append: import_zod7.z.boolean().nullable().optional(),
+  // mode=replace: the exact text to change, which must appear exactly once in
+  // the file; `content` is what replaces it. The rest of the file is kept.
+  find: import_zod7.z.string().min(1).nullable().optional()
 };
 
 // src/runtime/schema-normalizer.ts
-var import_zod4 = require("zod");
-function withDescription(source, target) {
-  return source.description ? target.describe(source.description) : target;
+var import_zod8 = require("zod");
+var deferredJsonParsers = /* @__PURE__ */ new WeakSet();
+function withDescription(source, target3) {
+  return source.description ? target3.describe(source.description) : target3;
 }
 function normalizeZodForDeferredJson(schema) {
+  if (deferredJsonParsers.has(schema)) return schema;
   const def = schema._def;
   switch (def?.type) {
     case "optional":
@@ -417,25 +1095,25 @@ function normalizeZodForDeferredJson(schema) {
           normalizeZodForDeferredJson(value)
         ])
       );
-      return withDescription(schema, import_zod4.z.strictObject(normalizedShape));
+      return withDescription(schema, import_zod8.z.strictObject(normalizedShape));
     }
     case "array":
-      return withDescription(schema, import_zod4.z.array(normalizeZodForDeferredJson(def.element)));
+      return withDescription(schema, import_zod8.z.array(normalizeZodForDeferredJson(def.element)));
     case "record": {
-      const keyType = def.keyType ?? import_zod4.z.string();
-      const valueType = def.valueType ? normalizeZodForDeferredJson(def.valueType) : import_zod4.z.json();
-      return withDescription(schema, import_zod4.z.record(keyType, valueType));
+      const keyType = def.keyType ?? import_zod8.z.string();
+      const valueType = def.valueType ? normalizeZodForDeferredJson(def.valueType) : import_zod8.z.json();
+      return withDescription(schema, import_zod8.z.record(keyType, valueType));
     }
     case "any":
     case "unknown":
-      return withDescription(schema, import_zod4.z.json());
+      return withDescription(schema, import_zod8.z.json());
     case "union": {
       const options = Array.isArray(def.options) ? def.options.map((item) => normalizeZodForDeferredJson(item)) : [];
-      if (options.length === 0) return withDescription(schema, import_zod4.z.string());
+      if (options.length === 0) return withDescription(schema, import_zod8.z.string());
       if (options.length === 1) return withDescription(schema, options[0]);
       return withDescription(
         schema,
-        import_zod4.z.union(options)
+        import_zod8.z.union(options)
       );
     }
     default:
@@ -461,8 +1139,8 @@ function jsonSchemaAllowsNull(schemaValue) {
   return false;
 }
 var ADVERTISED_FORMAT_EQUIVALENT_PATTERNS = new Map(
-  [import_zod4.z.string().datetime({ offset: true }), import_zod4.z.string().date()].flatMap((schema) => {
-    const advertised = import_zod4.z.toJSONSchema(schema);
+  [import_zod8.z.string().datetime({ offset: true }), import_zod8.z.string().date()].flatMap((schema) => {
+    const advertised = import_zod8.z.toJSONSchema(schema);
     return typeof advertised.format === "string" && typeof advertised.pattern === "string" ? [[advertised.format, advertised.pattern]] : [];
   })
 );
@@ -486,7 +1164,7 @@ function relaxJsonSchemaForDeferred(schemaValue) {
 }
 
 // src/runtime/harness/capability-manifest.ts
-var import_node_crypto3 = require("node:crypto");
+var import_node_crypto6 = require("node:crypto");
 
 // src/runtime/harness/mutation-verification-contract.ts
 function record(value) {
@@ -636,10 +1314,10 @@ var SEALED_CALL_CANONICAL_LIMITS = Object.freeze({
   maxTotalBytes: 8e6
 });
 var ClosedCanonicalJsonError = class extends Error {
-  constructor(message, code, path8) {
-    super(`${message} at ${path8}`);
+  constructor(message, code, path14) {
+    super(`${message} at ${path14}`);
     this.code = code;
-    this.path = path8;
+    this.path = path14;
     this.name = "ClosedCanonicalJsonError";
   }
   code;
@@ -662,57 +1340,57 @@ function closedCanonicalJson(value, options = {}) {
   const seen = /* @__PURE__ */ new Set();
   let nodes = 0;
   let bytes = 0;
-  const token = (text, path8) => {
+  const token = (text, path14) => {
     bytes += Buffer.byteLength(text, "utf8");
     if (bytes > maxTotalBytes) {
       throw new ClosedCanonicalJsonError(
         "canonical JSON exceeds the total byte limit",
         "total_byte_limit",
-        path8
+        path14
       );
     }
     return text;
   };
-  const encodeString = (text, path8) => {
+  const encodeString = (text, path14) => {
     if (Buffer.byteLength(text, "utf8") > maxStringBytes) {
       throw new ClosedCanonicalJsonError(
         "string exceeds the canonical JSON string limit",
         "string_limit",
-        path8
+        path14
       );
     }
-    return token(JSON.stringify(text), path8);
+    return token(JSON.stringify(text), path14);
   };
-  const visit = (input, path8, depth) => {
+  const visit = (input, path14, depth) => {
     nodes += 1;
     if (nodes > maxNodes) {
-      throw new ClosedCanonicalJsonError("canonical JSON exceeds the node limit", "node_limit", path8);
+      throw new ClosedCanonicalJsonError("canonical JSON exceeds the node limit", "node_limit", path14);
     }
     if (depth > maxDepth) {
-      throw new ClosedCanonicalJsonError("canonical JSON exceeds the depth limit", "depth_limit", path8);
+      throw new ClosedCanonicalJsonError("canonical JSON exceeds the depth limit", "depth_limit", path14);
     }
-    if (input === null) return token("null", path8);
-    if (typeof input === "string") return encodeString(input, path8);
-    if (typeof input === "boolean") return token(input ? "true" : "false", path8);
+    if (input === null) return token("null", path14);
+    if (typeof input === "string") return encodeString(input, path14);
+    if (typeof input === "boolean") return token(input ? "true" : "false", path14);
     if (typeof input === "number") {
       if (!Number.isFinite(input)) {
-        throw new ClosedCanonicalJsonError("number is not finite", "non_finite_number", path8);
+        throw new ClosedCanonicalJsonError("number is not finite", "non_finite_number", path14);
       }
-      return token(JSON.stringify(input), path8);
+      return token(JSON.stringify(input), path14);
     }
     if (typeof input !== "object") {
-      throw new ClosedCanonicalJsonError("value is outside the closed JSON domain", "unsupported_type", path8);
+      throw new ClosedCanonicalJsonError("value is outside the closed JSON domain", "unsupported_type", path14);
     }
     if (seen.has(input)) {
-      throw new ClosedCanonicalJsonError("value is cyclic", "cyclic", path8);
+      throw new ClosedCanonicalJsonError("value is cyclic", "cyclic", path14);
     }
     if (Object.getOwnPropertySymbols(input).length > 0) {
-      throw new ClosedCanonicalJsonError("symbol keys are not JSON data", "symbol_key", path8);
+      throw new ClosedCanonicalJsonError("symbol keys are not JSON data", "symbol_key", path14);
     }
     const prototype = Object.getPrototypeOf(input);
     if (Array.isArray(input)) {
       if (prototype !== Array.prototype) {
-        throw new ClosedCanonicalJsonError("array has a foreign prototype", "non_plain_object", path8);
+        throw new ClosedCanonicalJsonError("array has a foreign prototype", "non_plain_object", path14);
       }
       const descriptors2 = Object.getOwnPropertyDescriptors(input);
       const names = Object.getOwnPropertyNames(input);
@@ -722,47 +1400,47 @@ function closedCanonicalJson(value, options = {}) {
           throw new ClosedCanonicalJsonError(
             "array has an extra non-index property",
             "extra_array_property",
-            `${path8}.${name}`
+            `${path14}.${name}`
           );
         }
       }
       seen.add(input);
       try {
-        token("[", path8);
+        token("[", path14);
         const children = [];
         for (let index = 0; index < input.length; index += 1) {
           const descriptor = descriptors2[String(index)];
           if (!descriptor) {
-            throw new ClosedCanonicalJsonError("array is sparse", "sparse_array", `${path8}[${index}]`);
+            throw new ClosedCanonicalJsonError("array is sparse", "sparse_array", `${path14}[${index}]`);
           }
           if ("get" in descriptor || "set" in descriptor) {
             throw new ClosedCanonicalJsonError(
               "accessor properties are not canonical JSON",
               "accessor_property",
-              `${path8}[${index}]`
+              `${path14}[${index}]`
             );
           }
-          if (index > 0) token(",", path8);
-          children.push(visit(descriptor.value, `${path8}[${index}]`, depth + 1));
+          if (index > 0) token(",", path14);
+          children.push(visit(descriptor.value, `${path14}[${index}]`, depth + 1));
         }
-        token("]", path8);
+        token("]", path14);
         return `[${children.join(",")}]`;
       } finally {
         seen.delete(input);
       }
     }
     if (prototype !== Object.prototype && prototype !== null) {
-      throw new ClosedCanonicalJsonError("object is not plain JSON", "non_plain_object", path8);
+      throw new ClosedCanonicalJsonError("object is not plain JSON", "non_plain_object", path14);
     }
     const descriptors = Object.getOwnPropertyDescriptors(input);
     const keys = Object.getOwnPropertyNames(input).sort();
     seen.add(input);
     try {
-      token("{", path8);
+      token("{", path14);
       const fields = [];
       for (let index = 0; index < keys.length; index += 1) {
         const key = keys[index];
-        const keyPath = `${path8}.${key}`;
+        const keyPath = `${path14}.${key}`;
         if (RESERVED_KEYS.has(key)) {
           throw new ClosedCanonicalJsonError("reserved prototype key is forbidden", "reserved_key", keyPath);
         }
@@ -784,12 +1462,12 @@ function closedCanonicalJson(value, options = {}) {
           }
           continue;
         }
-        if (fields.length > 0) token(",", path8);
+        if (fields.length > 0) token(",", path14);
         const encodedKey = encodeString(key, keyPath);
         token(":", keyPath);
         fields.push(`${encodedKey}:${visit(descriptor.value, keyPath, depth + 1)}`);
       }
-      token("}", path8);
+      token("}", path14);
       return `{${fields.join(",")}}`;
     } finally {
       seen.delete(input);
@@ -949,7 +1627,7 @@ function canonicalManifestBytes(manifest) {
   });
 }
 function capabilityManifestDigest(manifest) {
-  return (0, import_node_crypto3.createHash)("sha256").update(canonicalManifestBytes(manifest), "utf8").digest("hex");
+  return (0, import_node_crypto6.createHash)("sha256").update(canonicalManifestBytes(manifest), "utf8").digest("hex");
 }
 function validateCapabilityManifestV1(manifest) {
   if (!manifest || manifest.version !== CAPABILITY_MANIFEST_VERSION) {
@@ -1027,23 +1705,23 @@ function currentCapabilityManifest(manifest) {
 function cliSetupSemantics(action) {
   return {
     consequence: "runtime_configuration",
-    reversibility: "irreversible",
+    reversibility: "ordinary_non_destructive",
     destructive: false,
     purpose: `cli_${action}`,
     inputKind: "cli_configuration_request",
-    outputKind: "cli_job_receipt",
+    outputKind: action === "remember" ? "cli_registry_receipt" : "cli_job_receipt",
     deliverableKind: "cli_configuration",
     destinationPosture: "named_existing",
     advisoryRoles: ["configure", "repair"],
     safeMode: {
       id: action,
       requiredEquals: { action },
-      absentOrNull: action === "auth" ? ["command", "saveAs", "jobId", "repairId", "values"] : action === "repair" ? ["command", "saveAs", "jobId"] : ["jobId", "repairId", "values"]
+      absentOrNull: action === "auth" ? ["command", "saveAs", "jobId", "repairId", "values"] : action === "repair" ? ["command", "saveAs", "jobId"] : action === "remember" ? ["catalogId", "saveAs", "jobId", "repairId", "values"] : ["jobId", "repairId", "values"]
     }
   };
 }
 var TOOL_REGISTRY = [
-  { name: "agent_propose", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", description: "Draft a reusable team-agent proposal for user review." },
+  { name: "agent_propose", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", description: "Draft a reusable team-agent proposal for user review." },
   { name: "agent_run_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "Fetch the full event timeline of a single autonomy cycle by runId." },
   { name: "agent_runs_recent", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "List recent autonomy cycles (daemon-source runs)." },
   { name: "answer_check_in", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Resolve an open check-in with an answer." },
@@ -1067,8 +1745,23 @@ var TOOL_REGISTRY = [
   { name: "background_task_revise", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", loopClass: "mutating", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", actionControlContext: "task_recovery", delegationPrimitive: true, description: "Version and course-correct an active durable background task on its existing session." },
   { name: "background_task_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "Inspect a durable background task by task id, run id, or session id." },
   { name: "background_tasks_recent", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", actionControlContext: "task_recovery", description: "List recent durable background tasks with status, latest activity, approvals, and result\u2026" },
-  { name: "browser_harness_run", sideEffect: "write", tier: "core", lanes: ["orchestrator", "cli"], delegationPrimitive: true, description: "Run a Browser Harness Python snippet against the user browser through the browser-harness\u2026" },
-  { name: "browser_harness_status", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Check Browser Harness availability and setup state." },
+  { name: "browser_harness_run", browserBackend: "local", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], delegationPrimitive: true, description: "Execute an arbitrary Python browser script; opaque execution is not a typed browser navigation/read capability." },
+  { name: "browser_harness_setup", browserBackend: "local", sideEffect: "admin", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", blockedFor: ["workflow-step", "worker"], description: "Install/update Browser Harness, diagnose it or open Chrome remote-debugging setup." },
+  { name: "browser_harness_status", browserBackend: "local", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Check Browser Harness availability and setup state." },
+  { name: "cloud_browser_start", browserBackend: "cloud", sideEffect: "write", localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "never_redispatch", reconciliation: "none" }, localPlanning: { consequence: "local_execution", reversibility: "create_only", destructive: false, purpose: "start_task_cloud_browser", safeMode: { id: "create_session", requiredEquals: {} }, inputKind: "task_browser_request", outputKind: "cloud_browser_resource", deliverableKind: "browser_page", destinationPosture: "create_new", advisoryRoles: ["browser", "cloud", "destination"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", needsApproval: false, description: "Start or rejoin this chat's Browserbase cloud browser, optionally opening a website, and return its exact resource and page handles." },
+  { name: "cloud_browser_resources", browserBackend: "cloud", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", needsApproval: false, description: "List cloud browser resources already owned by this task, including a browser the user opened in the UI." },
+  { name: "cloud_browser_status", browserBackend: "cloud", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", needsApproval: false, description: "Observe the exact task-owned cloud browser state and current control version after a handoff." },
+  { name: "cloud_browser_tabs", browserBackend: "cloud", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", needsApproval: false, description: "List current pages in an exact task-owned cloud browser, respecting human control." },
+  { name: "cloud_browser_read", browserBackend: "cloud", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", needsApproval: false, description: "Read bounded visible text from the exact task-owned cloud browser page." },
+  { name: "cloud_browser_open", browserBackend: "cloud", sideEffect: "write", localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "never_redispatch", reconciliation: "none" }, localPlanning: { consequence: "local_execution", reversibility: "reversible", destructive: false, purpose: "open_task_cloud_browser_page", inputKind: "task_browser_request", outputKind: "browser_page_receipt", deliverableKind: "browser_page", destinationPosture: "create_new", advisoryRoles: ["browser", "cloud", "destination"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", needsApproval: false, description: "Open one blank page in an exact task-owned cloud browser." },
+  { name: "cloud_browser_navigate", browserBackend: "cloud", sideEffect: "write", localExecution: { version: 1, adapter: "cloud_browser_operation_v1", idempotency: "never_redispatch", reconciliation: "none" }, localPlanning: { consequence: "local_execution", reversibility: "reversible", destructive: false, purpose: "navigate_task_cloud_browser_page", inputKind: "task_browser_request", outputKind: "page_observation", deliverableKind: "browser_page", destinationPosture: "named_existing", advisoryRoles: ["browser", "cloud", "destination"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", needsApproval: false, description: "Navigate an exact task-owned cloud browser page to a website URL without submitting or sending." },
+  { name: "cloud_browser_stop", browserBackend: "cloud", sideEffect: "write", runtimeEffect: "host_only", actionTopologyRole: "control", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", needsApproval: false, resultContract: "acknowledgement", description: "Request release of the exact task-owned cloud browser and observe provider status; only terminal status proves usage ended. Does not complete the task." },
+  { name: "browser_tabs", browserBackend: "local", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "List local Chrome browser pages with exact session and target handles." },
+  { name: "browser_read", browserBackend: "local", sideEffect: "read", localPlanningRead: true, localExecution: { version: 1, adapter: "browser_operation_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Read visible text, title and URL from this exact browser page target." },
+  { name: "browser_open", browserBackend: "local", sideEffect: "write", localExecution: { version: 1, adapter: "browser_operation_v1", idempotency: "never_redispatch", reconciliation: "none" }, localPlanning: { consequence: "local_execution", reversibility: "reversible", destructive: false, purpose: "open_blank_browser_tab", inputKind: "browser_session", outputKind: "browser_tab_receipt", deliverableKind: "browser_tab", destinationPosture: "create_new", advisoryRoles: ["open", "browser", "destination"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", needsApproval: false, description: "Open a browser: create one new blank tab in local Chrome and return its exact target handle." },
+  { name: "browser_navigate", browserBackend: "local", sideEffect: "write", localExecution: { version: 1, adapter: "browser_operation_v1", idempotency: "never_redispatch", reconciliation: "none" }, localPlanning: { consequence: "local_execution", reversibility: "reversible", destructive: false, purpose: "navigate_browser_tab", inputKind: "browser_target_url", outputKind: "browser_navigation_receipt", deliverableKind: "browser_page", destinationPosture: "named_existing", advisoryRoles: ["navigate", "browser", "destination"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", needsApproval: false, description: "Navigate an exact browser tab to an http(s) website URL; no forms, clicks, sends or arbitrary scripts." },
+  { name: "browser_skill_list", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", description: "List saved proposed browser playbooks for a host; read the relevant file explicitly." },
+  { name: "browser_skill_write", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], description: "Save a proposed per-host browser playbook; this does not prove execution or grant authority." },
   // Generic gated dispatcher for schema-on-demand (SCHEMA-ON-DEMAND-PLAN-2026-07-07,
   // Phase 1). Structural, orchestrator-lane only, added to assembledTools ONLY when
   // CLEMMY_CODEX_TOOL_SEARCH is on (lanes [] like request_approval/run_worker).
@@ -1077,9 +1770,11 @@ var TOOL_REGISTRY = [
   { name: "call_tool", sideEffect: "write", tier: "core", lanes: [], needsApproval: false, description: "Invoke a catalog-only built-in tool by name with a JSON args string; effects and gates key on the inner tool." },
   { name: "check_in", sideEffect: "read", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", blockedFor: ["worker"], actionTopologyRole: "control", desk: { rung: "full", promotedBy: ["long_work", "delegation"], purpose: "post a progress note without stopping" }, description: "Tell the user what you found or what you are doing, mid-task, without stopping. Lands in the conversation so they can read it whenever they come back." },
   { name: "check_capability", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", delegationPrimitive: true, description: "Check whether a CLI / binary is available on this machine." },
-  { name: "cli_inspect", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", loopClass: "idempotent", description: "Inspect connected CLI health, signed-in account and its public connection origin (instance URL / hostname), declared repairs, or a managed CLI job. Read-only; never starts login, installation, or repair." },
-  { name: "cli_setup", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, localPlanning: cliSetupSemantics("auth"), localPlanningVariants: [cliSetupSemantics("install"), cliSetupSemantics("repair")], description: "Install, re-authenticate, or REPAIR a local CLI via the approved runners: status | install | auth | repairs | repair | job_status. Repairs fix a tool's own configuration \u2014 for example a CLI that is signed in but has no default org, account, project or app selected, so every command fails. Ask the user before install/auth; run a declared repair once they agree." },
+  { name: "cli_inspect", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", loopClass: "idempotent", description: "Inspect connected CLI health, signed-in account and its public connection origin (instance URL / hostname), the commands the CLI itself lists (its own --help), declared repairs, or a managed CLI job. Read-only; never starts login, installation, or repair." },
+  { name: "cli_setup", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, localPlanning: cliSetupSemantics("auth"), localPlanningVariants: [cliSetupSemantics("install"), cliSetupSemantics("repair"), cliSetupSemantics("remember")], description: "Install, remember, re-authenticate, or REPAIR a local CLI via the approved local paths: status | install | remember | auth | repairs | repair | job_status. Remember adds an already installed bare executable to Connect without reinstalling or authenticating it. Repairs fix a tool's own configuration \u2014 for example a CLI that is signed in but has no default org, account, project or app selected, so every command fails. Installing or signing in a CLI is local work: do it when the request needs it; an interactive sign-in still needs the user at their browser or Terminal." },
   { name: "project_get", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Read one project: purpose, goals, context, assigned agents, bound accounts and resources, delegated tasks." },
+  { name: "project_tools_inspect", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "read-only", blockedFor: ["workflow-step", "worker"], description: "Inspect the selected local project\u2019s MCP tool setup on this computer: redacted .mcp.json requirements, Windows/Mac paths, missing executable and credential key names. No installation, login or server startup; returns exact setup previews." },
+  { name: "project_tools_connect", sideEffect: "admin", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], localPlanning: { consequence: "runtime_configuration", reversibility: "unknown", destructive: false, purpose: "configure_runtime", inputKind: "configuration", outputKind: "configuration", deliverableKind: "runtime_configuration", destinationPosture: "create_new", advisoryRoles: ["admin"] }, description: "Set up an exact inspected project MCP server with normal admin approval, project-relative launch paths, private credential entry and verified connection readiness. Never overwrite another connection or run business tools." },
   { name: "project_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "List the owner's projects (ongoing bodies of work, not code folders) and who is assigned to each." },
   { name: "project_run", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], loopClass: "mutating", blockedFor: ["workflow-step", "worker"], delegationPrimitive: true, description: "Inspect or stop coding runs in the user's local projects: status | runs | kill. New runs start with dispatch_coding_task." },
   // A project is the host's own record of how the owner's work is organised:
@@ -1087,6 +1782,7 @@ var TOOL_REGISTRY = [
   // Handing the owner's correction to the task that owns the work writes the
   // host's own task record. What the task then does passes every gate a task
   // passes.
+  { name: "work_item_settle", sideEffect: "read", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", description: "Settle one item of your work list that you finished yourself, citing your own successful calls." },
   { name: "delegated_task_correct", sideEffect: "read", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Give the owner's change or correction to a delegated task; its own agent applies it." },
   { name: "project_save", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", description: "Create or change a project: purpose, goals, context, the agents assigned to it, and the accounts and resources it uses." },
   { name: "check_delegation", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Check a delegated task by ID or list delegations for an agent." },
@@ -1095,10 +1791,10 @@ var TOOL_REGISTRY = [
   { name: "composio_search_tools", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "agentic", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", description: "Search Composio for the right action slug." },
   { name: "composio_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Inspect whether Composio is configured and list active third-party app connections availa\u2026" },
   { name: "convert_to_markdown", sideEffect: "write", tier: "discoverable", lanes: ["cli"], description: "Extract a non-text file (PDF, Word/Excel/PowerPoint, EPub, image, audio, \u2026) into Markdown\u2026" },
-  { name: "create_agent", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Create a new active team agent with its own personality, tools, and project binding." },
+  { name: "create_agent", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Create a new active team agent with its own personality, tools, and project binding." },
   { name: "create_tool", sideEffect: "admin", tier: "discoverable", lanes: ["cli"], blockedFor: ["workflow-step", "worker"], description: "Create a reusable shell or python tool script in ~/.clementine-next/tools." },
   { name: "cron_progress_read", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Read saved progress state for a cron job." },
-  { name: "delegate_task", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Delegate a task to another team agent using local delegation state." },
+  { name: "delegate_task", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Delegate a task to another team agent using local delegation state." },
   { name: "delegation_inbox", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "List delegated tasks assigned to the current team agent and still open." },
   { name: "complete_delegation", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, description: "Finish a delegated task assigned to the current team agent by recording its result." },
   { name: "delete_agent", sideEffect: "admin", tier: "discoverable", lanes: ["cli"], blockedFor: ["workflow-step", "worker"], description: "Delete an agent definition." },
@@ -1140,7 +1836,7 @@ var TOOL_REGISTRY = [
   { name: "goal_stale", sideEffect: "write", tier: "core", lanes: [], actionTopologyRole: "control", description: "Detect or mark long-running goals that have gone stale (not updated in a while)." },
   { name: "goal_upsert", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Create a persistent goal when no id matches, or update the existing goal when one does \u2014 the single durable-goal write tool." },
   { name: "harness_status", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Inspect Clementine harness-internal capability health." },
-  { name: "http_read", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Bounded public HTTP(S) GET for documentation, pricing and JSON schemas; no shell, credentials or writes." },
+  { name: "http_read", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Bounded public HTTP(S) GET for documentation, pricing and JSON schemas; an image URL comes back as the image itself; no shell, credentials or writes." },
   { name: "hold_task_for_later", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", delegationPrimitive: true, description: 'HOLD an agreed multi-step task for later instead of running it now \u2014 the "or you can ask\u2026' },
   { name: "list_files", sideEffect: "read", readReuse: "settled_within_source", readRevision: "local_path", resourceIdentityArgument: "directory", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["write_file", "artifact_bundle_save", "replace_file", "run_shell_command"], description: "List files in an allowed workspace directory." },
   { name: "list_pending_check_ins", sideEffect: "read", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "List open check-ins waiting for a user answer." },
@@ -1165,18 +1861,18 @@ var TOOL_REGISTRY = [
   // recomputes on its own schedule.
   { name: "memory_embed_backfill", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Compute embeddings for vault chunks and/or durable facts using the active embedding provi\u2026" },
   { name: "memory_forget", sideEffect: "write", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Soft-delete a fact by id (sets active=0)." },
-  { name: "memory_import", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Import ANOTHER agent's memory files (Claude Code memories, OpenClaw/Fermis stores, bare m\u2026" },
+  { name: "memory_import", sideEffect: "write", readOnlyWhen: { field: "action", values: ["discover", "scan", "batches"] }, tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Import ANOTHER agent's memory files (Claude Code memories, OpenClaw/Fermis stores, bare m\u2026" },
   { name: "memory_list_facts", sideEffect: "read", projectEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "List or query durable facts as filterable JSON. Pass query for targeted lookup." },
   { name: "memory_pin", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Pin a fact as a STANDING INSTRUCTION (always injected into context, exempt from the recen\u2026" },
   { name: "memory_read", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Read a durable memory reference (fact:<id> or policy:<id>), a key memory file, or a vault-relative markdown path." },
   { name: "memory_recall", sideEffect: "read", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Recall vault chunks." },
   { name: "memory_recall_all", sideEffect: "read", readReuse: "settled_within_source", readRevision: "memory_store", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Recall distilled memory \u2014 facts, notes, entities, resources, episode summaries, policies and proven tools \u2014 through one evidence-backed pipeline. This is NOT a transcript store: it does not hold what was literally said in an earlier conversation. To find or quote a prior conversation, use session_search instead." },
-  { name: "memory_remember", sideEffect: "write", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "mutating", actionTopologyRole: "control", description: "Record a durable fact in long-term memory." },
+  { name: "memory_remember", sideEffect: "write", runtimeEffect: "host_only", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "mutating", actionTopologyRole: "control", description: "Record durable facts or correct an observed fact while preserving its scope and untouched content." },
   { name: "memory_restore", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Restore (reactivate) a soft-deleted fact by id \u2014 the inverse of memory_forget." },
   { name: "memory_review_instructions", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Before a batch/irreversible external write, review the standing instructions in play." },
   { name: "memory_search", sideEffect: "read", readReuse: "settled_within_source", readRevision: "memory_store", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, readMutatedBy: ["memory_remember", "memory_forget"], actionTopologyRole: "control", description: "Search the local Clementine vault for relevant notes and memories." },
   { name: "memory_search_facts", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", actionTopologyRole: "control", description: "Semantically search durable FACTS (your long-term memory of the user, projects, standing\u2026" },
-  { name: "memory_self_heal", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Inspect or run the audited long-term-memory self-heal loop." },
+  { name: "memory_self_heal", sideEffect: "write", readOnlyWhen: { field: "action", values: ["list", "dry_run"] }, tier: "discoverable", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Inspect or run the audited long-term-memory self-heal loop." },
   { name: "note_create", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Create a new note in the vault." },
   // A notification is a durable host-owned record the user will read: at
   // runtime a host_only mutation like memory_remember, never a read. With no
@@ -1231,6 +1927,7 @@ var TOOL_REGISTRY = [
   { name: "session_resume", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Summarize a session using its continuity brief and recent transcript so work can resume c\u2026" },
   { name: "set_model_role", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Route a model ROLE to a specific model, when the user asks in chat (e.g." },
   { name: "set_timer", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", localPlanning: { consequence: "runtime_configuration", reversibility: "create_only", destructive: false, purpose: "schedule_local_reminder", inputKind: "reminder", outputKind: "local_timer", deliverableKind: "reminder", destinationPosture: "create_new", advisoryRoles: ["create", "schedule"], safeMode: { id: "local_inbox", requiredEquals: { delivery: "local" } } }, description: 'Schedule a one-time reminder notification ("remind me") at an exact time tonight or in N minutes, within 24 hours.' },
+  { name: "cancel_timer", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Cancel a pending reminder that was set with set_timer, by words from its message or its id." },
   { name: "share_plan", sideEffect: "read", tier: "core", lanes: ["orchestrator", "cli"], actionTopologyRole: "control", description: "Share a non-blocking working plan in the current chat before continuing." },
   { name: "skill_list", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", description: "List installed SKILL.md skills (Anthropic Skills format) with name + one-line description." },
   { name: "skill_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", cacheSafeRead: true, actionTopologyRole: "control", desk: { rung: "full", promotedBy: ["listed_skill", "delegation"], purpose: "load an installed skill by name" }, description: "Load the full body of an installed SKILL.md skill into context." },
@@ -1241,7 +1938,7 @@ var TOOL_REGISTRY = [
   { name: "space_edit_view", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", localPlanning: { consequence: "workspace_definition", reversibility: "reversible", destructive: false, purpose: "author_workspace", inputKind: "workspace_patch", outputKind: "workspace_revision", deliverableKind: "workspace", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Edit only the requested parts of an existing Workspace HTML view; preserve other content. Stored data and phone content stay unchanged." },
   { name: "home_get", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", projectEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", loopClass: "idempotent", description: "Read the owner\u2019s Home tiles and current placement revision; no refresh or execution." },
   { name: "home_update", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain"], sdkLayer: "authoring", featureGroup: "spaces-dock", actionTopologyRole: "control", needsApproval: false, loopClass: "mutating", localPlanning: { consequence: "runtime_configuration", reversibility: "reversible", destructive: false, purpose: "arrange_home", inputKind: "home_placement", outputKind: "home_revision", deliverableKind: "home", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Pin, resize, reorder or remove a Space tile on Home. Preserve the Space and unrelated placements; commit a versioned Home receipt." },
-  { name: "space_get", sideEffect: "read", readReuse: "settled_within_source", readRevision: "workspace_files", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read a Workspace: its manifest (title, status, data sources, re-engage contract), a snaps\u2026" },
+  { name: "space_get", sideEffect: "read", readReuse: "settled_within_source", readRevision: "workspace_files", localPlanningRead: true, localExecution: { version: 1, adapter: "workspace_snapshot_read_v1", idempotency: "read_only", reconciliation: "none" }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read a saved Workspace snapshot. Exact workflow calls return workspace.id/revision/data_sha256, source_id, complete and untrimmed data; omit source_id for the full document or select one saved source. No provider refresh." },
   { name: "space_get_runner", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read the SOURCE of a Workspace data/action RUNNER (the .mjs/.py/.sh script under data/ th\u2026" },
   { name: "space_get_view", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Read the CURRENT view HTML of a Workspace, line-numbered \u2014 this is the EXACT text you nee\u2026" },
   { name: "space_preview", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker"], sdkLayer: "read-only", featureGroup: "spaces-dock", actionTopologyRole: "control", description: "Render a Workspace exactly as the desktop shows it and return a screenshot, so the view can be checked visually." },
@@ -1259,22 +1956,24 @@ var TOOL_REGISTRY = [
   { name: "task_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "List tasks from the master task list." },
   { name: "task_update", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Update a task by ID and optionally move it between pending and completed." },
   { name: "team_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "List all team agents and their messaging permissions." },
-  { name: "team_message", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, description: "Queue a message to another team agent." },
+  { name: "team_message", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Queue a message to another team agent." },
   { name: "team_pending_requests", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "List pending requests assigned to the current team agent." },
   { name: "team_reply", sideEffect: "send", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", delegationPrimitive: true, description: "Reply to a queued team request and mark it completed." },
-  { name: "team_request", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, description: "Create a structured request for another team agent and queue it locally." },
+  { name: "team_request", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Create a structured request for another team agent and queue it locally." },
   { name: "tool_choice_forget", sideEffect: "write", tier: "core", lanes: ["orchestrator"], actionTopologyRole: "control", description: "HARD-clear a remembered tool choice so the next request fully re-discovers it." },
   { name: "tool_choice_invalidate", sideEffect: "write", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Mark the currently-recorded tool choice for an intent as broken." },
   { name: "tool_choice_recall", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Look up the previously-recorded tool choice for an intent (per-machine memory)." },
   { name: "tool_choice_remember", sideEffect: "write", tier: "core", lanes: ["orchestrator", "cli"], loopClass: "mutating", actionTopologyRole: "control", description: "Save the tool that worked for an intent so future runs skip discovery." },
   { name: "tool_output_query", sideEffect: "read", readsRetainedOutput: true, projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch"], sdkLayer: "read-only", innerDispatch: "read", actionTopologyRole: "control", desk: { rung: "readers", promotedBy: ["retained_output", "delegation"], purpose: "query a slice of a large saved tool result" }, description: "Query a slice of a large prior tool output by its call_id, without loading the whole payl\u2026" },
   { name: "tool_search", sideEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", actionTopologyRole: "control", description: "Search the full built-in tool catalog by intent and get matching names, summaries, and sc\u2026" },
-  { name: "update_agent", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, description: "Update an existing team agent." },
+  { name: "update_agent", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Update an existing team agent." },
+  // Clem's own map of the app: what is set up and where each part lives.
+  { name: "app_guide", sideEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator"], loopClass: "idempotent", actionTopologyRole: "control", desk: { rung: "full", promotedBy: [], purpose: "what is set up in Clementine, and where in the app to set things up" }, description: "What is set up in Clementine, what each part gives the owner, and where in the app it lives." },
   { name: "user_profile_read", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Read the user's current profile (name, role, timezone, working hours, communication prefe\u2026" },
   { name: "workflow_apply_contract_fixes", sideEffect: "write", tier: "discoverable", lanes: ["cli"], actionTopologyRole: "control", description: "Apply safe, machine-readable fixes from a workflow visual contract." },
   { name: "workflow_capability_resolve", sideEffect: "write", runtimeEffect: "host_only", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", description: "Resolve an exact workflow capability pause by saving a human account choice or retrying after setup." },
   { name: "workflow_create", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_definition", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"] }, description: "Create a workflow." },
-  { name: "workflow_delete", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "irreversible", destructive: true, purpose: "delete_workflow", inputKind: "workflow_reference", outputKind: "deletion_receipt", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["delete", "destination"] }, description: "Permanently delete a workflow definition file." },
+  { name: "workflow_delete", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "cli"], blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "irreversible", destructive: true, purpose: "delete_workflow", inputKind: "workflow_reference", outputKind: "deletion_receipt", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["delete", "destination"], safeMode: { id: "confirmed", requiredEquals: { confirm: true } } }, description: "Permanently delete a workflow definition file. Asks the owner first (one card)." },
   { name: "workflow_edit_step", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_patch", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Make a TARGETED, reversible edit to ONE step's prompt in an existing workflow \u2014 the FAST,\u2026" },
   { name: "workflow_from_session", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", delegationPrimitive: true, description: "Turn what you JUST did in this chat into a reusable, repeatable workflow." },
   { name: "workflow_get", sideEffect: "read", readReuse: "settled_within_source", readRevision: "workflow_files", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Fetch the full definition of a single workflow by name." },
@@ -1283,8 +1982,9 @@ var TOOL_REGISTRY = [
   { name: "workflow_list", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "List all workflows with description, steps, and trigger metadata." },
   { name: "workflow_rerun_failed_items", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Re-run only the failed forEach items from a prior workflow run." },
   { name: "workflow_run", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "dispatch_named_workflow", inputKind: "workflow_identity", outputKind: "workflow_run", deliverableKind: "workflow", destinationPosture: "create_new", advisoryRoles: ["control", "destination"] }, description: "Dispatch a workflow to run in the BACKGROUND (fire-and-forget) \u2014 it runs in the daemon an\u2026" },
-  { name: "workflow_run_status", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Check workflow runs." },
+  { name: "workflow_run_status", sideEffect: "read", localPlanningRead: true, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", loopClass: "idempotent", actionTopologyRole: "control", description: "Check workflow runs, list a workflow's run history, and read what each step of a run produced." },
   { name: "workflow_schedule", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "schedule_workflow", inputKind: "workflow_definition", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "create_new", destinationPostures: ["create_new", "named_existing"], advisoryRoles: ["author", "destination"] }, description: "Schedule work once at an absolute run_at timestamp or repeatedly with cron." },
+  { name: "workflow_test", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "rehearse_workflow", inputKind: "workflow_identity", outputKind: "workflow_run", deliverableKind: "workflow", destinationPosture: "create_new", advisoryRoles: ["control"] }, description: "Rehearse a saved workflow in this setup without turning it on or off: reads run for real, changes are previewed, and the result names what to fix." },
   { name: "workflow_set_enabled", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "toggle_workflow", inputKind: "workflow_reference", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Approve or disable a workflow." },
   // Data-operation primitive (2026-07-21 capability audit #1): deterministic
   // reconcile/transform — the "spreadsheet brain". Pure read-class compute
@@ -1318,26 +2018,26 @@ var TOOL_REGISTRY = [
   // amnesia lived (an hourly scrape re-processed the same items every run).
   // sdkLayer read-only mirrors memory_remember: a LOCAL durable write is
   // allowed even on the read-only step lane (it mutates nothing external).
-  { name: "workflow_reshape", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "workflow-step", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Add read-only prompt nodes with only a result channel and run-scoped artifact query, plus dependency edges into those nodes, on an active workflow run. Dynamic writes/sends, scripts, fan-out, and edge disable/enable are not supported; completed and in-flight targets are immutable." },
-  { name: "workflow_state", sideEffect: "write", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "workflow-step", "cli"], sdkLayer: "read-only", loopClass: "mutating", actionTopologyRole: "control", description: "Durable per-workflow memory across runs: watermarks/cursors + a processed-item ledger (filter_unprocessed / mark_processed) so recurring runs never redo work." },
+  { name: "workflow_reshape", sideEffect: "write", readOnlyWhen: { field: "action", values: ["inspect"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "workflow-step", "cli"], sdkLayer: "authoring", loopClass: "mutating", actionTopologyRole: "control", delegationPrimitive: true, description: "Add read-only prompt nodes with only a result channel and run-scoped artifact query, plus dependency edges into those nodes, on an active workflow run. Dynamic writes/sends, scripts, fan-out, and edge disable/enable are not supported; completed and in-flight targets are immutable." },
+  { name: "workflow_state", sideEffect: "write", readOnlyWhen: { field: "action", values: ["get", "filter_unprocessed"] }, workflowScopedMemory: { workflowArg: "workflow" }, tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "workflow-step", "cli"], sdkLayer: "read-only", loopClass: "mutating", actionTopologyRole: "control", description: "Durable per-workflow memory across runs: watermarks/cursors + a processed-item ledger (filter_unprocessed / mark_processed) so recurring runs never redo work." },
   { name: "workflow_unschedule", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "pause_workflow", inputKind: "workflow_reference", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Disable a scheduled workflow so it stops firing, without deleting it." },
   { name: "workflow_update", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", blockedFor: ["workflow-step", "worker"], actionTopologyRole: "control", delegationPrimitive: true, localPlanning: { consequence: "workflow_definition", reversibility: "reversible", destructive: false, purpose: "author_workflow", inputKind: "workflow_patch", outputKind: "workflow_revision", deliverableKind: "workflow", destinationPosture: "named_existing", advisoryRoles: ["author", "destination"] }, description: "Patch workflow fields. If `steps` is provided it replaces the entire graph; use workflow_edit_step for one targeted prompt edit." },
-  { name: "working_memory", sideEffect: "write", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Read, append, replace, or clear the working-memory scratchpad." },
+  { name: "working_memory", sideEffect: "write", readOnlyWhen: { field: "action", values: ["read"] }, tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "cli"], sdkLayer: "authoring", actionTopologyRole: "control", description: "Read, append, replace, or clear the working-memory scratchpad." },
   { name: "workspace_artifact_query", sideEffect: "read", projectEffect: "read", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", actionTopologyRole: "control", description: "Query exact rows, fields, and pages from a JSON/JSONL run-workspace artifact." },
   { name: "workspace_info", sideEffect: "read", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", actionTopologyRole: "control", description: "Inspect a project directory and its notes, manifest, and structure. Use read_file for a known file." },
   { name: "workspace_list", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "discoverable", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "cli"], sdkLayer: "read-only", loopClass: "idempotent", description: "List local projects found in configured workspace directories." },
-  { name: "view_image", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Look at the actual pixels of a stored attachment image." },
+  { name: "view_image", sideEffect: "read", localPlanningRead: true, hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "Look at the actual pixels of an attached image, or with Full computer access an image file in the owner's folders." },
   { name: "workspace_roots", sideEffect: "read", projectEffect: "read", hostReadOnlyExecution: "pure_local", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "read-only", innerDispatch: "read", loopClass: "idempotent", description: "List directories Clementine is allowed to inspect or operate in." },
-  { name: "write_file", localExecution: { version: 1, adapter: "local_file_revision_v1", idempotency: "receipt_reconciled", reconciliation: "local_file_revision_v1", semantics: { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "write_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", destinationPostures: ["create_new", "named_existing"], advisoryRoles: ["author", "create", "update", "destination"] } }, sideEffect: "write", resourceIdentityArgument: "path", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", localPlanning: { consequence: "local_artifact", reversibility: "create_only", destructive: false, purpose: "create_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"], safeMode: { id: "create", requiredEquals: { mode: "create" }, nullEquivalentToRequired: ["mode"], omittedEquivalentToRequired: ["mode"], absentOrNull: ["append"] } }, localPlanningVariants: [{ consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "append_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "append", requiredEquals: {}, alternatives: [{ requiredEquals: { append: true }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "append" }, absentOrNull: ["append"] }] } }, { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "overwrite_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "overwrite", requiredEquals: {}, alternatives: [{ requiredEquals: { append: false }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "overwrite" }, absentOrNull: ["append"] }] } }], description: "Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path with recoverable prior bytes and a committed-file receipt." }
+  { name: "write_file", localExecution: { version: 1, adapter: "local_file_revision_v1", idempotency: "receipt_reconciled", reconciliation: "local_file_revision_v1", semantics: { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "write_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", destinationPostures: ["create_new", "named_existing"], advisoryRoles: ["author", "create", "update", "destination"] } }, sideEffect: "write", resourceIdentityArgument: "path", tier: "core", lanes: ["orchestrator", "sdk-brain", "sdk-worker", "inner-dispatch", "cli"], sdkLayer: "agentic", innerDispatch: "write", loopClass: "mutating", localPlanning: { consequence: "local_artifact", reversibility: "create_only", destructive: false, purpose: "create_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "create_new", advisoryRoles: ["author", "create", "destination"], safeMode: { id: "create", requiredEquals: { mode: "create" }, nullEquivalentToRequired: ["mode"], omittedEquivalentToRequired: ["mode"], absentOrNull: ["append"] } }, localPlanningVariants: [{ consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "append_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "append", requiredEquals: {}, alternatives: [{ requiredEquals: { append: true }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "append" }, absentOrNull: ["append"] }] } }, { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "overwrite_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "overwrite", requiredEquals: {}, alternatives: [{ requiredEquals: { append: false }, allowedValues: { mode: ["create", "append", "overwrite", null] } }, { requiredEquals: { mode: "overwrite" }, absentOrNull: ["append"] }] } }, { consequence: "local_artifact", reversibility: "reversible", destructive: false, purpose: "revise_local_artifact", inputKind: "artifact_content", outputKind: "file_revision", deliverableKind: "file", destinationPosture: "named_existing", advisoryRoles: ["author", "update", "destination"], safeMode: { id: "replace", requiredEquals: { mode: "replace" }, absentOrNull: ["append"] } }], description: "Create, append to, overwrite, or change one exact passage of a UTF-8 file inside an allowed local workspace path with recoverable prior bytes and a committed-file receipt." }
 ];
 
 // src/tools/artifact-bundle-contract.ts
-var import_zod5 = require("zod");
+var import_zod9 = require("zod");
 
 // src/tools/artifact-bundle-core.ts
-var import_node_crypto4 = require("node:crypto");
-var import_node_fs2 = require("node:fs");
-var import_node_path4 = __toESM(require("node:path"), 1);
+var import_node_crypto7 = require("node:crypto");
+var import_node_fs5 = require("node:fs");
+var import_node_path6 = __toESM(require("node:path"), 1);
 var ARTIFACT_BUNDLE_LIMITS = Object.freeze({
   maxFiles: 32,
   maxFileBytes: 64e3,
@@ -1355,11 +2055,11 @@ var ArtifactBundleError = class extends Error {
   }
   code;
 };
-function sha256(value) {
-  return (0, import_node_crypto4.createHash)("sha256").update(value).digest("hex");
+function sha2562(value) {
+  return (0, import_node_crypto7.createHash)("sha256").update(value).digest("hex");
 }
 function rootDirectory(options) {
-  return import_node_path4.default.resolve(options.rootDir ?? import_node_path4.default.join(BASE_DIR, "files", "bundles"));
+  return import_node_path6.default.resolve(options.rootDir ?? import_node_path6.default.join(BASE_DIR, "files", "bundles"));
 }
 function safeBundleId(raw) {
   const bundleId = raw.trim();
@@ -1375,7 +2075,7 @@ function safeRelativeFilePath(raw) {
   if (raw.length === 0 || raw !== raw.trim() || raw.includes("\\") || raw.includes("\0")) {
     throw new ArtifactBundleError(`unsafe artifact path: ${JSON.stringify(raw)}`, "invalid_path");
   }
-  if (import_node_path4.default.posix.isAbsolute(raw) || import_node_path4.default.posix.normalize(raw) !== raw || raw === MANIFEST_NAME) {
+  if (import_node_path6.default.posix.isAbsolute(raw) || import_node_path6.default.posix.normalize(raw) !== raw || raw === MANIFEST_NAME) {
     throw new ArtifactBundleError(`unsafe artifact path: ${JSON.stringify(raw)}`, "invalid_path");
   }
   const segments = raw.split("/");
@@ -1414,9 +2114,9 @@ function prepareBundle(input) {
         "bundle_too_large"
       );
     }
-    return { path: relativePath, content: candidate.content, sha256: sha256(candidate.content), bytes };
+    return { path: relativePath, content: candidate.content, sha256: sha2562(candidate.content), bytes };
   }).sort((left, right) => left.path.localeCompare(right.path));
-  const revisionDigest = sha256(closedCanonicalJson({
+  const revisionDigest = sha2562(closedCanonicalJson({
     version: 1,
     bundleId,
     files: files.map(({ path: filePath, sha256: digest2, bytes }) => ({
@@ -1449,10 +2149,10 @@ function resultFor(bundle, directory, created) {
     contentDigest: bundle.revisionDigest,
     handle: directory,
     directory,
-    manifestPath: import_node_path4.default.join(directory, MANIFEST_NAME),
+    manifestPath: import_node_path6.default.join(directory, MANIFEST_NAME),
     files: bundle.files.map(({ path: filePath, sha256: digest2, bytes }) => ({
       path: filePath,
-      filePath: import_node_path4.default.join(directory, ...filePath.split("/")),
+      filePath: import_node_path6.default.join(directory, ...filePath.split("/")),
       sha256: digest2,
       bytes
     })),
@@ -1461,20 +2161,15 @@ function resultFor(bundle, directory, created) {
   };
 }
 function fsyncDirectory(directory) {
-  const fd = (0, import_node_fs2.openSync)(directory, "r");
-  try {
-    (0, import_node_fs2.fsyncSync)(fd);
-  } finally {
-    (0, import_node_fs2.closeSync)(fd);
-  }
+  syncDirectoryMetadata(directory);
 }
 function writeDurableFile(filePath, content) {
-  const fd = (0, import_node_fs2.openSync)(filePath, "wx", 384);
+  const fd = (0, import_node_fs5.openSync)(filePath, "wx", 384);
   try {
-    (0, import_node_fs2.writeFileSync)(fd, content, "utf8");
-    (0, import_node_fs2.fsyncSync)(fd);
+    (0, import_node_fs5.writeFileSync)(fd, content, "utf8");
+    (0, import_node_fs5.fsyncSync)(fd);
   } finally {
-    (0, import_node_fs2.closeSync)(fd);
+    (0, import_node_fs5.closeSync)(fd);
   }
 }
 function expectedDirectories(bundle) {
@@ -1491,10 +2186,10 @@ function walkRevision(directory) {
   const files = [];
   const directories = [];
   const visit = (absolute, relative) => {
-    for (const entry of (0, import_node_fs2.readdirSync)(absolute, { withFileTypes: true })) {
+    for (const entry of (0, import_node_fs5.readdirSync)(absolute, { withFileTypes: true })) {
       const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
-      const childAbsolute = import_node_path4.default.join(absolute, entry.name);
-      const stat = (0, import_node_fs2.lstatSync)(childAbsolute);
+      const childAbsolute = import_node_path6.default.join(absolute, entry.name);
+      const stat = (0, import_node_fs5.lstatSync)(childAbsolute);
       if (stat.isSymbolicLink()) return `symbolic link is forbidden: ${childRelative}`;
       if (stat.isDirectory()) {
         directories.push(childRelative);
@@ -1511,11 +2206,11 @@ function walkRevision(directory) {
   return { files, directories, refusal: visit(directory, "") };
 }
 function inspectPrepared(bundle, options) {
-  const directory = import_node_path4.default.join(rootDirectory(options), bundle.bundleId, bundle.revisionDigest);
-  if (!(0, import_node_fs2.existsSync)(directory)) return { status: "absent" };
+  const directory = import_node_path6.default.join(rootDirectory(options), bundle.bundleId, bundle.revisionDigest);
+  if (!(0, import_node_fs5.existsSync)(directory)) return { status: "absent" };
   let rootStat;
   try {
-    rootStat = (0, import_node_fs2.lstatSync)(directory);
+    rootStat = (0, import_node_fs5.lstatSync)(directory);
   } catch (error) {
     return { status: "mismatch", reason: `revision could not be inspected: ${error.message}` };
   }
@@ -1534,13 +2229,13 @@ function inspectPrepared(bundle, options) {
     if (closedCanonicalJson(walked.directories.sort()) !== closedCanonicalJson(expectedDirs)) {
       return { status: "mismatch", reason: "revision directory set differs from the frozen manifest" };
     }
-    const persisted = JSON.parse((0, import_node_fs2.readFileSync)(import_node_path4.default.join(directory, MANIFEST_NAME), "utf8"));
+    const persisted = JSON.parse((0, import_node_fs5.readFileSync)(import_node_path6.default.join(directory, MANIFEST_NAME), "utf8"));
     if (closedCanonicalJson(persisted) !== closedCanonicalJson(manifestFor(bundle))) {
       return { status: "mismatch", reason: "persisted bundle manifest differs from the requested revision" };
     }
     for (const file of bundle.files) {
-      const body = (0, import_node_fs2.readFileSync)(import_node_path4.default.join(directory, ...file.path.split("/")));
-      if (body.byteLength !== file.bytes || sha256(body) !== file.sha256) {
+      const body = (0, import_node_fs5.readFileSync)(import_node_path6.default.join(directory, ...file.path.split("/")));
+      if (body.byteLength !== file.bytes || sha2562(body) !== file.sha256) {
         return { status: "mismatch", reason: `artifact content differs: ${file.path}` };
       }
     }
@@ -1564,14 +2259,14 @@ function inspectArtifactBundleArtifactId(artifactId, options = {}) {
   if (!/^[a-f0-9]{64}$/.test(revisionDigest)) {
     return { status: "mismatch", reason: "artifact revision digest is malformed" };
   }
-  const directory = import_node_path4.default.join(rootDirectory(options), bundleId, revisionDigest);
-  if (!(0, import_node_fs2.existsSync)(directory)) return { status: "absent" };
+  const directory = import_node_path6.default.join(rootDirectory(options), bundleId, revisionDigest);
+  if (!(0, import_node_fs5.existsSync)(directory)) return { status: "absent" };
   try {
-    const stat = (0, import_node_fs2.lstatSync)(directory);
+    const stat = (0, import_node_fs5.lstatSync)(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       return { status: "mismatch", reason: "revision target is not a real directory" };
     }
-    const raw = JSON.parse((0, import_node_fs2.readFileSync)(import_node_path4.default.join(directory, MANIFEST_NAME), "utf8"));
+    const raw = JSON.parse((0, import_node_fs5.readFileSync)(import_node_path6.default.join(directory, MANIFEST_NAME), "utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw) || raw.version !== 1 || raw.bundleId !== bundleId || raw.revisionDigest !== revisionDigest || !Array.isArray(raw.files)) return { status: "mismatch", reason: "persisted bundle manifest identity is malformed" };
     const files = [];
     const seen = /* @__PURE__ */ new Set();
@@ -1584,7 +2279,7 @@ function inspectArtifactBundleArtifactId(artifactId, options = {}) {
       const relative = safeRelativeFilePath(row.path);
       if (seen.has(relative)) return { status: "mismatch", reason: `duplicate artifact path: ${relative}` };
       seen.add(relative);
-      files.push({ path: relative, content: (0, import_node_fs2.readFileSync)(import_node_path4.default.join(directory, ...relative.split("/")), "utf8") });
+      files.push({ path: relative, content: (0, import_node_fs5.readFileSync)(import_node_path6.default.join(directory, ...relative.split("/")), "utf8") });
     }
     const prepared = prepareBundle({ bundleId, files });
     if (prepared.revisionDigest !== revisionDigest) {
@@ -1606,31 +2301,31 @@ function saveArtifactBundle(input, options = {}) {
     );
   }
   const root = rootDirectory(options);
-  const bundleRoot = import_node_path4.default.join(root, bundle.bundleId);
-  const finalDirectory = import_node_path4.default.join(bundleRoot, bundle.revisionDigest);
-  (0, import_node_fs2.mkdirSync)(bundleRoot, { recursive: true, mode: 448 });
-  const stagingDirectory = (0, import_node_fs2.mkdtempSync)(import_node_path4.default.join(bundleRoot, `.tmp-${process.pid}-${(0, import_node_crypto4.randomBytes)(4).toString("hex")}-`));
+  const bundleRoot = import_node_path6.default.join(root, bundle.bundleId);
+  const finalDirectory = import_node_path6.default.join(bundleRoot, bundle.revisionDigest);
+  (0, import_node_fs5.mkdirSync)(bundleRoot, { recursive: true, mode: 448 });
+  const stagingDirectory = (0, import_node_fs5.mkdtempSync)(import_node_path6.default.join(bundleRoot, `.tmp-${process.pid}-${(0, import_node_crypto7.randomBytes)(4).toString("hex")}-`));
   let published = false;
   try {
     const directories = expectedDirectories(bundle);
     for (const relative of directories) {
-      (0, import_node_fs2.mkdirSync)(import_node_path4.default.join(stagingDirectory, ...relative.split("/")), { recursive: true, mode: 448 });
+      (0, import_node_fs5.mkdirSync)(import_node_path6.default.join(stagingDirectory, ...relative.split("/")), { recursive: true, mode: 448 });
     }
     for (const file of bundle.files) {
-      writeDurableFile(import_node_path4.default.join(stagingDirectory, ...file.path.split("/")), file.content);
+      writeDurableFile(import_node_path6.default.join(stagingDirectory, ...file.path.split("/")), file.content);
     }
     writeDurableFile(
-      import_node_path4.default.join(stagingDirectory, MANIFEST_NAME),
+      import_node_path6.default.join(stagingDirectory, MANIFEST_NAME),
       `${closedCanonicalJson(manifestFor(bundle))}
 `
     );
     for (const relative of [...directories].sort((left, right) => right.split("/").length - left.split("/").length)) {
-      fsyncDirectory(import_node_path4.default.join(stagingDirectory, ...relative.split("/")));
+      fsyncDirectory(import_node_path6.default.join(stagingDirectory, ...relative.split("/")));
     }
     fsyncDirectory(stagingDirectory);
     options.beforePublish?.(stagingDirectory);
     try {
-      (0, import_node_fs2.renameSync)(stagingDirectory, finalDirectory);
+      (0, import_node_fs5.renameSync)(stagingDirectory, finalDirectory);
       published = true;
       fsyncDirectory(bundleRoot);
     } catch (error) {
@@ -1655,19 +2350,19 @@ function saveArtifactBundle(input, options = {}) {
     if (error instanceof ArtifactBundleError) throw error;
     throw new ArtifactBundleError(`artifact bundle publication failed: ${error.message}`, "filesystem_refusal");
   } finally {
-    if (!published) (0, import_node_fs2.rmSync)(stagingDirectory, { recursive: true, force: true });
+    if (!published) (0, import_node_fs5.rmSync)(stagingDirectory, { recursive: true, force: true });
   }
 }
 
 // src/tools/artifact-bundle-contract.ts
-var artifactBundleFileShape = import_zod5.z.object({
-  path: import_zod5.z.string().min(1).max(ARTIFACT_BUNDLE_LIMITS.maxPathBytes).describe('Safe relative POSIX path inside the bundle, for example "public/index.html". Absolute paths, backslashes, dot segments, and duplicates are refused.'),
-  content: import_zod5.z.string().describe(`Exact UTF-8 file content (maximum ${ARTIFACT_BUNDLE_LIMITS.maxFileBytes} bytes per file).`)
+var artifactBundleFileShape = import_zod9.z.object({
+  path: import_zod9.z.string().min(1).max(ARTIFACT_BUNDLE_LIMITS.maxPathBytes).describe('Safe relative POSIX path inside the bundle, for example "public/index.html". Absolute paths, backslashes, dot segments, and duplicates are refused.'),
+  content: import_zod9.z.string().describe(`Exact UTF-8 file content (maximum ${ARTIFACT_BUNDLE_LIMITS.maxFileBytes} bytes per file).`)
 }).strict();
 var ARTIFACT_BUNDLE_TOOL_PARAMETERS = {
-  bundle_id: import_zod5.z.string().min(1).max(80).describe('Stable lowercase artifact id, for example "sales-portal". The revision digest is derived from every file path and byte sequence.'),
-  mode: import_zod5.z.literal("content_addressed").describe("Required safety mode. Revisions are immutable and never overwrite a prior revision."),
-  files: import_zod5.z.array(artifactBundleFileShape).min(1).max(ARTIFACT_BUNDLE_LIMITS.maxFiles)
+  bundle_id: import_zod9.z.string().min(1).max(80).describe('Stable lowercase artifact id, for example "sales-portal". The revision digest is derived from every file path and byte sequence.'),
+  mode: import_zod9.z.literal("content_addressed").describe("Required safety mode. Revisions are immutable and never overwrite a prior revision."),
+  files: import_zod9.z.array(artifactBundleFileShape).min(1).max(ARTIFACT_BUNDLE_LIMITS.maxFiles)
 };
 function executeArtifactBundleSave(args) {
   return saveArtifactBundle({
@@ -1676,146 +2371,63 @@ function executeArtifactBundleSave(args) {
   });
 }
 
-// src/spaces/workspace-set-data-contract.ts
-var import_node_crypto5 = require("node:crypto");
-var import_zod6 = require("zod");
-var WORKSPACE_SET_DATA_MAX_BYTES = 5 * 1024 * 1024;
-var WORKSPACE_SET_DATA_MAX_SOURCE_CHARS = 120;
-var WORKSPACE_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/;
-var SOURCE_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
-var ARTIFACT_PREFIX = "workspace-dataset:v1";
-var REFRESH_PREFIX = "workspace-set-data:v1";
-var MAX_JSON_NODES = 2e5;
-var MAX_JSON_DEPTH = 64;
-var WORKSPACE_SET_DATA_TOOL_PARAMETERS = {
-  slug: import_zod6.z.string().min(2).max(63).regex(WORKSPACE_SLUG_RE).describe("The existing active workspace slug."),
-  source_id: import_zod6.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_SOURCE_CHARS).describe("The canonical non-reserved source id to replace."),
-  data_json: import_zod6.z.string().min(1).max(WORKSPACE_SET_DATA_MAX_BYTES).describe("A complete JSON object or array for this source id.")
+// src/integrations/browserbase-setup.ts
+var import_node_fs6 = require("node:fs");
+var import_node_path7 = __toESM(require("node:path"), 1);
+
+// src/integrations/cloud-browser-provider.ts
+function isCloudBrowserProvider(value) {
+  return value === "browserbase" || value === "kernel";
+}
+function isBrowserChoice(value) {
+  return isCloudBrowserProvider(value) || value === "local";
+}
+
+// src/integrations/browserbase-setup.ts
+var PROJECT_ID = {
+  browserbase: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  kernel: /^[A-Za-z0-9_.-]{1,128}$/
 };
-var WorkspaceSetDataContractError = class extends Error {
-  constructor(code, message) {
-    super(message);
-    this.code = code;
-    this.name = "WorkspaceSetDataContractError";
-  }
-  code;
-};
-function sha2562(value) {
-  return (0, import_node_crypto5.createHash)("sha256").update(value, "utf8").digest("hex");
+function browserbaseStoreFile(baseDir = BASE_DIR) {
+  return import_node_path7.default.join(baseDir, "state", "browserbase", "resources.json");
 }
-function utf8(value) {
-  return Buffer.byteLength(value, "utf8");
-}
-function canonicalWorkspaceJson(value) {
-  let nodes = 0;
-  const visit = (input, depth) => {
-    nodes += 1;
-    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH) {
-      throw new WorkspaceSetDataContractError(
-        "json_limit_exceeded",
-        "data_json exceeds the reviewed JSON traversal limit"
-      );
-    }
-    if (input === null || typeof input === "string" || typeof input === "boolean") {
-      return JSON.stringify(input);
-    }
-    if (typeof input === "number" && Number.isFinite(input)) return JSON.stringify(input);
-    if (Array.isArray(input)) {
-      return `[${input.map((entry) => visit(entry, depth + 1)).join(",")}]`;
-    }
-    if (input && typeof input === "object") {
-      const object = input;
-      return `{${Object.keys(object).sort().map(
-        (key) => `${JSON.stringify(key)}:${visit(object[key], depth + 1)}`
-      ).join(",")}}`;
-    }
-    throw new WorkspaceSetDataContractError(
-      "invalid_json",
-      "data_json contains a value outside the JSON domain"
-    );
-  };
-  const canonical = visit(value, 0);
-  if (utf8(canonical) > WORKSPACE_SET_DATA_MAX_BYTES) {
-    throw new WorkspaceSetDataContractError(
-      "json_limit_exceeded",
-      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
-    );
-  }
-  return canonical;
-}
-function exactArguments(value) {
-  const parsed = import_zod6.z.strictObject(WORKSPACE_SET_DATA_TOOL_PARAMETERS).safeParse(value);
-  if (!parsed.success) {
-    const record3 = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-    if (typeof record3.slug === "string" && !WORKSPACE_SLUG_RE.test(record3.slug)) {
-      throw new WorkspaceSetDataContractError("invalid_slug", `invalid workspace slug "${record3.slug}"`);
-    }
-    throw new WorkspaceSetDataContractError(
-      "arguments_invalid",
-      "space_set_data arguments do not match the closed reviewed schema"
-    );
-  }
-  return parsed.data;
-}
-function prepareWorkspaceSetData(value) {
-  const args = exactArguments(value);
-  if (!WORKSPACE_SLUG_RE.test(args.slug)) {
-    throw new WorkspaceSetDataContractError("invalid_slug", `invalid workspace slug "${args.slug}"`);
-  }
-  const sourceId = args.source_id;
-  if (sourceId !== sourceId.trim() || sourceId.length === 0 || sourceId.length > WORKSPACE_SET_DATA_MAX_SOURCE_CHARS || SOURCE_CONTROL_RE.test(sourceId)) {
-    throw new WorkspaceSetDataContractError(
-      "invalid_source",
-      "source_id must already be canonical, bounded, and free of control characters"
-    );
-  }
-  if (sourceId === "_meta") {
-    throw new WorkspaceSetDataContractError(
-      "reserved_source",
-      '"_meta" is a reserved Workspace source key'
-    );
-  }
-  if (utf8(args.data_json) > WORKSPACE_SET_DATA_MAX_BYTES) {
-    throw new WorkspaceSetDataContractError(
-      "json_limit_exceeded",
-      `data_json exceeds the ${WORKSPACE_SET_DATA_MAX_BYTES}-byte limit`
-    );
-  }
-  let data;
+var NOTHING = { choice: "local", provider: null, configured: { browserbase: false, kernel: false } };
+var cached;
+function cloudBrowserSelection(baseDir = BASE_DIR) {
+  const file = browserbaseStoreFile(baseDir);
+  let stat;
   try {
-    data = JSON.parse(args.data_json);
-  } catch (error) {
-    throw new WorkspaceSetDataContractError(
-      "invalid_json",
-      `data_json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
-    );
+    stat = (0, import_node_fs6.statSync)(file);
+  } catch {
+    return NOTHING;
   }
-  if (!data || typeof data !== "object") {
-    throw new WorkspaceSetDataContractError(
-      "invalid_json_root",
-      "data_json must contain one complete JSON object or array"
-    );
+  if (cached && cached.file === file && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.selection;
+  let selection = NOTHING;
+  try {
+    const store = JSON.parse((0, import_node_fs6.readFileSync)(file, "utf8"));
+    const configured = { browserbase: false, kernel: false };
+    const providers = store.providers && typeof store.providers === "object" ? store.providers : {};
+    for (const [name, policy2] of Object.entries(providers)) {
+      if (isCloudBrowserProvider(name) && policy2 && typeof policy2.projectId === "string" && PROJECT_ID[name].test(policy2.projectId)) configured[name] = true;
+    }
+    if (!store.providers && store.policy && typeof store.policy.projectId === "string") {
+      const provider2 = isCloudBrowserProvider(store.policy.provider) ? store.policy.provider : "browserbase";
+      if (PROJECT_ID[provider2].test(store.policy.projectId)) configured[provider2] = true;
+    }
+    const choice = isBrowserChoice(store.choice) ? store.choice : configured.browserbase ? "browserbase" : configured.kernel ? "kernel" : "local";
+    const provider = isCloudBrowserProvider(choice) && configured[choice] ? choice : null;
+    selection = { choice, provider, configured };
+  } catch {
+    selection = NOTHING;
   }
-  const canonicalData = canonicalWorkspaceJson(data);
-  const contentDigest = sha2562(canonicalData);
-  const argsDigest = sha2562([
-    `${ARTIFACT_PREFIX}\0`,
-    args.slug,
-    "\0",
-    sourceId,
-    "\0",
-    canonicalData
-  ].join(""));
-  return Object.freeze({
-    args: Object.freeze({ ...args }),
-    slug: args.slug,
-    sourceId,
-    data,
-    canonicalData,
-    contentDigest,
-    argsDigest,
-    refreshId: `${REFRESH_PREFIX}:${argsDigest}`
-  });
+  cached = { file, mtimeMs: stat.mtimeMs, size: stat.size, selection };
+  return selection;
+}
+
+// src/tools/browser-backend.ts
+function browserBackendOffered(backend) {
+  if (!backend) return true;
+  return backend === "cloud" === (cloudBrowserSelection().provider !== null);
 }
 
 // src/runtime/harness/reviewed-local-tool-transport.ts
@@ -1838,10 +2450,13 @@ function exactDeclaration(name) {
 function validExecutionContract(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const contract = value;
+  if (contract.version === 1 && (contract.adapter === "browser_operation_v1" || contract.adapter === "cloud_browser_operation_v1")) {
+    return (contract.idempotency === "read_only" || contract.idempotency === "never_redispatch") && contract.reconciliation === "none";
+  }
   if (contract.version === 1 && contract.adapter === "workspace_script_v1") {
     return contract.idempotency === "never_redispatch" && contract.reconciliation === "none";
   }
-  if (contract.version === 1 && contract.adapter === "local_file_read_v1") {
+  if (contract.version === 1 && (contract.adapter === "local_file_read_v1" || contract.adapter === "workspace_snapshot_read_v1")) {
     return contract.idempotency === "read_only" && contract.reconciliation === "none";
   }
   return contract.version === 1 && (contract.idempotency === "content_addressed" || contract.adapter === "local_file_revision_v1" && contract.idempotency === "receipt_reconciled") && (contract.adapter === "artifact_bundle_v1" && contract.reconciliation === "artifact_bundle_v1" || contract.adapter === "workspace_dataset_v1" && contract.reconciliation === "workspace_dataset_v1" || contract.adapter === "local_file_revision_v1" && contract.reconciliation === "local_file_revision_v1" && contract.idempotency === "receipt_reconciled");
@@ -1913,7 +2528,19 @@ function deriveReviewedLocalReadDefinition(input) {
   if (!name || name !== row.name) return null;
   const capabilityRef = `cap:local:${name}:read`;
   const schemaFingerprint = stableJsonDigest(input.schema);
-  const registrySemanticsFingerprint = stableJsonDigest({
+  const browser2 = row.localExecution?.adapter === "browser_operation_v1" || row.localExecution?.adapter === "cloud_browser_operation_v1";
+  const canonicalPlanningRead = browser2 || row.localExecution?.adapter === "workspace_snapshot_read_v1";
+  const readPurpose = row.description?.trim() || "Read Clementine-local state.";
+  const registrySemanticsFingerprint = stableJsonDigest(canonicalPlanningRead ? {
+    version: 1,
+    name,
+    sideEffect: row.sideEffect,
+    projectEffect: row.projectEffect,
+    localPlanningRead: true,
+    runtimeEffect: row.runtimeEffect ?? null,
+    actionTopologyRole: row.actionTopologyRole ?? "business",
+    readOnly: { consequence: "read", reversibility: "read_only", destructive: false, purpose: readPurpose, destinationPosture: null }
+  } : {
     version: 1,
     name,
     sideEffect: row.sideEffect,
@@ -1946,7 +2573,7 @@ function deriveReviewedLocalReadDefinition(input) {
     descriptor: {
       id: capabilityRef,
       effect: "read",
-      purpose: row.description ?? "Read local state.",
+      purpose: canonicalPlanningRead ? readPurpose : row.description ?? "Read local state.",
       acceptedInputKinds: ["request", "evidence"],
       producedOutputKinds: ["evidence"],
       applicableDeliverableKinds: ["evidence"],
@@ -1959,7 +2586,7 @@ function deriveReviewedLocalReadDefinition(input) {
       handleRequired: false,
       readbackRequired: false,
       accountScope: REVIEWED_LOCAL_ACCOUNT,
-      manifestDigest: stableJsonDigest({ capabilityRef, envelopeFingerprint }),
+      manifestDigest: stableJsonDigest(canonicalPlanningRead ? { version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, capabilityRef, envelopeFingerprint } : { capabilityRef, envelopeFingerprint }),
       advisoryRoles: ["source", "collection", "read"]
     }
   };
@@ -2013,8 +2640,20 @@ function deriveReviewedScriptDefinition(input) {
 }
 function deriveReviewedLocalDefinition(input) {
   const name = input.declaration.name.trim();
+  if (input.declaration.localExecution?.adapter === "cloud_browser_operation_v1") {
+    if (!cloudBrowserOperationName(name)) return null;
+    const read = name === "cloud_browser_tabs" || name === "cloud_browser_read" || name === "cloud_browser_status" || name === "cloud_browser_resources";
+    if (input.declaration.sideEffect !== (read ? "read" : "write") || input.declaration.localExecution.idempotency !== (read ? "read_only" : "never_redispatch")) return null;
+    if (read) return deriveReviewedLocalReadDefinition(input);
+  }
+  if (input.declaration.localExecution?.adapter === "browser_operation_v1") {
+    if (!browserOperationName(name)) return null;
+    const read = name === "browser_tabs" || name === "browser_read";
+    if (input.declaration.sideEffect !== (read ? "read" : "write") || input.declaration.localExecution.idempotency !== (read ? "read_only" : "never_redispatch")) return null;
+    if (read) return deriveReviewedLocalReadDefinition(input);
+  }
   if (input.declaration.localExecution?.adapter === "workspace_script_v1") return deriveReviewedScriptDefinition(input);
-  if (input.declaration.localExecution?.adapter === "local_file_read_v1") {
+  if (input.declaration.localExecution?.adapter === "local_file_read_v1" || input.declaration.localExecution?.adapter === "workspace_snapshot_read_v1") {
     return deriveReviewedLocalReadDefinition(input);
   }
   const semantics = input.declaration.localExecution?.semantics ?? input.declaration.localPlanning;
@@ -2084,10 +2723,12 @@ function deriveReviewedLocalDefinition(input) {
     descriptor
   });
 }
-function currentReviewedLocalSchema(execution) {
-  const parametersShape = execution.adapter === "workspace_script_v1" ? WORKSPACE_SCRIPT_PARAMETERS : execution.adapter === "local_file_read_v1" ? READ_FILE_PARAMS : execution.adapter === "artifact_bundle_v1" ? ARTIFACT_BUNDLE_TOOL_PARAMETERS : execution.adapter === "local_file_revision_v1" ? WRITE_FILE_PARAMS : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
-  const deferredParameters = import_zod7.z.strictObject(normalizeShapeForDeferredJson(parametersShape));
-  const parameters = import_zod7.z.toJSONSchema(deferredParameters);
+function currentReviewedLocalSchema(execution, operationId) {
+  if (execution.adapter === "browser_operation_v1" && !browserOperationName(operationId)) return null;
+  if (execution.adapter === "cloud_browser_operation_v1" && !cloudBrowserOperationName(operationId)) return null;
+  const parametersShape = execution.adapter === "cloud_browser_operation_v1" && cloudBrowserOperationName(operationId) ? CLOUD_BROWSER_PARAMETERS[operationId] : execution.adapter === "browser_operation_v1" && browserOperationName(operationId) ? BROWSER_OPERATION_PARAMETERS[operationId] : execution.adapter === "workspace_script_v1" ? WORKSPACE_SCRIPT_PARAMETERS : execution.adapter === "local_file_read_v1" ? READ_FILE_PARAMS : execution.adapter === "workspace_snapshot_read_v1" ? WORKSPACE_GET_TOOL_PARAMETERS : execution.adapter === "artifact_bundle_v1" ? ARTIFACT_BUNDLE_TOOL_PARAMETERS : execution.adapter === "local_file_revision_v1" ? WRITE_FILE_PARAMS : WORKSPACE_SET_DATA_TOOL_PARAMETERS;
+  const deferredParameters = import_zod10.z.strictObject(normalizeShapeForDeferredJson(parametersShape));
+  const parameters = import_zod10.z.toJSONSchema(deferredParameters);
   const schema = relaxJsonSchemaForDeferred(parameters);
   return isRecord(schema) ? schema : null;
 }
@@ -2096,7 +2737,8 @@ function observeReviewedLocalTool(operationId) {
   if (!name || name !== operationId) return null;
   const declaration = exactDeclaration(name);
   if (!declaration || !validExecutionContract(declaration.localExecution)) return null;
-  const schema = currentReviewedLocalSchema(declaration.localExecution);
+  if (!browserBackendOffered(declaration.browserBackend)) return null;
+  const schema = currentReviewedLocalSchema(declaration.localExecution, name);
   if (!schema) return null;
   const definition = deriveReviewedLocalDefinition({ declaration, schema });
   if (!definition || definition.accountIdentity !== REVIEWED_LOCAL_ACCOUNT) return null;
@@ -2143,7 +2785,7 @@ function reviewedLocalCapabilityManifest(observed2) {
     } : {},
     accountId: REVIEWED_LOCAL_ACCOUNT,
     idempotency: descriptor.effect === "read" ? { required: false, policy: "none" } : { required: true, policy: "key_before_dispatch" },
-    reconciliation: observed2.execution.adapter === "workspace_script_v1" ? { supported: false, policy: "uncertain_if_absent" } : descriptor.effect === "read" ? { supported: false, policy: "none" } : { supported: true, policy: "exact_artifact" },
+    reconciliation: observed2.execution.reconciliation === "none" && descriptor.effect !== "read" ? { supported: false, policy: "uncertain_if_absent" } : descriptor.effect === "read" ? { supported: false, policy: "none" } : { supported: true, policy: "exact_artifact" },
     outputContract: { kind: descriptor.outputKind ?? observed2.definition.consequence },
     purpose: descriptor.purpose,
     acceptedInputKinds: [...descriptor.acceptedInputKinds],
@@ -2163,12 +2805,38 @@ function reviewedLocalCapabilityManifest(observed2) {
   });
 }
 function reviewedLocalToolArgumentsMatch(observed2, args) {
+  if (observed2.execution.adapter === "cloud_browser_operation_v1") {
+    if (!cloudBrowserOperationName(observed2.definition.name)) return false;
+    try {
+      parseCloudBrowserArguments(observed2.definition.name, args);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (observed2.execution.adapter === "browser_operation_v1") {
+    if (!browserOperationName(observed2.definition.name)) return false;
+    try {
+      parseBrowserOperationArguments(observed2.definition.name, args);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   if (observed2.execution.adapter === "workspace_script_v1") return workspaceScriptArguments.safeParse(args).success;
   if (observed2.execution.adapter === "local_file_read_v1") {
-    return import_zod7.z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
+    return import_zod10.z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
+  }
+  if (observed2.execution.adapter === "workspace_snapshot_read_v1") {
+    try {
+      prepareWorkspaceGet(args);
+      return true;
+    } catch {
+      return false;
+    }
   }
   if (observed2.execution.adapter === "artifact_bundle_v1") {
-    const parsed = import_zod7.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
+    const parsed = import_zod10.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
     if (!parsed.success) return false;
   } else if (observed2.execution.adapter === "workspace_dataset_v1") {
     try {
@@ -2177,7 +2845,7 @@ function reviewedLocalToolArgumentsMatch(observed2, args) {
       return false;
     }
   } else if (observed2.execution.adapter === "local_file_revision_v1") {
-    if (!import_zod7.z.strictObject(WRITE_FILE_PARAMS).safeParse(args).success) return false;
+    if (!import_zod10.z.strictObject(WRITE_FILE_PARAMS).safeParse(args).success) return false;
   } else {
     return false;
   }
@@ -2207,6 +2875,24 @@ function prepareReviewedLocalToolExecution(call) {
   if (!reviewedLocalToolArgumentsMatch(observed2, call.args)) {
     throw new Error("reviewed local execution arguments exceed the declared safe mode");
   }
+  if (observed2.execution.adapter === "cloud_browser_operation_v1") {
+    if (!cloudBrowserOperationName(observed2.definition.name)) throw new Error("Unknown cloud browser operation");
+    return {
+      observed: observed2,
+      adapter: observed2.execution.adapter,
+      operation: observed2.definition.name,
+      args: parseCloudBrowserArguments(observed2.definition.name, call.args)
+    };
+  }
+  if (observed2.execution.adapter === "browser_operation_v1") {
+    if (!browserOperationName(observed2.definition.name)) throw new Error("Unknown reviewed browser operation");
+    return {
+      observed: observed2,
+      adapter: observed2.execution.adapter,
+      operation: observed2.definition.name,
+      args: parseBrowserOperationArguments(observed2.definition.name, call.args)
+    };
+  }
   if (observed2.execution.adapter === "workspace_script_v1") {
     return { observed: observed2, adapter: observed2.execution.adapter, args: workspaceScriptArguments.parse(call.args) };
   }
@@ -2214,21 +2900,24 @@ function prepareReviewedLocalToolExecution(call) {
     return {
       observed: observed2,
       adapter: observed2.execution.adapter,
-      args: import_zod7.z.strictObject(READ_FILE_PARAMS).parse({ ...call.args, max_chars: call.args.max_chars ?? null })
+      args: import_zod10.z.strictObject(READ_FILE_PARAMS).parse({ ...call.args, max_chars: call.args.max_chars ?? null })
     };
+  }
+  if (observed2.execution.adapter === "workspace_snapshot_read_v1") {
+    return { observed: observed2, adapter: observed2.execution.adapter, args: prepareWorkspaceGet(call.args) };
   }
   if (observed2.execution.adapter === "artifact_bundle_v1") {
     return {
       observed: observed2,
       adapter: observed2.execution.adapter,
-      args: import_zod7.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args)
+      args: import_zod10.z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).parse(call.args)
     };
   }
   if (observed2.execution.adapter === "local_file_revision_v1") {
     return {
       observed: observed2,
       adapter: observed2.execution.adapter,
-      args: import_zod7.z.strictObject(WRITE_FILE_PARAMS).parse(call.args)
+      args: import_zod10.z.strictObject(WRITE_FILE_PARAMS).parse(call.args)
     };
   }
   return {
@@ -2259,13 +2948,715 @@ async function reconcileReviewedLocalTool(input) {
 }
 
 // src/runtime/harness/reviewed-cli-read-transport.ts
-var import_node_child_process = require("node:child_process");
-var import_node_crypto8 = require("node:crypto");
+var import_node_child_process2 = require("node:child_process");
+var import_node_crypto11 = require("node:crypto");
+
+// src/runtime/spawn-env.ts
+var import_node_path8 = __toESM(require("node:path"), 1);
+var import_node_os2 = __toESM(require("node:os"), 1);
+var import_node_fs7 = require("node:fs");
+
+// src/runtime/child-env-layers.ts
+function windowsLayer(layer) {
+  const entries = /* @__PURE__ */ new Map();
+  for (const [key, value] of Object.entries(layer)) {
+    if (typeof value !== "string") continue;
+    const identity = key.toUpperCase();
+    const previous = entries.get(identity);
+    if (previous?.key === identity && key !== identity) continue;
+    entries.set(identity, { key, value });
+  }
+  return entries;
+}
+function childEnvValue(layer, name, platform = process.platform) {
+  if (platform === "win32") {
+    const identity = name.toUpperCase();
+    let value;
+    for (const [key, candidate] of Object.entries(layer)) {
+      if (key.toUpperCase() !== identity || typeof candidate !== "string") continue;
+      if (key === identity) return candidate;
+      value = candidate;
+    }
+    return value;
+  }
+  return Object.hasOwn(layer, name) && typeof layer[name] === "string" ? layer[name] : void 0;
+}
+function mergeChildEnvLayers(layers, platform = process.platform) {
+  if (platform !== "win32") return Object.fromEntries(layers.flatMap((layer) => Object.entries(layer).filter((entry) => typeof entry[1] === "string")));
+  const merged = /* @__PURE__ */ new Map();
+  for (const layer of layers) for (const [identity, entry] of windowsLayer(layer)) merged.set(identity, entry);
+  return Object.fromEntries([...merged].map(([identity, { key, value }]) => [identity === "PATH" ? "PATH" : key, value]));
+}
+
+// src/runtime/spawn-env.ts
+function existingDirectory(candidate) {
+  try {
+    return (0, import_node_fs7.statSync)(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function versionDirectories(root, suffix = []) {
+  let names;
+  try {
+    names = (0, import_node_fs7.readdirSync)(root);
+  } catch {
+    return [];
+  }
+  return names.sort((a, b) => b.localeCompare(a, void 0, { numeric: true, sensitivity: "base" })).map((name) => import_node_path8.default.join(root, name, ...suffix)).filter(existingDirectory);
+}
+function nvmDefaultBin(home) {
+  const nvm = import_node_path8.default.join(home, ".nvm");
+  let value;
+  try {
+    value = (0, import_node_fs7.readFileSync)(import_node_path8.default.join(nvm, "alias", "default"), "utf8").trim();
+  } catch {
+    return null;
+  }
+  for (let hop = 0; hop < 3 && value && !/^v?\d/.test(value); hop += 1) {
+    try {
+      value = (0, import_node_fs7.readFileSync)(import_node_path8.default.join(nvm, "alias", value), "utf8").trim();
+    } catch {
+      return null;
+    }
+  }
+  if (!/^v?\d/.test(value)) return null;
+  const want = value.startsWith("v") ? value : `v${value}`;
+  const match = versionDirectories(import_node_path8.default.join(nvm, "versions", "node")).find((dir) => {
+    const name = import_node_path8.default.basename(dir);
+    return name === want || name.startsWith(`${want}.`);
+  });
+  return match && existingDirectory(import_node_path8.default.join(match, "bin")) ? import_node_path8.default.join(match, "bin") : null;
+}
+function nvmExecutableDirs(home) {
+  const all = versionDirectories(import_node_path8.default.join(home, ".nvm", "versions", "node"), ["bin"]);
+  const preferred = nvmDefaultBin(home);
+  return preferred ? [preferred, ...all.filter((dir) => dir !== preferred)] : all;
+}
+function userManagedExecutableDirs(home) {
+  if (!home) return [];
+  const candidates = [
+    import_node_path8.default.join(home, ".volta", "bin"),
+    import_node_path8.default.join(home, ".asdf", "shims"),
+    import_node_path8.default.join(home, ".local", "share", "mise", "shims"),
+    import_node_path8.default.join(home, ".mise", "shims"),
+    import_node_path8.default.join(home, ".local", "share", "fnm", "aliases", "default", "bin"),
+    import_node_path8.default.join(home, ".fnm", "aliases", "default", "bin"),
+    ...nvmExecutableDirs(home),
+    ...versionDirectories(import_node_path8.default.join(home, ".local", "share", "fnm", "node-versions"), ["installation", "bin"]),
+    ...versionDirectories(import_node_path8.default.join(home, ".fnm", "node-versions"), ["installation", "bin"])
+  ];
+  const npmPrefix = process.env.NPM_CONFIG_PREFIX ?? process.env.npm_config_prefix;
+  if (npmPrefix?.trim()) candidates.push(import_node_path8.default.join(npmPrefix.trim(), "bin"));
+  return [...new Set(candidates.filter(existingDirectory))];
+}
+function isolatedNpmCache(env2, platform) {
+  if (childEnvValue(env2, "NPM_CONFIG_CACHE", platform) !== void 0 || childEnvValue(env2, "npm_config_cache", platform) !== void 0) return void 0;
+  let base;
+  try {
+    base = process.env.CLEMENTINE_HOME?.trim() || import_node_path8.default.join(import_node_os2.default.homedir(), ".clementine-next");
+  } catch {
+    return void 0;
+  }
+  const cache = import_node_path8.default.join(base, "cache", "npm");
+  try {
+    (0, import_node_fs7.mkdirSync)(cache, { recursive: true, mode: 448 });
+    if (!(0, import_node_fs7.statSync)(cache).isDirectory()) return void 0;
+    (0, import_node_fs7.accessSync)(cache, import_node_fs7.constants.W_OK | import_node_fs7.constants.X_OK);
+    return cache;
+  } catch {
+    return void 0;
+  }
+}
+function augmentPath(existing) {
+  const candidates = [];
+  try {
+    const dir = import_node_path8.default.dirname(process.execPath);
+    if (dir) candidates.push(dir);
+  } catch {
+  }
+  try {
+    const home = import_node_os2.default.homedir();
+    if (home) {
+      if (process.platform === "win32") {
+        candidates.push(import_node_path8.default.join(home, "scoop", "shims"));
+      } else {
+        candidates.push(...userManagedExecutableDirs(home));
+        candidates.push(import_node_path8.default.join(home, ".local", "bin"));
+      }
+    }
+  } catch {
+  }
+  if (process.platform === "win32") {
+    if (process.env.APPDATA) candidates.push(import_node_path8.default.join(process.env.APPDATA, "npm"));
+    if (process.env.LOCALAPPDATA) candidates.push(import_node_path8.default.join(process.env.LOCALAPPDATA, "Microsoft", "WindowsApps"));
+    if (process.env.ProgramData) candidates.push(import_node_path8.default.join(process.env.ProgramData, "chocolatey", "bin"));
+    if (process.env.SCOOP) candidates.push(import_node_path8.default.join(process.env.SCOOP, "shims"));
+  } else {
+    candidates.push(
+      "/opt/homebrew/bin",
+      "/opt/homebrew/sbin",
+      "/usr/local/bin",
+      "/usr/local/sbin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    );
+  }
+  const existingParts = (existing ?? "").split(import_node_path8.default.delimiter).filter(Boolean);
+  const seen = new Set(existingParts);
+  const prepend = [];
+  for (const dir of candidates) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    prepend.push(dir);
+  }
+  return [...prepend, ...existingParts].join(import_node_path8.default.delimiter);
+}
+var CLI_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+var cliEnvCache;
+function cliEnvGeneration(stat) {
+  return `${stat.dev}\0${stat.ino}\0${stat.ctimeNs}\0${stat.mtimeNs}\0${stat.size}`;
+}
+function readCliEnvValues(file, before) {
+  const generation = cliEnvGeneration(before);
+  const fd = (0, import_node_fs7.openSync)(file, "r");
+  try {
+    const opened = (0, import_node_fs7.fstatSync)(fd, { bigint: true });
+    if (!opened.isFile() || cliEnvGeneration(opened) !== generation) throw new Error("CLI environment changed before read");
+    const text = (0, import_node_fs7.readFileSync)(fd, "utf8");
+    const afterRead = (0, import_node_fs7.fstatSync)(fd, { bigint: true });
+    const afterPath = (0, import_node_fs7.statSync)(file, { bigint: true });
+    if (!afterRead.isFile() || !afterPath.isFile() || cliEnvGeneration(afterRead) !== generation || cliEnvGeneration(afterPath) !== generation) {
+      throw new Error("CLI environment changed during read");
+    }
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("CLI environment is not an object");
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
+      if (!CLI_ENV_KEY.test(key) || key.toUpperCase() === "PATH") return [];
+      if (typeof value === "string") return [[key, value]];
+      if (typeof value === "number" || typeof value === "boolean") return [[key, String(value)]];
+      return [];
+    }));
+  } finally {
+    (0, import_node_fs7.closeSync)(fd);
+  }
+}
+function userDeclaredCliEnv() {
+  let file;
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || import_node_path8.default.join(import_node_os2.default.homedir(), ".clementine-next");
+    file = import_node_path8.default.join(base, "state", "cli-env.json");
+  } catch {
+    cliEnvCache = void 0;
+    return {};
+  }
+  try {
+    const before = (0, import_node_fs7.statSync)(file, { bigint: true });
+    if (!before.isFile()) throw new Error("CLI environment is not a file");
+    const generation = cliEnvGeneration(before);
+    if (cliEnvCache?.file === file && cliEnvCache.generation === generation) {
+      return Object.fromEntries(Object.entries(cliEnvCache.values));
+    }
+    const values = Object.freeze(readCliEnvValues(file, before));
+    cliEnvCache = { file, generation, values };
+    return Object.fromEntries(Object.entries(values));
+  } catch {
+    cliEnvCache = void 0;
+    return {};
+  }
+}
+function connectedCliBinDir() {
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || import_node_path8.default.join(import_node_os2.default.homedir(), ".clementine-next");
+    return import_node_path8.default.join(base, "state", "connected-cli-bin");
+  } catch {
+    return void 0;
+  }
+}
+function withConnectedCliBin(pathValue) {
+  if (process.platform === "win32") return pathValue;
+  const dir = connectedCliBinDir();
+  if (!dir || !existingDirectory(dir)) return pathValue;
+  const rest = pathValue.split(import_node_path8.default.delimiter).filter((part) => part && part !== dir);
+  return [dir, ...rest].join(import_node_path8.default.delimiter);
+}
+function childExecutablePath(inheritedPath) {
+  return withConnectedCliBin(augmentPath(inheritedPath));
+}
+function mergedSpawnEnv(extra = {}, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const inherited = options.inherited ?? process.env;
+  const env2 = mergeChildEnvLayers([
+    inherited,
+    { PATH: childExecutablePath(childEnvValue(inherited, "PATH", platform)) }
+  ], platform);
+  const merged = mergeChildEnvLayers([env2, userDeclaredCliEnv(), extra], platform);
+  const npmCache = isolatedNpmCache(merged, platform);
+  return npmCache ? mergeChildEnvLayers([merged, { NPM_CONFIG_CACHE: npmCache }], platform) : merged;
+}
 
 // src/runtime/harness/reviewed-cli-read-config.ts
-var import_node_crypto7 = require("node:crypto");
-var import_node_fs4 = require("node:fs");
-var import_node_path6 = __toESM(require("node:path"), 1);
+var import_node_crypto10 = require("node:crypto");
+var import_node_fs10 = require("node:fs");
+var import_node_path12 = __toESM(require("node:path"), 1);
+
+// src/integrations/cli-catalog/catalog-entries.ts
+function catalogReviewedReadsOf(entry) {
+  return Object.freeze([
+    ...entry.reviewedRead ? [entry.reviewedRead] : [],
+    ...entry.reviewedReads ?? []
+  ]);
+}
+var CLI_CATALOG = [
+  {
+    id: "salesforce",
+    name: "Salesforce CLI",
+    command: "sf",
+    vendor: "Salesforce",
+    description: "Manage Salesforce orgs, deploy metadata, run SOQL, and automate Apex.",
+    tags: ["salesforce", "sf", "sfdx", "crm", "apex", "soql"],
+    installCommand: "npm install -g @salesforce/cli",
+    installSource: "npm",
+    authDocsUrl: "https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_auth_intro.htm",
+    authCommand: "sf org login web -a default",
+    homepage: "https://developer.salesforce.com/tools/salesforcecli",
+    // Default-org only. `sf org list` would classify a second inactive org
+    // as signed-out even when the default org is Connected.
+    authProbe: {
+      args: ["org", "display", "--json"],
+      failurePatterns: [
+        { pattern: "SecKeychain|keychain.*(?:locked|incorrect|not correct)|user name or passphrase you entered is not correct", kind: "credential_store_unavailable" },
+        { pattern: "NoDefault(?:Env|OrgFound)Error|no default (?:environment|org)", kind: "configuration_required" }
+      ],
+      signedOutPattern: "No default org found|NoAuthInfoFound|no default org|Not authenticated|No org found|unable to refresh session",
+      usernameCapture: '"username"\\s*:\\s*"([^"]+)"',
+      connectionOriginPath: ["result", "instanceUrl"],
+      timeoutMs: 15e3
+    },
+    reviewedRead: {
+      descriptorId: "salesforce.data.query",
+      operationId: "salesforce_sf_soql_query",
+      displayName: "Salesforce CLI SOQL query",
+      description: 'Read-only SOQL via the local Salesforce sf CLI (sf data query --json). Query Salesforce opportunities, accounts, contacts, leads, and deals. If it fails because no default org is set, read salesforce_sf_org_list and fix it with cli_setup {action:"repairs", catalogId:"salesforce"} \u2014 never report that you cannot run the command.',
+      argvPrefix: ["data", "query", "--json"],
+      arguments: [
+        { name: "query", kind: "option", token: "--query", valueType: "string", required: true },
+        { name: "target_org", kind: "option", token: "--target-org", valueType: "string", required: false }
+      ],
+      limits: {
+        timeoutMs: 6e4,
+        maxStdoutBytes: 1048576,
+        maxStderrBytes: 65536,
+        maxArgumentBytes: 32768
+      }
+    },
+    repairs: [
+      {
+        id: "salesforce.default-org",
+        title: "Set the default Salesforce org",
+        description: "Point the Salesforce CLI at one of its authenticated orgs, so commands that do not name an org stop failing (sf config set target-org=<org> --global).",
+        argv: ["config", "set", "target-org={org}", "--global"],
+        arguments: [
+          { name: "org", description: "Username or alias of an authenticated org, exactly as the org list reports it.", required: true }
+        ],
+        diagnosis: "salesforce_sf_org_list",
+        failureSignals: [
+          "NoDefaultEnvError",
+          "No default environment",
+          "No default org",
+          "no default org"
+        ],
+        limits: { timeoutMs: 3e4, maxStdoutBytes: 65536, maxStderrBytes: 65536 }
+      }
+    ],
+    reviewedReads: [
+      {
+        descriptorId: "salesforce.org.list",
+        operationId: "salesforce_sf_org_list",
+        displayName: "Salesforce CLI org list",
+        description: "List the Salesforce orgs this machine is authenticated to (sf org list --json): each org's username, alias, connection status, and which one is the default target-org. Read this before reporting a Salesforce CLI authentication problem.",
+        argvPrefix: ["org", "list", "--json"],
+        arguments: [],
+        limits: {
+          timeoutMs: 3e4,
+          maxStdoutBytes: 262144,
+          maxStderrBytes: 65536,
+          maxArgumentBytes: 1024
+        }
+      }
+    ]
+  },
+  {
+    id: "higgsfield",
+    name: "Higgsfield CLI",
+    command: "higgsfield",
+    vendor: "Higgsfield",
+    description: "Run Higgsfield image, video, and Marketing Studio generative workflows from the terminal.",
+    tags: ["higgsfield", "higgs", "hf", "video", "image", "generative", "ai", "marketing studio", "soul-id", "product-photoshoot"],
+    installCommand: "npm install -g @higgsfield/cli",
+    installSource: "npm",
+    authDocsUrl: "https://higgsfield.ai/cli",
+    // Note: subcommand `auth login`, not bare `login` (verified against
+    // higgsfield 0.1.33). Surfaces as the post-install bootstrap step
+    // so the user knows the exact handshake command.
+    authCommand: "higgsfield auth login",
+    homepage: "https://higgsfield.ai"
+  },
+  {
+    id: "railway",
+    name: "Railway CLI",
+    command: "railway",
+    vendor: "Railway",
+    description: "Deploy services, manage environments, and tail logs on Railway.",
+    tags: ["railway", "deploy", "paas"],
+    installCommand: "npm install -g @railway/cli",
+    installSource: "npm",
+    authDocsUrl: "https://docs.railway.com/guides/cli",
+    authCommand: "railway login",
+    // Verified live: exit 0 + "Logged in as user@host 👋"; signed out
+    // reports "Unauthorized. Please login with `railway login`".
+    authProbe: { args: ["whoami"], signedOutPattern: "unauthorized|not logged in", usernameCapture: "Logged in as (\\S+)" },
+    // `railway login` opens the browser and waits on a callback — no TTY
+    // input. Job runner enforces a hard timeout as the safety net.
+    authHeadless: true,
+    homepage: "https://railway.com"
+  },
+  {
+    id: "vercel",
+    name: "Vercel CLI",
+    command: "vercel",
+    vendor: "Vercel",
+    description: "Deploy front-end and edge functions to Vercel, manage projects + domains.",
+    tags: ["vercel", "deploy", "next.js", "nextjs", "edge"],
+    installCommand: "npm install -g vercel",
+    installSource: "npm",
+    authDocsUrl: "https://vercel.com/docs/cli",
+    authCommand: "vercel login",
+    homepage: "https://vercel.com"
+  },
+  {
+    id: "supabase",
+    name: "Supabase CLI",
+    command: "supabase",
+    vendor: "Supabase",
+    description: "Local dev + migrations + Edge Functions for Supabase projects.",
+    tags: ["supabase", "postgres", "database", "edge functions"],
+    installCommand: "brew install supabase/tap/supabase",
+    installSource: "brew",
+    authDocsUrl: "https://supabase.com/docs/guides/local-development/cli/getting-started",
+    authCommand: "supabase login",
+    homepage: "https://supabase.com"
+  },
+  {
+    id: "github",
+    name: "GitHub CLI",
+    command: "gh",
+    vendor: "GitHub",
+    description: "Work with PRs, issues, releases, and Actions from the terminal.",
+    tags: ["github", "gh", "git", "pr", "pull request"],
+    installCommand: "brew install gh",
+    installSource: "brew",
+    authDocsUrl: "https://docs.github.com/en/github-cli/github-cli/quickstart",
+    authCommand: "gh auth login",
+    homepage: "https://cli.github.com"
+  },
+  {
+    id: "aws",
+    name: "AWS CLI",
+    command: "aws",
+    vendor: "Amazon Web Services",
+    description: "Manage every AWS service from S3 to IAM to Lambda.",
+    tags: ["aws", "amazon", "s3", "iam", "lambda", "ec2"],
+    installCommand: "brew install awscli",
+    installSource: "brew",
+    authDocsUrl: "https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html",
+    authCommand: "aws configure",
+    homepage: "https://aws.amazon.com/cli/"
+  },
+  {
+    id: "gcloud",
+    name: "Google Cloud CLI",
+    command: "gcloud",
+    vendor: "Google Cloud",
+    description: "Manage GCP projects, services, and resources.",
+    tags: ["gcloud", "gcp", "google cloud", "firebase"],
+    installCommand: "brew install --cask google-cloud-sdk",
+    installSource: "brew",
+    authDocsUrl: "https://cloud.google.com/sdk/docs/initializing",
+    authCommand: "gcloud init",
+    // Verified live: active account as a JSON array; with NO active
+    // account it prints `[]` and still exits 0 — the pattern carries the
+    // signed-out truth, not the exit code.
+    authProbe: { args: ["auth", "list", "--format=json", "--filter=status:ACTIVE"], signedOutPattern: "^\\s*\\[\\s*\\]\\s*$", usernameCapture: '"account":\\s*"([^"]+)"', timeoutMs: 1e4 },
+    homepage: "https://cloud.google.com/sdk"
+  },
+  {
+    id: "heroku",
+    name: "Heroku CLI (manual)",
+    // Note: Heroku is intentionally omitted from auto-install because
+    // the canonical brew form is `brew tap heroku/brew && brew install
+    // heroku`, which is a two-step command our installer allowlist
+    // rejects. Listed here so search finds it, but installCommand
+    // points the user at the docs rather than running a broken cmd.
+    command: "heroku",
+    vendor: "Heroku",
+    description: "Manage Heroku apps, dynos, addons, and releases. Install via the linked docs.",
+    tags: ["heroku", "paas", "deploy"],
+    installCommand: "brew install heroku",
+    installSource: "brew",
+    authDocsUrl: "https://devcenter.heroku.com/articles/heroku-cli",
+    authCommand: "heroku login",
+    homepage: "https://devcenter.heroku.com/articles/heroku-cli"
+  },
+  {
+    id: "stripe",
+    name: "Stripe CLI",
+    command: "stripe",
+    vendor: "Stripe",
+    description: "Trigger events, tail webhook logs, manage products and prices.",
+    tags: ["stripe", "payments", "webhooks"],
+    installCommand: "brew install stripe/stripe-cli/stripe",
+    installSource: "brew",
+    authDocsUrl: "https://docs.stripe.com/stripe-cli",
+    authCommand: "stripe login",
+    homepage: "https://stripe.com/docs/stripe-cli"
+  },
+  {
+    id: "wrangler",
+    name: "Cloudflare Wrangler",
+    command: "wrangler",
+    vendor: "Cloudflare",
+    description: "Build, deploy, and tail Workers; manage Pages, KV, R2, D1.",
+    tags: ["cloudflare", "wrangler", "workers", "pages", "kv", "r2", "d1"],
+    installCommand: "npm install -g wrangler",
+    installSource: "npm",
+    authDocsUrl: "https://developers.cloudflare.com/workers/wrangler/get-started/",
+    authCommand: "wrangler login",
+    homepage: "https://developers.cloudflare.com/workers/"
+  },
+  {
+    id: "flyio",
+    name: "Fly.io CLI",
+    command: "flyctl",
+    vendor: "Fly.io",
+    description: "Deploy apps globally on Fly.io machines.",
+    tags: ["fly", "flyio", "fly.io", "flyctl", "deploy"],
+    installCommand: "brew install flyctl",
+    installSource: "brew",
+    authDocsUrl: "https://fly.io/docs/flyctl/auth-login/",
+    authCommand: "flyctl auth login",
+    homepage: "https://fly.io"
+  },
+  {
+    id: "netlify",
+    name: "Netlify CLI",
+    command: "netlify",
+    vendor: "Netlify",
+    description: "Deploy sites, run local dev, manage Netlify Functions.",
+    tags: ["netlify", "jamstack", "deploy"],
+    installCommand: "npm install -g netlify-cli",
+    installSource: "npm",
+    authDocsUrl: "https://docs.netlify.com/cli/get-started/",
+    authCommand: "netlify login",
+    // Verified live: exit 0 with a "Current Netlify User" block (ANSI
+    // colored — auth-health strips escapes) even outside a linked
+    // project; signed out prints "Not logged in".
+    authProbe: { args: ["status"], signedOutPattern: "not logged in", usernameCapture: "Email:\\s*(\\S+)", timeoutMs: 1e4 },
+    authHeadless: true,
+    homepage: "https://www.netlify.com"
+  },
+  {
+    id: "doppler",
+    name: "Doppler CLI",
+    command: "doppler",
+    vendor: "Doppler",
+    description: "Sync secrets across environments without checking them into source.",
+    tags: ["doppler", "secrets", "env"],
+    installCommand: "brew install dopplerhq/cli/doppler",
+    installSource: "brew",
+    authDocsUrl: "https://docs.doppler.com/docs/install-cli",
+    authCommand: "doppler login",
+    homepage: "https://www.doppler.com"
+  },
+  {
+    id: "ngrok",
+    name: "ngrok",
+    command: "ngrok",
+    vendor: "ngrok",
+    description: "Expose local servers to the public internet via secure tunnels.",
+    tags: ["ngrok", "tunnel", "webhook"],
+    installCommand: "brew install ngrok/ngrok/ngrok",
+    installSource: "brew",
+    authDocsUrl: "https://ngrok.com/docs/getting-started/",
+    authCommand: "ngrok config add-authtoken <your-token>",
+    homepage: "https://ngrok.com"
+  },
+  {
+    id: "doctl",
+    name: "DigitalOcean CLI",
+    command: "doctl",
+    vendor: "DigitalOcean",
+    description: "Manage Droplets, Apps, Kubernetes, and Spaces on DigitalOcean.",
+    tags: ["digitalocean", "doctl", "do"],
+    installCommand: "brew install doctl",
+    installSource: "brew",
+    authDocsUrl: "https://docs.digitalocean.com/reference/doctl/how-to/install/",
+    authCommand: "doctl auth init",
+    homepage: "https://www.digitalocean.com/products/tools"
+  },
+  // Guest agent harnesses — these two are what project_run drives inside the
+  // user's local projects. They cannot ship bundled with the app (Claude Code
+  // is proprietary; both self-update and carry per-user subscription auth),
+  // so install-on-demand through this catalog IS the distribution story.
+  {
+    id: "claude-code",
+    name: "Claude Code",
+    command: "claude",
+    vendor: "Anthropic",
+    description: "Anthropic\u2019s coding agent \u2014 runs your projects\u2019 slash commands and skills on your Claude subscription.",
+    tags: ["claude", "claude code", "anthropic", "agent", "harness", "coding"],
+    installCommand: "npm install -g @anthropic-ai/claude-code",
+    installSource: "npm",
+    authDocsUrl: "https://docs.anthropic.com/en/docs/claude-code/setup",
+    authCommand: "claude auth login",
+    // Verified live (claude 2.1.220): `claude auth status` exits 0 with JSON
+    // {"loggedIn":true,...,"email":"..."}. Signed-out shape not exercised
+    // (would require logging the user out) — pattern targets the documented
+    // loggedIn:false field, and pattern-first classification covers an
+    // exit-0 signed-out report, same trap class as gcloud.
+    authProbe: { args: ["auth", "status"], signedOutPattern: '"loggedIn"\\s*:\\s*false', usernameCapture: '"email"\\s*:\\s*"([^"]+)"' },
+    homepage: "https://www.anthropic.com/claude-code"
+  },
+  {
+    id: "codex",
+    name: "Codex CLI",
+    command: "codex",
+    vendor: "OpenAI",
+    description: "OpenAI\u2019s coding agent \u2014 works in your projects on your ChatGPT subscription.",
+    tags: ["codex", "openai", "chatgpt", "agent", "harness", "coding"],
+    installCommand: "npm install -g @openai/codex",
+    installSource: "npm",
+    authDocsUrl: "https://developers.openai.com/codex/cli",
+    authCommand: "codex login",
+    // Verified live (codex-cli 0.144.3): `codex login status` exits 0 with
+    // "Logged in using ChatGPT". Signed-out shape not exercised — the CLI
+    // reports "Not logged in" per its own docs/help.
+    authProbe: { args: ["login", "status"], signedOutPattern: "not logged in", usernameCapture: "Logged in using (\\S+)" },
+    homepage: "https://developers.openai.com/codex"
+  }
+];
+
+// src/integrations/cli-catalog/cli-executable-identity.ts
+var import_node_path9 = __toESM(require("node:path"), 1);
+function cliHealthExecutableIdentity(binaryPath, platform = process.platform) {
+  if (!binaryPath || binaryPath !== binaryPath.trim() || /[\u0000-\u001f\u007f]/.test(binaryPath)) return null;
+  if (platform === "win32") {
+    const normalized = import_node_path9.default.win32.normalize(binaryPath);
+    const fullyQualified = /^[A-Za-z]:\\/.test(normalized) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(normalized);
+    return fullyQualified ? normalized.toLowerCase() : null;
+  }
+  return import_node_path9.default.posix.isAbsolute(binaryPath) ? binaryPath : null;
+}
+
+// src/integrations/cli-catalog/connected-cli-executable-selection.ts
+var import_node_path10 = __toESM(require("node:path"), 1);
+var import_node_fs8 = require("node:fs");
+
+// src/integrations/cli-catalog/cli-connection-revision.ts
+var import_node_crypto8 = require("node:crypto");
+function record3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (!record3(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+}
+function connectedCliRevision(value) {
+  if (!record3(value)) return null;
+  if (Object.hasOwn(value, "connectionRevision")) {
+    const revision = value.connectionRevision;
+    return typeof revision === "string" && revision.length > 0 && revision.length <= 128 && !/[\u0000-\u0020\u007f]/.test(revision) ? revision : null;
+  }
+  return `legacy:${(0, import_node_crypto8.createHash)("sha256").update(JSON.stringify(canonical(value))).digest("hex")}`;
+}
+function cliHealthMatchesConnection(connected, health) {
+  if (!record3(connected) || !record3(health) || !Object.hasOwn(connected, "id") || !Object.hasOwn(connected, "command") || !Object.hasOwn(health, "id") || !Object.hasOwn(health, "command") || typeof connected.id !== "string" || !connected.id || typeof connected.command !== "string" || !connected.command || connected.id !== health.id || connected.command !== health.command) return false;
+  const revision = connectedCliRevision(connected);
+  if (!revision) return false;
+  return !Object.hasOwn(connected, "connectionRevision") && !Object.hasOwn(health, "connectionRevision") || health.connectionRevision === revision;
+}
+
+// src/integrations/cli-catalog/connected-cli-executable-selection.ts
+function record4(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function reviewedCliExecutablePathIsSupported(executablePath, platform = process.platform) {
+  return platform !== "win32" || import_node_path10.default.win32.extname(executablePath).toLowerCase() === ".exe";
+}
+function reviewedCliExecutableFileIsSupported(input) {
+  const platform = input.platform ?? process.platform;
+  if (!input.isFile || !reviewedCliExecutablePathIsSupported(input.executablePath, platform)) return false;
+  if (platform === "win32") return true;
+  if (typeof input.mode === "number" && !Number.isInteger(input.mode)) return false;
+  return (BigInt(input.mode) & 0o111n) !== 0n;
+}
+function selectConnectedCliExecutable(target3, input) {
+  const platform = input.platform ?? process.platform;
+  if (input.forgotten.includes(target3.id)) return { status: "blocked", reason: "forgotten" };
+  if (!record4(input.connected)) return { status: "blocked", reason: "malformed_roster" };
+  if (!Object.hasOwn(input.connected, target3.id)) return { status: "unbound", reason: "not_connected" };
+  const connected = input.connected[target3.id];
+  if (!record4(connected)) return { status: "blocked", reason: "malformed_roster" };
+  if (!Object.hasOwn(connected, "id") || !Object.hasOwn(connected, "command") || connected.id !== target3.id || connected.command !== target3.command) {
+    return { status: "blocked", reason: "roster_identity_mismatch" };
+  }
+  if (!record4(input.health)) return { status: "blocked", reason: "malformed_health" };
+  if (!Object.hasOwn(input.health, target3.id)) return { status: "unbound", reason: "not_observed" };
+  const health = input.health[target3.id];
+  if (!record4(health)) return { status: "blocked", reason: "malformed_health" };
+  if (!Object.hasOwn(health, "id") || !Object.hasOwn(health, "command") || health.id !== target3.id || health.command !== target3.command) {
+    return { status: "blocked", reason: "health_identity_mismatch" };
+  }
+  if (!cliHealthMatchesConnection(connected, health)) {
+    return { status: "blocked", reason: "connection_revision_mismatch" };
+  }
+  if (health.installed === false) return { status: "blocked", reason: "not_installed" };
+  if (!Object.hasOwn(health, "installed") || health.installed !== true) return { status: "blocked", reason: "malformed_health" };
+  const binary = Object.hasOwn(health, "binaryPath") && typeof health.binaryPath === "string" ? health.binaryPath : void 0;
+  const identity = cliHealthExecutableIdentity(binary, platform);
+  if (!binary || !identity) return { status: "blocked", reason: "missing_executable_identity" };
+  if (!reviewedCliExecutablePathIsSupported(binary, platform)) {
+    return { status: "blocked", reason: "unsupported_windows_launcher" };
+  }
+  return { status: "selected", executablePath: binary, executableIdentity: identity };
+}
+function readMetadata(file) {
+  try {
+    return JSON.parse((0, import_node_fs8.readFileSync)(file, "utf8"));
+  } catch (error) {
+    return error.code === "ENOENT" ? void 0 : null;
+  }
+}
+function readConnectedCliExecutableSelection(target3, options = {}) {
+  const state = import_node_path10.default.join(options.baseDir ?? BASE_DIR, "state");
+  const roster = readMetadata(import_node_path10.default.join(state, "connected-clis.json"));
+  const health = readMetadata(import_node_path10.default.join(state, "cli-auth-health.json"));
+  const validRoster = record4(roster) && roster.version === "v1" && Object.hasOwn(roster, "entries");
+  const validHealth = record4(health) && health.version === "v1" && Object.hasOwn(health, "entries");
+  const forgotten = validRoster && roster.forgotten !== void 0 ? roster.forgotten : [];
+  if (!Array.isArray(forgotten) || !forgotten.every((id) => typeof id === "string")) {
+    return { status: "blocked", reason: "malformed_roster" };
+  }
+  return selectConnectedCliExecutable(target3, {
+    connected: roster === void 0 ? {} : validRoster ? roster.entries : null,
+    health: health === void 0 ? {} : validHealth ? health.entries : null,
+    forgotten,
+    platform: options.platform
+  });
+}
 
 // src/runtime/atomic-json.ts
 var import_node_async_hooks2 = require("node:async_hooks");
@@ -2274,9 +3665,9 @@ var UUID_TOKEN_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f
 var OWNER_TOKEN_PATTERN = new RegExp(`^([1-9]\\d*):([1-9]\\d*)(?::(${UUID_TOKEN_PATTERN}))?$`, "i");
 
 // src/runtime/harness/authority-argument-seal.ts
-var import_node_crypto6 = require("node:crypto");
-var import_node_fs3 = require("node:fs");
-var import_node_path5 = __toESM(require("node:path"), 1);
+var import_node_crypto9 = require("node:crypto");
+var import_node_fs9 = require("node:fs");
+var import_node_path11 = __toESM(require("node:path"), 1);
 var SEAL_VERSION = 2;
 var AUTHORITY_ARGUMENT_MAX_PLAINTEXT_BYTES = SEALED_CALL_CANONICAL_LIMITS.maxTotalBytes;
 var AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = Math.min(
@@ -2286,7 +3677,7 @@ var AUTHORITY_ARGUMENT_MAX_CIPHER_BYTES = Math.min(
 );
 var AUTHORITY_SEAL_KEY_ID_V2 = "authority_seal_v2";
 var AUTHORITY_SEAL_KEY_ID_V1 = "authority_seal_v1";
-var VAULT_FILE = import_node_path5.default.join(BASE_DIR, "state", "secrets-vault.json");
+var VAULT_FILE = import_node_path11.default.join(BASE_DIR, "state", "secrets-vault.json");
 var AuthoritySealKeyMissingError = class extends Error {
   code = "authority_seal_key_missing";
   constructor() {
@@ -2299,9 +3690,9 @@ function hexKey(raw) {
   return Buffer.from(raw.trim(), "hex");
 }
 function readVaultEntry(name) {
-  if (!(0, import_node_fs3.existsSync)(VAULT_FILE)) return void 0;
+  if (!(0, import_node_fs9.existsSync)(VAULT_FILE)) return void 0;
   try {
-    const parsed = JSON.parse((0, import_node_fs3.readFileSync)(VAULT_FILE, "utf8"));
+    const parsed = JSON.parse((0, import_node_fs9.readFileSync)(VAULT_FILE, "utf8"));
     if (parsed.version !== "v1" || !parsed.entries) return void 0;
     const value = parsed.entries[name];
     return value && value.length > 0 ? value : void 0;
@@ -2333,7 +3724,7 @@ function openCanonicalArguments(cipherText) {
       }
       lastMissing = false;
       try {
-        const decipher = (0, import_node_crypto6.createDecipheriv)("aes-256-gcm", key, Buffer.from(parsed.iv, "base64"));
+        const decipher = (0, import_node_crypto9.createDecipheriv)("aes-256-gcm", key, Buffer.from(parsed.iv, "base64"));
         decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
         const plain = Buffer.concat([
           decipher.update(Buffer.from(parsed.ct, "base64")),
@@ -2443,7 +3834,7 @@ function closeReviewedCliReadDescriptor(value) {
   const prefix = closedArray(value.argvPrefix, MAX_PREFIX_TOKENS);
   const argumentRows = closedArray(value.arguments, MAX_ARGUMENTS);
   const limits = closeLimits(value.limits);
-  if (value.version !== REVIEWED_CLI_READ_CONFIG_VERSION || !boundedText(value.descriptorId) || !boundedText(value.operationId) || !boundedText(value.displayName) || typeof value.description !== "string" || value.description !== value.description.trim() || Buffer.byteLength(value.description, "utf8") > MAX_DESCRIPTION_BYTES || value.effect !== "read" || value.accountId !== REVIEWED_CLI_READ_ACCOUNT || !boundedText(value.executableRealpath, MAX_TOKEN_BYTES) || !import_node_path6.default.isAbsolute(value.executableRealpath) || import_node_path6.default.resolve(value.executableRealpath) !== value.executableRealpath || typeof value.binarySha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.binarySha256) || !prefix || prefix.some((token) => !boundedText(token, MAX_TOKEN_BYTES)) || !argumentRows || !limits) return null;
+  if (value.version !== REVIEWED_CLI_READ_CONFIG_VERSION || !boundedText(value.descriptorId) || !boundedText(value.operationId) || !boundedText(value.displayName) || typeof value.description !== "string" || value.description !== value.description.trim() || Buffer.byteLength(value.description, "utf8") > MAX_DESCRIPTION_BYTES || value.effect !== "read" || value.accountId !== REVIEWED_CLI_READ_ACCOUNT || !boundedText(value.executableRealpath, MAX_TOKEN_BYTES) || !import_node_path12.default.isAbsolute(value.executableRealpath) || import_node_path12.default.resolve(value.executableRealpath) !== value.executableRealpath || typeof value.binarySha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.binarySha256) || !prefix || prefix.some((token) => !boundedText(token, MAX_TOKEN_BYTES)) || !argumentRows || !limits) return null;
   const args = argumentRows.map(closeArgument);
   if (args.some((row) => !row) || new Set(args.map((row) => row.name)).size !== args.length) return null;
   const closed = {
@@ -2495,12 +3886,12 @@ function closeConfigFile(value) {
   };
 }
 function reviewedCliReadConfigPath() {
-  return import_node_path6.default.join(BASE_DIR, "state", "reviewed-cli-read-descriptors.json");
+  return import_node_path12.default.join(BASE_DIR, "state", "reviewed-cli-read-descriptors.json");
 }
 function listReviewedCliReadDescriptors(filePath = reviewedCliReadConfigPath()) {
   let raw;
   try {
-    raw = (0, import_node_fs4.readFileSync)(filePath, "utf8");
+    raw = (0, import_node_fs10.readFileSync)(filePath, "utf8");
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
@@ -2516,11 +3907,11 @@ function listReviewedCliReadDescriptors(filePath = reviewedCliReadConfigPath()) 
   return Object.freeze(closed.descriptors.map((entry) => Object.freeze(entry.descriptor)));
 }
 function hashOpenFile(fd) {
-  const hash = (0, import_node_crypto7.createHash)("sha256");
+  const hash = (0, import_node_crypto10.createHash)("sha256");
   const buffer = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
   let position = 0;
   for (; ; ) {
-    const count = (0, import_node_fs4.readSync)(fd, buffer, 0, buffer.length, position);
+    const count = (0, import_node_fs10.readSync)(fd, buffer, 0, buffer.length, position);
     if (count === 0) break;
     hash.update(buffer.subarray(0, count));
     position += count;
@@ -2528,22 +3919,22 @@ function hashOpenFile(fd) {
   return hash.digest("hex");
 }
 function observeReviewedCliExecutable(executablePath) {
-  if (!import_node_path6.default.isAbsolute(executablePath) || executablePath.includes("\0")) return null;
+  if (!import_node_path12.default.isAbsolute(executablePath) || executablePath.includes("\0")) return null;
   let real;
   try {
-    real = (0, import_node_fs4.realpathSync)(executablePath);
+    real = (0, import_node_fs10.realpathSync)(executablePath);
   } catch {
     return null;
   }
   let fd = -1;
   try {
-    fd = (0, import_node_fs4.openSync)(real, "r");
-    const before = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
-    if (!before.isFile() || (before.mode & 0o111n) === 0n) return null;
+    fd = (0, import_node_fs10.openSync)(real, "r");
+    const before = (0, import_node_fs10.fstatSync)(fd, { bigint: true });
+    if (!reviewedCliExecutableFileIsSupported({ executablePath: real, isFile: before.isFile(), mode: before.mode })) return null;
     const binarySha256 = hashOpenFile(fd);
-    const after = (0, import_node_fs4.fstatSync)(fd, { bigint: true });
-    const pathAfter = (0, import_node_fs4.realpathSync)(real);
-    const pathStats = (0, import_node_fs4.statSync)(real, { bigint: true });
+    const after = (0, import_node_fs10.fstatSync)(fd, { bigint: true });
+    const pathAfter = (0, import_node_fs10.realpathSync)(real);
+    const pathStats = (0, import_node_fs10.statSync)(real, { bigint: true });
     if (pathAfter !== real || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || after.dev !== pathStats.dev || after.ino !== pathStats.ino || after.size !== pathStats.size || after.mtimeNs !== pathStats.mtimeNs) return null;
     return Object.freeze({
       executableRealpath: real,
@@ -2555,19 +3946,33 @@ function observeReviewedCliExecutable(executablePath) {
   } catch {
     return null;
   } finally {
-    if (fd >= 0) (0, import_node_fs4.closeSync)(fd);
+    if (fd >= 0) (0, import_node_fs10.closeSync)(fd);
   }
 }
 function reviewedCliDescriptorDigest(descriptor) {
   const closed = closeReviewedCliReadDescriptor(descriptor);
   if (!closed) throw new Error("reviewed CLI descriptor is invalid");
-  return (0, import_node_crypto7.createHash)("sha256").update(closedCanonicalJson(closed, CLOSED_OPTIONS), "utf8").digest("hex");
+  return (0, import_node_crypto10.createHash)("sha256").update(closedCanonicalJson(closed, CLOSED_OPTIONS), "utf8").digest("hex");
 }
 function currentReviewedCliDescriptor(descriptor) {
   const closed = closeReviewedCliReadDescriptor(descriptor);
   if (!closed) return null;
+  const catalog = CLI_CATALOG.find((entry) => catalogReviewedReadsOf(entry).some((contract) => contract.descriptorId === closed.descriptorId));
+  const selection = catalog ? readConnectedCliExecutableSelection(catalog) : null;
+  if (selection?.status === "blocked") return null;
+  const selectedPathMatches = () => {
+    if (selection?.status !== "selected") return true;
+    try {
+      const real = (0, import_node_fs10.realpathSync)(selection.executablePath);
+      return reviewedCliExecutablePathIsSupported(real) && cliHealthExecutableIdentity(real) === cliHealthExecutableIdentity(closed.executableRealpath);
+    } catch {
+      return false;
+    }
+  };
+  if (!selectedPathMatches()) return null;
   const executable = observeReviewedCliExecutable(closed.executableRealpath);
   if (!executable || executable.executableRealpath !== closed.executableRealpath || executable.binarySha256 !== closed.binarySha256) return null;
+  if (catalog && (JSON.stringify(readConnectedCliExecutableSelection(catalog)) !== JSON.stringify(selection) || !selectedPathMatches())) return null;
   return closed;
 }
 function reviewedCliInputSchema(descriptor) {
@@ -2705,7 +4110,7 @@ function currentTransportIdentity(descriptor) {
   const schemaFingerprint = stableJsonFingerprint(inputSchema);
   const outputSchemaFingerprint = stableJsonFingerprint(REVIEWED_CLI_OUTPUT_SCHEMA);
   const invokePortId = `port:reviewed-cli:v1:${operationVersion}`;
-  const definitionFingerprint = (0, import_node_crypto8.createHash)("sha256").update(closedCanonicalJson({
+  const definitionFingerprint = (0, import_node_crypto11.createHash)("sha256").update(closedCanonicalJson({
     domain: "live-read-capability-definition",
     version: 1,
     carrier: {
@@ -2818,15 +4223,17 @@ async function executeReviewedCliRead(call) {
   }
   const argv = compileReviewedCliArgv(descriptor, call.args);
   if (!argv) throw new Error("reviewed CLI arguments exceed the closed structured-argv schema");
+  const childEnv = mergedSpawnEnv();
   const before = observeReviewedCliExecutable(descriptor.executableRealpath);
   if (!before || before.binarySha256 !== descriptor.binarySha256) {
     throw new Error("reviewed CLI executable changed before dispatch");
   }
   const outcome = await new Promise((resolve, reject) => {
-    (0, import_node_child_process.execFile)(
+    (0, import_node_child_process2.execFile)(
       descriptor.executableRealpath,
       [...argv],
       {
+        env: childEnv,
         encoding: "utf8",
         timeout: descriptor.limits.timeoutMs,
         maxBuffer: Math.max(
@@ -2876,20 +4283,20 @@ async function executeReviewedCliRead(call) {
 
 // src/runtime/harness/implementation-artifacts/transport-entry.ts
 function here() {
-  return typeof import_meta_url === "string" ? (0, import_node_url2.fileURLToPath)(import_meta_url) : (0, import_node_url2.fileURLToPath)(import_meta_url);
+  return typeof import_meta_url === "string" ? (0, import_node_url3.fileURLToPath)(import_meta_url) : (0, import_node_url3.fileURLToPath)(import_meta_url);
 }
 function findPackageRoot(startFile) {
-  let dir = import_node_path7.default.dirname(startFile);
+  let dir = import_node_path13.default.dirname(startFile);
   for (let i = 0; i < 12; i += 1) {
-    const candidate = import_node_path7.default.join(dir, "package.json");
-    if ((0, import_node_fs5.existsSync)(candidate)) {
+    const candidate = import_node_path13.default.join(dir, "package.json");
+    if ((0, import_node_fs11.existsSync)(candidate)) {
       try {
-        const pkg = JSON.parse((0, import_node_fs5.readFileSync)(candidate, "utf8"));
+        const pkg = JSON.parse((0, import_node_fs11.readFileSync)(candidate, "utf8"));
         if (pkg.name === "clemmy") return dir;
       } catch {
       }
     }
-    const parent = import_node_path7.default.dirname(dir);
+    const parent = import_node_path13.default.dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
@@ -2897,18 +4304,18 @@ function findPackageRoot(startFile) {
 }
 function loadComposioClient() {
   const root = findPackageRoot(here());
-  const req = (0, import_node_module.createRequire)(import_node_path7.default.join(root, "package.json"));
-  const distClient = import_node_path7.default.join(root, "dist", "integrations", "composio", "client.js");
-  if ((0, import_node_fs5.existsSync)(distClient)) {
+  const req = (0, import_node_module.createRequire)(import_node_path13.default.join(root, "package.json"));
+  const distClient = import_node_path13.default.join(root, "dist", "integrations", "composio", "client.js");
+  if ((0, import_node_fs11.existsSync)(distClient)) {
     return req(distClient);
   }
   throw new Error("attested transport could not resolve the packaged provider client");
 }
 function loadNativeMcpCarrier() {
   const root = findPackageRoot(here());
-  const req = (0, import_node_module.createRequire)(import_node_path7.default.join(root, "package.json"));
-  const distCarrier = import_node_path7.default.join(root, "dist", "runtime", "harness", "production-mcp-read-carrier.js");
-  if ((0, import_node_fs5.existsSync)(distCarrier)) {
+  const req = (0, import_node_module.createRequire)(import_node_path13.default.join(root, "package.json"));
+  const distCarrier = import_node_path13.default.join(root, "dist", "runtime", "harness", "production-mcp-read-carrier.js");
+  if ((0, import_node_fs11.existsSync)(distCarrier)) {
     return req(distCarrier);
   }
   throw new Error("attested transport could not resolve the packaged native MCP carrier");
@@ -3094,14 +4501,14 @@ async function reconcileAttestedTransport(input) {
       args: { spreadsheet_id: id },
       accountId: input.accountId
     });
-    const record3 = result && typeof result === "object" ? result : {};
-    const returned = String(record3.spreadsheet_id ?? record3.spreadsheetId ?? record3.id ?? "").trim();
+    const record5 = result && typeof result === "object" ? result : {};
+    const returned = String(record5.spreadsheet_id ?? record5.spreadsheetId ?? record5.id ?? "").trim();
     if (!returned || returned !== id) return { exists: false };
     return {
       exists: true,
       artifactId: id,
-      handle: typeof record3.spreadsheet_url === "string" ? record3.spreadsheet_url : void 0,
-      receipt: typeof record3.receipt === "string" ? record3.receipt : void 0
+      handle: typeof record5.spreadsheet_url === "string" ? record5.spreadsheet_url : void 0,
+      receipt: typeof record5.receipt === "string" ? record5.receipt : void 0
     };
   } catch {
     return { exists: false };
