@@ -967,7 +967,7 @@ const WorkflowReadParallelSubgraphSchema = z.object({
 
 /** What a watch is, for the model authoring one (the watch-setup skill has the how). */
 const WATCH_FIELD_GUIDANCE = 'Make this workflow one of the owner\'s watches: a standing, read-only look at a source they handed you. '
-  + 'Every step only reads (no sends). The last step returns JSON {"findings":[{"title","detail","link"?,"key"?}],"learned":["…"]}: '
+  + 'Every step only reads (no sends): exact call steps list and read, one model step judges. No saved goal and no record of what was seen: the host never raises the same key twice. The last step returns JSON {"findings":[{"title","detail","link"?,"key"?}],"learned":["…"]}: '
   + 'findings are new things that match what the owner asked you to look for (empty list when nothing new); learned are durable things worth remembering about their work. '
   + 'The host keeps what it saw, raises new findings in From Clem as "Your <source> watch", and remembers what you learned. Confirm the source and scope with the owner once before saving.';
 
