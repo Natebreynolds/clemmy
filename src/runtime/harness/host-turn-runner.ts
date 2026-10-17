@@ -7350,9 +7350,13 @@ const runHostTurnBody = async (
           kind: 'direct', toolName: effective.toolName ?? '', args: effective.args,
         });
         if (effective.toolName && normalized.error) {
+          const repair = isPlainOrClementineLocalTool(name, 'work_call')
+            || isPlainOrClementineLocalTool(name, 'call_tool')
+            ? ' Prefer the target arguments as a JSON object in args_json; a complete valid JSON-object string is also accepted. Preserve the exact argument values and any inner provider wrapper. Keep the same name, requirement_id and carrier, and retry this operation without repeating discovery.'
+            : ' Correct the arguments and retry the same operation through the same carrier.';
           return `Tool '${name}' was refused before dispatch because the arguments for '${effective.toolName}' could not be parsed.`
             + ` Failed check: logical_call_contract_missing. ${redactSensitiveText(normalized.errorDetail ?? normalized.error)}.`
-            + ' No local or external mutation was attempted. Correct the arguments and retry the same operation through the same carrier.';
+            + ' No local or external mutation was attempted.' + repair;
         }
       }
       // Name the operations this turn actually bound.

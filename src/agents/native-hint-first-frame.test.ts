@@ -168,6 +168,9 @@ test('hinted native business contract is complete and source-owned before the fi
   assert.equal(rows[0]!.capabilityVariants[0]!.capabilityRef, ref);
   const instructions = String(await f.agent.getSystemPrompt(new RunContext({})));
   const line = instructions.split('\n').find(row => row.startsWith('[current-native-contracts]'))!;
+  assert.match(line, /target arguments as a JSON object in args_json/);
+  assert.match(line, /Preserve any inner string field required by the target schema/);
+  assert.doesNotMatch(line, /arguments encoded as one args_json string/);
   assert.match(line, /For a direct call without a frozen requirement, use the matching capabilityRef as requirement_id/);
   assert.match(line, /After plan_task activates a plan, use that plan's exact requirement id for required steps/);
   assert.match(line, /capabilityRef remains the schema\/definition reference/);

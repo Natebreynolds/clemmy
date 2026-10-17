@@ -1033,10 +1033,15 @@ function listWorkflowFiles(): WorkflowEntry[] {
 export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_list',
-    'List saved workflows as structured records with an exact total. Use detail="names" when only names/count are needed; summary includes descriptions, steps and trigger metadata. Does not execute workflows.',
-    { detail: z.enum(['names', 'summary']).optional().describe('names returns only names and total; summary (default) includes workflow metadata.') },
-    async ({ detail }) => {
-      const workflows = listWorkflowFiles();
+    'List saved workflows as structured records with an exact matching total. For a scoped name/collision check, pass query and detail="names"; query matches a literal case-insensitive substring of a saved name or slug. Omitted or blank query lists all workflows. Summary (default) includes matching descriptions, steps and trigger metadata. Does not execute workflows.',
+    {
+      detail: z.enum(['names', 'summary']).optional().describe('names returns only matching names and total; summary (default) includes workflow metadata.'),
+      query: z.string().optional().describe('Optional literal case-insensitive substring of the saved name or slug. Leading/trailing whitespace is ignored; omitted or blank lists all workflows. No fuzzy matching.'),
+    },
+    async ({ detail, query }) => {
+      const filter = query?.trim().toLowerCase();
+      const workflows = listWorkflowFiles().filter((entry) => !filter
+        || entry.data.name.toLowerCase().includes(filter) || entry.name.toLowerCase().includes(filter));
       const records = workflows.map(({ data }) => detail === 'names'
         ? { name: data.name }
         : { name: data.name, enabled: data.enabled, description: data.description ?? '',

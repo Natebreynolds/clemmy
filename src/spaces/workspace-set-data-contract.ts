@@ -31,7 +31,7 @@ export const WORKSPACE_SET_DATA_TOOL_PARAMETERS = {
   data_json: z.string()
     .min(1)
     .max(WORKSPACE_SET_DATA_MAX_BYTES)
-    .describe('A complete JSON object or array for this source id.'),
+    .describe('A complete JSON object or array encoded as JSON text for this source id. From a structured upstream workflow result, use a zero-model transform with jsonStringify(value) and bind its string output here.'),
 };
 
 export interface WorkspaceSetDataArguments {

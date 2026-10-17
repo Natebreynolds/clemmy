@@ -21,6 +21,9 @@ import type {
 } from './implementation-artifacts/host-local-write-carrier.js';
 import type { AttestedTransportCall, AttestedTransportReconcileResult } from './implementation-artifacts/attested-transport.js';
 import type { BrowserOperationRunner } from '../../integrations/browser-operation.js';
+import { lstatSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { projectWorkspaceSnapshotRead, WorkspaceReadContractError } from '../../spaces/workspace-read-contract.js';
 import {
   observeReviewedLocalTool,
   prepareReviewedLocalToolExecution,
@@ -94,6 +97,76 @@ const localFileReadStorage: HostLocalWriteStorageAdapter = Object.freeze({
   async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
 });
 
+const workspaceSnapshotReadStorage: HostLocalWriteStorageAdapter = Object.freeze({
+  async execute(call: AttestedTransportCall): Promise<unknown> {
+    const prepared = prepareReviewedLocalToolExecution(call);
+    if (prepared.adapter !== 'workspace_snapshot_read_v1') throw new Error('Not a reviewed Workspace snapshot read');
+    const [{ spaceStore, resolveSpaceDir, resolveInSpace }, { withWorkspaceSnapshotRead }, { currentToolAbortSignal }] = await Promise.all([
+      import('../../spaces/store.js'), import('../../spaces/workspace-snapshot.js'), import('../tool-abort-context.js'),
+    ]);
+    const signal = currentToolAbortSignal();
+    signal?.throwIfAborted();
+    const requireDirectRoot = () => {
+      try {
+        const root = lstatSync(resolveSpaceDir(prepared.args.slug));
+        if (!root.isDirectory() || root.isSymbolicLink()) throw new Error('not a direct Workspace directory');
+      } catch {
+        throw new WorkspaceReadContractError('workspace_unavailable', 'The exact saved Workspace directory is unavailable.');
+      }
+    };
+    // Recovery runs while acquiring the existing snapshot owner. Do not enter
+    // it through a pre-existing symlink, and check again under that owner.
+    requireDirectRoot();
+    return withWorkspaceSnapshotRead(prepared.args.slug, () => {
+      signal?.throwIfAborted();
+      requireDirectRoot();
+      // SpaceStore permits legacy manifest-only/empty views. An exact data
+      // read must not turn an absent dataset, symlink or foreign manifest into
+      // a successful empty snapshot, nor escape the requested native target.
+      try {
+        for (const name of prepared.args.metadata_only ? ['space.json'] : ['space.json', 'data.json']) {
+          const file = lstatSync(resolveInSpace(prepared.args.slug, name));
+          if (!file.isFile() || file.isSymbolicLink()) throw new Error('not a direct Workspace file');
+        }
+      } catch {
+        throw new WorkspaceReadContractError('workspace_unavailable', prepared.args.metadata_only
+          ? 'The exact saved Workspace manifest is unavailable.' : 'The exact saved Workspace manifest and dataset are unavailable.');
+      }
+      const record = spaceStore.get(prepared.args.slug);
+      if (prepared.args.metadata_only) {
+        const result = projectWorkspaceSnapshotRead(prepared.args, record ? {
+          record, manifest: readFileSync(resolveInSpace(prepared.args.slug, 'space.json'), 'utf8'),
+        } : undefined);
+        signal?.throwIfAborted();
+        return result;
+      }
+      if (!record) throw new WorkspaceReadContractError('workspace_unavailable', 'The exact saved Workspace is unavailable.');
+      // The existing snapshot includes view bytes in its revision. Validate
+      // each component before Store.snapshot can read it; a missing view is
+      // retained as viewMissing by that owner, never replaced with a foreign
+      // file reached through a symlinked leaf or ancestor.
+      try {
+        const root = resolveSpaceDir(prepared.args.slug);
+        const view = resolveInSpace(prepared.args.slug, record.viewEntry);
+        let current = root;
+        for (const part of path.relative(root, view).split(path.sep)) {
+          current = path.join(current, part);
+          let stat;
+          try { stat = lstatSync(current); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') break; throw error; }
+          if (stat.isSymbolicLink() || (current === view ? !stat.isFile() : !stat.isDirectory())) throw new Error('unsafe view component');
+        }
+      } catch {
+        throw new WorkspaceReadContractError('workspace_unavailable', 'The saved Workspace view path is not safe to read as part of its snapshot revision.');
+      }
+      const result = projectWorkspaceSnapshotRead(prepared.args, spaceStore.snapshot(prepared.args.slug));
+      signal?.throwIfAborted();
+      return result;
+    });
+  },
+  async reconcile(): Promise<AttestedTransportReconcileResult> { return { exists: false }; },
+});
+
 const workspaceScriptStorage: HostLocalWriteStorageAdapter = Object.freeze({
   async execute(call: AttestedTransportCall): Promise<unknown> {
     const prepared = prepareReviewedLocalToolExecution(call);
@@ -151,6 +224,7 @@ export const reviewedLocalStorageCarrier: HostLocalWriteCarrier = Object.freeze(
     if (observed?.execution.adapter === 'browser_operation_v1') return browserStorage;
     if (observed?.execution.adapter === 'workspace_script_v1') return workspaceScriptStorage;
     if (observed?.execution.adapter === 'local_file_read_v1') return localFileReadStorage;
+    if (observed?.execution.adapter === 'workspace_snapshot_read_v1') return workspaceSnapshotReadStorage;
     if (observed?.execution.adapter === 'local_file_revision_v1') return localFileStorage;
     if (observed?.execution.adapter !== 'workspace_dataset_v1') return null;
     return workspaceDatasetStorage;

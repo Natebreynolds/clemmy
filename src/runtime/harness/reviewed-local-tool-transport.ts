@@ -1,6 +1,7 @@
 import { CLOUD_BROWSER_PARAMETERS, cloudBrowserOperationName, parseCloudBrowserArguments, type CloudBrowserOperationName } from '../../tools/cloud-browser-contract.js';
 import { WORKSPACE_SCRIPT_PARAMETERS, workspaceScriptArguments, type WorkspaceScriptArguments } from '../../spaces/workspace-script-contract.js';
 import { READ_FILE_PARAMS } from '../../tools/local-file-read-contract.js';
+import { WORKSPACE_GET_TOOL_PARAMETERS, prepareWorkspaceGet, type WorkspaceGetArguments } from '../../spaces/workspace-read-contract.js';
 import { BROWSER_OPERATION_PARAMETERS, browserOperationName, parseBrowserOperationArguments, type BrowserOperationName } from '../../tools/browser-operation-contract.js';
 /**
  * Transport-only crossing for explicitly reviewed Clementine-local tools.
@@ -87,7 +88,7 @@ function validExecutionContract(value: unknown): value is ReviewedLocalExecution
   if (contract.version === 1 && contract.adapter === 'workspace_script_v1') {
     return contract.idempotency === 'never_redispatch' && contract.reconciliation === 'none';
   }
-  if (contract.version === 1 && contract.adapter === 'local_file_read_v1') {
+  if (contract.version === 1 && (contract.adapter === 'local_file_read_v1' || contract.adapter === 'workspace_snapshot_read_v1')) {
     return contract.idempotency === 'read_only' && contract.reconciliation === 'none';
   }
   return contract.version === 1
@@ -205,8 +206,9 @@ function deriveReviewedLocalReadDefinition(input: {
   const capabilityRef = `cap:local:${name}:read`;
   const schemaFingerprint = stableJsonDigest(input.schema);
   const browser = row.localExecution?.adapter === 'browser_operation_v1' || row.localExecution?.adapter === 'cloud_browser_operation_v1';
+  const canonicalPlanningRead = browser || row.localExecution?.adapter === 'workspace_snapshot_read_v1';
   const readPurpose = row.description?.trim() || 'Read Clementine-local state.';
-  const registrySemanticsFingerprint = stableJsonDigest(browser ? {
+  const registrySemanticsFingerprint = stableJsonDigest(canonicalPlanningRead ? {
     version: 1, name, sideEffect: row.sideEffect, projectEffect: row.projectEffect, localPlanningRead: true,
     runtimeEffect: row.runtimeEffect ?? null, actionTopologyRole: row.actionTopologyRole ?? 'business',
     readOnly: { consequence: 'read', reversibility: 'read_only', destructive: false, purpose: readPurpose, destinationPosture: null },
@@ -224,13 +226,13 @@ function deriveReviewedLocalReadDefinition(input: {
     reversibility: 'read_only', destructive: false,
     accountIdentity: REVIEWED_LOCAL_ACCOUNT, safeMode: null,
     descriptor: {
-      id: capabilityRef, effect: 'read', purpose: browser ? readPurpose : row.description ?? 'Read local state.',
+      id: capabilityRef, effect: 'read', purpose: canonicalPlanningRead ? readPurpose : row.description ?? 'Read local state.',
       acceptedInputKinds: ['request', 'evidence'], producedOutputKinds: ['evidence'],
       applicableDeliverableKinds: ['evidence'], inputShape: 'request',
       outputShape: 'evidence', outputKind: 'evidence', deliverableKind: 'evidence',
       destinationPosture: null, evidenceKinds: ['tool_result'], handleRequired: false,
       readbackRequired: false, accountScope: REVIEWED_LOCAL_ACCOUNT,
-      manifestDigest: stableJsonDigest(browser ? { version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, capabilityRef, envelopeFingerprint } : { capabilityRef, envelopeFingerprint }),
+      manifestDigest: stableJsonDigest(canonicalPlanningRead ? { version: 1, provenance: AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, capabilityRef, envelopeFingerprint } : { capabilityRef, envelopeFingerprint }),
       advisoryRoles: ['source', 'collection', 'read'],
     },
   };
@@ -288,7 +290,8 @@ function deriveReviewedLocalDefinition(input: {
     if (read) return deriveReviewedLocalReadDefinition(input);
   }
   if (input.declaration.localExecution?.adapter === 'workspace_script_v1') return deriveReviewedScriptDefinition(input);
-  if (input.declaration.localExecution?.adapter === 'local_file_read_v1') {
+  if (input.declaration.localExecution?.adapter === 'local_file_read_v1'
+    || input.declaration.localExecution?.adapter === 'workspace_snapshot_read_v1') {
     return deriveReviewedLocalReadDefinition(input);
   }
   const semantics = input.declaration.localExecution?.semantics ?? input.declaration.localPlanning;
@@ -379,6 +382,7 @@ function currentReviewedLocalSchema(
     : execution.adapter === 'browser_operation_v1' && browserOperationName(operationId) ? BROWSER_OPERATION_PARAMETERS[operationId]
     : execution.adapter === 'workspace_script_v1' ? WORKSPACE_SCRIPT_PARAMETERS
     : execution.adapter === 'local_file_read_v1' ? READ_FILE_PARAMS
+    : execution.adapter === 'workspace_snapshot_read_v1' ? WORKSPACE_GET_TOOL_PARAMETERS
     : execution.adapter === 'artifact_bundle_v1'
     ? ARTIFACT_BUNDLE_TOOL_PARAMETERS
     : execution.adapter === 'local_file_revision_v1' ? WRITE_FILE_PARAMS
@@ -496,6 +500,9 @@ export function reviewedLocalToolArgumentsMatch(
   if (observed.execution.adapter === 'local_file_read_v1') {
     return z.strictObject(READ_FILE_PARAMS).safeParse({ ...args, max_chars: args.max_chars ?? null }).success;
   }
+  if (observed.execution.adapter === 'workspace_snapshot_read_v1') {
+    try { prepareWorkspaceGet(args); return true; } catch { return false; }
+  }
   if (observed.execution.adapter === 'artifact_bundle_v1') {
     const parsed = z.strictObject(ARTIFACT_BUNDLE_TOOL_PARAMETERS).safeParse(args);
     if (!parsed.success) return false;
@@ -528,6 +535,7 @@ export type PreparedReviewedLocalToolExecution =
   | { observed: ReviewedLocalToolObservation; adapter: 'workspace_script_v1'; args: WorkspaceScriptArguments }
   | { observed: ReviewedLocalToolObservation; adapter: 'local_file_read_v1';
       args: z.infer<z.ZodObject<typeof READ_FILE_PARAMS>> }
+  | { observed: ReviewedLocalToolObservation; adapter: 'workspace_snapshot_read_v1'; args: WorkspaceGetArguments }
   | {
       observed: ReviewedLocalToolObservation;
       adapter: 'local_file_revision_v1';
@@ -610,6 +618,9 @@ export function prepareReviewedLocalToolExecution(
   if (observed.execution.adapter === 'local_file_read_v1') {
     return { observed, adapter: observed.execution.adapter,
       args: z.strictObject(READ_FILE_PARAMS).parse({ ...call.args, max_chars: call.args.max_chars ?? null }) };
+  }
+  if (observed.execution.adapter === 'workspace_snapshot_read_v1') {
+    return { observed, adapter: observed.execution.adapter, args: prepareWorkspaceGet(call.args) };
   }
   if (observed.execution.adapter === 'artifact_bundle_v1') {
     return {

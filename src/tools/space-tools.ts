@@ -38,6 +38,7 @@ import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonica
 import { readWorkspaceCanonicalEntityProjectionPage } from '../dashboard/workspace-canonical-entity-projection.js';
 import { getCanonicalRecord, listCanonicalRecordIds } from '../execution/canonical-entity-store.js';
 import { countWorkspaceRecords, renderWorkspaceDataDigest, renderWorkspaceSourceRecords } from '../spaces/workspace-data-digest.js';
+import { WORKSPACE_GET_TOOL_PARAMETERS } from '../spaces/workspace-read-contract.js';
 import { analyzeSpaceGaps, renderSpaceGapQuestions } from '../spaces/space-gap-test.js';
 import {
   SPACE_SAVE_MAX_READ_PREPARATIONS,
@@ -1439,15 +1440,10 @@ export function registerSpaceTools(server: McpServer): void {
 
   server.tool(
     'space_get',
-    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), its dataset, and recent user notes. For live sources the dataset is summarized per source: where the records are, how many, their fields, and trimmed samples. Pass source_id to page through one source\'s records (limit, offset). For view-only or configuration changes, use metadata_only=true to return exact source/action configuration without dataset records. Use this when re-engaged to see what the workspace shows and what the user did in it, and before writing view code against a source.',
-    {
-      slug: z.string().min(2).max(63).describe('The workspace slug.'),
-      source_id: z.string().max(120).nullish().describe('Optional: return this one source\'s records (trimmed) instead of the per-source summary.'),
-      metadata_only: z.boolean().nullish().describe('For view-only or configuration changes: include exact source/action declarations, omit dataset records. Cannot combine with source_id.'),
-      limit: z.number().int().min(1).max(60).nullish().describe('With source_id: records per page (default 20).'),
-      offset: z.number().int().min(0).nullish().describe('With source_id: first record index (default 0).'),
-    },
-    async ({ slug, source_id, metadata_only, limit, offset }) => {
+    'Read a Workspace: its manifest (title, status, data sources, re-engage contract), its dataset, and recent user notes. For live sources the dataset is summarized per source: where the records are, how many, their fields, and trimmed samples. Pass source_id to page through one source\'s records (limit, offset). For view-only or configuration changes, use metadata_only=true to return exact source/action configuration without dataset records. Use this when re-engaged to see what the workspace shows and what the user did in it, and before writing view code against a source. '
+      + 'An exact workflow call needs no reader model: a data read returns structured {version,origin,scope:"data",workspace:{id,title,status,version,revision,data_sha256},source_id,data,complete}. data is the full saved document or exact selected source, without text trimming; supplying limit/offset selects a record page with records_page metadata and complete=false unless the whole source record list is returned. metadata_only instead reads just the saved manifest: scope:"metadata", data:null, metadata, and workspace.metadata_revision (workspace-metadata:v1:<digest>), with no data revision/hash. Its completeness covers metadata only; omit expected_revision for that scope. This never refreshes provider sources. Use a pure transform jsonStringify(value) when the next tool requires JSON text, such as space_set_data.data_json.',
+    WORKSPACE_GET_TOOL_PARAMETERS,
+    async ({ slug, source_id, metadata_only, limit, offset, expected_revision }) => {
       if (metadata_only && source_id?.trim()) return invalidArgumentsTextResult('Choose metadata_only or source_id, not both.');
       if (!isValidSpaceSlug(slug)) return textResult(`Error: invalid workspace slug "${slug}".`);
       let rec = spaceStore.get(slug);
@@ -1455,6 +1451,9 @@ export function registerSpaceTools(server: McpServer): void {
       const observationStore = prepareWorkspaceObservationStore(rec);
       const snapshot = spaceStore.snapshot(slug);
       if (!snapshot) return textResult(`No workspace named "${slug}".`);
+      if (expected_revision != null && expected_revision !== snapshot.revision) {
+        return invalidArgumentsTextResult('The saved Workspace changed since the expected revision. Read its current snapshot before continuing.');
+      }
       rec = snapshot.record;
       const notes = listNotes(slug, 10);
       const audit = listAudit(slug, 5);

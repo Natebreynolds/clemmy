@@ -14,6 +14,8 @@ The user describes what they want; turning that into a working workflow is your 
 
 ## 1. Shape it before you save it
 
+For creation, check a name collision only when needed with `workflow_list(query="<intended name>", detail="names")`. Use current tool schemas for authoring examples, not unrelated saved workflow definitions; preserve the user's resource restrictions. A requested review of an existing workflow still needs its whole relevant definition.
+
 Decide these before calling `workflow_create`:
 
 1. **Steps and completion**: one meaningful job per step, with dependencies where needed. Preserve the whole objective, standing instructions and required deliverables. Declare output contracts for downstream consumers and a saved goal when completion needs whole-run verification.

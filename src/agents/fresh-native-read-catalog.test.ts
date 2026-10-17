@@ -71,6 +71,9 @@ for (const mode of ['normal', 'plan'] as const) {
     assert.ok(f.names.includes('workflow_get'));
     assert.ok(f.names.includes('space_get_view'));
     assert.match(f.block, /call_tool/);
+    assert.match(f.block, /args_json: \{<the target arguments>\}/);
+    assert.match(f.block, /prefer this JSON object form over an encoded string/);
+    assert.doesNotMatch(f.block, /args_json: "<one JSON object string>"/);
     assert.match(f.block, /tool_search with that exact name/);
     assert.doesNotMatch(f.block, /cap:|\b(?:workflow_create|workflow_update|workflow_run|space_save)\b/);
     for (const omitted of ['notify_user', 'dispatch_background_task', 'hold_task_for_later',

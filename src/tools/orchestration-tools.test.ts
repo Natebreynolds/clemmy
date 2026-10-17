@@ -2721,8 +2721,89 @@ test('workflow list supplies exact count and queryable names without prose extra
   assert.equal(summary.workflows[0].stepCount, 1);
   assert.equal(summary.workflows[0].description, 'Generate an audit brief from a URL.');
   assert.deepEqual(summary.workflows[0].trigger, { manual: true });
+  for (const query of ['', '  \t\n']) {
+    assert.deepEqual(JSON.parse((await handler({ detail: 'names', query })).content[0].text), names);
+    assert.deepEqual(JSON.parse((await handler({ query })).content[0].text), summary);
+  }
   resetState();
   assert.deepEqual(JSON.parse((await handler({})).content[0].text), { total: 0, workflows: [] });
+});
+
+test('workflow list scoped MCP queries match only literal saved names or slugs without exposing unrelated definitions or running work', async () => {
+  const [{ McpServer }, { Client }, { InMemoryTransport }] = await Promise.all([
+    import('@modelcontextprotocol/sdk/server/mcp.js'),
+    import('@modelcontextprotocol/sdk/client/index.js'),
+    import('@modelcontextprotocol/sdk/inMemory.js'),
+  ]);
+  const fixtures = [
+    { slug: 'controlled-alpha-saved-key', name: 'Équipe Review [West]', description: 'Selected metadata only.' },
+    { slug: 'controlled-beta', name: 'Équipe Review East', description: 'Second matching metadata only.' },
+    { slug: 'controlled-other', name: 'Unrelated Private Process', description: 'SCOPE_SENTINEL description mentions saved-key and Équipe.' },
+  ];
+  for (const entry of fixtures) writeWorkflow(entry.slug, {
+    name: entry.name, description: entry.description, enabled: false, trigger: { manual: true },
+    steps: [{ id: 'inspect', prompt: `SCOPE_SENTINEL full procedure for ${entry.slug}.`, sideEffect: 'read' }],
+  });
+  const before = inputDeclarationDurableSnapshot();
+  const server = new McpServer({ name: 'controlled-workflow-list', version: '1' });
+  // Register the production handler and schema on the actual SDK transport;
+  // other orchestration operations are not part of this read-only fixture.
+  registerOrchestrationTools({
+    tool(name: string, description: string, schema: never, handler: never) {
+      if (name === 'workflow_list') return server.tool(name, description, schema, handler);
+    },
+  } as never);
+  const client = new Client({ name: 'controlled-workflow-list-client', version: '1' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const previousFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => { fetchCalls += 1; throw new Error('Listing must not invoke a provider.'); }) as typeof fetch;
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const catalog = await client.listTools();
+    assert.deepEqual(catalog.tools.map(entry => entry.name), ['workflow_list']);
+    assert.equal(catalog.tools[0]?.inputSchema.properties?.query !== undefined, true, 'the scoped argument reaches the actual MCP schema');
+    const list = async (args: Record<string, unknown>) => {
+      const result = await client.callTool({ name: 'workflow_list', arguments: args });
+      assert.notEqual(result.isError, true);
+      const content = result.content as Array<{ type: string; text?: string }>;
+      assert.equal(content[0]?.type, 'text');
+      const text = content[0]!.text!;
+      return { text, value: JSON.parse(text) as { total: number; workflows: Array<Record<string, unknown>> } };
+    };
+    for (const [query, expected] of [
+      ['  éQUIPE  ', [fixtures[0]!.name, fixtures[1]!.name]],
+      ['SAVED-KEY', [fixtures[0]!.name]],
+      ['[wEsT]', [fixtures[0]!.name]],
+      ['équipe.*', []],
+      ['Equpe', []],
+      ['not-installed', []],
+    ] as const) {
+      const { text, value } = await list({ query, detail: 'names' });
+      assert.equal(value.total, expected.length, query);
+      assert.deepEqual(value.workflows.map(entry => entry.name).sort(), [...expected].sort(), query);
+      assert.equal(value.workflows.every(entry => Object.keys(entry).length === 1), true);
+      assert.doesNotMatch(text, /SCOPE_SENTINEL|Unrelated Private Process/, query);
+    }
+    const scopedSummary = await list({ query: '[WEST]' });
+    assert.equal(scopedSummary.value.total, 1);
+    assert.equal(scopedSummary.value.workflows[0]?.description, fixtures[0]!.description);
+    assert.doesNotMatch(scopedSummary.text, /SCOPE_SENTINEL|Unrelated Private Process/);
+    for (const args of [{ detail: 'names' }, { detail: 'names', query: '' }, { detail: 'names', query: ' \t ' }]) {
+      const { value } = await list(args);
+      assert.equal(value.total, fixtures.length);
+      assert.deepEqual(value.workflows.map(entry => entry.name).sort(), fixtures.map(entry => entry.name).sort());
+    }
+    const invalid = await client.callTool({ name: 'workflow_list', arguments: { query: 7, detail: 'names' } });
+    assert.equal(invalid.isError, true, 'invalid scoped input is refused by the actual MCP schema');
+    assert.doesNotMatch(JSON.stringify(invalid), /SCOPE_SENTINEL|Unrelated Private Process/);
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(inputDeclarationDurableSnapshot(), before, 'listing changes no saved definition, run, trigger or artifact');
+    assert.deepEqual(workflowRunFiles(), [], 'listing queues no execution');
+  } finally {
+    globalThis.fetch = previousFetch;
+    await Promise.allSettled([client.close(), server.close()]);
+  }
 });
 
 

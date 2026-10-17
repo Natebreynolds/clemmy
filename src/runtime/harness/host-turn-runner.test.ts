@@ -1297,6 +1297,101 @@ test('activated-plan carrier refusal names existing-call repair instead of an un
   }
 });
 
+test('production host repairs malformed carrier JSON with one same-source native-object retry', async (t) => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorFetch = globalThis.fetch;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  let fetchCalls = 0;
+  globalThis.fetch = async () => { fetchCalls += 1; throw new Error('this local carrier fixture cannot use a network transport'); };
+  t.after(() => {
+    globalThis.fetch = priorFetch;
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const file = path.join(TMP_HOME, `harness-native-object-retry-${++acceptedSerial}.txt`);
+  const content = 'Controlled local draft with "quoted text".\nRetain every byte.\n';
+  const fixture = acceptHostCanarySource('malformed-carrier-native-object',
+    `Create one new local text draft at ${file} with exactly this content: ${JSON.stringify(content)}. Do not use external tools or change another file.`);
+  const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `carrier-repair-${fixture.source.seq}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: fixture.source.data },
+    { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+  Object.assign(fixture.parent, { runAttemptId: attempt.attemptId });
+  t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
+  const primed = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
+  assert.equal(primed.ok, true);
+  if (!primed.ok) throw new Error('controlled local planning context unavailable');
+  const targetArgs = { path: file, content, mode: 'create' };
+  let requirementId = '';
+  let modelCalls = 0;
+  const outerCalls: Array<Record<string, unknown>> = [];
+  const model = {
+    async getResponse(request: { input: Array<{ type?: string; callId?: string; output?: { text?: string } }> }) {
+      modelCalls += 1;
+      const results = request.input.filter(item => item.type === 'function_call_result');
+      let output: unknown[];
+      if (modelCalls === 1) {
+        output = [toolCall('discover-native-retry', 'tool_search', { query: 'write_file', role_key: null, limit: 1 })];
+      } else if (modelCalls === 2) {
+        const found = results.find(item => item.callId === 'discover-native-retry');
+        const discovery = JSON.parse(found?.output?.text ?? '{}') as { results?: Array<{
+          name: string; capabilityVariants?: Array<{ variantId: string; capabilityRef: string }>;
+        }> };
+        requirementId = discovery.results?.find(row => row.name === 'write_file')?.capabilityVariants
+          ?.find(variant => variant.variantId === 'create')?.capabilityRef ?? '';
+        assert.ok(requirementId, 'actual local discovery must disclose the exact create-only capability');
+        const malformed = { name: 'write_file', requirement_id: requirementId,
+          args_json: JSON.stringify(targetArgs).slice(0, -1) };
+        outerCalls.push(malformed);
+        output = [toolCall('malformed-native-retry', 'work_call', malformed)];
+      } else if (modelCalls === 3) {
+        const refused = results.find(item => item.callId === 'malformed-native-retry');
+        const repair = refused?.output?.text ?? '';
+        assert.match(repair, /logical_call_contract_missing/);
+        assert.match(repair, /Prefer the target arguments as a JSON object in args_json/);
+        assert.match(repair, /same name, requirement_id and carrier/);
+        assert.match(repair, /without repeating discovery/);
+        assert.equal(existsSync(file), false, 'malformed inner bytes must not create the file');
+        assert.equal((eventlog.openEventLog().prepare(`SELECT COUNT(*) AS n FROM physical_dispatches
+          WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
+          .get(fixture.session.id, fixture.source.seq, 'malformed-native-retry') as { n: number }).n, 0,
+        'the malformed call has no physical inner crossing');
+        const corrected = { name: 'write_file', requirement_id: requirementId, args_json: targetArgs };
+        outerCalls.push(corrected);
+        output = [toolCall('valid-native-object-retry', 'work_call', corrected)];
+      } else {
+        assert.equal(readFileSync(file, 'utf8'), content, 'the actual native tool must retain the complete requested bytes');
+        output = [textMsg('The controlled local draft is saved.')];
+      }
+      return { responseId: `native-object-retry-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = await buildOrchestratorAgent({ ...fixture.context, userInput: String(fixture.source.data.text),
+    hostFreshPlanning: primed.planning, model: model as never, allowToolJit: true,
+    allowedToolNames: ['call_tool', 'tool_search', 'work_call', 'write_file'] });
+  const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>, undefined,
+    { hostJudgeCompletion: false });
+  assert.equal(outcome.finalOutput, 'The controlled local draft is saved.');
+  assert.equal(modelCalls, 4); assert.equal(fetchCalls, 0, 'no account/provider transport was involved');
+  assert.equal(outerCalls.length, 2);
+  assert.equal(outerCalls[0]?.name, outerCalls[1]?.name);
+  assert.equal(outerCalls[0]?.requirement_id, outerCalls[1]?.requirement_id);
+  assert.deepEqual(outerCalls[1]?.args_json, targetArgs, 'the host must not repair or infer target values');
+  const settlements = eventlog.openEventLog().prepare(`SELECT s.logical_tool_call_id, l.tool_name AS resolved_tool, s.outcome_kind,
+    s.physical_crossing_count, s.host_crossing_count, s.requires_reconciliation
+    FROM logical_call_settlements s JOIN logical_tool_calls l
+      ON l.session_id=s.session_id AND l.source_user_seq=s.source_user_seq AND l.logical_tool_call_id=s.logical_tool_call_id
+    WHERE s.session_id=? AND s.source_user_seq=? AND l.tool_name='write_file'`)
+    .all(fixture.session.id, fixture.source.seq) as Array<{ logical_tool_call_id: string; resolved_tool: string;
+      outcome_kind: string; physical_crossing_count: number; host_crossing_count: number; requires_reconciliation: number }>;
+  assert.deepEqual(settlements, [{ logical_tool_call_id: 'valid-native-object-retry', resolved_tool: 'write_file',
+    outcome_kind: 'succeeded', physical_crossing_count: 0, host_crossing_count: 1, requires_reconciliation: 0 }],
+  'one exact native mutation settles for the same accepted source after the parser refusal');
+});
+
 test('production host pairs a no-effect refusal when its durable ALS owner is absent', async () => {
   let bodies = 0;
   const model = stubModel([

@@ -4112,7 +4112,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         : '';
       catalogBlock = hostFreshPlanning
         ? [catalogNames.size > 0 ? [
-              '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: "<one JSON object string>"}). If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
+              '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: {<the target arguments>}}); prefer this JSON object form over an encoded string. If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
               catalogText,
             ].join('\n') : '', nativeAuthoringCatalog].filter(Boolean).join('\n') || null
         : [
@@ -4338,7 +4338,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     const nativeHintInstructions = '[current-native-contracts] These exact native operations were revalidated and disclosed for this request. '
       + (planMode
         ? 'Use these capabilityRef values and argument schemas to prepare publish_plan. Do not execute these business operations during Plan; disclosure is preparation evidence only, and the existing Plan effect boundary remains closed. '
-        : 'Invoke the selected operation through work_call with its exact name and arguments encoded as one args_json string. For a direct call without a frozen requirement, use the matching capabilityRef as requirement_id. After plan_task activates a plan, use that plan\'s exact requirement id for required steps; capabilityRef remains the schema/definition reference. Supplemental contextual reads may use their capabilityRef without claiming completion of a required step. ')
+        : 'Invoke the selected operation through work_call with its exact name and the target arguments as a JSON object in args_json; prefer this object form over an encoded string. Preserve any inner string field required by the target schema. For a direct call without a frozen requirement, use the matching capabilityRef as requirement_id. After plan_task activates a plan, use that plan\'s exact requirement id for required steps; capabilityRef remains the schema/definition reference. Supplemental contextual reads may use their capabilityRef without claiming completion of a required step. ')
       + 'No schema search is needed for these supplied contracts. This is discovery evidence, not approval: actual effects, consent, scope, frozen requirements and once-only dispatch retain their existing gates. Admin, destructive, unknown-effect or dependent work still needs its proper plan/consent boundary.\n';
     const nativeContractRow = (candidate: typeof candidates[number]) => ({
       name: candidate.name, carrier: 'work_call',
