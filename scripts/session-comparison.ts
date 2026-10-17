@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,7 +9,9 @@ import { presentationEventFromCompletionData } from '../src/runtime/harness/turn
 import { readApprovalExecutionSource } from '../src/runtime/harness/approval-execution-source.js';
 import { readAcceptedTaskNoticingParticipants } from './lib/accepted-task-noticing-participants.js';
 import { readAcceptedTaskWorkflowCandidates } from './lib/accepted-task-workflow-candidates.js';
-import { readAcceptedTaskWorkflowParticipants, type AcceptedTaskWorkflowParticipant } from './lib/accepted-task-workflow-participants.js';
+import { readAcceptedTaskWorkflowParticipants, readClosedCreationTestWorkflowParticipants,
+  type ClosedCreationTestParent, type WorkflowAccountingParticipant } from './lib/accepted-task-workflow-participants.js';
+import { compactResultProvesExactToolOutput } from '../src/runtime/harness/exact-output-receipt.js';
 import { readAcceptedTaskWorkflowParentTerminalIdentity } from './lib/accepted-task-workflow-parent-terminal.js';
 import { selectAcceptedTaskNoticingUsage, type NoticingAccountingParticipant } from './lib/accepted-task-noticing-usage.js';
 
@@ -215,7 +217,7 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   proactiveExactUsageRecords: number;
   proactiveUsageScope: { timing: 'precursor_operations_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
   /** Claims remain diagnostic; hosted steps require full retained authority. */
-  workflowUsageParticipants: AcceptedTaskWorkflowParticipant[];
+  workflowUsageParticipants: WorkflowAccountingParticipant[];
   workflowApprovalContinuations: Array<ApprovalContinuationMeasurement & { sessionId: string }>;
   workflowUsageIssues: string[];
   workflowAttemptCount: number;
@@ -2202,10 +2204,132 @@ interface WorkflowUsageScope {
   parentKey?: string;
 }
 
+/** A returned creation test has a different historical parent proof from a
+ * sealed workflow group. Only the exact original, paired tool result can
+ * nominate its run; a namespace, current workflow or time window cannot. */
+function readClosedCreationTestParents(home: string, sessionId: string,
+  sources: Map<number, SessionEvent>, attempts: Map<number, AttemptRead>, ownedEvents: readonly SessionEvent[]) {
+  const parents: ClosedCreationTestParent[] = []; const claimedRunIds = new Set<string>(); const issues = new Set<string>();
+  const calls = ownedEvents.filter(event => event.type === 'tool_called' && semanticToolName(event.data) === 'workflow_test'
+    && event.data.accounting !== 'transport_mirror' && sources.has(Number(event.data.sourceUserSeq)));
+  if (!calls.length) return { parents, claimedRunIds: [], issues: [] as string[] };
+  const safeId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 512
+    && !/[\u0000-\u001f\u007f]/.test(value);
+  const safeRun = (value: unknown): value is string => safeId(value) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(value);
+  const sha = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const hashText = (value: string) => createHash('sha256').update(value).digest('hex');
+  const time = (value: unknown) => typeof value === 'string' ? timestampValue(value) : null;
+  const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+  const ownedSeqs = new Set(ownedEvents.map(event => event.seq));
+  const ownedBySeq = new Map(ownedEvents.map(event => [event.seq, event]));
+  let db: Database.Database;
+  try { db = new Database(path.join(home, 'state', 'harness.db'), { readonly: true, fileMustExist: true, timeout: 5_000 }); }
+  catch { return { parents, claimedRunIds: [], issues: ['workflow_creation_test_receipt_store_unavailable'] }; }
+  const captured = new Map<string, string>();
+  try {
+    db.pragma('query_only = ON');
+    db.transaction(() => {
+      for (const call of calls.slice(0, 128)) {
+        const reject = (reason: string) => issues.add(`workflow_creation_test_${reason}:${call.seq}`);
+        const sourceSeq = Number(call.data.sourceUserSeq), callId = call.data.callId, tool = call.data.tool;
+        if (!safeId(callId) || !safeId(tool)) { reject('call_identity_unproved'); continue; }
+        const source = sources.get(sourceSeq)!;
+        const rawCalls = db.prepare(`SELECT * FROM events WHERE session_id = ? AND type = 'tool_called'
+          AND CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.callId') = ?
+            AND json_extract(data_json, '$.accounting') = 'top_level' ELSE 0 END LIMIT 2`).all(sessionId, callId) as Array<{
+              id: string; seq: number; turn: number; role: string; data_json: string; created_at: string }>;
+        const returns = db.prepare(`SELECT * FROM events WHERE session_id = ? AND type = 'tool_returned'
+          AND CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.callId') = ?
+            AND json_extract(data_json, '$.accounting') = 'top_level' ELSE 0 END LIMIT 2`).all(sessionId, callId) as Array<{
+              id: string; seq: number; turn: number; role: string; parent_event_id: string | null; data_json: string; created_at: string }>;
+        const outputs = db.prepare(`SELECT invocation_nonce, tool, output_full, content_bytes, truncated_at_write, output_sha256, chunk_count
+          FROM tool_output_invocations WHERE session_id = ? AND call_id = ? AND tool = ? LIMIT 2`).all(sessionId, callId, tool) as Array<{
+            invocation_nonce: string; tool: string; output_full: string; content_bytes: number; truncated_at_write: number;
+            output_sha256: string; chunk_count: number }>;
+        if (outputs.length !== 1 || outputs[0]!.truncated_at_write !== 0 || outputs[0]!.chunk_count !== 0
+          || !/^[a-f0-9-]{36}$/i.test(outputs[0]!.invocation_nonce) || typeof outputs[0]!.output_full !== 'string'
+          || Buffer.byteLength(outputs[0]!.output_full) > 1_048_576
+          || Buffer.byteLength(outputs[0]!.output_full) !== outputs[0]!.content_bytes
+          || hashText(outputs[0]!.output_full) !== outputs[0]!.output_sha256) { reject('original_output_unproved'); continue; }
+        const output = outputs[0]!;
+        const markers = [...output.output_full.matchAll(/\[clementine:inline-creation-test:v1\] (\{[^\r\n]*?\})/g)];
+        let marker: Record<string, unknown> | null = null;
+        try { const parsed: unknown = JSON.parse(markers[0]?.[1] ?? 'null'); if (object(parsed)) marker = parsed; } catch { /* Unknown receipt. */ }
+        if (safeRun(marker?.runId)) claimedRunIds.add(marker.runId);
+        if (markers.length !== 1 || !marker || Object.keys(marker).sort().join('\0') !== 'reportDigest\0runId\0token'
+          || !safeRun(marker.runId) || !sha(marker.token) || !sha(marker.reportDigest)) { reject('run_receipt_unproved'); continue; }
+        const called = rawCalls.length === 1 ? rawCalls[0] : undefined;
+        const returned = returns.length === 1 ? returns[0] : undefined;
+        const data = returned && parseObject(returned.data_json);
+        const callAt = timestampMs(call), returnedAt = returned ? timestampValue(returned.created_at) : null;
+        if (!called || called.seq !== call.seq || JSON.stringify(parseObject(called.data_json)) !== JSON.stringify(call.data)
+          || call.data.accounting !== 'top_level' || ['user', 'tool'].includes(called.role)
+          || !safeId(call.data.attemptId) || !attempts.get(sourceSeq)?.ids.has(call.data.attemptId)
+          || !returned || !data || returned.parent_event_id !== called.id || returned.role !== called.role
+          || returned.turn !== called.turn || returned.seq <= called.seq || !ownedSeqs.has(returned.seq)
+          || JSON.stringify(ownedBySeq.get(returned.seq)?.data) !== JSON.stringify(data)
+          || data.sourceUserSeq !== sourceSeq || data.attemptId !== call.data.attemptId
+          || data.tool !== tool || semanticToolName(data) !== 'workflow_test'
+          || (call.data.canonicalCallId !== undefined && call.data.canonicalCallId !== callId)
+          || (data.canonicalCallId !== undefined && data.canonicalCallId !== callId)
+          || callAt === null || returnedAt === null || callAt < (timestampMs(source) ?? Infinity) || returnedAt < callAt
+          || (data.result !== output.output_full && !compactResultProvesExactToolOutput(data.result, output.output_full, output.invocation_nonce))) {
+          reject('paired_return_unproved'); continue;
+        }
+        const file = path.join(home, 'workflows', 'runs', `${marker.runId}.json`);
+        let bytes: string; let run: Record<string, unknown> | null;
+        try {
+          const stat = lstatSync(file); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2_097_152) throw new Error('unavailable');
+          bytes = readFileSync(file, 'utf8'); run = parseObject(bytes);
+        } catch { reject('run_descriptor_unavailable'); continue; }
+        const origin = run?.creationTestSource, intent = run?.inlineCreationTestDelivery, report = run?.reportBack;
+        const lease = object(intent) ? intent.lease : undefined;
+        const snapshot = run?.workflowDefinitionSnapshot;
+        const definition = object(snapshot) ? snapshot.definition : undefined;
+        const created = run && time(run.createdAt), finished = run && time(run.finishedAt);
+        const intentStart = object(intent) ? time(intent.createdAt) : null;
+        const intentEnd = object(intent) ? time(intent.expiresAt) : null;
+        if (!run || run.id !== marker.runId || run.source !== 'workflow_test'
+          || !['creation_test', 'blocked', 'failed', 'error', 'cancelled'].includes(String(run.status))
+          || run.originSessionId !== sessionId || !object(origin) || origin.sessionId !== sessionId
+          || origin.sourceUserSeq !== sourceSeq || origin.logicalToolCallId !== callId
+          || !object(intent) || intent.version !== 1 || intent.runId !== run.id || intent.originSessionId !== sessionId
+          || intent.sourceUserSeq !== sourceSeq || intent.logicalToolCallId !== callId || intent.callId !== callId || intent.token !== marker.token
+          || !object(lease) || lease.sessionId !== sessionId || lease.runAttemptId !== call.data.attemptId
+          || lease.sourceUserSeq !== sourceSeq || lease.logicalToolCallId !== callId
+          || !safeId(lease.scopeId) || !safeId(lease.leaseId)
+          || intentStart === null || intentEnd === null || intentEnd <= intentStart || intentEnd - intentStart > 240_000
+          || returnedAt < intentStart || returnedAt >= intentEnd
+          || created === null || finished === null || created < callAt || finished < created || finished > returnedAt
+          || !object(report) || report.version !== 1 || !['done', 'blocked', 'failed'].includes(String(report.outcome))
+          || !object(definition) || report.workflowName !== definition.name || typeof report.detail !== 'string' || !report.detail.trim()
+          || !output.output_full.includes(report.detail.trim())
+          || hashText('clementine.workflow-run-report-back-content.v1\0' + JSON.stringify({
+            workflowName: report.workflowName, outcome: report.outcome, detail: report.detail })) !== marker.reportDigest) {
+          reject('run_binding_unproved'); continue;
+        }
+        if (captured.has(file) && captured.get(file) !== bytes) { reject('run_descriptor_changed'); continue; }
+        captured.set(file, bytes);
+        parents.push({ runId: marker.runId, parentSessionId: sessionId, parentSourceUserSeq: sourceSeq,
+          parentAttemptId: call.data.attemptId, parentCallId: callId, parentReturnSeq: returned.seq,
+          parentInvocationNonce: output.invocation_nonce, parentOutputSha256: output.output_sha256,
+          runDescriptorSha256: hashText(bytes) });
+      }
+      if (calls.length > 128) issues.add('workflow_creation_test_call_inventory_limit');
+    })();
+  } catch { parents.length = 0; issues.add('workflow_creation_test_receipt_store_unavailable'); }
+  finally { db.close(); }
+  for (const [file, bytes] of captured) {
+    try { if (readFileSync(file, 'utf8') === bytes) continue; } catch { /* Unknown retained descriptor. */ }
+    parents.length = 0; issues.add('workflow_creation_test_run_descriptors_changed'); break;
+  }
+  return { parents, claimedRunIds: [...claimedRunIds], issues: [...issues] };
+}
+
 /** Extend only already-proved hosted roots through the established approval
  * and reciprocal worker rules. Parent task ownership is not a trace ancestor:
  * a foreground source can never borrow a hosted attempt or its response. */
-function readWorkflowUsageGraph(dbPath: string, participants: readonly AcceptedTaskWorkflowParticipant[]) {
+function readWorkflowUsageGraph(dbPath: string, participants: readonly WorkflowAccountingParticipant[]) {
   const scopes = new Map<string, WorkflowUsageScope>();
   const claims = new Set<string>(); const attempts = new Set<string>(); const issues = new Set<string>();
   const workerGraphs: WorkerUsageGraph[] = [];
@@ -2348,10 +2472,13 @@ export function measureAcceptedTask(
   const workflowProof = readAcceptedTaskWorkflowParticipants(home, accountingSources, {
     isWorkflowParentTerminalIdentity: input => readAcceptedTaskWorkflowParentTerminalIdentity(home, input),
   });
-  const workflow = readWorkflowUsageGraph(dbPath, workflowProof.participants);
-  const workflowIssues = new Set([...workflowProof.issues, ...workflow.issues]);
+  const creationParents = readClosedCreationTestParents(home, sessionId, members, attemptsBySource, events);
+  const creationProof = readClosedCreationTestWorkflowParticipants(home, creationParents.parents, creationParents.claimedRunIds);
+  const workflowParticipants = [...workflowProof.participants, ...creationProof.participants];
+  const workflow = readWorkflowUsageGraph(dbPath, workflowParticipants);
+  const workflowIssues = new Set([...workflowProof.issues, ...creationParents.issues, ...creationProof.issues, ...workflow.issues]);
   // Dispatch claims alone do not prove every run-level judge/heal/memory leg.
-  if (workflowInventory.candidates.length) workflowIssues.add('workflow_run_level_usage_inventory_unproved');
+  if (workflowInventory.candidates.length || creationParents.claimedRunIds.length) workflowIssues.add('workflow_run_level_usage_inventory_unproved');
   const sourceByAccepted = new Map([...members.keys()].map((seq) => [usageSourceKey(sessionId, seq), seq]));
   for (const [key, scope] of workflow.scopes) {
     if (sourceByAccepted.has(key)) { workflow.scopes.delete(key); workflowIssues.add(`workflow_conflicting_public_source:${key}`); }
@@ -2394,10 +2521,12 @@ export function measureAcceptedTask(
   for (const key of workers.claimedSources) claimedAccepted.add(key);
   for (const key of workflow.claims) claimedAccepted.add(key);
   for (const source of workflowProof.claimedSources) claimedAccepted.add(usageSourceKey(source.sessionId, source.sourceUserSeq));
+  for (const source of creationProof.claimedSources) claimedAccepted.add(usageSourceKey(source.sessionId, source.sourceUserSeq));
   const claimedAttemptIds = new Set(sourceByAttempt.keys());
   for (const id of workers.claimedAttempts) claimedAttemptIds.add(id);
   for (const id of workflow.attempts) claimedAttemptIds.add(id);
   for (const id of workflowProof.claimedAttemptIds) claimedAttemptIds.add(id);
+  for (const id of creationProof.claimedAttemptIds) claimedAttemptIds.add(id);
   for (const source of claimedMembers.keys()) {
     if (!members.has(source)) {
       for (const id of readAttemptsForSource(dbPath, sessionId, source).ids) claimedAttemptIds.add(id);
@@ -2437,7 +2566,7 @@ export function measureAcceptedTask(
   let workflowExactUsageRecords = 0;
   let legacyWindowUsageRecords = 0;
   let unscopedWindowUsageRecords = 0;
-  const claimedWorkflowRunSources = new Set(workflowProof.claimedRunIds.map(id => `workflow:${id}`));
+  const claimedWorkflowRunSources = new Set([...workflowProof.claimedRunIds, ...creationProof.claimedRunIds].map(id => `workflow:${id}`));
   for (const [index, event] of usageRead.events.entries()) {
     // One read and one row selection. An exact precursor is included in task
     // recorded usage, but cannot supply an accepted source/attempt or time.
@@ -2634,7 +2763,7 @@ export function measureAcceptedTask(
     proactiveExactUsageRecords: proactiveExact.size,
     proactiveUsageScope: { timing: 'precursor_operations_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
     workflowUsageInventory: workflowInventory,
-    workflowUsageParticipants: workflowProof.participants.filter(participant => workflow.scopes.has(usageSourceKey(participant.sessionId, participant.sourceUserSeq))),
+    workflowUsageParticipants: workflowParticipants.filter(participant => workflow.scopes.has(usageSourceKey(participant.sessionId, participant.sourceUserSeq))),
     workflowApprovalContinuations: workflow.approvals, workflowUsageIssues: [...workflowIssues],
     workflowAttemptCount, unfinishedWorkflowAttempts, workflowExactUsageRecords,
     workflowUsageScope: { scope: 'recorded_hosted_steps_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,13 +15,14 @@ const home = mkdtempSync(path.join(os.tmpdir(), 'clem-workflow-participants-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
-const [log, groups, definitions, authority, plans, memory, usage, comparison, approvals, callAuthority, contracts, leases] = await Promise.all([
+const [log, groups, definitions, authority, plans, memory, usage, comparison, approvals, callAuthority, contracts, leases, inline, toolContext] = await Promise.all([
   import('../../src/runtime/harness/eventlog.js'), import('../../src/execution/workflow-origin-group.js'),
   import('../../src/execution/workflow-run-definition.js'), import('../../src/runtime/harness/authored-workflow-write-authority.js'),
   import('../../src/agents/plan-scope.js'), import('../../src/memory/db.js'),
   import('../../src/runtime/usage-log.js'), import('../session-comparison.js'), import('../../src/runtime/harness/approval-registry.js'),
   import('../../src/runtime/harness/accepted-turn-call-authority.js'), import('../../src/runtime/harness/logical-call-contract.js'),
   import('../../src/runtime/harness/dispatch-lease.js'),
+  import('../../src/execution/inline-creation-test-delivery.js'), import('../../src/runtime/harness/tool-output-context.js'),
 ]);
 const runsDir = path.join(home, 'workflows', 'runs');
 mkdirSync(runsDir, { recursive: true });
@@ -120,6 +121,152 @@ function recordBound(owner: Owner, label: string, inputTokens: number, role: 'br
     responseId: `${label}-${owner.sourceUserSeq}`, trace: { modelCallId: `${label}-call-${owner.sourceUserSeq}` },
     ...(failed ? { ok: false, failReason: 'Controlled failed response accounting.' } : {}) }));
 }
+
+/** Actual intent, report marker, nonce retention and authored-source producers;
+ * no workflow executor/model runs in this controlled accounting fixture. */
+function creationFixture(options: { beforeReturn?: 'human' | 'synthetic'; failed?: boolean; compact?: boolean } = {}) {
+  const source = parent('creation-test');
+  const callId = `controlled-creation-call-${randomUUID()}`, nonce = randomUUID();
+  const callArgs = { name: 'workflow_test', requirement_id: 'controlled-creation-test', args_json: JSON.stringify({ name: 'controlled-fixture' }) };
+  const acceptedTaskId = `task:${source.sessionId}#${source.sourceUserSeq}`;
+  const material = contracts.durableLogicalCallRecoveryMaterial(acceptedTaskId, 'work_call', callArgs)!;
+  assert.equal(callAuthority.armHostCallAuthority({ sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq,
+    catalogRevisionDigest: 'a'.repeat(64), bindingRevisionDigest: 'b'.repeat(64), maxLogicalCalls: 10, maxParallelCalls: 2 }).status, 'armed');
+  log.openEventLog().prepare(`INSERT INTO logical_tool_calls
+    (session_id, source_user_seq, accepted_task_id, logical_tool_call_id, tool_name, argument_digest, raw_argument_digest, state, opened_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)`).run(source.sessionId, source.sourceUserSeq, acceptedTaskId, callId,
+      material.toolName, material.argumentDigest, material.argumentDigest, new Date().toISOString());
+  const lease = leases.activateDispatchLease({ sessionId: source.sessionId, scopeId: `${source.sessionId}:creation-call`,
+    runAttemptId: source.attempt.attemptId, sourceUserSeq: source.sourceUserSeq, acceptedTaskId, logicalToolCallId: callId,
+    recovery: { material, effect: 'local_write', businessCall: false } });
+  const called = log.appendEvent({ sessionId: source.sessionId, turn: 1, role: 'Clem', type: 'tool_called', data: {
+    sourceUserSeq: source.sourceUserSeq, attemptId: source.attempt.attemptId, callId, canonicalCallId: callId,
+    tool: 'work_call', effectiveTool: 'workflow_test', accounting: 'top_level', arguments: callArgs,
+  } });
+  const run = describeRun(`creation-participant-${serial}`, source);
+  const owned = <T>(work: () => T) => leases.runWithDispatchLease(lease, () => toolContext.withToolOutputContext({
+    sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq, callId, toolName: 'work_call', settlementNonce: nonce,
+  }, work)) as T;
+  const intent = owned(() => inline.createInlineCreationTestDeliveryIntent(run.runId, source.sessionId));
+  assert.ok(intent, 'the actual host producer binds the invocation before the child source');
+  const original = JSON.parse(readFileSync(run.file, 'utf8'));
+  delete original.chatDispatchSourceGroupId; delete original.chatDispatchQueueRequestDigest;
+  writeFileSync(run.file, JSON.stringify({ ...original, status: 'creation_test', source: 'workflow_test', originSessionId: source.sessionId,
+    creationTestSource: { sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq, logicalToolCallId: callId },
+    inlineCreationTestDelivery: intent }));
+  const step = hostStep(run);
+  complete(step);
+  const report = { version: 1, workflowName: run.name, outcome: options.failed ? 'blocked' : 'done',
+    detail: 'Controlled creation-test report: the retained read completed; writes were only previewed.' };
+  const current = JSON.parse(readFileSync(run.file, 'utf8'));
+  writeFileSync(run.file, JSON.stringify({ ...current, status: 'creation_test', finishedAt: new Date().toISOString(),
+    terminalOutcome: options.failed ? 'blocked' : 'succeeded', rehearsal: { passed: !options.failed, definitionKey: 'controlled-rehearsal' },
+    reportBack: report }));
+  const marker = owned(() => inline.inlineCreationTestReceiptForSettlement({ runId: run.runId, body: report.detail }));
+  assert.match(marker, /^\[clementine:inline-creation-test:v1\] /);
+  const output = `${marker}Creation test report:\n${report.detail}`;
+  // This is a retained-record accounting fixture, not executor acceptance.
+  // Seed its returned logical row as closed; do not mint a live capability
+  // attestation or claim a real physical/model operation for this fixture.
+  log.openEventLog().prepare(`UPDATE logical_tool_calls SET state = 'settled', settled_at = ?, outcome_kind = 'succeeded'
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .run(new Date().toISOString(), source.sessionId, source.sourceUserSeq, callId);
+  if (options.beforeReturn) log.appendEvent({ sessionId: source.sessionId, turn: 2, role: 'user', type: 'user_input_received', data:
+    options.beforeReturn === 'human' ? { text: 'A separate controlled request.', synthetic: false }
+      : { text: 'Controlled report-back data.', synthetic: true, source: 'workflow_reportback' } });
+  log.writeToolOutput({ sessionId: source.sessionId, callId, tool: 'work_call', output, invocationNonce: nonce });
+  const outputHash = createHash('sha256').update(output).digest('hex');
+  const result = options.compact ? `[exact-output-receipt:v1 nonce=${nonce} sha256=${outputHash}]` : output;
+  const returned = log.appendEvent({ sessionId: source.sessionId, turn: 1, role: 'Clem', type: 'tool_returned', parentEventId: called.id, data: {
+    sourceUserSeq: source.sourceUserSeq, attemptId: source.attempt.attemptId, callId, canonicalCallId: callId,
+    tool: 'work_call', effectiveTool: 'workflow_test', accounting: 'top_level', result,
+  } });
+  complete(source);
+  return { source, run, step, called, returned, callId, nonce, output, outputHash,
+    measure: () => comparison.measureAcceptedTask(home, source.sessionId, source.sourceUserSeq) };
+}
+
+test('closed creation-test original-return proof admits exact hosted usage once without a group or foreground window expansion', () => {
+  for (const compact of [false, true]) {
+    const f = creationFixture({ compact, beforeReturn: 'synthetic' }); const before = f.measure();
+    recordBound(f.source, 'creation-foreground', 10); recordBound(f.step, 'creation-brain', 20);
+    recordBound(f.step, 'creation-review', 3, 'reviewer'); recordBound(f.step, 'creation-failed-response', 5, 'reviewer', true);
+    usage.withModelUsageAttribution({ sessionId: '', sourceUserSeq: 0,
+      memoryAccountingOrigin: usage.createMemoryAccountingOrigin({ sessionId: f.step.sessionId,
+        sourceUserSeq: f.step.sourceUserSeq, attemptId: f.step.attempt.attemptId }),
+      usageJobId: `memory:skills:creation-${f.step.sourceUserSeq}`, channel: 'memory:skills', role: 'memory',
+    }, () => usage.recordModelUsage({ sessionId: 'unknown', model: 'controlled-creation-memory', inputTokens: 4, outputTokens: 1,
+      cacheDialect: 'inclusive', responseId: `creation-memory-${f.step.sourceUserSeq}`,
+      trace: { modelCallId: `creation-memory-call-${f.step.sourceUserSeq}` } }));
+    usage.recordModelUsage({ sessionId: `workflow:${f.run.runId}`, model: 'controlled-run-only', inputTokens: 7, outputTokens: 1,
+      cacheDialect: 'inclusive', responseId: `creation-run-only-${serial}` });
+    const measured = f.measure();
+    assert.equal(measured.workflowUsageInventory.candidates.length, 0, 'no group dispatch or fabricated seal is introduced');
+    assert.equal(measured.workflowUsageParticipants.length, 1);
+    const participant = measured.workflowUsageParticipants[0]!;
+    assert.ok('lineageKind' in participant); if (!('lineageKind' in participant)) throw new Error('wrong proof kind');
+    assert.equal(participant.lineageKind, 'closed_creation_test_return');
+    assert.equal(Object.hasOwn(participant, 'sourceGroupId'), false);
+    assert.equal(participant.parentCallId, f.callId); assert.equal(participant.parentInvocationNonce, f.nonce);
+    assert.equal(participant.parentReturnSeq, f.returned.seq); assert.equal(participant.sourceReceiptDigest, f.step.receipt.data.authorityDigest);
+    assert.deepEqual(participant.parentAcceptedSources, [`${f.source.sessionId}:${f.source.sourceUserSeq}`]);
+    assert.equal(measured.workflowExactUsageRecords, 4); assert.equal(measured.exactUsageRecords, 5);
+    assert.equal(measured.promptTokens, 42); assert.equal(measured.unprovenUsage.promptTokens, 7);
+    assert.equal(measured.usageCompleteness.recordedTokenRows.failed, 1);
+    assert.deepEqual(measured.sourceUserSeqs, [f.source.sourceUserSeq]); assert.equal(measured.attemptCount, 1);
+    assert.equal(measured.workflowAttemptCount, 1); assert.equal(measured.unfinishedWorkflowAttempts, 0);
+    assert.equal(measured.taskWallMs, before.taskWallMs); assert.equal(measured.terminalSeq, before.terminalSeq);
+    assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    assert.deepEqual(f.measure(), measured, 'repeated measurement never sums overlapping root/child totals');
+  }
+});
+
+test('closed failed creation tests retain proved attempted-model spend rather than treating failure as free', () => {
+  const f = creationFixture({ failed: true }); recordBound(f.source, 'failed-creation-root', 10);
+  recordBound(f.step, 'failed-creation-child', 13, 'brain', true);
+  const result = f.measure(); assert.equal(result.workflowUsageParticipants.length, 1);
+  assert.equal(result.workflowExactUsageRecords, 1); assert.equal(result.promptTokens, 23);
+  assert.equal(result.usageCompleteness.recordedTokenRows.failed, 1);
+  assert.equal(result.usageCompleteness.allLegUsageCertified, false);
+});
+
+test('creation-test receipt, parent, run, attempt and retention contradictions fail closed', () => {
+  for (const variant of ['foreign-nonce', 'hash', 'source', 'run', 'attempt', 'ambiguous-output', 'missing-return', 'foreign-parent',
+    'mirror-return', 'duplicate-return', 'missing-original', 'missing-authored-receipt', 'snapshot', 'token', 'report-digest', 'legacy', 'real-human'] as const) {
+    const f = creationFixture({ compact: variant === 'foreign-nonce', beforeReturn: variant === 'real-human' ? 'human' : undefined });
+    const db = log.openEventLog();
+    const updateReturn = (patch: Record<string, unknown>) => db.prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...f.returned.data, ...patch }), f.returned.id);
+    if (variant === 'foreign-nonce') updateReturn({ result: `[exact-output-receipt:v1 nonce=${randomUUID()} sha256=${f.outputHash}]` });
+    if (variant === 'hash') db.prepare('UPDATE tool_output_invocations SET output_sha256 = ? WHERE session_id = ? AND call_id = ?')
+      .run('f'.repeat(64), f.source.sessionId, f.callId);
+    if (variant === 'source') updateReturn({ sourceUserSeq: f.source.sourceUserSeq + 1 });
+    if (variant === 'attempt') updateReturn({ attemptId: 'foreign-parent-attempt' });
+    if (variant === 'ambiguous-output') log.writeToolOutput({ sessionId: f.source.sessionId, callId: f.callId, tool: 'work_call',
+      output: f.output, invocationNonce: randomUUID() });
+    if (variant === 'missing-return') db.prepare('DELETE FROM events WHERE id = ?').run(f.returned.id);
+    if (variant === 'mirror-return') updateReturn({ accounting: 'transport_mirror' });
+    if (variant === 'duplicate-return') log.appendEvent({ sessionId: f.source.sessionId, turn: 1, role: 'Clem', type: 'tool_returned',
+      parentEventId: f.called.id, data: f.returned.data });
+    if (variant === 'missing-original') db.prepare('DELETE FROM tool_output_invocations WHERE session_id = ? AND call_id = ?')
+      .run(f.source.sessionId, f.callId);
+    if (variant === 'foreign-parent') db.prepare('UPDATE events SET parent_event_id = ? WHERE id = ?').run(f.source.source.id, f.returned.id);
+    if (variant === 'missing-authored-receipt') db.prepare('DELETE FROM events WHERE id = ?').run(f.step.receipt.id);
+    if (['run', 'snapshot', 'token', 'report-digest', 'legacy'].includes(variant)) {
+      const record = JSON.parse(readFileSync(f.run.file, 'utf8'));
+      if (variant === 'run') record.creationTestSource.logicalToolCallId = 'foreign-test-call';
+      if (variant === 'snapshot') delete record.workflowDefinitionSnapshot;
+      if (variant === 'token') record.inlineCreationTestDelivery.token = 'f'.repeat(64);
+      if (variant === 'report-digest') record.reportBack.detail = 'Contrary controlled report.';
+      if (variant === 'legacy') delete record.creationTestSource;
+      writeFileSync(f.run.file, JSON.stringify(record));
+    }
+    recordBound(f.source, `negative-creation-root-${variant}`, 10); recordBound(f.step, `negative-creation-child-${variant}`, 20);
+    const result = f.measure(); assert.equal(result.workflowUsageParticipants.length, 0, variant);
+    assert.equal(result.workflowExactUsageRecords, 0, variant); assert.equal(result.promptTokens, 10, variant);
+    assert.ok(result.workflowUsageIssues.length > 0, variant); assert.equal(result.usageCompleteness.allLegUsageCertified, false);
+  }
+});
 
 test('actual group and authored receipt producers bind only exact hosted step sources and attempts', () => {
   const f = fixture(2); const before = f.runs.map(run => readFileSync(run.file, 'utf8'));

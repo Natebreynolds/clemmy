@@ -13,9 +13,7 @@ interface SourceRow { id: string; seq: number; session_id: string; turn: number;
   parent_event_id: string | null; data_json: string; created_at: string }
 interface AttemptRow { attempt_id: string; session_id: string; run_id: string | null; source_user_seq: number | null }
 interface ReceiptRow extends SourceRow {}
-export interface AcceptedTaskWorkflowParticipant {
-  sourceGroupId: string;
-  sourceGroupDigest: string;
+interface HostedWorkflowParticipant {
   runId: string;
   parentAcceptedSources: string[];
   stepId: string;
@@ -24,6 +22,28 @@ export interface AcceptedTaskWorkflowParticipant {
   attemptIds: string[];
   sourceReceiptDigest: string;
 }
+export interface AcceptedTaskWorkflowParticipant extends HostedWorkflowParticipant {
+  sourceGroupId: string;
+  sourceGroupDigest: string;
+}
+/** Historical accounting parentage, not a group seal or execution authority.
+ * The canonical caller verifies the paired original tool return before passing
+ * this descriptor; this reader independently checks its exact retained run. */
+export interface ClosedCreationTestParent {
+  runId: string;
+  parentSessionId: string;
+  parentSourceUserSeq: number;
+  parentAttemptId: string;
+  parentCallId: string;
+  parentReturnSeq: number;
+  parentInvocationNonce: string;
+  parentOutputSha256: string;
+  runDescriptorSha256: string;
+}
+export interface ClosedCreationTestWorkflowParticipant extends HostedWorkflowParticipant, ClosedCreationTestParent {
+  lineageKind: 'closed_creation_test_return';
+}
+export type WorkflowAccountingParticipant = AcceptedTaskWorkflowParticipant | ClosedCreationTestWorkflowParticipant;
 export interface AcceptedTaskWorkflowParticipants {
   participants: AcceptedTaskWorkflowParticipant[];
   claimedRunIds: string[];
@@ -99,27 +119,42 @@ export function readAcceptedTaskWorkflowParticipants(home: string,
   acceptedSources: readonly { sessionId: string; sourceUserSeq: number }[],
   options: WorkflowOriginGroupProofOptions,
 ): AcceptedTaskWorkflowParticipants {
-  const result: AcceptedTaskWorkflowParticipants = { participants: [], claimedRunIds: [], claimedSources: [], claimedAttemptIds: [], issues: [] };
+  return readWorkflowParticipants(home, acceptedSources, options) as AcceptedTaskWorkflowParticipants;
+}
+
+export function readClosedCreationTestWorkflowParticipants(home: string, parents: readonly ClosedCreationTestParent[],
+  claimedRunIds: readonly string[] = []): Omit<AcceptedTaskWorkflowParticipants, 'participants'> & { participants: ClosedCreationTestWorkflowParticipant[] } {
+  return readWorkflowParticipants(home, [], undefined, parents, claimedRunIds) as ReturnType<typeof readClosedCreationTestWorkflowParticipants>;
+}
+
+function readWorkflowParticipants(home: string, acceptedSources: readonly { sessionId: string; sourceUserSeq: number }[],
+  options?: WorkflowOriginGroupProofOptions, creationParents: readonly ClosedCreationTestParent[] = [],
+  creationClaims: readonly string[] = []) {
+  const result: Omit<AcceptedTaskWorkflowParticipants, 'participants'> & { participants: WorkflowAccountingParticipant[] } = {
+    participants: [], claimedRunIds: [], claimedSources: [], claimedAttemptIds: [], issues: [] };
   const issues = new Set<string>(); const runClaims = new Set<string>(); const attemptClaims = new Set<string>();
   const sourceClaims = new Map<string, { sessionId: string; sourceUserSeq: number }>();
-  const finish = (): AcceptedTaskWorkflowParticipants => {
+  const finish = () => {
     result.claimedRunIds = [...runClaims].sort(); result.claimedAttemptIds = [...attemptClaims].sort();
     result.claimedSources = [...sourceClaims.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId) || a.sourceUserSeq - b.sourceUserSeq);
-    result.participants.sort((a, b) => a.sourceGroupId.localeCompare(b.sourceGroupId) || a.sessionId.localeCompare(b.sessionId) || a.sourceUserSeq - b.sourceUserSeq);
+    const order = (row: WorkflowAccountingParticipant) => 'sourceGroupId' in row ? row.sourceGroupId : row.runId;
+    result.participants.sort((a, b) => order(a).localeCompare(order(b)) || a.sessionId.localeCompare(b.sessionId) || a.sourceUserSeq - b.sourceUserSeq);
     result.issues = [...issues].sort(); return result;
   };
   if (!path.isAbsolute(home)) { issues.add('workflow_participant_explicit_home_invalid'); return finish(); }
   const inventory = readAcceptedTaskWorkflowCandidates(home, acceptedSources);
   for (const issue of inventory.issues) if (issue !== 'workflow_candidate_authority_and_usage_unproved') issues.add(issue);
   for (const candidate of inventory.candidates) for (const runId of candidate.runIds) runClaims.add(runId);
-  if (!inventory.candidates.length) return finish();
+  for (const runId of creationClaims) if (safeRun(runId)) runClaims.add(runId);
+  for (const parent of creationParents) if (safeRun(parent.runId)) runClaims.add(parent.runId);
+  if (!inventory.candidates.length && !runClaims.size) return finish();
   if (runClaims.size > 128) { issues.add('workflow_participant_run_inventory_limit'); return finish(); }
-  if (!options || typeof options.isWorkflowParentTerminalIdentity !== 'function') {
+  if (inventory.candidates.length && (!options || typeof options.isWorkflowParentTerminalIdentity !== 'function')) {
     issues.add('workflow_participant_parent_proof_unavailable'); return finish();
   }
   const runsDir = path.join(home, 'workflows', 'runs');
   const groups = new Map<string, ActiveWorkflowOriginGroup | null>();
-  const runGroups = new Map<string, Array<{ group: ActiveWorkflowOriginGroup; parent: string }>>();
+  const runGroups = new Map<string, Array<{ group: ActiveWorkflowOriginGroup; parent: string } | { creation: ClosedCreationTestParent; parent: string }>>();
   const snapshots = new Map<string, string>();
   const readRun = (runId: string): Row | null => {
     if (!safeRun(runId)) return null;
@@ -140,7 +175,7 @@ export function readAcceptedTaskWorkflowParticipants(home: string,
         let group: ActiveWorkflowOriginGroup | null;
         try {
           if (!groups.has(candidate.sourceGroupId)) groups.set(candidate.sourceGroupId,
-            readActiveWorkflowOriginGroupAtDirectory(runsDir, candidate.sourceGroupId, options));
+            readActiveWorkflowOriginGroupAtDirectory(runsDir, candidate.sourceGroupId, options!));
           group = groups.get(candidate.sourceGroupId)!;
         } catch { groups.set(candidate.sourceGroupId, null); group = null; }
         if (!group) { issues.add('workflow_participant_group_unproved'); continue; }
@@ -173,9 +208,25 @@ export function readAcceptedTaskWorkflowParticipants(home: string,
           }
           const entry = { group, parent: candidate.parentAcceptedSource };
           const previous = runGroups.get(member.runId) ?? [];
-          if (!previous.some(row => row.group.sealed.sourceGroupId === group!.sealed.sourceGroupId && row.parent === entry.parent))
+          if (!previous.some(row => 'group' in row && row.group.sealed.sourceGroupId === group!.sealed.sourceGroupId && row.parent === entry.parent))
             runGroups.set(member.runId, [...previous, entry]);
         }
+      }
+      for (const parent of creationParents) {
+        const descriptor = readRun(parent.runId);
+        const bytes = snapshots.get(path.join(runsDir, `${parent.runId}.json`));
+        const origin = descriptor?.creationTestSource;
+        if (!safeRun(parent.runId) || !bounded(parent.parentSessionId) || !positive(parent.parentSourceUserSeq)
+          || !bounded(parent.parentAttemptId) || !bounded(parent.parentCallId) || !positive(parent.parentReturnSeq)
+          || !/^[a-f0-9-]{36}$/i.test(parent.parentInvocationNonce)
+          || !hash(parent.runDescriptorSha256) || !hash(parent.parentOutputSha256)
+          || !descriptor || descriptor.id !== parent.runId || descriptor.source !== 'workflow_test'
+          || !bytes || createHash('sha256').update(bytes).digest('hex') !== parent.runDescriptorSha256
+          || !object(origin) || origin.sessionId !== parent.parentSessionId || origin.sourceUserSeq !== parent.parentSourceUserSeq
+          || origin.logicalToolCallId !== parent.parentCallId || descriptor.originSessionId !== parent.parentSessionId) {
+          issues.add('workflow_creation_test_run_binding_unproved'); continue;
+        }
+        runGroups.set(parent.runId, [{ creation: parent, parent: `${parent.parentSessionId}:${parent.parentSourceUserSeq}` }]);
       }
       const runIds = JSON.stringify([...runClaims]);
       // Explicit source/metadata claims only. A workflow: prefix or a title is
@@ -234,9 +285,11 @@ export function readAcceptedTaskWorkflowParticipants(home: string,
         const ownedAttempts = attempts.filter(row => row.session_id === source.session_id
           && row.source_user_seq === source.seq && row.run_id === own!.attemptRunId && bounded(row.attempt_id));
         if (ownedAttempts.length !== attempts.length) issues.add('workflow_participant_foreign_attempt_claim');
-        for (const { group, parent } of runGroups.get(data.workflowRunId)!) result.participants.push({
-          sourceGroupId: group.sealed.sourceGroupId, sourceGroupDigest: group.sealed.sourceGroupDigest,
-          runId: data.workflowRunId, parentAcceptedSources: [parent], stepId: data.stepId,
+        for (const origin of runGroups.get(data.workflowRunId)!) result.participants.push({
+          ...('group' in origin
+            ? { sourceGroupId: origin.group.sealed.sourceGroupId, sourceGroupDigest: origin.group.sealed.sourceGroupDigest }
+            : { lineageKind: 'closed_creation_test_return' as const, ...origin.creation }),
+          runId: data.workflowRunId, parentAcceptedSources: [origin.parent], stepId: data.stepId,
           sessionId: source.session_id, sourceUserSeq: source.seq, attemptIds: [...new Set(ownedAttempts.map(row => row.attempt_id))].sort(),
           sourceReceiptDigest: own.authorityDigest as string,
         });
@@ -252,9 +305,9 @@ export function readAcceptedTaskWorkflowParticipants(home: string,
   for (const [id, group] of groups) {
     if (!group) continue;
     try {
-      if (closedCanonicalJson(readActiveWorkflowOriginGroupAtDirectory(runsDir, id, options)) === closedCanonicalJson(group)) continue;
+      if (closedCanonicalJson(readActiveWorkflowOriginGroupAtDirectory(runsDir, id, options!)) === closedCanonicalJson(group)) continue;
     } catch { /* Do not publish a positive graph across a group mutation. */ }
-    result.participants = result.participants.filter(row => row.sourceGroupId !== id);
+    result.participants = result.participants.filter(row => !('sourceGroupId' in row) || row.sourceGroupId !== id);
     issues.add('workflow_participant_group_changed');
   }
   return finish();
