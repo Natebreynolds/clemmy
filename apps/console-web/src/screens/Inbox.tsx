@@ -923,7 +923,7 @@ function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBa
           <Link to="/connect" className="rounded-md border border-border bg-surface px-3 py-1.5 text-small font-medium text-primary hover:bg-hover">Open Connections</Link>
           <Button disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Resuming…' : 'I connected it — resume'}</Button>
         </>
-      ) : resolution.kind === 'retry_exact_metadata' ? (
+      ) : resolution.kind === 'retry_exact_metadata' || resolution.kind === 'retry_check' ? (
         <Button disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Retrying…' : 'Retry now'}</Button>
       ) : (
         <Link to="/automate" className="text-small font-medium text-primary hover:underline">Review the run</Link>

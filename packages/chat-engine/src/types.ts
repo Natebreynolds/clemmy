@@ -357,8 +357,9 @@ export interface TerminalFacts {
 }
 
 /** `needs_recheck` is an answer the host held because the evidence under it
- *  came from earlier work that needs a fresh look. */
-export type TerminalReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+ *  came from earlier work that needs a fresh look. `noted` is a finished
+ *  answer whose last review questioned only some of its wording. */
+export type TerminalReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'noted';
 
 export type RetainedOutsideChange = 'went_through' | 'did_not' | 'mixed' | 'refused' | 'uncertain' | 'none';
 

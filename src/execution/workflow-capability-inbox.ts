@@ -16,6 +16,7 @@ export type WorkflowCapabilityInboxResolution =
       choicesTruncated: boolean;
     }
   | { kind: 'retry_exact_metadata'; retryCount: number }
+  | { kind: 'retry_check'; retryCount: number }
   | { kind: 'connect_and_retry'; retryCount: number }
   | { kind: 'review_run'; reason: string };
 
@@ -98,6 +99,8 @@ export function projectWorkflowCapabilityInboxGate(
     }
   } else if (raw?.kind === 'retry_exact_metadata' && retryCount !== null) {
     resolution = { kind: 'retry_exact_metadata', retryCount };
+  } else if (raw?.kind === 'retry_check' && retryCount !== null) {
+    resolution = { kind: 'retry_check', retryCount };
   } else if (raw?.kind === 'connect_and_retry' && retryCount !== null) {
     resolution = { kind: 'connect_and_retry', retryCount };
   }

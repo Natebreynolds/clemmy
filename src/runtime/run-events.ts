@@ -78,6 +78,13 @@ export type RunInputBlocker =
         kind: 'retry_exact_metadata';
         actionTool: 'workflow_capability_resolve';
         retryCount: number;
+      }
+      | {
+        /** The service could not be reached to check; a retry, not a connection. */
+        kind: 'retry_check';
+        actionTool: 'workflow_capability_resolve';
+        toolkit: string;
+        retryCount: number;
       };
     retryAt?: string;
     provenNoDispatch: boolean;

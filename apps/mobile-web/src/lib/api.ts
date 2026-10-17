@@ -521,6 +521,7 @@ export interface WorkflowCapabilityInboxGate {
         choicesTruncated: boolean;
       }
     | { kind: 'retry_exact_metadata'; retryCount: number }
+    | { kind: 'retry_check'; retryCount: number }
     | { kind: 'connect_and_retry'; retryCount: number }
     | { kind: 'review_run'; reason: string };
 }

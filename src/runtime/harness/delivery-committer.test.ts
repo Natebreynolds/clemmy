@@ -767,7 +767,7 @@ for (const scope of ['claims', 'work'] as const) {
       replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
     } });
     const committed = commitTurnOutcome(outcome);
-    assert.equal(committed.event.data.review, 'rejected');
+    assert.equal(committed.event.data.review, scope === 'claims' ? 'noted' : 'rejected');
     assert.match(String(committed.event.data.reviewNote), /Which account/);
     assert.equal(committed.event.data.verificationDetail, 'completion_review_negative');
     assert.equal(committed.presentation.text, outcome.presentation.text, 'her words publish exactly either way');

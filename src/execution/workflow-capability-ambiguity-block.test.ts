@@ -17,7 +17,7 @@ const TMP = mkdtempSync(path.join(os.tmpdir(), 'clem-ambiguity-block-'));
 process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
-const { catalogPreparationRefusalToCapabilityBlock } = await import('./workflow-runner.js');
+const { catalogPreparationRefusalToCapabilityBlock, workflowCapabilityNotificationPresentation } = await import('./workflow-runner.js');
 const { attachSemanticContract } = await import('../runtime/harness/capability-manifest.js');
 const { createCapabilityManifestStore, installCapabilityManifestStore } = await import('../runtime/harness/capability-manifest-store.js');
 import type { CapabilityManifestV1 } from '../runtime/harness/capability-manifest.js';
@@ -107,4 +107,19 @@ test('a check that could not complete parks as retryable, never as not-connected
   assert.match(block.message, /could not complete/);
   assert.match(block.message, /refresh_unavailable/, 'the refusal code rides along for the honest notice');
   assert.doesNotMatch(block.message, /not connected|operation name is wrong/);
+});
+
+test('a check that could not complete offers a retry, never "open Connections"', () => {
+  const block = catalogPreparationRefusalToCapabilityBlock(
+    { id: 'main' },
+    { reason: 'selected_definition_revalidation_refused', operationId: 'GOOGLESHEETS_BATCH_GET',
+      detail: 'selected_connection_refresh_unavailable' },
+  );
+  const presentation = workflowCapabilityNotificationPresentation('Fixture review', {
+    stepId: block.stepId, tool: block.tool, toolkit: block.toolkit, reason: block.reason, message: block.message,
+    blockedAt: new Date().toISOString(), retryAt: new Date(Date.now() + 60_000).toISOString(), retryCount: 1,
+    provenNoDispatch: true, state: 'blocked',
+  } as never);
+  assert.equal(presentation.resolution.kind, 'retry_check');
+  assert.match(presentation.detail, /could not reach/i);
 });

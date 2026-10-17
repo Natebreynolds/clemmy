@@ -1752,11 +1752,12 @@ function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessi
   );
 }
 
-const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean }> = {
+const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean; neutral?: boolean }> = {
   checked: { label: '✓ Checked', ok: true },
   unchecked: { label: 'Not checked', ok: false },
   rejected: { label: 'Didn’t pass review', ok: false },
   needs_recheck: { label: 'Needs a fresh check', ok: false },
+  noted: { label: 'Done · review notes', ok: false, neutral: true },
 };
 
 /** A turn no model spoke for, as the app's own status line: what happened,
@@ -1808,7 +1809,7 @@ function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?:
       {offer && sessionId ? <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} /> : null}
       {review || touched || byline ? (
         <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
-          {review ? <span class={REVIEW_CHIP[review].ok ? 'receipt-ok' : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
+          {review ? <span class={REVIEW_CHIP[review].ok ? 'receipt-ok' : REVIEW_CHIP[review].neutral ? undefined : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
           {touched ? <span>{touched}</span> : null}
           {reveal && reviewNote ? <span class="receipt-model receipt-review-note">Review: {reviewNote}</span> : null}
           {reveal && byline ? <span class="receipt-model">{byline}</span> : null}

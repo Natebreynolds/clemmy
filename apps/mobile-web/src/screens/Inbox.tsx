@@ -1062,6 +1062,12 @@ function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenW
             {busy ? 'Retrying…' : 'Retry exact metadata now'}
           </button>
         </div>
+      ) : resolution.kind === 'retry_check' ? (
+        <div class="inbox-card-actions">
+          <button type="button" class="btn-approve" disabled={busy} onClick={() => void resolve()}>
+            {busy ? 'Retrying…' : 'Retry now'}
+          </button>
+        </div>
       ) : (
         <div>
           <p class="trust-consequence">{resolution.reason}</p>
@@ -1307,6 +1313,7 @@ function gateNeedLabel(gate: WorkflowCapabilityInboxGate): string {
     case 'choose_account': return 'needs one input';
     case 'connect_and_retry': return 'needs a connection';
     case 'retry_exact_metadata': return 'needs a retry';
+    case 'retry_check': return 'will retry on its own';
     default: return 'needs review';
   }
 }

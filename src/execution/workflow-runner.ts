@@ -15340,12 +15340,21 @@ export function workflowCapabilityNotificationPresentation(
           actionTool: 'workflow_capability_resolve' as const,
           retryCount: block.retryCount,
         }
-      : {
-          kind: 'connect_and_retry' as const,
-          actionTool: 'workflow_capability_resolve' as const,
-          toolkit: block.toolkit,
-          retryCount: block.retryCount,
-        };
+      : couldNotCheck
+        // The service did not answer the check; the connection is fine. The
+        // way forward is a retry, never "open Connections".
+        ? {
+            kind: 'retry_check' as const,
+            actionTool: 'workflow_capability_resolve' as const,
+            toolkit: block.toolkit,
+            retryCount: block.retryCount,
+          }
+        : {
+            kind: 'connect_and_retry' as const,
+            actionTool: 'workflow_capability_resolve' as const,
+            toolkit: block.toolkit,
+            retryCount: block.retryCount,
+          };
   const choiceQuestion = accountChoiceBlock
     ? [
         `Which ${block.toolkit} account should I use for step "${block.stepId}"?`,

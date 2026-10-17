@@ -567,6 +567,8 @@ function RunWorkspaceDrawer({
                         <AlertTriangle className="h-4 w-4" aria-hidden />
                         {selectedRun.capabilityBlock.reason === 'ambiguous-account'
                           ? 'Choose an exact account'
+                          : selectedRun.capabilityBlock.reason === 'connection-check-unavailable'
+                            ? 'Couldn’t reach the service — retrying'
                           : selectedRun.capabilityBlock.reason === 'exact_schema_refresh_unavailable'
                             || selectedRun.capabilityBlock.reason === 'exact_schema_boundary_mismatch'
                             ? 'Exact action metadata needs review'

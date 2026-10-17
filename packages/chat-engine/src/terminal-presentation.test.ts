@@ -105,6 +105,12 @@ test('review, review note, retained facts and notice are read from the terminal'
   assert.deepEqual(facts?.notice, { code: 'provider_out_of_credit', agentName: 'Desk', model: 'Vendor V4', providerSaid: 'Insufficient balance.' });
 });
 
+test('a finished answer whose last review questioned only wording reads as noted', () => {
+  const facts = terminalFactsFrom(withFacts('done', { review: 'noted', reviewNote: 'Which account the CLI uses is not shown.' }));
+  assert.equal(facts?.review, 'noted');
+  assert.equal(facts?.reviewNote, 'Which account the CLI uses is not shown.');
+});
+
 test('unknown review, retained and notice values are ignored, never invented', () => {
   const facts = terminalFactsFrom(withFacts('done', {
     review: 'approved-ish',
