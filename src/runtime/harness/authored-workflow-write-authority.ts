@@ -922,6 +922,11 @@ async function reviewAuthoredWriteConstraints(input: {
       args: input.args,
       observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
       stakes,
+      // Once a write of this step has been refused, the measured first read
+      // has already failed to clear it, and every later proposal would read
+      // the same prompt twice, measured and then full (live 2026-10-16 a
+      // channel review spent 58 reviewer calls, most of them in such pairs).
+      ...(rounds && rounds.count > 0 ? { measuredFirst: false } : {}),
     });
     if (result.verdict === 'uncertain' && !result.checkerFailure && stakes === 'ordinary') {
       // The compact view names each retained result in a line; a reviewer

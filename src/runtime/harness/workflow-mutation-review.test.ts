@@ -163,6 +163,18 @@ test('an ordinary write is read at a measured depth first; only a non-compatible
   assert.equal(decided.verdict, 'conflict');
   assert.deepEqual(efforts, ['medium', undefined]);
 
+  // A later proposal of a step whose write was already refused: the measured
+  // read already failed to clear it, so only the full review runs.
+  efforts.length = 0;
+  await reviewWorkflowMutation({ ...input, observations: retained, stakes: 'ordinary', measuredFirst: false }, {
+    evaluate: async () => { throw new Error('no classifier'); },
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      efforts.push(opts?.effort);
+      return { value: parse({ verdict: 'compatible', reason: 'ok', proposalDigest: JSON.parse(prompt).proposalDigest }), failure: null };
+    },
+  });
+  assert.deepEqual(efforts, [undefined], 'one full review, no measured read first');
+
   // High stakes (a send, a delete): the full review from the start, no measured read.
   efforts.length = 0;
   await reviewWorkflowMutation({ ...input, observations: retained, stakes: 'high' }, {

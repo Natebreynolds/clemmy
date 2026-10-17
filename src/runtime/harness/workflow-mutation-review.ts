@@ -39,6 +39,10 @@ export interface WorkflowMutationReviewInput {
    * send, a delete or an irreversible change is read at full depth from the
    * start. Omitted means full. */
   stakes?: 'ordinary' | 'high';
+  /** An ordinary write is first read at a measured depth, and only a write
+   * that read does not clear gets the full review. False skips that first read
+   * when this step's writes have already needed the full review. */
+  measuredFirst?: boolean;
 }
 
 const SYSTEM = [
@@ -48,6 +52,7 @@ const SYSTEM = [
   'account, when present, is the connected account the host has bound this exact write to: an authenticated fact about where the write runs, not something the arguments must repeat.',
   'Do not invent additional approval or read requirements. A permitted intermediate write need not complete the whole objective.',
   'Use authenticated observations and open retained evidence when needed. An omitted record or clipped view does not prove absence.',
+  'When you need retained evidence, open every result you need in the same step, as several lookups at once, rather than one per step.',
   'valueProvenance, when present, lists for each proposed value the retained results that contain it verbatim. It is a search, not a judgement: a value found in a read of the destination may already be there, a value found in a source read was taken from it, a value found nowhere was not read from this run. Judge what that means; open a result only when the verdict needs more than where a value appears.',
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
@@ -240,7 +245,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // reviews at 60–100 s and ~20k tokens a round; the writes were ordinary row
   // appends. A measured first read answers the compatible case; anything
   // else is decided by the full review, never by the measured one.
-  if (input.stakes === 'ordinary') {
+  if (input.stakes === 'ordinary' && input.measuredFirst !== false) {
     try {
       const started = Date.now();
       const measured = await judge(SYSTEM, prompt, parse, pass, 'mutation_constraints',
