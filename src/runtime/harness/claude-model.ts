@@ -28,7 +28,7 @@ import type { Model, ModelProvider, ModelRequest, ModelResponse } from '@openai/
 import type { StreamEvent } from '@openai/agents-core/types';
 import { loadFreshClaudeAccessToken } from '../claude-oauth.js';
 import { getClaudeBrainModel, getRuntimeEnv, MODELS } from '../../config.js';
-import { withResilience } from './resilient-model.js';
+import { withPublicModelCallObservation, withResilience } from './resilient-model.js';
 import { completedModelResponseBinding, type CompletedModelResponseBinding } from './model-response-binding.js';
 import { activeModelWireRequestSnapshot, beginActiveClaudeReviewWireTransform, createClaudeModelWireProducer,
   declareActiveClaudeModelWireProducer, finishActiveClaudeReviewWireTransform, observeModelTransportFetch,
@@ -53,7 +53,9 @@ import {
 import { claudeSubscriptionTransport, claudeHeadlessCliAvailable, getClaudeHeadlessModel, resetClaudeHeadlessModelCache } from './claude-headless-model.js';
 import { assertLiveModelTransportAllowed } from './live-model-guard.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
-import { captureMemoryModelUsageProvenance, capturedModelUsageAttribution, type CapturedModelUsageProvenance, recordModelUsage } from '../usage-log.js';
+import { captureMemoryModelUsageProvenance, capturedModelUsageAttribution, modelUsageAttributionStorage,
+  standaloneModelAccountingJobFromContext, type CapturedModelUsageProvenance, recordModelUsage } from '../usage-log.js';
+import { captureActiveModelTransportUsage, captureModelTransportUsageOwner } from './model-transport-observation.js';
 import { recordWindowAcceptance } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { appendEvent } from './eventlog.js';
@@ -1102,6 +1104,22 @@ export function rawClaudeUsageFields(response: ModelResponse): RawClaudeUsageFie
  * already includes the adapter's provider-reported cache details. */
 type RawClaudeCallContext = Pick<NonNullable<ReturnType<typeof harnessRunContextStorage.getStore>>,
   'sessionId' | 'sourceUserSeq' | 'runAttemptId' | 'promptComponents' | 'turn'>;
+function rawClaudeAccountingProvenance(): CapturedModelUsageProvenance | undefined {
+  const captured = captureActiveModelTransportUsage()?.callerProvenance;
+  if (captured && standaloneModelAccountingJobFromContext(capturedModelUsageAttribution(captured))) return captured;
+  return captureMemoryModelUsageProvenance();
+}
+/** Only standalone jobs opt into public lazy-entry metadata capture here.
+ * Accepted turns and detached memory keep their existing adapter behavior. */
+function withRawClaudeJobObservation(model: Model, target: Model): Model {
+  const observed = withPublicModelCallObservation(model, target, captureModelTransportUsageOwner);
+  return {
+    getResponse: request => standaloneModelAccountingJobFromContext(modelUsageAttributionStorage.getStore())
+      ? observed.getResponse(request) : model.getResponse(request),
+    getStreamedResponse: request => standaloneModelAccountingJobFromContext(modelUsageAttributionStorage.getStore())
+      ? observed.getStreamedResponse(request) : model.getStreamedResponse(request),
+  };
+}
 class RawClaudeUsageRecordingModel implements Model {
   constructor(
     private readonly inner: Model,
@@ -1158,7 +1176,7 @@ class RawClaudeUsageRecordingModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const provenance = captureMemoryModelUsageProvenance();
+    const provenance = rawClaudeAccountingProvenance();
     const startedAt = Date.now();
     const response = await this.inner.getResponse(request);
     this.record(response, startedAt, undefined, undefined, provenance);
@@ -1168,7 +1186,7 @@ class RawClaudeUsageRecordingModel implements Model {
   getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
     // Capture before returning the iterable: the host may drain it outside the
     // original async-local scope. Never join a later session to this source.
-    const provenance = captureMemoryModelUsageProvenance();
+    const provenance = rawClaudeAccountingProvenance();
     const current = harnessRunContextStorage.getStore();
     const context: RawClaudeCallContext | undefined = current && {
       sessionId: current.sessionId, sourceUserSeq: current.sourceUserSeq,
@@ -1248,7 +1266,8 @@ export function withRawClaudeUsageRecording(
   windowRecorder: typeof recordWindowAcceptance = recordWindowAcceptance,
   diagnosticRecorder: (entry: RawClaudeStreamDiagnostic) => void = recordRawClaudeStreamDiagnostic,
 ): Model {
-  return new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder, windowRecorder, diagnosticRecorder);
+  return withRawClaudeJobObservation(
+    new RawClaudeUsageRecordingModel(inner, modelId, usageRecorder, windowRecorder, diagnosticRecorder), inner);
 }
 
 /** Per-request transport router (owner question, 2026-07-24: "why can't
@@ -1318,10 +1337,10 @@ function buildRawClaudeModel(modelId: string): Model {
       refreshAuth: refreshClaudeAuth,
     });
   }
-  return withConversationProtocolBoundaryAssertion(
+  return withRawClaudeJobObservation(withConversationProtocolBoundaryAssertion(
     withRawClaudeUsageRecording(model, modelId),
     'claude.messages',
-  );
+  ), model);
 }
 
 /** Whether the Claude model used by the standard Agents harness can execute

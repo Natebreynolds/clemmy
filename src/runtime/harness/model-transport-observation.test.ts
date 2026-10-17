@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import type { ModelRequest } from '@openai/agents-core';
-import { withModelUsageAttribution } from '../usage-log.js';
+import { createStandaloneModelAccountingJob, standaloneModelAccountingJobBinding, withStandaloneModelAccountingJob,
+  withModelUsageAttribution } from '../usage-log.js';
 import { bindCompletedModelResponse } from './model-response-binding.js';
 import { captureUnavailableModelTransportOwner, createModelTransportAttempt, finishModelTransportAttempt, modelTransportAttemptStream,
+  captureModelTransportOwner, beginActiveClaudeReviewWireTransform,
   createClaudeModelWireProducer, declareActiveClaudeModelWireProducer,
   modelWireRequestSnapshot, observeCompletedTransportModelResponse, observeModelTransportFetch,
   withModelTransportAttempt, withModelTransportRecorder } from './model-transport-observation.js';
@@ -18,6 +20,60 @@ const legacyRows = (rows: readonly Readonly<Record<string, unknown>>[]) => rows.
 const streamedRequest = { input: 'fixture', modelSettings: {}, tools: [], handoffs: [] } as unknown as ModelRequest;
 const streamedPolicy = { label: 'transport-owner-fixture', capability: resolveModelCapability('claude-opus-4-8'),
   maxRetries: 1, sleep: async () => {} };
+
+test('standalone jobs retain immutable distinct owners under concurrent foreign drainers without turn or review authority', async () => {
+  const jobs = [0, 1].map(() => createStandaloneModelAccountingJob({ operation: 'noticing_proposal',
+    operationId: 'controlled-tick', revisionDigest: 'a'.repeat(64) }));
+  assert.notEqual(standaloneModelAccountingJobBinding(jobs[0]!)?.usageJobId,
+    standaloneModelAccountingJobBinding(jobs[1]!)?.usageJobId);
+  const rows: Readonly<Record<string, unknown>>[] = [];
+  const captured = jobs.map(job => withModelTransportRecorder(row => rows.push(row), () =>
+    withStandaloneModelAccountingJob(job, captureModelTransportOwner)));
+  await Promise.all(captured.map((owner, i) => withModelUsageAttribution({ sessionId: `foreign-drainer-${i}`,
+    sourceUserSeq: 700 + i, attemptId: `foreign-attempt-${i}`, role: 'brain' }, async () => {
+    const scope = createModelTransportAttempt(`controlled-job-call-${i}`, 1, owner);
+    assert.equal(scope.owner, undefined);
+    assert.equal(scope.accountingJob?.usageJobId, standaloneModelAccountingJobBinding(jobs[i]!)?.usageJobId);
+    const response = { id: `controlled-job-response-${i}` };
+    await withModelTransportAttempt(scope, async () => {
+      declareActiveClaudeModelWireProducer(createClaudeModelWireProducer());
+      assert.equal(beginActiveClaudeReviewWireTransform({ system: 'private guide' }), undefined);
+      await observeModelTransportFetch('raw_claude_messages', 'claude-controlled', async () => ({ status: 200, ok: true }));
+      bindCompletedModelResponse(response, scope.modelCallId, 1);
+      observeCompletedTransportModelResponse(scope, response);
+      finishModelTransportAttempt(scope, 'returned');
+    });
+  })));
+  for (const [i, job] of jobs.entries()) {
+    const own = rows.filter(row => row.usageJobId === standaloneModelAccountingJobBinding(job)?.usageJobId);
+    assert.deepEqual(own.map(row => row.phase), ['adapter_attempt_created', 'dispatch_started', 'headers_received',
+      'model_result_completed', 'adapter_attempt_finished']);
+    assert.ok(own.every(row => row.ownerKind === 'accounting_job' && row.modelCallId === `controlled-job-call-${i}`));
+    assert.equal(own.at(-1)?.providerResponseIdDigest,
+      createHash('sha256').update(`controlled-job-response-${i}`).digest('hex'));
+    for (const row of own) for (const field of ['sourceUserSeq', 'logicalTurnId', 'runAttemptId', 'wireInputInclusion', 'reviewWireInclusionReceipts']) {
+      assert.equal(Object.hasOwn(row, field), false, field);
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(rows), /private guide|foreign-drainer|foreign-attempt/);
+});
+
+test('a cloned job capture is unowned and a failed job attempt retains unknown usage', () => {
+  const rows: Readonly<Record<string, unknown>>[] = [];
+  const job = createStandaloneModelAccountingJob({ operation: 'noticing_answer', operationId: 'controlled-check-in',
+    revisionDigest: 'b'.repeat(64) });
+  const captured = withModelTransportRecorder(row => rows.push(row), () => withStandaloneModelAccountingJob(job, captureModelTransportOwner));
+  withModelUsageAttribution({ sessionId: 'later-turn', sourceUserSeq: 750, attemptId: 'later-attempt' }, () => {
+    const forged = createModelTransportAttempt('forged-job-call', 1, { ...captured });
+    assert.equal(forged.owner, undefined); assert.equal(forged.accountingJob, undefined);
+    finishModelTransportAttempt(forged, 'returned');
+    const actual = createModelTransportAttempt('failed-job-call', 1, captured);
+    finishModelTransportAttempt(actual, 'failed');
+  });
+  assert.deepEqual(rows.map(row => row.phase), ['adapter_attempt_created', 'adapter_attempt_finished']);
+  assert.equal(rows[1]?.outcome, 'failed'); assert.equal(rows[1]?.usage, 'unknown');
+  assert.equal(rows[1]?.remoteSettlement, 'unknown'); assert.equal(rows[1]?.providerResponseIdDigest, undefined);
+});
 
 test('concurrent dispatches retain whole immutable accepted owners and keep headers distinct from original completion', async () => {
   const rows: Readonly<Record<string, unknown>>[] = [];

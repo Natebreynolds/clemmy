@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { types as utilTypes } from 'node:util';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -458,6 +459,8 @@ export interface UsageParentTurn {
 }
 
 export interface ModelUsageAttributionContext {
+  /** Standalone accounting only; never an accepted source or execution scope. */
+  standaloneAccountingJob?: StandaloneModelAccountingJob;
   /** Accounting-only parent: never reinstates the turn's model pin or tool authority. */
   usageParentTurn?: UsageParentTurn;
   /** Private accounting origin; never model-selection or tool authority. */
@@ -491,6 +494,49 @@ export interface ModelUsageAttributionContext {
  */
 export const modelUsageAttributionStorage = new AsyncLocalStorage<ModelUsageAttributionContext>();
 
+export interface StandaloneModelAccountingJob { readonly kind: 'standalone_model_accounting_job' }
+export interface StandaloneModelAccountingJobBinding {
+  readonly usageJobId: string;
+  readonly operation: 'noticing_proposal' | 'noticing_answer';
+  readonly operationId: string;
+  readonly revisionDigest: string;
+}
+const standaloneAccountingJobs = new WeakMap<StandaloneModelAccountingJob, Readonly<StandaloneModelAccountingJobBinding> | undefined>();
+
+/** Minted once at the host invocation, independently of evidence equality or
+ * retries. Invalid metadata is explicitly unowned, never an ambient fallback. */
+export function createStandaloneModelAccountingJob(input?: {
+  operation: StandaloneModelAccountingJobBinding['operation']; operationId: string; revisionDigest: string;
+}): StandaloneModelAccountingJob {
+  const row = inertUsageData(input);
+  const valid = row && (row.operation === 'noticing_proposal' || row.operation === 'noticing_answer')
+    && typeof row.operationId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(row.operationId)
+    && typeof row.revisionDigest === 'string' && /^[a-f0-9]{64}$/.test(row.revisionDigest);
+  const token = Object.freeze({ kind: 'standalone_model_accounting_job' as const });
+  standaloneAccountingJobs.set(token, valid ? Object.freeze({ usageJobId: `noticing-job:${randomUUID()}`,
+    operation: row.operation as StandaloneModelAccountingJobBinding['operation'],
+    operationId: row.operationId as string, revisionDigest: row.revisionDigest as string }) : undefined);
+  return token;
+}
+export function standaloneModelAccountingJobBinding(token: StandaloneModelAccountingJob): Readonly<StandaloneModelAccountingJobBinding> | undefined {
+  return standaloneAccountingJobs.get(token);
+}
+/** Present malformed markers opt out of all inherited attribution. */
+export function standaloneModelAccountingJobFromContext(value: unknown): StandaloneModelAccountingJob | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  if (utilTypes.isProxy(value)) return createStandaloneModelAccountingJob();
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'standaloneAccountingJob');
+  if (!descriptor) return undefined;
+  return 'value' in descriptor && descriptor.value && typeof descriptor.value === 'object'
+    && standaloneAccountingJobs.has(descriptor.value) ? descriptor.value : createStandaloneModelAccountingJob();
+}
+export function withStandaloneModelAccountingJob<T>(job: StandaloneModelAccountingJob, work: () => T): T {
+  const token = standaloneAccountingJobs.has(job) ? job : createStandaloneModelAccountingJob();
+  const binding = standaloneModelAccountingJobBinding(token);
+  return modelUsageAttributionStorage.run({ sessionId: '', sourceUserSeq: 0, standaloneAccountingJob: token,
+    ...(binding ? { usageJobId: binding.usageJobId } : {}) }, work);
+}
+
 /** An origin is accounting data only. Its private identity prevents serialized
  * markers, explicit empty origins and later drainer scopes from adopting a task. */
 export interface MemoryAccountingOrigin { readonly kind: 'memory_accounting_origin' }
@@ -523,7 +569,8 @@ export function memoryAccountingOriginFromContext(value: unknown): MemoryAccount
  * a later drainer's source, parent, job, workflow, role or prompt components. */
 export interface CapturedModelUsageProvenance { readonly kind: 'captured_model_usage' }
 const capturedUsageProvenance = new WeakMap<CapturedModelUsageProvenance,
-  { attribution?: ModelUsageAttributionContext; workflowSource: string }>();
+  { attribution?: ModelUsageAttributionContext; workflowSource: string;
+    standaloneObservers?: { usage?: ObservedModelUsage[]; recording?: { recorded: boolean } } }>();
 
 function inertUsageData(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || utilTypes.isProxy(value)) return undefined;
@@ -563,6 +610,14 @@ function captureUsageAttribution(value: unknown): ModelUsageAttributionContext |
     const parent = memoryAccountingParent(origin);
     if (parent) result.usageParentTurn = parent; else delete result.usageParentTurn;
   }
+  const standalone = standaloneModelAccountingJobFromContext(value);
+  if (standalone) {
+    const binding = standaloneModelAccountingJobBinding(standalone);
+    result.standaloneAccountingJob = standalone;
+    result.sessionId = ''; result.sourceUserSeq = 0;
+    delete result.attemptId; delete result.usageParentTurn; delete result.memoryAccountingOrigin;
+    if (binding) result.usageJobId = binding.usageJobId; else delete result.usageJobId;
+  }
   return Object.freeze(result);
 }
 /** Inert data only, not harness/tool execution authority. Diagnostic callers
@@ -577,18 +632,26 @@ export function captureModelUsageProvenance(): CapturedModelUsageProvenance {
   try {
     const current = modelUsageAttributionStorage.getStore();
     attribution = captureUsageAttribution(current);
-    if (!attribution && memoryAccountingOriginFromContext(current)) attribution = Object.freeze({
+    const standalone = standaloneModelAccountingJobFromContext(current);
+    if (!attribution && standalone) attribution = Object.freeze({
+      sessionId: '', sourceUserSeq: 0, standaloneAccountingJob: standalone,
+    });
+    else if (!attribution && memoryAccountingOriginFromContext(current)) attribution = Object.freeze({
       sessionId: '', sourceUserSeq: 0, memoryAccountingOrigin: createMemoryAccountingOrigin(),
     });
-    workflowSource = resolveWorkflowUsageSource('unknown'); } catch { /* absent stays absent */ }
-  capturedUsageProvenance.set(token, { attribution, workflowSource });
+    workflowSource = standalone ? 'unknown' : resolveWorkflowUsageSource('unknown'); } catch { /* absent stays absent */ }
+  capturedUsageProvenance.set(token, { attribution, workflowSource,
+    ...(standaloneModelAccountingJobFromContext(attribution) ? { standaloneObservers: {
+      usage: modelUsageObservers.getStore(), recording: modelUsageRecordingObservation.getStore(),
+    } } : {}) });
   return token;
 }
 
-/** Raw Claude opts into entry capture only for the detached memory mode.
+/** Raw Claude opts into entry capture for independently owned accounting.
  * Plain callers retain the legacy ambient and response-ID behavior. */
 export function captureMemoryModelUsageProvenance(): CapturedModelUsageProvenance | undefined {
   const current = modelUsageAttributionStorage.getStore();
+  if (standaloneModelAccountingJobFromContext(current)) return captureModelUsageProvenance();
   const origin = memoryAccountingOriginFromContext(current);
   if (!origin) return undefined;
   const token = Object.freeze({ kind: 'captured_model_usage' as const });
@@ -672,6 +735,7 @@ export function withOwnModelRequestAttribution<T>(
     ...(inherited?.attemptId ? { attemptId: inherited.attemptId } : {}),
     ...(inherited?.usageParentTurn ? { usageParentTurn: inherited.usageParentTurn } : {}),
     ...(inherited?.usageJobId ? { usageJobId: inherited.usageJobId } : {}),
+    ...(() => { const job = standaloneModelAccountingJobFromContext(inherited); return job ? { standaloneAccountingJob: job } : {}; })(),
     ...(() => { const origin = memoryAccountingOriginFromContext(inherited); return origin ? { memoryAccountingOrigin: origin } : {}; })(),
     ...(role ? { role } : {}),
     ...(channel ? { channel } : {}),
@@ -761,10 +825,13 @@ export function recordModelUsage(args: {
 }): void {
   const captured = args.callerProvenance && capturedUsageProvenance.get(args.callerProvenance);
   const suppliedAttribution = args.callerProvenance !== undefined ? captured?.attribution : modelUsageAttributionStorage.getStore();
+  const standalone = standaloneModelAccountingJobFromContext(suppliedAttribution);
+  const standaloneBinding = standalone && standaloneModelAccountingJobBinding(standalone);
+  const standaloneMode = standalone !== undefined;
   const memoryMode = memoryAccountingOriginFromContext(suppliedAttribution) !== undefined;
   // Only the new marker mode snapshots here. Legacy callers keep their exact
   // field/read behavior; exotic marked contexts cannot execute recording hooks.
-  const attribution: ModelUsageAttributionContext | undefined = memoryMode ? captureUsageAttribution(suppliedAttribution) ?? Object.freeze({
+  const attribution: ModelUsageAttributionContext | undefined = memoryMode || standaloneMode ? captureUsageAttribution(suppliedAttribution) ?? Object.freeze({
     sessionId: '', sourceUserSeq: 0, memoryAccountingOrigin: createMemoryAccountingOrigin(),
   }) : suppliedAttribution;
   const memoryOrigin = memoryMode ? attribution!.memoryAccountingOrigin : undefined;
@@ -772,7 +839,7 @@ export function recordModelUsage(args: {
   const explicitExact = argsSource !== 'unknown'
     && Number.isSafeInteger(args.sourceUserSeq)
     && (args.sourceUserSeq as number) > 0;
-  const inheritedExact = !memoryMode && attribution
+  const inheritedExact = !memoryMode && !standaloneMode && attribution
     && attribution.sessionId.trim()
     && attribution.sessionId !== 'unknown'
     && Number.isSafeInteger(attribution.sourceUserSeq)
@@ -782,7 +849,7 @@ export function recordModelUsage(args: {
   // Select one whole authority tuple. Never combine a detached child's seq
   // with an inherited parent session (or vice versa). When both tuples name
   // the same source, the outer scope may safely fill the missing attempt id.
-  const exactAttribution = memoryMode ? undefined : explicitExact
+  const exactAttribution = memoryMode || standaloneMode ? undefined : explicitExact
     ? {
         sessionId: argsSource,
         sourceUserSeq: args.sourceUserSeq as number,
@@ -794,15 +861,15 @@ export function recordModelUsage(args: {
         ),
       }
     : inheritedExact;
-  const source = memoryMode ? attribution?.usageJobId ?? 'unknown' : exactAttribution?.sessionId
+  const source = standaloneMode ? standaloneBinding?.usageJobId ?? 'unknown' : memoryMode ? attribution?.usageJobId ?? 'unknown' : exactAttribution?.sessionId
     ?? (argsSource === 'unknown' && attribution?.usageJobId ? attribution.usageJobId
       : args.callerProvenance !== undefined ? (argsSource === 'unknown' ? captured?.workflowSource ?? 'unknown' : argsSource)
         : resolveWorkflowUsageSource(argsSource));
-  const parent = memoryMode ? memoryAccountingParent(memoryOrigin!) : attribution?.usageParentTurn;
+  const parent = standaloneMode ? undefined : memoryMode ? memoryAccountingParent(memoryOrigin!) : attribution?.usageParentTurn;
   const traceOwner = exactAttribution ?? (parent?.sessionId && parent.sessionId !== 'unknown'
     && Number.isSafeInteger(parent.sourceUserSeq) && parent.sourceUserSeq > 0 ? parent : undefined);
   const sourceUserSeq = traceOwner?.sourceUserSeq;
-  const attemptId = traceOwner?.attemptId ?? (!traceOwner && !memoryMode ? args.attemptId : undefined);
+  const attemptId = traceOwner?.attemptId ?? (!traceOwner && !memoryMode && !standaloneMode ? args.attemptId : undefined);
   // Write-time authority: the durable session row knows what this session IS,
   // so classification does not depend on every surface's id-minting habits.
   // Guarded — observability must never break the model-call path.
@@ -810,24 +877,24 @@ export function recordModelUsage(args: {
   try {
     sessionRowKind = getSession(source)?.kind;
   } catch { /* classification falls back to channel/prefix evidence */ }
-  const channel = args.channel ?? attribution?.channel;
+  const channel = standaloneMode ? attribution?.channel : args.channel ?? attribution?.channel;
   const resolution = resolveUsageKind(source, { channel, sessionRowKind });
-  const role = args.role ?? attribution?.role ?? usageRoleFromChannel(channel);
-  const roleReason: NonNullable<UsageEvent['roleReason']> = args.role ? 'explicit' : attribution?.role ? 'scope' : role ? 'channel' : 'unset';
+  const role = standaloneMode ? attribution?.role : args.role ?? attribution?.role ?? usageRoleFromChannel(channel);
+  const roleReason: NonNullable<UsageEvent['roleReason']> = !standaloneMode && args.role ? 'explicit' : attribution?.role ? 'scope' : role ? 'channel' : 'unset';
   const canonical = canonicalCacheAccounting(args);
   const hasExactAcceptedSource = source !== 'unknown'
     && Number.isSafeInteger(sourceUserSeq)
     && (sourceUserSeq as number) > 0;
   // A detached origin owns the complete accepted namespace. Only the actual
   // local call identity survives an adapter's foreign harness trace.
-  const memoryTrace = memoryMode ? inertUsageData(args.trace) : undefined;
-  const rawTrace = (memoryMode ? memoryTrace?.modelCallId : args.trace) || hasExactAcceptedSource || attemptId || args.responseId
+  const memoryTrace = memoryMode || standaloneMode ? inertUsageData(args.trace) : undefined;
+  const rawTrace = (memoryMode || standaloneMode ? memoryTrace?.modelCallId : args.trace) || hasExactAcceptedSource || attemptId || args.responseId
     ? {
-        ...(memoryMode ? (typeof memoryTrace?.modelCallId === 'string' ? { modelCallId: memoryTrace.modelCallId } : {}) : args.trace ?? {}),
+        ...(memoryMode || standaloneMode ? (typeof memoryTrace?.modelCallId === 'string' ? { modelCallId: memoryTrace.modelCallId } : {}) : args.trace ?? {}),
         ...(hasExactAcceptedSource ? { acceptedSource: acceptedSourceIdentity(traceOwner?.sessionId ?? source, sourceUserSeq) } : {}),
         ...(hasExactAcceptedSource ? { logicalTurnId: `turn:${sourceUserSeq}` } : {}),
         ...(attemptId ? { attemptId } : {}),
-        ...(args.callerProvenance === undefined && !memoryMode && args.responseId && !args.trace?.modelCallId ? { modelCallId: args.responseId } : {}),
+        ...(args.callerProvenance === undefined && !memoryMode && !standaloneMode && args.responseId && !args.trace?.modelCallId ? { modelCallId: args.responseId } : {}),
       }
     : undefined;
   const event = {
@@ -875,8 +942,8 @@ export function recordModelUsage(args: {
     responseId: args.responseId,
     promptComponents: reconcilePromptComponents(
       attribution?.promptComponents
-        ?? args.promptComponents
-        ?? (attribution?.ownRequest ? undefined : args.framePromptComponents),
+        ?? (standaloneMode ? undefined : args.promptComponents)
+        ?? (standaloneMode || attribution?.ownRequest ? undefined : args.framePromptComponents),
       args.inputTokens,
     ),
     contextWindowTokens: args.contextWindowTokens,
@@ -895,10 +962,12 @@ export function recordModelUsage(args: {
     try { recordAcceptedSourceUsage(traceOwner, event); }
     catch { /* usage observability must not break a model or completed write */ }
   }
-  const observation = modelUsageRecordingObservation.getStore();
+  const observation = standaloneMode && args.callerProvenance !== undefined
+    ? captured?.standaloneObservers?.recording : modelUsageRecordingObservation.getStore();
   if (observation && args.inputTokens + args.outputTokens > 0) observation.recorded = true;
   try {
-    modelUsageObservers.getStore()?.push({
+    (standaloneMode && args.callerProvenance !== undefined
+      ? captured?.standaloneObservers?.usage : modelUsageObservers.getStore())?.push({
       at: event.at,
       model: event.model,
       inputTokens: event.inputTokens,
@@ -926,7 +995,7 @@ export function recordModelUsage(args: {
     severity: 'info',
     sessionId: source,
     workflowRunId: event.runId,
-    modelCallId: args.callerProvenance !== undefined || memoryMode ? event.trace?.modelCallId : args.responseId,
+    modelCallId: args.callerProvenance !== undefined || memoryMode || standaloneMode ? event.trace?.modelCallId : args.responseId,
     actor: 'usage-log',
     now: new Date(event.at),
     payload: {

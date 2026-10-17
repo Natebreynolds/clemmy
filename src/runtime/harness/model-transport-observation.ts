@@ -1,8 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
+import { recordOperationalEvent } from '../operational-telemetry.js';
 import { completedModelResponseBinding } from './model-response-binding.js';
 import { modelUsageAttributionStorage, captureModelUsageProvenance, capturedModelUsageAttribution,
+  standaloneModelAccountingJobFromContext, standaloneModelAccountingJobBinding,
+  type StandaloneModelAccountingJob, type StandaloneModelAccountingJobBinding,
   type CapturedModelUsageProvenance, type ModelUsageAttributionContext } from '../usage-log.js';
 import { associateOriginalReviewWireResponse, beginReviewWireTransform, captureReviewWireExpectation,
   finishReviewWireTransform, reviewWireInclusionForDispatch, unavailableReviewWireExpectation, type ClaudeSystemTextProjection,
@@ -20,12 +23,14 @@ export interface ModelTransportAttempt {
   readonly modelCallId: string;
   readonly physicalAttempt: number;
   readonly owner?: Readonly<ObservationOwner>;
+  readonly accountingJob?: Readonly<StandaloneModelAccountingJobBinding>;
   readonly purpose: 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory' | 'unknown';
 }
 /** A nominal snapshot taken at the public model call, including an explicit
  * absent owner. A lazy stream must never borrow its later drainer's scope. */
 export interface CapturedModelTransportOwner {
   readonly owner?: Readonly<ObservationOwner>;
+  readonly accountingJob?: Readonly<StandaloneModelAccountingJobBinding>;
   readonly purpose: ModelTransportAttempt['purpose'];
 }
 const capturedOwners = new WeakMap<CapturedModelTransportOwner, { record?: ModelTransportRecorder; expectation: ReviewWireExpectation; usage?: CapturedModelUsageProvenance; framePromptComponents?: Record<string, number> }>();
@@ -59,7 +64,7 @@ export function declareActiveClaudeModelWireProducer(producer: ClaudeModelWirePr
   else state.producer = producer;
 }
 function reviewWireOwner(scope: ModelTransportAttempt): ReviewWireOwner | undefined {
-  return scope.owner ? { sessionId: scope.owner.sessionId, sourceUserSeq: scope.owner.sourceUserSeq,
+  return !scope.accountingJob && scope.owner ? { sessionId: scope.owner.sessionId, sourceUserSeq: scope.owner.sourceUserSeq,
     attemptId: scope.owner.runAttemptId, modelCallId: scope.modelCallId, physicalAttempt: scope.physicalAttempt } : undefined;
 }
 export function beginActiveClaudeReviewWireTransform(body: Record<string, unknown>): ReviewWireTransform | undefined {
@@ -112,7 +117,8 @@ export function modelWireRequestSnapshot(serialized: unknown): ModelWireRequestS
 
 /** Avoid hashing detached/unobserved traffic. Their inventory remains unknown. */
 export function activeModelWireRequestSnapshot(serialized: unknown): ModelWireRequestSnapshot | undefined {
-  return activeAttempt.getStore()?.owner ? modelWireRequestSnapshot(serialized) : undefined;
+  const scope = activeAttempt.getStore();
+  return scope?.owner || scope?.accountingJob ? modelWireRequestSnapshot(serialized) : undefined;
 }
 
 /** Test/request-local sink only; concurrent requests never share mutable sinks. */
@@ -122,6 +128,7 @@ export function withModelTransportRecorder<T>(record: ModelTransportRecorder, wo
 
 function snapshotOwner(): Readonly<ObservationOwner> | undefined {
   const current = modelUsageAttributionStorage.getStore();
+  if (standaloneModelAccountingJobFromContext(current)) return undefined;
   // Select a whole existing accounting tuple. A detached memory job may carry
   // its parent, but its own attempt must never be spliced into that tuple.
   const value = current && identity(current.sessionId) && current.sessionId !== 'unknown'
@@ -137,14 +144,16 @@ function snapshotOwner(): Readonly<ObservationOwner> | undefined {
 
 function emit(scope: ModelTransportAttempt, fields: Record<string, unknown>): void {
   const state = states.get(scope);
-  if (!state || !scope.owner) return;
+  if (!state || (!scope.owner && !scope.accountingJob)) return;
   try {
-    const data = Object.freeze({ ...fields, version: 1, sourceUserSeq: scope.owner.sourceUserSeq,
-    logicalTurnId: `turn:${scope.owner.sourceUserSeq}`, modelCallId: scope.modelCallId,
+    const data = Object.freeze({ ...fields, version: 1,
+    ...(scope.accountingJob ? { ownerKind: 'accounting_job', ...scope.accountingJob } : {
+      sourceUserSeq: scope.owner!.sourceUserSeq, logicalTurnId: `turn:${scope.owner!.sourceUserSeq}`,
+      ownerKind: scope.owner!.accountingParent ? 'accounting_parent' : 'accepted_source_scope',
+      ...(scope.owner!.usageJobId ? { usageJobId: scope.owner!.usageJobId } : {}),
+      ...(scope.owner!.runAttemptId ? { runAttemptId: scope.owner!.runAttemptId } : {}),
+    }), modelCallId: scope.modelCallId,
     physicalAttempt: scope.physicalAttempt, purpose: scope.purpose,
-    ownerKind: scope.owner.accountingParent ? 'accounting_parent' : 'accepted_source_scope',
-    ...(scope.owner.usageJobId ? { usageJobId: scope.owner.usageJobId } : {}),
-    ...(scope.owner.runAttemptId ? { runAttemptId: scope.owner.runAttemptId } : {}),
     at: Date.now(), clock: 'host_epoch_ms', journalFailed: state.journalFailed });
     const returned = state.record(data);
     if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
@@ -154,11 +163,16 @@ function emit(scope: ModelTransportAttempt, fields: Record<string, unknown>): vo
 }
 
 export function captureModelTransportOwner(): CapturedModelTransportOwner {
-  const role = modelUsageAttributionStorage.getStore()?.role;
+  const current = modelUsageAttributionStorage.getStore();
+  const role = current?.role;
   const purpose = role && ['brain', 'worker', 'reviewer', 'router', 'writer', 'memory'].includes(role) ? role : 'unknown';
   const owner = snapshotOwner();
-  const captured = Object.freeze({ ...(owner ? { owner } : {}), purpose }) as CapturedModelTransportOwner;
-  capturedOwners.set(captured, { record: overrideRecorder.getStore(), expectation: captureReviewWireExpectation() });
+  const job = standaloneModelAccountingJobFromContext(current);
+  const accountingJob = job && standaloneModelAccountingJobBinding(job);
+  const captured = Object.freeze({ ...(owner ? { owner } : {}), ...(accountingJob ? { accountingJob } : {}), purpose }) as CapturedModelTransportOwner;
+  capturedOwners.set(captured, { record: overrideRecorder.getStore(),
+    expectation: job ? unavailableReviewWireExpectation() : captureReviewWireExpectation(),
+    ...(job ? { usage: captureModelUsageProvenance() } : {}) });
   return captured;
 }
 
@@ -198,10 +212,14 @@ export function createModelTransportAttempt(modelCallId: string, physicalAttempt
   const nominal = capturedOwners.has(captured);
   const purpose = nominal ? captured.purpose : 'unknown';
   const owner = nominal ? captured.owner : undefined;
-  const scope = Object.freeze({ modelCallId, physicalAttempt, ...(owner ? { owner } : {}), purpose }) as ModelTransportAttempt;
+  const accountingJob = nominal ? captured.accountingJob : undefined;
+  const scope = Object.freeze({ modelCallId, physicalAttempt, ...(owner ? { owner } : {}),
+    ...(accountingJob ? { accountingJob } : {}), purpose }) as ModelTransportAttempt;
   const capturedState = nominal ? capturedOwners.get(captured) : undefined;
   const record = capturedState?.record ?? ((data: Readonly<Record<string, unknown>>) => {
-    appendEvent({ sessionId: owner!.sessionId, turn: 0, role: 'system', type: 'model_transport_observed', data });
+    if (accountingJob) recordOperationalEvent({ source: 'model', type: 'model_accounting_observed',
+      actor: 'model-transport-observation', modelCallId, payload: data });
+    else appendEvent({ sessionId: owner!.sessionId, turn: 0, role: 'system', type: 'model_transport_observed', data });
   });
   if (identity(modelCallId) && Number.isSafeInteger(physicalAttempt) && physicalAttempt > 0) {
     states.set(scope, { record, dispatchIds: [], terminal: false, journalFailed: false,
@@ -222,6 +240,14 @@ export interface CapturedModelTransportUsage {
 }
 function usageMatchesAttempt(scope: ModelTransportAttempt, usage: CapturedModelUsageProvenance): boolean {
   const current = capturedModelUsageAttribution(usage);
+  if (scope.accountingJob) {
+    const token = standaloneModelAccountingJobFromContext(current);
+    const binding = token && standaloneModelAccountingJobBinding(token);
+    return !!binding && binding.usageJobId === scope.accountingJob.usageJobId
+      && binding.operation === scope.accountingJob.operation && binding.operationId === scope.accountingJob.operationId
+      && binding.revisionDigest === scope.accountingJob.revisionDigest && !scope.owner
+      && scope.purpose === (current?.role ?? 'unknown');
+  }
   const value = current && identity(current.sessionId) && current.sessionId !== 'unknown'
     && Number.isSafeInteger(current.sourceUserSeq) && current.sourceUserSeq > 0 ? current : current?.usageParentTurn;
   const owner = scope.owner;
@@ -263,9 +289,27 @@ export function captureActiveModelTransportUsage(): CapturedModelTransportUsage 
 export function capturedModelTransportUsageCallId(scope: ModelTransportAttempt | undefined,
   usage: CapturedModelUsageProvenance): string | undefined {
   const state = scope && states.get(scope);
-  return scope && scope.purpose !== 'unknown' && state && !state.terminal && state.localOutcome === undefined
+  return scope && (scope.purpose !== 'unknown' || scope.accountingJob !== undefined) && state && !state.terminal && state.localOutcome === undefined
     && !state.journalFailed && state.usage === usage
     && usageMatchesAttempt(scope, usage) ? scope.modelCallId : undefined;
+}
+
+/** Local invocation/receipt links only. Missing observations never prove no
+ * model ran, and a returned operation does not certify provider usage. */
+export function recordStandaloneModelAccountingJobObservation(job: StandaloneModelAccountingJob, input: {
+  phase: 'job_started' | 'job_finished' | 'operation_receipt';
+  outcome?: 'returned' | 'failed'; receiptDigest?: string;
+}): void {
+  const binding = standaloneModelAccountingJobBinding(job);
+  if (!binding) return;
+  try {
+    recordOperationalEvent({ source: 'model', type: 'model_accounting_observed', actor: 'noticing', payload: {
+      version: 1, ownerKind: 'accounting_job', ...binding, phase: input.phase,
+      ...(input.outcome ? { outcome: input.outcome, usage: 'unknown' } : {}),
+      ...(input.receiptDigest && /^[a-f0-9]{64}$/.test(input.receiptDigest) ? { receiptDigest: input.receiptDigest } : {}),
+      at: Date.now(), clock: 'host_epoch_ms',
+    } });
+  } catch { /* Accounting never changes the operation's result. */ }
 }
 
 export function withModelTransportAttempt<T>(scope: ModelTransportAttempt, work: () => T): T {

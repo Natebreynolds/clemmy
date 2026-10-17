@@ -24,6 +24,9 @@ import { noticingApprovedTaskDigest, readAcceptedNoticingTask,
   type NoticingApprovedTaskPacket } from '../runtime/harness/noticing-approved-task.js';
 import type { AssistantRequest } from '../types.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
+import { createStandaloneModelAccountingJob, standaloneModelAccountingJobBinding, withStandaloneModelAccountingJob,
+  type StandaloneModelAccountingJob, type StandaloneModelAccountingJobBinding } from '../runtime/usage-log.js';
+import { recordStandaloneModelAccountingJobObservation } from '../runtime/harness/model-transport-observation.js';
 import { NOTICING_ANSWER_PURPOSE, NOTICING_PROPOSAL_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import {
   DEFAULT_NOTICING_CONFIG,
@@ -225,33 +228,55 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
 }
 
 // ── the model ─────────────────────────────────────────────────────────────────
-async function proposeWithConfiguredModel(input: Parameters<Parameters<typeof runNoticingTick>[0]['propose']>[0]) {
+async function runNoticingModelJob<T>(identity: Pick<StandaloneModelAccountingJobBinding, 'operation' | 'operationId' | 'revisionDigest'>,
+  work: () => Promise<T>, capture?: (job: StandaloneModelAccountingJob) => void): Promise<{ value: T; modelAccountingJobId?: string }> {
+  const job = createStandaloneModelAccountingJob(identity);
+  capture?.(job);
+  recordStandaloneModelAccountingJobObservation(job, { phase: 'job_started' });
+  try {
+    const value = await withStandaloneModelAccountingJob(job, work);
+    recordStandaloneModelAccountingJobObservation(job, { phase: 'job_finished', outcome: 'returned' });
+    return { value, modelAccountingJobId: standaloneModelAccountingJobBinding(job)?.usageJobId };
+  } catch (error) {
+    recordStandaloneModelAccountingJobObservation(job, { phase: 'job_finished', outcome: 'failed' });
+    throw error;
+  }
+}
+async function proposeWithConfiguredModel(input: Parameters<Parameters<typeof runNoticingTick>[0]['propose']>[0],
+  tickId: string, capture: (job: StandaloneModelAccountingJob) => void) {
   const port = peekTurnSemanticModelPort();
   if (!port?.noticing) return null;
-  const reply = await port.noticing({
+  const { value: reply, modelAccountingJobId } = await runNoticingModelJob({ operation: 'noticing_proposal',
+    operationId: tickId, revisionDigest: input.evidenceDigest }, () => port.noticing!({
     purpose: NOTICING_PROPOSAL_PURPOSE,
     observation: input.observation,
     rules: input.rules,
     standingAnswers: input.standingAnswers.map((a) => ({ about: a.about, said: a.text })),
     recentProposals: input.recentProposals,
     evidenceDigest: input.evidenceDigest,
-  });
+  }), capture);
   const parsed = NoticingAnswerV1Schema.safeParse(reply.answer);
   return parsed.success
-    ? { answer: parsed.data, modelIdentity: reply.modelIdentity }
-    : { answer: null, modelIdentity: reply.modelIdentity, error: `the model's answer was not well-formed: ${parsed.error.issues[0]?.message ?? 'invalid'}` };
+    ? { answer: parsed.data, modelIdentity: reply.modelIdentity, modelAccountingJobId }
+    : { answer: null, modelIdentity: reply.modelIdentity, modelAccountingJobId, error: `the model's answer was not well-formed: ${parsed.error.issues[0]?.message ?? 'invalid'}` };
 }
 
 /** The owner's words, read into a decision. No regex on their text. */
-export async function readNoticingAnswer(proposal: Pick<NoticingProposalRecord, 'title' | 'action'>, text: string): Promise<{ status: 'read' | 'unavailable'; decision: NoticingDecision; instruction?: string; modelIdentity?: string }> {
+export async function readNoticingAnswer(proposal: Pick<NoticingProposalRecord, 'title' | 'action'>, text: string,
+  accounting?: { checkInId: string; answerDigest: string; capture: (job: StandaloneModelAccountingJob) => void },
+): Promise<{ status: 'read' | 'unavailable'; decision: NoticingDecision; instruction?: string; modelIdentity?: string; modelAccountingJobId?: string }> {
   const port = peekTurnSemanticModelPort();
   if (!port?.readNoticingAnswer) return { status: 'unavailable', decision: 'unclear' };
   const digest = createHash('sha256').update(JSON.stringify({ title: proposal.title, action: proposal.action, text })).digest('hex');
-  const reply = await port.readNoticingAnswer({ purpose: NOTICING_ANSWER_PURPOSE, proposal: { title: proposal.title, action: proposal.action }, answer: text, evidenceDigest: digest });
+  const call = () => port.readNoticingAnswer!({ purpose: NOTICING_ANSWER_PURPOSE, proposal: { title: proposal.title, action: proposal.action }, answer: text, evidenceDigest: digest });
+  const { value: reply, modelAccountingJobId } = accounting
+    ? await runNoticingModelJob({ operation: 'noticing_answer', operationId: accounting.checkInId,
+      revisionDigest: accounting.answerDigest }, call, accounting.capture)
+    : { value: await call(), modelAccountingJobId: undefined };
   if (reply.evidenceDigest !== digest || !['do_it', 'not_now', 'never', 'unclear'].includes(reply.decision)) {
-    return { status: 'unavailable', decision: 'unclear', modelIdentity: reply.modelIdentity };
+    return { status: 'unavailable', decision: 'unclear', modelIdentity: reply.modelIdentity, modelAccountingJobId };
   }
-  return { status: 'read', decision: reply.decision, ...(reply.instruction ? { instruction: reply.instruction } : {}), modelIdentity: reply.modelIdentity };
+  return { status: 'read', decision: reply.decision, ...(reply.instruction ? { instruction: reply.instruction } : {}), modelIdentity: reply.modelIdentity, modelAccountingJobId };
 }
 
 // ── asking ────────────────────────────────────────────────────────────────────
@@ -338,7 +363,9 @@ async function settleNoticingAnswersOnce(now: number): Promise<number> {
     if (!alreadyRead && !(record.answer?.text === checkIn.answer && record.answer.decision === 'do_it'
       && record.handoff?.answerDigest === answerDigest)) {
       let read: Awaited<ReturnType<typeof readNoticingAnswer>>;
-      try { read = await readNoticingAnswer(record, checkIn.answer); }
+      let answerJob: StandaloneModelAccountingJob | undefined;
+      try { read = await readNoticingAnswer(record, checkIn.answer,
+        { checkInId: checkIn.id, answerDigest, capture: job => { answerJob = job; } }); }
       catch { read = { status: 'unavailable', decision: 'unclear' }; }
       const acceptedRead = updateNoticingState(state => {
         const current = state.proposals[record.id];
@@ -353,11 +380,19 @@ async function settleNoticingAnswersOnce(now: number): Promise<number> {
         }
         recordNoticingAnswer(state, { proposalId: record.id, text: checkIn.answer!, decision: read.decision,
           ...(read.instruction ? { instruction: read.instruction } : {}), at: checkIn.answeredAt! });
+        if (read.modelAccountingJobId && current.answer) current.answer.modelAccountingJobId = read.modelAccountingJobId;
         setHandoff(current, answerDigest, read.decision === 'unclear' ? 'needs_attention'
           : read.decision === 'do_it' ? 'not_started' : 'settled', now,
           read.decision === 'unclear' ? { reason: 'I could not tell whether you want this proposal started. Open a chat and say what you want to do; no work was started.' } : {});
         return true;
       });
+      if (acceptedRead && answerJob) {
+        try {
+          const retained = readNoticingStateStrict().state.proposals[record.id]?.answer;
+          if (retained?.modelAccountingJobId === read.modelAccountingJobId) recordStandaloneModelAccountingJobObservation(answerJob,
+            { phase: 'operation_receipt', receiptDigest: digest(retained) });
+        } catch { /* Missing receipt proof remains unknown; answer behavior is unchanged. */ }
+      }
       if (acceptedRead) settled++;
     }
     const current = loadNoticingState().proposals[record.id];
@@ -481,6 +516,7 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
     digest({ present: snapshot.present, proposals: snapshot.state.proposals,
       standingAnswers: snapshot.state.standingAnswers, ruleFilePresent: rules.present, rules: rules.rules });
   let publicationGeneration: string | undefined;
+  let tickJob: StandaloneModelAccountingJob | undefined;
   inFlight = settleNoticingAnswers().catch(() => 0).then(() => runNoticingTick({
     now: () => Date.now(),
     tickId,
@@ -488,7 +524,7 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
     config: { ...DEFAULT_NOTICING_CONFIG, dailyCap: policy.dailyCap },
     rules,
     observe: () => observeForNoticing(),
-    propose: proposeWithConfiguredModel,
+    propose: input => proposeWithConfiguredModel(input, tickId, job => { tickJob = job; }),
     ask: askViaCheckIn,
     isAnswered: (checkInId) => {
       const row = getCheckIn(checkInId);
@@ -506,6 +542,14 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
       && publicationGeneration === generation(readNoticingStateStrict(), readNoticingRulesStrict()),
     saveState: saveNoticingState,
   })).then((result) => {
+    if (tickJob && result.modelAccountingJobId) {
+      try {
+        const retained = readNoticingStateStrict().state.thinking.find(row => row.tickId === tickId
+          && row.modelAccountingJobId === result.modelAccountingJobId);
+        if (retained) recordStandaloneModelAccountingJobObservation(tickJob,
+          { phase: 'operation_receipt', receiptDigest: digest(retained) });
+      } catch { /* An unavailable retained receipt cannot become proof from this result. */ }
+    }
     logger.info({ tickId, source: options.source, produced: result.produced, quiet: result.quiet, durationMs: result.durationMs, summary: result.summary },
       result.quiet ? 'noticing: quiet tick' : 'noticing: proposed');
     return result;
@@ -573,7 +617,11 @@ export function noticingStatus(nowMs = Date.now()): NoticingStatus {
   const policy = noticingPolicy();
   const state = loadNoticingState();
   const due = isNoticingDue(nowMs);
-  const proposals = Object.values(state.proposals).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const proposals = Object.values(state.proposals).map(proposal => {
+    if (!proposal.answer) return proposal;
+    const { modelAccountingJobId: _accounting, ...answer } = proposal.answer;
+    return { ...proposal, answer };
+  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const latest = state.thinking[0];
   return {
     id: NOTICING_ID,
@@ -591,7 +639,7 @@ export function noticingStatus(nowMs = Date.now()): NoticingStatus {
     metrics: state.metrics,
     openItems: proposals.filter((p) => p.status === 'open' || (p.handoff && p.handoff.state !== 'settled')),
     recentlyRetired: proposals.filter((p) => p.status !== 'open' && (!p.handoff || p.handoff.state === 'settled')).slice(0, 20),
-    thinking: state.thinking,
+    thinking: state.thinking.map(({ modelAccountingJobId: _accounting, ...thinking }) => thinking),
     standingAnswers: state.standingAnswers,
   };
 }

@@ -48,6 +48,57 @@ test('classifyUsageKind tags boot warmups as their own kind', () => {
   assert.equal(classifyUsageKind('x', 'discord'), 'chat');
 });
 
+test('standalone captured accounting owns only its job namespace across a foreign caller and own-request scope', async () => {
+  const api = await import('./usage-log.js');
+  const job = api.createStandaloneModelAccountingJob({ operation: 'noticing_answer', operationId: 'controlled-check-in',
+    revisionDigest: 'a'.repeat(64) });
+  const binding = api.standaloneModelAccountingJobBinding(job)!;
+  const ownObserved: import('./usage-log.js').ObservedModelUsage[] = [];
+  const foreignObserved: import('./usage-log.js').ObservedModelUsage[] = [];
+  const provenance = api.withModelUsageObserver(ownObserved, () => api.withStandaloneModelAccountingJob(job, () => api.withOwnModelRequestAttribution({
+    channel: 'semantic:noticing_answer', role: 'reviewer', promptComponents: { instructions: 2, history: 3 },
+  }, () => api.captureMemoryModelUsageProvenance())));
+  assert.ok(provenance);
+  withModelUsageAttribution({ sessionId: 'foreign-accounting-drainer', sourceUserSeq: 2701,
+    attemptId: 'attempt:foreign-accounting-drainer', role: 'brain', channel: 'foreign-channel' }, () => api.withModelUsageObserver(foreignObserved, () => recordModelUsage({
+    callerProvenance: provenance, sessionId: 'foreign-adapter-source', sourceUserSeq: 2702,
+    attemptId: 'attempt:foreign-adapter', role: 'worker', channel: 'foreign-adapter-channel',
+    model: 'controlled-accounting-model', responseId: 'standalone-original-response', inputTokens: 10, outputTokens: 3,
+    cacheDialect: 'inclusive', framePromptComponents: { foreign: 999 },
+    trace: { modelCallId: 'standalone-local-call', acceptedSource: 'foreign:2702', logicalTurnId: 'turn:2702',
+      attemptId: 'attempt:foreign', activationId: 'foreign-activation', toolCallId: 'foreign-tool' },
+  })));
+  const row = api.readUsageEventsForDate().find(value => value.responseId === 'standalone-original-response')!;
+  assert.equal(row.source, binding.usageJobId); assert.equal(row.channel, 'semantic:noticing_answer');
+  assert.equal(row.role, 'reviewer'); assert.deepEqual(row.trace, { modelCallId: 'standalone-local-call' });
+  assert.equal(row.responseId, 'standalone-original-response'); assert.equal(row.promptComponents?.foreign, undefined);
+  assert.ok(Object.isFrozen(binding));
+  assert.equal(ownObserved.length, 1); assert.equal(foreignObserved.length, 0);
+});
+
+test('invalid standalone accounting tokens cannot borrow explicit or ambient accepted ownership', async () => {
+  const api = await import('./usage-log.js'); let hooks = 0;
+  for (const variant of ['clone', 'getter', 'proxy'] as const) {
+    const job = api.createStandaloneModelAccountingJob({ operation: 'noticing_proposal', operationId: 'controlled-tick',
+      revisionDigest: 'b'.repeat(64) });
+    const context: any = { sessionId: 'foreign-standalone', sourceUserSeq: 2801, attemptId: 'attempt:foreign',
+      usageJobId: 'invented-job', standaloneAccountingJob: { ...job } };
+    if (variant === 'getter') Object.defineProperty(context, 'standaloneAccountingJob', { enumerable: true,
+      get() { hooks++; throw new Error('must not run'); } });
+    const supplied = variant === 'proxy' ? new Proxy(context, { get() { hooks++; throw new Error('must not run'); } }) : context;
+    const provenance = withModelUsageAttribution(supplied, () => api.captureMemoryModelUsageProvenance());
+    assert.ok(provenance);
+    withModelUsageAttribution({ sessionId: 'late-standalone', sourceUserSeq: 2802 }, () => recordModelUsage({
+      callerProvenance: provenance, sessionId: 'explicit-standalone', sourceUserSeq: 2803, attemptId: 'attempt:explicit',
+      trace: { acceptedSource: 'explicit:2803', logicalTurnId: 'turn:2803', modelCallId: `standalone-invalid-${variant}` },
+      model: 'controlled-invalid-job', responseId: `standalone-invalid-response-${variant}`, inputTokens: 2, outputTokens: 1,
+    }));
+    const row = api.readUsageEventsForDate().find(value => value.responseId === `standalone-invalid-response-${variant}`)!;
+    assert.equal(row.source, 'unknown'); assert.deepEqual(row.trace, { modelCallId: `standalone-invalid-${variant}` });
+  }
+  assert.equal(hooks, 0);
+});
+
 test('rollupUsage derives an overall cache-hit-rate from cached/input tokens', () => {
   const r = rollupUsage([
     ev({ inputTokens: 1000, cachedInputTokens: 800 }),

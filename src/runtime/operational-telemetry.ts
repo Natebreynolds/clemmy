@@ -45,6 +45,7 @@ export const WORKFLOW_OPERATIONAL_EVENT_TYPES = [
 ] as const;
 
 export const MODEL_OPERATIONAL_EVENT_TYPES = [
+  'model_accounting_observed',
   'model_route_decided',
   'model_call_started',
   'model_call_completed',

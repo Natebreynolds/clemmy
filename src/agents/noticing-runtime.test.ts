@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,11 +18,105 @@ const ports = await import('../runtime/semantic-boundary/turn-semantic-port-regi
 const approved = await import('../runtime/harness/noticing-approved-task.js');
 const contracts = await import('./heartbeat-contracts.js');
 const { upsertGoalRecord } = await import('../memory/goals-list.js');
+const accounting = await import('../runtime/usage-log.js');
+const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 const stateFile = path.join(home, 'state', 'noticing.json');
 let sequence = 0;
 
 test.afterEach(() => { runtime.bindNoticingRespond(null); ports.installTurnSemanticModelPort(null); });
 test.after(() => { log.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
+
+const jobEvents = (jobId: string) => listOperationalEvents({ type: 'model_accounting_observed', limit: 1_000 })
+  .filter(row => row.payload.usageJobId === jobId).map(row => row.payload);
+
+test('a standalone answer invocation retains its exact job on the accepted answer receipt without importing a caller turn', async () => {
+  const f = fixture('Not now. Keep the controlled draft unsent.');
+  const bindings: NonNullable<ReturnType<typeof accounting.standaloneModelAccountingJobBinding>>[] = [];
+  ports.installTurnSemanticModelPort({ readNoticingAnswer: async input => {
+    const scope = accounting.modelUsageAttributionStorage.getStore()!;
+    assert.equal(scope.sessionId, ''); assert.equal(scope.sourceUserSeq, 0);
+    assert.equal(scope.attemptId, undefined); assert.equal(scope.usageParentTurn, undefined);
+    bindings.push(accounting.standaloneModelAccountingJobBinding(scope.standaloneAccountingJob!)!);
+    return { decision: 'not_now', evidenceDigest: input.evidenceDigest, modelIdentity: 'controlled-answer-reader',
+      modelAccountingJobId: 'forged-model-supplied-job' };
+  } } as TurnSemanticModelPort);
+  await accounting.withModelUsageAttribution({ sessionId: 'foreign-answer-caller', sourceUserSeq: 3101,
+    attemptId: 'attempt:foreign-answer' }, () => runtime.settleNoticingAnswers());
+  assert.equal(bindings.length, 1);
+  const own = bindings[0]!;
+  assert.equal(own.operation, 'noticing_answer'); assert.equal(own.operationId, f.checkIn.id);
+  assert.equal(own.revisionDigest, createHash('sha256').update(JSON.stringify({ proposalId: f.id,
+    checkInId: f.checkIn.id, answer: f.answer, answeredAt: f.checkIn.answeredAt })).digest('hex'));
+  assert.equal(f.record().answer?.modelAccountingJobId, own.usageJobId);
+  const events = jobEvents(own.usageJobId);
+  assert.deepEqual(events.map(row => row.phase).sort(), ['job_finished', 'job_started', 'operation_receipt']);
+  const finished = events.find(row => row.phase === 'job_finished')!;
+  assert.equal(finished.outcome, 'returned'); assert.equal(finished.usage, 'unknown');
+  assert.equal(events.find(row => row.phase === 'operation_receipt')?.receiptDigest,
+    createHash('sha256').update(JSON.stringify(f.record().answer)).digest('hex'));
+  assert.doesNotMatch(JSON.stringify(events), /foreign-answer-caller|attempt:foreign|Keep the controlled draft|forged-model/);
+  for (const row of events) for (const key of ['sourceUserSeq', 'logicalTurnId', 'runAttemptId']) assert.equal(Object.hasOwn(row, key), false);
+  assert.equal(runtime.noticingStatus().recentlyRetired.find(row => row.id === f.id)?.answer?.modelAccountingJobId, undefined);
+  await runtime.settleNoticingAnswers();
+  assert.equal(bindings.length, 1, 'a settled answer does not mint a second accounting invocation');
+});
+
+test('failed answer rereads have distinct job UUIDs and unknown local closure without an invented saved answer', async () => {
+  const f = fixture('Yes, prepare only the controlled local draft.');
+  const ids: string[] = [];
+  ports.installTurnSemanticModelPort({ readNoticingAnswer: async () => {
+    const scope = accounting.modelUsageAttributionStorage.getStore()!;
+    ids.push(accounting.standaloneModelAccountingJobBinding(scope.standaloneAccountingJob!)!.usageJobId);
+    throw new Error('private controlled provider diagnostic');
+  } } as TurnSemanticModelPort);
+  await runtime.settleNoticingAnswers();
+  await runtime.settleNoticingAnswers();
+  assert.equal(ids.length, 2); assert.notEqual(ids[0], ids[1]);
+  assert.equal(f.record().answer, undefined);
+  for (const id of ids) {
+    const events = jobEvents(id);
+    assert.deepEqual(events.map(row => row.phase).sort(), ['job_finished', 'job_started']);
+    const finished = events.find(row => row.phase === 'job_finished')!;
+    assert.equal(finished.outcome, 'failed'); assert.equal(finished.usage, 'unknown');
+    assert.equal(finished.operationId, f.checkIn.id);
+    assert.doesNotMatch(JSON.stringify(events), /private controlled provider diagnostic|prepare only the controlled/);
+  }
+});
+
+test('actual Noticing ticks retain host job receipts while quiet reuse and unavailable models mint no current job', async (t) => {
+  rmSync(stateFile, { force: true });
+  const created = upsertGoalRecord({ title: 'Controlled standalone Noticing goal', description: 'Prepare a controlled local draft only.' });
+  assert.ok(created.ok);
+  t.after(() => rmSync(path.join(home, 'goals', `${created.goal.id}.json`), { force: true }));
+  const inputs: unknown[] = [];
+  ports.installTurnSemanticModelPort({ noticing: async input => {
+    inputs.push(input);
+    return { answer: { proposal: null, setAside: [], evidenceDigest: input.evidenceDigest },
+      modelIdentity: 'controlled-tick-reader', modelAccountingJobId: 'forged-model-job' };
+  } } as TurnSemanticModelPort);
+  const first = await runtime.runNoticingTickNow({ source: 'manual' });
+  assert.ok(first.modelAccountingJobId);
+  const retained = runtime.readNoticingStateStrict().state.thinking.find(row => row.tickId === first.tickId)!;
+  assert.equal(retained.modelAccountingJobId, first.modelAccountingJobId);
+  const events = jobEvents(first.modelAccountingJobId);
+  assert.deepEqual(events.map(row => row.phase).sort(), ['job_finished', 'job_started', 'operation_receipt']);
+  const started = events.find(row => row.phase === 'job_started')!;
+  assert.equal(started.operation, 'noticing_proposal'); assert.equal(started.operationId, first.tickId);
+  assert.equal(events.find(row => row.phase === 'operation_receipt')?.receiptDigest,
+    createHash('sha256').update(JSON.stringify(retained)).digest('hex'));
+  assert.equal(runtime.noticingStatus().thinking[0]?.modelAccountingJobId, undefined);
+  assert.doesNotMatch(JSON.stringify(inputs), /noticing-job:|forged-model-job/);
+  const again = await runtime.runNoticingTickNow({ source: 'manual' });
+  assert.ok(again.modelAccountingJobId); assert.notEqual(again.modelAccountingJobId, first.modelAccountingJobId);
+  const quiet = await runtime.runNoticingTickNow({ source: 'heartbeat' });
+  assert.equal(quiet.modelCheck, 'recent_unchanged'); assert.equal(quiet.modelAccountingJobId, undefined);
+  assert.equal(inputs.length, 2);
+  ports.installTurnSemanticModelPort(null);
+  const beforeNoModel = listOperationalEvents({ type: 'model_accounting_observed', limit: 1_000 }).map(row => row.eventId).sort();
+  const noModel = await runtime.runNoticingTickNow({ source: 'manual' });
+  assert.equal(noModel.modelAccountingJobId, undefined);
+  assert.deepEqual(listOperationalEvents({ type: 'model_accounting_observed', limit: 1_000 }).map(row => row.eventId).sort(), beforeNoModel);
+});
 
 function fixture(answer = 'Yes, do it — use the existing account.\nDraft only; do not send.') {
   rmSync(stateFile, { force: true });

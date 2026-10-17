@@ -22,7 +22,8 @@ import {
 } from './claude-model.js';
 import { withModelUsageAttribution } from '../usage-log.js';
 import { activeModelWireRequestSnapshot, createModelTransportAttempt, observeModelTransportFetch,
-  createClaudeModelWireProducer, withModelTransportAttempt, withModelTransportRecorder } from './model-transport-observation.js';
+  createClaudeModelWireProducer, declareActiveClaudeModelWireProducer, beginActiveClaudeReviewWireTransform,
+  withModelTransportAttempt, withModelTransportRecorder } from './model-transport-observation.js';
 import { composeReviewInput, createReviewInputObservation, type BoundReviewInputObservation,
   type ReviewInputSeed } from './review-input-observation.js';
 import { createHash } from 'node:crypto';
@@ -1128,4 +1129,53 @@ test('raw Claude memory consumer-close retains one usage row and truthful closed
   const stream = usage.withModelUsageAttribution({ sessionId: '', sourceUserSeq: 0, usageJobId: 'memory:standing:closed', memoryAccountingOrigin: origin }, () => wrapped.getStreamedResponse({} as never));
   const iterator = stream[Symbol.asyncIterator](); assert.equal((await iterator.next()).done, false); await iterator.return?.();
   assert.equal(calls, 1); assert.equal(diagnostics[0].settlement, 'closed'); assert.equal(diagnostics[0].sessionId, 'sess-closed-memory');
+});
+
+test('actual raw Claude decorator keeps standalone job entry metadata and original usage while a foreign harness drains it', async () => {
+  const usage = await import('../usage-log.js');
+  const job = usage.createStandaloneModelAccountingJob({ operation: 'noticing_proposal', operationId: 'controlled-claude-tick',
+    revisionDigest: 'c'.repeat(64) });
+  const binding = usage.standaloneModelAccountingJobBinding(job)!;
+  const rows: Readonly<Record<string, unknown>>[] = [];
+  const diagnostics: RawClaudeStreamDiagnostic[] = [];
+  const foreign = { sessionId: 'foreign-claude-job-drainer', sourceUserSeq: 2901,
+    runAttemptId: 'attempt:foreign-claude-job', turn: 4 };
+  const original = { id: 'claude-standalone-original-response', responseId: 'claude-standalone-original-response',
+    output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Controlled job result.' }] }],
+    usage: { inputTokens: 9, outputTokens: 3, totalTokens: 12 } };
+  let calls = 0;
+  const resilient = withResilience({
+    getResponse: async () => { throw new Error('unused'); },
+    getStreamedResponse: async function* () {
+      calls++;
+      assert.equal(harnessRunContextStorage.getStore()?.sessionId, foreign.sessionId,
+        'the accounting wrapper does not restore a provider execution context');
+      declareActiveClaudeModelWireProducer(createClaudeModelWireProducer());
+      assert.equal(beginActiveClaudeReviewWireTransform({ system: 'private foreign guide' }), undefined);
+      await observeModelTransportFetch('raw_claude_messages', 'claude-controlled-job', async () => ({ status: 200, ok: true }));
+      yield { type: 'response_done', response: original } as never;
+    },
+  } as never, { label: 'controlled-claude-job', capability: resolveModelCapability('claude-opus-4-8'), maxRetries: 0 });
+  const model = withRawClaudeUsageRecording(resilient, 'claude-controlled-job', usage.recordModelUsage, () => {},
+    entry => diagnostics.push(entry));
+  const stream = withModelTransportRecorder(row => rows.push(row), () => usage.withStandaloneModelAccountingJob(job,
+    () => model.getStreamedResponse({ input: 'controlled', modelSettings: {}, tools: [], handoffs: [] } as never)));
+  const returned: unknown[] = [];
+  await withModelUsageAttribution({ sessionId: foreign.sessionId, sourceUserSeq: foreign.sourceUserSeq,
+    attemptId: foreign.runAttemptId, role: 'brain' }, () => harnessRunContextStorage.run(foreign as never, async () => {
+    for await (const event of stream) returned.push(event);
+  }));
+  assert.equal(calls, 1); assert.equal(returned.length, 1);
+  const row = usage.readUsageEventsForDate().find(value => value.responseId === original.responseId)!;
+  assert.equal(row.source, binding.usageJobId);
+  assert.equal(row.trace?.modelCallId, rows.find(value => value.phase === 'adapter_attempt_created')?.modelCallId);
+  assert.equal(row.trace?.acceptedSource, undefined); assert.equal(row.trace?.logicalTurnId, undefined);
+  assert.equal(row.trace?.attemptId, undefined);
+  assert.equal(row.inputTokens, 9); assert.equal(row.outputTokens, 3);
+  assert.ok(rows.every(value => value.ownerKind === 'accounting_job' && value.usageJobId === binding.usageJobId));
+  const finished = rows.find(value => value.phase === 'adapter_attempt_finished')!;
+  assert.equal(finished.resultScope, 'original_sdk_response'); assert.equal(finished.outcome, 'returned');
+  assert.equal(finished.providerResponseIdDigest, createHash('sha256').update(original.responseId).digest('hex'));
+  assert.deepEqual(diagnostics, [], 'a standalone job cannot issue a foreign accepted-turn diagnostic');
+  assert.doesNotMatch(JSON.stringify(rows), /foreign-claude-job-drainer|attempt:foreign|private foreign guide|Controlled job result/);
 });

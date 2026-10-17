@@ -128,7 +128,7 @@ export interface NoticingProposalRecord extends NoticingProposalV1 {
   checkInId?: string;
   notificationId?: string;
   status: 'open' | 'answered' | 'expired' | 'retired';
-  answer?: { text: string; decision: NoticingDecision; at: string; instruction?: string };
+  answer?: { text: string; decision: NoticingDecision; at: string; instruction?: string; modelAccountingJobId?: string };
   retiredReason?: string;
   /** Presentation/progress only. The normal accepted ingress and execution
    * ledgers, never this record, own consent, account and effect authority. */
@@ -159,6 +159,8 @@ export interface NoticingThinking {
   considered: Array<{ subject: string; outcome: 'proposed' | 'set_aside' | 'duplicate' | 'standing_no' | 'capped' | 'low_confidence'; why: string }>;
   proposalId?: string;
   model?: string;
+  /** Host invocation identity only; never execution or completion authority. */
+  modelAccountingJobId?: string;
   quiet: boolean;
   summary: string;
   error?: string;
@@ -209,7 +211,7 @@ export interface NoticingTickDeps {
   observe: () => Promise<NoticingObservation>;
   /** The one model call. Null when no model is available. */
   propose: (input: { observation: NoticingObservation; rules: string[]; standingAnswers: NoticingStandingAnswer[]; recentProposals: Array<{ title: string; status: string; createdAt: string }>; evidenceDigest: string })
-    => Promise<{ answer: NoticingAnswerV1 | null; modelIdentity?: string; error?: string } | null>;
+    => Promise<{ answer: NoticingAnswerV1 | null; modelIdentity?: string; error?: string; modelAccountingJobId?: string } | null>;
   /** Open the question for the owner; returns ids the answer path needs. */
   ask: (proposal: NoticingProposalRecord) => Promise<{ checkInId: string; notificationId?: string }>;
   /** `closed`: the question was dismissed or closed without an answer
@@ -272,7 +274,9 @@ function noticingDecisionFingerprint(observation: NoticingObservation, deps: Not
   const proposals = Object.entries(state.proposals).sort(([a], [b]) => a.localeCompare(b)).map(([id, proposal]) => {
     const created = Date.parse(proposal.createdAt);
     const answered = proposal.answer ? Date.parse(proposal.answer.at) : Number.NaN;
-    return { id, proposal,
+    const { modelAccountingJobId: _accounting, ...answer } = proposal.answer ?? {};
+    const semanticProposal = proposal.answer ? { ...proposal, answer } : proposal;
+    return { id, proposal: semanticProposal,
       countsToday: created >= now - DAY_MS && proposal.status !== 'retired',
       recent: now - created < 14 * DAY_MS,
       openExpired: proposal.status === 'open' && now - created > deps.config.openForMs,
@@ -280,7 +284,8 @@ function noticingDecisionFingerprint(observation: NoticingObservation, deps: Not
       doItQuiet: proposal.answer?.decision === 'do_it' && now - answered < 7 * DAY_MS,
     };
   });
-  // Only `at` is omitted. Preserve all evidence, user words, handoff changes,
+  // Omit the observation clock and diagnostic-only model accounting IDs.
+  // Preserve all evidence, user words, handoff changes,
   // rules and policy; include relative ages and exact existing expiry floors
   // so their transitions invalidate reuse even inside the finite window.
   return createHash('sha256').update(JSON.stringify({ version: 1, evidence,
@@ -309,6 +314,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   let read: NoticingThinking['read'] = { goals: 0, runs: 0, waits: 0, drafts: 0, calendar: 0, conversations: 0, memories: 0 };
   let proposalId: string | undefined;
   let model: string | undefined;
+  let modelAccountingJobId: string | undefined;
   let error: string | undefined;
   let produced = 0;
   let retired = 0;
@@ -395,6 +401,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       } else {
         state.metrics.modelCalls += 1;
         model = reply.modelIdentity;
+        modelAccountingJobId = reply.modelAccountingJobId;
         if (reply.error) { error = reply.error; state.metrics.modelFailures += 1; }
         else {
           const parsed = NoticingAnswerV1Schema.safeParse(reply.answer);
@@ -467,7 +474,8 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
     : considered.length ? `Quiet: considered ${considered.length} thing${considered.length === 1 ? '' : 's'}, nothing worth asking now`
     : 'Quiet: nothing new to consider';
   const thinking: NoticingThinking = { tickId: deps.tickId, at: nowIso, source: deps.source, durationMs: deps.now() - startedAt,
-    read, considered, ...(proposalId ? { proposalId } : {}), ...(model ? { model } : {}), quiet, summary, ...(error ? { error } : {}),
+    read, considered, ...(proposalId ? { proposalId } : {}), ...(model ? { model } : {}),
+    ...(modelAccountingJobId ? { modelAccountingJobId } : {}), quiet, summary, ...(error ? { error } : {}),
     ...(modelCheck ? { modelCheck } : {}) };
   state.thinking = [thinking, ...state.thinking].slice(0, deps.config.thinkingKept);
   if (quiet) state.metrics.quietTicks += 1;
