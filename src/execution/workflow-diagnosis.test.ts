@@ -668,4 +668,8 @@ test('a run that ends on its writes reports what it wrote, never the write recei
   assert.match(body, /We teach all ages, from toddlers to adults\./);
   assert.match(body, /✓ Saved: save draft/);
   assert.doesNotMatch(body, /artifactId|workspace-dataset|886514f6|306ad46e|\[\{/);
+  // The row's bookkeeping stays in the run record (live 2026-10-16: the chat
+  // reply ended with id:, revision:, created_at: and target: lines).
+  assert.doesNotMatch(body, /homepage-welcome|status: draft/);
+  assert.match(body, /^Welcome\nWe teach all ages/);
 });

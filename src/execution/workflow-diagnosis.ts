@@ -1212,17 +1212,29 @@ function stepWords(stepId: string): string {
   return stepId.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').trim().toLowerCase() || stepId;
 }
 
-/** A step's content for a person: rows of a JSON array read one by one. */
+/** A step's content for a person: rows of a JSON array read one by one,
+ *  each by its own words (title, body, links) when it has any, so its
+ *  bookkeeping fields (ids, revisions, timestamps) stay in the run record. */
 function humanizeContent(raw: unknown): string {
+  let rows: unknown = raw;
   if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((row) => row && typeof row === 'object')) {
-        return parsed.slice(0, 5).map((row) => humanizeStepOutput(row)).join('\n\n');
-      }
-    } catch { /* plain text */ }
+    try { rows = JSON.parse(raw) as unknown; } catch { rows = raw; }
+  }
+  if (Array.isArray(rows) && rows.length > 0 && rows.every((row) => row && typeof row === 'object' && !Array.isArray(row))) {
+    return rows.slice(0, 5).map((row) => rowWords(row as Record<string, unknown>) ?? humanizeStepOutput(row)).join('\n\n');
   }
   return humanizeStepOutput(raw);
+}
+
+function rowWords(row: Record<string, unknown>): string | null {
+  const words: string[] = [];
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value !== 'string' || !value.trim() || STRUCTURED_RESULT_SENSITIVE_KEY.test(key)) continue;
+    if (STRUCTURED_RESULT_TEXT_KEYS.has(key.toLowerCase()) || STRUCTURED_RESULT_URL_KEY.test(key)) {
+      if (!words.includes(value.trim())) words.push(value.trim());
+    }
+  }
+  return words.length > 0 ? words.join('\n') : null;
 }
 
 export interface LegibleOutcome {
