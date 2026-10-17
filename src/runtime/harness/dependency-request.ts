@@ -18,13 +18,12 @@ import {
   openEventLog,
 } from './eventlog.js';
 import {
-  dismissTaskContinuityPacket,
-  peekTaskContinuityPacket,
   readConsumedTaskContinuityPacket,
 } from '../../memory/task-continuity.js';
 import { listCachedToolkits } from '../../integrations/composio/client.js';
 import { renderTypedControlState } from './typed-control-state.js';
 import { completionEvidenceSource } from './recovery-activation.js';
+import { confirmedSourceStrategyBindingForSource } from './source-strategy-admission.js';
 
 export const DEPENDENCY_REQUEST_VERSION = 1 as const;
 
@@ -477,6 +476,14 @@ interface ToolSearchUnavailableSubjectProjection {
   capabilityRef?: unknown;
 }
 
+function exactProviderRouteIsRequired(input: { sessionId: string; sourceUserSeq: number },
+  subject: Extract<ConnectionDependencyObservedSubject, { kind: 'exact_capability_connection' }>): boolean {
+  const binding = confirmedSourceStrategyBindingForSource(input.sessionId, input.sourceUserSeq);
+  const capabilityId = `capability:composio:${subject.capability}`;
+  return binding?.primary.capabilityId === capabilityId
+    && binding.equivalentFallbacks.every(fallback => fallback.capabilityId === capabilityId);
+}
+
 export interface ConnectionDependencyPresentation {
   question: string;
   options: readonly [string, string];
@@ -501,8 +508,14 @@ function connectionPresentationForSubject(
 ): ConnectionDependencyPresentation {
   if (subject.kind === 'exact_capability_connection') {
     const label = toolkitDisplayName(subject.toolkit);
-    const question = `${label} needs to be connected before I can continue this task. `
-      + 'Connect it in Clementine, or pause to change the request.';
+    const alternate = connectedCliCoveringApp(subject.toolkit);
+    const question = alternate
+      ? `The discovered ${label} provider operation needs a connection. `
+        + `A signed-in ${alternate.name} CLI is also available to inspect as an alternative; `
+        + 'its intended account and requested operation are still unverified. '
+        + 'Connect the provider to keep this route, or tell me how to continue under the original request’s constraints.'
+      : `${label} needs to be connected before I can continue this task. `
+        + 'Connect it in Clementine, or pause to change the request.';
     const options = [
       `I’ve connected ${label} — continue this same task`,
       'Pause so I can change this request',
@@ -647,14 +660,9 @@ function observedConnectionPresentationForSource(input: {
         || !capability.startsWith(`${toolkit.toUpperCase()}_`)
         || capabilityRef !== `cap:resolved:${capability.toLowerCase()}`
       ) continue;
-      // A connected CLI whose sign-in was confirmed in its latest fresh check,
-      // and the only one matching this app, gives the work a way to run here.
-      // It proves no provider operation or account, so the brain still chooses
-      // and checks what it runs; but "connect this app" is the wrong question
-      // to put to the owner, and the projection never asks it (live
-      // 2026-10-16: with gh signed in, the host asked the owner to connect
-      // GitHub and ended the turn before Clem ran a command).
-      if (connectedCliCoveringApp(toolkit)) continue;
+      // A same-vendor CLI is an alternate discovery hint, not evidence that
+      // this exact provider operation or intended account is connected. Keep
+      // the observed gap; its presentation can explain the alternate route.
       // Another provider's result can answer a generic search, so it
       // disproves the gap; a search that names the app asked for that app,
       // and only the app's own result disproves it.
@@ -671,7 +679,16 @@ function observedConnectionPresentationForSource(input: {
     }
     const unique = new Map(subjects.map((subject) => [JSON.stringify(subject), subject]));
     if (unique.size !== 1) continue;
-    return connectionPresentationForSubject([...unique.values()][0]!);
+    const subject = [...unique.values()][0]!;
+    // A provider-specific miss is not necessarily the task's blocker. A fresh
+    // same-vendor CLI is still unverified discovery, but it is enough to avoid
+    // replacing Clem's own question with a forced connection choice for a
+    // generic task. Only a confirmed exact source choice rules that route in.
+    // This changes presentation only: no existing dependency or A/Q is closed,
+    // and neither CLI account nor operation readiness is inferred.
+    if (subject.kind === 'exact_capability_connection' && connectedCliCoveringApp(subject.toolkit)
+      && !exactProviderRouteIsRequired(input, subject)) return null;
+    return connectionPresentationForSubject(subject);
   }
   return null;
 }
@@ -715,39 +732,6 @@ export function parkObservedConnectionDependencyForSource(input: {
     // dependency. Model prose is intentionally ignored here.
     text: presentation.question,
   });
-}
-
-/**
- * A parked connection question no longer holds once a connected CLI whose
- * sign-in is freshly confirmed reaches that app: the work has a way to run.
- * Satisfy the dependency and dismiss the open question that parked it, so the
- * next message reaches the brain as a request instead of being read as an
- * answer to a question whose premise no longer holds.
- */
-export function releaseConnectionDependenciesCoveredByCli(sessionId: string): boolean {
-  const current = peekTaskContinuityPacket({ sessionId });
-  if (current.status !== 'available' || current.packet.pause.kind !== 'clarification') return false;
-  const rootSourceUserSeq = current.packet.rootSourceUserSeq ?? current.packet.originatingSourceUserSeq;
-  ensureTable();
-  const db = openEventLog();
-  const open = db.prepare(`
-    SELECT request_id, subject_toolkit
-      FROM dependency_requests
-     WHERE session_id = ? AND source_user_seq = ?
-       AND kind = 'connection_missing' AND status = 'open'
-  `).all(sessionId, rootSourceUserSeq) as Array<{ request_id: string; subject_toolkit: string | null }>;
-  if (open.length === 0) return false;
-  if (!open.every((row) => row.subject_toolkit && connectedCliCoveringApp(row.subject_toolkit))) return false;
-  const now = new Date().toISOString();
-  const satisfy = db.prepare(`
-    UPDATE dependency_requests SET status = 'satisfied', satisfied_at = ?
-     WHERE request_id = ? AND session_id = ? AND status = 'open'
-  `);
-  db.transaction(() => {
-    for (const row of open) satisfy.run(now, row.request_id, sessionId);
-  }).immediate();
-  dismissTaskContinuityPacket({ sessionId, reason: 'no_longer_needed' });
-  return true;
 }
 
 export function satisfyOpenDependency(input: {
