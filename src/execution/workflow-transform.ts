@@ -430,7 +430,12 @@ function evaluateExpression(
     }
     case 'jsonParse': {
       const raw = evaluateExpression(expression.value, context, budget);
-      if (typeof raw !== 'string') throw new WorkflowTransformError('jsonParse requires a string input.');
+      // An upstream result that is already JSON data (an object, a list, a
+      // number) is what parsing would have produced: use it as it is. Live
+      // 2026-10-17 a Space feed's creation test failed on "jsonParse requires
+      // a string input" because the model step had already returned an object,
+      // and the author spent a full edit and re-test round on it.
+      if (typeof raw !== 'string') return structuredClone(raw);
       if (Buffer.byteLength(raw, 'utf8') > WORKFLOW_TRANSFORM_MAX_VALUE_BYTES) {
         throw new WorkflowTransformError(`jsonParse input exceeds ${WORKFLOW_TRANSFORM_MAX_VALUE_BYTES} bytes.`);
       }

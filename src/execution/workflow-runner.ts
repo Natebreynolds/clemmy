@@ -8011,7 +8011,9 @@ export function finalizeStepOutput(
       // step ran but emitted the wrong shape — e.g. its decision object instead
       // of the contracted keys) instead of only "missing key X".
       const message = isEmptyOnly
-        ? `Step "${step.id}" produced no usable data: ${emptyProblems.join('; ')}. This usually means the upstream source returned nothing — an empty result, an expired credential, or an over-strict filter. The run was halted instead of continuing with empty data; check the source, then re-run.`
+        ? `Step "${step.id}" produced no usable data: ${emptyProblems.join('; ')}. ${emptyProblems.some((problem) => / is missing — /.test(problem))
+          ? 'Either the source returned nothing, or the step\'s output contract names a key the step does not produce: compare it with the keys the step did produce.'
+          : 'This usually means the upstream source returned nothing — an empty result, an expired credential, or an over-strict filter.'} The run was halted instead of continuing with empty data; check the source, then re-run.`
         : `Step "${step.id}" output failed its contract: ${result.problems.join('; ')} — the step produced ${got}.`;
       appendWorkflowEvent(workflowSlug, runId, {
         kind: 'step_failed',
