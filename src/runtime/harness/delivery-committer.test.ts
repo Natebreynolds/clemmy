@@ -750,6 +750,31 @@ test('a review that ran out of time says so, and never sends the owner to fix a 
   assert.equal(committed.event.data.verificationDetail, 'completion_review_failed_open');
 });
 
+for (const scope of ['claims', 'work'] as const) {
+  test(`a last review rejecting ${scope === 'claims' ? 'only claims in the reply publishes the finished answer with the chip' : 'the work itself still holds the answer'}`, () => {
+    // Owner decision 2026-10-16: finished work is not blocked over wording.
+    const sessionId = `last-review-rejects-${scope}`;
+    createSession({ id: sessionId, kind: 'chat' });
+    const outcome = acceptedAnswer(sessionId, 'The Space shows the checked status; the CLI is signed in as the owner.');
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
+      version: 1, sourceUserSeq: outcome.identity.sourceUserSeq, enabled: true,
+    } });
+    appendEvent({ sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: outcome.identity.sourceUserSeq,
+      fulfills: false, ...(scope === 'claims' ? { repairScope: 'claims' } : {}),
+      reason: 'Which account the CLI is signed in as is not shown by any result.',
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(outcome.presentation.text).digest('hex'),
+    } });
+    const committed = commitTurnOutcome(outcome);
+    assert.equal(committed.event.data.review, 'rejected');
+    assert.match(String(committed.event.data.reviewNote), /Which account/);
+    assert.equal(committed.event.data.verificationDetail, 'completion_review_negative');
+    assert.equal(committed.presentation.text, outcome.presentation.text, 'her words publish exactly either way');
+    assert.equal(committed.presentation.status, scope === 'claims' ? 'done' : 'blocked');
+  });
+}
+
 for (const issue of ['missing', 'malformed', 'partial', 'uncertain', 'positive_contradiction', 'missing_control']) {
   test(`a completed ${issue} assessment publishes an exact-source unverified answer without unreachable wording or new work`, () => {
     const sessionId = `answered-unqualified-${issue}`;

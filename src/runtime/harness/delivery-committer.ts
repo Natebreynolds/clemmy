@@ -1666,10 +1666,22 @@ export function commitTurnOutcome(
       && (publishedVerdict?.fulfills === true || answeredUnqualified)
       && publishedVerdict?.hostEvidenceHold !== true
       && joinsStand;
-    unverifiedHoldFallback = reviewCouldNotFire
+    // THE WORK LANDED; ONLY WORDING WAS QUESTIONED (owner decision 2026-10-16).
+    // A last review that found the work done and objected only to claims in
+    // the reply (its repair scope) after the repair rounds ran out is a note
+    // on the answer, not a reason to call finished work blocked. The answer
+    // publishes as authored; the chip says rejected and carries the
+    // reviewer's points. Live 2026-10-16: a Space build was verified and
+    // saved, then ended blocked over which account a CLI was signed in as.
+    const claimsOnlyRejection = detail === 'completion_review_negative'
+      && publishedVerdict?.repairScope === 'claims'
+      && publishedVerdict.hostEvidenceHold !== true
+      && joinsStand;
+    const publishAuthored = reviewCouldNotFire || claimsOnlyRejection;
+    unverifiedHoldFallback = publishAuthored
       ? () => unverifiedCompletionOutcome(authoredOutcome, true)
       : null;
-    effectiveOutcome = reviewCouldNotFire ? authoredOutcome : unverifiedCompletionOutcome(authoredOutcome, true);
+    effectiveOutcome = publishAuthored ? authoredOutcome : unverifiedCompletionOutcome(authoredOutcome, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the
