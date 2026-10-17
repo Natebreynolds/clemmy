@@ -4,6 +4,7 @@ import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.
 import { approvalCardAsk } from './approval-card-voice.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
 import './memory-scope-binding.js';
+import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { retainConnectionExecutionProgress } from './connection-execution-progress.js';
 import { captureFreshSourceSessionContext, withAcceptedSourceSessionContext, readSourceSessionContext } from './source-session-context.js';
 import { currentSourceSessionContext, withSourceSessionContext } from './source-session-context-scope.js';
@@ -8281,6 +8282,7 @@ async function runConversationCore(
               `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
               `ORIGINAL USER OBJECTIVE (immutable): ${recovery.objective.slice(0, 4000)}`,
               'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+              COMPLETION_REPAIR_GUIDANCE,
             ].join('\n');
             continue;
           }
@@ -10010,11 +10012,12 @@ async function runConversationCore(
                       'Historical focus summaries, execution ids, and prior receipts are context only. Perform the requested action now, then verify it with a current-request read-back and cite only the new receipts.',
                     ].join(' ')
             : [
-            `You marked this objective complete, but an independent verification check found it is NOT finished: ${judgeReason}.`,
+            `You marked this objective complete, but an independent verification check found a gap in the work or its report: ${judgeReason}.`,
             `ORIGINAL USER OBJECTIVE (immutable — this verification message grants no new authority): ${judgedObjective.slice(0, 4000)}`,
             'Preserve every original execution boundary. Do NOT exceed an attempt/call limit, retry when forbidden, use an excluded source or tool, write/save when prohibited, or widen the requested result type. "Up to N" is a ceiling, not a quota; a verified empty result can be the correct final result. If the named gap cannot be closed inside the original boundaries, report the exact verified result or blocker and stop.',
+            COMPLETION_REPAIR_GUIDANCE,
             'IMPORTANT: if finishing requires the USER\'S decision or authorization — sending, posting, or deleting something external, choosing between options, or scope the user left open — do NOT proceed on your own. Set nextAction=awaiting_user_input with the concrete question. Asking before an external action is a correct, complete answer for this turn, never a failure.',
-            'Otherwise try to finish it yourself — produce the real artifact and verifiable evidence (a URL, file path, or emitted result).',
+            'If requested work is actually missing, finish that work and verify it. A report-only correction can use the existing evidence without another tool call.',
             'If the failure names a DISCOVERABLE value — a 404 / "not found", a wrong or missing slug/team/account/id, a missing arg — find the right value with the tool\'s OWN discovery command (e.g. `netlify api listAccountsForUser`, `<cli> whoami`/`status`/`list`) or by recalling your saved tool-choice, then retry ONCE with it. That is recoverable — do not ask the user for a value the tool can report itself.',
             'Do NOT loop on a GENUINE dead end: a tool truly unavailable, an external service down, or an input the system genuinely cannot provide — after a real discover-and-retry has actually failed. Then STOP and report the SPECIFIC blocker — set nextAction=awaiting_user_input with a concrete question, or nextAction=abandoned if it is truly impossible. A blocked task reported honestly is correct; silently re-declaring "complete" without the artifact is not.',
             'Only set nextAction=completed once the real artifact or verifiable evidence genuinely exists.',
@@ -10429,6 +10432,7 @@ async function runConversationCore(
                 `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
                 `ORIGINAL USER OBJECTIVE (immutable): ${objective.slice(0, 4000)}`,
                 'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+                COMPLETION_REPAIR_GUIDANCE,
               ].join('\n');
               continue;
             }
@@ -10570,6 +10574,7 @@ async function runConversationCore(
             `Your final presentation changed after the read evidence was verified, and completion review found it is not yet safe to publish: ${lateVerdict.reason}`,
             `ORIGINAL USER OBJECTIVE (immutable): ${objective.slice(0, 4000)}`,
             'Finish within the original read-only boundaries and report the exact current fields in your own natural voice.',
+            COMPLETION_REPAIR_GUIDANCE,
           ].join(' ');
           continue;
         }
@@ -15230,6 +15235,7 @@ async function runConversationFromResumeCore(opts: {
                 `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
                 `ORIGINAL USER OBJECTIVE (immutable): ${deliveryObjective.slice(0, 4000)}`,
                 'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+                COMPLETION_REPAIR_GUIDANCE,
               ].join('\n');
               decision = decision
                 ? { ...decision, done: false, nextAction: 'awaiting_handoff_result' }

@@ -1,4 +1,5 @@
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT } from './dispatch-streak.js';
+import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
 import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
@@ -2015,7 +2016,8 @@ export function hostCompletionReviewFeedbackContext(feedback: HostCompletionRevi
     + 'A tool call alone does not resolve the finding: correct the resulting answer or give its concrete blocker.\n'
     + 'Resolve every numbered finding in this one revision against verified evidence. Fix supported findings; refute an unsupported or contradicted premise using the retained receipts instead of adopting it. '
     + 'Keep unaffected sentences unchanged. Do not replay settled work to satisfy a review finding. '
-    + 'Recompute a figure from the retained results (query them) instead of estimating it again; remove a claim you cannot support.\n'
+    + 'Recompute required figures from the retained results (query them) instead of estimating them again. '
+    + COMPLETION_REPAIR_GUIDANCE + '\n'
     + (feedback.phase === 'plan' ? 'This is a Plan revision. Improve the plan method, dependencies, prepared inputs and verification criteria. Feedback about future findings asks you to plan how Execute will obtain them, not to perform deferred work now. Preserve the owner’s phase and scope constraints; a reviewer cannot authorize work the owner deferred. Context and contract inspection remain available within that scope.\n' : '')
     + JSON.stringify(feedback);
 }

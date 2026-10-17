@@ -10935,6 +10935,7 @@ test('the host explanation survives an enabled completion judge without claiming
 // Live 2026-09-24/25: after the last review round an answer was delivered
 // "blocked" while still containing the figures the reviewer flagged.
 test('a claims paraphrase receives a whole-objective review even after the quoted substring is gone', async () => {
+  const { COMPLETION_REPAIR_GUIDANCE } = await import('../../agents/clem-rubric.js');
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
   const revised = 'Kernel is the chosen browser. Both providers are configured with credentials available.';
@@ -10954,6 +10955,11 @@ test('a claims paraphrase receives a whole-objective review even after the quote
     const outcome = await runJudgedHost(fixture, agent, true);
     assert.equal(judgeCalls, 2, 'the changed claim must reach the whole-objective reviewer');
     assert.equal(String(outcome.finalOutput), revised);
+    const correctiveRequest = JSON.stringify(model.requests[1]);
+    assert.ok(correctiveRequest.includes(COMPLETION_REPAIR_GUIDANCE), 'the actual host repair receives held-evidence and optional-claim guidance');
+    assert.match(correctiveRequest, /no live connection was tested/);
+    assert.match(correctiveRequest, /connected with live credentials/);
+    assert.match(correctiveRequest, /never delete required facts to manufacture completion/);
     const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     const last = verdicts.at(-1)!;
     assert.equal(last.data.fulfills, true);

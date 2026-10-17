@@ -6476,12 +6476,14 @@ test('runConversation: a completed-tagged ask_user_question tool result parks be
 });
 
 test('objective judge: gates premature completion and continues (action intent)', async () => {
+  const { COMPLETION_REPAIR_GUIDANCE } = await import('../../agents/clem-rubric.js');
   const sess = HarnessSession.create({ kind: 'chat' });
   const runner = scriptedRunner([
     { finalOutput: { summary: 'Said what I would do', reply: 'Here is what I would do to build the report.', done: true, nextAction: 'completed', reason: null } },
     { finalOutput: { summary: 'Built the report', reply: 'Done — report saved to /tmp/report.md', done: true, nextAction: 'completed', reason: null } },
   ]);
   const judgeCalls: string[] = [];
+  const modelInputs: unknown[] = [];
   const result = await runConversation(withSettledWork({
     agent: makeAgentStub(),
     sessionId: sess.id,
@@ -6492,11 +6494,17 @@ test('objective judge: gates premature completion and continues (action intent)'
       return judgeCalls.length === 1 ? { done: false, reason: 'no artifact produced yet' } : { done: true, reason: 'report saved' };
     },
     makeRunner: makeRunnerStub,
-    runRunner: runner,
+    runRunner: async (...args) => { modelInputs.push(args[2]); return runner(...args); },
   }));
   assert.equal(result.status, 'completed');
   assert.equal(result.steps, 2, 'judge forced a second step before completing');
   assert.equal(judgeCalls.length, 2);
+  const correction = JSON.stringify(modelInputs[1]);
+  assert.ok(correction.includes(COMPLETION_REPAIR_GUIDANCE), 'the actual corrective frame distinguishes report repair from missing work');
+  assert.match(correction, /build me a research report on solar adoption/);
+  assert.match(correction, /no artifact produced yet/);
+  assert.match(correction, /If requested work is actually missing, finish that work and verify it/,
+    'removing optional narration never substitutes for the requested artifact');
 });
 
 test('objective judge continuation does not quarantine a draft that later succeeds', async () => {

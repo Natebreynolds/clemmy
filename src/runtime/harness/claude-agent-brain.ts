@@ -2,7 +2,7 @@ import './memory-scope-binding.js';
 import { sessionIsDelegatedJob } from '../../agents/delegation-depth.js';
 import { renderCanonicalMemoryContext } from './canonical-context.js';
 import { acceptedPlanOwnerScopeInput } from './accepted-plan-execution.js';
-import { CLAUDE_BRAIN_RUBRIC } from '../../agents/clem-rubric.js';
+import { CLAUDE_BRAIN_RUBRIC, COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { batchShapeDirective } from '../../tools/batch-shape-directive.js';
 import { getComposio } from '../../integrations/composio/client.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from '../../agents/tool-jit.js';
@@ -3309,11 +3309,12 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           : '';
         const contResult = await runContinuation({
           prompt:
-            `Your previous attempt did NOT fully satisfy the request. Judge feedback: "${reason}". ` +
+            `Review found a gap in the work or its report. Judge feedback: "${reason}". ` +
             `Original request: "${turnObjective}". ` +
             `${freshnessDirective ? `${freshnessDirective} ` : ''}` +
+            `${COMPLETION_REPAIR_GUIDANCE} ` +
             `IMPORTANT: if finishing requires the USER'S decision or authorization — sending, posting, or deleting something external, or scope left open — do NOT proceed on your own; end your reply with the concrete question for the user. That is a correct, complete answer. ` +
-            `Otherwise continue now and FINISH it — produce the concrete artifact/evidence (file, sheet row, message, link, real result); do not just describe or promise it.`,
+            `If requested work is actually missing, finish it and verify the result; a report-only correction can use existing evidence without another tool call. Do not merely promise missing work.`,
           ...runOptions,
         });
         const continuationDispatch = finalizedWorkflowDispatchResponse();
@@ -3840,6 +3841,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
               `Recovery instruction: ${terminalDecision.recoveryInstruction}`,
               `ORIGINAL USER OBJECTIVE (immutable): ${turnObjective.slice(0, 4000)}`,
               'Continue within the original authority. Do not repeat an irreversible action or widen the task. Return a newly authored final answer when the gap is resolved; if it cannot be resolved, state the exact blocker.',
+              COMPLETION_REPAIR_GUIDANCE,
             ].join('\n'),
             ...runOptions,
           });

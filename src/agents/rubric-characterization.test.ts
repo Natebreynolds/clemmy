@@ -8,6 +8,7 @@ import { ORCHESTRATOR_INSTRUCTIONS, ORCHESTRATOR_BEHAVIOR_NATIVE } from './orche
 import {
   CLAUDE_BRAIN_RUBRIC,
   EXTERNAL_CONTENT_TRUST_RUBRIC,
+  FINAL_REPORT_SCOPE_RUBRIC,
   ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN,
   ORCHESTRATOR_INSTRUCTIONS_LEAN,
   renderClemRubric,
@@ -194,10 +195,12 @@ const GOLDEN = {
   // 2026-10-16: EVIDENCE, NOT ASSUMPTION — facts about the owner's world come
   // from a tool result or verified memory, never a name or pattern (a site's
   // host was built from its repository name). The lean lanes carry a short form.
-  instructions: { len: 34163, sha16: '27e23e1398876f97' },
-  native: { len: 33270, sha16: '3797cca1f0291254' },
-  claudeBrain: { len: 11347, sha16: '8f81c064e985ce31' },
-  lean: { len: 13352, sha16: 'aaff06aa4efb985b' },
+  // 2026-10-17: report only requested/relevant evidence; optional history or
+  // causal claims do not create a new investigation after the work succeeds.
+  instructions: { len: 34221, sha16: 'dbf1f484f1880a3b' },
+  native: { len: 33328, sha16: '17a64a4bf5329fb4' },
+  claudeBrain: { len: 11405, sha16: 'e3e01128126381d0' },
+  lean: { len: 13410, sha16: '59b195bb1c9d715d' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
@@ -238,6 +241,17 @@ test('both lean lanes tell the model to compute stated figures from the stored r
   for (const [name, text] of [['claude-brain', CLAUDE_BRAIN_RUBRIC], ['lean', ORCHESTRATOR_INSTRUCTIONS_LEAN]] as const) {
     assert.match(text, /FIGURES FROM THE DATA/, name);
     assert.match(text, /`tool_output_query` \(where \/ sort_by \/ aggregate\)/, name);
+  }
+});
+
+test('provider parity: every fresh flagship surface gets one grounded requested-result cue', () => {
+  for (const [lane, rubric] of [
+    ['full', ORCHESTRATOR_INSTRUCTIONS], ['native', ORCHESTRATOR_BEHAVIOR_NATIVE],
+    ['claude-brain', CLAUDE_BRAIN_RUBRIC], ['lean', ORCHESTRATOR_INSTRUCTIONS_LEAN],
+    ['action-lean', ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN],
+  ]) {
+    assert.equal(rubric.split(FINAL_REPORT_SCOPE_RUBRIC).length - 1, 1, lane);
+    assert.match(rubric, /ground the requested result; omit extras/);
   }
 });
 
