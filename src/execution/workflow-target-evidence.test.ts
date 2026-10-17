@@ -201,3 +201,119 @@ test('workflow target current Workspace bytes, not an upstream transform, qualif
     catalogs.installHostCapabilityCatalogFactory(null);
   }
 });
+
+test('workflow dataset evidence keeps each own observation when another run supersedes the same source', async () => {
+  const runner = await import('./workflow-runner.js');
+  const workflows = await import('../memory/workflow-store.js');
+  const queue = await import('../tools/workflow-run-queue.js');
+  const local = await import('../runtime/harness/reviewed-local-tool-carrier.js');
+  const adapters = await import('../runtime/harness/production-capability-adapters.js');
+  const manifests = await import('../runtime/harness/capability-manifest-store.js');
+  const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+  const ports = await import('../runtime/harness/production-capability-ports.js');
+  const observations = await import('../runtime/harness/independent-capability-observation.js');
+  const spaces = await import('../spaces/store.js');
+  const workspaceDb = await import('../spaces/workspace-db.js');
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts(); observations.clearIndependentCapabilityObservations();
+  const slug = 'target-evidence-ordered-source';
+  spaces.spaceStore.save({ id: slug, title: 'Controlled ordered source', status: 'active',
+    viewEntry: 'view/index.html', viewContent: '<!doctype html><title>Controlled ordered source</title>', dataSources: [], actions: [] });
+  const observed = local.observeReviewedLocalTool('space_set_data'); assert.ok(observed);
+  const manifest = local.reviewedLocalCapabilityManifest(observed); assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(ports.productionPortIdentityFromManifest(manifest), {
+    invoke: adapters.invokeForSealedManifest(manifest), reconcile: adapters.reconcileForSealedManifest(manifest),
+  }).ok, true);
+  const write = (id: string, value: number) => ({ id, prompt: '', sideEffect: 'write' as const,
+    call: { tool: 'space_set_data', args: { slug, source_id: 'result', data_json: JSON.stringify({ value }) } } });
+  const first = write('first', 1), second = write('second', 2), later = write('later', 3);
+  const prepare = (name: string, steps: ReturnType<typeof write>[]) => {
+    const persisted = workflows.writeWorkflow(name, { name, enabled: true, description: 'Save only the controlled source.',
+      trigger: { manual: true }, inputs: {}, steps });
+    const queued = queue.queueWorkflowRun(name, {}, { source: 'console', workflowSlug: persisted.name, dedupe: false });
+    assert.equal(queued.status, 'queued', queued.message); assert.ok(queued.id);
+    const ctx = { workflow: persisted.data, workflowSlug: persisted.name, runId: queued.id, inputs: {}, stepOutputs: {},
+      assistant: new Proxy({}, { get: () => { throw new Error('No model is allowed in this controlled readback.'); } }),
+      completedItems: new Map(), forEachFailures: [], qualityAdvisories: [] } as unknown as Parameters<typeof runner.executeStep>[1];
+    return { id: queued.id, ctx };
+  };
+  try {
+    const a = prepare('controlled-ordered-source-a', [first, second]);
+    await runner.executeStep(first, a.ctx);
+    const firstObservation = workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'result')!;
+    await runner.executeStep(second, a.ctx);
+    const secondObservation = workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'result')!;
+    assert.notEqual(firstObservation.id, secondObservation.id);
+    const beforeB = readWorkflowTargetEvidence(a.id);
+    assert.deepEqual(beforeB.workspaceDatasetHistory, { checked: 2, verified: 2, unavailable: 0 },
+      'two same-source writes retain and check both own receipts, not just the last Map entry');
+    assert.deepEqual(beforeB.artifactReadback, { checked: 1, verified: 1, unavailable: 0, uncoveredWrites: 0 });
+
+    const b = prepare('controlled-ordered-source-b', [later]);
+    await runner.executeStep(later, b.ctx);
+    const laterObservation = workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'result')!;
+    assert.notEqual(laterObservation.id, secondObservation.id);
+    const aAfterB = readWorkflowTargetEvidence(a.id);
+    assert.equal(aAfterB.available, true, aAfterB.summary);
+    assert.deepEqual(aAfterB.workspaceDatasetHistory, { checked: 2, verified: 2, unavailable: 0 });
+    assert.deepEqual(aAfterB.artifactReadback, { checked: 1, verified: 0, unavailable: 0, uncoveredWrites: 0, superseded: 1 });
+    assert.match(aAfterB.summary, /earlier value is not claimed current/);
+    assert.deepEqual(readWorkflowTargetEvidence(b.id).artifactReadback,
+      { checked: 1, verified: 1, unavailable: 0, uncoveredWrites: 0 });
+    eventlog.closeEventLog(); workspaceDb.closeWorkspaceDb();
+    assert.deepEqual(readWorkflowTargetEvidence(a.id).workspaceDatasetHistory, aAfterB.workspaceDatasetHistory,
+      'cold reopen preserves both exact historical observations');
+    assert.deepEqual(readWorkflowTargetEvidence(a.id).artifactReadback, aAfterB.artifactReadback);
+
+    const db = workspaceDb.openWorkspaceDb();
+    const original = db.prepare('SELECT * FROM workspace_dataset_observations WHERE id = ?').get(firstObservation.id) as Record<string, unknown>;
+    const provenance = JSON.parse(String(original.provenance_json));
+    const invalidObservations: Array<[string, unknown]> = [
+      ['refresh_id', 'foreign-refresh'], ['source_key', 'foreign-source'], ['content_hash', '0'.repeat(64)],
+      ['cause', 'foreign-cause'], ['projection_mode', 'document'], ['status', 'error'], ['dataset_id', null],
+      ['provenance_json', JSON.stringify({ ...provenance, adapter: 'foreign-adapter' })],
+      ['provenance_json', JSON.stringify({ ...provenance, initiatedBy: 'foreign-origin' })],
+      ['provenance_json', JSON.stringify({ ...provenance, argsHash: '0'.repeat(64) })],
+    ];
+    for (const [column, value] of invalidObservations) {
+      try {
+        db.prepare(`UPDATE workspace_dataset_observations SET ${column} = ? WHERE id = ?`).run(value, firstObservation.id);
+        const invalid = readWorkflowTargetEvidence(a.id);
+        assert.equal(invalid.available, false, `${column}: B cannot supply A's missing authority`);
+        assert.deepEqual(invalid.workspaceDatasetHistory, { checked: 2, verified: 1, unavailable: 1 }, column);
+        assert.equal(readWorkflowTargetEvidence(b.id).available, true, 'B keeps its own independently verified receipt');
+      } finally {
+        db.prepare(`UPDATE workspace_dataset_observations SET ${column} = ? WHERE id = ?`).run(original[column], firstObservation.id);
+      }
+    }
+    const firstBlob = db.prepare('SELECT doc_json FROM workspace_datasets WHERE id = ?').get(firstObservation.datasetId) as { doc_json: string };
+    try {
+      db.prepare('UPDATE workspace_datasets SET doc_json = ? WHERE id = ?').run('{"value":999}', firstObservation.datasetId);
+      assert.deepEqual(readWorkflowTargetEvidence(a.id).workspaceDatasetHistory, { checked: 2, verified: 1, unavailable: 1 },
+        'A must reopen its own retained bytes, not accept its metadata or B’s document');
+      assert.equal(readWorkflowTargetEvidence(a.id).available, false);
+    } finally { db.prepare('UPDATE workspace_datasets SET doc_json = ? WHERE id = ?').run(firstBlob.doc_json, firstObservation.datasetId); }
+    const currentBlob = db.prepare('SELECT doc_json FROM workspace_datasets WHERE id = ?').get(laterObservation.datasetId) as { doc_json: string };
+    try {
+      db.prepare('UPDATE workspace_datasets SET doc_json = ? WHERE id = ?').run('not-json', laterObservation.datasetId);
+      const unknownB = readWorkflowTargetEvidence(a.id);
+      assert.deepEqual(unknownB.workspaceDatasetHistory, { checked: 2, verified: 2, unavailable: 0 });
+      assert.equal(unknownB.available, false, 'an unproved current B cannot be called superseded');
+      assert.deepEqual(unknownB.artifactReadback, { checked: 1, verified: 0, unavailable: 1, uncoveredWrites: 0 });
+    } finally { db.prepare('UPDATE workspace_datasets SET doc_json = ? WHERE id = ?').run(currentBlob.doc_json, laterObservation.datasetId); }
+    const dataFile = spaces.resolveInSpace(slug, 'data.json'); const currentBytes = readFileSync(dataFile);
+    for (const contents of ['{"result":{"value":999}}', '{}', null]) {
+      try {
+        if (contents === null) unlinkSync(dataFile); else writeFileSync(dataFile, contents);
+        const changed = readWorkflowTargetEvidence(a.id);
+        assert.equal(changed.available, false, 'historical receipts do not hide missing or tampered current source bytes');
+        assert.deepEqual(changed.workspaceDatasetHistory, { checked: 2, verified: 2, unavailable: 0 });
+        assert.deepEqual(changed.artifactReadback, { checked: 1, verified: 0, unavailable: 1, uncoveredWrites: 0 });
+      } finally { writeFileSync(dataFile, currentBytes); }
+    }
+  } finally {
+    workspaceDb.closeWorkspaceDb(); ports.clearProductionCapabilityPorts(); observations.clearIndependentCapabilityObservations();
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
+});

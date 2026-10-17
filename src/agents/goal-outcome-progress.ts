@@ -26,7 +26,7 @@ export interface GoalWorkflowOutcome {
   state: 'in_progress' | 'satisfied' | 'not_satisfied' | 'unavailable';
   contractId?: string;
   criteria: { total: number; passed: number; remaining: string[] };
-  artifactReadback: 'verified' | 'changed_or_unavailable' | 'not_checked';
+  artifactReadback: 'verified' | 'superseded' | 'changed_or_unavailable' | 'not_checked';
   detail: string;
 }
 export interface GoalOutcomeTask {
@@ -252,9 +252,12 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
         // A known failed readback remains contrary evidence even when some
         // other write has no current-content contract. Unknown cannot hide bad.
         if (counts.unavailable > 0) result.artifactReadback = 'changed_or_unavailable';
-        else if (counts.uncoveredWrites === 0) result.artifactReadback = target.available
-          && counts.verified === counts.checked && !!target.results?.length
-          && target.results.every(row => row.status === 'verified') ? 'verified' : 'changed_or_unavailable';
+        else if (counts.uncoveredWrites === 0) {
+          const proved = target.available && !!target.results?.length && target.results.every(row => row.status === 'verified');
+          const superseded = counts.superseded ?? 0;
+          result.artifactReadback = proved && counts.verified + superseded === counts.checked
+            ? superseded > 0 ? 'superseded' : 'verified' : 'changed_or_unavailable';
+        }
       }
     }
     // Cross-process writes can replace a run while evidence is being read.

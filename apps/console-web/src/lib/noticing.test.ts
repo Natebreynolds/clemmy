@@ -24,6 +24,7 @@ test('workflow result presentation does not complete a goal or certify changed c
 
 test('current artifact check stays separate from the retained workflow outcome', () => {
   assert.equal(goalArtifactReadbackWords('verified'), 'Saved artifact matches the recorded result.');
+  assert.equal(goalArtifactReadbackWords('superseded'), 'The recorded result is preserved; a later saved result is current.');
   assert.equal(goalArtifactReadbackWords('changed_or_unavailable'), 'Saved artifact has changed or could not be checked.');
   assert.equal(goalArtifactReadbackWords('not_checked'), 'Current artifact has not been checked.');
 });

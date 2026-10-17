@@ -54,7 +54,7 @@ export interface GoalWorkflowOutcome {
   state: 'in_progress' | 'satisfied' | 'not_satisfied' | 'unavailable';
   contractId?: string;
   criteria: { total: number; passed: number; remaining: string[] };
-  artifactReadback: 'verified' | 'changed_or_unavailable' | 'not_checked';
+  artifactReadback: 'verified' | 'superseded' | 'changed_or_unavailable' | 'not_checked';
   detail: string;
 }
 export interface GoalOutcomeTask {
@@ -98,6 +98,7 @@ export function goalWorkflowOutcomeWords(state: GoalWorkflowOutcome['state']): s
 export function goalArtifactReadbackWords(state: GoalWorkflowOutcome['artifactReadback']): string {
   switch (state) {
     case 'verified': return 'Saved artifact matches the recorded result.';
+    case 'superseded': return 'The recorded result is preserved; a later saved result is current.';
     case 'changed_or_unavailable': return 'Saved artifact has changed or could not be checked.';
     default: return 'Current artifact has not been checked.';
   }

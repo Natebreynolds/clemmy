@@ -44,7 +44,11 @@ export interface WorkflowTargetEvidence {
   results?: CompletionEvidenceRow[];
   /** Current bytes reopened by this read, separate from historical result
    * redemption and objective validation. Zero checks proves no readback. */
-  artifactReadback?: { checked: number; verified: number; unavailable: number; uncoveredWrites: number };
+  artifactReadback?: { checked: number; verified: number; unavailable: number; uncoveredWrites: number; superseded?: number };
+  /** Every reviewed dataset receipt is checked against its own retained
+   * observation, including earlier writes to the same source. This proves
+   * historical write content, independently of which value is current. */
+  workspaceDatasetHistory?: { checked: number; verified: number; unavailable: number };
   /** What this run's settled work puts at stake, by the chat turn's rule:
    * reads alone take the fast review, writes the full one. */
   reviewStakes?: WorkflowCompletionStakesProof['reviewStakes'];
@@ -79,32 +83,51 @@ function workspaceDatasetReadback(result: unknown, args: unknown,
   } catch { return null; }
 }
 
-function currentWorkspaceDatasetMatches(readback: WorkspaceDatasetReadback): boolean {
+function retainedWorkspaceDatasetMatches({ identity, observationId }: WorkspaceDatasetReadback): boolean {
+  const observation = getWorkspaceDatasetObservation(identity.slug, observationId);
+  if (!observation || observation.status !== 'ok' || observation.projectionMode !== 'source'
+    || observation.sourceKey !== identity.sourceId || observation.refreshId !== identity.refreshId
+    || observation.contentHash !== identity.contentDigest || observation.cause !== 'reviewed_local'
+    || observation.provenance.adapter !== 'reviewed_local' || observation.provenance.initiatedBy !== 'workflow_v3'
+    || observation.provenance.argsHash !== identity.argsDigest) return false;
+  const retained = getWorkspaceObservationDocument(identity.slug, observation.id);
+  return retained !== undefined && workspaceDataContentDigest(retained) === identity.contentDigest;
+}
+
+function workspaceDatasetEvidence(readbacks: readonly WorkspaceDatasetReadback[]): {
+  history: boolean[]; current: 'verified' | 'superseded' | 'unavailable';
+} {
+  let history = readbacks.map(() => false);
   try {
-    const { identity, observationId, receipt } = readback;
+    const { identity, observationId, receipt } = readbacks[readbacks.length - 1]!;
     return withWorkspaceSnapshotRead(identity.slug, () => {
-      const observation = getWorkspaceDatasetObservation(identity.slug, observationId);
+      // All receipts in this group have the same exact workspace/source key.
+      // An earlier receipt is not replaced by the last write's observation.
+      history = readbacks.map(readback => {
+        try { return retainedWorkspaceDatasetMatches(readback); } catch { return false; }
+      });
+      const unavailable = { history, current: 'unavailable' as const };
       const current = getCurrentWorkspaceDatasetObservation(identity.slug, identity.sourceId);
-      if (!observation || !current || current.id !== observation.id || !current.isCurrent || current.status !== 'ok'
-        || observation.status !== 'ok' || observation.projectionMode !== 'source'
-        || observation.sourceKey !== identity.sourceId || observation.refreshId !== identity.refreshId
-        || observation.contentHash !== identity.contentDigest || observation.cause !== 'reviewed_local'
-        || observation.provenance.adapter !== 'reviewed_local' || observation.provenance.initiatedBy !== 'workflow_v3'
-        || observation.provenance.argsHash !== identity.argsDigest) return false;
-      const retained = getWorkspaceObservationDocument(identity.slug, observation.id);
-      if (retained === undefined || workspaceDataContentDigest(retained) !== identity.contentDigest) return false;
+      if (!current || !current.isCurrent || current.status !== 'ok' || current.projectionMode !== 'source'
+        || current.sourceKey !== identity.sourceId || !current.contentHash) return unavailable;
+      const retained = getWorkspaceObservationDocument(identity.slug, current.id);
+      if (retained === undefined || workspaceDataContentDigest(retained) !== current.contentHash) return unavailable;
       // The established opener still checks direct-file/root/symlink safety.
       // Its whole-container digest may differ after a harmless sibling-source
       // update; only this typed dataset contract may compare its own source.
       const content = readCommittedArtifactContent(receipt);
       const file = content.parts.length === 1 ? content.parts[0] : undefined;
-      if (!file || file.handle !== receipt.handle || file.role !== 'file' || file.bytes.byteLength > WORKSPACE_SET_DATA_MAX_BYTES) return false;
+      if (!file || file.handle !== receipt.handle || file.role !== 'file' || file.bytes.byteLength > WORKSPACE_SET_DATA_MAX_BYTES) return unavailable;
       const document = JSON.parse(file.bytes.toString('utf8')) as unknown;
       if (!document || typeof document !== 'object' || Array.isArray(document)
-        || !Object.hasOwn(document, identity.sourceId)) return false;
-      return workspaceDataContentDigest((document as Record<string, unknown>)[identity.sourceId]) === identity.contentDigest;
+        || !Object.hasOwn(document, identity.sourceId)
+        || workspaceDataContentDigest((document as Record<string, unknown>)[identity.sourceId]) !== current.contentHash) return unavailable;
+      // A different fully read-back current observation does not invalidate
+      // this run's own historical write, or prove its old bytes remain current.
+      return { history, current: current.id === observationId && history[history.length - 1]
+        ? 'verified' as const : current.id !== observationId ? 'superseded' as const : 'unavailable' as const };
     });
-  } catch { return false; }
+  } catch { return { history, current: 'unavailable' }; }
 }
 
 /** Read evidence owned by this exact run, never paths asserted in model output.
@@ -235,8 +258,9 @@ export function readWorkflowTargetEvidence(
       source: string; callId: string;
     }> = [];
     let available = true;
-    const artifactReadback = { checked: 0, verified: 0, unavailable: 0, uncoveredWrites: 0 };
-    const activationWorkspaceReceipts = new Map<string, WorkspaceDatasetReadback>();
+    const artifactReadback: NonNullable<WorkflowTargetEvidence['artifactReadback']> = { checked: 0, verified: 0, unavailable: 0, uncoveredWrites: 0 };
+    const workspaceDatasetHistory = { checked: 0, verified: 0, unavailable: 0 };
+    const activationWorkspaceReceipts = new Map<string, WorkspaceDatasetReadback[]>();
     const results: CompletionEvidenceRow[] = [];
     const blocks: string[] = [];
     const retained = new Map<string, JudgeEvidenceEntry>();
@@ -378,7 +402,12 @@ export function readWorkflowTargetEvidence(
           // result too. Reopen its actual data.json receipt, not an upstream
           // transform or the historical observation acknowledgement.
           const dataset = workspaceDatasetReadback(result.rawPayload, requestArgs, receipt);
-          if (dataset) activationWorkspaceReceipts.set(JSON.stringify([dataset.identity.slug, dataset.identity.sourceId]), dataset);
+          if (dataset) {
+            const key = JSON.stringify([dataset.identity.slug, dataset.identity.sourceId]);
+            const owned = activationWorkspaceReceipts.get(key) ?? [];
+            owned.push(dataset);
+            activationWorkspaceReceipts.set(key, owned);
+          }
           else artifactReadback.uncoveredWrites += 1;
         } else if (!hostFile) artifactReadback.uncoveredWrites += 1;
       }
@@ -456,12 +485,24 @@ export function readWorkflowTargetEvidence(
         blocks.push(`${label}: evidence contract=${item.evidenceContract}${item.unresolvedReason ? `; ${item.unresolvedReason}` : ''}. Provider effects and acknowledgements are evidenced by their retained results above; no host-file proof is implied.`);
       }
     });
-    for (const dataset of activationWorkspaceReceipts.values()) {
+    for (const datasets of activationWorkspaceReceipts.values()) {
+      const proof = workspaceDatasetEvidence(datasets);
+      proof.history.forEach((verified, index) => {
+        workspaceDatasetHistory.checked += 1;
+        if (verified) workspaceDatasetHistory.verified += 1;
+        else { workspaceDatasetHistory.unavailable += 1; available = false; }
+        blocks.push(`Reviewed Workspace dataset receipt ${datasets[index]!.observationId}: ${verified
+          ? 'its own retained successful observation and content match this write’s sealed request. This is historical write evidence; it does not claim these bytes are current.'
+          : 'its own retained observation or content does not verify against this write’s sealed request. Another write cannot supply the missing proof.'}`);
+      });
       artifactReadback.checked += 1;
-      if (!currentWorkspaceDatasetMatches(dataset)) {
+      if (proof.current === 'unavailable') {
         artifactReadback.unavailable += 1;
         available = false;
         blocks.push('Reviewed Workspace dataset: its current source observation and saved source bytes do not verify against this run’s authenticated receipt. Historical execution is retained.');
+      } else if (proof.current === 'superseded') {
+        artifactReadback.superseded = (artifactReadback.superseded ?? 0) + 1;
+        blocks.push('Reviewed Workspace dataset: a different successful retained observation now owns this source and its content matches the safely reopened saved source bytes. This run’s historical write is checked separately above; its earlier value is not claimed current. This does not prove the later writer’s account, workflow objective, visual or deployment acceptance.');
       } else {
         artifactReadback.verified += 1;
         blocks.push('Reviewed Workspace dataset: its exact current source observation and saved source bytes match this run’s authenticated receipt. Sibling sources are outside this write’s scope. This is source-content readback, not visual or deployment acceptance.');
@@ -538,7 +579,7 @@ export function readWorkflowTargetEvidence(
     // What the run's settled work puts at stake decides the review's depth;
     // whether its evidence verified decides whether a verdict can stand.
     const stakes = readWorkflowCompletionStakes({ runId });
-    return { available, results, artifactReadback, ...stakes, ...(retained.size ? { evidence: {
+    return { available, results, artifactReadback, workspaceDatasetHistory, ...stakes, ...(retained.size ? { evidence: {
       refKind: 'authenticated results and current artifacts of this workflow run',
       refs: () => [...retained.keys()],
       resolve: (ref: string) => retained.get(ref),

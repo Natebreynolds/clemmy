@@ -65,6 +65,7 @@ function accepted(existingGoal?: GoalRecord) {
 
 function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
   workflowName?: string; settleContract?: boolean; pinContract?: boolean; extraMembers?: number;
+  workspaceWrite?: { slug: string; value: number };
 } = {}) {
   const runId = `workflow-${f.proposal.id}-${label}`;
   const workflowName = options.workflowName ?? `controlled-${f.proposal.id}-${label}`;
@@ -73,7 +74,10 @@ function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
   const definition = { name: workflowName, enabled: true, description: objective,
     trigger: { manual: true }, goal: { objective, successCriteria },
     steps: [{ id: 'compute', prompt: '', sideEffect: 'read' as const,
-      transform: { version: 1 as const, expression: { op: 'literal' as const, value: { product: 323 } } } }] };
+      transform: { version: 1 as const, expression: { op: 'literal' as const, value: { product: 323 } } } },
+    ...(options.workspaceWrite ? [{ id: 'publish', prompt: '', sideEffect: 'write' as const,
+      call: { tool: 'space_set_data', args: { slug: options.workspaceWrite.slug, source_id: 'result',
+        data_json: JSON.stringify({ value: options.workspaceWrite.value }) } } }] : [])] };
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const observer = { sessionId: f.sessionId, sourceUserSeq: f.source.seq, replyTarget: { type: 'origin_chat' as const } };
@@ -261,6 +265,68 @@ test('goal outcome current artifact changes are distinct from a historical satis
   assert.equal(f.project().linkedTasks[0]?.state, 'needs_attention', 'historical success does not hide changed current bytes');
   rmSync(w.artifactFile);
   assert.equal(f.project().linkedTasks[0]?.workflows[0]?.artifactReadback, 'changed_or_unavailable');
+});
+
+test('goal outcome keeps a proved historical Workspace result superseded without false attention after another run writes', async () => {
+  const runner = await import('../execution/workflow-runner.js');
+  const local = await import('../runtime/harness/reviewed-local-tool-carrier.js');
+  const adapters = await import('../runtime/harness/production-capability-adapters.js');
+  const manifests = await import('../runtime/harness/capability-manifest-store.js');
+  const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+  const ports = await import('../runtime/harness/production-capability-ports.js');
+  const observations = await import('../runtime/harness/independent-capability-observation.js');
+  const spaces = await import('../spaces/store.js');
+  const workspaceDb = await import('../spaces/workspace-db.js');
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts(); observations.clearIndependentCapabilityObservations();
+  const slug = 'goal-proved-superseded-source';
+  spaces.spaceStore.save({ id: slug, title: 'Controlled goal result', status: 'active',
+    viewEntry: 'view/index.html', viewContent: '<!doctype html><title>Controlled goal result</title>', dataSources: [], actions: [] });
+  const observed = local.observeReviewedLocalTool('space_set_data'); assert.ok(observed);
+  const manifest = local.reviewedLocalCapabilityManifest(observed); assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(ports.productionPortIdentityFromManifest(manifest), {
+    invoke: adapters.invokeForSealedManifest(manifest), reconcile: adapters.reconcileForSealedManifest(manifest),
+  }).ok, true);
+  const a = accepted(); const aw = workflow(a, 'prior-dataset', { workspaceWrite: { slug, value: 1 }, pinContract: true });
+  const b = accepted(a.goal); const bw = workflow(b, 'current-dataset', { workspaceWrite: { slug, value: 2 }, pinContract: true });
+  const publish = async (w: typeof aw) => {
+    // The existing fixture supplies goal-review receipts. Only the controlled
+    // write uses production dispatch here; no model or judge is invoked.
+    const definition = w.run.workflowDefinitionSnapshot.definition;
+    const step = definition.steps.find((entry: { id: string }) => entry.id === 'publish'); assert.ok(step);
+    writeFileSync(w.file, JSON.stringify({ ...w.run, status: 'running', finishedAt: undefined, terminalOutcome: undefined }));
+    try {
+      await runner.executeStep(step, { workflow: definition, workflowSlug: w.workflowName, runId: w.runId,
+        inputs: {}, stepOutputs: { compute: { product: 323 } },
+        assistant: new Proxy({}, { get: () => { throw new Error('No model may run for this controlled write.'); } }),
+        completedItems: new Map(), forEachFailures: [], qualityAdvisories: [] } as unknown as Parameters<typeof runner.executeStep>[1]);
+    } finally { writeFileSync(w.file, JSON.stringify(w.run)); }
+  };
+  try {
+    await publish(aw);
+    assert.equal(a.project().linkedTasks[0]?.workflows[0]?.artifactReadback, 'verified');
+    const aObservation = workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'result')!.id;
+    await publish(bw);
+    assert.notEqual(workspaceDb.getCurrentWorkspaceDatasetObservation(slug, 'result')!.id, aObservation);
+    const old = a.project().linkedTasks[0]!;
+    assert.equal(old.workflows[0]?.state, 'satisfied', 'A retains only its own historical review');
+    assert.equal(old.workflows[0]?.artifactReadback, 'superseded');
+    assert.equal(old.state, 'outcome_retained', 'verified supersession alone is not a failure or request for attention');
+    assert.equal(b.project().linkedTasks[0]?.workflows[0]?.artifactReadback, 'verified');
+    log.closeEventLog(); workspaceDb.closeWorkspaceDb();
+    assert.equal(a.project().linkedTasks[0]?.workflows[0]?.artifactReadback, 'superseded');
+    const dataFile = spaces.resolveInSpace(slug, 'data.json'); const currentBytes = readFileSync(dataFile);
+    try {
+      writeFileSync(dataFile, '{"result":{"value":999}}');
+      const contrary = a.project().linkedTasks[0]!;
+      assert.equal(contrary.workflows[0]?.artifactReadback, 'changed_or_unavailable');
+      assert.equal(contrary.state, 'needs_attention', 'historical proof cannot hide actual current tampering');
+    } finally { writeFileSync(dataFile, currentBytes); }
+  } finally {
+    workspaceDb.closeWorkspaceDb(); ports.clearProductionCapabilityPorts(); observations.clearIndependentCapabilityObservations();
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
 });
 
 test('goal outcome refuses foreign, missing and ambiguous run or contract bindings and failed-open review', () => {
