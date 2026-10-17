@@ -1172,15 +1172,29 @@ export function buildObjectiveJudgePrompt(
   const shown = skillContext?.fullSourceEvidence
     ? { text: assistantResponse, truncated: false }
     : clipForJudge(assistantResponse, JUDGE_RESPONSE_MAX_CHARS);
-  const parts: ReviewInputPart[] = [
-    { text: `Objective: ${objective}`, component: 'effective_objective' },
-    '',
+  const responseParts: ReviewInputPart[] = [
     shown.truncated
       ? "Assistant's most recent response (LONG — windowed to its head and tail with the middle elided for length; judge ONLY what is visible and do NOT mark the objective incomplete merely because an expected deliverable might fall in the omitted middle):"
       : "Assistant's most recent response:",
     { text: shown.text, component: 'candidate_response' },
     '=== END OF CANDIDATE RESPONSE ===',
   ];
+  // THE REPLY GOES LAST IN THE LIVE REVIEW. A provider caches the longest
+  // identical prefix, and a re-review of the same turn changes the reply while
+  // the objective, the evidence (which only grows) and the skill references
+  // stay. With the reply second, everything after it was re-sent uncached:
+  // live 2026-10-17 two reviews of one Space build shared 18.8 KB of
+  // instructions, the objective and 26 KB of skill reference, yet ~180 KB of
+  // each request followed a reply that had changed, and the reviewer ran at
+  // ~1% cached. The legacy prompt keeps its frozen order.
+  // The skill references and standing instructions are the same for every
+  // review that read the same skill, so in the live review they lead, ahead
+  // of the objective and the evidence of this one request.
+  const responseLast = skillContext?.fullSourceEvidence === true;
+  const leading = responseLast ? completionRequirementParts(skillContext).slice(1) : [];
+  const parts: ReviewInputPart[] = responseLast
+    ? [...leading, ...(leading.length > 0 ? [''] : []), { text: `Objective: ${objective}`, component: 'effective_objective' }]
+    : [{ text: `Objective: ${objective}`, component: 'effective_objective' }, '', ...responseParts];
   // Tool-call evidence — surface it whenever we have it, EVEN with no skill
   // loaded. The judge audits an ACTION objective ("build/deploy X"); without the
   // list of tools that actually fired it sees only the prose reply and can
@@ -1201,7 +1215,8 @@ export function buildObjectiveJudgePrompt(
   // should have before it rules, not something to infer from each block.
   const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(reviewCoverageResults(skillContext)) : undefined;
   if (ledger) parts.push('', { text: ledger, component: 'coverage_ledger' });
-  parts.push(...completionRequirementParts(skillContext));
+  if (!responseLast) parts.push(...completionRequirementParts(skillContext));
+  if (responseLast) parts.push('', ...responseParts);
   const priorOpinion = skillContext?.priorJevOpinion && priorJevOpinions.get(skillContext.priorJevOpinion);
   const currentOwner = reviewOwnerAtModelEntry();
   let opinionPartStart: number | undefined;

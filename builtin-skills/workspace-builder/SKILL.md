@@ -14,7 +14,7 @@ A Workspace is a durable, interactive artifact. You author its structure once; a
 A Workspace has five parts. Decide all five before writing anything:
 
 1. **Data sources**: read operations the server runs on a schedule and on demand.
-2. **View**: sandboxed HTML that renders the stored data, served inside the desktop app.
+2. **View**: sandboxed HTML that renders the stored data, served inside the desktop app. It is built on the design layer (section 6) from the first draft: `.clem-app` fills the frame (no page max-width, no centered column) and every color is a `--clem-*` token, never a literal value, so light and dark both work.
 3. **Actions**: declared operations the view's buttons call.
 4. **Contract**: the user's objective, concrete success criteria, and invariants later edits must keep.
 5. **Phone content and re-engagement**: what the phone shows, and which in-Workspace events wake you.
