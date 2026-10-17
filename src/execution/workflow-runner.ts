@@ -3306,6 +3306,31 @@ function exactWorkflowV3Authorization(
   };
 }
 
+/**
+ * The card for one exact workflow call, in Clem's words: what the step will
+ * do and why it is asking. Live 2026-10-16 the card read "Approve exact
+ * local_write call space_set_data on local_registry:host".
+ */
+export function workflowCallCardVoice(
+  workflowName: string,
+  stepId: string,
+  effect: string,
+  operationId: string,
+): { ask: string; why: string } {
+  const step = creationTestStepName(stepId).toLowerCase();
+  const app = capabilityAppName(exactSchemaToolkitLabel(operationId));
+  const ask = effect === 'local_write'
+    ? `Can “${workflowName}” save its changes at the “${step}” step?`
+    : effect === 'external_write'
+      ? `Can “${workflowName}” make its change in ${app} at the “${step}” step?`
+      : effect === 'admin'
+        ? `Can “${workflowName}” change ${app} settings at the “${step}” step?`
+        : `Can “${workflowName}” run its “${step}” step?`;
+  const why = 'I couldn’t tie this run to you or to its schedule, so this step waits for your OK before it changes anything. '
+    + 'Nothing has changed yet, and everything before this step is kept.';
+  return { ask, why };
+}
+
 async function awaitExactWorkflowV3Authorization(
   step: WorkflowStepInput,
   ctx: StepExecutionContext,
@@ -3322,6 +3347,7 @@ async function awaitExactWorkflowV3Authorization(
     });
   }
   const request = consent.request;
+  const card = workflowCallCardVoice(ctx.workflow.name, step.id, prepared.binding.effect, prepared.operationId);
   const startedAt = Date.now();
   while (true) {
     throwIfWorkflowRunCancelled(ctx.runId);
@@ -3359,8 +3385,7 @@ async function awaitExactWorkflowV3Authorization(
       try {
         registered = approvalRegistry.registerResumable({
           sessionId,
-          subject: step.approvalPreview?.trim()
-            || `Approve exact ${prepared.binding.effect} call ${prepared.operationId} on ${prepared.binding.accountId}`,
+          subject: step.approvalPreview?.trim() || card.ask,
           tool: request.tool,
           args: { ...request.args },
           resumeKey: request.resumeKey,
@@ -3378,7 +3403,12 @@ async function awaitExactWorkflowV3Authorization(
         emitApprovalRequestedCard({
           sessionId,
           approvalId,
-          extra: { workflowName: ctx.workflow.name, runId: ctx.runId, stepId: step.id },
+          extra: {
+            workflowName: ctx.workflow.name,
+            runId: ctx.runId,
+            stepId: step.id,
+            preview: { ask: step.approvalPreview?.trim() || card.ask, why: card.why },
+          },
         });
       }
     }

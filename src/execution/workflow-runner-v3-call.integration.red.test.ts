@@ -20,6 +20,7 @@ const ports = await import('../runtime/harness/production-capability-ports.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const kernel = await import('../runtime/harness/workflow-read-only-call-kernel.js');
 const approvals = await import('../runtime/harness/approval-registry.js');
+const cardVoice = await import('../runtime/harness/approval-card-voice.js');
 const definitions = await import('./workflow-run-definition.js');
 const validator = await import('./workflow-validator.js');
 const workflowGraph = await import('./workflow-graph.js');
@@ -719,6 +720,16 @@ test('BARE CALL CONSENT — an ungated bare mutation waits on one exact v3 appro
   assert.equal(pending[0].args?.effect, 'external_write');
   assert.equal(pending[0].resolution, null);
   assert.equal(pending[0].resolver, null);
+  // The card speaks as Clem, never as an operation id or account handle
+  // (live 2026-10-16: "Approve exact local_write call space_set_data on
+  // local_registry:host").
+  assert.match(pending[0].subject, /^Can “.+” make its change in .+ at the “.+” step\?$/);
+  assert.doesNotMatch(pending[0].subject, /Approve exact|external_write/);
+  assert.equal(pending[0].subject.includes(installed.manifest.operationId), false);
+  assert.equal(pending[0].subject.includes(installed.manifest.accountId), false);
+  const voice = cardVoice.approvalCardVoice(sessionId, pending[0].approvalId);
+  assert.equal(voice?.ask, pending[0].subject);
+  assert.match(voice?.why ?? '', /Nothing has changed yet/);
 
   const approved = approvals.resolve(pending[0].approvalId, 'approved', 'runner-v3-integration-test');
   assert.equal(approved.ok, true, JSON.stringify(approved));
