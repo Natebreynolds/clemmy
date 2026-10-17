@@ -16729,6 +16729,9 @@ async function processOneRunFile(
             stepOutputs: publicStepOutputs,
             finalOutput,
             hasSynthesis: Boolean(workflow.data.synthesis?.prompt) && !run.targetStepId,
+            receiptStepIds: new Set(publicExecutionSteps
+              .filter((step) => step.call && structuredCallSideEffectClass(step) === 'write')
+              .map((step) => step.id)),
           }));
       const baseSuccessBody = originObserverState === 'exact'
         ? mergeWorkflowPresentationContribution(

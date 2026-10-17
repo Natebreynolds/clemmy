@@ -647,3 +647,25 @@ test('applyProposedFix: an edit_contract fix replaces the step output contract, 
   assert.equal(reverted.ok, true, reverted.message);
   assert.deepEqual(readWorkflow('contract-wf')!.data.steps[0].output, { type: 'object', required_keys: ['name', 'email', 'phone'] });
 });
+
+test('a run that ends on its writes reports what it wrote, never the write receipts', () => {
+  // Live 2026-10-16: a draft workflow that ended on its Space write reported
+  // "artifact ID workspace-dataset:v1:…", an observation id and a digest.
+  const row = JSON.stringify([{ id: 'homepage-welcome', title: 'Welcome', body: 'We teach all ages, from toddlers to adults.', status: 'draft' }]);
+  const receipt = JSON.stringify({
+    artifactId: 'workspace-dataset:v1:Zml4dHVyZQ:ZHJhZnRz:aef8370f1a85',
+    observationId: '886514f6-ff76-4a80-a7ac-280d543058de',
+    contentDigest: '306ad46e50e2816cead86c5b8a88029fbd2f3e051ecd92f267a9c943fec2ca32',
+    created: true,
+  });
+  const body = renderSuccessBody({
+    steps: [{ id: 'draft_row' }, { id: 'save_draft', dependsOn: ['draft_row'] }],
+    stepOutputs: { draft_row: row, save_draft: receipt },
+    finalOutput: '',
+    hasSynthesis: false,
+    receiptStepIds: new Set(['save_draft']),
+  });
+  assert.match(body, /We teach all ages, from toddlers to adults\./);
+  assert.match(body, /✓ Saved: save draft/);
+  assert.doesNotMatch(body, /artifactId|workspace-dataset|886514f6|306ad46e|\[\{/);
+});

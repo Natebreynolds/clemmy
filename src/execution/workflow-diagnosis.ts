@@ -1186,12 +1186,43 @@ export function renderSuccessBody(opts: {
   stepOutputs: Record<string, unknown>;
   finalOutput: string;
   hasSynthesis: boolean;
+  /** Steps whose output is a write's receipt (ids, digests), not content. */
+  receiptStepIds?: ReadonlySet<string>;
 }): string {
   if (opts.hasSynthesis && opts.finalOutput.trim()) return opts.finalOutput.trim();
   const shown = workflowResultSteps(opts.steps, opts.stepOutputs);
   if (shown.length === 0) return opts.finalOutput.trim() || '✓ completed';
+  // A write's receipt proves the write landed; it is not what the person
+  // asked for. Live 2026-10-16 a draft workflow that ended on its Space write
+  // reported an artifact id, a digest and a refresh id. Show the last content
+  // the run produced, and name the writes.
+  const receipts = opts.receiptStepIds;
+  if (receipts && shown.every((step) => receipts.has(step.id))) {
+    const content = [...opts.steps].reverse()
+      .find((step) => !receipts.has(step.id) && opts.stepOutputs[step.id] !== undefined);
+    const writes = opts.steps.filter((step) => receipts.has(step.id) && opts.stepOutputs[step.id] !== undefined);
+    const saved = `✓ Saved: ${writes.map((step) => stepWords(step.id)).join(', ')}`;
+    return content ? `${humanizeContent(opts.stepOutputs[content.id])}\n\n${saved}` : saved;
+  }
   if (shown.length === 1) return humanizeStepOutput(opts.stepOutputs[shown[0].id]);
   return shown.map((s) => `**${s.id}**: ${humanizeStepOutput(opts.stepOutputs[s.id])}`).join('\n');
+}
+
+function stepWords(stepId: string): string {
+  return stepId.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').trim().toLowerCase() || stepId;
+}
+
+/** A step's content for a person: rows of a JSON array read one by one. */
+function humanizeContent(raw: unknown): string {
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((row) => row && typeof row === 'object')) {
+        return parsed.slice(0, 5).map((row) => humanizeStepOutput(row)).join('\n\n');
+      }
+    } catch { /* plain text */ }
+  }
+  return humanizeStepOutput(raw);
 }
 
 export interface LegibleOutcome {
