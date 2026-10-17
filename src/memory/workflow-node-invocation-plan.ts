@@ -53,7 +53,10 @@ export function workflowNodeInvocationEffectIsMutation(
 ): effect is WorkflowNodeInvocationMutationEffectV1 {
   return effect === 'local_write' || effect === 'external_write' || effect === 'admin';
 }
+/** Null is an explicit JSON value, distinct from an absent runtime source.
+ * Adding its tag leaves existing v1 plans and their content digests unchanged. */
 export type WorkflowNodeInvocationValueTypeV1 =
+  | 'null'
   | 'string'
   | 'number'
   | 'boolean'
@@ -183,6 +186,7 @@ const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$/;
 const ARGUMENT_RE = /^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$/;
 const PATH_RE = /^(?:[A-Za-z_][A-Za-z0-9_-]*)(?:\.[A-Za-z_][A-Za-z0-9_-]*|\[\d+\])*$/;
 const VALUE_TYPES = new Set<WorkflowNodeInvocationValueTypeV1>([
+  'null',
   'string',
   'number',
   'boolean',

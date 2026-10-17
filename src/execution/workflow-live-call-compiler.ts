@@ -39,6 +39,7 @@ export function exactWorkflowCallIdOrDigest(value: string): string {
 }
 
 function runtimeValueType(value: unknown): WorkflowNodeInvocationValueTypeV1 | null {
+  if (value === null) return 'null';
   if (typeof value === 'string') return 'string';
   if (typeof value === 'number' && Number.isFinite(value)) return 'number';
   if (typeof value === 'boolean') return 'boolean';

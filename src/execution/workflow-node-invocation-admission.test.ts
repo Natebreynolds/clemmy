@@ -534,6 +534,40 @@ test('argument compilation resolves typed runtime sources without mutating the p
   assert.deepEqual(exact, before);
 });
 
+test('null-typed arguments preserve explicit null, while missing sources and old non-null null behavior stay distinct', () => {
+  const base = planFor(registered());
+  const exact = createWorkflowNodeInvocationPlan({ ...base, arguments: {
+    limit: { source: { kind: 'workflow_input', key: 'limit' }, required: true, type: 'null' },
+  } });
+  const source = Object.freeze({ limit: null });
+  const first = compileWorkflowNodeInvocationArguments(exact, { workflowInputs: source, stepOutputs: {} });
+  const replay = compileWorkflowNodeInvocationArguments(JSON.parse(JSON.stringify(exact)), { workflowInputs: source, stepOutputs: {} });
+  assert.equal(first.ok, true);
+  if (!first.ok) throw new Error(first.reason);
+  assert.deepEqual(first.args, { limit: null });
+  assert.ok(Object.hasOwn(first.args, 'limit'));
+  assert.deepEqual(replay, first, 'explicit null has stable canonical argument bytes and digest');
+  for (const missing of [{}, { limit: undefined }]) {
+    assert.deepEqual(compileWorkflowNodeInvocationArguments(exact, { workflowInputs: missing, stepOutputs: {} }),
+      { ok: false, reason: 'missing_source', argument: 'limit' });
+  }
+  for (const value of ['', 0, false, {}, []]) {
+    assert.deepEqual(compileWorkflowNodeInvocationArguments(exact, { workflowInputs: { limit: value }, stepOutputs: {} }),
+      { ok: false, reason: 'type_mismatch', argument: 'limit' });
+  }
+  for (const required of [true, false]) {
+    const legacy = createWorkflowNodeInvocationPlan({ ...base, arguments: {
+      limit: { source: { kind: 'workflow_input', key: 'limit' }, required, type: 'number' },
+    } });
+    const result = compileWorkflowNodeInvocationArguments(legacy, { workflowInputs: { limit: null }, stepOutputs: {} });
+    if (required) assert.deepEqual(result, { ok: false, reason: 'missing_source', argument: 'limit' });
+    else {
+      assert.equal(result.ok, true);
+      if (result.ok) assert.deepEqual(result.args, {});
+    }
+  }
+});
+
 test('typed source path traversal rejects accessors without evaluating them', () => {
   const entry = registered();
   const exact = createWorkflowNodeInvocationPlan({

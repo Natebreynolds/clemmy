@@ -122,6 +122,26 @@ test('closed plan parsing is canonical, replay-stable, and stores sources rather
   if (!parsed.ok) assert.match(parsed.errors.join(' '), /closed object/);
 });
 
+test('explicit null argument bindings round-trip in v1 without changing established non-null plan bytes', () => {
+  const exact = plan({ arguments: {
+    limit: { source: { kind: 'workflow_input', key: 'limit' }, required: true, type: 'null' },
+    cursor: { source: { kind: 'reviewed_literal', value: null, valueDigest: workflowNodeReviewedLiteralDigest(null),
+      reviewRef: 'review.null-cursor', reviewDigest: digest('review:null-cursor') }, required: true, type: 'null' },
+  } });
+  const serialized = JSON.stringify(exact);
+  assert.equal(exact.version, 1);
+  assert.deepEqual(parseWorkflowNodeInvocationPlan(JSON.parse(serialized)), { ok: true, plan: exact });
+  assert.equal(JSON.stringify(parseWorkflowNodeInvocationPlan(JSON.parse(serialized))), JSON.stringify({ ok: true, plan: exact }));
+  const compiled = compileWorkflowNodeInvocationArguments(exact, { workflowInputs: { limit: null }, stepOutputs: {} });
+  assert.equal(compiled.ok, true);
+  if (!compiled.ok) throw new Error(compiled.reason);
+  assert.deepEqual(compiled.args, { cursor: null, limit: null });
+  assert.ok(Object.hasOwn(compiled.args, 'limit'));
+  assert.ok(Object.hasOwn(compiled.args, 'cursor'));
+  assert.equal(JSON.stringify(exact), serialized, 'compilation preserves the saved binding bytes');
+  assert.equal(plan().bindingDigest, 'ee4e79a668259c6cd38c589277411bbaed387280e8a56f7bccfcd77f62a02c19');
+});
+
 test('provider-neutral write effects are content-addressed without widening read plan bytes', () => {
   const read = plan();
   const replay = plan();

@@ -156,6 +156,7 @@ function nonEmpty(value: unknown): boolean {
 }
 
 function valueFitsType(value: unknown, expected: WorkflowNodeInvocationValueTypeV1): boolean {
+  if (expected === 'null') return value === null;
   if (expected === 'array') return Array.isArray(value);
   if (expected === 'object') return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
   return typeof value === expected;
@@ -190,7 +191,9 @@ export function compileWorkflowNodeInvocationArguments(
   for (const [name, binding] of Object.entries(parsed.plan.arguments)
     .sort(([left], [right]) => left.localeCompare(right))) {
     const resolved = resolveSource(binding.source, context);
-    if (resolved === undefined || resolved === null) {
+    // Explicit null is data only for the exact null binding. Preserve the
+    // established missing-source behavior of every non-null v1 binding.
+    if (resolved === undefined || (resolved === null && binding.type !== 'null')) {
       if (binding.required) return { ok: false, reason: 'missing_source', argument: name };
       continue;
     }
