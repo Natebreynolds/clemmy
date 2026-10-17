@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -137,4 +138,45 @@ test('a request reservation alone never grants accepted lookup status or stale r
   assert.equal(isAcceptedMeetingLookup(packet, 'controlled-hash', receipt,
     { ...source, data: { ...source.data, text: `${packet.input}\nExpanded attached context` } }), true,
     'canonical enrichment cannot change the accepted raw owner choice');
+});
+
+test('the owner sees the plain lookup question while exact acceptance and Jev keep the full immutable packet', async () => {
+  const log = await import('../../runtime/harness/eventlog.js');
+  const { ownerBubbleText, publicUserInputText, projectHarnessEventForPublic } = await import('../../runtime/harness/public-presentation.js');
+  const { reconstructHarnessTranscript, reconstructHarnessTranscriptText, harnessPreview } = await import('../../runtime/harness/transcript.js');
+  const { acceptedObjectiveForSource } = await import('../../runtime/harness/host-turn-runner.js');
+  const { isAcceptedMeetingLookup } = await import('./meeting-assistance-chat.js');
+  const f = await fixture(); const packet = f.prepare();
+  const inputHash = createHash('sha256').update(JSON.stringify({ input: packet.input, attachmentIds: [] })).digest('hex');
+  const session = log.createSession({ id: packet.privateOriginSessionId, kind: 'chat', title: 'Controlled meeting lookup' });
+  const receipt = log.claimHarnessChatRequest({ requestId: packet.clientRequestId, sessionId: session.id,
+    runId: `controlled-lookup-${ordinal}`, inputHash, sinceSeq: 0 }).receipt;
+  const { attempt } = log.claimRunAttemptLease({ sessionId: session.id, runId: receipt.runId, ownerId: 'controlled-meeting-fixture', leaseMs: 10_000 });
+  assert.ok(attempt);
+  const source = log.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+    text: `${packet.input}\nControlled model-facing enrichment`, displayText: packet.input,
+    requestId: receipt.requestId, clientRequestId: receipt.requestId, runId: receipt.runId,
+    meetingLookupPresentation: { version: 1, kind: 'meeting_lookup', question: packet.question,
+      meetingId: packet.meetingId, offerId: packet.offerId, offerDigest: packet.offerDigest,
+      sourceDigest: packet.sourceDigest, clientRequestId: packet.clientRequestId,
+      privateOriginSessionId: packet.privateOriginSessionId, inputHash },
+  } });
+  const retained = log.getRunAttemptSourceUserEvent(attempt)!;
+  assert.equal(isAcceptedMeetingLookup(packet, inputHash, receipt, retained), true);
+  assert.equal(publicUserInputText(retained.data), packet.input);
+  assert.equal(acceptedObjectiveForSource({ sessionId: session.id, sourceUserSeq: source.seq }), packet.input,
+    'the review objective remains the complete accepted packet');
+  assert.equal(ownerBubbleText(retained.data, session.id), packet.question);
+  assert.equal(harnessPreview(session.id), packet.question);
+  assert.deepEqual(reconstructHarnessTranscript(session.id).map(turn => turn.text), [packet.question]);
+  assert.deepEqual(reconstructHarnessTranscriptText(session.id).map(turn => turn.text), [packet.question]);
+  const live = projectHarnessEventForPublic(retained)!;
+  assert.deepEqual(live.data, { text: packet.question });
+  assert.equal(live.seq, retained.seq); assert.equal(live.sessionId, retained.sessionId);
+  assert.equal(log.getRunAttemptSourceUserEvent(attempt)!.data.displayText, packet.input,
+    'history and live rendering leave the audited source unchanged');
+  const altered = { ...retained, data: { ...retained.data, meetingLookupPresentation: { question: 'Untyped substitute' } } };
+  assert.equal(ownerBubbleText(altered.data, session.id), packet.input);
+  assert.equal(isAcceptedMeetingLookup(packet, inputHash, receipt, altered), true,
+    'presentation metadata cannot grant or revoke task execution privileges');
 });

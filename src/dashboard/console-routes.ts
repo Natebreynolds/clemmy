@@ -453,6 +453,7 @@ import {
   publicPresentationText,
   PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT,
   PUBLIC_RUN_FAILURE_TEXT,
+  type MeetingLookupOwnerPresentation,
 } from '../runtime/harness/public-presentation.js';
 import { readPublicHarnessEventPage } from '../runtime/harness/public-event-page.js';
 import { commitTurnOutcome } from '../runtime/harness/delivery-committer.js';
@@ -17503,7 +17504,7 @@ export function registerConsoleRoutes(
     }
     if (existingId && !session) { res.status(404).json({ error: 'session not found' }); return; }
     if (!session) {
-      const titleSeed = input || (attachmentIds.length ? 'Attached file' : '');
+      const titleSeed = meetingLookup?.question || input || (attachmentIds.length ? 'Attached file' : '');
       session = createHarnessSession({
         ...(deterministicSessionId ? { id: deterministicSessionId } : {}),
         kind: 'chat',
@@ -18136,6 +18137,13 @@ export function registerConsoleRoutes(
             ...turnLearningPolicyFields(learningPolicy),
             ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),
             displayText: input || (attachmentIds.length ? 'Attached file' : ''),
+            ...(meetingLookup ? { meetingLookupPresentation: {
+              version: 1, kind: 'meeting_lookup', question: meetingLookup.question,
+              meetingId: meetingLookup.meetingId, offerId: meetingLookup.offerId,
+              offerDigest: meetingLookup.offerDigest, sourceDigest: meetingLookup.sourceDigest,
+              clientRequestId: meetingLookup.clientRequestId, privateOriginSessionId: meetingLookup.privateOriginSessionId,
+              inputHash: payloadHash,
+            } satisfies MeetingLookupOwnerPresentation } : {}),
             ...(reviewedPlanOwnerControl ? { reviewedPlanOwnerControl, userId: reviewedPlanOwnerControl.conversationPrincipalId } : {}),
             requestId: requestClaim.receipt.requestId,
             clientRequestId: requestClaim.receipt.requestId,

@@ -3879,7 +3879,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 95107
+          "bytes": 98350
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823
@@ -7794,7 +7794,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 95107
+          "bytes": 98350
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823

@@ -168,7 +168,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     sources.set(key, {
       key,
       event,
-      userText: event.data.synthetic === true ? '' : ownerBubbleText(event.data),
+      userText: event.data.synthetic === true ? '' : ownerBubbleText(event.data, event.sessionId),
     });
   }
 
@@ -464,7 +464,7 @@ export function harnessPreview(sessionId: string): string {
   const latest = events[0];
   if (!latest) return '';
   if (latest.type === 'user_input_received') {
-    return ownerBubbleText(latest.data);
+    return ownerBubbleText(latest.data, latest.sessionId);
   }
   if (latest.type === 'clem_message') return typeof latest.data.text === 'string' ? latest.data.text.trim() : '';
   return humanHarnessText(latest.data, '');
