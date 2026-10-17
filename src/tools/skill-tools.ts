@@ -99,7 +99,7 @@ async function renderSkillToolContracts(declared: unknown): Promise<string> {
   if (result.contracts.length === 0) return '';
   return [
     '=== TOOLS THIS SKILL USES ===',
-    'Call each by its exact name with these arguments (? marks optional); these need no tool_search. A rejected call returns the exact problem to fix.',
+    'Call each by its exact name with these arguments (? marks optional); these need no tool_search. An argument shown as object takes a JSON object, never JSON text, including inside args_json. A rejected call returns the exact problem to fix.',
     ...result.contracts.map((tool) => `- ${tool.signature}${tool.summary ? `\n  ${tool.summary}` : ''}`),
     ...(result.overflow.length ? [`Also used, schema not shown (use tool_search for it): ${result.overflow.join(', ')}`] : []),
   ].join('\n');

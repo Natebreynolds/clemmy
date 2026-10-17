@@ -48,7 +48,10 @@ test("a skill's declared tools come after its body with their argument shapes", 
   const section = text.slice(tools);
   assert.match(section, /- space_save\(slug: string, title: string, /);
   assert.match(section, /objective\?: string/, 'a nullable field of a strict schema reads as optional');
-  assert.match(section, /- space_set_data\(slug: string, source_id: string, data_json: string\)/);
+  assert.match(section, /- space_set_data\(slug: string, source_id: string, data_json: string\)/,
+    'a text-only contract stays text');
+  assert.match(section, /initial_data_json\?: object, replacement_data_json\?: object/,
+    'a JSON-document argument reads as an object, so it is never nested as escaped text');
 
   const watch = await readSkill('watch-setup');
   assert.match(watch, /- workflow_run\(name: string, inputs\?: string\)/);

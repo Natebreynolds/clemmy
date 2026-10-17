@@ -1096,7 +1096,7 @@ export async function skillToolContracts(
   for (const name of [...new Set(names)]) {
     const entry = metadata.get(name);
     if (!entry) continue;
-    const signature = `${name}(${toolArgumentSignature(entry.schema)})`;
+    const signature = `${name}(${toolArgumentSignature(entry.schema, await objectDocumentArguments(name))})`;
     const summary = (entry.description.split(/(?<=[.!?])\s/)[0] ?? '').trim().slice(0, 200);
     const size = signature.length + summary.length + 8;
     if (used + size > maxChars) { overflow.push(name); continue; }
@@ -1135,7 +1135,34 @@ function schemaAllowsNull(schema: unknown): boolean {
 }
 
 /** "slug: string, title?: string, steps: object[]" from a JSON object schema. */
-function toolArgumentSignature(schema: unknown): string {
+function schemaAcceptsObject(schema: unknown): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  if (node.type === 'object') return true;
+  const union = (node.anyOf ?? node.oneOf) as unknown[] | undefined;
+  return Array.isArray(union) && union.some(schemaAcceptsObject);
+}
+
+/**
+ * Arguments a tool accepts as a JSON object although its strict wire schema
+ * can only say "string" (strict function schemas cannot carry an open
+ * object). Live 2026-10-17: the signature said `initial_data_json?: string`,
+ * Clem nested the dataset as JSON text inside the carrier's args_json, and
+ * five of six failed Space saves broke on that escaping.
+ */
+async function objectDocumentArguments(name: string): Promise<Set<string>> {
+  try {
+    const [{ getLocalToolSchemas }, { z }] = await Promise.all([import('./local-runtime-tools.js'), import('zod')]);
+    const schema = getLocalToolSchemas().get(name);
+    if (!schema) return new Set();
+    const json = z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }) as { properties?: Record<string, unknown> };
+    return new Set(Object.entries(json.properties ?? {}).filter(([, value]) => schemaAcceptsObject(value)).map(([key]) => key));
+  } catch {
+    return new Set();
+  }
+}
+
+function toolArgumentSignature(schema: unknown, objectArguments: ReadonlySet<string> = new Set()): string {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return '';
   const node = schema as Record<string, unknown>;
   const properties = node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)
@@ -1145,7 +1172,10 @@ function toolArgumentSignature(schema: unknown): string {
   // Strict function schemas list every field as required and mark the
   // optional ones nullable, so a field that accepts null is optional too.
   return Object.entries(properties)
-    .map(([key, value]) => `${key}${required.has(key) && !schemaAllowsNull(value) ? '' : '?'}: ${schemaTypeWords(value)}`)
+    .map(([key, value]) => {
+      const words = schemaTypeWords(value);
+      return `${key}${required.has(key) && !schemaAllowsNull(value) ? '' : '?'}: ${objectArguments.has(key) && words === 'string' ? 'object' : words}`;
+    })
     .join(', ');
 }
 
