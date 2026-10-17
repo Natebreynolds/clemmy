@@ -197,21 +197,10 @@ verify_recall_packaged() {
     actual_version="$(node -p "require('$recall_root/package.json').version")"
     [[ "$actual_version" == "$expected_version" ]] \
       || { echo "::error::packaged Recall SDK $actual_version != pinned $expected_version"; exit 1; }
-    local actual_commit
-    actual_commit="$(node -p "require('$recall_root/package.json').commit_sha")"
-    [[ "$actual_commit" == "90d670e842200a4d546cbe36cc0b9c48fbe6a204" ]] \
-      || { echo "::error::packaged Recall SDK has unexpected commit $actual_commit"; exit 1; }
-    RECALL_ROOT="$recall_root" node --input-type=module -e '
-      import fs from "node:fs";
-      import path from "node:path";
-      const manifest = JSON.parse(fs.readFileSync(path.join(process.env.RECALL_ROOT, "clementine-native-manifest.json"), "utf8"));
-      if (manifest.sdkVersion !== "2.0.25"
-        || manifest.sdkCommit !== "90d670e842200a4d546cbe36cc0b9c48fbe6a204"
-        || manifest.platform !== "darwin"
-        || manifest.archiveBytes !== 50971984
-        || manifest.archiveSha256 !== "e3125c49cdf6d54593e6334024df2ecbed99e0c6b1d2e410a4187ab19421433b") {
-        throw new Error(`packaged Recall native provenance is invalid: ${JSON.stringify(manifest)}`);
-      }
+    RECALL_ROOT="$recall_root" RECALL_VENDOR_MODULE="$SCRIPT_DIR/vendor-recall-native.mjs" node --input-type=module -e '
+      import { pathToFileURL } from "node:url";
+      const { validatePackagedRecallNative } = await import(pathToFileURL(process.env.RECALL_VENDOR_MODULE).href);
+      validatePackagedRecallNative(process.env.RECALL_ROOT, "darwin");
     '
 
     local native
