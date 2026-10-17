@@ -13,6 +13,7 @@ import { textResult } from './shared.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { issueManualSkillDraftRequestReceipt } from '../memory/learning-receipt.js';
 import { captureManualSkillDistillAuthority, userDeclinedSkillDistillation } from './manual-skill-distill-authority.js';
+import { toolPresentationMaxChars } from './tool-registry.js';
 
 /** Runtime check for the model-facing manual distillation authority. A tool
  * choice alone is not proof that the user asked Clementine to remember a
@@ -79,8 +80,6 @@ function renderToolNameCrib(skill: Skill): string {
  * pulls them in with skill_read.
  */
 
-/** Large enough for the largest built-in skill with its tool signatures. */
-const SKILL_READ_MAX_CHARS = 60_000;
 
 /** The tools a skill declares in its frontmatter (`tools:`), with their exact
  *  argument schemas, so the model can call them without searching. */
@@ -236,7 +235,7 @@ export function registerSkillTools(server: McpServer): void {
       // its verify and phone sections never reached the model.
       return textResult(
         `${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}${toolContracts ? `\n\n${toolContracts}` : ''}`,
-        { maxChars: SKILL_READ_MAX_CHARS },
+        { maxChars: toolPresentationMaxChars('skill_read') },
       );
     },
   );

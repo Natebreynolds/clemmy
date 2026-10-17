@@ -138,7 +138,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129302
+          "bytes": 129863
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -360,7 +360,7 @@
           "bytes": 739
         },
         "src/runtime/harness/tool-output-format.ts": {
-          "bytes": 32891
+          "bytes": 33252
         },
         "src/tools/shared.ts": {
           "bytes": 45251
@@ -3360,7 +3360,7 @@
           "bytes": 9824
         },
         "src/tools/skill-tools.ts": {
-          "bytes": 16295
+          "bytes": 16262
         },
         "src/tools/workflow-schedule-tools.ts": {
           "bytes": 16088
@@ -4053,7 +4053,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129302
+          "bytes": 129863
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -4275,7 +4275,7 @@
           "bytes": 739
         },
         "src/runtime/harness/tool-output-format.ts": {
-          "bytes": 32891
+          "bytes": 33252
         },
         "src/tools/shared.ts": {
           "bytes": 45251
@@ -7275,7 +7275,7 @@
           "bytes": 9824
         },
         "src/tools/skill-tools.ts": {
-          "bytes": 16295
+          "bytes": 16262
         },
         "src/tools/workflow-schedule-tools.ts": {
           "bytes": 16088
@@ -7850,8 +7850,8 @@
       }
     },
     "transport": {
-      "file": "transport-d7e032c16b71ffef1e3eb02a788a16fa1f32c367fb468e671edce361906370eb.cjs",
-      "sha256": "d7e032c16b71ffef1e3eb02a788a16fa1f32c367fb468e671edce361906370eb",
+      "file": "transport-f2ed370feda662a8344240941933d7684faab760ed92bd121ff806fb9423610c.cjs",
+      "sha256": "f2ed370feda662a8344240941933d7684faab760ed92bd121ff806fb9423610c",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -7929,7 +7929,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129302
+          "bytes": 129863
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17265
@@ -8057,5 +8057,5 @@
       }
     }
   },
-  "manifestDigest": "05f7601fe45735c4ee0e0fcb43996af26b44e6445695c9332a6a887ec60e9615"
+  "manifestDigest": "540409d4d4a80e0851d435f128b7d9d2dc0bebff050b8a1e12b226a48490a1bf"
 }
