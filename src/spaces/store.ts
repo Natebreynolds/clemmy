@@ -623,6 +623,12 @@ function normAction(raw: unknown, manifestErrors: string[], index: number): Spac
     const tpl = parseJsonObjField(a.args_template_json, `${diagnosticLabel} args_template_json`, manifestErrors);
     if (tpl) act.argsTemplate = tpl;
   }
+  // A button bound to a saved workflow keeps that binding when it is read back:
+  // without it the click lost its workflow, was taken for an unbound action
+  // that needs approval, and a Space's Approve button raised a second card
+  // (live 2026-10-16, a fixture approval Space).
+  const workflow = asStr(a.workflow);
+  if (workflow) act.workflow = workflow;
   if (a.confirm === true) act.confirm = true;
   return act;
 }

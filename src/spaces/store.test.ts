@@ -80,6 +80,25 @@ test('save creates a manifest; get + list read it back; idempotent update', () =
   assert.equal(list.filter((s) => s.id === 'demo').length, 1);
 });
 
+test('a button bound to a saved workflow keeps that binding when the Space is read back', async () => {
+  // Live 2026-10-16: the binding was dropped on load, so an Approve button was
+  // treated as an unbound action and raised a second approval card.
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  store.spaceStore.save({ id: 'approval-board', title: 'Approval board' });
+  const file = path.join(store.SPACES_DIR, 'approval-board', 'space.json');
+  const manifest = JSON.parse(readFileSync(file, 'utf8'));
+  manifest.actions = [
+    { id: 'approve', label: 'Approve & publish', workflow: 'Fixture Publish' },
+    { id: 'request_changes', label: 'Request changes', workflow: 'Fixture Draft' },
+  ];
+  writeFileSync(file, JSON.stringify(manifest));
+  const got = store.spaceStore.get('approval-board');
+  assert.deepEqual(got?.actions.map((action) => [action.id, action.workflow]), [
+    ['approve', 'Fixture Publish'],
+    ['request_changes', 'Fixture Draft'],
+  ]);
+});
+
 test('initial static data is visible with its manifest, retries orphaned pre-manifest files, and transitions on real sources', () => {
   const slug = 'static-snapshot-store';
   const dir = store.resolveSpaceDir(slug);
