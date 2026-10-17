@@ -15,9 +15,8 @@ import type { ActivityItem, ModelRuleOffer, TerminalFacts, WorkflowCardData } fr
 /** `checked` is a review that passed. `unchecked` is a turn whose reviewer
  *  never ran or could not rule: it must never read as a pass. `rejected` is
  *  the last review saying no. `needs_recheck` is an answer resting on earlier
- *  work that needs a fresh look before it is relied on. `noted` is finished
- *  work whose last review questioned only some of the reply's wording. */
-export type TurnReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'noted';
+ *  work that needs a fresh look before it is relied on. */
+export type TurnReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
 
 /** The host's own ruling on the terminal decides when it sent one. Otherwise
  *  the latest verdict decides; an earlier rejection followed by a passing

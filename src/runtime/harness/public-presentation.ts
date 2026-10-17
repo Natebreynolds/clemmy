@@ -749,18 +749,18 @@ export function durableCompletionTextForModel(data: Record<string, unknown>): st
   }
 }
 
-const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck', 'noted']);
+const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
 const PUBLIC_REVIEW_NOTE_MAX_CHARS = 400;
 
 /** The committer's review state for the exact published text. Only the
  * committer writes it (it is not caller metadata); an unknown value stays
  * private rather than being guessed into a chip. */
 function publicTerminalReview(data: Record<string, unknown>): {
-  review?: 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'noted';
+  review?: 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
   reviewNote?: string;
 } {
   const review = typeof data.review === 'string' && PUBLIC_REVIEW_STATES.has(data.review)
-    ? data.review as 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'noted'
+    ? data.review as 'checked' | 'unchecked' | 'rejected' | 'needs_recheck'
     : undefined;
   if (!review) return {};
   const note = typeof data.reviewNote === 'string'

@@ -76,9 +76,7 @@ import {
 } from './terminal-notice.js';
 
 /** The committer's review state for the exact published text. */
-/** `noted`: a finished answer published as done whose last review found the
- * work done and questioned only claims in its wording; the note carries them. */
-export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'noted';
+export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
 
 /** What the completion review did for this source, as the terminal records
  * it beside the verdict reference. `rejected` is a reviewer that answered and
@@ -1586,8 +1584,6 @@ export function commitTurnOutcome(
     const finding = publishedVerdict.reason.split(WHOLE_JSON_OBJECT_FORMAT_FINDING).join(' ').replace(/\s+/g, ' ').trim();
     return finding ? reviewFindingForOwner(finding, 400) : undefined;
   })();
-  /** Set when a claims-only rejection published the authored answer as done. */
-  let claimsOnlyPublished = false;
   if (verificationFailed && effectiveOutcome.status === 'done') {
     // TYPED INDEPENDENT CAUSES, tested in order of what is actually knowable.
     // Previously a MISSING verdict fell through to "reply mismatch" (there was
@@ -1670,23 +1666,10 @@ export function commitTurnOutcome(
       && (publishedVerdict?.fulfills === true || answeredUnqualified)
       && publishedVerdict?.hostEvidenceHold !== true
       && joinsStand;
-    // THE WORK LANDED; ONLY WORDING WAS QUESTIONED (owner decision 2026-10-16).
-    // A last review that found the work done and objected only to claims in
-    // the reply (its repair scope) after the repair rounds ran out is a note
-    // on the answer, not a reason to call finished work blocked. The answer
-    // publishes as authored; the chip says rejected and carries the
-    // reviewer's points. Live 2026-10-16: a Space build was verified and
-    // saved, then ended blocked over which account a CLI was signed in as.
-    const claimsOnlyRejection = detail === 'completion_review_negative'
-      && publishedVerdict?.repairScope === 'claims'
-      && publishedVerdict.hostEvidenceHold !== true
-      && joinsStand;
-    const publishAuthored = reviewCouldNotFire || claimsOnlyRejection;
-    claimsOnlyPublished = claimsOnlyRejection;
-    unverifiedHoldFallback = publishAuthored
+    unverifiedHoldFallback = reviewCouldNotFire
       ? () => unverifiedCompletionOutcome(authoredOutcome, true)
       : null;
-    effectiveOutcome = publishAuthored ? authoredOutcome : unverifiedCompletionOutcome(authoredOutcome, true);
+    effectiveOutcome = reviewCouldNotFire ? authoredOutcome : unverifiedCompletionOutcome(authoredOutcome, true);
     effectiveOptions = {
       ...effectiveOptions,
       // The verification projection changed done to blocked. Derive the
@@ -1712,12 +1695,8 @@ export function commitTurnOutcome(
   effectiveOptions = withFormatUnmetNotice(effectiveOutcome.status, effectiveOptions);
   // The review chip for the exact text being published, derived here from the
   // durable verdict rather than accepted from caller metadata.
-  // An answer that published as done over a claims-only rejection reads as
-  // done with notes; if the hold took it back after all, it reads rejected.
-  const publishedReviewState = reviewState === 'rejected' && claimsOnlyPublished && effectiveOutcome.status === 'done'
-    ? 'noted' : reviewState;
-  const reviewMetadata = publishedReviewState
-    ? { review: publishedReviewState, ...(reviewNote ? { reviewNote } : {}) }
+  const reviewMetadata = reviewState
+    ? { review: reviewState, ...(reviewNote ? { reviewNote } : {}) }
     : {};
   const verdictMetadata = publishedVerdict ? { completionVerdictRef: {
     ...(publishedPlan ? { planMatches, planDigest: publishedVerdict.planDigest } : {}),
@@ -1833,8 +1812,6 @@ export function commitTurnOutcome(
       data = {
         ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
         ...planMetadata, ...verdictMetadata, ...reviewMetadata, ...refusalMetadata,
-        // The hold took a claims-only answer back: it is not a finished one.
-        ...(publishedReviewState === 'noted' ? { review: 'rejected' as const } : {}),
       };
       terminal = appendTerminalEventOnce({
         sessionId: heldPresentation.identity.sessionId,
