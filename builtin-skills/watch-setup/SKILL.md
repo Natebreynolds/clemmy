@@ -26,8 +26,9 @@ Ask this as one question with your proposal filled in, so they can answer "yes" 
 ## 2. Build it
 
 - Use the source through a connected tool, CLI, or local read the owner already has. When nothing can read it, offer the connection instead of saving a watch that cannot run.
-- Read only what is new since the last run: bound the read by time (for example `{{now-2h}}` for a two-hour cadence) or use `forEachNewOnly` with stable item ids.
-- Use exact call steps for the reads you know, and one model step to judge what matters against what the owner asked you to look for.
+- Keep it to two or three steps: exact `call` steps to list and read (`list_files`, `read_file`, a provider read), then ONE model step that judges what matters against what the owner asked you to look for. Listing or reading never needs a model step.
+- Read what is recent; do not build your own record of what was already seen. The host remembers every finding's `key` and never raises the same one twice, so re-reading an item is harmless. Bound the read by time when the source is large (for example `{{now-2h}}` for a two-hour cadence).
+- A watch needs no saved `goal`: its findings list is its result, and the host flags a run that returns none. A goal adds a judge to every run and to every rehearsal.
 - The LAST step returns JSON and nothing else:
 
 ```json

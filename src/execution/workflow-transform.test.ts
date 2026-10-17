@@ -290,3 +290,25 @@ test('row selection rejects absent/non-scalar IDs and mixed sort types; explicit
     { op: 'sort', by: [{ column: 'id', direction: 'asc', code: 'anything' }] },
   ]) assert.equal(validateWorkflowTransform({ version: 1, expression: { ...expression, value: { op: 'literal', value: [] } } }).ok, false);
 });
+
+test('jsonParse of a result that is already JSON data uses it as it is', () => {
+  // Live 2026-10-17: a Space feed's creation test failed on "jsonParse
+  // requires a string input" because the model step had already returned an
+  // object; the author spent a full edit and re-test round on it.
+  const transform = {
+    version: 1 as const,
+    expression: { op: 'jsonParse' as const, value: { op: 'get' as const, from: 'steps.build.output' } },
+  };
+  const parsedAlready = executeWorkflowTransform({
+    transform,
+    inputs: {},
+    stepOutputs: { build: { clients: [{ name: 'Summit' }] } },
+  });
+  assert.deepEqual(parsedAlready, { clients: [{ name: 'Summit' }] });
+  const asText = executeWorkflowTransform({
+    transform,
+    inputs: {},
+    stepOutputs: { build: '{"clients":[{"name":"Summit"}]}' },
+  });
+  assert.deepEqual(asText, parsedAlready, 'text and data give the same result');
+});

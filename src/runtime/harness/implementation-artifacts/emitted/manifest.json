@@ -627,7 +627,7 @@
           "bytes": 4731
         },
         "src/execution/workflow-transform.ts": {
-          "bytes": 24906
+          "bytes": 25241
         },
         "src/spaces/source-transforms.ts": {
           "bytes": 3023
@@ -1347,7 +1347,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52009
+          "bytes": 52164
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
@@ -2049,7 +2049,7 @@
           "bytes": 83286
         },
         "src/execution/step-output-verify.ts": {
-          "bytes": 12663
+          "bytes": 14224
         },
         "src/tools/step-result-tool.ts": {
           "bytes": 12085
@@ -3156,10 +3156,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 869830
+          "bytes": 870080
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 182363
+          "bytes": 182506
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -3426,7 +3426,7 @@
           "bytes": 2241
         },
         "src/spaces/view-design-layer.ts": {
-          "bytes": 50130
+          "bytes": 50477
         },
         "src/spaces/publish.ts": {
           "bytes": 14602
@@ -4536,7 +4536,7 @@
           "bytes": 4731
         },
         "src/execution/workflow-transform.ts": {
-          "bytes": 24906
+          "bytes": 25241
         },
         "src/spaces/source-transforms.ts": {
           "bytes": 3023
@@ -5256,7 +5256,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52009
+          "bytes": 52164
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
@@ -5958,7 +5958,7 @@
           "bytes": 83286
         },
         "src/execution/step-output-verify.ts": {
-          "bytes": 12663
+          "bytes": 14224
         },
         "src/tools/step-result-tool.ts": {
           "bytes": 12085
@@ -7065,10 +7065,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 869830
+          "bytes": 870080
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 182363
+          "bytes": 182506
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -7335,7 +7335,7 @@
           "bytes": 2241
         },
         "src/spaces/view-design-layer.ts": {
-          "bytes": 50130
+          "bytes": 50477
         },
         "src/spaces/publish.ts": {
           "bytes": 14602

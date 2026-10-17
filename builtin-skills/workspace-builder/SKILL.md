@@ -144,6 +144,13 @@ Every served view already carries a stylesheet and a helper kit. Spend your byte
 - **Cover what was asked.** List every deliverable the owner named ("manage the site and its backend", "blog approvals with previews") and check the Workspace does each with live data and working buttons. A page of links to other tools covers none of them. When one is missing, build it before you finish.
 
 - **Look at it.** `space_preview` renders the Workspace exactly as the desktop shows it, with its real data, and returns an image. Preview after every create or redesign, and after any visual change. Check the image against sections 5 and 6: is the attention list short and real, is text decoded, does the page fill the frame, is anything cluttered, empty, or broken? Fix what you see and preview again. Check dark theme and a 390-pixel width once before you finish.
+- **Check the preview for the failures that slip through most.** Fix each one you see before you say it is done:
+  - Raw text from the source: markup like `<mailto:…|…>` or `<@U123>`, entity codes, security banners, signatures, ids in place of names. Render through `clem.fmt.slack`, `clem.fmt.text`, `clem.mail.preview` and `clem.fmt.person`.
+  - A list showing what its title rules out: promotions or notifications under "waiting on reply", finished items under "needs you".
+  - Notes to yourself as page copy: "verified", "not a guess", "record only", "at most 7". The page speaks to the owner about their work; how you checked it belongs in your reply, not on the page.
+  - A conversation joined into one line. Show a thread as messages, one per line with the author, newest last.
+  - Text breaking one letter per line, a lone tile on its own row, placeholders like `--` or doubled numbers.
+- **Never copy secrets into a Workspace.** A password, code, key or token that appears in a source message stays out of the data and the page; write "[password removed]" in its place.
 - Read the whole save result. Fix every gap-test item it names; the save refuses until they are fixed.
 - Preview a long page in parts with `offset_y` (for example 0, then 1000, then 2000) instead of one very tall screenshot, whose text is shrunk before you see it. Check tables for cramped columns and words broken mid-word.
 - Confirm each source refreshed with real rows, and that the view renders them under the right ids.

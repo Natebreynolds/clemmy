@@ -36,6 +36,26 @@ function resolvePath(value: unknown, dotted: string): unknown {
   return cursor;
 }
 
+/** Why a dotted path resolves to nothing, when it is absent rather than empty. */
+function missingPathNote(value: unknown, dotted: string): string | null {
+  let cursor: unknown = value;
+  const parts = dotted.split('.');
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]!;
+    if (cursor === null || cursor === undefined || typeof cursor !== 'object') {
+      const at = parts.slice(0, index).join('.') || 'the output';
+      return `${at} is ${cursor === null || cursor === undefined ? 'empty' : typeof cursor}, not an object with "${part}"`;
+    }
+    if (!Object.prototype.hasOwnProperty.call(cursor, part)) {
+      const keys = Object.keys(cursor as Record<string, unknown>).slice(0, 8);
+      const at = parts.slice(0, index).join('.');
+      return `${at ? `"${at}"` : 'the output'} has no "${part}" (it has: ${keys.length ? keys.map((key) => `"${key}"`).join(', ') : 'no keys'})`;
+    }
+    cursor = (cursor as Record<string, unknown>)[part];
+  }
+  return null;
+}
+
 function matchesType(value: unknown, type: WorkflowContractType): boolean {
   switch (type) {
     case 'string': return typeof value === 'string';
@@ -110,10 +130,18 @@ export function verifyStepOutput(
   // remediation message instead of a cryptic contract error.
   if (contract.non_empty && contract.non_empty.length > 0) {
     for (const p of contract.non_empty) {
-      const resolved = p === '' || p === '.' ? value : resolvePath(value, p);
-      if (isEmptyValue(resolved)) {
-        problems.push(`non_empty: output "${p || '(root)'}" is empty (no data produced)`);
-      }
+      const root = p === '' || p === '.';
+      const resolved = root ? value : resolvePath(value, p);
+      if (!isEmptyValue(resolved)) continue;
+      // A key the output does not have at all is usually a contract that names
+      // the wrong key, not an empty source: say which keys the step did
+      // produce so the author fixes it in one pass (live 2026-10-17 a Space
+      // feed's creation test failed on an absent "upstream" key and was
+      // reported as a source that returned nothing).
+      const absent = !root && resolved === undefined ? missingPathNote(value, p) : null;
+      problems.push(absent
+        ? `non_empty: output "${p}" is missing — ${absent}`
+        : `non_empty: output "${p || '(root)'}" is empty (no data produced)`);
     }
   }
 

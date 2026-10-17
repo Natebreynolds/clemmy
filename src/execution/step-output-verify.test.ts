@@ -167,3 +167,15 @@ test('a committed local-file receipt that names its path satisfies the natural s
   assert.equal(verdict.ok, true, verdict.ok ? '' : verdict.problems.join('; '));
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('a non-empty key the output does not have says which keys it did produce, and routes as before', async () => {
+  // Live 2026-10-17: a Space feed's creation test failed on an absent
+  // "upstream" key and was reported as a source that returned nothing.
+  const { classifyContractProblems } = await import('./step-output-verify.js');
+  const result = verifyStepOutput({ type: 'object', non_empty: ['upstream'] }, { clients: [{ name: 'Summit' }], updatedAt: '2026-10-17' });
+  assert.equal(result.ok, false);
+  assert.match(result.problems.join('\n'), /non_empty: output "upstream" is missing — the output has no "upstream" \(it has: "clients", "updatedAt"\)/);
+  assert.equal(classifyContractProblems(result.problems), 'empty_output', 'routing is unchanged');
+  const empty = verifyStepOutput({ type: 'object', non_empty: ['upstream'] }, { upstream: [] });
+  assert.match(empty.problems.join('\n'), /non_empty: output "upstream" is empty \(no data produced\)/, 'a present but empty key is still empty');
+});

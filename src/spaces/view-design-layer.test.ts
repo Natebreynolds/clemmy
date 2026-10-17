@@ -135,8 +135,12 @@ test('ui helpers render the vocabulary and escape every interpolated field', () 
   // Sandbox values come from another realm; compare by value, not prototype.
   assert.equal(JSON.stringify(sources.map((s) => [s.id, s.ok, s.stale])), JSON.stringify([['emails', true, false], ['sf', false, true]]));
   const strip = kit.ui.sourceStrip();
-  assert.match(strip, /clem-dot clem-dot-ok"><\/i>emails/);
-  assert.match(strip, /clem-dot clem-dot-danger"><\/i>sf .*No default org &lt;found&gt;/);
+  // The owner reads a name and plain words; the raw error stays in the
+  // tooltip (live 2026-10-17: "slack_dms", "source result was not persisted:
+  // Workspace observation…" on the page).
+  assert.match(strip, /clem-dot clem-dot-ok"><\/i>Emails · /);
+  assert.match(strip, /title="No default org &lt;found&gt;"><i class="clem-dot clem-dot-danger"><\/i>Sf · .*couldn’t refresh/);
+  assert.doesNotMatch(strip, />[^<]*No default org/, 'the raw error is not page text');
   assert.equal(loadKit({ data: {} }).kit.ui.sourceStrip(), '', 'no _meta, no strip');
 });
 
