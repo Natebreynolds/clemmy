@@ -2795,7 +2795,7 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
       warnings.push(`${measurement.acceptedSource}: incomplete attribution; proven totals are a lower bound, not comparable whole-task cost. ${measurement.usageCertificationIssues.join(', ')}.`);
     }
     if (measurement.proactiveUsageParticipants?.length) {
-      warnings.push(`${measurement.acceptedSource}: proactive precursor usage is response-linked; its timing is separate from task execution and its serving identity is not measured by the latest build pin.`);
+      warnings.push(`${measurement.acceptedSource}: proactive operations are receipt-linked; only original-response-proved rows extend usage. Precursor timing is separate from task execution and its serving identity is not measured by the latest build pin.`);
     }
     if (measurement.workflowUsageInventory?.candidates.length) {
       warnings.push(`${measurement.acceptedSource}: workflow dispatch candidates are unproved and excluded; missing full retention-compatible authority/call evidence does not establish zero usage.`);

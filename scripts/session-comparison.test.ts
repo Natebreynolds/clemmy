@@ -530,6 +530,23 @@ test('task scope unions proved approval descendants and their own reviews withou
   } finally { rmSync(fixture.home, { recursive: true, force: true }); }
 });
 
+test('task report distinguishes receipt-linked proactive operations from proved response usage', () => {
+  const fixture = approvalTaskFixture();
+  try {
+    const task = measureAcceptedTask(fixture.home, 'task', 501);
+    task.proactiveUsageParticipants = [{ usageJobId: 'noticing-job:11111111-1111-4111-8111-111111111111',
+      operation: 'noticing_answer', operationId: 'controlled-checkin', revisionDigest: 'a'.repeat(64),
+      parentAcceptedSources: ['task:501'], responseBindings: [], startedAt: null, finishedAt: null }];
+    task.proactiveExactUsageRecords = 0;
+    const report = formatAcceptedTaskComparison({ home: fixture.home, baseline: task, candidate: task });
+    assert.match(report, /Receipt-linked proactive jobs\s+1\s+1/);
+    assert.match(report, /Original-response-linked proactive usage rows\s+0\s+0/);
+    assert.match(report, /only original-response-proved rows extend usage/);
+    assert.match(report, /serving identity is not measured by the latest build pin/);
+    assert.doesNotMatch(report, /proactive precursor usage is response-linked/);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
 test('ambiguous or missing approval proof cannot certify a cheaper task and preserves excluded candidate cost', () => {
   const corruptions = [
     "UPDATE pending_approvals SET resolution = 'rejected' WHERE approval_id = 'apr-one'",
