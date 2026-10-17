@@ -645,7 +645,7 @@
           "bytes": 24866
         },
         "src/spaces/store.ts": {
-          "bytes": 76987
+          "bytes": 77706
         },
         "src/spaces/data-store.ts": {
           "bytes": 6547
@@ -3407,8 +3407,11 @@
         "src/spaces/workspace-script-refresh.ts": {
           "bytes": 12744
         },
+        "src/spaces/file-source.ts": {
+          "bytes": 5052
+        },
         "src/spaces/runner.ts": {
-          "bytes": 37409
+          "bytes": 37926
         },
         "src/spaces/space-action-canonical-consent.ts": {
           "bytes": 3417
@@ -3483,7 +3486,7 @@
           "bytes": 64880
         },
         "src/tools/space-tools.ts": {
-          "bytes": 130763
+          "bytes": 131260
         },
         "src/runtime/home-layout.ts": {
           "bytes": 6038
@@ -4560,7 +4563,7 @@
           "bytes": 24866
         },
         "src/spaces/store.ts": {
-          "bytes": 76987
+          "bytes": 77706
         },
         "src/spaces/data-store.ts": {
           "bytes": 6547
@@ -7322,8 +7325,11 @@
         "src/spaces/workspace-script-refresh.ts": {
           "bytes": 12744
         },
+        "src/spaces/file-source.ts": {
+          "bytes": 5052
+        },
         "src/spaces/runner.ts": {
-          "bytes": 37409
+          "bytes": 37926
         },
         "src/spaces/space-action-canonical-consent.ts": {
           "bytes": 3417
@@ -7398,7 +7404,7 @@
           "bytes": 64880
         },
         "src/tools/space-tools.ts": {
-          "bytes": 130763
+          "bytes": 131260
         },
         "src/runtime/home-layout.ts": {
           "bytes": 6038
