@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -2477,6 +2477,124 @@ function initOnlyMessage(): any {
 }
 function successResultMessage(text: string): any {
   return { type: 'result', subtype: 'success', session_id: 's', uuid: 'r', result: text, duration_ms: 1, duration_api_ms: 1, is_error: false, num_turns: 1, stop_reason: 'end_turn', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {}, permission_denials: [] };
+}
+
+for (const order of ['stream-first', 'handler-first'] as const) {
+  test(`Claude Space ${order} actual permission plus MCP producer keeps one canonical return and output nonce`, { timeout: 10_000 }, async (context) => {
+    const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+    const { requireAcceptedTaskAuthority } = await import('./accepted-task-authority.js');
+    const { requireKnownExpectedWorkContract } = await import('./expected-work-contract.js');
+    const { requireActionExpectedWorkActivation } = await import('./action-expected-work-boundary.js');
+    const approvalRegistry = await import('./approval-registry.js');
+    const { workflowApprovalResumeKey } = await import('./claude-agent-approval.js');
+    const spaces = await import('../../spaces/store.js');
+    const proof = await import('./host-local-write-commit.js');
+    const { _setWorkspaceDeliverablesReaderForTests } = await import('../../spaces/workspace-deliverables-check.js');
+    const originalFetch = globalThis.fetch;
+    let unmockedFetches = 0;
+    globalThis.fetch = (async () => { unmockedFetches++; throw new Error('Unexpected provider/network transport in controlled Space identity fixture.'); }) as typeof fetch;
+    context.after(() => {
+      _setWorkspaceDeliverablesReaderForTests(null);
+      globalThis.fetch = originalFetch;
+      assert.equal(unmockedFetches, 0, 'all intended model transport is stubbed; no provider/network attempt');
+    });
+    _setWorkspaceDeliverablesReaderForTests(async (_system, user) => {
+      const packet = JSON.parse(user);
+      return { bindingDigest: packet.bindingDigest, assessmentComplete: false,
+        assessedCriteriaIds: packet.workspace.successCriteria.map((item: { id: string }) => item.id),
+        deliverables: [{ deliverable: 'Semantic and visual review are outside this call identity control.',
+          status: 'unverified', requiredEvidence: 'render_readback', evidenceIds: [], gap: 'This fixture proves call identity and saved bytes only.' }] };
+    });
+    const session = eventlog.createSession({ kind: 'chat' });
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `sdk-space-${order}` });
+    const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+      data: { text: 'Create only the controlled local Workspace for the call identity proof.' } });
+    assert.ok(recordTurnGraphShadow({ identity: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq } }));
+    requireAcceptedTaskAuthority({ sessionId: session.id, sourceUserSeq: source.seq });
+    requireKnownExpectedWorkContract({ sessionId: session.id, sourceUserSeq: source.seq });
+    requireActionExpectedWorkActivation({ sessionId: session.id, sourceUserSeq: source.seq });
+    const parent = dispatchLease.activateDispatchLease({ sessionId: session.id,
+      scopeId: `${session.id}::space-parent`, runAttemptId: attempt.attemptId });
+    const trackerScopeId = `${session.id}::space-proof`;
+    const slug = `sdk-space-${order}`;
+    const args = { slug, title: 'Exact SDK Workspace', objective: null,
+      view_html: '<html><body><p>One exact controlled save.</p></body></html>' };
+    // Carrier handler-first also exercises the source.input-dependent parked
+    // nonce branch; direct stream-first covers canonical append before entry.
+    const localName = order === 'handler-first' ? 'call_tool' : 'space_save';
+    const sdkName = `mcp__clementine-local__${localName}`;
+    const input = localName === 'call_tool' ? { name: 'space_save', args_json: args } : args;
+    const id = `toolu_space_${order}`;
+    let savedText = '';
+    let repeatPermission: any;
+    setClaudeAgentSdkQueryForTest(((params: any) => stubsFor((async function* () {
+      yield initOnlyMessage();
+      const canUse = params.options.canUseTool;
+      const permissionPromise = canUse(sdkName, input, { signal: AbortSignal.timeout(5_000),
+        toolUseID: id, requestId: `permission-${id}` });
+      if (localName === 'call_tool') {
+        // Active action turns intentionally exclude the generic carrier from
+        // fastAllow. Preserve supervised consent: resolve only the exact real
+        // registry row this permission created, then let its own gate claim it.
+        const pending = approvalRegistry.listPending({ sessionId: session.id });
+        assert.equal(pending.length, 1, 'carrier permission reached its real consent boundary');
+        const row = pending[0]!;
+        assert.equal(row.tool, 'call_tool');
+        assert.deepEqual(row.args, input);
+        assert.equal(row.resumeKey, workflowApprovalResumeKey(session.id, 'call_tool', input));
+        const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'controlled-call-identity-fixture');
+        assert.equal(resolved.ok, true);
+        assert.equal(resolved.row?.resolution, 'approved');
+      }
+      const permission = await permissionPromise;
+      assert.equal(permission.behavior, 'allow', JSON.stringify(permission));
+      if (localName === 'call_tool') {
+        const [row] = approvalRegistry.listPending({ sessionId: session.id, status: 'any' });
+        assert.ok(row?.consumedAt, 'the real exact-payload approval was claimed once before ALLOW');
+      }
+      const frame = { type: 'assistant', session_id: 'sdk-space-proof', uuid: `use-${order}`, parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id, name: sdkName, input }] } } as any;
+      if (order === 'stream-first') yield frame;
+      const instance = params.options.mcpServers['clementine-local'].instance;
+      const output = await instance._registeredTools[localName].handler(input,
+        { requestId: `rpc-${id}`, _meta: { 'claudecode/toolUseId': id } });
+      savedText = output.content[0].text;
+      assert.ok(proof.parseHostLocalWriteCommitFacts(savedText), savedText);
+      if (order === 'handler-first') yield frame;
+      yield { type: 'user', session_id: 'sdk-space-proof', uuid: `result-${order}`, parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: id, content: output.content }] } } as any;
+      repeatPermission = await canUse(sdkName, input, { signal: new AbortController().signal,
+        toolUseID: id, requestId: `repeated-${id}` });
+      yield successResultMessage('The controlled Workspace was saved.');
+    })())) as any);
+    try {
+      await runClaudeAgentSdk({ prompt: 'Create only the controlled local Workspace for the call identity proof.',
+        sessionId: session.id, sourceUserSeq: source.seq, trackerScopeId, dispatchLease: parent,
+        modelId: 'claude-sonnet-4-6', agentic: true, directOrchestrator: true,
+        allowedLocalMcpTools: ['space_save', 'space_get', 'call_tool'],
+        mcpToolAllowlist: ['space_save'],
+        maxWallClockMs: 10_000,
+      });
+      assert.equal(repeatPermission.behavior, 'deny', 'a cached mutation ALLOW cannot authorize redispatch');
+      assert.equal(readFileSync(spaces.resolveInSpace(slug, 'view/index.html'), 'utf8'), args.view_html);
+      assert.equal(proof.readCommittedArtifactContent(proof.parseHostLocalWriteCommitFacts(savedText)!).verified, true);
+      const events = eventlog.listEvents(session.id, { types: ['tool_called', 'tool_returned'] });
+      const calls = events.filter(event => event.type === 'tool_called' && event.data.accounting === 'top_level');
+      const returns = events.filter(event => event.type === 'tool_returned' && event.data.accounting === 'top_level');
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0]!.data.callId, id);
+      assert.equal(returns.length, 1);
+      assert.equal(returns[0]!.parentEventId, calls[0]!.id);
+      assert.equal(eventlog.listToolOutputInvocationNonces(session.id, id, 3).length, 1,
+        'canonical SDK return reuses the exact inner producer output instead of duplicating it');
+      const settled = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind
+        FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?`).all(session.id, source.seq) as any[];
+      assert.deepEqual(settled.map(row => [row.logical_tool_call_id, row.outcome_kind]), [[id, 'succeeded']]);
+      assert.equal(unmockedFetches, 0, 'all intended model transport is stubbed; no provider/network attempt');
+    } finally {
+      dispatchLease.revokeDispatchLease(parent);
+    }
+  });
 }
 
 test('Claude inline-result delivery binds an owned query and actual retained return without a fabricated call lease', async () => {

@@ -73,7 +73,13 @@ import { durableSelectedLocalPlanningCapabilityNames } from '../runtime/harness/
 import { getLocalToolSchemas } from './local-runtime-tools.js';
 import { confirmedSourceStrategyBindingForSource } from '../runtime/harness/source-strategy-admission.js';
 import { registerGatedMutatingTools } from './gated-mutating-tools.js';
-import { ensureToolDirectories, textResult } from './shared.js';
+import { ensureToolDirectories, isHarnessRefusalText, textResult } from './shared.js';
+import {
+  claudeLocalMcpProviderCallId,
+  claudeLocalSpaceWriteRefusal,
+  claudeLocalSpaceWriteTarget,
+  claimClaudeLocalPermissionAdmission,
+} from '../runtime/harness/claude-local-tool-correlation.js';
 import { loadPlugins } from '../plugins/loader.js';
 import type { PluginTool } from '../plugins/types.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -106,6 +112,9 @@ function resolvedMcpToolScope(
 }
 
 export interface ClementineMcpServerOptions {
+  /** Host-only Claude transport mode. Other providers and authenticated HTTP
+   * actions do not use Claude permission markers. */
+  claudeSpaceCallIdentity?: boolean;
   sessionId?: string;
   runScopeId?: string;
   /** Explicit foreground-orchestrator eligibility for one-shot read recovery.
@@ -348,8 +357,10 @@ export async function boundClementineMcpCapabilityRevision(
 }
 
 function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerOptions = {}): void {
-  const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim();
-  if (!sessionId) return;
+  const claudeSpaceCallIdentity = opts.claudeSpaceCallIdentity
+    ?? process.env.CLEMENTINE_MCP_CLAUDE_SPACE_CALL_IDENTITY === 'on';
+  const sessionId = opts.sessionId?.trim() || process.env.CLEMENTINE_MCP_SESSION_ID?.trim() || '';
+  if (!sessionId && !claudeSpaceCallIdentity) return;
   // Workflow attribution flows via opts (in-process server) OR env (stdio child) —
   // mirrors how sessionId reaches here, so run_worker's context carries the run.
   const workflowRunId = opts.workflowRunId?.trim() || process.env.CLEMENTINE_MCP_WORKFLOW_RUN_ID?.trim() || undefined;
@@ -409,7 +420,30 @@ function installAmbientToolContext(server: McpServer, opts: ClementineMcpServerO
                 runAttemptId: dispatchLease.runAttemptId,
               } : {}),
             },
-            () => handler(...handlerArgs),
+            async () => {
+              const rawInput = handlerArgs[0];
+              const spaceWrite = claudeSpaceCallIdentity && toolName !== 'call_tool'
+                ? claudeLocalSpaceWriteTarget(toolName, rawInput) : null;
+              if (!spaceWrite) return handler(...handlerArgs);
+              // Selected authoring requirements retain their existing work_call
+              // owner; a direct control registration is not an alternate grant.
+              if (!sourceUserSeq || durableSelectedLocalPlanningCapabilityNames({
+                sessionId, sourceUserSeq, workCallConfiguredNames: new Set(getLocalToolSchemas().keys()),
+              }).has(spaceWrite)) return textResult(claudeLocalSpaceWriteRefusal(), { isError: true });
+              const claim = claimClaudeLocalPermissionAdmission({ sessionId, sourceUserSeq,
+                runScopeId: runScopeId ?? '', toolName, rawInput, directOrchestrator,
+                dispatchLease, providerCallId: claudeLocalMcpProviderCallId(handlerArgs[1]),
+              });
+              if (!claim) return textResult(claudeLocalSpaceWriteRefusal(), { isError: true });
+              // The raw Space producer does not own a logical bracket. Reuse
+              // the same real local Tool, consent hooks and bracket as call_tool.
+              const { dispatchBatchItemTool } = await import('./inner-dispatch.js');
+              const output = await dispatchBatchItemTool(spaceWrite, rawInput, sessionId,
+                new ToolCallsCounter(AMBIENT_COUNTER_LIMIT), undefined,
+                { accounting: 'transport_mirror', canonicalCallId: claim.providerCallId }, mcpToolScope);
+              const rendered = typeof output === 'string' ? output : JSON.stringify(output ?? null);
+              return textResult(rendered, { isError: isHarnessRefusalText(rendered) });
+            },
           ),
         );
       };
@@ -692,6 +726,12 @@ export function createClementineMcpServer(opts: ClementineMcpServerOptions = {})
         outside: [name],
         reason: 'the MCP capability controller is unavailable',
       },
+    }, {
+      claudeSpaceCallIdentity: opts.claudeSpaceCallIdentity
+        ?? process.env.CLEMENTINE_MCP_CLAUDE_SPACE_CALL_IDENTITY === 'on',
+      isSelectedLocalPlanningCapability: (name, sessionId, sourceUserSeq) =>
+        durableSelectedLocalPlanningCapabilityNames({ sessionId, sourceUserSeq,
+          workCallConfiguredNames: workCallLocalSchemaNames }).has(name),
     });
   }
 
