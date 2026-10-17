@@ -90,3 +90,15 @@ test("the owner's press starts a person's run; Clem's own press does not", async
   assert.equal(sourceOf('owner-press'), 'space_click:site-ops');
   assert.equal(sourceOf('clem-press'), 'space_action:site-ops');
 });
+
+test("the owner's press is answered in words the Space can show; Clem's keeps its guidance", async () => {
+  saveWorkflow('Plain Answer On Press', true);
+  const pressed = await runSpaceAction('site-ops', { id: 'go', workflow: 'Plain Answer On Press' },
+    { draft_id: 'plain-owner' }, { initiatedBy: 'person' });
+  assert.equal(pressed.ok, true, pressed.ok ? '' : pressed.error);
+  const messageOf = (result: unknown) => (result as { data?: { message?: unknown } }).data?.message;
+  assert.equal(messageOf(pressed), 'Started “Plain Answer On Press”. Its result lands here when it finishes.');
+  const byClem = await runSpaceAction('site-ops', { id: 'go', workflow: 'Plain Answer On Press' }, { draft_id: 'plain-clem' });
+  assert.equal(byClem.ok, true, byClem.ok ? '' : byClem.error);
+  assert.match(String(messageOf(byClem)), /BACKGROUND/);
+});

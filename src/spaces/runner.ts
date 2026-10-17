@@ -464,7 +464,16 @@ async function runSpaceWorkflowAction(
     source: pressedByPerson ? `${SPACE_BUTTON_RUN_SOURCE_PREFIX}${slug}` : `space_action:${slug}`,
   });
   if (queued.status === 'queued' || queued.status === 'duplicate' || queued.status === 'held') {
-    return { ok: true, data: { workflow, runId: queued.id ?? null, status: queued.status, message: queued.message } };
+    // The owner's press is answered in plain words the Space can show; the
+    // queue's message is guidance for Clem ("tell the user… do not poll").
+    const message = !pressedByPerson
+      ? queued.message
+      : queued.status === 'duplicate'
+        ? `“${workflow}” is already running. Its result lands here when it finishes.`
+        : queued.status === 'held'
+          ? `“${workflow}” is waiting to start. Its result lands here when it finishes.`
+          : `Started “${workflow}”. Its result lands here when it finishes.`;
+    return { ok: true, data: { workflow, runId: queued.id ?? null, status: queued.status, message } };
   }
   return {
     ok: false,
