@@ -21,6 +21,14 @@ interface RowState {
 const WAITING_SHOWN = 5;
 const UPDATES_SHOWN = 3;
 
+function pulseNeedsVisibility(pulse: FromClem['pulses'][number]): boolean {
+  const state = pulse.presentation?.state;
+  const last = pulse.presentation?.lastCheck.state;
+  return pulse.availability === 'unavailable' || state === undefined
+    || state === 'checking' || state === 'due' || state === 'failed' || state === 'partial' || state === 'unknown'
+    || last === 'failed' || last === 'partial' || last === 'unknown';
+}
+
 /**
  * From Clem: what Clem's heartbeats brought you, in her words, in two groups.
  * What waits on you comes first, each with the answers she offers as buttons
@@ -57,6 +65,23 @@ export function FromClemPane({
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
   const pulses = recentPulses(data?.pulses ?? []);
+  const visiblePulses = pulses.filter(pulseNeedsVisibility);
+  const quietPulses = pulses.filter(pulse => !pulseNeedsVisibility(pulse));
+  const pulseRow = (pulse: FromClem['pulses'][number]) => <li key={pulse.heartbeat}>
+    <span className="font-semibold">{pulse.title}</span>
+    {' · '}{pulse.availability === 'unavailable' ? 'Status unavailable' : heartbeatStateWords(pulse.presentation)}
+    {pulse.presentation?.lastCheck.at ? ` · ${heartbeatLastCheckWords(pulse.presentation)} ${agoLabel(pulse.presentation.lastCheck.at)}` : ''}
+    {pulse.summary ? ` — ${pulse.summary}` : ''}
+  </li>;
+  const pulseHistory = <>
+    {visiblePulses.length > 0 && <ul className="flex flex-col gap-1 text-small text-muted">{visiblePulses.map(pulseRow)}</ul>}
+    {quietPulses.length > 0 && <details className="text-small text-muted">
+      <summary className="min-h-11 cursor-pointer py-2.5 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+        Background check history · {quietPulses.length}
+      </summary>
+      <ul className="flex flex-col gap-1 pb-2">{quietPulses.map(pulseRow)}</ul>
+    </details>}
+  </>;
 
   const act = (
     row: FromClemRow,
@@ -308,25 +333,22 @@ export function FromClemPane({
           </>
         )}
       />
-      {loading && !data ? (
-        <PaneCard><RowSkeleton rows={2} tall /></PaneCard>
-      ) : error && !data ? (
+      {error && data && <p role="status" className="text-small text-warning">
+        Couldn’t refresh what Clem noticed. Showing the last saved reading.{' '}
+        <button type="button" onClick={onRetry} className="rounded-sm font-semibold underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Try again</button>
+      </p>}
+      {error && !data ? (
         <PaneCard><LoadFailedLine what="what Clem noticed" onRetry={onRetry} /></PaneCard>
+      ) : loading && !data ? (
+        <PaneCard><RowSkeleton rows={2} tall /></PaneCard>
       ) : rows.length === 0 ? (
         <PaneCard>
           <PaneRow className="flex-col items-stretch gap-1.5 py-3.5">
-            <p className="text-body text-fg">Nothing from Clem right now.</p>
+            <p className="text-body text-fg">{error ? 'No updates in the last saved reading.' : 'Nothing new from Clem.'}</p>
             {pulses.length > 0 ? (
-              <ul className="flex flex-col gap-1 text-small text-muted">
-                {pulses.map((pulse) => (
-                  <li key={pulse.heartbeat}>
-                    <span className="font-semibold">{pulse.title}</span>
-                    {' · '}{pulse.availability === 'unavailable' ? 'Status unavailable' : heartbeatStateWords(pulse.presentation)}{pulse.presentation?.lastCheck.at ? ` · ${heartbeatLastCheckWords(pulse.presentation)} ${agoLabel(pulse.presentation.lastCheck.at)}` : ''}{pulse.summary ? ` — ${pulse.summary}` : ''}
-                  </li>
-                ))}
-              </ul>
+              pulseHistory
             ) : (
-              <p className="text-small text-muted">No background check results are available yet. You can check their status in Heartbeats.</p>
+              <p className="text-small text-muted">{error ? 'Background check history could not be refreshed.' : 'Background check history will appear here.'}</p>
             )}
           </PaneRow>
         </PaneCard>
@@ -342,11 +364,7 @@ export function FromClemPane({
           )}
         </>
       )}
-      {rows.length > 0 && pulses.length > 0 && (
-        <p className="text-caption text-faint">
-          {pulses.map((pulse) => `${pulse.title}: ${pulse.availability === 'unavailable' ? 'status unavailable' : heartbeatStateWords(pulse.presentation)}`).join(' · ')}
-        </p>
-      )}
+      {rows.length > 0 && pulses.length > 0 && pulseHistory}
     </section>
   );
 }

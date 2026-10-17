@@ -58,7 +58,7 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
         aria-live="polite"
         title="Everything Clementine is working on right now"
         className={cn(
-          'live-band live-status-pill flex h-9 max-w-[22rem] items-center gap-2.5 rounded-md border px-3 text-left transition-colors hover:bg-canvas',
+          'live-band live-status-pill flex h-9 min-w-0 max-w-[22rem] items-center gap-2.5 rounded-md border px-3 text-left transition-colors hover:bg-canvas',
           working ? 'is-working border-primary/40 bg-gradient-to-r from-primary-tint to-surface' : 'border-border bg-surface',
           mode === 'still' && 'live-band-still',
         )}

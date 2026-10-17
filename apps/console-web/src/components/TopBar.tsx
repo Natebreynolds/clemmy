@@ -53,13 +53,13 @@ export function TopBar({
         {sidebarCollapsed ? <PanelLeft className="h-5 w-5" aria-hidden /> : <PanelLeftClose className="h-5 w-5" aria-hidden />}
       </Button>
 
-      <h1 className="max-w-[18rem] shrink-0 truncate text-h3 font-semibold text-fg">{title}</h1>
+      <h1 className="min-w-0 max-w-[18rem] truncate text-h3 font-semibold text-fg sm:shrink-0">{title}</h1>
 
       {/* Model account health as one quiet dot; the words on hover, the meters in Settings › Models. */}
       <ModelStatusChips compact />
 
       {/* shrink-0: the controls on the right must never clip, whatever grows on the left */}
-      <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      <div className="ml-auto flex min-w-0 items-center gap-1.5">
         {/* One icon, like its neighbors: the palette jumps anywhere and the
             shortcut lives in the tooltip. A labeled search box read as a
             feature of its own and took the room the title needed. */}
@@ -69,6 +69,7 @@ export function TopBar({
           onClick={openPalette}
           aria-label={`Search or jump anywhere (${modKey}K)`}
           title={`Search or jump anywhere · ${modKey}K`}
+          className="hidden shrink-0 sm:inline-flex"
         >
           <Search className="h-5 w-5" aria-hidden />
         </Button>
