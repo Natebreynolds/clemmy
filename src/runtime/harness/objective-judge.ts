@@ -117,9 +117,16 @@ export const HOST_COMPLETION_EVIDENCE_GUIDANCE = `Judge only the effective accep
 /** A same-call reasoning operation after the complete candidate and evidence.
  * It asks the reviewer to test sufficiency, not to accept an evidence label or
  * to execute hypothetical work. Neither this cue nor its rationale is proof. */
-interface OwnedReviewPresentation { readonly legacy: string; readonly assessment: string }
+/** A rule's legacy text, or null for a rule only the assessment review carries
+ *  (the legacy instructions stay byte-identical for their frozen audit). */
+interface OwnedReviewPresentation { readonly legacy: string | null; readonly assessment: string }
 function renderOwnedReviewParts(parts: readonly (string | OwnedReviewPresentation)[], assessment: boolean): string {
-  return parts.map(part => typeof part === 'string' ? part : assessment ? part.assessment : part.legacy).join('\n');
+  const rendered: string[] = [];
+  for (const part of parts) {
+    const text = typeof part === 'string' ? part : assessment ? part.assessment : part.legacy;
+    if (text !== null) rendered.push(text);
+  }
+  return rendered.join('\n');
 }
 const AUDIT_OUTPUT_PRESENTATION: OwnedReviewPresentation = {
   legacy: 'Perform this audit within this review and respond with exactly one verdict line.',
@@ -156,6 +163,14 @@ const JUDGE_SYSTEM_PARTS = [
   '- Partial completion of multiple deliverables is NOT complete unless the objective only asked for one.',
   '- Check factual claims and limitations against the supplied source evidence. A field omitted from a selected projection is not evidence that the provider omitted it. A result shown as a bounded view is what the assistant itself received of it. Inspect the evidence shown, including nested records, before accepting claims that data is absent, empty, unavailable or complete; such a claim resting on content outside the evidence shown is unverified unless other evidence shown covers it. Distinguish missing values from zero and from values the assistant did not inspect.',
   '- A saved artifact and matching readback prove persistence, not the correctness of its claims. Compare material conclusions, added specificity and claimed certainty against the actual source values and the adopted constraints or preferences. Plausible details unsupported by those sources are a gap. Interpretations of ambiguous data must remain labeled as interpretations, not promoted to confirmed facts or diagnoses.',
+  {
+    legacy: null,
+    // Live 2026-10-17: three review rounds re-argued how a research report
+    // classified borderline repos ("not established that X is a platform"),
+    // the report grew more defensive each round, and finished work ended
+    // blocked. A counterexample can always be imagined for a judgment call.
+    assessment: '- JUDGMENT CALLS: a choice the response makes and explains (a classification, a screening rule, a ranking method, a recommendation) is supported when the response states its basis and that basis matches the evidence. Do not demand proof that it is the only reasonable choice, and do not ask for its rationale to be argued again. Reject it only when its stated basis contradicts the evidence or a fact it rests on is missing; facts, counts and quoted values stay checked as strictly as before.',
+  },
   {
     legacy: '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry.',
     assessment: '- USER CONSTRAINTS ARE IMMUTABLE: verification never grants authority to exceed a call/attempt limit, retry when retries were forbidden, use an excluded source/tool, or perform a write the user prohibited. If the permitted attempt produced a verified empty/negative result, that honest result is complete; do not demand an out-of-contract retry. A prohibited action that already occurred under the effective owner instructions is a substantive violation even if disclosed and the result is correct. If irreparable within permission, use BLOCKED; never demand replay or unauthorized rollback/cleanup.',

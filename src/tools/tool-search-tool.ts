@@ -1075,6 +1075,80 @@ async function toolMetadataMap(): Promise<Map<string, ToolSearchMetadata>> {
   return metadataMapPromise;
 }
 
+/**
+ * The exact names and argument signatures of the tools a skill declares. A
+ * skill that names its tools hands the model their contracts when it is read,
+ * so the model calls them by exact name instead of searching for each one
+ * (live 2026-10-17: a Space build spent six rounds searching for tools its own
+ * skill names). Signatures, not full schemas: a skill read is one tool result
+ * and its guidance must not be clipped. Presentation only: names the registry
+ * does not know are skipped, and calling a tool still passes the turn's
+ * ordinary catalog and execution authority.
+ */
+export async function skillToolContracts(
+  names: readonly string[],
+  maxChars = 5_000,
+): Promise<{ contracts: Array<{ name: string; summary: string; signature: string }>; overflow: string[] }> {
+  const metadata = await toolMetadataMap();
+  const contracts: Array<{ name: string; summary: string; signature: string }> = [];
+  const overflow: string[] = [];
+  let used = 0;
+  for (const name of [...new Set(names)]) {
+    const entry = metadata.get(name);
+    if (!entry) continue;
+    const signature = `${name}(${toolArgumentSignature(entry.schema)})`;
+    const summary = (entry.description.split(/(?<=[.!?])\s/)[0] ?? '').trim().slice(0, 200);
+    const size = signature.length + summary.length + 8;
+    if (used + size > maxChars) { overflow.push(name); continue; }
+    used += size;
+    contracts.push({ name, summary, signature });
+  }
+  return { contracts, overflow };
+}
+
+function schemaTypeWords(schema: unknown): string {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return 'any';
+  const node = schema as Record<string, unknown>;
+  if (Array.isArray(node.enum) && node.enum.length > 0 && node.enum.length <= 6) {
+    return node.enum.map((value) => JSON.stringify(value)).join(' | ');
+  }
+  const union = (node.anyOf ?? node.oneOf) as unknown[] | undefined;
+  if (Array.isArray(union)) {
+    const parts = [...new Set(union.map(schemaTypeWords).flatMap((text) => text.split(' | ')).filter((text) => text !== 'null'))];
+    return parts.length ? parts.join(' | ') : 'null';
+  }
+  if (node.type === 'array') {
+    const item = schemaTypeWords(node.items);
+    return `${item === 'any' ? '' : item}[]` || 'array';
+  }
+  if (typeof node.type === 'string') return node.type;
+  if (Array.isArray(node.type)) return node.type.filter((type) => type !== 'null').join(' | ');
+  return node.properties ? 'object' : 'any';
+}
+
+function schemaAllowsNull(schema: unknown): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  if (node.type === 'null' || (Array.isArray(node.type) && node.type.includes('null'))) return true;
+  const union = (node.anyOf ?? node.oneOf) as unknown[] | undefined;
+  return Array.isArray(union) && union.some(schemaAllowsNull);
+}
+
+/** "slug: string, title?: string, steps: object[]" from a JSON object schema. */
+function toolArgumentSignature(schema: unknown): string {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return '';
+  const node = schema as Record<string, unknown>;
+  const properties = node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)
+    ? node.properties as Record<string, unknown>
+    : {};
+  const required = new Set(Array.isArray(node.required) ? node.required.filter((key): key is string => typeof key === 'string') : []);
+  // Strict function schemas list every field as required and mark the
+  // optional ones nullable, so a field that accepts null is optional too.
+  return Object.entries(properties)
+    .map(([key, value]) => `${key}${required.has(key) && !schemaAllowsNull(value) ? '' : '?'}: ${schemaTypeWords(value)}`)
+    .join(', ');
+}
+
 export function registerToolSearchTool(
   server: McpServer,
   opts: {
