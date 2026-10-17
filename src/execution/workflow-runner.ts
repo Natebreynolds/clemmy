@@ -4803,6 +4803,10 @@ interface StepExecutionContext {
   // out over only the FIRST item (bounded cost — we just need to confirm the
   // step returns data, not process the whole batch). No-op for normal runs.
   creationTest?: boolean;
+  /** Host-only notice that the optional READ catch produced a declared gap.
+   * Rehearsals preserve that continuation policy without accepting a model's
+   * returned gap/blocked fields as permission to ignore a required failure. */
+  onOptionalReadGap?: () => void;
   // Run-goal re-pursuit: the prior attempt's validation evidence. When set,
   // every LLM step prompt gets a PRIOR ATTEMPT FEEDBACK block so the re-run
   // addresses the unmet criteria instead of repeating the same output.
@@ -7430,6 +7434,7 @@ async function executeStepVerified(
       meta: { softFailed: true, optional: true, blocked: true, error: reason.slice(0, 500) },
     });
     logger.warn({ stepId: step.id, reason: reason.slice(0, 200) }, 'optional workflow step failed — continuing with a declared gap');
+    ctx.onOptionalReadGap?.();
     return gap;
   }
 }
@@ -14919,6 +14924,12 @@ export async function runCreationTest(
   const choiceBlocked = new Set<string>();
   const dependsOnChoiceBlock = (step: WorkflowStepInput): boolean =>
     (step.dependsOn ?? []).some((dep) => choiceBlocked.has(dep));
+  // Readiness says a prerequisite settled, not that it produced usable data.
+  // Keep its actual rehearsal verdict so a failed read cannot launch a model
+  // or even prepare/preview a dependent write with a missing input packet.
+  const failedPrerequisites = new Set<string>();
+  const failedDependencies = (step: WorkflowStepInput): string[] =>
+    (step.dependsOn ?? []).filter((dep) => failedPrerequisites.has(dep));
   let guard = 0;
   while (completed.size < steps.length && guard++ < steps.length + 2) {
     const readyIds = new Set(resolveWorkflowReadiness(steps, completed).readyStepIds);
@@ -14926,19 +14937,9 @@ export async function runCreationTest(
     if (batch.length === 0) break;
     for (const step of batch) {
       throwIfWorkflowRunCancelled(runId);
-      if (stepLooksMutating(step)) {
-        // Never execute a send/write while authoring — preview it. Downstream
-        // read-only steps still get a stub so they can run. A preview still
-        // fills in and checks the step's arguments the way the run will.
-        results.push(await rehearseWriteCall(step, {
-          workflow, workflowSlug, runId, inputs, stepOutputs,
-          assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
-          creationTest: true,
-          ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
-        }));
-        stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
-        previewTainted.add(step.id);
-      } else if (dependsOnChoiceBlock(step)) {
+      let optionalReadGap = false;
+      const failedUpstream = failedDependencies(step);
+      if (dependsOnChoiceBlock(step)) {
         choiceBlocked.add(step.id);
         stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on could not run yet' };
         results.push({
@@ -14946,6 +14947,33 @@ export async function runCreationTest(
           status: 'not_run',
           detail: 'waits on a step above that could not run yet',
         });
+      } else if (failedUpstream.length > 0) {
+        stepOutputs[step.id] = { blocked: true, reason: 'a required upstream step did not produce a usable result in the creation test' };
+        results.push({
+          stepId: step.id,
+          status: 'not_run',
+          detail: `waits on required upstream ${failedUpstream.map((id) => `"${id}"`).join(', ')}; no dependent work was prepared or run`,
+        });
+      } else if (stepLooksMutating(step)) {
+        // Never execute a send/write while authoring — preview it. Downstream
+        // read-only verification is marked unverifiable. A preview still
+        // fills in and checks the step's arguments the way the run will.
+        const verdict = await rehearseWriteCall(step, {
+          workflow, workflowSlug, runId, inputs, stepOutputs,
+          assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
+          creationTest: true,
+          ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
+        });
+        results.push(verdict);
+        if (verdict.status === 'previewed') {
+          stepOutputs[step.id] = { previewed: true, reason: 'mutating step — previewed, not executed in the creation test' };
+          previewTainted.add(step.id);
+        } else {
+          stepOutputs[step.id] = { blocked: true, reason: 'the mutating step could not be prepared in the creation test' };
+          if (verdict.status === 'needs_choice' || verdict.status === 'needs_connection' || verdict.status === 'not_run') {
+            choiceBlocked.add(step.id);
+          }
+        }
       } else if (dependsOnPreview(step)) {
         // Verifying a write that was intentionally skipped is not possible.
         // Run nothing, claim nothing, and do not hold activation hostage.
@@ -14962,6 +14990,7 @@ export async function runCreationTest(
             workflow, workflowSlug, runId, inputs, stepOutputs,
             assistant, completedItems: new Map(), forEachFailures, qualityAdvisories,
             creationTest: true,
+            onOptionalReadGap: () => { optionalReadGap = true; },
             // An answered account question resumes THIS test with the exact
             // selection, mutations still previewed.
             ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
@@ -15008,6 +15037,10 @@ export async function runCreationTest(
             results.push({ stepId: step.id, status: 'error', detail: boundedStepDetail(err instanceof Error ? err.message : String(err)) });
           }
         }
+      }
+      const verdict = results[results.length - 1]!;
+      if (!optionalReadGap && verdict.status !== 'ok' && verdict.status !== 'previewed' && verdict.status !== 'unverifiable') {
+        failedPrerequisites.add(step.id);
       }
       completed.add(step.id);
     }
