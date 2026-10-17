@@ -82,7 +82,7 @@ const report: Record<string, unknown> = { version: 1, startedAt: new Date().toIS
   surface: mobileCredentials ? 'authenticated_mobile_http' : 'desktop_http', turns: [],
   taskAccounting: { qualification: 'unqualified', allLegUsageCertified: false, totals: 'recorded_lower_bound',
     providerPricedCost: 'not_measured', actualBilling: 'not_measured',
-    note: 'Final task entries are measured separately for each exact accepted source and may overlap. Do not sum them or treat recorded usage as complete cost.' } };
+    note: 'Final task entries are measured separately for each exact accepted source and may overlap. Do not sum them or treat recorded usage as complete cost. Linked precursors may predate this runner window and require their own serving evidence.' } };
 const turns = report.turns as Record<string, unknown>[];
 let pinnedBuild: ProofBuildIdentity | undefined;
 let measurementStartedAt: string | undefined;
@@ -339,9 +339,9 @@ try {
         report.sourceFingerprintAfter = fingerprintRuntimeSourceFromGit({ repoRoot: path.dirname(path.dirname(expectedEntry)) });
         if (report.sourceFingerprintAfter !== report.sourceFingerprintBefore) throw new Error('candidate source changed');
       }
-      report.measurementWindow = { startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unchanged' };
+      report.measurementWindow = { scope: 'runner_request_window', startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unchanged' };
     } catch {
-      report.measurementWindow = { startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unavailable_or_changed' };
+      report.measurementWindow = { scope: 'runner_request_window', startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unavailable_or_changed' };
       report.completed = false; report.assertionsPassed = false; process.exitCode = 1;
       report.closeoutIdentityError = 'The same exact build/process could not be proved throughout the measurement window.';
     }

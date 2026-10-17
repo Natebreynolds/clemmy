@@ -7,6 +7,9 @@ import { canonicalCacheAccounting, type UsageEvent } from '../src/runtime/usage-
 import { projectCanonicalTopLevelToolEvents } from '../src/runtime/harness/tool-effect.js';
 import { presentationEventFromCompletionData } from '../src/runtime/harness/turn-outcome.js';
 import { readApprovalExecutionSource } from '../src/runtime/harness/approval-execution-source.js';
+import { readAcceptedTaskNoticingParticipants } from './lib/accepted-task-noticing-participants.js';
+import { readAcceptedTaskWorkflowCandidates } from './lib/accepted-task-workflow-candidates.js';
+import { selectAcceptedTaskNoticingUsage, type NoticingAccountingParticipant } from './lib/accepted-task-noticing-usage.js';
 
 /**
  * Read-only accounting for one dedicated harness session.
@@ -203,6 +206,15 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   workerLineageIssues: string[];
   workerAttemptCount: number;
   unfinishedWorkerAttempts: number;
+  /** Saved operation/response-linked precursors, not execution attempts.
+   * Their clocks never extend taskWallMs or segmentWallMs. */
+  proactiveUsageParticipants: NoticingAccountingParticipant[];
+  proactiveUsageIssues: string[];
+  proactiveExactUsageRecords: number;
+  proactiveUsageScope: { timing: 'precursor_operations_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
+  /** Candidate dispatch metadata only. Full retention-compatible workflow
+   * authority proof is still required before admitting its usage rows. */
+  workflowUsageInventory: ReturnType<typeof readAcceptedTaskWorkflowCandidates>;
   lineageIssues: string[];
   exactUsageRecords: number;
   /** Exact-looking rows whose attempt/lineage cannot be proved. Kept visible,
@@ -2200,12 +2212,28 @@ export function measureAcceptedTask(
     return false;
   };
   const usageRead = readUsageEvents(path.join(home, 'state', 'token-usage'));
+  const accountingSources = [...members.keys()].map(sourceUserSeq => ({ sessionId, sourceUserSeq }));
+  const proactive = readAcceptedTaskNoticingParticipants(home, accountingSources);
+  const workflowInventory = readAcceptedTaskWorkflowCandidates(home, accountingSources);
+  const proactiveSelection = selectAcceptedTaskNoticingUsage({ ...proactive,
+    acceptedSources: new Set(accountingSources.map(source => usageSourceKey(source.sessionId, source.sourceUserSeq))),
+    usage: usageRead.events });
+  const proactiveIssues = [...new Set([...proactive.issues, ...proactiveSelection.issues])];
+  for (const issue of proactiveIssues) issues.add(issue);
+  for (const issue of workflowInventory.issues) issues.add(issue);
+  if (workflowInventory.candidates.length) issues.add('workflow_participant_inventory_unproved');
+  const proactiveExact = new Set(proactiveSelection.exactIndices);
+  const proactiveUnproven = new Set(proactiveSelection.unprovenIndices);
   const exactUsage: UsageEvent[] = [];
   const unprovenUsage: UsageEvent[] = [];
   const usageAttemptIds = new Set<string>();
   let legacyWindowUsageRecords = 0;
   let unscopedWindowUsageRecords = 0;
-  for (const event of usageRead.events) {
+  for (const [index, event] of usageRead.events.entries()) {
+    // One read and one row selection. An exact precursor is included in task
+    // recorded usage, but cannot supply an accepted source/attempt or time.
+    if (proactiveExact.has(index)) { exactUsage.push(event); continue; }
+    if (proactiveUnproven.has(index)) { unprovenUsage.push(event); continue; }
     const traceSource = sourceByAccepted.get(event.trace?.acceptedSource ?? '');
     const attemptId = event.trace?.attemptId;
     const attemptSource = typeof attemptId === 'string' ? usageSourceByAttempt.get(attemptId) : undefined;
@@ -2375,6 +2403,10 @@ export function measureAcceptedTask(
     sourceUserSeqs: [...members.keys()], approvalContinuations, lineageIssues: [...lineageIssues],
     workerUsageParticipants: [...workers.scopes.values()].map(scope => scope.participant),
     workerLineageIssues: [...workers.issues], workerAttemptCount, unfinishedWorkerAttempts,
+    proactiveUsageParticipants: proactive.jobs, proactiveUsageIssues: proactiveIssues,
+    proactiveExactUsageRecords: proactiveExact.size,
+    proactiveUsageScope: { timing: 'precursor_operations_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
+    workflowUsageInventory: workflowInventory,
     exactUsageRecords: exactUsage.length,
     unprovenUsage: { usageRecords: unproven.usageRecords, promptTokens: unproven.promptTokens,
       cachedInputTokens: unproven.cachedInputTokens, uncachedInputTokens: unproven.uncachedInputTokens, outputTokens: unproven.outputTokens },
@@ -2727,6 +2759,9 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     row('Proved exact helper sources', b.workerUsageParticipants?.length ?? 0, c.workerUsageParticipants?.length ?? 0),
     row('Helper attempts', b.workerAttemptCount ?? 0, c.workerAttemptCount ?? 0),
     row('Unfinished helper attempts', b.unfinishedWorkerAttempts ?? 0, c.unfinishedWorkerAttempts ?? 0),
+    row('Receipt-linked proactive jobs', b.proactiveUsageParticipants?.length ?? null, c.proactiveUsageParticipants?.length ?? null),
+    row('Original-response-linked proactive usage rows', b.proactiveExactUsageRecords ?? null, c.proactiveExactUsageRecords ?? null),
+    row('Workflow dispatch candidates (unproved, not admitted)', b.workflowUsageInventory?.candidates.length ?? null, c.workflowUsageInventory?.candidates.length ?? null),
     row('Durable attempts', b.attemptCount, c.attemptCount),
     row('Unfinished attempts', b.unfinishedAttempts, c.unfinishedAttempts),
     row('Model routes', b.modelRouteEvents, c.modelRouteEvents),
@@ -2759,6 +2794,12 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     if (!measurement.usageAttributionCertified) {
       warnings.push(`${measurement.acceptedSource}: incomplete attribution; proven totals are a lower bound, not comparable whole-task cost. ${measurement.usageCertificationIssues.join(', ')}.`);
     }
+    if (measurement.proactiveUsageParticipants?.length) {
+      warnings.push(`${measurement.acceptedSource}: proactive precursor usage is response-linked; its timing is separate from task execution and its serving identity is not measured by the latest build pin.`);
+    }
+    if (measurement.workflowUsageInventory?.candidates.length) {
+      warnings.push(`${measurement.acceptedSource}: workflow dispatch candidates are unproved and excluded; missing full retention-compatible authority/call evidence does not establish zero usage.`);
+    }
     if (measurement.usageCertificationIssues.some(issue => /^(worker_(host_response|response_without|model_without|failed_attempt)|conflicting_worker_response_bridge|invalid_worker_response_ownership)/.test(issue))) {
       warnings.push(`${measurement.acceptedSource}: helper request usage coverage is unknown/incomplete; absent or conflicting response evidence does not establish zero cost.`);
     }
@@ -2772,6 +2813,7 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
   }
   if (warnings.length > 0) lines.push('', 'Warnings', ...warnings.map((warning) => `  - ${warning}`));
   lines.push('', 'Public delivery follows proved approval continuations; reciprocally proved helpers extend usage only. Unrelated follow-up turns are excluded.',
+    'Receipt-linked proactive operations extend recorded usage only; their clocks and serving identity require separate proof.',
     'Wall spans and approval waits may overlap; do not add them. Unrecorded waits remain unknown.');
   return `${lines.join('\n')}\n`;
 }
