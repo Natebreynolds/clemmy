@@ -175,6 +175,7 @@ import {
 } from './exact-checkpoint-reentry.js';
 import pino from 'pino';
 import { appendEvent, getSession, isKillRequested, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
+import { publicAsyncWorkDispatchedData } from './public-presentation.js';
 import { sessionAgentReviewContext } from './session-composition.js';
 import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
 import * as approvalRegistry from './approval-registry.js';
@@ -393,6 +394,8 @@ export interface SourceArtifactEvidence {
      *  different success contract (such as deletion); `unknown` is evidence
      *  that could not be resolved at all. Only `file` can require content. */
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
+    /** A later generation written by a workflow run this request started. */
+    writtenByRun?: string;
   }>;
 }
 
@@ -424,6 +427,65 @@ function operationResultContract(toolName: string): OperationResultContract {
   return 'other';
 }
 
+/**
+ * LATER GENERATIONS WRITTEN BY WORK THIS REQUEST STARTED.
+ *
+ * A workflow run this request dispatched is released when the model's answer
+ * closes the dispatch batch, while completion review may still be judging the
+ * turn. When that run rewrites a file this request wrote (a Space feed
+ * publishing the rows Clem also saved by hand, or the data of a Space Clem just
+ * saved), the request's own receipt no longer matches and finished work read
+ * as drift. Live 2026-10-17: the feed published 39 s after Clem's own write,
+ * two reviews were told the dataset was UNVERIFIED, and the turn ended blocked
+ * after the third review passed.
+ *
+ * Only the public dispatch edge of this exact source names the runs, and a run
+ * counts only when its record carries that dispatch group. Only files this
+ * request wrote (a saved Space's data included) are considered, and only a run
+ * receipt the current bytes match: the final state must be that run's write.
+ */
+export function dispatchedRunGenerations(
+  input: { sessionId: string; sourceUserSeq: number },
+  own: ReadonlyArray<{ handle: string; contentDigest: string; facts: unknown }>,
+): Array<{ runId: string; facts: NonNullable<ReturnType<typeof parseHostLocalWriteCommitFacts>> }> {
+  const latestOwn = new Map<string, string>();
+  for (const entry of own) {
+    if (!entry.facts || !entry.handle) continue;
+    latestOwn.set(entry.handle, entry.contentDigest);
+    const bundle = entry.handle.match(/^(spaces\/[^/]+\/)\.clementine-workspace-commit\.json$/);
+    if (bundle && !latestOwn.has(`${bundle[1]}data.json`)) latestOwn.set(`${bundle[1]}data.json`, '');
+  }
+  if (latestOwn.size === 0) return [];
+  const dispatches = listEvents(input.sessionId, { types: ['async_work_dispatched'] })
+    .map((event) => publicAsyncWorkDispatchedData(event.data))
+    .filter((dispatch): dispatch is NonNullable<typeof dispatch> => dispatch?.sourceUserSeq === input.sourceUserSeq);
+  const found = new Map<string, { runId: string; facts: NonNullable<ReturnType<typeof parseHostLocalWriteCommitFacts>> }>();
+  for (const dispatch of dispatches) {
+    for (const runId of dispatch.runIds) {
+      let record: Record<string, unknown>;
+      try {
+        record = JSON.parse(readFileSync(path.join(BASE_DIR, 'workflows', 'runs', `${runId}.json`), 'utf8')) as Record<string, unknown>;
+      } catch { continue; }
+      if (record.id !== runId || record.chatDispatchSourceGroupId !== dispatch.sourceGroupId) continue;
+      const outputs = record.stepOutputs && typeof record.stepOutputs === 'object' ? Object.values(record.stepOutputs) : [];
+      for (const output of outputs) {
+        let value: unknown = output;
+        if (typeof value === 'string' && value.trimStart().startsWith('{')) {
+          try { value = JSON.parse(value); } catch { /* the raw text may itself carry the receipt */ }
+        }
+        const receipt = value && typeof value === 'object' && typeof (value as Record<string, unknown>).hostFileCommit === 'string'
+          ? (value as Record<string, unknown>).hostFileCommit
+          : output;
+        const facts = parseHostLocalWriteCommitFacts(receipt);
+        if (!facts || !latestOwn.has(facts.handle) || latestOwn.get(facts.handle) === facts.contentDigest) continue;
+        if (!readCommittedArtifactContent(facts).verified) continue;
+        found.set(facts.handle, { runId, facts });
+      }
+    }
+  }
+  return [...found.values()];
+}
+
 export function settledSourceArtifacts(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -434,6 +496,7 @@ export function settledSourceArtifacts(input: {
     unresolvedReason?: string;
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
     facts: ReturnType<typeof parseHostLocalWriteCommitFacts> | null;
+    writtenByRun?: string;
   }> = [];
   try {
     const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
@@ -587,6 +650,20 @@ export function settledSourceArtifacts(input: {
         facts,
       });
     }
+    for (const generation of dispatchedRunGenerations(input, collected)) {
+      ordinal += 1;
+      collected.push({
+        createdId: generation.facts.createdId,
+        handle: generation.facts.handle,
+        contentDigest: generation.facts.contentDigest,
+        writeOrdinal: ordinal,
+        digestMatches: null,
+        superseded: false,
+        evidenceContract: 'file',
+        facts: generation.facts,
+        writtenByRun: generation.runId,
+      });
+    }
   } catch {
     // The spine was unreadable. Say so; never present it as "wrote nothing".
     return { count: 0, evidenceAvailable: false, summary: '', artifacts: [] };
@@ -627,7 +704,10 @@ export function settledSourceArtifacts(input: {
     }
     const lines = [
       `- artifact ${entry.createdId} (handle ${entry.handle})`,
-      `  written by THIS request as its write #${entry.writeOrdinal}; receipt digest ${entry.contentDigest.slice(0, 16)}`,
+      entry.writtenByRun
+        ? `  written by workflow run ${entry.writtenByRun}, which THIS request started, after this request's own `
+          + `write of it; receipt digest ${entry.contentDigest.slice(0, 16)}. This is the file's final state.`
+        : `  written by THIS request as its write #${entry.writeOrdinal}; receipt digest ${entry.contentDigest.slice(0, 16)}`,
     ];
     const content = entry.facts
       ? readCommittedArtifactContent(entry.facts, { laterReceipts: laterReceiptsAfter(index) })
