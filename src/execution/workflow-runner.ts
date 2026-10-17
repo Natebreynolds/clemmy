@@ -1614,6 +1614,22 @@ export function catalogPreparationRefusalToCapabilityBlock(
 ): WorkflowCapabilityBlockedError {
   const tool = (refusal.operationId ?? '').trim();
   const why = [refusal.reason, refusal.detail].filter(Boolean).join(': ');
+  // The check itself could not complete (the provider did not answer while
+  // the connection or definition was re-verified). That is neither a missing
+  // connection nor a definition mismatch, and a prompt step has no exact-
+  // schema proof to resume from: live 2026-10-16 a network blip parked two
+  // scheduled workflows as "not connected" and as an unretryable "definition
+  // mismatch", and the second held every later run until it was cancelled.
+  if (/refresh_unavailable/.test(why)) {
+    return new WorkflowCapabilityBlockedError({
+      stepId: step.id,
+      tool: tool || `(${refusal.reason})`,
+      toolkit: tool ? exactSchemaToolkitLabel(tool) : 'provider',
+      reason: 'connection-check-unavailable',
+      message: `Step "${step.id}" names ${tool || 'an operation'}, but the check with ${tool ? exactSchemaToolkitLabel(tool) : 'the provider'} could not complete (${why}). `
+        + 'No provider dispatch occurred; the run retries on its own, and a new run of this workflow replaces it.',
+    });
+  }
   // A definition DRIFT that the successor path could not settle is not a
   // missing connection: the toolkit is connected and the provider changed the
   // operation. Say that, and park under the exact-schema reason the Inbox
@@ -2438,9 +2454,14 @@ function workflowMessageWithAnsweredInput(
 
 export type WorkflowCapabilityBlockReason = ComposioGatewayBlockReason
   | 'exact_schema_refresh_unavailable'
-  | 'exact_schema_boundary_mismatch';
+  | 'exact_schema_boundary_mismatch'
+  /** The provider could not be reached to re-check the connection or the
+   * operation's definition (the check itself failed). Nothing is known to be
+   * wrong; the run retries on its own and a new run supersedes it. */
+  | 'connection-check-unavailable';
 
 const RECOVERABLE_CAPABILITY_BLOCK_REASONS: ReadonlySet<WorkflowCapabilityBlockReason> = new Set([
+  'connection-check-unavailable',
   'not-connected',
   'identity-absent',
   'ambiguous-account',
@@ -12301,6 +12322,15 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
  * retrying is just a machine insisting; the run waits for a person.
  */
 export const WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT = 1;
+/** A check that could not complete is retried a few times, spaced out (about
+ * fifteen minutes in all), before it waits for the owner; still bounded. */
+export const WORKFLOW_CAPABILITY_CHECK_RETRY_LIMIT = 4;
+
+function workflowCapabilityAutomaticRetryLimit(reason: WorkflowCapabilityBlockReason): number {
+  return reason === 'connection-check-unavailable'
+    ? WORKFLOW_CAPABILITY_CHECK_RETRY_LIMIT
+    : WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT;
+}
 
 export function workflowCapabilityRetryDelayMs(retryCount: number): number {
   const baseRaw = Number.parseInt(
@@ -12782,7 +12812,7 @@ export function reapCapabilityBlockedRuns(nowMs: number = Date.now()): number {
     // ONE free automatic attempt, then it is the owner's call. An unbounded
     // ladder kept a run alive for ten hours over a transient check failure and
     // silently held every later occurrence of that workflow behind it.
-    if ((run.capabilityBlock.retryCount ?? 0) > WORKFLOW_CAPABILITY_AUTOMATIC_RETRY_LIMIT) continue;
+    if ((run.capabilityBlock.retryCount ?? 0) > workflowCapabilityAutomaticRetryLimit(run.capabilityBlock.reason)) continue;
     const retryAtMs = Date.parse(run.capabilityBlock.retryAt);
     if (!Number.isFinite(retryAtMs) || retryAtMs > nowMs) continue;
     if (readmitCapabilityBlockedRun(filePath, run, new Date(nowMs).toISOString(), 'automatic-retry')) {

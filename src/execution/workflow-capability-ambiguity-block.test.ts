@@ -93,3 +93,18 @@ test('one current account or an unknown operation still parks as not-connected',
     installCapabilityManifestStore(null);
   }
 });
+
+test('a check that could not complete parks as retryable, never as not-connected or a definition mismatch', () => {
+  // Live 2026-10-16: a network blip during the connection re-check parked one
+  // scheduled workflow as "not connected" and another as an unretryable
+  // definition mismatch that held every later run.
+  const block = catalogPreparationRefusalToCapabilityBlock(
+    { id: 'main' },
+    { reason: 'selected_definition_revalidation_refused', operationId: 'GOOGLESHEETS_BATCH_GET',
+      detail: 'selected_connection_refresh_unavailable' },
+  );
+  assert.equal(block.reason, 'connection-check-unavailable');
+  assert.match(block.message, /could not complete/);
+  assert.match(block.message, /refresh_unavailable/, 'the refusal code rides along for the honest notice');
+  assert.doesNotMatch(block.message, /not connected|operation name is wrong/);
+});

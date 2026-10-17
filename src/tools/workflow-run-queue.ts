@@ -25,7 +25,8 @@ import { getNotification } from '../runtime/notifications.js';
 import { syncExistingFileBytes, syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { listWorkflows, readWorkflow, type WorkflowDefinition } from '../memory/workflow-store.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from '../execution/workflow-inputs.js';
-import { computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
+import { appendWorkflowEvent, computeResumeState, listFinalFailedItems } from '../execution/workflow-events.js';
+import { cancelWorkflowRunAtBoundary } from '../execution/workflow-run-cancellation.js';
 import { checkWorkflowRunReadiness, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
 import {
   buildWorkflowMutationContractSnapshot,
@@ -870,6 +871,51 @@ function findWorkflowRunByTriggerReceiptId(receiptId: string): { id: string; sta
     throw new Error(`Trigger receipt ${receiptId} is attached to multiple workflow runs; refusing another queue attempt.`);
   }
   return matches[0] ?? null;
+}
+
+/**
+ * A run parked only because the service could not be reached to re-check its
+ * connection, and that provably sent nothing, does not hold its workflow: the
+ * new run replaces it (live 2026-10-16 a network blip parked a scheduled review
+ * that then refused every later run as a duplicate until it was cancelled).
+ * Every other parked run (a missing connection, an account to choose) still
+ * holds, since a new run would stop at the same place.
+ */
+function supersedeUnreachableCheckBlock(
+  duplicate: { id: string; status: string } | null,
+): { id: string; status: string } | null {
+  if (!duplicate || duplicate.status !== 'blocked_capability') return duplicate;
+  try {
+    const result = cancelWorkflowRunAtBoundary({
+      runId: duplicate.id,
+      reason: 'Replaced by a new run: this one paused because the service could not be reached, and nothing was sent.',
+      source: 'workflow-run-queue',
+      precondition: (run) => {
+        const block = (run as { capabilityBlock?: { reason?: unknown; provenNoDispatch?: unknown; state?: unknown } })
+          .capabilityBlock;
+        return run.status === 'blocked_capability'
+          && block?.reason === 'connection-check-unavailable'
+          && block.provenNoDispatch === true
+          && block.state === 'blocked'
+          ? 'allow'
+          : 'ownership_unproved';
+      },
+    });
+    if (result.status !== 'cancelled') return duplicate;
+    const slug = typeof (result.run as { workflowSlug?: unknown }).workflowSlug === 'string'
+      ? String((result.run as { workflowSlug?: unknown }).workflowSlug)
+      : String(result.run.workflow ?? '');
+    if (slug) {
+      appendWorkflowEvent(slug, duplicate.id, {
+        kind: 'run_cancelled',
+        error: result.request.reason,
+        meta: { source: 'workflow-run-queue', supersededBy: 'new_run' },
+      });
+    }
+    return null;
+  } catch {
+    return duplicate;
+  }
 }
 
 export function findDuplicateQueuedWorkflowRun(
@@ -2509,6 +2555,7 @@ function queueWorkflowRunUnlocked(
         workflowSlug: workflowEntry?.name,
         includeAwaitingChatDispatchSeal: opts?.originObserver !== undefined,
       });
+    duplicate = supersedeUnreachableCheckBlock(duplicate);
   }
   const originObserver = normalizeWorkflowRunOriginObserver(opts?.originObserver);
   const explicitPrimaryOrigin = normalizedOptionalString(opts?.originSessionId);

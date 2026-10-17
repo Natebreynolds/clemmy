@@ -2603,6 +2603,7 @@ function projectWorkflowCapabilityBlock(value: unknown): Record<string, unknown>
 /** The same three human labels the Automate drawer uses for a capability gate. */
 function workflowCapabilityGateTitle(reason: unknown): string {
   if (reason === 'ambiguous-account') return 'Choose an exact account';
+  if (reason === 'connection-check-unavailable') return 'Could not reach the service; retrying';
   if (reason === 'exact_schema_refresh_unavailable' || reason === 'exact_schema_boundary_mismatch') return 'Exact action metadata needs review';
   return 'Connection needs attention';
 }
