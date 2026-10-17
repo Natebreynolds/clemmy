@@ -26,11 +26,17 @@ const jsonObject = () => preserveDeferredJsonParser(z.unknown().refine((value) =
   return prototype === Object.prototype || prototype === null;
 }, 'Expected a JSON object').meta({ type: 'object', additionalProperties: {} }) as z.ZodType<Record<string, unknown>>);
 
-/** A JSON object, either as its text or as the object. */
-export const jsonObjectArgument = () => z.union([z.string(), jsonObject()]);
+/**
+ * A JSON object, either as the object or as its text. The object comes first:
+ * a model reads the first branch of the advertised `anyOf` as the expected
+ * form. Live 2026-10-17, with text first, every one of 22 failed Space saves in
+ * a week arrived as text through a carrier and broke on its escaping (41% of
+ * space_save calls); a native object is escaped once, by the provider.
+ */
+export const jsonObjectArgument = () => z.union([jsonObject(), z.string()]);
 
-/** A JSON value of any shape (object or array), either as its text or as the value. */
-export const jsonValueArgument = () => z.union([z.string(), jsonObject(), preserveDeferredJsonParser(z.array(z.unknown()))]);
+/** A JSON value of any shape (object or array), either as the value or as its text. */
+export const jsonValueArgument = () => z.union([jsonObject(), preserveDeferredJsonParser(z.array(z.unknown())), z.string()]);
 
 export type JsonArgument = string | Record<string, unknown> | unknown[] | null | undefined;
 
