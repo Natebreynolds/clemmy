@@ -1362,7 +1362,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 179420
+          "bytes": 180284
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -1965,7 +1965,7 @@
           "bytes": 9350
         },
         "src/tools/json-argument.ts": {
-          "bytes": 2444
+          "bytes": 2779
         },
         "src/runtime/harness/resolved-carrier-refusal.ts": {
           "bytes": 3749
@@ -5271,7 +5271,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 179420
+          "bytes": 180284
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -5874,7 +5874,7 @@
           "bytes": 9350
         },
         "src/tools/json-argument.ts": {
-          "bytes": 2444
+          "bytes": 2779
         },
         "src/runtime/harness/resolved-carrier-refusal.ts": {
           "bytes": 3749
