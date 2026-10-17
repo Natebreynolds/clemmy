@@ -1350,7 +1350,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52164
+          "bytes": 52194
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
@@ -5268,7 +5268,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52164
+          "bytes": 52194
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
