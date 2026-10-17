@@ -14,6 +14,7 @@ import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { markWorkflowCapabilityNotificationsSettled } from '../runtime/notifications.js';
 import { syncExistingFileBytes } from '../runtime/sync-directory.js';
+import * as approvalRegistry from '../runtime/harness/approval-registry.js';
 import {
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
@@ -247,6 +248,9 @@ export function cancelWorkflowRunAtBoundary(input: {
   try { if (existsSync(file)) readFileSync(file, 'utf-8'); } catch { /* authoritative read below */ }
   beforeCancellationLockForTests?.();
 
+  // The cards the run was parked on, read under the lock before the park is
+  // cleared: a stopped run cannot use them, so they leave Needs you with it.
+  let parkedApprovals: Array<{ approvalId: string; sessionId: string }> = [];
   const result = withWorkflowRunRecordLock<CancelWorkflowRunResult>(file, () => {
     const current = readWorkflowRunRecordUnlocked<WorkflowRunProjection>(file);
     if (!current) return { status: 'not_found' };
@@ -338,6 +342,7 @@ export function cancelWorkflowRunAtBoundary(input: {
         cancelledAt: request.requestedAt,
       };
     }
+    parkedApprovals = parkedStepApprovals(current.parked);
     delete next.parked;
     const reportBack = {
       version: 1 as const,
@@ -373,12 +378,41 @@ export function cancelWorkflowRunAtBoundary(input: {
           : 'cancelled',
       });
     } catch { /* terminal run truth is authoritative; a later replay can settle presentation */ }
+    if (result.status === 'cancelled') retireParkedApprovals(input.runId, parkedApprovals);
     const settlement = settleCompiledProjectRootFromRun(file, result.run);
     if (settlement.kind === 'settled' || settlement.kind === 'already_settled') {
       stampCompiledProjectRootSettlement(file, settlement);
     }
   }
   return result;
+}
+
+function parkedStepApprovals(parked: unknown): Array<{ approvalId: string; sessionId: string }> {
+  const steps = (parked as { parkedSteps?: unknown } | null | undefined)?.parkedSteps;
+  if (!Array.isArray(steps)) return [];
+  const out: Array<{ approvalId: string; sessionId: string }> = [];
+  for (const step of steps) {
+    const sessionId = (step as { sessionId?: unknown })?.sessionId;
+    const ids = (step as { approvalIds?: unknown })?.approvalIds;
+    if (typeof sessionId !== 'string' || !Array.isArray(ids)) continue;
+    for (const id of ids) if (typeof id === 'string' && id) out.push({ approvalId: id, sessionId: sessionId as string });
+  }
+  return out;
+}
+
+/** Live 2026-10-16: a cancelled fixture run left "Approve exact local_write
+ * call space_set_data" pending in Needs you, since the dead-session reaper
+ * skips durable product approvals. Only a still-pending card of this run's
+ * own parked step session is retired. */
+function retireParkedApprovals(runId: string, parked: ReadonlyArray<{ approvalId: string; sessionId: string }>): void {
+  for (const { approvalId, sessionId } of parked) {
+    try {
+      const row = approvalRegistry.get(approvalId);
+      if (!row || row.status !== 'pending' || row.sessionId !== sessionId) continue;
+      if (sessionId !== `workflow:${runId}` && !sessionId.startsWith(`workflow:${runId}:`)) continue;
+      approvalRegistry.resolve(approvalId, 'cancelled_by_system', 'workflow-run-cancelled');
+    } catch { /* the cancelled run is authoritative; the reaper can still settle the card */ }
+  }
 }
 
 export function workflowRunCancellationRequested(runId: string): boolean {

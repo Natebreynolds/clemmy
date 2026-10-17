@@ -377,3 +377,42 @@ test('delete/disable cleanup: a non-terminal run cancels at the boundary; an alr
   assert.equal(r2.status, 'already_terminal');
   assert.equal(JSON.parse(readFileSync(done, 'utf-8')).status, 'completed', 'a finished run is never rewritten');
 });
+
+test("cancelling a run parked on a card retires that card, and leaves another session's card alone", async () => {
+  // Live 2026-10-16: a cancelled fixture run left "Approve exact local_write
+  // call space_set_data" pending in Needs you.
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { HarnessSession } = await import('../runtime/harness/session.js');
+  for (const id of ['workflow:run-parked:save_draft', 'workflow:run-other:save_draft']) {
+    HarnessSession.create({ id, kind: 'workflow', channel: 'workflow', title: id });
+  }
+  const own = approvalRegistry.registerResumable({
+    sessionId: 'workflow:run-parked:save_draft',
+    subject: 'Approve exact local_write call space_set_data on local_registry:host',
+    tool: 'workflow_v3_call',
+    args: { operationId: 'space_set_data' },
+    resumeKey: 'rk-run-parked-save-draft',
+  }).row;
+  const other = approvalRegistry.registerResumable({
+    sessionId: 'workflow:run-other:save_draft',
+    subject: 'Approve exact local_write call space_set_data on local_registry:host',
+    tool: 'workflow_v3_call',
+    args: { operationId: 'space_set_data' },
+    resumeKey: 'rk-run-other-save-draft',
+  }).row;
+  writeRun('run-parked', {
+    status: 'parked',
+    parked: {
+      parkedSteps: [
+        { stepId: 'save_draft', kind: 'gate', approvalIds: [own.approvalId], sessionId: own.sessionId },
+        // A foreign id listed under this run's step is not this run's card.
+        { stepId: 'other', kind: 'gate', approvalIds: [other.approvalId], sessionId: other.sessionId },
+      ],
+      parkedAt: new Date().toISOString(),
+    },
+  });
+  const result = cancelWorkflowRunAtBoundary({ runId: 'run-parked', reason: 'Stopped by the owner.', source: 'test' });
+  assert.equal(result.status, 'cancelled');
+  assert.equal(approvalRegistry.get(own.approvalId)?.status, 'cancelled');
+  assert.equal(approvalRegistry.get(other.approvalId)?.status, 'pending');
+});
