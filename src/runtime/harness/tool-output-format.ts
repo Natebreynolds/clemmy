@@ -6,7 +6,7 @@ import { getToolOutputContext } from './tool-output-context.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import { actionTopologyRoleForRuntimeCall, unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
 import { effectiveContextWindow } from './model-window-observations.js';
-import { toolReadsRetainedOutput } from '../../tools/tool-registry.js';
+import { toolPresentationMaxChars, toolReadsRetainedOutput } from '../../tools/tool-registry.js';
 
 // Reuse this pure policy in brain/reviewer instruction assembly. Model-facing
 // host metadata is separate from the lossless provider payload and its evidence.
@@ -158,6 +158,11 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
   if (effectiveName) {
     const explicitRead = explicitLocalReadPreviewBudget(effectiveName, effectiveArgs);
     if (explicitRead !== undefined) return explicitRead;
+    // A result the model must read whole to follow it. Live 2026-10-17 a
+    // skill read was cut to 20,000 characters on its way to the model, so
+    // its verify and phone sections and its tool contracts never arrived.
+    const declared = toolPresentationMaxChars(effectiveName);
+    if (declared !== undefined) return declared;
   }
   if (role !== 'control') return PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
   if (effectiveName && toolReadsRetainedOutput(effectiveName)) {

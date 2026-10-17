@@ -56,3 +56,14 @@ test("a skill's declared tools come after its body with their argument shapes", 
   const watch = await readSkill('watch-setup');
   assert.match(watch, /- workflow_run\(name: string, inputs\?: string\)/);
 });
+
+test('the skill read is not cut on its way to the model', async () => {
+  // The tool's own cap was not the whole path: live 2026-10-17 the outer
+  // presentation budget still cut the read to 20,000 characters.
+  const { presentationBudgetFor, transportPresentationMaxChars } = await import('../runtime/harness/tool-output-format.js');
+  const text = await readSkill('workspace-builder');
+  for (const input of [{ toolName: 'skill_read' }, { toolName: 'call_tool', args: { name: 'skill_read', args_json: { name: 'workspace-builder' } } }]) {
+    assert.ok(presentationBudgetFor(input) >= text.length, `${input.toolName}: the budget holds the whole read`);
+    assert.ok(transportPresentationMaxChars(input) >= text.length, `${input.toolName}: the transport keeps it whole`);
+  }
+});

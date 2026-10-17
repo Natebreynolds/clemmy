@@ -261,6 +261,9 @@ export interface ToolDecl {
   resultContract?: 'acknowledgement';
   /** Re-reads only already-retained output; crosses nothing. See ToolRuntimeEffectOverride docs. */
   readsRetainedOutput?: boolean;
+  /** Characters of one result shown inline, above the ordinary per-result
+   *  budget, for a result the model must read whole to follow it (a skill). */
+  presentationMaxChars?: number;
   /** Declared freshness policy for a read: an identical call in the same
    * accepted source, with no mutation settled since, may be answered from the
    * settled result (settled-read-reuse.ts). Absent = never reused: status polls
@@ -592,7 +595,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   { name: 'cancel_timer', sideEffect: 'write', runtimeEffect: 'host_only', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', loopClass: 'mutating', actionTopologyRole: 'control', description: 'Cancel a pending reminder that was set with set_timer, by words from its message or its id.' },
   { name: 'share_plan', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'cli'], actionTopologyRole: 'control', description: 'Share a non-blocking working plan in the current chat before continuing.' },
   { name: 'skill_list', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, actionTopologyRole: 'control', description: 'List installed SKILL.md skills (Anthropic Skills format) with name + one-line description.' },
-  { name: 'skill_read', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, actionTopologyRole: 'control', desk: { rung: 'full', promotedBy: ['listed_skill', 'delegation'], purpose: 'load an installed skill by name' }, description: 'Load the full body of an installed SKILL.md skill into context.' },
+  { name: 'skill_read', sideEffect: 'read', projectEffect: 'read', hostReadOnlyExecution: 'pure_local', presentationMaxChars: 60_000, tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'inner-dispatch', 'cli'], sdkLayer: 'read-only', innerDispatch: 'read', loopClass: 'idempotent', cacheSafeRead: true, actionTopologyRole: 'control', desk: { rung: 'full', promotedBy: ['listed_skill', 'delegation'], purpose: 'load an installed skill by name' }, description: 'Load the full body of an installed SKILL.md skill into context.' },
   { name: 'source_map_upsert', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', actionTopologyRole: 'control', description: 'Record WHERE a resource lives in one of the user\'s connected sources — a Drive folder, an…' },
   { name: 'space_action_prepare', sideEffect: 'write', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain'], sdkLayer: 'authoring', featureGroup: 'spaces-dock', loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Prepare one declared Workspace action for exact approval, or execute it only when an exact existing standing approval covers the current action, arguments, and runner bytes.' },
   { name: 'space_diff', sideEffect: 'read', tier: 'discoverable', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker'], sdkLayer: 'read-only', featureGroup: 'spaces-dock', loopClass: 'idempotent', actionTopologyRole: 'control', description: 'Compare two retained successful observations for one Workspace data source, defaulting to current versus prior.' },
@@ -808,6 +811,12 @@ export function deskDeclaredToolNames(): string[] {
  * default so no new tool can silently acquire pre-contract authority. */
 
 /** Does this tool only re-read output already retained this session? */
+/** A tool's declared whole-result presentation budget, when it has one. */
+export function toolPresentationMaxChars(toolName: string): number | undefined {
+  const bare = toolName.includes('__') ? toolName.slice(toolName.lastIndexOf('__') + 2) : toolName;
+  return TOOL_REGISTRY.find((entry) => entry.name === bare)?.presentationMaxChars;
+}
+
 export function toolReadsRetainedOutput(toolName: string): boolean {
   const bare = toolName.includes('__') ? toolName.slice(toolName.lastIndexOf('__') + 2) : toolName;
   return TOOL_REGISTRY.some((entry) => entry.name === bare && entry.readsRetainedOutput === true);
