@@ -9,6 +9,8 @@ import { presentationEventFromCompletionData } from '../src/runtime/harness/turn
 import { readApprovalExecutionSource } from '../src/runtime/harness/approval-execution-source.js';
 import { readAcceptedTaskNoticingParticipants } from './lib/accepted-task-noticing-participants.js';
 import { readAcceptedTaskWorkflowCandidates } from './lib/accepted-task-workflow-candidates.js';
+import { readAcceptedTaskWorkflowParticipants, type AcceptedTaskWorkflowParticipant } from './lib/accepted-task-workflow-participants.js';
+import { readAcceptedTaskWorkflowParentTerminalIdentity } from './lib/accepted-task-workflow-parent-terminal.js';
 import { selectAcceptedTaskNoticingUsage, type NoticingAccountingParticipant } from './lib/accepted-task-noticing-usage.js';
 
 /**
@@ -212,8 +214,14 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   proactiveUsageIssues: string[];
   proactiveExactUsageRecords: number;
   proactiveUsageScope: { timing: 'precursor_operations_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
-  /** Candidate dispatch metadata only. Full retention-compatible workflow
-   * authority proof is still required before admitting its usage rows. */
+  /** Claims remain diagnostic; hosted steps require full retained authority. */
+  workflowUsageParticipants: AcceptedTaskWorkflowParticipant[];
+  workflowApprovalContinuations: Array<ApprovalContinuationMeasurement & { sessionId: string }>;
+  workflowUsageIssues: string[];
+  workflowAttemptCount: number;
+  unfinishedWorkflowAttempts: number;
+  workflowExactUsageRecords: number;
+  workflowUsageScope: { scope: 'recorded_hosted_steps_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
   workflowUsageInventory: ReturnType<typeof readAcceptedTaskWorkflowCandidates>;
   lineageIssues: string[];
   exactUsageRecords: number;
@@ -1834,6 +1842,7 @@ function workerAttemptOwnsParentCall(
   parent: { sessionId: string; seq: number; callId: string; argumentDigest: string },
   deliverySessionId: string,
   deliverySources: ReadonlyMap<number, SessionEvent>,
+  ownsParentAttempt: (sessionId: string, source: number, attemptId: string) => boolean,
 ): boolean {
   try {
     const rows = db.prepare(`SELECT parent_scope_id, parent_lease_id FROM run_dispatch_leases
@@ -1861,7 +1870,8 @@ function workerAttemptOwnsParentCall(
           && row.recovery_argument_digest === parent.argumentDigest) {
           const owner = db.prepare('SELECT session_id, source_user_seq FROM run_attempts WHERE attempt_id = ?')
             .get(row.run_attempt_id) as { session_id: string; source_user_seq: number } | undefined;
-          if (owner?.session_id !== parent.sessionId) break;
+          if (owner?.session_id !== parent.sessionId || typeof row.run_attempt_id !== 'string'
+            || !ownsParentAttempt(owner.session_id, owner.source_user_seq, row.run_attempt_id)) break;
           let source: number | null = positiveEventSeq(owner.source_user_seq);
           const controls = new Set<number>();
           while (source !== null && source !== parent.seq && parent.sessionId === deliverySessionId
@@ -1889,6 +1899,7 @@ function readWorkerUsageGraph(
   rootSessionId: string,
   roots: ReadonlyMap<number, SessionEvent>,
   claimedRoots: ReadonlyMap<number, SessionEvent> = roots,
+  rootAttemptIds?: ReadonlyMap<number, ReadonlySet<string>>,
 ): WorkerUsageGraph {
   const graph: WorkerUsageGraph = { scopes: new Map(), claimedSources: new Set(), claimedAttempts: new Set(), issues: new Set() };
   const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
@@ -1897,6 +1908,11 @@ function readWorkerUsageGraph(
   const seen = new Set<string>();
   const conflicting = new Set<string>();
   const ownerByChild = new Map<string, string>();
+  const ownsParentAttempt = (ownerSession: string, ownerSource: number, attemptId: string): boolean => {
+    if (ownerSession === rootSessionId && roots.has(ownerSource))
+      return rootAttemptIds === undefined || rootAttemptIds.get(ownerSource)?.has(attemptId) === true;
+    return graph.scopes.get(usageSourceKey(ownerSession, ownerSource))?.attempts.ids.has(attemptId) === true;
+  };
   try {
     db.pragma('query_only = ON');
     for (let index = 0; index < queue.length; index += 1) {
@@ -1984,7 +2000,7 @@ function readWorkerUsageGraph(
             && exactIdentity(data.parentLogicalCallId)) {
             for (const id of attempts.ids) {
               if (workerAttemptOwnsParentCall(db, childSessionId, id, { sessionId: parent.sessionId, seq: parent.seq,
-                callId: data.parentLogicalCallId, argumentDigest: call.argument_digest }, rootSessionId, roots)) ownedAttempts.add(id);
+                callId: data.parentLogicalCallId, argumentDigest: call.argument_digest }, rootSessionId, roots, ownsParentAttempt)) ownedAttempts.add(id);
               else graph.issues.add(`unproved_worker_attempt:${childKey}:${id}`);
             }
           }
@@ -2046,28 +2062,18 @@ function readWorkerUsageGraph(
   return graph;
 }
 
-/**
- * Explicit whole-task scope. Host-validated approval execution edges extend
- * public delivery; reciprocally verified worker edges extend usage ownership.
- * Adjacent turns, matching text and timestamps never establish parentage.
- * Each NDJSON row is selected once; overlapping turn totals are never summed.
- * Unproved candidate cost is reported separately, not discarded as free work.
- */
-export function measureAcceptedTask(
-  home: string,
-  sessionId: string,
-  rootSourceUserSeq: number,
-): AcceptedTaskMeasurement {
-  if (!Number.isSafeInteger(rootSourceUserSeq) || rootSourceUserSeq <= 0) {
-    throw new Error('rootSourceUserSeq must be a positive event sequence');
-  }
-  const dbPath = path.join(home, 'state', 'harness.db');
-  const sessionRead = readSessionEvents(dbPath, sessionId);
-  const inputs = sessionRead.events.filter((event) => event.type === 'user_input_received');
-  const root = inputs.find((event) => event.seq === rootSourceUserSeq);
-  if (!root || root.role !== 'user' || root.data.synthetic === true) {
-    throw new Error(`${sessionId}:${rootSourceUserSeq} is not an accepted human user input`);
-  }
+interface AcceptedApprovalGraph {
+  members: Map<number, SessionEvent>;
+  claimedMembers: Map<number, SessionEvent>;
+  parentBySource: Map<number, number>;
+  approvalContinuations: ApprovalContinuationMeasurement[];
+  lineageIssues: Set<string>;
+}
+
+/** Shared exact approval traversal for public tasks and already-proved hosted
+ * workflow roots. Calling this does not admit an otherwise unproved root. */
+function readAcceptedApprovalGraph(dbPath: string, sessionId: string, root: SessionEvent,
+  inputs: SessionEvent[], sessionEvents: SessionEvent[]): AcceptedApprovalGraph {
   const members = new Map<number, SessionEvent>([[root.seq, root]]);
   // A readable claim is enough to keep possible cost visible, never enough to
   // admit a source to the authoritative lineage used for proven totals.
@@ -2075,7 +2081,7 @@ export function measureAcceptedTask(
   const parentBySource = new Map<number, number>();
   const approvalContinuations: ApprovalContinuationMeasurement[] = [];
   const lineageIssues = new Set<string>();
-  const resumes = sessionRead.events.filter((event) => event.type === 'run_resumed' && event.role === 'system');
+  const resumes = sessionEvents.filter((event) => event.type === 'run_resumed' && event.role === 'system');
   const db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 5_000 });
   try {
     db.pragma('query_only = ON');
@@ -2133,6 +2139,135 @@ export function measureAcceptedTask(
       lineageIssues.add(`unproved_approval_resume:${resume.seq}`);
     }
   }
+  return { members, claimedMembers, parentBySource, approvalContinuations, lineageIssues };
+}
+
+interface WorkflowUsageScope {
+  sessionId: string;
+  source: SessionEvent;
+  events: SessionEvent[];
+  attempts: AttemptRead;
+  terminal?: SessionEvent;
+  rootKey: string;
+  parentKey?: string;
+}
+
+/** Extend only already-proved hosted roots through the established approval
+ * and reciprocal worker rules. Parent task ownership is not a trace ancestor:
+ * a foreground source can never borrow a hosted attempt or its response. */
+function readWorkflowUsageGraph(dbPath: string, participants: readonly AcceptedTaskWorkflowParticipant[]) {
+  const scopes = new Map<string, WorkflowUsageScope>();
+  const claims = new Set<string>(); const attempts = new Set<string>(); const issues = new Set<string>();
+  const workerGraphs: WorkerUsageGraph[] = [];
+  const approvals: AcceptedTaskMeasurement['workflowApprovalContinuations'] = [];
+  const conflicting = new Set<string>();
+  for (const participant of participants) {
+    const read = readSessionEvents(dbPath, participant.sessionId);
+    const root = read.events.find(event => event.seq === participant.sourceUserSeq
+      && event.role === 'user' && event.type === 'user_input_received' && event.data.synthetic !== true);
+    const rootKey = usageSourceKey(participant.sessionId, participant.sourceUserSeq);
+    if (!root) { issues.add(`workflow_hosted_source_changed:${rootKey}`); continue; }
+    if (read.malformedEventPayloads) issues.add(`workflow_malformed_session_events:${rootKey}`);
+    const graph = readAcceptedApprovalGraph(dbPath, participant.sessionId, root,
+      read.events.filter(event => event.type === 'user_input_received'), read.events);
+    for (const issue of graph.lineageIssues) issues.add(`workflow_${issue}`);
+    for (const seq of graph.claimedMembers.keys()) {
+      claims.add(usageSourceKey(participant.sessionId, seq));
+      for (const id of readAttemptsForSource(dbPath, participant.sessionId, seq).ids) attempts.add(id);
+    }
+    const allowedParentAttempts = new Map<number, ReadonlySet<string>>();
+    for (const source of graph.members.values()) {
+      const key = usageSourceKey(participant.sessionId, source.seq);
+      let owned = readAttemptsForSource(dbPath, participant.sessionId, source.seq);
+      if (source.seq === root.seq) {
+        if (participant.attemptIds.some(id => !owned.ids.has(id))) {
+          issues.add(`workflow_hosted_attempt_changed:${key}`); conflicting.add(key); continue;
+        }
+        const ids = new Set(participant.attemptIds);
+        // Receipt proof may reject foreign same-source run attempts. Never
+        // re-admit them via a broad session/source lookup here.
+        if (owned.ids.size !== ids.size) owned = { ids, closeoutAt: null,
+          unfinished: [...ids].filter(id => owned.bounds.get(id)?.end == null).length,
+          bounds: new Map([...owned.bounds].filter(([id]) => ids.has(id))) };
+      }
+      allowedParentAttempts.set(source.seq, owned.ids);
+      const parent = graph.parentBySource.get(source.seq);
+      const next: WorkflowUsageScope = { sessionId: participant.sessionId, source, events: read.events, attempts: owned,
+        terminal: ownedTerminal(participant.sessionId, source, read.events, false) ?? undefined, rootKey,
+        ...(parent === undefined ? {} : { parentKey: usageSourceKey(participant.sessionId, parent) }) };
+      const previous = scopes.get(key);
+      if (previous && (previous.rootKey !== next.rootKey || previous.parentKey !== next.parentKey
+        || JSON.stringify([...previous.attempts.ids].sort()) !== JSON.stringify([...next.attempts.ids].sort()))) {
+        conflicting.add(key); issues.add(`workflow_conflicting_source_owner:${key}`);
+      } else scopes.set(key, next);
+    }
+    for (const approval of graph.approvalContinuations) {
+      if (!approvals.some(row => row.sessionId === participant.sessionId && row.controlSourceUserSeq === approval.controlSourceUserSeq))
+        approvals.push({ sessionId: participant.sessionId, ...approval });
+    }
+    workerGraphs.push(readWorkerUsageGraph(dbPath, participant.sessionId, graph.members, graph.claimedMembers, allowedParentAttempts));
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [key, scope] of scopes) if (conflicting.has(key) || (scope.parentKey && !scopes.has(scope.parentKey))) {
+      scopes.delete(key); issues.add(`workflow_unproved_source_ancestry:${key}`); changed = true;
+    }
+  }
+  return { scopes, claims, attempts, issues, workerGraphs, approvals };
+}
+
+/** One worker source has one reciprocal parent. Conflicts remain claimed and
+ * invalidate descendants across independently proved hosted/public roots. */
+function mergeWorkerUsageGraphs(graphs: readonly WorkerUsageGraph[], roots: ReadonlySet<string>): WorkerUsageGraph {
+  const result: WorkerUsageGraph = { scopes: new Map(), claimedSources: new Set(), claimedAttempts: new Set(), issues: new Set() };
+  const conflicting = new Set<string>();
+  for (const graph of graphs) {
+    for (const key of graph.claimedSources) result.claimedSources.add(key);
+    for (const id of graph.claimedAttempts) result.claimedAttempts.add(id);
+    for (const issue of graph.issues) result.issues.add(issue);
+    for (const [key, scope] of graph.scopes) {
+      const previous = result.scopes.get(key);
+      if (roots.has(key) || (previous && JSON.stringify(previous.participant) !== JSON.stringify(scope.participant))) {
+        conflicting.add(key); result.issues.add(`conflicting_worker_parent:${key}`);
+      } else result.scopes.set(key, scope);
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [key, scope] of result.scopes) if (conflicting.has(key)
+      || (!roots.has(scope.parentKey) && !result.scopes.has(scope.parentKey))) {
+      result.scopes.delete(key); result.issues.add(`unproved_worker_ancestry:${key}`); changed = true;
+    }
+  }
+  return result;
+}
+
+/**
+ * Explicit whole-task scope. Host-validated approval execution edges extend
+ * public delivery; reciprocally verified worker edges extend usage ownership.
+ * Adjacent turns, matching text and timestamps never establish parentage.
+ * Each NDJSON row is selected once; overlapping turn totals are never summed.
+ * Unproved candidate cost is reported separately, not discarded as free work.
+ */
+export function measureAcceptedTask(
+  home: string,
+  sessionId: string,
+  rootSourceUserSeq: number,
+): AcceptedTaskMeasurement {
+  if (!Number.isSafeInteger(rootSourceUserSeq) || rootSourceUserSeq <= 0) {
+    throw new Error('rootSourceUserSeq must be a positive event sequence');
+  }
+  const dbPath = path.join(home, 'state', 'harness.db');
+  const sessionRead = readSessionEvents(dbPath, sessionId);
+  const inputs = sessionRead.events.filter((event) => event.type === 'user_input_received');
+  const root = inputs.find((event) => event.seq === rootSourceUserSeq);
+  if (!root || root.role !== 'user' || root.data.synthetic === true) {
+    throw new Error(`${sessionId}:${rootSourceUserSeq} is not an accepted human user input`);
+  }
+  const { members, claimedMembers, parentBySource, approvalContinuations, lineageIssues } =
+    readAcceptedApprovalGraph(dbPath, sessionId, root, inputs, sessionRead.events);
 
   const issues = new Set<string>(lineageIssues);
   const attemptsBySource = new Map<number, AttemptRead>();
@@ -2163,11 +2298,41 @@ export function measureAcceptedTask(
   }
   const events = sessionRead.events.filter((event) => eventSeqs.has(event.seq));
   const acceptedSource = `${sessionId}:${root.seq}`;
-  const workers = readWorkerUsageGraph(dbPath, sessionId, members, claimedMembers);
-  for (const issue of workers.issues) issues.add(issue);
+  const accountingSources = [...members.keys()].map(sourceUserSeq => ({ sessionId, sourceUserSeq }));
+  const workflowInventory = readAcceptedTaskWorkflowCandidates(home, accountingSources);
+  const workflowProof = readAcceptedTaskWorkflowParticipants(home, accountingSources, {
+    isWorkflowParentTerminalIdentity: input => readAcceptedTaskWorkflowParentTerminalIdentity(home, input),
+  });
+  const workflow = readWorkflowUsageGraph(dbPath, workflowProof.participants);
+  const workflowIssues = new Set([...workflowProof.issues, ...workflow.issues]);
+  // Dispatch claims alone do not prove every run-level judge/heal/memory leg.
+  if (workflowInventory.candidates.length) workflowIssues.add('workflow_run_level_usage_inventory_unproved');
   const sourceByAccepted = new Map([...members.keys()].map((seq) => [usageSourceKey(sessionId, seq), seq]));
+  for (const [key, scope] of workflow.scopes) {
+    if (sourceByAccepted.has(key)) { workflow.scopes.delete(key); workflowIssues.add(`workflow_conflicting_public_source:${key}`); }
+    else sourceByAccepted.set(key, scope.source.seq);
+  }
+  const workers = mergeWorkerUsageGraphs([readWorkerUsageGraph(dbPath, sessionId, members, claimedMembers), ...workflow.workerGraphs],
+    new Set(sourceByAccepted.keys()));
+  for (const issue of workers.issues) issues.add(issue);
+  for (const issue of workflowIssues) issues.add(issue);
   const usageSourceByAttempt = new Map([...sourceByAttempt].map(([id, seq]) => [id, usageSourceKey(sessionId, seq)]));
   const usageParentBySource = new Map([...parentBySource].map(([child, parent]) => [usageSourceKey(sessionId, child), usageSourceKey(sessionId, parent)]));
+  const conflictingUsageAttempts = new Set<string>();
+  const bindUsageAttempt = (id: string, key: string) => {
+    const prior = usageSourceByAttempt.get(id);
+    if (conflictingUsageAttempts.has(id) || (prior !== undefined && prior !== key)) {
+      conflictingUsageAttempts.add(id); usageSourceByAttempt.delete(id); issues.add(`conflicting_usage_attempt:${id}`);
+    } else usageSourceByAttempt.set(id, key);
+  };
+  let workflowAttemptCount = 0; let unfinishedWorkflowAttempts = 0;
+  for (const [key, scope] of workflow.scopes) {
+    if (scope.parentKey) usageParentBySource.set(key, scope.parentKey);
+    workflowAttemptCount += scope.attempts.ids.size;
+    unfinishedWorkflowAttempts += scope.attempts.unfinished;
+    if (scope.attempts.unfinished) issues.add(`unfinished_workflow_attempt:${key}`);
+    for (const id of scope.attempts.ids) bindUsageAttempt(id, key);
+  }
   let workerAttemptCount = 0;
   let unfinishedWorkerAttempts = 0;
   for (const [key, worker] of workers.scopes) {
@@ -2177,17 +2342,17 @@ export function measureAcceptedTask(
     unfinishedWorkerAttempts += worker.attempts.unfinished;
     if (worker.attempts.unfinished > 0) issues.add(`unfinished_worker_attempt:${key}`);
     for (const id of worker.attempts.ids) {
-      const prior = usageSourceByAttempt.get(id);
-      if (prior !== undefined && prior !== key) {
-        usageSourceByAttempt.delete(id);
-        issues.add(`conflicting_worker_attempt:${id}`);
-      } else usageSourceByAttempt.set(id, key);
+      bindUsageAttempt(id, key);
     }
   }
   const claimedAccepted = new Set([...claimedMembers.keys()].map((seq) => `${sessionId}:${seq}`));
   for (const key of workers.claimedSources) claimedAccepted.add(key);
+  for (const key of workflow.claims) claimedAccepted.add(key);
+  for (const source of workflowProof.claimedSources) claimedAccepted.add(usageSourceKey(source.sessionId, source.sourceUserSeq));
   const claimedAttemptIds = new Set(sourceByAttempt.keys());
   for (const id of workers.claimedAttempts) claimedAttemptIds.add(id);
+  for (const id of workflow.attempts) claimedAttemptIds.add(id);
+  for (const id of workflowProof.claimedAttemptIds) claimedAttemptIds.add(id);
   for (const source of claimedMembers.keys()) {
     if (!members.has(source)) {
       for (const id of readAttemptsForSource(dbPath, sessionId, source).ids) claimedAttemptIds.add(id);
@@ -2212,23 +2377,22 @@ export function measureAcceptedTask(
     return false;
   };
   const usageRead = readUsageEvents(path.join(home, 'state', 'token-usage'));
-  const accountingSources = [...members.keys()].map(sourceUserSeq => ({ sessionId, sourceUserSeq }));
   const proactive = readAcceptedTaskNoticingParticipants(home, accountingSources);
-  const workflowInventory = readAcceptedTaskWorkflowCandidates(home, accountingSources);
   const proactiveSelection = selectAcceptedTaskNoticingUsage({ ...proactive,
     acceptedSources: new Set(accountingSources.map(source => usageSourceKey(source.sessionId, source.sourceUserSeq))),
     usage: usageRead.events });
   const proactiveIssues = [...new Set([...proactive.issues, ...proactiveSelection.issues])];
   for (const issue of proactiveIssues) issues.add(issue);
-  for (const issue of workflowInventory.issues) issues.add(issue);
-  if (workflowInventory.candidates.length) issues.add('workflow_participant_inventory_unproved');
+  for (const issue of workflowInventory.issues) if (issue !== 'workflow_candidate_authority_and_usage_unproved') issues.add(issue);
   const proactiveExact = new Set(proactiveSelection.exactIndices);
   const proactiveUnproven = new Set(proactiveSelection.unprovenIndices);
   const exactUsage: UsageEvent[] = [];
   const unprovenUsage: UsageEvent[] = [];
   const usageAttemptIds = new Set<string>();
+  let workflowExactUsageRecords = 0;
   let legacyWindowUsageRecords = 0;
   let unscopedWindowUsageRecords = 0;
+  const claimedWorkflowRunSources = new Set(workflowProof.claimedRunIds.map(id => `workflow:${id}`));
   for (const [index, event] of usageRead.events.entries()) {
     // One read and one row selection. An exact precursor is included in task
     // recorded usage, but cannot supply an accepted source/attempt or time.
@@ -2247,11 +2411,17 @@ export function measureAcceptedTask(
           : isUsageAncestor(event.trace.acceptedSource!, attemptSource))) {
         exactUsage.push(event);
         usageAttemptIds.add(attemptId!);
+        if (workflow.scopes.has(attemptSource)) workflowExactUsageRecords += 1;
       } else {
         unprovenUsage.push(event);
         issues.add('unproved_usage_attribution');
       }
       continue;
+    }
+    // Run-level namespace is a possible cost claim only, never an exact
+    // accepted-source/attempt bridge or evidence of absent background work.
+    if (claimedWorkflowRunSources.has(event.source) || claimedWorkflowRunSources.has(event.trace?.acceptedSource ?? '')) {
+      unprovenUsage.push(event); issues.add('workflow_run_level_usage_unproved'); continue;
     }
     // A different exact source is not a legacy same-session row just because
     // its asynchronous work happened during a member's wall-time window.
@@ -2270,6 +2440,18 @@ export function measureAcceptedTask(
   for (const issue of mainModelUsageCoverageIssues(sessionId, sessionRead.events, new Map(
     [...members].map(([seq, source]) => [seq, { source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq) }]),
   ), exactUsage, isAncestor)) issues.add(issue);
+  const hostedSessions = new Map<string, { events: SessionEvent[]; sources: Map<number, TimingSource> }>();
+  for (const scope of workflow.scopes.values()) {
+    let hosted = hostedSessions.get(scope.sessionId);
+    if (!hosted) { hosted = { events: scope.events, sources: new Map() }; hostedSessions.set(scope.sessionId, hosted); }
+    hosted.sources.set(scope.source.seq, { source: scope.source, attempts: scope.attempts, terminal: scope.terminal });
+  }
+  for (const [hostSessionId, hosted] of hostedSessions) {
+    for (const issue of mainModelUsageCoverageIssues(hostSessionId, hosted.events, hosted.sources, exactUsage,
+      (ancestor, descendant) => isUsageAncestor(usageSourceKey(hostSessionId, ancestor), usageSourceKey(hostSessionId, descendant)))) {
+      issues.add(`workflow_${issue}:${hostSessionId}`);
+    }
+  }
   for (const [key, worker] of workers.scopes) {
     const usage = exactUsage.filter(row => typeof row.trace?.attemptId === 'string' && worker.attempts.ids.has(row.trace.attemptId));
     const responses = worker.events.filter(event => event.type === 'worker_model_response_completed'
@@ -2407,6 +2589,10 @@ export function measureAcceptedTask(
     proactiveExactUsageRecords: proactiveExact.size,
     proactiveUsageScope: { timing: 'precursor_operations_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
     workflowUsageInventory: workflowInventory,
+    workflowUsageParticipants: workflowProof.participants.filter(participant => workflow.scopes.has(usageSourceKey(participant.sessionId, participant.sourceUserSeq))),
+    workflowApprovalContinuations: workflow.approvals, workflowUsageIssues: [...workflowIssues],
+    workflowAttemptCount, unfinishedWorkflowAttempts, workflowExactUsageRecords,
+    workflowUsageScope: { scope: 'recorded_hosted_steps_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
     exactUsageRecords: exactUsage.length,
     unprovenUsage: { usageRecords: unproven.usageRecords, promptTokens: unproven.promptTokens,
       cachedInputTokens: unproven.cachedInputTokens, uncachedInputTokens: unproven.uncachedInputTokens, outputTokens: unproven.outputTokens },
@@ -2761,7 +2947,11 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     row('Unfinished helper attempts', b.unfinishedWorkerAttempts ?? 0, c.unfinishedWorkerAttempts ?? 0),
     row('Receipt-linked proactive jobs', b.proactiveUsageParticipants?.length ?? null, c.proactiveUsageParticipants?.length ?? null),
     row('Original-response-linked proactive usage rows', b.proactiveExactUsageRecords ?? null, c.proactiveExactUsageRecords ?? null),
-    row('Workflow dispatch candidates (unproved, not admitted)', b.workflowUsageInventory?.candidates.length ?? null, c.workflowUsageInventory?.candidates.length ?? null),
+    row('Workflow dispatch claims (authority checked separately)', b.workflowUsageInventory?.candidates.length ?? null, c.workflowUsageInventory?.candidates.length ?? null),
+    row('Proved hosted workflow sources', b.workflowUsageParticipants?.length ?? null, c.workflowUsageParticipants?.length ?? null),
+    row('Exact hosted workflow usage rows', b.workflowExactUsageRecords ?? null, c.workflowExactUsageRecords ?? null),
+    row('Hosted workflow attempts (separate from foreground)', b.workflowAttemptCount ?? null, c.workflowAttemptCount ?? null),
+    row('Unfinished hosted workflow attempts', b.unfinishedWorkflowAttempts ?? null, c.unfinishedWorkflowAttempts ?? null),
     row('Durable attempts', b.attemptCount, c.attemptCount),
     row('Unfinished attempts', b.unfinishedAttempts, c.unfinishedAttempts),
     row('Model routes', b.modelRouteEvents, c.modelRouteEvents),
@@ -2798,7 +2988,7 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
       warnings.push(`${measurement.acceptedSource}: proactive operations are receipt-linked; only original-response-proved rows extend usage. Precursor timing is separate from task execution and its serving identity is not measured by the latest build pin.`);
     }
     if (measurement.workflowUsageInventory?.candidates.length) {
-      warnings.push(`${measurement.acceptedSource}: workflow dispatch candidates are unproved and excluded; missing full retention-compatible authority/call evidence does not establish zero usage.`);
+      warnings.push(`${measurement.acceptedSource}: workflow rows extend recorded usage only for proved hosted sources/attempts and reciprocal helpers. Run-level call inventory, serving identity and workflow critical path remain unqualified; absent rows do not establish zero cost.`);
     }
     if (measurement.usageCertificationIssues.some(issue => /^(worker_(host_response|response_without|model_without|failed_attempt)|conflicting_worker_response_bridge|invalid_worker_response_ownership)/.test(issue))) {
       warnings.push(`${measurement.acceptedSource}: helper request usage coverage is unknown/incomplete; absent or conflicting response evidence does not establish zero cost.`);
