@@ -1,7 +1,7 @@
 /**
  * Run: node scripts/run-tests-isolated.mjs src/journeys/host-process-restart-settled.test.ts
  *
- * A real process boundary for settled host_v1 calls. Provider body evidence is
+ * A real process boundary for settled and Stop-uncertain host_v1 calls. Provider body evidence is
  * append-only and deliberately lives outside SQLite, so reopening durable
  * result bytes cannot be confused with another in-process callback count.
  */
@@ -52,6 +52,16 @@ type PhaseAResult = {
     read: DurableCounts;
     write: DurableCounts;
   };
+  uncertain?: {
+    stoppedAttemptId: string;
+    counts: DurableCounts;
+    frozenRows: string;
+    state: 'unknown';
+    outcome: 'uncertain_write';
+    requiresReconciliation: true;
+    retrySameCandidate: false;
+    stopLatchCleared: true;
+  };
 };
 
 type PhaseBResult = {
@@ -79,6 +89,14 @@ type PhaseBResult = {
     successorAfterFirst: DurableCounts;
     successorAfterReplay: DurableCounts;
   };
+  uncertain?: {
+    continuedAttemptId: string;
+    denials: string[];
+    countsBefore: DurableCounts;
+    countsAfter: DurableCounts;
+    frozenRows: string;
+    outcome: 'uncertain_write';
+  };
 };
 
 function spawnPhase(input: {
@@ -86,6 +104,7 @@ function spawnPhase(input: {
   phase: 'A' | 'B';
   bodyLog: string;
   prior?: PhaseAResult;
+  stopUncertain?: boolean;
 }) {
   return spawnSync(process.execPath, ['--import', 'tsx', fixture], {
     cwd: repoRoot,
@@ -98,6 +117,7 @@ function spawnPhase(input: {
       MCP_AUTO_IMPORT_ENABLED: 'false',
       CLEM_HOST_RESTART_PHASE: input.phase,
       CLEM_HOST_RESTART_BODY_LOG: input.bodyLog,
+      CLEM_HOST_RESTART_STOP_UNCERTAIN: input.stopUncertain ? '1' : '0',
       ...(input.prior ? {
         CLEM_HOST_RESTART_PRIOR: Buffer.from(JSON.stringify(input.prior), 'utf8').toString('base64url'),
       } : {}),
@@ -105,7 +125,9 @@ function spawnPhase(input: {
   });
 }
 
-test('settled host_v1 calls reopen across a fresh OS process without another provider crossing', () => {
+for (const stopUncertain of [false, true]) test(stopUncertain
+  ? 'an exact Stop preserves an uncertain write across a fresh process and repeated owned continuation never crosses again'
+  : 'settled host_v1 calls reopen across a fresh OS process without another provider crossing', () => {
   const home = mkdtempSync(path.join(os.tmpdir(), 'clem-host-process-restart-'));
   const bodyLog = path.join(home, 'provider-bodies.jsonl');
   try {
@@ -113,13 +135,13 @@ test('settled host_v1 calls reopen across a fresh OS process without another pro
     writeFileSync(path.join(home, 'state', 'machine-id'), 'machine-host-process-restart\n', 'utf8');
     writeFileSync(bodyLog, '', { encoding: 'utf8', mode: 0o600 });
 
-    const first = spawnPhase({ home, phase: 'A', bodyLog });
+    const first = spawnPhase({ home, phase: 'A', bodyLog, stopUncertain });
     assert.equal(first.status, 0, first.stderr || first.stdout);
     const phaseA = JSON.parse(first.stdout) as PhaseAResult;
     assert.equal(phaseA.phase, 'A');
     assert.equal(phaseA.root.authorityKind, 'host_v1');
 
-    const second = spawnPhase({ home, phase: 'B', bodyLog, prior: phaseA });
+    const second = spawnPhase({ home, phase: 'B', bodyLog, prior: phaseA, stopUncertain });
     assert.equal(second.status, 0, second.stderr || second.stdout);
     const phaseB = JSON.parse(second.stdout) as PhaseBResult;
     assert.equal(phaseB.phase, 'B');
@@ -152,6 +174,32 @@ test('settled host_v1 calls reopen across a fresh OS process without another pro
     assert.deepEqual(phaseA.counts.write, expectedSettledCounts);
     assert.deepEqual(phaseB.counts.successorAfterFirst, expectedSettledCounts);
 
+    if (stopUncertain) {
+      assert.ok(phaseA.uncertain);
+      assert.ok(phaseB.uncertain);
+      assert.equal(phaseA.uncertain.state, 'unknown');
+      assert.equal(phaseA.uncertain.outcome, 'uncertain_write');
+      assert.equal(phaseA.uncertain.requiresReconciliation, true);
+      assert.equal(phaseA.uncertain.retrySameCandidate, false);
+      assert.equal(phaseA.uncertain.stopLatchCleared, true,
+        'unknown settlement survives the production attempt finisher clearing its exact Stop latch');
+      assert.notEqual(phaseB.uncertain.continuedAttemptId, phaseA.uncertain.stoppedAttemptId);
+      assert.equal(phaseB.uncertain.denials.length, 2);
+      for (const denial of phaseB.uncertain.denials) assert.match(denial, /uncertain_write is not replayable/);
+      assert.deepEqual(phaseA.uncertain.counts, { ...expectedSettledCounts, result_handle_n: 0 });
+      assert.deepEqual(phaseB.uncertain.countsBefore, phaseA.uncertain.counts);
+      assert.deepEqual(phaseB.uncertain.countsAfter, phaseA.uncertain.counts);
+      assert.equal(phaseB.uncertain.frozenRows, phaseA.uncertain.frozenRows,
+        'Stop, ignored late success, restart and two exact re-drives preserve the same durable uncertain effect');
+      assert.equal(phaseB.uncertain.outcome, 'uncertain_write');
+      // This exercises the actual host invocation kernel for the same accepted
+      // source/logical call. It does not prove UI Continue routing, a newly
+      // generated call identity, provider reconnect, or real provider success.
+    } else {
+      assert.equal(phaseA.uncertain, undefined);
+      assert.equal(phaseB.uncertain, undefined);
+    }
+
     const bodyRows = readFileSync(bodyLog, 'utf8')
       .split('\n')
       .filter(Boolean)
@@ -159,10 +207,11 @@ test('settled host_v1 calls reopen across a fresh OS process without another pro
     assert.deepEqual(bodyRows.map((row) => row.callId), [
       'restaurant-read',
       'sheet-create',
+      ...(stopUncertain ? ['uncertain-sheet-create'] : []),
       'successor-read',
     ]);
-    assert.deepEqual(bodyRows.map((row) => row.phase), ['A', 'A', 'B']);
-    assert.deepEqual(bodyRows.map((row) => row.pid), [phaseA.pid, phaseA.pid, phaseB.pid]);
+    assert.deepEqual(bodyRows.map((row) => row.phase), ['A', 'A', ...(stopUncertain ? ['A'] : []), 'B']);
+    assert.deepEqual(bodyRows.map((row) => row.pid), [phaseA.pid, phaseA.pid, ...(stopUncertain ? [phaseA.pid] : []), phaseB.pid]);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

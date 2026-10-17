@@ -5,6 +5,7 @@
  * completed write stays visible as already done so it is never re-issued.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -13,8 +14,11 @@ import type { AgentInputItem } from '@openai/agents';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-compaction-continuity-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 process.env.CLEMMY_AUTO_COMPACT = 'on';
+process.env.EMBEDDINGS_DISABLED = 'true';
+process.env.CLEMMY_EMBED_AT_WRITE = 'off';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-compaction-continuity\n', 'utf8');
 
@@ -136,4 +140,118 @@ test('an approved plan, a user correction, a pending approval and a completed-wr
     observer: { lane: 'composio', callId: 'write-q3', turn: 1 },
   });
   assert.notEqual(again.status, 'committed', `a settled write is not committed a second time: ${JSON.stringify(again)}`);
+});
+
+test('a scoped durable correction and complete standing context survive forced compaction and reopen after selection changes', async t => {
+  const agents = await import('../../agents/agent-record.js');
+  const projects = await import('../../projects/project-record.js');
+  const { setSessionAgent } = await import('../../agents/session-agent.js');
+  const { setSessionProject } = await import('../../projects/session-project.js');
+  const contexts = await import('./source-session-context.js');
+  const sourceScope = await import('./source-session-context-scope.js');
+  const composition = await import('./session-composition.js');
+  const memory = await import('../../memory/db.js');
+  const scopes = await import('../../memory/memory-scope.js');
+  const facts = await import('../../memory/facts.js');
+  const corrections = await import('../../memory/fact-correction.js');
+  t.after(() => {
+    _setCompactionSummarizerForTests(null);
+    memory.closeMemoryDb();
+    projects._closeProjectStoreForTests();
+  });
+  const standing = `For controlled reports, preserve the complete project code and the separate footer.\n${'Keep each controlled section in its saved order.\n'.repeat(100)}Draft only; never send a report without my approval.`;
+  const projectContext = `Controlled compaction project: keep each saved section.\n${'Retain the controlled context for every section.\n'.repeat(60)}The approved report uses its saved heading and keeps its footer unchanged.`;
+  const savedAgent = agents.createAgentRecord({ name: 'Controlled Continuity Editor', instructions: standing, createdFrom: 'console' });
+  const savedProject = projects.createProject({ name: 'Controlled Continuity Project', context: projectContext });
+  assert.ok(savedAgent.ok); assert.ok(savedProject.ok);
+  if (!savedAgent.ok || !savedProject.ok) throw new Error('Controlled standing context was not created.');
+  const session = HarnessSession.create({ kind: 'chat', title: 'scoped correction continuity' });
+  assert.ok(setSessionAgent(session.id, savedAgent.agent.id, { by: 'owner' }).ok);
+  assert.ok(setSessionProject(session.id, savedProject.project.id, { by: 'owner' }).ok);
+  const scope = { projectId: savedProject.project.id, agentKey: scopes.agentScopeKey(savedAgent.agent) };
+  const original = 'The controlled report heading is COPPER GARDEN. The footer stays IVORY MOON.';
+  const revised = original.replace('COPPER GARDEN', 'SILVER ORCHARD');
+  const oldFact = facts.rememberFact({ kind: 'project', content: original, scope, sessionId: session.id,
+    occurredAt: '2026-01-01T00:00:00.000Z' });
+  const neighbor = facts.rememberFact({ kind: 'project', content: 'The separate controlled report code is CEDAR LANTERN.', scope, sessionId: session.id });
+  const ownerText = 'Correction: replace the saved report heading COPPER GARDEN with SILVER ORCHARD. Keep the footer and report code unchanged, and prepare a draft only.';
+  const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: ownerText } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  const captured = contexts.captureFreshSourceSessionContext(identity);
+  assert.ok(captured); assert.deepEqual(captured.memoryScope, scope);
+  const observed = scopes.withMemoryReadScope(scope, () => corrections.readFactObservation(oldFact.id));
+  assert.ok(observed);
+  const patches = [{ before: 'COPPER GARDEN', after: 'SILVER ORCHARD' }];
+  const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const request = { targetId: oldFact.id, expectedObservationDigest: observed.digest, patches,
+    owner: { ...identity, sourceEventId: source.id, sourceContextDigest: captured.digest,
+      logicalToolCallId: 'controlled-scoped-correction', argumentsDigest: digest({ targetId: oldFact.id, patches }),
+      assessmentDigest: digest({ targetId: oldFact.id, expected: observed.digest, patches }), ownerText, occurredAt: source.createdAt } };
+  const corrected = scopes.withMemoryReadScope(scope, () => corrections.correctFactExact(request));
+  assert.equal(corrected.status, 'corrected');
+  if (corrected.status !== 'corrected') throw new Error('Controlled exact correction did not commit.');
+  assert.equal(corrected.proof.after.content, revised);
+  assert.deepEqual(corrected.proof.after.scope, scope);
+  const proofOutput = JSON.stringify(corrected.proof);
+  eventlog.writeToolOutput({ sessionId: session.id, callId: request.owner.logicalToolCallId, tool: 'memory_remember', output: proofOutput });
+  const items: AgentInputItem[] = [user(ownerText),
+    call(request.owner.logicalToolCallId, 'memory_remember', { kind: 'project', content: revised }),
+    result(request.owner.logicalToolCallId, proofOutput)];
+  for (let index = 0; index < 16; index++) {
+    const callId = `scoped-continuity-read-${index}`;
+    const output = `Controlled background notes ${index}: ${'detail '.repeat(200)}`;
+    items.push(call(callId, 'read_file', { path: `controlled-notes/${index}.txt` }), result(callId, output), assistant(`Read controlled section ${index}.`));
+    eventlog.writeToolOutput({ sessionId: session.id, callId, tool: 'read_file', output });
+  }
+  const followup = 'Continue the controlled draft. Keep its saved heading, footer and project code; do not send it.';
+  items.push(user(followup));
+  session.updateConversationSnapshot(items);
+  _setCompactionSummarizerForTests(async () => ({ summary: '- Older controlled lookup notes were read.', modelUsed: 'fixture-summarizer' }));
+  const compacted = await compactSessionIfNeeded(session, items, {
+    inputBudgetTokens: 200_000, layer1ItemThreshold: 10, layer1RetainToolPairs: 2, layer2RetainMessages: 4, forceLayer2: true,
+  });
+  assert.equal(compacted.result.layer1.applied, true);
+  assert.equal(compacted.result.layer2.applied, true);
+  assert.ok(compacted.result.afterTokens < compacted.result.beforeTokens);
+  assert.deepEqual(compacted.nextItems.filter(item => (item as { role?: string }).role === 'user')
+    .map(item => String((item as { content?: unknown }).content)), [ownerText, followup]);
+  session.updateConversationSnapshot(compacted.nextItems);
+
+  const otherAgent = agents.createAgentRecord({ name: 'Controlled Other Editor', instructions: 'FOREIGN_STANDING_CONTEXT' });
+  const otherProject = projects.createProject({ name: 'Controlled Other Project', context: 'FOREIGN_PROJECT_CONTEXT' });
+  assert.ok(otherAgent.ok); assert.ok(otherProject.ok);
+  if (!otherAgent.ok || !otherProject.ok) throw new Error('Controlled alternate selection was not created.');
+  assert.ok(setSessionAgent(session.id, otherAgent.agent.id, { by: 'owner' }).ok);
+  assert.ok(setSessionProject(session.id, otherProject.project.id, { by: 'owner' }).ok);
+  facts.rememberFact({ kind: 'project', content: 'The foreign controlled report heading remains COPPER GARDEN.',
+    scope: { projectId: otherProject.project.id, agentKey: scopes.agentScopeKey(otherAgent.agent) }, sessionId: session.id });
+  memory.closeMemoryDb(); eventlog.closeEventLog();
+  assert.deepEqual(HarnessSession.load(session.id)?.toInputItems(), compacted.nextItems);
+  const retained = contexts.readSourceSessionContext(identity, captured.digest);
+  assert.ok(retained); assert.deepEqual(retained.memoryScope, scope);
+  const replay = scopes.withMemoryReadScope(scope, () => corrections.correctFactExact(request));
+  assert.equal(replay.status, 'replayed');
+  if (replay.status !== 'replayed') throw new Error('The exact correction receipt was not reopened.');
+  assert.equal(replay.currentStateMatches, true);
+  assert.deepEqual(replay.proof, corrected.proof);
+  sourceScope.withSourceSessionContext(retained, () => scopes.withMemoryReadScope(retained.memoryScope, () => {
+    const old = corrections.readFactObservation(oldFact.id);
+    assert.equal(old?.active, false); assert.equal(old?.supersededByFactId, corrected.proof.after.id);
+    const current = corrections.readFactObservation(corrected.proof.after.id);
+    assert.equal(current?.content, revised); assert.deepEqual(current?.scope, scope);
+    assert.equal(corrections.readFactObservation(neighbor.id)?.active, true);
+    const factsContext = facts.renderFactsForInstructions(10, 6000, 'controlled report heading footer project code');
+    assert.ok(factsContext.includes(revised)); assert.ok(factsContext.includes('CEDAR LANTERN'));
+    assert.doesNotMatch(factsContext, /COPPER GARDEN|FOREIGN/);
+    const mount = composition.composeSessionFromStore(session.id);
+    assert.equal(mount.agent?.agent.id, savedAgent.agent.id); assert.equal(mount.project?.project.id, savedProject.project.id);
+    const primaryContext = composition.sessionMountContext(mount);
+    const reviewerContext = composition.sessionAgentReviewContext(session.id);
+    for (const context of [primaryContext, reviewerContext]) {
+      assert.ok(context.includes(standing)); assert.ok(context.includes(projectContext));
+      assert.doesNotMatch(context, /FOREIGN_STANDING_CONTEXT|FOREIGN_PROJECT_CONTEXT/);
+    }
+  }));
+  assert.equal(composition.composeSessionFromStore(session.id).agent?.agent.id, otherAgent.agent.id,
+    'retained task context does not rewrite the owner’s later selection');
 });
