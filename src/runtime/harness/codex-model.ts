@@ -1359,8 +1359,8 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest, ca
     const hasExactSource = Boolean(shapeContext?.sessionId)
       && Number.isSafeInteger(shapeContext?.sourceUserSeq)
       && (shapeContext?.sourceUserSeq ?? 0) > 0;
-    const acceptedSource = hasExactSource
-      ? acceptedSourceIdentity(shapeContext!.sessionId, shapeContext!.sourceUserSeq)
+    const acceptedSource = shapeContext?.sessionId && hasExactSource
+      ? acceptedSourceIdentity(shapeContext.sessionId, shapeContext.sourceUserSeq)
       : undefined;
     // A long chat must not exhaust all diagnostics in its first turn. Use the
     // same exact source key as the usage ledger; never infer it from timing.
