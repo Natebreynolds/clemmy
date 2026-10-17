@@ -9702,7 +9702,9 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.get('/api/console/watches', async (req, res) => {
+  // The older system-heartbeat status/control DTO is distinct from workflow
+  // watches, whose canonical routes are registered by watch-routes.ts.
+  app.get('/api/console/legacy-heartbeat-watches', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const [{ calendarWatchStatus }, { workflowSuggestionsStatus }] = await Promise.all([
@@ -9715,7 +9717,7 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.patch('/api/console/watches/:id', async (req, res) => {
+  app.patch('/api/console/legacy-heartbeat-watches/:id', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
     try {
@@ -9738,7 +9740,7 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/watches/:id/tick', async (req, res) => {
+  app.post('/api/console/legacy-heartbeat-watches/:id/tick', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     if (req.params.id !== 'calendar' && req.params.id !== 'workflow-suggestions') { res.status(404).json({ error: 'unknown watch' }); return; }
     try {
