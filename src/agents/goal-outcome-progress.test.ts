@@ -25,9 +25,9 @@ const { upsertGoalRecord } = await import('../memory/goals-list.js');
 let sequence = 0;
 test.after(() => { log.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
-function accepted() {
+function accepted(existingGoal?: GoalRecord) {
   const id = `goal-projection-${++sequence}`;
-  const saved = upsertGoalRecord({ title: `Controlled business goal ${id}`,
+  const saved = existingGoal ? { ok: true as const, goal: existingGoal } : upsertGoalRecord({ title: `Controlled business goal ${id}`,
     description: 'Produce the fixture result while keeping the account, scope and no-send rule.',
     nextActions: ['Save the controlled result'], blockers: ['External deployment is not accepted'] });
   assert.ok(saved.ok);
@@ -63,9 +63,11 @@ function accepted() {
       progress.readGoalOutcomeProgress({ goals: [currentGoal], proposals: [currentProposal] })[currentGoal.id]! };
 }
 
-function workflow(f: ReturnType<typeof accepted>, label = 'one') {
+function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
+  workflowName?: string; settleContract?: boolean; pinContract?: boolean;
+} = {}) {
   const runId = `workflow-${f.proposal.id}-${label}`;
-  const workflowName = `controlled-${f.proposal.id}-${label}`;
+  const workflowName = options.workflowName ?? `controlled-${f.proposal.id}-${label}`;
   const objective = 'Return the exact controlled product without sending anything.';
   const successCriteria = ['The controlled product is 323.'];
   const definition = { name: workflowName, enabled: true, description: objective,
@@ -98,12 +100,13 @@ function workflow(f: ReturnType<typeof accepted>, label = 'one') {
   const contract = plans.ensureWorkflowRunGoal({ workflowName, runId, objective, successCriteria })!;
   const perCriterion = [{ criterion: successCriteria[0]!, pass: true, method: 'deterministic' as const }];
   plans.recordGoalValidation(contract.id, perCriterion.map(row => ({ ...row, at: '2026-10-17T00:03:00Z', attempt: 1 })));
-  plans.satisfyGoal(contract.id, 'Controlled review passed.');
+  if (options.settleContract !== false) plans.satisfyGoal(contract.id, 'Controlled review passed.');
   const artifact = artifacts.recordStepOutput({ workflowName, runId, stepId: 'compute', output: { product: 323 }, nowIso: '2026-10-17T00:03:00Z' });
   events.appendWorkflowEvent(workflowName, runId, { kind: 'step_completed', stepId: 'compute', output: { product: 323 },
     meta: { mode: 'transform', stepOutputArtifact: artifact } });
   const run = JSON.parse(readFileSync(file, 'utf8'));
   Object.assign(run, { status: 'completed', finishedAt: '2026-10-17T00:03:00Z', goalOutcome: 'satisfied',
+    ...(options.pinContract ? { goalContractId: contract.id } : {}),
     goalValidation: { version: 1, objective, successCriteria, pass: true, judgeFailedOpen: false, perCriterion,
       objectiveReview: { criterion: objective, scope: 'objective', pass: true, method: 'judge' }, validatedAt: '2026-10-17T00:03:00Z' } });
   writeFileSync(file, JSON.stringify(run));
@@ -128,6 +131,105 @@ test('goal outcome exact source, sealed workflow and retained contract survive c
   assert.equal(readFileSync(goalFile, 'utf8'), before, 'projection never changes the broad goal or its self-drive policy');
   assert.equal(JSON.parse(before).status, 'active');
   assert.equal(JSON.parse(before).autoSchedule, undefined);
+});
+
+test('goal outcome exact contract pins join independent runs of one goal without donating either run validation', () => {
+  const first = accepted();
+  const workflowName = `controlled-shared-contract-${first.proposal.id}`;
+  const a = workflow(first, 'first', { workflowName, settleContract: false, pinContract: true });
+  const second = accepted(first.goal);
+  const b = workflow(second, 'independent', { workflowName, pinContract: true });
+  assert.equal(b.contract.id, a.contract.id, 'the real contract producer reuses its active contract');
+  assert.equal(b.contract.origin?.runId, a.runId, 'origin continues to name the first run');
+  assert.equal(b.run.requeuedFromRunId, undefined, 'an independent fire needs no fabricated retry lineage');
+  const failed = structuredClone(a.run);
+  failed.goalOutcome = 'gap'; failed.goalValidation.pass = false;
+  failed.goalValidation.perCriterion[0].pass = false; failed.goalValidation.objectiveReview.pass = false;
+  writeFileSync(a.file, JSON.stringify(failed));
+  const goalFile = path.join(home, 'goals', `${first.goal.id}.json`);
+  const goalBefore = readFileSync(goalFile, 'utf8');
+  const projectBoth = () => progress.readGoalOutcomeProgress({ goals: [first.goal],
+    proposals: [first.proposal, second.proposal] })[first.goal.id]!;
+  const projected = projectBoth();
+  const byProposal = new Map(projected.linkedTasks.map(task => [task.proposalId, task]));
+  assert.equal(byProposal.get(first.proposal.id)?.workflows[0]?.contractId, a.contract.id);
+  assert.equal(byProposal.get(first.proposal.id)?.workflows[0]?.state, 'not_satisfied');
+  assert.equal(byProposal.get(second.proposal.id)?.workflows[0]?.contractId, a.contract.id);
+  assert.equal(byProposal.get(second.proposal.id)?.workflows[0]?.state, 'satisfied');
+  log.closeEventLog(); assert.deepEqual(projectBoth(), projected, 'the exact cross-run link survives reopen');
+  assert.equal(readFileSync(goalFile, 'utf8'), goalBefore, 'subtask links never complete the broad goal');
+  for (const patch of [
+    { goalValidation: undefined },
+    { goalValidation: { ...b.run.goalValidation, judgeFailedOpen: true } },
+    { goalValidation: { ...b.run.goalValidation, successCriteria: ['An unrelated criterion.'] } },
+  ]) {
+    writeFileSync(b.file, JSON.stringify({ ...b.run, ...patch }));
+    assert.notEqual(second.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied',
+      'the shared contract does not replace this run’s own exact review');
+  }
+});
+
+test('goal outcome legacy independent runs join a uniquely retained contract epoch even after it is satisfied', () => {
+  const first = accepted(); const workflowName = `controlled-legacy-contract-${first.proposal.id}`;
+  const a = workflow(first, 'first', { workflowName, settleContract: false });
+  const second = accepted(first.goal); const b = workflow(second, 'independent', { workflowName });
+  const file = path.join(home, 'state', 'plan-proposals', `${a.contract.id}.json`);
+  const contract = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(contract.status, 'satisfied'); assert.equal(contract.origin.runId, a.runId);
+  contract.proposedAt = '2026-10-17T00:00:00Z'; contract.resolvedAt = '2026-10-17T00:04:00Z';
+  writeFileSync(file, JSON.stringify(contract));
+  assert.equal(b.run.goalContractId, undefined);
+  assert.equal(second.project().linkedTasks[0]?.workflows[0]?.contractId, a.contract.id);
+  assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+  const duplicateFile = path.join(path.dirname(file), `other-epoch-${contract.id}.json`);
+  try {
+    writeFileSync(duplicateFile, JSON.stringify({ ...contract, id: `other-epoch-${contract.id}`,
+      proposedAt: '2026-10-17T00:05:00Z', resolvedAt: '2026-10-17T00:08:00Z' }));
+    assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied', 'a disjoint later epoch does not replace the old run’s own epoch');
+    writeFileSync(duplicateFile, JSON.stringify({ ...contract, id: `other-epoch-${contract.id}` }));
+    assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable', 'overlapping compatible epochs are ambiguous, never latest-wins');
+  } finally { rmSync(duplicateFile, { force: true }); }
+  const changed = structuredClone(b.run);
+  changed.workflowDefinitionSnapshot.definition.description = 'A later workflow revision with other constraints.';
+  changed.workflowDefinitionSnapshot.definitionHash = definitions.workflowDefinitionHash(changed.workflowDefinitionSnapshot.definition);
+  writeFileSync(b.file, JSON.stringify(changed));
+  assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable', 'legacy session identity cannot donate across admitted revisions');
+});
+
+test('goal outcome explicit contract identity never falls back through a malformed, missing, foreign or ambiguous pin', () => {
+  const f = accepted(); const w = workflow(f, 'pinned', { pinContract: true });
+  const foreign = accepted(); const other = workflow(foreign);
+  for (const goalContractId of ['', null, 42, 'missing-controlled-contract', other.contract.id]) {
+    writeFileSync(w.file, JSON.stringify({ ...w.run, goalContractId }));
+    assert.equal(f.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable', String(goalContractId));
+  }
+  writeFileSync(w.file, JSON.stringify(w.run));
+  const contractFile = path.join(home, 'state', 'plan-proposals', `${w.contract.id}.json`);
+  const duplicateFile = path.join(path.dirname(contractFile), `copy-${w.contract.id}.json`);
+  try {
+    writeFileSync(duplicateFile, readFileSync(contractFile));
+    assert.equal(f.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable', 'a duplicate retained ID cannot establish uniqueness');
+  } finally { rmSync(duplicateFile, { force: true }); }
+  const unrelated = { ...f.goal, id: `${f.goal.id}-unrelated` };
+  assert.deepEqual(progress.readGoalOutcomeProgress({ goals: [unrelated], proposals: [f.proposal] })[unrelated.id]?.linkedTasks, []);
+});
+
+test('goal outcome legacy retry uses exact retained predecessor proof and rejects a foreign or cyclic chain', () => {
+  const first = accepted(); const workflowName = `controlled-retry-contract-${first.proposal.id}`;
+  const a = workflow(first, 'first', { workflowName, settleContract: false });
+  const second = accepted(first.goal); const b = workflow(second, 'retry', { workflowName });
+  const retry = { ...b.run, requeuedFromRunId: a.runId, recoveryIntent: { sourceRunId: a.runId } };
+  writeFileSync(b.file, JSON.stringify(retry));
+  assert.equal(second.project().linkedTasks[0]?.workflows[0]?.contractId, a.contract.id);
+  assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied');
+  for (const patch of [
+    { recoveryIntent: { sourceRunId: 'foreign-run' } },
+    { requeuedFromRunId: b.runId, recoveryIntent: { sourceRunId: b.runId } },
+    { requeuedFromRunId: '../outside', recoveryIntent: { sourceRunId: '../outside' } },
+  ]) {
+    writeFileSync(b.file, JSON.stringify({ ...retry, ...patch }));
+    assert.equal(second.project().linkedTasks[0]?.workflows[0]?.state, 'unavailable');
+  }
 });
 
 test('goal outcome historical criteria do not become current acceptance after a goal edit or late unrelated task', () => {

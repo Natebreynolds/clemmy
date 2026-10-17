@@ -164,6 +164,8 @@ test('FRAMEWORK-TEST-landed-dataset: a gap after a landed, repeat-safe write re-
   assert.notEqual(first.needsAttention, true);
   assert.equal(first.goalOutcome, 'repursue', first.goalReason);
   assert.equal(first.goalValidation?.pass, false, 'the review verdict stays on the record');
+  assert.equal(typeof first.goalContractId, 'string', 'the actual run retains the exact contract it reviewed');
+  assert.equal(planProposals.getPlanProposal(first.goalContractId)?.origin?.runId, firstRunId);
   assert.equal(first.reportBack?.outcome, 'done');
   assert.doesNotMatch(String(first.reportBack?.detail), /auto-heal is PAUSED|reconcile any completed writes|re-running could double/);
   assert.match(String(first.reportBack?.detail), /landed and stays as it is/);
@@ -183,6 +185,7 @@ test('FRAMEWORK-TEST-landed-dataset: a gap after a landed, repeat-safe write re-
   await runner.processWorkflowRuns({} as never);
 
   const second = readRun(followUp.id);
+  assert.equal(second.goalContractId, first.goalContractId, 'a later actual run pins the reused contract despite its original origin run');
   assert.equal(second.status, 'completed', JSON.stringify(second).slice(0, 800));
   assert.equal(second.terminalOutcome, 'succeeded');
   assert.notEqual(second.needsAttention, true);

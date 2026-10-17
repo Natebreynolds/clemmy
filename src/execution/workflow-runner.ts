@@ -1072,6 +1072,9 @@ export interface QueuedRunRecord {
    * authorities must consume this evidence instead of reconstructing success
    * from terminal prose or a mechanically completed lifecycle state. */
   goalValidation?: WorkflowRunGoalValidationV1;
+  /** Exact contract used by this run's own goal review; shared goals can span
+   * multiple runs while origin.runId continues to name their first run. */
+  goalContractId?: string;
   /** Capability marker: this occurrence was admitted under the fsynced exact
    * structured-mutation receipt protocol. Legacy records omit it. */
   mutationReceiptProtocolVersion?: number;
@@ -16970,6 +16973,7 @@ async function processOneRunFile(
       }
       let goalVerdict: GoalValidationResult | null = null;
       let goalValidation: WorkflowRunGoalValidationV1 | null = null;
+      let goalContractId: string | null = null;
       let goalDecision: GoalRunDecision | null = null;
       let goalFeedbackNext = '';
       let goalRequeueId: string | undefined;
@@ -17049,7 +17053,6 @@ async function processOneRunFile(
         // goal's external home — attempt lineage + per-criterion evidence
         // accumulate across re-pursuit runs, visible to /goal status. Pure
         // bookkeeping: a store hiccup never affects the run.
-        let goalContractId: string | null = null;
         try {
           const contract = ensureWorkflowRunGoal({
             workflowName: workflow.data.name,
@@ -17473,6 +17476,7 @@ async function processOneRunFile(
           : {}),
         ...(goalDecision ? { goalOutcome: goalDecision.action, goalReason: goalDecision.reason } : {}),
         ...(goalValidation ? { goalValidation } : {}),
+        ...(goalContractId ? { goalContractId } : {}),
       };
 
       // Pinned-goal re-pursuit: the run completed mechanically but its goal is

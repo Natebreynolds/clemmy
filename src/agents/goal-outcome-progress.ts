@@ -16,7 +16,7 @@ import { readActiveWorkflowOriginGroup, workflowOriginSourceGroupId,
 import { resolveWorkflowRunDefinitionSnapshot } from '../execution/workflow-run-definition.js';
 import { readWorkflowTargetEvidence } from '../execution/workflow-target-evidence.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
-import { listPlanProposals, type PlanProposal } from './plan-proposals.js';
+import { listPlanProposals, workflowGoalSessionId, type PlanProposal } from './plan-proposals.js';
 import type { QueuedRunRecord } from '../execution/workflow-runner.js';
 
 export interface GoalWorkflowOutcome {
@@ -102,13 +102,22 @@ function exactGroup(sessionId: string, sourceUserSeq: number): ActiveWorkflowOri
   return active;
 }
 
-function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: string, contracts: Map<string, PlanProposal[]>, readbackBudget: { remaining: number }): GoalWorkflowOutcome {
+interface WorkflowGoalContracts {
+  byId: Map<string, PlanProposal[]>;
+  byRun: Map<string, PlanProposal[]>;
+  bySession: Map<string, PlanProposal[]>;
+}
+
+const safeRunId = (value: unknown): value is string => typeof value === 'string'
+  && /^[a-zA-Z0-9_.:-]+$/.test(value) && value !== '.' && value !== '..';
+
+function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: string, contracts: WorkflowGoalContracts, readbackBudget: { remaining: number }): GoalWorkflowOutcome {
   const runId = member.runId;
   const unknown: GoalWorkflowOutcome = { runId, workflowName: 'Workflow', state: 'unavailable',
     criteria: { total: 0, passed: 0, remaining: [] }, artifactReadback: 'not_checked',
     detail: 'The exact workflow record or its objective evidence is unavailable.' };
   try {
-    if (!/^[a-zA-Z0-9_.:-]+$/.test(runId) || runId === '.' || runId === '..') return unknown;
+    if (!safeRunId(runId)) return unknown;
     const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
     const bytes = readFileSync(file, 'utf8');
     const run = JSON.parse(bytes) as QueuedRunRecord;
@@ -118,17 +127,80 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
     unknown.workflowName = bounded(run.workflow, 120);
     const running = ['awaiting_chat_dispatch_seal', 'queued', 'running', 'pending_approval', 'paused'].includes(run.status ?? '');
     if (running && !run.finishedAt) return { ...unknown, state: 'in_progress', detail: 'This exact workflow run has not finished. No completion is inferred.' };
-    const candidates = contracts.get(runId) ?? [];
+    const admission = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+    if (admission.status !== 'valid') return unknown;
+    const declared = admission.snapshot.definition.goal;
+    const contractSessionId = workflowGoalSessionId(admission.snapshot.definition.name);
+    const snapshots = new Map<string, string>([[file, bytes]]);
+    const sameRevision = (id: unknown): QueuedRunRecord | null => {
+      if (!safeRunId(id)) return null;
+      const ancestorFile = path.join(WORKFLOW_RUNS_DIR, `${id}.json`);
+      const ancestorBytes = snapshots.get(ancestorFile) ?? readFileSync(ancestorFile, 'utf8');
+      const ancestor = JSON.parse(ancestorBytes) as QueuedRunRecord;
+      const prior = record(ancestor) && ancestor.id === id
+        ? resolveWorkflowRunDefinitionSnapshot(ancestor.workflowDefinitionSnapshot) : null;
+      if (!prior || prior.status !== 'valid' || prior.snapshot.workflowSlug !== admission.snapshot.workflowSlug
+        || prior.snapshot.definitionHash !== admission.snapshot.definitionHash
+        || prior.snapshot.codeRevision !== admission.snapshot.codeRevision) return null;
+      snapshots.set(ancestorFile, ancestorBytes);
+      return ancestor;
+    };
+    const pinnedCandidates = (run: QueuedRunRecord) => typeof run.goalContractId === 'string' && run.goalContractId.trim()
+      ? contracts.byId.get(run.goalContractId) ?? [] : [];
+    const candidates = (() => {
+      // A present pin is binding, even when malformed or no longer readable.
+      // Never replace it with an unrelated active or same-named contract.
+      if (Object.hasOwn(run, 'goalContractId')) return pinnedCandidates(run);
+      const exact = contracts.byRun.get(runId) ?? [];
+      if (exact.length) return exact;
+      if (run.requeuedFromRunId !== undefined) {
+        let current: QueuedRunRecord = run;
+        const seen = new Set<string>([runId]);
+        for (let hop = 0; hop < 4; hop++) {
+          const previousId = current.requeuedFromRunId;
+          if (!safeRunId(previousId) || seen.has(previousId)) return [];
+          const continued = record(current.goalFollowUp) ? current.goalFollowUp.fromRunId : undefined;
+          const recoveryIntent = (current as QueuedRunRecord & { recoveryIntent?: unknown }).recoveryIntent;
+          const recovery = record(recoveryIntent) ? recoveryIntent.sourceRunId : undefined;
+          if ((continued !== undefined && continued !== previousId) || (recovery !== undefined && recovery !== previousId)
+            || (continued !== previousId && recovery !== previousId)) return [];
+          seen.add(previousId);
+          const previous = sameRevision(previousId);
+          if (!previous) return [];
+          if (Object.hasOwn(previous, 'goalContractId')) return pinnedCandidates(previous);
+          const priorContracts = contracts.byRun.get(previousId) ?? [];
+          if (priorContracts.length) return priorContracts;
+          if (previous.requeuedFromRunId === undefined) return [];
+          current = previous;
+        }
+        return [];
+      }
+      // Legacy independent fires have no persisted pin. A retained contract's
+      // exact canonical session, revision and lifetime must cover this run's
+      // own validation. Overlapping epochs stay ambiguous; never pick latest.
+      return (contracts.bySession.get(contractSessionId) ?? []).filter(contract => {
+        const plan = contract.approvedPlan ?? contract.plan;
+        const validatedAt = Date.parse(run.goalValidation?.validatedAt ?? '');
+        const createdAt = Date.parse(run.createdAt ?? ''), finishedAt = Date.parse(run.finishedAt ?? '');
+        const openedAt = Date.parse(contract.proposedAt);
+        const closedAt = contract.resolvedAt === undefined ? Infinity : Date.parse(contract.resolvedAt);
+        return ['active', 'satisfied', 'expired', 'superseded'].includes(contract.status)
+          && (contract.status === 'active' || Number.isFinite(closedAt))
+          && Number.isFinite(openedAt) && Number.isFinite(validatedAt) && Number.isFinite(createdAt) && Number.isFinite(finishedAt)
+          && openedAt <= validatedAt && validatedAt <= closedAt && createdAt <= validatedAt && validatedAt <= finishedAt
+          && declared && plan?.objective === declared.objective
+          && isDeepStrictEqual(plan?.successCriteria, declared.successCriteria ?? [])
+          && sameRevision(contract.origin?.runId) !== null;
+      });
+    })();
     if (candidates.length !== 1) return { ...unknown, detail: candidates.length > 1
       ? 'More than one goal contract claims this run; its objective evidence is ambiguous.'
       : 'No exact workflow-origin goal contract is retained for this run. A terminal run alone does not verify its objective.' };
     const contract = candidates[0]!;
     const plan = contract.approvedPlan ?? contract.plan;
     const validation = run.goalValidation;
-    const admission = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
-    const declared = admission.status === 'valid' ? admission.snapshot.definition.goal : undefined;
     if (typeof contract.id !== 'string' || !contract.id || !plan || typeof plan.objective !== 'string' || !Array.isArray(plan.successCriteria)
-      || admission.status !== 'valid' || !declared
+      || contract.origin?.kind !== 'workflow' || contract.sessionId !== contractSessionId || !declared
       || (run.workflow !== admission.snapshot.workflowSlug && run.workflow !== admission.snapshot.definition.name)
       || !validation || validation.version !== 1 || validation.objective !== plan.objective
       || declared.objective !== plan.objective
@@ -174,7 +246,7 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
     }
     // Cross-process writes can replace a run while evidence is being read.
     // Never mix one record's review with another generation's readback.
-    if (readFileSync(file, 'utf8') !== bytes) return unknown;
+    if ([...snapshots].some(([name, captured]) => readFileSync(name, 'utf8') !== captured)) return unknown;
     return result;
   } catch { return unknown; }
 }
@@ -186,7 +258,7 @@ export function readGoalOutcomeProgress(input: {
 }): Record<string, GoalOutcomeProgress> {
   const result: Record<string, GoalOutcomeProgress> = Object.create(null);
   if (input.goals.length === 0) return result;
-  const contracts = new Map<string, PlanProposal[]>();
+  const contracts: WorkflowGoalContracts = { byId: new Map(), byRun: new Map(), bySession: new Map() };
   const readbackBudget = { remaining: MAX_READBACKS_PER_CAPTURE };
   let remainingTasks = MAX_TASKS_PER_CAPTURE;
   let remainingRuns = MAX_RUNS_PER_CAPTURE;
@@ -209,8 +281,12 @@ export function readGoalOutcomeProgress(input: {
   }
   for (const contract of capturedContracts) {
     if (contract?.origin?.kind !== 'workflow' || typeof contract.origin.runId !== 'string') continue;
-    const rows = contracts.get(contract.origin.runId) ?? [];
-    rows.push(contract); contracts.set(contract.origin.runId, rows);
+    for (const [index, key] of [[contracts.byRun, contract.origin.runId], [contracts.byId, contract.id],
+      [contracts.bySession, contract.sessionId]] as const) {
+      if (typeof key !== 'string' || !key) continue;
+      const rows = index.get(key) ?? [];
+      rows.push(contract); index.set(key, rows);
+    }
   }
   for (const goal of input.goals) {
     if (!goal || typeof goal.id !== 'string') continue;
