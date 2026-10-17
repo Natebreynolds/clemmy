@@ -87,6 +87,14 @@ export interface CommitWorkspaceObservationBatchInput {
    * projection without duplicating observations.
    */
   afterCommit?: () => void;
+  /**
+   * An item whose refresh id is already stored as an EARLIER observation of
+   * its source (not the current one) makes that observation current again,
+   * instead of a no-op. A content-addressed write that puts back content the
+   * source held before (A, then B, then A) must land; its identity stays the
+   * stored artifact. A retired source is never restored.
+   */
+  restoreEarlierObservation?: boolean;
 }
 
 export interface WorkspaceDatasetObservation {
@@ -1038,7 +1046,12 @@ function commitWorkspaceObservationBatchInternal(
             `refreshId conflict for source "${item.sourceKey}": "${item.refreshId}" was already committed with different content`,
           );
         }
-        committed.push({ ...mapWorkspaceObservation(existing), deduped: true });
+        const restored = input.restoreEarlierObservation === true && !behavior.baselineOnly
+          ? restoreEarlierWorkspaceObservation(db, workspaceId, item, existing)
+          : null;
+        committed.push(restored
+          ? { ...mapWorkspaceObservation(restored), deduped: false }
+          : { ...mapWorkspaceObservation(existing), deduped: true });
         continue;
       }
 
@@ -1166,6 +1179,49 @@ function commitWorkspaceObservationBatchInternal(
       sources: projectedSources,
     },
   };
+}
+
+/** Make an earlier successful observation of a source current again, inside
+ * the caller's commit transaction. Null when it is already current, when the
+ * current observation already holds the same content, or when the source was
+ * retired (re-adding a retired source never restores its old snapshot). */
+function restoreEarlierWorkspaceObservation(
+  db: Database.Database,
+  workspaceId: string,
+  item: PreparedWorkspaceObservation,
+  existing: WorkspaceObservationRow,
+): WorkspaceObservationRow | null {
+  if (existing.is_current === 1 || existing.status !== 'ok' || item.status !== 'ok') return null;
+  const retired = db.prepare(`
+    SELECT 1
+    FROM workspace_dataset_source_retirements
+    WHERE workspace_id = ? AND source_key = ?
+  `).get(workspaceId, item.sourceKey);
+  if (retired) return null;
+  const current = db.prepare(`
+    SELECT *
+    FROM workspace_dataset_observations
+    WHERE workspace_id = ? AND source_key = ? AND is_current = 1
+    LIMIT 1
+  `).get(workspaceId, item.sourceKey) as WorkspaceObservationRow | undefined;
+  if (current && current.content_hash === existing.content_hash) return null;
+  if (current) {
+    db.prepare(`
+      UPDATE workspace_dataset_observations
+      SET is_current = 0
+      WHERE id = ? AND workspace_id = ?
+    `).run(current.id, workspaceId);
+  }
+  db.prepare(`
+    UPDATE workspace_dataset_observations
+    SET is_current = 1, observed_at = ?
+    WHERE id = ? AND workspace_id = ?
+  `).run(item.observedAt, existing.id, workspaceId);
+  return db.prepare(`
+    SELECT *
+    FROM workspace_dataset_observations
+    WHERE id = ?
+  `).get(existing.id) as WorkspaceObservationRow;
 }
 
 function prepareWorkspaceObservation(

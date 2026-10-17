@@ -94,6 +94,7 @@ function mappedObservation(input: {
     data: input.data,
     bytes: input.bytes,
     deduped: input.row.deduped === true,
+    current: input.row.isCurrent,
   };
 }
 
@@ -142,6 +143,7 @@ function createStoragePort(): {
           data: prepared.data,
           provenance,
         }],
+        restoreEarlierObservation: true,
       });
       const row = batch.observations[0];
       if (!row) throw new Error('Workspace observation commit returned no observation');

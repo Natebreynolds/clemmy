@@ -179,9 +179,18 @@ test('manual and reviewed source writes keep source identity and carry whole-fil
   const manual = await carrier.executeManualWorkspaceSetData({ ...args, data_json: '[{"id":"one","state":"Changed"}]' });
   assert.ok(manual.hostFileCommit);
   assert.equal(receipts.readCommittedArtifactContent(facts).verified, false);
+  const manualFacts = receipts.parseHostLocalWriteCommitFacts(manual.hostFileCommit)!;
+  // A reviewed write of content the source held before lands again: it is a
+  // new write, not a replay (live 2026-10-16 a workflow's second "clear
+  // pending" was taken for a replay and the published draft stayed pending).
+  // Its proof vouches only for the bytes it put back, never the manual ones.
+  const again = await carrier.executeReviewedWorkspaceSetData(args);
+  assert.equal(again.created, true);
+  const againFacts = receipts.parseHostLocalWriteCommitFacts(contract.workspaceDatasetHostFileCommit(JSON.stringify(again)))!;
+  assert.equal(receipts.readCommittedArtifactContent(againFacts).verified, true);
+  assert.equal(receipts.readCommittedArtifactContent(manualFacts).verified, false, 'a superseded receipt cannot vouch for the current bytes');
   const replay = await carrier.executeReviewedWorkspaceSetData(args);
-  assert.equal(replay.created, false);
-  assert.equal(replay.hostFileCommit, undefined, 'historical source receipt cannot vouch for fresh unrelated file bytes');
+  assert.equal(replay.created, false, 'writing the current content again is still a replay');
   assert.equal(contract.workspaceDatasetHostFileCommit({ arbitrary: reviewed.hostFileCommit }), undefined);
 });
 

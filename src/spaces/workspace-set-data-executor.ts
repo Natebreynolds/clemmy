@@ -26,6 +26,9 @@ export interface WorkspaceSetDataObservation {
   data: unknown;
   bytes: number;
   deduped: boolean;
+  /** False when this is an earlier observation of the source, not its
+   *  current one. Omitted by ports that cannot tell. */
+  current?: boolean;
 }
 
 export interface WorkspaceSetDataCommitRequest {
@@ -180,7 +183,11 @@ export function executeWorkspaceSetDataWithStorage(
 
   if (options.mode === 'content_addressed') {
     const retained = storage.inspectExact({ workspace, prepared, refreshId });
-    if (retained) {
+    // The same content stored as an EARLIER observation is not a replay of
+    // this write: the source has moved on since, and this write puts that
+    // content back (live 2026-10-16: a workflow's "clear pending" wrote [] a
+    // second time and nothing landed). The commit below makes it current.
+    if (retained && retained.current !== false) {
       if (!observationMatches(retained, workspace, prepared, refreshId)) {
         throw new WorkspaceSetDataExecutionError(
           'observation_conflict',
