@@ -520,12 +520,17 @@ interface CodexCallerSnapshot {
   readonly sessionId?: string; readonly sourceUserSeq?: number; readonly runAttemptId?: string;
   readonly turn?: number; readonly promptComponents?: Record<string, number>;
 }
+interface CodexCacheIdentity {
+  readonly key: string;
+  readonly source: CodexCallerSnapshot;
+}
 interface CodexCallCapture {
   readonly harness: CodexCallerSnapshot;
+  readonly cacheIdentity: CodexCacheIdentity;
   readonly usage: CapturedModelUsageProvenance;
   readonly observation: ReturnType<typeof captureNativeModelCallObservation>;
 }
-function captureCodexCall(path: 'getResponse' | 'getStreamedResponse', signal?: AbortSignal): CodexCallCapture {
+function captureCodexCall(path: 'getResponse' | 'getStreamedResponse', request: ModelRequest): CodexCallCapture {
   // Copy accounting/journal data only. Never run provider work in this harness
   // scope or copy tools, gates, mutable session objects or execution authority.
   let harness: CodexCallerSnapshot = Object.freeze({});
@@ -549,9 +554,17 @@ function captureCodexCall(path: 'getResponse' | 'getStreamedResponse', signal?: 
         ...(Number.isSafeInteger(turn) ? { turn: turn as number } : {}), ...(promptComponents ? { promptComponents } : {}) });
     }
   } catch { /* unowned accounting/journal snapshot remains unowned */ }
+  // A lazy stream may be drained under a different conversation. Capture only
+  // its nonsecret routing key and accounting identity, never the execution ALS
+  // or credentials. The same key survives both adapter and OAuth retries.
+  const split = splitCodexInstructions(request.systemInstructions);
+  const cacheIdentity = Object.freeze({
+    key: codexPromptCacheKey(split.cacheKeySource || split.instructions || 'You are a helpful assistant.', harness.sessionId),
+    source: harness,
+  });
   const usage = captureModelUsageProvenance();
-  return Object.freeze({ harness, usage,
-    observation: captureNativeModelCallObservation('codex', path, CODEX_TRANSPARENT_MAX_RETRIES, signal, usage) });
+  return Object.freeze({ harness, cacheIdentity, usage,
+    observation: captureNativeModelCallObservation('codex', path, CODEX_TRANSPARENT_MAX_RETRIES, request.signal, usage) });
 }
 function inertCodexMetadata(value: unknown, key: string): unknown {
   try {
@@ -595,7 +608,7 @@ export class CodexResponsesModel implements Model {
   constructor(public readonly modelId: string) {}
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const captured = captureCodexCall('getResponse', request.signal);
+    const captured = captureCodexCall('getResponse', request);
     const telemetry = captured.observation.begin();
     let outcome: 'returned' | 'failed' | 'cancelled' = 'failed';
     try {
@@ -605,7 +618,7 @@ export class CodexResponsesModel implements Model {
       const diag: StreamDiagnostics = {};
       telemetry.startAttempt(attempt + 1);
       try {
-        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag))) {
+        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag, captured.cacheIdentity))) {
           events.push(evt);
         }
         if (!events.some((event) => event.type === 'response.completed' || event.type === 'response.done')) {
@@ -639,7 +652,7 @@ export class CodexResponsesModel implements Model {
   }
 
   getStreamedResponse(request: ModelRequest): AsyncIterable<StreamEvent> {
-    const captured = captureCodexCall('getStreamedResponse', request.signal);
+    const captured = captureCodexCall('getStreamedResponse', request);
     return this.observedStreamedResponse(request, captured);
   }
 
@@ -711,7 +724,7 @@ export class CodexResponsesModel implements Model {
       let eventsConsumed = 0;
       let failedEvent: AnyCodexEvent | undefined;
       try {
-        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag))) {
+        for await (const evt of telemetry.attemptStream(this.streamCodex(request, diag, captured.cacheIdentity))) {
           eventsConsumed += 1;
           const metadataType = inertCodexMetadata(evt, 'type');
           if (typeof metadataType !== 'string') closingMetadataUnavailable = true;
@@ -965,12 +978,12 @@ export class CodexResponsesModel implements Model {
    * truncation fires — without this every failure was indistinguish-
    * able from every other).
    */
-  protected async *streamCodex(request: ModelRequest, diag?: StreamDiagnostics): AsyncGenerator<AnyCodexEvent> {
+  protected async *streamCodex(request: ModelRequest, diag?: StreamDiagnostics, cacheIdentity?: CodexCacheIdentity): AsyncGenerator<AnyCodexEvent> {
     assertLiveModelTransportAllowed('Codex Responses API');
     assertConversationProtocolAtProviderBoundary(request.input, 'codex.responses');
     // Request body is token-independent — build it once and reuse across a
     // possible refresh-and-retry below.
-    const body = buildCodexRequestBody(this.modelId, request);
+    const body = buildCodexRequestBody(this.modelId, request, cacheIdentity);
     if (diag && typeof body.model === 'string') diag.requestModel = body.model;
     const bodyJson = JSON.stringify(body);
     logNativeCompactionRequestTelemetry(request, body);
@@ -1239,8 +1252,8 @@ interface CodexRequestBody {
  * - Within a role the key survives a tool list that grows mid-turn. The host
  *   appends a newly enabled tool after the tools already shown, so the earlier
  *   prefix is still byte-identical — and still on the node the key names.
- * - Across sessions the key is the same, so a new conversation starts on the
- *   node that already holds this role's instructions and tool schemas.
+ * - Across sessions the conversation component differs, so growing histories
+ *   do not compete for a role's single routing key.
  */
 function codexPromptCacheKey(instructions: string, sessionId?: string): string {
   const role = createHash('sha256').update(instructions, 'utf8').digest('hex').slice(0, 12);
@@ -1298,7 +1311,7 @@ export function splitCodexInstructions(raw: string | undefined | null): {
 
 // Exported so contract tests can assert the wire shape without
 // having to mock fetch + OAuth + SSE for every assertion.
-export function buildCodexRequestBody(modelId: string, request: ModelRequest): CodexRequestBody {
+export function buildCodexRequestBody(modelId: string, request: ModelRequest, cacheIdentity?: CodexCacheIdentity): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
   const input = withLatestFunctionOutputImages(serializeInput(request.input));
   // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
@@ -1324,7 +1337,7 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
   // Route every call of this prompt role to the node holding its prefix, so
   // the (large, stable) tool-schema block actually hits. See codexPromptCacheKey().
   const shapeKey = codexPromptShapeKey(body.instructions ?? '', tools ?? []);
-  const cacheKey = codexPromptCacheKey(
+  const cacheKey = cacheIdentity?.key ?? codexPromptCacheKey(
     split.cacheKeySource || body.instructions || '',
     harnessRunContextStorage.getStore()?.sessionId,
   );
@@ -1342,7 +1355,7 @@ export function buildCodexRequestBody(modelId: string, request: ModelRequest): C
     // cacheable prefix is byte-identical call to call, quiet enough to live in
     // production. A prefix whose sha moves between frames can never cache, and
     // that is invisible from the usage numbers alone.
-    const shapeContext = harnessRunContextStorage.getStore();
+    const shapeContext = cacheIdentity ? cacheIdentity.source : harnessRunContextStorage.getStore();
     const hasExactSource = Boolean(shapeContext?.sessionId)
       && Number.isSafeInteger(shapeContext?.sourceUserSeq)
       && (shapeContext?.sourceUserSeq ?? 0) > 0;

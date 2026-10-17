@@ -1029,6 +1029,141 @@ test('native observer exceptions/rejections cannot alter provider events/results
   await Promise.resolve();
 });
 
+interface CapturedCodexWire {
+  body: Record<string, unknown>;
+  headers: Headers;
+  executionSessionId: string | undefined;
+}
+
+async function successfulCodexWireResponse(responseId: string): Promise<Response> {
+  const events: any[] = [];
+  for await (const event of successfulTurn(responseId)) events.push(event);
+  return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(''), { status: 200 });
+}
+
+async function withMockedCodexWire(
+  respond: (wire: CapturedCodexWire, ordinal: number) => Promise<Response> | Response,
+  work: (calls: CapturedCodexWire[], refreshCount: () => number) => Promise<void>,
+): Promise<void> {
+  const { BASE_DIR } = await import('../../config.js');
+  const { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } = await import('node:fs');
+  const path = await import('node:path');
+  const auth = await import('../auth-store.js');
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1');
+  const authPath = path.join(BASE_DIR, 'state', 'auth.json');
+  const prior = existsSync(authPath) ? readFileSync(authPath) : undefined;
+  const priorFetch = globalThis.fetch;
+  const priorDisabled = process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+  const token = `fixture.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600,
+    'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-account' } })).toString('base64url')}.fixture`;
+  const grant = { accessToken: token, refreshToken: 'fixture-refresh', accountId: 'fixture-account', lastRefresh: new Date().toISOString() };
+  mkdirSync(path.dirname(authPath), { recursive: true });
+  writeFileSync(authPath, JSON.stringify({ source: 'native', codexOauth: grant }));
+  const calls: CapturedCodexWire[] = [];
+  let refreshes = 0;
+  auth.__setRefreshTokenImplForTests(async () => { refreshes++; return { ...grant, idToken: 'fixture-id' }; });
+  globalThis.fetch = async (_url, init) => {
+    const wire = { body: JSON.parse(String(init?.body)) as Record<string, unknown>, headers: new Headers(init?.headers),
+      executionSessionId: harnessRunContextStorage.getStore()?.sessionId };
+    calls.push(wire);
+    return respond(wire, calls.length);
+  };
+  // No network or developer credential is available: only this injected fetch
+  // and the disposable home's fixture OAuth grant can serve the transport.
+  delete process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+  try { await work(calls, () => refreshes); }
+  finally {
+    globalThis.fetch = priorFetch;
+    auth.__setRefreshTokenImplForTests(null);
+    if (priorDisabled === undefined) delete process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS;
+    else process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS = priorDisabled;
+    if (prior) writeFileSync(authPath, prior); else rmSync(authPath, { force: true });
+  }
+}
+
+for (const mode of ['success', 'adapter retry', 'OAuth retry'] as const) {
+  test(`actual Codex wire keeps A cache body and headers when B drains its lazy stream (${mode})`, async () => {
+    const responseId = `resp_cache_owner_${mode.replaceAll(' ', '_')}`;
+    await withMockedCodexWire((_wire, ordinal) => {
+      if (ordinal === 1 && mode === 'adapter retry') throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' });
+      if (ordinal === 1 && mode === 'OAuth retry') return new Response('', { status: 401 });
+      return successfulCodexWireResponse(responseId);
+    }, async (calls, refreshCount) => {
+      const request = { ...modelRequest(), systemInstructions: `Cache role${INSTRUCTION_CACHE_DELIM}Current context` } as ModelRequest;
+      const a: any[] = [], b: any[] = [];
+      const keyA = capturedCodexFixture('sess-cache-wire-a', 761, [], () => buildCodexRequestBody('gpt-5.5', request).prompt_cache_key);
+      const keyB = capturedCodexFixture('sess-cache-wire-b', 762, [], () => buildCodexRequestBody('gpt-5.5', request).prompt_cache_key);
+      assert.notEqual(keyA, keyB);
+      const stream = capturedCodexFixture('sess-cache-wire-a', 761, a, () => new CodexResponsesModel('gpt-5.5').getStreamedResponse(request));
+      assert.equal(calls.length, 0, 'the public call does not eagerly dispatch a lazy stream');
+      const events = await capturedCodexFixture('sess-cache-wire-b', 762, b, () => collectCodexStream(stream));
+      assert.equal(calls.length, mode === 'success' ? 1 : 2);
+      assert.equal(refreshCount(), mode === 'OAuth retry' ? 1 : 0);
+      for (const call of calls) {
+        assert.equal(call.executionSessionId, 'sess-cache-wire-b', 'routing ownership never restores A execution authority');
+        assert.equal(call.body.prompt_cache_key, keyA);
+        assert.equal(call.headers.get('session_id'), keyA);
+        assert.equal(call.headers.get('conversation_id'), keyA);
+      }
+      assert.equal(b.length, 0, 'the drainer must not acquire source accounting');
+      assert.ok(a.every(event => event.sourceUserSeq === 761));
+      const binding = responseBindingModule.completedModelResponseBinding(completedSdkStream(events))!;
+      assert.equal(binding.physicalAttempt, mode === 'adapter retry' ? 2 : 1);
+      const usage = usageModule.readUsageEventsForDate().find(row => row.responseId === responseId)!;
+      assert.equal(usage.source, 'sess-cache-wire-a');
+      assert.equal(usage.trace?.acceptedSource, 'sess-cache-wire-a:761');
+      assert.equal(usage.trace?.modelCallId, binding.modelCallId);
+    });
+  });
+}
+
+test('actual initially unowned Codex wire keeps its role-only cache key when B drains it', async () => {
+  await withMockedCodexWire(() => successfulCodexWireResponse('resp_cache_wire_unowned'), async calls => {
+    const request = modelRequest();
+    const unownedKey = buildCodexRequestBody('gpt-5.5', request).prompt_cache_key;
+    const laterKey = capturedCodexFixture('sess-cache-wire-late-b', 763, [], () => buildCodexRequestBody('gpt-5.5', request).prompt_cache_key);
+    assert.notEqual(unownedKey, laterKey);
+    const stream = new CodexResponsesModel('gpt-5.5').getStreamedResponse(request);
+    const late: any[] = [];
+    await capturedCodexFixture('sess-cache-wire-late-b', 763, late, () => collectCodexStream(stream));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].executionSessionId, 'sess-cache-wire-late-b');
+    assert.equal(calls[0].body.prompt_cache_key, unownedKey);
+    assert.equal(calls[0].headers.get('session_id'), unownedKey);
+    assert.equal(calls[0].headers.get('conversation_id'), unownedKey);
+    assert.equal(late.length, 0);
+    const usage = usageModule.readUsageEventsForDate().find(row => row.responseId === 'resp_cache_wire_unowned')!;
+    assert.equal(usage.source, 'unknown');
+    assert.equal(usage.trace?.acceptedSource, undefined);
+  });
+});
+
+test('actual buffered Codex wire keeps its invocation key across a mutated caller and adapter retry', async () => {
+  await withMockedCodexWire((_wire, ordinal) => {
+    if (ordinal === 1) {
+      harnessRunContextStorage.getStore()!.sessionId = 'sess-cache-buffered-mutated-b';
+      throw buildTransportTimeoutError('UND_ERR_HEADERS_TIMEOUT', { phase: 'headers' });
+    }
+    return successfulCodexWireResponse('resp_cache_wire_buffered');
+  }, async calls => {
+    const request = modelRequest();
+    const keyA = capturedCodexFixture('sess-cache-buffered-a', 764, [], () => buildCodexRequestBody('gpt-5.5', request).prompt_cache_key);
+    const journal: any[] = [];
+    await capturedCodexFixture('sess-cache-buffered-a', 764, journal, () => new CodexResponsesModel('gpt-5.5').getResponse(request));
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(call => call.executionSessionId), ['sess-cache-buffered-a', 'sess-cache-buffered-mutated-b']);
+    for (const call of calls) {
+      assert.equal(call.body.prompt_cache_key, keyA);
+      assert.equal(call.headers.get('session_id'), keyA);
+      assert.equal(call.headers.get('conversation_id'), keyA);
+    }
+    assert.ok(journal.every(event => event.sourceUserSeq === 764));
+    const usage = usageModule.readUsageEventsForDate().find(row => row.responseId === 'resp_cache_wire_buffered')!;
+    assert.equal(usage.source, 'sess-cache-buffered-a');
+    assert.equal(usage.trace?.acceptedSource, 'sess-cache-buffered-a:764');
+  });
+});
+
 test('actual native stream records resolved outgoing body.model and one adapter ordinal across an inner 401 refresh', async () => {
   const { BASE_DIR } = await import('../../config.js');
   const { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } = await import('node:fs');
