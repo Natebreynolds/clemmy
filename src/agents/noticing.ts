@@ -22,6 +22,7 @@
  */
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import type { GoalOutcomeProgress, GoalOutcomeTask, GoalWorkflowOutcome } from './goal-outcome-progress.js';
 
 export const NOTICING_ID = 'noticing';
 export const NOTICING_SESSION_ID = 'watch:noticing';
@@ -37,7 +38,45 @@ export interface NoticingGoalView {
   progressNotes: string[];
   nextActions: string[];
   blockers: string[];
+  /** Derived retained evidence only; never a goal-status or permission grant. */
+  outcomeProgress?: NoticingGoalOutcomeProgress;
 }
+export interface NoticingGoalOutcomeProgress {
+  version: 1;
+  availability: GoalOutcomeProgress['availability'];
+  summary: string;
+  linkedTasks: Array<Pick<GoalOutcomeTask, 'proposalId' | 'sessionId' | 'sourceUserSeq' | 'state' | 'goalBinding'> & {
+    workflows: Array<Pick<GoalWorkflowOutcome, 'runId' | 'state' | 'artifactReadback'> & {
+      criteria: { total: number; passed: number; remaining: string[]; omittedRemaining: number };
+    }>;
+    omittedWorkflows: number;
+  }>;
+  omittedTasks: number;
+}
+
+/** Bounded context for one existing Noticing decision. Complete packets and
+ * outcome evidence remain available through the original chat and Goals UI. */
+export function compactGoalOutcomeProgressForNoticing(progress: GoalOutcomeProgress): NoticingGoalOutcomeProgress {
+  const clipText = (text: string, limit: number): string => text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+  // An identity is either kept exactly or omitted with its whole entry.
+  const boundedId = (id: string): boolean => id.length <= 160;
+  const linkedTasks = progress.linkedTasks.filter(task => boundedId(task.proposalId)
+    && (task.sessionId === undefined || boundedId(task.sessionId))).slice(0, 2).map(task => {
+    const workflows = task.workflows.filter(workflow => boundedId(workflow.runId)).slice(0, 2).map(workflow => {
+      const remaining = workflow.criteria.remaining.slice(0, 2).map(criterion => clipText(criterion, 120));
+      return { runId: workflow.runId, state: workflow.state, artifactReadback: workflow.artifactReadback,
+        criteria: { total: workflow.criteria.total, passed: workflow.criteria.passed, remaining,
+          omittedRemaining: Math.max(0, workflow.criteria.total - workflow.criteria.passed - remaining.length) } };
+    });
+    return { proposalId: task.proposalId, ...(task.sessionId ? { sessionId: task.sessionId } : {}),
+      ...(task.sourceUserSeq !== undefined ? { sourceUserSeq: task.sourceUserSeq } : {}),
+      state: task.state, goalBinding: task.goalBinding, workflows,
+      omittedWorkflows: task.omittedWorkflows + task.workflows.length - workflows.length };
+  });
+  return { version: 1, availability: progress.availability, summary: clipText(progress.summary, 180), linkedTasks,
+    omittedTasks: progress.omittedTasks + progress.linkedTasks.length - linkedTasks.length };
+}
+
 export interface NoticingObservation {
   at: string;
   goals: NoticingGoalView[];

@@ -554,21 +554,40 @@ export interface ListPlanProposalsFilter {
   /** Filter to proposals that originated on this channel (e.g. discord:<id>). */
   channel?: string;
   limit?: number;
+  /** Read-only proof consumers must not establish uniqueness from a partial
+   * registry. Ordinary presentation retains its legacy best-effort behavior. */
+  strictRead?: boolean;
 }
 
 export function listPlanProposals(filter: ListPlanProposalsFilter = {}): PlanProposal[] {
-  if (!existsSync(PROPOSALS_DIR)) return [];
+  let entries: string[];
+  if (filter.strictRead) {
+    try { entries = readdirSync(PROPOSALS_DIR); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+  } else {
+    if (!existsSync(PROPOSALS_DIR)) return [];
+    entries = readdirSync(PROPOSALS_DIR);
+  }
   const wantedStatus = filter.status ?? 'pending';
   const items: PlanProposal[] = [];
-  for (const entry of readdirSync(PROPOSALS_DIR)) {
+  for (const entry of entries) {
     if (!entry.endsWith('.json')) continue;
     try {
       const p = JSON.parse(readFileSync(path.join(PROPOSALS_DIR, entry), 'utf-8')) as PlanProposal;
+      if (filter.strictRead && (!p || typeof p !== 'object' || Array.isArray(p))) {
+        throw new Error('Plan proposal registry contains a non-object record.');
+      }
       if (wantedStatus !== 'all' && p.status !== wantedStatus) continue;
       if (filter.sessionId && p.sessionId !== filter.sessionId) continue;
       if (filter.channel && p.channel !== filter.channel) continue;
       items.push(p);
-    } catch { continue; }
+    } catch (error) {
+      if (filter.strictRead) throw error;
+      continue;
+    }
   }
   items.sort((a, b) => b.proposedAt.localeCompare(a.proposedAt));
   if (filter.limit !== undefined) return items.slice(0, Math.max(0, filter.limit));

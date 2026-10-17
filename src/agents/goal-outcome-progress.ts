@@ -1,0 +1,269 @@
+/** Informational goal progress. These projections never complete a goal,
+ * authorize work, or turn delivery acknowledgement into objective evidence. */
+import type { GoalRecord } from '../memory/goals-list.js';
+import type { NoticingProposalRecord } from './noticing.js';
+import { isDeepStrictEqual } from 'node:util';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { readAcceptedNoticingTask } from '../runtime/harness/noticing-approved-task.js';
+import { getRunAttemptBySourceUserSeq, isKillRequested, listEvents, openEventLog } from '../runtime/harness/eventlog.js';
+import { resolveExactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
+import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
+import { exactOriginDeliveryTargetDigest, sameExactOriginDeliveryTarget } from '../runtime/exact-origin-delivery.js';
+import { readActiveWorkflowOriginGroup, workflowOriginSourceGroupId,
+  type WorkflowOriginGroupMember,
+  type ActiveWorkflowOriginGroup } from '../execution/workflow-origin-group.js';
+import { resolveWorkflowRunDefinitionSnapshot } from '../execution/workflow-run-definition.js';
+import { readWorkflowTargetEvidence } from '../execution/workflow-target-evidence.js';
+import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { listPlanProposals, type PlanProposal } from './plan-proposals.js';
+import type { QueuedRunRecord } from '../execution/workflow-runner.js';
+
+export interface GoalWorkflowOutcome {
+  runId: string;
+  workflowName: string;
+  state: 'in_progress' | 'satisfied' | 'not_satisfied' | 'unavailable';
+  contractId?: string;
+  criteria: { total: number; passed: number; remaining: string[] };
+  artifactReadback: 'verified' | 'changed_or_unavailable' | 'not_checked';
+  detail: string;
+}
+export interface GoalOutcomeTask {
+  proposalId: string;
+  title: string;
+  sessionId?: string;
+  sourceUserSeq?: number;
+  goalBinding: 'current' | 'historical' | 'unavailable';
+  state: 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
+  detail: string;
+  workflows: GoalWorkflowOutcome[];
+  omittedWorkflows: number;
+}
+export interface GoalOutcomeProgress {
+  version: 1;
+  availability: 'available' | 'unavailable';
+  summary: string;
+  linkedTasks: GoalOutcomeTask[];
+  omittedTasks: number;
+}
+
+export function unavailableGoalOutcomeProgress(): GoalOutcomeProgress {
+  return { version: 1, availability: 'unavailable',
+    summary: 'Linked task evidence is unavailable. Open the original chat to review it.',
+    linkedTasks: [], omittedTasks: 0 };
+}
+
+const MAX_TASKS_PER_GOAL = 4;
+const MAX_RUNS_PER_TASK = 4;
+const MAX_TASKS_PER_CAPTURE = 8;
+const MAX_RUNS_PER_CAPTURE = 8;
+// Current content is deliberately a bounded fresh read, never a run-status
+// cache that could keep claiming verification after an artifact changes.
+const MAX_READBACKS_PER_CAPTURE = 2;
+const bounded = (text: string, limit = 220): string => typeof text !== 'string' ? 'Unavailable'
+  : text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+const record = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+
+/** Progress-log edits do not change the objective. All other saved descriptor
+ * fields (including constraints, owner and next actions) must still agree. */
+function sameGoalDescriptor(saved: Record<string, unknown>, goal: GoalRecord): boolean {
+  const descriptor = (input: Record<string, unknown>): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'updatedAt' && key !== 'progressNotes'));
+  return isDeepStrictEqual(descriptor(saved), descriptor(goal as unknown as Record<string, unknown>));
+}
+
+function unavailableTask(proposal: NoticingProposalRecord): GoalOutcomeTask {
+  return { proposalId: proposal.id, title: bounded(proposal.title, 120), goalBinding: 'unavailable',
+    state: 'unavailable', detail: 'The exact accepted task or its linked evidence could not be verified.', workflows: [], omittedWorkflows: 0 };
+}
+
+function exactGroup(sessionId: string, sourceUserSeq: number): ActiveWorkflowOriginGroup | null {
+  const source = listEvents(sessionId, { types: ['user_input_received'], sinceSeq: sourceUserSeq - 1, limit: 1 })[0];
+  if (!source || source.seq !== sourceUserSeq) throw new Error('missing accepted source');
+  // The indexed query is confined to this named source. A second claimed
+  // dispatch is ambiguity, not permission to choose the newest winner.
+  const rows = openEventLog().prepare(`SELECT id, role, turn, parent_event_id, data_json FROM events
+    WHERE session_id = ? AND type = 'async_work_dispatched'
+      AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq LIMIT 2`)
+    .all(sessionId, sourceUserSeq) as Array<{ id: string; role: string; turn: number; parent_event_id: string; data_json: string }>;
+  const active = readActiveWorkflowOriginGroup(workflowOriginSourceGroupId({ sessionId, sourceUserSeq }));
+  if (!active && rows.length === 0) return null;
+  if (!active || rows.length !== 1) throw new Error('missing or ambiguous dispatch');
+  const row = rows[0]!;
+  const data = JSON.parse(row.data_json) as Record<string, unknown>;
+  const target = workflowOriginReplyTargetForSource({ sessionId, sourceUserSeq });
+  if (row.role !== 'system' || row.turn !== source.turn || row.parent_event_id !== source.id
+    || active.sealed.originSessionId !== sessionId || active.sealed.sourceUserSeq !== sourceUserSeq
+    || !target || !sameExactOriginDeliveryTarget(target, active.sealed.replyTarget)
+    || exactOriginDeliveryTargetDigest(target) !== active.sealed.replyTargetDigest
+    || !Object.entries(active.publicDispatch).every(([key, value]) => isDeepStrictEqual(data[key], value))
+    || !isDeepStrictEqual(data.replyTarget, active.sealed.replyTarget)) throw new Error('dispatch mismatch');
+  return active;
+}
+
+function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: string, contracts: Map<string, PlanProposal[]>, readbackBudget: { remaining: number }): GoalWorkflowOutcome {
+  const runId = member.runId;
+  const unknown: GoalWorkflowOutcome = { runId, workflowName: 'Workflow', state: 'unavailable',
+    criteria: { total: 0, passed: 0, remaining: [] }, artifactReadback: 'not_checked',
+    detail: 'The exact workflow record or its objective evidence is unavailable.' };
+  try {
+    if (!/^[a-zA-Z0-9_.:-]+$/.test(runId) || runId === '.' || runId === '..') return unknown;
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    const bytes = readFileSync(file, 'utf8');
+    const run = JSON.parse(bytes) as QueuedRunRecord;
+    if (!record(run) || run.id !== runId || typeof run.workflow !== 'string') return unknown;
+    if (run.chatDispatchSourceGroupId !== sourceGroupId
+      || run.chatDispatchQueueRequestDigest !== member.queueRequestDigest) return unknown;
+    unknown.workflowName = bounded(run.workflow, 120);
+    const running = ['awaiting_chat_dispatch_seal', 'queued', 'running', 'pending_approval', 'paused'].includes(run.status ?? '');
+    if (running && !run.finishedAt) return { ...unknown, state: 'in_progress', detail: 'This exact workflow run has not finished. No completion is inferred.' };
+    const candidates = contracts.get(runId) ?? [];
+    if (candidates.length !== 1) return { ...unknown, detail: candidates.length > 1
+      ? 'More than one goal contract claims this run; its objective evidence is ambiguous.'
+      : 'No exact workflow-origin goal contract is retained for this run. A terminal run alone does not verify its objective.' };
+    const contract = candidates[0]!;
+    const plan = contract.approvedPlan ?? contract.plan;
+    const validation = run.goalValidation;
+    const admission = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
+    const declared = admission.status === 'valid' ? admission.snapshot.definition.goal : undefined;
+    if (typeof contract.id !== 'string' || !contract.id || !plan || typeof plan.objective !== 'string' || !Array.isArray(plan.successCriteria)
+      || admission.status !== 'valid' || !declared
+      || (run.workflow !== admission.snapshot.workflowSlug && run.workflow !== admission.snapshot.definition.name)
+      || !validation || validation.version !== 1 || validation.objective !== plan.objective
+      || declared.objective !== plan.objective
+      || !isDeepStrictEqual(validation.successCriteria, plan.successCriteria)
+      || !isDeepStrictEqual(declared.successCriteria ?? [], validation.successCriteria)
+      || !Array.isArray(validation.perCriterion)
+      || !Number.isFinite(Date.parse(validation.validatedAt))) return { ...unknown, contractId: contract.id };
+    const criteria = validation.successCriteria;
+    if (!criteria.every(c => typeof c === 'string')
+      || new Set(criteria).size !== criteria.length
+      || validation.perCriterion.length !== criteria.length
+      || !criteria.every(c => validation.perCriterion.filter(row => row.criterion === c).length === 1)
+      || !validation.perCriterion.every(row => typeof row.pass === 'boolean' && ['deterministic', 'judge', 'skipped'].includes(row.method))) return unknown;
+    const passed = validation.perCriterion.filter(row => row.pass === true && row.method !== 'skipped').length;
+    const objectivePassed = validation.objectiveReview?.pass === true && validation.objectiveReview.scope === 'objective'
+      && ['deterministic', 'judge'].includes(validation.objectiveReview.method);
+    const satisfied = run.status === 'completed' && Number.isFinite(Date.parse(run.finishedAt ?? '')) && run.needsAttention !== true
+      && run.goalOutcome === 'satisfied' && contract.status === 'satisfied'
+      && validation.pass === true && validation.judgeFailedOpen === false && passed === criteria.length
+      && objectivePassed;
+    const remaining = validation.perCriterion.filter(row => !row.pass || row.method === 'skipped').map(row => row.criterion);
+    if (!objectivePassed) {
+      remaining.push(validation.objectiveReview?.criterion ?? validation.objective);
+    }
+    const result: GoalWorkflowOutcome = { ...unknown, contractId: contract.id,
+      state: satisfied ? 'satisfied' : 'not_satisfied',
+      criteria: { total: criteria.length, passed,
+        remaining: remaining.slice(0, 4).map(criterion => bounded(criterion, 180)) },
+      detail: satisfied ? 'The retained run-local review satisfied this workflow contract. This is historical subtask evidence, not completion of the whole goal.'
+        : 'The retained workflow contract is not independently satisfied; preserve its remaining work and any settled or uncertain effects.' };
+    if (satisfied && readbackBudget.remaining > 0) {
+      readbackBudget.remaining -= 1;
+      const target = readWorkflowTargetEvidence(runId, { compactResults: true });
+      const counts = target.artifactReadback;
+      if (counts && counts.checked > 0) {
+        // A known failed readback remains contrary evidence even when some
+        // other write has no current-content contract. Unknown cannot hide bad.
+        if (counts.unavailable > 0) result.artifactReadback = 'changed_or_unavailable';
+        else if (counts.uncoveredWrites === 0) result.artifactReadback = target.available
+          && counts.verified === counts.checked && !!target.results?.length
+          && target.results.every(row => row.status === 'verified') ? 'verified' : 'changed_or_unavailable';
+      }
+    }
+    // Cross-process writes can replace a run while evidence is being read.
+    // Never mix one record's review with another generation's readback.
+    if (readFileSync(file, 'utf8') !== bytes) return unknown;
+    return result;
+  } catch { return unknown; }
+}
+
+/** One bounded, fresh read for a Goals screen or a Noticing observation.
+ * No source, goal, run, contract, artifact or delivery record is changed. */
+export function readGoalOutcomeProgress(input: {
+  goals: readonly GoalRecord[]; proposals: readonly NoticingProposalRecord[];
+}): Record<string, GoalOutcomeProgress> {
+  const result: Record<string, GoalOutcomeProgress> = Object.create(null);
+  if (input.goals.length === 0) return result;
+  const contracts = new Map<string, PlanProposal[]>();
+  const readbackBudget = { remaining: MAX_READBACKS_PER_CAPTURE };
+  let remainingTasks = MAX_TASKS_PER_CAPTURE;
+  let remainingRuns = MAX_RUNS_PER_CAPTURE;
+  const goalIds = new Set(input.goals.filter(goal => goal && typeof goal.id === 'string').map(goal => goal.id));
+  const byGoal = new Map<string, NoticingProposalRecord[]>();
+  for (const proposal of input.proposals) {
+    if (!proposal || typeof proposal.goalId !== 'string' || !goalIds.has(proposal.goalId)
+      || proposal.answer?.decision !== 'do_it' || !proposal.handoff) continue;
+    const rows = byGoal.get(proposal.goalId) ?? [];
+    rows.push(proposal); byGoal.set(proposal.goalId, rows);
+  }
+  // Shared once, never a full run-directory scan per lightweight goal.
+  // The existing plan registry has no run-origin index. This remains one
+  // full registry read only when there are qualifying linked tasks.
+  let capturedContracts: PlanProposal[];
+  try { capturedContracts = byGoal.size ? listPlanProposals({ status: 'all', strictRead: true }) : []; }
+  catch {
+    for (const goalId of goalIds) result[goalId] = unavailableGoalOutcomeProgress();
+    return result;
+  }
+  for (const contract of capturedContracts) {
+    if (contract?.origin?.kind !== 'workflow' || typeof contract.origin.runId !== 'string') continue;
+    const rows = contracts.get(contract.origin.runId) ?? [];
+    rows.push(contract); contracts.set(contract.origin.runId, rows);
+  }
+  for (const goal of input.goals) {
+    if (!goal || typeof goal.id !== 'string') continue;
+    const linked = (byGoal.get(goal.id) ?? [])
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
+    const selected = linked.slice(0, Math.min(MAX_TASKS_PER_GOAL, remainingTasks));
+    remainingTasks -= selected.length;
+    const linkedTasks = selected.map(proposal => {
+      const unavailable = unavailableTask(proposal);
+      try {
+        const handoff = proposal.handoff!;
+        if (!handoff.sessionId || !Number.isSafeInteger(handoff.sourceUserSeq) || !handoff.requestId) return unavailable;
+        const identity = { sessionId: handoff.sessionId, sourceUserSeq: handoff.sourceUserSeq! };
+        const accepted = readAcceptedNoticingTask(identity);
+        const source = listEvents(identity.sessionId, { types: ['user_input_received'], sinceSeq: identity.sourceUserSeq - 1, limit: 1 })[0];
+        const binding = source?.data.noticingApprovedTask as { requestId?: unknown } | undefined;
+        if (!accepted || !source || accepted.packet.proposal.id !== proposal.id
+          || accepted.packet.proposal.goalId !== goal.id || accepted.packet.goal?.id !== goal.id
+          || binding?.requestId !== handoff.requestId || accepted.packet.checkIn.answer !== proposal.answer?.text) return unavailable;
+        const current = sameGoalDescriptor(accepted.packet.goal, goal);
+        const active = exactGroup(identity.sessionId, identity.sourceUserSeq);
+        const selectedMembers = (active?.sealed.members ?? []).slice(0, Math.min(MAX_RUNS_PER_TASK, remainingRuns));
+        remainingRuns -= selectedMembers.length;
+        const workflows = selectedMembers
+          .map(member => workflowOutcome(member, active!.sealed.sourceGroupId, contracts, readbackBudget));
+        const omittedWorkflows = Math.max(0, (active?.sealed.members.length ?? 0) - workflows.length);
+        const truncated = omittedWorkflows > 0;
+        const terminal = resolveExactTerminalForAcceptedSource(source);
+        const stopped = isKillRequested(identity.sessionId, { sourceUserSeq: identity.sourceUserSeq });
+        const attempt = getRunAttemptBySourceUserSeq(identity.sessionId, identity.sourceUserSeq);
+        const attention = workflows.some(row => row.state === 'not_satisfied')
+          || stopped
+          || (terminal.kind === 'terminal' && terminal.presentation.status !== 'done');
+        const state: GoalOutcomeTask['state'] = truncated || workflows.some(row => row.state === 'unavailable')
+          || terminal.kind === 'corrupt' || terminal.kind === 'legacy' ? 'unavailable'
+          : attention ? 'needs_attention'
+          : workflows.some(row => row.state === 'in_progress') ? 'in_progress'
+          : workflows.length > 0 || terminal.kind === 'terminal' ? 'outcome_retained'
+          : handoff.state === 'needs_attention' || handoff.state === 'settled' || attempt?.status !== 'active'
+            ? 'needs_attention' : 'in_progress';
+        return { proposalId: proposal.id, title: bounded(accepted.packet.proposal.title, 120), ...identity,
+          goalBinding: current ? 'current' as const : 'historical' as const, state, workflows, omittedWorkflows,
+          detail: !current ? 'This task belongs to an earlier goal definition. Review the current goal before relying on its old criteria.'
+            : truncated ? 'This task has more workflow members than this bounded view shows. Open its original chat for the complete result.'
+            : workflows.length ? 'Exact workflow subtask evidence is linked below. The whole goal remains under your control.'
+            : terminal.kind === 'terminal' ? 'A task result is retained in its original chat; no exact workflow contract or current artifact readback is claimed.'
+            : 'Open the original task chat for progress or recovery; this view does not start or repeat work.' } satisfies GoalOutcomeTask;
+      } catch { return unavailable; }
+    });
+    result[goal.id] = { version: 1, availability: 'available', linkedTasks,
+      omittedTasks: Math.max(0, linked.length - linkedTasks.length),
+      summary: linkedTasks.length || linked.length ? 'Linked task evidence is bounded partial progress. Omitted work is unqualified; the goal’s status is unchanged.'
+        : 'No exact approved task is linked yet. The goal’s status remains unchanged.' };
+  }
+  return result;
+}

@@ -46,6 +46,65 @@ export const getNoticing = () => apiGet<{ noticing: NoticingStatus }>('/api/cons
 export const patchNoticing = (patch: { enabled?: boolean; cadenceMinutes?: number; dailyCap?: number }) =>
   api<{ noticing: NoticingStatus }>('/api/console/noticing', { method: 'PATCH', body: JSON.stringify(patch) });
 
+/** Informational evidence from existing exact task/run records. These rows
+ * do not complete the owner's goal or grant execution authority. */
+export interface GoalWorkflowOutcome {
+  runId: string;
+  workflowName: string;
+  state: 'in_progress' | 'satisfied' | 'not_satisfied' | 'unavailable';
+  contractId?: string;
+  criteria: { total: number; passed: number; remaining: string[] };
+  artifactReadback: 'verified' | 'changed_or_unavailable' | 'not_checked';
+  detail: string;
+}
+export interface GoalOutcomeTask {
+  proposalId: string;
+  title: string;
+  sessionId?: string;
+  sourceUserSeq?: number;
+  goalBinding: 'current' | 'historical' | 'unavailable';
+  state: 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
+  detail: string;
+  workflows: GoalWorkflowOutcome[];
+  omittedWorkflows?: number;
+}
+export interface GoalOutcomeProgress {
+  version: 1;
+  availability: 'available' | 'unavailable';
+  summary: string;
+  linkedTasks: GoalOutcomeTask[];
+  omittedTasks: number;
+}
+export function goalOutcomeTaskWords(task: Pick<GoalOutcomeTask, 'goalBinding' | 'state'>): string {
+  if (task.goalBinding === 'historical') return 'For an earlier version of this goal';
+  if (task.goalBinding === 'unavailable') return 'Link to this goal unconfirmed';
+  switch (task.state) {
+    case 'in_progress': return 'Work in progress';
+    case 'needs_attention': return 'Needs attention';
+    case 'outcome_retained': return 'Result recorded';
+    default: return 'Work evidence unavailable';
+  }
+}
+export function goalWorkflowOutcomeWords(state: GoalWorkflowOutcome['state']): string {
+  switch (state) {
+    case 'satisfied': return 'Workflow criteria met';
+    case 'not_satisfied': return 'Workflow needs attention';
+    case 'in_progress': return 'Workflow in progress';
+    default: return 'Workflow evidence unavailable';
+  }
+}
+export function goalArtifactReadbackWords(state: GoalWorkflowOutcome['artifactReadback']): string {
+  switch (state) {
+    case 'verified': return 'Saved artifact matches the recorded result.';
+    case 'changed_or_unavailable': return 'Saved artifact has changed or could not be checked.';
+    default: return 'Current artifact has not been checked.';
+  }
+}
+export function goalWorkflowHref(workflow: Pick<GoalWorkflowOutcome, 'workflowName' | 'runId'>): string | null {
+  return workflow.workflowName && workflow.runId
+    ? `/automate?workflow=${encodeURIComponent(workflow.workflowName)}&run=${encodeURIComponent(workflow.runId)}` : null;
+}
+
 export interface MyGoal {
   id: string;
   title: string;
@@ -57,6 +116,7 @@ export interface MyGoal {
   updatedAt: string;
   targetDate?: string;
   reviewFrequency: 'daily' | 'weekly' | 'on-demand';
+  outcomeProgress?: GoalOutcomeProgress;
   progressNotes: string[];
   nextActions: string[];
   blockers: string[];

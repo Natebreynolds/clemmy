@@ -9610,12 +9610,22 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const { listGoalRecords } = await import('../memory/goals-list.js');
-      const { loadNoticingState } = await import('../agents/noticing-runtime.js');
-      const proposals = Object.values(loadNoticingState().proposals);
-      const goals = listGoalRecords()
-        .sort((a, b) => (a.status === b.status ? b.updatedAt.localeCompare(a.updatedAt) : a.status === 'active' ? -1 : b.status === 'active' ? 1 : a.status.localeCompare(b.status)))
+      const { readNoticingStateStrict } = await import('../agents/noticing-runtime.js');
+      const { readGoalOutcomeProgress, unavailableGoalOutcomeProgress } = await import('../agents/goal-outcome-progress.js');
+      const noticingState = (() => { try { return readNoticingStateStrict().state; } catch { return null; } })();
+      const proposals = Object.values(noticingState?.proposals ?? {});
+      const retainedGoals = listGoalRecords()
+        .sort((a, b) => (a.status === b.status ? b.updatedAt.localeCompare(a.updatedAt) : a.status === 'active' ? -1 : b.status === 'active' ? 1 : a.status.localeCompare(b.status)));
+      const outcomeProgress = (() => {
+        try {
+          if (noticingState) return readGoalOutcomeProgress({ goals: retainedGoals, proposals });
+        } catch { /* a failed relation read is unavailable, never evidence of no linked work */ }
+        return Object.fromEntries(retainedGoals.map((goal) => [goal.id, unavailableGoalOutcomeProgress()]));
+      })();
+      const goals = retainedGoals
         .map((goal) => ({
           ...goal,
+          outcomeProgress: outcomeProgress[goal.id] ?? unavailableGoalOutcomeProgress(),
           proposals: proposals.filter((p) => p.goalId === goal.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
             .map((p) => ({ id: p.id, title: p.title, action: p.action, why: p.why, status: p.status, createdAt: p.createdAt, answer: p.answer ?? null })),
         }));

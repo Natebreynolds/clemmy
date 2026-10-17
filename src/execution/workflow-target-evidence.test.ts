@@ -1,7 +1,7 @@
 /**
  * Run: node scripts/run-tests-isolated.mjs src/execution/workflow-target-evidence.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -9,6 +9,7 @@ import { test } from 'node:test';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-target-evidence-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
 const { readWorkflowTargetEvidence } = await import('./workflow-target-evidence.js');
@@ -83,6 +84,13 @@ for (const variant of ['verified', 'missing-artifact', 'tampered-artifact', 'inv
     if (variant === 'tampered-artifact') writeFileSync(path.join(runWorkspaceDir(slug, runId), artifact.path), '{"product":999}');
     if (variant === 'invalidated') appendWorkflowEvent(slug, runId, { kind: 'step_invalidated', stepId: 'compute' });
     const evidence = readWorkflowTargetEvidence(runId);
+    if (variant === 'verified') assert.deepEqual(evidence.artifactReadback, { checked: 1, verified: 1, unavailable: 0, uncoveredWrites: 0 });
+    if (variant === 'missing-artifact' || variant === 'tampered-artifact') {
+      assert.deepEqual(evidence.artifactReadback, { checked: 1, verified: 0, unavailable: 1, uncoveredWrites: 0 });
+    }
+    if (variant === 'invalidated' || variant === 'model-output' || variant === 'wrong-run') {
+      assert.deepEqual(evidence.artifactReadback, { checked: 0, verified: 0, unavailable: 0, uncoveredWrites: 0 });
+    }
     const coverage = assessCompletionEvidenceCoverage({ objective: 'Return the computed product.', results: evidence.results });
     assert.equal(coverage.complete, variant === 'verified');
     if (variant === 'verified') {
@@ -101,3 +109,95 @@ for (const variant of ['verified', 'missing-artifact', 'tampered-artifact', 'inv
     }
   });
 }
+
+test('workflow target current Workspace bytes, not an upstream transform, qualify mixed-write readback', async () => {
+  const { writeFileSync, unlinkSync } = await import('node:fs');
+  const runner = await import('./workflow-runner.js');
+  const workflows = await import('../memory/workflow-store.js');
+  const queue = await import('../tools/workflow-run-queue.js');
+  const local = await import('../runtime/harness/reviewed-local-tool-carrier.js');
+  const adapters = await import('../runtime/harness/production-capability-adapters.js');
+  const manifests = await import('../runtime/harness/capability-manifest-store.js');
+  const catalogs = await import('../runtime/harness/host-capability-catalog-factory.js');
+  const ports = await import('../runtime/harness/production-capability-ports.js');
+  const observations = await import('../runtime/harness/independent-capability-observation.js');
+  const spaces = await import('../spaces/store.js');
+  const db = await import('../spaces/workspace-db.js');
+  const datasets = await import('../spaces/workspace-set-data-carrier.js');
+  const { recordStepOutput } = await import('./workflow-run-workspace.js');
+  const { appendWorkflowEvent } = await import('./workflow-events.js');
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+  const slug = 'goal-evidence-mixed-space';
+  spaces.spaceStore.save({ id: slug, title: 'Controlled mixed result', status: 'active',
+    viewEntry: 'view/index.html', viewContent: '<!doctype html><title>Controlled result</title>', dataSources: [], actions: [] });
+  const observed = local.observeReviewedLocalTool('space_set_data');
+  assert.ok(observed);
+  const manifest = local.reviewedLocalCapabilityManifest(observed);
+  assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(ports.productionPortIdentityFromManifest(manifest), {
+    invoke: adapters.invokeForSealedManifest(manifest), reconcile: adapters.reconcileForSealedManifest(manifest),
+  }).ok, true);
+  const step = { id: 'publish', prompt: '', sideEffect: 'write' as const,
+    call: { tool: 'space_set_data', args: { slug, source_id: 'result', data_json: '{"product":323}' } } };
+  const definition = { name: 'goal-evidence-mixed-workflow', description: 'Retain the controlled product.',
+    enabled: true, trigger: { manual: true }, inputs: {}, steps: [
+      { id: 'compute', prompt: '', sideEffect: 'read' as const,
+        transform: { version: 1 as const, expression: { op: 'literal' as const, value: { product: 323 } } } }, step,
+    ] };
+  const persisted = workflows.writeWorkflow(definition.name, definition);
+  const queued = queue.queueWorkflowRun(persisted.data.name, {}, { source: 'console', workflowSlug: persisted.name, dedupe: false });
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+  // The host executed this admitted deterministic transform. Its artifact is
+  // intentionally still valid when the later delivered Space data drifts.
+  const transform = recordStepOutput({ workflowName: persisted.name, runId: queued.id, stepId: 'compute',
+    output: { product: 323 }, nowIso: new Date().toISOString() });
+  appendWorkflowEvent(persisted.name, queued.id, { kind: 'step_completed', stepId: 'compute', output: { product: 323 },
+    meta: { mode: 'transform', stepOutputArtifact: transform } });
+  const ctx = { workflow: persisted.data, workflowSlug: persisted.name, runId: queued.id,
+    inputs: {}, stepOutputs: { compute: { product: 323 } },
+    assistant: new Proxy({}, { get: () => { throw new Error('No model may be consulted for a reviewed local write.'); } }),
+    completedItems: new Map(), forEachFailures: [], qualityAdvisories: [] } as unknown as Parameters<typeof runner.executeStep>[1];
+  try {
+    await runner.executeStep(step, ctx);
+    const original = readWorkflowTargetEvidence(queued.id);
+    assert.deepEqual(original.artifactReadback, { checked: 2, verified: 2, unavailable: 0, uncoveredWrites: 0 }, original.summary);
+    assert.equal(original.results?.filter(row => row.toolName === 'space_set_data' && row.status === 'verified').length, 1);
+    const dataFile = spaces.resolveInSpace(slug, 'data.json');
+    const bytes = readFileSync(dataFile);
+    eventlog.closeEventLog(); db.closeWorkspaceDb();
+    assert.deepEqual(readWorkflowTargetEvidence(queued.id).artifactReadback, original.artifactReadback, 'cold database reopen redeems the exact retained write');
+    const originalObservation = db.getCurrentWorkspaceDatasetObservation(slug, 'result')!.id;
+    await datasets.executeReviewedWorkspaceSetData({ slug, source_id: 'unrelated_sibling', data_json: '{"count":7}' });
+    const withSibling = readFileSync(dataFile);
+    assert.notDeepEqual(withSibling, bytes, 'the sibling writer really changed the whole data.json container');
+    assert.equal(db.getCurrentWorkspaceDatasetObservation(slug, 'result')?.id, originalObservation);
+    const siblingReadback = readWorkflowTargetEvidence(queued.id);
+    assert.deepEqual(siblingReadback.artifactReadback, original.artifactReadback,
+      'a legitimate different source does not invalidate this run’s unchanged exact source');
+    assert.equal(siblingReadback.available, true, siblingReadback.summary);
+    const tampered = JSON.parse(withSibling.toString('utf8'));
+    tampered.result = { product: 999 };
+    writeFileSync(dataFile, JSON.stringify(tampered));
+    const changed = readWorkflowTargetEvidence(queued.id);
+    assert.deepEqual(changed.artifactReadback, { checked: 2, verified: 1, unavailable: 1, uncoveredWrites: 0 });
+    assert.equal(changed.available, false, 'matching intermediate transform bytes cannot verify changed delivered Space bytes');
+    writeFileSync(dataFile, withSibling);
+    const missingOwnSource = JSON.parse(withSibling.toString('utf8'));
+    delete missingOwnSource.result;
+    writeFileSync(dataFile, JSON.stringify(missingOwnSource));
+    assert.deepEqual(readWorkflowTargetEvidence(queued.id).artifactReadback,
+      { checked: 2, verified: 1, unavailable: 1, uncoveredWrites: 0 }, 'an own-source deletion is not rescued by intact sibling content');
+    writeFileSync(dataFile, withSibling);
+    unlinkSync(dataFile);
+    assert.deepEqual(readWorkflowTargetEvidence(queued.id).artifactReadback,
+      { checked: 2, verified: 1, unavailable: 1, uncoveredWrites: 0 });
+  } finally {
+    db.closeWorkspaceDb();
+    ports.clearProductionCapabilityPorts(); observations.clearIndependentCapabilityObservations();
+    catalogs.installHostCapabilityCatalogFactory(null);
+  }
+});

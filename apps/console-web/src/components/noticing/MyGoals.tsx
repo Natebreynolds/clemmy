@@ -5,6 +5,7 @@
  * the Goals screen, above the runs' own objectives.
  */
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Loader2, Plus, Target } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
@@ -12,7 +13,9 @@ import { Button } from '@/components/ui/Button';
 import { Input, Textarea } from '@/components/ui/Field';
 import { StatusPill, Tag, type Tone } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
-import { DECISION_WORDS, listMyGoals, progressWords, upsertMyGoal, type MyGoal, type MyGoalPatch } from '@/lib/noticing';
+import { unifiedChatSessionId } from '@/lib/last-session';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
+import { DECISION_WORDS, goalArtifactReadbackWords, goalOutcomeTaskWords, goalWorkflowHref, goalWorkflowOutcomeWords, listMyGoals, progressWords, upsertMyGoal, type GoalOutcomeProgress, type MyGoal, type MyGoalPatch } from '@/lib/noticing';
 
 const STATUS: Record<MyGoal['status'], { tone: Tone; label: string }> = {
   active: { tone: 'live', label: 'Active' },
@@ -28,16 +31,49 @@ function ago(iso?: string): string {
   return d <= 0 ? 'today' : d === 1 ? 'yesterday' : `${d} days ago`;
 }
 
+function GoalWorkProgress({ progress }: { progress: GoalOutcomeProgress | undefined }) {
+  if (!progress) return null;
+  return <section className="mt-4 space-y-1 text-small" aria-label="Work linked to this goal">
+    <h4 className="text-label text-fg">Work toward this goal</h4>
+    <p className={progress.availability === 'unavailable' ? 'text-warning' : 'text-muted'}>{progress.summary}</p>
+    {progress.linkedTasks.length > 0 && <details className="group">
+      <summary className="w-fit cursor-pointer rounded-sm py-1 font-semibold text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Review linked work ({progress.linkedTasks.length})</summary>
+      <ul className="divide-y divide-border">
+        {progress.linkedTasks.map(task => <li key={task.proposalId} className="space-y-1 py-3 [overflow-wrap:anywhere]">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+            <span className="font-semibold text-fg">{task.title}</span>
+            <span className="text-caption text-muted">{goalOutcomeTaskWords(task)}</span>
+          </div>
+          <p className="text-muted">{task.detail}</p>
+          {task.sessionId && <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(task.sessionId))}`} className="inline-flex min-h-8 items-center rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Open conversation</Link>}
+          {task.workflows.map(workflow => <div key={workflow.runId} className="space-y-1 pt-2">
+            <p className="font-medium text-fg">{workflow.workflowName} · {goalWorkflowOutcomeWords(workflow.state)}</p>
+            <p className="text-caption text-muted">{workflow.detail}</p>
+            <p className="text-caption text-muted">{goalArtifactReadbackWords(workflow.artifactReadback)}</p>
+            {workflow.criteria.total > 0 && <p className="text-caption text-muted">{workflow.criteria.passed} of {workflow.criteria.total} workflow criteria recorded as met</p>}
+            {workflow.criteria.remaining.length > 0 && <div className="text-caption text-muted"><span className="font-medium text-fg">Still to verify:</span><ul className="list-disc space-y-1 pl-5">{workflow.criteria.remaining.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>}
+            {goalWorkflowHref(workflow) && <Link to={goalWorkflowHref(workflow)!} className="inline-flex min-h-8 items-center rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Open workflow run</Link>}
+          </div>)}
+          {(task.omittedWorkflows ?? 0) > 0 && <p className="text-caption text-muted">{task.omittedWorkflows} additional workflow {task.omittedWorkflows === 1 ? 'run is' : 'runs are'} outside this view. Open the original conversation for the full result.</p>}
+        </li>)}
+      </ul>
+      {progress.omittedTasks > 0 && <p className="text-caption text-muted">{progress.omittedTasks} additional linked {progress.omittedTasks === 1 ? 'task is' : 'tasks are'} outside this view. Open the original conversations for their records.</p>}
+    </details>}
+    {progress.linkedTasks.length === 0 && progress.omittedTasks > 0 && <p className="text-caption text-muted">{progress.omittedTasks} linked {progress.omittedTasks === 1 ? 'task is' : 'tasks are'} outside this view. Their results are not checked here.</p>}
+    {progress.linkedTasks.length > 0 && <p className="text-caption text-muted">These results describe linked work. Your goal keeps the status you set above.</p>}
+  </section>;
+}
+
 function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState('');
   const [editing, setEditing] = useState<'next' | 'blockers' | null>(null);
   const [draft, setDraft] = useState('');
-  const save = async (what: string, patch: MyGoalPatch) => {
+  const save = async (what: string, patch: MyGoalPatch): Promise<boolean> => {
     setBusy(what); setError(null);
-    try { await upsertMyGoal({ id: goal.id, ...patch }); onSaved(); }
-    catch (e) { setError((e as Error).message); }
+    try { await upsertMyGoal({ id: goal.id, ...patch }); onSaved(); return true; }
+    catch (e) { setError((e as Error).message); return false; }
     finally { setBusy(null); }
   };
   const status = STATUS[goal.status];
@@ -85,12 +121,12 @@ function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
         <section>
           <div className="mb-1 flex items-center justify-between text-label text-fg">
             Next actions
-            <button type="button" className="text-caption text-primary cursor-pointer" onClick={() => { setEditing(editing === 'next' ? null : 'next'); setDraft(goal.nextActions.join('\n')); }}>{editing === 'next' ? 'Cancel' : 'Edit'}</button>
+            <button type="button" className="text-caption text-primary cursor-pointer" disabled={busy !== null} onClick={() => { setEditing(editing === 'next' ? null : 'next'); setDraft(goal.nextActions.join('\n')); }}>{editing === 'next' ? 'Cancel' : 'Edit'}</button>
           </div>
           {editing === 'next' ? (
             <div className="space-y-1">
-              <Textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4} aria-label={`${goal.title} next actions`} placeholder="One per line" />
-              <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => { void save('next', { nextActions: draft.split('\n').map((l) => l.trim()).filter(Boolean) }).then(() => setEditing(null)); }}>Save</Button>
+              <Textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4} disabled={busy !== null} aria-label={`${goal.title} next actions`} placeholder="One per line" />
+              <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => { void save('next', { nextActions: draft.split('\n').map((l) => l.trim()).filter(Boolean) }).then(saved => { if (saved) setEditing(null); }); }}>Save</Button>
             </div>
           ) : goal.nextActions.length === 0 ? <p className="text-small text-muted">None listed.</p> : (
             <ul className="space-y-1 text-small text-fg">{goal.nextActions.map((a, i) => <li key={i}>• {a}</li>)}</ul>
@@ -99,12 +135,12 @@ function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
         <section>
           <div className="mb-1 flex items-center justify-between text-label text-fg">
             Blockers
-            <button type="button" className="text-caption text-primary cursor-pointer" onClick={() => { setEditing(editing === 'blockers' ? null : 'blockers'); setDraft(goal.blockers.join('\n')); }}>{editing === 'blockers' ? 'Cancel' : 'Edit'}</button>
+            <button type="button" className="text-caption text-primary cursor-pointer" disabled={busy !== null} onClick={() => { setEditing(editing === 'blockers' ? null : 'blockers'); setDraft(goal.blockers.join('\n')); }}>{editing === 'blockers' ? 'Cancel' : 'Edit'}</button>
           </div>
           {editing === 'blockers' ? (
             <div className="space-y-1">
-              <Textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4} aria-label={`${goal.title} blockers`} placeholder="One per line" />
-              <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => { void save('blockers', { blockers: draft.split('\n').map((l) => l.trim()).filter(Boolean) }).then(() => setEditing(null)); }}>Save</Button>
+              <Textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4} disabled={busy !== null} aria-label={`${goal.title} blockers`} placeholder="One per line" />
+              <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => { void save('blockers', { blockers: draft.split('\n').map((l) => l.trim()).filter(Boolean) }).then(saved => { if (saved) setEditing(null); }); }}>Save</Button>
             </div>
           ) : goal.blockers.length === 0 ? <p className="text-small text-muted">None.</p> : (
             <ul className="space-y-1 text-small text-fg">{goal.blockers.map((b, i) => <li key={i}>• {b}</li>)}</ul>
@@ -117,16 +153,17 @@ function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
           )}
           <div className="mt-2 flex items-center gap-2">
             <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a progress note" aria-label={`${goal.title} progress note`} disabled={busy !== null}
-              onKeyDown={(e) => { if (e.key === 'Enter' && note.trim()) { e.preventDefault(); void save('note', { progressNote: note.trim() }).then(() => setNote('')); } }} />
-            <Button size="sm" variant="secondary" disabled={busy !== null || !note.trim()} onClick={() => { void save('note', { progressNote: note.trim() }).then(() => setNote('')); }} aria-label="Add note">
+              onKeyDown={(e) => { if (e.key === 'Enter' && note.trim()) { e.preventDefault(); void save('note', { progressNote: note.trim() }).then(saved => { if (saved) setNote(''); }); } }} />
+            <Button size="sm" variant="secondary" disabled={busy !== null || !note.trim()} onClick={() => { void save('note', { progressNote: note.trim() }).then(saved => { if (saved) setNote(''); }); }} aria-label="Add note">
               {busy === 'note' ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Plus size={16} aria-hidden />}
             </Button>
           </div>
         </section>
       </div>
 
-      <section className="mt-3">
-        <div className="mb-1 text-label text-fg">What Clementine proposed for this</div>
+      <GoalWorkProgress progress={goal.outcomeProgress} />
+      <details className="mt-3">
+        <summary className="mb-1 w-fit cursor-pointer rounded-sm py-1 text-label text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">What Clementine proposed for this</summary>
         {goal.proposals.length === 0 ? <p className="text-small text-muted">Nothing yet — Noticing proposes against your goals on its cadence.</p> : (
           <ul className="space-y-1.5">
             {goal.proposals.slice(0, 5).map((p) => (
@@ -138,8 +175,8 @@ function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
             ))}
           </ul>
         )}
-      </section>
-      {error ? <p className="mt-2 text-caption text-danger">{error}</p> : null}
+      </details>
+      {error ? <p className="mt-2 text-caption text-danger" role="alert">{error}</p> : null}
     </Card>
   );
 }
@@ -170,22 +207,24 @@ export function MyGoals() {
           </div>
           <p className="mt-1 text-small text-muted">Clem reads these when she notices things and proposes against them. Tell her in chat or edit here; both write the same goal.</p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => setAdding((v) => !v)}><Plus size={16} aria-hidden /> {adding ? 'Cancel' : 'Add a goal'}</Button>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => setAdding((v) => !v)}><Plus size={16} aria-hidden /> {adding ? 'Cancel' : 'Add a goal'}</Button>
       </div>
       {adding ? (
         <Card className="mt-3 p-4">
           <div className="grid gap-2">
-            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="The goal, in one line — e.g. My team books 10 appointments a week" aria-label="New goal title" />
-            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} placeholder="What done looks like, how you will know, and anything Clem should know" aria-label="New goal description" />
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy} placeholder="The goal, in one line — e.g. My team books 10 appointments a week" aria-label="New goal title" />
+            <Textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={busy} rows={3} placeholder="What done looks like, how you will know, and anything Clem should know" aria-label="New goal description" />
             <div className="flex items-center gap-2">
               <Button size="sm" disabled={busy || !title.trim() || !description.trim()} onClick={() => { void create(); }}>{busy ? <Loader2 size={16} className="animate-spin" aria-hidden /> : null} Save goal</Button>
-              {error ? <span className="text-caption text-danger">{error}</span> : null}
+              {error ? <span className="text-caption text-danger" role="alert">{error}</span> : null}
             </div>
           </div>
         </Card>
       ) : null}
       <div className="mt-3 grid gap-3">
+        {q.isError && q.data && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 text-small text-warning"><span>Showing the last loaded goals. Work evidence could not be refreshed.</span><Button variant="secondary" size="sm" onClick={() => { void q.refetch(); }}>Retry</Button></div>}
         {q.isLoading && goals.length === 0 ? <p className="text-small text-muted">Loading…</p>
+          : q.isError && !q.data ? <QueryUnavailable title="Goals could not be loaded" description="This is not an empty list. Retry to see your goals and linked work." onRetry={() => { void q.refetch(); }} />
           : goals.length === 0 ? <p className="text-small text-muted">No goals yet. A goal is what Clem anchors her work to and reports against: one line with a number in it reads best, such as “My team books 10 appointments a week.” Add one here, or tell Clem in chat.</p>
           : goals.map((g) => <GoalCard key={g.id} goal={g} onSaved={refresh} />)}
       </div>

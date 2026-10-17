@@ -31,6 +31,7 @@ import {
   NOTICING_SESSION_ID,
   NoticingAnswerV1Schema,
   emptyNoticingState,
+  compactGoalOutcomeProgressForNoticing,
   recordNoticingAnswer,
   runNoticingTick,
   type NoticingDecision,
@@ -57,7 +58,7 @@ function readOptionalJson(file: string): { present: boolean; value: unknown } {
   }
   return { present: true, value: JSON.parse(text) as unknown };
 }
-function readNoticingStateStrict(): { present: boolean; state: NoticingState } {
+export function readNoticingStateStrict(): { present: boolean; state: NoticingState } {
     const read = readOptionalJson(STATE_FILE);
     if (!read.present) return { present: false, state: emptyNoticingState() };
     const raw = read.value as Partial<NoticingState> | null;
@@ -164,13 +165,21 @@ const clip = (value: unknown, max = MAX_TEXT): string => {
 
 export async function observeForNoticing(now = Date.now()): Promise<NoticingObservation> {
   const since = new Date(now - 3 * 24 * 60 * 60_000).toISOString();
-  const goals = listGoalRecords()
-    .filter((g) => g.status === 'active' || g.status === 'blocked')
-    .map((g) => ({ id: g.id, title: clip(g.title, 120), status: g.status, priority: g.priority, updatedAt: g.updatedAt,
+  const retainedGoals = listGoalRecords().filter((g) => g.status === 'active' || g.status === 'blocked');
+  const { readGoalOutcomeProgress, unavailableGoalOutcomeProgress } = await import('./goal-outcome-progress.js');
+  const outcomeProgress = (() => {
+    try {
+      return readGoalOutcomeProgress({ goals: retainedGoals, proposals: Object.values(readNoticingStateStrict().state.proposals) });
+    } catch {
+      return Object.fromEntries(retainedGoals.map((goal) => [goal.id, unavailableGoalOutcomeProgress()]));
+    }
+  })();
+  const goals = retainedGoals.map((g) => ({ id: g.id, title: clip(g.title, 120), status: g.status, priority: g.priority, updatedAt: g.updatedAt,
       ...(g.targetDate ? { targetDate: g.targetDate } : {}),
       progressNotes: (g.progressNotes ?? []).slice(-4).map((n) => clip(n)),
       nextActions: (g.nextActions ?? []).slice(0, 5).map((n) => clip(n)),
-      blockers: (g.blockers ?? []).slice(0, 4).map((n) => clip(n)) }));
+      blockers: (g.blockers ?? []).slice(0, 4).map((n) => clip(n)),
+      outcomeProgress: compactGoalOutcomeProgressForNoticing(outcomeProgress[g.id] ?? unavailableGoalOutcomeProgress()) }));
   const { observeWork } = await import('./work-review-runtime.js');
   const work = (await observeWork()).observation;
   const { calendarWatchStatus } = await import('./calendar-watch-runtime.js');
