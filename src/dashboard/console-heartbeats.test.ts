@@ -113,11 +113,11 @@ test('heartbeats are listed with their contracts, changed by the owner, given ru
     assert.equal(noticed.status, 200, JSON.stringify(noticed.body).slice(0, 300));
     const nt = noticed.body.tick as { summary: string; produced: number; quiet: boolean };
     assert.equal(nt.produced, 0);
-    assert.match(nt.summary, /waiting until a model is set up/);
+    assert.match(nt.summary, /no local evidence to consider/);
     const afterTick = await send(`${server.url}/api/console/noticing`, 'GET');
     const thinking = (afterTick.body.noticing as { thinking: Array<{ summary: string; read: { goals: number } }> }).thinking;
     assert.equal(thinking.length, 1);
-    assert.match(thinking[0]!.summary, /waiting until a model is set up/);
+    assert.match(thinking[0]!.summary, /no local evidence to consider/);
   } finally {
     await server.close();
   }

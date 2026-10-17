@@ -1,7 +1,7 @@
 import { BrowserConnection } from '../components/BrowserConnection';
 import { useEffect, useState } from 'preact/hooks';
 import { Fragment } from 'preact';
-import { CHECKER_ROLE_WORDS, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, modelScoreLine, presentUsageMeters } from '@clem/chat-engine';
+import { CHECKER_ROLE_WORDS, heartbeatStateWords, accountStatus, checkerBackupAutomaticLabel, creditRefusalSentence, modelScoreLine, presentUsageMeters } from '@clem/chat-engine';
 import {
   forgetLearnedWriteKind,
   getApprovalMode,
@@ -145,6 +145,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
             devicesLoading={devices.loading}
             heartbeats={heartbeats.data?.heartbeats}
             heartbeatsError={heartbeats.error}
+            unavailableHeartbeats={heartbeats.data?.unavailable ?? []}
             onChanged={() => Promise.all([heartbeats.refresh(), devices.refresh()])}
           />
         ) : section === 'mode' ? (
@@ -438,11 +439,12 @@ type PushState =
  * heartbeat's findings reach it only when the owner says so, the same switch
  * the Mac's Heartbeats page calls "reach my phone".
  */
-function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError, onChanged }: {
+function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError, unavailableHeartbeats, onChanged }: {
   device?: MobileDeviceRow;
   devicesLoading: boolean;
   heartbeats?: PhoneHeartbeat[];
   heartbeatsError: string | null;
+  unavailableHeartbeats: Array<{id:string;title:string}>;
   onChanged: () => Promise<unknown>;
 }) {
   const nativeShell = inNativeShell();
@@ -549,6 +551,8 @@ function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError
             </span>
             <span class="settings-row-kind">Always</span>
           </div>
+          {unavailableHeartbeats.length > 0 ? <p class="card-note" role="alert">Could not load {unavailableHeartbeats.map(item => item.title).join(', ')}. Nothing has been turned off.</p> : null}
+          {heartbeatsError && heartbeats ? <p class="card-note" role="alert">Check statuses could not be refreshed. These are the last loaded settings.</p> : null}
           {heartbeatsError && !heartbeats ? (
             <p class="card-note">Could not load what Clem watches right now.</p>
           ) : !heartbeats ? (
@@ -566,7 +570,7 @@ function NotificationsPage({ device, devicesLoading, heartbeats, heartbeatsError
               <span class="settings-row-main">
                 <span class="settings-row-label">{h.title}</span>
                 <span class="settings-row-note">
-                  {!h.enabled ? 'Off on your computer.' : h.notify === 'push' ? 'Findings reach this phone.' : 'Findings wait in the app.'}
+                  {heartbeatStateWords(h.presentation)}. {h.enabled ? h.notify === 'push' ? 'Findings reach this phone.' : 'Findings wait in the app.' : ''}
                 </span>
               </span>
               <span class={`settings-switch${h.notify === 'push' ? ' on' : ''}`} aria-hidden="true"><i /></span>

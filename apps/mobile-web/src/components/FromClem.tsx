@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
-import { appPlaceHref } from '@clem/chat-engine';
+import { useRef, useState } from 'preact/hooks';
+import { appPlaceHref, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { markInboxNotificationRead, replyFromClem, type FromClem as FromClemData, type FromClemReplyOutcome, type FromClemRow } from '../lib/api';
 import { relativeTime } from './Approvals';
 import { haptic } from '../lib/native-bridge';
@@ -34,14 +34,17 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
   /** Home places current decisions in its configurable Needs you pane. */
   mode?: 'all' | 'decisions' | 'updates';
   onChanged: () => void;
-  onOpenThread: () => void;
+  onOpenThread: (sessionId?: string) => void;
 }) {
+  const inFlight = useRef(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [notices, setNotices] = useState<Record<string, { text: string; error?: boolean }>>({});
+  const [notices, setNotices] = useState<Record<string, ProactiveReplyReceipt>>({});
   const [replying, setReplying] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
-  const [draft, setDraft] = useState('');
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const rows = (data?.rows ?? []).filter(row => mode === 'all' || (mode === 'decisions' ? row.asks && !row.setup : !row.asks || Boolean(row.setup)));
+  const latestRows = useRef(rows);
+  latestRows.current = rows;
   const sectionId = `home-from-clem-${mode}`;
   if (rows.length === 0) return null;
   const waiting = rows.filter((row) => row.asks && !row.setup);
@@ -51,50 +54,52 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     : mode === 'updates' ? (updates.length > 0 ? 'Updates from Clem' : 'Set up next') : 'From Clem';
   const showGroupHeading = mode === 'all' || [waiting, updates, offers].filter(group => group.length > 0).length > 1;
 
-  const run = async (row: FromClemRow, work: () => Promise<string>) => {
+  const run = async (row: FromClemRow, work: () => Promise<{text: string; settled: boolean}>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     haptic('light');
     setBusy(row.key);
     try {
-      const text = await work();
-      setNotices((all) => ({ ...all, [row.key]: { text } }));
-      setReplying((key) => (key === row.key ? null : key));
-      setDraft('');
+      const result = await work();
+      setNotices((all) => ({ ...all, [row.key]: { ...result, voiceDigest: row.voiceDigest, tone: result.settled ? 'success' : 'info' } }));
+      if (result.settled && latestRows.current.some(current => current.key === row.key && current.voiceDigest === row.voiceDigest)) setReplying((key) => (key === row.key ? null : key));
       onChanged();
     } catch (error) {
-      setNotices((all) => ({ ...all, [row.key]: { text: error instanceof Error ? error.message : 'That didn’t reach Clem.', error: true } }));
+      setNotices((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, settled: false, tone: 'error', text: error instanceof Error ? error.message : 'That didn’t reach Clem. Your reply is kept; check the item before trying again.' } }));
     } finally {
+      inFlight.current = false;
       setBusy(null);
     }
   };
   const reply = (row: FromClemRow, text: string, decision?: Decision, choiceIndex?: number) =>
-    run(row, async () => outcomeText(await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex)));
+    run(row, async () => { const result = await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex); return { text: outcomeText(result), settled: proactiveReplySettled(result.outcome) }; });
 
   const meta = (row: FromClemRow) => (
     <div class="home-row-note">{row.heartbeatTitle} · {relativeTime(row.at)}</div>
   );
   const notice = (row: FromClemRow) => {
-    const said = notices[row.key];
+    const said = currentProactiveReceipt(notices[row.key], row.voiceDigest);
     if (!said) return null;
-    return said.error
+    return said.tone === 'error'
       ? <p class="home-row-error" role="alert">{said.text}</p>
-      : <div class="home-row-receipt" role="status">{said.text}</div>;
+      : <div class={said.tone === 'success' ? 'home-row-receipt' : 'home-row-note'} role="status">{said.text}</div>;
   };
   const replyBox = (row: FromClemRow) => (replying === row.key ? (
-    <form class="from-clem-reply" onSubmit={(event) => { event.preventDefault(); if (draft.trim()) void reply(row, draft.trim()); }}>
-      <input class="cz-input" value={draft} placeholder="Reply to Clem…" aria-label="Reply to Clem"
-        onInput={(event) => setDraft((event.target as HTMLInputElement).value)} autoFocus />
-      <button type="submit" class="home-btn home-btn-primary" disabled={busy !== null || !draft.trim()}>Send</button>
+    <form class="from-clem-reply" onSubmit={(event) => { event.preventDefault(); if (drafts[row.key]?.trim()) void reply(row, drafts[row.key]!.trim()); }}>
+      <input class="cz-input" value={drafts[row.key] ?? ''} placeholder="Reply to Clem…" aria-label="Reply to Clem"
+        onInput={(event) => setDrafts(all => ({ ...all, [row.key]: (event.target as HTMLInputElement).value }))} autoFocus />
+      <button type="submit" class="home-btn home-btn-primary" disabled={busy !== null || !drafts[row.key]?.trim()}>Send</button>
     </form>
   ) : null);
   const openReply = (row: FromClemRow, label: string) => (
     <button type="button" class="home-btn" disabled={busy !== null}
-      onClick={() => { setReplying(replying === row.key ? null : row.key); setDraft(''); }}>
+      onClick={() => { setReplying(replying === row.key ? null : row.key); }}>
       {replying === row.key ? 'Close' : label}
     </button>
   );
 
   const waitingRow = (row: FromClemRow) => {
-    const done = Boolean(notices[row.key] && !notices[row.key]!.error);
+    const done = Boolean(currentProactiveReceipt(notices[row.key], row.voiceDigest)?.settled);
     return (
       <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
         {meta(row)}
@@ -121,7 +126,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
   };
 
   const updateRow = (row: FromClemRow) => {
-    const done = Boolean(notices[row.key] && !notices[row.key]!.error);
+    const done = Boolean(currentProactiveReceipt(notices[row.key], row.voiceDigest)?.settled);
     const notificationId = row.done?.notificationId;
     // A report leads with its title; its text opens in place, as she wrote it.
     const report = row.authored === true && Boolean(row.say);
@@ -131,8 +136,12 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
         {meta(row)}
         <div class="home-row-title">{report ? row.text : row.say || row.text}</div>
         {report ? <div class={open ? 'from-clem-report' : 'from-clem-report from-clem-report-clamped'}>{row.say}</div> : null}
+        {row.handoff ? <div class="home-row-note">
+          <p>{row.handoff.reason || (row.handoff.state === 'dispatched' ? 'The approved task is in its conversation.' : 'This suggestion needs another look before work continues.')}</p>
+          <button type="button" class="home-btn" onClick={() => onOpenThread(row.handoff?.sessionId)}>{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</button>
+        </div> : null}
         {notice(row)}
-        {!done ? (
+        {!row.handoff && !done ? (
           <div class="home-row-actions">
             {report ? (
               <button type="button" class="home-btn" aria-expanded={open}
@@ -140,7 +149,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
             ) : null}
             {notificationId ? (
               <button type="button" class="home-btn" disabled={busy !== null}
-                onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return 'Cleared.'; })}>Done</button>
+                onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return {text: 'Cleared.', settled: true}; })}>Done</button>
             ) : null}
             {openReply(row, 'Tell Clem')}
           </div>
@@ -151,7 +160,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
   };
 
   const offerRow = (row: FromClemRow) => {
-    const done = Boolean(notices[row.key] && !notices[row.key]!.error);
+    const done = Boolean(currentProactiveReceipt(notices[row.key], row.voiceDigest)?.settled);
     const setup = row.setup!;
     const href = appPlaceHref(setup.place, 'phone');
     return (

@@ -62,7 +62,8 @@ test('the live band names running work from the shared presenter and leads to th
   const LIVE = readFileSync(new URL('../components/home/LiveStatus.tsx', import.meta.url), 'utf8');
   assert.match(LIVE, /entries\.filter\(\(p\) => p\.membership === 'running'\)/);
   assert.match(LIVE, /<Link to="\/tasks"/);
-  assert.match(LIVE, /if \(mode === 'off' \|\| unavailable\) return null;/, 'unknown is not "caught up"');
+  assert.match(LIVE, /liveWorkSummary\(entries\.map\(entry => entry\.membership\), unavailable\)/, 'unknown and unfinished work keep their own status');
+  assert.doesNotMatch(LIVE, /Caught up|Clem is caught up/, 'no running turn is not proof that every task is finished');
   assert.match(LIVE, /prefers-reduced-motion: reduce/);
   const CSS = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
   assert.match(CSS, /\.live-band\.is-working:not\(\.live-band-still\)::after/);

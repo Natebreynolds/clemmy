@@ -134,7 +134,7 @@ export function AppShell() {
           liveEntries={workingView.entries}
           liveMode={liveMode}
           nextCheckAt={today.data?.nextCheckAt ?? null}
-          liveUnavailable={workingNow.isError && !workingNow.data}
+          liveUnavailable={workingNow.isError || !workingNow.data}
         />
         <LocalRecordingBanner />
         {needsLogin && (

@@ -1,3 +1,4 @@
+import { liveWorkSummary } from '@clem/chat-engine';
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { ActivityEntry } from '@/lib/activity';
@@ -40,11 +41,12 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
     return () => window.clearInterval(timer);
   }, [cycle, running.length]);
 
-  if (mode === 'off' || unavailable) return null;
-  const working = running.length > 0;
+  if (mode === 'off') return null;
+  const summary = liveWorkSummary(entries.map(entry => entry.membership), unavailable);
+  const working = !unavailable && running.length > 0;
   const current = working ? running[index % running.length]! : null;
   const step = current ? runningMeta(current.entry) : '';
-  const next = nextCheckAt ? clockLabel(nextCheckAt) : '';
+  const next = !unavailable && nextCheckAt && Date.parse(nextCheckAt) > Date.now() ? clockLabel(nextCheckAt) : '';
 
   if (compact) {
     const second = current ? step : (next ? `Next check ${next}` : '');
@@ -61,10 +63,10 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
           mode === 'still' && 'live-band-still',
         )}
       >
-        <span className={cn('live-dot h-2 w-2 shrink-0 rounded-full', working ? 'bg-primary' : 'bg-success')} aria-hidden />
+        <span className={cn('live-dot h-2 w-2 shrink-0 rounded-full', working ? 'bg-primary' : summary.attention ? 'bg-warning' : 'bg-faint')} aria-hidden />
         <span className="flex min-w-0 flex-col leading-tight">
           <span key={current?.entry.runKey ?? 'quiet'} className="truncate text-small font-semibold text-fg animate-fade-in">
-            {current ? (current.entry.headline || 'Working') : 'Caught up'}
+            {current ? (current.entry.headline || 'Working') : summary.label}
           </span>
           {second && <span className="truncate text-caption text-muted">{second}</span>}
         </span>
@@ -88,7 +90,7 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
       )}
     >
       <span
-        className={cn('live-dot h-2.5 w-2.5 shrink-0 rounded-full', working ? 'bg-primary' : 'bg-success')}
+        className={cn('live-dot h-2.5 w-2.5 shrink-0 rounded-full', working ? 'bg-primary' : summary.attention ? 'bg-warning' : 'bg-faint')}
         aria-hidden
       />
       <span className="flex min-w-0 flex-1 flex-col">
@@ -105,7 +107,7 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
           </>
         ) : (
           <>
-            <span className="text-body font-semibold text-fg">Clem is caught up</span>
+            <span className="text-body font-semibold text-fg">{summary.label}</span>
             {next && <span className="text-small text-muted">Next calendar check at {next}</span>}
           </>
         )}

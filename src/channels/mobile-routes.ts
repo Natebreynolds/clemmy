@@ -6863,8 +6863,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // app; cadence and rules stay on the Mac.
   router.get('/api/heartbeats', requireMobileSession, async (_req, res) => {
     try {
-      const { listHeartbeats } = await import('../agents/heartbeats.js');
-      res.json({ heartbeats: (await listHeartbeats()).map(serializeHeartbeatForMobile) });
+      const { readHeartbeatSnapshot } = await import('../agents/heartbeats.js');
+      const snapshot = await readHeartbeatSnapshot();
+      res.json(serializeHeartbeatSnapshotForMobile(snapshot));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -6961,7 +6962,11 @@ export async function authenticateMobileRequest(
 }
 
 /** The phone's view of a heartbeat: what it is, whether it runs, and whether its items reach the phone. */
-function serializeHeartbeatForMobile(h: import('../agents/heartbeats.js').HeartbeatStatus) {
+export function serializeHeartbeatSnapshotForMobile(snapshot: import('../agents/heartbeats.js').HeartbeatSnapshot) {
+  return { ...snapshot, heartbeats: snapshot.heartbeats.map(serializeHeartbeatForMobile) };
+}
+
+export function serializeHeartbeatForMobile(h: import('../agents/heartbeats.js').HeartbeatStatus) {
   return {
     id: h.id,
     title: h.title,
@@ -6970,6 +6975,7 @@ function serializeHeartbeatForMobile(h: import('../agents/heartbeats.js').Heartb
     cadenceMinutes: h.cadenceMinutes,
     notify: h.contract.notify,
     openItems: h.openItems.length,
+    presentation: h.presentation,
     ...(h.lastFinding ? { lastFinding: { at: h.lastFinding.at, summary: h.lastFinding.summary, quiet: h.lastFinding.quiet } } : {}),
     phonePush: h.phonePush,
   };

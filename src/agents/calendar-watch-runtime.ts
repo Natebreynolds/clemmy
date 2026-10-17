@@ -964,7 +964,7 @@ export function calendarWatchStatus(nowMs = Date.now()): CalendarWatchStatus {
     connectedOperations,
     running: inFlight !== null,
     ...(state.lastTickAt ? { lastTickAt: state.lastTickAt } : {}),
-    ...(due.nextAt ? { nextTickAt: due.nextAt } : policy.enabled && !state.lastTickAt ? { nextTickAt: new Date(nowMs).toISOString() } : {}),
+    ...(due.nextAt ? { nextTickAt: due.nextAt } : due.due && !state.lastTickAt ? { nextTickAt: new Date(nowMs).toISOString() } : {}),
     ...(state.snapshotAt ? { snapshotAt: state.snapshotAt } : {}),
     ...(state.lastFinding ? { lastFinding: state.lastFinding } : {}),
     ...(state.lastError ? { lastError: state.lastError } : {}),

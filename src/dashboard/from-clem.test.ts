@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildFromClem, type FromClemInput } from './from-clem.js';
+import { buildFromClem, fromClemVoiceDigest, type FromClemInput } from './from-clem.js';
 import type { NotificationRecord } from '../runtime/notifications.js';
 
 const notification = (id: string, metadata: Record<string, unknown>, extra: Partial<NotificationRecord> = {}): NotificationRecord => ({
@@ -92,6 +92,60 @@ test('a check that failed says when it looked, never what went wrong', () => {
     { heartbeat: 'calendar', title: 'Calendar watch', enabled: true, lastAt: '2026-10-01T21:09:00.000Z' });
   assert.equal(out.pulses.find((pulse) => pulse.heartbeat === 'noticing')?.summary, 'Quiet: considered 7 things');
   assert.ok(!JSON.stringify(out).includes('Read failed'), 'no failure text anywhere in the stream');
+});
+
+test('pulse presentation retains partial and unavailable states without claiming a clean check or hiding owner decisions', () => {
+  const at = '2026-10-01T21:09:00.000Z';
+  const out = buildFromClem(input({
+    heartbeats: [{ id: 'calendar', title: 'Calendar watch', enabled: true,
+      lastFinding: { at, summary: 'No changes in one account.' },
+      presentation: { state: 'partial', lastCheck: { state: 'partial', at, readFailures: 1, successfulReads: 1 } } }],
+    unavailableHeartbeats: [{ id: 'noticing', title: 'Noticing', reason: 'status_unavailable' }],
+  }));
+  const calendar = out.pulses.find(row => row.heartbeat === 'calendar');
+  assert.equal(calendar?.presentation?.lastCheck.state, 'partial');
+  assert.equal(calendar?.lastAt, at);
+  assert.equal(calendar?.summary, undefined);
+  assert.deepEqual(out.pulses.find(row => row.heartbeat === 'noticing'), {
+    heartbeat: 'noticing', title: 'Noticing', enabled: null, availability: 'unavailable',
+  });
+  assert.ok(out.rows.some(row => row.key === 'noticing:p-open'), 'a failed status read does not remove its retained question');
+  assert.ok(out.rows.some(row => row.key === 'plan:plan-s'), 'a failed status read does not remove a retained suggestion');
+  assert.ok(out.covers.questionIds.includes('checkin:ci-1'));
+  const unknown = buildFromClem(input({ heartbeats: [{ id: 'calendar', title: 'Calendar watch', enabled: true,
+    lastFinding: { at: 'invalid', summary: 'Unverified retained text.' },
+    presentation: { state: 'unknown', lastCheck: { state: 'unknown' } } }] }));
+  assert.equal(unknown.pulses[0]?.lastAt, undefined);
+  assert.equal(unknown.pulses[0]?.summary, undefined);
+});
+
+test('an answered proposal keeps only its retained handoff progress and chat, never another answer or approval action', () => {
+  for (const state of ['not_started', 'needs_attention', 'dispatched'] as const) {
+    const out = buildFromClem(input({ notifications: [], planProposals: [], noticingProposals: [{ id: 'controlled-handoff',
+      title: 'Prepare the controlled draft', why: 'Keep its result reviewable.', action: 'Prepare a draft.', status: 'answered',
+      createdAt: '2026-10-01T10:00:00.000Z', checkInId: 'controlled-answered-question', notificationId: 'controlled-carrier',
+      handoff: { state, updatedAt: '2026-10-01T11:00:00.000Z', sessionId: 'exact-retained-handoff-chat', reason: 'Controlled progress.' } }],
+      voiced: () => ({ message: 'Controlled progress in her words.', choices: ['Run again'] }),
+    }));
+    assert.equal(out.rows.length, 1);
+    const row = out.rows[0]!;
+    assert.equal(row.key, 'noticing:controlled-handoff');
+    assert.equal(row.asks, false);
+    assert.equal(row.at, '2026-10-01T11:00:00.000Z');
+    assert.deepEqual(row.handoff, { state, sessionId: 'exact-retained-handoff-chat', reason: 'Controlled progress.' });
+    assert.equal(row.answer, undefined);
+    assert.equal(row.done, undefined);
+    assert.equal(row.say, undefined, 'a handoff does not reuse proposal wording');
+    assert.equal(row.choices, undefined, 'old voiced choices cannot become another run grant');
+    assert.notEqual(fromClemVoiceDigest(row), fromClemVoiceDigest({ ...row, handoff: { ...row.handoff!, sessionId: 'changed-chat' } }));
+    assert.notEqual(fromClemVoiceDigest(row), fromClemVoiceDigest({ ...row, handoff: { ...row.handoff!, state: 'settled' } }));
+    assert.deepEqual(out.covers.questionIds, ['checkin:controlled-answered-question']);
+    assert.deepEqual(out.covers.notificationIds, ['controlled-carrier']);
+  }
+  const settled = buildFromClem(input({ notifications: [], planProposals: [], noticingProposals: [{ id: 'settled',
+    title: 'Already settled', status: 'answered', createdAt: '2026-10-01T10:00:00.000Z',
+    handoff: { state: 'settled', updatedAt: '2026-10-01T11:00:00.000Z' } }] }));
+  assert.deepEqual(settled.rows, []);
 });
 
 test('a report a workflow run sent the owner is hers to say as written, with its run, while it is news', () => {

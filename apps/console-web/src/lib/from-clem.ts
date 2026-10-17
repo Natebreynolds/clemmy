@@ -1,3 +1,4 @@
+import type { HeartbeatPresentation } from '@clem/chat-engine';
 /** From Clem on Home: what the heartbeats brought the owner, as one stream
  *  (server: src/dashboard/from-clem.ts). */
 import { apiGet, apiPost } from './api';
@@ -24,6 +25,7 @@ export interface FromClemRow {
   run?: { runId: string; workflow?: string };
   /** A report she already wrote: `say` is the report itself. */
   authored?: boolean;
+  handoff?: {state:'not_started'|'dispatched'|'needs_attention'|'settled';sessionId?:string;reason?:string};
 }
 
 /** Where a report's run opens, when its workflow is known. */
@@ -36,7 +38,9 @@ export function fromClemRunHref(row: Pick<FromClemRow, 'run'>): string | null {
 export interface FromClemPulse {
   heartbeat: string;
   title: string;
-  enabled: boolean;
+  enabled: boolean | null;
+  availability?: 'available'|'unavailable';
+  presentation?: HeartbeatPresentation;
   lastAt?: string;
   summary?: string;
 }
@@ -106,6 +110,6 @@ export function withoutFromClem<T extends { questionId?: string; planProposalId?
 
 /** The heartbeats Clem runs that have looked at anything, newest look first. */
 export function recentPulses(pulses: readonly FromClemPulse[]): FromClemPulse[] {
-  return pulses.filter((pulse) => pulse.enabled && pulse.lastAt)
+  return pulses.filter((pulse) => pulse.enabled !== false && (pulse.lastAt || pulse.availability === 'unavailable' || pulse.presentation))
     .sort((a, b) => (b.lastAt ?? '').localeCompare(a.lastAt ?? ''));
 }

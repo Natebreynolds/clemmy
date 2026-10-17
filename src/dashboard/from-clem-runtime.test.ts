@@ -380,9 +380,53 @@ test('a heartbeat\'s latest check counts as failed only when its error belongs t
   const { lastCheckFailed } = await import('./from-clem-runtime.js');
   assert.equal(lastCheckFailed('2026-10-02T10:00:00.000Z', undefined), false);
   assert.equal(lastCheckFailed('2026-10-02T10:00:00.000Z', '2026-10-02T10:00:00.000Z'), true, 'the same check');
-  assert.equal(lastCheckFailed('2026-10-02T10:00:40.000Z', '2026-10-02T10:00:00.000Z'), true, 'error recorded as the check started');
+  assert.equal(lastCheckFailed('2026-10-02T10:00:40.000Z', '2026-10-02T10:00:00.000Z'), false, 'a rapid later finding cannot inherit an older failure');
+  assert.equal(lastCheckFailed('2026-10-02T10:00:00.000Z', '2026-10-02T10:00:40.000Z'), true, 'a later failed attempt supersedes the older finding');
   assert.equal(lastCheckFailed('2026-10-02T10:30:00.000Z', '2026-10-02T10:00:00.000Z'), false, 'an older failure, since checked cleanly');
   assert.equal(lastCheckFailed('not a date', '2026-10-02T10:00:00.000Z'), false);
+});
+
+test('the shared live From Clem read preserves partial check state without presenting raw failure text as a finding', async () => {
+  const { readFromClem } = await import('./from-clem-runtime.js');
+  const { emptyCalendarWatchState } = await import('../agents/calendar-watch.js');
+  const { loadCalendarWatchState, saveCalendarWatchState } = await import('../agents/calendar-watch-runtime.js');
+  const before = loadCalendarWatchState();
+  const state = emptyCalendarWatchState();
+  const at = new Date(Date.now() - 1_000).toISOString();
+  state.lastTickAt = at;
+  state.lastFinding = { tickId: 'controlled-partial-read', at, source: 'manual', durationMs: 1, accounts: 1,
+    events: 0, changes: 0, produced: 0, vetoed: 0, retired: 0, quiet: true, readFailures: 1,
+    summary: 'No change across the successfully read account.' };
+  state.lastError = { at, reason: 'Controlled private read diagnostic.' };
+  try {
+    saveCalendarWatchState(state);
+    // This control owns heartbeat projection, not setup readiness. The
+    // default setup reader loads unrelated provider/credential/MCP graphs.
+    let setupReads = 0;
+    const stream = await readFromClem({ readSetup: async () => { setupReads++; return null; } });
+    assert.equal(setupReads, 1);
+    const pulse = stream.pulses.find(row => row.heartbeat === 'calendar');
+    assert.equal(pulse?.presentation?.lastCheck.state, 'partial');
+    assert.equal(pulse?.presentation?.lastCheck.readFailures, 1);
+    assert.equal(pulse?.summary, undefined);
+    assert.equal(pulse?.lastAt, at);
+    assert.ok(!JSON.stringify(stream).includes('Controlled private read diagnostic'));
+  } finally { saveCalendarWatchState(before); }
+});
+
+test('structured handoff progress needs no extra model wording or repeated invitation', async () => {
+  const progress = buildFromClem({ heartbeats: [], notifications: [], planProposals: [], asksOwner: () => false,
+    noticingProposals: [{ id: 'controlled-progress', title: 'Prepare the controlled draft', status: 'answered',
+      createdAt: '2026-10-01T10:00:00.000Z', handoff: { state: 'dispatched', sessionId: 'controlled-progress-chat',
+        updatedAt: '2026-10-01T11:00:00.000Z' } }] }).rows;
+  let calls = 0;
+  const written = await voiceFromClemRows(progress, { thread: null, port: () => ({
+    async voiceProactiveItem() { calls++; throw new Error('handoff progress must use the retained state'); },
+  }) as never });
+  assert.equal(written, 0);
+  assert.equal(calls, 0);
+  assert.equal(progress[0]?.asks, false);
+  assert.equal(progress[0]?.answer, undefined);
 });
 
 test('an item moved to later is hidden until the next morning and stays covered meanwhile', async () => {

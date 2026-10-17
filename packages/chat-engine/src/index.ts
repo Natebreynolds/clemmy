@@ -48,3 +48,6 @@ export * from './model-scorecard-presentation.js';
 export * from './live-voice.js';
 
 export * from './steer-receipt.js';
+
+export * from './proactive-reply.js';
+export * from './proactive-status.js';

@@ -91,6 +91,18 @@ export interface NoticingProposalRecord extends NoticingProposalV1 {
   status: 'open' | 'answered' | 'expired' | 'retired';
   answer?: { text: string; decision: NoticingDecision; at: string; instruction?: string };
   retiredReason?: string;
+  /** Presentation/progress only. The normal accepted ingress and execution
+   * ledgers, never this record, own consent, account and effect authority. */
+  handoff?: {
+    version: 1;
+    answerDigest: string;
+    state: 'not_started' | 'dispatched' | 'needs_attention' | 'settled';
+    updatedAt: string;
+    sessionId?: string;
+    sourceUserSeq?: number;
+    requestId?: string;
+    reason?: string;
+  };
 }
 export interface NoticingStandingAnswer {
   /** The owner's words, kept as they said them. */
@@ -111,6 +123,7 @@ export interface NoticingThinking {
   quiet: boolean;
   summary: string;
   error?: string;
+  modelCheck?: 'fresh' | 'no_local_evidence' | 'recent_unchanged';
 }
 export interface NoticingState {
   version: 1;
@@ -119,6 +132,8 @@ export interface NoticingState {
   proposals: Record<string, NoticingProposalRecord>;
   standingAnswers: NoticingStandingAnswer[];
   thinking: NoticingThinking[];
+  /** Bounded reuse of a successful proposal decision; not execution evidence. */
+  decisionReuse?: { version: 1; fingerprint: string; decidedAt: string };
   metrics: {
     ticks: number; quietTicks: number; modelCalls: number; modelFailures: number;
     itemsProduced: number; itemsAcknowledged: number; itemsRetired: number;
@@ -163,6 +178,9 @@ export interface NoticingTickDeps {
   isAnswered: (checkInId: string) => { answered: boolean; closed?: boolean; text?: string; at?: string };
   loadState: () => NoticingState;
   saveState: (state: NoticingState) => void;
+  /** Optional host fence over the state/rules captured by loadState. Reads
+   * metadata only; a changed generation cannot publish a stale suggestion. */
+  publicationStillCurrent?: () => boolean;
 }
 export interface NoticingTickResult extends NoticingThinking { produced: number; retired: number }
 
@@ -182,6 +200,67 @@ export function observationDigest(observation: NoticingObservation, rules: strin
   return createHash('sha256').update(JSON.stringify({ observation, rules })).digest('hex');
 }
 
+// The normal default cadence is three hours, so this deliberately short reuse
+// window helps empty/repeated local checks and a custom 30-minute cadence; it
+// does not imply fewer model calls on the default cadence. Skips never renew it.
+export const NOTICING_DECISION_REUSE_MS = 60 * 60_000;
+const DAY_MS = 24 * 60 * 60_000;
+
+function hasLocalNoticingEvidence(observation: NoticingObservation): boolean {
+  return observation.goals.length > 0 || observation.work.runs.length > 0
+    || observation.work.waits.length > 0 || observation.work.drafts.length > 0
+    || observation.calendar.length > 0
+    || observation.conversations.some(row => Boolean(row.lastRequest?.trim()))
+    || observation.memories.some(row => Boolean(row.text.trim()))
+    || Boolean(observation.alreadyAskingOwner?.some(row => Boolean(row.about.trim())));
+}
+
+function hasTimeSensitiveNoticingEvidence(observation: NoticingObservation): boolean {
+  // Calendar items and waits have relative urgency. A target date may be in
+  // an owner's local timezone or malformed legacy data: do not reinterpret
+  // any of those clocks or infer deadlines by reading prose to skip a check.
+  return observation.calendar.length > 0 || observation.work.waits.length > 0
+    || observation.goals.some(goal => goal.targetDate !== undefined);
+}
+
+function noticingDecisionFingerprint(observation: NoticingObservation, deps: NoticingTickDeps,
+  state: NoticingState, now: number): string {
+  const { at: _clock, ...evidence } = observation;
+  const ageDays = (at: string | undefined): number | null => {
+    const timestamp = at ? Date.parse(at) : Number.NaN;
+    return Number.isFinite(timestamp) ? Math.floor((now - timestamp) / DAY_MS) : null;
+  };
+  const proposals = Object.entries(state.proposals).sort(([a], [b]) => a.localeCompare(b)).map(([id, proposal]) => {
+    const created = Date.parse(proposal.createdAt);
+    const answered = proposal.answer ? Date.parse(proposal.answer.at) : Number.NaN;
+    return { id, proposal,
+      countsToday: created >= now - DAY_MS && proposal.status !== 'retired',
+      recent: now - created < 14 * DAY_MS,
+      openExpired: proposal.status === 'open' && now - created > deps.config.openForMs,
+      notNowQuiet: proposal.answer?.decision === 'not_now' && now - answered < deps.config.notNowForMs,
+      doItQuiet: proposal.answer?.decision === 'do_it' && now - answered < 7 * DAY_MS,
+    };
+  });
+  // Only `at` is omitted. Preserve all evidence, user words, handoff changes,
+  // rules and policy; include relative ages and exact existing expiry floors
+  // so their transitions invalidate reuse even inside the finite window.
+  return createHash('sha256').update(JSON.stringify({ version: 1, evidence,
+    ages: { goals: observation.goals.map(goal => ageDays(goal.updatedAt)),
+      runs: observation.work.runs.map(run => ageDays(run.finishedAt)),
+      drafts: observation.work.drafts.map(draft => ageDays(draft.modifiedAt)),
+      conversations: observation.conversations.map(conversation => ageDays(conversation.updatedAt)) },
+    rules: deps.rules, standingAnswers: state.standingAnswers, proposals, config: deps.config,
+  })).digest('hex');
+}
+
+function canReuseNoticingDecision(state: NoticingState, fingerprint: string, now: number): boolean {
+  const previous = state.decisionReuse;
+  const decidedAt = typeof previous?.decidedAt === 'string' ? Date.parse(previous.decidedAt) : Number.NaN;
+  return previous?.version === 1 && typeof previous.fingerprint === 'string' && /^[a-f0-9]{64}$/.test(previous.fingerprint)
+    && previous.fingerprint === fingerprint && Number.isFinite(decidedAt)
+    && now >= decidedAt && now - decidedAt < NOTICING_DECISION_REUSE_MS;
+}
+
 /** One tick: read, think, maybe ask, write the thinking down. */
 export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingTickResult> {
   const startedAt = deps.now();
@@ -194,6 +273,17 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   let error: string | undefined;
   let produced = 0;
   let retired = 0;
+  let modelCheck: NoticingThinking['modelCheck'];
+  let publicationDeferred: 'changed' | 'unavailable' | undefined;
+  const publicationStillCurrent = (): boolean => {
+    if (!deps.publicationStillCurrent) return true;
+    try {
+      if (deps.publicationStillCurrent() === true) return true;
+      publicationDeferred = 'changed';
+    } catch { publicationDeferred = 'unavailable'; }
+    delete state.decisionReuse;
+    return false;
+  };
   state.metrics.ticks += 1;
   state.lastTickAt = nowIso;
   state.lastTickId = deps.tickId;
@@ -230,6 +320,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       conversations: observation.conversations.length, memories: observation.memories.length };
   } catch (err) {
     error = `could not read: ${err instanceof Error ? err.message : String(err)}`;
+    observation = null;
   }
 
   // 3. The boundaries the model does not own: the daily cap.
@@ -242,7 +333,18 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   // No model signed in yet is a home that is not set up, not a failure:
   // the tick is quiet and says so plainly, never as "Could not finish".
   let waitingForModel = false;
-  if (observation && !capped) {
+  const noLocalEvidence = observation !== null && !hasLocalNoticingEvidence(observation);
+  const ordinaryTick = deps.source === 'heartbeat' || deps.source === 'boot';
+  const unchanged = observation !== null && !noLocalEvidence && ordinaryTick
+    && !hasTimeSensitiveNoticingEvidence(observation)
+    && canReuseNoticingDecision(state, noticingDecisionFingerprint(observation, deps, state, startedAt), startedAt);
+  if (noLocalEvidence) modelCheck = 'no_local_evidence';
+  else if (unchanged && !capped) modelCheck = 'recent_unchanged';
+  if (observation && !capped && !noLocalEvidence && !unchanged) {
+    modelCheck = 'fresh';
+    // Do not retain an older success through a failed fresh check, manual
+    // reconsideration, model outage, malformed reply or failed publication.
+    delete state.decisionReuse;
     const evidenceDigest = observationDigest(observation, deps.rules);
     const recent = Object.values(state.proposals)
       .filter((p) => startedAt - Date.parse(p.createdAt) < 14 * 24 * 60 * 60_000)
@@ -255,14 +357,25 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
         state.metrics.modelCalls += 1;
         model = reply.modelIdentity;
         if (reply.error) { error = reply.error; state.metrics.modelFailures += 1; }
-        else if (reply.answer && reply.answer.evidenceDigest === evidenceDigest) answer = reply.answer;
-        else { error = 'the model answered for different evidence'; state.metrics.modelFailures += 1; }
+        else {
+          const parsed = NoticingAnswerV1Schema.safeParse(reply.answer);
+          if (!parsed.success) { error = 'the model answered in an invalid shape'; state.metrics.modelFailures += 1; }
+          else if (parsed.data.evidenceDigest === evidenceDigest) answer = parsed.data;
+          else { error = 'the model answered for different evidence'; state.metrics.modelFailures += 1; }
+        }
       }
     } catch (err) {
       error = `the model could not be asked: ${err instanceof Error ? err.message : String(err)}`;
       state.metrics.modelFailures += 1;
     }
   }
+
+  if (!observation || noLocalEvidence || capped) delete state.decisionReuse;
+  // A reply is bound to the exact evidence the model saw, but an owner may
+  // have answered/dismissed another proposal or changed a rule while it was
+  // thinking. Do not publish or cache that now-stale decision, or pay for an
+  // immediate replacement; the next scheduled check can reconsider it.
+  if (answer && !publicationStillCurrent()) answer = null;
   if (capped) considered.push({ subject: 'anything new', outcome: 'capped', why: `${sentToday} proposal${sentToday === 1 ? '' : 's'} already sent today (cap ${deps.config.dailyCap})` });
   for (const aside of answer?.setAside ?? []) considered.push({ subject: aside.subject, outcome: 'set_aside', why: aside.why });
 
@@ -286,7 +399,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
     } else {
       const id = `ntc-${Date.now().toString(36)}-${shapeKey.slice(0, 6)}`;
       const record: NoticingProposalRecord = { ...proposal, id, shapeKey, createdAt: nowIso, status: 'open' };
-      try {
+      if (publicationStillCurrent()) try {
         const asked = await deps.ask(record);
         record.checkInId = asked.checkInId;
         if (asked.notificationId) record.notificationId = asked.notificationId;
@@ -298,17 +411,25 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       }
     }
   }
+  if (answer && !error && !publicationDeferred && observation) {
+    state.decisionReuse = { version: 1, fingerprint: noticingDecisionFingerprint(observation, deps, state, startedAt), decidedAt: nowIso };
+  }
 
   // 6. Write the thinking down.
   const quiet = produced === 0;
   const summary = error ? `Could not finish: ${error}`
+    : publicationDeferred === 'unavailable' ? 'Quiet: current local context could not be confirmed; no suggestion was published'
+    : publicationDeferred === 'changed' ? 'Quiet: local context changed while I was thinking; I will reconsider it on the next check'
     : waitingForModel ? 'Quiet: waiting until a model is set up to think with'
     : produced ? `Proposed: ${state.proposals[proposalId!]!.title}`
     : capped ? 'Quiet: today\'s proposals are used up'
+    : noLocalEvidence ? 'Quiet: no local evidence to consider'
+    : unchanged ? 'Quiet: local evidence is unchanged since the recent successful check'
     : considered.length ? `Quiet: considered ${considered.length} thing${considered.length === 1 ? '' : 's'}, nothing worth asking now`
     : 'Quiet: nothing new to consider';
   const thinking: NoticingThinking = { tickId: deps.tickId, at: nowIso, source: deps.source, durationMs: deps.now() - startedAt,
-    read, considered, ...(proposalId ? { proposalId } : {}), ...(model ? { model } : {}), quiet, summary, ...(error ? { error } : {}) };
+    read, considered, ...(proposalId ? { proposalId } : {}), ...(model ? { model } : {}), quiet, summary, ...(error ? { error } : {}),
+    ...(modelCheck ? { modelCheck } : {}) };
   state.thinking = [thinking, ...state.thinking].slice(0, deps.config.thinkingKept);
   if (quiet) state.metrics.quietTicks += 1;
   // Old settled proposals decay out of the record.
