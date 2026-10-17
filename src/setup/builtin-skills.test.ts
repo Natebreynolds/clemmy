@@ -361,7 +361,7 @@ test('an unusable preserved override makes the exact foreground daemon process f
 
 function packageRootWith(label: string, overrides: Record<string, string> = {}): string {
   const root = path.join(HOME, `package-${label}`);
-  for (const name of [builtins.TECHNICAL_CONTENT_MARKETING_SKILL, builtins.WORKSPACE_BUILDER_SKILL, builtins.PEOPLE_LOOKUP_SKILL, builtins.WORKFLOW_BUILDER_SKILL]) {
+  for (const name of [builtins.TECHNICAL_CONTENT_MARKETING_SKILL, builtins.WORKSPACE_BUILDER_SKILL, builtins.PEOPLE_LOOKUP_SKILL, builtins.WORKFLOW_BUILDER_SKILL, builtins.WATCH_SETUP_SKILL]) {
     const dir = path.join(root, 'builtin-skills', name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(
@@ -527,6 +527,40 @@ test('Clem finds the workflow-builder skill when a request is to automate or fix
   }
   for (const [index, [relevant, ranked]] of found.slice(3).entries()) {
     assert.equal(relevant.includes(builtins.WORKFLOW_BUILDER_SKILL) || ranked.includes(builtins.WORKFLOW_BUILDER_SKILL), false,
+      `unrelated request ${index} pulled it in: ${JSON.stringify([relevant, ranked])}`);
+  }
+});
+
+test('Clem finds the watch-setup skill when the owner hands her a source to keep an eye on, and not for unrelated work', async () => {
+  const home = path.join(HOME, 'watch-discovery');
+  builtins.provisionBuiltinSkills({ baseDir: home, packageRoot: PKG_DIR });
+  const probe = spawnSync(process.execPath, ['--import', 'tsx', '-e', `
+    const { findRelevantSkills } = await import(${JSON.stringify(path.join(PKG_DIR, 'src', 'memory', 'skill-store.ts'))});
+    const { rankSkills } = await import(${JSON.stringify(path.join(PKG_DIR, 'src', 'runtime', 'harness', 'context-packet.ts'))});
+    const asks = JSON.parse(process.argv[1]);
+    console.log(JSON.stringify(asks.map((ask) => [
+      findRelevantSkills(ask).map((m) => m.skill.name),
+      rankSkills(ask).map((m) => m.name),
+    ])));
+  `, JSON.stringify([
+    'keep an eye on the #platform-49 slack channel and tell me if a client sounds unhappy',
+    'watch my inbox for anything from acme and let me know',
+    'monitor the Q4 contracts drive folder for new files',
+    'what is the weather in denver tomorrow',
+    'summarize this article for me in three bullets',
+  ])], {
+    cwd: PKG_DIR,
+    env: { ...process.env, CLEMENTINE_HOME: home, CLEMMY_TEST_ISOLATED_HOME: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  const found = JSON.parse(probe.stdout.trim().split('\n').pop()!) as Array<[string[], string[]]>;
+  for (const [index, [relevant, ranked]] of found.slice(0, 3).entries()) {
+    assert.ok(relevant.includes(builtins.WATCH_SETUP_SKILL) || ranked.includes(builtins.WATCH_SETUP_SKILL),
+      `request ${index} did not surface the skill: ${JSON.stringify([relevant, ranked])}`);
+  }
+  for (const [index, [relevant, ranked]] of found.slice(3).entries()) {
+    assert.equal(relevant.includes(builtins.WATCH_SETUP_SKILL) || ranked.includes(builtins.WATCH_SETUP_SKILL), false,
       `unrelated request ${index} pulled it in: ${JSON.stringify([relevant, ranked])}`);
   }
 });

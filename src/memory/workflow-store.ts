@@ -1,3 +1,5 @@
+import { parseWorkflowWatch, type WorkflowWatch } from './workflow-watch.js';
+export { parseWorkflowWatch, type WorkflowWatch } from './workflow-watch.js';
 import { closeSync, chmodSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -645,6 +647,9 @@ export interface WorkflowDefinition {
   /** Who this workflow is for. 'dev' = created by smoke/creation tests —
    *  hidden from every user-facing surface. Absent = 'user'. */
   origin?: 'user' | 'dev';
+  /** Present when this workflow is one of the owner's watches: a standing,
+   *  read-only look at a source they handed Clem (see agents/watches.ts). */
+  watch?: WorkflowWatch;
 }
 
 /** What the on-disk loader returns. */
@@ -1107,6 +1112,10 @@ if (step.optional === true || (step as Record<string, unknown>).optional === 'tr
       })(),
       ...(goal ? { goal } : {}),
       ...(data.origin === 'dev' ? { origin: 'dev' as const } : {}),
+      ...((): Partial<WorkflowDefinition> => {
+        const watch = parseWorkflowWatch(data.watch);
+        return watch ? { watch } : {};
+      })(),
     };
   } catch {
     return null;
@@ -1318,6 +1327,9 @@ function writeWorkflowToDir(dirPath: string, def: WorkflowDefinition): void {
   if (def.models && (def.models.brain || def.models.worker)) frontmatter.models = { ...def.models };
   // Only 'dev' is persisted — absent means 'user', keeping legacy files byte-identical.
   if (def.origin === 'dev') frontmatter.origin = 'dev';
+  if (def.watch) {
+    frontmatter.watch = { source: def.watch.source, look_for: def.watch.lookFor, purpose: def.watch.purpose };
+  }
   if (def.goal?.objective) {
     const goal: Record<string, unknown> = { objective: def.goal.objective };
     if (def.goal.successCriteria && def.goal.successCriteria.length > 0) goal.success_criteria = def.goal.successCriteria;

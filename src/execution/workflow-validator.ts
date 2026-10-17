@@ -47,6 +47,7 @@ import {
   type WorkflowNodeInvocationPlanV1,
 } from '../memory/workflow-node-invocation-plan.js';
 import { validateWorkflowTransform } from './workflow-transform.js';
+import { parseWorkflowWatch } from '../memory/workflow-watch.js';
 
 /**
  * Shape of a workflow's parsed frontmatter — kept loose because the
@@ -1016,6 +1017,18 @@ export function validateWorkflowDefinition(
   }
 
   const steps = data.steps ?? [];
+  // A watch only looks: it is the owner's standing read of a source. A send
+  // from it would turn a look into an act the owner never set up.
+  const rawWatch = (data as { watch?: unknown }).watch;
+  if (rawWatch !== undefined) {
+    if (!parseWorkflowWatch(rawWatch)) errors.push('A watch needs a source and what to look for.');
+    for (const step of steps) {
+      const declared = step.sideEffect ?? step.side_effect;
+      if (structuredCallSideEffectClass({ call: step.call, sideEffect: declared }) === 'send') {
+        errors.push(`Watch step "${step.id ?? '?'}" sends; a watch only reads. Put the send in its own workflow.`);
+      }
+    }
+  }
   const ids = new Set<string>();
   const workflowInputKeys = new Set(Object.keys(data.inputs ?? {}));
   let duplicates = 0;

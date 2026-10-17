@@ -230,6 +230,7 @@ import {
   workflowRunCancellationRequested,
 } from './workflow-run-cancellation.js';
 import { workflowRunProducedWork } from './workflow-dead-occurrences.js';
+import { extractWatchReport, productionWatchRunDeps, recordWatchRun } from '../agents/watches.js';
 import {
   checkWorkflowForWrite,
   classifyStepSideEffect,
@@ -17700,6 +17701,7 @@ async function processOneRunFile(
       // to decide: its notice asks them, so it is never folded into a step's
       // own report and it waits on Needs you.
       const outcomeAsksOwner = needsAttention || goalGap;
+      const cleanWatchRun = Boolean(workflow.data.watch) && !outcomeAsksOwner && !hasFailures;
       const stepAlreadyNotified = shouldSilenceCompletionEcho({
         needsAttention: outcomeAsksOwner,
         runId: run.id,
@@ -17805,7 +17807,10 @@ async function processOneRunFile(
           // A chronic-failure escalation must also always deliver. A routine
           // no-op goes dashboard-only (recorded + auditable, no Discord/push).
           silent: suppressGlobalTerminal
-            || ((stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused),
+            || ((stepAlreadyNotified || runIsNoOp) && !hasAdvisories && !autoHealPaused)
+            // A clean watch run's report is its findings (agents/watches.ts);
+            // this record stays for history, never a second item.
+            || (cleanWatchRun && !hasAdvisories && !autoHealPaused),
           metadata: {
             workflow: workflow.data.name,
             runId: run.id,
@@ -17819,6 +17824,18 @@ async function processOneRunFile(
         }));
       }
       markRunNotified(filePath);
+      const runWatch = workflow.data.watch;
+      if (runWatch) {
+        const watchReport = extractWatchReport({ steps: publicExecutionSteps, stepOutputs: publicStepOutputs, finalOutput });
+        void productionWatchRunDeps()
+          .then((deps) => recordWatchRun({
+            workflowSlug: workflow.name, workflowName: workflow.data.name, watch: runWatch, runId: run.id, report: watchReport,
+          }, deps))
+          .catch((error) => logger.warn(
+            { workflow: workflow.data.name, runId: run.id, err: error instanceof Error ? error.message : String(error) },
+            'watch run could not be recorded',
+          ));
+      }
       try {
         finalizeStep('finish_run', () => finishRun(run.id, {
           status: 'completed',
