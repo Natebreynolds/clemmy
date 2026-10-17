@@ -29,6 +29,18 @@ test('in the live review the reply comes after the evidence, so re-reviews share
   assert.ok(second.startsWith(shared), 'a changed reply leaves everything before it identical');
 });
 
+test('skill references lead the live review, so later turns that read the same skill share them too', () => {
+  const skill = { name: 'workspace-builder', body: 'SKILL-BODY', bodyDigest: 'd'.repeat(64), evidenceStatus: 'verified' as const,
+    origins: [{ readEventSeq: 7, sourceUserSeq: 5, scope: 'current_source' as const, authority: 'exact' as const }] };
+  const one = buildObjectiveJudgePrompt('Build the Space.', 'Reply.', { skills: [skill], fullSourceEvidence: true, toolCallSummary: EVIDENCE } as never);
+  const reread = buildObjectiveJudgePrompt('Build another Space.', 'Other reply.', { skills: [{ ...skill,
+    origins: [...skill.origins, { readEventSeq: 90, sourceUserSeq: 88, scope: 'current_source' as const, authority: 'exact' as const }] }],
+  fullSourceEvidence: true, toolCallSummary: EVIDENCE } as never);
+  assert.ok(one.indexOf('SKILL-BODY') < one.indexOf('Objective: Build the Space.'), 'the skill leads the objective');
+  const shared = one.slice(0, one.indexOf('SKILL-BODY') + 'SKILL-BODY'.length);
+  assert.ok(reread.startsWith(shared), 'a new read of the same skill leaves its body in the shared prefix');
+});
+
 test('the legacy review keeps its order: the reply comes before the evidence', () => {
   const prompt = buildObjectiveJudgePrompt('Build the Space.', 'First reply.', { skills: [], toolCallSummary: EVIDENCE } as never);
   assert.ok(prompt.indexOf('First reply.') < prompt.indexOf('EVIDENCE-BODY'));

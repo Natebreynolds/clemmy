@@ -1187,9 +1187,13 @@ export function buildObjectiveJudgePrompt(
   // instructions, the objective and 26 KB of skill reference, yet ~180 KB of
   // each request followed a reply that had changed, and the reviewer ran at
   // ~1% cached. The legacy prompt keeps its frozen order.
+  // The skill references and standing instructions are the same for every
+  // review that read the same skill, so in the live review they lead, ahead
+  // of the objective and the evidence of this one request.
   const responseLast = skillContext?.fullSourceEvidence === true;
+  const leading = responseLast ? completionRequirementParts(skillContext).slice(1) : [];
   const parts: ReviewInputPart[] = responseLast
-    ? [{ text: `Objective: ${objective}`, component: 'effective_objective' }]
+    ? [...leading, ...(leading.length > 0 ? [''] : []), { text: `Objective: ${objective}`, component: 'effective_objective' }]
     : [{ text: `Objective: ${objective}`, component: 'effective_objective' }, '', ...responseParts];
   // Tool-call evidence — surface it whenever we have it, EVEN with no skill
   // loaded. The judge audits an ACTION objective ("build/deploy X"); without the
@@ -1211,7 +1215,7 @@ export function buildObjectiveJudgePrompt(
   // should have before it rules, not something to infer from each block.
   const ledger = coverageReviewed(skillContext) ? reviewCoverageLedger(reviewCoverageResults(skillContext)) : undefined;
   if (ledger) parts.push('', { text: ledger, component: 'coverage_ledger' });
-  parts.push(...completionRequirementParts(skillContext));
+  if (!responseLast) parts.push(...completionRequirementParts(skillContext));
   if (responseLast) parts.push('', ...responseParts);
   const priorOpinion = skillContext?.priorJevOpinion && priorJevOpinions.get(skillContext.priorJevOpinion);
   const currentOwner = reviewOwnerAtModelEntry();

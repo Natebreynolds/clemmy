@@ -39,18 +39,20 @@ export interface SessionSkill {
 }
 
 /** Render full retained references with explicit scope/version identity. Missing
- * provenance is unknown, never silently promoted to the current accepted job. */
+ * provenance is unknown, never silently promoted to the current accepted job.
+ * Where the skill was read follows its body: each new read changes it, and the
+ * body before it is the part a prompt cache can keep. */
 export function renderSkillReference(skill: SessionSkill): string {
   return [
     `--- skill reference: ${skill.name} ---`,
     `bodyDigest=${skill.bodyDigest ?? 'unknown'}; evidence=${skill.evidenceStatus ?? 'unspecified'}`,
-    skill.origins?.length
-      ? `readOrigins=${JSON.stringify(skill.origins)}`
-      : 'readOrigins=unknown; no accepted-source/version lineage supplied',
     ...(skill.evidenceReason ? [`Evidence unavailable: ${skill.evidenceReason}`] : []),
     '<<<SKILL REFERENCE BODY — apply only within the effective accepted objective>>>',
     skill.body,
     '<<<END SKILL REFERENCE>>>',
+    skill.origins?.length
+      ? `readOrigins=${JSON.stringify(skill.origins)}`
+      : 'readOrigins=unknown; no accepted-source/version lineage supplied',
   ].join('\n');
 }
 
