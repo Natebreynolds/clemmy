@@ -303,7 +303,7 @@ export function recordStandaloneModelAccountingJobObservation(job: StandaloneMod
   const binding = standaloneModelAccountingJobBinding(job);
   if (!binding) return;
   try {
-    recordOperationalEvent({ source: 'model', type: 'model_accounting_observed', actor: 'noticing', payload: {
+    recordOperationalEvent({ source: 'model', type: 'model_accounting_observed', actor: binding.operation === 'meeting_opportunity' ? 'meeting' : 'noticing', payload: {
       version: 1, ownerKind: 'accounting_job', ...binding, phase: input.phase,
       ...(input.outcome ? { outcome: input.outcome, usage: 'unknown' } : {}),
       ...(input.receiptDigest && /^[a-f0-9]{64}$/.test(input.receiptDigest) ? { receiptDigest: input.receiptDigest } : {}),

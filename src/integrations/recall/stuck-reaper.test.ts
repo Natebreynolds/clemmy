@@ -31,6 +31,7 @@ test('listAllRecallMeetingRecords: empty detected stubs are excluded from the li
 
 test('reapStuckRecallRecordings: finalizes an idle recording, spares a fresh one', () => {
   // Stuck: a recording whose only segment is well past the idle window.
+  mc.noteRecallMeetingDetected({ windowId: 'win-stuck', recordingId: 'rec-stuck', status: 'recording' });
   mc.appendRecallTranscriptSegment({
     windowId: 'win-stuck',
     recordingId: 'rec-stuck',
@@ -41,6 +42,7 @@ test('reapStuckRecallRecordings: finalizes an idle recording, spares a fresh one
     isFinal: true,
   });
   // Fresh: a recording with activity right now.
+  mc.noteRecallMeetingDetected({ windowId: 'win-fresh', recordingId: 'rec-fresh', status: 'recording' });
   mc.appendRecallTranscriptSegment({
     windowId: 'win-fresh',
     recordingId: 'rec-fresh',

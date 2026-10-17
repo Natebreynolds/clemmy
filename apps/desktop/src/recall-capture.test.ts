@@ -7,6 +7,274 @@ import { strict as assert } from 'node:assert';
 
 import { getRecallPlatformSupport, RecallDesktopCapture } from './recall-capture.js';
 
+function finalDeliveryHarness(post: (pathname: string, payload: Record<string, unknown>) => Promise<Record<string, unknown>>) {
+  const events: Array<Record<string, unknown>> = [];
+  const capture = new RecallDesktopCapture({
+    getDaemonBaseUrl: () => '', getWebhookToken: () => '', emit: (event) => events.push(event),
+    runtime: { platform: 'darwin', arch: 'arm64' },
+  });
+  Reflect.set(capture, 'recording', true);
+  Reflect.set(capture, 'currentWindowId', 'final-window');
+  Reflect.set(capture, 'currentSdkUploadId', 'final-upload');
+  Reflect.set(capture, 'currentRecordingId', 'final-recording');
+  Reflect.set(capture, 'postDaemon', post);
+  const send = (data: unknown, windowId = 'final-window') => (Reflect.get(capture, 'onRealtimeEvent') as (event: unknown) => Promise<void>).call(capture, {
+    event: 'transcript.data', window: { id: windowId }, data,
+  });
+  return { capture, events, send };
+}
+
+function sdkFinal(utteranceId = 'utterance-1') {
+  return { text: 'A controlled final', recording_id: 'final-recording', utterance_id: utteranceId, participant: { id: 7 } };
+}
+
+test('final delivery retries only the same frozen event and waits for acknowledgement', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const { events, send } = finalDeliveryHarness(async (_pathname, payload) => {
+    payloads.push(payload);
+    if (payloads.length === 1) throw new Error('A transient acknowledgement failure');
+    return { status: 'accepted', meetingId: 'meeting-1', segmentId: 'segment-1' };
+  });
+  await send(sdkFinal());
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[0], payloads[1], 'replay preserves the exact payload object and receive timestamp');
+  assert.equal(Object.isFrozen(payloads[0]), true);
+  assert.match(String(payloads[0].eventId), /^recall-final-[a-f0-9]{64}$/);
+  const stored = events.filter((event) => event.type === 'transcript');
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].meetingId, 'meeting-1');
+  assert.equal(stored[0].segmentId, 'segment-1');
+});
+
+test('exhausted, ignored, and unacknowledged final delivery never emits a stored transcript', async () => {
+  for (const response of ['throw', 'ignored', 'unacknowledged'] as const) {
+    let calls = 0;
+    const { capture, events, send } = finalDeliveryHarness(async () => {
+      calls += 1;
+      if (response === 'throw') throw new Error('Store unavailable');
+      return response === 'ignored' ? { status: 'ignored', reason: 'capture_finalized' } : {};
+    });
+    await send(sdkFinal());
+    assert.equal(events.some((event) => event.type === 'transcript'), false);
+    assert.equal(calls, response === 'ignored' ? 1 : 2);
+    assert.equal(events.some((event) => event.type === (response === 'ignored' ? 'transcript-ignored' : 'transcript-store-failed')), true);
+    if (response !== 'ignored') assert.match(capture.status().lastError ?? '', /could not be saved/);
+  }
+});
+
+test('SDK replay delivers once, while text-only repeated utterances stay distinct', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const { send } = finalDeliveryHarness(async (_pathname, payload) => {
+    payloads.push(payload);
+    return { status: 'accepted', meetingId: 'meeting-1', segmentId: `segment-${payloads.length}` };
+  });
+  await send(sdkFinal());
+  await send(sdkFinal());
+  assert.equal(payloads.length, 1);
+  await send({ text: 'Yes', recording_id: 'final-recording' });
+  await send({ text: 'Yes', recording_id: 'final-recording' });
+  assert.equal(payloads.length, 3);
+  assert.notEqual(payloads[1].eventId, payloads[2].eventId);
+});
+
+test('a later exact SDK replay recovers an exhausted delivery with the original frozen payload', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const { events, send } = finalDeliveryHarness(async (_pathname, payload) => {
+    payloads.push(payload);
+    if (payloads.length <= 2) throw new Error('private-outage-detail-must-not-leak');
+    return { status: 'accepted', meetingId: 'meeting-1', segmentId: 'segment-recovered' };
+  });
+  await send(sdkFinal());
+  assert.equal(payloads.length, 2); assert.equal(events.some((event) => event.type === 'transcript'), false);
+  assert.equal(JSON.stringify(events).includes('private-outage-detail-must-not-leak'), false);
+  await send(sdkFinal());
+  assert.equal(payloads.length, 3); assert.equal(payloads[2], payloads[0]);
+  assert.equal(payloads[0], payloads[1]); assert.equal(Object.isFrozen(payloads[2]), true);
+  assert.equal(events.filter((event) => event.type === 'transcript').length, 1);
+  await send(sdkFinal());
+  assert.equal(payloads.length, 3, 'successful recovery becomes the stable replay receipt');
+});
+
+test('completion retains failed delivery uncertainty and permits only its exact replay after stop', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const statusPayloads: Array<Record<string, unknown>> = [];
+  let completedPayload: Record<string, unknown> | undefined;
+  const { capture, send } = finalDeliveryHarness(async (pathname, payload) => {
+    if (pathname.endsWith('/complete')) { completedPayload = payload; return { recordingSaved: true }; }
+    if (pathname.endsWith('/transcript-delivery-status')) { statusPayloads.push(payload); return {}; }
+    payloads.push(payload);
+    if (payloads.length <= 2) return { status: 'ignored', reason: 'capture_inventory_unavailable' };
+    return { status: 'accepted', meetingId: 'meeting-1', segmentId: 'segment-recovered' };
+  });
+  await send(sdkFinal()); assert.equal(payloads.length, 2, 'temporary identity uncertainty remains retryable');
+  const complete = await (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<Record<string, unknown>>).call(capture, {
+    windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording',
+  });
+  assert.equal(completedPayload!.unresolvedFinalCount, 1);
+  assert.deepEqual(complete.transcriptDelivery, { status: 'incomplete', failedFinalCount: 1 });
+  Reflect.set(capture, 'currentWindowId', undefined); Reflect.set(capture, 'currentSdkUploadId', undefined);
+  Reflect.set(capture, 'currentRecordingId', undefined);
+  await send(sdkFinal('new-after-completion')); assert.equal(payloads.length, 2);
+  await send(sdkFinal()); assert.equal(payloads.length, 3); assert.equal(payloads[2], payloads[0]);
+  assert.deepEqual(statusPayloads, [{ windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording', unresolvedFinalCount: 0 }]);
+  assert.equal((Reflect.get(capture, 'failedFinalDeliveries') as Map<string, unknown>).size, 0);
+  assert.equal((Reflect.get(capture, 'endingRecordingContexts') as Map<string, unknown>).size, 0);
+  await send(sdkFinal()); assert.equal(payloads.length, 3);
+});
+
+test('a final that fails during completion updates qualification without rescheduling completion', async () => {
+  let releaseComplete!: () => void;
+  const completeGate = new Promise<void>((resolve) => { releaseComplete = resolve; });
+  const calls: Array<{ pathname: string; payload: Record<string, unknown> }> = [];
+  const { capture, send } = finalDeliveryHarness(async (pathname, payload) => {
+    calls.push({ pathname, payload });
+    if (pathname.endsWith('/complete')) { await completeGate; return { recordingSaved: true }; }
+    if (pathname.endsWith('/transcript-event')) throw new Error('private-store-failure');
+    return {};
+  });
+  const completion = (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<Record<string, unknown>>).call(capture, {
+    windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording',
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await send(sdkFinal('late-during-completion'));
+  releaseComplete();
+  const complete = await completion;
+  assert.equal(calls.filter(({ pathname }) => pathname.endsWith('/complete')).length, 1);
+  assert.equal(calls.find(({ pathname }) => pathname.endsWith('/complete'))!.payload.unresolvedFinalCount, 0);
+  assert.deepEqual(calls.find(({ pathname }) => pathname.endsWith('/transcript-delivery-status'))!.payload,
+    { windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording', unresolvedFinalCount: 1 });
+  assert.deepEqual(complete.transcriptDelivery, { status: 'incomplete', failedFinalCount: 1 });
+});
+
+test('failed post-completion qualification updates remain visibly incomplete without exposing daemon errors', async () => {
+  let releaseComplete!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseComplete = resolve; });
+  const { capture, events, send } = finalDeliveryHarness(async (pathname) => {
+    if (pathname.endsWith('/complete')) { await gate; return { recordingSaved: true }; }
+    throw new Error('private-daemon-error-sentinel');
+  });
+  const completion = (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<Record<string, unknown>>).call(capture, {
+    windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording',
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await send(sdkFinal()); releaseComplete();
+  const complete = await completion;
+  assert.deepEqual(complete.transcriptDelivery, { status: 'incomplete', failedFinalCount: 1, statusUpdatePending: true });
+  assert.match(capture.status().lastError ?? '', /delivery status could not be confirmed/);
+  assert.equal(JSON.stringify(events).includes('private-daemon-error-sentinel'), false);
+  assert.equal((Reflect.get(capture, 'failedFinalDeliveries') as Map<string, unknown>).size, 1);
+});
+
+test('unknown windows and conflicting recording or upload ids never reach transcript ingress', async () => {
+  let calls = 0;
+  const { events, send } = finalDeliveryHarness(async () => { calls += 1; return { status: 'accepted' }; });
+  await send(sdkFinal(), 'unknown-window');
+  await send({ ...sdkFinal(), recording_id: 'another-recording' });
+  await send({ ...sdkFinal(), sdk_upload_id: 'another-upload' });
+  assert.equal(calls, 0);
+  assert.equal(events.filter((event) => event.type === 'transcript-ignored').length, 3);
+});
+
+test('a reused window cannot bind a late unknown old recording to its new capture without strong identity', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const { capture, events, send } = finalDeliveryHarness(async (pathname, payload) => {
+    if (pathname.endsWith('/transcript-event')) {
+      payloads.push(payload); return { status: 'accepted', meetingId: 'meeting-1', segmentId: `segment-${payloads.length}` };
+    }
+    return {};
+  });
+  Reflect.set(capture, 'currentRecordingId', undefined);
+  await send({ text: 'First capture words without a recording id', utterance_id: 'capture-a-utterance' });
+  assert.equal(payloads.length, 1, 'first-use windows retain qualified legacy association');
+  await (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<unknown>).call(capture,
+    { windowId: 'final-window', sdkUploadId: 'final-upload' });
+  Reflect.set(capture, 'currentSdkUploadId', 'second-upload');
+  Reflect.set(capture, 'currentRecordingId', undefined);
+  await send({ text: 'Old callback after window reuse', recording_id: 'late-old-recording', utterance_id: 'capture-a-late' });
+  assert.equal(payloads.length, 1); assert.equal(Reflect.get(capture, 'currentRecordingId'), undefined);
+  assert.equal(events.some((event) => event.type === 'transcript-ignored' && event.reason === 'ambiguous-reused-window'), true);
+  await send({ text: 'Second capture identifies its own upload', sdk_upload_id: 'second-upload', recording_id: 'second-recording', utterance_id: 'capture-b-first' });
+  assert.equal(payloads.length, 2); assert.equal(payloads[1].sdkUploadId, 'second-upload');
+  assert.equal(Reflect.get(capture, 'currentRecordingId'), 'second-recording');
+  await send({ text: 'Second capture now has a known recording id', recording_id: 'second-recording', utterance_id: 'capture-b-second' });
+  assert.equal(payloads.length, 3); assert.equal(payloads[2].sdkUploadId, 'second-upload');
+});
+
+test('an exact failed old final can recover during a new same-window capture without enriching that new capture', async () => {
+  const payloads: Array<Record<string, unknown>> = [];
+  const { capture, send } = finalDeliveryHarness(async (pathname, payload) => {
+    if (!pathname.endsWith('/transcript-event')) return {};
+    payloads.push(payload);
+    if (payloads.length <= 2) throw new Error('Temporary persistence failure');
+    return { status: 'accepted', meetingId: 'meeting-old', segmentId: 'segment-recovered' };
+  });
+  Reflect.set(capture, 'currentRecordingId', undefined);
+  const original = { text: 'Exact old final retained for retry', utterance_id: 'old-retry-utterance' };
+  await send(original);
+  await (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<unknown>).call(capture,
+    { windowId: 'final-window', sdkUploadId: 'final-upload' });
+  Reflect.set(capture, 'currentSdkUploadId', 'new-upload');
+  Reflect.set(capture, 'currentRecordingId', undefined);
+  await send({ ...original, recording_id: 'old-late-recording' });
+  assert.equal(payloads.length, 3); assert.equal(payloads[2], payloads[0]);
+  assert.equal(payloads[2].sdkUploadId, 'final-upload');
+  assert.equal(Reflect.get(capture, 'currentSdkUploadId'), 'new-upload');
+  assert.equal(Reflect.get(capture, 'currentRecordingId'), undefined);
+});
+
+test('capture completion drains a slow final delivery before the completion POST', async () => {
+  const calls: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const { capture, send } = finalDeliveryHarness(async (pathname) => {
+    calls.push(pathname);
+    if (pathname.endsWith('/transcript-event')) {
+      await gate;
+      return { status: 'accepted', meetingId: 'meeting-1', segmentId: 'segment-1' };
+    }
+    return {};
+  });
+  const final = send(sdkFinal());
+  const complete = (Reflect.get(capture, 'completeRecording') as (input: unknown) => Promise<unknown>).call(capture, {
+    windowId: 'final-window', sdkUploadId: 'final-upload', recordingId: 'final-recording',
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls.some((call) => call.endsWith('/complete')), false);
+  release();
+  await Promise.all([final, complete]);
+  assert.deepEqual(calls.map((call) => call.split('/').at(-1)), ['transcript-event', 'complete']);
+});
+
+test('a final arriving during native completion remains tied to that ending capture', async () => {
+  let releaseComplete!: () => void;
+  let releaseFinal!: () => void;
+  const completeGate = new Promise<void>((resolve) => { releaseComplete = resolve; });
+  const finalGate = new Promise<void>((resolve) => { releaseFinal = resolve; });
+  let finalCalls = 0;
+  const { capture, events, send } = finalDeliveryHarness(async (pathname, payload) => {
+    if (pathname.endsWith('/complete')) { await completeGate; return {}; }
+    if (pathname.endsWith('/transcript-event')) {
+      finalCalls += 1;
+      assert.equal(payload.sdkUploadId, 'final-upload');
+      await finalGate;
+      return { status: 'accepted', meetingId: 'meeting-1', segmentId: 'segment-late' };
+    }
+    return {};
+  });
+  const end = (Reflect.get(capture, 'onRecordingEnded') as (input: unknown) => Promise<void>).call(capture, { window: { id: 'final-window' } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const final = send(sdkFinal('late-final'));
+  releaseComplete();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(events.some((event) => event.type === 'recording-ended'), false);
+  releaseFinal();
+  await Promise.all([end, final]);
+  assert.equal(finalCalls, 1);
+  assert.equal(events.some((event) => event.type === 'recording-ended'), true);
+  await send(sdkFinal('after-completion'));
+  assert.equal(finalCalls, 1, 'a later callback cannot create a new capture after completion');
+});
+
 test('Recall native capture supports only Apple Silicon macOS and x64 Windows', () => {
   assert.deepEqual(getRecallPlatformSupport('darwin', 'arm64'), {
     supported: true,
@@ -297,6 +565,7 @@ test('Notch always-record rolls back durable consent when the current start fail
     if (pathname.endsWith('/upload-token')) {
       return { uploadToken: 'token', sdkUploadId: 'upload', region: 'us-west-2' };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -346,6 +615,7 @@ test('SDK upload id is never treated as the canonical Recall recording id', asyn
         region: 'eu-central-1',
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -422,6 +692,7 @@ test('synchronous SDK transcript and end events retain the pending upload contex
         retentionHours: 1,
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -479,6 +750,7 @@ test('manual stop owns a synchronous recording-ended echo and preserves later id
         retentionHours: 6,
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -535,6 +807,7 @@ test('two sequential captures in the same window each complete by SDK upload ses
         retentionHours: 24,
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -581,6 +854,7 @@ test('concurrent starts share one same-window handshake and reject another windo
       return uploadResponse;
     }
     if (pathname.endsWith('/detected') && body.status === 'recording') detectedRecordingCalls += 1;
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -651,6 +925,7 @@ test('a failed native start rolls back pending ids and permits a clean retry', a
         retentionHours: 24,
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -695,6 +970,7 @@ test('prepareForShutdown drains a start-in-flight through native stop and daemon
     calls.push(pathname);
     if (pathname.endsWith('/upload-token')) return upload;
     if (pathname.endsWith('/complete')) return completion;
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -838,6 +1114,7 @@ test('prepareForShutdown waits for a natural recording-ended completion after vi
       };
     }
     if (pathname.endsWith('/complete')) return completion;
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -889,6 +1166,7 @@ test('prepareForShutdown shares a stop already in flight and waits for its daemo
       };
     }
     if (pathname.endsWith('/complete')) return completion;
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -940,6 +1218,7 @@ test('native SDK shutdown completes the owned upload and clean exit can initiali
         retentionHours: 1,
       };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 
@@ -1006,6 +1285,7 @@ test('re-initialization never duplicates SDK listeners (failed-init retry + post
     if (pathname.endsWith('/upload-token')) {
       return { uploadToken: 'upload-token', sdkUploadId: 'sdk-upload-1', id: 'sdk-upload-1', region: 'us-east-1' };
     }
+    if (pathname.endsWith('/transcript-event')) return { status: 'accepted', meetingId: 'fixture-meeting', segmentId: 'fixture-segment' };
     return {};
   });
 

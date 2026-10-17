@@ -1,3 +1,7 @@
+import { registerMeetingAssistanceRoutes } from './meeting-assistance-routes.js';
+import { installMeetingAssistanceModel } from '../integrations/recall/meeting-assistance-model.js';
+import { requestMeetingAssistanceCheck, readPreparedMeetingLookup, type PreparedMeetingLookup } from '../integrations/recall/meeting-assistance.js';
+import { verifyMeetingLookupChat, isAcceptedMeetingLookup } from '../integrations/recall/meeting-assistance-chat.js';
 import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js';
 import { Readable } from 'node:stream';
 import { requestSpeech, spokenReplyText } from './voice-speech.js';
@@ -549,7 +553,8 @@ import {
 } from '../runtime/operational-telemetry.js';
 import {
   appendMeetingNote,
-  appendRecallTranscriptSegment,
+  ingestRecallTranscriptSegment,
+  updateRecallTranscriptDelivery,
   buildAnalyzerPrompt,
   buildMeetingChatPrompt,
   createRecallSdkUpload,
@@ -10504,6 +10509,17 @@ export function registerConsoleRoutes(
   // Resume upload-id → recording-id handoffs interrupted by daemon exit.
   try { recoverPendingRecallSdkUploads(); } catch { /* completion/status can retry */ }
 
+  installMeetingAssistanceModel();
+  const isLookupAccepted = (packet: PreparedMeetingLookup): boolean => {
+    const receipt = getHarnessChatRequestReceipt(packet.clientRequestId);
+    const attempt = receipt ? getLatestHarnessRunAttemptByRunId(receipt.sessionId, receipt.runId) : null;
+    const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+    return isAcceptedMeetingLookup(packet, harnessChatPayloadHash(packet.input, []), receipt, source);
+  };
+  registerMeetingAssistanceRoutes(app, isAuthorized, {
+    isLookupAccepted,
+  });
+
   // ─── Optional Recall.ai desktop meeting capture ───────────────────
 
   app.get('/api/console/meetings/recall', async (req, res) => {
@@ -10523,6 +10539,7 @@ export function registerConsoleRoutes(
           source: secret.source,
           hasValue: Boolean(secret.value),
         },
+        activeMeetingId: activeRecording?.id,
         activeWindowId: activeRecording?.windowId,
         activeStartedAt: activeRecording?.startedAt,
         regions: RECALL_REGIONS,
@@ -10632,26 +10649,59 @@ export function registerConsoleRoutes(
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
     if (!text.trim()) { res.json({ skipped: true }); return; }
     try {
-      const record = appendRecallTranscriptSegment({
+      const ingestion = ingestRecallTranscriptSegment({
         windowId,
         sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
         recordingId: typeof req.body?.recordingId === 'string' ? req.body.recordingId : undefined,
+        eventId: typeof req.body?.eventId === 'string' ? req.body.eventId : undefined,
+        eventIdentity: req.body?.eventIdentity === 'sdk' || req.body?.eventIdentity === 'delivery' ? req.body.eventIdentity : undefined,
+        participantId: typeof req.body?.participantId === 'string' ? req.body.participantId : undefined,
+        sourceStartSeconds: typeof req.body?.sourceStartSeconds === 'number' ? req.body.sourceStartSeconds : undefined,
+        sourceEndSeconds: typeof req.body?.sourceEndSeconds === 'number' ? req.body.sourceEndSeconds : undefined,
         event: typeof req.body?.event === 'string' ? req.body.event : 'transcript.data',
         speaker: typeof req.body?.speaker === 'string' ? req.body.speaker : undefined,
         text,
         timestamp: typeof req.body?.timestamp === 'string' ? req.body.timestamp : undefined,
         isFinal: typeof req.body?.isFinal === 'boolean' ? req.body.isFinal : undefined,
       });
-      res.json({ record, segmentCount: record.segments.length });
+      if (ingestion.status === 'accepted') {
+        // Optional suggestions cannot turn a durable transcript ack into a failure.
+        try { requestMeetingAssistanceCheck(ingestion.meetingId); } catch { /* assistance GET retains its own error */ }
+      }
+      // The SDK needs an acknowledgement, not another copy of the growing
+      // meeting transcript on every finalized utterance.
+      const { record: retainedRecord, ...acknowledgement } = ingestion;
+      res.json({ ...acknowledgement, segmentCount: retainedRecord?.segments.length ?? 0 });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.post('/api/console/meetings/recall/transcript-delivery-status', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).some(key => !['windowId', 'sdkUploadId', 'recordingId', 'unresolvedFinalCount'].includes(key))
+      || typeof body.windowId !== 'string' || !body.windowId
+      || typeof body.sdkUploadId !== 'string' || !body.sdkUploadId
+      || body.recordingId !== undefined && typeof body.recordingId !== 'string'
+      || !Number.isSafeInteger(body.unresolvedFinalCount) || body.unresolvedFinalCount < 0) {
+      res.status(400).json({ error: 'An exact capture and unresolved transcript count are required.' }); return;
+    }
+    try {
+      const result = updateRecallTranscriptDelivery(body);
+      res.json(result.status === 'updated' ? { status: result.status, meetingId: result.meetingId } : result);
+    } catch { res.status(409).json({ error: 'This capture changed. Transcript delivery status was not updated.' }); }
   });
 
   app.post('/api/console/meetings/recall/complete', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    if (req.body?.unresolvedFinalCount !== undefined
+      && (!Number.isSafeInteger(req.body.unresolvedFinalCount) || req.body.unresolvedFinalCount < 0)) {
+      res.status(400).json({ error: 'Invalid unresolved transcript count.' }); return;
+    }
     try {
       const settings = loadRecallMeetingSettings();
       const captureRetentionMode = req.body?.recallRetentionMode === 'zero' || req.body?.recallRetentionMode === 'timed'
@@ -10672,6 +10722,7 @@ export function registerConsoleRoutes(
         retentionMode: captureRetentionMode,
         retentionHours: captureRetentionHours,
         canonicalBackfill: captureRetentionMode !== 'zero',
+        unresolvedFinalCount: req.body?.unresolvedFinalCount,
       });
       const effectiveRetentionMode = result.record.recallRetentionMode ?? captureRetentionMode;
       if (result.artifactPath) {
@@ -17326,6 +17377,21 @@ export function registerConsoleRoutes(
       res.status(409).json({ error: 'client request id is already bound to different input' });
       return;
     }
+    let meetingLookup: ReturnType<typeof verifyMeetingLookupChat> | undefined;
+    if (body.meetingLookup !== undefined) {
+      if (body.connectionRequestId !== undefined || attachmentIds.length || body.steerOnly === true
+        || taskMode || learningPolicy || requestedAgentId || requestedProjectId) {
+        res.status(400).json({ error: 'Meeting lookup must use its own private task.' }); return;
+      }
+      try {
+        const ref = body.meetingLookup as { meetingId: string; offerId: string; digest: string };
+        const retainedPacket = readPreparedMeetingLookup(ref.meetingId, ref.offerId, ref.digest, { acceptedReplay: true });
+        const acceptedReplay = Boolean(priorReceipt) && isLookupAccepted(retainedPacket);
+        meetingLookup = verifyMeetingLookupChat({ reference: body.meetingLookup, text: input,
+          clientRequestId: requestIdentity.requestId, sessionId: requestedSessionId,
+          acceptedSessionId: priorReceipt?.sessionId, acceptedReplay });
+      } catch { res.status(409).json({ error: 'This meeting suggestion is no longer available. Reopen the meeting to continue.' }); return; }
+    }
     if (priorReceipt) {
       // A committed card control owns its own terminal, not an execution
       // attempt. Rejoin it before reclassifying a reply or ordinary admission.
@@ -17447,6 +17513,7 @@ export function registerConsoleRoutes(
           source: 'desktop',
           channelId: deterministicSessionId || undefined,
           userId: 'desktop',
+          ...(meetingLookup ? { meetingAssistance: { meetingId: meetingLookup.meetingId, offerId: meetingLookup.offerId, sourceDigest: meetingLookup.sourceDigest } } : {}),
           ...(requestedAgent ? { agentId: requestedAgent.agent.id, agentName: requestedAgent.agent.name } : {}),
           ...(requestedProject
             ? { projectId: requestedProject.id, projectName: requestedProject.name, projectIds: [requestedProject.id], projectSetBy: 'owner' }

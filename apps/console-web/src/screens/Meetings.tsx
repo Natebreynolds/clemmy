@@ -1,3 +1,5 @@
+import { MeetingLiveTranscript } from '@/components/meetings/MeetingLiveTranscript';
+import { MeetingCompanion } from '@/components/meetings/MeetingCompanion';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -138,6 +140,10 @@ export function Meetings() {
   const credConnected = (status.data?.credential?.status ?? '').toLowerCase() === 'connected';
   const regions = status.data?.regions ?? DEFAULT_REGIONS;
   const rows = meetings.data?.meetings ?? [];
+  const companionId = selected && detail.data?.record && detail.data.record.provider !== 'local'
+    ? selected : status.data?.activeMeetingId;
+  const companionActive = companionId === status.data?.activeMeetingId
+    || (companionId === selected && detail.data?.record?.status === 'recording');
   const sdkData = sdk.data ?? undefined;
   const recording = Boolean(sdkData?.recording);
   const recallUnsupported = sdkData?.platformSupport?.supported === false;
@@ -328,6 +334,7 @@ export function Meetings() {
 
   return (
     <Page title="Meetings" subtitle="Local recordings and online calls, with transcripts, summaries, and action items">
+      {companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={companionActive} />}
       {/* Local in-person capture */}
       <Card className="mb-4 p-5">
         <div className="flex flex-wrap items-center gap-3">
@@ -595,7 +602,7 @@ export function Meetings() {
               <Video className="h-6 w-6 text-faint" aria-hidden />
               <p className="text-body text-muted">Select a meeting to see its summary and action items.</p>
             </div>
-          ) : detail.isLoading ? <Skeleton className="h-64 w-full" /> : (
+          ) : detail.isLoading ? <Skeleton className="h-64 w-full" /> : detail.isError && !detail.data ? <QueryUnavailable title="This meeting couldn’t load" description="The transcript is unavailable right now. This does not mean it is empty." onRetry={() => { void detail.refetch(); }} /> : (
             <>
               <div className="mb-3 flex justify-end">
                 <Button size="sm" onClick={() => discuss(selected)}><MessageCircle className="h-4 w-4" aria-hidden /> Discuss in chat</Button>
@@ -813,6 +820,8 @@ function MeetingDetailView({
   retryError?: string | null;
   onRetry?: () => void;
 }) {
+  const [transcriptLimit, setTranscriptLimit] = useState(200);
+  useEffect(() => setTranscriptLimit(200), [data?.record?.id]);
   const a = (data?.analysis ?? {}) as Record<string, unknown>;
   const r = (data?.record ?? {}) as Record<string, unknown>;
   const summary = asText(a.summary);
@@ -824,6 +833,7 @@ function MeetingDetailView({
   const localProvider = asText(r.provider) === 'local';
   const transcriptionStatus = asText(r.transcriptionStatus);
   const transcriptionError = asText(r.transcriptionError);
+  const delivery = r.liveTranscriptDelivery as { status?: string; failedFinalCount?: number } | undefined;
   const recallPresentation = data?.presentation;
   const recallProcessing = !localProvider
     && (recallPresentation?.status === 'processing' || recallPresentation?.status === 'recording');
@@ -837,6 +847,9 @@ function MeetingDetailView({
         {r.startedAt ? <span>· {relativeTime(asText(r.startedAt))}</span> : null}
       </div>
       <h3 className="mb-3 text-h2 text-fg">{asText(a.title) || 'Meeting'}</h3>
+      {!localProvider && delivery?.status === 'incomplete' && <p className="mb-4 rounded-md bg-warning-tint px-3 py-2 text-small text-warning" role="status">
+        Some live transcript lines couldn’t be saved. This transcript may have gaps until a complete transcript is recovered.
+      </p>}
       {localProvider && (transcriptionStatus === 'queued' || transcriptionStatus === 'transcribing') && (
         <p className="mb-4 rounded-md border border-info/30 bg-info-tint px-3 py-2 text-small text-info" role="status">
           {transcriptionStatus === 'queued' ? 'Local transcription is queued.' : 'Transcribing locally on this device…'}
@@ -893,12 +906,17 @@ function MeetingDetailView({
           <ScratchpadPanel windowId={asText(r.windowId)} compact />
         </Section>
       )}
-      {segments.length > 0 && (
+      {(segments.length > 0 || (!localProvider && asText(r.status) === 'recording')) && (
         <Section icon={Mic} title="Transcript">
+          {!localProvider && asText(r.status) === 'recording' && <MeetingLiveTranscript capture={{ windowId: asText(r.windowId), sdkUploadId: asText(r.sdkUploadId) || undefined, recordingId: asText(r.recordingId) || undefined }} />}
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-caption text-muted">
+            <span>{segments.length > transcriptLimit ? `Latest ${transcriptLimit} of ${segments.length} lines` : `${segments.length} transcript lines`}</span>
+            {segments.length > transcriptLimit && <Button variant="ghost" size="sm" onClick={() => setTranscriptLimit(n => n + 200)}>Show earlier lines</Button>}
+          </div>
           <div className="max-h-72 space-y-2 overflow-auto">
-            {segments.slice(0, 200).map((s, i) => {
+            {segments.slice(-transcriptLimit).map((s, i) => {
               const seg = s as Record<string, unknown>;
-              return <p key={i} className="text-small text-muted"><span className="font-semibold text-fg">{asText(seg.speaker) || 'Speaker'}:</span> {asText(seg.text)}</p>;
+              return <p key={asText(seg.id) || i} className="text-small text-muted"><span className="font-semibold text-fg">{asText(seg.speaker) || 'Speaker'}:</span> {asText(seg.text)}</p>;
             })}
           </div>
         </Section>

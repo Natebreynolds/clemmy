@@ -79,6 +79,7 @@ test('update edits text/marker and clears it; remove deletes', () => {
 
 test('notes render a ## Notes section (mm:ss + marker) in the vault artifact', () => {
   const windowId = 'win-notes-artifact';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({ windowId, event: 'transcript.data', speaker: 'Host', text: 'lets review the pipeline' });
   appendMeetingNote(windowId, { text: 'push back on the 50% rule', kind: 'action', atSeconds: 872 });
   appendMeetingNote(windowId, { text: 'who owns the quota?', kind: 'question', atSeconds: 65 });
@@ -94,6 +95,7 @@ test('notes render a ## Notes section (mm:ss + marker) in the vault artifact', (
 
 test('## Notes lives OUTSIDE the analysis managed markers (survives re-file)', () => {
   const windowId = 'win-notes-markers';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({ windowId, event: 'transcript.data', speaker: 'Host', text: 'quarterly review' });
   appendMeetingNote(windowId, { text: 'user note stays', kind: 'followup', atSeconds: 10 });
   const { record, artifactPath } = finalizeRecallMeeting({ windowId, platform: 'zoom' });
@@ -116,6 +118,7 @@ test('## Notes lives OUTSIDE the analysis managed markers (survives re-file)', (
 
 test('analyzer prompt injects the notes block + weighting rule', () => {
   const windowId = 'win-notes-prompt';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({ windowId, event: 'transcript.data', speaker: 'Host', text: 'ok' });
   appendMeetingNote(windowId, { text: 'flagged action item', kind: 'action', atSeconds: 5 });
   const record = loadRecallMeetingById(noteRecallMeetingDetected({ windowId }).id)!;

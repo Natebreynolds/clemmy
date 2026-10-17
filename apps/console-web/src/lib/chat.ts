@@ -78,6 +78,7 @@ export async function postChat(
   connectionRequestId?: string,
   /** Spoken in voice mode: the reply will be read aloud. */
   voice?: boolean,
+  meetingLookup?: { meetingId: string; offerId: string; digest: string },
 ): Promise<ChatPostResult> {
   const result = await apiPost<ChatPostResult>('/api/harness/chat', {
     input,
@@ -89,6 +90,7 @@ export async function postChat(
     ...(projectId ? { projectId } : {}),
     ...(connectionRequestId ? { connectionRequestId } : {}),
     ...(voice ? { voice: true } : {}),
+    ...(meetingLookup ? { meetingLookup } : {}),
   });
   if (!result || typeof result.sessionId !== 'string' || !result.sessionId) {
     throw Object.assign(new TypeError('chat acknowledgement was incomplete'), { status: 0 });

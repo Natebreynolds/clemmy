@@ -3,7 +3,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -12,6 +12,9 @@ process.env.CLEMENTINE_HOME = TMP_HOME;
 
 const {
   appendRecallTranscriptSegment,
+  _observeRecallRecordReadsForTests,
+  ingestRecallTranscriptSegment,
+  applyCanonicalTranscript,
   finalizeRecallMeeting,
   saveRecallMeetingAnalysis,
   fileMeetingFromAnalysis,
@@ -22,6 +25,8 @@ const {
   listAllRecallMeetingRecords,
   loadRecallMeetingById,
   noteRecallMeetingDetected,
+  patchMeetingRecord,
+  updateRecallTranscriptDelivery,
   recordMeetingTitle,
   renameMeeting,
   summarizeRecallMeeting,
@@ -35,8 +40,260 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
+function identifiedFinal(windowId: string, sdkUploadId: string, id = 'a') {
+  return { windowId, sdkUploadId, event: 'transcript.data', isFinal: true, text: 'A controlled final utterance',
+    eventId: `recall-final-${id.repeat(64)}`, eventIdentity: 'sdk' as const, participantId: '7', sourceStartSeconds: 10, sourceEndSeconds: 11 };
+}
+
+test('repeated final ingestion and exact meeting reads leave unchanged historical transcripts undecoded', () => {
+  const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');
+  mkdirSync(directory, { recursive: true });
+  const history = Array.from({ length: 12 }, (_, index) => path.join(directory, `hot-path-history-${index}.json`));
+  const historical = (index: number) => ({ id: `hot-path-history-${index}`, windowId: `hot-path-history-window-${index}`,
+    status: 'completed', startedAt: '2026-10-16T12:00:00.000Z', segments: [{ text: 'Retained historical words. '.repeat(2_000) }] });
+  for (const [index, filePath] of history.entries()) writeFileSync(filePath, JSON.stringify(historical(index)));
+  const input = identifiedFinal('hot-path-current-window', 'hot-path-current-upload');
+  const active = noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  assert.equal(ingestRecallTranscriptSegment(input).status, 'accepted');
+  assert.ok(loadRecallMeetingById(active.id)); // warm the metadata for the last write
+  const reads: Array<{ filePath: string; kind: string }> = [];
+  const restore = _observeRecallRecordReadsForTests((event) => reads.push(event));
+  try {
+    for (let index = 0; index < 4; index++) {
+      const result = ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${index.toString(16).padStart(64, '0')}` });
+      assert.equal(result.status, 'accepted');
+      const fresh = loadRecallMeetingById(active.id)!;
+      assert.equal(fresh.segments.length, index + 2);
+      fresh.segments.length = 0;
+      assert.equal(loadRecallMeetingById(active.id)?.segments.length, index + 2, 'mutable full records are never cached');
+    }
+    assert.equal(reads.filter((read) => history.includes(read.filePath)).length, 0);
+    const changed = history[0];
+    writeFileSync(`${changed}.tmp`, JSON.stringify({ ...historical(0), id: 'hot-path-changed-history' }));
+    renameSync(`${changed}.tmp`, changed);
+    assert.ok(loadRecallMeetingById(active.id));
+    assert.ok(loadRecallMeetingById(active.id));
+    assert.equal(reads.filter((read) => read.filePath === changed && read.kind === 'inventory').length, 1);
+    assert.equal(loadRecallMeetingById('hot-path-history-0'), null);
+    assert.equal(loadRecallMeetingById('hot-path-changed-history')?.id, 'hot-path-changed-history');
+    writeFileSync(`${changed}.tmp`, '{ corrupt history'); renameSync(`${changed}.tmp`, changed);
+    assert.equal(ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${'f'.repeat(64)}` }).status, 'ignored');
+    assert.equal(loadRecallMeetingById(active.id), null, 'unknown identities cannot certify an exact capture');
+    writeFileSync(`${changed}.tmp`, JSON.stringify(historical(0))); renameSync(`${changed}.tmp`, changed);
+    assert.equal(ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${'f'.repeat(64)}` }).status, 'accepted');
+  } finally {
+    restore();
+    for (const filePath of history) rmSync(filePath, { force: true });
+  }
+});
+
+test('live final saves defer memory episodes until completion, and canonical updates project normally', () => {
+  const input = identifiedFinal('projection-boundary-window', 'projection-boundary-upload');
+  const record = noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  const episodeCount = () => (openMemoryDb().prepare('SELECT COUNT(*) AS count FROM memory_episodes WHERE call_id = ?').get(record.id) as { count: number }).count;
+  assert.equal(episodeCount(), 0);
+  for (const id of ['1', '2', '3']) assert.equal(ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${id.repeat(64)}` }).status, 'accepted');
+  assert.equal(episodeCount(), 0);
+  const stopped = finalizeRecallMeeting({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, retentionMode: 'zero' });
+  assert.equal(episodeCount(), 1);
+  const canonicalText = 'The canonical projection has its own retained evidence.';
+  applyCanonicalTranscript(stopped.record, [{ id: 'projection-canonical', windowId: input.windowId, event: 'transcript.canonical', isFinal: true, text: canonicalText, timestamp: '2026-10-17T12:00:00.000Z' }]);
+  assert.equal(episodeCount(), 1);
+  const episode = openMemoryDb().prepare('SELECT evidence_excerpt FROM memory_episodes WHERE call_id = ?').get(record.id) as { evidence_excerpt: string };
+  assert.match(episode.evidence_excerpt, /canonical projection/);
+});
+
+test('duplicate meeting ids or capture ids in changed history cannot admit a final to one guessed record', () => {
+  const input = identifiedFinal('inventory-duplicate-window', 'inventory-duplicate-upload');
+  const active = noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  const duplicatePath = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings', 'inventory-duplicate-alias.json');
+  try {
+    for (const duplicate of [
+      { ...active, id: 'different-meeting-id', windowId: 'another-window' },
+      { ...active, sdkUploadId: 'different-capture-id', windowId: 'another-window' },
+    ]) {
+      writeFileSync(`${duplicatePath}.tmp`, JSON.stringify(duplicate)); renameSync(`${duplicatePath}.tmp`, duplicatePath);
+      const result = ingestRecallTranscriptSegment(input);
+      assert.equal(result.status, 'ignored');
+      if (result.status === 'ignored') assert.equal(result.reason, 'ambiguous_capture');
+    }
+  } finally { rmSync(duplicatePath, { force: true }); }
+  const result = ingestRecallTranscriptSegment(input);
+  assert.equal(result.status, 'accepted');
+  if (result.status === 'accepted') assert.equal(result.record.segments.length, 1);
+});
+
+test('final ingestion refuses unknown captures and nonfinal events without creating records', () => {
+  const before = listAllRecallMeetingRecords().length;
+  assert.deepEqual(ingestRecallTranscriptSegment(identifiedFinal('unknown-ingress', 'unknown-upload')), { status: 'ignored', reason: 'unknown_capture' });
+  assert.deepEqual(ingestRecallTranscriptSegment({ ...identifiedFinal('unknown-ingress', 'unknown-upload'), event: 'transcript.partial_data' }), { status: 'ignored', reason: 'not_a_final_transcript' });
+  assert.equal(listAllRecallMeetingRecords().length, before);
+  assert.throws(() => appendRecallTranscriptSegment({ windowId: 'unknown-legacy-ingress', event: 'transcript.data', text: 'Legacy final' }), /unknown_capture/);
+});
+
+test('exact final replay is idempotent and an altered payload cannot reuse its identity', () => {
+  const input = identifiedFinal('replay-window', 'replay-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  const first = ingestRecallTranscriptSegment(input);
+  assert.equal(first.status, 'accepted');
+  const repeated = ingestRecallTranscriptSegment({ ...input, timestamp: '2026-10-17T12:00:00.000Z' });
+  assert.equal(repeated.status, 'duplicate');
+  if (first.status === 'accepted' && repeated.status === 'duplicate') assert.equal(repeated.segmentId, first.segmentId);
+  const conflicting = ingestRecallTranscriptSegment({ ...input, text: 'Different content' });
+  assert.equal(conflicting.status, 'ignored');
+  if (conflicting.status === 'ignored') assert.equal(conflicting.reason, 'event_identity_conflict');
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: input.sdkUploadId })?.segments.length, 1);
+  const distinct = ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${'b'.repeat(64)}`, sourceStartSeconds: 20, sourceEndSeconds: 21 });
+  assert.equal(distinct.status, 'accepted', 'identical words at another source time are another utterance');
+});
+
+test('capture identity must match window, SDK upload, and an already-known recording', () => {
+  const input = identifiedFinal('strict-window', 'strict-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, recordingId: 'strict-recording', status: 'recording' });
+  for (const bad of [
+    { ...input, windowId: 'other-window' },
+    { ...input, sdkUploadId: 'other-upload', recordingId: 'strict-recording' },
+    { ...input, recordingId: 'other-recording' },
+  ]) assert.equal(ingestRecallTranscriptSegment(bad).status, 'ignored');
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: input.sdkUploadId })?.segments.length, 0);
+});
+
+test('an unassigned capture cannot adopt another meeting recording id through final, detection, completion, or patch', () => {
+  const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');
+  const input = identifiedFinal('ownership-fixture-window-a', 'ownership-fixture-upload-a');
+  const a = noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  const b = noteRecallMeetingDetected({ windowId: 'ownership-fixture-window-b', sdkUploadId: 'ownership-fixture-upload-b', recordingId: 'ownership-fixture-recording-x', status: 'recording' });
+  const snapshot = () => Object.fromEntries(readdirSync(directory).filter((name) => name.endsWith('.json')).sort().map((name) => [name, readFileSync(path.join(directory, name), 'utf8')]));
+  const before = snapshot();
+  const result = ingestRecallTranscriptSegment({ ...input, recordingId: b.recordingId });
+  assert.equal(result.status, 'ignored');
+  if (result.status === 'ignored') assert.equal(result.reason, 'capture_identity_conflict');
+  assert.deepEqual(snapshot(), before, 'no overwritten foreign record or alias cleanup');
+  for (const mutate of [
+    () => noteRecallMeetingDetected({ windowId: a.windowId, sdkUploadId: a.sdkUploadId, recordingId: b.recordingId }),
+    () => finalizeRecallMeeting({ windowId: a.windowId, sdkUploadId: a.sdkUploadId, recordingId: b.recordingId }),
+    () => patchMeetingRecord(a.id, { recordingId: b.recordingId }),
+  ]) {
+    assert.throws(mutate, /capture identity/);
+    assert.deepEqual(snapshot(), before);
+  }
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: a.sdkUploadId })?.id, a.id);
+  assert.equal(findRecallMeetingRecord({ recordingId: b.recordingId })?.id, b.id);
+  assert.equal(loadRecallMeetingById(a.id)?.recordingId, undefined);
+});
+
+test('unowned recording enrichment migrates only its own alias and preserves another capture in the reused window', () => {
+  const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');
+  const windowId = 'ownership-migration-fixture-window';
+  const a = noteRecallMeetingDetected({ windowId, sdkUploadId: 'ownership-migration-fixture-a', status: 'recording' });
+  const b = noteRecallMeetingDetected({ windowId, sdkUploadId: 'ownership-migration-fixture-b', recordingId: 'ownership-migration-fixture-recording-b', status: 'recording' });
+  const bPath = path.join(directory, 'ownership-migration-fixture-recording-b.json');
+  const bBytes = readFileSync(bPath, 'utf8');
+  const enriched = ingestRecallTranscriptSegment({ ...identifiedFinal(windowId, a.sdkUploadId!), recordingId: 'ownership-migration-fixture-recording-a' });
+  assert.equal(enriched.status, 'accepted');
+  if (enriched.status === 'accepted') { assert.equal(enriched.record.id, a.id); assert.equal(enriched.record.recordingId, 'ownership-migration-fixture-recording-a'); }
+  assert.equal(existsSync(path.join(directory, 'ownership-migration-fixture-a.json')), false, 'only A upload alias migrated');
+  assert.equal(readFileSync(bPath, 'utf8'), bBytes);
+  assert.equal(findRecallMeetingRecord({ sdkUploadId: b.sdkUploadId })?.id, b.id);
+});
+
+test('a recording identity cannot overwrite a foreign upload target in the shared legacy filename namespace', () => {
+  const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');
+  const a = noteRecallMeetingDetected({ windowId: 'namespace-fixture-window-a', sdkUploadId: 'namespace-fixture-upload-a', status: 'recording' });
+  const b = noteRecallMeetingDetected({ windowId: 'namespace-fixture-window-b', sdkUploadId: 'namespace-fixture-shared-key', status: 'recording' });
+  const aPath = path.join(directory, 'namespace-fixture-upload-a.json');
+  const bPath = path.join(directory, 'namespace-fixture-shared-key.json');
+  const before = [readFileSync(aPath, 'utf8'), readFileSync(bPath, 'utf8')];
+  assert.throws(() => patchMeetingRecord(a.id, { recordingId: b.sdkUploadId }), /target belongs to another meeting/);
+  assert.deepEqual([readFileSync(aPath, 'utf8'), readFileSync(bPath, 'utf8')], before);
+  assert.equal(loadRecallMeetingById(a.id)?.recordingId, undefined);
+  assert.equal(loadRecallMeetingById(b.id)?.sdkUploadId, b.sdkUploadId);
+});
+
+test('native transcript delivery uncertainty survives completion and only exact status or canonical readback clears it', () => {
+  const input = identifiedFinal('delivery-status-fixture-window', 'delivery-status-fixture-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  ingestRecallTranscriptSegment(input);
+  const completed = finalizeRecallMeeting({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, unresolvedFinalCount: 2, retentionMode: 'zero' }).record;
+  assert.deepEqual(completed.liveTranscriptDelivery, { status: 'incomplete', failedFinalCount: 2 });
+  assert.deepEqual(summarizeRecallMeeting(completed).liveTranscriptDelivery, completed.liveTranscriptDelivery, 'native meeting_read summary carries the qualification');
+  const bytes = JSON.stringify(loadRecallMeetingById(completed.id));
+  for (const bad of [
+    { windowId: 'foreign-window', sdkUploadId: input.sdkUploadId!, unresolvedFinalCount: 0 },
+    { windowId: input.windowId, sdkUploadId: 'foreign-upload', unresolvedFinalCount: 0 },
+    { windowId: input.windowId, sdkUploadId: input.sdkUploadId!, unresolvedFinalCount: -1 },
+  ]) assert.equal(updateRecallTranscriptDelivery(bad).status, 'ignored');
+  assert.equal(JSON.stringify(loadRecallMeetingById(completed.id)), bytes);
+  const acknowledged = updateRecallTranscriptDelivery({ windowId: input.windowId, sdkUploadId: input.sdkUploadId!, unresolvedFinalCount: 0 });
+  assert.equal(acknowledged.status, 'updated');
+  if (acknowledged.status === 'updated') { assert.equal(acknowledged.record.status, 'completed'); assert.equal(acknowledged.record.liveTranscriptDelivery, undefined); assert.equal(acknowledged.record.endedAt, completed.endedAt); }
+  updateRecallTranscriptDelivery({ windowId: input.windowId, sdkUploadId: input.sdkUploadId!, unresolvedFinalCount: 1 });
+  const marked = loadRecallMeetingById(completed.id)!;
+  assert.equal(marked.liveTranscriptDelivery?.failedFinalCount, 1);
+  const canonical = applyCanonicalTranscript(marked, [{ id: 'delivery-status-canonical', windowId: input.windowId, event: 'transcript.canonical', isFinal: true,
+    text: 'The canonical fixture transcript is retained.', timestamp: '2026-10-17T12:00:00.000Z' }]).record;
+  assert.equal(canonical.liveTranscriptDelivery, undefined);
+  const afterCanonical = updateRecallTranscriptDelivery({ windowId: input.windowId, sdkUploadId: input.sdkUploadId!, unresolvedFinalCount: 1 });
+  assert.equal(afterCanonical.status, 'updated');
+  if (afterCanonical.status === 'updated') assert.equal(afterCanonical.record.liveTranscriptDelivery, undefined);
+  assert.equal(loadRecallMeetingById(completed.id)?.status, 'completed');
+});
+
+test('a synchronous first final can activate an already-detected exact SDK capture', () => {
+  const input = identifiedFinal('detected-final-window', 'detected-final-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'detected' });
+  const result = ingestRecallTranscriptSegment(input);
+  assert.equal(result.status, 'accepted');
+  if (result.status === 'accepted') assert.equal(result.record.status, 'recording');
+});
+
+test('an identified late final extends only its completed streamed capture and keeps its status', () => {
+  const input = identifiedFinal('late-final-window', 'late-final-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  ingestRecallTranscriptSegment(input);
+  const stopped = finalizeRecallMeeting({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, retentionMode: 'zero' });
+  const late = ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${'c'.repeat(64)}`, text: 'The last slow utterance', sourceStartSeconds: 30, sourceEndSeconds: 31 });
+  assert.equal(late.status, 'accepted');
+  if (late.status === 'accepted') {
+    assert.equal(late.record.status, 'completed');
+    assert.equal(late.meetingId, stopped.record.id);
+    assert.equal(late.record.segments.length, 2);
+    assert.match(readFileSync(late.record.artifactPath!, 'utf-8'), /last slow utterance/);
+  }
+  const legacy = ingestRecallTranscriptSegment({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, event: 'transcript.data', text: 'An unkeyed late callback' });
+  assert.equal(legacy.status, 'ignored');
+});
+
+test('canonical replacement preserves exact final replay receipts and refuses new late streamed content', () => {
+  const input = identifiedFinal('canonical-receipt-window', 'canonical-receipt-upload');
+  noteRecallMeetingDetected({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, status: 'recording' });
+  ingestRecallTranscriptSegment(input);
+  const stopped = finalizeRecallMeeting({ windowId: input.windowId, sdkUploadId: input.sdkUploadId, retentionMode: 'timed' });
+  const inFlightFinal = { ...input, eventId: `recall-final-${'e'.repeat(64)}`, text: 'Arrived while backfill was waiting', sourceStartSeconds: 30, sourceEndSeconds: 31 };
+  assert.equal(ingestRecallTranscriptSegment(inFlightFinal).status, 'accepted');
+  // Deliberately pass the older snapshot held by an async backfill worker.
+  const canonical = applyCanonicalTranscript(stopped.record, [{ id: 'canonical-1', windowId: input.windowId, event: 'canonical', text: 'Canonical source content', timestamp: '2026-10-17T12:00:00.000Z' }]);
+  assert.equal(ingestRecallTranscriptSegment(input).status, 'duplicate');
+  assert.equal(ingestRecallTranscriptSegment(inFlightFinal).status, 'duplicate', 'backfill must retain receipts accepted after its snapshot');
+  const late = ingestRecallTranscriptSegment({ ...input, eventId: `recall-final-${'d'.repeat(64)}` });
+  assert.equal(late.status, 'ignored');
+  assert.deepEqual(loadRecallMeetingById(canonical.record.id)?.segments, canonical.record.segments);
+  assert.doesNotMatch(readFileSync(canonical.artifactPath!, 'utf-8'), /controlled final utterance/);
+});
+
+test('legacy finals remain explicitly qualified and require one already-active window', () => {
+  noteRecallMeetingDetected({ windowId: 'legacy-known-window', status: 'recording' });
+  const record = appendRecallTranscriptSegment({ windowId: 'legacy-known-window', event: 'transcript.data', text: 'Legacy compatible final' });
+  assert.equal(record.segments[0].eventIdentity, 'legacy');
+  assert.equal(record.segments[0].eventId, undefined);
+  const partial = ingestRecallTranscriptSegment({ windowId: record.windowId, event: 'transcript.data', isFinal: false, text: 'Not final' });
+  assert.equal(partial.status, 'ignored');
+  assert.equal(loadRecallMeetingById(record.id)?.segments.length, 1);
+});
+
 test('fileMeetingFromAnalysis folds title + analysis into the note, idempotently, and keeps the transcript', () => {
   const windowId = 'win-onboarding';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   // Transcript text is deliberately distinct from the analysis summary so
   // we can prove the curated summary (not just the raw transcript) becomes
   // searchable.
@@ -121,6 +378,7 @@ test('named meeting participants become replay-safe canonical source observation
   );
 
   const windowId = 'win-named-participants';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({
     windowId,
     event: 'transcript.data',
@@ -174,6 +432,7 @@ test('named meeting participants become replay-safe canonical source observation
 
 test('meeting decisions and actions become replay-safe review proposals, not automatic facts', () => {
   const windowId = 'win-reviewable-meeting-memory';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({
     windowId,
     event: 'transcript.data',
@@ -229,6 +488,7 @@ test('meeting decisions and actions become replay-safe review proposals, not aut
 
 test('renameMeeting sets a user title that the analyzer cannot overwrite', () => {
   const windowId = 'win-rename';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({ windowId, event: 'transcript.data', speaker: 'Host', text: 'quarterly numbers look good' });
   const { record, artifactPath } = finalizeRecallMeeting({ windowId, platform: 'zoom' });
   assert.ok(artifactPath);
@@ -257,6 +517,7 @@ test('renameMeeting sets a user title that the analyzer cannot overwrite', () =>
 
 test('live transcript refresh preserves a user title lock', () => {
   const windowId = 'win-live-rename';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   const initial = appendRecallTranscriptSegment({
     windowId,
     event: 'transcript.data',
@@ -293,6 +554,7 @@ test('live transcript refresh preserves a user title lock', () => {
 
 test('buildMeetingChatPrompt requires the full transcript and asks for next action', () => {
   const windowId = 'win-chat-prompt';
+  noteRecallMeetingDetected({ windowId, status: 'recording' });
   appendRecallTranscriptSegment({
     windowId,
     event: 'transcript.data',

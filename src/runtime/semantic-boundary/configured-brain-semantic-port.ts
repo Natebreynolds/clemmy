@@ -69,6 +69,8 @@ const logger = pino({ name: 'configured-brain-semantic-port' });
 // otherwise BYO receives json_object without the revision's actual schema.
 const ClarificationRevisionWireSchema = z.object({ result: ClarificationRevisionV1Schema }).strict();
 
+import { MeetingOpportunityV1Schema } from '../../integrations/recall/meeting-opportunity.js';
+
 export type ConfiguredSemanticPurpose =
   | 'turn_semantics'
   | 'clarification_revision'
@@ -81,6 +83,7 @@ export type ConfiguredSemanticPurpose =
   | 'calendar_read_recipe'
   | 'calendar_read_operation'
   | 'noticing_proposal'
+  | 'meeting_opportunity'
   | 'noticing_answer'
   | 'clem_voice'
   | 'clem_reply'
@@ -97,7 +100,7 @@ export interface ConfiguredBrainSemanticComplete {
     signal?: AbortSignal;
     deadlineAt?: number;
     checkActive?: () => void;
-    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
+    schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'MeetingOpportunityV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
   }): Promise<{
     raw: unknown;
     modelIdentity: string;
@@ -374,7 +377,7 @@ export function semanticModelRoleForPurpose(
   if (purpose === 'mcp_tool_effect_labels_second') return 'quick';
   // Reading what an unmarked workflow step does is a one-time quick check,
   // saved against the exact step; every call's permission is checked at run.
-  if (purpose === 'workflow_step_effect') return 'quick';
+  if (purpose === 'workflow_step_effect' || purpose === 'meeting_opportunity') return 'quick';
   // Noticing is Clem thinking on her own behalf, so it runs on the brain the
   // owner chose for her, never on a premium judge unbidden.
   return purpose === 'noticing_proposal' || purpose === 'noticing_answer'
@@ -457,7 +460,7 @@ async function completeStructured(input: {
   let firstRole: ReturnType<typeof resolveRoleModel>;
   try {
     firstRole = resolveRoleModel(wantedRole);
-    if (input.purpose === 'clarification_revision' && firstRole.inactiveBinding) {
+    if ((input.purpose === 'clarification_revision' || input.purpose === 'meeting_opportunity') && firstRole.inactiveBinding) {
       throw new Error('The selected quick-check binding is unavailable for clarification revision');
     }
   } catch (error) {
@@ -472,7 +475,7 @@ async function completeStructured(input: {
     checkActive();
     // A nonexecuting clarification repair has one selected Quick call. Failure
     // stays unavailable; an unrequested brain retry changes identity and cost.
-    if (input.purpose === 'clarification_revision') throw error;
+    if (input.purpose === 'clarification_revision' || input.purpose === 'meeting_opportunity') throw error;
     // The judge role is cross-family by default, so it can be bound to a model
     // whose sign-in is expired or whose provider is down while the brain that
     // is running this very turn is fine. A review that cannot run is not a
@@ -515,7 +518,9 @@ async function completeStructured(input: {
   checkActive();
   signal?.throwIfAborted();
   const agent = new Agent({
-    name: input.purpose === 'clarification_revision'
+    name: input.purpose === 'meeting_opportunity'
+      ? 'meeting-opportunity'
+      : input.purpose === 'clarification_revision'
       ? 'clarification-revision'
       : input.purpose === 'turn_semantics'
       ? 'turn-semantics'
@@ -532,7 +537,8 @@ async function completeStructured(input: {
     outputType: input.schema as typeof TurnSemanticProposalV1WireSchema,
     ...(reasoning ? { modelSettings: { reasoning: { effort: reasoning } } } : {}),
   }) as unknown as Agent;
-  const runner = new Runner({ workflowName: `clementine-${input.purpose}` });
+  const runner = new Runner({ workflowName: `clementine-${input.purpose}`,
+    ...(input.purpose === 'meeting_opportunity' ? { tracingDisabled: true, traceIncludeSensitiveData: false } : {}) });
   // Its own request: the enclosing turn's role and prompt measurements do not
   // describe this call, so it records the purpose's role and its own sizes.
   const observed = await observeModelUsageRecording(async () => {
@@ -545,7 +551,7 @@ async function completeStructured(input: {
         instructions: estimateTokens(input.system),
         history: estimateTokens(input.user),
       },
-    }, () => withPinnedWorkerModel(input.purpose === 'clarification_revision' ? role.modelId : undefined,
+    }, () => withPinnedWorkerModel(input.purpose === 'clarification_revision' || input.purpose === 'meeting_opportunity' ? role.modelId : undefined,
       () => {
         checkActive();
         signal?.throwIfAborted();
@@ -774,7 +780,7 @@ export async function completeViaConfiguredBrain(input: {
   signal?: AbortSignal;
   deadlineAt?: number;
   checkActive?: () => void;
-  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
+  schemaName: 'TurnSemanticProposalV1' | 'SourceEffectJudgeV1' | 'PlanGroundingJudgeV1' | 'SourceAccountJudgeV1' | 'OperationDeliveryJudgeV1' | 'RequestEffectJudgeV1' | 'OperationVariantReadJudgeV1' | 'CalendarReadRecipeV1' | 'CalendarReadOperationsV1' | 'NoticingAnswerV1' | 'MeetingOpportunityV1' | 'NoticingDecisionV1' | 'ClemVoiceV1' | 'ClemReplyV1' | 'McpToolEffectLabelsV1' | 'ClarificationRevisionV1' | 'WorkflowStepEffectV1' | 'WorkspaceDeliverablesV1' | 'WorkspaceDeliverablesV2';
 }): Promise<{
   raw: unknown;
   modelIdentity: string;
@@ -802,6 +808,8 @@ export async function completeViaConfiguredBrain(input: {
       ? CalendarReadRecipeAnswerV1Schema
       : input.schemaName === 'CalendarReadOperationsV1'
       ? CalendarReadOperationsV1Schema
+      : input.schemaName === 'MeetingOpportunityV1'
+      ? MeetingOpportunityV1Schema
       : input.schemaName === 'NoticingAnswerV1'
       ? NoticingAnswerWireV1Schema
       : input.schemaName === 'NoticingDecisionV1'
@@ -835,7 +843,7 @@ export async function completeViaConfiguredBrain(input: {
         : TurnSemanticProposalV1WireSchema,
   });
   let usageRecorded = result.usageRecorded;
-  if (input.purpose === 'clarification_revision') {
+  if (input.purpose === 'clarification_revision' || input.purpose === 'meeting_opportunity') {
     usageRecorded = recordSemanticModelUsage({ ...result, purpose: input.purpose });
   }
   if (clarificationWire) {

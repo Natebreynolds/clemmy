@@ -500,7 +500,7 @@ export const modelUsageAttributionStorage = new AsyncLocalStorage<ModelUsageAttr
 export interface StandaloneModelAccountingJob { readonly kind: 'standalone_model_accounting_job' }
 export interface StandaloneModelAccountingJobBinding {
   readonly usageJobId: string;
-  readonly operation: 'noticing_proposal' | 'noticing_answer';
+  readonly operation: 'noticing_proposal' | 'noticing_answer' | 'meeting_opportunity';
   readonly operationId: string;
   readonly revisionDigest: string;
 }
@@ -512,11 +512,11 @@ export function createStandaloneModelAccountingJob(input?: {
   operation: StandaloneModelAccountingJobBinding['operation']; operationId: string; revisionDigest: string;
 }): StandaloneModelAccountingJob {
   const row = inertUsageData(input);
-  const valid = row && (row.operation === 'noticing_proposal' || row.operation === 'noticing_answer')
+  const valid = row && (row.operation === 'noticing_proposal' || row.operation === 'noticing_answer' || row.operation === 'meeting_opportunity')
     && typeof row.operationId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/.test(row.operationId)
     && typeof row.revisionDigest === 'string' && /^[a-f0-9]{64}$/.test(row.revisionDigest);
   const token = Object.freeze({ kind: 'standalone_model_accounting_job' as const });
-  standaloneAccountingJobs.set(token, valid ? Object.freeze({ usageJobId: `noticing-job:${randomUUID()}`,
+  standaloneAccountingJobs.set(token, valid ? Object.freeze({ usageJobId: `${row.operation === 'meeting_opportunity' ? 'meeting' : 'noticing'}-job:${randomUUID()}`,
     operation: row.operation as StandaloneModelAccountingJobBinding['operation'],
     operationId: row.operationId as string, revisionDigest: row.revisionDigest as string }) : undefined);
   return token;

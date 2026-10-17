@@ -32,6 +32,7 @@ function seedStreamedMeeting() {
   seedCount += 1;
   const windowId = `win-${seedCount}`;
   const recordingId = `rec-${seedCount}`;
+  mc.noteRecallMeetingDetected({ windowId, recordingId, status: 'recording' });
   // Streamed segments: generic Recall labels (the bug we're fixing —
   // they're "Host" + "Speaker 2", not real names).
   mc.appendRecallTranscriptSegment({
@@ -124,6 +125,7 @@ test('markCanonicalTranscriptIncomplete: streamed segments survive a failed back
 
 test('finalizeRecallMeeting: no recordingId → canonicalStatus=not_started, no backfill kicked off', () => {
   // Different windowId so it doesn't collide with the seed above.
+  mc.noteRecallMeetingDetected({ windowId: 'win-no-rec', status: 'recording' });
   mc.appendRecallTranscriptSegment({
     windowId: 'win-no-rec',
     event: 'transcript.data',
