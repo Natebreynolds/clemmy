@@ -232,6 +232,84 @@ test('a human-initiated run makes the same reversible workspace commit a schedul
   assert.deepEqual(replay, first);
 });
 
+test('a run the owner started from a Space button writes that Space without a second approval', async () => {
+  // Live 2026-10-16: the redraft behind "Request changes" parked its own
+  // Space write on "Approve exact local_write call space_set_data".
+  manifests.installCapabilityManifestStore(manifests.createCapabilityManifestStore());
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  ports.clearProductionCapabilityPorts();
+  observations.clearIndependentCapabilityObservations();
+
+  const args = {
+    slug: 'site-approvals-button',
+    source_id: 'dashboard',
+    data_json: JSON.stringify({ summary: { pipeline: '$98,000' }, rows: [{ id: 'opp-50' }] }),
+  };
+  spaces.spaceStore.save({
+    id: args.slug,
+    title: 'Site approvals (button run)',
+    status: 'active',
+    viewEntry: 'view/index.html',
+    viewContent: '<!doctype html><title>Site approvals (button run)</title>',
+    dataSources: [],
+    actions: [],
+  });
+  const observed = carrier.observeReviewedLocalTool('space_set_data');
+  assert.ok(observed);
+  const manifest = carrier.reviewedLocalCapabilityManifest(observed);
+  assert.ok(manifest);
+  assert.equal(ports.registerFixtureCapabilityPort(
+    ports.productionPortIdentityFromManifest(manifest),
+    {
+      invoke: adapters.invokeForSealedManifest(manifest),
+      reconcile: adapters.reconcileForSealedManifest(manifest),
+    },
+  ).ok, true);
+
+  const step: WorkflowStepInput = {
+    id: 'refresh_dashboard',
+    prompt: '',
+    sideEffect: 'write',
+    call: { tool: 'space_set_data', args },
+  };
+  const workflow: WorkflowDefinition = {
+    name: 'reviewed-workspace-dataset-space-button',
+    description: 'Commit one reviewed dashboard dataset from a run a person asked for.',
+    enabled: true,
+    trigger: { manual: true },
+    inputs: {},
+    steps: [step],
+  };
+  const persisted = workflowStore.writeWorkflow(workflow.name, workflow);
+  // The Space button route: the owner pressed it.
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'space_click:site-approvals-button',
+    workflowSlug: persisted.name,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  assert.ok(queued.id);
+  const ctx = {
+    workflow: persisted.data,
+    workflowSlug: persisted.name,
+    runId: queued.id,
+    inputs: {},
+    stepOutputs: {},
+    assistant: new Proxy({}, { get: () => { throw new Error('model fallback was consulted'); } }),
+    completedItems: new Map(),
+    forEachFailures: [],
+    qualityAdvisories: [],
+  } as unknown as Parameters<typeof runner.executeStep>[1];
+
+  const first = await runner.executeStep(step, ctx) as { created: boolean };
+  assert.equal(first.created, true);
+  const grants = approvals.listPending({ sessionId: `workflow:${queued.id}:${step.id}`, status: 'any' });
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0]?.resolver, 'system:workflow-manual_run_authority');
+  const replay = await runner.executeStep(step, ctx);
+  assert.deepEqual(replay, first);
+});
+
 test('chat and dashboard Friday-style commits do not park when the run record omitted source or workflowSlug', async () => {
   // Live 2026-09-15: "run friday-dashboard" from chat parked on
   // space_set_data because chat dispatch wrote neither source nor

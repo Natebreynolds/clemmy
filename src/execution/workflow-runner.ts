@@ -3438,6 +3438,7 @@ type WorkflowV3SystemAuthorizationPolicy =
 /** Run sources a person initiates: the console/desktop run button, the
  * mobile run door, and a chat dispatch ("run my Friday dashboard"). */
 const HUMAN_INITIATED_RUN_SOURCES = new Set(['console', 'dashboard', 'mobile', 'chat', 'dispatch', 'discord']);
+const SPACE_BUTTON_RUN_SOURCE = /^space_click:[a-z0-9][a-z0-9-]*$/;
 
 function recordedWorkflowSlug(rec: QueuedRunRecord): string | undefined {
   if (typeof rec.workflowSlug === 'string' && rec.workflowSlug.trim()) return rec.workflowSlug.trim();
@@ -3472,6 +3473,11 @@ function exactHumanRunAuthority(
   }
   const source = typeof rec.source === 'string' ? rec.source : '';
   if (HUMAN_INITIATED_RUN_SOURCES.has(source)) return { ok: true, source };
+  // The owner pressed a Space button bound to this workflow (live 2026-10-16:
+  // "Request changes" parked its own Space write on "Approve exact
+  // local_write call space_set_data"). Clem's tool and the Space scheduler
+  // start runs as space_action:, which stays a non-human source.
+  if (SPACE_BUTTON_RUN_SOURCE.test(source)) return { ok: true, source: 'space_button' };
   if (typeof rec.originSessionId === 'string' && rec.originSessionId.trim()) {
     return { ok: true, source: 'chat' };
   }

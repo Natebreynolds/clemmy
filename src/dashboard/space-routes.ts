@@ -1153,12 +1153,14 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
       return;
     }
     try {
+      // This route is the owner's press: a workflow it starts is their run.
       const result = standing?.ok
         ? await runSpaceAction(slug, action, callerArgs, {
             approvalId: standing.approvalId,
             executionNonce: randomUUID(),
+            initiatedBy: 'person',
           })
-        : await runSpaceAction(slug, action, callerArgs);
+        : await runSpaceAction(slug, action, callerArgs, { initiatedBy: 'person' });
       appendAudit(slug, {
         method: 'ACTION',
         path: `/action/${actionId}`,

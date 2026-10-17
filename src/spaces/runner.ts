@@ -89,6 +89,13 @@ export interface SpaceActionRunOptions {
   /** Present only after the canonical approval registry resolved this action. */
   approvalId?: string;
   /**
+   * Set only by the authenticated console route: the owner pressed this
+   * button. A workflow it starts is then a person's run, so the workflow's
+   * local and non-send steps run without a second card (sends keep their
+   * floor). Clem's own tool and the Space scheduler never set it.
+   */
+  initiatedBy?: 'person';
+  /**
    * Compatibility input retained for standing-decision callers. It cannot mint
    * a shared-kernel activation or unlock local process execution.
    */
@@ -431,6 +438,9 @@ async function runSpaceDataSourceRead(
   };
 }
 
+/** The run source of a workflow the owner started by pressing a Space button. */
+export const SPACE_BUTTON_RUN_SOURCE_PREFIX = 'space_click:';
+
 /**
  * A workflow button starts one run of a saved, turned-on workflow with the
  * merged args as its inputs, through the same path as the workflow page's Run.
@@ -442,6 +452,7 @@ async function runSpaceWorkflowAction(
   slug: string,
   workflow: string,
   args: Record<string, unknown>,
+  pressedByPerson: boolean,
 ): Promise<RunSourceResult> {
   const { resumeWorkflowRun } = await import('../tools/workflow-run-queue.js');
   const inputs: Record<string, string> = {};
@@ -449,7 +460,9 @@ async function runSpaceWorkflowAction(
     if (value === undefined || value === null) continue;
     inputs[key] = typeof value === 'string' ? value : JSON.stringify(value);
   }
-  const queued = resumeWorkflowRun(workflow, inputs, { source: `space_action:${slug}` });
+  const queued = resumeWorkflowRun(workflow, inputs, {
+    source: pressedByPerson ? `${SPACE_BUTTON_RUN_SOURCE_PREFIX}${slug}` : `space_action:${slug}`,
+  });
   if (queued.status === 'queued' || queued.status === 'duplicate' || queued.status === 'held') {
     return { ok: true, data: { workflow, runId: queued.id ?? null, status: queued.status, message: queued.message } };
   }
@@ -470,7 +483,9 @@ export async function runSpaceAction(
   opts: SpaceActionRunOptions = {},
 ): Promise<RunSourceResult> {
   const args = { ...(action.argsTemplate ?? {}), ...(callerArgs ?? {}) };
-  if (action.workflow?.trim()) return runSpaceWorkflowAction(slug, action.workflow.trim(), args);
+  if (action.workflow?.trim()) {
+    return runSpaceWorkflowAction(slug, action.workflow.trim(), args, opts.initiatedBy === 'person');
+  }
   const requestedApprovalId = opts.approvalId?.trim() ?? '';
   const requiresApproval = workspaceActionRequiresApproval(action);
   const authority = requestedApprovalId

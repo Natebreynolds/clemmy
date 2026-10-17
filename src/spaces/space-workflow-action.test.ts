@@ -73,3 +73,20 @@ test('a workflow that is off says how to turn it on and starts nothing', async (
   assert.match(result.ok ? '' : result.error, /is off\. Turn it on/);
   assert.equal(queuedRuns().length, before);
 });
+
+test("the owner's press starts a person's run; Clem's own press does not", async () => {
+  // Live 2026-10-16: "Request changes" ran its workflow, which then parked its
+  // own Space write on a second card because the run did not count as a
+  // person's. Only the console route passes initiatedBy.
+  saveWorkflow('Redraft On Press', true);
+  const pressed = await runSpaceAction('site-ops', { id: 'redraft', workflow: 'Redraft On Press' },
+    { draft_id: 'owner-press' }, { initiatedBy: 'person' });
+  assert.equal(pressed.ok, true, pressed.ok ? '' : pressed.error);
+  const byClem = await runSpaceAction('site-ops', { id: 'redraft', workflow: 'Redraft On Press' },
+    { draft_id: 'clem-press' });
+  assert.equal(byClem.ok, true, byClem.ok ? '' : byClem.error);
+  const sourceOf = (draftId: string) => queuedRuns()
+    .find((record) => (record.inputs as Record<string, unknown> | undefined)?.draft_id === draftId)?.source;
+  assert.equal(sourceOf('owner-press'), 'space_click:site-ops');
+  assert.equal(sourceOf('clem-press'), 'space_action:site-ops');
+});
