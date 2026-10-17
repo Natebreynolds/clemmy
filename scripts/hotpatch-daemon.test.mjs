@@ -9,6 +9,7 @@ import { deflateRawSync } from 'node:zlib';
 import {
   SEALED_SHELL_PARTS,
   captureAppliedUpdateEvidence,
+  captureRepeatedAppliedUpdateEvidence,
   captureNoActiveUpdateEvidence,
   isInstalledAppRunning,
   isUpdaterHelperRunning,
@@ -749,6 +750,90 @@ function receiptChainFixture(t, rounds = 3) {
   return g;
 }
 
+function captureRepeatForFixture(g, overrides = {}, operations = fs) {
+  return captureRepeatedAppliedUpdateEvidence({
+    app: g.app, home: g.home, shellSnapshot: g.snapshot, repeatedReference: g.repeat,
+    retainedArchiveReference: g.retained,
+    isRunning: () => false, isUpdaterRunning: () => false,
+    verifyNativeSignature: bundle => {
+      assert.ok([g.reference, g.retained?.referenceBundle].includes(bundle), 'only independent pristine references are signature-verified');
+      assert.notEqual(bundle, g.app, 'the modified installed resource seal is never relabelled pristine');
+      g.signatures.push(bundle);
+    },
+    readReferenceCodeIdentity: bundle => {
+      assert.ok([g.reference, g.retained?.referenceBundle].includes(bundle));
+      return { bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: 'c'.repeat(40) };
+    },
+    ...overrides,
+  }, operations);
+}
+
+test('repeat capture returns serializable observations only after the complete ordered proof, with no file mutation', t => {
+  const g = receiptChainFixture(t);
+  const spy = forbiddenMutations();
+  const captured = captureRepeatForFixture(g, {}, spy.operations);
+  assert.deepEqual(captured, { shellSnapshot: g.snapshot, appliedUpdateEvidence: g.evidence });
+  assert.deepEqual(g.signatures, [g.reference]);
+  assert.deepEqual(spy.calls, []);
+  assert.deepEqual(Object.keys(captured).sort(), ['appliedUpdateEvidence', 'shellSnapshot']);
+  assert.throws(() => assertMutableInstallTarget(g.daemonDist, captured), REFUSED_BUNDLE,
+    'serialized observations are not an installation capability');
+
+  const retained = JSON.parse(JSON.stringify(captured));
+  assert.doesNotThrow(() => g.proveRepeat({ shellSnapshot: retained.shellSnapshot, appliedUpdateEvidence: retained.appliedUpdateEvidence }));
+  fs.appendFileSync(path.join(g.daemonDist, 'index.js'), 'unaccounted later change');
+  assert.throws(() => g.proveRepeat({ shellSnapshot: retained.shellSnapshot, appliedUpdateEvidence: retained.appliedUpdateEvidence }),
+    /runtime differs from its ordered authorized receipt/, 'the installer must reprove current runtime bytes');
+});
+
+test('repeat capture retains signature, publisher, receipt, rollback, immutable and exact snapshot refusal floors', async t => {
+  for (const [name, change, overrides = {}] of [
+    ['missing repeat authority', () => {}, { repeatedReference: undefined }],
+    ['wrong latest receipt pin', g => { g.repeat.authorizedReceiptSha256 = '0'.repeat(64); }],
+    ['wrong ancestor pin', g => { g.manifest.receipts[0].sha256 = '0'.repeat(64); g.repinManifest(); }],
+    ['missing rollback', g => fs.rmSync(g.chain[0].receipt.parts['mobile-web'].backup, { recursive: true })],
+    ['changed immutable resource', g => fs.appendFileSync(path.join(g.app, 'Contents/Frameworks/Test.framework/Versions/A/Test'), 'changed')],
+    ['different native snapshot', g => { g.snapshot['Contents/Resources/app.asar'] = '0'.repeat(64); }],
+    ['different signed publisher', () => {}, { readReferenceCodeIdentity: () => ({ bundleId: 'com.example.fixture', team: 'FOREIGN', cdHash: 'c'.repeat(40) }) }],
+    ['invalid full reference signature', () => {}, { verifyNativeSignature() { throw new Error('fixture reference signature refused'); } }],
+  ]) await t.test(name, t => {
+    const g = receiptChainFixture(t); change(g);
+    const spy = forbiddenMutations();
+    assert.throws(() => captureRepeatForFixture(g, overrides, spy.operations));
+    assert.deepEqual(spy.calls, [], 'no capture refusal stages, replaces, repairs or cleans up anything');
+  });
+});
+
+test('repeat capture requires closed app and updater before inspection and again after complete verification', async t => {
+  for (const [name, overrides] of [
+    ['running app', { isRunning: () => true }],
+    ['running updater', { isUpdaterRunning: () => true }],
+    ['unavailable process inventory', { isRunning() { throw new Error('fixture process inventory unavailable'); } }],
+  ]) await t.test(name, t => {
+    const g = receiptChainFixture(t); let reads = 0;
+    assert.throws(() => captureRepeatForFixture(g, overrides, { ...fs, readdirSync(...args) { reads += 1; return fs.readdirSync(...args); } }));
+    assert.equal(reads, 0, 'a live or unknown process prevents the archive/tree inspection from starting');
+    assert.deepEqual(g.signatures, []);
+  });
+  for (const helper of [false, true]) await t.test(helper ? 'updater appears during verification' : 'app appears during verification', t => {
+    const g = receiptChainFixture(t); let started = false;
+    assert.throws(() => captureRepeatForFixture(g, {
+      isRunning: () => !helper && started,
+      isUpdaterRunning: () => helper && started,
+      verifyNativeSignature(bundle) { assert.equal(bundle, g.reference); started = true; },
+    }), /running during repeat capture/);
+  });
+  await t.test('updater changes across verification', t => {
+    const g = receiptChainFixture(t);
+    assert.throws(() => captureRepeatForFixture(g, {
+      verifyNativeSignature(bundle) {
+        assert.equal(bundle, g.reference);
+        fs.writeFileSync(path.join(g.cache, 'current.blockmap'), 'new updater evidence');
+      },
+    }), /repeat applied-update evidence after verification/);
+  });
+});
+
 test('bounded ordered receipt chain proves three installed rounds and privately retains the fourth rollback set', t => {
   const g = receiptChainFixture(t); const proof = g.proveRepeat();
   assert.deepEqual(g.signatures, [g.reference]);
@@ -1284,6 +1369,46 @@ function refusesMixedBeforeInstall(g, acquire) {
   assert.deepEqual(spy.calls, [], 'refusal precedes target staging/copy/backup/cleanup');
   assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
 }
+
+test('repeat capture proves both independent signed generations and exact old archive history for an already patched current app', t => {
+  const g = mixedAppliedGenerationsFixture(t);
+  g.parts = {
+    daemon: 'Contents/Resources/daemon/dist',
+    'builtin-skills': 'Contents/Resources/daemon/builtin-skills',
+    'console-web': 'Contents/Resources/daemon/apps/console-web/dist',
+    'mobile-web': 'Contents/Resources/daemon/apps/mobile-web/dist',
+  };
+  for (const relative of Object.values(g.parts)) {
+    fs.mkdirSync(path.join(g.app, relative), { recursive: true });
+    fs.writeFileSync(path.join(g.app, relative, 'official.txt'), 'current signed release');
+  }
+  g.reference = path.join(g.root, 'official-current/Fixture.app');
+  fs.cpSync(g.app, g.reference, { recursive: true, verbatimSymlinks: true });
+  g.writeArchives(fullBundleZip(g.reference));
+  const receipt = { bundle: g.app, wasVersion: '3.18.38', sourceFingerprint: 'b'.repeat(64), parts: {} };
+  for (const [name, relative] of Object.entries(g.parts)) {
+    const target = path.join(g.app, relative); const backup = `${target}.backup-Mixed${name.replace(/-/g, '')}`;
+    fs.renameSync(target, backup); fs.cpSync(g.sourceDist, target, { recursive: true });
+    const digest = name === 'daemon' ? inspectDaemonBuildForFixture(target) : assetDigestForFixture(target);
+    receipt.parts[name] = { ...(name === 'daemon' ? { digest } : { built: digest }), served: digest, backup };
+  }
+  const receiptPath = path.join(g.root, 'authorized-current.json');
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt));
+  g.repeat = { referenceBundle: g.reference, authorizedReceipt: receiptPath,
+    authorizedReceiptSha256: createHash('sha256').update(fs.readFileSync(receiptPath)).digest('hex'),
+    expectedPriorFingerprint: receipt.sourceFingerprint, expectedReferenceCdHash: 'c'.repeat(40) };
+  const oldBefore = g.retainedBytes(); const spy = forbiddenMutations();
+  const captured = captureRepeatForFixture(g, {}, spy.operations);
+  assert.equal(captured.appliedUpdateEvidence.version, 2);
+  assert.equal(captured.appliedUpdateEvidence.identity.version, '3.18.38');
+  assert.equal(captured.appliedUpdateEvidence.retainedArchive.identity.version, '3.18.37');
+  assert.deepEqual(captured.appliedUpdateEvidence.retainedArchiveReference, g.retained);
+  assert.deepEqual(new Set(g.signatures), new Set([g.reference, g.retained.referenceBundle]));
+  assert.deepEqual(g.retainedBytes(), oldBefore, 'historical download, metadata and original capture remain byte-identical');
+  assert.deepEqual(spy.calls, []);
+  fs.appendFileSync(g.historicalPath, ' ');
+  assert.throws(() => captureRepeatForFixture(g), /historical authorized receipt or manifest hash differs/);
+});
 
 test('mixed retained generations require the actual applied shell, not merely the newer active archive', t => {
   const g = mixedAppliedGenerationsFixture(t);

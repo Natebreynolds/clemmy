@@ -964,6 +964,30 @@ export function captureAppliedUpdateEvidence({ app, home, retainedArchiveReferen
   return evidence;
 }
 
+/** Recapture an already patched installation without claiming its modified
+ * resource seal is pristine. The complete repeat guard instead proves the
+ * independent signed references, exact archive and ordered runtime/rollback
+ * chain. This returns observation data only; the installer must prove it again.
+ * Take shellSnapshot before quitting, then call only after app/updater exit. */
+export function captureRepeatedAppliedUpdateEvidence({ app, home, shellSnapshot, retainedArchiveReference, repeatedReference,
+  isRunning = () => isInstalledAppRunning(app), isUpdaterRunning = isUpdaterHelperRunning,
+  verifyNativeSignature, readReferenceCodeIdentity = referenceCodeIdentity,
+}, fileOps = fs) {
+  if (typeof app !== 'string' || path.resolve(app) !== app || typeof home !== 'string' || path.resolve(home) !== home) guardRefusal('repeat capture requires canonical app and home paths');
+  if (!repeatedReference) guardRefusal('repeat capture requires the exact signed reference and receipt chain');
+  const closed = () => { if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper is running during repeat capture'); };
+  closed();
+  const evidence = inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps, readReferenceCodeIdentity);
+  verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpdateEvidence: evidence, repeatedReference,
+    isRunning, isUpdaterRunning, verifyNativeSignature, readReferenceCodeIdentity,
+  }, fileOps);
+  sameEvidence(inspectAppliedUpdateEvidence({ app, home, retainedArchiveReference }, fileOps, readReferenceCodeIdentity), evidence,
+    'repeat applied-update evidence after verification');
+  for (const rel of SEALED_SHELL_PARTS) if (shellSnapshot?.[rel] !== evidence.shellSnapshot[rel]) guardRefusal('repeat capture native snapshot differs');
+  closed();
+  return { shellSnapshot: { ...evidence.shellSnapshot }, appliedUpdateEvidence: evidence };
+}
+
 /** Read-only observation, never installation authority on its own. An explicit
  * no-active-update repeat must still prove the signed official archive, every
  * immutable installed entry and the ordered runtime/rollback receipt chain. */
