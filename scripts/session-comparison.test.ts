@@ -439,6 +439,86 @@ test('causally owned background memory after delivery is included exactly once i
   } finally { rmSync(fixture.home, {recursive:true, force:true}); }
 });
 
+test('turn and task counters retain exact owned calls across synthetic reports without adopting control or legacy work', () => {
+  const fixture = fixtureHome();
+  try {
+    const db = new Database(fixture.dbPath);
+    const owner = { sourceUserSeq: 1000, attemptId: 'report-owner' };
+    seedSession(db, 'report-interleave', [
+      { seq: 1000, type: 'user_input_received', at: '2026-08-08T10:00:00.000Z' },
+      { seq: 1001, type: 'tool_called', at: '2026-08-08T10:00:01.000Z', data: { tool: 'legacy_prefix', callId: 'legacy-prefix', accounting: 'top_level' } },
+      { seq: 1002, type: 'tool_returned', at: '2026-08-08T10:00:01.100Z', data: { tool: 'legacy_prefix', callId: 'legacy-prefix', accounting: 'top_level' } },
+      { seq: 1003, type: 'tool_called', at: '2026-08-08T10:00:02.000Z', data: { ...owner, tool: 'before_report', callId: 'before', accounting: 'top_level' } },
+      { seq: 1004, type: 'tool_returned', at: '2026-08-08T10:00:02.100Z', data: { ...owner, tool: 'before_report', callId: 'before', accounting: 'top_level' } },
+      { seq: 1005, type: 'user_input_received', at: '2026-08-08T10:00:03.000Z', data: { synthetic: true, source: 'outcome' } },
+      { seq: 1006, type: 'tool_called', at: '2026-08-08T10:00:04.000Z', data: { sourceUserSeq: 1005, attemptId: 'foreign-control', tool: 'foreign_control', callId: 'foreign-control-call', accounting: 'top_level' } },
+      { seq: 1007, type: 'tool_called', at: '2026-08-08T10:00:05.000Z', data: { tool: 'unscoped_after_report', callId: 'legacy-after', accounting: 'top_level' } },
+      { seq: 1008, type: 'tool_called', at: '2026-08-08T10:00:06.000Z', data: { ...owner, attemptId: 'foreign-control', tool: 'foreign_attempt', callId: 'before', accounting: 'top_level' } },
+      { seq: 1009, type: 'tool_called', at: '2026-08-08T10:00:07.000Z', data: { sourceUserSeq: 1000, tool: 'source_without_attempt', callId: 'before', accounting: 'top_level' } },
+      { seq: 1010, type: 'tool_called', at: '2026-08-08T10:00:08.000Z', data: { ...owner, tool: 'after_report', callId: 'after', canonicalCallId: 'logical-after', accounting: 'top_level' } },
+      { seq: 1011, type: 'tool_called', at: '2026-08-08T10:00:08.010Z', data: { sourceUserSeq: 1000, tool: 'after_report', callId: 'after', canonicalCallId: 'logical-after', accounting: 'transport_mirror' } },
+      { seq: 1012, type: 'tool_returned', at: '2026-08-08T10:00:08.020Z', data: { sourceUserSeq: 1000, tool: 'after_report', callId: 'after', canonicalCallId: 'logical-after', accounting: 'transport_mirror' } },
+      { seq: 1013, type: 'tool_returned', at: '2026-08-08T10:00:08.030Z', data: { ...owner, tool: 'after_report', callId: 'after', canonicalCallId: 'logical-after', accounting: 'top_level' } },
+      { seq: 1014, type: 'warm_schema_metadata_refresh', at: '2026-08-08T10:00:08.050Z', data: { sourceUserSeq: 1000, tool: 'before_report', callId: 'before', outcome: 'matched', durationMs: 25 } },
+      { seq: 1015, type: 'user_input_received', at: '2026-08-08T10:00:09.000Z', data: { synthetic: true, source: 'outcome' } },
+      { seq: 1016, type: 'conversation_completed', at: '2026-08-08T10:00:10.000Z', data: typedTerminal('report-interleave', 1000, 1) },
+    ]);
+    db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+      .run('report-owner', 'report-interleave', '2026-08-08T10:00:00.000Z', '2026-08-08T10:00:10.100Z', 'completed', 1000);
+    db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+      .run('foreign-control', 'report-interleave', '2026-08-08T10:00:03.000Z', '2026-08-08T10:00:04.100Z', 'completed', 1005);
+    db.close();
+    const beforeDb = readFileSync(fixture.dbPath), beforeUsage = readFileSync(fixture.usageFile);
+    for (const measured of [measureAcceptedTurn(fixture.home, 'report-interleave', 1000), measureAcceptedTask(fixture.home, 'report-interleave', 1000)]) {
+      assert.equal(measured.canonicalTopLevelToolCalls, 3);
+      assert.equal(measured.transportMirrorCalls, 1);
+      assert.equal(measured.toolCalledRows, 4);
+      assert.equal(measured.toolReturnedRows, 4);
+      assert.equal(measured.acceptedTurns, 1);
+      assert.equal(measured.schemaMetadataRefreshes, 0, 'unowned metadata cannot borrow an old call identity');
+      assert.deepEqual(measured.perTool, { legacy_prefix: 1, before_report: 1, after_report: 1 });
+      assert.equal(measured.terminalSeq, 1016);
+      assert.equal(measured.terminalType, 'conversation_completed');
+      if (measured.scope === 'task') assert.equal(measured.taskWallMs, 10_000);
+      else assert.equal(measured.turnWallMs, 10_000);
+      assert.equal(measured.usageCompleteness.allLegUsageCertified, false);
+    }
+    assert.deepEqual(readFileSync(fixture.dbPath), beforeDb);
+    assert.deepEqual(readFileSync(fixture.usageFile), beforeUsage);
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
+test('a real next request remains the counter boundary after a synthetic report even for a late old-source call', () => {
+  const fixture = fixtureHome();
+  try {
+    const db = new Database(fixture.dbPath);
+    const owner = { sourceUserSeq: 1100, attemptId: 'human-bound-owner' };
+    seedSession(db, 'human-after-report', [
+      { seq: 1100, type: 'user_input_received', at: '2026-08-08T11:00:00.000Z' },
+      { seq: 1101, type: 'user_input_received', at: '2026-08-08T11:00:01.000Z', data: { synthetic: true, source: 'outcome' } },
+      { seq: 1102, type: 'tool_called', at: '2026-08-08T11:00:02.000Z', data: { ...owner, tool: 'owned_after_report', callId: 'owned-before-human', accounting: 'top_level' } },
+      { seq: 1103, type: 'tool_returned', at: '2026-08-08T11:00:02.100Z', data: { ...owner, tool: 'owned_after_report', callId: 'owned-before-human', accounting: 'top_level' } },
+      { seq: 1104, type: 'user_input_received', at: '2026-08-08T11:00:03.000Z' },
+      { seq: 1105, type: 'tool_called', at: '2026-08-08T11:00:04.000Z', data: { sourceUserSeq: 1104, attemptId: 'new-human-attempt', tool: 'new_human_call', callId: 'new-human-call', accounting: 'top_level' } },
+      { seq: 1106, type: 'tool_called', at: '2026-08-08T11:00:05.000Z', data: { ...owner, tool: 'late_old_source', callId: 'late-old-call', accounting: 'top_level' } },
+      { seq: 1107, type: 'tool_called', at: '2026-08-08T11:00:06.000Z', data: { tool: 'late_legacy', callId: 'late-legacy', accounting: 'top_level' } },
+      { seq: 1108, type: 'conversation_completed', at: '2026-08-08T11:00:07.000Z', data: typedTerminal('human-after-report', 1100, 1, { attemptId: 'human-bound-owner' }) },
+    ]);
+    db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+      .run('human-bound-owner', 'human-after-report', '2026-08-08T11:00:00.000Z', '2026-08-08T11:00:07.100Z', 'completed', 1100);
+    db.prepare('INSERT INTO run_attempts VALUES (?, ?, ?, ?, ?, ?)')
+      .run('new-human-attempt', 'human-after-report', '2026-08-08T11:00:03.000Z', '2026-08-08T11:00:06.100Z', 'completed', 1104);
+    db.close();
+    for (const measured of [measureAcceptedTurn(fixture.home, 'human-after-report', 1100), measureAcceptedTask(fixture.home, 'human-after-report', 1100)]) {
+      assert.equal(measured.canonicalTopLevelToolCalls, 1);
+      assert.equal(measured.toolCalledRows, 1);
+      assert.equal(measured.toolReturnedRows, 1);
+      assert.deepEqual(measured.perTool, { owned_after_report: 1 });
+      assert.equal(measured.terminalSeq, 1108);
+    }
+  } finally { rmSync(fixture.home, { recursive: true, force: true }); }
+});
+
 function approvalTaskFixture(): ReturnType<typeof fixtureHome> {
   const fixture = fixtureHome();
   const db = new Database(fixture.dbPath);

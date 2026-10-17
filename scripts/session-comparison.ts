@@ -828,6 +828,63 @@ function timestampMs(event: SessionEvent | undefined): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+/** A background report is not a new human request. Beyond such a control,
+ * count only journal rows that still prove this source's durable attempt or
+ * one of its exact call identities. Anonymous legacy rows keep their original
+ * first-input bound; a real next request remains a hard boundary for all rows.
+ * This is accounting membership, never execution or continuation authority. */
+function acceptedSourceWindowEvents(input: {
+  events: readonly SessionEvent[];
+  source: SessionEvent;
+  attempts: AttemptRead;
+  endMs: number | null;
+  terminal: SessionEvent | null;
+}): SessionEvent[] {
+  const { events, source, attempts, endMs } = input;
+  const nextInput = events.find(event => event.seq > source.seq && event.type === 'user_input_received');
+  const nextHumanInput = events.find(event => event.seq > source.seq
+    && event.type === 'user_input_received' && event.data.synthetic !== true);
+  const withinBounds = (event: SessionEvent): boolean => {
+    if (event.seq < source.seq || (nextHumanInput && event.seq >= nextHumanInput.seq)) return false;
+    const at = timestampMs(event);
+    return at !== null && (endMs === null || at <= endMs);
+  };
+  const ownsAttempt = (data: Record<string, unknown>): boolean | null => {
+    const values = ['attemptId', 'runAttemptId'].filter(key => Object.hasOwn(data, key)).map(key => data[key]);
+    if (values.length === 0) return null;
+    return values.every(value => typeof value === 'string' && attempts.ids.has(value));
+  };
+  const callIdentities = (data: Record<string, unknown>): string[] =>
+    ['callId', 'canonicalCallId', 'logicalToolCallId'].map(key => data[key])
+      .filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const ownedCalls = new Map<string, string | null>();
+  for (const event of events.filter(event => withinBounds(event) && event.type === 'tool_called'
+    && event.data.accounting === 'top_level'
+    && event.data.sourceUserSeq === source.seq && ownsAttempt(event.data) === true)
+  ) {
+    const name = semanticToolName(event.data);
+    for (const id of callIdentities(event.data)) {
+      if (ownedCalls.has(id) && ownedCalls.get(id) !== name) ownedCalls.set(id, null);
+      else if (!ownedCalls.has(id)) ownedCalls.set(id, name);
+    }
+  }
+  return events.filter(event => {
+    if (!withinBounds(event)) return false;
+    if (!nextInput || event.seq < nextInput.seq) return true;
+    // ownedTerminal already validated this exact terminal's typed source
+    // identity. Older terminal producers need not repeat an attempt/call id.
+    if (input.terminal?.seq === event.seq) return true;
+    if (event.data.sourceUserSeq !== source.seq) return false;
+    const attempt = ownsAttempt(event.data);
+    // An explicit contrary/malformed attempt cannot borrow a matching call id.
+    if (attempt !== null) return attempt;
+    if ((event.type !== 'tool_called' && event.type !== 'tool_returned')
+      || event.data.accounting !== 'transport_mirror') return false;
+    const name = semanticToolName(event.data);
+    return callIdentities(event.data).some(id => ownedCalls.get(id) === name);
+  });
+}
+
 function wallClock(events: readonly SessionEvent[]): {
   turnWallMs: number | null;
   wallStartType: 'user_input_received' | 'turn_started' | null;
@@ -1107,14 +1164,7 @@ export function measureAcceptedTurn(
   const attemptCloseoutMs = timestampValue(attempts.closeoutAt ?? '');
   const terminalMs = timestampValue(terminal.createdAt);
   const closeoutMs = Math.max(terminalMs ?? 0, attemptCloseoutMs ?? 0);
-  const nextInput = sessionRead.events.find((event) => (
-    event.seq > source.seq && event.type === 'user_input_received'
-  ));
-  const events = sessionRead.events.filter((event) => {
-    if (event.seq < source.seq || (nextInput && event.seq >= nextInput.seq)) return false;
-    const at = timestampValue(event.createdAt);
-    return at !== null && at <= closeoutMs;
-  });
+  const events = acceptedSourceWindowEvents({ events: sessionRead.events, source, attempts, endMs: closeoutMs, terminal });
   const acceptedSource = `${sessionId}:${sourceUserSeq}`;
   const usageRead = readUsageEvents(usageDir);
   const exactCandidates = usageRead.events.filter((event) => (
@@ -2287,14 +2337,9 @@ export function measureAcceptedTask(
     if (attempts.unfinished > 0) issues.add(`unfinished_source_attempt:${source.seq}`);
     const start = timestampMs(source);
     const end = Math.max(timestampMs(terminal ?? undefined) ?? 0, timestampValue(attempts.closeoutAt ?? '') ?? 0);
-    const nextInput = inputs.find((event) => event.seq > source.seq);
     if (start !== null && end >= start) windows.push([start, end]);
     else issues.add(`unbounded_source_window:${source.seq}`);
-    for (const event of sessionRead.events) {
-      if (event.seq < source.seq || (nextInput && event.seq >= nextInput.seq)) continue;
-      const at = timestampMs(event);
-      if (at !== null && (!end || at <= end)) eventSeqs.add(event.seq);
-    }
+    for (const event of acceptedSourceWindowEvents({ events: sessionRead.events, source, attempts, endMs: end || null, terminal })) eventSeqs.add(event.seq);
   }
   const events = sessionRead.events.filter((event) => eventSeqs.has(event.seq));
   const acceptedSource = `${sessionId}:${root.seq}`;
