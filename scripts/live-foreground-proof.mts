@@ -16,11 +16,16 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { measureAcceptedTurn } from './session-comparison.js';
+import { measureAcceptedTask, measureAcceptedTurn } from './session-comparison.js';
 import { z } from 'zod';
 import { checkLiveTurn, LiveProofMessageSchema, type LiveTurnFacts } from './lib/live-foreground-proof-assertions.js';
 import { taskModeFields } from '../src/runtime/harness/task-mode.js';
 import { fingerprintRuntimeSourceFromGit } from '../src/runtime/source-fingerprint.js';
+import { readCredentialFileSync, readCredentialSourceFileSync } from '../src/runtime/credential-private-filesystem.js';
+import { captureProofTaskCloseout, parseProofHomeAuth, proofAcceptanceMetadata, proofAcceptedSource, proofBuildIdentity,
+  proofDesktopCancellationTarget, proofFailureReason, proofLoopbackRequestUrl, proofRequestOperation,
+  proofResponseObject, proofTransport, ProofRunnerFailure, sameProofBuildIdentity, unavailableProofTaskCloseout,
+  type ProofBuildIdentity, type ProofRequestReceipt } from './lib/live-proof-closeout.js';
 
 const args = process.argv.slice(2);
 function option(name: string): string | undefined {
@@ -46,34 +51,47 @@ const output = path.resolve(option('--out') ?? path.join('output', 'live-proofs'
 const expectedFingerprint = option('--expected-source-fingerprint');
 const expectedEntry = option('--expected-entry');
 const mobileCredentialsPath = option('--mobile-credentials');
-const mobileCredentials = mobileCredentialsPath ? z.object({
+const mobileCredentialsSchema = z.object({
   cookie: z.string().min(1), deviceId: z.string().min(1), sessionFingerprint: z.string().min(1),
   privateKeyJwk: z.record(z.string(), z.unknown()),
-}).strict().parse(JSON.parse(readFileSync(mobileCredentialsPath, 'utf8'))) : null;
-const mobileKey = mobileCredentials ? createPrivateKey({ key: mobileCredentials.privateKeyJwk as never, format: 'jwk' }) : null;
+}).strict();
+const mobileCredentials = (() => {
+  try { return mobileCredentialsPath ? mobileCredentialsSchema.parse(JSON.parse(readFileSync(mobileCredentialsPath, 'utf8'))) : null; }
+  catch { throw new Error('The selected mobile proof credential file could not be read safely; no request submitted.'); }
+})();
+const mobileKey = (() => {
+  try { return mobileCredentials ? createPrivateKey({ key: mobileCredentials.privateKeyJwk as never, format: 'jwk' }) : null; }
+  catch { throw new Error('The selected mobile proof signing key is unusable; no request submitted.'); }
+})();
 if (expectedFingerprint && !/^[a-f0-9]{64}$/.test(expectedFingerprint)) throw new Error('invalid expected source fingerprint');
 const timeoutMs = Number(option('--timeout-ms') ?? 360_000);
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 1_800_000) {
   throw new Error('--timeout-ms must be between 1000 and 1800000');
 }
-const env = Object.fromEntries(readFileSync(path.join(home, '.env'), 'utf8').split('\n').flatMap((line) => {
-  const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line.trim());
-  return match ? [[match[1]!, match[2]!.trim().replace(/^(['"])(.*)\1$/, '$2')]] : [];
-}));
-const baseUrl = `http://127.0.0.1:${env.WEBHOOK_PORT || '8420'}`;
-const secret = env.WEBHOOK_SECRET;
-if (!secret) throw new Error('The dev home has no WEBHOOK_SECRET; no request submitted');
+let auth: ReturnType<typeof parseProofHomeAuth>;
+try {
+  auth = parseProofHomeAuth({ envText: readCredentialSourceFileSync(path.join(home, '.env')),
+    vaultText: readCredentialFileSync(path.join(home, 'state', 'secrets-vault.json')) });
+} catch { throw new Error('The selected home’s local webhook authentication could not be read safely; no request submitted.'); }
+const baseUrl = `http://127.0.0.1:${auth.port}`;
+const secret = auth.secret;
 const headers = { authorization: `Bearer ${secret}`, 'content-type': 'application/json' };
 const db = new Database(path.join(home, 'state', 'harness.db'), { readonly: true, fileMustExist: true });
 let sessionId = option('--session');
 const report: Record<string, unknown> = { version: 1, startedAt: new Date().toISOString(), baseUrl, home,
-  surface: mobileCredentials ? 'authenticated_mobile_http' : 'desktop_http', turns: [] };
+  surface: mobileCredentials ? 'authenticated_mobile_http' : 'desktop_http', turns: [],
+  taskAccounting: { qualification: 'unqualified', allLegUsageCertified: false, totals: 'recorded_lower_bound',
+    providerPricedCost: 'not_measured', actualBilling: 'not_measured',
+    note: 'Final task entries are measured separately for each exact accepted source and may overlap. Do not sum them or treat recorded usage as complete cost.' } };
 const turns = report.turns as Record<string, unknown>[];
+let pinnedBuild: ProofBuildIdentity | undefined;
+let measurementStartedAt: string | undefined;
 function save(): void {
   mkdirSync(path.dirname(output), { recursive: true });
   writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
 }
 async function api(url: string, body?: unknown, mobileRequestKey?: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  const requestUrl = proofLoopbackRequestUrl(baseUrl, url);
   const method = body === undefined ? 'GET' : 'POST';
   let requestHeaders: Record<string, string> = headers;
   if (url.startsWith('/m/')) {
@@ -89,17 +107,39 @@ async function api(url: string, body?: unknown, mobileRequestKey?: string): Prom
       ...(mobileRequestKey ? { 'idempotency-key': mobileRequestKey } : {}) };
   }
   const startedAt = Date.now();
-  const response = await fetch(`${baseUrl}${url}`, {
-    method, headers: requestHeaders,
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    // A slow daemon is evidence, not a driver failure: record the latency and
-    // let the assertions judge it (live 2026-09-09: the post-terminal
-    // build-info read exceeded 20 s after a 50-write turn).
-    signal: AbortSignal.timeout(90_000),
-  });
-  const latencyMs = Date.now() - startedAt;
-  ((report as { requestLatencies?: unknown[] }).requestLatencies ??= []).push({ at: new Date(startedAt).toISOString(), url, latencyMs, status: response.status });
-  return { status: response.status, body: await response.json() as Record<string, unknown> };
+  let status: number | null = null;
+  let failureReason: string | undefined;
+  try {
+    const response = await proofTransport(() => fetch(requestUrl, {
+      method, headers: requestHeaders,
+      redirect: 'error',
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      // A slow daemon is evidence, not a driver failure: record the latency and
+      // let the assertions judge it (live 2026-09-09: the post-terminal
+      // build-info read exceeded 20 s after a 50-write turn).
+      signal: AbortSignal.timeout(90_000),
+    }));
+    status = response.status;
+    return { status, body: await proofResponseObject(() => response.json()) };
+  } catch (error) { failureReason = proofFailureReason(error); throw error; }
+  finally {
+    ((report as { requestLatencies?: unknown[] }).requestLatencies ??= []).push({
+      at: new Date(startedAt).toISOString(), operation: proofRequestOperation(url), method,
+      latencyMs: Date.now() - startedAt, status, ...(failureReason ? { failureReason } : {}),
+    });
+  }
+}
+function requestReceipt(requestId: string): ProofRequestReceipt | null {
+  const receipt = db.prepare('SELECT session_id, run_id FROM harness_chat_requests WHERE request_id = ?').get(requestId) as
+    { session_id: string; run_id: string } | undefined;
+  return receipt ? { sessionId: receipt.session_id, runId: receipt.run_id } : null;
+}
+function acceptedSource(receipt: ProofRequestReceipt, returned?: ProofRequestReceipt, knownSourceUserSeq?: number) {
+  const sources = db.prepare(`SELECT seq, session_id, role, data_json FROM events
+    WHERE type = 'user_input_received' AND json_extract(data_json, '$.runId') = ?
+      AND session_id = ? ORDER BY seq LIMIT 2`).all(receipt.runId, receipt.sessionId) as
+    Array<{ seq: number; session_id: string; role: string; data_json: string }>;
+  return proofAcceptedSource({ receipt, returned, sources, knownSourceUserSeq });
 }
 try {
   const build = await api('/api/console/build-info');
@@ -110,52 +150,68 @@ try {
     report.sourceFingerprintBefore = fingerprintRuntimeSourceFromGit({ repoRoot: path.dirname(path.dirname(expectedEntry)) });
     if (report.sourceFingerprintBefore !== build.body.sourceFingerprint) throw new Error('candidate source changed after boot; no request submitted');
   }
+  pinnedBuild = proofBuildIdentity(build.body);
+  measurementStartedAt = new Date().toISOString();
   report.candidateMatched = expectedFingerprint ? true : null;
-  report.buildBefore = build.body;
+  report.buildBefore = pinnedBuild;
   save();
   for (const { message, expect, taskMode } of messages) {
+    if (turns.length > 0) {
+      const beforeTurn = await api('/api/console/build-info');
+      if (beforeTurn.status !== 200 || !sameProofBuildIdentity(pinnedBuild, proofBuildIdentity(beforeTurn.body))) {
+        throw new Error('daemon build/process changed before the next proof request; no next message submitted');
+      }
+    }
     const clientRequestId = `live-foreground-${randomUUID()}`;
     const requestId = mobileCredentials ? `mobile:${createHash('sha256').update(mobileCredentials.deviceId).update('\0').update(clientRequestId).digest('hex')}` : clientRequestId;
-    const accepted = mobileCredentials
-      ? await api('/m/api/chat/send', { message, async: true, ...taskModeFields(taskMode), ...(sessionId ? { sessionId } : {}) }, clientRequestId)
-      : await api('/api/harness/chat', { input: message, clientRequestId, ...taskModeFields(taskMode), ...(sessionId ? { sessionId } : {}) });
-    if (accepted.status !== 202 || (!mobileCredentials && accepted.body.clientRequestId !== clientRequestId)
-      || (mobileCredentials && accepted.body.accepted !== true)
-      || typeof accepted.body.runId !== 'string' || typeof accepted.body.sessionId !== 'string') {
-      throw new Error(`chat not accepted as an exact new request: HTTP ${accepted.status}; ${JSON.stringify(accepted.body).slice(0, 500)}`);
-    }
-    const receipt = db.prepare('SELECT session_id, run_id FROM harness_chat_requests WHERE request_id = ?').get(requestId) as { session_id: string; run_id: string } | undefined;
-    if (!receipt || receipt.session_id !== accepted.body.sessionId || receipt.run_id !== accepted.body.runId) {
-      throw new Error('accepted HTTP identity has no matching durable request receipt');
-    }
-    sessionId = accepted.body.sessionId;
-    const turn: Record<string, unknown> = { message, expect, ...taskModeFields(taskMode), clientRequestId, requestId, accepted: accepted.body, startedAt: new Date().toISOString() };
+    // Record only this runner's freshly generated request nonce before I/O.
+    // A lost HTTP reply may still have a durable accepted request to account.
+    const turn: Record<string, unknown> = { message, expect, ...taskModeFields(taskMode), clientRequestId, requestId,
+      startedAt: new Date().toISOString(), acceptanceVerified: false };
     turns.push(turn);
     save();
-    console.log(JSON.stringify({ phase: 'accepted', sessionId, runId: accepted.body.runId, turn: turns.length }));
+    const response = mobileCredentials
+      ? await api('/m/api/chat/send', { message, async: true, ...taskModeFields(taskMode), ...(sessionId ? { sessionId } : {}) }, clientRequestId)
+      : await api('/api/harness/chat', { input: message, clientRequestId, ...taskModeFields(taskMode), ...(sessionId ? { sessionId } : {}) });
+    turn.acceptanceHttpStatus = response.status;
+    const accepted = proofAcceptanceMetadata({ ...response, clientRequestId, mobile: !!mobileCredentials });
+    if (!accepted) {
+      turn.rejectionReason = 'exact_acceptance_shape_unavailable';
+      throw new ProofRunnerFailure('chat_not_accepted');
+    }
+    turn.accepted = accepted;
+    turn.returnedIdentity = { sessionId: accepted.sessionId, runId: accepted.runId };
+    const receipt = requestReceipt(requestId);
+    if (!receipt || receipt.sessionId !== accepted.sessionId || receipt.runId !== accepted.runId) {
+      throw new Error('accepted HTTP identity has no matching durable request receipt');
+    }
+    turn.acceptanceVerified = true;
+    turn.receiptIdentity = receipt;
+    sessionId = accepted.sessionId;
+    save();
+    console.log(JSON.stringify({ phase: 'accepted', sessionId, runId: accepted.runId, turn: turns.length }));
     const deadline = Date.now() + timeoutMs;
-    let source: { seq: number; session_id: string } | undefined;
+    let source: ReturnType<typeof acceptedSource> = null;
     let terminal: { seq: number; data_json: string } | undefined;
     let lastProgress = '';
     while (Date.now() < deadline) {
       // The accepted run identity remains stable even if the shared ingress
       // selects a same-principal successor rather than the requested session.
-      const sources = db.prepare(`SELECT seq, session_id FROM events
-        WHERE type = 'user_input_received' AND json_extract(data_json, '$.runId') = ?
-        AND session_id = ? ORDER BY seq`).all(receipt.run_id, receipt.session_id) as Array<{ seq: number; session_id: string }>;
-      if (sources.length > 1) throw new Error('ambiguous accepted user source');
-      source = sources[0];
+      source = acceptedSource(receipt, turn.returnedIdentity as ProofRequestReceipt,
+        typeof turn.sourceUserSeq === 'number' ? turn.sourceUserSeq : undefined);
       if (source) {
+        turn.sourceUserSeq = source.seq;
+        turn.sessionId = source.sessionId;
         const terminals = db.prepare(`SELECT seq, data_json FROM events
           WHERE session_id = ? AND type = 'conversation_completed'
-          AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq`).all(source.session_id, source.seq) as Array<{ seq: number; data_json: string }>;
+          AND json_extract(data_json, '$.sourceUserSeq') = ? ORDER BY seq`).all(source.sessionId, source.seq) as Array<{ seq: number; data_json: string }>;
         if (terminals.length > 1) throw new Error('multiple terminals for exact accepted source');
         terminal = terminals[0];
         const progress = db.prepare(`SELECT
           (SELECT count(*) FROM model_request_provenance WHERE session_id = ? AND source_user_seq = ?) modelRequests,
           count(*) toolCalls FROM events WHERE session_id = ? AND type = 'tool_called'
           AND json_extract(data_json, '$.sourceUserSeq') = ? AND json_extract(data_json, '$.accounting') = 'top_level'`
-        ).get(source.session_id, source.seq, source.session_id, source.seq) as Record<string, number>;
+        ).get(source.sessionId, source.seq, source.sessionId, source.seq) as Record<string, number>;
         const rendered = JSON.stringify(progress);
         if (rendered !== lastProgress) {
           console.log(JSON.stringify({ phase: 'progress', sourceUserSeq: source.seq, ...progress }));
@@ -168,15 +224,36 @@ try {
     if (!source || !terminal) {
       // Never blindly repeat a possibly effected request after a timeout.
       turn.timedOut = true;
-      if (typeof accepted.body.cancelEndpoint === 'string') {
-        turn.cancelResult = await api(accepted.body.cancelEndpoint, { reason: 'live proof deadline reached' });
-      } else if (mobileCredentials) {
-        turn.cancelResult = await api(`/m/api/chat/sessions/${encodeURIComponent(sessionId!)}/cancel`, { clientRequestId });
+      let cancelRoute: string | null = null;
+      try {
+        const currentReceipt = requestReceipt(requestId);
+        if (currentReceipt?.sessionId === receipt.sessionId && currentReceipt.runId === receipt.runId) {
+          if (mobileCredentials) {
+            cancelRoute = `/m/api/chat/sessions/${encodeURIComponent(receipt.sessionId)}/cancel`;
+          } else {
+            const currentSource = acceptedSource(currentReceipt, turn.returnedIdentity as ProofRequestReceipt,
+              typeof turn.sourceUserSeq === 'number' ? turn.sourceUserSeq : undefined);
+            if (currentSource) {
+              const attempts = db.prepare(`SELECT attempt_id, session_id, run_id, source_user_seq, status, finished_at
+                FROM run_attempts WHERE session_id = ? AND run_id = ? AND source_user_seq = ?
+                  AND finished_at IS NULL ORDER BY started_at LIMIT 2`).all(receipt.sessionId, receipt.runId, currentSource.seq);
+              const target = proofDesktopCancellationTarget({ receipt: currentReceipt, source: currentSource,
+                attempts: attempts as Parameters<typeof proofDesktopCancellationTarget>[0]['attempts'] });
+              if (target) { cancelRoute = target.route; turn.cancelAttemptId = target.attemptId; }
+            }
+          }
+        }
+      } catch { /* Unknown ownership never broadens cancellation. */ }
+      if (cancelRoute) {
+        const cancelled = await api(cancelRoute, mobileCredentials ? { clientRequestId } : { reason: 'live proof deadline reached' });
+        turn.cancelResult = { status: cancelled.status, acknowledgement: cancelled.body.ok === true ? 'reported_ok' : 'unconfirmed' };
+      } else {
+        turn.cancelResult = { status: 'not_sent', reason: 'exact_owned_cancellation_target_unavailable', reconciliationNeeded: true };
       }
       save();
       throw new Error('exact terminal not observed before deadline; inspect saved receipt before any retry');
     }
-    sessionId = source.session_id;
+    sessionId = source.sessionId;
     turn.sourceUserSeq = source.seq;
     turn.sessionId = sessionId;
     turn.terminalSeq = terminal.seq;
@@ -221,21 +298,54 @@ try {
       if (failures.length > 0) throw new Error(`task assertions failed: ${failures.join('; ')}`);
     }
   }
-  report.buildAfter = (await api('/api/console/build-info')).body;
-  if (JSON.stringify(report.buildBefore) !== JSON.stringify(report.buildAfter)) throw new Error('daemon build changed during proof');
-  if (expectedEntry) {
-    report.sourceFingerprintAfter = fingerprintRuntimeSourceFromGit({ repoRoot: path.dirname(path.dirname(expectedEntry)) });
-    if (report.sourceFingerprintAfter !== report.sourceFingerprintBefore) throw new Error('candidate source changed during proof');
-  }
   report.completed = true;
   report.assertionsPassed = messages.every((item) => item.expect !== undefined) ? true : null;
 } catch (error) {
   report.completed = false;
   report.assertionsPassed = false;
-  report.error = error instanceof Error ? error.message : String(error);
+  report.error = proofFailureReason(error);
   process.exitCode = 1;
   console.error(JSON.stringify({ phase: 'failed', error: report.error }));
 } finally {
+  // This closeout runs after assertion/transport/time-limit failures too. No
+  // retry, restart, tick or model/tool dispatch is part of accounting.
+  for (const turn of turns) {
+    try {
+      const receipt = requestReceipt(String(turn.requestId));
+      if (!receipt) {
+        turn.taskCloseout = unavailableProofTaskCloseout('durable_request_receipt_unavailable');
+        continue;
+      }
+      const source = acceptedSource(receipt, (turn.receiptIdentity ?? turn.returnedIdentity) as ProofRequestReceipt | undefined,
+        typeof turn.sourceUserSeq === 'number' ? turn.sourceUserSeq : undefined);
+      if (!source) {
+        turn.taskCloseout = unavailableProofTaskCloseout('accepted_source_unavailable_at_closeout');
+        continue;
+      }
+      turn.sessionId = source.sessionId;
+      turn.sourceUserSeq = source.seq;
+      turn.closeoutAcceptance = turn.acceptanceVerified === true ? 'http_and_journal' : 'journal_only_response_unconfirmed';
+      turn.taskCloseout = captureProofTaskCloseout(source, () => measureAcceptedTask(home, source.sessionId, source.seq));
+    } catch { turn.taskCloseout = unavailableProofTaskCloseout('durable_accepted_source_identity_unavailable'); }
+  }
+  if (pinnedBuild) {
+    try {
+      const after = await api('/api/console/build-info');
+      if (after.status !== 200) throw new Error('closeout identity unavailable');
+      const identity = proofBuildIdentity(after.body);
+      report.buildAfter = identity;
+      if (!sameProofBuildIdentity(pinnedBuild, identity)) throw new Error('closeout identity changed');
+      if (expectedEntry) {
+        report.sourceFingerprintAfter = fingerprintRuntimeSourceFromGit({ repoRoot: path.dirname(path.dirname(expectedEntry)) });
+        if (report.sourceFingerprintAfter !== report.sourceFingerprintBefore) throw new Error('candidate source changed');
+      }
+      report.measurementWindow = { startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unchanged' };
+    } catch {
+      report.measurementWindow = { startedAt: measurementStartedAt, endedAt: new Date().toISOString(), identityStatus: 'unavailable_or_changed' };
+      report.completed = false; report.assertionsPassed = false; process.exitCode = 1;
+      report.closeoutIdentityError = 'The same exact build/process could not be proved throughout the measurement window.';
+    }
+  }
   report.finishedAt = new Date().toISOString();
   save();
   db.close();
