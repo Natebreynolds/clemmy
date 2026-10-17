@@ -35,6 +35,7 @@ import {
   NoticingAnswerV1Schema,
   emptyNoticingState,
   compactGoalOutcomeProgressForNoticing,
+  publicNoticingAnswer,
   recordNoticingAnswer,
   runNoticingTick,
   type NoticingDecision,
@@ -618,9 +619,8 @@ export function noticingStatus(nowMs = Date.now()): NoticingStatus {
   const state = loadNoticingState();
   const due = isNoticingDue(nowMs);
   const proposals = Object.values(state.proposals).map(proposal => {
-    if (!proposal.answer) return proposal;
-    const { modelAccountingJobId: _accounting, ...answer } = proposal.answer;
-    return { ...proposal, answer };
+    const answer = publicNoticingAnswer(proposal.answer);
+    return answer ? { ...proposal, answer } : proposal;
   }).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const latest = state.thinking[0];
   return {

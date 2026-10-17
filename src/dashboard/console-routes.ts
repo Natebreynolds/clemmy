@@ -9611,6 +9611,7 @@ export function registerConsoleRoutes(
     try {
       const { listGoalRecords } = await import('../memory/goals-list.js');
       const { readNoticingStateStrict } = await import('../agents/noticing-runtime.js');
+      const { publicNoticingAnswer } = await import('../agents/noticing.js');
       const { readGoalOutcomeProgress, unavailableGoalOutcomeProgress } = await import('../agents/goal-outcome-progress.js');
       const noticingState = (() => { try { return readNoticingStateStrict().state; } catch { return null; } })();
       const proposals = Object.values(noticingState?.proposals ?? {});
@@ -9627,7 +9628,7 @@ export function registerConsoleRoutes(
           ...goal,
           outcomeProgress: outcomeProgress[goal.id] ?? unavailableGoalOutcomeProgress(),
           proposals: proposals.filter((p) => p.goalId === goal.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-            .map((p) => ({ id: p.id, title: p.title, action: p.action, why: p.why, status: p.status, createdAt: p.createdAt, answer: p.answer ?? null })),
+            .map((p) => ({ id: p.id, title: p.title, action: p.action, why: p.why, status: p.status, createdAt: p.createdAt, answer: publicNoticingAnswer(p.answer) })),
         }));
       res.json({ goals, unassignedProposals: proposals.filter((p) => !p.goalId && p.status === 'open').map((p) => ({ id: p.id, title: p.title, why: p.why, createdAt: p.createdAt })) });
     } catch (err) {

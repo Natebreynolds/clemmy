@@ -251,7 +251,7 @@ test('goal outcome historical criteria do not become current acceptance after a 
   assert.equal(projected.linkedTasks[0]?.goalBinding, 'historical');
   assert.equal(projected.linkedTasks[0]?.sourceUserSeq, f.source.seq, 'late A never attaches to current B');
   assert.equal(projected.linkedTasks[0]?.workflows[0]?.state, 'satisfied', 'historical workflow verdict remains visible as historical');
-  assert.match(projected.linkedTasks[0]?.detail ?? '', /earlier goal definition/);
+  assert.match(projected.linkedTasks[0]?.detail ?? '', /earlier version of your goal/);
   assert.equal(f.project({ ...f.goal, updatedAt: 'later', progressNotes: ['New human progress note.'] }).linkedTasks[0]?.goalBinding, 'current');
 });
 
@@ -347,8 +347,18 @@ test('goal outcome refuses foreign, missing and ambiguous run or contract bindin
         contract.origin.runId = 'another-run'; writeFileSync(contractFile, JSON.stringify(contract));
       } else writeFileSync(path.join(path.dirname(contractFile), `duplicate-${w.contract.id}.json`), JSON.stringify({ ...contract, id: `duplicate-${w.contract.id}` }));
     }
-    assert.notEqual(f.project().linkedTasks[0]?.workflows[0]?.state, 'satisfied', variant);
+    const projected = f.project().linkedTasks[0]?.workflows[0];
+    assert.notEqual(projected?.state, 'satisfied', variant);
+    if (variant === 'missing-run' || variant === 'foreign-run') assert.equal(projected?.workflowName, '',
+      'an unknown run supplies no fabricated workflow name for navigation');
   }
+});
+
+test('goal workflow navigation retains the full known workflow identity', () => {
+  const f = accepted(); const name = `controlled-${'long-name-'.repeat(16)}`;
+  workflow(f, 'long-name', { workflowName: name, pinContract: true });
+  assert.equal(f.project().linkedTasks[0]?.workflows[0]?.workflowName, name,
+    'display clipping must not change the workflow route identity');
 });
 
 test('goal outcome does not guess missing accepted identity, ambiguous dispatch or a stopped start as active', () => {
@@ -365,7 +375,7 @@ test('goal outcome does not guess missing accepted identity, ambiguous dispatch 
   assert.equal(f.project().linkedTasks[0]?.state, 'unavailable');
   const unknown = progress.unavailableGoalOutcomeProgress();
   assert.equal(unknown.availability, 'unavailable');
-  assert.match(unknown.summary, /unavailable/);
+  assert.match(unknown.summary, /Couldn’t load/);
 });
 
 test('goal outcome pending handoffs are readable without inventing accepted identity or execution', () => {
@@ -379,7 +389,7 @@ test('goal outcome pending handoffs are readable without inventing accepted iden
   assert.equal(row.sessionId, undefined);
   assert.equal(row.sourceUserSeq, undefined);
   assert.deepEqual(row.workflows, []);
-  assert.match(row.detail, /no accepted task|no work/i);
+  assert.match(row.detail, /start is not confirmed/i);
   assert.equal(log.listEvents(f.sessionId).length, before, 'the display does not accept or start work');
   assert.equal(f.project(f.goal, { ...pending, handoff: { ...pending.handoff!, state: 'needs_attention' } }).linkedTasks[0]?.state, 'needs_attention');
   assert.equal(f.project(f.goal, { ...pending, handoff: { ...pending.handoff!, sourceUserSeq: f.source.seq } }).linkedTasks[0]?.state,
@@ -399,7 +409,7 @@ test('goal outcome known failures and attention outrank unavailable siblings wit
     assert.equal(task.state, 'needs_attention', terminalOutcome);
     const failed = task.workflows.find(row => row.runId === w.runId)!;
     assert.equal(failed.state, 'not_satisfied');
-    assert.match(failed.detail, new RegExp(terminalOutcome));
+    assert.match(failed.detail, /outstanding|could not finish|was stopped|failed/);
     assert.equal(failed.criteria.passed, 0);
     assert.equal(failed.artifactReadback, 'not_checked');
     assert.equal(task.workflows.find(row => row.runId === extra.runId)?.state, 'unavailable');
@@ -457,7 +467,7 @@ test('goal outcome capture bounds total task and current artifact work without p
   assert.equal(projected.flatMap(task => task.workflows).filter(run => run.artifactReadback === 'not_checked').length, 6);
   const omitted = snapshot[fixtures[8]!.goal.id]!;
   assert.equal(omitted.omittedTasks, 1);
-  assert.match(omitted.summary, /Omitted work is unqualified/);
+  assert.match(omitted.summary, /Tasks outside this view haven’t been checked/);
 });
 
 test('goal outcome preserves known bad artifact bytes beside an uncovered retained write', async () => {

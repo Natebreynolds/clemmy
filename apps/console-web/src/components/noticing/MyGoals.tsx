@@ -47,11 +47,11 @@ function GoalWorkProgress({ progress }: { progress: GoalOutcomeProgress | undefi
           <p className="text-muted">{task.detail}</p>
           {task.sessionId && <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(task.sessionId))}`} className="inline-flex min-h-8 items-center rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Open conversation</Link>}
           {task.workflows.map(workflow => <div key={workflow.runId} className="space-y-1 pt-2">
-            <p className="font-medium text-fg">{workflow.workflowName} · {goalWorkflowOutcomeWords(workflow.state)}</p>
+            <p className="font-medium text-fg">{workflow.workflowName || 'Workflow'} · {goalWorkflowOutcomeWords(workflow.state)}</p>
             <p className="text-caption text-muted">{workflow.detail}</p>
             <p className="text-caption text-muted">{goalArtifactReadbackWords(workflow.artifactReadback)}</p>
-            {workflow.criteria.total > 0 && <p className="text-caption text-muted">{workflow.criteria.passed} of {workflow.criteria.total} workflow criteria recorded as met</p>}
-            {workflow.criteria.remaining.length > 0 && <div className="text-caption text-muted"><span className="font-medium text-fg">Still to verify:</span><ul className="list-disc space-y-1 pl-5">{workflow.criteria.remaining.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>}
+            {workflow.criteria.total > 0 && <p className="text-caption text-muted">{workflow.criteria.passed} of {workflow.criteria.total} checks passed in this run</p>}
+            {workflow.criteria.remaining.length > 0 && <div className="text-caption text-muted"><span className="font-medium text-fg">Still to check:</span><ul className="list-disc space-y-1 pl-5">{workflow.criteria.remaining.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>}
             {goalWorkflowHref(workflow) && <Link to={goalWorkflowHref(workflow)!} className="inline-flex min-h-8 items-center rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Open workflow run</Link>}
           </div>)}
           {(task.omittedWorkflows ?? 0) > 0 && <p className="text-caption text-muted">{task.omittedWorkflows} additional workflow {task.omittedWorkflows === 1 ? 'run is' : 'runs are'} outside this view. Open the original conversation for the full result.</p>}
@@ -164,7 +164,7 @@ function GoalCard({ goal, onSaved }: { goal: MyGoal; onSaved: () => void }) {
       <GoalWorkProgress progress={goal.outcomeProgress} />
       <details className="mt-3">
         <summary className="mb-1 w-fit cursor-pointer rounded-sm py-1 text-label text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">What Clementine proposed for this</summary>
-        {goal.proposals.length === 0 ? <p className="text-small text-muted">Nothing yet — Noticing proposes against your goals on its cadence.</p> : (
+        {goal.proposals.length === 0 ? <p className="text-small text-muted">No suggestions yet. Clem will suggest useful next steps when she checks in.</p> : (
           <ul className="space-y-1.5">
             {goal.proposals.slice(0, 5).map((p) => (
               <li key={p.id} className="rounded-md border border-border bg-surface px-3 py-2 text-small">
@@ -205,7 +205,7 @@ export function MyGoals() {
             <Target className="h-5 w-5 text-primary" aria-hidden />
             <h3 className="text-title-sm font-semibold text-fg">Your goals</h3>
           </div>
-          <p className="mt-1 text-small text-muted">Clem reads these when she notices things and proposes against them. Tell her in chat or edit here; both write the same goal.</p>
+          <p className="mt-1 text-small text-muted">Tell Clem what you want to achieve. She uses your goals to suggest next steps. Update them here or in chat.</p>
         </div>
         <Button variant="secondary" size="sm" disabled={busy} onClick={() => setAdding((v) => !v)}><Plus size={16} aria-hidden /> {adding ? 'Cancel' : 'Add a goal'}</Button>
       </div>

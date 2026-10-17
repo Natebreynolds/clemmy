@@ -76,35 +76,34 @@ export interface GoalOutcomeProgress {
   omittedTasks: number;
 }
 export function goalOutcomeTaskWords(task: Pick<GoalOutcomeTask, 'goalBinding' | 'state'>): string {
-  if (task.goalBinding === 'historical') return 'For an earlier version of this goal';
-  if (task.goalBinding === 'unavailable') return 'Link to this goal unconfirmed';
   switch (task.state) {
     case 'pending': return 'Waiting to start';
-    case 'partial': return 'More results in the chat';
+    case 'partial': return 'More work in the chat';
     case 'in_progress': return 'Work in progress';
     case 'needs_attention': return 'Needs attention';
-    case 'outcome_retained': return 'Result recorded';
-    default: return 'Work evidence unavailable';
+    case 'outcome_retained': return task.goalBinding === 'historical' ? 'For an earlier version of this goal'
+      : task.goalBinding === 'unavailable' ? 'Couldn’t confirm the goal link' : 'Result recorded';
+    default: return 'Couldn’t check this result';
   }
 }
 export function goalWorkflowOutcomeWords(state: GoalWorkflowOutcome['state']): string {
   switch (state) {
-    case 'satisfied': return 'Workflow criteria met';
-    case 'not_satisfied': return 'Workflow needs attention';
-    case 'in_progress': return 'Workflow in progress';
-    default: return 'Workflow evidence unavailable';
+    case 'satisfied': return 'Requirements met';
+    case 'not_satisfied': return 'Needs attention';
+    case 'in_progress': return 'In progress';
+    default: return 'Couldn’t check this run';
   }
 }
 export function goalArtifactReadbackWords(state: GoalWorkflowOutcome['artifactReadback']): string {
   switch (state) {
-    case 'verified': return 'Saved artifact matches the recorded result.';
-    case 'superseded': return 'The recorded result is preserved; a later saved result is current.';
-    case 'changed_or_unavailable': return 'Saved artifact has changed or could not be checked.';
-    default: return 'Current artifact has not been checked.';
+    case 'verified': return 'Saved output matches this run’s result.';
+    case 'superseded': return 'Another saved result has replaced this one. This run’s result is still verified.';
+    case 'changed_or_unavailable': return 'Saved output has changed or couldn’t be checked.';
+    default: return 'The current saved output hasn’t been checked.';
   }
 }
 export function goalWorkflowHref(workflow: Pick<GoalWorkflowOutcome, 'workflowName' | 'runId'>): string | null {
-  return workflow.workflowName && workflow.runId
+  return workflow.workflowName.trim() && workflow.runId
     ? `/automate?workflow=${encodeURIComponent(workflow.workflowName)}&run=${encodeURIComponent(workflow.runId)}` : null;
 }
 

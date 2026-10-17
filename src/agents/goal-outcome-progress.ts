@@ -50,7 +50,7 @@ export interface GoalOutcomeProgress {
 
 export function unavailableGoalOutcomeProgress(): GoalOutcomeProgress {
   return { version: 1, availability: 'unavailable',
-    summary: 'Linked task evidence is unavailable. Open the original chat to review it.',
+    summary: 'Couldn’t load linked work. Open its conversation to check the result.',
     linkedTasks: [], omittedTasks: 0 };
 }
 
@@ -76,7 +76,7 @@ function sameGoalDescriptor(saved: Record<string, unknown>, goal: GoalRecord): b
 
 function unavailableTask(proposal: NoticingProposalRecord): GoalOutcomeTask {
   return { proposalId: proposal.id, title: bounded(proposal.title, 120), goalBinding: 'unavailable',
-    state: 'unavailable', detail: 'The exact accepted task or its linked evidence could not be verified.', workflows: [], omittedWorkflows: 0 };
+    state: 'unavailable', detail: 'Couldn’t confirm the task linked to this goal. Check the original conversation.', workflows: [], omittedWorkflows: 0 };
 }
 
 function exactGroup(sessionId: string, sourceUserSeq: number): ActiveWorkflowOriginGroup | null {
@@ -114,9 +114,9 @@ const safeRunId = (value: unknown): value is string => typeof value === 'string'
 
 function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: string, contracts: WorkflowGoalContracts, readbackBudget: { remaining: number }): GoalWorkflowOutcome {
   const runId = member.runId;
-  const unknown: GoalWorkflowOutcome = { runId, workflowName: 'Workflow', state: 'unavailable',
+  const unknown: GoalWorkflowOutcome = { runId, workflowName: '', state: 'unavailable',
     criteria: { total: 0, passed: 0, remaining: [] }, artifactReadback: 'not_checked',
-    detail: 'The exact workflow record or its objective evidence is unavailable.' };
+    detail: 'Couldn’t load this workflow run or check its result.' };
   try {
     if (!safeRunId(runId)) return unknown;
     const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -125,21 +125,21 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
     if (!record(run) || run.id !== runId || typeof run.workflow !== 'string') return unknown;
     if (run.chatDispatchSourceGroupId !== sourceGroupId
       || run.chatDispatchQueueRequestDigest !== member.queueRequestDigest) return unknown;
-    unknown.workflowName = bounded(run.workflow, 120);
+    unknown.workflowName = run.workflow;
     const outcome = deriveWorkflowTerminalOutcome(run);
     if (outcome && outcome !== 'succeeded') {
       // A readable exact failure does not need a successful goal review to
       // remain visible. This records no criterion pass or current readback.
       const result: GoalWorkflowOutcome = { ...unknown, state: 'not_satisfied',
-        detail: `This exact workflow run is ${outcome}. Review its completed, remaining and uncertain work in the original chat.` };
+        detail: `This workflow ${outcome === 'partial' ? 'finished with work still outstanding' : outcome === 'blocked' ? 'could not finish' : outcome === 'cancelled' ? 'was stopped' : 'failed'}. Open its conversation for what finished and what still needs attention.` };
       return readFileSync(file, 'utf8') === bytes ? result : unknown;
     }
     if (run.status === 'pending_approval' || run.status === 'paused') {
       return readFileSync(file, 'utf8') === bytes ? { ...unknown, state: 'not_satisfied',
-        detail: 'This exact workflow run is waiting for approval or is paused. No completion is inferred.' } : unknown;
+        detail: 'This workflow is waiting for approval or is paused. It hasn’t finished yet.' } : unknown;
     }
     const running = ['awaiting_chat_dispatch_seal', 'queued', 'running', 'pending_approval', 'paused'].includes(run.status ?? '');
-    if (running && !run.finishedAt) return { ...unknown, state: 'in_progress', detail: 'This exact workflow run has not finished. No completion is inferred.' };
+    if (running && !run.finishedAt) return { ...unknown, state: 'in_progress', detail: 'This workflow hasn’t finished yet.' };
     const admission = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
     if (admission.status !== 'valid') return unknown;
     const declared = admission.snapshot.definition.goal;
@@ -207,8 +207,8 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
       });
     })();
     if (candidates.length !== 1) return { ...unknown, detail: candidates.length > 1
-      ? 'More than one goal contract claims this run; its objective evidence is ambiguous.'
-      : 'No exact workflow-origin goal contract is retained for this run. A terminal run alone does not verify its objective.' };
+      ? 'The saved requirements for this run conflict. Open its conversation to check the result.'
+      : 'The saved requirements for this run are missing. A finished run alone doesn’t confirm the task was done.' };
     const contract = candidates[0]!;
     const plan = contract.approvedPlan ?? contract.plan;
     const validation = run.goalValidation;
@@ -242,8 +242,8 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
       state: satisfied ? 'satisfied' : 'not_satisfied',
       criteria: { total: criteria.length, passed,
         remaining: remaining.slice(0, 4).map(criterion => bounded(criterion, 180)) },
-      detail: satisfied ? 'The retained run-local review satisfied this workflow contract. This is historical subtask evidence, not completion of the whole goal.'
-        : 'The retained workflow contract is not independently satisfied; preserve its remaining work and any settled or uncertain effects.' };
+      detail: satisfied ? 'This run met its saved requirements. That does not mark the whole goal done.'
+        : 'This run hasn’t met all its saved requirements. Review what remains, including any changes that may already have happened.' };
     if (satisfied && readbackBudget.remaining > 0) {
       readbackBudget.remaining -= 1;
       const target = readWorkflowTargetEvidence(runId, { compactResults: true });
@@ -319,8 +319,8 @@ export function readGoalOutcomeProgress(input: {
           return { proposalId: proposal.id, title: bounded(proposal.title, 120), goalBinding: 'pending' as const,
             state: handoff.state === 'not_started' ? 'pending' as const : 'needs_attention' as const,
             detail: handoff.state === 'not_started'
-              ? 'The answer is saved, but no accepted task is linked yet. No work or accepted goal binding is inferred.'
-              : 'This handoff needs attention before a task can be confirmed. No accepted task or completed work is inferred.',
+              ? 'Your answer is saved; the task’s start is not confirmed yet.'
+              : 'Clem couldn’t confirm that the task started. Please check the original conversation.',
             workflows: [], omittedWorkflows: 0 } satisfies GoalOutcomeTask;
         }
         if (!handoff.sessionId || !Number.isSafeInteger(handoff.sourceUserSeq) || !handoff.requestId) return unavailable;
@@ -362,18 +362,19 @@ export function readGoalOutcomeProgress(input: {
           : 'in_progress';
         return { proposalId: proposal.id, title: bounded(accepted.packet.proposal.title, 120), ...identity,
           goalBinding: current ? 'current' as const : 'historical' as const, state, workflows, omittedWorkflows,
-          detail: !current ? 'This task belongs to an earlier goal definition. Review the current goal before relying on its old criteria.'
-            : truncated ? 'This task has more workflow members than this bounded view shows. Open its original chat for the complete result.'
-            : evidenceUnavailable ? 'Some exact linked evidence is unavailable. Retained failures, requests for attention and active work remain visible; no completion is inferred.'
-            : workflows.length ? 'Exact workflow subtask evidence is linked below. The whole goal remains under your control.'
-            : terminal.kind === 'terminal' ? 'A task result is retained in its original chat; no exact workflow contract or current artifact readback is claimed.'
-            : 'Open the original task chat for progress or recovery; this view does not start or repeat work.' } satisfies GoalOutcomeTask;
+          detail: !current ? 'This task used an earlier version of your goal. Check the current requirements before relying on its result.'
+            : truncated ? 'More workflow runs are in the original conversation.'
+            : evidenceUnavailable ? 'Some results couldn’t be checked. Known problems and ongoing work are still shown below.'
+            : workflows.length ? 'Workflow results are below. You decide when the whole goal is done.'
+            : terminal.kind === 'terminal' ? 'A result is saved in the conversation. Workflow requirements and the current saved output haven’t been checked here.'
+            : 'Open the conversation for progress or to continue. This view does not restart work.' } satisfies GoalOutcomeTask;
       } catch { return unavailable; }
     });
     result[goal.id] = { version: 1, availability: 'available', linkedTasks,
       omittedTasks: Math.max(0, linked.length - linkedTasks.length),
-      summary: linkedTasks.length || linked.length ? 'Linked task evidence is bounded partial progress. Omitted work is unqualified; the goal’s status is unchanged.'
-        : 'No exact approved task is linked yet. The goal’s status remains unchanged.' };
+      summary: linkedTasks.length ? 'Recent work is shown below. Tasks outside this view haven’t been checked here. Your goal’s status stays as you set it.'
+        : linked.length ? 'More tasks are linked to this goal. Tasks outside this view haven’t been checked here. Your goal’s status stays as you set it.'
+        : 'No approved task is linked to this goal yet. Your goal’s status stays as you set it.' };
   }
   return result;
 }

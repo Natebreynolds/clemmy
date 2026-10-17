@@ -143,6 +143,21 @@ export interface NoticingProposalRecord extends NoticingProposalV1 {
     reason?: string;
   };
 }
+
+export interface PublicNoticingAnswer {
+  text: string;
+  decision: NoticingDecision;
+  at: string;
+  instruction?: string;
+}
+
+/** Public presentation only. Stored answer records retain their private
+ * accounting links, and future internal fields do not expand this DTO. */
+export function publicNoticingAnswer(answer: NoticingProposalRecord['answer']): PublicNoticingAnswer | null {
+  return answer ? { text: answer.text, decision: answer.decision, at: answer.at,
+    ...(answer.instruction !== undefined ? { instruction: answer.instruction } : {}) } : null;
+}
+
 export interface NoticingStandingAnswer {
   /** The owner's words, kept as they said them. */
   text: string;

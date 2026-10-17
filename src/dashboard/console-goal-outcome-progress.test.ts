@@ -10,7 +10,7 @@ import test from 'node:test';
 import express from 'express';
 import type { GoalRecord } from '../memory/goals-list.js';
 import type { GoalOutcomeProgress } from '../agents/goal-outcome-progress.js';
-import type { NoticingProposalRecord } from '../agents/noticing.js';
+import type { NoticingProposalRecord, PublicNoticingAnswer } from '../agents/noticing.js';
 import type { NoticingApprovedTaskPacket } from '../runtime/harness/noticing-approved-task.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-goal-outcome-http-'));
@@ -42,7 +42,7 @@ async function boot(authorized = true) {
   };
 }
 
-type GoalRow = GoalRecord & { outcomeProgress: GoalOutcomeProgress; proposals: Array<{ id: string }> };
+type GoalRow = GoalRecord & { outcomeProgress: GoalOutcomeProgress; proposals: Array<{ id: string; answer: PublicNoticingAnswer | null }> };
 async function readGoals(url: string): Promise<GoalRow[]> {
   const response = await fetch(`${url}/api/console/my-goals`);
   assert.equal(response.status, 200);
@@ -191,6 +191,46 @@ test('my-goals retains a readable pending answer without claiming an accepted ta
     assert.deepEqual(log.openEventLog().prepare('SELECT COUNT(*) AS n FROM events').get(), beforeEvents);
     assert.equal(readFileSync(goalFile, 'utf8'), before);
     assert.equal(projected.status, 'active');
+  } finally { await h.close(); }
+});
+
+test('my-goals and Noticing expose only public answer fields while retaining private accounting unchanged', async () => {
+  const { emptyNoticingState } = await import('../agents/noticing.js');
+  const { saveNoticingState, noticingStatus } = await import('../agents/noticing-runtime.js');
+  const retained = goal('Controlled goal with private answer accounting');
+  const state = emptyNoticingState();
+  const expected = new Map<string, PublicNoticingAnswer>();
+  for (const decision of ['do_it', 'not_now'] as const) {
+    const id = `controlled-private-answer-${decision}`;
+    const answer: NoticingProposalRecord['answer'] = { text: `Keep the literal ${decision} answer — \"quoted\" \\ unchanged.`,
+      decision, at: '2026-10-17T00:01:00Z', ...(decision === 'do_it' ? { instruction: 'Use only the existing local draft. Do not send.' } : {}),
+      modelAccountingJobId: `private-accounting-${decision}` };
+    Object.assign(answer, { futureInternalAccounting: `private-future-${decision}` });
+    state.proposals[id] = { id, title: 'Controlled answer projection', action: 'Prepare only a controlled local draft.',
+      why: 'The owner controls whether work starts.', evidence: ['Controlled fixture.'], goalId: retained.id,
+      createdAt: '2026-10-17T00:00:00Z', shapeKey: id, confidence: 1,
+      status: decision === 'do_it' ? 'answered' : 'retired', answer,
+      handoff: { version: 1, answerDigest: `controlled-answer-${decision}`,
+        state: decision === 'do_it' ? 'not_started' : 'settled', updatedAt: '2026-10-17T00:01:00Z' } };
+    expected.set(id, { text: answer.text, decision, at: answer.at,
+      ...(answer.instruction !== undefined ? { instruction: answer.instruction } : {}) });
+  }
+  saveNoticingState(state);
+  const stateFile = path.join(home, 'state', 'noticing.json'); const before = readFileSync(stateFile, 'utf8');
+  const h = await boot();
+  try {
+    const row = (await readGoals(h.url)).find(row => row.id === retained.id)!;
+    const status = noticingStatus();
+    for (const [id, answer] of expected) {
+      assert.deepEqual(row.proposals.find(proposal => proposal.id === id)?.answer, answer);
+      assert.deepEqual([...status.openItems, ...status.recentlyRetired].find(proposal => proposal.id === id)?.answer, answer);
+    }
+    assert.doesNotMatch(JSON.stringify(row.proposals), /modelAccountingJobId|private-accounting-|futureInternalAccounting|private-future-/);
+    assert.doesNotMatch(JSON.stringify([...status.openItems, ...status.recentlyRetired]),
+      /modelAccountingJobId|private-accounting-|futureInternalAccounting|private-future-/);
+    assert.equal(readFileSync(stateFile, 'utf8'), before, 'public projection never strips private fields from the saved record');
+    const persisted = JSON.parse(before) as { proposals: Record<string, NoticingProposalRecord> };
+    assert.equal(persisted.proposals['controlled-private-answer-do_it']?.answer?.modelAccountingJobId, 'private-accounting-do_it');
   } finally { await h.close(); }
 });
 
