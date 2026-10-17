@@ -12,6 +12,8 @@ test('a goal\'s progress line says what the record carries, never a percentage n
 
 
 test('workflow result presentation does not complete a goal or certify changed criteria', () => {
+  assert.equal(goalOutcomeTaskWords({goalBinding:'pending',state:'pending'}), 'Waiting to start');
+  assert.equal(goalOutcomeTaskWords({goalBinding:'current',state:'partial'}), 'More results in the chat');
   assert.equal(goalOutcomeTaskWords({goalBinding:'current',state:'outcome_retained'}), 'Result recorded');
   assert.equal(goalOutcomeTaskWords({goalBinding:'historical',state:'outcome_retained'}), 'For an earlier version of this goal');
   assert.equal(goalOutcomeTaskWords({goalBinding:'unavailable',state:'outcome_retained'}), 'Link to this goal unconfirmed');

@@ -155,6 +155,42 @@ test('my-goals and Noticing project only the exact accepted goal link without ch
     assert.equal(readFileSync(goalFile, 'utf8'), before);
     assert.equal(log.listEvents(session.id, { types: ['user_input_received'] }).length, 1);
     assert.equal(log.getRunAttemptBySourceUserSeq(session.id, source.seq)?.attemptId, attempt.attemptId);
+    log.requestKill(session.id, 'Controlled goal projection Stop', { sourceUserSeq: source.seq });
+    const stopped = (await readGoals(h.url)).find(row => row.id === retained.id)!.outcomeProgress.linkedTasks[0]!;
+    assert.equal(stopped.state, 'needs_attention');
+    assert.equal(stopped.sessionId, session.id);
+    assert.equal(stopped.sourceUserSeq, source.seq);
+    assert.equal(readFileSync(goalFile, 'utf8'), before);
+  } finally { await h.close(); }
+});
+
+test('my-goals retains a readable pending answer without claiming an accepted task or starting work', async () => {
+  const { emptyNoticingState, compactGoalOutcomeProgressForNoticing } = await import('../agents/noticing.js');
+  const { saveNoticingState, observeForNoticing } = await import('../agents/noticing-runtime.js');
+  const retained = goal('Controlled goal with a saved pending answer');
+  const proposalId = 'controlled-pending-goal-link';
+  const proposal: NoticingProposalRecord = { id: proposalId, checkInId: 'controlled-pending-check-in',
+    title: 'Prepare only the pending controlled draft', action: 'Prepare a controlled local draft without sending.',
+    why: 'The owner has saved an answer; no task has been accepted.', evidence: ['Controlled saved answer.'],
+    goalId: retained.id, createdAt: '2026-10-17T00:00:00Z', shapeKey: proposalId, confidence: 1, status: 'answered',
+    answer: { text: 'Yes; prepare only the local draft.', decision: 'do_it', at: '2026-10-17T00:01:00Z' },
+    handoff: { version: 1, answerDigest: 'controlled-pending-answer', state: 'not_started', updatedAt: '2026-10-17T00:01:00Z' } };
+  const state = emptyNoticingState(); state.proposals[proposalId] = proposal; saveNoticingState(state);
+  const beforeEvents = log.openEventLog().prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number };
+  const goalFile = path.join(home, 'goals', `${retained.id}.json`); const before = readFileSync(goalFile, 'utf8');
+  const h = await boot();
+  try {
+    const projected = (await readGoals(h.url)).find(row => row.id === retained.id)!;
+    const task = projected.outcomeProgress.linkedTasks[0]!;
+    assert.equal(projected.outcomeProgress.availability, 'available');
+    assert.equal(task.proposalId, proposalId); assert.equal(task.state, 'pending'); assert.equal(task.goalBinding, 'pending');
+    assert.equal(task.sessionId, undefined); assert.equal(task.sourceUserSeq, undefined); assert.deepEqual(task.workflows, []);
+    const observation = await observeForNoticing();
+    assert.deepEqual(observation.goals.find(row => row.id === retained.id)?.outcomeProgress,
+      compactGoalOutcomeProgressForNoticing(projected.outcomeProgress));
+    assert.deepEqual(log.openEventLog().prepare('SELECT COUNT(*) AS n FROM events').get(), beforeEvents);
+    assert.equal(readFileSync(goalFile, 'utf8'), before);
+    assert.equal(projected.status, 'active');
   } finally { await h.close(); }
 });
 

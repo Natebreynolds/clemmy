@@ -62,8 +62,8 @@ export interface GoalOutcomeTask {
   title: string;
   sessionId?: string;
   sourceUserSeq?: number;
-  goalBinding: 'current' | 'historical' | 'unavailable';
-  state: 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
+  goalBinding: 'current' | 'historical' | 'pending' | 'unavailable';
+  state: 'pending' | 'partial' | 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
   detail: string;
   workflows: GoalWorkflowOutcome[];
   omittedWorkflows?: number;
@@ -79,6 +79,8 @@ export function goalOutcomeTaskWords(task: Pick<GoalOutcomeTask, 'goalBinding' |
   if (task.goalBinding === 'historical') return 'For an earlier version of this goal';
   if (task.goalBinding === 'unavailable') return 'Link to this goal unconfirmed';
   switch (task.state) {
+    case 'pending': return 'Waiting to start';
+    case 'partial': return 'More results in the chat';
     case 'in_progress': return 'Work in progress';
     case 'needs_attention': return 'Needs attention';
     case 'outcome_retained': return 'Result recorded';

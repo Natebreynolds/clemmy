@@ -14,6 +14,7 @@ import { readActiveWorkflowOriginGroup, workflowOriginSourceGroupId,
   type WorkflowOriginGroupMember,
   type ActiveWorkflowOriginGroup } from '../execution/workflow-origin-group.js';
 import { resolveWorkflowRunDefinitionSnapshot } from '../execution/workflow-run-definition.js';
+import { deriveWorkflowTerminalOutcome } from '../execution/workflow-terminal-outcome.js';
 import { readWorkflowTargetEvidence } from '../execution/workflow-target-evidence.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { listPlanProposals, workflowGoalSessionId, type PlanProposal } from './plan-proposals.js';
@@ -33,8 +34,8 @@ export interface GoalOutcomeTask {
   title: string;
   sessionId?: string;
   sourceUserSeq?: number;
-  goalBinding: 'current' | 'historical' | 'unavailable';
-  state: 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
+  goalBinding: 'current' | 'historical' | 'pending' | 'unavailable';
+  state: 'pending' | 'partial' | 'in_progress' | 'needs_attention' | 'outcome_retained' | 'unavailable';
   detail: string;
   workflows: GoalWorkflowOutcome[];
   omittedWorkflows: number;
@@ -125,6 +126,18 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
     if (run.chatDispatchSourceGroupId !== sourceGroupId
       || run.chatDispatchQueueRequestDigest !== member.queueRequestDigest) return unknown;
     unknown.workflowName = bounded(run.workflow, 120);
+    const outcome = deriveWorkflowTerminalOutcome(run);
+    if (outcome && outcome !== 'succeeded') {
+      // A readable exact failure does not need a successful goal review to
+      // remain visible. This records no criterion pass or current readback.
+      const result: GoalWorkflowOutcome = { ...unknown, state: 'not_satisfied',
+        detail: `This exact workflow run is ${outcome}. Review its completed, remaining and uncertain work in the original chat.` };
+      return readFileSync(file, 'utf8') === bytes ? result : unknown;
+    }
+    if (run.status === 'pending_approval' || run.status === 'paused') {
+      return readFileSync(file, 'utf8') === bytes ? { ...unknown, state: 'not_satisfied',
+        detail: 'This exact workflow run is waiting for approval or is paused. No completion is inferred.' } : unknown;
+    }
     const running = ['awaiting_chat_dispatch_seal', 'queued', 'running', 'pending_approval', 'paused'].includes(run.status ?? '');
     if (running && !run.finishedAt) return { ...unknown, state: 'in_progress', detail: 'This exact workflow run has not finished. No completion is inferred.' };
     const admission = resolveWorkflowRunDefinitionSnapshot(run.workflowDefinitionSnapshot);
@@ -298,6 +311,15 @@ export function readGoalOutcomeProgress(input: {
       const unavailable = unavailableTask(proposal);
       try {
         const handoff = proposal.handoff!;
+        if (handoff.sessionId === undefined && handoff.sourceUserSeq === undefined && handoff.requestId === undefined
+          && (handoff.state === 'not_started' || handoff.state === 'needs_attention')) {
+          return { proposalId: proposal.id, title: bounded(proposal.title, 120), goalBinding: 'pending' as const,
+            state: handoff.state === 'not_started' ? 'pending' as const : 'needs_attention' as const,
+            detail: handoff.state === 'not_started'
+              ? 'The answer is saved, but no accepted task is linked yet. No work or accepted goal binding is inferred.'
+              : 'This handoff needs attention before a task can be confirmed. No accepted task or completed work is inferred.',
+            workflows: [], omittedWorkflows: 0 } satisfies GoalOutcomeTask;
+        }
         if (!handoff.sessionId || !Number.isSafeInteger(handoff.sourceUserSeq) || !handoff.requestId) return unavailable;
         const identity = { sessionId: handoff.sessionId, sourceUserSeq: handoff.sourceUserSeq! };
         const accepted = readAcceptedNoticingTask(identity);
@@ -307,7 +329,10 @@ export function readGoalOutcomeProgress(input: {
           || accepted.packet.proposal.goalId !== goal.id || accepted.packet.goal?.id !== goal.id
           || binding?.requestId !== handoff.requestId || accepted.packet.checkIn.answer !== proposal.answer?.text) return unavailable;
         const current = sameGoalDescriptor(accepted.packet.goal, goal);
-        const active = exactGroup(identity.sessionId, identity.sourceUserSeq);
+        let active: ActiveWorkflowOriginGroup | null = null;
+        let groupUnavailable = false;
+        try { active = exactGroup(identity.sessionId, identity.sourceUserSeq); }
+        catch { groupUnavailable = true; }
         const selectedMembers = (active?.sealed.members ?? []).slice(0, Math.min(MAX_RUNS_PER_TASK, remainingRuns));
         remainingRuns -= selectedMembers.length;
         const workflows = selectedMembers
@@ -317,20 +342,26 @@ export function readGoalOutcomeProgress(input: {
         const terminal = resolveExactTerminalForAcceptedSource(source);
         const stopped = isKillRequested(identity.sessionId, { sourceUserSeq: identity.sourceUserSeq });
         const attempt = getRunAttemptBySourceUserSeq(identity.sessionId, identity.sourceUserSeq);
-        const attention = workflows.some(row => row.state === 'not_satisfied')
+        const attention = workflows.some(row => row.state === 'not_satisfied' || row.artifactReadback === 'changed_or_unavailable')
           || stopped
-          || (terminal.kind === 'terminal' && terminal.presentation.status !== 'done');
-        const state: GoalOutcomeTask['state'] = truncated || workflows.some(row => row.state === 'unavailable')
-          || terminal.kind === 'corrupt' || terminal.kind === 'legacy' ? 'unavailable'
-          : attention ? 'needs_attention'
+          || (terminal.kind === 'terminal' && terminal.presentation.status !== 'done')
+          || handoff.state === 'needs_attention'
+          || (terminal.kind === 'absent' && attempt && ['failed', 'cancelled', 'interrupted', 'superseded'].includes(attempt.status))
+          || (terminal.kind === 'absent' && !active && !groupUnavailable
+            && (handoff.state === 'settled' || attempt?.status !== 'active'));
+        const evidenceUnavailable = groupUnavailable || workflows.some(row => row.state === 'unavailable')
+          || terminal.kind === 'corrupt' || terminal.kind === 'legacy';
+        const state: GoalOutcomeTask['state'] = attention ? 'needs_attention'
           : workflows.some(row => row.state === 'in_progress') ? 'in_progress'
+          : evidenceUnavailable ? 'unavailable'
+          : truncated ? 'partial'
           : workflows.length > 0 || terminal.kind === 'terminal' ? 'outcome_retained'
-          : handoff.state === 'needs_attention' || handoff.state === 'settled' || attempt?.status !== 'active'
-            ? 'needs_attention' : 'in_progress';
+          : 'in_progress';
         return { proposalId: proposal.id, title: bounded(accepted.packet.proposal.title, 120), ...identity,
           goalBinding: current ? 'current' as const : 'historical' as const, state, workflows, omittedWorkflows,
           detail: !current ? 'This task belongs to an earlier goal definition. Review the current goal before relying on its old criteria.'
             : truncated ? 'This task has more workflow members than this bounded view shows. Open its original chat for the complete result.'
+            : evidenceUnavailable ? 'Some exact linked evidence is unavailable. Retained failures, requests for attention and active work remain visible; no completion is inferred.'
             : workflows.length ? 'Exact workflow subtask evidence is linked below. The whole goal remains under your control.'
             : terminal.kind === 'terminal' ? 'A task result is retained in its original chat; no exact workflow contract or current artifact readback is claimed.'
             : 'Open the original task chat for progress or recovery; this view does not start or repeat work.' } satisfies GoalOutcomeTask;

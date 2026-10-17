@@ -64,7 +64,7 @@ function accepted(existingGoal?: GoalRecord) {
 }
 
 function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
-  workflowName?: string; settleContract?: boolean; pinContract?: boolean;
+  workflowName?: string; settleContract?: boolean; pinContract?: boolean; extraMembers?: number;
 } = {}) {
   const runId = `workflow-${f.proposal.id}-${label}`;
   const workflowName = options.workflowName ?? `controlled-${f.proposal.id}-${label}`;
@@ -77,22 +77,29 @@ function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
   mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const observer = { sessionId: f.sessionId, sourceUserSeq: f.source.seq, replyTarget: { type: 'origin_chat' as const } };
-  const queueRequestDigest = origins.workflowChatDispatchQueueRequestDigest({ workflowName, normalizedInputs: {} });
-  const authority = origins.createWorkflowChatDispatchPreparationAuthority({ runId, observer, queueRequestDigest });
-  writeFileSync(file, JSON.stringify({ id: runId, workflow: workflowName, inputs: {}, status: 'awaiting_chat_dispatch_seal',
+  const prepareMember = (memberRunId: string, inputs: Record<string, unknown>) => {
+    const queueRequestDigest = origins.workflowChatDispatchQueueRequestDigest({ workflowName, normalizedInputs: inputs });
+    const authority = origins.createWorkflowChatDispatchPreparationAuthority({ runId: memberRunId, observer, queueRequestDigest });
+    const memberFile = path.join(WORKFLOW_RUNS_DIR, `${memberRunId}.json`);
+    writeFileSync(memberFile, JSON.stringify({ id: memberRunId, workflow: workflowName, inputs, status: 'awaiting_chat_dispatch_seal',
     createdAt: '2026-10-17T00:02:00Z', chatDispatchSourceGroupId: authority.sourceGroupId,
     chatDispatchQueueRequestDigest: queueRequestDigest,
     workflowDefinitionSnapshot: { version: 1, workflowSlug: workflowName, admittedAt: '2026-10-17T00:02:00Z',
       definition, definitionHash: definitions.workflowDefinitionHash(definition as never) } }));
-  const preparedEvent = log.appendEvent({ sessionId: f.sessionId, turn: 1, role: 'system',
-    type: 'async_work_dispatch_prepared', parentEventId: f.source.id, data: { ...authority } });
-  const prepared = origins.recordWorkflowChatDispatchPreparation(origins.createWorkflowChatDispatchPreparedReceipt(authority,
-    { eventId: preparedEvent.id, eventSeq: preparedEvent.seq, preparedAt: preparedEvent.createdAt }));
-  const close = origins.createWorkflowOriginGroupCloseAuthority([prepared]);
+    const preparedEvent = log.appendEvent({ sessionId: f.sessionId, turn: 1, role: 'system',
+      type: 'async_work_dispatch_prepared', parentEventId: f.source.id, data: { ...authority } });
+    const prepared = origins.recordWorkflowChatDispatchPreparation(origins.createWorkflowChatDispatchPreparedReceipt(authority,
+      { eventId: preparedEvent.id, eventSeq: preparedEvent.seq, preparedAt: preparedEvent.createdAt }));
+    return { runId: memberRunId, file: memberFile, prepared };
+  };
+  const members = [prepareMember(runId, {}), ...Array.from({ length: options.extraMembers ?? 0 }, (_, index) =>
+    prepareMember(`${runId}-extra-${index}`, { controlledMember: index }))];
+  const preparedReceipts = members.map(member => member.prepared);
+  const close = origins.createWorkflowOriginGroupCloseAuthority(preparedReceipts);
   const closedEvent = log.appendAsyncWorkDispatchBatchClosedOnce({ sessionId: f.sessionId, turn: 1,
     sourceUserSeq: f.source.seq, data: { ...close } }).event;
   origins.recordWorkflowOriginGroupClosedBatch({ receipt: origins.createWorkflowOriginGroupClosedBatchReceipt(close,
-    { eventId: closedEvent.id, eventSeq: closedEvent.seq, closedAt: closedEvent.createdAt }), preparedReceipts: [prepared] });
+    { eventId: closedEvent.id, eventSeq: closedEvent.seq, closedAt: closedEvent.createdAt }), preparedReceipts });
   const active = origins.finalizeWorkflowOriginGroupClosedBatch(close.sourceGroupId, { beforeMemberRelease: group => {
     log.appendAsyncWorkDispatchedOnce({ sessionId: f.sessionId, turn: 1, sourceUserSeq: f.source.seq,
       sourceGroupId: group.sealed.sourceGroupId, data: { ...group.publicDispatch, replyTarget: group.sealed.replyTarget } });
@@ -110,7 +117,7 @@ function workflow(f: ReturnType<typeof accepted>, label = 'one', options: {
     goalValidation: { version: 1, objective, successCriteria, pass: true, judgeFailedOpen: false, perCriterion,
       objectiveReview: { criterion: objective, scope: 'objective', pass: true, method: 'judge' }, validatedAt: '2026-10-17T00:03:00Z' } });
   writeFileSync(file, JSON.stringify(run));
-  return { runId, workflowName, file, active, contract, run, artifact,
+  return { runId, workflowName, file, active, contract, run, artifact, extraMembers: members.slice(1),
     artifactFile: path.join(artifacts.runWorkspaceDir(workflowName, runId), artifact.path) };
 }
 
@@ -251,6 +258,7 @@ test('goal outcome current artifact changes are distinct from a historical satis
   const changed = f.project().linkedTasks[0]!.workflows[0]!;
   assert.equal(changed.state, 'satisfied');
   assert.equal(changed.artifactReadback, 'changed_or_unavailable');
+  assert.equal(f.project().linkedTasks[0]?.state, 'needs_attention', 'historical success does not hide changed current bytes');
   rmSync(w.artifactFile);
   assert.equal(f.project().linkedTasks[0]?.workflows[0]?.artifactReadback, 'changed_or_unavailable');
 });
@@ -292,6 +300,71 @@ test('goal outcome does not guess missing accepted identity, ambiguous dispatch 
   const unknown = progress.unavailableGoalOutcomeProgress();
   assert.equal(unknown.availability, 'unavailable');
   assert.match(unknown.summary, /unavailable/);
+});
+
+test('goal outcome pending handoffs are readable without inventing accepted identity or execution', () => {
+  const f = accepted();
+  const pending: NoticingProposalRecord = { ...f.proposal, id: `${f.proposal.id}-pending`,
+    handoff: { version: 1, state: 'not_started', answerDigest: 'retained-controlled-answer', updatedAt: f.proposal.createdAt } };
+  const before = log.listEvents(f.sessionId).length;
+  const row = f.project(f.goal, pending).linkedTasks[0]!;
+  assert.equal(row.state, 'pending');
+  assert.equal(row.goalBinding, 'pending');
+  assert.equal(row.sessionId, undefined);
+  assert.equal(row.sourceUserSeq, undefined);
+  assert.deepEqual(row.workflows, []);
+  assert.match(row.detail, /no accepted task|no work/i);
+  assert.equal(log.listEvents(f.sessionId).length, before, 'the display does not accept or start work');
+  assert.equal(f.project(f.goal, { ...pending, handoff: { ...pending.handoff!, state: 'needs_attention' } }).linkedTasks[0]?.state, 'needs_attention');
+  assert.equal(f.project(f.goal, { ...pending, handoff: { ...pending.handoff!, sourceUserSeq: f.source.seq } }).linkedTasks[0]?.state,
+    'unavailable', 'a partial claimed identity is not a fresh unaccepted handoff');
+});
+
+test('goal outcome known failures and attention outrank unavailable siblings without inventing criterion passes', () => {
+  const f = accepted(); const w = workflow(f, 'failed-and-unknown', { extraMembers: 1 });
+  const extra = w.extraMembers[0]!;
+  const unknown = JSON.parse(readFileSync(extra.file, 'utf8'));
+  Object.assign(unknown, { status: 'completed', finishedAt: '2026-10-17T00:03:00Z' });
+  writeFileSync(extra.file, JSON.stringify(unknown));
+  for (const terminalOutcome of ['failed', 'blocked', 'partial', 'cancelled'] as const) {
+    writeFileSync(w.file, JSON.stringify({ ...w.run, terminalOutcome,
+      status: terminalOutcome === 'cancelled' ? 'cancelled' : 'error', goalValidation: undefined, goalContractId: undefined }));
+    const task = f.project().linkedTasks[0]!;
+    assert.equal(task.state, 'needs_attention', terminalOutcome);
+    const failed = task.workflows.find(row => row.runId === w.runId)!;
+    assert.equal(failed.state, 'not_satisfied');
+    assert.match(failed.detail, new RegExp(terminalOutcome));
+    assert.equal(failed.criteria.passed, 0);
+    assert.equal(failed.artifactReadback, 'not_checked');
+    assert.equal(task.workflows.find(row => row.runId === extra.runId)?.state, 'unavailable');
+  }
+  writeFileSync(w.file, JSON.stringify(w.run));
+  assert.equal(f.project().linkedTasks[0]?.state, 'unavailable', 'unknown evidence alone stays unknown');
+  log.requestKill(f.sessionId, 'Controlled exact Stop with unreadable sibling', { sourceUserSeq: f.source.seq });
+  assert.equal(f.project().linkedTasks[0]?.state, 'needs_attention', 'known exact Stop survives unavailable sibling proof');
+});
+
+test('goal outcome active work survives an unknown sibling and caps stay partial without claiming done or active work', () => {
+  const f = accepted(); const w = workflow(f, 'bounded-group', { pinContract: true, extraMembers: 4 });
+  for (const extra of w.extraMembers) {
+    const queued = JSON.parse(readFileSync(extra.file, 'utf8'));
+    writeFileSync(extra.file, JSON.stringify({ ...w.run, ...queued, status: 'completed', finishedAt: w.run.finishedAt,
+      goalContractId: w.contract.id, goalValidation: w.run.goalValidation, goalOutcome: 'satisfied' }));
+  }
+  const partial = f.project().linkedTasks[0]!;
+  assert.equal(partial.workflows.length, 4);
+  assert.equal(partial.omittedWorkflows, 1);
+  assert.equal(partial.state, 'partial', 'view limits alone are neither unavailable, executing nor done');
+  const shown = w.extraMembers.filter(extra => partial.workflows.some(row => row.runId === extra.runId));
+  assert.ok(shown.length >= 2);
+  const first = shown[0]!, second = shown[1]!;
+  const firstRun = JSON.parse(readFileSync(first.file, 'utf8'));
+  const secondRun = JSON.parse(readFileSync(second.file, 'utf8'));
+  writeFileSync(first.file, JSON.stringify({ ...firstRun, status: 'running', finishedAt: undefined }));
+  writeFileSync(second.file, JSON.stringify({ ...secondRun, goalValidation: undefined }));
+  assert.equal(f.project().linkedTasks[0]?.state, 'in_progress', 'exact active workflow progress survives other missing evidence and the display cap');
+  writeFileSync(first.file, JSON.stringify({ ...firstRun, status: 'pending_approval', finishedAt: undefined }));
+  assert.equal(f.project().linkedTasks[0]?.state, 'needs_attention', 'an exact approval wait outranks progress, caps and unknown siblings');
 });
 
 test('goal outcome tampered accepted packet cannot borrow an otherwise successful workflow and target readback has no empty success', () => {
