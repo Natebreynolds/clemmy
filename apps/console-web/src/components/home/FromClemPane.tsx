@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { appPlaceHref } from '@clem/chat-engine';
+import { appPlaceHref, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
 import { fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
@@ -12,8 +12,9 @@ import { AnswerRow } from './NeedsYouPane';
 import { LoadFailedLine, PaneCard, PaneRow, RowSkeleton, SectionHeader } from './HomeSection';
 
 interface RowState {
+  voiceDigest: string;
   busy?: 'answer' | 'yes' | 'no' | 'done';
-  notice?: { tone: 'success' | 'error'; text: string; sessionId?: string };
+  notice?: ProactiveReplyReceipt;
 }
 
 /** How many rows each group shows before "Show more" opens the rest in place. */
@@ -43,12 +44,15 @@ export function FromClemPane({
   onRetry: () => void;
 }) {
   const qc = useQueryClient();
+  const inFlight = useRef(new Set<string>());
   const [states, setStates] = useState<Record<string, RowState>>({});
   // One reply box open at a time. Drafts outlive closing.
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [showAll, setShowAll] = useState<{ waiting: boolean; updates: boolean }>({ waiting: false, updates: false });
   const rows = data?.rows ?? [];
+  const latestRows = useRef(rows);
+  latestRows.current = rows;
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
@@ -58,27 +62,28 @@ export function FromClemPane({
     row: FromClemRow,
     busy: NonNullable<RowState['busy']>,
     run: () => Promise<unknown>,
-    success: string | ((result: unknown) => { text: string; sessionId?: string }),
+    success: string | ((result: unknown) => { text: string; sessionId?: string; settled?: boolean }),
   ) => {
-    setStates((all) => ({ ...all, [row.key]: { busy } }));
+    if (inFlight.current.has(row.key)) return;
+    inFlight.current.add(row.key);
+    setStates((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, busy } }));
     run().then(
       (result) => {
         const said = typeof success === 'string' ? { text: success } : success(result);
-        setStates((all) => ({ ...all, [row.key]: { notice: { tone: 'success', ...said } } }));
-        setOpenKey((key) => (key === row.key ? null : key));
+        setStates((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, notice: { tone: said.settled === false ? 'info' : 'success', settled: said.settled !== false, voiceDigest: row.voiceDigest, ...said } } }));
+        if (said.settled !== false && latestRows.current.some(current => current.key === row.key && current.voiceDigest === row.voiceDigest)) setOpenKey((key) => (key === row.key ? null : key));
         void qc.invalidateQueries({ queryKey: ['home-from-clem'] });
         void qc.invalidateQueries({ queryKey: ['command-center'] });
       },
-      (err: unknown) => setStates((all) => ({
+    ).catch((err: unknown) => setStates((all) => ({
         ...all,
-        [row.key]: { notice: { tone: 'error', text: err instanceof Error ? err.message : 'That didn’t reach Clem.' } },
-      })),
-    );
+        [row.key]: { voiceDigest: row.voiceDigest, notice: { voiceDigest: row.voiceDigest, settled: false, tone: 'error', text: err instanceof Error ? err.message : 'That didn’t reach Clem. Your reply is kept; check the item before trying again.' } },
+      }))).finally(() => { inFlight.current.delete(row.key); });
   };
 
   const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
     const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
-    return { text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
+    return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });
 
   /** The answers on the row itself: hers when she offered some, else the
@@ -141,7 +146,7 @@ export function FromClemPane({
   const source = (row: FromClemRow) => (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join(' · ');
 
   const waitingRow = (row: FromClemRow) => {
-    const state = states[row.key] ?? {};
+    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
     const open = openKey === row.key;
     const offered = answers(row, state);
     return (
@@ -149,7 +154,8 @@ export function FromClemPane({
         {meta(row)}
         <p className="text-body text-fg">{row.say || row.text}</p>
         {open && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
-        {state.notice ? notice(state) : (
+        {state.notice && notice(state)}
+        {!state.notice?.settled && (
           <>
             <div className="flex flex-wrap items-center gap-2">
               {offered}
@@ -175,7 +181,7 @@ export function FromClemPane({
   };
 
   const updateRow = (row: FromClemRow) => {
-    const state = states[row.key] ?? {};
+    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
     const open = openKey === row.key;
     const done = row.done;
     // A report leads with its title; opened, it reads as she wrote it.
@@ -190,7 +196,12 @@ export function FromClemPane({
           <span className={cn('text-body text-fg', open ? report && 'whitespace-pre-line [overflow-wrap:anywhere]' : 'line-clamp-2')}>{row.say || row.text}</span>
         </button>
         {open && !report && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
-        {state.notice ? notice(state) : (
+        {row.handoff && <div className="space-y-1 text-small text-muted">
+          <p>{row.handoff.reason || (row.handoff.state === 'dispatched' ? 'The approved task is in its conversation.' : 'This suggestion needs another look before work continues.')}</p>
+          <Link to={row.handoff.sessionId ? `/chat/${encodeURIComponent(unifiedChatSessionId(row.handoff.sessionId))}` : `/chat/${encodeURIComponent(unifiedChatSessionId('clem'))}`} className="font-semibold text-primary hover:underline">{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</Link>
+        </div>}
+        {state.notice && notice(state)}
+        {!row.handoff && !state.notice?.settled && (
           <div className="flex flex-wrap items-center gap-2">
             {runHref && (
               <Link to={runHref} className="inline-flex h-8 items-center rounded-md px-1 text-small font-medium text-primary hover:underline">
@@ -226,14 +237,15 @@ export function FromClemPane({
   // An offer to help set something up: go there, have Clem walk you through
   // it, or move it out of the way.
   const offerRow = (row: FromClemRow) => {
-    const state = states[row.key] ?? {};
+    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
     const href = row.setup ? appPlaceHref(row.setup.place, 'desktop') : null;
     const busy = Boolean(state.busy);
     return (
       <PaneRow key={row.key} className="flex-col items-stretch gap-2 py-3.5">
         <p className="text-body text-fg">{row.say || row.text}</p>
         {!row.say && row.detail && <p className="text-small text-muted">{row.detail}</p>}
-        {state.notice ? notice(state) : (
+        {state.notice && notice(state)}
+        {!state.notice?.settled && (
           <div className="flex flex-wrap items-center gap-2">
             {href && row.setup && (
               <Link to={href} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">
@@ -309,12 +321,12 @@ export function FromClemPane({
                 {pulses.map((pulse) => (
                   <li key={pulse.heartbeat}>
                     <span className="font-semibold">{pulse.title}</span>
-                    {' · '}{agoLabel(pulse.lastAt)}{pulse.summary ? ` — ${pulse.summary}` : ''}
+                    {' · '}{pulse.availability === 'unavailable' ? 'Status unavailable' : heartbeatStateWords(pulse.presentation)}{pulse.presentation?.lastCheck.at ? ` · ${heartbeatLastCheckWords(pulse.presentation)} ${agoLabel(pulse.presentation.lastCheck.at)}` : ''}{pulse.summary ? ` — ${pulse.summary}` : ''}
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="text-small text-muted">Her heartbeats haven’t looked at anything yet.</p>
+              <p className="text-small text-muted">No background check results are available yet. You can check their status in Heartbeats.</p>
             )}
           </PaneRow>
         </PaneCard>
@@ -332,7 +344,7 @@ export function FromClemPane({
       )}
       {rows.length > 0 && pulses.length > 0 && (
         <p className="text-caption text-faint">
-          Last looked: {pulses.map((pulse) => `${pulse.title} ${agoLabel(pulse.lastAt)}`).join(' · ')}
+          {pulses.map((pulse) => `${pulse.title}: ${pulse.availability === 'unavailable' ? 'status unavailable' : heartbeatStateWords(pulse.presentation)}`).join(' · ')}
         </p>
       )}
     </section>

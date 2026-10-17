@@ -13,6 +13,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { NotificationRecord } from '../runtime/notifications.js';
+import type { HeartbeatPresentation, HeartbeatUnavailable } from '../agents/heartbeats.js';
 import { isWorkflowReport } from '../runtime/notification-intent.js';
 
 /** notify_user's own limit on what a report says. */
@@ -50,6 +51,9 @@ export interface FromClemRow {
   run?: { runId: string; workflow?: string };
   /** Words Clem already wrote for the owner (a report); said as they are. */
   authored?: boolean;
+  /** Progress of an already-answered proposal. This never reopens its old
+   * question or authorizes a retry; the retained chat owns the work. */
+  handoff?: { state: 'not_started' | 'dispatched' | 'needs_attention' | 'settled'; sessionId?: string; reason?: string };
   /** Identifiers the item is about (a calendar event, an account), from the
    * record's own metadata: what a tapped choice acts on. */
   ref?: Record<string, string>;
@@ -69,9 +73,11 @@ function refOf(metadata: Record<string, unknown> | undefined): Record<string, st
 export interface FromClemPulse {
   heartbeat: string;
   title: string;
-  enabled: boolean;
+  enabled: boolean | null;
   lastAt?: string;
   summary?: string;
+  availability?: 'available' | 'unavailable';
+  presentation?: HeartbeatPresentation;
 }
 
 export interface FromClem {
@@ -82,8 +88,11 @@ export interface FromClem {
 }
 
 export interface FromClemInput {
-  heartbeats: ReadonlyArray<{ id: string; title: string; enabled: boolean; lastFinding?: { at: string; summary: string; failed?: boolean } }>;
-  noticingProposals: ReadonlyArray<{ id: string; title: string; why?: string; action?: string; status: string; createdAt: string; checkInId?: string; notificationId?: string }>;
+  heartbeats: ReadonlyArray<{ id: string; title: string; enabled: boolean; presentation?: HeartbeatPresentation;
+    lastFinding?: { at: string; summary: string; failed?: boolean } }>;
+  unavailableHeartbeats?: readonly HeartbeatUnavailable[];
+  noticingProposals: ReadonlyArray<{ id: string; title: string; why?: string; action?: string; status: string; createdAt: string; checkInId?: string; notificationId?: string;
+    handoff?: { state: 'not_started' | 'dispatched' | 'needs_attention' | 'settled'; updatedAt: string; sessionId?: string; reason?: string } }>;
   notifications: readonly NotificationRecord[];
   planProposals: ReadonlyArray<{ id: string; proposedAt: string; proposedByAgent: string; status: string; title: string; context?: string }>;
   /** Heartbeat items that are still waiting on the owner (the Needs you rule). */
@@ -105,17 +114,23 @@ export interface FromClemInput {
 /** Bumped when what she is asked to say changes, so every item is said again. */
 const VOICE_RUBRIC = 3;
 
-type VoicedItem = Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at'>;
+type VoicedItem = Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at' | 'handoff'>;
+
+function itemDigestFields(row: VoicedItem): unknown[] {
+  const fields: unknown[] = [row.heartbeat, row.text, row.detail ?? '', row.asks, row.at];
+  if (row.handoff) fields.push(row.handoff);
+  return fields;
+}
 
 /** The item itself: posted to her thread once per item, however often it is
  *  said again in new words. */
 export function fromClemItemDigest(row: VoicedItem): string {
-  return createHash('sha256').update(JSON.stringify([row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
+  return createHash('sha256').update(JSON.stringify(itemDigestFields(row))).digest('hex').slice(0, 24);
 }
 
 /** What she would be speaking about: a changed item is said again. */
 export function fromClemVoiceDigest(row: VoicedItem, rubric = VOICE_RUBRIC): string {
-  return createHash('sha256').update(JSON.stringify([rubric, row.heartbeat, row.text, row.detail ?? '', row.asks, row.at])).digest('hex').slice(0, 24);
+  return createHash('sha256').update(JSON.stringify([rubric, ...itemDigestFields(row)])).digest('hex').slice(0, 24);
 }
 
 /** Whether words written under an earlier rubric were about this same item. */
@@ -142,6 +157,21 @@ export function buildFromClem(input: FromClemInput): FromClem {
   const covers = { questionIds: [] as string[], planProposalIds: [] as string[], notificationIds: [] as string[] };
 
   for (const proposal of input.noticingProposals) {
+    const handoff = proposal.handoff;
+    if (proposal.status === 'answered' && handoff && handoff.state !== 'settled') {
+      const detail = [proposal.why, handoff.reason].filter(Boolean).join('\n');
+      rows.push({
+        key: `noticing:${proposal.id}`, heartbeat: 'noticing', heartbeatTitle: title('noticing'),
+        at: handoff.updatedAt, asks: false, text: proposal.title,
+        ...(detail ? { detail } : {}),
+        handoff: { state: handoff.state,
+          ...(handoff.sessionId ? { sessionId: handoff.sessionId } : {}),
+          ...(handoff.reason ? { reason: handoff.reason } : {}) },
+      });
+      if (proposal.checkInId) covers.questionIds.push(`checkin:${proposal.checkInId}`);
+      if (proposal.notificationId) covers.notificationIds.push(proposal.notificationId);
+      continue;
+    }
     if (proposal.status !== 'open' || !proposal.checkInId) continue;
     const questionId = `checkin:${proposal.checkInId}`;
     rows.push({
@@ -221,19 +251,29 @@ export function buildFromClem(input: FromClemInput): FromClem {
     || Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
   const voicedRows: FromClemRow[] = rows.map((row) => {
     const voiceDigest = fromClemVoiceDigest(row);
-    const said = input.voiced?.(row.key, voiceDigest);
+    // Progress is shown from its retained state, never as another voiced
+    // proposal that might invite the owner to authorize the same work again.
+    const said = row.handoff ? undefined : input.voiced?.(row.key, voiceDigest);
     return { ...row, voiceDigest,
       ...(said && !row.authored ? { say: said.message } : {}),
       // A brain-outage ask keeps its yes/no: two outcomes the host carries
       // out exactly, never read back from her wording.
       ...(said?.choices?.length && row.asks && row.answer?.kind !== 'brain_outage' ? { choices: said.choices } : {}) };
   });
-  // A check that failed says when it looked, never what went wrong: the
-  // reason is the heartbeat's own page's to explain, in its own words, and a
-  // raw failure is never Clem's latest word on Home.
+  // Attempt time and coverage remain distinct. A failed or partial read is
+  // not promoted to a successful "look", and raw failure text stays on the
+  // heartbeat's own page. Older callers without presentation retain their
+  // explicit failed flag rather than inferring it from summary prose.
   const pulses = input.heartbeats.map((row) => ({
     heartbeat: row.id, title: row.title, enabled: row.enabled,
-    ...(row.lastFinding ? { lastAt: row.lastFinding.at, ...(row.lastFinding.failed ? {} : { summary: row.lastFinding.summary }) } : {}),
+    ...(row.presentation ? { availability: 'available' as const, presentation: row.presentation } : {}),
+    ...(row.presentation ? row.presentation.lastCheck.at ? { lastAt: row.presentation.lastCheck.at } : {}
+      : row.lastFinding ? { lastAt: row.lastFinding.at } : {}),
+    ...(row.lastFinding && !row.lastFinding.failed
+      && (!row.presentation || row.presentation.lastCheck.state === 'recorded') ? { summary: row.lastFinding.summary } : {}),
   }));
-  return { rows: input.later ? voicedRows.filter((row) => !input.later!(row.key)) : voicedRows, pulses, covers };
+  const unavailable: FromClemPulse[] = (input.unavailableHeartbeats ?? []).map(row => ({
+    heartbeat: row.id, title: row.title, enabled: null, availability: 'unavailable',
+  }));
+  return { rows: input.later ? voicedRows.filter((row) => !input.later!(row.key)) : voicedRows, pulses: [...pulses, ...unavailable], covers };
 }

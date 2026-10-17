@@ -9538,8 +9538,8 @@ export function registerConsoleRoutes(
   app.get('/api/console/heartbeats', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const { listHeartbeats } = await import('../agents/heartbeats.js');
-      res.json({ heartbeats: await listHeartbeats() });
+      const { readHeartbeatSnapshot } = await import('../agents/heartbeats.js');
+      res.json(await readHeartbeatSnapshot());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

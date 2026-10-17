@@ -9,7 +9,7 @@
  * same contract, so a sentence in chat and a rule typed here land in the same
  * place.
  */
-import { workflowDisplayName } from '@clem/chat-engine';
+import { heartbeatStateWords, heartbeatLastCheckWords, workflowDisplayName } from '@clem/chat-engine';
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -72,7 +72,7 @@ export function Heartbeats() {
   return (
     <Page
       title="Heartbeats"
-      subtitle="What Clementine checks on her own, how often, and what she is allowed to bring you. Tell her here or in chat; both change the same contract."
+      subtitle="Choose what Clem keeps an eye on. Useful suggestions and questions appear in From Clem; you decide what happens next."
     >
       {q.isLoading && list.length === 0 ? (
         <Skeleton className="h-64" />
@@ -80,6 +80,11 @@ export function Heartbeats() {
         <QueryUnavailable title="Heartbeats are unavailable" description="Clementine couldn’t load them, so this is not an empty list. Nothing has been turned off." onRetry={() => { void q.refetch(); }} />
       ) : (
         <div className="grid gap-4">
+          {(q.isError || (q.data?.unavailable?.length ?? 0) > 0) && <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-warning/40 px-4 py-3 text-small">
+            <p className="min-w-0 flex-1 text-fg">{q.isError ? 'These are the last loaded settings. Refresh before relying on their status.' : `${q.data?.unavailable?.map(item => item.title).join(', ')} status could not be loaded. Nothing has been turned off.`}</p>
+            <Button variant="secondary" size="sm" onClick={() => { void q.refetch(); }}>Retry</Button>
+          </div>}
+          <p className="text-small text-muted"><Link to="/" className="font-semibold text-primary hover:underline">Open From Clem</Link> to answer a suggestion or continue the conversation.</p>
           {list.map((h) => <HeartbeatCard key={h.id} heartbeat={h} />)}
         </div>
       )}
@@ -95,7 +100,8 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
   const [ruleText, setRuleText] = useState('');
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['heartbeats'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); };
   const run = async (what: string, fn: () => Promise<unknown>) => {
-    setBusy(what); setError(null);
+    if (busy !== null) return;
+    setBusy(what); setError(null); setNote(null);
     try { await fn(); refresh(); }
     catch (e) { setError((e as Error).message); }
     finally { setBusy(null); }
@@ -117,9 +123,7 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-h3 text-fg">{h.title}</h3>
-            {h.running ? <StatusPill tone="live">Checking now</StatusPill> : null}
-            {h.quietHoursActive ? <Tag>Quiet hours</Tag> : null}
-            {!h.enabled ? <Tag>Off</Tag> : null}
+<StatusPill tone={h.running ? 'live' : h.presentation?.state === 'failed' || h.presentation?.state === 'partial' ? 'warning' : 'neutral'}>{heartbeatStateWords(h.presentation)}</StatusPill>
           </div>
           <p className="mt-1 max-w-3xl text-small text-muted">{h.purpose}</p>
         </div>
@@ -157,19 +161,19 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
                 <option value="push">reach my phone</option>
               </select>
             </label>
-            <span>Last check {ago(h.lastTickAt)}{h.enabled && h.nextTickAt ? ` · next ${inWords(h.nextTickAt)}` : ''}</span>
+            <span>{heartbeatLastCheckWords(h.presentation)}{h.presentation?.lastCheck.at ? ` ${ago(h.presentation.lastCheck.at)}` : ''}{h.presentation?.nextCheckAt ? ` · next ${inWords(h.presentation.nextCheckAt)}` : ''}</span>
           </div>
           {h.contract.notify === 'push' && phonePushCaveat(h.phonePush) ? (
             <p className="text-caption text-warning">{phonePushCaveat(h.phonePush)}</p>
           ) : null}
 
           <div className="rounded-md border border-border bg-subtle px-3 py-2 text-small">
-            <span className="text-muted">Last finding: </span>
+            <span className="text-muted">Last recorded result: </span>
             <span className="text-fg">{h.lastFinding ? h.lastFinding.summary : 'none yet'}</span>
-            {h.lastError ? <span className="text-danger"> · {h.lastError.reason}</span> : null}
-            <div className="mt-1 text-caption text-faint">
-              {h.metrics.ticks} checks · {h.metrics.quietTicks} quiet · {h.metrics.itemsProduced} raised · {h.metrics.itemsAcknowledged} seen by you · {h.metrics.itemsRetired} resolved on their own · {h.metrics.modelCalls} Jev calls{h.metrics.modelVetoes ? ` (${h.metrics.modelVetoes} judged routine)` : ''}
-            </div>
+            {h.lastError && h.presentation?.lastCheck.state !== 'recorded' ? <p className="mt-1 text-danger">{h.lastError.reason}</p> : null}
+            <details className="mt-2 text-caption text-muted"><summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Check history</summary><div className="mt-1">
+              {h.metrics.ticks} checks · {h.metrics.quietTicks} quiet · {h.metrics.itemsProduced} raised · {h.metrics.itemsAcknowledged} seen by you · {h.metrics.itemsRetired} resolved on their own · {h.metrics.modelCalls} model calls{h.metrics.modelVetoes ? ` (${h.metrics.modelVetoes} judged routine)` : ''}
+            </div></details>
           </div>
 
           <section>
@@ -185,6 +189,8 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
                       <span className="min-w-0 flex-1 truncate font-medium text-fg">{workflowDisplayName(item.subject)}</span>
                       <span className="text-caption text-faint">{ago(item.createdAt)}{item.acknowledgedAt ? ' · seen' : ''}</span>
                     </div>
+                    {item.handoff?.sessionId ? <Link className="font-semibold text-primary hover:underline" to={`/chat/${encodeURIComponent(item.handoff.sessionId)}`}>Open conversation</Link> : null}
+                    {item.handoff?.reason ? <p className="mt-1 text-caption text-warning">{item.handoff.reason}</p> : null}
                     {item.detail ? <p className="mt-0.5 line-clamp-2 text-caption text-muted" title={item.detail}>{item.detail}</p> : null}
                   </li>
                 ))}
@@ -194,9 +200,9 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
           </section>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button variant="secondary" size="sm" onClick={checkNow} disabled={busy !== null}>
+            <Button variant="secondary" size="sm" onClick={checkNow} disabled={busy !== null || h.running}>
               {busy === 'tick' ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <HeartPulse size={16} aria-hidden />}
-              Check now
+              {h.running ? 'Checking…' : 'Check now'}
             </Button>
             <Link to={`/chat?prompt=${encodeURIComponent(refineHeartbeatPrompt(h.title))}`}>
               <Button variant="ghost" size="sm">
@@ -204,20 +210,20 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
                 Refine with Clementine
               </Button>
             </Link>
-            {note ? <span className="text-caption text-muted">{note}</span> : null}
-            {error ? <span className="text-caption text-danger">{error}</span> : null}
+            {note ? <span className="text-caption text-muted" role="status">{note}</span> : null}
+            {error ? <span className="text-caption text-danger" role="alert">{error}</span> : null}
           </div>
         </div>
 
         <aside className="min-w-0">
-          <div className="mb-1.5 text-label text-fg">Your rules</div>
+          <div className="mb-1.5 text-label text-fg">{h.rulesApply ? 'Your rules' : 'Your saved preferences'}</div>
           <p className="mb-2 text-caption text-muted">
             {h.rulesApply
               ? 'In your own words. Clementine applies them to every item before it reaches you.'
-              : 'In your own words. This heartbeat has its own built-in rules for now; yours are kept and shown to Clementine when you talk about it.'}
+              : 'Saved preferences only: this check does not apply your rules automatically yet. Clem can read them when you discuss it.'}
           </p>
           {h.contract.rules.length === 0 ? (
-            <p className="mb-2 text-small text-muted">No rules yet: everything it notices is raised.</p>
+            <p className="mb-2 text-small text-muted">No owner rules saved. Built-in relevance and delivery limits still apply.</p>
           ) : (
             <ul className="mb-2 space-y-1.5">
               {h.contract.rules.map((rule, i) => (

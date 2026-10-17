@@ -557,7 +557,10 @@ export async function runWorkflowSuggestionsTick(
   deps: WorkflowSuggestionsDeps = productionWorkflowSuggestionsDeps(),
 ): Promise<WorkflowSuggestionsTickResult> {
   if (inFlight) return inFlight;
-  inFlight = (async () => {
+  // The processor is synchronous. Defer it so the published promise exists
+  // before cleanup runs; an async IIFE's finally ran before this assignment
+  // and left the first resolved promise installed forever.
+  inFlight = Promise.resolve().then(() => {
     try {
       return processWorkflowSuggestionsTick(deps, opts);
     } catch (error) {
@@ -570,10 +573,8 @@ export async function runWorkflowSuggestionsTick(
       logger.warn({ err: reason }, 'workflow suggestions tick failed');
       const at = deps.now().toISOString();
       return { tickId: `ws-failed-${Date.now().toString(36)}`, at, source: opts.source, durationMs: 0, observations: 0, candidates: 0, covered: 0, proposed: 0, expired: 0, quiet: true, summary: `Tick failed: ${reason}` };
-    } finally {
-      inFlight = null;
     }
-  })();
+  }).finally(() => { inFlight = null; });
   return inFlight;
 }
 

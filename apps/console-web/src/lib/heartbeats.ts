@@ -1,3 +1,4 @@
+import type { HeartbeatPresentation } from '@clem/chat-engine';
 /** Heartbeats: what Clementine checks on her own, and the owner's contract for each. */
 import { api, apiGet, apiPost } from './api';
 
@@ -20,10 +21,12 @@ export interface HeartbeatItem {
   acknowledgedAt?: string;
   retiredAt?: string;
   retiredReason?: string;
+  handoff?: {state:'not_started'|'dispatched'|'needs_attention'|'settled';sessionId?:string;reason?:string};
 }
 
 export interface HeartbeatStatus {
   id: HeartbeatId;
+  presentation?: HeartbeatPresentation;
   title: string;
   purpose: string;
   enabled: boolean;
@@ -44,7 +47,7 @@ export interface HeartbeatStatus {
   phonePush: { ready: boolean; reason?: 'no_phone_registered' | 'apns_key_missing'; phones: { webPush: number; apns: number } };
 }
 
-export const listHeartbeats = () => apiGet<{ heartbeats: HeartbeatStatus[] }>('/api/console/heartbeats');
+export const listHeartbeats = () => apiGet<{ heartbeats: HeartbeatStatus[]; unavailable?: {id:HeartbeatId;title:string;reason:'status_unavailable'}[]; generatedAt?:string }>('/api/console/heartbeats');
 export const patchHeartbeat = (id: HeartbeatId, patch: { enabled?: boolean; cadenceMinutes?: number; notify?: HeartbeatNotifyMode }) =>
   api<{ heartbeat: HeartbeatStatus }>(`/api/console/heartbeats/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) });
 export const tickHeartbeat = (id: HeartbeatId) =>

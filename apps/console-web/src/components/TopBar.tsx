@@ -39,7 +39,7 @@ export function TopBar({
   liveUnavailable?: boolean;
 }) {
   const openPalette = () => window.dispatchEvent(new Event('clem:command-palette'));
-  const showLive = liveMode !== 'off' && !liveUnavailable;
+  const showLive = liveMode !== 'off';
 
   return (
     <header className="app-drag flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-4">

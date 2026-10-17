@@ -1,3 +1,4 @@
+import type { HeartbeatPresentation } from '@clem/chat-engine';
 import { readChatStopReceipt, readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike, type WorkflowStopQualification } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
@@ -2186,6 +2187,12 @@ export async function startLiveVoiceSession(body: { sdp: string; history: readon
 
 /** A heartbeat as the phone sees it: what it watches and whether its items reach this phone. */
 export interface PhoneHeartbeat {
+  presentation?: HeartbeatPresentation;
+  quietHoursActive?: boolean;
+  running?: boolean;
+  lastTickAt?: string;
+  nextTickAt?: string;
+  lastError?: {at:string;reason:string};
   id: string;
   title: string;
   purpose: string;
@@ -2197,7 +2204,7 @@ export interface PhoneHeartbeat {
   phonePush: { ready: boolean; reason?: 'no_phone_registered' | 'apns_key_missing'; phones: { webPush: number; apns: number } };
 }
 
-export async function listHeartbeats(): Promise<{ heartbeats: PhoneHeartbeat[] }> {
+export async function listHeartbeats(): Promise<{ heartbeats: PhoneHeartbeat[]; unavailable?: {id:string;title:string;reason:'status_unavailable'}[]; generatedAt?:string }> {
   return api('/m/api/heartbeats');
 }
 
@@ -2230,11 +2237,12 @@ export interface FromClemRow {
   run?: { runId: string; workflow?: string };
   /** A report she already wrote: `say` is the report itself. */
   authored?: boolean;
+  handoff?: {state:'not_started'|'dispatched'|'needs_attention'|'settled';sessionId?:string;reason?:string};
 }
 
 export interface FromClem {
   rows: FromClemRow[];
-  pulses: Array<{ heartbeat: string; title: string; enabled: boolean; lastAt?: string; summary?: string }>;
+  pulses: Array<{ heartbeat: string; title: string; enabled: boolean | null; lastAt?: string; summary?: string; availability?: 'available'|'unavailable'; presentation?: HeartbeatPresentation }>;
   covers: { questionIds: string[]; planProposalIds: string[]; notificationIds: string[] };
 }
 

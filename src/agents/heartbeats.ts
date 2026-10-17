@@ -36,6 +36,86 @@ export interface HeartbeatItem {
   acknowledgedAt?: string;
   retiredAt?: string;
   retiredReason?: string;
+  /** An accepted proposal's handoff progress, not execution authority. */
+  handoff?: { state: 'not_started' | 'dispatched' | 'needs_attention' | 'settled'; sessionId?: string; reason?: string };
+}
+
+/** Presentation of retained observations, never execution or approval authority.
+ * A recorded tick may have found no source or had nothing worth surfacing;
+ * neither `quiet` nor `enabled` establishes a successful underlying read. */
+export interface HeartbeatPresentation {
+  state: 'off' | 'quiet_hours' | 'checking' | 'scheduled' | 'due' | 'never' | 'failed' | 'partial' | 'unknown';
+  nextCheckAt?: string;
+  lastCheck: {
+    state: 'never' | 'recorded' | 'partial' | 'failed' | 'unknown';
+    at?: string;
+    readFailures?: number;
+    successfulReads?: number;
+  };
+}
+
+export function projectHeartbeatPresentation(input: {
+  enabled: boolean;
+  quietHoursActive: boolean;
+  running: boolean;
+  cadenceMinutes: number;
+  lastTickAt?: string;
+  nextTickAt?: string;
+  lastFinding?: { at: string };
+  lastError?: { at: string };
+  readFailures?: number;
+  successfulReads?: number;
+}, nowMs = Date.now()): HeartbeatPresentation {
+  const timestamp = (value: string | undefined): number | undefined => {
+    const ms = value === undefined ? NaN : Date.parse(value);
+    return Number.isFinite(ms) && ms <= nowMs ? ms : undefined;
+  };
+  const findingAt = timestamp(input.lastFinding?.at);
+  const tickAt = timestamp(input.lastTickAt);
+  const errorAt = timestamp(input.lastError?.at);
+  const count = (value: number | undefined): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  const readFailures = count(input.readFailures);
+  const successfulReads = count(input.successfulReads);
+  const malformed = input.lastFinding !== undefined && findingAt === undefined
+    || input.lastError !== undefined && errorAt === undefined
+    || input.readFailures !== undefined && readFailures === undefined
+    || input.successfulReads !== undefined && successfulReads === undefined;
+  let lastCheck: HeartbeatPresentation['lastCheck'];
+  if (malformed) {
+    lastCheck = { state: 'unknown', ...(findingAt !== undefined ? { at: input.lastFinding!.at } : {}) };
+  } else if (errorAt !== undefined && (findingAt === undefined || errorAt >= findingAt)) {
+    lastCheck = { state: successfulReads && findingAt === errorAt ? 'partial' : 'failed', at: input.lastError!.at };
+  } else if (tickAt !== undefined && (findingAt === undefined || tickAt > findingAt) && !input.running) {
+    lastCheck = { state: 'unknown', at: input.lastTickAt };
+  } else if (findingAt !== undefined) {
+    lastCheck = { state: readFailures && successfulReads === 0 ? 'failed'
+      : readFailures && successfulReads !== undefined ? 'partial'
+      : readFailures ? 'unknown' : 'recorded', at: input.lastFinding!.at };
+  } else if (input.lastTickAt !== undefined || input.lastFinding || input.lastError) {
+    lastCheck = { state: 'unknown', ...(tickAt !== undefined ? { at: input.lastTickAt } : {}) };
+  } else {
+    lastCheck = { state: 'never' };
+  }
+  // Read coverage belongs to that finding, not a later failed attempt.
+  if (lastCheck.at === input.lastFinding?.at) {
+    if (readFailures !== undefined) lastCheck.readFailures = readFailures;
+    if (successfulReads !== undefined) lastCheck.successfulReads = successfulReads;
+  }
+  const next = input.nextTickAt === undefined ? NaN : Date.parse(input.nextTickAt);
+  const cadenceMs = Number.isFinite(input.cadenceMinutes) && input.cadenceMinutes > 0
+    ? input.cadenceMinutes * 60_000 : NaN;
+  const nextMs = Number.isFinite(next) ? next : tickAt === undefined ? NaN : tickAt + cadenceMs;
+  const scheduled = input.enabled && !input.quietHoursActive && !input.running && Number.isFinite(nextMs) && nextMs > nowMs;
+  const state: HeartbeatPresentation['state'] = input.running ? 'checking'
+    : !input.enabled ? 'off'
+    : input.quietHoursActive ? 'quiet_hours'
+    : lastCheck.state === 'failed' || lastCheck.state === 'partial' ? lastCheck.state
+    : lastCheck.state === 'never' ? 'never'
+    : lastCheck.state === 'unknown' ? 'unknown'
+    : scheduled ? 'scheduled'
+    : Number.isFinite(nextMs) && nextMs <= nowMs ? 'due' : 'unknown';
+  return { state, ...(scheduled ? { nextCheckAt: new Date(nextMs).toISOString() } : {}), lastCheck };
 }
 
 export interface HeartbeatStatus {
@@ -60,7 +140,24 @@ export interface HeartbeatStatus {
   contract: HeartbeatContract;
   /** Whether "reach my phone" could reach one right now, and if not, why. */
   phonePush: PhonePushReadiness;
+  presentation: HeartbeatPresentation;
 }
+
+export interface HeartbeatUnavailable {
+  id: HeartbeatId;
+  title: string;
+  reason: 'status_unavailable';
+}
+
+export interface HeartbeatSnapshot {
+  heartbeats: HeartbeatStatus[];
+  unavailable: HeartbeatUnavailable[];
+  generatedAt: string;
+}
+
+const HEARTBEAT_TITLES: Record<HeartbeatId, string> = {
+  'work-review': 'Work review', calendar: 'Calendar watch', 'workflow-suggestions': 'Workflow suggestions', noticing: 'Noticing',
+};
 
 const CADENCE_RANGE: Record<HeartbeatId, { min: number; max: number }> = {
   'work-review': { min: 15, max: 1440 },
@@ -95,15 +192,19 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       rulesApply: true,
       contract,
       phonePush,
+      presentation: projectHeartbeatPresentation({ ...s, readFailures: s.lastFinding?.readFailures }),
     };
   }
   if (id === 'noticing') {
     const { noticingStatus } = await import('./noticing-runtime.js');
     const s = noticingStatus();
-    const item = (p: typeof s.openItems[number]): HeartbeatItem => ({
+    const item = (p: typeof s.openItems[number], retired: boolean): HeartbeatItem => ({
       key: p.id, kind: p.goalId ? 'proposal_for_goal' : 'proposal', subject: p.title, detail: p.why, createdAt: p.createdAt,
       ...(p.answer ? { acknowledgedAt: p.answer.at } : {}),
-      ...(p.status !== 'open' ? { retiredAt: p.answer?.at ?? p.createdAt, retiredReason: p.answer ? `${p.answer.decision}: ${p.answer.text}` : p.retiredReason ?? p.status } : {}),
+      ...(retired ? { retiredAt: p.answer?.at ?? p.createdAt, retiredReason: p.answer ? `${p.answer.decision}: ${p.answer.text}` : p.retiredReason ?? p.status } : {}),
+      ...(p.handoff ? { handoff: { state: p.handoff.state,
+        ...(p.handoff.sessionId ? { sessionId: p.handoff.sessionId } : {}),
+        ...(p.handoff.reason ? { reason: p.handoff.reason } : {}) } } : {}),
     });
     return {
       id, title: s.title, purpose: s.purpose, enabled: s.enabled, cadenceMinutes: s.cadenceMinutes, cadenceRange: CADENCE_RANGE[id],
@@ -112,11 +213,12 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       ...(s.lastFinding ? { lastFinding: s.lastFinding } : {}),
       ...(s.lastError ? { lastError: s.lastError } : {}),
       metrics: pickMetrics(s.metrics),
-      openItems: s.openItems.map(item),
-      recentlyRetired: s.recentlyRetired.map(item),
+      openItems: s.openItems.map(p => item(p, false)),
+      recentlyRetired: s.recentlyRetired.map(p => item(p, true)),
       rulesApply: true,
       contract,
       phonePush,
+      presentation: projectHeartbeatPresentation(s),
     };
   }
   if (id === 'calendar') {
@@ -134,10 +236,11 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
       rulesApply: false,
       contract,
       phonePush,
+      presentation: projectHeartbeatPresentation({ ...s, readFailures: s.lastFinding?.readFailures, successfulReads: s.lastFinding?.accounts }),
     };
   }
   const { workflowSuggestionsStatus } = await import('./workflow-suggestions.js');
-  const s = workflowSuggestionsStatus() as unknown as Record<string, unknown>;
+  const s = workflowSuggestionsStatus();
   const finding = s.lastFinding as { at?: string; summary?: string; quiet?: boolean; durationMs?: number } | undefined;
   const metrics = (s.metrics ?? {}) as Record<string, number>;
   const items = (list: unknown): HeartbeatItem[] => (Array.isArray(list) ? list : []).map((raw) => {
@@ -171,6 +274,7 @@ async function statusFor(id: HeartbeatId): Promise<HeartbeatStatus> {
     rulesApply: false,
     contract,
     phonePush,
+    presentation: projectHeartbeatPresentation({ ...s, readFailures: s.lastFinding?.readFailures }),
   };
 }
 
@@ -183,12 +287,24 @@ function pickMetrics(source: object): HeartbeatStatus['metrics'] {
   };
 }
 
-export async function listHeartbeats(): Promise<HeartbeatStatus[]> {
-  const out: HeartbeatStatus[] = [];
+export async function readHeartbeatSnapshot(
+  readStatus: (id: HeartbeatId) => Promise<HeartbeatStatus> = statusFor,
+  now = new Date(),
+): Promise<HeartbeatSnapshot> {
+  const snapshot: HeartbeatSnapshot = { heartbeats: [], unavailable: [], generatedAt: now.toISOString() };
   for (const id of HEARTBEAT_IDS) {
-    try { out.push(await statusFor(id)); } catch { /* one heartbeat's status failing never hides the others */ }
+    try {
+      const status = await readStatus(id);
+      if (status.id !== id) throw new Error('heartbeat identity changed');
+      snapshot.heartbeats.push(status);
+    }
+    catch { snapshot.unavailable.push({ id, title: HEARTBEAT_TITLES[id], reason: 'status_unavailable' }); }
   }
-  return out;
+  return snapshot;
+}
+
+export async function listHeartbeats(): Promise<HeartbeatStatus[]> {
+  return (await readHeartbeatSnapshot()).heartbeats;
 }
 
 export async function heartbeatStatus(id: HeartbeatId): Promise<HeartbeatStatus> {
@@ -244,8 +360,8 @@ export async function tickHeartbeat(id: HeartbeatId, source: 'heartbeat' | 'manu
     summary = tick.summary; produced = tick.produced; quiet = tick.quiet;
   } else {
     const { runWorkflowSuggestionsTick } = await import('./workflow-suggestions.js');
-    const tick = await runWorkflowSuggestionsTick({ source, force: true }) as unknown as { summary?: string; produced?: number; quiet?: boolean };
-    summary = String(tick.summary ?? 'checked'); produced = Number(tick.produced ?? 0); quiet = tick.quiet !== false;
+    const tick = await runWorkflowSuggestionsTick({ source, force: true });
+    summary = tick.summary; produced = tick.proposed; quiet = tick.quiet;
   }
   return { summary, produced, quiet, status: await statusFor(id) };
 }

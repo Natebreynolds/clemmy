@@ -16,6 +16,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR } from '../tools/shared.js';
 import { buildFromClem, fromClemItemDigest, fromClemSaidUnderEarlierRubric, type FromClem, type FromClemRow } from './from-clem.js';
+import type { FromClemSetup } from './from-clem-setup.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
@@ -117,20 +118,21 @@ function voiced(file: VoiceFile) {
   };
 }
 
-/** Whether a heartbeat's latest check is the one that failed: its error was
- *  recorded at, or within the same check as, its latest finding. Checks are
- *  minutes apart, so a two-minute window cannot reach an older one. */
+/** An earlier error cannot invalidate a later completed finding. Manual
+ * checks may be seconds apart; elapsed-time proximity is not call identity. */
 export function lastCheckFailed(findingAt: string, errorAt: string | undefined): boolean {
   if (!errorAt) return false;
   const finding = Date.parse(findingAt);
   const error = Date.parse(errorAt);
   if (!Number.isFinite(finding) || !Number.isFinite(error)) return false;
-  return error >= finding - 2 * 60_000;
+  return error >= finding;
 }
 
 // ── the stream ────────────────────────────────────────────────────────────────
-export async function readFromClem(): Promise<FromClem> {
-  const [{ listHeartbeats }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }] = await Promise.all([
+export async function readFromClem(options: {
+  readSetup?: (hidden: (key: string) => boolean) => Promise<FromClemSetup | null>;
+} = {}): Promise<FromClem> {
+  const [{ readHeartbeatSnapshot }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }] = await Promise.all([
     import('../agents/heartbeats.js'),
     import('../agents/noticing-runtime.js'),
     import('../runtime/notifications.js'),
@@ -138,17 +140,20 @@ export async function readFromClem(): Promise<FromClem> {
   ]);
   const needsYouRef = needsYouReferents();
   const later = laterNow();
-  const { readSetupSuggestion } = await import('./from-clem-setup.js');
-  const setup = await readSetupSuggestion(later).catch(() => null);
+  const readSetup = options.readSetup ?? (await import('./from-clem-setup.js')).readSetupSuggestion;
+  const setup = await readSetup(later).catch(() => null);
+  const snapshot = await readHeartbeatSnapshot();
   return buildFromClem({
-    heartbeats: (await listHeartbeats()).map((row) => ({
+    heartbeats: snapshot.heartbeats.map((row) => ({
       id: row.id, title: row.title, enabled: row.enabled,
+      presentation: row.presentation,
       ...(row.lastFinding ? { lastFinding: {
         at: row.lastFinding.at,
         summary: row.lastFinding.summary,
-        failed: lastCheckFailed(row.lastFinding.at, row.lastError?.at),
+        failed: row.presentation.lastCheck.state === 'failed' || row.presentation.lastCheck.state === 'partial',
       } } : {}),
     })),
+    unavailableHeartbeats: snapshot.unavailable,
     noticingProposals: Object.values(loadNoticingState().proposals),
     notifications: loadNotifications(),
     planProposals: listPlanProposals({ status: 'pending' }).map((proposal) => ({
@@ -264,7 +269,7 @@ export async function voiceFromClemRows(
   let written = 0;
   if (port?.voiceProactiveItem) {
     const pending = rows
-      .filter((row) => !row.authored && file.entries[row.key]?.digest !== row.voiceDigest && !waitingAfterFailure(failures[row.key], row.voiceDigest, nowMs))
+      .filter((row) => !row.authored && !row.handoff && file.entries[row.key]?.digest !== row.voiceDigest && !waitingAfterFailure(failures[row.key], row.voiceDigest, nowMs))
       .slice(0, deps.max ?? MAX_VOICES_PER_PASS);
     for (const row of pending) {
       const unsaid = (reason: string): void => {

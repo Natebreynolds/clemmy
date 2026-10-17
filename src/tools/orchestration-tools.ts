@@ -2484,7 +2484,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     [
       'Change one of the owner\'s heartbeats (the checks Clementine runs on her own: work review, calendar watch, workflow suggestions, noticing) the way the owner just asked.',
       'Use when the owner says how a heartbeat should behave: "stop telling me about fixture runs", "check every two hours", "push those to my phone", "turn the calendar watch off".',
-      'add_rule stores the owner\'s wish in plain words and Jev applies it to every future item; remove_rule takes one back; cadence_minutes, notify and enabled change the contract directly. Read the current contract first with action "status" when unsure.',
+      'add_rule stores the owner\'s wish in plain words. Check rulesApply in status: work review and noticing apply owner rules; calendar watch and workflow suggestions retain them as preferences but do not enforce them yet; remove_rule takes one back; cadence_minutes, notify and enabled change the contract directly. Read the current contract first with action "status" when unsure.',
     ].join(' '),
     {
       heartbeat: z.enum(['work-review', 'calendar', 'workflow-suggestions', 'noticing']).describe('Which heartbeat.'),
@@ -2501,7 +2501,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         s.lastFinding ? `Last check ${s.lastFinding.at}: ${s.lastFinding.summary}` : 'Not checked yet.',
         s.contract.rules.length
           ? `Rules:\n${s.contract.rules.map((r, i) => `${i + 1}. ${r.text} (${r.id})`).join('\n')}`
-          : 'No rules yet: everything it notices is raised.',
+          : 'No owner rules saved; built-in relevance and delivery limits still apply.',
+        s.rulesApply ? 'Owner rules apply to future checks.' : 'Saved owner preferences are not enforced by this heartbeat yet. Do not claim they apply.',
         s.openItems.length ? `Open items: ${s.openItems.slice(0, 6).map((i) => i.subject).join('; ')}` : 'No open items.',
       ].join('\n');
       if (action === 'status') return textResult(render(await heartbeatStatus(heartbeat)));
@@ -2509,7 +2510,8 @@ export function registerOrchestrationTools(server: McpServer): void {
         if (!rule?.trim()) return textResult('Say the rule in one sentence, in the owner\'s words.');
         const added = addRule(heartbeat, rule, 'clementine');
         if (!added.ok) return textResult(`Rule not added: ${added.reason.replace('_', ' ')}.`);
-        return textResult(`Added: "${added.rule.text}". It applies from the next check.\n${render(await heartbeatStatus(heartbeat))}`);
+        const current = await heartbeatStatus(heartbeat);
+        return textResult(`Added: "${added.rule.text}". ${current.rulesApply ? 'It applies from the next check.' : 'Saved as a preference; this heartbeat does not enforce owner rules yet.'}\n${render(current)}`);
       }
       if (action === 'remove_rule') {
         const current = await heartbeatStatus(heartbeat);

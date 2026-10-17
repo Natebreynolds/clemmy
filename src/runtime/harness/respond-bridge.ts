@@ -6,6 +6,7 @@ import { redactSensitiveText } from '../security.js';
 import { withAcceptedSourceSessionContext } from './source-session-context.js';
 import { admitPlanExecutionBridgeSource } from './plan-execution-bridge.js';
 import { acceptedPlanExecutionText } from './accepted-plan-execution.js';
+import { readNoticingTaskThroughVerifiedClarifications } from './noticing-approved-task.js';
 import { getPlanRevision, type PlanArtifactV1 } from './plan-artifacts.js';
 import { checkReviewedPlanPreparation } from './reviewed-plan-runtime.js';
 import { parseTaskMode, taskModeDigest, taskModeFields } from './task-mode.js';
@@ -66,6 +67,7 @@ import {
   prepareCheckedHostClarificationAnswer,
   prepareMaterialSourceVariantRecovery,
   readVerifiedAdvisoryContinuationInput,
+  rehydrateConsumedClarificationContext,
 } from './task-continuity-runtime.js';
 import {
   materiallyVariantSourceStrategyDecision,
@@ -1779,7 +1781,9 @@ export async function respondViaHarness(
   // waiting on them. Facts only, never a sentence for the owner (owner
   // 2026-10-08: "Clem is driving the harness; the harness is the vehicle").
   const turnFacts = request.turnFacts ?? turnFactsFor(sessionId);
-  const turnSteer = [verifiedMetaContinuationSteer, turnFacts].filter(Boolean).join('\n\n') || undefined;
+  const approvedNoticing = readNoticingTaskThroughVerifiedClarifications(
+    { sessionId, sourceUserSeq: execution.sourceUserSeq }, rehydrateConsumedClarificationContext);
+  const turnSteer = [verifiedMetaContinuationSteer, approvedNoticing?.context, turnFacts].filter(Boolean).join('\n\n') || undefined;
   if (hostOwnsTurn && !resumesExecutionCheckpoint) {
     const materialSource = inspectDurableMaterialSourceContinuation({
       sessionId,

@@ -55,6 +55,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { hostLocalWriteCommitResultIsProven, parseHostLocalWriteCommitFacts, readCommittedArtifactContent } from './host-local-write-commit.js';
 import { acceptedPlanExecution, acceptedPlanExecutionText } from './accepted-plan-execution.js';
+import { readNoticingTaskThroughVerifiedClarifications } from './noticing-approved-task.js';
 import { captureSourceBudgetPolicy, readSourceBudgetPolicy } from './source-budget-policy.js';
 import { assertSourceBudgetBeforeModel, SourceBudgetBoundaryError } from './source-budget-boundary.js';
 import { acceptedTaskMode, acceptedTaskModeIdentity, planModeCallRefusal, planModeReadOnlyRefusalText } from './accepted-task-mode.js';
@@ -13386,7 +13387,8 @@ export function acceptedObjectiveForSource(input: {
     // "Scorpion cal", the event was created with NO attendee, and the judge —
     // measuring "Scorpion cal" — passed it. The judged objective on a consumed
     // clarification continuation is the parent task plus the exchange.
-    const clarified = mode?.kind === 'plan' ? null : clarificationJudgeObjective(input, text);
+    const approvedNoticing = readNoticingTaskThroughVerifiedClarifications(input, rehydrateConsumedClarificationContext);
+    const clarified = mode?.kind === 'plan' ? null : approvedNoticing?.objective ?? clarificationJudgeObjective(input, text);
     const base = clarified ?? (mode?.kind === 'plan'
       // A Plan turn's DELIVERABLE is the plan. "Investigate" led this
       // sentence until 2026-09-10, and a live run took it literally: it read

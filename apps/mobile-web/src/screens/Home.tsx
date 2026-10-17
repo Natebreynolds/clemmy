@@ -283,7 +283,7 @@ export function Home({
       <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
     ) : null),
     needs_you: () => (needsPane.show || clemDecisions.length > 0) ? <>
-      <FromClem data={fromClem.data ?? null} mode="decisions" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={() => onOpenThread('clem', 'Clem')} />
+      <FromClem data={fromClem.data ?? null} mode="decisions" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'clem', 'Clem')} />
       {needsPane.show ? (
         <NeedsYou
           pane={needsPane}
@@ -297,7 +297,7 @@ export function Home({
     // Delivered work is a row in Today now; this pane is folded in.
     made: () => null,
     while_away: () => (dayRows.length > 0 || clemUpdates.length > 0) ? <>
-      <FromClem data={fromClem.data ?? null} mode="updates" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={() => onOpenThread('clem', 'Clem')} />
+      <FromClem data={fromClem.data ?? null} mode="updates" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'clem', 'Clem')} />
       {dayRows.length > 0 ? (
         <section class="home-section" aria-labelledby="home-today">
           <h2 id="home-today" class="section-head pane-head">Today</h2>

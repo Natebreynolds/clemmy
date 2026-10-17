@@ -30,3 +30,12 @@ test('a report opens its own run, and only when its workflow is known', () => {
   assert.equal(fromClemRunHref({ run: { runId: 'trigger-1' } }), null);
   assert.equal(fromClemRunHref({}), null);
 });
+
+test('missing and failed background status is visible without pretending it is off or successful', () => {
+  const pulses = recentPulses([
+    {heartbeat:'missing',title:'Missing',enabled:null,availability:'unavailable'},
+    {heartbeat:'failed',title:'Failed',enabled:true,presentation:{state:'failed',lastCheck:{state:'failed'}}},
+    {heartbeat:'off',title:'Off',enabled:false,presentation:{state:'off',lastCheck:{state:'never'}}},
+  ]);
+  assert.deepEqual(pulses.map(pulse=>pulse.heartbeat), ['missing','failed']);
+});

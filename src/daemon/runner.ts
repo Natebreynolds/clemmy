@@ -3649,7 +3649,7 @@ export async function startDaemon(
     // making across goals and what is happening, asked as a question in the
     // owner's inbox; a yes starts an ordinary turn the owner can watch.
     const { bindNoticingRespond, startNoticingHeartbeat } = await import('../agents/noticing-runtime.js');
-    bindNoticingRespond((request) => respondPreferHarness('background', request, (next) => assistant.respond(next)));
+    bindNoticingRespond((request) => respondPreferHarness('home', request, (next) => assistant.respond(next)));
     startNoticingHeartbeat();
     // From Clem: each item the heartbeats raise, put in Clem's own words once,
     // and the owner's reply to any of them starts an ordinary turn.
