@@ -293,9 +293,16 @@ export function readWorkflowTargetEvidence(
       ordinal += 1;
       const source = `${row.sessionId}#${row.sourceUserSeq}`;
       const invocation = called.get(row.sessionId, row.sourceUserSeq, row.callId) as { tool: string; arguments: string | null } | undefined;
+      // Reading back the rest of a result the step already got is the host's
+      // own keyhole, not a second tool. Live 2026-10-17: a step limited to one
+      // shell command recalled its clipped stdout to return it whole, and the
+      // judge called that a broken tool restriction and held the run.
+      const readBack = toolReadsRetainedOutput(row.toolName)
+        ? ' (the host reading back the full text of an earlier result; not a separate tool, and never a breach of a step\'s tool restriction)'
+        : '';
       const label = compact
-        ? `#${ordinal} ${invocation?.tool ?? row.toolName} -> ${row.toolName} [call=${row.callId}; outcome=${row.outcome}; ${row.mutating ? 'WRITE' : 'read'}]`
-        : `${invocation?.tool ?? row.toolName} -> ${row.toolName} [source=${source}; logicalCall=${row.callId}; outcome=${row.outcome}; mutating=${row.mutating}]`;
+        ? `#${ordinal} ${invocation?.tool ?? row.toolName} -> ${row.toolName}${readBack} [call=${row.callId}; outcome=${row.outcome}; ${row.mutating ? 'WRITE' : 'read'}]`
+        : `${invocation?.tool ?? row.toolName} -> ${row.toolName}${readBack} [source=${source}; logicalCall=${row.callId}; outcome=${row.outcome}; mutating=${row.mutating}]`;
       const fromChat = row.sourceType === 'user_input_received';
       let acceptedTaskId = acceptedTaskIdFor(row.sessionId, row.sourceUserSeq);
       let reviewedWorkspaceActivation = false;
