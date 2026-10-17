@@ -189,7 +189,7 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
   let alreadyAskingOwner: NonNullable<NoticingObservation['alreadyAskingOwner']> = [];
   try {
     const { readFromClem } = await import('../dashboard/from-clem-runtime.js');
-    alreadyAskingOwner = (await readFromClem()).rows
+    alreadyAskingOwner = (await readFromClem({ includeSetup: false })).rows
       .filter((row) => row.asks && row.heartbeat !== 'noticing')
       .slice(0, 12)
       .map((row) => ({ from: clip(row.heartbeatTitle, 60), about: clip([row.text, row.detail ?? ''].filter(Boolean).join(' — '), 240) }));

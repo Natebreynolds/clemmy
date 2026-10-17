@@ -8,9 +8,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import type { PlanProposal } from '../agents/plan-proposals.js';
+import type { FromClemSetup } from './from-clem-setup.js';
 
 const TMP = mkdtempSync(path.join(os.tmpdir(), 'clem-from-clem-runtime-'));
 process.env.CLEMENTINE_HOME = TMP;
@@ -413,6 +415,56 @@ test('the shared live From Clem read preserves partial check state without prese
     assert.ok(!JSON.stringify(stream).includes('Controlled private read diagnostic'));
   } finally { saveCalendarWatchState(before); }
 });
+
+for (const unavailableSetup of ['held', 'rejecting'] as const) {
+  test(`retained pending asks do not invoke ${unavailableSetup} setup enrichment when it is omitted`, { timeout: 10_000 }, async (t) => {
+    const { readFromClem } = await import('./from-clem-runtime.js');
+    const proposal: PlanProposal = {
+      id: `controlled-no-setup-${unavailableSetup}`, proposedAt: new Date().toISOString(),
+      proposedByAgent: 'workflow-suggestions', status: 'pending', version: 'v1',
+      originatingRequest: 'Save the controlled report as a reusable workflow.',
+      context: 'Keep the current account and prepare a local draft only.',
+      plan: {
+        objective: 'Prepare the controlled local report.',
+        steps: [{ n: 1, action: 'Read the controlled fixture.', rationale: 'Preserve its source evidence.', verification: 'The draft cites the fixture.' }],
+        successCriteria: ['The local draft cites the controlled fixture.'], stages: null, risks: [],
+        estimatedComplexity: 'moderate', recommendsTrackedExecution: false, needsUserInput: [],
+        appliedInstructions: ['Use the current account; do not send.'], externalSends: null,
+      },
+    };
+    const proposalDir = path.join(TMP, 'state', 'plan-proposals');
+    const proposalFile = path.join(proposalDir, `${proposal.id}.json`);
+    mkdirSync(proposalDir, { recursive: true });
+    writeFileSync(proposalFile, JSON.stringify(proposal));
+    let releaseHeld!: (value: FromClemSetup | null) => void;
+    const held = new Promise<FromClemSetup | null>((resolve) => { releaseHeld = resolve; });
+    t.after(() => { releaseHeld(null); rmSync(proposalFile, { force: true }); });
+
+    const setup: FromClemSetup = {
+      ability: 'phone', name: 'The phone app', unlocks: 'answer from anywhere', detail: 'No controlled phone is paired.',
+      state: 'not_set_up', place: 'phone', placeName: 'Your phone', since: proposal.proposedAt,
+    };
+    let defaultSetupReads = 0;
+    const enriched = await readFromClem({ readSetup: async () => { defaultSetupReads++; return setup; } });
+    assert.equal(defaultSetupReads, 1, 'ordinary reads retain setup enrichment by default');
+    assert.ok(enriched.rows.some((row) => row.key === 'setup:phone' && row.asks === false));
+
+    let omittedSetupReads = 0;
+    const retained = await readFromClem({ includeSetup: false, readSetup: () => {
+      omittedSetupReads++;
+      return unavailableSetup === 'held' ? held : Promise.reject(new Error('controlled setup reader must not run'));
+    } });
+    assert.equal(omittedSetupReads, 0);
+    assert.ok(retained.rows.every((row) => !row.setup));
+    assert.deepEqual(retained.rows, enriched.rows.filter((row) => !row.setup), 'retained rows keep their content, bindings and digests');
+    assert.deepEqual(retained.covers, enriched.covers);
+    const pending = retained.rows.filter((row) => row.asks && row.heartbeat !== 'noticing');
+    assert.deepEqual(pending, enriched.rows.filter((row) => row.asks && row.heartbeat !== 'noticing'));
+    assert.ok(pending.some((row) => row.key === `plan:${proposal.id}`));
+    assert.deepEqual(pending.find((row) => row.key === `plan:${proposal.id}`)?.answer,
+      { kind: 'yes_no', planProposalId: proposal.id });
+  });
+}
 
 test('structured handoff progress needs no extra model wording or repeated invitation', async () => {
   const progress = buildFromClem({ heartbeats: [], notifications: [], planProposals: [], asksOwner: () => false,

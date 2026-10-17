@@ -130,6 +130,8 @@ export function lastCheckFailed(findingAt: string, errorAt: string | undefined):
 
 // ── the stream ────────────────────────────────────────────────────────────────
 export async function readFromClem(options: {
+  /** Internal readers of retained questions can omit optional setup enrichment. */
+  includeSetup?: boolean;
   readSetup?: (hidden: (key: string) => boolean) => Promise<FromClemSetup | null>;
 } = {}): Promise<FromClem> {
   const [{ readHeartbeatSnapshot }, { loadNoticingState }, { loadNotifications }, { listPlanProposals }] = await Promise.all([
@@ -140,8 +142,11 @@ export async function readFromClem(options: {
   ]);
   const needsYouRef = needsYouReferents();
   const later = laterNow();
-  const readSetup = options.readSetup ?? (await import('./from-clem-setup.js')).readSetupSuggestion;
-  const setup = await readSetup(later).catch(() => null);
+  let setup: FromClemSetup | null = null;
+  if (options.includeSetup !== false) {
+    const readSetup = options.readSetup ?? (await import('./from-clem-setup.js')).readSetupSuggestion;
+    setup = await readSetup(later).catch(() => null);
+  }
   const snapshot = await readHeartbeatSnapshot();
   return buildFromClem({
     heartbeats: snapshot.heartbeats.map((row) => ({
