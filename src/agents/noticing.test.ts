@@ -15,6 +15,7 @@ import {
   observationDigest,
   NOTICING_DECISION_REUSE_MS,
   recordNoticingAnswer,
+  projectNoticingProposalSnapshot,
   runNoticingTick,
   type NoticingAnswerV1,
   type NoticingObservation,
@@ -67,6 +68,27 @@ const proposal = (digest: string, over: Partial<NoticingAnswerV1['proposal'] & o
     goalId: 'goal-1', confidence: 0.82, ...over },
   setAside: [{ subject: 'weekly-pipeline-sheet failed', why: 'the run already reported it and a fix needs the sheet tab name' }],
   evidenceDigest: digest,
+});
+
+test('read-only Noticing proposal projection isolates malformed rows without rewriting state or inventing empty coverage', () => {
+  const healthy = { ...proposal('controlled-digest').proposal!, id: 'healthy', shapeKey: 'controlled-shape',
+    createdAt: '2026-10-17T00:00:00Z', status: 'answered',
+    answer: { text: 'Prepare only the controlled local draft.', decision: 'do_it', at: '2026-10-17T00:01:00Z',
+      modelAccountingJobId: 'private-controlled-job' },
+    handoff: { version: 1, answerDigest: 'controlled-answer', state: 'not_started', updatedAt: '2026-10-17T00:01:00Z' } };
+  const rows = { healthy, nullRow: null, missingDate: { ...healthy, id: 'missingDate', createdAt: undefined },
+    badAnswer: { ...healthy, id: 'badAnswer', answer: { ...healthy.answer, text: 42 } },
+    wrongKey: { ...healthy, id: 'foreign-key' } };
+  const before = JSON.stringify(rows);
+  const snapshot = projectNoticingProposalSnapshot(rows);
+  assert.deepEqual(snapshot.proposals.map(row => row.id), ['healthy']);
+  assert.deepEqual(snapshot.coverage, { availability: 'partial', omitted: 4 });
+  assert.deepEqual(snapshot.unavailableGoalIds, ['goal-1']);
+  assert.equal(snapshot.unknownGoalAssociation, true);
+  assert.equal(snapshot.proposals[0]?.answer?.modelAccountingJobId, 'private-controlled-job', 'internal accounting remains available internally');
+  assert.equal(JSON.stringify(rows), before, 'the original records remain byte-equivalent');
+  assert.deepEqual(projectNoticingProposalSnapshot({}).coverage, { availability: 'complete', omitted: 0 });
+  assert.deepEqual(projectNoticingProposalSnapshot(null).coverage, { availability: 'unavailable', omitted: 0 });
 });
 
 test('one proposal per tick, asked as a question, with the thinking written down', async () => {

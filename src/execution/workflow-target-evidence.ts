@@ -220,6 +220,9 @@ export function readWorkflowTargetEvidence(
   try {
     const db = openEventLog();
     const prefix = `workflow:${runId}:`;
+    // The final ASCII ':' has an exact lexical successor. This range uses
+    // the existing session-leading primary key without scanning other runs.
+    const prefixEnd = `${prefix.slice(0, -1)};`;
     // A chat-sourced call answers a person's message. A workflow step's call
     // answers its own activation event; admitting only the first reported
     // every deterministic step as "0 logical settlements" (live 2026-09-25).
@@ -236,9 +239,9 @@ export function readWorkflowTargetEvidence(
          AND ((source.type = 'user_input_received' AND source.role = 'user')
            OR (source.role = 'system'
              AND source.type IN ('workflow_node_invocation_activated', 'workflow_paginated_read_activated')))
-       WHERE substr(s.session_id, 1, ?) = ?
+       WHERE s.session_id >= ? COLLATE BINARY AND s.session_id < ? COLLATE BINARY
        ORDER BY s.rowid
-    `).all(prefix.length, prefix) as Array<{
+    `).all(prefix, prefixEnd) as Array<{
       ordinal: number; sessionId: string; sourceUserSeq: number; callId: string;
       toolName: string; outcome: string; detail: string | null; mutating: number; sourceType: string;
       executionKind: string; requirementId: string | null;

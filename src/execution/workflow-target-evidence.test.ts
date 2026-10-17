@@ -5,7 +5,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync
 import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
+import Database from 'better-sqlite3';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-target-evidence-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -16,6 +17,50 @@ const { readWorkflowTargetEvidence } = await import('./workflow-target-evidence.
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
+
+test('workflow target uses an indexed exact session range with full substring-query parity', () => {
+  const actual = eventlog.openEventLog();
+  const prepare = actual.prepare;
+  let sql = '';
+  const spy = mock.method(actual, 'prepare', (...args: any[]) => {
+    if (typeof args[0] === 'string' && args[0].includes('FROM logical_call_settlements s')
+      && args[0].includes('s.session_id >= ?')) sql = args[0];
+    return Reflect.apply(prepare, actual, args);
+  });
+  try { readWorkflowTargetEvidence('controlled-range-query'); } finally { spy.mock.restore(); }
+  assert.ok(sql, 'capture the query actually used by the production reader');
+  assert.doesNotMatch(sql, /\bLIMIT\b/i, 'full target review retains every matching settlement');
+  const db = new Database(':memory:');
+  try {
+    db.exec(`CREATE TABLE logical_call_settlements (session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT,
+      outcome_kind TEXT, outcome_detail TEXT, mutating INTEGER, execution_kind TEXT, requirement_id TEXT,
+      PRIMARY KEY(session_id, source_user_seq, logical_tool_call_id));
+      CREATE TABLE logical_tool_calls (session_id TEXT, source_user_seq INTEGER, logical_tool_call_id TEXT, tool_name TEXT,
+      PRIMARY KEY(session_id, source_user_seq, logical_tool_call_id));
+      CREATE TABLE events (session_id TEXT, seq INTEGER, type TEXT, role TEXT, PRIMARY KEY(session_id,seq));`);
+    const prefix = 'workflow:controlled-range:';
+    const sessions = [prefix + 'read', prefix + 'read:child', prefix + 'Ω', prefix + '😀',
+      'workflow:controlled-range0:read', 'workflow:controlled-rang:read', 'workflow:controlled-range;:read',
+      'workflow:controlled-range', prefix + 'wrong-source'];
+    for (const session of sessions) {
+      db.prepare('INSERT INTO logical_call_settlements VALUES (?,1,?, ?,NULL,0,?,NULL)')
+        .run(session, 'controlled-call', 'succeeded', 'local_execution');
+      db.prepare('INSERT INTO logical_tool_calls VALUES (?,1,?,?)').run(session, 'controlled-call', 'space_get');
+      db.prepare('INSERT INTO events VALUES (?,1,?,?)').run(session,
+        session.endsWith('wrong-source') ? 'unrelated_event' : 'workflow_node_invocation_activated', 'system');
+    }
+    const upper = 'workflow:controlled-range;';
+    const rows = db.prepare(sql).all(prefix, upper);
+    const legacy = sql.replace('WHERE s.session_id >= ? COLLATE BINARY AND s.session_id < ? COLLATE BINARY',
+      'WHERE substr(s.session_id, 1, ?) = ?');
+    assert.deepEqual(rows, db.prepare(legacy).all(prefix.length, prefix), 'same joins, membership and settlement order');
+    assert.deepEqual((rows as Array<{ sessionId: string }>).map(row => row.sessionId), sessions.slice(0, 4), 'neighboring IDs and non-activation sources stay excluded');
+    const plan = (db.prepare('EXPLAIN QUERY PLAN ' + sql).all(prefix, upper) as Array<{ detail: string }>)
+      .map(row => row.detail).join('\n');
+    assert.match(plan, /SEARCH s USING INDEX .*session_id>\? AND session_id<\?/, 'existing leading session key bounds the scan');
+    assert.doesNotMatch(plan, /SCAN s\b/, 'unrelated retained runs are not scanned');
+  } finally { db.close(); }
+});
 
 test.after(() => {
   try { eventlog.closeEventLog(); } catch { /* ignore */ }

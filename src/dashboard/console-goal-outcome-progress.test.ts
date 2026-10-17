@@ -242,3 +242,51 @@ test('my-goals outcome evidence keeps the existing authorization boundary', asyn
     assert.deepEqual(await response.json(), { error: 'unauthorized' });
   } finally { await h.close(); }
 });
+
+test('my-goals and Noticing keep healthy proposal rows visible with explicit partial relationship coverage', async () => {
+  const { emptyNoticingState, compactGoalOutcomeProgressForNoticing } = await import('../agents/noticing.js');
+  const runtime = await import('../agents/noticing-runtime.js');
+  const retained = goal('Controlled healthy proposal snapshot');
+  const unrelated = goal('Controlled unreadable proposal link');
+  const stateFile = path.join(home, 'state', 'noticing.json');
+  rmSync(stateFile, { force: true });
+  const state = emptyNoticingState();
+  const healthy: NoticingProposalRecord = { id: 'controlled-snapshot-healthy', shapeKey: 'controlled-snapshot-shape',
+    title: 'Prepare the controlled local draft', action: 'Prepare only a local draft.', why: 'The controlled goal requests it.',
+    evidence: ['Controlled goal'], goalId: retained.id, confidence: 1, status: 'answered',
+    createdAt: '2026-10-17T00:00:00Z', answer: { text: 'Yes; draft only.', decision: 'do_it', at: '2026-10-17T00:01:00Z' },
+    handoff: { version: 1, answerDigest: 'controlled-snapshot-answer', state: 'not_started', updatedAt: '2026-10-17T00:01:00Z' } };
+  state.proposals[healthy.id] = healthy;
+  runtime.saveNoticingState(state);
+  const h = await boot();
+  const goalFile = path.join(home, 'goals', `${retained.id}.json`); const goalBefore = readFileSync(goalFile, 'utf8');
+  const eventsBefore = log.openEventLog().prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number };
+  try {
+    for (const unknownAssociation of [false, true]) {
+      const proposals = { ...state.proposals, broken: unknownAssociation ? null : {
+        ...healthy, id: 'broken', goalId: unrelated.id, createdAt: null,
+      } };
+      const bytes = JSON.stringify({ ...state, proposals }); writeFileSync(stateFile, bytes);
+      const response = await fetch(`${h.url}/api/console/my-goals`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { goals: GoalRow[]; proposalCoverage: { availability: string; omitted: number } };
+      assert.deepEqual(body.proposalCoverage, { availability: 'partial', omitted: 1 });
+      const row = body.goals.find(candidate => candidate.id === retained.id)!;
+      assert.deepEqual(row.proposals.map(proposal => proposal.id), [healthy.id]);
+      assert.equal(row.outcomeProgress.linkedTasks[0]?.state, 'pending', 'healthy saved answer is still visible without invented execution');
+      assert.equal(row.outcomeProgress.availability, unknownAssociation ? 'unavailable' : 'available');
+      assert.equal(body.goals.find(candidate => candidate.id === unrelated.id)?.outcomeProgress.availability, 'unavailable');
+      assert.doesNotMatch(body.goals.find(candidate => candidate.id === unrelated.id)?.outcomeProgress.summary ?? '', /^No approved task/);
+      const observation = await runtime.observeForNoticing();
+      assert.deepEqual(observation.goals.find(candidate => candidate.id === retained.id)?.outcomeProgress,
+        compactGoalOutcomeProgressForNoticing(row.outcomeProgress));
+      const status = runtime.noticingStatus();
+      assert.deepEqual(status.proposalCoverage, body.proposalCoverage);
+      assert.ok(status.openItems.some(proposal => proposal.id === healthy.id));
+      assert.equal(readFileSync(stateFile, 'utf8'), bytes, 'all read paths preserve corrupt and healthy stored bytes');
+    }
+    assert.equal(readFileSync(goalFile, 'utf8'), goalBefore);
+    assert.equal((log.openEventLog().prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number }).n, eventsBefore.n,
+      'read-only projection neither accepts a task nor starts any work');
+  } finally { await h.close(); rmSync(stateFile, { force: true }); }
+});

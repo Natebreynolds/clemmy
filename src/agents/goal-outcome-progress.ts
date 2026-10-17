@@ -1,7 +1,7 @@
 /** Informational goal progress. These projections never complete a goal,
  * authorize work, or turn delivery acknowledgement into objective evidence. */
 import type { GoalRecord } from '../memory/goals-list.js';
-import type { NoticingProposalRecord } from './noticing.js';
+import type { NoticingProposalRecord, NoticingProposalSnapshot } from './noticing.js';
 import { isDeepStrictEqual } from 'node:util';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -17,7 +17,7 @@ import { resolveWorkflowRunDefinitionSnapshot } from '../execution/workflow-run-
 import { deriveWorkflowTerminalOutcome } from '../execution/workflow-terminal-outcome.js';
 import { readWorkflowTargetEvidence } from '../execution/workflow-target-evidence.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
-import { listPlanProposals, workflowGoalSessionId, type PlanProposal } from './plan-proposals.js';
+import { readPlanProposalSnapshot, workflowGoalSessionId, type PlanProposal } from './plan-proposals.js';
 import type { QueuedRunRecord } from '../execution/workflow-runner.js';
 
 export interface GoalWorkflowOutcome {
@@ -107,6 +107,9 @@ interface WorkflowGoalContracts {
   byId: Map<string, PlanProposal[]>;
   byRun: Map<string, PlanProposal[]>;
   bySession: Map<string, PlanProposal[]>;
+  canonicalIds: Set<string>;
+  unavailableIds: Set<string>;
+  complete: boolean;
 }
 
 const safeRunId = (value: unknown): value is string => typeof value === 'string'
@@ -159,11 +162,13 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
       return ancestor;
     };
     const pinnedCandidates = (run: QueuedRunRecord) => typeof run.goalContractId === 'string' && run.goalContractId.trim()
+      && contracts.canonicalIds.has(run.goalContractId) && !contracts.unavailableIds.has(run.goalContractId)
       ? contracts.byId.get(run.goalContractId) ?? [] : [];
     const candidates = (() => {
       // A present pin is binding, even when malformed or no longer readable.
       // Never replace it with an unrelated active or same-named contract.
       if (Object.hasOwn(run, 'goalContractId')) return pinnedCandidates(run);
+      if (!contracts.complete) return [];
       const exact = contracts.byRun.get(runId) ?? [];
       if (exact.length) return exact;
       if (run.requeuedFromRunId !== undefined) {
@@ -271,10 +276,12 @@ function workflowOutcome(member: WorkflowOriginGroupMember, sourceGroupId: strin
  * No source, goal, run, contract, artifact or delivery record is changed. */
 export function readGoalOutcomeProgress(input: {
   goals: readonly GoalRecord[]; proposals: readonly NoticingProposalRecord[];
+  proposalSnapshot?: Pick<NoticingProposalSnapshot, 'coverage' | 'unavailableGoalIds' | 'unknownGoalAssociation'>;
 }): Record<string, GoalOutcomeProgress> {
   const result: Record<string, GoalOutcomeProgress> = Object.create(null);
   if (input.goals.length === 0) return result;
-  const contracts: WorkflowGoalContracts = { byId: new Map(), byRun: new Map(), bySession: new Map() };
+  const contracts: WorkflowGoalContracts = { byId: new Map(), byRun: new Map(), bySession: new Map(),
+    canonicalIds: new Set(), unavailableIds: new Set(), complete: true };
   const readbackBudget = { remaining: MAX_READBACKS_PER_CAPTURE };
   let remainingTasks = MAX_TASKS_PER_CAPTURE;
   let remainingRuns = MAX_RUNS_PER_CAPTURE;
@@ -289,13 +296,11 @@ export function readGoalOutcomeProgress(input: {
   // Shared once, never a full run-directory scan per lightweight goal.
   // The existing plan registry has no run-origin index. This remains one
   // full registry read only when there are qualifying linked tasks.
-  let capturedContracts: PlanProposal[];
-  try { capturedContracts = byGoal.size ? listPlanProposals({ status: 'all', strictRead: true }) : []; }
-  catch {
-    for (const goalId of goalIds) result[goalId] = unavailableGoalOutcomeProgress();
-    return result;
-  }
-  for (const contract of capturedContracts) {
+  const capturedContracts = byGoal.size ? readPlanProposalSnapshot() : { entries: [], unavailableIds: [], duplicateIds: [], complete: true };
+  contracts.complete = capturedContracts.complete;
+  contracts.unavailableIds = new Set([...capturedContracts.unavailableIds, ...capturedContracts.duplicateIds]);
+  for (const { proposal: contract, canonical } of capturedContracts.entries) {
+    if (canonical) contracts.canonicalIds.add(contract.id);
     if (contract?.origin?.kind !== 'workflow' || typeof contract.origin.runId !== 'string') continue;
     for (const [index, key] of [[contracts.byRun, contract.origin.runId], [contracts.byId, contract.id],
       [contracts.bySession, contract.sessionId]] as const) {
@@ -370,9 +375,13 @@ export function readGoalOutcomeProgress(input: {
             : 'Open the conversation for progress or to continue. This view does not restart work.' } satisfies GoalOutcomeTask;
       } catch { return unavailable; }
     });
-    result[goal.id] = { version: 1, availability: 'available', linkedTasks,
+    const proposalCoverageMissing = input.proposalSnapshot?.coverage.availability !== undefined
+      && input.proposalSnapshot.coverage.availability !== 'complete'
+      && (input.proposalSnapshot.unknownGoalAssociation || input.proposalSnapshot.unavailableGoalIds.includes(goal.id));
+    result[goal.id] = { version: 1, availability: proposalCoverageMissing ? 'unavailable' : 'available', linkedTasks,
       omittedTasks: Math.max(0, linked.length - linkedTasks.length),
-      summary: linkedTasks.length ? 'Recent work is shown below. Tasks outside this view haven’t been checked here. Your goal’s status stays as you set it.'
+      summary: proposalCoverageMissing ? 'Some saved suggestions could not be read. The work shown below may be incomplete. Your goal’s status stays as you set it.'
+        : linkedTasks.length ? 'Recent work is shown below. Tasks outside this view haven’t been checked here. Your goal’s status stays as you set it.'
         : linked.length ? 'More tasks are linked to this goal. Tasks outside this view haven’t been checked here. Your goal’s status stays as you set it.'
         : 'No approved task is linked to this goal yet. Your goal’s status stays as you set it.' };
   }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -22,6 +22,17 @@ const accounting = await import('../runtime/usage-log.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
 const stateFile = path.join(home, 'state', 'noticing.json');
 let sequence = 0;
+
+test('read-only Noticing snapshots distinguish absent and unreadable stores without repairing authority state', () => {
+  mkdirSync(path.dirname(stateFile), { recursive: true });
+  rmSync(stateFile, { force: true });
+  assert.deepEqual(runtime.readNoticingProposalSnapshot().coverage, { availability: 'complete', omitted: 0 });
+  writeFileSync(stateFile, '{');
+  assert.deepEqual(runtime.readNoticingProposalSnapshot().coverage, { availability: 'unavailable', omitted: 0 });
+  assert.throws(() => runtime.readNoticingStateStrict(), 'the authority reader remains strict');
+  assert.equal(readFileSync(stateFile, 'utf8'), '{');
+  rmSync(stateFile, { force: true });
+});
 
 test.afterEach(() => { runtime.bindNoticingRespond(null); ports.installTurnSemanticModelPort(null); });
 test.after(() => { log.closeEventLog(); rmSync(home, { recursive: true, force: true }); });

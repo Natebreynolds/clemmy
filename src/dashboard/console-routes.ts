@@ -9610,16 +9610,24 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const { listGoalRecords } = await import('../memory/goals-list.js');
-      const { readNoticingStateStrict } = await import('../agents/noticing-runtime.js');
+      const { readNoticingProposalSnapshot } = await import('../agents/noticing-runtime.js');
       const { publicNoticingAnswer } = await import('../agents/noticing.js');
       const { readGoalOutcomeProgress, unavailableGoalOutcomeProgress } = await import('../agents/goal-outcome-progress.js');
-      const noticingState = (() => { try { return readNoticingStateStrict().state; } catch { return null; } })();
-      const proposals = Object.values(noticingState?.proposals ?? {});
+      const proposalSnapshot = readNoticingProposalSnapshot();
+      const proposals = proposalSnapshot.proposals;
+      const proposalsByGoal = new Map<string, typeof proposals>();
+      const unassignedProposals: typeof proposals = [];
+      for (const proposal of proposals) {
+        if (proposal.goalId) {
+          const rows = proposalsByGoal.get(proposal.goalId) ?? [];
+          rows.push(proposal); proposalsByGoal.set(proposal.goalId, rows);
+        } else if (proposal.status === 'open') unassignedProposals.push(proposal);
+      }
       const retainedGoals = listGoalRecords()
         .sort((a, b) => (a.status === b.status ? b.updatedAt.localeCompare(a.updatedAt) : a.status === 'active' ? -1 : b.status === 'active' ? 1 : a.status.localeCompare(b.status)));
       const outcomeProgress = (() => {
         try {
-          if (noticingState) return readGoalOutcomeProgress({ goals: retainedGoals, proposals });
+          return readGoalOutcomeProgress({ goals: retainedGoals, proposals, proposalSnapshot });
         } catch { /* a failed relation read is unavailable, never evidence of no linked work */ }
         return Object.fromEntries(retainedGoals.map((goal) => [goal.id, unavailableGoalOutcomeProgress()]));
       })();
@@ -9627,10 +9635,11 @@ export function registerConsoleRoutes(
         .map((goal) => ({
           ...goal,
           outcomeProgress: outcomeProgress[goal.id] ?? unavailableGoalOutcomeProgress(),
-          proposals: proposals.filter((p) => p.goalId === goal.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          proposals: (proposalsByGoal.get(goal.id) ?? [])
             .map((p) => ({ id: p.id, title: p.title, action: p.action, why: p.why, status: p.status, createdAt: p.createdAt, answer: publicNoticingAnswer(p.answer) })),
         }));
-      res.json({ goals, unassignedProposals: proposals.filter((p) => !p.goalId && p.status === 'open').map((p) => ({ id: p.id, title: p.title, why: p.why, createdAt: p.createdAt })) });
+      res.json({ goals, proposalCoverage: proposalSnapshot.coverage,
+        unassignedProposals: unassignedProposals.map((p) => ({ id: p.id, title: p.title, why: p.why, createdAt: p.createdAt })) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

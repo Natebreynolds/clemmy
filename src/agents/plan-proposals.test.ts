@@ -9,9 +9,11 @@
  *   - deletePlanProposal is idempotent
  *   - supersedePlanProposal marks pending → superseded only
  */
-import { test, before, beforeEach } from 'node:test';
+import { test, before, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 
 const TEST_HOME = '/tmp/clemmy-test-plan-proposals';
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -20,6 +22,7 @@ const {
   surfacePlan,
   getPlanProposal,
   listPlanProposals,
+  readPlanProposalSnapshot,
   approvePlanProposal,
   rejectPlanProposal,
   deletePlanProposal,
@@ -60,6 +63,50 @@ function aPlan(overrides = {}) {
     ...overrides,
   };
 }
+
+test('read-only proposal snapshot isolates corrupt files and preserves canonical IDs and duplicates', () => {
+  assert.deepEqual(readPlanProposalSnapshot(), { entries: [], unavailableIds: [], duplicateIds: [], complete: true });
+  const healthy = surfacePlan({ plan: aPlan(), originatingRequest: 'Prepare the controlled local plan.' });
+  const dir = TEST_HOME + '/state/plan-proposals/';
+  const raw = readFileSync(dir + healthy.id + '.json', 'utf8');
+  writeFileSync(dir + 'broken.json', '{');
+  writeFileSync(dir + 'no-date.json', JSON.stringify({ ...healthy, id: 'no-date', proposedAt: undefined }));
+  writeFileSync(dir + 'array-status.json', JSON.stringify({ ...healthy, id: 'array-status', status: ['active'] }));
+  writeFileSync(dir + 'array-kind.json', JSON.stringify({ ...healthy, id: 'array-kind', origin: { kind: ['workflow'], runId: 'controlled-run' } }));
+  let snapshot = readPlanProposalSnapshot();
+  assert.equal(snapshot.complete, false);
+  assert.deepEqual(snapshot.entries.map(row => [row.proposal.id, row.canonical]), [[healthy.id, true]]);
+  assert.deepEqual(new Set(snapshot.unavailableIds), new Set(['broken', 'no-date', 'array-status', 'array-kind']));
+  writeFileSync(dir + 'copy.json', raw);
+  snapshot = readPlanProposalSnapshot();
+  assert.deepEqual(snapshot.duplicateIds, [healthy.id], 'an alias cannot hide a second claim to the same ID');
+  assert.equal(snapshot.entries.find(row => row.fileId === 'copy')?.canonical, false);
+  writeFileSync(dir + healthy.id + '.json', JSON.stringify({ ...healthy, id: 'another-id' }));
+  snapshot = readPlanProposalSnapshot();
+  assert.equal(snapshot.entries.some(row => row.canonical && row.proposal.id === healthy.id), false,
+    'the canonical filename must contain its own exact ID');
+  assert.equal(readFileSync(dir + 'copy.json', 'utf8'), raw, 'projection never repairs retained files');
+});
+
+test('read-only proposal capture reads each file once and refuses a replaced canonical generation', () => {
+  const healthy = surfacePlan({ plan: aPlan(), originatingRequest: 'Prepare the controlled snapshot.' });
+  const file = TEST_HOME + '/state/plan-proposals/' + healthy.id + '.json';
+  const raw = readFileSync(file, 'utf8');
+  const original = fs.readFileSync;
+  let reads = 0;
+  const spy = mock.method(fs, 'readFileSync', (...args: any[]) => {
+    const result = Reflect.apply(original, fs, args);
+    if (String(args[0]) === file) { reads += 1; writeFileSync(file, raw + '\n'); }
+    return result;
+  });
+  syncBuiltinESMExports();
+  try {
+    const snapshot = readPlanProposalSnapshot();
+    assert.equal(reads, 1, 'generation validation never reparses a file');
+    assert.equal(snapshot.complete, false);
+    assert.ok(snapshot.unavailableIds.includes(healthy.id), 'a changed direct pin cannot use its earlier captured generation');
+  } finally { spy.mock.restore(); syncBuiltinESMExports(); }
+});
 
 // ─── surface ───────────────────────────────────────────────────
 
