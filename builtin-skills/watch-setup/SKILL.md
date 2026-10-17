@@ -4,6 +4,7 @@ description: Set up, change, or explain a watch — a standing, read-only look a
 applicability:
   toolFamilies: [watch, watches, monitor, workflow, workflows]
   entitySlots: [source, inbox, channel, folder, schedule, what to look for]
+tools: [workflow_create, workflow_update, workflow_run, workflow_run_status]
 ---
 
 # Watch setup

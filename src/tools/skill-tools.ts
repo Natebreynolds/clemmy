@@ -79,6 +79,32 @@ function renderToolNameCrib(skill: Skill): string {
  * pulls them in with skill_read.
  */
 
+/** Large enough for the largest built-in skill with its tool signatures. */
+const SKILL_READ_MAX_CHARS = 60_000;
+
+/** The tools a skill declares in its frontmatter (`tools:`), with their exact
+ *  argument schemas, so the model can call them without searching. */
+async function renderSkillToolContracts(declared: unknown): Promise<string> {
+  const names = Array.isArray(declared)
+    ? declared.filter((name): name is string => typeof name === 'string' && /^[a-z][a-z0-9_]{1,63}$/.test(name)).slice(0, 12)
+    : [];
+  if (names.length === 0) return '';
+  let result: Awaited<ReturnType<typeof import('./tool-search-tool.js')['skillToolContracts']>>;
+  try {
+    const { skillToolContracts } = await import('./tool-search-tool.js');
+    result = await skillToolContracts(names);
+  } catch {
+    return '';
+  }
+  if (result.contracts.length === 0) return '';
+  return [
+    '=== TOOLS THIS SKILL USES ===',
+    'Call each by its exact name with these arguments (? marks optional); these need no tool_search. A rejected call returns the exact problem to fix.',
+    ...result.contracts.map((tool) => `- ${tool.signature}${tool.summary ? `\n  ${tool.summary}` : ''}`),
+    ...(result.overflow.length ? [`Also used, schema not shown (use tool_search for it): ${result.overflow.join(', ')}`] : []),
+  ].join('\n');
+}
+
 export function registerSkillTools(server: McpServer): void {
   server.tool(
     'skill_list',
@@ -190,6 +216,7 @@ export function registerSkillTools(server: McpServer): void {
       ].filter(Boolean).join('\n');
 
       const crib = renderToolNameCrib(skill);
+      const toolContracts = await renderSkillToolContracts((skill.frontmatter as Record<string, unknown>).tools);
 
       // Loading a reference is not a separate execution contract. The owner
       // may be planning, inspecting, comparing, or applying only a scoped part.
@@ -202,7 +229,15 @@ export function registerSkillTools(server: McpServer): void {
         'Prior or unrelated references do not add work; explain a material conflict or ambiguity through the ordinary conversation.',
       ].join('\n');
 
-      return textResult(`${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}`);
+      // A skill is read whole, with its tools after the body. Its later
+      // sections (verify, edit safely) matter most at the end of the work, and
+      // skill_read has no offset to page the rest: live 2026-10-17 the
+      // workspace-builder read was clipped at the 20,000-character default and
+      // its verify and phone sections never reached the model.
+      return textResult(
+        `${head}\n\n${manifestLines}\n\n${crib}\n\n${executionContract}\n\n---\n${skill.body}${toolContracts ? `\n\n${toolContracts}` : ''}`,
+        { maxChars: SKILL_READ_MAX_CHARS },
+      );
     },
   );
 

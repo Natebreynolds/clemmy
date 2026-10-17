@@ -4,6 +4,7 @@ description: Build, redesign, fix, or extend a Workspace (a Space) — a live, c
 applicability:
   toolFamilies: [space, spaces, workspace, workspaces, dashboard, board, cockpit]
   entitySlots: [view, data source, action, button, layout, design]
+tools: [space_get, space_get_view, space_save, space_edit_view, space_set_data, space_preview, workflow_create, workflow_run, workflow_set_enabled]
 ---
 
 # Workspace builder

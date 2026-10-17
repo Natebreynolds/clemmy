@@ -4,6 +4,7 @@ description: Build, change, optimize, test, fix, or explain a saved workflow —
 applicability:
   toolFamilies: [workflow, workflows, automation, automate, automated, recurring, scheduled, job, routine, schedule, pipeline, optimize, optimise, improve]
   entitySlots: [step, trigger, schedule, forEach, input, test]
+tools: [workflow_get, workflow_create, workflow_update, workflow_edit_step, workflow_set_enabled, workflow_run, workflow_run_status]
 ---
 
 # Workflow builder
