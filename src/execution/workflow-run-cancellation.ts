@@ -415,6 +415,35 @@ function retireParkedApprovals(runId: string, parked: ReadonlyArray<{ approvalId
   }
 }
 
+/**
+ * Cards whose workflow run has already ended. A step's call session is never
+ * marked finished when its run ends, so the dead-session reaper never sees
+ * these; a run that ended before its cards were retired with it (or ended
+ * some other way) left them in Needs you for good. Only a still-pending card
+ * of a `workflow:<runId>:<stepId>` session whose own run record is terminal
+ * is retired, quietly: the run already reported how it ended.
+ */
+export function retireCardsOfEndedWorkflowRuns(): string[] {
+  const retired: string[] = [];
+  for (const row of approvalRegistry.listPending({ status: 'pending' })) {
+    const match = /^workflow:([A-Za-z0-9][A-Za-z0-9_.-]*):[^:]+$/.exec(row.sessionId);
+    if (!match || match[1] === 'partition') continue;
+    const runId = match[1]!;
+    let record: { id?: unknown; status?: unknown };
+    try {
+      record = JSON.parse(readFileSync(runFile(runId), 'utf-8')) as { id?: unknown; status?: unknown };
+    } catch {
+      continue; // no readable run record proves nothing about the card
+    }
+    if (record.id !== runId || !isTerminalWorkflowRunStatus(record.status)) continue;
+    try {
+      const result = approvalRegistry.resolve(row.approvalId, 'cancelled_by_system', 'workflow-run-ended');
+      if (result.ok) retired.push(row.approvalId);
+    } catch { /* the next sweep tries again */ }
+  }
+  return retired;
+}
+
 export function workflowRunCancellationRequested(runId: string): boolean {
   return existsSync(cancellationFile(runId));
 }

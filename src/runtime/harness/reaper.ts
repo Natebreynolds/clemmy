@@ -48,6 +48,7 @@ import {
 import { reconcileSilentAcceptedInputSessions } from './session-reconcile.js';
 import { releaseSessionBrainPin } from './model-roles.js';
 import { remindUnansweredApprovals } from './approval-reminder.js';
+import { retireCardsOfEndedWorkflowRuns } from '../../execution/workflow-run-cancellation.js';
 
 const logger = pino({ name: 'clementine-next.approval-reaper' });
 
@@ -629,6 +630,15 @@ export function reapOnce(options: { nowMs?: number } = {}): approvalRegistry.Pen
       { approvalId: row.approvalId, sessionId: row.sessionId, subject: row.subject },
       cancelledBySystem ? 'approval closed with ended session' : 'approval expired',
     );
+  }
+
+  // 2b) A workflow step's card whose run has already ended. Quiet: the run
+  // reported its own ending, and a closed card needs no answer.
+  try {
+    const retired = retireCardsOfEndedWorkflowRuns();
+    if (retired.length > 0) logger.info({ approvalIds: retired }, 'cards of ended workflow runs retired');
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err }, 'ended-run card sweep failed');
   }
 
   // 3) One reminder for a formal approval still unanswered past its

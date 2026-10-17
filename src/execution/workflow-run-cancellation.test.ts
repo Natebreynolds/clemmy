@@ -12,6 +12,7 @@ process.env.HOME = TMP_HOME;
 const {
   _setWorkflowRunCancellationBeforeLockForTests,
   cancelWorkflowRunAtBoundary,
+  retireCardsOfEndedWorkflowRuns,
   readWorkflowRunCancellation,
   requestWorkflowRunCancellation,
   workflowRunCancellationRequested,
@@ -415,4 +416,30 @@ test("cancelling a run parked on a card retires that card, and leaves another se
   assert.equal(result.status, 'cancelled');
   assert.equal(approvalRegistry.get(own.approvalId)?.status, 'cancelled');
   assert.equal(approvalRegistry.get(other.approvalId)?.status, 'pending');
+});
+
+test('a card whose run already ended is retired by the sweep; a parked run keeps its card', async () => {
+  // Live 2026-10-16: a fixture run cancelled before cards were retired with it
+  // left its card in Needs you for good.
+  const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+  const { HarnessSession } = await import('../runtime/harness/session.js');
+  const card = (runId: string) => {
+    const sessionId = `workflow:${runId}:save_draft`;
+    HarnessSession.create({ id: sessionId, kind: 'workflow', channel: 'workflow', title: sessionId });
+    return approvalRegistry.registerResumable({
+      sessionId,
+      subject: 'Approve exact local_write call space_set_data on local_registry:host',
+      tool: 'workflow_v3_call',
+      args: { operationId: 'space_set_data' },
+      resumeKey: `rk-${runId}`,
+    }).row;
+  };
+  const ended = card('run-ended-earlier');
+  const parked = card('run-still-parked');
+  writeRun('run-ended-earlier', { status: 'cancelled' });
+  writeRun('run-still-parked', { status: 'parked' });
+  const retired = retireCardsOfEndedWorkflowRuns();
+  assert.deepEqual(retired, [ended.approvalId]);
+  assert.equal(approvalRegistry.get(ended.approvalId)?.status, 'cancelled');
+  assert.equal(approvalRegistry.get(parked.approvalId)?.status, 'pending');
 });
