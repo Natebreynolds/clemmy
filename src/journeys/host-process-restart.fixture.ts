@@ -22,21 +22,31 @@ import {
 } from '../runtime/harness/dispatch-lease.js';
 import {
   appendEvent,
+  beginRunAttempt,
+  bindRunAttemptSourceUserEvent,
   closeEventLog,
   createSession,
+  finishRunAttempt,
+  getRunAttemptBySourceUserSeq,
+  isKillRequested,
   openEventLog,
+  requestKill,
+  type RunAttemptRef,
 } from '../runtime/harness/eventlog.js';
 import {
   hostCallAttestationBindingDigest,
 } from '../runtime/harness/host-call-capability-binding.js';
 import {
   invokeHostToolCall,
+  HostToolInvocationUncertainError,
   type HostToolInvocationResult,
   type InvokeHostToolCallInput,
 } from '../runtime/harness/host-tool-invocation.js';
 import {
   durableLogicalCallContract,
 } from '../runtime/harness/logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
+import { retryDispositionFor } from '../runtime/harness/dispatch-ledger.js';
 
 type Task = {
   sessionId: string;
@@ -47,6 +57,7 @@ type Task = {
 type RunOwner = {
   parentLease: DispatchLeaseRef;
   context: HarnessRunContext;
+  attempt?: RunAttemptRef;
 };
 
 type DurableCounts = {
@@ -75,6 +86,16 @@ type PhaseAResult = {
     read: DurableCounts;
     write: DurableCounts;
   };
+  uncertain?: {
+    stoppedAttemptId: string;
+    counts: DurableCounts;
+    frozenRows: string;
+    state: 'unknown';
+    outcome: 'uncertain_write';
+    requiresReconciliation: true;
+    retrySameCandidate: false;
+    stopLatchCleared: true;
+  };
 };
 
 const phase = process.env.CLEM_HOST_RESTART_PHASE;
@@ -83,6 +104,7 @@ if ((phase !== 'A' && phase !== 'B') || !bodyLog) {
   throw new Error('host restart fixture requires an exact phase and append-only body log');
 }
 const exactBodyLog: string = bodyLog;
+const stopUncertainScenario = process.env.CLEM_HOST_RESTART_STOP_UNCERTAIN === '1';
 
 const digest = (label: string): string => createHash('sha256').update(label, 'utf8').digest('hex');
 
@@ -106,6 +128,11 @@ const SUCCESSOR_CALL = Object.freeze({
   callId: 'successor-read',
   toolName: 'read_file',
   args: { path: '/fixtures/santa-clarita-restaurants-successor.json' },
+});
+const UNCERTAIN_CALL = Object.freeze({
+  callId: 'uncertain-sheet-create',
+  toolName: 'space_publish',
+  args: { title: 'Controlled draft awaiting reconciliation', rows: [{ name: 'Fixture restaurant' }] },
 });
 
 function appendBody(callId: string): void {
@@ -145,19 +172,26 @@ function createAcceptedTask(): Task {
   };
 }
 
-function openRunOwner(task: Task, generation: string): RunOwner {
+function openRunOwner(task: Task, generation: string, registeredAttempt = false): RunOwner {
+  const attempt = registeredAttempt ? beginRunAttempt(task.sessionId, {
+    runId: `${task.sessionId}:${generation}`,
+  }) : undefined;
+  if (attempt) bindRunAttemptSourceUserEvent(attempt, task.sourceUserSeq);
   const parentLease = activateDispatchLease({
     sessionId: task.sessionId,
     scopeId: `${task.sessionId}::run:${generation}:${randomUUID()}`,
+    ...(attempt ? { runAttemptId: attempt.attemptId } : {}),
   });
   return {
     parentLease,
+    ...(attempt ? { attempt } : {}),
     context: {
       sessionId: task.sessionId,
       sourceUserSeq: task.sourceUserSeq,
       turn: 1,
       counter: new ToolCallsCounter(20),
       dispatchLease: parentLease,
+      ...(attempt ? { runAttemptId: attempt.attemptId } : {}),
     },
   };
 }
@@ -252,6 +286,10 @@ function runHostCall<T>(input: {
         effect: input.effect,
         boundary: 'host_owned_external',
         deadlineMs: 2_000,
+        ...(input.owner.attempt ? {
+          isKillRequested: () => isKillRequested(input.task.sessionId, { attemptId: input.owner.attempt!.attemptId }),
+          killPollMs: 5,
+        } : {}),
         invoke: input.body,
       }))) as Promise<HostToolInvocationResult<T>>;
 }
@@ -284,9 +322,61 @@ function exactDenial(error: unknown): string {
   return `${error.name}: ${error.message}`;
 }
 
+function uncertainRows(task: Task): string {
+  const db = openEventLog();
+  const parameters = [task.sessionId, task.sourceUserSeq, UNCERTAIN_CALL.callId] as const;
+  return JSON.stringify({
+    logical: db.prepare('SELECT * FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?').all(...parameters),
+    physical: db.prepare('SELECT * FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?').all(...parameters),
+    settlement: db.prepare('SELECT * FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?').all(...parameters),
+  });
+}
+
+async function stopAfterUncertainCrossing(task: Task, owner: RunOwner): Promise<NonNullable<PhaseAResult['uncertain']>> {
+  assert.ok(owner.attempt, 'Stop must own an actual registered attempt for the retained source');
+  const attempt = owner.attempt;
+  assert.equal(getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq)?.attemptId, attempt.attemptId);
+  let entered!: () => void;
+  let resolveLate!: (value: unknown) => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const late = new Promise<unknown>(resolve => { resolveLate = resolve; });
+  const pending = runHostCall({ task, owner, ...UNCERTAIN_CALL, effect: 'external_write', body: () => {
+    appendBody(UNCERTAIN_CALL.callId);
+    entered();
+    return late;
+  } });
+  const rejected = assert.rejects(pending, (error: unknown) => error instanceof HostToolInvocationUncertainError && error.reason === 'kill');
+  await started;
+  requestKill(task.sessionId, 'controlled exact-attempt Stop after provider body entry', { attemptId: attempt.attemptId });
+  await rejected;
+  const rows = openEventLog().prepare(`SELECT state FROM physical_dispatches
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .all(task.sessionId, task.sourceUserSeq, UNCERTAIN_CALL.callId) as Array<{ state: string }>;
+  assert.deepEqual(rows, [{ state: 'unknown' }], 'Stop does not claim the entered mutation had no effect');
+  const retained = redeemDurableLogicalCallSettlementForHost({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+    acceptedTaskId: task.acceptedTaskId, logicalToolCallId: UNCERTAIN_CALL.callId });
+  assert.equal(retained.status, 'ok');
+  if (retained.status !== 'ok') throw new Error('the exact uncertain settlement is unavailable');
+  assert.equal(retained.settlement.outcome.kind, 'uncertain_write');
+  assert.equal(retained.settlement.outcome.directive.requiresReconciliation, true);
+  assert.equal(retained.settlement.outcome.directive.retrySameCandidate, false);
+  assert.equal(retained.settlement.resultHandleId, undefined, 'an unacknowledged write cannot gain a successful result handle');
+  assert.equal(retryDispositionFor('unknown', 'external_write', 'explicit_retry'), 'require_reconciliation');
+  const frozenRows = uncertainRows(task);
+  resolveLate({ successful: true, data: { id: 'late-fixture-result' } });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(uncertainRows(task), frozenRows, 'late provider success cannot rewrite the frozen uncertainty');
+  finishRunAttempt(attempt, 'cancelled');
+  assert.equal(isKillRequested(task.sessionId, { attemptId: attempt.attemptId }), false);
+  assert.equal(getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq)?.status, 'cancelled');
+  assert.equal(uncertainRows(task), frozenRows, 'finishing the exact stopped attempt preserves its effect settlement');
+  return { stoppedAttemptId: attempt.attemptId, counts: durableCounts(task, UNCERTAIN_CALL.callId), frozenRows,
+    state: 'unknown', outcome: 'uncertain_write', requiresReconciliation: true, retrySameCandidate: false, stopLatchCleared: true };
+}
+
 async function runPhaseA(): Promise<PhaseAResult> {
   const task = createAcceptedTask();
-  const owner = openRunOwner(task, 'A');
+  const owner = openRunOwner(task, 'A', stopUncertainScenario);
   const readExpected = {
     successful: true,
     data: {
@@ -333,6 +423,8 @@ async function runPhaseA(): Promise<PhaseAResult> {
     assert.deepEqual(write.value, writeExpected);
     assert.equal(write.settlement.duplicate, false);
 
+    const uncertain = stopUncertainScenario ? await stopAfterUncertainCrossing(task, owner) : undefined;
+
     return {
       phase: 'A',
       pid: process.pid,
@@ -343,6 +435,7 @@ async function runPhaseA(): Promise<PhaseAResult> {
         read: durableCounts(task, READ_CALL.callId),
         write: durableCounts(task, WRITE_CALL.callId),
       },
+      ...(uncertain ? { uncertain } : {}),
     };
   } finally {
     revokeDispatchLease(owner.parentLease);
@@ -351,7 +444,7 @@ async function runPhaseA(): Promise<PhaseAResult> {
 
 async function runPhaseB(prior: PhaseAResult) {
   const task = prior.task;
-  const owner = openRunOwner(task, 'B');
+  const owner = openRunOwner(task, 'B', Boolean(prior.uncertain));
   try {
     const root = reconstructedRoot(task);
     assert.deepEqual(root, prior.root, 'fresh process reopened different root authority bytes');
@@ -422,6 +515,36 @@ async function runPhaseB(prior: PhaseAResult) {
     assert.deepEqual(readAfter, readBefore);
     assert.deepEqual(writeAfter, writeBefore);
 
+    let uncertain: { continuedAttemptId: string; denials: string[]; countsBefore: DurableCounts; countsAfter: DurableCounts;
+      frozenRows: string; outcome: 'uncertain_write' } | undefined;
+    if (prior.uncertain) {
+      assert.ok(owner.attempt);
+      assert.notEqual(owner.attempt.attemptId, prior.uncertain.stoppedAttemptId);
+      assert.equal(getRunAttemptBySourceUserSeq(task.sessionId, task.sourceUserSeq)?.sourceUserSeq, task.sourceUserSeq);
+      assert.equal(uncertainRows(task), prior.uncertain.frozenRows, 'new process reopened different uncertain effect bytes');
+      const countsBefore = durableCounts(task, UNCERTAIN_CALL.callId);
+      const denials: string[] = [];
+      for (let replay = 0; replay < 2; replay++) {
+        try {
+          await runHostCall({ task, owner, ...UNCERTAIN_CALL, effect: 'external_write', body: async () => {
+            appendBody('DUPLICATE-UNCERTAIN-WRITE-BODY');
+            return { successful: true, data: { id: 'duplicate-fixture-write' } };
+          } });
+          assert.fail('a continued uncertain write crossed without reconciliation');
+        } catch (error) { denials.push(exactDenial(error)); }
+      }
+      assert.ok(denials.every(reason => /uncertain_write is not replayable/.test(reason)));
+      assert.equal(uncertainRows(task), prior.uncertain.frozenRows);
+      const countsAfter = durableCounts(task, UNCERTAIN_CALL.callId);
+      assert.deepEqual(countsAfter, countsBefore);
+      const retained = redeemDurableLogicalCallSettlementForHost({ sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq,
+        acceptedTaskId: task.acceptedTaskId, logicalToolCallId: UNCERTAIN_CALL.callId });
+      assert.equal(retained.status, 'ok');
+      assert.equal(retained.status === 'ok' && retained.settlement.outcome.kind, 'uncertain_write');
+      uncertain = { continuedAttemptId: owner.attempt.attemptId, denials, countsBefore, countsAfter,
+        frozenRows: uncertainRows(task), outcome: 'uncertain_write' };
+    }
+
     const successorExpected = {
       successful: true,
       data: {
@@ -476,6 +599,7 @@ async function runPhaseB(prior: PhaseAResult) {
         successorAfterFirst,
         successorAfterReplay: durableCounts(task, SUCCESSOR_CALL.callId),
       },
+      ...(uncertain ? { uncertain } : {}),
     };
   } finally {
     revokeDispatchLease(owner.parentLease);

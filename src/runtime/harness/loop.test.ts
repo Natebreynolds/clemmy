@@ -13929,6 +13929,67 @@ test('orphaned tool: production claim is acknowledged only after durable outbox 
 // to send the 55?"), the scold-continuation pushed the agent from asking into
 // doing, and YOLO waved the send through. These pin the three loop-side fixes.
 
+test('fresh CLI alternate keeps a generic task’s unrelated ASK through the actual host conversation', async () => {
+  resetEventLog();
+  const catalog = await import('../../integrations/cli-catalog/catalog.js');
+  const connected = catalog.reconnectCli('github');
+  assert.ok(connected);
+  writeFileSync(path.join(TMP_HOME, 'state', 'cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
+    github: { id: 'github', command: 'gh', installed: true, authStatus: 'ok', binaryPath: '/controlled/bin/gh',
+      connectionRevision: connected.connectionRevision, username: 'another-owner', checkedAt: new Date().toISOString() },
+  } }));
+  try {
+    const sess = HarnessSession.create({ kind: 'chat', title: 'optional provider route' });
+    const input = 'Inspect the site repository and prepare a Space. Do not deploy, send, or edit the repository.';
+    const source = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: input } });
+    const query = 'site repository GitHub';
+    const output = JSON.stringify({ query, brokerCoverage: 'authorized_external_v1', results: [], unavailable: [{
+      source: 'authorized_composio', code: 'no_connections', dependencySubject: { version: 1,
+        kind: 'exact_capability_connection', source: 'authorized_composio', query, toolkit: 'github',
+        capability: 'GITHUB_GET_A_REPOSITORY', capabilityRef: 'cap:resolved:github_get_a_repository' },
+    }] });
+    writeToolOutput({ sessionId: sess.id, callId: 'optional-github-provider', tool: 'tool_search', output });
+    appendEvent({ sessionId: sess.id, turn: 1, role: 'tool', type: 'tool_returned',
+      data: { sourceUserSeq: source.seq, tool: 'tool_search', callId: 'optional-github-provider',
+        accounting: 'top_level', topologyRole: 'control', result: output } });
+    const question = 'Which environment should I inspect?';
+    let modelCalls = 0;
+    const model = {
+      async getResponse() {
+        modelCalls++;
+        return { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+          responseId: 'optional-cli-question', output: [{ type: 'message', role: 'assistant', status: 'completed',
+            content: [{ type: 'output_text', text: `ASK: ${question}` }] }] };
+      },
+      async *getStreamedResponse() {
+        const response = await this.getResponse();
+        yield { type: 'response_started' };
+        yield { type: 'model', event: { type: 'finish', finishReason: 'stop' } };
+        yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
+      },
+    };
+    const agent = { model, instructions: 'Ask which environment to inspect. Do not call any tool.', tools: [], getAllTools: async () => [] };
+    const capabilities = await import('../../agents/capability-envelope.js');
+    const sealed = capabilities.sealAgentCapabilityUniverse({ sessionId: sess.id, universeTools: [], activeToolNames: [],
+      policyHash: 'optional-cli-ask-fixture', budget: { maxUncachedTokens: 1000, maxModelCalls: 2, maxToolCalls: 1, maxElapsedMs: 60_000 } });
+    assert.ok(sealed.ok);
+    if (!sealed.ok) return;
+    capabilities.bindAgentCapabilityEnvelope(agent, sealed.envelope);
+    capabilities.bindAgentCapabilityRevision(agent, sealed.revision);
+    const result = await runConversation({ sessionId: sess.id, sourceUserSeq: source.seq, input, agent: agent as never,
+      turnEngine: 'host_v1', judgeCompletion: false, suppressAutomaticMemoryForRequest: true,
+      suppressMemoryCapture: true, contextWarmedAtNode: true, maxSteps: 1, maxTurns: 2, makeRunner: makeRunnerStub });
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(modelCalls, 1, 'the relevant ASK needs no correction or model retry');
+    const asks = listEvents(sess.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0]?.data.sourceUserSeq, source.seq);
+    assert.equal(asks[0]?.data.question, question);
+    assert.notEqual(asks[0]?.data.source, 'host_connection_dependency_projection');
+    assert.equal(listEvents(sess.id, { types: ['tool_called'] }).length, 0, 'no CLI/provider operation gains authority');
+  } finally { catalog.forgetConnectedCli('github'); }
+});
+
 test('ask-first invariant: a completed-tagged direction question yields awaiting_user_input and NEVER reaches the judge', async () => {
   resetEventLog();
   const sess = HarnessSession.create({ kind: 'chat' });

@@ -2065,6 +2065,49 @@ test('a connection gap the latest search found still takes over the connection q
   assert.doesNotMatch(String(asked?.data.question), /wrong_app|Le service/, 'model prose with a wrong link never becomes the connection control');
 });
 
+for (const pinned of [false, true]) test(`fresh CLI alternate ${pinned ? 'preserves a confirmed exact provider pin' : 'keeps Clem’s unrelated question for a generic task'} in actual ask arbitration`, async () => {
+  resetEventLog();
+  const catalog = await import('../integrations/cli-catalog/catalog.js');
+  const connected = catalog.reconnectCli('github');
+  assert.ok(connected);
+  writeFileSync(path.join(TMP_HOME, 'state', 'cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
+    github: { id: 'github', command: 'gh', installed: true, authStatus: 'ok', binaryPath: '/controlled/bin/gh',
+      connectionRevision: connected.connectionRevision, username: 'another-owner', checkedAt: new Date().toISOString() },
+  } }));
+  try {
+    const sess = createSession({ kind: 'chat' });
+    const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Build a Space showing the site repository and ask which environment to inspect. Do not deploy or send anything.' } });
+    const binding = { version: 1, primary: { capabilityId: 'capability:composio:GITHUB_SEARCH', accountIdentity: 'fixture-owner',
+      schemaFingerprint: 'a'.repeat(64) }, equivalentFallbacks: [], topology: 'single_aggregate_read_then_single_artifact_write',
+      topologyDigest: 'b'.repeat(64), destination: { family: 'workspace', posture: 'create_new' }, effect: 'local_write' };
+    if (pinned) appendEvent({ sessionId: sess.id, turn: 0, role: 'system', type: 'turn_preflight_decision',
+      data: { sourceUserSeq: parent.seq, phase: 'act', consequential: true, reason: 'continuation_approved',
+        sourceStrategyPosture: 'confirmed_exact', sourceStrategyBinding: binding } });
+    recordFixtureSearch(sess.id, parent.seq, 'search-optional-github', 'site repository GitHub', 'github');
+    const question = 'Which environment should I inspect?';
+    const options = ['Staging', 'Production'];
+    const { terminal } = await invokeAskWithArbitration(buildAskUserQuestionTool(),
+      { question, options, purpose: 'clarification' }, { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq });
+    const asks = listEvents(sess.id, { types: ['awaiting_user_input'] });
+    assert.equal(asks.length, 1);
+    assert.equal(asks[0]?.data.sourceUserSeq, parent.seq);
+    if (pinned) {
+      assert.equal(asks[0]?.data.source, 'host_connection_dependency_projection');
+      assert.match(String(asks[0]?.data.question), /provider operation needs a connection/);
+      assert.match(String(asks[0]?.data.question), /account and requested operation are still unverified/);
+      assert.deepEqual(listEvents(sess.id, { types: ['turn_preflight_decision'] })[0]?.data.sourceStrategyBinding, binding);
+    } else {
+      assert.equal(terminal.finalOutput, `[clementine:awaiting-user-input:final]\n${question}`);
+      assert.equal(asks[0]?.data.question, question);
+      assert.deepEqual(asks[0]?.data.options, options);
+      assert.equal(asks[0]?.data.source, undefined);
+    }
+    assert.equal(listEvents(sess.id, { types: ['tool_called'] }).filter(row => row.data.tool !== 'ask_user_question').length, 0,
+      'projection/arbitration does not dispatch the alternate or a write');
+  } finally { catalog.forgetConnectedCli('github'); }
+});
+
 test('a unique tool_search account-selection write asks instead of continuing to plan', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

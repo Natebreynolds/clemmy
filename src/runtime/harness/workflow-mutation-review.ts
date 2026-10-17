@@ -53,7 +53,7 @@ const SYSTEM = [
   'Do not invent additional approval or read requirements. A permitted intermediate write need not complete the whole objective.',
   'Use authenticated observations and open retained evidence when needed. An omitted record or clipped view does not prove absence.',
   'When you need retained evidence, open every result you need in the same step, as several lookups at once, rather than one per step.',
-  'valueProvenance, when present, lists for each proposed value the retained results that contain it verbatim. It is a search, not a judgement: a value found in a read of the destination may already be there, a value found in a source read was taken from it, a value found nowhere was not read from this run. Judge what that means; open a result only when the verdict needs more than where a value appears.',
+  'valueProvenance, when present, lists verbatim matches in a bounded search of retained results; coverage says how many results were searched, unavailable or left unsearched. A match establishes text presence, not its source or correctness; a destination match may indicate existing data. A miss never proves absence or invention, especially outside the searched results. Judge context and open the relevant retained results when the verdict needs it.',
   'compatible means this exact proposed write respects the applicable saved constraints. conflict means it contradicts them.',
   'uncertain means required facts are missing or ambiguous. Never resolve uncertainty by assuming a safe destination or unchanged contents.',
   'Name every conflict and every missing piece of evidence you can see in this one answer, each as a specific correction or the exact read that would settle it. A corrected write is reviewed once more, not again for what could have been said now.',
@@ -77,25 +77,38 @@ function leafStrings(value: unknown, out: Set<string>, depth = 0): void {
   if (value && typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) leafStrings(item, out, depth + 1);
 }
 
-/** For each proposed value, the retained results that contain it verbatim.
- * Null when there is nothing to search or nothing worth searching for. */
-export function valueProvenance(args: unknown, evidence: JudgeEvidenceSource | undefined): Record<string, string[] | 'not in any retained result'> | null {
+type ValueProvenance = {
+  matches: Record<string, string[] | 'not found in searched results'>;
+  coverage: { indexedResults: number; searchedResults: number; unavailableResults: number; unsearchedResults: number };
+};
+
+/** Bounded verbatim search, never proof that an unmatched value was not read.
+ * Keep the search boundary explicit so a later retained result cannot become
+ * a false accusation of invention and send a valid write around again. */
+export function valueProvenance(args: unknown, evidence: JudgeEvidenceSource | undefined): ValueProvenance | null {
   if (!evidence) return null;
   const values = new Set<string>();
   leafStrings(args, values);
   if (values.size === 0) return null;
   const texts: Array<{ ref: string; text: string }> = [];
-  for (const ref of evidence.refs().slice(0, PROVENANCE_MAX_REFS)) {
+  const refs = [...new Set(evidence.refs())];
+  const selected = refs.slice(0, PROVENANCE_MAX_REFS);
+  for (const ref of selected) {
     const entry = evidence.resolve(ref);
     if (entry?.text) texts.push({ ref, text: entry.text });
   }
-  if (texts.length === 0) return null;
-  const out: Record<string, string[] | 'not in any retained result'> = {};
+  if (refs.length === 0) return null;
+  const out: ValueProvenance['matches'] = {};
   for (const value of [...values].sort((a, b) => b.length - a.length).slice(0, PROVENANCE_MAX_VALUES)) {
     const found = texts.filter((item) => item.text.includes(value) || item.text.includes(JSON.stringify(value).slice(1, -1))).map((item) => item.ref);
-    out[value.length > 80 ? `${value.slice(0, 80)}…` : value] = found.length ? found : 'not in any retained result';
+    // Long values can share the same displayed prefix. Bind their labels to
+    // the complete value instead of overwriting one value's evidence with another.
+    const label = value.length > 80
+      ? `${value.slice(0, 60)}… [${createHash('sha256').update(value).digest('hex').slice(0, 16)}]` : value;
+    out[label] = found.length ? found : 'not found in searched results';
   }
-  return out;
+  return { matches: out, coverage: { indexedResults: refs.length, searchedResults: texts.length,
+    unavailableResults: selected.length - texts.length, unsearchedResults: refs.length - selected.length } };
 }
 
 /** Corrected arguments stay small enough to reach the model whole. */

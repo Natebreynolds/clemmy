@@ -195,12 +195,13 @@ test('the review view says where each proposed value already appears, so the rev
       : ref === 'rh_destination' ? { text: JSON.stringify({ values: [['2026-09-29', 'Budget approved']] }) } : undefined,
   };
   const found = valueProvenance({ values: [['2026-09-30', 'Launch review moved to Thursday', 'Budget approved', 'Brand new line']], range: 'Log!A1' }, evidence);
-  assert.deepEqual(found, {
+  assert.deepEqual(found?.matches, {
     'Launch review moved to Thursday': ['rh_source'],
     'Budget approved': ['rh_destination'],
-    'Brand new line': 'not in any retained result',
-    'Log!A1': 'not in any retained result',
+    'Brand new line': 'not found in searched results',
+    'Log!A1': 'not found in searched results',
   });
+  assert.deepEqual(found?.coverage, { indexedResults: 2, searchedResults: 2, unavailableResults: 0, unsearchedResults: 0 });
   assert.equal(valueProvenance({ values: [['2026-09-30']] }, evidence), null, 'dates and numbers alone are not searched');
   assert.equal(valueProvenance({ note: 'anything' }, undefined), null);
 
@@ -215,5 +216,40 @@ test('the review view says where each proposed value already appears, so the rev
     },
   });
   assert.deepEqual(Object.keys(seen!), ['instructions', 'tool', 'schema', 'args', 'observations', 'valueProvenance', 'proposalDigest']);
-  assert.deepEqual(seen!.valueProvenance, { 'Budget approved': ['rh_destination'] });
+  assert.deepEqual(seen!.valueProvenance, { matches: { 'Budget approved': ['rh_destination'] },
+    coverage: { indexedResults: 2, searchedResults: 2, unavailableResults: 0, unsearchedResults: 0 } });
+});
+
+test('bounded provenance never calls an unsearched or unavailable value absent and keeps every exact result accessible', async () => {
+  const refs = Array.from({ length: 25 }, (_, i) => `result-${i}`);
+  const evidence = { refKind: 'authenticated records', refs: () => refs,
+    resolve: (ref: string) => ref === 'result-0' ? undefined
+      : { text: ref === 'result-24' ? 'The supported value is in this later result' : 'Other data' } };
+  let calls = 0;
+  await reviewWorkflowMutation({ ...input, args: { values: ['The supported value is in this later result'] }, stakes: 'high',
+    observations: { complete: false, summary: 'Exact retained results available.', evidence } }, {
+    evaluate: async () => { throw new Error('no classifier'); },
+    judge: async (system, prompt, parse, _pass, _lane, opts) => {
+      calls++;
+      const packet = JSON.parse(prompt);
+      assert.deepEqual(packet.valueProvenance, { matches: {
+        'The supported value is in this later result': 'not found in searched results',
+      }, coverage: { indexedResults: 25, searchedResults: 23, unavailableResults: 1, unsearchedResults: 1 } });
+      assert.match(system, /A miss never proves absence or invention/);
+      assert.equal(opts?.evidence?.resolve('result-24')?.text, 'The supported value is in this later result');
+      return { value: parse({ verdict: 'compatible', reason: 'Verified the exact later result.', proposalDigest: packet.proposalDigest }), failure: null };
+    },
+  });
+  assert.equal(calls, 1, 'coverage does not add another review round');
+});
+
+test('different long proposed values with the same displayed prefix retain distinct evidence matches', async () => {
+  const { valueProvenance } = await import('./workflow-mutation-review.js');
+  const shared = 'Same opening text. '.repeat(6);
+  const first = `${shared}First exact ending`;
+  const second = `${shared}Second exact ending`;
+  const found = valueProvenance({ values: [first, second] }, { refKind: 'authenticated results',
+    refs: () => ['first', 'second'], resolve: ref => ({ text: ref === 'first' ? first : second }) });
+  assert.equal(Object.keys(found!.matches).length, 2);
+  assert.deepEqual(Object.values(found!.matches).sort(), [['first'], ['second']]);
 });

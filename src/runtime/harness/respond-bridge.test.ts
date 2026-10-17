@@ -691,12 +691,23 @@ test('fresh host candidate recall stays advisory and cannot carry source authori
   `).get(sessionId, source.seq) as { n: number }).n, 0);
 });
 
-for (const newerSourceDuringLookup of [false, true]) test(`released question retry ${newerSourceDuringLookup ? 'discards a late result after a newer source' : 'recalls full context once without inheriting consent'}`, async () => {
+for (const newerSourceDuringLookup of [false, true]) test(`fresh CLI recovery ${newerSourceDuringLookup ? 'discards a late advisory result after a newer source' : 'retains partial A/Q/B across reopen without inheriting consent'}`, async () => {
   const sessionId = `bridge-cli-advisory-question-retry-${newerSourceDuringLookup}`;
+  const catalog = await import('../../integrations/cli-catalog/catalog.js');
+  const coverage = await import('../../integrations/cli-catalog/connected-cli-coverage.js');
+  const connected = catalog.reconnectCli('github');
+  assert.ok(connected);
+  mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+  writeFileSync(path.join(TEST_HOME, 'state', 'cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
+    github: { id: 'github', command: 'gh', installed: true, authStatus: 'ok', binaryPath: '/controlled/bin/gh',
+      connectionRevision: connected.connectionRevision, username: 'another-owner', checkedAt: new Date().toISOString() },
+  } }));
+  assert.equal(coverage.connectedCliCandidatesForApp('github')[0]?.authentication.state, 'confirmed');
   createSession({ id: sessionId, kind: 'chat', userId: 'fixture-owner' });
-  const rootText = 'Inspect the repository and Railway environment for one website. Do not deploy or edit anything.';
+  const rootText = 'Inspect the repository and Railway environment for one website using GitHub account fixture-owner. '
+    + 'Keep the existing draft. Do not deploy, edit, resend, or recreate anything; reconcile an uncertain prior write before continuing it.';
   const question = 'Which GitHub repository and Railway environment should I inspect?';
-  const replyText = 'Use the local GitHub CLI for the repository; I still need to choose the environment.';
+  const replyText = 'Use the local GitHub CLI for fixture-org/site under fixture-owner; I still need to choose the environment.';
   const parent = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: rootText } });
   appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
     data: { sourceUserSeq: parent.seq, question, purpose: 'clarification' } });
@@ -718,11 +729,10 @@ for (const newerSourceDuringLookup of [false, true]) test(`released question ret
   try {
     const route = await continuityRuntime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
     assert.equal(route?.route, 'respond');
-    const first = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: replyText }, reply.seq,
-      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
-    assert.ok(first.semanticTaskInput?.includes(rootText));
-    assert.equal(first.taskContinuation, undefined);
-    assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'none');
+    assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'available', 'the bridge must interpret B before releasing A/Q');
+    const { closeEventLog } = await import('./eventlog.js');
+    closeEventLog();
+    assert.equal(peekTaskContinuityPacket({ sessionId }).status, 'available', 'the exact parked task survives reopening');
     let selectors = 0, builds = 0;
     const forged = { version: 1, primary: { capabilityId: 'capability:composio:FORGED_CLI_AUTHORITY' },
       equivalentFallbacks: [], topology: 'single_aggregate_read_then_single_artifact_write', topologyDigest: 'a'.repeat(64),
@@ -730,7 +740,7 @@ for (const newerSourceDuringLookup of [false, true]) test(`released question ret
     _setBridgeImplsForTests({ configure: okConfigure,
       resolveTurnCandidates: (async ({ userInput }: { userInput: string }) => {
         selectors++;
-        assert.equal(userInput, first.semanticTaskInput);
+        assert.equal(userInput, continuityRuntime.readVerifiedAdvisoryContinuationInput({ sessionId, sourceUserSeq: reply.seq }));
         assert.ok(userInput.includes(rootText)); assert.ok(userInput.includes(question)); assert.ok(userInput.includes(replyText));
         if (newerSourceDuringLookup) appendEvent({ sessionId, turn: 3, role: 'user', type: 'user_input_received',
           data: { text: 'A separate task now replaces that inspection.' } });
@@ -743,7 +753,10 @@ for (const newerSourceDuringLookup of [false, true]) test(`released question ret
       }) as never,
       runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; input: string; semanticTaskInput?: string;
         buildAgent: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown> }) => {
-        assert.equal(options.input, replyText); assert.equal(options.semanticTaskInput, first.semanticTaskInput);
+        assert.equal(options.input, replyText);
+        assert.ok(options.semanticTaskInput?.includes(rootText));
+        assert.ok(options.semanticTaskInput?.includes(question));
+        assert.ok(options.semanticTaskInput?.includes(replyText));
         const identity = stubBuildIdentity(options);
         await options.buildAgent(identity); await options.buildAgent(identity);
         return { sessionId, status: 'completed', steps: 1, lastTurn: 2, publicPresentation: stubAnswerPresentation(options, 'Which environment should I inspect?') };
@@ -761,6 +774,87 @@ for (const newerSourceDuringLookup of [false, true]) test(`released question ret
   } finally {
     continuityRuntime._setClarificationAnswerCompletenessForTests(null);
     continuityRuntime._setClarificationRevisionProposerForTests(null);
+    catalog.forgetConnectedCli('github');
+  }
+});
+
+test('fresh CLI recovery keeps a verified complete answer bound to its original task and provider/account constraints', async () => {
+  const sessionId = 'bridge-cli-verified-answer';
+  const catalog = await import('../../integrations/cli-catalog/catalog.js');
+  const connected = catalog.reconnectCli('github');
+  assert.ok(connected);
+  mkdirSync(path.join(TEST_HOME, 'state'), { recursive: true });
+  writeFileSync(path.join(TEST_HOME, 'state', 'cli-auth-health.json'), JSON.stringify({ version: 'v1', entries: {
+    github: { id: 'github', command: 'gh', installed: true, authStatus: 'ok', binaryPath: '/controlled/bin/gh',
+      connectionRevision: connected.connectionRevision, username: 'another-owner', checkedAt: new Date().toISOString() },
+  } }));
+  createSession({ id: sessionId, kind: 'chat', userId: 'fixture-owner' });
+  const rootText = 'Inspect the existing site repository through the requested GitHub provider under fixture-owner.\n'
+    + 'Keep the current draft. Do not deploy, edit, send, or create a second artifact.';
+  const semanticRootText = rootText.replace(/\s+/g, ' ').trim();
+  const question = 'Which repository and environment should I inspect under that account?';
+  const replyText = 'Use fixture-org/site and the staging environment. Keep the requested provider and account.';
+  const parent = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: rootText } });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+    data: { sourceUserSeq: parent.seq, question, purpose: 'clarification' } });
+  const parentIdentity = { sessionId, turn: 1, sourceUserSeq: parent.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(parentIdentity), identity: parentIdentity,
+    status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: question } });
+  const dependencies = await import('./dependency-request.js');
+  dependencies.parkDependencyRequest({ sessionId, sourceUserSeq: parent.seq, turn: 1, kind: 'connection_missing', text: question,
+    connectionSubject: { kind: 'exact_capability_connection', provider: 'authorized_composio', toolkit: 'github',
+      capability: 'GITHUB_GET_A_REPOSITORY', capabilityRef: 'cap:resolved:github_get_a_repository',
+      discoveryQuery: 'GitHub site repository', continueOptionId: 'opt-1', continueOptionLabel: 'Continue' } });
+  const attempt = beginRunAttempt(sessionId);
+  const reply = recordRunAttemptUserInput(attempt, { turn: 2, role: 'user', data: { text: replyText } });
+  recordTypedProvidedAnswer(reply);
+  const { closeEventLog } = await import('./eventlog.js');
+  closeEventLog();
+  let runs = 0, builds = 0;
+  try {
+    _setBridgeImplsForTests({ configure: okConfigure,
+      resolveTurnCandidates: (async () => { throw new Error('a verified continuation needs no new selector'); }) as never,
+      buildAgent: (async (input: { userInput?: string; taskContinuation?: import('../../types.js').TaskContinuationContext;
+        turnCandidates?: { sourceStrategyBinding?: unknown } }) => {
+        builds++;
+        assert.equal(input.userInput, replyText);
+        assert.equal(input.taskContinuation?.parentInput, semanticRootText);
+        assert.equal(input.taskContinuation?.question, question);
+        assert.equal(input.taskContinuation?.answer, replyText);
+        assert.equal(input.taskContinuation?.parentSourceUserSeq, parent.seq);
+        assert.equal(input.taskContinuation?.consumingSourceUserSeq, reply.seq);
+        assert.equal(input.taskContinuation?.disposition, 'provided');
+        assert.deepEqual(input.taskContinuation?.capabilities, [], 'CLI authentication contributes no inherited capability/account evidence');
+        assert.equal(input.turnCandidates?.sourceStrategyBinding, undefined);
+        return FAKE_AGENT;
+      }) as never,
+      runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; input: string; semanticTaskInput?: string;
+        taskContinuation?: import('../../types.js').TaskContinuationContext;
+        buildAgent: (identity: ReturnType<typeof stubBuildIdentity>) => Promise<unknown> }) => {
+        runs++;
+        assert.equal(options.input, replyText);
+        assert.equal(options.semanticTaskInput, continuityRuntime.canonicalClarificationTaskInput({
+          parentInput: rootText, question, answer: replyText,
+        }), 'private context is the complete canonical A/Q/B, not a bare answer or a CLI substitution');
+        assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).find(row => row.seq === parent.seq)?.data.text,
+          rootText, 'the accepted parent source keeps its original bytes, including the newline');
+        const replay = await continuityRuntime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: replyText }, reply.seq,
+          { continuationOnly: true, resolveCandidates: false });
+        assert.deepEqual(replay.taskContinuation, options.taskContinuation, 'the consumed proof rehydrates without taking CLI sign-in as consent');
+        await options.buildAgent(stubBuildIdentity(options));
+        return { sessionId, status: 'completed', steps: 1, lastTurn: 2,
+          publicPresentation: stubAnswerPresentation(options, 'The intended provider connection is still needed before this inspection can run.') };
+      }) as never,
+    });
+    await respondViaHarness('home', { sessionId, sourceUserSeq: reply.seq, message: replyText, channel: 'desktop' },
+      { sourceUserSeq: reply.seq, turnEngine: 'host_v1' });
+    assert.equal(runs, 1); assert.equal(builds, 1);
+    assert.equal((openEventLog().prepare('SELECT status FROM dependency_requests WHERE session_id = ?').get(sessionId) as { status: string }).status, 'open');
+    for (const table of ['logical_tool_calls', 'physical_dispatches']) assert.equal(
+      (openEventLog().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`).get(sessionId) as { n: number }).n, 0);
+  } finally {
+    continuityRuntime._setClarificationAnswerCompletenessForTests(null);
+    catalog.forgetConnectedCli('github');
   }
 });
 
