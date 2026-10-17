@@ -68,6 +68,7 @@ import { deriveWorkflowTerminalOutcome } from '../execution/workflow-terminal-ou
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { isConsoleNextEnabled, registerConsoleSpaRoutes } from '../dashboard/console-spa.js';
 import { registerSpaceRoutes } from '../dashboard/space-routes.js';
+import { registerWatchRoutes } from '../dashboard/watch-routes.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { defaultDenyAuthGate } from './auth-policy.js';
 import {
@@ -2043,6 +2044,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   // intercept GET /console/spaces/:id/view and serve the React index instead
   // of the agent-authored view.
   registerSpaceRoutes(app, isAuthorized);
+  registerWatchRoutes(app, isAuthorized);
   const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
   registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });
   app.use('/m', createMobileRouter({

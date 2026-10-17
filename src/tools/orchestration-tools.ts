@@ -21,6 +21,7 @@ import {
   readWorkflow,
   type WorkflowDefinition,
   type WorkflowEntry,
+  parseWorkflowWatch,
   type WorkflowResourceBinding,
   type WorkflowStepInput,
 } from '../memory/workflow-store.js';
@@ -964,6 +965,12 @@ const WorkflowReadParallelSubgraphSchema = z.object({
   + 'Specialists cannot write, send, call external tools, nest fan-out, or request approval; put data-fetch and effect nodes elsewhere in the workflow graph.',
 );
 
+/** What a watch is, for the model authoring one (the watch-setup skill has the how). */
+const WATCH_FIELD_GUIDANCE = 'Make this workflow one of the owner\'s watches: a standing, read-only look at a source they handed you. '
+  + 'Every step only reads (no sends). The last step returns JSON {"findings":[{"title","detail","link"?,"key"?}],"learned":["…"]}: '
+  + 'findings are new things that match what the owner asked you to look for (empty list when nothing new); learned are durable things worth remembering about their work. '
+  + 'The host keeps what it saw, raises new findings in From Clem as "Your <source> watch", and remembers what you learned. Confirm the source and scope with the owner once before saving.';
+
 const WORKFLOW_TRANSFORM_INPUT_GUIDANCE =
   'Runtime inputs containing rows use JSON strings: apply jsonParse before row/array operations. '
   + 'select.where is one object with column, op and optional value; where.value is a literal string, not an expression. '
@@ -1272,13 +1279,18 @@ export function registerOrchestrationTools(server: McpServer): void {
       portable_models: z.boolean().optional().describe('True removes per-step model pins, using intent/default routing. Omit/false preserves pins.'),
       allowSends: z.boolean().optional().describe('Allow autonomous sends/publishes without approval gates. Defaults to true (autonomous). Set false for strict mode: any send-looking step must then carry requiresApproval: true or the save is refused.'),
       allowedTools: z.array(z.string()).optional().describe('Workflow-wide tool scope: discovered tool names every step without its own allowedTools may use.'),
+      watch: z.object({
+        source: z.string().min(1).describe('What you watch for the owner, in their words, e.g. "Slack #platform-49", "my Outlook inbox", "the Q4 Drive folder".'),
+        look_for: z.string().min(1).describe('What matters to the owner there, in their words, e.g. "a client who sounds unhappy".'),
+        purpose: z.enum(['learn', 'tell_me']).optional().describe('tell_me (default) raises what matters in From Clem; learn only remembers what you see.'),
+      }).optional().describe(WATCH_FIELD_GUIDANCE),
       goal: z.object({
         objective: z.string().min(4).describe('What a completed run must achieve — judged externally at run completion.'),
         success_criteria: z.array(z.string()).optional().describe('Reusable pass/fail rules for each run against its current inputs. Keep sample-specific expected values in the current acceptance check, not the saved goal, unless the user requires that constant on every run. File paths are checked deterministically; other criteria by a judge. Empty means judge the objective.'),
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3 — re-pursuit re-runs the whole workflow.'),
       }).optional().describe('External completion check. Failure re-runs with feedback, bounded by max_attempts; never after an irreversible step. Exhaustion reports criterion evidence.'),
     },
-    async ({ name, description, enabled, steps, project, trigger_schedule, trigger_once_at, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, allowedTools, goal }) => {
+    async ({ name, description, enabled, steps, project, trigger_schedule, trigger_once_at, trigger_timezone, trigger_webhook_path, trigger_events, inputs, resources, test_inputs, synthesis_prompt, portable_models, allowSends, allowedTools, goal, watch }) => {
       // The already-running primary model owns semantic topology. Refuse a
       // missing graph even for direct/internal callers that bypass the tool
       // schema; keyword synthesis here would be a second, less-informed author.
@@ -1356,6 +1368,10 @@ export function registerOrchestrationTools(server: McpServer): void {
           ? { allowedTools: allowedTools.map((tool) => tool.trim()).filter(Boolean) }
           : {}),
         ...(goal ? { goal: { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts } } : {}),
+        ...((): Partial<WorkflowDefinition> => {
+          const parsed = watch ? parseWorkflowWatch(watch) : undefined;
+          return parsed ? { watch: parsed } : {};
+        })(),
         resources: Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined,
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
@@ -2138,8 +2154,14 @@ export function registerOrchestrationTools(server: McpServer): void {
         max_attempts: z.number().min(1).max(3).optional().describe('Total run attempts (original + automatic re-pursuits). Default 2, ceiling 3.'),
       }).optional().describe('PINNED RUN GOAL (run-to-completion) — see workflow_create. Pass to set/replace; use clear_goal to remove.'),
       clear_goal: z.boolean().optional().describe('Pass true to remove an existing pinned goal.'),
+      watch: z.object({
+        source: z.string().min(1).describe('What you watch for the owner, in their words, e.g. "Slack #platform-49", "my Outlook inbox", "the Q4 Drive folder".'),
+        look_for: z.string().min(1).describe('What matters to the owner there, in their words, e.g. "a client who sounds unhappy".'),
+        purpose: z.enum(['learn', 'tell_me']).optional().describe('tell_me (default) raises what matters in From Clem; learn only remembers what you see.'),
+      }).optional().describe(WATCH_FIELD_GUIDANCE),
+      clear_watch: z.boolean().optional().describe('Pass true to stop treating this workflow as a watch.'),
     },
-    async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_once_at, clear_trigger_once_at, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal }) => {
+    async ({ name, description, steps, project, clear_project, trigger_schedule, trigger_once_at, clear_trigger_once_at, trigger_timezone, clear_trigger_schedule, trigger_webhook_path, clear_trigger_webhook_path, trigger_events, clear_trigger_events, inputs, resources, clear_resources, test_inputs, synthesis_prompt, portable_models, allowSends, goal, clear_goal, watch, clear_watch }) => {
       // OpenAI strict function schemas materialize omitted nullable optionals as
       // `null`. workflow_update is a PATCH surface: null must mean "omitted",
       // never "clear this field" and never `.trim()` on null. Preserve explicit
@@ -2166,6 +2188,8 @@ export function registerOrchestrationTools(server: McpServer): void {
       allowSends = allowSends ?? undefined;
       goal = goal ?? undefined;
       clear_goal = clear_goal ?? undefined;
+      watch = watch ?? undefined;
+      clear_watch = clear_watch ?? undefined;
 
       let inputsSchema: Record<string, { type?: 'string' | 'number'; default?: string; description?: string }>;
       try {
@@ -2235,6 +2259,12 @@ export function registerOrchestrationTools(server: McpServer): void {
         delete next.goal;
       } else if (goal) {
         next.goal = { objective: goal.objective, successCriteria: goal.success_criteria, maxAttempts: goal.max_attempts };
+      }
+      if (clear_watch) {
+        delete next.watch;
+      } else if (watch) {
+        const parsed = parseWorkflowWatch(watch);
+        if (parsed) next.watch = parsed;
       }
 
       const triggerPatch = applyWorkflowTriggerPatch(next.trigger, {

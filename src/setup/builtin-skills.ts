@@ -22,12 +22,14 @@ export const TECHNICAL_CONTENT_MARKETING_RULE_MARKER =
 export const WORKSPACE_BUILDER_SKILL = 'workspace-builder' as const;
 export const PEOPLE_LOOKUP_SKILL = 'people-lookup' as const;
 export const WORKFLOW_BUILDER_SKILL = 'workflow-builder' as const;
+export const WATCH_SETUP_SKILL = 'watch-setup' as const;
 
 const BUILTIN_SKILLS = Object.freeze([
   TECHNICAL_CONTENT_MARKETING_SKILL,
   WORKSPACE_BUILDER_SKILL,
   PEOPLE_LOOKUP_SKILL,
   WORKFLOW_BUILDER_SKILL,
+  WATCH_SETUP_SKILL,
 ]);
 
 /**

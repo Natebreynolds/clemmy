@@ -21,6 +21,7 @@ import {
   FolderOpen,
   Workflow,
   HeartPulse,
+  Eye,
   FolderKanban,
   type LucideIcon,
 } from 'lucide-react';
@@ -63,6 +64,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/projects', label: 'Projects', icon: FolderKanban, hint: 'What you are working on, who is on it and what it needs from you' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
+  { path: '/watching', label: 'Watching', icon: Eye, hint: 'What Clem can see: the sources you handed her to keep an eye on' },
   { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
