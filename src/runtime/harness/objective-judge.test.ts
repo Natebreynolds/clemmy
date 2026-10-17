@@ -1702,3 +1702,13 @@ test('an answer that wrote a local file keeps the second-model review', async ()
   _setCompletionJudgeForTests(unavailableSettingsJudge);
   _setTypesafeKeyForTests(undefined);
 });
+
+test('the live completion review weighs an explained judgment call by its basis; the frozen legacy rubric is unchanged', async () => {
+  // Live 2026-10-17: three review rounds re-argued a research report's
+  // classification of borderline repos and finished work ended blocked.
+  const { buildCompletionJudgeInstructions, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const live = buildCompletionJudgeInstructions({ fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE } as never);
+  assert.match(live, /JUDGMENT CALLS: a choice the response makes and explains/);
+  assert.match(live, /facts, counts and quoted values stay checked as strictly as before/);
+  assert.doesNotMatch(JUDGE_SYSTEM_PROMPT, /JUDGMENT CALLS/, 'the legacy rubric keeps its exact bytes');
+});
