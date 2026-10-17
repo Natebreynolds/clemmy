@@ -2829,13 +2829,13 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 721411
+          "bytes": 725766
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
         },
         "src/execution/workflow-target-evidence.ts": {
-          "bytes": 40931
+          "bytes": 41479
         },
         "src/agents/goal-outcome-progress.ts": {
           "bytes": 26486
@@ -6738,13 +6738,13 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 721411
+          "bytes": 725766
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
         },
         "src/execution/workflow-target-evidence.ts": {
-          "bytes": 40931
+          "bytes": 41479
         },
         "src/agents/goal-outcome-progress.ts": {
           "bytes": 26486
