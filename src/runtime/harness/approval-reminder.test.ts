@@ -166,6 +166,25 @@ test('an approval still unanswered 30 minutes after it was requested gets exactl
   assert.equal(reg.get(row.approvalId)?.remindedAt, recorded?.remindedAt);
 });
 
+test('a card in Clem\'s words is reminded in those words: no tool name, code or ids', async () => {
+  const { approvalReminderCopy } = await import('./approval-reminder.js');
+  const copy = approvalReminderCopy({
+    subject: 'kernel__execute_playwright_code',
+    preview: {
+      operation: 'kernel__execute_playwright_code',
+      fields: [
+        { name: 'code', value: 'await page.waitForTimeout(2500);' },
+        { name: 'session_id', value: 'ux1uroybv3buj6uwg25r1ggc' },
+      ],
+      ask: 'The browser is open — can I read @creator’s profile stats and recent video captions?',
+    },
+    waitedMs: 31 * 60_000,
+  });
+  assert.equal(copy.title, 'The browser is open — can I read @creator’s profile stats and recent video captions?');
+  assert.equal(copy.body, 'Waiting 31 minutes for your answer.');
+  assert.doesNotMatch(`${copy.title}\n${copy.body}`, /kernel__|waitForTimeout|ux1uro|Session id|Code:/);
+});
+
 test('a card raised without a preview is reminded from its exact frozen call', () => {
   const session = createSession({ kind: 'chat' });
   // The live shape: planned work wraps a broker call whose arguments are a

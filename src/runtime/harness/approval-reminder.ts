@@ -127,6 +127,17 @@ export function approvalReminderCopy(input: {
   preview: ApprovalCallPreview | null;
   waitedMs: number;
 }): { title: string; body: string } {
+  // The card in Clem's words is the reminder: her question, as the owner saw
+  // it on the card. Tool names, raw arguments and ids never stand in for it
+  // (live 2026-10-18: a TikTok read was reminded as "Still waiting on you:
+  // kernel__execute_playwright_code" with its browser code and a session id).
+  const ask = oneLine(input.preview?.ask ?? '');
+  if (ask) {
+    return {
+      title: clip(ask, REMINDER_TITLE_MAX_CHARS),
+      body: clip(`Waiting ${waitedPhrase(input.waitedMs)} for your answer.`, REMINDER_BODY_MAX_CHARS),
+    };
+  }
   const operation = oneLine(input.preview?.operation ?? '');
   const headline = oneLine(input.subject) || operation || 'an approval';
   const title = clip(`Still waiting on you: ${headline}`, REMINDER_TITLE_MAX_CHARS);
