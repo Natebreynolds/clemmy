@@ -330,14 +330,14 @@ export const getCredentials = () =>
 
 // ─── Codex re-auth — the SAME proven daemon endpoints the legacy console uses ──
 // Local: opens a browser + loopback callback on the daemon (desktop only).
-export const codexReauthLocal = () =>
-  apiPost<{ ok?: boolean; message?: string; error?: string }>('/api/console/auth/codex-login');
+export const codexReauthLocal = (signal?: AbortSignal) =>
+  api<{ ok?: boolean; message?: string; error?: string }>('/api/console/auth/codex-login', { method: 'POST', signal });
 // Remote: device-code flow — works from any device / over the tunnel.
 export interface CodexDeviceBegin { loginId?: string; verificationUri?: string; userCode?: string; intervalSeconds?: number; expiresAt?: string; error?: string; message?: string }
-export const codexDeviceBegin = () =>
-  apiPost<CodexDeviceBegin>('/api/console/auth/codex-device/begin');
-export const codexDevicePoll = (loginId: string) =>
-  apiPost<{ status?: 'complete' | 'pending' | 'expired'; message?: string; error?: string }>('/api/console/auth/codex-device/poll', { loginId });
+export const codexDeviceBegin = (signal?: AbortSignal) =>
+  api<CodexDeviceBegin>('/api/console/auth/codex-device/begin', { method: 'POST', signal });
+export const codexDevicePoll = (loginId: string, signal?: AbortSignal) =>
+  api<{ status?: 'complete' | 'pending' | 'expired' | 'error'; message?: string; error?: string }>('/api/console/auth/codex-device/poll', { method: 'POST', body: JSON.stringify({ loginId }), signal });
 // ─── xAI (Grok) subscription sign-in — RFC 8628 device code ──────────────────
 // One flow for every surface: no redirect URI, no loopback listener, so the
 // SAME path works on desktop, over the tunnel, and from a phone.
@@ -350,10 +350,10 @@ export interface XaiDeviceBegin {
   expiresAt?: string;
   error?: string;
 }
-export const xaiDeviceBegin = () =>
-  apiPost<XaiDeviceBegin>('/api/console/auth/xai-device/begin');
-export const xaiDevicePoll = (loginId: string) =>
-  apiPost<{ status?: 'complete' | 'pending' | 'slow_down' | 'denied' | 'expired' | 'error'; intervalSeconds?: number; message?: string; error?: string }>('/api/console/auth/xai-device/poll', { loginId });
+export const xaiDeviceBegin = (signal?: AbortSignal) =>
+  api<XaiDeviceBegin>('/api/console/auth/xai-device/begin', { method: 'POST', signal });
+export const xaiDevicePoll = (loginId: string, signal?: AbortSignal) =>
+  api<{ status?: 'complete' | 'pending' | 'slow_down' | 'denied' | 'expired' | 'error'; intervalSeconds?: number; message?: string; error?: string }>('/api/console/auth/xai-device/poll', { method: 'POST', body: JSON.stringify({ loginId }), signal });
 export const xaiAuthStatus = () =>
   apiGet<{ connected: boolean; expiresAt?: string; lastRefresh?: string; expiresSoon?: boolean }>('/api/console/auth/xai/status');
 export const xaiDisconnect = () =>

@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, KeyRound, RotateCw, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import { clemmy } from '@/lib/clemmy';
 import { getCredentials, codexReauthLocal, codexDeviceBegin, codexDevicePoll } from '@/lib/connect';
+import { createSignInAttemptOwner, deviceSignInDeadline, deviceSignInPollDelay } from '@/lib/sign-in-attempt';
 
 /**
  * Codex (OpenAI) re-auth — the SAME proven daemon endpoints the legacy console
@@ -23,47 +24,69 @@ export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: (
   const [device, setDevice] = useState<{ uri: string; code: string } | null>(null);
   const [deviceStatus, setDeviceStatus] = useState('');
   const [deviceBusy, setDeviceBusy] = useState(false);
+  const attempts = useRef(createSignInAttemptOwner());
+  useEffect(() => () => attempts.current.stop(), []);
 
   const runLocal = async () => {
+    const attempt = attempts.current.begin();
+    setDevice(null); setDeviceStatus(''); setDeviceBusy(false);
     setLocalErr(''); setLocalState('opening');
     try {
-      const r = await codexReauthLocal();
+      const r = await codexReauthLocal(attempt.signal);
+      if (!attempt.isCurrent()) return;
       if (r && r.ok) {
         setLocalState('done'); onDone();
-        setTimeout(() => setLocalState('idle'), 2500);
+        attempt.later(() => setLocalState('idle'), 2500);
       } else {
         setLocalState('idle'); setLocalErr((r && (r.message || r.error)) || 'Re-auth failed.');
       }
-    } catch (e) { setLocalState('idle'); setLocalErr((e as Error).message || 'Re-auth failed.'); }
+    } catch (e) { if (attempt.isCurrent()) { setLocalState('idle'); setLocalErr((e as Error).message || 'Re-auth failed.'); } }
   };
 
   const runRemote = async () => {
+    const attempt = attempts.current.begin();
+    setLocalState('idle');
     setLocalErr(''); setDeviceBusy(true); setDeviceStatus('Requesting a sign-in code…'); setDevice(null);
+    const cancelBeginTimeout = attempt.later(() => {
+      setDeviceStatus('The sign-in code request timed out. Try again.'); setDeviceBusy(false); attempt.stop();
+    }, 30_000);
     try {
-      const start = await codexDeviceBegin();
+      const start = await codexDeviceBegin(attempt.signal);
+      if (!attempt.isCurrent()) return;
+      cancelBeginTimeout();
       if (!start.loginId || !start.verificationUri || !start.userCode) {
         setDeviceStatus(`Couldn't start device login: ${start.error || start.message || 'unknown error'}`); setDeviceBusy(false); return;
       }
+      const expiresAt = deviceSignInDeadline(start.expiresAt, 900_000);
+      if (expiresAt === null) { setDeviceStatus('Couldn’t confirm the sign-in code’s expiry. Try again.'); setDeviceBusy(false); return; }
       setDevice({ uri: start.verificationUri, code: start.userCode });
       setDeviceStatus('Waiting for sign-in…');
-      const intervalMs = Math.max(3, start.intervalSeconds || 5) * 1000;
-      const expiresAt = start.expiresAt ? Date.parse(start.expiresAt) : Date.now() + 900_000;
+      const intervalMs = deviceSignInPollDelay(start.intervalSeconds);
       const loginId = start.loginId;
+      const expired = () => {
+        setDeviceStatus('Code expired — click “Sign in on another device” to retry.'); setDeviceBusy(false); attempt.stop();
+      };
+      const cancelExpiry = attempt.later(expired, Math.max(1, expiresAt - Date.now()));
+      const later = () => attempt.later(() => { void poll(); }, Math.min(intervalMs, Math.max(1, expiresAt - Date.now())));
       const poll = async () => {
-        if (Date.now() > expiresAt) { setDeviceStatus('Code expired — click “Sign in on another device” to retry.'); setDeviceBusy(false); return; }
+        if (!attempt.isCurrent()) return;
+        if (Date.now() >= expiresAt) { expired(); return; }
         try {
-          const res = await codexDevicePoll(loginId);
+          const res = await codexDevicePoll(loginId, attempt.signal);
+          if (!attempt.isCurrent()) return;
           if (res.status === 'complete') {
+            cancelExpiry();
             setDeviceStatus('Signed in'); onDone();
-            setTimeout(() => { setDevice(null); setDeviceStatus(''); setDeviceBusy(false); }, 2500);
+            attempt.later(() => { setDevice(null); setDeviceStatus(''); setDeviceBusy(false); }, 2500);
             return;
           }
-          if (res.status === 'expired') { setDeviceStatus('Code expired — try again.'); setDeviceBusy(false); return; }
-          setDeviceStatus('Waiting for sign-in…'); setTimeout(poll, intervalMs); // pending
-        } catch { setDeviceStatus('Network hiccup — retrying…'); setTimeout(poll, intervalMs); }
+          if (res.status === 'expired') { cancelExpiry(); setDeviceStatus('Code expired — try again.'); setDeviceBusy(false); return; }
+          if (res.status !== 'pending') { cancelExpiry(); setDeviceStatus(res.message || res.error || 'Sign-in failed. Try again.'); setDeviceBusy(false); return; }
+          setDeviceStatus('Waiting for sign-in…'); later();
+        } catch { if (attempt.isCurrent()) { setDeviceStatus('Network hiccup — retrying…'); later(); } }
       };
-      setTimeout(poll, intervalMs);
-    } catch (e) { setDeviceStatus(`Device login failed: ${(e as Error).message}`); setDeviceBusy(false); }
+      later();
+    } catch (e) { if (attempt.isCurrent()) { cancelBeginTimeout(); setDeviceStatus(`Device login failed: ${(e as Error).message}`); setDeviceBusy(false); } }
   };
 
   return (
