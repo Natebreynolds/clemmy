@@ -261,7 +261,7 @@ export function deriveWorkReviewCandidates(
         key: `run_failed:${run.runId}`,
         kind: 'run_failed',
         subject: run.workflow,
-        detail: `${run.workflow} failed ${formatWhen(finished, nowMs, 'at')}${run.error ? `: ${short(run.error, 160)}` : '.'}`,
+        detail: `${readableWorkflowName(run.workflow)} failed ${formatWhen(finished, nowMs, 'at')}${run.error ? `: ${short(run.error, 160)}` : '.'}`,
         ref: { type: 'workflow_run', id: run.runId },
         refs: [run.runId],
         count: 1,
@@ -287,8 +287,8 @@ export function deriveWorkReviewCandidates(
       kind: 'run_waiting',
       subject: workflow,
       detail: n === 1
-        ? `${workflow} has been waiting on you ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ' for a connection' : ''}.`
-        : `${n} runs of ${workflow} are waiting on you, the oldest ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ', one for a connection' : ''}.`,
+        ? `${readableWorkflowName(workflow)} has been waiting on you ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ' for a connection' : ''}.`
+        : `${n} runs of ${readableWorkflowName(workflow)} are waiting on you, the oldest ${formatWhen(group.oldest, nowMs, 'since')}${group.connection ? ', one for a connection' : ''}.`,
       ref: { type: 'workflow_run', id: group.runs[0].runId },
       refs: group.runs.map((r) => r.runId),
       count: n,
