@@ -1439,6 +1439,25 @@ test('the reviewer sees the standing instructions of the agent a reply was writt
     'the agent section only adds to what a plain reply is judged on');
 });
 
+test('a skill\'s method advice reaches the reviewer as guidance judged by its effect, never as the owner\'s prohibition', () => {
+  // Live 2026-10-18: a Space build tested its new button once against the
+  // state file it had just created, reset it, and found an example runner by
+  // listing Space folders. The reviewer read the skill's "never prove a
+  // button works by a write" and a tool's "read runners with the runner
+  // tool" as the owner's prohibitions and returned BLOCKED for a working
+  // Space, so its one wrong price went out uncorrected.
+  const prompt = buildObjectiveJudgePrompt('build a Space with a mark-read button', 'Built the Space.', {
+    skills: [{ name: 'workspace-builder', body: 'Never prove a button works by performing a write on the user\'s real data.' }],
+    toolCallSummary: '',
+  });
+  assert.match(prompt, /RETAINED SKILL REFERENCES/);
+  assert.match(prompt, /advice about method \(how to test, which tool to read with\) guides the assistant; it is not the owner's prohibition/);
+  assert.match(prompt, /changed the owner's data or reached anyone must be stated plainly/);
+  assert.match(prompt, /A departure never makes the requested work BLOCKED/);
+  const plain = buildObjectiveJudgePrompt('build a Space', 'Built the Space.', { skills: [], toolCallSummary: '' });
+  assert.doesNotMatch(plain, /advice about method/, 'only a review that holds a skill carries the clause');
+});
+
 test('a read-only answer never waits on its review longer than the read time box', async () => {
   // Live 2026-10-05: a workflow list answered in 2 s and then sat 93 s on a
   // hung confirming review before failing open. The wall is the goal-judge
