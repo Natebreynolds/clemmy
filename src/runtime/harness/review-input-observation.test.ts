@@ -404,3 +404,66 @@ test('an active unsupported prompt override stays unqualified without being call
   assert.equal(await observed.wrap(inner).getResponse(req), original);
   assert.equal(observed.finish([original], 'DONE: controlled.').status, 'bound');
 });
+
+test('a second review round continues the first round\'s exact conversation with only what changed, and both rounds stay bound', async () => {
+  const { _resetReviewConversationsForTests } = await import('./review-continuation.js');
+  _resetReviewConversationsForTests();
+  const evidence = { refKind: 'call ids', refs: () => ['controlled_ref'], resolve: () => ({ text: 'controlled result' }) };
+  const round = (candidate: string, toolCallSummary: string) => {
+    const context = { skills: [], toolCallSummary, fullSourceEvidence: true,
+      completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE, agentInstructions: 'controlled standing rule' };
+    let instructions: ReviewInputSeed['instructions'] | undefined; let prompt: ReviewInputSeed['prompt'] | undefined;
+    const instructionText = buildCompletionJudgeInstructions(context, value => { instructions = value; });
+    const promptText = buildObjectiveJudgePrompt('controlled objective', candidate, context, value => { prompt = value; });
+    return { instructionText, promptText, value: { ...seed(), candidateDigest: digest(candidate), instructions: instructions!, prompt: prompt! } };
+  };
+  const requests: ModelRequest[] = []; const records: ReviewInputObservation[] = [];
+  const replies = ['CORRECT: (1) "the second claim" is not supported by the evidence.', 'DONE: controlled.'];
+  const route = { modelId: 'controlled-reviewer', judgeFamily: 'byo', brainFamily: 'byo', selfJudge: false,
+    model: { async getResponse(current: ModelRequest) {
+      requests.push(current); return response(replies[requests.length - 1]);
+    }, async *getStreamedResponse() {} } };
+  const review = (input: ReturnType<typeof round>) => withModelUsageAttribution({ ...owner }, () => runRoutedJudgeAttempt(
+    route as never, input.instructionText, input.promptText, parseCompletionVerdict, true, evidence, undefined, 'medium',
+    undefined, { input: record => { records.push(record); } }, undefined, input.value));
+  // Evidence the size a real review carries; the round's closing rules are a
+  // small share of it, as they are live.
+  const evidenceRows = Array.from({ length: 300 }, (_, index) => `controlled source row ${index}: a retained result line`).join('\n');
+  const first = await review(round('The first candidate, with the second claim.', `controlled source evidence\n${evidenceRows}`));
+  assert.equal(first.done, false);
+  const second = await review(round('The revised candidate.',
+    `controlled source evidence\n${evidenceRows}\n[HISTORICAL COMPLETION FINDING] the second claim was unsupported`));
+  assert.equal(second.done, true);
+  assert.equal(requests.length, 2);
+  const firstInput = requests[0]!.input as unknown[];
+  const secondInput = requests[1]!.input as unknown[];
+  // The second request is the first round exactly (its prompt and its verdict),
+  // then one new message: what the provider can reuse instead of re-reading.
+  assert.deepEqual(secondInput.slice(0, firstInput.length), firstInput);
+  assert.equal(secondInput.length, firstInput.length + 2, 'the earlier verdict, then the new message');
+  const message = secondInput.at(-1) as { role: string; content: string };
+  assert.equal(message.role, 'user');
+  assert.match(message.content, /^=== REVISED RESPONSE: REVIEW AGAIN ===/);
+  assert.match(message.content, /as a complete review, against the whole objective and all of the evidence/);
+  assert.match(message.content, /The revised candidate\./);
+  assert.match(message.content, /Added to the evidence since your first review:\n\[HISTORICAL COMPLETION FINDING\] the second claim was unsupported/);
+  assert.doesNotMatch(message.content, /Objective: controlled objective/, 'the unchanged objective is not sent again');
+  assert.doesNotMatch(message.content, /The first candidate/, 'the superseded response is only in the earlier turn');
+  assert.equal(requests[1]!.systemInstructions, requests[0]!.systemInstructions);
+  assert.equal(records.length, 2);
+  bound(records[0]!);
+  assert.deepEqual(bound(records[1]!).components.map(item => item.name).filter(name => name === 'review_revision'), ['review_revision']);
+
+  // A changed objective is a different review: the next round starts fresh.
+  const fresh = round('Another candidate.', `controlled source evidence\n${evidenceRows}`);
+  const changed = { ...fresh, promptText: fresh.promptText.replace('controlled objective', 'a different objective') };
+  let changedPrompt: ReviewInputSeed['prompt'] | undefined;
+  buildObjectiveJudgePrompt('a different objective', 'Another candidate.', { skills: [], toolCallSummary: `controlled source evidence\n${evidenceRows}`,
+    fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE, agentInstructions: 'controlled standing rule' },
+  value => { changedPrompt = value; });
+  replies.push('DONE: controlled.');
+  await review({ ...changed, value: { ...changed.value, objectiveDigest: digest('a different objective'), prompt: changedPrompt! } });
+  const third = requests[2]!.input as Array<{ role?: string; content?: string }>;
+  assert.equal(third.length, 1, 'a fresh round carries only its own prompt');
+  assert.match(String(third[0]?.content), /a different objective/);
+});

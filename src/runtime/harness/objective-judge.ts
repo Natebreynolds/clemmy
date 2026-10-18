@@ -37,9 +37,10 @@ import { completedModelResponseBinding, type CompletedModelResponseBinding } fro
 import { COMPLETION_DECISION_ASSESSMENT_INSTRUCTIONS, parseCompletionDecisionAssessment,
   type CompletionReviewAssessmentDiagnostic } from './completion-decision-assessment.js';
 import { modelUsageAttributionStorage } from '../usage-log.js';
-import { composeReviewInput, createReviewInputObservation,
+import { composeReviewInput, continuesReview, createReviewInputObservation,
   type ReviewInputComposition, type ReviewInputPart, type ReviewInputOwner,
   type ReviewInputSeed, type ReviewInputObservation } from './review-input-observation.js';
+import { continuedReviewRound, rememberReviewRound, reviewConversationKey } from './review-continuation.js';
 
 /** An observer never changes the joined bytes or becomes review authority. */
 function joinReviewParts(parts: readonly ReviewInputPart[], separator: string,
@@ -1329,7 +1330,7 @@ const ambiguousAssessmentOriginals = new WeakSet<object>();
 /** Capture originals before Runner aggregation. Serialized observations, raw
  * response clones and prior replies cannot mint this same-call join. */
 function captureAssessmentOriginal(inner: Model, seed: ReviewInputSeed | undefined,
-  instructions: string, prompt: string, signal?: AbortSignal) {
+  instructions: string, prompt: string, signal?: AbortSignal, continuedFrom?: readonly unknown[]) {
   const token = {};
   const expectedOwner = seed ? Object.freeze({ ...seed.owner }) : undefined;
   const entries = new WeakMap<object, { snapshot: string; binding?: CompletedModelResponseBinding;
@@ -1356,7 +1357,8 @@ function captureAssessmentOriginal(inner: Model, seed: ReviewInputSeed | undefin
         const first = typeof input === 'string' ? undefined : input[0] as {role?:unknown;content?:unknown} | undefined;
         valid = sameOwner() && !signal?.aborted && !request.signal?.aborted
           && request.systemInstructions === instructions
-          && (typeof input === 'string' ? input === prompt : first?.role === 'user' && first?.content === prompt);
+          && (continuedFrom ? continuesReview(input, prompt, continuedFrom)
+            : typeof input === 'string' ? input === prompt : first?.role === 'user' && first?.content === prompt);
       } catch { /* absent proof cannot authorize approval */ }
       const telemetry: Readonly<ResilienceTelemetryEvent>[] = [];
       const response = await withModelResilienceTelemetry(event => { telemetry.push(event); },
@@ -1480,6 +1482,17 @@ export async function runRoutedJudgeAttempt<T>(
   const reviewEffort = effort;
   const agentInstructions = evidence && routing.judgeFamily === 'claude'
     ? `${reviewInstructions}${INSTRUCTION_CACHE_DELIM}` : evidence ? reviewInstructions : instructions;
+  // A later round of the same request continues the earlier round's exact
+  // conversation, so the provider reuses it instead of reading the unchanged
+  // objective and evidence again at full price (review-continuation.ts). It is
+  // still a complete review; anything that does not line up is a fresh round.
+  const conversationKey = evidence && selectedInput?.stage === 'completion' && requireCompletePrompt && routing.model
+    ? reviewConversationKey(selectedInput.owner, routing.modelId) : null;
+  let continued = conversationKey
+    ? continuedReviewRound(conversationKey, { instructions: agentInstructions, prompt: selectedInput!.prompt, evidenceReferences })
+    : null;
+  if (continued && !completionJudgeContextAdmissionWithBudget(routing.modelId, reviewInstructions,
+    `${JSON.stringify(continued.history)}${continued.message}`, outputBudget).fits) continued = null;
   let inputCollector: ReturnType<typeof createReviewInputObservation> | undefined;
   let observedRouting = routing;
   if (selectedInput && routing.model) try {
@@ -1490,14 +1503,17 @@ export async function runRoutedJudgeAttempt<T>(
         ...(evidence ? [{ text: evidenceGuidance, component: 'evidence_tool_guidance' as const }] : []),
         ...(evidence && routing.judgeFamily === 'claude' ? [INSTRUCTION_CACHE_DELIM] : []),
       ], ''),
-      prompt: composeReviewInput([selectedInput.prompt,
-        ...(evidence ? [{ text: evidenceReferences, component: 'evidence_reference_inventory' as const }] : []),
-      ], ''),
-    }, { signal, ownerAtEntry: reviewOwnerAtModelEntry });
+      prompt: continued
+        ? composeReviewInput([{ text: continued.message, component: 'review_revision' }], '')
+        : composeReviewInput([selectedInput.prompt,
+          ...(evidence ? [{ text: evidenceReferences, component: 'evidence_reference_inventory' as const }] : []),
+        ], ''),
+    }, { signal, ownerAtEntry: reviewOwnerAtModelEntry, ...(continued ? { continuedFrom: continued.history } : {}) });
     observedRouting = { ...routing, model: inputCollector.wrap(routing.model) };
   } catch { /* input observation cannot change review routing or execution */ }
   const originalCapture = assessment && observedRouting.model
-    ? captureAssessmentOriginal(observedRouting.model, selectedInput, agentInstructions, reviewPrompt, signal) : undefined;
+    ? captureAssessmentOriginal(observedRouting.model, selectedInput, agentInstructions,
+      continued ? continued.message : reviewPrompt, signal, continued?.history) : undefined;
   if (originalCapture) observedRouting = { ...observedRouting, model: originalCapture.model };
   const agent = evidence
     ? buildJudgeAgent(observedRouting, agentInstructions,
@@ -1508,7 +1524,9 @@ export async function runRoutedJudgeAttempt<T>(
     const observed = observe?.priorOpinion?.(priorOpinionDisposition);
     if (observed && typeof (observed as PromiseLike<unknown>).then === 'function') void Promise.resolve(observed).catch(() => {});
   } catch { /* diagnostics cannot change a reviewer request */ }
-  const result = await runner.run(agent, reviewPrompt, { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
+  const result = await runner.run(agent,
+    continued ? [...continued.history, { role: 'user', content: continued.message }] as never : reviewPrompt,
+    { maxTurns: evidence ? JUDGE_EVIDENCE_LOOKUP_BUDGET + 2 : 1, signal });
   signal?.throwIfAborted();
   const observeResponder = (responses: typeof result.rawResponses): void => {
     // Adapter response metadata is wire evidence; assistant prose and the
@@ -1524,6 +1542,13 @@ export async function runRoutedJudgeAttempt<T>(
   let inputObservation = inputCollector?.finish(result.rawResponses, result.finalOutput);
   let value = assessment ? assessment.answer(result.finalOutput, originalCapture?.finish(result.rawResponses, result.finalOutput))
     : parse(result.finalOutput);
+  // The round answered in its own words: keep its exact conversation so a
+  // later round of this request can continue it. A restated verdict below is
+  // a separate call and is not part of that conversation.
+  if (value !== null && conversationKey && selectedInput) try {
+    rememberReviewRound(conversationKey, { instructions: agentInstructions, history: result.history as unknown[],
+      prompt: selectedInput.prompt, continued: Boolean(continued) });
+  } catch { /* remembering a round is an optimisation only */ }
   if (value === null) {
     // Live 2026-09-24 (source 294528): a flagship reviewer wrote a 2,800-token
     // review of three drafts and never emitted the one verdict line; the

@@ -11,7 +11,9 @@ export type ReviewInputComponentName =
   | 'effective_objective' | 'candidate_response' | 'private_review_evidence'
   | 'coverage_ledger' | 'retained_skill_references' | 'standing_instructions'
   | 'memory_requirement_context' | 'evidence_tool_guidance' | 'evidence_reference_inventory'
-  | 'coverage_followup' | 'verdict_restatement_instructions' | 'verdict_restatement_input';
+  | 'coverage_followup' | 'verdict_restatement_instructions' | 'verdict_restatement_input'
+  /** A later review round's new message, sent after the earlier round's exact conversation. */
+  | 'review_revision';
 
 export interface ReviewInputComponent {
   readonly name: ReviewInputComponentName;
@@ -35,6 +37,7 @@ const componentNames = new Set<string>([
   'candidate_response', 'private_review_evidence', 'coverage_ledger', 'retained_skill_references',
   'standing_instructions', 'memory_requirement_context', 'evidence_tool_guidance',
   'evidence_reference_inventory', 'coverage_followup', 'verdict_restatement_instructions', 'verdict_restatement_input',
+  'review_revision',
 ]);
 const hash = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
@@ -386,11 +389,25 @@ function requestSnapshot(request: ModelRequest) {
     toolsSha256: hash(canonical(request.tools)), toolCount: request.tools.length });
 }
 
-function hasInitialPrompt(input: ModelRequest['input'], prompt: string): boolean {
+function hasInitialPrompt(input: ModelRequest['input'], prompt: string, continuedFrom?: readonly unknown[]): boolean {
+  if (continuedFrom) return continuesReview(input, prompt, continuedFrom);
   if (typeof input === 'string') return input === prompt;
   const first = input[0] as { role?: unknown; content?: unknown } | undefined;
   // Exact structural SDK message, never substring/prefix matching or inferred prose.
   return first?.role === 'user' && first.content === prompt;
+}
+
+/** A continued review round: the earlier round's exact conversation, item for
+ *  item, then this round's message as the next user turn. Nothing else. */
+export function continuesReview(input: ModelRequest['input'], prompt: string, history: readonly unknown[]): boolean {
+  if (typeof input === 'string' || history.length === 0 || input.length <= history.length) return false;
+  const next = input[history.length] as { role?: unknown; content?: unknown } | undefined;
+  if (next?.role !== 'user' || next.content !== prompt) return false;
+  try {
+    return JSON.stringify(input.slice(0, history.length)) === JSON.stringify(history);
+  } catch {
+    return false;
+  }
 }
 
 function finalResponseText(response: unknown): string | undefined {
@@ -423,6 +440,8 @@ export function createReviewInputObservation(seed: ReviewInputSeed, options: {
   /** Read the owning request-local scope; a supplied seed alone cannot attest ownership. */
   ownerAtEntry?: () => ReviewInputOwner | undefined;
   observe?: (record: ReviewInputObservation) => unknown;
+  /** A continued round: the exact earlier conversation the prompt follows. */
+  continuedFrom?: readonly unknown[];
 } = {}): {
   wrap: (inner: Model) => Model;
   finish: (responses: readonly unknown[] | undefined, finalOutput: unknown) => ReviewInputObservation;
@@ -457,7 +476,7 @@ export function createReviewInputObservation(seed: ReviewInputSeed, options: {
           || current.attemptId !== owner.attemptId) entry.reason = 'owner_unavailable';
         else {
           entry.snapshot = requestSnapshot(request);
-          if (request.systemInstructions !== instructions.text || !hasInitialPrompt(request.input, prompt.text)) entry.reason = 'request_mismatch';
+          if (request.systemInstructions !== instructions.text || !hasInitialPrompt(request.input, prompt.text, options.continuedFrom)) entry.reason = 'request_mismatch';
         }
       }
     } catch { entry.reason = 'request_unavailable'; }
