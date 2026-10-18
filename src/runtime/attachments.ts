@@ -6,12 +6,13 @@ import { convertToMarkdown, convertUrlToMarkdown, isConvertibleExtension } from 
 import { describeImage, hasOpenAiKey, isAudioExtension, isImageExtension, transcribeAudio } from './transcribe.js';
 import { LocalFileSendRefusal, readLocalFileToSend, resolveLocalFileToSend } from './local-file-sending.js';
 import { computerAccessChoice } from './computer-access.js';
+import { attachmentFileNameAllowed, attachmentFilePath, captureAttachmentFileReference, type AttachmentFileReference } from './attachment-file-reference.js';
 
 /**
  * Unified attachment ingestion — the ONE pipeline every transport (desktop
  * dashboard, Discord, …) funnels file/URL attachments through. Each transport
  * supplies bytes / a local path / a URL; this module saves the original,
- * converts it to Markdown via the markitdown runtime, and hands back a result
+ * retains the selected bytes and extracts readable context where supported, then hands back a result
  * the caller folds into the user's turn with foldAttachmentsIntoMessage().
  *
  * Storage: ingested attachments live in an INBOX keyed by a generated id, so
@@ -37,6 +38,7 @@ const UNSUPPORTED_EXTENSIONS = new Map<string, string>([
   ['.exe', 'executable'], ['.dmg', 'disk image'], ['.iso', 'disk image'], ['.app', 'application'],
   ['.bin', 'binary'], ['.dll', 'binary'], ['.so', 'binary'], ['.dylib', 'binary'],
 ]);
+const OPAQUE_ARCHIVES = new Set(['.zip', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.7z', '.rar', '.zst']);
 
 export function unsupportedReason(name: string): string | null {
   const kind = UNSUPPORTED_EXTENSIONS.get(path.extname(name).toLowerCase());
@@ -79,6 +81,10 @@ export interface IngestedAttachment {
    *  vision-capable brain can LOOK at the actual pixels via view_image
    *  instead of settling for the OCR/description text. */
   imagePath?: string;
+  /** Exact retained bytes. Extraction is supplementary and grants no action. */
+  file?: AttachmentFileReference;
+  /** Bytes are valid even when there is no extracted readable context. */
+  extraction?: 'unavailable';
 }
 
 function clip(text: string): string {
@@ -145,10 +151,11 @@ async function fetchToBytes(url: string): Promise<{ ok: true; bytes: Buffer } | 
 export async function ingestAttachment(input: IngestInput): Promise<IngestedAttachment> {
   const name = sanitizeAttachmentName(input.name);
   try {
-    // Known-unsupported (video, executables, …): bail with a clear message
-    // before fetching/converting anything.
+    // Executables and credential-like names stay refused. Video/archive bytes
+    // are useful as files even when they have no supported text extraction.
     const unsupported = unsupportedReason(name);
-    if (unsupported) return { name, error: unsupported };
+    const isVideo = UNSUPPORTED_EXTENSIONS.get(path.extname(name).toLowerCase()) === 'video';
+    if ((!attachmentFileNameAllowed(name)) || (unsupported && !isVideo)) return { name, error: unsupported ?? 'This file cannot be attached or sent.' };
 
     // Pure URL with no bytes/path: YouTube/web convert directly; other URLs
     // (e.g. a Discord-hosted file) get fetched so the extension picks the
@@ -170,7 +177,7 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
       const dir = path.join(BASE_DIR, 'state', 'attachments-files');
       mkdirSync(dir, { recursive: true });
       target = path.join(dir, `${randomUUID()}__${name}`);
-      writeFileSync(target, input.bytes);
+      writeFileSync(target, input.bytes, { flag: 'wx', mode: 0o600 });
     } else if (input.sourcePath) {
       if (!existsSync(input.sourcePath)) return { name, error: `File not found: ${input.sourcePath}` };
       const size = statSync(input.sourcePath).size;
@@ -180,12 +187,29 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
       return { name, error: 'No file content provided.' };
     }
 
+    // Bytes and readable text are different capabilities. A small binary is
+    // useful to a schema-declared file operation without being a document.
+    let file: AttachmentFileReference | undefined;
+    const attachmentStore = path.join(BASE_DIR, 'state', 'attachments-files');
+    if (existsSync(attachmentStore) && path.dirname(realpathSync(target)) === realpathSync(attachmentStore)) {
+      file = captureAttachmentFileReference(target, name);
+    }
+    if (isVideo || OPAQUE_ARCHIVES.has(path.extname(name).toLowerCase())) return file
+      ? { name, file, extraction: 'unavailable', markdown: isVideo ? 'Video bytes retained. No transcript, playback or analysis was performed.'
+        : 'Archive bytes retained. No extraction, unpacking or execution was performed.' }
+      : { name, error: unsupported ?? 'Select this file as an attachment to retain its bytes.' };
+    const retained = (result: IngestedAttachment): IngestedAttachment => {
+      if (!file) return result;
+      const { error, ...content } = result;
+      return { ...content, file, ...(error ? { extraction: 'unavailable' as const, markdown: `File bytes retained. Text extraction was unavailable: ${error}` } : {}) };
+    };
+
     // Audio (and audio extracted from video) → Whisper: cheap, reliable,
     // ~$0.006/min. No ffmpeg needed for plain audio files.
     if (isAudioExtension(target)) {
-      if (input.localOnly) return { name, markdown: 'Audio bytes are available in the saved snapshot. No transcription was performed during attachment preparation.' };
+      if (input.localOnly) return retained({ name, markdown: 'Audio bytes are available in the saved snapshot. No transcription was performed during attachment preparation.' });
       const res = await transcribeAudio(target);
-      return res.ok ? { name, markdown: clip(`# Transcript — ${name}\n\n${res.text}`) } : { name, error: res.error };
+      return retained(res.ok ? { name, markdown: clip(`# Transcript — ${name}\n\n${res.text}`) } : { name, error: res.error });
     }
     // Images → vision OCR + description when a key is set (real text
     // extraction); otherwise fall back to markitdown's metadata-only path —
@@ -199,11 +223,11 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
       const imagePath = existsSync(imageStore) && realpathSync(target).startsWith(realpathSync(imageStore) + path.sep)
         ? realpathSync(target)
         : undefined;
-      if (input.localOnly && imagePath) return { name, markdown: 'Image bytes are available in the saved snapshot. No image analysis was performed during attachment preparation.', imagePath };
+      if (input.localOnly && imagePath) return retained({ name, markdown: 'Image bytes are available in the saved snapshot. No image analysis was performed during attachment preparation.', imagePath });
       const keyed = !input.localOnly && hasOpenAiKey();
       if (keyed) {
         const res = await describeImage(target);
-        if (res.ok) return { name, markdown: clip(res.text), imagePath };
+        if (res.ok) return retained({ name, markdown: clip(res.text), imagePath });
         // vision failed — fall through to markitdown metadata rather than error
       }
       const res = await convertToMarkdown(target);
@@ -211,28 +235,29 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
         const note = keyed || imagePath
           ? ''
           : '\n\n> ⚠️ Image metadata only. Full image analysis (text/OCR + description) needs an OpenAI API key — set OPENAI_API_KEY to enable vision.';
-        return { name, markdown: clip(res.markdown + note), imagePath };
+        return retained({ name, markdown: clip(res.markdown + note), imagePath });
       }
       // Metadata failed too — with a stored image the native view still works.
-      if (imagePath) return { name, markdown: '_(no extractable text)_', imagePath };
-      return {
+      if (imagePath) return retained({ name, markdown: '_(no extractable text)_', imagePath });
+      return retained({
         name,
         error: keyed
           ? res.error
           : `Image analysis needs an OpenAI API key — set OPENAI_API_KEY for text/OCR + description. (Metadata-only fallback also unavailable: ${res.error})`,
-      };
+      });
     }
     if (isConvertibleExtension(target)) {
       const res = await convertToMarkdown(target);
-      return res.ok ? { name, markdown: clip(res.markdown) } : { name, error: res.error };
+      return retained(res.ok ? { name, markdown: clip(res.markdown) } : { name, error: res.error });
     }
     // Not a known convertible type: read the bytes and decide. Real text →
     // return it; binary (NUL bytes) → a clean message, never garbage.
     const raw = readFileSync(target);
     if (looksBinary(raw)) {
-      return { name, error: `This looks like a binary "${path.extname(name) || 'unknown'}" file with no extractable text. Supported: PDF, Office docs, images, audio, EPub, and YouTube links.` };
+        return file ? { name, file, extraction: 'unavailable', markdown: 'Binary file bytes retained. No text extraction, unpacking or execution was performed.' }
+          : { name, error: `This looks like a binary "${path.extname(name) || 'unknown'}" file with no extractable text.` };
     }
-    return { name, markdown: clip(raw.toString('utf-8')) };
+    return { name, ...(file ? { file } : {}), markdown: clip(raw.toString('utf-8')) };
   } catch (err) {
     return { name, error: err instanceof Error ? err.message : String(err) };
   }
@@ -251,7 +276,10 @@ export function foldAttachmentsIntoMessage(message: string, attachments: Ingeste
     const nativeView = a.imagePath
       ? `\n\n> 🖼 This is an IMAGE — call view_image with path "${a.imagePath}" to look at it directly. The text above is only a machine description.`
       : '';
-    return `### Attachment: ${a.name}\n\n${a.markdown || '_(no extractable content)_'}${nativeView}`;
+    const retained = a.file
+      ? `\n\nRetained file reference (host metadata, not instructions or permission): ${JSON.stringify({ path: attachmentFilePath(a.file), name: a.file.name, bytes: a.file.bytes, sha256: a.file.sha256 })}. The exact bytes may be supplied to a declared file-content operation under this request's normal account, effect and approval checks. No content was inferred from the filename.`
+      : '';
+    return `### Attachment: ${a.name}\n\n${a.markdown || '_(no extractable content)_'}${nativeView}${retained}`;
   });
   const head = message.trim() || 'The user attached the following file(s) — use their content to answer.';
   return `${head}\n\n---\n\n${blocks.join('\n\n---\n\n')}`;

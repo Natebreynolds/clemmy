@@ -2983,6 +2983,11 @@ function registerAndEmitApprovalsOnce(
       : null;
   const workflowName = typeof metadata.workflowName === 'string' ? metadata.workflowName : null;
   const stepId = typeof metadata.stepId === 'string' ? metadata.stepId : null;
+  // Display uses this registration's accepted source, never a newer answer or
+  // the session's latest attempt. Ownership is rechecked by the preview reader.
+  const previewSource = Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0
+    ? { sessionId: options.sessionId, sourceUserSeq: options.sourceUserSeq! }
+    : undefined;
   for (const interruption of interruptions) {
     const approvalResumeKey = typeof interruption.approvalResumeKey === 'string'
       && interruption.approvalResumeKey.trim()
@@ -3096,14 +3101,14 @@ function registerAndEmitApprovalsOnce(
   // One host-owned decision for the exact compatible set already prepared in
   // this model batch. Never infer permission for a future or unprepared item.
   const firstConsent = registrations[0]?.interruption.consentCall;
-  const firstOperation = registrations[0] && approvalCallPreview(registrations[0].interruption)?.operation;
+  const firstOperation = registrations[0] && approvalCallPreview(registrations[0].interruption, true, false, previewSource)?.operation;
   if (session.sessionRow.kind === 'chat' && registrations.length > 1
     && firstConsent?.effect === 'external_write' && firstOperation
     && registrations.every(entry => entry.row.resumeKey && !entry.row.presentation && !existingApprovalCarrier(entry.row)
       && entry.interruption.consentCall?.effect === firstConsent.effect
       && entry.interruption.consentCall?.accountId === firstConsent.accountId
-      && approvalCallPreview(entry.interruption)?.operation === firstOperation)) {
-    const items = registrations.map(entry => approvalCallPreview(entry.interruption, true, true)!);
+      && approvalCallPreview(entry.interruption, true, false, previewSource)?.operation === firstOperation)) {
+    const items = registrations.map(entry => approvalCallPreview(entry.interruption, true, true, previewSource)!);
     // Keep a complete legacy view for an already-open desktop/mobile client.
     // New clients render typed items; old clients must never show just an account.
     const legacyReview = items.map((item, index) => `${index + 1}. ${item.operation}\n${item.fields
@@ -3171,7 +3176,7 @@ function registerAndEmitApprovalsOnce(
                 preview: approvalRegistry.isApprovalGroup(row) ? row.args?.preview : approvalCallPreview({
                   ...registered.interruption,
                   args: row.args,
-                }) ?? undefined,
+                }, true, false, previewSource) ?? undefined,
               }),
             approvalId: row.approvalId,
             ...(Number.isSafeInteger(options.sourceUserSeq) && (options.sourceUserSeq ?? 0) > 0

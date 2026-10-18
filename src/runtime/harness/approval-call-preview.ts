@@ -1,7 +1,11 @@
 import { scanSecrets } from './guardrails.js';
-import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
+import { isPlainOrClementineLocalTool, stripMcpTransportPrefix } from './runtime-tool-identity.js';
 import type { InterruptionInfo } from './loop.js';
 import { LocalFileSendRefusal, describeLocalFileToSend, looksLikeLocalFilePath, resolveLocalFileToSend } from '../local-file-sending.js';
+import { isAttachmentSnapshotPath, sourceOwnedAttachmentFile, type AttachmentFileSource } from '../attachment-file-reference.js';
+import { peekHostCapabilityCatalogFactory, canonicalCatalogIdentityOf } from './host-capability-catalog-factory.js';
+import { digestSchema, loadToolContract } from '../../tools/tool-contract-store.js';
+import { MCP_INLINE_FILE_MAX_BYTES, mcpFileContentField } from '../mcp-file-inputs.js';
 
 /**
  * What an approval shows a person: the operation and the exact arguments it
@@ -33,7 +37,7 @@ export function approvalJsonRecord(value: unknown): Record<string, unknown> | nu
 /** How a card names the file(s) an argument would send from this computer;
  * undefined when the argument names no local file. A file that cannot be
  * sent says why. */
-export function approvalFileLabel(raw: unknown): string | undefined {
+export function approvalFileLabel(raw: unknown, attachmentSource?: AttachmentFileSource): string | undefined {
   const paths = typeof raw === 'string' ? [raw]
     : Array.isArray(raw) && raw.length > 0 && raw.every((item) => typeof item === 'string') ? raw as string[]
       : [];
@@ -41,6 +45,13 @@ export function approvalFileLabel(raw: unknown): string | undefined {
   if (local.length === 0 || local.length !== paths.length) return undefined;
   return local.map((item) => {
     try {
+      if (attachmentSource && isAttachmentSnapshotPath(item)) {
+        const reference = sourceOwnedAttachmentFile(item.trim(), attachmentSource);
+        if (reference.bytes > MCP_INLINE_FILE_MAX_BYTES) throw new LocalFileSendRefusal('too_large',
+          `This attachment exceeds the native MCP inline file limit (${MCP_INLINE_FILE_MAX_BYTES / (1024 * 1024)}MiB).`);
+        return describeLocalFileToSend({ requested: item, path: item, name: reference.name, bytes: reference.bytes,
+          folder: 'your attached files', mimetype: 'application/octet-stream' });
+      }
       return describeLocalFileToSend(resolveLocalFileToSend(item));
     } catch (error) {
       const reason = error instanceof LocalFileSendRefusal ? error.message : 'it cannot be read';
@@ -162,7 +173,7 @@ export function approvalReadableText(raw: unknown): string | undefined {
  * Display only: authority and resume keep pinning the untouched arguments,
  * and a value that looks like a secret is withheld.
  */
-export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true, complete = false): ApprovalCallPreview | null {
+export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = true, complete = false, attachmentSource?: AttachmentFileSource): ApprovalCallPreview | null {
   const args = (info.args ?? {}) as Record<string, unknown>;
   // Both carriers hold the real call as { name, args_json }: work_call for
   // planned work, call_tool for a schema-on-demand (MCP) operation.
@@ -173,13 +184,23 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
     const targetName = typeof args.name === 'string' ? args.name.trim() : '';
     const targetArgs = approvalJsonRecord(args.args_json);
     return targetName && targetArgs
-      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false, complete)
+      ? approvalCallPreview({ ...info, toolName: targetName, args: targetArgs }, false, complete, attachmentSource)
       : null;
   }
   const slug = typeof args.tool_slug === 'string' ? args.tool_slug.trim() : '';
   const operation = truncate((slug ? humanizeComposioSlug(slug) : '') || info.toolName, 80);
   const provider = slug ? approvalJsonRecord(args.arguments) ?? {} : args;
   const fields: ApprovalCallPreview['fields'] = [];
+  // Only an exact current native MCP definition supports source-owned state
+  // snapshots in this slice. Composio/default paths keep their ordinary denial.
+  const exactOperation = stripMcpTransportPrefix(info.toolName);
+  const contract = attachmentSource ? loadToolContract(exactOperation) : null;
+  const native = contract && (peekHostCapabilityCatalogFactory()?.snapshot() ?? []).some(entry => {
+    const identity = canonicalCatalogIdentityOf(entry);
+    return identity?.providerKind === 'native_mcp' && identity.operationId === exactOperation
+      && (!info.consentCall?.accountId || identity.account === info.consentCall.accountId)
+      && identity.providerInputSchemaDigest === digestSchema(contract.schema);
+  });
   for (const [name, raw] of Object.entries(provider)) {
     if (!complete && fields.length >= APPROVAL_PREVIEW_MAX_FIELDS) break;
     const value = approvalPreviewValue(raw, complete);
@@ -187,7 +208,8 @@ export function approvalCallPreview(info: InterruptionInfo, unwrapWorkCall = tru
     const secret = scanSecrets(value).length > 0;
     // A file on this computer is named exactly (name, size, folder), so the
     // owner sees which file leaves before saying yes.
-    const label = secret ? undefined : approvalFileLabel(raw) ?? info.previewLabels?.[value];
+    const fileSource = native && mcpFileContentField(contract!.schema, name, raw) ? attachmentSource : undefined;
+    const label = secret ? undefined : approvalFileLabel(raw, fileSource) ?? info.previewLabels?.[value];
     const display = secret ? undefined : approvalReadableText(raw);
     fields.push({
       name: truncate(name, 80),

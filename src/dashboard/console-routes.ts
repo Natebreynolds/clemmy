@@ -168,6 +168,7 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
+import { acceptedAttachmentFiles, type AttachmentFileReference } from '../runtime/attachment-file-reference.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
 import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
@@ -17845,6 +17846,7 @@ export function registerConsoleRoutes(
       }
     }
     let turnInput = input;
+    let attachmentFiles: AttachmentFileReference[] = [];
     if (command === 'continue') {
       const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
       const { isContinueCompletionReason, buildContinueInput } = await import('../runtime/harness/continue-directive.js');
@@ -17862,6 +17864,7 @@ export function registerConsoleRoutes(
       const ingested: IngestedAttachment[] = attachmentIds
         .map((id) => loadInboxAttachment(id))
         .filter((a): a is IngestedAttachment => a !== null);
+      attachmentFiles = acceptedAttachmentFiles(ingested);
       for (const url of extractYouTubeUrls(input).slice(0, 3)) {
         ingested.push(await ingestAttachment({ name: url, url }));
       }
@@ -18151,6 +18154,7 @@ export function registerConsoleRoutes(
           role: 'user',
           data: {
             text: turnInput,
+            ...(attachmentFiles.length ? { attachmentFiles } : {}),
             ...taskModeFields(taskMode),
             ...turnLearningPolicyFields(learningPolicy),
             ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),

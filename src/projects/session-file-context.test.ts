@@ -65,6 +65,39 @@ test('concurrent and durable retries reuse one inbox id and one exact snapshot',
   assert.deepEqual(replay, results[0]);
 });
 
+test('explicitly selecting a legacy cached artifact re-prepares only that entry with an exact raw reference', async () => {
+  const f = fixture('legacy-selected.custom', Buffer.from([0, 1, 9, 255]));
+  const untouched = fixture('legacy-unselected.custom', Buffer.from([9, 2, 1, 255]));
+  const first = await prepareSessionFileContext(f.sessionId, f.request);
+  const other = await prepareSessionFileContext(untouched.sessionId, untouched.request);
+  assert.ok(first.ok && other.ok);
+  for (const prepared of [first, other]) {
+    const inboxPath = path.join(BASE_DIR, 'state', 'attachments-inbox', `${prepared.id}.json`);
+    const legacy = JSON.parse(readFileSync(inboxPath, 'utf8'));
+    delete legacy.file;
+    writeFileSync(inboxPath, JSON.stringify(legacy));
+  }
+  const before = snapshots();
+  const oldBytes = readFileSync(first.provenance.snapshotPath);
+  const originalBytes = readFileSync(f.target);
+  const otherInbox = path.join(BASE_DIR, 'state', 'attachments-inbox', `${other.id}.json`);
+  const untouchedBefore = readFileSync(otherInbox);
+  const repaired = await prepareSessionFileContext(f.sessionId, f.request);
+  assert.ok(repaired.ok);
+  assert.notEqual(repaired.id, first.id);
+  assert.equal(snapshots().length, before.length + 1);
+  assert.deepEqual(readFileSync(first.provenance.snapshotPath), oldBytes, 'the legacy snapshot is preserved');
+  assert.deepEqual(readFileSync(f.target), originalBytes, 'the original artifact is preserved');
+  assert.deepEqual(readFileSync(otherInbox), untouchedBefore, 'unselected legacy entries are not migrated');
+  const references = await import('../runtime/attachment-file-reference.js');
+  const attachment = loadInboxAttachment(repaired.id)!;
+  const [reference] = references.acceptedAttachmentFiles([attachment]);
+  assert.ok(reference);
+  assert.equal(references.attachmentFilePath(reference), repaired.provenance.snapshotPath);
+  assert.equal(`sha256:${reference.sha256}`, f.request.expectedRevision);
+  assert.deepEqual(await prepareSessionFileContext(f.sessionId, f.request), repaired, 'the upgraded exact entry is reused');
+});
+
 test('same-size changes with restored modification time still refuse the displayed revision', async () => {
   const f = fixture('same-size.txt', 'before');
   const stat = statSync(f.target);

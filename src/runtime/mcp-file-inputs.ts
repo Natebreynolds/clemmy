@@ -1,9 +1,9 @@
 import {
-  LocalFileSendRefusal,
   looksLikeLocalFilePath,
   readLocalFileToSend,
   resolveLocalFileToSend,
 } from './local-file-sending.js';
+import { isAttachmentSnapshotPath, readSourceOwnedAttachmentFile, sourceOwnedAttachmentFile, type AttachmentFileSource } from './attachment-file-reference.js';
 
 /**
  * File content an MCP tool takes, from its own input schema: a string the
@@ -37,6 +37,19 @@ function variants(schema: Schema): Schema[] {
     .map(record).filter((entry): entry is Schema => entry !== null);
 }
 
+/** Display-only counterpart of the same schema rule used at native dispatch. */
+export function mcpFileContentField(inputSchema: unknown, field: string, value: unknown): boolean {
+  const root = record(inputSchema);
+  if (!root) return false;
+  const properties = record(root.properties) ?? variants(root).map(variant => record(variant.properties)).find(Boolean);
+  const schema = properties ? record(properties[field]) : null;
+  if (!schema) return false;
+  if (typeof value === 'string') return declaresFileContent(schema) || variants(schema).some(declaresFileContent);
+  if (!Array.isArray(value) || !value.every(item => typeof item === 'string')) return false;
+  const items = record(schema.items) ?? variants(schema).map(variant => record(variant.items)).find(Boolean);
+  return Boolean(items && (declaresFileContent(items) || variants(items).some(declaresFileContent)));
+}
+
 class McpFileInputRefusal extends Error {
   constructor(message: string) {
     super(message);
@@ -46,17 +59,23 @@ class McpFileInputRefusal extends Error {
   }
 }
 
-function convert(schema: Schema | null, value: unknown, depth: number): { value: unknown; changed: boolean } {
+function convert(schema: Schema | null, value: unknown, depth: number, attachmentSource?: AttachmentFileSource): { value: unknown; changed: boolean } {
   if (!schema || depth > 32) return { value, changed: false };
   if (typeof value === 'string') {
     const fileSchema = declaresFileContent(schema) ? schema : variants(schema).find(declaresFileContent);
     if (!fileSchema || !looksLikeLocalFilePath(value)) return { value, changed: false };
     try {
+      if (isAttachmentSnapshotPath(value)) {
+        if (!attachmentSource) throw new Error('This request does not own that attachment file.');
+        const reference = sourceOwnedAttachmentFile(value.trim(), attachmentSource);
+        if (reference.bytes > MCP_INLINE_FILE_MAX_BYTES) throw new Error('The attachment is over the file-content limit.');
+        return { value: readSourceOwnedAttachmentFile(reference, attachmentSource).toString('base64'), changed: true };
+      }
       const file = resolveLocalFileToSend(value, { maxBytes: MCP_INLINE_FILE_MAX_BYTES });
       return { value: readLocalFileToSend(file).toString('base64'), changed: true };
     } catch (error) {
       throw new McpFileInputRefusal(
-        `${error instanceof LocalFileSendRefusal ? error.message : 'The file could not be read.'} Nothing was sent.`,
+        `${error instanceof Error ? error.message : 'The file could not be read.'} Nothing was sent.`,
       );
     }
   }
@@ -64,7 +83,7 @@ function convert(schema: Schema | null, value: unknown, depth: number): { value:
     const items = record(schema.items) ?? variants(schema).map((variant) => record(variant.items)).find(Boolean) ?? null;
     let changed = false;
     const out = value.map((item) => {
-      const next = convert(items, item, depth + 1);
+      const next = convert(items, item, depth + 1, attachmentSource);
       changed ||= next.changed;
       return next.value;
     });
@@ -78,7 +97,7 @@ function convert(schema: Schema | null, value: unknown, depth: number): { value:
     let changed = false;
     const out: Schema = { ...object };
     for (const [key, item] of Object.entries(object)) {
-      const next = convert(record(properties[key]), item, depth + 1);
+      const next = convert(record(properties[key]), item, depth + 1, attachmentSource);
       if (next.changed) { out[key] = next.value; changed = true; }
     }
     return changed ? { value: out, changed } : { value, changed: false };
@@ -88,7 +107,22 @@ function convert(schema: Schema | null, value: unknown, depth: number): { value:
 
 /** The arguments with every declared file-content field that names a local
  * file replaced by that file's bytes; the same object when nothing changes. */
-export function mcpArgumentsWithFileContent<T extends Record<string, unknown>>(inputSchema: unknown, args: T): T {
-  const converted = convert(record(inputSchema), args, 0);
+export function mcpArgumentsWithFileContent<T extends Record<string, unknown>>(inputSchema: unknown, args: T, attachmentSource?: AttachmentFileSource): T {
+  // A local server may interpret a plain path itself. A snapshot reference
+  // cannot bypass ownership merely by appearing outside a byte field. This
+  // check confers no conversion or execution authority on that plain field.
+  let nodes = 0;
+  const checkReferences = (value: unknown, depth: number): void => {
+    if (++nodes > 100_000 || depth > 64) throw new McpFileInputRefusal('File arguments exceed the inspection limit. Nothing was sent.');
+    if (typeof value === 'string' && isAttachmentSnapshotPath(value)) {
+      try {
+        if (!attachmentSource) throw new Error('This request does not own that attachment file. Attach the file to this request.');
+        sourceOwnedAttachmentFile(value.trim(), attachmentSource);
+      } catch (error) { throw new McpFileInputRefusal(`${error instanceof Error ? error.message : 'Attachment file unavailable.'} Nothing was sent.`); }
+    } else if (Array.isArray(value)) for (const item of value) checkReferences(item, depth + 1);
+    else if (record(value)) for (const item of Object.values(value as Schema)) checkReferences(item, depth + 1);
+  };
+  checkReferences(args, 0);
+  const converted = convert(record(inputSchema), args, 0, attachmentSource);
   return (converted.changed ? converted.value : args) as T;
 }
