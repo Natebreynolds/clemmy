@@ -203,10 +203,13 @@ const GOLDEN = {
   // stale "mutating pauses for approval" and two duplicated list items. Later
   // the same day it names comparisons and superlatives, which research reviews
   // rejected most (a misranked library, "oldest by more than a decade").
-  instructions: { len: 34360, sha16: 'af3a88d46f66bed1' },
-  native: { len: 33467, sha16: '7ca8ef4538a132dc' },
-  claudeBrain: { len: 11445, sha16: 'd32a16386254ed17' },
-  lean: { len: 13450, sha16: '0a59b6d7e9bf2f3c' },
+  // 2026-10-18 (Pi comparison): FINAL REPORT says "Answer the ask, then stop"
+  // and names the extras reviews kept catching (unasked options, method notes);
+  // 37 of 60 reviewed requests had bounced, 32 of them on unsupported extras.
+  instructions: { len: 34365, sha16: '1b3f0f8ef413c2f7' },
+  native: { len: 33472, sha16: '4ed5fcea62c0284e' },
+  claudeBrain: { len: 11450, sha16: 'cfbe5ece004a177c' },
+  lean: { len: 13455, sha16: 'ce86b58033007e8e' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

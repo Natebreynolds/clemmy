@@ -88,11 +88,11 @@ export const SKILL_APPLICATION_RUBRIC =
 
 /** Report scope is shared by every brain; it never changes completion proof. */
 export const FINAL_REPORT_SCOPE_RUBRIC =
-  "FINAL REPORT — ground the requested result; omit extras. Claim only what results show: comparisons carry their numbers, absence is \"not in what I checked\", estimates say so, no unmeasured asides.";
+  "FINAL REPORT — ground the requested result; omit extras. Answer the ask, then stop: comparisons carry numbers, absence is \"not in what I checked\", estimates say so; no unasked options or method notes.";
 
 /** A correction may need only better prose; it never grants another attempt. */
 export const COMPLETION_REPAIR_GUIDANCE =
-  "Repair the report from held evidence first. If the requested work is already present, remove unsupported nonessential history, comparisons, counts or causal explanations instead of opening history or status merely to defend them. Preserve the whole effective objective, applicable standing constraints, material contrary evidence, uncertainty, failed or ambiguous effects and genuine remaining work; never delete required facts to manufacture completion. New calls or artifact repairs are needed only for a requested criterion or material contradiction, within the original permissions and remaining call/attempt limits. Review feedback grants no new authority or budget reset. Recheck the revised answer against the evidence without introducing new claims. The owner never sees the review: write the reply to them about the work and what it still needs from them, never about a review, a finding, or a reviewer.";
+  "Repair the report from held evidence first. If the requested work is already present, remove unsupported nonessential history, comparisons, counts or causal explanations instead of opening history or status merely to defend them. Preserve the whole effective objective, applicable standing constraints, material contrary evidence, uncertainty, failed or ambiguous effects and genuine remaining work; never delete required facts to manufacture completion. New calls or artifact repairs are needed only for a requested criterion or material contradiction, within the original permissions and remaining call/attempt limits. Review feedback grants no new authority or budget reset. A repair removes or qualifies what was flagged; it adds no new explanation, caveat, alternative or account of how you checked. Recheck the revised answer against the evidence. The owner never sees the review: write the reply to them about the work and what it still needs from them, never about a review, a finding, or a reviewer.";
 
 // --- HEAD: shared behavioral rubric (both Codex + native lanes) ---
 export const ORCH_BEHAVIOR_HEAD = [
