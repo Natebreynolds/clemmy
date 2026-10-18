@@ -2,6 +2,7 @@ import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStop
 import { isPermanentActivationError } from './permanent-activation-error.js';
 import { committedMutationVerificationHoldsForSource, type CommittedMutationVerificationHold } from './mutation-verification-executor.js';
 import { planReadContinuationWake } from './read-continuation-wake.js';
+import { asyncReadRefinementRecoveryWake } from './async-read-refinement-store.js';
 import { assertMeetingResearchModelAllowed, meetingResearchSource } from '../../integrations/recall/meeting-research-boundary.js';
 import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import { approvalCardAsk } from './approval-card-voice.js';
@@ -6497,7 +6498,7 @@ export function planCommittedVerifierRecoveryWake(
   return ready ? { status: 'ordinary' } : { status: 'waiting', notBeforeAtMs: Math.min(...dueTimes) };
 }
 
-function exactCheckpointVerifierWake(
+export function exactCheckpointReadRecoveryWake(
   sessionId: string,
   sourceUserSeq: number,
   recovery?: HostRecoveryState,
@@ -6505,8 +6506,15 @@ function exactCheckpointVerifierWake(
   try {
     const blob = recovery ? undefined : HarnessSession.load(sessionId)?.loadRecoveryState();
     const state = recovery ?? (blob ? HostRecoveryState.fromString(blob) : undefined);
-    if (!state || state.phase !== 'continue' || state.sessionId !== sessionId
-      || state.sourceUserSeq !== sourceUserSeq || !state.acceptedModelBatchRef) return { status: 'ordinary' };
+    if (!state || state.sessionId !== sessionId || state.sourceUserSeq !== sourceUserSeq) return { status: 'ordinary' };
+    if (state.phase === 'admit') {
+      const ids = state.frameHistory.flatMap(item => {
+        const row = item as { type?: unknown; callId?: unknown };
+        return row.type === 'function_call' && typeof row.callId === 'string' ? [row.callId] : [];
+      });
+      return asyncReadRefinementRecoveryWake({ sessionId, sourceUserSeq, logicalToolCallIds: ids, nowMs: Date.now() });
+    }
+    if (state.phase !== 'continue' || !state.acceptedModelBatchRef) return { status: 'ordinary' };
     return planCommittedVerifierRecoveryWake(
       committedMutationVerificationHoldsForSource({ sessionId, sourceUserSeq }), Date.now(),
     );
@@ -6572,7 +6580,7 @@ function scheduleHostCheckpointRecovery(
   const key = `${options.sessionId}:${sourceUserSeq}`;
   if (scheduledHostRecoveries.has(key)) return;
   const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
-  const verifierWake = exactCheckpointVerifierWake(options.sessionId, sourceUserSeq);
+  const verifierWake = exactCheckpointReadRecoveryWake(options.sessionId, sourceUserSeq);
   const activationNotBeforeAtMs = verifierWake.status === 'waiting'
     ? Math.max(Date.now() + delayMs, verifierWake.notBeforeAtMs)
     : undefined;
@@ -6998,7 +7006,7 @@ export function checkpointContinuationIsReady(
       && state.sessionId === options.sessionId
       && state.sourceUserSeq === Number(options.sourceUserSeq)
       && state.acceptedModelBatchRef !== undefined
-      && exactCheckpointVerifierWake(options.sessionId, Number(options.sourceUserSeq), state).status === 'ordinary';
+      && exactCheckpointReadRecoveryWake(options.sessionId, Number(options.sourceUserSeq), state).status === 'ordinary';
   } catch {
     return false;
   }

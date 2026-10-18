@@ -19,6 +19,7 @@ import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { redeemSuccessfulSettlementResultForHost } from './result-handle.js';
+import { planReadContinuationWake, type ReadContinuationWakePlan } from './read-continuation-wake.js';
 import {
   prepareRecentArticleBatchCandidates,
   VERIFIED_RECENT_ARTICLES_PROTOCOL,
@@ -28,6 +29,32 @@ import {
 } from './recent-article-date-evidence.js';
 
 const SHA256 = /^[a-f0-9]{64}$/u;
+const GETTER_BACKOFF_MS = [0, 1_000, 2_500, 5_000, 10_000, 20_000] as const;
+
+function canonicalTimestampMs(value: string): number | null {
+  const parsed = Date.parse(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 && new Date(parsed).toISOString() === value ? parsed : null;
+}
+
+/** Scheduling arithmetic shared by the executor and its passive recovery wake.
+ * A ready plan is never authority to invoke a provider. */
+export function planAsyncReadRefinementGetterWake(input: {
+  startRecordedAt: string;
+  previousSettledAt?: string;
+  attemptOrdinal: number;
+  maximumElapsedMs: number;
+  nowMs: number;
+}): ReadContinuationWakePlan {
+  const start = canonicalTimestampMs(input.startRecordedAt);
+  if (start === null) return { status: 'invalid', reason: 'anchor_invalid' };
+  if (!Number.isSafeInteger(input.attemptOrdinal) || input.attemptOrdinal < 0 || input.attemptOrdinal >= GETTER_BACKOFF_MS.length
+    || (input.attemptOrdinal > 0) !== (input.previousSettledAt !== undefined)) return { status: 'invalid', reason: 'anchor_invalid' };
+  const previous = input.previousSettledAt === undefined ? start : canonicalTimestampMs(input.previousSettledAt);
+  if (previous === null || previous < start) return { status: 'invalid', reason: 'anchor_invalid' };
+  if (!Number.isSafeInteger(input.maximumElapsedMs) || input.maximumElapsedMs <= 0) return { status: 'invalid', reason: 'deadline_invalid' };
+  return planReadContinuationWake({ anchorAtMs: previous, delayMs: GETTER_BACKOFF_MS[input.attemptOrdinal]!,
+    nowMs: input.nowMs, deadlineAtMs: start + input.maximumElapsedMs });
+}
 
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
@@ -937,6 +964,121 @@ export function asyncReadGetterLogicalCallId(startLogicalToolCallId: string, att
     throw new Error('async read getter attempt ordinal is out of bounds');
   }
   return `async-read-get:v1:${sha256(`${startLogicalToolCallId}\0${attemptOrdinal}`)}`;
+}
+
+export type AsyncReadRefinementRecoveryWake =
+  | { status: 'ordinary' }
+  | { status: 'waiting'; notBeforeAtMs: number }
+  | { status: 'invalid' };
+
+/** Read-only scheduling projection. Never call loadAsyncReadRefinementOwner or
+ * a record* producer here: even receipt replay can issue INSERT OR IGNORE.
+ * Only a sole, already-admitted exact async call may defer its recovery. A
+ * ready/unknown sibling retains ordinary activation, whose kernel re-proves
+ * all current execution authority and decides completion/repair. */
+export function asyncReadRefinementRecoveryWake(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  logicalToolCallIds: readonly string[];
+  nowMs: number;
+}): AsyncReadRefinementRecoveryWake {
+  if (!Number.isSafeInteger(input.nowMs) || input.nowMs < 0) return { status: 'invalid' };
+  if (input.logicalToolCallIds.length !== 1) return { status: 'ordinary' };
+  try {
+    const db = openEventLog();
+    const id = input.logicalToolCallIds[0]!;
+    const row = db.prepare(`SELECT * FROM ${ASYNC_READ_REFINEMENT_INTENTS_TABLE}
+      WHERE session_id = ? AND source_user_seq = ? AND start_logical_tool_call_id = ?`)
+      .get(input.sessionId, input.sourceUserSeq, id) as Record<string, unknown> | undefined;
+    if (!row) return { status: 'ordinary' };
+    const task = String(row.accepted_task_id);
+    const sealed = loadSealedNodeBinding(input.sessionId, input.sourceUserSeq, String(row.requirement_id));
+    const recipe = sealed?.asyncRead ? parseAsyncReadContinuationRecipe(sealed.asyncRead) : null;
+    if (!recipe || recipe.recipeDigest !== row.recipe_digest || recipe.ownerBindingDigest !== row.owner_binding_digest
+      || recipe.acceptedTaskId !== task || recipe.ownerRequirementId !== row.requirement_id) return { status: 'invalid' };
+    const admitted = db.prepare(`SELECT 1 FROM expected_work_call_bindings binding
+      JOIN logical_tool_calls call ON call.session_id=binding.session_id AND call.source_user_seq=binding.source_user_seq
+        AND call.logical_tool_call_id=binding.logical_tool_call_id AND call.accepted_task_id=binding.accepted_task_id
+      JOIN accepted_turn_call_authorities authority ON authority.session_id=call.session_id
+        AND authority.source_user_seq=call.source_user_seq AND authority.accepted_task_id=call.accepted_task_id
+      JOIN accepted_model_batch_admissions_readable_v1 batch ON batch.session_id=binding.session_id
+        AND batch.source_user_seq=binding.source_user_seq AND batch.accepted_task_id=binding.accepted_task_id
+        AND batch.work_contract_id=binding.contract_id AND batch.authority_digest=authority.authority_digest
+      WHERE binding.session_id=? AND binding.source_user_seq=? AND binding.logical_tool_call_id=?
+        AND binding.accepted_task_id=? AND binding.requirement_id=? AND binding.contract_id=?
+        AND binding.argument_digest=? AND call.state='open' AND authority.state='open' AND authority.authority_kind='host_v1'
+        AND batch.call_count=1 AND json_extract(batch.call_ids_json,'$[0]')=?`)
+      .get(input.sessionId, input.sourceUserSeq, id, task, row.requirement_id, recipe.workContractId, row.start_argument_digest, id);
+    if (!admitted) return { status: 'invalid' };
+    // A completed/terminal receipt must be redeemed by the active kernel before
+    // any elapsed-time policy. Its presence can never prolong a dormant wait.
+    for (const table of [ASYNC_READ_REFINEMENT_COMPLETION_RECEIPTS_TABLE, ASYNC_READ_REFINEMENT_TERMINAL_RECEIPTS_TABLE]) {
+      if (db.prepare(`SELECT 1 FROM ${table} WHERE session_id=? AND source_user_seq=? AND start_logical_tool_call_id=?`)
+        .get(input.sessionId, input.sourceUserSeq, id)) return { status: 'ordinary' };
+    }
+    const start = db.prepare(`SELECT * FROM ${ASYNC_READ_REFINEMENT_START_RECEIPTS_TABLE}
+      WHERE session_id=? AND source_user_seq=? AND start_logical_tool_call_id=?`)
+      .get(input.sessionId, input.sourceUserSeq, id) as Record<string, unknown> | undefined;
+    if (!start) return { status: 'ordinary' }; // The active kernel owns start/uncertain-start recovery.
+    const childId = asyncReadProviderStartLogicalCallId(id);
+    const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, acceptedTaskId: task };
+    const startResult = redeemSuccessfulSettlementResultForHost({ ...identity, logicalToolCallId: childId });
+    const startSettlement = redeemDurableLogicalCallSettlementForHost({ ...identity, logicalToolCallId: childId });
+    const receipt = startResult.status === 'ok' ? parseExactStartReceipt(startResult.value.rawPayload) : null;
+    const candidates = JSON.parse(String(row.candidates_json)) as RecentArticleCandidateV1[];
+    const startLogical = Array.isArray(candidates) && sha256(canonicalJson(candidates)) === row.candidate_digest
+      ? durableLogicalCallContract(task, recipe.owner.operationId, { urls: candidates.map(candidate => candidate.url), formats: ['rawHtml'] }) : null;
+    const startBinding = loadHostCallCapabilityBinding({ db, ...identity, logicalToolCallId: childId });
+    if (start.accepted_task_id !== task || start.recipe_digest !== recipe.recipeDigest || start.receipt_version !== 1
+      || start.provider_start_logical_tool_call_id !== childId || !receipt || !startLogical
+      || startResult.status !== 'ok' || startResult.value.resultHandleId !== start.start_result_handle_id
+      || startResult.value.rawPayloadSha256 !== start.start_raw_payload_sha256
+      || receipt.jobId !== start.job_id || receipt.jobUrl !== start.job_url
+      || startSettlement.status !== 'ok' || startSettlement.settlement.settledAt !== start.recorded_at
+      || startBinding.status !== 'ok' || startBinding.binding.acceptedTaskId !== task
+      || startBinding.binding.capabilityId !== sealed!.capabilityId || startBinding.binding.schemaFingerprint !== sealed!.schemaDigest
+      || startBinding.binding.operationId !== recipe.owner.operationId || startBinding.binding.accountId !== recipe.owner.account
+      || startBinding.binding.providerInputSchemaDigest !== recipe.owner.providerInputSchemaDigest
+      || startBinding.binding.attestedArgumentDigest !== startLogical.argumentDigest || startBinding.binding.effect !== 'read') return { status: 'invalid' };
+    const getterLogical = durableLogicalCallContract(task, recipe.getter.operationId, { [recipe.getterIdArgument]: start.job_id });
+    if (!getterLogical) return { status: 'invalid' };
+    let previousSettledAt: string | undefined;
+    let priorEpoch = canonicalTimestampMs(String(start.recorded_at));
+    if (priorEpoch === null) return { status: 'invalid' };
+    let missingOrdinal: number | undefined;
+    for (let ordinal = 0; ordinal < recipe.maximumGetterAttempts; ordinal += 1) {
+      const getterId = asyncReadGetterLogicalCallId(id, ordinal);
+      const prior = redeemDurableLogicalCallSettlementForHost({ ...identity, logicalToolCallId: getterId });
+      if (prior.status === 'missing') { missingOrdinal ??= ordinal; continue; }
+      if (prior.status !== 'ok' || missingOrdinal !== undefined) return { status: 'invalid' };
+      const binding = loadHostCallCapabilityBinding({ db, ...identity, logicalToolCallId: getterId });
+      const settledEpoch = canonicalTimestampMs(prior.settlement.settledAt);
+      if (binding.status !== 'ok' || binding.binding.acceptedTaskId !== task || binding.binding.operationId !== recipe.getter.operationId
+        || binding.binding.capabilityId !== recipe.getter.capabilityId || binding.binding.manifestId !== recipe.getter.manifestId
+        || binding.binding.invokePortId !== recipe.getter.invokePortId
+        || binding.binding.accountId !== recipe.getter.account || binding.binding.effect !== 'read'
+        || binding.binding.providerInputSchemaDigest !== recipe.getter.providerInputSchemaDigest
+        || binding.binding.schemaFingerprint !== recipe.getter.schemaDigest || binding.binding.manifestDigest !== recipe.getter.manifestDigest
+        || binding.binding.attestedArgumentDigest !== getterLogical.argumentDigest
+        || prior.settlement.toolName !== getterLogical.toolName || prior.settlement.argumentDigest !== getterLogical.argumentDigest
+        || prior.settlement.outcome.directive.requiresReconciliation || settledEpoch === null || settledEpoch < priorEpoch) return { status: 'invalid' };
+      priorEpoch = settledEpoch;
+      if (prior.settlement.outcome.kind === 'succeeded' || prior.settlement.outcome.kind === 'empty_result') {
+        const result = redeemSuccessfulSettlementResultForHost({ ...identity, logicalToolCallId: getterId });
+        if (result.status !== 'ok') return { status: 'invalid' };
+        const outer = record(result.value.rawPayload), provider = record(outer?.data);
+        // Only an acknowledged pending result can defer work. Every completed,
+        // failed or unfamiliar result goes to the existing evidence verifier.
+        if (outer?.successful !== true || !['queued', 'running', 'scraping', 'processing'].includes(String(provider?.status))) return { status: 'ordinary' };
+      } else if (prior.settlement.outcome.directive.action !== 'retry_with_backoff') return { status: 'ordinary' };
+      previousSettledAt = prior.settlement.settledAt;
+    }
+    if (missingOrdinal === undefined) return { status: 'ordinary' };
+    const wake = planAsyncReadRefinementGetterWake({ startRecordedAt: String(start.recorded_at), previousSettledAt,
+      attemptOrdinal: missingOrdinal, maximumElapsedMs: recipe.maximumElapsedMs, nowMs: input.nowMs });
+    return wake.status === 'waiting' ? { status: 'waiting', notBeforeAtMs: wake.notBeforeAtMs }
+      : wake.status === 'invalid' ? { status: 'invalid' } : { status: 'ordinary' };
+  } catch { return { status: 'invalid' }; }
 }
 
 function exactDefinitiveChildFailure(input: {

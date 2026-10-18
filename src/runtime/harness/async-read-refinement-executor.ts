@@ -8,6 +8,7 @@ import {
   asyncReadGetterLogicalCallId,
   asyncReadProviderStartLogicalCallId,
   loadAsyncReadRefinementOwner,
+  planAsyncReadRefinementGetterWake,
   recordAsyncReadRefinementBudgetTerminalOutcome,
   recordAsyncReadRefinementCancellationTerminalOutcome,
   recordAsyncReadRefinementChildFailureTerminalOutcome,
@@ -33,7 +34,6 @@ import { invokeHostToolCall } from './host-tool-invocation.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
-import { planReadContinuationWake } from './read-continuation-wake.js';
 import type { VerifiedRecentArticlesV1 } from './recent-article-date-evidence.js';
 
 export type ExecuteAsyncReadRefinementResult =
@@ -566,8 +566,6 @@ export async function executeAsyncReadRefinement(input: {
     return { status: 'held', reason: 'durable batch start time is unavailable' };
   }
   const getterArgs = { [recipe.getterIdArgument]: jobId };
-  const backoff = [0, 1_000, 2_500, 5_000, 10_000, 20_000] as const;
-  const durableDeadlineAtMs = durableStartEpoch + recipe.maximumElapsedMs;
   for (let ordinal = 0; ordinal < recipe.maximumGetterAttempts; ordinal += 1) {
     const getterLogicalToolCallId = asyncReadGetterLogicalCallId(
       input.ownerLogicalToolCallId,
@@ -610,9 +608,11 @@ export async function executeAsyncReadRefinement(input: {
       if (previous && (previous.status !== 'ok' || previous.settlement.toolName !== durableLogicalCallContract(input.acceptedTaskId, recipe.getter.operationId, getterArgs)?.toolName)) {
         return { status: 'held', reason: 'previous exact getter settlement cannot anchor the next read' };
       }
-      const anchorAtMs = previous?.status === 'ok' ? canonicalTimestampMs(previous.settlement.settledAt) : durableStartEpoch;
-      if (anchorAtMs === null) return { status: 'held', reason: 'previous exact getter settlement time is invalid' };
-      const planWake = () => planReadContinuationWake({ anchorAtMs, delayMs: backoff[ordinal]!, nowMs: Date.now(), deadlineAtMs: durableDeadlineAtMs });
+      const planWake = () => planAsyncReadRefinementGetterWake({
+        startRecordedAt: new Date(durableStartEpoch).toISOString(),
+        ...(previous?.status === 'ok' ? { previousSettledAt: previous.settlement.settledAt } : {}),
+        attemptOrdinal: ordinal, maximumElapsedMs: recipe.maximumElapsedMs, nowMs: Date.now(),
+      });
       const wake = planWake();
       if (wake.status === 'invalid') return { status: 'held', reason: `durable getter timing is invalid: ${wake.reason}` };
       if (wake.status === 'expired') {

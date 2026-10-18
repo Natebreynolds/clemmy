@@ -34,7 +34,7 @@ import {
 } from '../runtime/harness/eventlog.js';
 import { activateDispatchLease, reconcileTerminalRunAttemptDispatchLeasesAtBoot, revokeDispatchLease, runWithDispatchLease } from '../runtime/harness/dispatch-lease.js';
 import { executeAsyncReadRefinement } from '../runtime/harness/async-read-refinement-executor.js';
-import { asyncReadGetterLogicalCallId, loadAsyncReadRefinementOwner } from '../runtime/harness/async-read-refinement-store.js';
+import { asyncReadGetterLogicalCallId, loadAsyncReadRefinementOwner, asyncReadRefinementRecoveryWake } from '../runtime/harness/async-read-refinement-store.js';
 import { durableLogicalCallContract } from '../runtime/harness/logical-call-contract.js';
 import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
 import { harnessRunContextStorage, ToolCallsCounter } from '../runtime/harness/brackets.js';
@@ -44,7 +44,7 @@ import { acceptedTurnCallAuthorityFor, withHostCallAttestation } from '../runtim
 import { loadHostCallCapabilityBinding } from '../runtime/harness/host-call-capability-binding.js';
 import { claimPendingAsyncReadRefinementRecoveries } from '../runtime/harness/async-read-refinement-recovery.js';
 import { HostRecoveryState } from '../runtime/harness/host-turn-runner.js';
-import { runConversation } from '../runtime/harness/loop.js';
+import { runConversation, exactCheckpointReadRecoveryWake } from '../runtime/harness/loop.js';
 import {
   _setBridgeImplsForTests,
   respondPreferHarness,
@@ -482,6 +482,25 @@ if (input.mode === 'timing') {
   const before = physicalRows(input.sessionId);
   try {
     Date.now = () => fakeNow;
+    const db = openEventLog();
+    const batch = db.prepare(`SELECT pre_history_json,frame_history_json,batch_ordinal FROM accepted_model_batch_admissions_readable_v1
+      WHERE session_id=? AND source_user_seq=? AND call_count=1 AND json_extract(call_ids_json,'$[0]')=?`)
+      .get(input.sessionId, input.sourceUserSeq, OWNER_CALL_ID) as { pre_history_json: string; frame_history_json: string; batch_ordinal: number };
+    assert.ok(batch);
+    const checkpoint = new HostRecoveryState(input.sessionId, input.sourceUserSeq, 'admit', JSON.parse(batch.pre_history_json),
+      JSON.parse(batch.frame_history_json), [], undefined, undefined, 'host_v1', undefined, batch.batch_ordinal);
+    const changesBefore = db.prepare('SELECT total_changes() AS n').get();
+    db.pragma('query_only=ON');
+    try {
+      assert.deepEqual(asyncReadRefinementRecoveryWake({ ...input, logicalToolCallIds: [OWNER_CALL_ID], nowMs: fakeNow }), {
+        status: 'waiting', notBeforeAtMs: settledAt + 1_000,
+      }, 'real retained intent/start/getter receipts project the original due time');
+      assert.deepEqual(exactCheckpointReadRecoveryWake(input.sessionId, input.sourceUserSeq, checkpoint), {
+        status: 'waiting', notBeforeAtMs: settledAt + 1_000,
+      }, 'the production checkpoint scheduler consumes the same exact passive projection');
+      assert.deepEqual(asyncReadRefinementRecoveryWake({ ...input, logicalToolCallIds: [OWNER_CALL_ID, 'ready-other-call'], nowMs: fakeNow }), { status: 'ordinary' }, 'a ready sibling cannot inherit a sole async wait');
+      assert.deepEqual(db.prepare('SELECT total_changes() AS n').get(), changesBefore, 'passive scheduling cannot replay receipt INSERTs');
+    } finally { db.pragma('query_only=OFF'); }
     const invoke = (callerSignal?: AbortSignal) => harnessRunContextStorage.run({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
       dispatchLease: lease, counter: new ToolCallsCounter(20) }, () => runWithDispatchLease(lease, () => withHostCallAttestation(attestation, () =>
         withExpectedWorkBinding(binding.binding, () => executeAsyncReadRefinement({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
@@ -512,6 +531,7 @@ if (input.mode === 'timing') {
     const openAuthority = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
     assert.equal(openAuthority.status, 'ok', JSON.stringify(openAuthority));
     fakeNow = settledAt + 1_001;
+    assert.deepEqual(exactCheckpointReadRecoveryWake(input.sessionId, input.sourceUserSeq, checkpoint), { status: 'ordinary' }, 'elapsed downtime permits the existing kernel activation');
     const elapsed = await invoke().catch(error => {
       const authority = openEventLog().prepare('SELECT state, close_reason FROM accepted_turn_call_authorities WHERE session_id = ? AND source_user_seq = ?')
         .get(input.sessionId, input.sourceUserSeq);

@@ -27,7 +27,7 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 const { createSession, appendEvent, closeEventLog } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { HostRecoveryState } = await import('./host-turn-runner.js');
-const { checkpointContinuationIsReady, planCommittedVerifierRecoveryWake } = await import('./loop.js');
+const { checkpointContinuationIsReady, planCommittedVerifierRecoveryWake, exactCheckpointReadRecoveryWake } = await import('./loop.js');
 import type { AgentInputItem } from '@openai/agents';
 
 test.after(() => {
@@ -171,4 +171,12 @@ test('invalid due times or clocks never become scheduling readiness, including m
   for (const invalid of [-1, NaN, Infinity, 0.5]) {
     assert.deepEqual(planCommittedVerifierRecoveryWake([automaticVerifier(11_000)], invalid), { status: 'invalid' });
   }
+});
+
+test('ordinary admission, foreign source and finalize checkpoints cannot inherit an async wait', () => {
+  const { sessionId, sourceUserSeq } = sourceFor('async-wake-ordinary-admit');
+  const state = HostRecoveryState.fromString(admitCheckpoint(sessionId, sourceUserSeq));
+  assert.deepEqual(exactCheckpointReadRecoveryWake(sessionId, sourceUserSeq, state), { status: 'ordinary' });
+  assert.deepEqual(exactCheckpointReadRecoveryWake(sessionId, sourceUserSeq + 1, state), { status: 'ordinary' });
+  assert.deepEqual(exactCheckpointReadRecoveryWake('foreign-session', sourceUserSeq, state), { status: 'ordinary' });
 });
