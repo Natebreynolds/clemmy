@@ -308,7 +308,11 @@ export function Automate() {
                             </button>
                             <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${workflowDisplayName(w.name, w.description)}`} />
                           </div>
-                          <button type="button" onClick={() => openWorkflow(w.name)} className="mb-3 line-clamp-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">{w.description || 'No description yet.'}</button>
+                          <button type="button" onClick={() => openWorkflow(w.name)} className="mb-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">
+                            {/* The clamp sits on a span: a button ignores line-clamp, so the
+                                fourth line showed cut in half under the card's edge. */}
+                            <span className="line-clamp-3">{w.description || 'No description yet.'}</span>
+                          </button>
                           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
                             {active && (
                               <button

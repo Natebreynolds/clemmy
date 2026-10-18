@@ -1,3 +1,4 @@
+import { workflowDisplayName } from '@clem/chat-engine';
 /**
  * One workflow, opened: what it does on top, its steps as a graph in the
  * middle, the step you clicked on the right, and everything operational
@@ -501,7 +502,7 @@ function WorkflowView({ name }: { name: string }) {
     <div className="flex h-full min-h-0">
       <aside id="workflow-conversation" aria-label="Workflow conversation with Clementine"
         className={cn('min-h-0 w-full shrink-0 flex-col border-r border-border bg-subtle lg:w-[380px]', conversationOpen ? 'flex' : 'hidden')}>
-        <WorkflowConversation key={workflowSlug} workflowSlug={workflowSlug} title={detail.name}
+        <WorkflowConversation key={workflowSlug} workflowSlug={workflowSlug} title={workflowDisplayName(detail.name, detail.description)}
           question={conversationQuestion} unsavedChanges={dirty}
           onClose={() => {
             setConversationOpen(false);
@@ -510,7 +511,7 @@ function WorkflowView({ name }: { name: string }) {
       </aside>
       <div className={cn('min-w-0 flex-1 overflow-y-auto', conversationOpen && 'hidden lg:block')}>
     <Page
-      title={detail.name}
+      title={workflowDisplayName(detail.name, detail.description)}
       actions={
         <>
           <Link to="/automate">
@@ -693,10 +694,14 @@ function WorkflowView({ name }: { name: string }) {
                 deleteKeyCode={view === 'steps' && !saving ? ['Backspace', 'Delete'] : null}
                 colorMode={isDark ? 'dark' : 'light'}
                 fitView
+                // A one- or two-step workflow fit at the default 2x filled the
+                // canvas with one giant card; 1x is the size it is drawn at.
+                fitViewOptions={{ maxZoom: 1, padding: 0.2 }}
               >
                 <Background />
                 <Controls showInteractive={false} />
-                <MiniMap pannable zoomable />
+                {/* The overview earns its corner only on a graph too big to see whole. */}
+                {nodes.length > 6 && <MiniMap pannable zoomable />}
               </ReactFlow>
             </div>
           )}
