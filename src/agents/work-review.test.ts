@@ -2,7 +2,7 @@
  * Run: npx tsx --test src/agents/work-review.test.ts
  *
  * The work-review heartbeat's contract:
- *   - a failed run is raised once; a fresh wait is not, a long wait is
+ *   - a failed run is raised once; a wait never is (it already has its own card)
  *   - a one-step try never counts as work
  *   - the owner's rules, applied by Jev, skip an item; the judge budget holds the rest
  *   - quiet mode keeps items in the app; push mode lets them travel
@@ -51,26 +51,20 @@ const observation: WorkObservation = {
   ],
 };
 
-test('candidates: failures and long waits are raised, grouped by what they are about; fresh waits, clean runs, tests, one-step tries and ancient waits are not', () => {
+test('candidates: failures and old drafts are raised; waits, clean runs, tests and one-step tries are not', () => {
   const c = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, null);
   assert.deepEqual(c.map((x) => x.key).sort(), [
-    'chat_waiting:send the leadership email',
-    'chat_waiting:workflow: daily-standup-email',
     'draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md',
     'run_failed:r-error',
     'run_failed:r-fail',
-    'run_waiting:weekly-review',
   ]);
+  // A run or conversation waiting on the owner already has its own card in
+  // Needs you; a second "still waiting" card about it is noise (owner 2026-10-18).
+  assert.equal(c.some((x) => x.kind === 'run_waiting' || x.kind === 'chat_waiting'), false);
   const failed = c.find((x) => x.key === 'run_failed:r-fail')!;
   assert.match(failed.detail, /Friday Dashboard Daily Refresh failed (at|on) .+?: Salesforce query timed out/, 'the workflow by name, not its slug');
   assert.match(failed.offer, /look at what went wrong/);
   assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /Inbox Sweep failed (at|on) .+?: IMAP login refused/, 'a record stored as error is a failure');
-  const wait = c.find((x) => x.kind === 'run_waiting')!;
-  assert.match(wait.detail, /2 runs of Weekly Review are waiting on you, the oldest since \S+/);
-  assert.deepEqual(wait.refs, ['r-wait-old', 'r-wait-old-2']);
-  const standup = c.find((x) => x.key === 'chat_waiting:workflow: daily-standup-email')!;
-  assert.equal(standup.count, 2);
-  assert.match(standup.detail, /2 conversations about "Workflow: daily-standup-email" are waiting for your answer, the oldest since \S+/);
   // A failure older than the last tick is not raised again on the next tick.
   const later = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, NOW - 60 * 60_000);
   assert.equal(later.some((x) => x.kind === 'run_failed'), false);
@@ -110,9 +104,9 @@ function harness(opts: {
 test('a tick raises each new item once, quietly by default, and a second tick is quiet', async () => {
   const h = harness({});
   const first = await runWorkReviewTick(h.deps);
-  assert.equal(first.produced, 6);
+  assert.equal(first.produced, 3);
   assert.equal(first.quiet, false);
-  assert.equal(h.published.length, 6);
+  assert.equal(h.published.length, 3);
   for (const n of h.published) {
     assert.equal(n.metadata?.needsAttention, true);
     assert.equal(n.metadata?.inboxOnly, true, 'quiet mode stays in the app');
@@ -126,9 +120,9 @@ test('a tick raises each new item once, quietly by default, and a second tick is
   const second = await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000 });
   assert.equal(second.produced, 0);
   assert.equal(second.quiet, true);
-  assert.equal(h.published.length, 6);
+  assert.equal(h.published.length, 3);
   assert.equal(h.state.metrics.quietTicks, 1);
-  assert.equal(h.state.metrics.duplicatesSuppressed, 4, 'the waits and the draft were seen again; the failures aged out of the window');
+  assert.equal(h.state.metrics.duplicatesSuppressed, 1, 'the draft was seen again; the failures aged out of the window');
 });
 
 test("the owner's rules skip an item through Jev, and the judge budget holds what it cannot judge", async () => {
@@ -138,8 +132,8 @@ test("the owner's rules skip an item through Jev, and the judge budget holds wha
   });
   const tick = await runWorkReviewTick(h.deps);
   assert.equal(tick.vetoed, 1);
-  assert.equal(tick.produced, 5);
-  assert.equal(h.judgeCalls, 6);
+  assert.equal(tick.produced, 2);
+  assert.equal(h.judgeCalls, 3);
   const skipped = h.state.items['draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md'];
   assert.equal(skipped.retiredReason, 'jev_skip');
   assert.equal(h.published.some((n) => /Unsent draft/.test(n.title)), false);
@@ -149,19 +143,19 @@ test("the owner's rules skip an item through Jev, and the judge budget holds wha
   tight.deps.config = { ...DEFAULT_WORK_REVIEW_CONFIG, maxJudgeCallsPerTick: 2 };
   const t = await runWorkReviewTick(tight.deps);
   assert.equal(t.produced, 2);
-  assert.equal(t.held, 4);
+  assert.equal(t.held, 1);
   assert.ok(t.items.every((i) => i.kind === 'run_failed'), 'the budget goes to failures first');
-  assert.equal(tight.state.metrics.heldForBudget, 4);
+  assert.equal(tight.state.metrics.heldForBudget, 1);
   // Jev unavailable: the item is kept, not dropped.
   const dark = harness({ rules: ['any rule'], judge: async () => null });
   const d = await runWorkReviewTick(dark.deps);
-  assert.equal(d.produced, 6);
+  assert.equal(d.produced, 3);
 });
 
 test('a rule added later quiets the open items it covers; removing it brings them back; nothing is judged twice against the same rules', async () => {
   const h = harness({});
   const first = await runWorkReviewTick(h.deps);
-  assert.equal(first.produced, 6);
+  assert.equal(first.produced, 3);
   const draftKey = 'draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md';
   const draftCard = h.state.items[draftKey].notificationId!;
 
@@ -170,60 +164,55 @@ test('a rule added later quiets the open items it covers; removing it brings the
   const judge = async (c: WorkReviewCandidate): Promise<WorkReviewJudgeVerdict> => { calls += 1; return { surface: c.kind !== 'draft_unsent', confidence: 0.9, model: 'jev', durationMs: 3 }; };
   const withRule = { ...h.deps, tickId: 't2', now: () => NOW + 20 * 60_000, rules: ['Stop telling me about unsent drafts; I file those myself.'], rulesUpdatedAt: iso(10 * 60_000), judge };
   const second = await runWorkReviewTick(withRule);
-  // Failures are raised once and are not live afterwards; the four waits and drafts are.
-  assert.equal(second.reconsidered, 4, 'every live item is judged once against the new rules');
-  assert.equal(calls, 4);
+  // Failures are raised once and are not live afterwards; the draft is.
+  assert.equal(second.reconsidered, 1, 'every live item is judged once against the new rules');
+  assert.equal(calls, 1);
   assert.equal(h.state.items[draftKey].retiredReason, 'jev_skip');
   assert.ok(h.markedRead.includes(draftCard), 'the quieted card leaves Needs you');
   assert.match(second.summary, /1 now skipped by your rules/);
   assert.equal(h.state.items['run_failed:r-fail'].retiredAt, undefined);
   assert.equal(h.state.items['run_failed:r-fail'].judgedAt, undefined, 'a failure already shown is not re-judged');
-  assert.equal(h.state.items['run_waiting:weekly-review'].judgedAt, iso(20 * 60_000));
 
   // Same rules, another tick: nothing is judged again.
   const third = await runWorkReviewTick({ ...withRule, tickId: 't3', now: () => NOW + 30 * 60_000 });
   assert.equal(third.reconsidered, 0);
-  assert.equal(calls, 4);
+  assert.equal(calls, 1);
   assert.equal(third.quiet, true);
 
   // The owner removes the rule. No rules means nothing to ask Jev: the draft item comes back on its own.
   const before = h.published.length;
   const fourth = await runWorkReviewTick({ ...withRule, tickId: 't4', now: () => NOW + 50 * 60_000, rules: [], rulesUpdatedAt: iso(40 * 60_000) });
-  assert.equal(calls, 4);
+  assert.equal(calls, 1);
   assert.equal(h.state.items[draftKey].retiredAt, undefined);
   assert.notEqual(h.state.items[draftKey].notificationId, draftCard, 'a fresh card, the old one was read');
   assert.equal(h.published.length, before + 1);
   assert.match(fourth.summary, /1 back after a rule change/);
-  assert.equal(fourth.reconsidered, 4);
+  assert.equal(fourth.reconsidered, 1);
 });
 
 test('push mode lets an item travel; an item retires when what it points at resolves; a read card is acknowledged', async () => {
   const h = harness({ notify: 'push' });
   await runWorkReviewTick(h.deps);
   assert.equal(h.published[0].metadata?.inboxOnly, undefined);
-  const waitId = h.state.items['run_waiting:weekly-review'].notificationId!;
-  // Both parked weekly-review runs resumed and the old chat was answered.
-  const resolved: WorkObservation = {
-    ...observation,
-    runs: observation.runs.filter((r) => r.workflow !== 'weekly-review'),
-    chats: observation.chats.filter((c) => c.runId !== 'c-old'),
-  };
-  const second = await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000, observe: async () => ({ observation: resolved, readFailures: 0 }), isNotificationRead: (id) => id === waitId });
-  assert.equal(second.retired, 2);
-  assert.equal(h.state.items['run_waiting:weekly-review'].retiredReason, 'resolved');
-  assert.equal(h.state.items['chat_waiting:send the leadership email'].retiredReason, 'resolved');
-  assert.ok(h.markedRead.includes(h.state.items['chat_waiting:send the leadership email'].notificationId!), 'a resolved item leaves Needs you');
-  assert.equal(h.state.items['run_waiting:weekly-review'].acknowledgedAt !== undefined, true);
+  const draftKey = 'draft_unsent:drafts/weekly-workflow-priorities-2026-09-28.md';
+  const draftId = h.state.items[draftKey].notificationId!;
+  // The draft was filed away.
+  const resolved: WorkObservation = { ...observation, drafts: [] };
+  const second = await runWorkReviewTick({ ...h.deps, tickId: 't2', now: () => NOW + 30 * 60_000, observe: async () => ({ observation: resolved, readFailures: 0 }), isNotificationRead: (id) => id === draftId });
+  assert.equal(second.retired, 1);
+  assert.equal(h.state.items[draftKey].retiredReason, 'resolved');
+  assert.ok(h.markedRead.includes(draftId), 'a resolved item leaves Needs you');
+  assert.equal(h.state.items[draftKey].acknowledgedAt !== undefined, true);
   assert.equal(h.state.metrics.itemsAcknowledged, 1);
   // A failure never retires by absence: the record stays failed, and the owner saw it.
   assert.equal(h.state.items['run_failed:r-fail'].retiredAt, undefined);
 });
 
 test('the notification reads as the item, and a read failure is a recorded error, not an exception', async () => {
-  const c = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, null).find((x) => x.kind === 'chat_waiting')!;
+  const c = deriveWorkReviewCandidates(observation, DEFAULT_WORK_REVIEW_CONFIG, NOW, null).find((x) => x.kind === 'draft_unsent')!;
   const n = buildWorkReviewNotification(c, iso(0), 'quiet');
-  assert.equal(n.title, 'Still waiting: Send the leadership email');
-  assert.match(n.body, /waiting for your approval since \S+/);
+  assert.equal(n.title, 'Unsent draft: weekly-workflow-priorities-2026-09-28.md');
+  assert.match(n.body, /sitting in drafts since .+, unsent\.\nI can send it/);
   assert.equal(n.kind, 'execution');
   const h = harness({});
   h.deps.observe = async () => { throw new Error('disk gone'); };
@@ -231,6 +220,24 @@ test('the notification reads as the item, and a read failure is a recorded error
   assert.equal(tick.quiet, true);
   assert.match(tick.summary, /read failed \(disk gone\)/);
   assert.equal(h.state.lastError?.reason, 'disk gone');
+});
+
+test('a "still waiting" card raised before waits stopped being raised retires on the next tick and leaves Needs you', async () => {
+  const state = emptyWorkReviewState();
+  const earlier = (key: string, kind: 'run_waiting' | 'chat_waiting', subject: string): void => {
+    state.items[key] = { key, kind, subject, detail: `${subject} has been waiting on you.`, ref: { type: kind === 'run_waiting' ? 'workflow_run' : 'chat_run', id: `${key}-ref` },
+      refs: [`${key}-ref`], count: 1, offer: 'I can show you what it is asking.', observedAt: iso(-2 * H), createdAt: iso(-2 * H), tickId: 't0',
+      notificationId: `work-review:${key}:${iso(-2 * H)}` };
+  };
+  earlier('run_waiting:books-live-sync-feed', 'run_waiting', 'books-live-sync-feed');
+  earlier('chat_waiting:scrape this tik tok please', 'chat_waiting', 'scrape this tik tok please');
+  const h = harness({ state });
+  await runWorkReviewTick(h.deps);
+  for (const key of ['run_waiting:books-live-sync-feed', 'chat_waiting:scrape this tik tok please']) {
+    assert.equal(h.state.items[key].retiredReason, 'resolved', key);
+    assert.ok(h.markedRead.includes(h.state.items[key].notificationId!), `${key} leaves Needs you`);
+  }
+  assert.equal(h.published.some((n) => /Still waiting/.test(n.title)), false, 'no new still-waiting card');
 });
 
 test('a failure a later successful run of the same workflow superseded stops asking; the failure alone does not', async () => {
