@@ -98,7 +98,7 @@ export function CollaborativeWorkstate({
 
   return (
     <section
-      aria-label="Working together"
+      aria-label="What Clem is keeping in mind"
       className={cn(
         'rounded-lg border border-primary/20 bg-primary-tint/30 px-4 py-3',
         className,
@@ -110,9 +110,9 @@ export function CollaborativeWorkstate({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="text-caption font-semibold text-muted">Working together</p>
+            <p className="text-caption font-semibold text-muted">Keeping in mind</p>
             {mode && <StatusPill tone={MODE_TONE[mode]}>{MODE_LABEL[mode]}</StatusPill>}
-            {snapshot?.needsConfirm && <StatusPill tone="warning">Check context</StatusPill>}
+            {snapshot?.needsConfirm && <StatusPill tone="warning">Still relevant?</StatusPill>}
             {/* A context check must be ANSWERABLE where it is asked — the pill
                 alone shipped as a question with no reply box (live 2026-07-30). */}
             {snapshot?.needsConfirm && (
@@ -123,7 +123,7 @@ export function CollaborativeWorkstate({
                   onClick={() => resolveCheck('confirm')}
                   className="rounded-md border border-border px-2 py-0.5 text-caption font-medium text-fg hover:border-primary/40 hover:text-primary disabled:opacity-50"
                 >
-                  Still current
+                  Yes, keep it
                 </button>
                 <button
                   type="button"
@@ -131,7 +131,7 @@ export function CollaborativeWorkstate({
                   onClick={() => resolveCheck('done')}
                   className="rounded-md border border-border px-2 py-0.5 text-caption text-muted hover:text-fg disabled:opacity-50"
                 >
-                  Done with this
+                  No, let it go
                 </button>
               </span>
             )}
@@ -246,7 +246,7 @@ export function CollaborativeWorkstate({
 
       {!compact && (
         <p className="mt-3 border-t border-primary/15 pt-2 text-caption text-faint">
-          Shared context Clementine carries across conversations and connected work.
+          What Clem keeps in mind across your chats and connected work.
         </p>
       )}
     </section>

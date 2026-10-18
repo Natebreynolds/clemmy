@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { MessageCircle, Keyboard, RefreshCw, LifeBuoy } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
+import { MessageCircle, Keyboard, RefreshCw, LifeBuoy, Map as MapIcon, Sparkles } from 'lucide-react';
+import { APP_PLACES } from '@clem/chat-engine';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -9,6 +10,15 @@ import { getBuildInfo } from '@/lib/advanced';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 
 const modKey = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl';
+
+/** First things a newcomer can ask (owner 2026-10-18: novice-first). Each
+ *  only reads or shows how; nothing here changes anything on its own. */
+const TRY_ASKING = [
+  'What can you help me with?',
+  'What needs my attention today?',
+  'Show me how to set up something that runs every Monday morning.',
+  'Build me a Space to keep track of my goals this month.',
+] as const;
 
 const SHORTCUTS: [string, string][] = [
   [`${modKey} K`, 'Search or jump anywhere'],
@@ -68,7 +78,7 @@ export function Help() {
   };
 
   return (
-    <Page title="Help" subtitle="Guides, shortcuts, and version" width="reading">
+    <Page title="Help" subtitle="How to get started, where things are, and how to reach support" width="reading">
       <div className="space-y-4">
         <Card className="flex items-center gap-3 p-5">
           <MessageCircle className="h-5 w-5 text-primary" aria-hidden />
@@ -77,6 +87,35 @@ export function Help() {
             <p className="text-small text-muted">The fastest way to get unstuck — just ask.</p>
           </div>
           <Button size="sm" onClick={() => navigate('/chat')}>Open chat</Button>
+        </Card>
+
+        <Card className="p-5">
+          <div className="mb-3 flex items-center gap-2"><Sparkles className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Things you can ask Clem</h3></div>
+          <ul className="space-y-1">
+            {TRY_ASKING.map((ask) => (
+              <li key={ask}>
+                <Link to={`/chat?prompt=${encodeURIComponent(ask)}`}
+                  className="flex items-center justify-between gap-3 rounded-md px-2 py-2 text-body text-fg hover:bg-subtle">
+                  <span>“{ask}”</span>
+                  <span className="shrink-0 text-small font-semibold text-primary-ink">Ask</span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Card>
+
+        <Card className="p-5">
+          <div className="mb-3 flex items-center gap-2"><MapIcon className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Where things are</h3></div>
+          <ul className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
+            {APP_PLACES.filter((place) => place.id !== 'help').map((place) => (
+              <li key={place.id}>
+                <Link to={place.desktop} className="group block rounded-md px-2 py-1.5 hover:bg-subtle">
+                  <span className="block text-body font-semibold text-fg group-hover:text-primary-ink">{place.name}</span>
+                  <span className="block text-small text-muted">{place.purpose}</span>
+                </Link>
+              </li>
+            ))}
+          </ul>
         </Card>
 
         <Card className="p-5">

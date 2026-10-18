@@ -3795,7 +3795,7 @@ test('GET /api/console/board shows a scheduled workflow with an unbound required
     assert.ok(card, 'the scheduled unbound workflow has a card');
     assert.equal(card!.column, 'needs_you');
     assert.equal(card!.status, 'needs_binding');
-    assert.match(card!.progressHint ?? '', /Won't run on its schedule until you bind: Pipeline sheet/);
+    assert.match(card!.progressHint ?? '', /Won't run on its schedule until you choose where its Pipeline sheet comes from/);
     assert.equal(card!.nextEdge?.href, '/automate?workflow=board-unbound-sheet');
     assert.ok(!body.cards.some((c) => c.id === 'wf-binding:board-unbound-manual'), 'a manual workflow with the same gap is not a stop');
   } finally {

@@ -17659,8 +17659,9 @@ async function processOneRunFile(
           // not a step this run completed.
           const executed = publicExecutionSteps.length - blockedSteps.length;
           return blockedSteps.length > 0
-            ? `completed ${Math.max(0, executed)} of ${publicExecutionSteps.length} steps — `
-              + `${blockedSteps.length} blocked (${blockedSteps.map((b) => b.stepId).join(', ')})`
+            // Plain words, no step ids (owner 2026-10-18: novice-first); the
+            // blocked steps are named on the run's own page.
+            ? `got through ${Math.max(0, executed)} of ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}, then stopped`
             : `completed ${publicExecutionSteps.length} step${publicExecutionSteps.length === 1 ? '' : 's'}`;
         })();
       const producedItems = [

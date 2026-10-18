@@ -1899,7 +1899,7 @@ function workflowRunRecovery(workflowSlug: string, runId: string): {
     failureSummary: undefined,
     primaryAction: 'none',
     continueMode: 'none',
-    nextSafeAction: summary.because ? `Run summary: ${summary.because}` : 'Open the trace to review the run.',
+    nextSafeAction: summary.because ? `It ${summary.because}.` : 'Open it to see what happened.',
   };
 }
 
@@ -13456,14 +13456,15 @@ export function registerConsoleRoutes(
           title: stop.workflow,
           column: 'needs_you',
           status: 'needs_binding',
-          progressHint: `Won't run on its schedule until you bind: ${stop.gaps[0]}${stop.gaps.length > 1 ? ` (+${stop.gaps.length - 1} more)` : ''}`,
+          // The gap names are the workflow's own inputs; its page lists them.
+          progressHint: `Won't run on its schedule until you choose where its ${(stop.gaps[0] ?? 'input').split(':')[0].replace(/_/g, ' ').trim()} comes from${stop.gaps.length > 1 ? ` (and ${stop.gaps.length - 1} more)` : ''}.`,
           sessionId: null,
           ageMs: 0,
           updatedAt: new Date(now).toISOString(),
           actions: [],
           primaryAction: 'none',
           continueMode: 'none',
-          nextEdge: { label: 'Bind it in Automate', href: `/automate?workflow=${encodeURIComponent(stop.slug)}` },
+          nextEdge: { label: 'Choose it', href: `/automate?workflow=${encodeURIComponent(stop.slug)}` },
           raw: { slug: stop.slug, gaps: stop.gaps.slice(0, 6) },
         });
       }
