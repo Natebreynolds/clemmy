@@ -1485,7 +1485,7 @@
           "bytes": 72275
         },
         "src/execution/workflow-objective-judge.ts": {
-          "bytes": 17440
+          "bytes": 17760
         },
         "src/execution/workflow-contract-proposals.ts": {
           "bytes": 32491
@@ -5418,7 +5418,7 @@
           "bytes": 72275
         },
         "src/execution/workflow-objective-judge.ts": {
-          "bytes": 17440
+          "bytes": 17760
         },
         "src/execution/workflow-contract-proposals.ts": {
           "bytes": 32491

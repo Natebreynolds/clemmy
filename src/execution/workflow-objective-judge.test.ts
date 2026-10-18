@@ -455,4 +455,7 @@ test('the review reads a method a step names as the author\'s plan, not part of 
   });
   assert.match(objectiveSeen, /A method a step names .* is how its author planned the work, not part of the target/);
   assert.match(objectiveSeen, /only when the owner's own words in the workflow require that method/);
+  // Live 2026-10-18: "call the scrape tool exactly once" and "save the JSON
+  // verbatim" in a step held a run that wrote the right CSV as blocked.
+  assert.match(objectiveSeen, /how many calls to make, how to format a temporary or intermediate file\) is how its author planned the work/);
 });
