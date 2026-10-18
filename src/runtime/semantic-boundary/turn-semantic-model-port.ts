@@ -350,6 +350,21 @@ export interface ApprovedActionEndingCall {
   evidenceDigest: string;
 }
 
+/** A workflow run the owner started from a chat has ended, to be reported in
+ * that chat by Clem in her own words. Every field is data about the owner's
+ * own work, never an instruction. */
+export interface WorkflowRunEndingCall {
+  purpose: typeof CLEM_VOICE_PURPOSE;
+  /** What the owner asked for in the chat that started the run, in their words. */
+  asked: string;
+  workflow: string;
+  /** done: it finished. blocked: it stopped and needs attention. failed: it broke. */
+  outcome: 'done' | 'blocked' | 'failed';
+  /** The run's report as the runner wrote it: the facts to tell. */
+  report: string;
+  evidenceDigest: string;
+}
+
 /** The owner's words in reply to something Clem said, read into a decision. */
 export interface ClemReplyCall {
   purpose: typeof CLEM_REPLY_PURPOSE;
@@ -400,6 +415,9 @@ export interface TurnSemanticModelPort {
   /** On the brain role: Clem's reply when an approved action did not go
    * through: what happened, what she would change, and whether to go ahead. */
   voiceApprovedActionEnding?(call: ApprovedActionEndingCall): Promise<ClemVoiceResult>;
+  /** On the brain role: Clem's report, in the chat that started it, of how a
+   * workflow run ended. */
+  voiceWorkflowRunEnding?(call: WorkflowRunEndingCall): Promise<ClemVoiceResult>;
   /** On the brain role: what the owner's reply to Clem's message means. */
   readClemReply?(call: ClemReplyCall): Promise<ClemReplyResult>;
 }

@@ -283,6 +283,7 @@ import {
 import { skillBodyExecutionShortfall } from '../runtime/harness/skill-execution.js';
 import { deliverOutcome } from '../runtime/outcome.js';
 import { rewriteInClementineVoice } from './voice-rewrite.js';
+import { workflowEndingInClemsWords } from './workflow-ending-voice.js';
 import { AgentRuntimeCancelledError } from '../runtime/provider.js';
 import { looksLikeToolUnavailableSelfReport } from '../runtime/harness/tool-unavailable-text.js';
 import { reportedBackRunIdsFrom, terminalDashboardNotificationRunIdsFrom } from './workflow-watchdog.js';
@@ -17737,6 +17738,16 @@ async function processOneRunFile(
         reportBody = scrubWorkflowTerminalPresentation(voiced.message);
         runIsNoOp = voiced.nothingHappened
           && !needsAttention && !hasFailures && !hasAdvisories && !autoHealPaused && !interactiveForNoOpCompatibility;
+      } else if (!isCompiledProjectRun && hasExactOriginObserver) {
+        // The chat that started the run hears its ending from Clem, on the
+        // brain the owner chose, not as the runner's template.
+        const voiced = await workflowEndingInClemsWords({
+          runId: run.id,
+          workflow: workflow.data.name,
+          outcome: workflowReportLaneForOutcome({ needsAttention, advisories: publicQualityAdvisories }),
+          report: reportBody,
+        });
+        if (voiced) reportBody = scrubWorkflowTerminalPresentation(voiced);
       }
       const terminalReport = {
         workflowName: workflow.data.name,
@@ -18341,6 +18352,16 @@ async function processOneRunFile(
         failureBody = scrubWorkflowTerminalPresentation(
           (await rewriteWorkflowReportInVoiceImpl(failureBody, { workflowName: run.workflow, lane: 'failed' })).message,
         );
+      } else if (
+        !cancelled
+        && !structuredFailure
+        && definitionResolution.definitionSource !== 'compiled_snapshot'
+        && originObserverState === 'exact'
+      ) {
+        const voiced = await workflowEndingInClemsWords({
+          runId: run.id, workflow: run.workflow, outcome: 'failed', report: failureBody,
+        });
+        if (voiced) failureBody = scrubWorkflowTerminalPresentation(voiced);
       }
       const requestedReport = { workflowName: run.workflow, outcome: 'failed' as const, detail: failureBody };
       const terminalRecord = writeRunRecord(filePath, {
