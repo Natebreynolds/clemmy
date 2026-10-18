@@ -2163,7 +2163,7 @@
           "bytes": 70407
         },
         "src/agents/work-review.ts": {
-          "bytes": 24360
+          "bytes": 21168
         },
         "src/agents/work-review-runtime.ts": {
           "bytes": 12873
@@ -6093,7 +6093,7 @@
           "bytes": 70407
         },
         "src/agents/work-review.ts": {
-          "bytes": 24360
+          "bytes": 21168
         },
         "src/agents/work-review-runtime.ts": {
           "bytes": 12873
