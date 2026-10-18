@@ -829,7 +829,7 @@ async function prepareProvenOperationInScope(
     const ruled = decideTurnStart ? ownerRuleOperations(input.query) : [];
     for (const row of ruled) if (!ownerRuleFor.has(row.id)) ownerRuleFor.set(row.id, row.rule);
     const operations = decideTurnStart ? [
-      ...ruled.map(({ id, purpose }) => ({ id, purpose })),
+      ...ruled.map(({ id, purpose, rule }) => ({ id, purpose, rule: rule.text })),
       ...routableOperationsFromStrategies(input.query, strategyScope, verified),
     ].filter((row, index, rows) => rows.findIndex((other) => other.id === row.id) === index) : [];
     if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
@@ -1041,7 +1041,10 @@ async function prepareProvenOperationInScope(
     skipDiscoverySearch,
     // A judgement that a run did the same kind of work, sure or corroborated,
     // says its operations do the core of the request, not all of it.
-    narrowSurface: skipDiscoverySearch && pickedBy !== 'jev' && pickedBy !== 'jev_corroborated',
+    // An owner's rule picks the tool for one part of the work (reading the
+    // page), not the whole method, so the rest of the surface stays.
+    narrowSurface: skipDiscoverySearch && pickedBy !== 'jev' && pickedBy !== 'jev_corroborated'
+      && !(routed && ownerRuleFor.has(strategy.toolsUsed[0] ?? '')),
     boundAccounts,
     capabilityRefs,
     descriptors,

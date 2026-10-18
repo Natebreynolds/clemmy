@@ -1024,3 +1024,35 @@ test('two unsure answers that name the same operation are reported as corroborat
   answers = { which: choice('strat-events', 0.56), run_0: noul(0.67), run_1: noul(0.05) };
   assert.equal((await decideTurnStartWithJev('Prepare two invitations', runs, [], { timeoutMs: 1_000 })).corroborated, undefined);
 });
+
+test("an operation an owner's standing rule names is asked about by the rule, not by whether it is the request's core", async () => {
+  _setTypesafeKeyForTests('ts_test');
+  const posted: Array<Record<string, any>> = [];
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted.push(JSON.parse(String(init.body)));
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          select: { type: 'choice', choice: 'op_0', confidence: 0.9, probabilities: { op_0: 0.9 } },
+          fit_0: { type: 'noul', noul: 0.9 },
+          fit_1: { type: 'noul', noul: 0.2 },
+        },
+        usage: { input_tokens: 90, output_tokens: 8 },
+      }),
+    };
+  });
+  const rule = 'When I ask for information from a web page, read it with PageGrab unless the page needs a login; then use the browser.';
+  const operations = [
+    { id: 'PAGEGRAB_SCRAPE', purpose: `Owner's standing rule: "${rule}"`, rule },
+    { id: 'space_preview', purpose: 'Render a Space for review' },
+  ];
+  const routed = await decideTurnStartWithJev('Open https://example.test/list and count the five-star items', [], operations, { timeoutMs: 1_000 });
+  const questions = posted[0]!.questions;
+  assert.match(questions.select.instructions, /When the owner's standing rule for an operation applies to this request \(its exception not met\), choose that operation, even if more work follows it/);
+  assert.match(questions.fit_0.instructions, /^The owner's standing rule: "When I ask for information from a web page, read it with PageGrab unless the page needs a login; then use the browser\."\. Does this rule apply to this request/);
+  assert.match(questions.fit_1.instructions, /^Would calling space_preview directly do the core of this request\?/, 'other candidates keep the core question');
+  assert.equal(routed.route.pick?.id, 'PAGEGRAB_SCRAPE');
+});

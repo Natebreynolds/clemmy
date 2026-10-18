@@ -229,6 +229,8 @@ const CORROBORATED_FIT_MIN = 0.5;
 export interface RoutableOperation {
   id: string;
   purpose: string;
+  /** The owner's standing rule that names this operation's tool, in their words. */
+  rule?: string;
 }
 
 export interface OperationRoute<T extends RoutableOperation> {
@@ -314,14 +316,26 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
     const criteria: Record<string, string | null> = {
       none: 'No single listed operation does the core of this request, or not sure.',
     };
+    const ruled = ops.some((operation) => operation.rule);
     questions.select = {
       type: 'choice',
-      instructions: 'Which listed operation should run first to do the core of this request? Choose none unless one clearly fits.',
+      instructions: ruled
+        ? 'Which listed operation should run first for this request? When the owner\'s standing rule for an operation applies to this request (its exception not met), choose that operation, even if more work follows it. Otherwise choose the one that does the core of the request. Choose none unless one clearly fits.'
+        : 'Which listed operation should run first to do the core of this request? Choose none unless one clearly fits.',
       criteria,
     };
     ops.forEach((operation, index) => {
       criteria[`op_${index}`] = `${operation.id} · ${operation.purpose}`.slice(0, 240);
-      questions[`fit_${index}`] = {
+      // An owner's rule says which tool does part of the work ("read pages
+      // with X"); it applies whether or not that part is the request's core.
+      questions[`fit_${index}`] = operation.rule ? {
+        type: 'noul',
+        instructions: `The owner's standing rule: "${operation.rule.slice(0, 200)}". Does this rule apply to this request, with any exception in it not met, so ${operation.id} should do its part?`,
+        criteria: {
+          true: 'The rule covers this request and its exception does not hold.',
+          false: 'The rule is about different work, its exception holds, or not sure.',
+        },
+      } : {
         type: 'noul',
         instructions: `Would calling ${operation.id} directly do the core of this request?`,
         criteria: {
