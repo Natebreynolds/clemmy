@@ -1416,6 +1416,11 @@ export interface HarnessRunContext {
    * flight. An adapter that places per-turn context beside that message finds
    * it by this digest. Refreshed before every call with the prompt components. */
   modelTurnAnchor?: string;
+  /** Digests of the turn-context items (context packet, memory primer, proven
+   * operation, retry context) the input filter appended to the model call in
+   * flight. An adapter that keeps them beside the anchor finds them by these.
+   * Refreshed before every call with the anchor. */
+  modelTurnContext?: string[];
   /** Run-scoped account stickiness: toolkit → connectionId → use. One answered
    * account choice (explicit pin/alias or a positively resolved identity) holds
    * for the rest of the run; two DISTINCT accounts used in one run means later

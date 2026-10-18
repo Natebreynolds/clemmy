@@ -472,7 +472,7 @@ import {
   type WorkflowOriginGroupClosedBatchReceipt,
 } from '../../execution/workflow-origin-group.js';
 import { workflowOriginReplyTargetForSource } from '../workflow-origin-authority.js';
-import { turnAnchorDigest, turnAnchorItem } from './byo-prompt-layout.js';
+import { turnAnchorDigest, turnAnchorItem, turnContextDigest } from './byo-prompt-layout.js';
 import { nextModelRequestOrdinal } from './model-request-provenance.js';
 import {
   exactOriginDeliveryTargetDigest,
@@ -12716,6 +12716,10 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
         // guidance is appended after it, so the last user message here is the
         // one that opened the turn.
         harnessContext.modelTurnAnchor = turnAnchorDigest(value.input);
+        harnessContext.modelTurnContext = [
+          composedTexts.contextPacket, composedTexts.memoryPrimer,
+          composedTexts.provenOperation, composedTexts.retryContext,
+        ].filter((text): text is string => typeof text === 'string' && text.length > 0).map(turnContextDigest);
       }
       const composed = value;
       let published = false;

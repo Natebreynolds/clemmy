@@ -196,6 +196,64 @@ export function turnAnchorItem<T>(input: readonly T[]): (T & { content?: unknown
   return undefined;
 }
 
+/** Digest of one turn-context item's text, as the anchor helpers compare it. */
+export function turnContextDigest(text: string): string {
+  return textDigest(text);
+}
+
+/**
+ * Keep a turn's requests append-only on a wire whose prompt cache extends only
+ * a previous request's whole prompt (the Codex Responses backend): the turn's
+ * context items, appended after the history on every request, move to just
+ * after the user message that opened the turn, followed by `turnContext`.
+ *
+ * The first request of a turn is unchanged: its anchor is the last item, so
+ * the context already follows it. Each later request then extends the one
+ * before it, where at the tail the context stood between the earlier calls and
+ * results. Live 2026-10-18 the GPT brain read the same 6,272 cached tokens of
+ * 9k-39k prompts on all fourteen calls of a turn, while the reviewer on the
+ * same backend and model, whose input only grows, read ~90% of each prompt.
+ *
+ * Only items whose text digest is in `contextDigests` move; a single-request
+ * guidance item appended after them keeps its place at the tail. Returns
+ * `undefined` (keep the tail layout) when the anchor is not in the input.
+ */
+export function keepTurnContextBesideAnchor<T>(
+  input: readonly T[],
+  turnContext: readonly T[],
+  anchorDigest: string | undefined,
+  contextDigests: readonly string[] | undefined,
+): T[] | undefined {
+  if (!anchorDigest) return undefined;
+  const messageOf = (item: T): { role?: unknown; content?: unknown } | undefined => {
+    const entry = item as { role?: unknown; type?: unknown; content?: unknown } | undefined;
+    return entry && (entry.type === undefined || entry.type === 'message') ? entry : undefined;
+  };
+  let anchor = -1;
+  for (let i = input.length - 1; i >= 0; i -= 1) {
+    const message = messageOf(input[i]!);
+    if (message?.role !== 'user') continue;
+    const text = userMessageText(message.content);
+    if (text.trim() && textDigest(text) === anchorDigest) {
+      anchor = i;
+      break;
+    }
+  }
+  if (anchor < 0) return undefined;
+  const wanted = new Set(contextDigests ?? []);
+  const moved: T[] = [];
+  const rest: T[] = [];
+  for (const item of input.slice(anchor + 1)) {
+    const message = messageOf(item);
+    if (wanted.size > 0 && message?.role === 'system' && wanted.has(textDigest(userMessageText(message.content)))) {
+      moved.push(item);
+    } else {
+      rest.push(item);
+    }
+  }
+  return [...input.slice(0, anchor + 1), ...moved, ...turnContext, ...rest];
+}
+
 /**
  * Move the per-turn context to the turn anchor. Returns `undefined` (send the
  * body unchanged) unless the first system message carries the exact stable /

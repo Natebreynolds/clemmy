@@ -54,6 +54,7 @@ import type { AgentInputItem, AgentOutputItem } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { MODELS, getRuntimeEnv } from '../../config.js';
 import { harnessRunContextStorage } from './brackets.js';
+import { keepTurnContextBesideAnchor } from './byo-prompt-layout.js';
 import { loadFreshCodexAccessToken, extractAccountIdFromJwt } from './codex-client.js';
 import { refreshStoredNativeOAuth, getStoredCodexOAuthTokens, classifyCodexAuthError } from '../auth-store.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -519,6 +520,7 @@ async function waitBeforeTransparentCodexRetry(
 interface CodexCallerSnapshot {
   readonly sessionId?: string; readonly sourceUserSeq?: number; readonly runAttemptId?: string;
   readonly turn?: number; readonly promptComponents?: Record<string, number>;
+  readonly modelTurnAnchor?: string; readonly modelTurnContext?: readonly string[];
 }
 interface CodexCacheIdentity {
   readonly key: string;
@@ -548,10 +550,16 @@ function captureCodexCall(path: 'getResponse' | 'getStreamedResponse', request: 
           promptComponents = Object.freeze(Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, v.value])));
         }
       }
+      // The turn layout digests, so a lazily drained stream keeps its layout.
+      const anchor = own('modelTurnAnchor'), turnContext = own('modelTurnContext');
+      const contextDigests = Array.isArray(turnContext) && !utilTypes.isProxy(turnContext)
+        && turnContext.every((digest) => typeof digest === 'string') ? Object.freeze([...turnContext as string[]]) : undefined;
       harness = Object.freeze({ ...(typeof sessionId === 'string' ? { sessionId } : {}),
         ...(Number.isSafeInteger(seq) && (seq as number) > 0 ? { sourceUserSeq: seq as number } : {}),
         ...(typeof attempt === 'string' ? { runAttemptId: attempt } : {}),
-        ...(Number.isSafeInteger(turn) ? { turn: turn as number } : {}), ...(promptComponents ? { promptComponents } : {}) });
+        ...(Number.isSafeInteger(turn) ? { turn: turn as number } : {}), ...(promptComponents ? { promptComponents } : {}),
+        ...(typeof anchor === 'string' ? { modelTurnAnchor: anchor } : {}),
+        ...(contextDigests ? { modelTurnContext: contextDigests } : {}) });
     }
   } catch { /* unowned accounting/journal snapshot remains unowned */ }
   // A lazy stream may be drained under a different conversation. Capture only
@@ -1313,16 +1321,19 @@ export function splitCodexInstructions(raw: string | undefined | null): {
 // having to mock fetch + OAuth + SSE for every assertion.
 export function buildCodexRequestBody(modelId: string, request: ModelRequest, cacheIdentity?: CodexCacheIdentity): CodexRequestBody {
   const tools = serializeTools(request.tools, request.handoffs);
-  const input = withLatestFunctionOutputImages(serializeInput(request.input));
+  const serialized = withLatestFunctionOutputImages(serializeInput(request.input));
   // Stable-prefix wire: role rubric stays in `instructions`; the per-turn memory
-  // ctx moves to a trailing input system message (after tools) so `instructions +
-  // tools` caches. Placed at the input tail where the [AGENT CONTEXT PACKET]
-  // already lives — the model still sees it, it just no longer busts the prefix.
+  // ctx moves to an input system message (after tools) so `instructions + tools`
+  // caches. It rides with the [AGENT CONTEXT PACKET] and the other turn-context
+  // items, kept just after the turn's opening user message so every request of
+  // the turn extends the one before it (keepTurnContextBesideAnchor). Without a
+  // known anchor they stay at the input tail.
   const split = splitCodexInstructions(request.systemInstructions);
   const instructions = split.instructions || 'You are a helpful assistant.';
-  if (split.trailingContext.trim()) {
-    input.push({ role: 'system', content: split.trailingContext.trim() });
-  }
+  const turnContext = split.trailingContext.trim() ? [{ role: 'system', content: split.trailingContext.trim() }] : [];
+  const layoutSource = cacheIdentity ? cacheIdentity.source : harnessRunContextStorage.getStore();
+  const input = keepTurnContextBesideAnchor(serialized, turnContext, layoutSource?.modelTurnAnchor, layoutSource?.modelTurnContext)
+    ?? [...serialized, ...turnContext];
   const body: CodexRequestBody = {
     model: resolveCodexModel(modelId),
     instructions,

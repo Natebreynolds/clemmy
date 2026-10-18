@@ -161,6 +161,37 @@ test('Codex wire (default): instructions is the STABLE role only; dynamic ctx re
   assert.deepEqual(last, { role: 'system', content: 'DYNAMIC_CTX' });
 });
 
+test('Codex wire: a turn\'s requests only grow — its context stays beside the opening message, one-off guidance stays last', async () => {
+  // Live 2026-10-18 the GPT brain read the same 6,272 cached tokens on all
+  // fourteen calls of a turn: the context at the tail stood where the next
+  // call's results go, so no call extended the one before it.
+  const { turnAnchorDigest, turnContextDigest } = await import('./byo-prompt-layout.js');
+  const opening = { role: 'user', content: 'Build the shelf Space from books.csv' };
+  const packet = { role: 'system', content: '[AGENT CONTEXT PACKET]\nskills: workspace-builder' };
+  const primer = { role: 'system', content: '[MEMORY PRIMER]\nshelf lives in ~/Documents' };
+  const history = [{ role: 'user', content: 'earlier ask' }, { role: 'assistant', content: 'earlier reply' }];
+  const call = { type: 'function_call', callId: 'c1', name: 'space_save', arguments: '{}', status: 'completed' };
+  const result = { type: 'function_call_result', callId: 'c1', name: 'space_save', status: 'completed', output: { type: 'text', text: 'saved' } };
+  const store = { sessionId: 'sess-layout', modelTurnAnchor: turnAnchorDigest([opening]),
+    modelTurnContext: [packet.content, primer.content].map(turnContextDigest) };
+  const wire = (input: unknown[]) => harnessRunContextStorage.run(store as never, () => buildCodexRequestBody('gpt-5.5',
+    requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}TURN_CTX`, input as ModelRequest['input']))).input as unknown[];
+  const ctx = { role: 'system', content: 'TURN_CTX' };
+  const first = wire([...history, opening, packet, primer]);
+  assert.deepEqual(first, [...history, opening, packet, primer, ctx], 'the first request is the tail layout, byte for byte');
+  const second = wire([...history, opening, call, result, packet, primer]);
+  assert.deepEqual(second.slice(0, first.length), first, 'the second request extends the first');
+  assert.equal(second.length, first.length + 2);
+  const guidance = { role: 'system', content: 'Your reply was reviewed: name the file you read.' };
+  const third = wire([...history, opening, call, result, packet, primer, guidance]);
+  assert.deepEqual(third.slice(0, second.length), second);
+  assert.deepEqual(third.at(-1), guidance, 'single-request guidance keeps its place at the tail');
+  const unanchored = harnessRunContextStorage.run({ ...store, modelTurnAnchor: turnAnchorDigest([{ role: 'user', content: 'another turn' }]) } as never,
+    () => buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}TURN_CTX`,
+      [opening, call, result, packet] as ModelRequest['input']))).input as unknown[];
+  assert.deepEqual(unanchored.at(-1), ctx, 'no anchor in the input keeps the tail layout');
+});
+
 test('Codex wire cache stability: two turns with the SAME role+tools but DIFFERENT ctx yield an IDENTICAL instructions prefix', () => {
   const a = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}ctx turn A: focus=alpha`));
   const b = buildCodexRequestBody('gpt-5.5', requestWithInstructions(`ROLE${INSTRUCTION_CACHE_DELIM}ctx turn B: focus=bravo`));
