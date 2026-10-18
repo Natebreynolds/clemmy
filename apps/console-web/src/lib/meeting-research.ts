@@ -62,6 +62,7 @@ export interface MeetingResearchJob {
   task?: { sessionId: string; sourceUserSeq: number; attemptId: string; runId: string; clientRequestId: string };
   reason?: string;
   outcomeUnknown?: boolean;
+  reviewState?: 'reviewed' | 'disabled_by_owner' | 'not_required' | 'unverified';
 }
 export interface MeetingResearchState {
   meetingId: string;
@@ -113,7 +114,9 @@ export function parseMeetingResearchState(value: unknown, meetingId: string): Me
     }
     return { id: job.id, question: job.question, status: job.status as MeetingResearchJob['status'],
       ...(task ? { task } : {}), ...(job.reason ? { reason: job.reason as string } : {}),
-      ...(job.outcomeUnknown !== undefined ? { outcomeUnknown: job.outcomeUnknown as boolean } : {}) };
+      ...(job.outcomeUnknown !== undefined ? { outcomeUnknown: job.outcomeUnknown as boolean } : {}),
+      ...(job.reviewState !== undefined ? { reviewState: ['reviewed', 'disabled_by_owner', 'not_required'].includes(String(job.reviewState))
+        ? job.reviewState as MeetingResearchJob['reviewState'] : 'unverified' as const } : {}) };
   });
   return { meetingId, version: raw.version, enabled: raw.enabled, useMemory: raw.useMemory,
     maxLookups: raw.maxLookups, usedLookups: raw.usedLookups, status: raw.status as MeetingResearchState['status'], documentRefs: refs, jobs,
@@ -140,6 +143,15 @@ export function meetingResearchJobLabel(job: Pick<MeetingResearchJob, 'status' |
     case 'completed': return 'Answer ready';
     case 'blocked': return 'Needs attention';
     case 'cancelled': return 'Stopped';
+  }
+}
+export function meetingResearchReviewNotice(job: Pick<MeetingResearchJob, 'status' | 'task' | 'reviewState'>): string | undefined {
+  if (job.status !== 'completed' || !job.task) return undefined;
+  switch (job.reviewState) {
+    case 'reviewed': return 'Reviewed';
+    case 'disabled_by_owner': return 'Review was off for this answer.';
+    case 'not_required': return 'Separate review wasn’t required for this answer.';
+    default: return 'The answer is available, but review couldn’t confirm it.';
   }
 }
 export function meetingResearchRefsCurrent(refs: readonly MeetingResearchDocumentRef[], documents: readonly MeetingResearchDocument[]): boolean {

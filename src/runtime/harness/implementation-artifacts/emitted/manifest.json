@@ -1368,7 +1368,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 180653
+          "bytes": 182657
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -5289,7 +5289,7 @@
           "bytes": 19025
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 180653
+          "bytes": 182657
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478

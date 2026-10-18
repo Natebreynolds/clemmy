@@ -16,7 +16,9 @@ process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
 const capture = await import('../integrations/recall/meeting-capture.js');
 const assistance = await import('../integrations/recall/meeting-assistance.js');
 const { meetingDocuments } = await import('../integrations/recall/meeting-documents.js');
-const { meetingResearch } = await import('../integrations/recall/meeting-research-service.js');
+const { meetingResearch, createMeetingResearchTaskDispatch } = await import('../integrations/recall/meeting-research-service.js');
+const { createMeetingResearchCoordinator } = await import('../integrations/recall/meeting-research.js');
+const eventlog = await import('../runtime/harness/eventlog.js');
 const { registerMeetingResearchRoutes } = await import('./meeting-research-routes.js');
 assistance.registerMeetingAssistanceScanPort(null);
 
@@ -36,6 +38,7 @@ test.after(async () => {
   await settle(); assistance.registerMeetingAssistanceScanPort(null);
   for (const timer of heldTimers) clearTimeout(timer);
   globalThis.setTimeout = realSetTimeout;
+  eventlog.closeEventLog();
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -230,5 +233,63 @@ test('context POST/DELETE require capture and snapshot/revision CAS, preserving 
     const removed = await fetch(`${url}/documents/${document.id}`, json('DELETE', remove)); assert.equal(removed.status, 200);
     const result = await removed.json() as MeetingDocumentSnapshot;
     assert.deepEqual(result.documents, []); assert.equal(result.snapshotVersion, saved.snapshotVersion + 1);
+  } finally { await harness.close(); }
+});
+
+test('GET preserves a saved answer while honestly projecting reviewed, failed-open, owner-off and wrong-source review', async () => {
+  const host = await import('../runtime/harness/host-turn-runner.js');
+  const { completionDataForTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+  const answer = 'The controlled note records the approved version as seven.';
+  const harness = await boot();
+  try {
+    for (const variant of ['reviewed', 'failed_open', 'owner_off', 'wrong_source'] as const) {
+      const f = fixture(); const url = `${harness.url}${f.route}`;
+      const question = 'What is the approved controlled version?';
+      const record = capture.appendRecallTranscriptSegment({ windowId: f.record.windowId, sdkUploadId: f.record.sdkUploadId,
+        event: 'transcript.data', text: question, isFinal: true, timestamp: '2026-10-17T12:00:00.000Z' });
+      const before = meetingDocuments.getMeetingDocuments(record.id);
+      const saved = meetingDocuments.attachMeetingDocument(record.id, { expectedVersion: before.snapshotVersion,
+        captureDigest: before.captureDigest, title: 'Controlled source', text: answer });
+      let executions = 0;
+      const coordinator = createMeetingResearchCoordinator({ directory: path.join(home, 'state', 'meeting-capture', 'research'),
+        readMeeting: capture.loadRecallMeetingById,
+        readDocumentRefs: id => meetingDocuments.getMeetingDocuments(id).documents.map(({ id, revision, digest }) => ({ id, revision, digest })),
+        dispatch: createMeetingResearchTaskDispatch(async input => {
+          executions++;
+          const source = eventlog.listEventsAtSequences(input.sessionId, [input.sourceUserSeq])[0]!;
+          const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, turn: source.turn,
+            attemptId: input.runAttemptId, runId: source.data.runId as string };
+          host.captureEffectiveCompletionPolicyOnce({ ...identity, enabled: variant !== 'owner_off', ownerEnabled: variant !== 'owner_off' });
+          let metadata: Record<string, unknown>;
+          if (variant === 'owner_off') metadata = { completionReview: { version: 1, disposition: 'disabled_by_owner', policyEvidence: 'captured' } };
+          else {
+            const objectiveDigest = sha(host.acceptedObjectiveForSource(identity)!); const replyDigest = sha(answer);
+            const verdict = eventlog.appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+              lane: 'host_v1', kind: 'completion', sourceUserSeq: input.sourceUserSeq, fulfills: true,
+              objectiveDigest, replyDigest, ...(variant === 'failed_open' ? { failedOpen: true } : {}),
+            } });
+            metadata = { completionVerdictRef: { version: 1, sourceUserSeq: input.sourceUserSeq + (variant === 'wrong_source' ? 1 : 0),
+              eventId: String(verdict.id), seq: verdict.seq, verified: true, disposition: 'reviewed', policyEvidence: 'captured',
+              deliveredTextIsJudgedText: true, replyMatches: true, objectiveMatches: true, artifactsMatch: true, objectiveDigest, replyDigest } };
+          }
+          const outcome = { version: 2 as const, id: turnOutcomeId(identity), identity, status: 'done' as const, resumable: false as const,
+            presentation: { kind: 'answer' as const, text: answer } };
+          eventlog.appendEvent({ sessionId: input.sessionId, turn: source.turn, role: 'Clem', type: 'conversation_completed',
+            data: { ...completionDataForTurnOutcome(outcome), terminalKey: outcome.id, ...metadata } });
+        }) });
+      coordinator.set(record.id, { enabled: true, useMemory: false, maxLookups: 3, expectedVersion: 0,
+        documentRefs: saved.documents.map(({ id, revision, digest }) => ({ id, revision, digest })) });
+      coordinator.enqueue(record.id, { offerId: `route-review-${variant}`, offerDigest: sha(variant), sourceDigest: sha(question),
+        question, quote: question, segmentIds: [record.segments[0]!.id] });
+      const result = await coordinator.drain(record.id); assert.equal(result.jobs[0]!.status, 'completed');
+      const eventCount = eventlog.listEvents(result.jobs[0]!.task!.sessionId).length;
+      const state = await readResearch(url) as MeetingResearchSnapshot & { jobs: { reviewState: string; task: unknown }[] };
+      assert.equal(state.jobs[0]!.reviewState, variant === 'reviewed' ? 'reviewed' : variant === 'owner_off' ? 'disabled_by_owner' : 'unverified');
+      assert.deepEqual(state.jobs[0]!.task, result.jobs[0]!.task); assert.equal(JSON.stringify(state).includes(answer), false);
+      assert.deepEqual(await readResearch(url), state); assert.equal(executions, 1);
+      assert.equal(eventlog.listEvents(result.jobs[0]!.task!.sessionId).length, eventCount, 'GET never adds a review or executor event');
+    }
   } finally { await harness.close(); }
 });

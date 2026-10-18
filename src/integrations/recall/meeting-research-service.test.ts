@@ -24,6 +24,7 @@ const facts = await import('../../memory/facts.js');
 const memoryDb = await import('../../memory/db.js');
 const { completionDataForTurnOutcome } = await import('../../runtime/harness/delivery-committer.js');
 const { turnOutcomeId } = await import('../../runtime/harness/turn-outcome.js');
+const host = await import('../../runtime/harness/host-turn-runner.js');
 const executionErrors: unknown[] = [];
 afterEach(() => {
   boundaryGuard.installMeetingResearchBoundary(null);
@@ -80,18 +81,69 @@ function taskFromExecution(input: Parameters<MeetingResearchExecutionPort>[0]): 
   return { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, attemptId: input.runAttemptId,
     runId: source.data.runId as string, clientRequestId: source.data.clientRequestId as string };
 }
-function typedTerminal(input: Parameters<MeetingResearchExecutionPort>[0], status: 'done' | 'blocked') {
+const fixtureAnswerText = 'The controlled briefing says seven; this is a fixture answer.';
+function typedTerminal(input: Parameters<MeetingResearchExecutionPort>[0], status: 'done' | 'blocked', metadata: Record<string, unknown> = {}) {
   const source = eventlog.listEventsAtSequences(input.sessionId, [input.sourceUserSeq])[0]!;
   const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, turn: source.turn,
     attemptId: input.runAttemptId, runId: source.data.runId as string };
   const outcome = status === 'done'
     ? { version: 2 as const, id: turnOutcomeId(identity), identity, status: 'done' as const, resumable: false as const,
-      presentation: { kind: 'answer' as const, text: 'The controlled briefing says seven; this is a fixture answer.' } }
+      presentation: { kind: 'answer' as const, text: fixtureAnswerText } }
     : { version: 2 as const, id: turnOutcomeId(identity), identity, status: 'blocked' as const, resumable: false as const,
       presentation: { kind: 'blocked' as const, text: 'The controlled evidence is insufficient.' } };
   return eventlog.appendEvent({ sessionId: input.sessionId, turn: source.turn, role: 'Clem', type: 'conversation_completed',
-    data: { ...completionDataForTurnOutcome(outcome), terminalKey: outcome.id } });
+    data: { ...completionDataForTurnOutcome(outcome), terminalKey: outcome.id, ...metadata } });
 }
+
+test('saved answer review is passively projected from exact source policy and verdict evidence, never completion alone', async () => {
+  const cases = ['reviewed', 'failed_open', 'abstained', 'missing', 'owner_off', 'surface_not_required',
+    'wrong_source', 'wrong_verdict_source', 'wrong_verdict_event', 'changed_reply', 'changed_objective'] as const;
+  for (const variant of cases) {
+    let task: MeetingResearchTask | undefined;
+    const f = fixture(async input => {
+      task = taskFromExecution(input);
+      const ownerEnabled = variant !== 'owner_off';
+      host.captureEffectiveCompletionPolicyOnce({ ...task, enabled: ownerEnabled && variant !== 'surface_not_required', ownerEnabled });
+      if (variant === 'owner_off' || variant === 'surface_not_required') {
+        typedTerminal(input, 'done', { completionReview: { version: 1, policyEvidence: 'captured',
+          disposition: variant === 'owner_off' ? 'disabled_by_owner' : 'not_required' } });
+        return;
+      }
+      if (variant === 'missing') { typedTerminal(input, 'done'); return; }
+      const objective = host.acceptedObjectiveForSource(task)!;
+      const objectiveDigest = sha(variant === 'changed_objective' ? 'A different controlled objective.' : objective);
+      const replyDigest = sha(variant === 'changed_reply' ? 'A different controlled answer.' : fixtureAnswerText);
+      const unverified = variant === 'failed_open' || variant === 'abstained';
+      const verdict = eventlog.appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+        lane: 'host_v1', kind: 'completion', sourceUserSeq: task.sourceUserSeq + (variant === 'wrong_verdict_source' ? 1 : 0),
+        fulfills: variant !== 'abstained', objectiveDigest, replyDigest, settledEvidenceAvailable: true,
+        ...(unverified ? { failedOpen: true, reviewFailure: 'invalid', ...(variant === 'abstained' ? { reviewDisposition: 'answered_unqualified' } : {}) } : {}),
+      } });
+      typedTerminal(input, 'done', { completionVerdictRef: { version: 1,
+        sourceUserSeq: task.sourceUserSeq + (variant === 'wrong_source' ? 1 : 0),
+        eventId: String(verdict.id), seq: verdict.seq + (variant === 'wrong_verdict_event' ? 1 : 0),
+        // Deliberately optimistic metadata cannot override the real verdict,
+        // its source binding or its objective/reply digests.
+        verified: true, disposition: 'reviewed', policyEvidence: 'captured', fulfills: true,
+        deliveredTextIsJudgedText: true, replyMatches: true, objectiveMatches: true, artifactsMatch: true,
+        objectiveDigest, replyDigest } });
+    });
+    const saved = await f.coordinator.drain(f.record.id);
+    assert.equal(saved.jobs[0]!.status, 'completed', `${variant}: the answer remains available`);
+    const expected = variant === 'reviewed' ? 'reviewed' : variant === 'owner_off' ? 'disabled_by_owner'
+      : variant === 'surface_not_required' ? 'not_required' : 'unverified';
+    const before = readFileSync(f.file(), 'utf8');
+    const eventCount = eventlog.listEvents(task!.sessionId).length;
+    const projected = await service.projectMeetingResearchSnapshot(saved);
+    assert.equal(projected.jobs[0]!.reviewState, expected, variant);
+    assert.deepEqual(projected.jobs[0]!.task, task);
+    assert.equal(JSON.stringify(projected).includes(fixtureAnswerText), false, 'projection contains no copied answer text');
+    assert.deepEqual(await service.projectMeetingResearchSnapshot(saved), projected, 'polling cannot rejudge or redispatch');
+    assert.equal(readFileSync(f.file(), 'utf8'), before); assert.equal(eventlog.listEvents(task!.sessionId).length, eventCount);
+    assert.equal(f.calls(), 1);
+    assert.equal(await service.meetingResearchResultReview(task!, { meetingId: 'a-different-meeting', jobId: f.job.id }), 'unverified');
+  }
+});
 
 test('dispatch binds the real receipt, active lease and immutable accepted source before execution, with only selected bounded evidence', async () => {
   let observedTask: MeetingResearchTask | undefined;

@@ -6,15 +6,17 @@ import { searchFactsByText, getFact } from '../../memory/facts.js';
 import { withMemoryReadScope } from '../../memory/memory-scope.js';
 import { claimHarnessChatRequest, claimRunAttemptLease, createSession, finishRunAttempt, getSession,
   getHarnessChatRequestReceipt, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent,
-  recordRunAttemptUserInput, renewRunAttemptLease, requestKill } from '../../runtime/harness/eventlog.js';
+  recordRunAttemptUserInput, renewRunAttemptLease, requestKill, listEvents } from '../../runtime/harness/eventlog.js';
 import { exactTerminalForAcceptedSource } from '../../runtime/harness/accepted-source-terminal.js';
+import { conversationalReviewSkipMatches } from '../../runtime/harness/completion-review-skip.js';
+import { parseRetainedWorkCheckpoint } from '../../runtime/harness/retained-work-checkpoint.js';
 import { captureFreshSourceSessionContext } from '../../runtime/harness/source-session-context.js';
 import { turnOutcomeId } from '../../runtime/harness/turn-outcome.js';
 import { meetingDocuments } from './meeting-documents.js';
 import { loadRecallMeetingById, listRecentRecallMeetingSummaries } from './meeting-capture.js';
 import { getMeetingAssistance, registerMeetingAssistanceListener, markMeetingOfferResearchQueued, setMeetingAssistance } from './meeting-assistance.js';
 import { createMeetingResearchCoordinator, type MeetingResearchBoundary, type MeetingResearchCoordinatorOptions,
-  type MeetingResearchTask } from './meeting-research.js';
+  type MeetingResearchTask, type MeetingResearchSnapshot } from './meeting-research.js';
 import { installMeetingResearchBoundary } from './meeting-research-boundary.js';
 import { createMeetingResearchController } from './meeting-research-controller.js';
 import { createMeetingResearchExecutor } from './meeting-research-executor.js';
@@ -53,7 +55,7 @@ export function verifyMeetingResearchSourceEvidence(boundary: MeetingResearchBou
   });
 }
 
-export function meetingResearchTaskStatus(task: MeetingResearchTask) {
+function readMeetingResearchTaskBinding(task: MeetingResearchTask) {
   const receipt = getHarnessChatRequestReceipt(task.clientRequestId);
   const attempt = getLatestRunAttemptByRunId(task.sessionId, task.runId);
   const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
@@ -63,12 +65,81 @@ export function meetingResearchTaskStatus(task: MeetingResearchTask) {
     || source.data.source !== 'meeting_research' || source.data.attemptId !== task.attemptId || source.data.runId !== task.runId
     || typeof source.data.text !== 'string' || source.data.displayText !== source.data.text
     || source.data.meetingResearchInputDigest !== sha(source.data.text)
-    || receipt.inputHash !== sha(JSON.stringify({ input: source.data.text, attachmentIds: [] }))) return { status: 'unknown' as const };
+    || receipt.inputHash !== sha(JSON.stringify({ input: source.data.text, attachmentIds: [] }))) return null;
+  return { source, attempt };
+}
+
+export function meetingResearchTaskStatus(task: MeetingResearchTask) {
+  const binding = readMeetingResearchTaskBinding(task);
+  if (!binding) return { status: 'unknown' as const };
+  const { source, attempt } = binding;
   const terminal = exactTerminalForAcceptedSource(source);
   if (!terminal) return { status: attempt.finishedAt || !attempt.leaseExpiresAt
     || Date.parse(attempt.leaseExpiresAt) <= Date.now() ? 'unknown' as const : 'in_progress' as const };
   return { status: terminal.presentation.status === 'done' ? 'completed' as const
     : terminal.presentation.status === 'cancelled' ? 'cancelled' as const : 'blocked' as const };
+}
+
+export type MeetingResearchReviewState = 'reviewed' | 'disabled_by_owner' | 'not_required' | 'unverified';
+export type MeetingResearchPublicSnapshot = Omit<MeetingResearchSnapshot, 'jobs'> & {
+  jobs: readonly (MeetingResearchSnapshot['jobs'][number] & { reviewState?: MeetingResearchReviewState })[];
+};
+const asRecord = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value)
+  ? value as Record<string, unknown> : null;
+
+/** Content-free observation of the review belonging to this exact saved answer.
+ * A done terminal is answer availability, never proof that its review passed.
+ * This reader cannot run a reviewer, repair a verdict, or redispatch a task. */
+export async function meetingResearchResultReview(task: MeetingResearchTask,
+  expected: { meetingId: string; jobId: string }): Promise<MeetingResearchReviewState> {
+  try {
+    const binding = readMeetingResearchTaskBinding(task);
+    if (!binding) return 'unverified';
+    const reference = asRecord(binding.source.data.meetingResearchReference);
+    if (reference?.meetingId !== expected.meetingId || reference.jobId !== expected.jobId
+      || task.runId !== `meeting-research:${expected.jobId}` || task.clientRequestId !== `meeting-research-${expected.jobId}`) return 'unverified';
+    const terminal = exactTerminalForAcceptedSource(binding.source);
+    if (terminal?.presentation.status !== 'done' || terminal.presentation.kind !== 'answer') return 'unverified';
+    const { readCapturedCompletionPolicy, completionVerdictForAcceptedSource, acceptedObjectiveForSource } = await import('../../runtime/harness/host-turn-runner.js');
+    const policy = readCapturedCompletionPolicy(task);
+    if (policy.status !== 'captured') return 'unverified';
+    const data = terminal.event.data;
+    const ref = asRecord(data.completionVerdictRef);
+    const disposition = ref ?? asRecord(data.completionReview);
+    if (disposition?.version !== 1 || disposition.policyEvidence !== 'captured') return 'unverified';
+    if (ref && ref.sourceUserSeq !== task.sourceUserSeq) return 'unverified';
+    if (!policy.policy.enabled) {
+      if (policy.policy.ownerEnabled === false && disposition.disposition === 'disabled_by_owner') return 'disabled_by_owner';
+      if (policy.policy.ownerEnabled === true && disposition.disposition === 'not_required') return 'not_required';
+      return 'unverified';
+    }
+    const objective = acceptedObjectiveForSource(task);
+    const reply = parseRetainedWorkCheckpoint(terminal.presentation.text.trim()).head;
+    if (!objective?.trim()) return 'unverified';
+    const verdict = completionVerdictForAcceptedSource(task);
+    if (!verdict && disposition.disposition === 'not_required'
+      && listEvents(task.sessionId, { types: ['completion_review_skipped'] }).some(event => event.role === 'system'
+        && conversationalReviewSkipMatches(event.data, { sourceUserSeq: task.sourceUserSeq, objective, reply }))) return 'not_required';
+    if (!ref || ref.version !== 1 || ref.sourceUserSeq !== task.sourceUserSeq || ref.disposition !== 'reviewed'
+      || ref.verified !== true || ref.deliveredTextIsJudgedText !== true
+      || ref.replyMatches !== true || ref.objectiveMatches !== true || ref.artifactsMatch !== true || ref.planMatches === false
+      || ref.failedOpen === true || ref.reviewDisposition === 'answered_unqualified' || ref.settledEvidenceAvailable === false
+      || !verdict || verdict.eventId !== ref.eventId || verdict.seq !== ref.seq || !verdict.fulfills
+      || verdict.failedOpen === true || verdict.reviewDisposition === 'answered_unqualified' || verdict.hostEvidenceHold === true
+      || verdict.settledEvidenceAvailable === false || verdict.substituteForExactPin === true
+      || (verdict.evidenceCoverage !== undefined && verdict.evidenceCoverage !== 'sufficient')
+      || verdict.replyDigest !== sha(reply) || verdict.objectiveDigest !== sha(objective)
+      || ref.replyDigest !== verdict.replyDigest || ref.objectiveDigest !== verdict.objectiveDigest) return 'unverified';
+    return 'reviewed';
+  } catch { return 'unverified'; }
+}
+
+/** Passive route projection; review state is not persisted into job history. */
+export async function projectMeetingResearchSnapshot(snapshot: MeetingResearchSnapshot): Promise<MeetingResearchPublicSnapshot> {
+  const jobs = await Promise.all(snapshot.jobs.map(async job => job.status === 'completed' && job.task
+    ? { ...job, reviewState: await meetingResearchResultReview(job.task, { meetingId: snapshot.meetingId, jobId: job.id }) }
+    : job));
+  return { ...snapshot, jobs };
 }
 
 export type MeetingResearchExecutionPort = (input: {
