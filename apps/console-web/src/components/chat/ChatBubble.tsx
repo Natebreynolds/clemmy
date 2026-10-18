@@ -11,7 +11,8 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { ActivityCard } from '@/components/chat/ActivityCard';
-import { RememberedStrip } from '@/components/chat/RememberedStrip';
+import { TaskDetails } from '@/components/chat/TaskDetails';
+import { taskHandlingSource } from '@/lib/task-handling-source';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { OutsideWorkCards, TurnReceipt } from '@/components/chat/TurnReceipt';
@@ -648,9 +649,6 @@ export function ChatBubble({
           onBackground={live ? onBackground : undefined}
         />
       )}
-      {!live && message.status === 'complete' && sessionId && message.startedAt && (
-        <RememberedStrip sessionId={sessionId} startedAt={message.startedAt} />
-      )}
       {showReply && (
         <>
           {message.taskMode?.kind === 'plan' && <div className="text-caption font-semibold text-primary">{thinking ? 'Planning · read-only investigation' : 'Plan investigation'}</div>}
@@ -952,6 +950,10 @@ export function ChatBubble({
         {live
           ? <OutsideWorkCards activity={message.activity} />
           : <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} sessionId={sessionId} />}
+        {!live && (() => {
+          const source = taskHandlingSource(message, sessionId);
+          return source ? <TaskDetails key={`${source.sessionId}:${source.sourceUserSeq}`} {...source} /> : null;
+        })()}
     </article>
   );
 }

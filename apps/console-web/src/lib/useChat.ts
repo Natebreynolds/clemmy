@@ -114,8 +114,8 @@ export interface ChatMessage {
   /** Present only while `text` is a live answer draft (chat-engine answer-stream). */
   answerDraft?: LiveAnswerDraft;
   status?: MessageStatus;
-  /** Client clock when this reply's turn started — the recall receipts for the
-   *  turn are read back "since" this moment. */
+  /** Client clock for elapsed-time presentation only. Task evidence uses the
+   * durable acceptedSource, never a client-time recall window. */
   startedAt?: number;
   /** The backend's typed terminal; see chat-engine TerminalFacts. */
   terminal?: TerminalFacts;

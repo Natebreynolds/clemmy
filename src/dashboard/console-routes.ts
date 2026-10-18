@@ -45,6 +45,7 @@ import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { getProject as getProjectRecord } from '../projects/project-record.js';
 import { listFactsByScope, scopeFilterFromQuery, withScopeViews } from '../projects/memory-scope-views.js';
 import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
+import { registerConsoleTaskHandlingRoutes } from './console-task-handling-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
   BASE_DIR,
@@ -4070,6 +4071,7 @@ export function registerConsoleRoutes(
   });
   registerConsoleAgentsRoutes(app, isAuthorized);
   registerConsoleMemoryWorkRoutes(app, { isAuthorized });
+  registerConsoleTaskHandlingRoutes(app, { isAuthorized });
   armWorkflowListMemoWarm();
 
   /**

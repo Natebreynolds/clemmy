@@ -1,6 +1,7 @@
 export * from './app-places.js';
 export * from './chat-seen.js';
 export * from './types.js';
+export type { TaskHandlingDetails, TaskHandlingUsageTotals } from './task-handling.js';
 export * from './write-ledger.js';
 export * from './tool-labels.js';
 export * from './work-plan-presentation.js';
