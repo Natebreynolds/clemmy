@@ -445,3 +445,14 @@ test('the review reads setup notes in a description as configuration, not as wor
   });
   assert.match(objectiveSeen, /notes to the owner about setting the workflow up .* describe its configuration, not work a run must do/);
 });
+
+test('the review reads a method a step names as the author\'s plan, not part of the target', async () => {
+  let objectiveSeen = '';
+  await judgeWorkflowTarget({
+    workflow: wf({ description: 'Save page 9 of the catalogue as CSV with title, price and star rating.' }), inputs: {},
+    finalOutput: 'Saved 20 rows.', deliveredBody: 'Saved 20 rows.',
+    judgeFn: async (objective) => { objectiveSeen = objective; return { done: true, reason: 'Delivered.' }; },
+  });
+  assert.match(objectiveSeen, /A method a step names .* is how its author planned the work, not part of the target/);
+  assert.match(objectiveSeen, /only when the owner's own words in the workflow require that method/);
+});
