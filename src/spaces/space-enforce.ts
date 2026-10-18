@@ -148,6 +148,7 @@ export function checkSpaceForWrite(
   actions: SpaceAction[],
   availableRunnerFiles: ReadonlySet<string> = new Set(),
   legacyRunnerDeclarations: ReadonlySet<string> = new Set(),
+  legacyRunnerActions: ReadonlySet<string> = new Set(),
 ): SpaceWriteCheck {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -209,6 +210,17 @@ export function checkSpaceForWrite(
       try { target = resolveInSpace(slug, path.join('data', a.runner.trim())); } catch { /* invalid */ }
       if ((!target || !existsSync(target)) && !availableRunnerFiles.has(a.runner.trim())) {
         errors.push(`Action "${a.id}" points at runner "data/${a.runner}" but that file doesn't exist — pass the authored file as runner_path in this space_save call.`);
+        continue;
+      }
+      // A press never runs a runner script: runSpaceAction has no durable call
+      // authority for one, approved or not. Live 2026-10-18: two "Mark read"
+      // buttons were saved this way and each press would have raised a card
+      // and then done nothing. A workflow button runs on the press, card-free.
+      const declaration = runnerDeclarationKey(a);
+      if (declaration && legacyRunnerActions.has(declaration)) {
+        warnings.push(`Legacy runner button "${a.id}" was preserved, but a press cannot run it. Replace it with a workflow button: build a workflow that does its work and declare the action with workflow.`);
+      } else {
+        errors.push(`Action "${a.id}" runs a runner script, and a Workspace button cannot run one: a press would do nothing. Build a workflow that does this work (a call step such as write_file or space_set_data needs no model), save it, and declare this action as { id, label, workflow: "<saved workflow name>" }. A press then runs that workflow with no approval card.`);
       }
     }
   }
@@ -240,10 +252,17 @@ export function prepareSpaceForWrite(input: {
    * still gates every spawn. New/swapped runner declarations remain blocked.
    */
   existingDataSources?: SpaceDataSource[];
+  /** The installed buttons: one that keeps its id + runner is preserved with a warning. */
+  existingActions?: SpaceAction[];
 }): SpaceWritePrep {
   const { dataSources, actions, repairs } = autoRepairSpaceManifest(input.dataSources ?? [], input.actions ?? []);
   const legacyRunnerDeclarations = new Set(
     (input.existingDataSources ?? [])
+      .map(runnerDeclarationKey)
+      .filter((key): key is string => key !== null),
+  );
+  const legacyRunnerActions = new Set(
+    (input.existingActions ?? [])
       .map(runnerDeclarationKey)
       .filter((key): key is string => key !== null),
   );
@@ -253,6 +272,7 @@ export function prepareSpaceForWrite(input: {
     actions,
     input.availableRunnerFiles,
     legacyRunnerDeclarations,
+    legacyRunnerActions,
   );
   const identityErrors = workspaceIdentityErrors(dataSources, actions);
   const errors = [...identityErrors, ...check.errors];

@@ -3387,7 +3387,7 @@
           "bytes": 3217
         },
         "src/spaces/space-enforce.ts": {
-          "bytes": 11306
+          "bytes": 12731
         },
         "src/spaces/space-read-authority.ts": {
           "bytes": 12088
@@ -3501,7 +3501,7 @@
           "bytes": 64880
         },
         "src/tools/space-tools.ts": {
-          "bytes": 131260
+          "bytes": 131279
         },
         "src/runtime/home-layout.ts": {
           "bytes": 6038
@@ -7320,7 +7320,7 @@
           "bytes": 3217
         },
         "src/spaces/space-enforce.ts": {
-          "bytes": 11306
+          "bytes": 12731
         },
         "src/spaces/space-read-authority.ts": {
           "bytes": 12088
@@ -7434,7 +7434,7 @@
           "bytes": 64880
         },
         "src/tools/space-tools.ts": {
-          "bytes": 131260
+          "bytes": 131279
         },
         "src/runtime/home-layout.ts": {
           "bytes": 6038

@@ -595,7 +595,10 @@ test('space_save preserves an installed runner source and holds its smoke for pi
   assert.doesNotMatch(refreshOut, /FAILED/i);
 });
 
-test('space_save preserves an exact local post-approval action without fake outbound remediation', async () => {
+test('space_save refuses a new runner button and names the workflow button that runs on a press', async () => {
+  // Live 2026-10-18: "Mark read" buttons were saved as runner actions; a press
+  // cannot run a runner script, so each would have raised a card and then done
+  // nothing. Nothing is created, and the refusal says what to build instead.
   const slug = 'local-post-approval';
   const viewDraft = path.join(process.env.CLEMENTINE_HOME!, 'tmp-local-post-approval.html');
   const actionDraft = path.join(process.env.CLEMENTINE_HOME!, 'approve-post.mjs');
@@ -623,13 +626,10 @@ test('space_save preserves an exact local post-approval action without fake outb
     }],
   }));
 
-  assert.match(out, /Created workspace "Local Post Approval"/);
-  assert.match(out, /confirm:true|approval/i);
-  const rec = store.spaceStore.get(slug);
-  assert.equal(rec?.actions.length, 1, 'the valid local action remains declared');
-  assert.equal(rec?.actions[0].id, 'approve_post');
-  assert.equal(rec?.actions[0].confirm, true);
-  assert.equal(spaceActionNeedsApproval(rec!.actions[0]), true, 'opaque runner code must take the approval path');
+  assert.match(out, /was NOT saved/);
+  assert.match(out, /Action "approve_post" runs a runner script, and a Workspace button cannot run one/);
+  assert.match(out, /A press then runs that workflow with no approval card/);
+  assert.equal(store.spaceStore.get(slug), undefined, 'nothing is created');
 });
 
 test('space_save preserves a newer installed action-runner repair over a stale runner_path', async () => {
@@ -658,9 +658,17 @@ test('space_save preserves a newer installed action-runner repair over a stale r
       confirm: true,
     }],
   };
-  assert.match(text(await tools.space_save(args)), /Created workspace/);
-
+  // A new runner button is refused, so this is a Space that already had one.
   const installed = store.resolveInSpace('newer-runner-wins', 'data/tmp-newer-runner.mjs');
+  mkdirSync(path.dirname(installed), { recursive: true });
+  writeFileSync(installed, original, 'utf-8');
+  store.spaceStore.save({
+    id: 'newer-runner-wins',
+    title: 'Newer Runner Wins',
+    actions: [{ id: 'sync', label: 'Sync', runner: 'tmp-newer-runner.mjs', confirm: true }],
+  });
+  assert.match(text(await tools.space_save(args)), /Updated workspace/);
+
   writeFileSync(installed, repaired, 'utf-8');
   const old = new Date('2026-01-01T00:00:01.000Z');
   const newer = new Date('2026-01-01T00:00:02.000Z');

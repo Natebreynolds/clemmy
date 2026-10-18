@@ -248,8 +248,8 @@ const actionShape = z.object({
   label: z.string().max(80).nullish().describe('Button label shown in the view, e.g. "Send follow-up".'),
   workflow: z.string().max(200).nullish().describe('The exact name of a saved workflow this button runs once per click, with the merged args as its inputs. Use it for any tool: a CLI, an MCP server, a built-in, a connected app, or several steps. The workflow\'s own approvals apply; the click takes no extra card. Mutually exclusive with composio_slug and runner.'),
   composio_slug: z.string().max(120).nullish().describe('Composio tool to call server-side, e.g. OUTLOOK_SEND_EMAIL. Mutually exclusive with runner and workflow.'),
-  runner: z.string().max(120).nullish().describe('OR the installed filename of a script under data/ that performs the side effect. Use runner_path to install a newly-authored script in this call.'),
-  runner_path: z.string().max(1000).nullish().describe(`Optional source path to the action runner you authored with write_file (inside ${BASE_DIR}). space_save copies it into the Workspace data/ directory. If runner is omitted, its basename is used.`),
+  runner: z.string().max(120).nullish().describe('Legacy compatibility only: an already-installed button may keep its runner filename, but a press cannot run a runner script and new runner buttons are refused. For local work use workflow.'),
+  runner_path: z.string().max(1000).nullish().describe(`Legacy compatibility only (inside ${BASE_DIR}): new runner buttons are refused because a press cannot run them. Use workflow.`),
   args_template_json: jsonObjectArgument().nullish().describe('JSON string of base args. The view supplies the variable parts (e.g. {to, subject, body}) at click time, merged over this template.'),
   confirm: z.boolean().nullish().describe('Hint that the view should confirm before firing (advisory).'),
 });
@@ -661,6 +661,7 @@ export function registerSpaceTools(server: McpServer): void {
         status: existing?.status,
         availableRunnerFiles: new Set(runnerSources.keys()),
         existingDataSources: existing?.dataSources,
+        existingActions: existing?.actions,
       });
       if (!prep.ok) {
         return invalidArgumentsTextResult(`Workspace "${slug}" was NOT saved — fix these first, then call space_save again:\n- ${[...prep.errors, ...readPreparationNotes].join('\n- ')}`);

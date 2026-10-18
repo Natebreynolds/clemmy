@@ -168,22 +168,34 @@ test('auto-repair coerces confirm:true on a send-like action', () => {
   assert.match(prep.repairs.join(' '), /confirm:true/);
 });
 
-test('auto-repair marks every opaque runner action as approval-required', () => {
+test('a new runner button is refused with the workflow button as its next step; an installed one is kept with a warning', () => {
+  // Live 2026-10-18: two "Mark read" buttons were saved as runner actions.
+  // A press cannot run a runner script, so each would have raised a card and
+  // then done nothing; a workflow button runs on the press with no card.
   writeRunner('local-approval', 'approve-post.mjs');
-  const prep = enforce.prepareSpaceForWrite({
-    slug: 'local-approval',
-    dataSources: [],
-    actions: [{
-      id: 'approve_post',
-      label: 'Approve locally',
-      runner: 'approve-post.mjs',
-      argsTemplate: { external: false },
-      confirm: false,
-    }],
+  const button = {
+    id: 'approve_post',
+    label: 'Approve locally',
+    runner: 'approve-post.mjs',
+    argsTemplate: { external: false },
+    confirm: false,
+  };
+  const fresh = enforce.prepareSpaceForWrite({ slug: 'local-approval', dataSources: [], actions: [button] });
+  assert.equal(fresh.ok, false);
+  assert.match(fresh.errors.join(' '), /Action "approve_post" runs a runner script, and a Workspace button cannot run one: a press would do nothing/);
+  assert.match(fresh.errors.join(' '), /declare this action as \{ id, label, workflow: "<saved workflow name>" \}\. A press then runs that workflow with no approval card\./);
+
+  const kept = enforce.prepareSpaceForWrite({
+    slug: 'local-approval', dataSources: [], actions: [button], existingActions: [{ id: 'approve_post', runner: 'approve-post.mjs' }],
   });
-  assert.equal(prep.ok, true);
-  assert.equal(prep.actions[0].confirm, true);
-  assert.equal(prep.repairs.some((repair) => /confirm:true/.test(repair)), true);
+  assert.equal(kept.ok, true, 'editing a Space never fails on a button it already had');
+  assert.equal(kept.actions[0].confirm, true, 'the kept runner still stays behind the approval path');
+  assert.match(kept.warnings.join(' '), /Legacy runner button "approve_post" was preserved, but a press cannot run it\. Replace it with a workflow button/);
+
+  const swapped = enforce.prepareSpaceForWrite({
+    slug: 'local-approval', dataSources: [], actions: [button], existingActions: [{ id: 'approve_post', runner: 'other.mjs' }],
+  });
+  assert.equal(swapped.ok, false, 'a kept button cannot swap in a new runner');
 });
 
 test('auto-repair drops a bad timezone (keeps the source)', () => {
