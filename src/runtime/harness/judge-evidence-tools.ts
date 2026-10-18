@@ -65,7 +65,7 @@ export function judgeEvidenceGuidance(source: JudgeEvidenceSource, budget = JUDG
     `EVIDENCE TOOLS: open_evidence reads a retained result as text and query_evidence filters the records of a retained JSON result and returns their true count. A ref is one of the ${source.refKind}.`,
     'Use them when your verdict depends on content you were not shown: the rest of a bounded view, every record of a list, a field a claim rests on. Do not re-open content already shown in full, and do not look up what your verdict does not depend on.',
     'A result shown in part supports a statement that something is absent from it, is true of all of it, or that so many of its records match something only after you queried every record for it or opened the rest. How many records it holds, or that the call succeeded, is not that check.',
-    `You have at most ${budget} lookups. Then reply in the required format.`,
+    `You have at most ${budget} lookups; make lookups that do not depend on each other together in one turn. Then reply in the required format.`,
   ].join('\n');
 }
 
