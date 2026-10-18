@@ -767,10 +767,12 @@ export function App() {
             </button>
           ) : null}
           {door === 'direct' ? (
-            // Direct is the quiet default: one green dot. Remote and offline
-            // keep their words because they change what the user can expect.
+            // Direct is the normal state and draws nothing (2026-10-18: an
+            // unexplained dot read as noise); screen readers still hear it.
+            // Remote and offline keep their words because they change what
+            // the user can expect.
             <span
-              class="conn-dot-only"
+              class="sr-only"
               role="status"
               aria-live="polite"
               aria-atomic="true"
@@ -1087,7 +1089,7 @@ const TAB_TITLES: Record<Tab, string> = {
   projects: 'Projects',
   agents: 'Agents',
   spaces: 'Spaces',
-  workflows: 'Flows',
+  workflows: 'Automations',
   memory: 'Memory',
   activity: 'Activity',
   settings: 'Settings',
@@ -1155,7 +1157,7 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   },
   {
     id: 'workflows',
-    label: 'Flows',
+    label: 'Automations',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />

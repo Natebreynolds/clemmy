@@ -59,7 +59,7 @@ export function Workflows() {
       <div class="empty">
         <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
         <p class="empty-title">No flows yet</p>
-        <p class="empty-body">Flows are the routines Clem runs for you. Build one on the desktop and trigger it from here.</p>
+        <p class="empty-body">Automations are the work Clem does for you, on a schedule or with one tap. Ask Clem to set one up and run it from here.</p>
       </div>
     );
   }
@@ -78,11 +78,10 @@ export function Workflows() {
           {/* The list reads as names; the workflow's id stays on its own page. */}
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
-            <span>{wf.stepCount} {wf.stepCount === 1 ? 'step' : 'steps'}</span>
             {wf.schedule ? <span>{whenLabel(wf.schedule)}</span> : null}
-            {wf.requiresInput ? <span class="workflow-row-tag">needs input</span> : null}
-            {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">needs binding</span> : null}
-            {wf.lastRunAt ? <span>last: {relativeTime(wf.lastRunAt)}</span> : null}
+            {wf.requiresInput ? <span class="workflow-row-tag">Needs an answer</span> : null}
+            {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">Needs a connection</span> : null}
+            {wf.lastRunAt ? <span>Last ran {relativeTime(wf.lastRunAt)}</span> : null}
           </div>
         </button>
       ))}

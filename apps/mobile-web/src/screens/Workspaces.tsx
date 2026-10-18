@@ -427,7 +427,7 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
 
           {detail.linkedWorkflows?.length ? (
             <section class="home-section">
-              <h2 class="section-head">Flows that feed this</h2>
+              <h2 class="section-head">Automations that feed this</h2>
               <div class="stack">
                 {detail.linkedWorkflows.map((wf) => (
                   <div key={wf.name} class="card">

@@ -5794,7 +5794,7 @@ textarea.cz-input { resize: vertical; }
 .home-row-needs .home-btn {
   flex: 0 0 auto;
   min-height: 40px;
-  padding: 0 18px;
+  padding: 0 14px;
   border-radius: 999px;
   font-family: var(--font-body);
   font-size: 15px;
@@ -6051,3 +6051,11 @@ textarea.cz-input { resize: vertical; }
 .ws-details-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .chat-options-note { margin: 12px 8px; color: var(--fg-2); font-size: var(--t-sm); line-height: 1.5; overflow-wrap: anywhere; }
+
+/* A reply-in-your-words opener reads as a link beside the tap answers. */
+.home-link-btn {
+  display: inline-flex; align-items: center; min-height: 40px; padding: 0 4px;
+  border: 0; background: transparent; color: var(--accent-ink, var(--accent));
+  font-family: var(--font-body); font-size: 15px; font-weight: 600; cursor: pointer;
+}
+.home-link-btn:disabled { opacity: .5; }

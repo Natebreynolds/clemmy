@@ -92,7 +92,9 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     </form>
   ) : null);
   const openReply = (row: FromClemRow, label: string) => (
-    <button type="button" class="home-btn" disabled={busy !== null}
+    // A quiet text link, as on the desktop: the tap answers are the choices;
+    // typing is the fallback (2026-10-18: three stacked pills per card).
+    <button type="button" class="home-link-btn" disabled={busy !== null}
       onClick={() => { setReplying(replying === row.key ? null : row.key); }}>
       {replying === row.key ? 'Close' : label}
     </button>
