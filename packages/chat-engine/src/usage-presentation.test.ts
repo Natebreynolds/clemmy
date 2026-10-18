@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compactUsageText, formatTokenCount, meterTone, presentUsageMeters, resetsInText } from './usage-presentation.js';
+import { compactUsageText, formatTokenCount, headerAttentionMeter, meterTone, presentUsageMeters, resetsInText, type UsageMeter } from './usage-presentation.js';
 
 const now = Date.parse('2026-09-16T16:00:00Z');
 
@@ -201,4 +201,15 @@ test('the account that keeps the memory says so, in the memory role\'s own words
   assert.deepEqual(claude.uses, ['checks the work', 'keeps your memory']);
   assert.equal(claude.uses?.[1], MEMORY_ROLE_WORDS.title.toLowerCase(), 'one owner for the words: the memory role title');
   assert.equal(accountCaption(claude, now), 'Checks the work · keeps your memory · nothing today');
+});
+
+test('the header dot speaks only for an account doing a job for Clem', () => {
+  const meter = (id: string, extra: Partial<UsageMeter>): UsageMeter => ({ id, label: id, windows: [], ...extra });
+  const idleRefusing = meter('openai', { outOfCredit: { since: 1, lastSeenAt: 2 } });
+  const idleFull = meter('claude', { windows: [{ id: 'w', label: 'week', usedPercent: 100, tone: 'danger' }] });
+  const brainBusy = meter('together', { uses: ['does the work'], windows: [{ id: 'w', label: 'tokens', usedPercent: 75, tone: 'warning' }] });
+  assert.equal(headerAttentionMeter([idleRefusing, idleFull]), null, 'idle accounts never light the dot');
+  assert.equal(headerAttentionMeter([idleRefusing, idleFull, brainBusy])?.id, 'together');
+  const judgeRefusing = meter('codex', { uses: ['checks the work'], outOfCredit: { since: 1, lastSeenAt: 2 } });
+  assert.equal(headerAttentionMeter([brainBusy, judgeRefusing])?.id, 'codex', 'a working account refusing work comes first');
 });

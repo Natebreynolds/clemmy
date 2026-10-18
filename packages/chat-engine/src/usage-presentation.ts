@@ -319,6 +319,19 @@ export function meterTone(meter: UsageMeter): UsageTone {
   ), 'ok');
 }
 
+/** The one account the header's health dot speaks for: the worst of the
+ *  accounts doing a job for Clem right now, refusing work first, then a window
+ *  nearly or mostly used. An idle account is the owner's to see in Settings ›
+ *  Models, never a red dot on every page (live 2026-10-18: an unused API key
+ *  out of credit kept the dot red all day). */
+export function headerAttentionMeter(meters: readonly UsageMeter[]): UsageMeter | null {
+  const working = meters.filter((meter) => (meter.uses?.length ?? 0) > 0);
+  return working.find((meter) => meter.outOfCredit)
+    ?? working.find((meter) => meter.windows.length > 0 && meterTone(meter) === 'danger')
+    ?? working.find((meter) => meter.windows.length > 0 && meterTone(meter) === 'warning')
+    ?? null;
+}
+
 /** What the provider did, in one sentence, for an account that needs its
  *  owner: "Together AI turned down Clem’s last request at 10:13 PM: “Credit
  *  limit exceeded.” Clem uses another model where it can until Together AI

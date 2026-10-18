@@ -1,5 +1,5 @@
 import { ExternalLink } from 'lucide-react';
-import { CREDIT_REFUSAL_WORDS, creditRefusalSentence, formatTokenCount, meterTone, presentUsageMeters, resetsInText, usageChipText, type UsageMeter, type UsageTone } from '@clem/chat-engine';
+import { CREDIT_REFUSAL_WORDS, creditRefusalSentence, formatTokenCount, headerAttentionMeter, meterTone, presentUsageMeters, resetsInText, usageChipText, type UsageMeter, type UsageTone } from '@clem/chat-engine';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { getModelStatus, type ModelStatus } from '@/lib/model-status';
@@ -97,12 +97,14 @@ export function ModelStatusChips({ compact = false }: { compact?: boolean } = {}
     // One dot for the header (owner 09-26: a provider banner beside every
     // page title was an engine fact in the person's face all day). Red when
     // an account is refusing work, amber when a window is nearly used up,
-    // otherwise nothing at all. The words live in the tooltip; a refusing
-    // account still opens its billing page, because that is the fix.
-    const worst = out[0] ?? windowed.find((m) => meterTone(m) === 'danger') ?? windowed.find((m) => meterTone(m) === 'warning');
+    // otherwise nothing at all. Only an account doing a job for Clem counts.
+    // The words live in the tooltip; a refusing account still opens its
+    // billing page, because that is the fix.
+    const worst = headerAttentionMeter(meters);
     if (!worst) return null;
     const tone: UsageTone = worst.outOfCredit ? 'danger' : meterTone(worst);
-    const title = [...out, ...windowed].map((m) => `${m.label}: ${m.outOfCredit ? CREDIT_REFUSAL_WORDS : usageChipText(m, now).text}`).join('\n');
+    const title = [...out, ...windowed].filter((m) => (m.uses?.length ?? 0) > 0)
+      .map((m) => `${m.label}: ${m.outOfCredit ? CREDIT_REFUSAL_WORDS : usageChipText(m, now).text}`).join('\n');
     const dot = <span className={cn('h-2 w-2 rounded-full', TONE_BAR[tone])} aria-hidden />;
     const label = worst.outOfCredit ? `${worst.label} is ${CREDIT_REFUSAL_WORDS} for lack of credit` : `${worst.label} usage is ${meterTone(worst) === 'danger' ? 'nearly used up' : 'running high'}`;
     return worst.outOfCredit && worst.billing
