@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { Link } from 'react-router-dom';
 import { Globe, PanelRightClose, RefreshCw, Square, Hand, ArrowRight } from 'lucide-react';
@@ -8,10 +8,15 @@ import { embedsBrowserViewer } from '@/lib/clemmy';
 import './cloud-browser.css';
 
 /** A task room beside the conversation: watching never covers steering or approvals. */
-export function CloudBrowserWorkspace({ conversationId, children }: { conversationId?: string; children: ReactNode }) {
-  return <BrowserWorkspace conversationId={conversationId}>{children}</BrowserWorkspace>;
+/** The chat header's Browser button, when the strip lives in the header. */
+export interface BrowserControl { label: string; status: string | null; open: boolean; toggle: () => void }
+const BrowserControlContext = createContext<BrowserControl | null>(null);
+export function useBrowserControl(): BrowserControl | null { return useContext(BrowserControlContext); }
+
+export function CloudBrowserWorkspace({ conversationId, children, inHeader = false }: { conversationId?: string; children: ReactNode; inHeader?: boolean }) {
+  return <BrowserWorkspace conversationId={conversationId} inHeader={inHeader}>{children}</BrowserWorkspace>;
 }
-function BrowserWorkspace({ conversationId, children }: { conversationId?: string; children: ReactNode }) {
+function BrowserWorkspace({ conversationId, children, inHeader = false }: { conversationId?: string; children: ReactNode; inHeader?: boolean }) {
   const [status, setStatus] = useState<CloudBrowserStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
   const [visible, setVisible] = useState(!document.hidden);
@@ -203,9 +208,12 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
     catch { if (mounted.current && context.current === requested.conversationId) { setNotice(`Recovery was not confirmed. Check the session ID in your ${cloudBrowserProviderLabel(requested.provider)} account, then refresh.`); await refresh(); } }
     finally { if (mounted.current && context.current === requested.conversationId) setBusy(null); }
   };
-  return <div className={`cloud-browser-workspace${open ? ' is-open' : ''}`}>
+  const toggleBrowser = () => { if (open) void lifecycle.current?.stop(); setOpen(!open); };
+  const browserStatus = resource ? (resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state) : null;
+  const control: BrowserControl | null = conversationId && inHeader ? { label: browsersChipLabel(openCount), status: browserStatus, open, toggle: toggleBrowser } : null;
+  return <BrowserControlContext.Provider value={control}><div className={`cloud-browser-workspace${open ? ' is-open' : ''}`}>
     <div className="cloud-browser-conversation">
-      {conversationId ? <div className="cloud-browser-strip">
+      {conversationId && !inHeader ? <div className="cloud-browser-strip">
         <button type="button" onClick={() => { if (open) void lifecycle.current?.stop(); setOpen(!open); }} aria-expanded={open}><Globe size={16} aria-hidden />{browsersChipLabel(openCount)}{resource ? <span>{resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state}</span> : null}</button>
         <span className="cloud-browser-strip-note">{open ? 'Chat and approvals stay here' : resource ? browserElapsed(resource.elapsedSeconds) : 'A browser for this conversation'}</span>
       </div> : null}
@@ -245,5 +253,5 @@ function BrowserWorkspace({ conversationId, children }: { conversationId?: strin
       </section> : null}
       {notice ? <p className="cloud-browser-notice" role="status">{notice}</p> : null}
     </aside> : null}
-  </div>;
+  </div></BrowserControlContext.Provider>;
 }

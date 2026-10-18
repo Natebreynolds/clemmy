@@ -219,8 +219,8 @@ export function Automate() {
 
   return (
     <Page
-      title="Automate"
-      subtitle="Workflows and skills"
+      title="Automations"
+      subtitle="Work Clem does for you, on a schedule or with one tap"
       actions={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
@@ -245,16 +245,21 @@ export function Automate() {
       )}
 
       {tab === 'workflows' && repairCount > 0 && (
-        <Link
-          to="/advanced/evolution"
-          className="mb-4 flex items-center gap-2 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning transition-colors hover:border-warning"
-        >
-          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+        // Loop health is Clem's to fix, not a page for the owner to read
+        // (owner 2026-10-18: novice-first). The button hands her the job,
+        // pre-written, for the owner to send.
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-warning/30 bg-warning-tint px-4 py-3 text-small text-fg">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-warning" aria-hidden />
           <span className="min-w-0 flex-1">
-            {repairCount} thing{repairCount === 1 ? '' : 's'} need{repairCount === 1 ? 's' : ''} repair — details in Advanced
+            Clem noticed {repairCount === 1 ? 'an automation' : `${repairCount} automations`} struggling to finish.
           </span>
-          <ArrowRight className="h-4 w-4 shrink-0" aria-hidden />
-        </Link>
+          <Link
+            to={`/chat?prompt=${encodeURIComponent('Some of my automations are struggling to finish. Look into which ones, tell me what is wrong in plain words, and fix what you safely can.')}`}
+            className="inline-flex items-center gap-1.5 rounded-md font-semibold text-primary-ink hover:underline"
+          >
+            Ask Clem to look <ArrowRight className="h-4 w-4" aria-hidden />
+          </Link>
+        </div>
       )}
 
       {tab === 'workflows' && (
@@ -317,13 +322,13 @@ export function Automate() {
                             {active && (
                               <button
                                 type="button"
-                                title={active.inFlightStepId ? `Running step ${active.inFlightStepId} — open to watch` : 'Running — open to watch'}
+                                title="Running — open to watch"
                                 onClick={() => setOpenRun({ workflow: w.name, runId: active.runId })}
                                 className="cursor-pointer"
                               >
                                 <StatusPill tone="live">
                                   <span className="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current align-middle" aria-hidden />
-                                  {active.status === 'parked' || active.status.startsWith('blocked') ? 'Waiting' : 'Running'}{active.inFlightStepId ? ` · ${active.inFlightStepId}` : ''}
+                                  {active.status === 'parked' || active.status.startsWith('blocked') ? 'Waiting' : 'Running'}
                                 </StatusPill>
                               </button>
                             )}
@@ -339,7 +344,6 @@ export function Automate() {
                               </button>
                             )}
                             <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
-                              {typeof w.stepCount === 'number' && <span>{w.stepCount} step{w.stepCount === 1 ? '' : 's'}</span>}
                               {schedule && <span className="inline-flex items-center gap-1"><Clock className="h-3.5 w-3.5" aria-hidden />{humanizeCron(schedule, w.trigger?.timezone)}{nextRun ? ` · ${nextRun}` : ''}</span>}
                               {w.lastRunId && lastRunAgo && (
                                 <button type="button" onClick={() => setOpenRun({ workflow: w.name, runId: w.lastRunId ?? undefined })} className="cursor-pointer underline-offset-2 hover:text-fg hover:underline">

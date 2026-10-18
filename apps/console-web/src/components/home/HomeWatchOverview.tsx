@@ -53,3 +53,38 @@ export function HomeWatchOverview({ overview, onRetry, refreshing, animate }: {
         </>}
   </section>;
 }
+
+/** "Client Notes Deadline Watch" reads as "Client Notes Deadline" in a sentence. */
+function watchNoun(name: string): string {
+  return name.replace(/\s+watch$/i, '').trim() || name;
+}
+
+/** Today's one line about watches (owner 2026-10-18: calm, novice-first):
+ * what Clem keeps an eye on, in a sentence, and where to change it. The full
+ * panel lives on Watching. */
+export function HomeWatchLine({ overview, onRetry, refreshing }: {
+  overview: WatchOverview; onRetry: () => void; refreshing: boolean;
+}) {
+  const current = overview.status === 'loaded';
+  const loading = overview.status === 'loading' && overview.rows.length === 0;
+  const total = overview.currentCounts?.total ?? overview.rows.length;
+  const names = overview.rows.map(row => watchNoun(row.name));
+  const more = Math.max(0, total - names.length);
+  const listed = names.map((name, index) => <span key={name + index}>
+    {index > 0 && (index === names.length - 1 && more === 0 ? ' and ' : ', ')}
+    <b className="font-semibold text-fg">{name}</b>
+  </span>);
+  return <section aria-label="What Clem is keeping an eye on"
+    className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg bg-subtle px-5 py-4">
+    <Eye size={18} className="shrink-0 text-muted" aria-hidden />
+    {loading
+      ? <Skeleton className="h-4 w-72" />
+      : total === 0 && current
+        ? <p className="min-w-0 flex-1 text-body text-muted">Clem isn’t keeping an eye on anything yet. Point her at a folder, inbox or channel and she’ll tell you what matters.</p>
+        : <p className="min-w-0 flex-1 text-body text-muted">Clem is keeping an eye on {listed}{more > 0 ? <> and {more} more</> : null}.
+            {!current && overview.status !== 'loading' && <span className="text-warning"> {overview.detail}</span>}</p>}
+    {!current && overview.status !== 'loading' && !loading && <Button variant="ghost" size="sm" onClick={onRetry} disabled={refreshing}>
+      <RefreshCw size={14} aria-hidden />{refreshing ? 'Refreshing…' : 'Refresh'}</Button>}
+    <Link to={overview.href} className="rounded-sm text-small font-semibold text-primary hover:underline">{total === 0 && current ? 'Choose what she watches' : 'Manage'}</Link>
+  </section>;
+}

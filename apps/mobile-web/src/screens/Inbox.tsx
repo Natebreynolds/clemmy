@@ -712,7 +712,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               <p class="inbox-card-body">{item.detail}</p>
               {item.workflow ? (
                 <div class="inbox-card-actions">
-                  <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Flows</button>
+                  <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Automations</button>
                 </div>
               ) : null}
             </article>

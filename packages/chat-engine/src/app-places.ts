@@ -27,7 +27,7 @@ export const APP_PLACES: readonly AppPlace[] = [
   { id: 'projects', name: 'Projects', purpose: 'What you are working on, who is on it and what it needs', desktop: '/projects', phone: '?tab=projects' },
   { id: 'agents', name: 'Agents', purpose: 'Specialist agents you work with', desktop: '/agents', phone: '?tab=agents' },
   { id: 'spaces', name: 'Spaces', purpose: 'Live pages Clem built for you', desktop: '/workspaces', phone: '?tab=spaces' },
-  { id: 'automate', name: 'Automate', purpose: 'Workflows and skills', desktop: '/automate', phone: '?tab=workflows' },
+  { id: 'automate', name: 'Automations', purpose: 'Work Clem does for you on a schedule or with one tap, and her skills', desktop: '/automate', phone: '?tab=workflows' },
   { id: 'running', name: 'Running', purpose: 'Everything Clem is working on right now', desktop: '/tasks', phone: '?tab=activity' },
   { id: 'heartbeats', name: 'Heartbeats', purpose: 'What Clem checks on her own, and how often', desktop: '/heartbeats', phone: null },
   { id: 'connect', name: 'Connect', purpose: 'Apps, keys, command-line tools, MCP servers and your phone', desktop: '/connect', phone: '?tab=settings&section=connections' },

@@ -2,7 +2,7 @@ import { APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, X, RefreshCw, Mail, BellRing, Send, MoreHorizontal } from 'lucide-react';
+import { Check, X, RefreshCw, Mail, BellRing, Send, MoreHorizontal, ChevronDown } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -108,6 +108,7 @@ export function Inbox() {
     6000,
   );
   const notifications = usePoll(['notifications'], listNotifications, 8000);
+  const [showOlder, setShowOlder] = useState(false);
   const trustProposals = usePoll(['trust-proposals'], listTrustProposals, 8000);
   const planProposals = usePoll(['plan-proposals'], listPlanProposals, 6000);
   const questions = usePoll(['inbox-questions'], listInboxQuestions, 5000);
@@ -474,7 +475,7 @@ export function Inbox() {
 
   const tabs: { key: Tab; label: string; icon: typeof Mail; count: number }[] = [
     { key: 'needs', label: 'Needs you', icon: Mail, count: needsCount },
-    { key: 'notifications', label: 'Notifications', icon: BellRing, count: unread },
+    { key: 'notifications', label: 'Updates', icon: BellRing, count: unread },
   ];
 
   const loading =
@@ -499,7 +500,11 @@ export function Inbox() {
   const showDetail = hasRows && (wide || (opened && Boolean(selItem || selNotif)));
   const back = wide ? undefined : () => { setOpened(false); userPicked.current = false; };
 
-  const firstAgedIndex = needsViews.findIndex((view) => view.aged);
+  const OLDER_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+  const isOlder = (view: (typeof needsViews)[number]) => view.aged
+    || (Boolean(view.at) && Date.now() - Date.parse(view.at!) > OLDER_AFTER_MS);
+  const currentViews = needsViews.filter((view) => !isOlder(view));
+  const olderViews = needsViews.filter(isOlder);
   const cleanupMenu = tab === 'needs' && anyDecisionRows > 0 ? (
     confirmClearAsks ? (
       <span className="inline-flex flex-wrap items-center gap-2 text-small text-muted">
@@ -609,12 +614,12 @@ export function Inbox() {
                       </div>
                     </div>
                   )}
+                  {/* What is current first; anything waiting more than a few
+                      days folds below (owner 2026-10-18: a newcomer facing 32
+                      rows, a week old among them, could not tell what mattered). */}
                   <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Decisions waiting on you">
-                    {needsViews.map((view, index) => (
+                    {currentViews.map((view) => (
                       <li key={view.id}>
-                        {index === firstAgedIndex && (
-                          <div className="bg-subtle px-3.5 py-1.5 text-caption text-muted">Older approvals — waiting 2+ days, still approvable</div>
-                        )}
                         <DecisionRow
                           view={view}
                           selected={selected === view.id}
@@ -626,11 +631,36 @@ export function Inbox() {
                       </li>
                     ))}
                   </ul>
+                  {olderViews.length > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <button type="button" aria-expanded={showOlder} onClick={() => setShowOlder((open) => !open)}
+                        className="inline-flex items-center gap-1.5 self-start rounded-sm px-1 text-small font-semibold text-muted hover:text-fg">
+                        <ChevronDown className={cn('h-4 w-4 transition-transform', !showOlder && '-rotate-90')} aria-hidden />
+                        {showOlder ? 'Hide older' : `Show ${olderViews.length} older`}
+                      </button>
+                      {showOlder && (
+                        <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Older, still open">
+                          {olderViews.map((view) => (
+                            <li key={view.id}>
+                              <DecisionRow
+                                view={view}
+                                selected={selected === view.id}
+                                checked={checked.has(view.id)}
+                                disabled={bulkBusy || decisionStates[view.id]?.busy === true}
+                                onToggleCheck={() => toggleChecked(view.id)}
+                                onSelect={() => pick(view.id)}
+                              />
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
                 </>
               ))}
 
             {!loading && !queryUnavailable && tab === 'notifications' && (plainNotifRows.length === 0
-              ? <EmptyState title="No notifications" description="Updates from completed work will appear here." />
+              ? <EmptyState title="No updates yet" description="When Clem finishes something, it shows up here." />
               : (
                 <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Notifications">
                   {plainNotifRows.map((n) => (
@@ -1069,14 +1099,24 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
       {queued?.preview && !draft && <Field label="Preview"><span className="whitespace-pre-wrap">{queued.preview}</span></Field>}
       {details.length > 0 ? (
         <div className="space-y-3" data-testid="approval-presentation">
-          {details.map((line) => (
+          {/* Plain first (owner 2026-10-18: novice-first): a bare id says
+              nothing to the owner and stays in Technical details; a long block
+              (a script, a page of text) folds behind its label. */}
+          {details.filter((line) => line.long || !(isIdentifierLike(String(line.value ?? '')) || /\bids?$/i.test(String(line.label ?? '').trim()))).map((line) => (
             line.long
-              ? (
-                <div key={line.label}>
-                  <div className="mb-1 text-label text-faint">{line.label}</div>
-                  <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2">{line.value}</p>
-                </div>
-              )
+              ? String(line.value ?? '').length > 280
+                ? (
+                  <details key={line.label} className="rounded-md border border-border bg-subtle">
+                    <summary className="cursor-pointer px-3 py-2 text-small font-semibold text-muted">Show the full {line.label.toLowerCase()}</summary>
+                    <p className="max-h-80 overflow-auto whitespace-pre-wrap border-t border-border px-3 py-2">{line.value}</p>
+                  </details>
+                )
+                : (
+                  <div key={line.label}>
+                    <div className="mb-1 text-label text-faint">{line.label}</div>
+                    <p className="whitespace-pre-wrap rounded-md border border-border bg-subtle px-3 py-2">{line.value}</p>
+                  </div>
+                )
               : <Field key={line.label} label={line.label}>{line.value}</Field>
           ))}
         </div>

@@ -44,12 +44,18 @@ export function FromClemPane({
   loading,
   error,
   onRetry,
+  section = 'all',
 }: {
   headingId: string;
   data?: FromClem;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
+  /** Today folds Clem's rows into its own lists (owner 2026-10-18: one
+   *  Needs you, one While you were away): `waiting` draws what waits on the
+   *  owner (and her offers), `updates` what she brought back, each without a
+   *  heading of its own. `all` is the standalone pane. */
+  section?: 'all' | 'waiting' | 'updates';
 }) {
   const qc = useQueryClient();
   const inFlight = useRef(new Set<string>());
@@ -301,9 +307,9 @@ export function FromClemPane({
     const visible = all ? list : list.slice(0, shown);
     return (
       <div className="flex flex-col gap-1.5">
-        <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">
+        {section === 'all' && <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">
           {label}{list.length > 1 ? ` · ${list.length}` : ''}
-        </h3>
+        </h3>}
         <PaneCard>
           {visible.map(render)}
           {list.length > shown && (
@@ -318,6 +324,18 @@ export function FromClemPane({
       </div>
     );
   };
+
+  if (section !== 'all') {
+    // Inside a Today list: its rows only, or nothing; the list owns the
+    // heading, the loading line and the empty state.
+    if (!data) return null;
+    return section === 'waiting'
+      ? <>
+          {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
+          {offers.length > 0 && <PaneCard>{offers.map(offerRow)}</PaneCard>}
+        </>
+      : group('Updates', updates, UPDATES_SHOWN, 'updates', updateRow);
+  }
 
   return (
     <section aria-labelledby={headingId} className="flex min-w-0 flex-col gap-2.5">

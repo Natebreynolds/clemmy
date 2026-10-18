@@ -20,19 +20,22 @@ export function SectionHeader({
   id?: string;
 }) {
   return (
-    <div className="flex min-h-5 items-center gap-2">
-      <h2 id={id} className="text-small font-semibold text-muted">{label}</h2>
+    // A section title reads as a heading, its count as a quiet number beside
+    // it (owner 2026-10-18: premium and novice-first; the small grey label
+    // and orange pill read as chrome).
+    <div className="flex min-h-7 items-baseline gap-2.5">
+      <h2 id={id} className="text-h3 font-semibold text-fg">{label}</h2>
       {typeof count === 'number' && count > 0 && (
         <span
           className={cn(
-            'inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-caption font-bold tabular-nums',
-            countTone === 'primary' ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted',
+            'text-body font-semibold tabular-nums',
+            countTone === 'primary' ? 'text-primary-ink' : 'text-muted',
           )}
         >
           {count}
         </span>
       )}
-      {aside && <div className="ml-auto flex items-center gap-2 text-caption text-faint">{aside}</div>}
+      {aside && <div className="ml-auto flex items-center gap-2 text-small text-faint">{aside}</div>}
     </div>
   );
 }

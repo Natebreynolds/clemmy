@@ -1237,6 +1237,15 @@ function rowWords(row: Record<string, unknown>): string | null {
   return words.length > 0 ? words.join('\n') : null;
 }
 
+/** A workflow's name as the owner reads it in a title: a slug's words,
+ *  capitalized ("books-live-sync-feed" → "Books Live Sync Feed"), as the
+ *  apps show it; a name that is already words is kept. */
+export function readableWorkflowName(name: string): string {
+  const trimmed = name.trim();
+  if (!/^[a-z0-9]+(?:[-_][a-z0-9]+)+$/.test(trimmed)) return trimmed;
+  return trimmed.split(/[-_]+/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+}
+
 export interface LegibleOutcome {
   title: string;
   body: string;
@@ -1257,7 +1266,8 @@ export function renderLegibleOutcome(opts: {
 }): LegibleOutcome {
   const { workflowName, blockedSteps, diagnosis, fixId, fallbackBody } = opts;
   if (blockedSteps.length === 0) {
-    return { title: `Workflow completed: ${workflowName}`, body: fallbackBody, needsAttention: false };
+    // Plain words a first-time owner reads at a glance (owner 2026-10-18).
+    return { title: `Finished: ${readableWorkflowName(workflowName)}`, body: fallbackBody, needsAttention: false };
   }
   const stepList = blockedSteps.map((b) => `• ${b.stepId}: ${b.reason}`).join('\n');
   const lines: string[] = [
@@ -1272,5 +1282,5 @@ export function renderLegibleOutcome(opts: {
       lines.push('', `Suggested fix: ${diagnosis.fix.description}`);
     }
   }
-  return { title: `⚠️ Workflow needs attention: ${workflowName}`, body: lines.join('\n'), needsAttention: true };
+  return { title: `Couldn't finish: ${readableWorkflowName(workflowName)}`, body: lines.join('\n'), needsAttention: true };
 }

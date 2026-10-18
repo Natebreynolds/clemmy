@@ -50,6 +50,7 @@ const TITLE_MAX = 160;
 
 /** The shared reading rules (one line, no reference ids, short headings). */
 export { oneLine, isIdentifierLike, decisionHeading as detailHeading } from '@clem/chat-engine';
+import { workflowDisplayName } from '@clem/chat-engine';
 const previewFor = decisionPreview;
 
 /** Where an attention item is resolved, from the server's own grouping key
@@ -67,7 +68,7 @@ export function attentionDestination(needsYouKey: string | null | undefined): { 
 
 function questionContext(row: InboxQuestionRow): string {
   const source = row.source === 'workflow'
-    ? (row.workflowName ? `${row.workflowName} workflow` : 'Workflow')
+    ? (row.workflowName ? `${workflowDisplayName(row.workflowName)} workflow` : 'Workflow')
     : row.source === 'background_task' ? 'Background task' : 'Check-in';
   return row.agentLabel && row.agentLabel !== source ? `${row.agentLabel} · ${source}` : source;
 }

@@ -111,8 +111,8 @@ export function TopBar({
           </Button>
         )}
 
-        {/* Which model does the work, and whether it is a stand-in. */}
-        <BrainChip />
+        {/* A stand-in brain is news; the usual one is named in the composer. */}
+        <BrainChip standInOnly />
 
         <HealthIndicator />
         <ThemeToggle />

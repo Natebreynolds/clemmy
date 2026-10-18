@@ -442,7 +442,7 @@ function QuickActions({ actions, onAsk }: {
       setNote({
         tone: 'error',
         text: e.status === 409 && e.message?.includes('REQUIRES_INPUT')
-          ? `${action.label} needs input first — run it from Flows.`
+          ? `${action.label} needs an answer first — run it from Automations.`
           : e.status === 409 && e.message?.includes('DISABLED')
             ? `${action.label} is disabled. Enable it on your computer first.`
             : e.message || `Could not start ${action.label}.`,

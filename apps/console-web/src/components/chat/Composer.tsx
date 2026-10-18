@@ -1,7 +1,7 @@
 import type { ComposerMode, TaskMode } from '@/lib/task-mode';
 import { ModelPicker } from '@/components/chat/ModelPicker';
 import { useEffect, useId, useRef, useState, useCallback, useSyncExternalStore, type KeyboardEvent, type ChangeEvent, type ReactNode, type RefObject } from 'react';
-import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic, AudioLines } from 'lucide-react';
+import { Paperclip, ArrowUp, Square, X, Loader2, FileText, SendToBack, Mic, AudioLines, ListChecks } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { uploadAttachment } from '@/lib/chat';
 import { useDictation } from '@/lib/use-dictation';
@@ -341,8 +341,8 @@ export function Composer({
     : busy && activeTaskMode?.kind === 'execute'
     ? 'Executing the reviewed plan'
     : planning
-      ? (busy ? 'Planning · investigating with read-only tools' : 'Plan shows you the steps first, then you say go.')
-      : busy ? 'Anything you send now reaches her at her next step.' : 'Act does it now. Plan shows you the steps first.';
+      ? (busy ? 'Planning · looking things up without changing anything' : 'Clem will show you the steps first, then you say go.')
+      : busy ? 'Anything you send now reaches her at her next step.' : '';
 
   return (
     <div className="chat-composer min-w-0 max-w-full">
@@ -459,18 +459,17 @@ export function Composer({
           <Paperclip className="h-[18px] w-[18px]" aria-hidden />
         </Button>
 
-        <div role="group" aria-label="Mode" className="inline-flex rounded-full bg-subtle p-0.5">
-          <button type="button" aria-pressed={!planning} disabled={busy}
-            onClick={() => changeMode('normal')}
-            className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', !planning ? 'bg-surface text-fg shadow-[0_1px_2px_rgba(31,27,22,.08)]' : 'text-muted hover:text-fg')}>
-            Act
-          </button>
-          <button type="button" aria-pressed={planning} disabled={busy}
-            onClick={() => changeMode('plan')}
-            className={cn('rounded-full px-3 py-1 text-small font-semibold transition-colors disabled:opacity-60', planning ? 'bg-surface text-fg shadow-[0_1px_2px_rgba(31,27,22,.08)]' : 'text-muted hover:text-fg')}>
-            Plan
-          </button>
-        </div>
+        {/* One toggle a first-time owner understands: off, Clem just does it;
+            on, she shows the steps first and waits for go. "Act / Plan" read
+            as two modes to learn. */}
+        <button type="button" aria-pressed={planning} disabled={busy}
+          onClick={() => changeMode(planning ? 'normal' : 'plan')}
+          title={planning ? 'Clem will show you the steps first, then wait for your go' : 'Have Clem show you the steps before doing anything'}
+          className={cn('inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-small font-semibold transition-colors disabled:opacity-60',
+            planning ? 'border-primary/40 bg-primary-tint text-primary-ink' : 'border-border bg-surface text-muted hover:text-fg')}>
+          <ListChecks className="h-4 w-4" aria-hidden />
+          Plan first
+        </button>
         </div>
 
         <div className="composer-toolbar-models">
@@ -574,7 +573,8 @@ export function Composer({
         <button type="button" onClick={() => voiceMode.disable()} className="cursor-pointer text-faint underline-offset-2 hover:text-fg hover:underline">End voice</button>
       </p>
     ) : (
-      <p className="mt-2 text-center text-caption text-faint" role="status">{voice.error && !voice.enabled ? voice.error : hint}</p>
+      // Silent when idle: the toggle says what it does.
+      <p className={cn('text-center text-caption text-faint', (voice.error && !voice.enabled) || hint ? 'mt-2' : 'sr-only')} role="status">{voice.error && !voice.enabled ? voice.error : hint}</p>
     )}
     </div>
   );

@@ -134,7 +134,9 @@ export function BoardCard({
       </div>
 
       <p className="mt-2 line-clamp-2 text-body font-medium text-fg">
-        {card.sourceKind === 'workflow' ? workflowDisplayName(card.title) : card.title}
+        {/* A run's title arrives as "Workflow: <slug>"; the owner reads the name. */}
+        {card.sourceKind === 'workflow' ? workflowDisplayName(card.title)
+          : /^Workflow:\s*/.test(card.title) ? workflowDisplayName(card.title.replace(/^Workflow:\s*/, '')) : card.title}
       </p>
 
       {card.progressHint && (
@@ -166,10 +168,13 @@ export function BoardCard({
           // look and wears the warning tone like every other ask.
           <p className={cn('mt-2 line-clamp-3 break-words rounded-sm px-2 py-1 text-caption',
             card.failureSummary.failedItems > 0 ? 'bg-danger-tint text-danger' : 'bg-warning-tint text-warning')}>
+            {/* The status chip below already says "Needs review"; a reason is
+                what this line adds. */}
             {card.failureSummary.failedItems > 0
               ? `${card.failureSummary.failedItems} failed item${card.failureSummary.failedItems === 1 ? '' : 's'}`
-              : 'Needs review'}
-            {card.failureSummary.reason && !failureReasonIsRedundant(card) ? ` · ${stripInlineMarkdown(card.failureSummary.reason)}` : ''}
+              : card.failureSummary.reason && !failureReasonIsRedundant(card) ? '' : 'Needs review'}
+            {card.failureSummary.reason && !failureReasonIsRedundant(card)
+              ? `${card.failureSummary.failedItems > 0 ? ' · ' : ''}${stripInlineMarkdown(card.failureSummary.reason)}` : ''}
           </p>
         );
       })()}

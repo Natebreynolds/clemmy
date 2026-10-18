@@ -13,7 +13,9 @@ import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
  * Reads the same settings poll the composer's picker reads; adds no call.
  * Opens Who does what.
  */
-export function BrainChip() {
+/** `standInOnly`: the header shows the chip only when the brain is a stand-in
+ *  for the owner's pick; the composer's picker names the model otherwise. */
+export function BrainChip({ standInOnly = false }: { standInOnly?: boolean } = {}) {
   const navigate = useNavigate();
   const settings = usePoll(['settings'], getSettings, 0);
   const mr = settings.data?.modelRoles;
@@ -21,6 +23,7 @@ export function BrainChip() {
   const brain = mr.roles.brain;
   const label = shortModelLabel(roleLabel(mr, 'brain'));
   const swapped = brain.inactiveBinding && brain.inactiveBinding.modelId !== brain.modelId ? brain.inactiveBinding : null;
+  if (standInOnly && !swapped) return null;
   const color = (PROVIDER_DOT as Record<string, string>)[brain.provider] ?? PROVIDER_DOT.unknown;
   // Say why in Clem's words: the server's reason distinguishes "your pick
   // needs a sign-in" from "the active-model switch chose another".

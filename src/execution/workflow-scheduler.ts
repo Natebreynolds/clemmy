@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readableWorkflowName } from './workflow-diagnosis.js';
 import {
   closeSync,
   existsSync,
@@ -1687,7 +1688,7 @@ function emitScheduledReadinessBlockedNotice(
       kind: 'workflow',
       title: migration
         ? `Workflow update required: "${workflowName}" did not start`
-        : `Workflow needs attention: "${workflowName}" did not start`,
+        : `Didn't start: ${readableWorkflowName(workflowName)}`,
       body: migration
         ? `The scheduled occurrence was stopped before any workflow step or provider call because this workflow still uses a retired raw script runner${target}. `
           + `Open "${workflowName}" in Workflows—or ask Clem to inspect it with workflow_get—and replace external work with exact call steps plus bounded transform or a reviewed in-process host primitive using workflow_update. `

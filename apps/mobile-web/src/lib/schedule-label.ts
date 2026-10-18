@@ -12,6 +12,12 @@ export function whenLabel(schedule: string | null): string {
     const hour12 = h % 12 === 0 ? 12 : h % 12;
     return m === 0 ? `${hour12}${suffix}` : `${hour12}:${String(m).padStart(2, '0')}${suffix}`;
   };
+  // Intervals in words; "*/5 * * * *" is not "Hourly" (2026-10-18).
+  if (minute === '*' && hour === '*') return 'Every minute';
+  const everyMinutes = /^\*\/(\d+)$/.exec(minute);
+  if (everyMinutes && hour === '*') return `Every ${everyMinutes[1]} min`;
+  const everyHours = /^\*\/(\d+)$/.exec(hour);
+  if (everyHours) return everyHours[1] === '1' ? 'Hourly' : `Every ${everyHours[1]} hours`;
   if (hour.includes('*')) return 'Hourly';
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   if (dow !== '*' && !dow.includes('*')) {

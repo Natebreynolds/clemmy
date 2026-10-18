@@ -1,12 +1,12 @@
 import { CliSessions } from '@/components/chat/CliSessions';
-import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
-import { FileDockWorkspace } from '@/components/chat/FileDock';
+import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/CloudBrowserDock';
+import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import { Fragment, useEffect, useRef } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { FolderKanban, Pin, Loader2 } from 'lucide-react';
+import { FolderKanban, Pin, Loader2, Files, Globe } from 'lucide-react';
 import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
@@ -40,13 +40,16 @@ import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '../lib/chatColumn';
 
 function Header({ session }: { session: Session }) {
   const mutations = useSessionMutations();
+  const files = useFileDock()?.filesControl;
+  const browser = useBrowserControl();
   const meta = originMeta(session.origin);
   return (
     <div className="flex items-center gap-3 border-b border-border bg-surface px-5 py-3">
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <h2 className="min-w-0 truncate text-h3 text-fg">{session.title || 'New chat'}</h2>
-          <Tag className="shrink-0 whitespace-nowrap">{meta.label}</Tag>
+          {/* A chat is a chat; only another origin (a workflow, a channel) earns a tag. */}
+          {meta.label !== 'Chat' && <Tag className="shrink-0 whitespace-nowrap">{meta.label}</Tag>}
           {session.agentName && <Tag title="Answering this conversation" className="max-w-[12rem] shrink-0 truncate whitespace-nowrap">{session.agentName}</Tag>}
           {session.projectId && session.projectName && (
             <Link
@@ -62,6 +65,19 @@ function Header({ session }: { session: Session }) {
           )}
         </div>
       </div>
+      {/* Files and the browser sit here, one header row (owner 2026-10-18:
+          three stacked bars above every chat read as clutter). */}
+      {files && (
+        <Button size="sm" variant="ghost" aria-expanded={files.open} onClick={files.toggle}
+          aria-label={files.open ? 'Close files from this chat' : 'Open files from this chat'}>
+          <Files className="h-4 w-4" aria-hidden /> Files{files.count > 0 ? <span className="text-faint">{files.count}</span> : null}
+        </Button>
+      )}
+      {browser && (
+        <Button size="sm" variant="ghost" aria-expanded={browser.open} onClick={browser.toggle} title="A browser Clem can use for this conversation">
+          <Globe className="h-4 w-4" aria-hidden /> {browser.label}{browser.status ? <span className="text-faint">· {browser.status}</span> : null}
+        </Button>
+      )}
       <Button
         size="icon"
         variant="ghost"
@@ -174,8 +190,8 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
   };
 
   return (
-    <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
-    <FileDockWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
+    <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
+    <FileDockWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">

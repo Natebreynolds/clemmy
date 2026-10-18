@@ -1,4 +1,5 @@
 import { inlineCreationTestOriginDisposition, registerInlineCreationTestDeliveryReconciler } from './inline-creation-test-delivery.js';
+import { readableWorkflowName } from './workflow-diagnosis.js';
 import { createHash } from 'node:crypto';
 import { withoutHostReceiptLines } from '../runtime/host-receipt-lines.js';
 import { readWorkflowSettlementEvidence } from './workflow-settlement-evidence.js';
@@ -1057,11 +1058,18 @@ function deliverToOrigins(
       addNotification({
         id: notificationId,
         kind: 'workflow',
-        title: `Workflow ${committedStatus === 'done'
-          ? 'completed'
+        // Plain words a first-time owner reads at a glance (owner 2026-10-18).
+        title: `${committedStatus === 'done'
+          ? 'Finished'
           : committedStatus === 'needs_input'
-            ? 'needs input'
-            : committedStatus}: ${projection.workflowName}`,
+            ? 'Needs your answer'
+            : committedStatus === 'blocked'
+              ? 'Couldn\'t finish'
+              : committedStatus === 'failed'
+                ? 'Something went wrong'
+                : committedStatus === 'cancelled'
+                  ? 'Cancelled'
+                  : 'Update'}: ${readableWorkflowName(projection.workflowName)}`,
         body: committed.presentation.text,
         createdAt: new Date().toISOString(),
         read: false,

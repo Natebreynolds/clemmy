@@ -17,7 +17,9 @@ import '../chat/file-dock.css';
 const PdfPreview = lazy(() => import('../chat/PdfPreview'));
 
 export type DockedItem = { kind: 'file'; ref: SessionFileRef; conversationSessionId?: string } | { kind: 'page'; projectId: string; page: ProjectPageView };
-interface FileDock { item: DockedItem | null; open: (item: DockedItem) => void; close: () => void; showFiles: () => void }
+/** The chat header's Files button, when the toolbar lives in the header. */
+export interface FilesControl { count: number; open: boolean; toggle: () => void }
+interface FileDock { item: DockedItem | null; open: (item: DockedItem) => void; close: () => void; showFiles: () => void; filesControl?: FilesControl }
 const FileDockContext = createContext<FileDock | null>(null);
 export function useFileDock(): FileDock | null { return useContext(FileDockContext); }
 interface DockState { visible: boolean; item: DockedItem | null; expanded: boolean }
@@ -33,12 +35,15 @@ export interface ArtifactWorkspaceProps {
   /** Chat adds its existing Files toolbar and session file list. */
   filesSessionId?: string;
   showFilesBar?: boolean;
+  /** The conversation header draws the Files button (one header row); the
+   *  toolbar row is not drawn. */
+  filesInHeader?: boolean;
 }
 
 export function ArtifactWorkspace(props: ArtifactWorkspaceProps) {
   return <Workspace key={props.scopeKey} {...props} />;
 }
-function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = true, filesSessionId, showFilesBar = false }: ArtifactWorkspaceProps) {
+function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = true, filesSessionId, showFilesBar = false, filesInHeader = false }: ArtifactWorkspaceProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const [state, setState] = useState<DockState>(() => {
@@ -108,10 +113,13 @@ function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = t
     return () => { current = false; };
   }, [filesSessionId, state.visible, refresh]);
   useEffect(() => { if (state.visible) panel.current?.focus({ preventScroll: true }); }, [state.visible, state.item]);
-  const dock = useMemo<FileDock>(() => ({ item: state.visible ? state.item : null, open, close, showFiles }), [state.visible, state.item, open, close, showFiles]);
+  const filesCount = files.length;
+  const dock = useMemo<FileDock>(() => ({ item: state.visible ? state.item : null, open, close, showFiles,
+    ...(showFilesBar && filesInHeader ? { filesControl: { count: filesCount, open: state.visible, toggle: state.visible ? close : showFiles } } : {}) }),
+  [state.visible, state.item, open, close, showFiles, showFilesBar, filesInHeader, filesCount]);
   return <FileDockContext.Provider value={dock}>
     <div className="file-dock-root" data-scroll-content={scrollContent}>
-      {showFilesBar ? <div className="file-dock-bar">
+      {showFilesBar && !filesInHeader ? <div className="file-dock-bar">
         <button ref={filesButton} type="button" className={ACTION} onClick={state.visible ? close : showFiles} aria-expanded={state.visible} aria-label={state.visible ? 'Close files panel' : 'Open files from this chat'}>
           <Files className="h-4 w-4" aria-hidden /> Files {files.length > 0 ? <span className="text-faint">{files.length}</span> : null}
         </button>

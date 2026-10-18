@@ -65,23 +65,9 @@ export function HealthIndicator() {
     if (health !== 'attention') setOpen(false);
   }, [health]);
 
-  if (health !== 'attention') {
-    const good = health === 'good';
-    const text = good ? 'All good' : 'Checking status…';
-    return (
-      <span
-        role="status"
-        aria-label={text}
-        title={text}
-        className="app-no-drag inline-flex h-10 w-8 shrink-0 items-center justify-center"
-      >
-        <span
-          className={cn('h-2 w-2 rounded-full', good ? 'bg-success' : 'bg-faint')}
-          aria-hidden
-        />
-      </span>
-    );
-  }
+  // Healthy is the normal state and says nothing: an unexplained dot on
+  // every page read as noise. Only a problem earns a place in the header.
+  if (health !== 'attention') return null;
 
   return (
     <div className="relative app-no-drag" ref={ref}>
