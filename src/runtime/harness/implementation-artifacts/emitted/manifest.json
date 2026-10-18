@@ -2000,11 +2000,14 @@
         "src/runtime/harness/frozen-work-surface.ts": {
           "bytes": 11677
         },
+        "src/runtime/harness/read-continuation-wake.ts": {
+          "bytes": 2057
+        },
         "src/runtime/harness/recent-article-date-evidence.ts": {
           "bytes": 24393
         },
         "src/runtime/harness/async-read-refinement-store.ts": {
-          "bytes": 71298
+          "bytes": 82708
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
           "bytes": 14208
@@ -2024,11 +2027,8 @@
         "src/runtime/harness/host-tool-invocation.ts": {
           "bytes": 112851
         },
-        "src/runtime/harness/read-continuation-wake.ts": {
-          "bytes": 2057
-        },
         "src/runtime/harness/async-read-refinement-executor.ts": {
-          "bytes": 29865
+          "bytes": 29627
         },
         "src/runtime/harness/host-local-workspace-derivation.ts": {
           "bytes": 54266
@@ -2835,7 +2835,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 829612
+          "bytes": 830137
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -5930,11 +5930,14 @@
         "src/runtime/harness/frozen-work-surface.ts": {
           "bytes": 11677
         },
+        "src/runtime/harness/read-continuation-wake.ts": {
+          "bytes": 2057
+        },
         "src/runtime/harness/recent-article-date-evidence.ts": {
           "bytes": 24393
         },
         "src/runtime/harness/async-read-refinement-store.ts": {
-          "bytes": 71298
+          "bytes": 82708
         },
         "src/runtime/harness/plan-task-result-contract.ts": {
           "bytes": 14208
@@ -5954,11 +5957,8 @@
         "src/runtime/harness/host-tool-invocation.ts": {
           "bytes": 112851
         },
-        "src/runtime/harness/read-continuation-wake.ts": {
-          "bytes": 2057
-        },
         "src/runtime/harness/async-read-refinement-executor.ts": {
-          "bytes": 29865
+          "bytes": 29627
         },
         "src/runtime/harness/host-local-workspace-derivation.ts": {
           "bytes": 54266
@@ -6765,7 +6765,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 829612
+          "bytes": 830137
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
