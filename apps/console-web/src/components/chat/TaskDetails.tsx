@@ -9,6 +9,7 @@ import {
   type TaskHandlingDetails,
 } from '@/lib/task-details';
 import { cn } from '@/lib/cn';
+import { memoryFactHref } from '@/lib/memory-fact-links';
 
 type LoadState = { kind: 'idle' | 'loading' | 'error' } | { kind: 'ready'; detail: TaskHandlingDetails };
 
@@ -129,6 +130,7 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
           <ul className="divide-y divide-border">
             {tools.map((row, index) => {
               const reason = taskToolReason(row);
+              const preferenceHref = row.selection?.kind === 'owner_preference' ? memoryFactHref(row.selection.factId) : null;
               return (
                 <li key={`${row.callId}:${index}`} className="min-w-0 py-2 first:pt-0 last:pb-0">
                   <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5">
@@ -136,6 +138,7 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
                     <span className={row.status === 'failed' ? 'text-caption text-danger' : 'text-caption text-muted'}>{taskToolStatus(row)}</span>
                   </div>
                   <p className="break-words text-caption text-muted [overflow-wrap:anywhere]">{reason || 'Choice reason not recorded'}</p>
+                  {preferenceHref && <Link to={preferenceHref} className="inline-flex min-h-9 items-center rounded-sm text-caption font-medium text-primary-ink underline underline-offset-4 hover:text-primary-ink-hover">View this preference</Link>}
                   <p className="text-caption text-muted">{taskToolEvidence(row)}</p>
                   {row.effect && <p className="break-words text-caption text-muted [overflow-wrap:anywhere]">Effect: {plainRecordName(row.effect)}</p>}
                 </li>
@@ -161,6 +164,7 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
                   <li key={`${ref.type}:${ref.id}:${index}`} className="min-w-0">
                     <p className="break-words text-fg [overflow-wrap:anywhere]">{ref.text || `${plainRecordName(ref.type)} · content not retained`}</p>
                     <p className="text-caption text-muted">{ref.outcome === 'used' ? 'Recorded as used' : ref.outcome === 'not_useful' ? 'Recorded as not useful' : 'Offered to Clem'}</p>
+                    {ref.type === 'fact' && memoryFactHref(ref.id) && <Link to={memoryFactHref(ref.id)!} className="inline-flex min-h-9 items-center rounded-sm text-caption font-medium text-primary-ink underline underline-offset-4 hover:text-primary-ink-hover">View this memory</Link>}
                   </li>
                 ))}
               </ul>

@@ -45,6 +45,8 @@ import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { getProject as getProjectRecord } from '../projects/project-record.js';
 import { listFactsByScope, scopeFilterFromQuery, withScopeViews } from '../projects/memory-scope-views.js';
 import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js';
+import { registerConsoleMemoryFactDetailRoutes } from './console-memory-fact-detail-routes.js';
+import { runGuardedMemoryFactMutation } from './memory-fact-mutation-guard.js';
 import { registerConsoleTaskHandlingRoutes } from './console-task-handling-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
@@ -4074,6 +4076,7 @@ export function registerConsoleRoutes(
   });
   registerConsoleAgentsRoutes(app, isAuthorized);
   registerConsoleMemoryWorkRoutes(app, { isAuthorized });
+  registerConsoleMemoryFactDetailRoutes(app, { isAuthorized });
   registerConsoleTaskHandlingRoutes(app, { isAuthorized });
   armWorkflowListMemoWarm();
 
@@ -4723,6 +4726,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    if (Object.hasOwn(req.body ?? {}, 'expectedMemory')) {
+      const result = runGuardedMemoryFactMutation(String(req.params.id ?? ''), req.body.expectedMemory, 'forget', () => forgetFact(id));
+      if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
+      if (result.value) bumpStableContextGeneration();
+      res.json({ ok: result.value });
+      return;
+    }
     try {
       const ok = forgetFact(id);
       if (ok) bumpStableContextGeneration();
@@ -4838,6 +4848,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
+    if (Object.hasOwn(req.body ?? {}, 'expectedMemory')) {
+      const result = runGuardedMemoryFactMutation(String(req.params.id ?? ''), req.body.expectedMemory, 'restore', () => reactivateFact(id));
+      if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
+      if (result.value) bumpStableContextGeneration();
+      res.json({ ok: result.value });
+      return;
+    }
     try {
       const ok = reactivateFact(id);
       if (ok) bumpStableContextGeneration();
@@ -4947,6 +4964,21 @@ export function registerConsoleRoutes(
       res.status(400).json({ error: 'nothing to update (provide content and/or importance)' });
       return;
     }
+    if (Object.hasOwn(req.body ?? {}, 'expectedMemory')) {
+      const result = runGuardedMemoryFactMutation(String(req.params.id ?? ''), req.body.expectedMemory, 'correct', (existing) => patch.content
+        ? supersedeFact(id, {
+            content: patch.content,
+            importance: patch.importance ?? existing.importance ?? undefined,
+            trustLevel: 1,
+            sourceApp: 'Clementine Console',
+          })
+        : updateFact(id, { importance: patch.importance }));
+      if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
+      if (!result.value) { res.status(404).json({ error: 'This saved memory was not found.' }); return; }
+      bumpStableContextGeneration();
+      res.json({ ok: true, fact: result.value, supersededFactId: patch.content ? id : null });
+      return;
+    }
     try {
       const existing = getFact(id);
       if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }
@@ -4974,6 +5006,13 @@ export function registerConsoleRoutes(
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: 'invalid id' }); return; }
     const pinned = ((req.body ?? {}) as { pinned?: unknown }).pinned !== false;
+    if (Object.hasOwn(req.body ?? {}, 'expectedMemory')) {
+      const result = runGuardedMemoryFactMutation(String(req.params.id ?? ''), req.body.expectedMemory, 'pin', () => setFactPinned(id, pinned));
+      if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
+      if (result.value) bumpStableContextGeneration();
+      res.json({ ok: result.value, pinned });
+      return;
+    }
     try {
       const existing = getFact(id);
       if (!existing) { res.status(404).json({ error: `no fact #${id}` }); return; }

@@ -1,6 +1,8 @@
 import type { MemoryScope } from '@clem/chat-engine';
-import { apiGet, apiPatch, apiPost } from './api';
+import { api, apiGet, apiPatch, apiPost } from './api';
 import { factScopeQuery, type FactScopeFilter } from './memory-scope';
+import { exactFactPayload, type ExpectedMemorySnapshot } from './memory-fact-detail';
+import { memoryFactId } from './memory-fact-links';
 
 export interface Fact {
   /** Where the fact applies: everywhere, one project, one agent, or one
@@ -63,24 +65,33 @@ export const FACT_KINDS: { key: Fact['kind']; label: string }[] = [
 export const listFacts = (kind?: Fact['kind'], limit = 80, includeInactive = false, scope?: FactScopeFilter) =>
   apiGet<{ facts: Fact[]; total: number; visible: number }>(`/api/console/memory/facts?${kind ? `kind=${kind}&` : ''}limit=${limit}${includeInactive ? '&includeInactive=1' : ''}${factScopeQuery(scope)}`);
 
+/** Load the exact retained fact, including inactive and superseded records.
+ * No list/search fallback can silently substitute a different memory. */
+export async function getFactDetail(id: Fact['id'], signal?: AbortSignal,
+  request: (path: string, options?: RequestInit) => Promise<unknown> = (path, options) => api(path, options)): Promise<Fact> {
+  const exactId = memoryFactId(id);
+  if (exactId === null) throw new Error('An exact memory link is required.');
+  return exactFactPayload(await request(`/api/console/memory/facts/${exactId}/detail`, { signal }), exactId);
+}
+
 /** Move a fact to a project, an agent, both, or (both null) everywhere. */
 export const moveFactScope = (id: Fact['id'], target: { projectId: string | null; agentId: string | null }) =>
   apiPost<Fact | { fact: Fact }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}/scope`, target)
     .then((r): Fact => ((r as { fact?: Fact }).fact ?? (r as Fact)));
 
-export const forgetFact = (id: Fact['id']) =>
-  apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/forget`);
+export const forgetFact = (id: Fact['id'], expectedMemory?: ExpectedMemorySnapshot) =>
+  apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/forget`, expectedMemory ? { expectedMemory } : undefined);
 
 export const pinFact = (id: Fact['id'], pinned = true) =>
   apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/pin`, { pinned });
 
 /** Reverse a soft-delete (forget / auto-clean / approved retire/merge). The
  *  undo half of every reversible memory action — 30-day window. */
-export const restoreFact = (id: Fact['id']) =>
-  apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/restore`);
+export const restoreFact = (id: Fact['id'], expectedMemory?: ExpectedMemorySnapshot) =>
+  apiPost(`/api/console/memory/facts/${encodeURIComponent(String(id))}/restore`, expectedMemory ? { expectedMemory } : undefined);
 
-export const updateFact = (id: Fact['id'], patch: { content?: string; importance?: number }) =>
-  apiPatch<{ ok: boolean; fact: Fact; supersededFactId?: number | null }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}`, patch);
+export const updateFact = (id: Fact['id'], patch: { content?: string; importance?: number }, expectedMemory?: ExpectedMemorySnapshot) =>
+  apiPatch<{ ok: boolean; fact: Fact; supersededFactId?: number | null }>(`/api/console/memory/facts/${encodeURIComponent(String(id))}`, { ...patch, ...(expectedMemory ? { expectedMemory } : {}) });
 
 export interface MemoryReviewCandidate {
   id: string;

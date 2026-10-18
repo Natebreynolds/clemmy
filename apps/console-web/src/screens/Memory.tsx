@@ -48,6 +48,8 @@ import { canMoveToEverywhere, factScopeChoices, factScopeFromKey, factScopeKey, 
 import { apiErrorCode, listProjects, projectKeys, refusalText } from '@/lib/projects';
 import { listAgents } from '@/lib/agents';
 import { isMac } from '@/lib/platform';
+import { ExactMemoryDetail } from '@/components/memory/ExactMemoryDetail';
+import { memoryFactId } from '@/lib/memory-fact-links';
 
 type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
 const TABS: readonly Tab[] = ['overview', 'facts', 'tools', 'episodes', 'entities', 'sources'];
@@ -77,6 +79,15 @@ function factToHit(f: Fact): MemoryHit {
 }
 
 export function Memory() {
+  const [params] = useSearchParams();
+  // A task's exact reference has its own view. The normal overview's polls,
+  // list and search never mount while that reference is open.
+  const linkedFacts = params.getAll('fact');
+  if (linkedFacts.length) return <ExactMemoryDetail factId={linkedFacts.length === 1 ? memoryFactId(linkedFacts[0]) : null} />;
+  return <MemoryOverview />;
+}
+
+function MemoryOverview() {
   const qc = useQueryClient();
   // A link from a project or an agent opens the facts kept for it.
   const [params] = useSearchParams();
