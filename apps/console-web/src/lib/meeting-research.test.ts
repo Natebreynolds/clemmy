@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { addMeetingResearchDocument, getMeetingResearch, getMeetingResearchDocuments, meetingResearchJobLabel,
-  meetingResearchNotice, meetingResearchRefsCurrent, parseMeetingResearchDocuments, parseMeetingResearchState,
+  meetingResearchNotice, meetingResearchRefsCurrent, meetingResearchReviewNotice, parseMeetingResearchDocuments, parseMeetingResearchState,
   removeMeetingResearchDocument, setMeetingResearch, stopMeetingResearch, type MeetingResearchDocuments, type MeetingResearchState } from './meeting-research';
 
 const meetingId = 'controlled/meeting';
@@ -43,6 +43,22 @@ test('a private lookup link requires a complete accepted task binding, not a res
   }
   assert.throws(() => parseMeetingResearchState({ ...state, jobs: [{ ...job, status: 'probably_done' }] }, meetingId), /couldn’t refresh/);
   assert.throws(() => parseMeetingResearchState({ ...state, jobs: [job, job] }, meetingId), /couldn’t refresh/);
+});
+
+test('answer availability never implies a passed review, and unavailable review keeps the saved answer link', () => {
+  const job = { id: 'review-result', question: 'Which plan is approved?', status: 'completed', task };
+  for (const reviewState of [undefined, 'unverified', 'unknown_future_state', true]) {
+    const parsed = parseMeetingResearchState({ ...state, jobs: [{ ...job, ...(reviewState === undefined ? {} : { reviewState }) }] }, meetingId).jobs[0];
+    assert.deepEqual(parsed.task, task, 'an unconfirmed review never removes the available answer');
+    assert.match(meetingResearchReviewNotice(parsed)!, /review couldn’t confirm/);
+  }
+  for (const [reviewState, label] of [['reviewed', 'Reviewed'], ['disabled_by_owner', 'Review was off for this answer.'],
+    ['not_required', 'Separate review wasn’t required for this answer.']] as const) {
+    const parsed = parseMeetingResearchState({ ...state, jobs: [{ ...job, reviewState }] }, meetingId).jobs[0];
+    assert.equal(meetingResearchReviewNotice(parsed), label);
+  }
+  assert.equal(meetingResearchReviewNotice({ status: 'running', task, reviewState: 'reviewed' }), undefined);
+  assert.equal(meetingResearchReviewNotice({ status: 'completed', reviewState: 'reviewed' }), undefined);
 });
 
 test('context metadata is capture-bound and does not carry pasted text into the display snapshot', () => {
