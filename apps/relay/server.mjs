@@ -43,13 +43,18 @@
  *   RELAY_BASE_DOMAIN   — e.g. r.example.com  (SNI suffix to demux on)
  *   RELAY_TLS_KEY_PEM / RELAY_TLS_CERT_PEM — PEM material for the tunnel leg
  *     (or RELAY_TLS_KEY_FILE / RELAY_TLS_CERT_FILE paths)
+ *   RELAY_PORT          — optional TCP override, preserving legacy PORT
+ *   RELAY_HEALTH_PORT   — optional separate HTTP /healthz and /readyz listener
+ *   RELAY_DRAIN_TIMEOUT_MS — bounded SIGTERM grace (default 20000)
  */
 import net from 'node:net';
 import tls from 'node:tls';
+import http from 'node:http';
 import { Duplex } from 'node:stream';
 import { createHash, timingSafeEqual, randomBytes, createVerify, X509Certificate } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ─── mux framing (mirrored in src/runtime/mobile-relay.ts — keep in sync) ───
 // [u32 payloadLen BE][u8 type][u32 streamId BE][payload]
@@ -226,6 +231,8 @@ const PONG_DEADLINE_MS = 90_000;
 // free. The relay's own heartbeat is one PING per tunnel per 30 s, so one
 // reply per second is three orders of magnitude more than the protocol needs.
 const MIN_PONG_INTERVAL_MS = 1_000;
+const MAX_HELLO_BYTES = 4096;
+const MAX_PROOF_BYTES = 32 * 1024;
 
 // ─── availability limits ────────────────────────────────────────────────────
 //
@@ -251,6 +258,13 @@ const MIN_PONG_INTERVAL_MS = 1_000;
 // defensible read either way, and nothing below is allowed to REFUSE a proven
 // daemon on the strength of this address — see makeRoomForTunnel.
 const DEFAULT_LIMITS = Object.freeze({
+  maxPendingRegistrations: 64,
+  maxQueuedBytesPerTunnel: 4 * 1024 * 1024,
+  maxQueuedBytesPerPhone: 2 * 1024 * 1024,
+  maxQueuedBytesTotal: 32 * 1024 * 1024,
+  maxQueuedWritesPerSocket: 1024,
+  maxQueuedWritesTotal: 8192,
+  writeStallMs: 60_000,
   /** Streams one tunnel may hold open at once, across every source. */
   maxStreamsPerTunnel: 128,
   /** Streams one source address may hold in one tunnel (see the note above). */
@@ -307,17 +321,115 @@ export function allocateStreamId(tunnel, maxAttempts) {
   return null;
 }
 
-export function startRelay(opts) {
+export async function startRelay(opts) {
   const {
     port, baseDomain, tlsKeyPem, tlsCertPem, log = console,
+    host = '0.0.0.0', healthPort, healthHost = '0.0.0.0',
     // Overridable so tests can prove a cap with three sockets instead of a
     // hundred, and so a self-hoster can size a bigger box. Defaults are the
     // shipped behaviour — there is no flag to turn any of this on.
     limits: limitOverrides, recordOptions,
   } = opts;
+  const validPort = (value) => Number.isInteger(value) && value >= 0 && value <= 65535;
+  if (!validPort(port) || (healthPort !== undefined && !validPort(healthPort))) {
+    throw new Error('relay: ports must be integers between 0 and 65535');
+  }
+  if (healthPort !== undefined && port !== 0 && healthPort === port) {
+    throw new Error('relay: health and encrypted TCP listeners need different ports');
+  }
+  if (typeof baseDomain !== 'string' || baseDomain.length > 253
+      || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(baseDomain)) {
+    throw new Error('relay: a valid DNS base domain is required');
+  }
   const base = baseDomain.toLowerCase();
+  for (const name of Object.keys(limitOverrides ?? {})) {
+    if (!Object.hasOwn(DEFAULT_LIMITS, name)) throw new Error(`relay: unknown limit ${name}`);
+  }
   const limits = { ...DEFAULT_LIMITS, ...(limitOverrides ?? {}) };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value <= 0 || value > 1024 * 1024 * 1024) {
+      throw new Error(`relay: invalid limit ${name}`);
+    }
+  }
+  // Validate once at startup; public callers must not repeatedly parse our key.
+  const secureContext = tls.createSecureContext({ key: tlsKeyPem, cert: tlsCertPem, minVersion: 'TLSv1.3' });
   const registrations = registrationRecord(recordOptions ?? {});
+  const sockets = new Set();
+  const socketRoles = new Map();
+  const writers = new Map();
+  let queuedBytes = 0;
+  let queuedWrites = 0;
+  let pendingRegistrations = 0;
+  let stopping = false;
+  let closePromise;
+  let healthServer;
+  let started = false;
+  let listenerFailure;
+
+  // Control frames need the same bounds as data. Rapid OPEN/CLOSE churn must
+  // not create an unbounded queue on a daemon that stopped reading. Callbacks
+  // account for bytes and frame overhead; socket close releases them once.
+  function boundedWrite(socket, bytes, maxBytes) {
+    if (socket.destroyed || !socket.writable) return false;
+    let writer = writers.get(socket);
+    if (!writer) {
+      writer = { bytes: 0, pending: new Set(), timer: null, lastProgressAt: 0 };
+      writers.set(socket, writer);
+      const drained = () => { clearTimeout(writer.timer); writer.timer = null; };
+      socket.on('drain', drained);
+      socket.once('close', () => {
+        drained();
+        socket.off('drain', drained);
+        for (const release of writer.pending) release();
+        writers.delete(socket);
+      });
+    }
+    if (writer.bytes + bytes.length > maxBytes || queuedBytes + bytes.length > limits.maxQueuedBytesTotal
+        || writer.pending.size >= limits.maxQueuedWritesPerSocket || queuedWrites >= limits.maxQueuedWritesTotal) {
+      socket.destroy();
+      return false;
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      writer.pending.delete(release);
+      writer.bytes -= bytes.length;
+      queuedBytes -= bytes.length;
+      queuedWrites -= 1;
+    };
+    writer.pending.add(release);
+    writer.bytes += bytes.length;
+    queuedBytes += bytes.length;
+    queuedWrites += 1;
+    try {
+      const ok = socket.write(bytes, (error) => {
+        if (!error) writer.lastProgressAt = Date.now();
+        release();
+      });
+      if (!ok && !writer.timer) {
+        // A stalled phone must not pause every stream (and PONG) indefinitely.
+        // New queued input does not count as progress. Successful write
+        // completions do, so a slow reader is not given a total-duration wall.
+        writer.lastProgressAt = Date.now();
+        const checkStall = () => {
+          const remaining = limits.writeStallMs - (Date.now() - writer.lastProgressAt);
+          if (remaining <= 0) { socket.destroy(); return; }
+          writer.timer = setTimeout(checkStall, remaining);
+          writer.timer.unref?.();
+        };
+        writer.timer = setTimeout(checkStall, limits.writeStallMs);
+        writer.timer.unref?.();
+      }
+      return ok;
+    } catch {
+      release();
+      socket.destroy();
+      return false;
+    }
+  }
+  const writeTunnel = (tunnel, type, streamId, payload) =>
+    boundedWrite(tunnel.socket, encodeFrame(type, streamId, payload), limits.maxQueuedBytesPerTunnel);
   /**
    * pairId → tunnel {
    *   socket, ip, feed, nextStreamId, lastPong, lastStreamAt, pauses,
@@ -327,7 +439,7 @@ export function startRelay(opts) {
    */
   const tunnels = new Map();
 
-  function attachTunnel(rawTlsSocket, pairId, sourceIp) {
+  function attachTunnel(rawTlsSocket, pairId, sourceIp, feed = frameReader(), initialFrames = []) {
     const existing = tunnels.get(pairId);
     if (existing) existing.socket.destroy();
     const tunnel = {
@@ -351,24 +463,19 @@ export function startRelay(opts) {
       pauses: 0,
       lastPongSentAt: 0,
       lastCapLogAt: 0,
-      feed: frameReader(),
+      feed,
     };
     tunnels.set(pairId, tunnel);
 
-    rawTlsSocket.on('data', (chunk) => {
-      let frames;
-      try { frames = tunnel.feed(chunk); } catch (err) {
-        log.error(`relay: tunnel ${pairId} framing error: ${err.message}`);
-        rawTlsSocket.destroy();
-        return;
-      }
+    const acceptFrames = (frames) => {
       for (const frame of frames) {
+        if (rawTlsSocket.destroyed) return;
         if (frame.type === FRAME.DATA) {
           const stream = tunnel.streams.get(frame.streamId);
           if (stream && !stream.socket.destroyed) {
             // THE daemon answered this stream: the deadline's whole question.
-            stream.answered();
-            const ok = stream.socket.write(frame.payload);
+            if (frame.payload.length > 0) stream.answered();
+            const ok = boundedWrite(stream.socket, frame.payload, limits.maxQueuedBytesPerPhone);
             // Resume on 'close' as well as 'drain': a phone that dies while
             // the tunnel is paused for it would otherwise wedge the tunnel —
             // and with it every OTHER stream on the same Mac — permanently.
@@ -376,12 +483,14 @@ export function startRelay(opts) {
             // accumulates on a long-lived socket. The count is what makes two
             // congested phones safe: one draining must not un-pause the tunnel
             // while the other is still backed up.
-            if (!ok) {
+            if (!ok && !stream.socket.destroyed && !stream.waitingForPhone) {
+              stream.waitingForPhone = true;
               tunnel.pauses += 1;
               rawTlsSocket.pause();
               const resume = () => {
                 stream.socket.off('drain', resume);
                 stream.socket.off('close', resume);
+                stream.waitingForPhone = false;
                 tunnel.pauses -= 1;
                 if (tunnel.pauses === 0) rawTlsSocket.resume();
               };
@@ -400,9 +509,15 @@ export function startRelay(opts) {
           const now = Date.now();
           if (now - tunnel.lastPongSentAt >= MIN_PONG_INTERVAL_MS) {
             tunnel.lastPongSentAt = now;
-            rawTlsSocket.write(encodeFrame(FRAME.PONG, 0));
+            writeTunnel(tunnel, FRAME.PONG, 0);
           }
         }
+      }
+    };
+    rawTlsSocket.on('data', (chunk) => {
+      try { acceptFrames(tunnel.feed(chunk)); } catch {
+        log.error('relay: invalid tunnel frame; closing connection');
+        rawTlsSocket.destroy();
       }
     });
     const drop = () => {
@@ -414,6 +529,7 @@ export function startRelay(opts) {
     rawTlsSocket.on('close', drop);
     rawTlsSocket.on('error', () => rawTlsSocket.destroy());
     log.info(`relay: tunnel registered for ${pairId}`);
+    acceptFrames(initialFrames);
   }
 
   /**
@@ -456,16 +572,16 @@ export function startRelay(opts) {
    * stale token must not veto a good proof.
    */
   function handleTunnelLeg(rawSocket, buffered) {
+    if (stopping || pendingRegistrations >= limits.maxPendingRegistrations) {
+      rawSocket.destroy();
+      return;
+    }
+    pendingRegistrations += 1;
+    socketRoles.set(rawSocket, 'registration');
     const sourceIp = normalizeIp(rawSocket.remoteAddress);
     const tlsSocket = new tls.TLSSocket(replayedSocket(rawSocket, buffered), {
       isServer: true,
-      secureContext: tls.createSecureContext({
-        key: tlsKeyPem,
-        cert: tlsCertPem,
-        // The control leg is our own code on both ends, so there is no legacy
-        // client to accommodate and no reason to accept anything older.
-        minVersion: 'TLSv1.3',
-      }),
+      secureContext,
     });
     const feed = frameReader();
     let stage = 'hello';
@@ -473,31 +589,52 @@ export function startRelay(opts) {
     let pendingToken = '';
     const nonce = randomBytes(32).toString('base64url');
     const helloTimer = setTimeout(() => { if (stage !== 'done') tlsSocket.destroy(); }, HELLO_TIMEOUT_MS);
+    helloTimer.unref?.();
+    let pending = true;
+    const releaseRegistration = () => {
+      clearTimeout(helloTimer);
+      if (!pending) return;
+      pending = false;
+      pendingRegistrations -= 1;
+    };
+    tlsSocket.once('close', releaseRegistration);
 
     const refuse = (error) => {
-      tlsSocket.write(encodeFrame(FRAME.HELLO_ERR, 0, JSON.stringify({ error })));
+      releaseRegistration();
+      boundedWrite(tlsSocket, encodeFrame(FRAME.HELLO_ERR, 0, JSON.stringify({ error })), limits.maxQueuedBytesPerTunnel);
       tlsSocket.destroy();
     };
 
     const onData = (chunk) => {
       let frames;
       try { frames = feed(chunk); } catch { tlsSocket.destroy(); return; }
-      for (const frame of frames) {
+      for (let index = 0; index < frames.length; index += 1) {
+        const frame = frames[index];
+        if (stopping) { tlsSocket.destroy(); return; }
         if (stage === 'hello') {
-          if (frame.type !== FRAME.HELLO) { tlsSocket.destroy(); return; }
+          if (frame.type !== FRAME.HELLO || frame.streamId !== 0 || frame.payload.length > MAX_HELLO_BYTES) {
+            tlsSocket.destroy(); return;
+          }
           let hello;
           try { hello = JSON.parse(frame.payload.toString('utf8')); } catch { tlsSocket.destroy(); return; }
-          const pairId = String(hello.pairId ?? '').toLowerCase();
-          const token = String(hello.authToken ?? '');
+          if (!hello || typeof hello !== 'object' || Array.isArray(hello)
+              || typeof hello.pairId !== 'string' || typeof hello.authToken !== 'string'
+              || hello.authToken.length > 512) {
+            refuse('BAD_HELLO'); return;
+          }
+          const pairId = hello.pairId.toLowerCase();
+          const token = hello.authToken;
           if (!PAIR_ID_RE.test(pairId) || token.length < 16) { refuse('BAD_HELLO'); return; }
           pendingPairId = pairId;
           pendingToken = token;
           stage = 'proof';
-          tlsSocket.write(encodeFrame(FRAME.CHALLENGE, 0, JSON.stringify({ nonce })));
+          boundedWrite(tlsSocket, encodeFrame(FRAME.CHALLENGE, 0, JSON.stringify({ nonce })), limits.maxQueuedBytesPerTunnel);
           continue;
         }
         if (stage === 'proof') {
-          if (frame.type !== FRAME.PROOF) { tlsSocket.destroy(); return; }
+          if (frame.type !== FRAME.PROOF || frame.streamId !== 0 || frame.payload.length > MAX_PROOF_BYTES) {
+            tlsSocket.destroy(); return;
+          }
           let proof;
           try { proof = JSON.parse(frame.payload.toString('utf8')); } catch { tlsSocket.destroy(); return; }
           if (!verifyPossession(pendingPairId, nonce, proof)) {
@@ -525,10 +662,13 @@ export function startRelay(opts) {
             log.warn(`relay: ${pendingPairId} rebound to a new auth token on a valid possession proof`);
           }
           stage = 'done';
-          clearTimeout(helloTimer);
+          releaseRegistration();
+          socketRoles.set(rawSocket, 'tunnel');
           tlsSocket.removeListener('data', onData);
-          tlsSocket.write(encodeFrame(FRAME.HELLO_OK, 0, JSON.stringify({ ok: true })));
-          attachTunnel(tlsSocket, pendingPairId, sourceIp);
+          boundedWrite(tlsSocket, encodeFrame(FRAME.HELLO_OK, 0, JSON.stringify({ ok: true })), limits.maxQueuedBytesPerTunnel);
+          if (tlsSocket.destroyed) return;
+          // Preserve decoded frames AND the parser's partial suffix at handoff.
+          attachTunnel(tlsSocket, pendingPairId, sourceIp, feed, frames.slice(index + 1));
           return;
         }
       }
@@ -545,7 +685,9 @@ export function startRelay(opts) {
     try {
       const certPem = String(proof?.certPem ?? '');
       const signature = String(proof?.signature ?? '');
-      if (!certPem || !signature) return false;
+      if (!proof || typeof proof !== 'object' || Array.isArray(proof)
+          || typeof proof.certPem !== 'string' || typeof proof.signature !== 'string'
+          || !certPem || certPem.length > 16 * 1024 || !signature || signature.length > 16 * 1024) return false;
       const cert = new X509Certificate(certPem);
       // (a) the certificate really is the one this address names
       const derived = createHash('sha256').update(cert.raw).digest('hex').slice(0, 16);
@@ -626,6 +768,7 @@ export function startRelay(opts) {
   }
 
   function handlePhoneLeg(rawSocket, pairId, buffered) {
+    if (stopping) { rawSocket.destroy(); return; }
     const tunnel = tunnels.get(pairId);
     if (!tunnel || tunnel.socket.destroyed) {
       rawSocket.destroy(); // daemon offline — phone falls back / retries
@@ -673,15 +816,18 @@ export function startRelay(opts) {
       if (released) return;
       released = true;
       answered();
+      stream.releaseTunnelWait?.();
       if (tunnel.streams.get(streamId) === stream) tunnel.streams.delete(streamId);
       const held = (tunnel.streamsByIp.get(ip) ?? 1) - 1;
       if (held > 0) tunnel.streamsByIp.set(ip, held);
       else tunnel.streamsByIp.delete(ip);
       if (notifyTunnel && !tunnel.socket.destroyed) {
-        tunnel.socket.write(encodeFrame(FRAME.CLOSE, streamId));
+        writeTunnel(tunnel, FRAME.CLOSE, streamId);
       }
+      if (stopping && tunnel.streams.size === 0) tunnel.socket.destroy();
     };
     const stream = { socket: rawSocket, ip, release, answered };
+    socketRoles.set(rawSocket, 'phone');
     tunnel.streams.set(streamId, stream);
     tunnel.streamsByIp.set(ip, (tunnel.streamsByIp.get(ip) ?? 0) + 1);
     // This tunnel is carrying a phone right now; it is not an eviction target.
@@ -691,24 +837,28 @@ export function startRelay(opts) {
     // the stream slot comes back without waiting for the tunnel to drop.
     rawSocket.setKeepAlive(true, 60_000);
 
-    tunnel.socket.write(encodeFrame(FRAME.OPEN, streamId, JSON.stringify({ ip })));
+    writeTunnel(tunnel, FRAME.OPEN, streamId, JSON.stringify({ ip }));
     // Replay the ClientHello bytes we consumed while sniffing SNI, then pipe.
-    if (buffered.length) tunnel.socket.write(encodeFrame(FRAME.DATA, streamId, buffered));
+    if (buffered.length) writeTunnel(tunnel, FRAME.DATA, streamId, buffered);
     rawSocket.on('data', (chunk) => {
       // Deliberately NOT clearing the answer deadline: bytes from the peer are
       // the thing the deadline exists to be unimpressed by.
-      const ok = tunnel.socket.write(encodeFrame(FRAME.DATA, streamId, chunk));
+      const ok = writeTunnel(tunnel, FRAME.DATA, streamId, chunk);
       // Same pairing as the tunnel→phone direction above: resume on either
       // event, and unsubscribe both so nothing piles up on the tunnel socket.
-      if (!ok) {
+      if (!ok && !tunnel.socket.destroyed && !rawSocket.destroyed && !stream.releaseTunnelWait) {
         rawSocket.pause();
         const resume = () => {
           tunnel.socket.off('drain', resume);
           tunnel.socket.off('close', resume);
-          rawSocket.resume();
+          rawSocket.off('close', resume);
+          stream.releaseTunnelWait = null;
+          if (!rawSocket.destroyed) rawSocket.resume();
         };
+        stream.releaseTunnelWait = resume;
         tunnel.socket.once('drain', resume);
         tunnel.socket.once('close', resume);
+        rawSocket.once('close', resume);
       }
     });
     // Every terminal path releases the slot. 'error' destroys, which emits
@@ -719,10 +869,20 @@ export function startRelay(opts) {
   }
 
   const server = net.createServer((socket) => {
+    if (stopping) { socket.destroy(); return; }
+    sockets.add(socket);
+    socketRoles.set(socket, 'sniff');
     socket.setNoDelay(true);
     let buffered = Buffer.alloc(0);
     const sniTimer = setTimeout(() => socket.destroy(), SNI_TIMEOUT_MS);
+    sniTimer.unref?.();
+    socket.once('close', () => {
+      clearTimeout(sniTimer);
+      sockets.delete(socket);
+      socketRoles.delete(socket);
+    });
     const onData = (chunk) => {
+      if (stopping) { socket.destroy(); return; }
       buffered = Buffer.concat([buffered, chunk]);
       if (buffered.length > SNI_MAX_BUFFER) { clearTimeout(sniTimer); socket.destroy(); return; }
       const parsed = parseSni(buffered);
@@ -757,41 +917,132 @@ export function startRelay(opts) {
         log.warn(`relay: tunnel ${pairId} missed heartbeat; dropping`);
         tunnel.socket.destroy();
       } else if (!tunnel.socket.destroyed) {
-        tunnel.socket.write(encodeFrame(FRAME.PING, 0));
+        writeTunnel(tunnel, FRAME.PING, 0);
       }
     }
   }, PING_INTERVAL_MS);
   heartbeat.unref();
 
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, () => {
-      const bound = server.address().port;
-      log.info(`relay: listening on :${bound} for *.${base}`);
-      // The four counters are read-only observation, and exist because the
-      // caps and the evictions are only assertable from outside the process by
-      // looking at what the relay is actually holding.
-      resolve({
-        port: bound,
-        tunnelCount: () => tunnels.size,
-        streamCount: (pairId) => tunnels.get(pairId)?.streams.size ?? 0,
-        hasTunnel: (pairId) => tunnels.has(pairId),
-        registrationCount: () => registrations.size(),
-        // Nothing is written anywhere, so shutdown has nothing to flush and a
-        // kill -9 loses nothing a restart would have wanted.
-        close: () => new Promise((done) => {
-          clearInterval(heartbeat);
-          for (const tunnel of tunnels.values()) tunnel.socket.destroy();
-          server.close(() => done());
-        }),
-      });
+  const status = () => ({
+    ready: server.listening && !stopping && !listenerFailure,
+    draining: stopping,
+    connections: sockets.size,
+    pendingRegistrations,
+    tunnels: tunnels.size,
+    streams: [...tunnels.values()].reduce((count, tunnel) => count + tunnel.streams.size, 0),
+    queuedBytes,
+    queuedWrites,
+  });
+
+  // Stop accepting first. Existing encrypted streams may drain for a bounded
+  // window; a half-open sniff/registration socket is not ongoing user work.
+  // Every accepted socket is owned here, including those not yet registered.
+  const close = ({ graceMs = 0 } = {}) => {
+    if (!Number.isSafeInteger(graceMs) || graceMs < 0 || graceMs > 300_000) {
+      throw new Error('relay: invalid shutdown grace');
+    }
+    if (closePromise) return closePromise;
+    stopping = true;
+    clearInterval(heartbeat);
+    closePromise = new Promise((done) => {
+      let deadline;
+      const destroyAll = () => {
+        for (const tunnel of tunnels.values()) tunnel.socket.destroy();
+        for (const socket of sockets) socket.destroy();
+      };
+      const finish = () => {
+        clearTimeout(deadline);
+        if (!healthServer) { done(); return; }
+        healthServer.close(() => done());
+        healthServer.closeAllConnections();
+      };
+      server.close(finish);
+      if (!graceMs) {
+        destroyAll();
+      } else {
+        for (const [socket, role] of socketRoles) {
+          if (role !== 'phone' && role !== 'tunnel') socket.destroy();
+        }
+        for (const tunnel of tunnels.values()) {
+          if (tunnel.streams.size === 0) tunnel.socket.destroy();
+        }
+        deadline = setTimeout(destroyAll, graceMs);
+      }
+    });
+    return closePromise;
+  };
+  const listen = (listener, selectedPort, selectedHost) => new Promise((resolve, reject) => {
+    const failed = (error) => reject(error);
+    listener.once('error', failed);
+    listener.listen(selectedPort, selectedHost, () => {
+      listener.off('error', failed);
+      resolve();
     });
   });
+  const listenerError = (error) => {
+    listenerFailure = error;
+    if (!started) return; // Startup's listen promise/catch owns this failure.
+    log.error('relay: listener failure; closing');
+    opts.onFatalError?.();
+    void close();
+  };
+  server.on('error', listenerError);
+  try {
+    await listen(server, port, host);
+    if (healthPort !== undefined) {
+      healthServer = http.createServer({ maxHeaderSize: 8192 }, (req, res) => {
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('x-content-type-options', 'nosniff');
+        // This listener is operational only: no routing IDs, credentials,
+        // customer content, detailed metrics or access to the encrypted leg.
+        let code = 200;
+        let body;
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          code = 405; body = { ok: false }; res.setHeader('allow', 'GET, HEAD');
+        } else if (req.url === '/healthz') {
+          body = { ok: true };
+        } else if (req.url === '/readyz') {
+          code = status().ready ? 200 : 503;
+          body = { ready: status().ready };
+        } else {
+          code = 404; body = { ok: false };
+        }
+        res.statusCode = code;
+        res.setHeader('connection', 'close');
+        res.end(req.method === 'HEAD' ? undefined : JSON.stringify(body));
+      });
+      healthServer.maxConnections = 64;
+      healthServer.headersTimeout = 5000;
+      healthServer.requestTimeout = 5000;
+      healthServer.timeout = 5000;
+      healthServer.keepAliveTimeout = 1000;
+      healthServer.maxRequestsPerSocket = 1;
+      healthServer.on('error', listenerError);
+      await listen(healthServer, healthPort, healthHost);
+    }
+    if (listenerFailure) throw listenerFailure;
+    started = true;
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  log.info(`relay: listening on :${server.address().port} for *.${base}`);
+  return {
+    port: server.address().port,
+    healthPort: healthServer?.address().port,
+    status,
+    tunnelCount: () => tunnels.size,
+    streamCount: (pairId) => tunnels.get(pairId)?.streams.size ?? 0,
+    hasTunnel: (pairId) => tunnels.has(pairId),
+    registrationCount: () => registrations.size(),
+    close,
+  };
 }
 
 // ─── CLI entry ──────────────────────────────────────────────────────────────
 
-const isMain = process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]));
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 if (isMain) {
   const env = process.env;
   const readMaterial = (inline, file, label) => {
@@ -801,13 +1052,28 @@ if (isMain) {
   };
   const baseDomain = env.RELAY_BASE_DOMAIN;
   if (!baseDomain) throw new Error('relay: RELAY_BASE_DOMAIN is required');
+  const shutdownGraceMs = Number(env.RELAY_DRAIN_TIMEOUT_MS ?? 20_000);
+  if (!Number.isSafeInteger(shutdownGraceMs) || shutdownGraceMs < 0 || shutdownGraceMs > 300_000) {
+    throw new Error('relay: invalid RELAY_DRAIN_TIMEOUT_MS');
+  }
   startRelay({
-    port: Number(env.PORT ?? 9400),
+    port: Number(env.RELAY_PORT ?? env.PORT ?? 9400),
+    healthPort: env.RELAY_HEALTH_PORT === undefined ? undefined : Number(env.RELAY_HEALTH_PORT),
     baseDomain,
     tlsKeyPem: readMaterial('RELAY_TLS_KEY_PEM', 'RELAY_TLS_KEY_FILE', 'TLS key'),
     tlsCertPem: readMaterial('RELAY_TLS_CERT_PEM', 'RELAY_TLS_CERT_FILE', 'TLS cert'),
+    onFatalError: () => { process.exitCode = 1; },
+  }).then((relay) => {
+    const stop = () => { void relay.close({ graceMs: shutdownGraceMs }); };
+    process.once('SIGTERM', stop);
+    process.once('SIGINT', stop);
+    console.info(JSON.stringify({
+      event: 'relay_ready',
+      sourceSha256: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+      nodeVersion: process.version,
+    }));
   }).catch((err) => {
-    console.error(err);
+    console.error(`relay: startup failed (${err.code ?? 'invalid configuration'})`);
     process.exit(1);
   });
 }
