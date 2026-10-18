@@ -613,11 +613,12 @@ test('a worked-around read failure does not block a source that completed other 
   assert.equal(declaredRequiredReads.facts.unrecoveredBusinessFailures, 1);
 });
 
-test('a host-run read that answered its own failure has settled, in a declared step too, once other work succeeded', () => {
+test('a host-run read that exited with its own failure has settled, in a declared step too, once other work succeeded', () => {
   // Live 2026-10-18: a workflow write step's script exited 1 on its own
   // checks twice, the corrected script wrote all 20 rows, and the step was
   // blocked: the repaired script's arguments never match the failed ones.
-  const settleShell = (sessionId: string, source: { seq: number; turn: number }, id: string, ok: boolean) => {
+  type Ending = 'ok' | 'stdout' | 'stderr' | 'dark';
+  const settleShell = (sessionId: string, source: { seq: number; turn: number }, id: string, ending: Ending) => {
     const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
     const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId, logicalToolCallId: `logical:${id}` };
     const begun = dispatch.beginPhysicalDispatch({
@@ -631,10 +632,12 @@ test('a host-run read that answered its own failure has settled, in a declared s
       identity,
       contract: { toolName: 'alpha_script_run', args: { command: `python3 scrape-${id}.py` } },
       execution: { kind: 'provider_execution' },
-      ...(ok ? { result: { payload: { successful: true, data: { rows: 20 } } } } : {}),
-      outcome: ok
+      ...(ending === 'ok' ? { result: { payload: { successful: true, data: { rows: 20 } } } } : {}),
+      outcome: ending === 'ok'
         ? outcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
-        : outcomes.classifyAttemptOutcome({ executionFailed: true, mutating: false, answeredReadDigest: 'a'.repeat(63) + id.length }),
+        : outcomes.classifyAttemptOutcome({ executionFailed: true, mutating: false,
+          ...(ending === 'stdout' ? { answeredReadDigest: 'a'.repeat(63) + id.length } : {}),
+          ...(ending === 'stderr' ? { answeredReadExit: true } : {}) }),
       recovery: { businessCall: true, mutating: false },
       observer: { lane: 'agents_runner', turn: source.turn },
     });
@@ -649,17 +652,24 @@ test('a host-run read that answered its own failure has settled, in a declared s
 
   const repaired = 'workflow:answered-shell-read:save_books';
   const repairedSource = sourceFor(repaired);
-  settleShell(repaired, repairedSource, 'first', false);
-  settleShell(repaired, repairedSource, 'second', false);
-  settleShell(repaired, repairedSource, 'fixed', true);
+  settleShell(repaired, repairedSource, 'first', 'stdout');
+  settleShell(repaired, repairedSource, 'second', 'stderr');
+  settleShell(repaired, repairedSource, 'fixed', 'ok');
   const audit = auditAcceptedSourceSettlementTruth({ sessionId: repaired, sourceUserSeq: repairedSource.seq, requireEveryBusinessReadToSettle: true });
   assert.equal(audit.status, 'clean', JSON.stringify(audit));
 
   const neverWorked = 'workflow:answered-shell-read-only:save_books';
   const neverSource = sourceFor(neverWorked);
-  settleShell(neverWorked, neverSource, 'only', false);
+  settleShell(neverWorked, neverSource, 'only', 'stderr');
   const failedOnly = auditAcceptedSourceSettlementTruth({ sessionId: neverWorked, sourceUserSeq: neverSource.seq, requireEveryBusinessReadToSettle: true });
   assert.equal(failedOnly.status, 'unrecovered_failure', 'a source whose every business call failed still has only the failure');
+
+  const killed = 'workflow:dark-shell-read:save_books';
+  const killedSource = sourceFor(killed);
+  settleShell(killed, killedSource, 'killed', 'dark');
+  settleShell(killed, killedSource, 'after', 'ok');
+  const dark = auditAcceptedSourceSettlementTruth({ sessionId: killed, sourceUserSeq: killedSource.seq, requireEveryBusinessReadToSettle: true });
+  assert.equal(dark.status, 'unrecovered_failure', 'a read that never answered (killed, timed out) still needs its recovery');
 });
 
 // ── A reversible ambiguous write is a disclosure, not a veto ────────────────

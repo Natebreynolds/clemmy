@@ -219,6 +219,10 @@ export interface AttemptSignals {
    * The outcome stays a failure; the digest names what came back so a new
    * answer counts as evidence and the same answer again does not. */
   answeredReadDigest?: string;
+  /** A read that ran to completion and exited with its own failure, its
+   * reason on stderr only: answered, though with no answer bytes to count as
+   * evidence. A killed process, a timeout or a Stop never sets this. */
+  answeredReadExit?: boolean;
   /** The lane already knows the connection is missing/expired (nominal). */
   connectionMissing?: boolean;
   /** A local policy/approval layer refused (nominal). */
@@ -486,7 +490,8 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       && /^[a-f0-9]{64}$/.test(signals.answeredReadDigest)
       ? signals.answeredReadDigest
       : null;
-    return outcome('unknown', 'nominal', answer ? `read_answered:${answer}` : 'execution_failed');
+    return outcome('unknown', 'nominal', answer ? `read_answered:${answer}`
+      : signals.mutating !== true && signals.answeredReadExit === true ? 'read_exited' : 'execution_failed');
   }
 
   // The host ran it itself and it returned. This sits below every nominal and

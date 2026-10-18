@@ -175,7 +175,7 @@ test('a read that fails but prints its answer gives the governor new evidence; s
   assert.deepEqual(evidence(), afterAnswer, 'the same answer again is not new');
 
   await fixture.shell({ command: 'echo "unrecognized subcommand" >&2; exit 2' });
-  assert.equal(details().at(-1)!.outcome_detail, 'execution_failed');
+  assert.equal(details().at(-1)!.outcome_detail, 'read_exited', 'it ran to completion and said why on stderr');
   assert.deepEqual(evidence(), afterAnswer, 'a failure with nothing on stdout brings nothing back');
 });
 

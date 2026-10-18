@@ -71,6 +71,9 @@ export interface ShellExecutionOutcome {
    * evidence like any returned read; stderr alone (a usage error, a typo)
    * carries none. */
   answeredStdoutDigest?: string;
+  /** The same read with its reason on stderr only (a traceback, its own
+   * check failing): answered, though it carries no evidence. */
+  answeredOnStderr?: boolean;
 }
 
 export interface ClassifyShellExecutionInput {
@@ -200,7 +203,7 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
       executable,
       ...(typeof exitCode === 'number' && stdout.trim()
         ? { answeredStdoutDigest: createHash('sha256').update(stdout.trim(), 'utf8').digest('hex') }
-        : {}),
+        : typeof exitCode === 'number' && stderr.trim() ? { answeredOnStderr: true } : {}),
     };
   }
 
