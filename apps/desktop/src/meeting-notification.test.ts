@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
-import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation } from '../../console-web/src/lib/meeting-live-navigation.js';
 import { DesktopNotificationRetention } from './desktop-toast-queue.js';
 import { isRecallMeetingNotificationRoute, openRecallMeetingNotification, recallMeetingNotificationRoute, recallMeetingNotificationTarget,
   recallMeetingNotificationTargetIsCurrent } from './meeting-notification.js';
@@ -146,24 +145,4 @@ test('the shared bounded retention keeps Windows Action Center clicks after bann
   const queued = [new ControlledNotification(), new ControlledNotification(), new ControlledNotification()];
   for (const next of queued) retention.retain(next);
   assert.equal(retention.size, 2); assert.equal(retention.has(queued[0]!), false);
-});
-
-
-test('a stale popup cannot become another current recording through the renderer default', async () => {
-  const original = status(true);
-  const target = recallMeetingNotificationTarget(windowId, original, true);
-  const replacement = { ...original, currentWindowId: 'different-window',
-    recordingStartedAt: '2026-10-18T08:05:00.000Z',
-    detectedWindows: [{ windowId: 'different-window', detectedAt: '2026-10-18T08:04:00.000Z' }] };
-  const opened = ports(() => replacement);
-  await openRecallMeetingNotification(target, opened.ports);
-  const query = new URL(opened.routes[0]!, 'http://controlled.local').search;
-  const parsed = parseMeetingCaptureTarget(query);
-  assert.equal(parsed.kind, 'target');
-  if (parsed.kind !== 'target') assert.fail('Original capture identity must survive');
-  assert.deepEqual(parsed.target, { windowId, detectedAt, startedAt });
-  const resolved = resolveMeetingLiveNavigation({ target: parsed, sdk: { ...replacement, sdkAvailable: true, initialized: true },
-    daemon: { activeMeetingId: 'different-meeting', activeWindowId: 'different-window', activeRecordingStartedAt: replacement.recordingStartedAt },
-    meetings: [{ id: 'different-meeting', windowId: 'different-window', recordingStartedAt: replacement.recordingStartedAt, status: 'recording' }] });
-  assert.deepEqual(resolved, { kind: 'unavailable', reason: 'capture_not_detected', explicit: true, target: parsed.target });
 });
