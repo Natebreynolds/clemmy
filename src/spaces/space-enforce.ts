@@ -51,7 +51,8 @@ const nonEmpty = (value?: string): boolean => Boolean(value && value.trim());
 function dataSourceHasBackend(source: SpaceDataSource): boolean {
   return nonEmpty(source.runner)
     || nonEmpty(source.composioSlug)
-    || Boolean(source.cliArgv?.length);
+    || Boolean(source.cliArgv?.length)
+    || nonEmpty(source.filePath);
 }
 
 /**
@@ -153,7 +154,7 @@ export function checkSpaceForWrite(
 
   for (const s of dataSources ?? []) {
     if (!dataSourceHasBackend(s)) {
-      errors.push(`Data source "${s.id}" declares nothing to read. Give it a read-only connected-app operation (composio_slug) or a catalog-reviewed command (cli_argv), or feed it from a workflow that reads with any tool and writes the rows here with space_set_data.`);
+      errors.push(`Data source "${s.id}" declares nothing to read. Give it a local file (file_path), a read-only connected-app operation (composio_slug) or a catalog-reviewed command (cli_argv), or feed it from a workflow that reads with any tool and writes the rows here with space_set_data.`);
       continue;
     }
     if (s.runner && s.runner.trim()) {

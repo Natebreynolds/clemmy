@@ -78,3 +78,27 @@ test('a refresh reads the file into the Space with no model, and picks up a chan
   assert.equal(second[0]?.ok, true, JSON.stringify(second));
   assert.equal((read() as unknown[]).length, 2);
 });
+
+test('space_save accepts a file source end to end and the Space holds the file rows', async () => {
+  // The store-level test missed the save path's own declaration check (live
+  // 2026-10-17: "declares nothing to read" eleven times in one build).
+  const { registerSpaceTools } = await import('../tools/space-tools.js');
+  type Handler = (input: Record<string, unknown>) => Promise<unknown>;
+  const handlers: Record<string, Handler> = {};
+  registerSpaceTools({ tool(name: string, _d: string, _p: unknown, h: Handler) { handlers[name] = h; } } as never);
+  const csv = path.join(FIXTURES, 'saved-shelf.csv');
+  writeFileSync(csv, 'title,price,star_rating\nThirst,£17.27,Five\nSoumission,£50.10,One\n');
+  const result = await handlers.space_save!({
+    slug: 'framework-test-file-saved-shelf',
+    title: 'FRAMEWORK-TEST file saved shelf',
+    view_html: '<!doctype html><html><body><div class="clem-app" id="app"></div><script>async function render(){const d=await clem.data();document.getElementById("app").textContent=(d.books||[]).length+" books";}clem.onData(render);render();</script></body></html>',
+    data_sources: [{ id: 'books', file_path: csv }],
+  });
+  const text = (result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+  assert.doesNotMatch(text, /NOT saved|declares nothing to read/, text.slice(0, 600));
+  assert.equal(spaces.spaceStore.get('framework-test-file-saved-shelf')?.dataSources[0]?.filePath, csv);
+  const refreshed = await refreshSpaceData('framework-test-file-saved-shelf', 'books', { allowPaused: true });
+  assert.equal(refreshed[0]?.ok, true, JSON.stringify(refreshed));
+  const data = JSON.parse(readFileSync(spaces.resolveInSpace('framework-test-file-saved-shelf', 'data.json'), 'utf8')) as Record<string, unknown>;
+  assert.deepEqual(data.books, [{ title: 'Thirst', price: '£17.27', star_rating: 'Five' }, { title: 'Soumission', price: '£50.10', star_rating: 'One' }]);
+});
