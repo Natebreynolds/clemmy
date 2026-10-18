@@ -62,11 +62,11 @@ test('candidates: failures and long waits are raised, grouped by what they are a
     'run_waiting:weekly-review',
   ]);
   const failed = c.find((x) => x.key === 'run_failed:r-fail')!;
-  assert.match(failed.detail, /friday-dashboard-daily-refresh failed (at|on) .+?: Salesforce query timed out/);
+  assert.match(failed.detail, /Friday Dashboard Daily Refresh failed (at|on) .+?: Salesforce query timed out/, 'the workflow by name, not its slug');
   assert.match(failed.offer, /look at what went wrong/);
-  assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /inbox-sweep failed (at|on) .+?: IMAP login refused/, 'a record stored as error is a failure');
+  assert.match(c.find((x) => x.key === 'run_failed:r-error')!.detail, /Inbox Sweep failed (at|on) .+?: IMAP login refused/, 'a record stored as error is a failure');
   const wait = c.find((x) => x.kind === 'run_waiting')!;
-  assert.match(wait.detail, /2 runs of weekly-review are waiting on you, the oldest since \S+/);
+  assert.match(wait.detail, /2 runs of Weekly Review are waiting on you, the oldest since \S+/);
   assert.deepEqual(wait.refs, ['r-wait-old', 'r-wait-old-2']);
   const standup = c.find((x) => x.key === 'chat_waiting:workflow: daily-standup-email')!;
   assert.equal(standup.count, 2);
