@@ -450,7 +450,7 @@
           "bytes": 70906
         },
         "src/runtime/harness/review-input-observation.ts": {
-          "bytes": 36332
+          "bytes": 37393
         },
         "src/runtime/harness/model-transport-observation.ts": {
           "bytes": 26195
@@ -1370,8 +1370,11 @@
         "src/runtime/harness/completion-decision-assessment.ts": {
           "bytes": 19025
         },
+        "src/runtime/harness/review-continuation.ts": {
+          "bytes": 7370
+        },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 183580
+          "bytes": 185561
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -4380,7 +4383,7 @@
           "bytes": 70906
         },
         "src/runtime/harness/review-input-observation.ts": {
-          "bytes": 36332
+          "bytes": 37393
         },
         "src/runtime/harness/model-transport-observation.ts": {
           "bytes": 26195
@@ -5300,8 +5303,11 @@
         "src/runtime/harness/completion-decision-assessment.ts": {
           "bytes": 19025
         },
+        "src/runtime/harness/review-continuation.ts": {
+          "bytes": 7370
+        },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 183580
+          "bytes": 185561
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
