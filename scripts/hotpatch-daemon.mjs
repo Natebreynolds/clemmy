@@ -597,6 +597,8 @@ function repeatReceiptChain(options, context, fileOps) {
       sameEvidence(receipt.recoveryGenesis, recoveryGenesis, 'explicit recovery genesis for every ordered receipt');
       if (receipt.recoveryStatus !== 'four_roots_verified' || !Number.isFinite(Date.parse(receipt.completedAt))) guardRefusal('incomplete recovery receipt');
     } else if (receipt.recoveryGenesis !== undefined) guardRefusal('recovery receipt requires explicit genesis pins');
+    if (context.observed.mode === 'signed-build-anchor') sameEvidence(receipt.signedBuildAnchor, context.observed.anchor, 'signed build anchor for every ordered receipt');
+    else if (receipt.signedBuildAnchor !== undefined) guardRefusal('an anchored receipt requires its signed build anchor');
     if (index === files.length - 1 && receipt.sourceFingerprint !== expectedPriorFingerprint) guardRefusal('latest receipt fingerprint differs from its pin');
     for (const [name, part] of Object.entries(receipt.parts)) {
       const digest = name === 'daemon' ? part?.digest : part?.built;
@@ -628,19 +630,27 @@ function inspectRepeatReference(options, context, fileOps) {
   if (fileOps.realpathSync(reference) !== reference || reference === context.bundle || reference.startsWith(context.bundle + path.sep) || context.bundle.startsWith(reference + path.sep)) guardRefusal('signed reference must be a separate canonical bundle');
   const chain = repeatReceiptChain(options, context, fileOps);
   const referenceTree = typedTree(reference, fileOps, { links: true });
-  const archive = context.observed.mode === 'no-active-update'
+  // An anchored chain's reference is proven by its own notarization and the
+  // pinned replacement record, not by an updater download.
+  const anchored = context.observed.mode === 'signed-build-anchor';
+  const archive = anchored ? null : context.observed.mode === 'no-active-update'
     ? context.observed.archive.path
     : path.join(updaterLocations({ app: context.bundle, home: context.observed.home }, fileOps).cache, 'update.zip');
-  const checksum = context.observed.files[archive];
-  if (typeof checksum !== 'string' || Buffer.from(checksum, 'base64').length !== 64) guardRefusal('no exact retained reference archive');
-  if (fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('reference archive checksum changed');
-  sameEvidence(archivedBundleTree(archive, path.basename(context.bundle), fileOps), referenceTree, 'archive/reference typed footprint');
+  const checksum = anchored ? null : context.observed.files[archive];
+  if (anchored) {
+    if (reference !== context.observed.reference) guardRefusal('anchored reference differs from its signed build anchor');
+  } else {
+    if (typeof checksum !== 'string' || Buffer.from(checksum, 'base64').length !== 64) guardRefusal('no exact retained reference archive');
+    if (fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('reference archive checksum changed');
+    sameEvidence(archivedBundleTree(archive, path.basename(context.bundle), fileOps), referenceTree, 'archive/reference typed footprint');
+  }
   context.verifyNativeSignature(reference);
+  if (anchored) context.assessNotarization(reference);
   const codeIdentity = context.readReferenceCodeIdentity(reference);
   sameEvidence(codeIdentity, { bundleId: context.observed.identity.bundleId, team: DESKTOP_TEAM_IDENTIFIER, cdHash: expectedReferenceCdHash }, 'signed reference publisher/identity');
   // Recheck bytes after the signature subprocess and identity inspection.
   sameEvidence(typedTree(reference, fileOps, { links: true }), referenceTree, 'verified reference footprint');
-  if (fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('verified reference archive changed');
+  if (!anchored && fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('verified reference archive changed');
   for (const rel of SEALED_SHELL_PARTS) if (fileDigest(path.join(reference, rel), 'sha256', 'hex', fileOps) !== context.observed.shellSnapshot[rel]) guardRefusal('reference native part differs');
   if (fileDigest(path.join(reference, 'Contents/Resources/app-update.yml'), 'sha256', 'hex', fileOps) !== context.observed.files[path.join(context.bundle, 'Contents/Resources/app-update.yml')]) guardRefusal('reference updater configuration differs');
   const roots = new Map(); const backups = new Map();
@@ -705,7 +715,7 @@ function inspectRepeatReference(options, context, fileOps) {
 
 function recheckRepeatReference(ledger, fileOps) {
   for (const pin of [...ledger.receiptFiles, ...(ledger.manifest ? [ledger.manifest] : [])]) pinnedRepeatJSON(pin.path, pin.sha256, fileOps, pin.limit);
-  if (fileDigest(ledger.archive, 'sha512', 'base64', fileOps) !== ledger.checksum) guardRefusal('repeat reference archive bytes changed');
+  if (ledger.archive !== null && fileDigest(ledger.archive, 'sha512', 'base64', fileOps) !== ledger.checksum) guardRefusal('repeat reference archive bytes changed');
   sameEvidence(typedTree(ledger.reference, fileOps, { links: true }), ledger.referenceTree, 'signed reference footprint');
   sameEvidence(ledger.context.readReferenceCodeIdentity(ledger.reference), ledger.codeIdentity, 'signed reference identity');
   if (ledger.pendingStage) sameEvidence(typedTree(ledger.pendingStage.path, fileOps), ledger.pendingStage.expected, 'exact pending staging footprint');
@@ -1183,10 +1193,76 @@ export function updaterStagingPaths({ app, home }, fileOps = fs) {
  * is byte-identical to the snapshot the caller took before quitting. Anything
  * unproven refuses.
  */
-export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpdateEvidence, noActiveUpdateEvidence, priorProof, repeatedReference, isRunning,
+function compareVersions(left, right) {
+  const a = left.split(/[.-]/).map(Number); const b = right.split(/[.-]/).map(Number);
+  for (let index = 0; index < 3; index += 1) if ((a[index] ?? 0) !== (b[index] ?? 0)) return (a[index] ?? 0) - (b[index] ?? 0);
+  return 0;
+}
+
+/**
+ * A SIGNED LOCAL BUILD AS THE TRUST ANCHOR.
+ *
+ * The updater admissions start from what the updater delivered: its verified
+ * download is the signed reference. A whole signed bundle built, signed and
+ * notarized here and installed in place (a whole_signed_bundle_replacement
+ * record) has no such download. Its anchor is that record, pinned by SHA-256:
+ * it names this installed bundle, a separate retained signed reference copy,
+ * our team and the exact CDHash, and states that nothing was re-signed and no
+ * attributes were cleared. The updater may hold only consumed state: no staged
+ * installer bundle, and retained downloads no newer than the installed version,
+ * so nothing can be applied on quit. Every receipt chained from the anchor
+ * names it, so a receipt of another chain on the same bundle path never counts.
+ */
+export function inspectSignedBuildAnchor({ app, home, anchor }, fileOps = fs) {
+  const bundle = path.resolve(app);
+  if (!anchor || typeof anchor.path !== 'string' || !path.isAbsolute(anchor.path) || !/^[a-f0-9]{64}$/.test(anchor.sha256 ?? '')) guardRefusal('missing exact signed build anchor pins');
+  if (anchor.path === bundle || anchor.path.startsWith(bundle + path.sep)) guardRefusal('signed build anchor must be outside the installed bundle');
+  const record = pinnedRepeatJSON(anchor.path, anchor.sha256, fileOps, 256 * 1024);
+  const code = record?.candidate?.code;
+  if (record?.version !== 1 || record.kind !== 'whole_signed_bundle_replacement' || record.app !== bundle
+    || typeof record.signedReference !== 'string' || !path.isAbsolute(record.signedReference)
+    || !code || code.team !== DESKTOP_TEAM_IDENTIFIER || !/^[a-f0-9]{40}$/.test(code.cdHash ?? '')
+    || record.installed?.code?.cdHash !== code.cdHash || record.codeResigned !== false || record.xattrsCleared !== false) guardRefusal('unrecognized signed build anchor');
+  const { config, cache, shipIt, bundleId } = updaterLocations({ app: bundle, home }, fileOps);
+  if (code.identifier !== bundleId) guardRefusal('signed build anchor names another bundle identity');
+  const identity = nativeIdentity(fileOps.readFileSync(path.join(bundle, 'Contents/Info.plist'), 'utf8'));
+  const files = { [config]: fileDigest(config, 'sha256', 'hex', fileOps) };
+  if (fileOps.existsSync(shipIt)) {
+    regularPath(shipIt, fileOps, true);
+    for (const name of fileOps.readdirSync(shipIt).sort()) {
+      if (name.startsWith('update.')) guardRefusal('an installer bundle is staged to apply on quit');
+    }
+    const statePath = path.join(shipIt, 'ShipItState.plist');
+    if (fileOps.existsSync(statePath)) {
+      const state = flatJSONObject(statePath, fileOps);
+      const url = new URL(String(state.updateBundleURL ?? ''));
+      if (url.protocol !== 'file:' || url.host) guardRefusal('unexpected installer request URL');
+      absentPath(path.dirname(path.resolve(fileURLToPath(url))), fileOps);
+      files[statePath] = fileDigest(statePath, 'sha256', 'hex', fileOps);
+    }
+  }
+  if (fileOps.existsSync(cache)) {
+    regularPath(cache, fileOps, true);
+    for (const name of fileOps.readdirSync(cache).sort().filter(entry => entry === 'pending' || entry.startsWith('pending.'))) {
+      const metadataPath = path.join(cache, name, 'update-info.json');
+      regularPath(metadataPath, fileOps);
+      const metadata = flatJSONObject(metadataPath, fileOps);
+      const version = /-(\d+\.\d+\.\d+)(?=[-.])/.exec(String(metadata.fileName ?? ''))?.[1];
+      if (!version || compareVersions(version, identity.version) > 0) guardRefusal('a newer download is retained and could apply on quit');
+      files[metadataPath] = fileDigest(metadataPath, 'sha256', 'hex', fileOps);
+    }
+  }
+  const shellSnapshot = Object.fromEntries(SEALED_SHELL_PARTS.map(rel => [rel, fileDigest(path.join(bundle, rel), 'sha256', 'hex', fileOps)]));
+  return { version: 1, mode: 'signed-build-anchor', app: bundle, home: path.resolve(home), identity, shellSnapshot,
+    anchor: { path: anchor.path, sha256: anchor.sha256 }, reference: path.resolve(record.signedReference),
+    code: { bundleId, team: code.team, cdHash: code.cdHash }, files };
+}
+
+export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpdateEvidence, noActiveUpdateEvidence, signedBuildAnchor, priorProof, repeatedReference, isRunning,
   readReferenceCodeIdentity = referenceCodeIdentity,
   isUpdaterRunning = isUpdaterHelperRunning,
   verifyNativeSignature = (bundle) => execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle], { stdio: 'pipe' }),
+  assessNotarization = (bundle) => execFileSync('/usr/sbin/spctl', ['--assess', '--type', 'execute', bundle], { stdio: 'pipe' }),
 }, fileOps = fs) {
   const bundle = path.resolve(app);
   if (priorProof && CURRENT_STATE_RECOVERIES.has(priorProof)) guardRefusal('current recovery authority cannot enter the legacy admission path');
@@ -1194,6 +1270,44 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
   if (isUpdaterRunning()) guardRefusal('an installer helper is still running');
   if (!home) guardRefusal('no updater home for a fresh staging inventory');
   if (appliedUpdateEvidence && noActiveUpdateEvidence) guardRefusal('updater evidence modes are mutually exclusive');
+  if (signedBuildAnchor) {
+    if (appliedUpdateEvidence || noActiveUpdateEvidence) guardRefusal('a signed build anchor replaces updater evidence');
+    const observed = inspectSignedBuildAnchor({ app: bundle, home, anchor: signedBuildAnchor }, fileOps);
+    const anchorDigest = createHash('sha256').update(JSON.stringify(observed)).digest('hex');
+    let ledger = null;
+    if (priorProof) {
+      if (!GUARDED_PATCHES.has(priorProof) || priorProof.app !== bundle || priorProof.appliedEvidenceDigest !== anchorDigest) guardRefusal('no matching signed-build anchor proof');
+      ledger = REPEAT_PATCHES.get(priorProof) ?? null;
+      if (repeatedReference && !ledger) guardRefusal('no matching private anchored repeat proof');
+      if (ledger) {
+        if (ledger.context.bundle !== bundle || ledger.context.observed.home !== path.resolve(home)) guardRefusal('private repeat proof context differs');
+        sameEvidence(shellSnapshot, ledger.context.observed.shellSnapshot, 'private repeat shell snapshot');
+        if (repeatedReference !== undefined) sameEvidence(repeatedReference, ledger.optionSnapshot, 'private repeat authority context');
+        recheckRepeatReference(ledger, fileOps);
+      }
+    } else if (repeatedReference) {
+      if (path.resolve(String(repeatedReference.referenceBundle ?? '')) !== observed.reference || repeatedReference.expectedReferenceCdHash !== observed.code.cdHash) guardRefusal('anchored repeat reference differs from its signed build anchor');
+      const context = { bundle, observed, verifyNativeSignature, readReferenceCodeIdentity, assessNotarization };
+      context.reprove = (proof) => verifyGuardedSealedPatch({ app: bundle, home, shellSnapshot, signedBuildAnchor, priorProof: proof, repeatedReference,
+        isRunning, isUpdaterRunning, verifyNativeSignature, readReferenceCodeIdentity, assessNotarization }, fileOps);
+      ledger = inspectRepeatReference(repeatedReference, context, fileOps);
+    } else {
+      // First link: the installed bundle is still exactly the signed build.
+      verifyNativeSignature(bundle);
+      assessNotarization(bundle);
+      sameEvidence(readReferenceCodeIdentity(bundle), observed.code, 'installed signed build identity');
+    }
+    for (const rel of SEALED_SHELL_PARTS) {
+      if (typeof shellSnapshot?.[rel] !== 'string') throw new Error(`Refusing a guarded patch: no pre-quit snapshot of ${rel}.`);
+      if (observed.shellSnapshot[rel] !== shellSnapshot[rel]) throw new Error(`Refusing a guarded patch: ${rel} changed since the pre-quit snapshot.`);
+    }
+    if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper started during anchored verification');
+    sameEvidence(inspectSignedBuildAnchor({ app: bundle, home, anchor: signedBuildAnchor }, fileOps), observed, 'signed build anchor evidence after verification');
+    const proof = Object.freeze({ app: bundle, canonical: fileOps.realpathSync(bundle), appliedEvidenceDigest: anchorDigest });
+    GUARDED_PATCHES.add(proof);
+    if (ledger) REPEAT_PATCHES.set(proof, ledger);
+    return proof;
+  }
   const previousRepeat = priorProof && REPEAT_PATCHES.get(priorProof);
   if (previousRepeat) {
     if (previousRepeat.context.bundle !== bundle || previousRepeat.context.observed.home !== path.resolve(home)) guardRefusal('private repeat proof context differs');

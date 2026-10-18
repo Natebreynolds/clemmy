@@ -57,16 +57,22 @@ const repeatFlags = { referenceBundle: '--signed-reference-bundle', authorizedRe
 const ancestorFlags = { authorizedAncestorManifest: '--authorized-ancestor-manifest', authorizedAncestorManifestSha256: '--authorized-ancestor-manifest-sha256' };
 const genesisFlags = { authorizedRecoveryGenesis: '--authorized-recovery-genesis', authorizedRecoveryGenesisSha256: '--authorized-recovery-genesis-sha256' };
 const recoveryFlags = { path: '--current-state-recovery', sha256: '--current-state-recovery-sha256', directory: '--recovery-evidence-directory' };
+// A whole signed bundle built and notarized here, installed in place, anchors
+// its own chain (inspectSignedBuildAnchor); it replaces updater evidence.
+const anchorFlags = { anchorPath: '--signed-build-anchor', anchorSha256: '--signed-build-anchor-sha256' };
 const repeatedReference = {};
 const recovery = {};
-for (const [key, flag] of Object.entries({ ...repeatFlags, ...ancestorFlags, ...genesisFlags, ...recoveryFlags })) {
+const anchorPins = {};
+for (const [key, flag] of Object.entries({ ...repeatFlags, ...ancestorFlags, ...genesisFlags, ...recoveryFlags, ...anchorFlags })) {
   const positions = process.argv.flatMap((arg, index) => arg === flag ? [index] : []);
   if (positions.length > 1) throw new Error(`Duplicate ${flag}.`);
   if (!positions.length) continue;
   const value = process.argv[positions[0] + 1];
   if (!value || value.startsWith('--')) throw new Error(`${flag} requires an exact value.`);
-  (key in recoveryFlags ? recovery : repeatedReference)[key] = value;
+  (key in recoveryFlags ? recovery : key in anchorFlags ? anchorPins : repeatedReference)[key] = value;
 }
+const signedBuildAnchor = Object.keys(anchorPins).length ? { path: anchorPins.anchorPath, sha256: anchorPins.anchorSha256 } : undefined;
+if (signedBuildAnchor && (!signedBuildAnchor.path || !signedBuildAnchor.sha256)) throw new Error('A signed build anchor requires both its exact path and SHA256 pin.');
 if (Object.keys(repeatedReference).length && (!SHELL_SNAPSHOT || Object.keys(repeatFlags).some(key => repeatedReference[key] === undefined))) throw new Error('Repeat installation requires the shell snapshot and all five exact reference/receipt pins.');
 if (Object.keys(ancestorFlags).some(key => repeatedReference[key] !== undefined) && Object.keys(ancestorFlags).some(key => repeatedReference[key] === undefined)) throw new Error('Ancestor manifest requires both the exact path and SHA256 pin.');
 if (Object.keys(genesisFlags).some(key => repeatedReference[key] !== undefined) && Object.keys(genesisFlags).some(key => repeatedReference[key] === undefined)) throw new Error('Recovery genesis requires both the exact path and SHA256 pin.');
@@ -74,7 +80,8 @@ const currentRecovery = recovery.path !== undefined || recovery.sha256 !== undef
 if (currentRecovery && (!SHELL_SNAPSHOT || !recovery.path || !recovery.sha256 || !recovery.directory || Object.keys(repeatedReference).length)) throw new Error('Current-state recovery requires its exact capture pins, shell snapshot and durable evidence directory, and cannot use prior-receipt authority.');
 if (repeatedReference.authorizedRecoveryGenesis && !recovery.directory) throw new Error('A recovery-derived repeat requires a durable evidence directory.');
 if (recovery.directory && !currentRecovery && !repeatedReference.authorizedRecoveryGenesis) throw new Error('Recovery evidence directory requires explicit recovery authority.');
-const valuedFlags = new Set(['--guarded-shell-snapshot', ...Object.values(repeatFlags), ...Object.values(ancestorFlags), ...Object.values(genesisFlags), ...Object.values(recoveryFlags)]);
+if (signedBuildAnchor && (!SHELL_SNAPSHOT || currentRecovery || recovery.directory || repeatedReference.authorizedRecoveryGenesis)) throw new Error('A signed build anchor requires the shell snapshot and cannot combine with recovery authority.');
+const valuedFlags = new Set(['--guarded-shell-snapshot', ...Object.values(repeatFlags), ...Object.values(ancestorFlags), ...Object.values(genesisFlags), ...Object.values(recoveryFlags), ...Object.values(anchorFlags)]);
 for (let index = 2; index < process.argv.length; index += 1) {
   const arg = process.argv[index];
   if (arg === '--no-relaunch') continue;
@@ -136,6 +143,7 @@ else if (running()) {
 }
 const snapshot = SHELL_SNAPSHOT ? JSON.parse(fs.readFileSync(SHELL_SNAPSHOT, 'utf8')) : null;
 if (currentRecovery && snapshot.noActiveUpdateEvidence) throw new Error('Current-state recovery cannot use no-active-update admission.');
+if (signedBuildAnchor && (snapshot.appliedUpdateEvidence || snapshot.noActiveUpdateEvidence)) throw new Error('A signed build anchor snapshot carries no updater evidence.');
 let guarded;
 const proveGuard = () => currentRecovery ? verifyCurrentStateRecoveryPatch({
   app: APP, home, evidence: { path: recovery.path, sha256: recovery.sha256 },
@@ -146,6 +154,7 @@ const proveGuard = () => currentRecovery ? verifyCurrentStateRecoveryPatch({
   shellSnapshot: snapshot.shellSnapshot ?? snapshot,
   appliedUpdateEvidence: snapshot.appliedUpdateEvidence,
   noActiveUpdateEvidence: snapshot.noActiveUpdateEvidence,
+  signedBuildAnchor,
   priorProof: guarded,
   repeatedReference: Object.keys(repeatedReference).length ? repeatedReference : undefined,
   isRunning: running,
@@ -183,7 +192,8 @@ if (running()) {
 console.log(`target ${APP} (was ${installed.version})\n`);
 
 const { stamp } = inspectDaemonBuild(path.join(REPO, 'dist'));
-const report = { patchedAt: new Date().toISOString(), bundle: APP, wasVersion: installed.version, sourceFingerprint: stamp.sourceFingerprint, gitSha: stamp.gitSha, parts: {} };
+const report = { patchedAt: new Date().toISOString(), bundle: APP, wasVersion: installed.version, sourceFingerprint: stamp.sourceFingerprint, gitSha: stamp.gitSha, parts: {},
+  ...(signedBuildAnchor ? { signedBuildAnchor } : {}) };
 
 try {
 // 1. The daemon itself.
