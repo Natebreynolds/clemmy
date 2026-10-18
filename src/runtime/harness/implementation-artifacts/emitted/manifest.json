@@ -2121,7 +2121,7 @@
           "bytes": 13261
         },
         "src/tools/admit-named-workflow-run.ts": {
-          "bytes": 7864
+          "bytes": 8295
         },
         "src/execution/workflow-visual-contract-fixes.ts": {
           "bytes": 8969
@@ -2598,7 +2598,7 @@
           "bytes": 2115
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 266406
+          "bytes": 266886
         },
         "src/runtime/harness/connection-agent-rebuild.ts": {
           "bytes": 5591
@@ -3162,7 +3162,7 @@
           "bytes": 870080
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 182506
+          "bytes": 182608
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -6039,7 +6039,7 @@
           "bytes": 13261
         },
         "src/tools/admit-named-workflow-run.ts": {
-          "bytes": 7864
+          "bytes": 8295
         },
         "src/execution/workflow-visual-contract-fixes.ts": {
           "bytes": 8969
@@ -6516,7 +6516,7 @@
           "bytes": 2115
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 266406
+          "bytes": 266886
         },
         "src/runtime/harness/connection-agent-rebuild.ts": {
           "bytes": 5591
@@ -7080,7 +7080,7 @@
           "bytes": 870080
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 182506
+          "bytes": 182608
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
