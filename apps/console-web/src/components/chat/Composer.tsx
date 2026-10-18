@@ -282,12 +282,11 @@ export function Composer({
   const voiceAvailable = Boolean(dictation && voiceMessages) && !listening && !transcribing;
   const readyIds = attachments.filter((a) => a.status === 'ready' && a.id).map((a) => a.id!);
   // Mid-run steering: TEXT can be sent while Clem is working — it reaches her
-  // at the next step without stopping the run. Attachments still wait for the
-  // turn to finish (a file mid-run would have to start a new turn).
+  // at the next step without stopping the run. A message with files waits in
+  // the thread and goes out as its own message when the turn finishes.
   const canSend = !uploading && !preparing
     && !(pendingPost && !busy)
     && (value.trim().length > 0 || readyIds.length > 0)
-    && !(busy && readyIds.length > 0)
     && !(busy && draft.artifact)
     && !(busy && activeTaskMode?.kind === 'execute');
 
@@ -338,6 +337,7 @@ export function Composer({
 
   const hint = preparing ? 'Preparing your message…'
     : busy && draft.artifact ? 'The selected file can be sent when this turn finishes. Your message will stay here.'
+    : busy && readyIds.length > 0 ? 'Messages with files send when Clem finishes.'
     : busy && activeTaskMode?.kind === 'execute'
     ? 'Executing the reviewed plan'
     : planning
