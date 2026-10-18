@@ -1,4 +1,5 @@
 import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
+import { followUpSendsAfter, steerRefusalWaitsForTurnEnd } from './follow-up.js';
 import { readQuestionOptions } from './question-options.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import { readBackgroundOutcomeReport } from './background-outcome-report.js';
@@ -207,6 +208,9 @@ export class ChatEngine {
   private activeAssistantId: string | null = null;
   private listeners = new Set<(snapshot: EngineSnapshot) => void>();
   private disposed = false;
+  /** Messages the running turn refused because it was ending: each goes out
+   *  as its own message when the turn finishes (see follow-up.ts). */
+  private followUps: Array<{ id: string; text: string; voice?: boolean }> = [];
   private cursor = 0;
   /** Exact accepted source currently owning activeAssistantId, once its
    * user_input_received row has crossed the stream. */
@@ -400,6 +404,14 @@ export class ChatEngine {
             : entry
         ));
       } catch (error) {
+        // The turn was ending and recorded nothing: the same words wait and
+        // go out as their own message when it finishes.
+        if (steerRefusalWaitsForTurnEnd(error) && !hasSteerAdmission(this.messages.find((entry) => entry.id === steerId))) {
+          this.messages = this.messages.map((entry) => entry.id === steerId ? { ...entry, pending: undefined, steer: 'queued' } : entry);
+          this.followUps.push({ id: steerId, text: message, ...(steerMessage.voice === true ? { voice: true } : {}) });
+          this.emit();
+          return;
+        }
         // The computer may well have answered (a refusal is a 409 with its
         // own line): the row shows that line, not a connection guess.
         this.messages = this.messages.map((entry) => (
@@ -446,6 +458,13 @@ export class ChatEngine {
 
   async retry(messageId: string): Promise<void> {
     const failed = this.messages.find((m) => m.id === messageId && m.pending === 'failed');
+    if (failed?.steer === 'held') {
+      // Never sent: the owner's tap sends it now as their own message.
+      this.messages = this.messages.filter((m) => m.id !== messageId);
+      this.emit();
+      await this.send(failed.text, undefined, failed.voice === true ? { voice: true } : {});
+      return;
+    }
     if (!failed || !failed.idempotencyKey || (this.busy && !failed.steer)) return;
     if (failed.steer) {
       this.messages = this.messages.map(message => message.id === messageId ? { ...message, pending: 'sending' } : message);
@@ -1105,6 +1124,26 @@ export class ChatEngine {
     if (this.disposed) return;
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
+    if (!this.busy && this.followUps.length > 0) queueMicrotask(() => this.sendFollowUp());
+  }
+
+  /** The turn ended: the first waiting message goes out, one at a time. A
+   *  turn that ended on a question, a card, a plan or a Stop keeps them for
+   *  the owner's tap instead. */
+  private sendFollowUp(): void {
+    if (this.disposed || this.busy || this.followUps.length === 0) return;
+    const ended = [...this.messages].reverse().find((m) => m.role === 'assistant')?.status;
+    if (ended === undefined || ended === 'thinking') return;
+    if (!followUpSendsAfter(ended)) {
+      const ids = new Set(this.followUps.map((item) => item.id));
+      this.followUps = [];
+      this.messages = this.messages.map((m) => ids.has(m.id) ? { ...m, steer: 'held', pending: 'failed' } : m);
+      this.emit();
+      return;
+    }
+    const next = this.followUps.shift()!;
+    this.messages = this.messages.filter((m) => m.id !== next.id);
+    void this.send(next.text, undefined, next.voice === true ? { voice: true } : {}).catch(() => { /* the send shows its own failure */ });
   }
 }
 

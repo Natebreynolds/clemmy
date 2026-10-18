@@ -342,6 +342,7 @@ export function ChatBubble({
   traceHref,
   onAnswer,
   onContinue,
+  onSendHeld,
   speaker,
   project,
   ownedTaskIds,
@@ -379,6 +380,8 @@ export function ChatBubble({
   onAnswer?: (text: string, resume?: ConnectionResume) => Promise<void> | void;
   /** The latest idle continuation target, guarded again by its owner before send. */
   onContinue?: () => Promise<void>;
+  /** Send a message that waited for a turn to end, at the owner's tap. */
+  onSendHeld?: (messageId: string) => void;
 }) {
   const isUser = message.role === 'user';
   // Approve/Reject fire a follow-up turn but never patch THIS bubble's status, so
@@ -538,6 +541,13 @@ export function ChatBubble({
           {message.steer && (
             <p className="mt-1 text-caption text-muted">
               {steerReceiptLabel(message)}
+              {message.steer === 'held' && onSendHeld && (
+                <>
+                  {' · '}
+                  <button type="button" className="font-medium text-fg underline-offset-2 hover:underline"
+                    onClick={() => onSendHeld(message.id)}>Send now</button>
+                </>
+              )}
             </p>
           )}
         </div>

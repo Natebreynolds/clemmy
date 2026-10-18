@@ -514,6 +514,85 @@ test('OPEN-THE-GATES 4.2: a send while busy steers the live turn instead of no-o
   engine.dispose();
 });
 
+test('a message the ending turn refused waits and goes out by itself when the turn completes', async () => {
+  const { steerRefusalWaitsForTurnEnd, followUpSendsAfter } = await import('./follow-up.js');
+  const refusal = Object.assign(new Error('The run just finished; send this again as a new message.'),
+    { status: 409, body: { code: 'RUN_NOT_ACTIVE', error: 'The run just finished; send this again as a new message.' } });
+  assert.equal(steerRefusalWaitsForTurnEnd(refusal), true);
+  assert.equal(steerRefusalWaitsForTurnEnd(Object.assign(new Error('x'), { status: 409, body: { code: 'ATTACHMENTS_REQUIRE_IDLE_CHAT' } })), false);
+  assert.equal(steerRefusalWaitsForTurnEnd(Object.assign(new Error('x'), { status: 503, body: { code: 'RUN_NOT_ACTIVE' } })), false);
+  assert.equal(steerRefusalWaitsForTurnEnd(new TypeError('Failed to fetch')), false, 'a lost response may already be recorded');
+  assert.equal(followUpSendsAfter('complete'), true);
+  assert.equal(followUpSendsAfter('failed'), true);
+  for (const status of ['stopped', 'awaiting-reply', 'awaiting-approval', 'awaiting-plan', 'thinking', undefined]) {
+    assert.equal(followUpSendsAfter(status), false, String(status));
+  }
+
+  const transport = new FakeTransport();
+  const sent: Array<{ message: string; steerOnly?: boolean }> = [];
+  const engine = new ChatEngine({
+    transport,
+    sessionId: 's-follow',
+    api: {
+      send: async (input) => {
+        sent.push({ message: input.message, steerOnly: input.steerOnly });
+        if (input.steerOnly) throw refusal;
+        return { sessionId: 's-follow', accepted: true };
+      },
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+    streamTimings: { reconnectBaseDelayMs: 5 },
+  });
+  try {
+    await engine.send('first');
+    await wait(10);
+    transport.live!.onEvent({ ...ev(1, 'user_input_received', { text: 'first' }), role: 'user', turn: 1 });
+    await engine.send('and add a summary');
+    assert.equal(engine.snapshot().messages.find((m) => m.text === 'and add a summary')?.steer, 'queued');
+    assert.equal(sent.length, 2);
+    transport.live!.onEvent(ev(2, 'conversation_completed', { sourceUserSeq: 1, reply: 'Done.' }));
+    await wait(10);
+    assert.equal(sent.length, 3, 'the waiting message went out when the turn finished');
+    assert.deepEqual(sent[2], { message: 'and add a summary', steerOnly: undefined });
+    const rows = engine.snapshot().messages.filter((m) => m.text === 'and add a summary');
+    assert.equal(rows.length, 1, 'one bubble for it, the new turn\'s');
+    assert.equal(rows[0]?.steer, undefined);
+  } finally { engine.dispose(); }
+});
+
+test('after a stopped turn a waiting message is held for the owner\'s tap, and the tap sends it', async () => {
+  const transport = new FakeTransport();
+  const sent: Array<{ message: string; steerOnly?: boolean }> = [];
+  const engine = new ChatEngine({
+    transport,
+    sessionId: 's-held',
+    api: {
+      send: async (input) => {
+        sent.push({ message: input.message, steerOnly: input.steerOnly });
+        if (input.steerOnly) throw Object.assign(new Error('This turn is finishing; the message was not queued.'), { status: 409, body: { code: 'STEER_NOTE_CUTOVER' } });
+        return { sessionId: 's-held', accepted: true };
+      },
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+    streamTimings: { reconnectBaseDelayMs: 5 },
+  });
+  try {
+    await engine.send('first');
+    await wait(10);
+    transport.live!.onEvent({ ...ev(1, 'user_input_received', { text: 'first' }), role: 'user', turn: 1 });
+    await engine.send('one more thing');
+    transport.live!.onEvent(ev(2, 'conversation_completed', { sourceUserSeq: 1, reply: 'Stopped.', reason: 'cancelled' }));
+    await wait(10);
+    assert.equal(sent.length, 2, 'a stopped turn sends nothing by itself');
+    const held = engine.snapshot().messages.find((m) => m.text === 'one more thing');
+    assert.equal(held?.steer, 'held');
+    assert.equal(held?.pending, 'failed', 'the row shows its send and discard controls');
+    await engine.retry(held!.id);
+    assert.equal(sent.length, 3);
+    assert.deepEqual(sent[2], { message: 'one more thing', steerOnly: undefined });
+  } finally { engine.dispose(); }
+});
+
 test('ChatEngine adopts a server-selected successor for an existing held session', async () => {
   const transport = new FakeTransport();
   const engine = new ChatEngine({

@@ -496,8 +496,10 @@ export interface ChatMessage {
   connectionRequestId?: string;
   /** Spoken request presentation intent, retained on an uncertain send. */
   voice?: boolean;
-  /** Mid-run steer: text delivered into the live turn, not a new attempt. */
-  steer?: 'pending' | 'delivered' | 'failed';
+  /** Mid-run steer: text delivered into the live turn, not a new attempt.
+   *  'queued' waits for the turn to end and is then sent as its own message;
+   *  'held' waits for the owner's tap (the turn stopped or asked something). */
+  steer?: 'pending' | 'delivered' | 'failed' | 'queued' | 'held';
   /** Display-only durable acknowledgement, never task/effect authority. */
   steerReceipt?: import('./steer-receipt.js').SteerReceipt;
   steerNoteSeq?: number;

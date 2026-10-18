@@ -1103,7 +1103,7 @@ function MessageRow({
         {message.pending === 'failed' ? (
           <div class="pending-status pending-failed">
             {!message.steer ? <span>failed — {message.pendingError ?? 'couldn’t reach your computer'}</span> : null}
-            <button class="pending-action" onClick={() => onRetry(message.id)}>retry</button>
+            <button class="pending-action" onClick={() => onRetry(message.id)}>{message.steer === 'held' ? 'send' : 'retry'}</button>
             <button class="pending-action" onClick={() => onDiscard(message.id)}>discard</button>
           </div>
         ) : null}
