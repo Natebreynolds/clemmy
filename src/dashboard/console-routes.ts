@@ -15306,7 +15306,7 @@ export function registerConsoleRoutes(
         notification.metadata?.source !== 'notify_user_tool' &&
         // The runner's own titles, before and after they were put in plain
         // words (2026-10-18): Finished / Couldn't finish / Needs a look / Didn't start.
-        /workflow (completed|needs attention|still running)|^(finished|couldn't finish|needs a look|didn't start|done, with a gap):/i.test(notification.title) &&
+        /workflow (completed|needs attention|still running|blocked)|^(finished|couldn't finish|needs a look|didn't start|done, with a gap):/i.test(notification.title) &&
         reportedRunIds.has(String(notification.metadata?.runId || notification.metadata?.workflowRunId || ''));
       const dedupeByTitle = <T extends { title: string }>(items: T[], cap: number): T[] => {
         const seen = new Set<string>();

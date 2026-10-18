@@ -17943,7 +17943,7 @@ async function processOneRunFile(
         addNotification({
           id: `workflow-${run.id}-blocked`,
           kind: 'workflow',
-          title: `Workflow blocked: ${workflow.data.name}`,
+          title: `Couldn't finish: ${readableWorkflowName(workflow.data.name)}`,
           body: `${detail}${workflowEscalationLine(workflow.data.name, escalation)}`,
           createdAt: finishedAt,
           read: false,
