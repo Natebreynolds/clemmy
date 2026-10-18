@@ -140,7 +140,7 @@ test('a delayed refused request cannot clear a different accepted source that is
   } finally { engine.dispose(); }
 });
 
-test('a refused mid-turn message shows the route’s plain line on its failed row, an offline one the transport’s, and never a connection guess', async () => {
+test('a mid-turn message the ending turn refused waits for it; an offline one shows the transport’s line, and none shows a connection guess', async () => {
   const line = 'This turn is finishing; the message was not queued.';
   const offline = "Can't reach your computer right now";
   const failures: unknown[] = [
@@ -163,12 +163,13 @@ test('a refused mid-turn message shows the route’s plain line on its failed ro
     await engine.send('And a third.');
     assert.equal(steers, 3);
     const rows = engine.snapshot().messages.filter(message => message.steer);
+    // The server recorded nothing for a turn that was finishing: the words
+    // wait and go out as their own message when it ends (follow-up.ts).
     assert.deepEqual(rows.map(message => [message.pending, message.steer, message.pendingError]), [
-      ['failed', 'failed', line],
+      [undefined, 'queued', undefined],
       ['failed', 'failed', offline],
       ['failed', 'failed', STEER_NOT_DELIVERED_TEXT],
     ]);
-    assert.doesNotMatch(rows[0]!.pendingError!, /STEER_NOTE/, 'the owner reads the line, never the code');
     assert.doesNotMatch(STEER_NOT_DELIVERED_TEXT, /reach|\b(?:I|I’m|I'm|me|my)\b/, 'a wordless failure claims nothing about the connection');
     assert.equal(engine.snapshot().busy, true, 'a refused mid-turn message never clears the live turn');
   } finally { engine.dispose(); }

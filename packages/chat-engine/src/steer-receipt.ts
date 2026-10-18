@@ -32,7 +32,7 @@ export function readSteerReceipt(value: unknown): SteerReceipt | null {
 }
 interface SteerMessage {
   id: string; role: 'user' | 'assistant'; text: string;
-  steer?: 'pending' | 'delivered' | 'failed'; steerReceipt?: SteerReceipt;
+  steer?: 'pending' | 'delivered' | 'failed' | 'queued' | 'held'; steerReceipt?: SteerReceipt;
   idempotencyKey?: string; requestSessionId?: string | null; steerNoteSeq?: number;
   pending?: 'sending' | 'failed'; pendingError?: string;
 }
@@ -89,5 +89,7 @@ export function steerReceiptLabel(message: { steer?: string; steerReceipt?: Stee
   if (message.steerReceipt?.state === 'unhandled') return 'Run ended — use of this addition wasn’t confirmed; your message is kept';
   if (message.steerReceipt?.state === 'accepted' || message.steer === 'delivered') return 'Received for this run';
   return message.steer === 'pending' ? 'Reaching her mid-run…'
+    : message.steer === 'queued' ? 'Sends when Clem finishes'
+    : message.steer === 'held' ? 'Not sent yet'
     : message.steer === 'failed' ? 'Couldn’t confirm this addition — check the run before resending' : '';
 }

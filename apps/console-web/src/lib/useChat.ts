@@ -1,7 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
-import { boundedModelId, modelDisplayName } from '@clem/chat-engine';
+import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd } from '@clem/chat-engine';
 import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -145,8 +145,10 @@ export interface ChatMessage {
    *  live reply says it on its model-phase activity row instead. */
   projectName?: string | null;
   /** Mid-run steering: this user message was sent while a run was active and
-   *  rides to the model at its next step instead of starting a new turn. */
-  steer?: 'pending' | 'delivered' | 'failed';
+   *  rides to the model at its next step instead of starting a new turn.
+   *  'queued' waits for the turn to end and then goes out as its own message;
+   *  'held' waits for the owner's tap. */
+  steer?: 'pending' | 'delivered' | 'failed' | 'queued' | 'held';
   steerReceipt?: SteerReceipt;
   steerNoteSeq?: number;
   idempotencyKey?: string;
@@ -1685,6 +1687,9 @@ export async function readReattachTurn(sessionId: string, input: {
   return null;
 }
 
+/** What one send carries; a follow-up keeps it until the turn ends. */
+type ChatSendInput = { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void };
+
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
   const [busy, setBusyState] = useState(false);
@@ -1698,6 +1703,11 @@ export function useChat(options?: UseChatOptions) {
   // Only in-flight POST echoes: an SSE receipt can confirm admission even
   // when the HTTP acknowledgement is lost. No retry or extra request.
   const pendingSteerEchoes = useRef(new Map<string, ChatMessage>());
+  // Messages that could not join the running turn: queued ones go out by
+  // themselves when it ends; held ones wait for the owner's tap.
+  const followUpsRef = useRef<Array<{ id: string; input: ChatSendInput }>>([]);
+  const heldFollowUpsRef = useRef(new Map<string, ChatSendInput>());
+  const stoppedRef = useRef(false);
   const observePendingSteerReceipt = useCallback((event: HarnessEvent) => {
     observePendingSteerReceiptEchoes(pendingSteerEchoes.current, event);
   }, []);
@@ -2234,17 +2244,32 @@ export function useChat(options?: UseChatOptions) {
     }
   }, [patch]);
 
-  const send = useCallback(async (input: { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void }, retryRequest?: PendingChatPost) => {
+  // A message that cannot join the running turn (files, a mode change, or a
+  // turn already finishing) waits for it instead of coming back refused.
+  const queueFollowUp = useCallback((input: ChatSendInput, echoId?: string) => {
+    const { onAccepted, ...waiting } = input;
+    const id = echoId ?? nextId();
+    followUpsRef.current = [...followUpsRef.current, { id, input: waiting }];
+    if (echoId) patch(echoId, { steer: 'queued' } as Partial<ChatMessage>);
+    else {
+      setMessages((prev) => [...prev, { id, role: 'user', text: input.displayText?.trim() || input.text.trim(),
+        attachmentNames: input.attachmentNames, steer: 'queued' }]);
+    }
+    onAccepted?.();
+  }, [patch]);
+
+  const send = useCallback(async (input: ChatSendInput, retryRequest?: PendingChatPost) => {
     const running = busyRef.current;
     if (running && input.connectionResume) throw new Error('Another turn is running. Your connection is saved; check again when it finishes.');
     const taskMode = snapshotTaskMode(input.connectionResume ? undefined : input.taskMode);
     const activeMode = messages.find(message => message.id === activeAssistantId.current)?.taskMode;
-    if (running && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
-      throw new Error('Wait for the current turn to finish before changing modes or executing a plan.');
-    }
     const text = input.text.trim();
     const attachmentIds = input.attachmentIds ?? [];
     if (!text && attachmentIds.length === 0) return;
+    if (running && (taskMode?.kind === 'execute' || !sameTaskMode(taskMode, activeMode))) {
+      queueFollowUp(input);
+      return;
+    }
     // A new session opens inside the chosen agent. Once this chat has a
     // session, a switch travels separately (lib/conversation-agent) and the
     // field is dropped so a retry fingerprint never differs by it.
@@ -2261,7 +2286,10 @@ export function useChat(options?: UseChatOptions) {
       // supersede and kill the active run). steerOnly makes the server
       // steer-or-409, never silently accept a competing turn. Attachments
       // wait for the turn to finish.
-      if (attachmentIds.length > 0) throw new Error('Wait for this turn to finish before sending files. Your message is still here.');
+      if (attachmentIds.length > 0) {
+        queueFollowUp(input);
+        return;
+      }
       const steerId = nextId();
       const steerRequestId = createChatClientRequestId();
       const steerSessionId = sessionIdRef.current;
@@ -2284,12 +2312,16 @@ export function useChat(options?: UseChatOptions) {
         else throw new Error('That addition was not accepted. Your message is still here.');
       } catch (error) {
         if (hasSteerAdmission(pendingSteerEchoes.current.get(steerRequestId))) { input.onAccepted?.(); return; }
+        // The server recorded nothing (the turn was finishing or changed):
+        // the same words go out as their own message when it ends.
+        if (steerRefusalWaitsForTurnEnd(error)) { queueFollowUp(input, steerId); return; }
         patch(steerId, { steer: 'failed' } as Partial<ChatMessage>);
         if (input.onAccepted) throw error;
       } finally { pendingSteerEchoes.current.delete(steerRequestId); }
       return;
     }
 
+    stoppedRef.current = false;
     const userId = nextId();
     const assistantId = nextId();
     // A new turn owns the session's event stream — a still-running late watch
@@ -2441,9 +2473,54 @@ export function useChat(options?: UseChatOptions) {
       const pendingBackground = pendingBackgroundRef.current as { assistantId: string } | null;
       if (pendingBackground?.assistantId === assistantId) pendingBackgroundRef.current = null;
     }
-  }, [busy, messages, applyEvent, handoffAcceptedRun, patch, retainPending]);
+  }, [busy, messages, applyEvent, handoffAcceptedRun, patch, retainPending, queueFollowUp]);
+
+  // When the turn ends, the first queued message goes out as its own turn,
+  // one at a time. A turn that ended on a question, a card, a plan or a Stop
+  // keeps them for the owner's tap instead.
+  useEffect(() => {
+    if (busy || followUpsRef.current.length === 0) return;
+    const ended = [...messages].reverse().find((message) => message.role === 'assistant')?.status;
+    if (!stoppedRef.current && (ended === undefined || ended === 'thinking')) return;
+    if (stoppedRef.current || !followUpSendsAfter(ended)) {
+      const waiting = followUpsRef.current;
+      followUpsRef.current = [];
+      for (const item of waiting) heldFollowUpsRef.current.set(item.id, item.input);
+      const ids = new Set(waiting.map((item) => item.id));
+      setMessages((prev) => prev.map((message) => ids.has(message.id) ? { ...message, steer: 'held' } : message));
+      return;
+    }
+    const [next, ...rest] = followUpsRef.current;
+    followUpsRef.current = rest;
+    const echo = messages.find((message) => message.id === next!.id);
+    setMessages((prev) => prev.filter((message) => message.id !== next!.id));
+    void send(next!.input).catch(() => {
+      heldFollowUpsRef.current.set(next!.id, next!.input);
+      if (echo) setMessages((prev) => [...prev, { ...echo, steer: 'held' }]);
+    });
+  }, [busy, messages, send]);
+
+  /** The owner's tap on a waiting message: it goes now, or right after the
+   *  turn that is running. */
+  const sendHeld = useCallback((id: string) => {
+    const input = heldFollowUpsRef.current.get(id);
+    if (!input) return;
+    heldFollowUpsRef.current.delete(id);
+    if (busyRef.current) {
+      followUpsRef.current = [...followUpsRef.current, { id, input }];
+      patch(id, { steer: 'queued' } as Partial<ChatMessage>);
+      return;
+    }
+    const echo = messages.find((message) => message.id === id);
+    setMessages((prev) => prev.filter((message) => message.id !== id));
+    void send(input).catch(() => {
+      heldFollowUpsRef.current.set(id, input);
+      if (echo) setMessages((prev) => [...prev, { ...echo, steer: 'held' }]);
+    });
+  }, [messages, patch, send]);
 
   const stop = useCallback(() => {
+    stoppedRef.current = true;
     const aid = activeAssistantId.current;
     const accepted = activeRunRef.current;
     const source = acceptedStreamSourceRef.current?.assistantId === aid ? acceptedStreamSourceRef.current.source : undefined;
@@ -2504,6 +2581,9 @@ export function useChat(options?: UseChatOptions) {
   }, [handoffAcceptedRun, patch]);
 
   const reset = useCallback(() => {
+    followUpsRef.current = [];
+    heldFollowUpsRef.current.clear();
+    stoppedRef.current = false;
     postAbortRef.current?.abort();
     postAbortRef.current = null;
     streamRef.current?.stop();
@@ -2569,7 +2649,7 @@ export function useChat(options?: UseChatOptions) {
       + 'revision. Only ask me about something that genuinely needs my answer.',
     taskMode: { version: 1, kind: 'plan' },
   });
-  return { messages, busy, send, stop, background, reset, approveWithEdits, sessionId: sessionIdRef, conversationSessionId: conversationSessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
+  return { messages, busy, send, sendHeld, stop, background, reset, approveWithEdits, sessionId: sessionIdRef, conversationSessionId: conversationSessionIdRef, composerMode, setComposerMode, activeTaskMode, executePlan, preparePlan, pendingPost, retryPending, cancelPending, delegatedTaskTick };
 }
 
 
