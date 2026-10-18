@@ -200,11 +200,13 @@ const GOLDEN = {
   // 2026-10-17: FINAL REPORT names the claims completion reviews rejected in
   // every live regression turn (absence beyond what was checked, unmarked
   // estimates, unmeasured cost/time/rigor asides); the toolset line drops a
-  // stale "mutating pauses for approval" and two duplicated list items.
-  instructions: { len: 34348, sha16: '8686b59b5c2ad6ac' },
-  native: { len: 33455, sha16: 'f849533e0c04dd53' },
-  claudeBrain: { len: 11433, sha16: 'f7894fd682752772' },
-  lean: { len: 13438, sha16: '7b41f151f92cbcab' },
+  // stale "mutating pauses for approval" and two duplicated list items. Later
+  // the same day it names comparisons and superlatives, which research reviews
+  // rejected most (a misranked library, "oldest by more than a decade").
+  instructions: { len: 34360, sha16: 'af3a88d46f66bed1' },
+  native: { len: 33467, sha16: '7ca8ef4538a132dc' },
+  claudeBrain: { len: 11445, sha16: 'd32a16386254ed17' },
+  lean: { len: 13450, sha16: '0a59b6d7e9bf2f3c' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

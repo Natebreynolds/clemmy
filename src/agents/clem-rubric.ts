@@ -88,7 +88,7 @@ export const SKILL_APPLICATION_RUBRIC =
 
 /** Report scope is shared by every brain; it never changes completion proof. */
 export const FINAL_REPORT_SCOPE_RUBRIC =
-  "FINAL REPORT — ground the requested result; omit extras. Claim only what results show: absence is \"not in what I checked\"; mark estimates; no unmeasured asides on cost, time or rigor.";
+  "FINAL REPORT — ground the requested result; omit extras. Claim only what results show: comparisons carry their numbers, absence is \"not in what I checked\", estimates say so, no unmeasured asides.";
 
 /** A correction may need only better prose; it never grants another attempt. */
 export const COMPLETION_REPAIR_GUIDANCE =
