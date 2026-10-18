@@ -25,19 +25,27 @@ function describeDays(dow: string): string | null {
   return `Every ${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
+function localTimeZone(): string {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return ''; }
+}
+
 export function humanizeCron(expr?: string | null, timezone?: string): string {
   if (!expr || typeof expr !== 'string') return 'On demand';
   const parts = expr.trim().split(/\s+/);
   if (parts.length < 5) return 'A custom schedule';
   const [min, hour, dom, , dow] = parts;
-  const tz = timezone ? ` (${timezone.replace(/_/g, ' ')})` : '';
+  // A clock time names its zone only when it is not the owner's own; an
+  // interval ("every 5 minutes") has no zone to name (owner 2026-10-18:
+  // "Every 5 minutes (America/Los Angeles)" read as noise).
+  const tz = timezone && timezone !== localTimeZone() ? ` (${timezone.replace(/_/g, ' ')})` : '';
 
+  if (min === '*' && hour === '*' && dom === '*' && dow === '*') return 'Every minute';
   // Every N minutes.
   let mm = /^\*\/(\d+)$/.exec(min);
-  if (mm && hour === '*') return `Every ${mm[1]} minutes${tz}`;
+  if (mm && hour === '*') return mm[1] === '1' ? 'Every minute' : `Every ${mm[1]} minutes`;
   // Every N hours.
   const hm = /^\*\/(\d+)$/.exec(hour);
-  if (hm) return `Every ${hm[1]} hours${tz}`;
+  if (hm) return hm[1] === '1' ? 'Every hour' : `Every ${hm[1]} hours`;
   // Top of every hour.
   if (hour === '*' && /^\d+$/.test(min)) return `Every hour at :${min.padStart(2, '0')}${tz}`;
 

@@ -15,6 +15,7 @@
  * because the fresh wait already has its own card.
  */
 import { STALLED_WORK_REAP_MS } from '../dashboard/working-now-policy.js';
+import { readableWorkflowName } from '../execution/workflow-diagnosis.js';
 import type { NotificationRecord } from '../runtime/notifications.js';
 
 export interface WorkRunObservation {
@@ -375,8 +376,9 @@ export function buildWorkReviewNotification(
   at: string,
   notify: 'quiet' | 'push',
 ): NotificationRecord {
-  const title = candidate.kind === 'run_failed' ? `Run failed: ${short(candidate.subject, 60)}`
-    : candidate.kind === 'run_waiting' ? `Still waiting on you: ${short(candidate.subject, 60)}`
+  // A workflow's subject is its slug; the owner reads its name (2026-10-18).
+  const title = candidate.kind === 'run_failed' ? `Something went wrong: ${short(readableWorkflowName(candidate.subject), 60)}`
+    : candidate.kind === 'run_waiting' ? `Still waiting on you: ${short(readableWorkflowName(candidate.subject), 60)}`
       : candidate.kind === 'chat_waiting' ? `Still waiting: ${short(candidate.subject, 60)}`
         : `Unsent draft: ${short(candidate.subject, 60)}`;
   return {

@@ -118,7 +118,7 @@ test('a tick raises each new item once, quietly by default, and a second tick is
     assert.equal(n.metadata?.inboxOnly, true, 'quiet mode stays in the app');
     assert.equal(n.metadata?.heartbeatId, 'work-review');
   }
-  assert.match(h.published[0].title, /^Run failed: /, 'failures first');
+  assert.match(h.published[0].title, /^Something went wrong: /, 'failures first');
   assert.match(h.published[0].body, /I can look at what went wrong/);
   assert.equal(h.judgeCalls, 0, 'no rules, no model call');
 
