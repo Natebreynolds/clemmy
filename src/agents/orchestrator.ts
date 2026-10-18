@@ -3984,8 +3984,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // reachableBuiltinNames nor firstClassNames; widening only the latter,
         // and only under carrierWork, left the non-carrier turn refusing a
         // wrapped plan_task exactly as before — verified live three times.
+        // Clem's own control tools are always callable (owner rule
+        // 2026-10-18). Under an action carrier a deferred control was
+        // discoverable through tool_search yet refused here as "NOT on this
+        // turn's surface": live, a file-synced Space could never refresh its
+        // source, so the review could never accept the sync. Each control
+        // still answers to its own effect and approval checks downstream.
         reachableBuiltinNames: new Set([
-          ...(carrierWork ? workCallBuiltinNames : discoverableNames),
+          ...(carrierWork ? [...workCallBuiltinNames, ...deferredActionControlNames] : discoverableNames),
           ...structuralControlNames,
         ]),
         // Emptying this wholesale removed the "first-class-wrap fallback"
