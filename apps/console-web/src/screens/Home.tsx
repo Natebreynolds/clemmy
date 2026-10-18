@@ -41,6 +41,8 @@ import { presentWorkingNow } from '@/lib/activity-presentation';
 import { listSpaces } from '@/lib/spaces';
 import type { CommandCenter } from '@/lib/types';
 import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
+import { useStuck } from '@/lib/use-stuck';
+import { cn } from '@/lib/cn';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
@@ -55,7 +57,7 @@ import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
 import { TodayPane } from '@/components/home/TodayPane';
 import { FromClemPane } from '@/components/home/FromClemPane';
-import { HomeWatchOverview } from '@/components/home/HomeWatchOverview';
+import { HomeWatchLine } from '@/components/home/HomeWatchOverview';
 import { buildWatchOverview } from '@/components/home/watch-overview-model';
 import { buildHomeContentLayout } from '@/components/home/home-content-layout';
 import { listWatches } from '@/lib/watches';
@@ -140,6 +142,10 @@ function LiveHome() {
   const routeDraftKey = newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
   const captureSendScope = useConversationSendScope(routeDraftKey, chat.sessionId);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // The composer stays in reach while the owner scrolls Today (owner
+  // 2026-10-18: "the chat bar should stay as the user scrolls").
+  const composerSentinel = useRef<HTMLDivElement>(null);
+  const composerStuck = useStuck(composerSentinel);
   const openingRef = useRef(false);
   const [opening, setOpening] = useState(false);
   const [notice, setNotice] = useState<HomeNoticeState | null>(null);
@@ -207,6 +213,14 @@ function LiveHome() {
   const needsYouTotal = typeof cc.data?.counts?.waiting === 'number'
     ? Math.max(cc.data.counts.waiting, needsYou.length)
     : needsYou.length;
+  // Today's lists lead with what Clem brought (owner 2026-10-18: one Needs
+  // you, one While you were away). Their numbers: the inbox's, less what
+  // Clem's rows already stand for, plus her own.
+  const clemRows = fromClem.data?.rows ?? [];
+  const clemWaiting = clemRows.filter((row) => row.asks || row.setup).length;
+  const clemUpdates = clemRows.filter((row) => !row.asks && !row.setup).length;
+  const coveredNeeds = Math.max(0, (cc.data?.needsYou?.length ?? 0) - needsYou.length);
+  const todayNeedsTotal = Math.max(0, needsYouTotal - coveredNeeds) + clemWaiting;
   const silent = new Set(silentImmediatePanes({
     needsYou: needsYouTotal,
     running: workingView.running,
@@ -215,8 +229,8 @@ function LiveHome() {
     settled: immediateSettled,
     workRows: workingView.total,
   }));
-  const showNeeds = !daemonUnreachable && shown('needs_you') && !silent.has('needs_you');
-  const showRecent = !daemonUnreachable && shown('while_away') && !silent.has('while_away');
+  const showNeeds = !daemonUnreachable && shown('needs_you') && (!silent.has('needs_you') || clemWaiting > 0);
+  const showRecent = !daemonUnreachable && shown('while_away') && (!silent.has('while_away') || clemUpdates > 0);
   // Today appears once a calendar is connected (or while its read is loading);
   // Tune lists it either way.
   const showToday = !daemonUnreachable && shown('today') && (today.isLoading || today.isError || Boolean(today.data?.connected));
@@ -242,7 +256,7 @@ function LiveHome() {
     ? 'Live work status is unavailable.'
     : !immediateSettled && !servingCached
     ? null
-    : presenceLine({ needsYou: needsYouTotal, running: 0, updates: away.updates, attention: away.attention })
+    : presenceLine({ needsYou: todayNeedsTotal, running: 0, updates: away.updates + clemUpdates, attention: away.attention })
       + staleSuffix({ updatedAtMs: Number.isFinite(oldestReading) ? oldestReading : 0, nowMs: Date.now(), live: !servingCached });
 
   const renderLower = (id: HomePaneId): ReactNode => {
@@ -277,19 +291,25 @@ function LiveHome() {
     <NeedsYouPane
       headingId="home-needs-you"
       items={needsYou}
-      total={cc.data?.counts?.waiting}
+      total={Math.max(0, needsYouTotal - coveredNeeds)}
       loading={ccLoading}
       error={ccError}
       onRetry={retryCommandCenter}
       layout={layoutKind}
       maxRows={maxRows}
+      lead={<FromClemPane section="waiting" headingId="home-from-clem-waiting" data={fromClem.data} loading={fromClem.isLoading}
+        error={fromClem.isError} onRetry={() => { void fromClem.refetch(); }} />}
+      leadCount={clemWaiting}
     />
   );
   const todayPane = (
     <TodayPane headingId="home-today" today={today.data} loading={today.isLoading} error={today.isError && !today.data} onRetry={() => { void today.refetch(); }} maxRows={prefs.style === 'briefing' ? 6 : 5} />
   );
   const recentPane = (variant: 'list' | 'timeline') => (
-    <WhileAwayPane headingId="home-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} variant={variant} />
+    <WhileAwayPane headingId="home-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} variant={variant}
+      lead={<FromClemPane section="updates" headingId="home-from-clem-updates" data={fromClem.data} loading={fromClem.isLoading}
+        error={fromClem.isError} onRetry={() => { void fromClem.refetch(); }} />}
+      leadCount={clemUpdates} />
   );
 
   const buildCards = liveBuilds.map(({ build, state }) => (
@@ -355,8 +375,9 @@ function LiveHome() {
   const contentLayout = buildHomeContentLayout(panes.filter(id => Boolean(paneContent.get(id))), prefs.style);
 
   return (
-    <div className="clem-home mx-auto flex w-full max-w-[1240px] flex-col gap-7 px-5 py-6 sm:px-10 sm:py-8">
-      <section className="flex flex-col gap-4" aria-label="Ask Clementine">
+    // A reading width: Clem's sentences ran 150 characters a line at 1240px.
+    <div className="clem-home mx-auto flex w-full max-w-[960px] flex-col gap-8 px-5 py-6 sm:px-10 sm:py-8">
+      <section aria-label="Today" className="flex flex-col">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div className="clem-home-greeting">
             <span aria-hidden><DogMark size={56} /></span>
@@ -365,8 +386,15 @@ function LiveHome() {
               ? <Skeleton className="h-4 w-64" />
               : <p className="text-body text-muted" aria-live="polite">{presence}</p>}</div>
           </div>
-          <Button variant="ghost" size="sm" onClick={openCustomizeHome} title="Which stacks show, in what style"><SlidersHorizontal className="h-4 w-4" aria-hidden /> Arrange</Button>
+          <Button variant="ghost" size="sm" onClick={openCustomizeHome} title="Choose what Today shows, and in what order"><SlidersHorizontal className="h-4 w-4" aria-hidden /> Arrange</Button>
         </div>
+        {/* When this passes out of view the composer below has pinned. */}
+        <div ref={composerSentinel} aria-hidden className="h-0" />
+      </section>
+      {/* A direct child of the page column: a sticky element pins only within
+          its parent, and this one stays in reach the whole way down. */}
+      <section aria-label="Ask Clementine" className={cn('sticky top-0 z-20 -mx-5 -mt-4 bg-canvas px-5 pb-3 pt-3 transition-shadow sm:-mx-10 sm:px-10',
+          composerStuck && 'shadow-[0_10px_18px_-14px_rgba(31,27,22,0.35)]')}>
         <Composer
           inputRef={composerRef}
           sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current}
@@ -380,11 +408,11 @@ function LiveHome() {
           onStop={chat.stop}
           voiceMessages={chat.messages}
           agentSlot={<><ProjectPicker value={projectChoice.chosen} onChange={projectChoice.choose} /><AgentPicker value={agentChoice.chosen} onChange={agentChoice.choose} /></>}
-          placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : 'What can we move forward?'}
+          placeholder={agentChoice.chosen ? `Message ${agentChoice.chosen.name}…` : 'What can I help with?'}
           agentId={agentChoice.chosen?.id ?? null}
         />
-        {opening && !notice && <p role="status" className="text-small text-faint">Opening your conversation…</p>}
-        {notice && <HomeNotice notice={notice} onDismiss={() => setNotice(null)} />}
+        {opening && !notice && <p role="status" className="mt-2 text-small text-faint">Opening your conversation…</p>}
+        {notice && <div className="mt-2"><HomeNotice notice={notice} onDismiss={() => setNotice(null)} /></div>}
       </section>
 
       {daemonUnreachable && (
@@ -401,18 +429,6 @@ function LiveHome() {
         <HomeNotice notice={{ tone: 'error', text: 'That change to your Home didn’t save. Try it again.' }} onDismiss={() => savePrefs.reset()} />
       )}
 
-      <div className="clem-home-insights">
-      {!daemonUnreachable && (
-        <FromClemPane
-          headingId="home-from-clem"
-          data={fromClem.data}
-          loading={fromClem.isLoading}
-          error={fromClem.isError}
-          onRetry={() => { void fromClem.refetch(); }}
-        />
-      )}
-      <HomeWatchOverview overview={watchOverview} refreshing={watches.isFetching} onRetry={() => { void watches.refetch(); }} animate={prefs.liveStatus === 'animated'} />
-      </div>
 
       {homeIsBare ? (
         <section className="flex flex-col items-center gap-4 px-4 py-12 text-center" aria-label="Build your Home">
@@ -428,7 +444,10 @@ function LiveHome() {
         </section>
       ) : contentLayout.map((block, index) => block.kind === 'spaces'
         ? <Fragment key="spaces">{spacesPane}</Fragment>
-        : <div key={block.panes.join(':') + index} className="clem-home-pane-grid" data-columns={block.panes.length}>{block.panes.map(id => <Fragment key={id}>{paneContent.get(id)}</Fragment>)}</div>)}
+        // One reading column (owner 2026-10-18): Needs you and While you were
+        // away now carry Clem's own cards, which side by side were cramped.
+        : <div key={block.panes.join(':') + index} className="flex min-w-0 flex-col gap-7">{block.panes.map(id => <Fragment key={id}>{paneContent.get(id)}</Fragment>)}</div>)}
+      {!daemonUnreachable && <HomeWatchLine overview={watchOverview} refreshing={watches.isFetching} onRetry={() => { void watches.refetch(); }} />}
       {building && layout.data && (
         <HomeBuilder
           layout={layout.data}

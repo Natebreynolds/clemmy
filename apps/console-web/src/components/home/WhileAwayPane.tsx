@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertCircle, Info } from 'lucide-react';
 import { cn } from '@/lib/cn';
@@ -23,7 +24,12 @@ export function WhileAwayPane({
   onRetry,
   headingId,
   variant = 'list',
+  lead,
+  leadCount = 0,
 }: {
+  /** Rows that lead this list on Today (what Clem brought back). */
+  lead?: ReactNode;
+  leadCount?: number;
   items: readonly HomeFeedItem[];
   loading: boolean;
   error: boolean;
@@ -37,9 +43,10 @@ export function WhileAwayPane({
       <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
         <SectionHeader
           id={headingId}
-          label="What came back"
+          label="While you were away"
           aside={<Link to="/inbox?tab=notifications" className="rounded-sm font-semibold text-primary hover:underline">All updates</Link>}
         />
+        {lead}
         <ol className="relative flex flex-col gap-3.5 rounded-md border border-border bg-surface px-5 py-4 before:absolute before:bottom-6 before:left-[7rem] before:top-6 before:w-px before:bg-border-strong">
           {visible.map((item, index) => {
             const outcome = awayOutcome(item);
@@ -72,14 +79,15 @@ export function WhileAwayPane({
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
         id={headingId}
-        label="What came back"
+        label="While you were away"
         aside={
           <Link to="/inbox?tab=notifications" className="rounded-sm font-semibold text-primary hover:underline">
             All updates
           </Link>
         }
       />
-      <PaneCard>
+      {lead}
+      {!(leadCount > 0 && !loading && !error && visible.length === 0) && <PaneCard>
         {loading ? (
           <RowSkeleton rows={3} />
         ) : error ? (
@@ -128,7 +136,7 @@ export function WhileAwayPane({
             );
           })
         )}
-      </PaneCard>
+      </PaneCard>}
     </section>
   );
 }

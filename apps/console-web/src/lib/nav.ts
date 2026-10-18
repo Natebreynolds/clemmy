@@ -63,7 +63,7 @@ export const PRIMARY_NAV: NavDest[] = [
   { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
   { path: '/projects', label: 'Projects', icon: FolderKanban, hint: 'What you are working on, who is on it and what it needs from you' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
-  { path: '/automate', label: 'Automate', icon: Zap, hint: 'Workflows & skills' },
+  { path: '/automate', label: 'Automations', icon: Zap, hint: 'Work Clem runs for you on a schedule or with one tap, and her skills' },
   { path: '/watching', label: 'Watching', icon: Eye, hint: 'What Clem can see: the sources you handed her to keep an eye on' },
   { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
   { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },

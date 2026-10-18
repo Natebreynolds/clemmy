@@ -134,7 +134,13 @@ export function NeedsYouPane({
   headingId,
   layout = 'list',
   maxRows = MAX_ROWS,
+  lead,
+  leadCount = 0,
 }: {
+  /** Rows that lead this list on Today (Clem's own asks), counted in its
+   *  one number. */
+  lead?: ReactNode;
+  leadCount?: number;
   items: readonly HomeFeedItem[];
   /** The one needs-you count (the sidebar's number); the list shows the
    *  first few of those items. */
@@ -254,8 +260,9 @@ export function NeedsYouPane({
     ? <div className="grid items-stretch gap-3 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
     : <PaneCard>{children}</PaneCard>;
   const rowCard = strip ? 'rounded-md border border-border bg-surface first:border-t' : '';
-  const count = typeof total === 'number' ? Math.max(total, items.length === 0 ? 0 : visible.length) : items.length;
-  const overflow = count - visible.length;
+  const ownCount = typeof total === 'number' ? Math.max(total, items.length === 0 ? 0 : visible.length) : items.length;
+  const count = ownCount + leadCount;
+  const overflow = ownCount - visible.length;
 
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
@@ -264,9 +271,10 @@ export function NeedsYouPane({
         label="Needs you"
         count={count}
         countTone="muted"
-        aside={strip && overflow > 0 ? <Link to="/inbox?tab=needs" className="rounded-sm font-semibold text-primary hover:underline">See all {count}</Link> : undefined}
+        aside={overflow > 0 ? <Link to="/inbox?tab=needs" className="rounded-sm font-semibold text-primary hover:underline">See all</Link> : undefined}
       />
-      {wrap(<>
+      {lead}
+      {!(leadCount > 0 && !loading && !error && items.length === 0 && ownCount === 0) && wrap(<>
         {loading ? (
           <RowSkeleton rows={2} tall />
         ) : error ? (
@@ -381,7 +389,7 @@ export function NeedsYouPane({
             {overflow > 0 && !strip && (
               <PaneRow className="justify-center">
                 <Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">
-                  See all {count} in Inbox
+                  {overflow} more in Needs you
                 </Link>
               </PaneRow>
             )}

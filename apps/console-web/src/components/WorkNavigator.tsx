@@ -65,8 +65,8 @@ export function RecentWork({ onHistory }: { onHistory: () => void }) {
   const catalog = useWorkCatalog(true, 'chat');
   const items = searchWorkItems(catalog.items, '', 5);
   return (
-    <section className="mb-3 border-b border-border pb-3" aria-labelledby="work-recent-heading">
-      <div className="flex items-center justify-between gap-2 px-2 pb-1 pt-2">
+    <section className="border-t border-border pt-3" aria-labelledby="work-recent-heading">
+      <div className="flex items-center justify-between gap-2 px-2 pb-1">
         <h2 id="work-recent-heading" className="text-caption font-semibold text-muted">Recent chats</h2>
         <button type="button" onClick={onHistory} className="rounded-sm text-caption text-muted hover:text-fg hover:underline">All chats</button>
       </div>
