@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { appPlaceHref, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
+import { appPlaceHref, fromClemSourceName, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
 import { fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
@@ -108,7 +108,7 @@ export function FromClemPane({
 
   const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
     const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
-    return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, row.heartbeatTitle), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
+    return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, fromClemSourceName(row)), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
   });
 
   /** The answers on the row itself: hers when she offered some, else the
@@ -160,7 +160,7 @@ export function FromClemPane({
 
   const meta = (row: FromClemRow) => (
     <span className="flex items-center gap-2 text-caption text-faint">
-      <span className="font-semibold text-muted">{row.heartbeatTitle}</span>
+      <span className="font-semibold text-muted">{fromClemSourceName(row)}</span>
       <span aria-hidden>·</span>
       <span>{agoLabel(row.at)}</span>
       {drafts[row.key]?.trim() && openKey !== row.key && <span className="ml-auto text-muted">Draft saved</span>}

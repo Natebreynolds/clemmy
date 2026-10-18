@@ -15096,7 +15096,8 @@ export function registerConsoleRoutes(
         ...planProposals.map((proposal) => ({
           kind: 'plan',
           title: proposal.plan?.objective || proposal.originatingRequest || proposal.id,
-          meta: `plan ${proposal.id}`,
+          // An id read as noise to the owner ("plan wfask-4f5dbd02").
+          meta: 'A plan to look over before it runs',
           panel: 'settings',
           urgency: 'high',
           planProposalId: proposal.id,
@@ -15107,7 +15108,7 @@ export function registerConsoleRoutes(
         ...checkInProposals.map((proposal) => ({
           kind: 'proposal',
           title: proposal.name || proposal.description || proposal.id,
-          meta: 'check-in proposal',
+          meta: 'A check-in Clem suggests',
           panel: 'settings',
           urgency: 'normal',
           dismissKind: 'proposal',

@@ -365,15 +365,17 @@ function emitTerminalReportBack(
 ): void {
   const label = (session.title ?? '').trim() || 'your request';
   const titlePrefix: Record<TurnOutcomeStatus, string> = {
-    done: 'Chat run completed',
-    needs_input: 'Chat run needs you',
-    blocked: 'Chat run blocked',
-    failed: 'Chat run failed',
-    cancelled: 'Chat run cancelled',
+    // Plain words a first-time owner reads at a glance (owner 2026-10-18:
+    // "easy enough for the most novice AI user"); "Chat run" was engine talk.
+    done: 'Finished',
+    needs_input: 'Needs your answer',
+    blocked: 'Couldn\'t finish',
+    failed: 'Something went wrong',
+    cancelled: 'Cancelled',
     // Not "cancelled": the work is still running under a background owner, and
     // the report-back the user gets has to say which of those two happened.
-    transferred: 'Chat run moved to the background',
-    uncertain: 'Chat run needs reconciliation',
+    transferred: 'Still working in the background',
+    uncertain: 'Not sure it finished',
   };
   // A finished run leads with its answer. Anything else leads with its status,
   // because a stop the owner has to act on is not scannable as prose — they

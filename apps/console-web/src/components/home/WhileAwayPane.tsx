@@ -11,6 +11,11 @@ const MAX_ROWS = 5;
  * list (a tile) or a timeline down the page (Briefing). Notification delivery
  * must not be presented as task completion.
  */
+/** A second line that only repeats the title says nothing new. */
+function distinctMeta(meta: string, title?: string): string {
+  return meta && plainText(meta, 200) !== plainText(title, 200) ? meta : '';
+}
+
 export function WhileAwayPane({
   items,
   loading,
@@ -39,7 +44,7 @@ export function WhileAwayPane({
           {visible.map((item, index) => {
             const outcome = awayOutcome(item);
             const href = awayTarget(item);
-            const meta = awayMeta(item);
+            const meta = distinctMeta(awayMeta(item), item.title);
             const key = item.notifId ?? item.taskId ?? item.targetRunId ?? `${index}:${item.title ?? ''}`;
             const text = (
               <span className="min-w-0 flex-1 text-body">
@@ -85,7 +90,7 @@ export function WhileAwayPane({
           visible.map((item, index) => {
             const outcome = awayOutcome(item);
             const href = awayTarget(item);
-            const meta = awayMeta(item);
+            const meta = distinctMeta(awayMeta(item), item.title);
             const time = clockLabel(item.createdAt);
             const body = (
               <>

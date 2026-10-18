@@ -57,3 +57,16 @@ export function workflowDisplayName(name: string, description?: string | null): 
 export function workflowCaption(name: string, description?: string | null): string {
   return workflowDisplayName(name, description) === name.trim() ? '' : name.trim();
 }
+
+/** What a From Clem row came from, as the owner reads it: a watch by its
+ *  workflow's readable name (the stored "Your <source> watch" wrapped the
+ *  owner's own description, path and all: "Your Nate's client note folder
+ *  ~/notes watch"), a workflow report by its readable name, anything else as
+ *  the server titled it. */
+export function fromClemSourceName(row: { heartbeat: string; heartbeatTitle: string }): string {
+  if (row.heartbeat.startsWith('watch:') && row.heartbeat.length > 'watch:'.length) {
+    return workflowDisplayName(row.heartbeat.slice('watch:'.length));
+  }
+  if (row.heartbeat === 'workflow' && row.heartbeatTitle.trim()) return workflowDisplayName(row.heartbeatTitle);
+  return row.heartbeatTitle;
+}
