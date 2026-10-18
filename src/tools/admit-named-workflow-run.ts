@@ -22,7 +22,6 @@ import { listEvents } from '../runtime/harness/eventlog.js';
 import { workflowOriginReplyTargetForSource } from '../runtime/workflow-origin-authority.js';
 import { prepareWorkflowChatDispatch } from '../runtime/harness/workflow-chat-dispatch-prepare.js';
 import { queueWorkflowRun, pendingWorkflowVerification } from './workflow-run-queue.js';
-import { disabledWorkflowRunMessage } from './workflow-verification-state.js';
 import { workflowNamesEqual } from './workflow-resolve.js';
 import { linkFocusActionForSession } from '../memory/focus.js';
 
@@ -73,14 +72,13 @@ export function admitNamedWorkflowRunFromAcceptedSource(
   }
   const canonicalName = workflow.data.name;
   const verificationRunId = !workflow.data.enabled ? pendingWorkflowVerification(canonicalName, workflow.data) : undefined;
-  if (!workflow.data.enabled && !verificationRunId) {
-    return {
-      ok: false,
-      status: 'disabled',
-      workflowName: canonicalName,
-      message: disabledWorkflowRunMessage(canonicalName, pendingWorkflowVerification(canonicalName, workflow.data)),
-    };
-  }
+  // A run the owner asks for now is a one-shot request: it runs once and the
+  // workflow stays off for its schedule (the queue's acceptDisabled contract;
+  // effects inside still meet their own approvals). Refusing it made "run it
+  // once and leave it off" impossible: live 2026-10-18 the brain enabled the
+  // workflow to queue the run, disabled it again to honor "leave it off", and
+  // the run — released after the turn — was refused as disabled.
+  const oneShotWhileOff = !workflow.data.enabled && !verificationRunId;
 
   const normalizedInputs = normalizeWorkflowRunInputs(input.inputs ?? {});
   const runCertification = certifyWorkflow(workflow.data, {
@@ -149,6 +147,7 @@ export function admitNamedWorkflowRunFromAcceptedSource(
     : undefined;
   const queued = queueWorkflowRun(canonicalName, normalizedInputs, {
     ...(verificationRunId ? { verificationRunId } : {}),
+    ...(oneShotWhileOff ? { acceptDisabled: true } : {}),
     ...(originObserver
       ? {
           originObserver,
@@ -189,7 +188,9 @@ export function admitNamedWorkflowRunFromAcceptedSource(
     workflowName: canonicalName,
     message: verificationRunId
       ? `Requested execution ${queued.id ?? "(not admitted)"} depends on verification ${verificationRunId}. It will execute only after that exact verification passes and this saved definition is enabled. Do not queue another run or do the work independently. ${queued.message}`
-      : queued.message,
+      : oneShotWhileOff && ok
+        ? `${queued.message}\nThis is a one-time run: "${canonicalName}" stays off for its schedule. Do not enable it to run it, and do not disable it again.`
+        : queued.message,
     ...(queued.id ? { runId: queued.id } : {}),
     ...(queued.chatDispatchPreparation ? { chatDispatchPreparation: queued.chatDispatchPreparation } : {}),
   };

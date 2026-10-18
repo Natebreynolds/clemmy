@@ -7,9 +7,18 @@ import { disabledWorkflowRunMessage } from './workflow-verification-state.js';
 const ADMIT = readFileSync(new URL('./admit-named-workflow-run.ts', import.meta.url), 'utf8');
 const QUEUE = readFileSync(new URL('./workflow-run-queue.ts', import.meta.url), 'utf8');
 
-for (const [label, src] of [['admit', ADMIT], ['queue', QUEUE]]) {
+test('admit: a run the owner asks for of a disabled workflow runs once and leaves it off', () => {
+  // Live 2026-10-18 "run it once now and leave it off" was impossible: the
+  // brain enabled the workflow to queue it, disabled it again, and the run
+  // released after the turn was refused as disabled.
+  assert.match(ADMIT, /oneShotWhileOff = !workflow\.data\.enabled && !verificationRunId/);
+  assert.match(ADMIT, /oneShotWhileOff \? \{ acceptDisabled: true \}/, 'the queue carries the one-shot contract');
+  assert.match(ADMIT, /stays off for its schedule/, 'the reply says it stays off');
+});
+
+for (const [label, src] of [['queue', QUEUE]]) {
   test(`${label}: a disabled saved workflow retains the requested execution and names its enablement door`, () => {
-    assert.match(src, /disabledWorkflowRunMessage\(/, 'both entry points share the recovery guidance');
+    assert.match(src, /disabledWorkflowRunMessage\(/, 'the resume entry point shares the recovery guidance');
     const message = disabledWorkflowRunMessage('Quarterly refresh');
     assert.match(message, /Quarterly refresh/);
     assert.match(message, /no execution was queued/);

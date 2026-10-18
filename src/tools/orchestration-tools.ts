@@ -1236,7 +1236,7 @@ export function registerOrchestrationTools(server: McpServer): void {
     {
       name: z.string().min(1),
       description: z.string().min(1),
-      enabled: z.boolean().optional().describe('False saves a disabled draft and keeps it disabled after verification. Omit for normal activation after successful verification.'),
+      enabled: z.boolean().optional().describe('False saves a disabled draft and keeps it disabled after verification: pass false whenever the owner says to leave it off, not to schedule it, or to run it only when asked. Omit for normal activation after successful verification.'),
       steps: z.array(z.object({
         id: z.string().min(1),
         prompt: z.string().optional().describe('Model task; omit for call/transform. Dependencies arrive in STEP CONTEXT.upstream. Templates: {{steps.<id>.output}}, {{input.<key>}}, {{project.path}}, {{project.name}}, {{item}} with forEach.'),
