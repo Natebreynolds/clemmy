@@ -459,7 +459,7 @@
           "bytes": 953
         },
         "src/runtime/harness/resilient-model.ts": {
-          "bytes": 50485
+          "bytes": 51121
         },
         "src/runtime/harness/judge-fallback-policy.ts": {
           "bytes": 1613
@@ -2850,7 +2850,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 727352
+          "bytes": 727873
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -4392,7 +4392,7 @@
           "bytes": 953
         },
         "src/runtime/harness/resilient-model.ts": {
-          "bytes": 50485
+          "bytes": 51121
         },
         "src/runtime/harness/judge-fallback-policy.ts": {
           "bytes": 1613
@@ -6783,7 +6783,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 727352
+          "bytes": 727873
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624

@@ -107,7 +107,7 @@ import { isToolMediaContent, toolMediaText } from './tool-media-content.js';
 import { admitModelStep, codexOneStep } from './codex-one-step.js';
 import { BoundaryError } from '../boundary-error.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
-import { classifyModelError, modelRetriesSpentBeforeContent, withModelResilienceTelemetry } from './resilient-model.js';
+import { classifyModelError, modelRetriesSpentBeforeContent, networkLookupFailed, withModelResilienceTelemetry } from './resilient-model.js';
 import { createModelResilienceObservation } from './model-resilience-observation.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { serializeAdvertisedTools, toolsOnAdvertisedWire, usesSessionWireOrder } from './advertised-tool-wire.js';
@@ -11335,8 +11335,13 @@ const runHostTurnBody = async (
         return blockedOutcome(HOST_MODEL_STALL_BLOCKED_TEXT, 'model_stalled');
       }
       if (transportInterrupted && !signal?.aborted && !bufferedRequestInFlight) {
+        // A name lookup that failed is this computer being offline, not the
+        // model: say what the owner can act on. Live 2026-10-18: Slack,
+        // Discord, the phone relay and the brain all failed with ENOTFOUND.
         const waiting = blockedOutcome(
-          'The connection to my model keeps dropping. I saved the completed work and have not run any tool calls from the interrupted response. Would you like me to try continuing from here?',
+          networkLookupFailed(error)
+            ? 'This computer can\'t reach the internet right now, so I can\'t reach my model. I saved the completed work and have not run any tool calls from the interrupted response. Would you like me to try continuing from here?'
+            : 'The connection to my model keeps dropping. I saved the completed work and have not run any tool calls from the interrupted response. Would you like me to try continuing from here?',
           'model_transport_unavailable',
         );
         return { ...waiting, terminal: { status: 'awaiting_user_input', reason: 'model_transport_unavailable' } };

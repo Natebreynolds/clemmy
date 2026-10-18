@@ -346,6 +346,19 @@ export function modelRetriesSpentBeforeContent(err: unknown): boolean {
   return !!err && typeof err === 'object' && retriesSpentBeforeContent.has(err);
 }
 
+/** True when the failure is a name lookup that found nothing (undici's
+ *  `cause.code`), which means this computer is offline or has no working DNS,
+ *  not that the provider dropped the connection. Read from codes only. */
+export function networkLookupFailed(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current && typeof current === 'object'; depth += 1) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && /^(ENOTFOUND|EAI_AGAIN|EAI_NONAME)$/.test(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 /** One model call across its attempts. `noAnswerRetries` counts only the
  * retries granted after the provider gave no answer. */
 interface NoAnswerCall {

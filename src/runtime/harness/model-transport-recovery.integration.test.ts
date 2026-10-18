@@ -202,6 +202,29 @@ test('a provider that never answers ends in a resumable question after one bound
   assert.ok(completed.every(event => event.data.status !== 'failed'), 'the turn is not recorded as failed');
 });
 
+/** undici's shape for a name lookup that failed: this computer is offline. */
+function lookupFailed(): never {
+  const cause = Object.assign(new Error('getaddrinfo ENOTFOUND transport-recovery-fixture.invalid'),
+    { code: 'ENOTFOUND', errno: -3008, syscall: 'getaddrinfo', hostname: 'transport-recovery-fixture.invalid' });
+  throw Object.assign(new TypeError('fetch failed'), { cause });
+}
+
+test('a brain whose address cannot be looked up says this computer is offline, not that the model keeps dropping', async () => {
+  // Live 2026-10-18: the Mac lost its name lookups (Slack, Discord, the phone
+  // relay and every model failed with ENOTFOUND). Clem asked whether to keep
+  // going because "the connection to my model keeps dropping"; the owner has
+  // to check their internet, not their model.
+  const session = HarnessSession.create({ kind: 'chat', title: 'offline' });
+  fakeWire(() => lookupFailed());
+  const result = await runChatTurn(session.id, productionBrain(session.id));
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.match(String(result.finalOutput), /^This computer can't reach the internet right now, so I can't reach my model\./);
+  assert.match(String(result.finalOutput), /Would you like me to try continuing from here\?/);
+  assert.doesNotMatch(String(result.finalOutput), /keeps dropping/);
+  const waiting = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(waiting[0]?.data.reason, 'model_transport_unavailable', 'the same resumable wait');
+});
+
 function rateLimited(): Response {
   return new Response(JSON.stringify({ error: { message: 'Too many requests', type: 'rate_limit_error' } }),
     { status: 429, headers: { 'content-type': 'application/json' } });
