@@ -5,7 +5,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate } from '@clem/chat-engine';
+import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate, isIdentifierLike } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -332,6 +332,11 @@ function TerminalContinueButton({ onContinue }: { onContinue: () => Promise<void
 /** Client-written stand-in when Stop fires before any tokens. The StatusPill
  *  is the record — do not wrap this string in a hollow reply card. */
 const STOPPED_PLACEHOLDER = 'Stopped.';
+
+/** A field the owner reads on the card: not a bare id, which stays under Details. */
+function plainApprovalField(field: { name: string; value: string }): boolean {
+  return !(isIdentifierLike(String(field.value ?? '')) || /\bids?$/i.test(approvalFieldLabel(field.name).trim()));
+}
 
 export function ChatBubble({
   message,
@@ -748,16 +753,29 @@ export function ChatBubble({
                 </div>
               )}
               <dl className={cn('mt-2 space-y-1.5 text-caption', editing && 'opacity-60')}>
-                {message.approval.preview.fields.filter((field) => !field.detail).map((field) => {
+                {/* Plain first, as in Needs you (owner 2026-10-18: no weird
+                    approval messages): a bare id stays under Details and a
+                    long block (a script, a page of text) folds behind its label. */}
+                {message.approval.preview.fields.filter((field) => !field.detail && plainApprovalField(field)).map((field) => {
                   const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
                   const changed = Boolean(was && was.value !== field.value);
+                  const shown = field.label ?? field.display ?? field.value;
                   return (
                     <div key={field.name}>
                       <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
+                      {!changed && String(shown).length > 280 ? (
+                        <dd>
+                          <details className="rounded-md border border-border bg-subtle">
+                            <summary className="cursor-pointer px-2.5 py-1.5 font-semibold text-muted">Show the full {approvalFieldLabel(field.name).toLowerCase()}</summary>
+                            <p className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-border px-2.5 py-2 text-fg">{shown}</p>
+                          </details>
+                        </dd>
+                      ) : (
                       <dd className={cn('whitespace-pre-wrap break-words text-fg', changed && '-mx-1.5 rounded bg-primary-tint px-1.5 py-0.5')}>
                         {/* A named id reads as its name; the id itself is under Details. */}
-                        {field.label ?? field.display ?? field.value}
+                        {shown}
                       </dd>
+                      )}
                       {changed && (
                         // The change in words, shown as a change: what it was, struck.
                         <dd className="mt-0.5 text-muted">Was: <span className="line-through">{was!.value}</span></dd>
@@ -766,14 +784,14 @@ export function ChatBubble({
                   );
                 })}
               </dl>
-              {message.approval.preview.fields.some((field) => field.detail || field.label || field.display) && (
+              {message.approval.preview.fields.some((field) => field.detail || field.label || field.display || !plainApprovalField(field)) && (
                 // The plumbing (ids, flags, the raw JSON) stays one tap away,
                 // never in the way of what the owner is approving.
                 <details className="mt-2 text-caption text-muted">
                   <summary className="cursor-pointer select-none">Details</summary>
                   <dl className="mt-1.5 space-y-1">
                     {message.approval.preview.fields
-                      .filter((field) => field.detail || field.label || field.display)
+                      .filter((field) => field.detail || field.label || field.display || !plainApprovalField(field))
                       .map((field) => (
                         <div key={field.name}>
                           <dt>{approvalFieldLabel(field.name)}</dt>
