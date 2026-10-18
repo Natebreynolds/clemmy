@@ -55,3 +55,17 @@ export function appPlaceHref(id: string, surface: 'desktop' | 'phone'): string |
   if (surface === 'desktop') return place.desktop;
   return place.phone ? `/m/${place.phone}` : null;
 }
+
+/** One thing Clem built that a reply can open directly, as
+ *  `[Open <title>](app:space:<id>)` or `[Open <name>](app:workflow:<name>)`.
+ *  The id is the slug Clementine assigned, so only that thing's own page opens. */
+const APP_ITEM_ID = /^[a-z0-9](?:[a-z0-9_-]{0,78}[a-z0-9])?$/;
+
+/** Where one Space or workflow opens on a surface; undefined when the link is
+ *  not a known kind with a well-formed id. */
+export function appItemHref(kind: string, id: string, surface: 'desktop' | 'phone'): string | undefined {
+  if (!APP_ITEM_ID.test(id)) return undefined;
+  if (kind === 'space') return surface === 'desktop' ? `/workspaces/${id}` : `/m/?tab=spaces&workspace=${id}`;
+  if (kind === 'workflow') return surface === 'desktop' ? `/automate/${id}` : '/m/?tab=workflows';
+  return undefined;
+}

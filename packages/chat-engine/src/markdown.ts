@@ -13,7 +13,7 @@
  * practice, and a flat list renders those fine too).
  */
 
-import { appPlace, appPlaceHref } from './app-places.js';
+import { appItemHref, appPlace, appPlaceHref } from './app-places.js';
 
 export interface RenderMarkdownOptions {
   /** Activate the same-origin mobile Workspace route. Only the phone serves
@@ -51,6 +51,12 @@ function renderInline(escaped: string, options: RenderMarkdownOptions): string {
     return `\u0000${held.length - 1}\u0000`;
   };
   out = out.replace(/`([^`\n]+)`/g, (_m, code: string) => hold(`<code>${code}</code>`));
+  // One Space or workflow Clem built opens its own page.
+  out = out.replace(/\[([^\]\n]+)\]\(app:([a-z]+):([a-z0-9_-]{1,80})\)/g, (_m, label: string, kind: string, id: string) => {
+    const surface = options.appPlaceLinks;
+    const href = surface ? appItemHref(kind, id, surface) : undefined;
+    return href ? hold(`<a href="${escapeHtml(href)}" class="app-place-link" data-app-item="${kind}">${label}</a>`) : hold(label);
+  });
   out = out.replace(/\[([^\]\n]+)\]\(app:([a-z][a-z-]{0,40})\)/g, (_m, label: string, id: string) => {
     const surface = options.appPlaceLinks;
     if (!surface || !appPlace(id)) return hold(label);
@@ -58,6 +64,9 @@ function renderInline(escaped: string, options: RenderMarkdownOptions): string {
     if (!href) return hold(`<span class="app-place-elsewhere">${label} (on your computer)</span>`);
     return hold(`<a href="${escapeHtml(href)}" class="app-place-link" data-app-place="${id}">${label}</a>`);
   });
+  // Any other app link is a place Clementine does not have: its label, never
+  // the raw markdown.
+  out = out.replace(/\[([^\]\n]+)\]\(app:[^)\s]{0,120}\)/g, (_m, label: string) => hold(label));
   out = out.replace(
     /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+|\/m\/\?tab=spaces&amp;workspace=[a-z0-9][a-z0-9-]{0,61}[a-z0-9])\)/g,
     (match, label: string, href: string) => {

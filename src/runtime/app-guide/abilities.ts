@@ -229,6 +229,6 @@ export function appGuideText(abilities: readonly AppAbility[], options: { places
     lines.push('', 'Places (id: name, what it is for):');
     for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (on the computer, not the phone)'}`);
   }
-  lines.push('', 'To send the owner to a place, link it in your reply as [Open <name>](app:<id>); they tap it to go there. Say what to do once they are there.');
+  lines.push('', 'To send the owner to a place, link it in your reply as [Open <name>](app:<id>); they tap it to go there. Say what to do once they are there. To open one Space or workflow itself, link it as [Open <title>](app:space:<id>) or [Open <name>](app:workflow:<name>) with its exact id.');
   return lines.join('\n');
 }

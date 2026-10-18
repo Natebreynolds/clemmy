@@ -81,3 +81,20 @@ test('a place link label is escaped like every other reply text', () => {
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
 });
+
+test('a Space or workflow Clem built opens its own page, and a malformed app link is just its label', () => {
+  // Live 2026-10-18: "Created [Shelf gptcache](app:space:shelf-gptcache)" reached
+  // the owner as raw markdown.
+  const desktop = renderMarkdown('Created [Shelf gptcache](app:space:shelf-gptcache) with 60 books.', { appPlaceLinks: 'desktop' });
+  assert.match(desktop, /<a href="\/workspaces\/shelf-gptcache" class="app-place-link" data-app-item="space">Shelf gptcache<\/a>/);
+  assert.match(renderMarkdown('[Open it](app:space:shelf-gptcache)', { appPlaceLinks: 'phone' }),
+    /href="\/m\/\?tab=spaces&amp;workspace=shelf-gptcache"/);
+  assert.match(renderMarkdown('[Open it](app:workflow:books-toscrape-page7-csv)', { appPlaceLinks: 'desktop' }),
+    /href="\/automate\/books-toscrape-page7-csv"/);
+  for (const md of ['[Open it](app:vault:x)', '[Open it](app:space:../settings)', '[Open it](app:space:Shelf%20One)', '[Open it](app:space:shelf-gptcache)']) {
+    const html = renderMarkdown(md, md.endsWith('shelf-gptcache)') ? {} : { appPlaceLinks: 'desktop' });
+    assert.doesNotMatch(html, /<a /, md);
+    assert.doesNotMatch(html, /app:/, md);
+    assert.match(html, /Open it/, md);
+  }
+});
