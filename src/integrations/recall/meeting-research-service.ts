@@ -17,6 +17,7 @@ import { createMeetingResearchCoordinator, type MeetingResearchBoundary, type Me
   type MeetingResearchTask } from './meeting-research.js';
 import { installMeetingResearchBoundary } from './meeting-research-boundary.js';
 import { createMeetingResearchController } from './meeting-research-controller.js';
+import { createMeetingResearchExecutor } from './meeting-research-executor.js';
 
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const factRefs = z.array(z.object({ id: z.number().int().positive(), digest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -92,19 +93,7 @@ async function closeResearchFailure(task: MeetingResearchTask, cancelled: boolea
 
 /** The default uses the ordinary accepted-task host, review and Stop policy.
  * Tests replace only execution; acceptance/leases/source identity stay real. */
-export function createMeetingResearchTaskDispatch(execute: MeetingResearchExecutionPort = async input => {
-  const [{ runConversation }, { buildOrchestratorAgent }] = await Promise.all([
-    import('../../runtime/harness/loop.js'), import('../../agents/orchestrator.js'),
-  ]);
-  return runConversation({ ...input, sourceUserSeq: input.sourceUserSeq, reuseRecordedUserInput: true,
-    learningPolicy: { version: 1, mode: 'exclude', reason: 'owner_opt_out' },
-    suppressMemoryCapture: true, suppressAutomaticMemoryForRequest: true, mcpToolScope: null,
-    maxSteps: 1, maxTurns: 2, maxWallClockMs: 90_000, maxRunTokens: 32_000, callerOwnsRecovery: true,
-    judgeCompletion: true,
-    buildAgent: identity => buildOrchestratorAgent({ sessionId: input.sessionId, sourceUserSeq: identity.sourceUserSeq,
-      userInput: input.input, allowedToolNames: [], allowToolJit: false }),
-  });
-}): MeetingResearchCoordinatorOptions['dispatch'] {
+export function createMeetingResearchTaskDispatch(execute: MeetingResearchExecutionPort = createMeetingResearchExecutor()): MeetingResearchCoordinatorOptions['dispatch'] {
   return async input => {
     let boundary: MeetingResearchBoundary;
     let evidence: ReturnType<typeof prepareMeetingResearchEvidence>;
