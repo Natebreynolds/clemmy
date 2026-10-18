@@ -311,7 +311,9 @@ export function attemptSignalsFromShellExecutionOutcome(
       ...(answered ? { providerAnsweredFailure: true } : shell.externalMutation ? { acknowledged: false } : {}),
       ...(!shell.externalMutation && shell.answeredStdoutDigest
         ? { answeredReadDigest: shell.answeredStdoutDigest }
-        : {}),
+        : !shell.externalMutation && shell.answeredOnStderr === true && shell.errorKind === 'nonzero_exit'
+          ? { answeredReadExit: true }
+          : {}),
     };
   }
   if (shell.exitCode === 0) {
