@@ -1,4 +1,4 @@
-import type { ProjectOverview, ProjectSummary } from '@clem/chat-engine';
+import { workflowDisplayName, type ProjectOverview, type ProjectSummary } from '@clem/chat-engine';
 import type { Session } from '../features/conversations/types';
 import type { AgentRecord } from './agents';
 import type { WorkflowRow } from './automate';
@@ -44,7 +44,7 @@ export function workItems(catalog: WorkCatalog): WorkItem[] {
   return [
     ...(catalog.projects ?? []).filter(p => p.status !== 'archived').map(p => ({ key: `project:${p.id}`, kind: 'project' as const, title: p.name, path: workPath('project', p.id), detail: p.purpose, updatedAt: p.updatedAt })),
     ...(catalog.spaces ?? []).filter(s => s.status !== 'archived').map(s => ({ key: `space:${s.id}`, kind: 'space' as const, title: s.title, path: workPath('space', s.id), detail: s.contract?.objective, updatedAt: s.lastOpenedAt ?? s.updatedAt })),
-    ...(catalog.workflows ?? []).map(w => ({ key: `workflow:${w.name}`, kind: 'workflow' as const, title: w.name, path: workPath('workflow', w.name), detail: w.description, updatedAt: w.lastRunAt })),
+    ...(catalog.workflows ?? []).map(w => ({ key: `workflow:${w.name}`, kind: 'workflow' as const, title: workflowDisplayName(w.name, w.description), path: workPath('workflow', w.name), detail: w.description, updatedAt: w.lastRunAt })),
     ...(catalog.agents ?? []).map(a => ({ key: `agent:${a.id}`, kind: 'agent' as const, title: a.name, path: workPath('agent', a.id), detail: a.handles, updatedAt: a.updatedAt })),
     ...(catalog.chats ?? []).filter(s => !s.archived && !(s.store === 'desktop' && s.turnCount === 0)).map(s => ({ key: `chat:${s.id}`, kind: 'chat' as const, title: s.title || 'Untitled chat', path: workPath('chat', s.id), detail: [s.projectName, s.agentName].filter(Boolean).join(' · '), updatedAt: s.updatedAt, pinned: s.pinned, running: s.running })),
   ];
@@ -67,7 +67,8 @@ export function searchWorkItems(items: readonly WorkItem[], query = '', limit = 
   return items.filter(item => {
     if (seen.has(item.key)) return false;
     seen.add(item.key);
-    const text = `${item.title} ${item.detail ?? ''} ${WORK_KIND_LABEL[item.kind]}`.toLocaleLowerCase();
+    // The key keeps a slug findable when the title shows a readable name.
+    const text = `${item.title} ${item.detail ?? ''} ${WORK_KIND_LABEL[item.kind]} ${item.key}`.toLocaleLowerCase();
     return words.every(word => text.includes(word));
   }).sort((a, b) => score(b) - score(a) || Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || timestamp(b) - timestamp(a) || a.title.localeCompare(b.title)).slice(0, Math.max(0, limit));
 }
