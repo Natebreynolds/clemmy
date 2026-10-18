@@ -825,7 +825,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 81029
+          "bytes": 82127
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -1374,7 +1374,7 @@
           "bytes": 7370
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 185561
+          "bytes": 185771
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -2565,7 +2565,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 48863
+          "bytes": 49100
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -4758,7 +4758,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 81029
+          "bytes": 82127
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -5307,7 +5307,7 @@
           "bytes": 7370
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 185561
+          "bytes": 185771
         },
         "src/runtime/harness/goal-fidelity-gate.ts": {
           "bytes": 48478
@@ -6498,7 +6498,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 48863
+          "bytes": 49100
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
