@@ -28,6 +28,35 @@ function sdkFinal(utteranceId = 'utterance-1') {
   return { text: 'A controlled final', recording_id: 'final-recording', utterance_id: utteranceId, participant: { id: 7 } };
 }
 
+test('exact dashboard detection is rechecked after initialize, token creation and daemon admission before native recording', async () => {
+  const windowId = 'controlled-generation-window'; const detectedAt = '2026-10-18T10:00:00.000Z';
+  for (const changeAt of ['initialize', 'upload', 'admission', 'unchanged'] as const) {
+    let nativeStarts = 0; let uploads = 0; let admissions = 0;
+    const capture = new RecallDesktopCapture({ getDaemonBaseUrl: () => '', getWebhookToken: () => '',
+      emit: () => undefined, runtime: { platform: 'darwin', arch: 'arm64' } });
+    const detected = new Map([[windowId, { windowId, detectedAt, recording: false }]]);
+    const replace = () => detected.set(windowId, { windowId, detectedAt: '2026-10-18T10:01:00.000Z', recording: false });
+    Reflect.set(capture, 'detectedWindows', detected);
+    Reflect.set(capture, 'initialize', async () => { if (changeAt === 'initialize') replace(); });
+    Reflect.set(capture, 'sdk', { startRecording: async () => { nativeStarts++; } });
+    Reflect.set(capture, 'postDaemon', async (pathname: string) => {
+      if (pathname.endsWith('/upload-token')) { uploads++; if (changeAt === 'upload') replace(); return { uploadToken: 'controlled-token', sdkUploadId: 'controlled-upload' }; }
+      if (pathname.endsWith('/detected')) { admissions++; if (changeAt === 'admission') replace(); }
+      return {};
+    });
+    if (changeAt === 'unchanged') {
+      await capture.recordDetectedWindow(windowId, detectedAt);
+      assert.equal(nativeStarts, 1); assert.equal(uploads, 1); assert.equal(admissions, 2);
+    } else {
+      await assert.rejects(capture.recordDetectedWindow(windowId, detectedAt), /detection is no longer current/);
+      assert.equal(nativeStarts, 0, changeAt);
+      assert.equal(uploads, changeAt === 'initialize' ? 0 : 1, changeAt);
+      assert.equal(admissions, changeAt === 'admission' ? 1 : 0, changeAt);
+      assert.equal(capture.status().recording, false, 'failed generation must not leave a phantom recording');
+    }
+  }
+});
+
 test('final delivery retries only the same frozen event and waits for acknowledgement', async () => {
   const payloads: Array<Record<string, unknown>> = [];
   const { events, send } = finalDeliveryHarness(async (_pathname, payload) => {
@@ -625,6 +654,12 @@ test('SDK upload id is never treated as the canonical Recall recording id', asyn
   assert.equal(detected?.body.sdkUploadId, 'sdk-upload-123');
   assert.equal(detected?.body.sdkUploadRegion, 'eu-central-1');
   assert.equal(detected?.body.recordingId, undefined);
+  const uploadDetections = daemonCalls.filter((call) => call.pathname.endsWith('/detected') && call.body.sdkUploadId === 'sdk-upload-123');
+  assert.equal(uploadDetections.length, 2, 'pre-start and confirmed store calls bind the same upload');
+  const epoch = capture.status().recordingStartedAt;
+  assert.ok(epoch); assert.equal(new Date(epoch).toISOString(), epoch);
+  assert.deepEqual(uploadDetections.map((call) => call.body.recordingStartedAt), [epoch, epoch], 'both stores use the native capture epoch verbatim');
+  assert.deepEqual(uploadDetections.map((call) => call.body.status), ['detected', 'recording']);
 
   // Changing the default while a capture is in progress must not retarget
   // this upload's later reconciliation to a different data region.

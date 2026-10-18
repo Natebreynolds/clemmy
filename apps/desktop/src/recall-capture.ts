@@ -1090,14 +1090,24 @@ export class RecallDesktopCapture {
    * detected (vs `startManualRecording()` which spins up a generic
    * desktop-audio capture not tied to any window).
    */
-  async recordDetectedWindow(windowId: string): Promise<RecallCaptureStatus> {
+  async recordDetectedWindow(windowId: string, expectedDetectedAt?: string): Promise<RecallCaptureStatus> {
     await this.initialize();
+    this.assertDetectedGeneration(windowId, expectedDetectedAt);
     const existing = this.detectedWindows.get(windowId);
     await this.startRecording(windowId, {
       platform: existing?.platform,
       title: existing?.title,
+      ...(expectedDetectedAt !== undefined ? { expectedDetectedAt } : {}),
     });
     return this.status();
+  }
+
+  private assertDetectedGeneration(windowId: string, expectedDetectedAt?: string): void {
+    if (expectedDetectedAt === undefined) return; // legacy callers retain their existing behavior
+    const detected = this.detectedWindows.get(windowId);
+    if (!detected || detected.detectedAt !== expectedDetectedAt || this.userDismissedWindows.has(windowId)) {
+      throw new Error('That meeting detection is no longer current.');
+    }
   }
 
   /** Notch prompt path: unlike the dashboard's legacy method, this requires
@@ -1254,7 +1264,7 @@ export class RecallDesktopCapture {
 
   private async startRecording(
     windowId: string,
-    meta: { platform?: string; title?: string } = {},
+    meta: { platform?: string; title?: string; expectedDetectedAt?: string } = {},
     signal?: AbortSignal,
   ): Promise<void> {
     if (!this.sdk) throw new Error('Recall SDK is unavailable.');
@@ -1290,7 +1300,7 @@ export class RecallDesktopCapture {
 
   private async startRecordingOnce(
     windowId: string,
-    meta: { platform?: string; title?: string },
+    meta: { platform?: string; title?: string; expectedDetectedAt?: string },
     signal?: AbortSignal,
   ): Promise<void> {
     const sdk = this.sdk;
@@ -1307,6 +1317,7 @@ export class RecallDesktopCapture {
       liveTranscript: this.settings.liveTranscript,
       region: requestedRegion,
     }, 'POST', signal);
+    this.assertDetectedGeneration(windowId, meta.expectedDetectedAt);
     const sdkUploadId = upload.sdkUploadId ?? upload.id;
     if (!sdkUploadId) {
       throw new Error('Clementine did not receive a Recall SDK upload id; recording was not started.');
@@ -1348,8 +1359,10 @@ export class RecallDesktopCapture {
       // detected placeholders rather than phantom recording sessions.
       await this.postDaemon('/api/console/meetings/recall/detected', {
         windowId, sdkUploadId, sdkUploadRegion, recallRetentionMode, recallRetentionHours,
+        recordingStartedAt: startedAt,
         platform: meta.platform, title: meta.title, status: 'detected',
       }, 'POST', signal);
+      this.assertDetectedGeneration(windowId, meta.expectedDetectedAt);
       await sdk.startRecording({ windowId, uploadToken: upload.uploadToken });
     } catch (error) {
       const ownsContext = this.currentWindowId === windowId
@@ -1392,6 +1405,7 @@ export class RecallDesktopCapture {
     await this.postDaemon('/api/console/meetings/recall/detected', {
       windowId,
       sdkUploadId,
+      recordingStartedAt: startedAt,
       sdkUploadRegion,
       recallRetentionMode,
       recallRetentionHours,

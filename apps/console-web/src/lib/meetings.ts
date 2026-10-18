@@ -18,6 +18,8 @@ export interface RecallStatus {
   activeWindowId?: string;
   /** startedAt of that active recording, so notes can be timestamped. */
   activeStartedAt?: string;
+  /** Exact native recording epoch; separate from first detection. */
+  activeRecordingStartedAt?: string;
   regions?: Record<string, string>;
   docsUrl?: string;
 }
@@ -90,6 +92,7 @@ export interface MeetingSummary {
   platform?: string;
   status?: string;
   startedAt?: string;
+  recordingStartedAt?: string;
   endedAt?: string;
   segmentCount?: number;
   notesCount?: number;
@@ -108,7 +111,7 @@ export interface MeetingSegment { speaker?: string; text?: string; [k: string]: 
 export interface MeetingDetail {
   record?: {
     id?: string; provider?: string; source?: string; platform?: string; status?: string; startedAt?: string; endedAt?: string;
-    windowId?: string; segments?: MeetingSegment[]; notes?: MeetingNote[]; artifactPath?: string;
+    windowId?: string; sdkUploadId?: string; recordingId?: string; recordingStartedAt?: string; segments?: MeetingSegment[]; notes?: MeetingNote[]; artifactPath?: string;
     transcriptionStatus?: string; transcriptionError?: string; transcriptionModel?: string;
     sdkUploadStatus?: string; sdkUploadError?: string; canonicalStatus?: string; canonicalError?: string;
   };

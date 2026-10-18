@@ -570,6 +570,8 @@ import {
   loadRecallMeetingById,
   loadRecallMeetingSettings,
   isRecallRegion,
+  isRecallRecordingEpoch,
+  RecallRecordingEpochConflictError,
   noteRecallMeetingDetected,
   patchMeetingRecord,
   removeMeetingNote,
@@ -10547,6 +10549,7 @@ export function registerConsoleRoutes(
         activeMeetingId: activeRecording?.id,
         activeWindowId: activeRecording?.windowId,
         activeStartedAt: activeRecording?.startedAt,
+        activeRecordingStartedAt: activeRecording?.recordingStartedAt,
         regions: RECALL_REGIONS,
         docsUrl: 'https://docs.recall.ai/docs/desktop-sdk',
         signupUrl: 'https://www.recall.ai/signup',
@@ -10623,10 +10626,16 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    const recordingStartedAt: unknown = req.body?.recordingStartedAt;
+    if (recordingStartedAt !== undefined && (!isRecallRecordingEpoch(recordingStartedAt)
+      || typeof req.body?.sdkUploadId !== 'string' || !req.body.sdkUploadId.trim())) {
+      res.status(400).json({ error: 'A canonical recording start requires an exact SDK upload.' }); return;
+    }
     try {
       const record = noteRecallMeetingDetected({
         windowId,
         sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
+        ...(recordingStartedAt !== undefined ? { recordingStartedAt: recordingStartedAt as string } : {}),
         sdkUploadRegion: isRecallRegion(req.body?.sdkUploadRegion)
           ? req.body.sdkUploadRegion as RecallRegion
           : undefined,
@@ -10643,6 +10652,7 @@ export function registerConsoleRoutes(
       });
       res.json({ record });
     } catch (err) {
+      if (err instanceof RecallRecordingEpochConflictError) { res.status(409).json({ error: err.message }); return; }
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });

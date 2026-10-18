@@ -25,6 +25,8 @@ const {
   listAllRecallMeetingRecords,
   loadRecallMeetingById,
   noteRecallMeetingDetected,
+  isRecallRecordingEpoch,
+  RecallRecordingEpochConflictError,
   patchMeetingRecord,
   updateRecallTranscriptDelivery,
   recordMeetingTitle,
@@ -44,6 +46,53 @@ function identifiedFinal(windowId: string, sdkUploadId: string, id = 'a') {
   return { windowId, sdkUploadId, event: 'transcript.data', isFinal: true, text: 'A controlled final utterance',
     eventId: `recall-final-${id.repeat(64)}`, eventIdentity: 'sdk' as const, participantId: '7', sourceStartSeconds: 10, sourceEndSeconds: 11 };
 }
+
+test('native recording epoch enriches only its exact upload and preserves historical detection time through replay and completion', () => {
+  const windowId = 'canonical-epoch-fixture-window'; const sdkUploadId = 'canonical-epoch-fixture-upload';
+  const detectedAt = '2026-10-18T09:00:00.000Z'; const recordingStartedAt = '2026-10-18T09:02:00.123Z';
+  const placeholder = noteRecallMeetingDetected({ windowId, startedAt: detectedAt, status: 'detected' });
+  const bound = noteRecallMeetingDetected({ windowId, sdkUploadId, recordingStartedAt, status: 'detected' });
+  assert.equal(bound.id, placeholder.id); assert.equal(bound.startedAt, detectedAt); assert.equal(bound.recordingStartedAt, recordingStartedAt);
+  const replay = noteRecallMeetingDetected({ windowId, sdkUploadId, recordingStartedAt, status: 'recording', startedAt: recordingStartedAt });
+  assert.equal(replay.id, bound.id); assert.equal(replay.startedAt, detectedAt); assert.equal(replay.recordingStartedAt, recordingStartedAt);
+  assert.equal(summarizeRecallMeeting(replay).recordingStartedAt, recordingStartedAt);
+  const completed = finalizeRecallMeeting({ windowId, sdkUploadId, retentionMode: 'zero', canonicalBackfill: false }).record;
+  assert.equal(completed.startedAt, detectedAt); assert.equal(completed.recordingStartedAt, recordingStartedAt);
+  const next = noteRecallMeetingDetected({ windowId, sdkUploadId: 'canonical-epoch-fixture-upload-next',
+    recordingStartedAt: '2026-10-18T10:00:00.000Z', status: 'recording' });
+  assert.notEqual(next.id, bound.id); assert.equal(next.recordingStartedAt, '2026-10-18T10:00:00.000Z');
+  assert.equal(loadRecallMeetingById(bound.id)?.recordingStartedAt, recordingStartedAt, 'a reused window does not change its previous capture');
+});
+
+test('recording epoch rejects malformed, unbound and local input before changing persisted state', () => {
+  const base = { windowId: 'canonical-epoch-validation-fixture', sdkUploadId: 'canonical-epoch-validation-upload', status: 'recording' as const };
+  const original = noteRecallMeetingDetected(base); const before = JSON.stringify(loadRecallMeetingById(original.id));
+  for (const recordingStartedAt of ['', '2026-02-30T09:00:00.000Z', '2026-10-18T09:00:00Z', '2026-10-18T09:00:00.000+00:00', null, 1]) {
+    assert.equal(isRecallRecordingEpoch(recordingStartedAt), false);
+    assert.throws(() => noteRecallMeetingDetected({ ...base, recordingStartedAt } as never), /canonical recording start/);
+    assert.equal(JSON.stringify(loadRecallMeetingById(original.id)), before);
+  }
+  const epoch = '2026-10-18T09:00:00.000Z'; assert.equal(isRecallRecordingEpoch(epoch), true);
+  assert.throws(() => noteRecallMeetingDetected({ windowId: base.windowId, recordingStartedAt: epoch }), /exact Recall SDK upload/);
+  assert.throws(() => noteRecallMeetingDetected({ ...base, provider: 'local', recordingStartedAt: epoch }), /exact Recall SDK upload/);
+  assert.throws(() => noteRecallMeetingDetected({ ...base, source: 'local-audio', recordingStartedAt: epoch }), /exact Recall SDK upload/);
+  assert.equal(JSON.stringify(loadRecallMeetingById(original.id)), before);
+  assert.equal(summarizeRecallMeeting(original).recordingStartedAt, undefined, 'legacy startedAt is not relabeled as native capture proof');
+});
+
+test('recording epoch replacement or generic metadata backfill cannot overwrite exact capture identity', () => {
+  const base = { windowId: 'canonical-epoch-immutable-fixture', sdkUploadId: 'canonical-epoch-immutable-upload', status: 'recording' as const };
+  const epoch = '2026-10-18T09:00:00.000Z'; const different = '2026-10-18T09:00:00.001Z';
+  const original = noteRecallMeetingDetected({ ...base, recordingStartedAt: epoch });
+  const before = JSON.stringify(loadRecallMeetingById(original.id));
+  assert.throws(() => noteRecallMeetingDetected({ ...base, recordingStartedAt: different, title: 'Must not save' }), RecallRecordingEpochConflictError);
+  assert.throws(() => patchMeetingRecord(original.id, { recordingStartedAt: different }), RecallRecordingEpochConflictError);
+  assert.throws(() => patchMeetingRecord(original.id, { recordingStartedAt: undefined }), RecallRecordingEpochConflictError);
+  assert.equal(JSON.stringify(loadRecallMeetingById(original.id)), before);
+  assert.equal(patchMeetingRecord(original.id, { recordingStartedAt: epoch })?.recordingStartedAt, epoch, 'same exact replay is permitted');
+  const legacy = noteRecallMeetingDetected({ windowId: 'canonical-epoch-legacy-fixture', sdkUploadId: 'canonical-epoch-legacy-upload', status: 'recording' });
+  assert.throws(() => patchMeetingRecord(legacy.id, { recordingStartedAt: epoch }), RecallRecordingEpochConflictError);
+});
 
 test('repeated final ingestion and exact meeting reads leave unchanged historical transcripts undecoded', () => {
   const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');

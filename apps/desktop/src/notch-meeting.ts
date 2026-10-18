@@ -118,8 +118,8 @@ export function recallMeetingDetectionNotificationCopy(
   return {
     title: `${provider} detected`,
     body: recording
-      ? 'Clementine is recording it now. Click to open the notch controls.'
-      : 'Clementine is ready to record it. Click to choose from the notch.',
+      ? 'Clementine is recording it now. Click to view the meeting.'
+      : 'Clementine is ready to record it. Click to view recording options.',
   };
 }
 

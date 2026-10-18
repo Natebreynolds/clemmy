@@ -1,7 +1,10 @@
 import { MeetingLiveTranscript } from '@/components/meetings/MeetingLiveTranscript';
 import { MeetingCompanion } from '@/components/meetings/MeetingCompanion';
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { LiveMeetingRoom } from '@/components/meetings/LiveMeetingRoom';
+import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, type MeetingNavigationSdkStatus } from '@/lib/meeting-live-navigation';
+import type { MeetingTranscriptSegment } from '@/lib/meeting-transcript-panel';
+import { useEffect, useMemo, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, type LucideIcon } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -58,7 +61,8 @@ const PERMS: { key: string; label: string }[] = [
 // The live SDK truth (permissions, recording, detected windows) only exists
 // in the Electron main process — reachable via clemmy().recallStatus(), NOT
 // the daemon route. recordActiveMeeting() returns `blocked` when it can't.
-interface SdkStatus {
+interface SdkStatus extends MeetingNavigationSdkStatus {
+  networkStatus?: 'reconnected' | 'disconnected';
   sdkAvailable?: boolean; initialized?: boolean; recording?: boolean;
   hasActiveMeetingWindow?: boolean; lastError?: string;
   platformSupport?: { supported?: boolean; platform?: string; arch?: string; message?: string };
@@ -78,6 +82,10 @@ function formatElapsed(seconds: number): string {
 export function Meetings() {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const location = useLocation();
+  const captureTarget = useMemo(() => parseMeetingCaptureTarget(location.search), [location.search]);
+  const [historySelected, setHistorySelected] = useState(false);
+  const [showLibrary, setShowLibrary] = useState(false);
   const desktop = isDesktop();
   const status = usePoll(['recall-status'], getRecallStatus, 15000);
   // Desktop-only: poll the Electron SDK for the real permission/recording state.
@@ -140,11 +148,36 @@ export function Meetings() {
   const credConnected = (status.data?.credential?.status ?? '').toLowerCase() === 'connected';
   const regions = status.data?.regions ?? DEFAULT_REGIONS;
   const rows = meetings.data?.meetings ?? [];
-  const companionId = selected && detail.data?.record && detail.data.record.provider !== 'local'
-    ? selected : status.data?.activeMeetingId;
+  const companionId = selected
+    ? detail.data?.record?.id === selected && detail.data.record.provider !== 'local' ? selected : undefined
+    : status.data?.activeMeetingId;
   const companionActive = companionId === status.data?.activeMeetingId
     || (companionId === selected && detail.data?.record?.status === 'recording');
   const sdkData = sdk.data ?? undefined;
+  const liveNavigation = resolveMeetingLiveNavigation({ target: captureTarget, sdk: desktop ? sdk.data : null,
+    daemon: status.data, meetings: meetings.data?.meetings, historySelected });
+  const liveId = liveNavigation.kind === 'recording' ? liveNavigation.meetingId : undefined;
+  const liveRoom = liveNavigation.kind === 'recording' ? liveNavigation : undefined;
+  const liveRecord = liveRoom && detail.data?.record?.id === liveRoom.meetingId
+    && detail.data.record.windowId === liveRoom.windowId && detail.data.record.recordingStartedAt === liveRoom.startedAt
+    ? detail.data.record : undefined;
+  const liveSegments = useMemo(() => (liveRecord?.segments ?? []).flatMap(segment => segment && typeof segment === 'object' && typeof segment.text === 'string' && segment.text.trim()
+    ? [{ text: segment.text, ...(typeof segment.id === 'string' ? { id: segment.id } : {}),
+      ...(typeof segment.eventId === 'string' ? { eventId: segment.eventId } : {}),
+      ...(typeof segment.speaker === 'string' ? { speaker: segment.speaker } : {}),
+      ...(typeof segment.timestamp === 'string' ? { timestamp: segment.timestamp } : {}),
+      ...(segment.isFinal === false ? { isFinal: false } : {}) } satisfies MeetingTranscriptSegment] : []), [liveRecord?.segments]);
+  useEffect(() => { if (liveId) setSelected(liveId); }, [liveId]);
+  useEffect(() => { if (location.search) setHistorySelected(false); }, [location.search]);
+  useEffect(() => {
+    const unsubscribe = clemmy()?.onRecallEvent?.(event => {
+      if (!['recording-started', 'recording-ended', 'recording-start-failed', 'network-status', 'meeting-closed', 'meeting-detected'].includes(String(event.type))) return;
+      void qc.invalidateQueries({ queryKey: ['recall-sdk'] });
+      void qc.invalidateQueries({ queryKey: ['recall-status'] });
+      void qc.invalidateQueries({ queryKey: ['meetings'] });
+    });
+    return () => { unsubscribe?.(); };
+  }, [qc]);
   const recording = Boolean(sdkData?.recording);
   const recallUnsupported = sdkData?.platformSupport?.supported === false;
   const recallUnsupportedMessage = sdkData?.platformSupport?.message
@@ -227,7 +260,34 @@ export function Meetings() {
   const stop = async () => {
     setBusy(true);
     try { await clemmy()?.recallStop?.(); }
+    catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
     finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
+  };
+
+  const stopLive = async () => {
+    if (!liveRoom) return;
+    setBusy(true); setNotice(null);
+    try {
+      if (!clemmy()?.recallStop) throw new Error('Recording controls are unavailable. Use the desktop meeting controls.');
+      await clemmy()!.recallStop!({ windowId: liveRoom.windowId, recordingStartedAt: liveRoom.startedAt });
+    } catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
+    finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
+  };
+
+  const recordTarget = async () => {
+    if (liveNavigation.kind !== 'prompt') return;
+    setBusy(true); setNotice(null);
+    try {
+      if (!clemmy()?.recallRecordDetected) throw new Error('Open meeting recording controls in the desktop app.');
+      const st = await clemmy()!.recallRecordDetected!(liveNavigation.target.windowId, liveNavigation.target.detectedAt) as SdkStatus | null;
+      if (st?.blocked?.message) setNotice({ tone: 'warn', text: st.blocked.message });
+    } catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
+    finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
+  };
+
+  const selectHistory = (id: string) => {
+    setHistorySelected(true); setSelected(id);
+    if (location.search) navigate({ pathname: location.pathname, search: '' }, { replace: true });
   };
 
   const applyLocalSetting = async (partial: Partial<LocalMeetingSettings>) => {
@@ -333,8 +393,31 @@ export function Meetings() {
   };
 
   return (
-    <Page title="Meetings" subtitle="Local recordings and online calls, with transcripts, summaries, and action items">
-      {companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={companionActive} />}
+    <Page title="Meetings" subtitle={liveRoom ? undefined : 'A little help before, during and after your meeting.'}>
+      {liveRoom ? liveRecord ? <LiveMeetingRoom key={liveRoom.meetingId} meetingId={liveRoom.meetingId}
+        title={detail.data?.analysis?.title || rows.find(row => row.id === liveRoom.meetingId)?.title || 'Your meeting'}
+        platform={liveRecord.platform ? sentence(liveRecord.platform) : undefined} startedAt={liveRoom.startedAt}
+        capture={{ windowId: liveRoom.windowId, sdkUploadId: liveRecord.sdkUploadId, recordingId: liveRecord.recordingId }}
+        segments={liveSegments} connection={sdk.isError ? 'unknown' : sdkData?.networkStatus === 'disconnected' ? 'disconnected' : sdkData?.networkStatus === 'reconnected' ? 'connected' : 'unknown'}
+        transcriptReadError={detail.isError} statusReadError={sdk.isError || status.isError || meetings.isError} deliveryIncomplete={(liveRecord as { liveTranscriptDelivery?: { status?: string } }).liveTranscriptDelivery?.status === 'incomplete'}
+        busy={busy} onStop={() => void stopLive()} onFinal={() => { void qc.invalidateQueries({ queryKey: ['meeting', liveRoom.meetingId] }); }}
+        notes={<ScratchpadPanel windowId={liveRoom.windowId} startedAtMs={Date.parse(liveRoom.startedAt)} compact />} />
+        : <div className="mb-6" role="status">{detail.isError || (detail.data && selected === liveId) ? <QueryUnavailable title="This meeting couldn’t load" description="Recording controls remain available in the desktop meeting controls. Try loading the transcript again." onRetry={() => { void detail.refetch(); }} /> : <><p className="mb-3 text-small text-muted">Opening your live meeting…</p><Skeleton className="h-80 w-full" /></>}</div>
+        : captureTarget.kind === 'none' && companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={companionActive} />}
+      {liveNavigation.kind === 'prompt' && <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-subtle p-5">
+        <div className="min-w-0"><h2 className="text-h3 text-fg">Your meeting is ready</h2><p className="mt-1 max-w-prose text-small text-muted">Recording is off. Start when everyone in the meeting is aware.</p></div>
+        <Button disabled={busy} onClick={() => void recordTarget()}>{busy ? 'Starting…' : 'Record this meeting'}</Button>
+      </div>}
+      {liveNavigation.kind === 'waiting' && <p className="mb-5 text-small text-muted" role="status">{liveNavigation.reason === 'capture_stopping' ? 'Finishing your recording…' : 'Checking your meeting. The transcript will open when its recording is confirmed.'}</p>}
+      {liveNavigation.kind === 'unavailable' && liveNavigation.explicit && <div className="mb-5 flex flex-wrap items-center gap-3" role="status">
+        <p className="max-w-prose text-small text-warning">That meeting can’t be opened from this notification. Choose a meeting below, or open the current one.</p>
+        <Button size="sm" variant="secondary" onClick={() => { setHistorySelected(false); navigate({ pathname: location.pathname, search: '' }, { replace: true }); }}>View current meeting</Button>
+      </div>}
+      {liveRoom && notice && <p className="mb-4 text-small text-warning" role="status">{notice.text}</p>}
+      {liveRoom && <Button className="mb-5" size="sm" variant="ghost" aria-expanded={showLibrary} aria-controls="meeting-library" onClick={() => setShowLibrary(value => !value)}>{showLibrary ? 'Hide settings & history' : 'Settings & meeting history'}</Button>}
+      {historySelected && recording && <Button className="mb-5" size="sm" variant="secondary" onClick={() => setHistorySelected(false)}>Back to live meeting</Button>}
+      {(!liveRoom || showLibrary) && <div id="meeting-library">
+
       {/* Local in-person capture */}
       <Card className="mb-4 p-5">
         <div className="flex flex-wrap items-center gap-3">
@@ -593,7 +676,7 @@ export function Meetings() {
             : meetings.isError && !meetings.data
               ? <QueryUnavailable title="Meetings are unavailable" description="Clementine couldn’t load your meetings, so this is not an empty-meetings state. Nothing has been deleted." onRetry={() => { void meetings.refetch(); }} />
             : rows.length === 0 ? <EmptyState title="No meetings yet" description="Recorded meetings will show up here with summaries and action items." />
-              : rows.map((m) => <MeetingRow key={m.id} m={m} selected={selected === m.id} onSelect={() => setSelected(m.id)} />)}
+              : rows.map((m) => <MeetingRow key={m.id} m={m} selected={selected === m.id} onSelect={() => selectHistory(m.id)} />)}
         </div>
 
         <div className="rounded-lg border border-border-raised bg-raised p-5">
@@ -621,6 +704,7 @@ export function Meetings() {
           )}
         </div>
       </div>
+      </div>}
     </Page>
   );
 }

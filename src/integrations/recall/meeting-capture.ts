@@ -91,6 +91,9 @@ export interface RecallMeetingRecord {
   titleSource?: 'user' | 'analyzer';
   status: 'detected' | 'recording' | 'completed' | 'cancelled';
   startedAt: string;
+  /** Immutable native SDK recording epoch. startedAt retains historical
+   * detection/history semantics and is never inferred to be this identity. */
+  recordingStartedAt?: string;
   endedAt?: string;
   segments: RecallTranscriptSegment[];
   /** Final-event receipts survive replacement of streamed segments by the canonical transcript. */
@@ -786,6 +789,16 @@ function saveMeetingRecord(record: RecallMeetingRecord, options: { projectMemory
   return record;
 }
 
+export function isRecallRecordingEpoch(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value;
+}
+
+export class RecallRecordingEpochConflictError extends Error {
+  constructor() { super('The retained recording start cannot be replaced.'); }
+}
+
 export function noteRecallMeetingDetected(input: {
   windowId: string;
   provider?: RecallMeetingRecord['provider'];
@@ -797,6 +810,7 @@ export function noteRecallMeetingDetected(input: {
   title?: string;
   status?: RecallMeetingRecord['status'];
   startedAt?: string;
+  recordingStartedAt?: string;
   endedAt?: string;
   audioPath?: string;
   audioDurationSeconds?: number;
@@ -807,8 +821,16 @@ export function noteRecallMeetingDetected(input: {
   recallRetentionMode?: RecallMeetingSettings['retentionMode'];
   recallRetentionHours?: number;
 }): RecallMeetingRecord {
+  if (input.recordingStartedAt !== undefined && (!isRecallRecordingEpoch(input.recordingStartedAt)
+    || !input.sdkUploadId?.trim() || input.provider === 'local' || input.source === 'local-audio')) {
+    throw new Error('A canonical recording start requires an exact Recall SDK upload.');
+  }
   const existing = loadMeetingRecord(input.windowId, input.recordingId, input.sdkUploadId);
   if (existing && captureIdentityConflict(existing, input)) throw new Error('Meeting capture identity does not match the retained meeting.');
+  if (input.recordingStartedAt !== undefined) {
+    if (existing?.provider === 'local' || existing?.source === 'local-audio') throw new Error('Local audio does not have a Recall SDK recording start.');
+    if (existing?.recordingStartedAt !== undefined && existing.recordingStartedAt !== input.recordingStartedAt) throw new RecallRecordingEpochConflictError();
+  }
   const record: RecallMeetingRecord = {
     id: existing?.id ?? `${input.provider === 'local' ? 'local' : 'recall'}-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`,
     windowId: input.windowId,
@@ -835,6 +857,7 @@ export function noteRecallMeetingDetected(input: {
     titleSource: existing?.titleSource,
     status: input.status ?? existing?.status ?? 'detected',
     startedAt: existing?.startedAt ?? input.startedAt ?? nowIso(),
+    recordingStartedAt: existing?.recordingStartedAt ?? input.recordingStartedAt,
     endedAt: input.endedAt ?? existing?.endedAt,
     segments: existing?.segments ?? [],
     transcriptEventReceipts: existing?.transcriptEventReceipts,
@@ -1357,6 +1380,9 @@ export function patchMeetingRecord(
 ): RecallMeetingRecord | null {
   const existing = findMeetingRecordByIdIncludingHidden(meetingId);
   if (!existing) return null;
+  // Only the exact upload-bound native detection path may establish this
+  // identity. Generic metadata updates cannot add, replace or clear it.
+  if (Object.hasOwn(patch, 'recordingStartedAt') && patch.recordingStartedAt !== existing.recordingStartedAt) throw new RecallRecordingEpochConflictError();
   return saveMeetingRecord({ ...existing, ...patch, id: existing.id, windowId: existing.windowId });
 }
 
@@ -1612,6 +1638,7 @@ export interface RecallMeetingSummary {
   title?: string;
   status: RecallMeetingRecord['status'];
   startedAt: string;
+  recordingStartedAt?: string;
   endedAt?: string;
   segmentCount: number;
   notesCount: number;
@@ -1800,6 +1827,7 @@ export function summarizeRecallMeeting(record: RecallMeetingRecord): RecallMeeti
     title: record.title,
     status: record.status,
     startedAt: record.startedAt,
+    recordingStartedAt: record.recordingStartedAt,
     endedAt: record.endedAt,
     segmentCount: record.segments?.length ?? 0,
     notesCount: record.notes?.length ?? 0,

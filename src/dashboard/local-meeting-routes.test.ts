@@ -197,3 +197,38 @@ test('delivery status updates are authenticated exact-capture metadata and never
     assert.equal(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery, undefined);
   } finally { await harness.close(); }
 });
+
+test('Recall routes retain the exact upload-bound native recording epoch without rewriting history timestamps', async () => {
+  const auth = { value: false }; const harness = await boot(auth);
+  const windowId = 'route-canonical-epoch-fixture'; const sdkUploadId = 'route-canonical-epoch-upload';
+  // Deterministically newest within this disposable test home; no wall-clock or
+  // history fixture can make the status endpoint choose a different record.
+  const detectedAt = '2099-10-18T10:00:00.000Z'; const recordingStartedAt = '2099-10-18T10:02:00.123Z';
+  const placeholder = recall.noteRecallMeetingDetected({ windowId, startedAt: detectedAt, status: 'detected' });
+  const route = `${harness.url}/api/console/meetings/recall/detected`;
+  const payload = { windowId, sdkUploadId, recordingStartedAt, status: 'recording' };
+  try {
+    assert.equal((await fetch(route, json('POST', payload))).status, 401);
+    auth.value = true;
+    const response = await fetch(route, json('POST', payload)); assert.equal(response.status, 200);
+    const body = await response.json() as { record: { id: string; startedAt: string; recordingStartedAt?: string } };
+    assert.equal(body.record.id, placeholder.id); assert.equal(body.record.startedAt, detectedAt);
+    assert.equal(body.record.recordingStartedAt, recordingStartedAt);
+    const before = JSON.stringify(recall.loadRecallMeetingById(placeholder.id));
+    assert.equal((await fetch(route, json('POST', payload))).status, 200, 'same exact epoch replay is valid');
+    const conflict = await fetch(route, json('POST', { ...payload, recordingStartedAt: '2099-10-18T10:02:00.124Z', title: 'Must not save' }));
+    assert.equal(conflict.status, 409);
+    for (const invalid of ['', '2099-02-30T10:00:00.000Z', '2099-10-18T10:00:00Z', null, 1]) {
+      assert.equal((await fetch(route, json('POST', { ...payload, recordingStartedAt: invalid }))).status, 400);
+    }
+    assert.equal((await fetch(route, json('POST', { windowId, recordingStartedAt }))).status, 400, 'window-only requests cannot establish capture identity');
+    assert.equal(JSON.stringify(recall.loadRecallMeetingById(placeholder.id)), before, 'rejections never change a retained record');
+    const status = await (await fetch(`${harness.url}/api/console/meetings/recall`)).json() as Record<string, unknown>;
+    assert.equal(status.activeMeetingId, placeholder.id); assert.equal(status.activeWindowId, windowId);
+    assert.equal(status.activeStartedAt, detectedAt); assert.equal(status.activeRecordingStartedAt, recordingStartedAt);
+    const recent = await (await fetch(`${harness.url}/api/console/meetings/recall/recent`)).json() as { meetings: Array<{ id: string; recordingStartedAt?: string }> };
+    assert.equal(recent.meetings.find(row => row.id === placeholder.id)?.recordingStartedAt, recordingStartedAt);
+    const detail = await (await fetch(`${harness.url}/api/console/meetings/recall/${placeholder.id}`)).json() as typeof body;
+    assert.equal(detail.record.recordingStartedAt, recordingStartedAt); assert.equal(detail.record.startedAt, detectedAt);
+  } finally { await harness.close(); }
+});

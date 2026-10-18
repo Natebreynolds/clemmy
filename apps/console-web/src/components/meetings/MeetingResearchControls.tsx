@@ -8,7 +8,7 @@ import { getMeetingResearch, getMeetingResearchDocuments, meetingResearchJobLabe
   meetingResearchRefsCurrent, setMeetingResearch, stopMeetingResearch, type MeetingResearchDocumentRef } from '@/lib/meeting-research';
 import { MeetingContext } from './MeetingContext';
 
-export function MeetingResearchControls({ meetingId, active }: { meetingId: string; active: boolean }) {
+export function MeetingResearchControls({ meetingId, active, presentation = 'default', onOpenLookup }: { meetingId: string; active: boolean; presentation?: 'default' | 'live'; onOpenLookup?: (sessionId: string) => void }) {
   const qc = useQueryClient();
   const key = ['meeting-research', meetingId];
   const research = useQuery({ queryKey: key, queryFn: () => getMeetingResearch(meetingId),
@@ -54,7 +54,18 @@ export function MeetingResearchControls({ meetingId, active }: { meetingId: stri
   const validLimit = Number.isInteger(limit) && limit >= 1 && limit <= 8;
   const canSave = !!view && draftVersion !== null && active && !research.isError && !documents.isError
     && !!documents.data && selectedCurrent && validLimit && (useMemory || selected.length > 0);
-  return <><details className="group/research mt-5 min-w-0 border-t border-border pt-4">
+  const lookupList = !!view?.jobs.length ? <div className="mt-4">
+      <h3 className="text-small font-semibold text-fg">Private lookups</h3>
+      <ul className="mt-1 divide-y divide-border">{view.jobs.map(job => <li key={job.id} className="flex min-w-0 flex-wrap items-center gap-2 py-3">
+        <div className="min-w-0 flex-1"><p className="break-words text-small text-fg">{job.question}</p>
+          <p className="mt-1 text-caption text-muted">{meetingResearchJobLabel(job)}</p>
+          {meetingResearchReviewNotice(job) && <p className={`mt-1 max-w-prose text-caption ${job.reviewState === 'unverified' || !job.reviewState ? 'text-warning' : 'text-muted'}`}>{meetingResearchReviewNotice(job)}</p>}</div>
+        {job.task && (onOpenLookup ? <Button size="sm" variant="ghost" onClick={() => onOpenLookup(job.task!.sessionId)}>{job.status === 'completed' ? 'Show answer' : 'Show lookup'}</Button> : <Link className="inline-flex min-h-11 shrink-0 items-center gap-1 text-small text-primary hover:underline" to={`/chat/${encodeURIComponent(job.task.sessionId)}`}>
+          {job.status === 'completed' ? 'Open answer' : 'Open lookup'}<ArrowUpRight size={14} aria-hidden />
+        </Link>)}
+      </li>)}</ul>
+    </div> : null;
+  return <>{presentation === 'live' && lookupList}<details className="group/research mt-5 min-w-0 border-t border-border pt-4">
     <summary className="flex min-h-11 cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 text-small font-semibold text-fg">
       <ChevronRight size={16} aria-hidden className="shrink-0 transition-transform group-open/research:rotate-90 motion-reduce:transition-none" />
       Research privately
@@ -104,16 +115,6 @@ export function MeetingResearchControls({ meetingId, active }: { meetingId: stri
     </form>}
     {error && <p className="mt-3 text-small text-danger" role="alert">{error}</p>}
     {view && <p className="mt-3 text-caption text-muted">{view.usedLookups} of {view.maxLookups} private lookups used</p>}
-    {!!view?.jobs.length && <div className="mt-4">
-      <h3 className="text-small font-semibold text-fg">Private lookups</h3>
-      <ul className="mt-1 divide-y divide-border">{view.jobs.map(job => <li key={job.id} className="flex min-w-0 flex-wrap items-center gap-2 py-3">
-        <div className="min-w-0 flex-1"><p className="break-words text-small text-fg">{job.question}</p>
-          <p className="mt-1 text-caption text-muted">{meetingResearchJobLabel(job)}</p>
-          {meetingResearchReviewNotice(job) && <p className={`mt-1 max-w-prose text-caption ${job.reviewState === 'unverified' || !job.reviewState ? 'text-warning' : 'text-muted'}`}>{meetingResearchReviewNotice(job)}</p>}</div>
-        {job.task && <Link className="inline-flex min-h-11 shrink-0 items-center gap-1 text-small text-primary hover:underline" to={`/chat/${encodeURIComponent(job.task.sessionId)}`}>
-          {job.status === 'completed' ? 'Open answer' : 'Open lookup'}<ArrowUpRight size={14} aria-hidden />
-        </Link>}
-      </li>)}</ul>
-    </div>}
+    {presentation !== 'live' && lookupList}
   </details><MeetingContext key={meetingId} meetingId={meetingId} state={documents} /></>;
 }
