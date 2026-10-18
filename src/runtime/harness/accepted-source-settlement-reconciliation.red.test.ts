@@ -613,6 +613,55 @@ test('a worked-around read failure does not block a source that completed other 
   assert.equal(declaredRequiredReads.facts.unrecoveredBusinessFailures, 1);
 });
 
+test('a host-run read that answered its own failure has settled, in a declared step too, once other work succeeded', () => {
+  // Live 2026-10-18: a workflow write step's script exited 1 on its own
+  // checks twice, the corrected script wrote all 20 rows, and the step was
+  // blocked: the repaired script's arguments never match the failed ones.
+  const settleShell = (sessionId: string, source: { seq: number; turn: number }, id: string, ok: boolean) => {
+    const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+    const identity = { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId, logicalToolCallId: `logical:${id}` };
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: { ...identity, physicalDispatchId: `dispatch:${id}`, ordinal: 0 },
+      tool: 'alpha_script_run',
+      args: { command: `python3 scrape-${id}.py` },
+    });
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    dispatch.settlePhysicalDispatch({ identity: begun.identity, tool: 'alpha_script_run', outcome: 'returned' });
+    settlements.commitLogicalCallSettlement({
+      identity,
+      contract: { toolName: 'alpha_script_run', args: { command: `python3 scrape-${id}.py` } },
+      execution: { kind: 'provider_execution' },
+      ...(ok ? { result: { payload: { successful: true, data: { rows: 20 } } } } : {}),
+      outcome: ok
+        ? outcomes.classifyAttemptOutcome({ envelopeSuccessful: true })
+        : outcomes.classifyAttemptOutcome({ executionFailed: true, mutating: false, answeredReadDigest: 'a'.repeat(63) + id.length }),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'agents_runner', turn: source.turn },
+    });
+  };
+  const sourceFor = (sessionId: string) => {
+    eventlog.createSession({ id: sessionId, kind: 'workflow' });
+    const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Save the page as CSV.' } });
+    recordSemanticParticipation(sessionId, source.seq, 'participated');
+    assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq } }));
+    return source;
+  };
+
+  const repaired = 'workflow:answered-shell-read:save_books';
+  const repairedSource = sourceFor(repaired);
+  settleShell(repaired, repairedSource, 'first', false);
+  settleShell(repaired, repairedSource, 'second', false);
+  settleShell(repaired, repairedSource, 'fixed', true);
+  const audit = auditAcceptedSourceSettlementTruth({ sessionId: repaired, sourceUserSeq: repairedSource.seq, requireEveryBusinessReadToSettle: true });
+  assert.equal(audit.status, 'clean', JSON.stringify(audit));
+
+  const neverWorked = 'workflow:answered-shell-read-only:save_books';
+  const neverSource = sourceFor(neverWorked);
+  settleShell(neverWorked, neverSource, 'only', false);
+  const failedOnly = auditAcceptedSourceSettlementTruth({ sessionId: neverWorked, sourceUserSeq: neverSource.seq, requireEveryBusinessReadToSettle: true });
+  assert.equal(failedOnly.status, 'unrecovered_failure', 'a source whose every business call failed still has only the failure');
+});
+
 // ── A reversible ambiguous write is a disclosure, not a veto ────────────────
 //
 // Live (2026-08-12): a business-hours Slack review read every channel, updated

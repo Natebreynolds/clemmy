@@ -752,6 +752,21 @@ export function auditAcceptedSourceSettlementTruth(input: {
         row.mutating === 0 && row.outcome_kind === 'unknown' && !row.outcome_detail
         && (row.returned_dispatches ?? 0) > 0 && (row.unreturned_dispatches ?? 0) === 0
       ) return false;
+      // AN ANSWERED READ HAS SETTLED. A host-run read that exited non-zero
+      // with output (`read_answered:`) is the command's own answer: it changed
+      // nothing, and the model read why it stopped. Repairing a script changes
+      // its arguments, so exact identity never registers the repair as
+      // recovery. Live 2026-10-18 a workflow step's script failed its own
+      // checks twice, the corrected script wrote all 20 rows, and the step was
+      // blocked for "2 business call failure(s) have no successful recovery".
+      // Like any failed read it clears only when the source completed other
+      // business work; whether that work covers the step is the contract's and
+      // the reviewers' question. A failure with no answer still counts.
+      if (
+        row.mutating === 0 && row.outcome_kind === 'unknown'
+        && typeof row.outcome_detail === 'string' && row.outcome_detail.startsWith('read_answered:')
+        && successful.length > 0
+      ) return false;
       // A FAILED READ THAT WAS WORKED AROUND IS NOT AN UNRECOVERED FAILURE.
       // Recovery identity is the exact call (requirement, or tool+arguments),
       // so trying a query, having it rejected, and getting the same facts from
