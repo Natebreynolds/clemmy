@@ -20,6 +20,8 @@ import {
   readWorkflowRunRecordUnlocked,
   withWorkflowRunRecordLock,
 } from '../../execution/workflow-run-record.js';
+import { workflowRunInventoryEntry } from '../../execution/workflow-run-inventory.js';
+import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
 
 const WORK_LIFECYCLE_EVENT_TYPES: EventType[] = [
   'turn_started',
@@ -46,6 +48,7 @@ const NON_TERMINAL_COMPLETION_REASONS = new Set([
 const DEFAULT_ACTIVE_WORK_STALE_MS = 12 * 60 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
 const SESSION_SCAN_PAGE_SIZE = 500;
+const MAX_WORKFLOW_DISPLAY_RECONCILIATION_SOURCES = 8;
 const TERMINAL_WORKFLOW_RUN_STATUSES = new Set([
   'completed',
   'completed_with_errors',
@@ -114,6 +117,14 @@ export function isIgnorableActiveWorkSession(
 ): boolean {
   if (session.kind === 'chat') return false;
   if (options.pendingSessionIds?.has(session.id)) return false;
+  if (session.kind === 'workflow' && (!session.metadata || typeof session.metadata !== 'object'
+    || Array.isArray(session.metadata))) return false;
+  // Workflow steps can finish with a settled tool result rather than a legacy
+  // conversation-completed event. Their exact parent is the status owner. Do
+  // not turn an absent, changed or unreadable parent into an age-based guess.
+  if (session.kind === 'workflow' && Object.hasOwn(session.metadata, 'workflowRunId')) {
+    return isFinishedWorkflowChildForDisplay(session, options.nowMs ?? Date.now());
+  }
   if (isDormantTerminalWorkSession(session, { pendingSessionIds: options.pendingSessionIds })) return true;
 
   const latest = latestSessionEvent(session.id);
@@ -126,6 +137,69 @@ export function isIgnorableActiveWorkSession(
     return true;
   }
   return false;
+}
+
+/** Display only: this neither closes a session nor settles/replays its calls. */
+function isFinishedWorkflowChildForDisplay(session: SessionRow, nowMs: number): boolean {
+  try {
+    // Re-read the exact row so an earlier list snapshot cannot hide a new
+    // pause/recovery owner. Workflow child metadata is bounded by the step;
+    // arbitrary chat/model history never enters this path.
+    const current = openEventLog().prepare(
+      'SELECT kind, status, metadata_json FROM sessions WHERE id = ?',
+    ).get(session.id) as { kind: string; status: string; metadata_json: string } | undefined;
+    if (!current || current.kind !== 'workflow' || current.status !== 'active') return false;
+    const metadata = JSON.parse(current.metadata_json) as Record<string, unknown> | null;
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+    const runId = metadata.workflowRunId;
+    if (typeof runId !== 'string' || !/^[A-Za-z0-9._:-]+$/.test(runId)
+      || runId !== session.metadata.workflowRunId) return false;
+    if (typeof metadata.stepId !== 'string' || !metadata.stepId.trim()) return false;
+    for (const key of [
+      '__run_in_flight', '__run_in_flight_owner', '__host_recovery_state',
+      '__interrupt_state', '__source_approval_checkpoints', '__host_recovery_mcp_scope',
+      '__continuation_owner', '__host_recovery_owner',
+    ]) {
+      if (metadata[key] !== undefined && metadata[key] !== null) return false;
+    }
+    if (isExplicitlyResumableLifecycle(latestWorkLifecycleEvent(session.id))) return false;
+    if (hasDurableResumeOwner(openEventLog(), session.id, current.metadata_json, nowMs)) return false;
+
+    // Use the shared generation-aware inventory: repeated status polls do not
+    // parse every run's heavy outputs or independently invent another cache.
+    const record = workflowRunInventoryEntry(runId)?.record;
+    if (record?.id !== runId || record.status !== 'completed') return false;
+    if (typeof metadata.workflowName !== 'string' || metadata.workflowName !== record.workflow) return false;
+    if (!Array.isArray(record.stepOutputKeys) || !record.stepOutputKeys.includes(metadata.stepId)) return false;
+    const latest = latestSessionEvent(session.id);
+    if (!latest || typeof record.finishedAt !== 'string') return false;
+    const finishedAt = Date.parse(record.finishedAt);
+    const latestAt = Date.parse(latest.createdAt);
+    return Number.isFinite(finishedAt) && Number.isFinite(latestAt)
+      && finishedAt >= latestAt && finishedAt <= nowMs
+      && workflowChildReconciliationSettledForDisplay(session.id);
+  } catch {
+    // An unknown record/owner stays visible. This projection grants no recovery
+    // or execution authority and never rewrites retained user history.
+    return false;
+  }
+}
+
+/** Immutable uncertainty flags are history, not live owners. Reuse the exact
+ * source audit only for this completed-parent display projection; retention
+ * and execution policy remain independent. Unknown/oversized history stays
+ * visible instead of inventing a reconciliation decision. */
+function workflowChildReconciliationSettledForDisplay(sessionId: string): boolean {
+  const sources = openEventLog().prepare(`
+    SELECT DISTINCT source_user_seq AS sourceUserSeq
+      FROM logical_call_settlements
+     WHERE session_id = ? AND requires_reconciliation = 1
+     ORDER BY source_user_seq
+     LIMIT ?
+  `).all(sessionId, MAX_WORKFLOW_DISPLAY_RECONCILIATION_SOURCES + 1) as Array<{ sourceUserSeq: number }>;
+  if (sources.length > MAX_WORKFLOW_DISPLAY_RECONCILIATION_SOURCES) return false;
+  return sources.every(({ sourceUserSeq }) => Number.isSafeInteger(sourceUserSeq) && sourceUserSeq > 0
+    && auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq }).status === 'clean');
 }
 
 function normalizeSessionScanLimit(limit: number): number {
@@ -232,13 +306,16 @@ function hasDurableResumeOwner(
   )) return true;
 
   const graphPrefix = `gnl2|${Buffer.byteLength(sessionId, 'utf8')}:${sessionId}|`;
+  // The prefix ends in ASCII '|'; its immediate successor '}' bounds exactly
+  // this prefix while allowing SQLite to use the lease-key index.
+  const graphPrefixEnd = `${graphPrefix.slice(0, -1)}}`;
   if (reconcileTableExists(db, 'graph_node_leases') && exists(
     `SELECT 1 FROM graph_node_leases
-      WHERE substr(lease_key, 1, length(?)) = ?
+      WHERE lease_key >= ? AND lease_key < ?
         AND released = 0 AND expires_at > ?
       LIMIT 1`,
     graphPrefix,
-    graphPrefix,
+    graphPrefixEnd,
     nowMs,
   )) return true;
   if (reconcileTableExists(db, 'accepted_turn_call_authorities') && exists(

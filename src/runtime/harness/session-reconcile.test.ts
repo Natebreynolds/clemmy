@@ -6,6 +6,7 @@
  * though terminal events are already durable; those should stop counting as
  * active work. Parked states must remain visible.
  */
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -23,6 +24,7 @@ const {
   createSession,
   finishRunAttempt,
   getSession,
+  listEvents,
   openEventLog,
   resetEventLog,
 } = await import('./eventlog.js');
@@ -165,6 +167,196 @@ test('active-work visibility ignores empty and stale orphan sessions without mut
   assert.equal(isIgnorableActiveWorkSession(staleTool, { pendingSessionIds: pendingIds, nowMs: Date.now() + 10_000, staleMs: 1 }), true);
   assert.equal(getSession(empty.id)?.status, 'active', 'visibility filtering does not rewrite history');
   assert.equal(getSession(staleTool.id)?.status, 'active', 'stale orphan filtering does not rewrite history');
+});
+
+test('active-work display joins completed workflow children to their exact retained parent without closing history', () => {
+  resetEventLog();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const now = Date.now() + 1_000;
+  const runId = 'display-exact-completed-parent';
+  const session = createSession({
+    id: 'workflow:display-exact-completed-parent:read', kind: 'workflow', channel: 'workflow',
+    metadata: { workflowRunId: runId, workflowName: 'display-fixture', stepId: 'read' },
+  });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_returned', data: { tool: 'read_file', ok: true } });
+  const runFile = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  const record = { id: runId, workflow: 'display-fixture', status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { read: { ok: true } } };
+  writeFileSync(runFile, JSON.stringify(record));
+  const before = openEventLog().prepare('SELECT * FROM sessions WHERE id = ?').get(session.id);
+  const eventsBefore = openEventLog().prepare('SELECT count(*) AS n FROM events WHERE session_id = ?').get(session.id);
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now }), true);
+  assert.deepEqual(openEventLog().prepare('SELECT * FROM sessions WHERE id = ?').get(session.id), before);
+  assert.deepEqual(openEventLog().prepare('SELECT count(*) AS n FROM events WHERE session_id = ?').get(session.id), eventsBefore);
+
+  // A changed existing record invalidates the shared inventory immediately.
+  writeFileSync(runFile, JSON.stringify({ ...record, status: 'running' }));
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now, staleMs: 0 }), false);
+  writeFileSync(runFile, JSON.stringify(record));
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now }), true);
+  const attempt = beginRunAttempt(session.id, { attemptId: 'attempt:display-owner' });
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now }), false, 'a live owner wins over terminal parent');
+  finishRunAttempt(attempt, 'completed');
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now }), true);
+  approvalRegistry.register({ sessionId: session.id, subject: 'Fixture retained approval', tool: 'fixture_write' });
+  assert.equal(isIgnorableActiveWorkSession(session, { nowMs: now }), false, 'database approval wins even without a caller-provided pending set');
+});
+
+test('workflow display retains unknown parents, newer activity and paused or recovery-owned children regardless of age', () => {
+  resetEventLog();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const now = Date.now() + 10_000;
+  const makeChild = (label: string, metadata: Record<string, unknown> = {}) => {
+    const runId = `display-retained-${label}`;
+    const child = createSession({
+      id: `workflow:${runId}:read`, kind: 'workflow', channel: 'workflow',
+      metadata: { workflowRunId: runId, workflowName: 'display-fixture', stepId: 'read', ...metadata },
+    });
+    appendEvent({ sessionId: child.id, turn: 1, role: 'system', type: 'turn_started', data: {} });
+    return { child, runId, file: path.join(WORKFLOW_RUNS_DIR, `${runId}.json`) };
+  };
+  for (const [label, patch] of Object.entries({
+    mismatched: { id: 'other-run' }, wrongWorkflow: { workflow: 'another-workflow' },
+    wrongStep: { stepOutputs: { anotherStep: { ok: true } } },
+    failed: { status: 'failed' }, running: { status: 'running' },
+    missingFinish: { finishedAt: null }, invalidFinish: { finishedAt: 'not-a-time' },
+    oldFinish: { finishedAt: '2020-01-01T00:00:00.000Z' },
+    futureFinish: { finishedAt: new Date(now + 1).toISOString() },
+  })) {
+    const { child, runId, file } = makeChild(label);
+    writeFileSync(file, JSON.stringify({ id: runId, workflow: 'display-fixture', status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { read: { ok: true } }, ...patch }));
+    assert.equal(isIgnorableActiveWorkSession(child, { nowMs: now, staleMs: 0 }), false, label);
+  }
+  for (const label of ['missing', 'corrupt']) {
+    const { child, file } = makeChild(label);
+    if (label === 'corrupt') writeFileSync(file, '{');
+    assert.equal(isIgnorableActiveWorkSession(child, { nowMs: now, staleMs: 0 }), false, label);
+  }
+  const { child: paused, runId, file } = makeChild('pause');
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: 'display-fixture', status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { read: { ok: true } } }));
+  appendEvent({ sessionId: paused.id, turn: 1, role: 'system', type: 'run_paused', data: {} });
+  assert.equal(isIgnorableActiveWorkSession(paused, { nowMs: now, staleMs: 0 }), false);
+  for (const key of ['__run_in_flight', '__run_in_flight_owner', '__host_recovery_state', '__interrupt_state', '__source_approval_checkpoints', '__continuation_owner', '__host_recovery_owner']) {
+    const { child, runId: ownedId, file: ownedFile } = makeChild(`metadata-${key}`, { [key]: 'retained' });
+    writeFileSync(ownedFile, JSON.stringify({ id: ownedId, workflow: 'display-fixture', status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { read: { ok: true } } }));
+    assert.equal(isIgnorableActiveWorkSession(child, { nowMs: now, staleMs: 0 }), false, key);
+  }
+});
+
+/** Real isolated host call/settlement/reservation producers, with no provider.
+ * Once their authority is closed, only the disposable session KIND is changed
+ * to exercise the workflow DISPLAY classifier. This is not workflow execution
+ * acceptance and does not bypass its expected-work binding requirement. */
+async function workflowDisplayWriteFixture(label: string, answered: boolean) {
+  const authorities = await import('./accepted-turn-call-authority.js');
+  const bindings = await import('./host-call-capability-binding.js');
+  const identities = await import('./attempt-identity.js');
+  const contracts = await import('./logical-call-contract.js');
+  const leases = await import('./dispatch-lease.js');
+  const brackets = await import('./brackets.js');
+  const invocation = await import('./host-tool-invocation.js');
+  const projection = await import('./external-write-event-projection.js');
+  const audit = await import('./accepted-source-settlement-audit.js');
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  const runId = `display-uncertain-${label}`;
+  const sessionId = `workflow:${runId}:write`;
+  createSession({ id: sessionId, kind: 'chat', channel: 'desktop',
+    metadata: { workflowRunId: runId, workflowName: 'display-fixture', stepId: 'write' } });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled display classification fixture' } });
+  const armed = authorities.armHostCallAuthority({ sessionId, sourceUserSeq: source.seq,
+    catalogRevisionDigest: digest(`catalog:${sessionId}`), bindingRevisionDigest: digest(`binding:${sessionId}`),
+    maxLogicalCalls: 4, maxParallelCalls: 1 });
+  assert.equal(armed.status, 'armed');
+  const parentLease = leases.activateDispatchLease({ sessionId, scopeId: `${sessionId}::parent` });
+  const root = authorities.acceptedTurnCallAuthorityFor(sessionId, source.seq);
+  assert.equal(root.status, 'ok');
+  if (root.status !== 'ok') throw new Error('controlled root unavailable');
+  const logicalToolCallId = `controlled-write-${label}`;
+  const toolName = 'controlled_write';
+  const args = { record_id: label };
+  const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+  const contract = contracts.durableLogicalCallContract(acceptedTaskId, toolName, args)!;
+  const base = {
+    sessionId, sourceUserSeq: source.seq, acceptedTaskId, logicalToolCallId,
+    sourceEventId: root.authority.sourceEventId, sourceEventDigest: root.authority.sourceEventDigest,
+    toolName: contract.toolName, argumentDigest: contract.argumentDigest,
+    effect: 'external_write' as const, bindingKind: 'catalog_manifest' as const,
+    capabilityId: `cap:${toolName}`, schemaFingerprint: digest(`schema:${toolName}`),
+    accountId: 'account:display-fixture', invokePortId: 'controlled:invoke', operationId: toolName,
+    manifestId: `manifest:${toolName}`, manifestDigest: digest(`manifest:${toolName}`),
+    engineVersion: root.authority.engineVersion, surfaceVersion: root.authority.surfaceVersion,
+    authorityDigest: root.authority.authorityDigest, authorityRevision: root.authority.revision,
+    surfaceDigest: root.authority.surfaceDigest, catalogRevisionDigest: root.authority.catalogRevisionDigest!,
+    bindingRevisionDigest: root.authority.bindingRevisionDigest!,
+  };
+  const attestation = { ...base, bindingDigest: bindings.hostCallAttestationBindingDigest(base) };
+  const execute = () => authorities.withHostCallAttestation(attestation, () => brackets.withHarnessRunContext({
+    sessionId, sourceUserSeq: source.seq, turn: 1, counter: new brackets.ToolCallsCounter(4), dispatchLease: parentLease,
+  }, () => invocation.invokeHostToolCall({
+    identity: { sessionId, sourceUserSeq: source.seq, modelCallId: logicalToolCallId, toolName, args, turn: 1 },
+    parentLease, effect: 'external_write', businessCall: true, boundary: 'host_owned_external', deadlineMs: 500,
+    invoke: async () => { if (answered) return { successful: false, error: { code: 'not_found' } }; throw new Error('controlled missing acknowledgement'); },
+  })));
+  if (answered) await execute();
+  else await assert.rejects(execute(), /controlled missing acknowledgement/);
+  assert.equal(authorities.closeHostCallAuthority({ sessionId, sourceUserSeq: source.seq, outcome: 'blocked' }).status, 'closed');
+  leases.revokeDispatchLease(parentLease);
+  const db = openEventLog();
+  // Synthetic classification only: no execution follows this change.
+  db.prepare("UPDATE sessions SET kind = 'workflow', channel = 'workflow' WHERE id = ?").run(sessionId);
+  const child = getSession(sessionId)!;
+  const original = () => db.prepare(`SELECT outcome_kind, outcome_detail, requires_reconciliation
+    FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+    .get(sessionId, source.seq, logicalToolCallId);
+  assert.deepEqual(original(), { outcome_kind: 'uncertain_write',
+    outcome_detail: answered ? 'provider_refused_envelope' : 'unacknowledged_mutation', requires_reconciliation: 1 });
+  const publishParent = () => {
+    const now = Date.now() + 1_000;
+    mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({ id: runId,
+      workflow: 'display-fixture', status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { write: { ok: true } } }));
+    return now;
+  };
+  const resolve = () => {
+    const reservation = listEvents(sessionId, { types: ['external_write'] })
+      .find(event => event.data.canonicalCallId === logicalToolCallId);
+    assert.ok(reservation);
+    const identity = projection.externalWriteProjectionIdentityFromReservation(reservation);
+    assert.ok(identity);
+    projection.projectExternalWriteTerminal({ sessionId, sourceUserSeq: source.seq, acceptedTaskId, ...identity,
+      physicalDispatchId: String(reservation.data.physicalDispatchId), type: 'external_write_succeeded', reason: 'verified_fixture_resolution' });
+  };
+  return { child, sourceUserSeq: source.seq, original, publishParent, resolve,
+    audit: () => audit.auditAcceptedSourceSettlementTruth({ sessionId, sourceUserSeq: source.seq }) };
+}
+
+test('completed-parent display retains unresolved writes, then accepts exact resolution without rewriting the original uncertainty', async () => {
+  resetEventLog();
+  const fixture = await workflowDisplayWriteFixture('resolution', false);
+  assert.equal(fixture.audit().status, 'uncertain_write');
+  assert.equal(isIgnorableActiveWorkSession(fixture.child, { nowMs: fixture.publishParent(), staleMs: 0 }), false);
+  appendEvent({ sessionId: fixture.child.id, turn: 1, role: 'system', type: 'external_write_succeeded',
+    data: { canonicalCallId: 'unrelated-call', shapeKey: 'CONTROLLED_WRITE', targets: ['other-record'] } });
+  assert.equal(fixture.audit().status, 'uncertain_write', 'an unrelated success is not reconciliation');
+  assert.equal(isIgnorableActiveWorkSession(fixture.child, { nowMs: fixture.publishParent(), staleMs: 0 }), false);
+  fixture.resolve();
+  assert.equal(fixture.audit().status, 'clean');
+  const original = fixture.original();
+  const before = openEventLog().prepare('SELECT count(*) AS n FROM events WHERE session_id = ?').get(fixture.child.id);
+  assert.equal(isIgnorableActiveWorkSession(fixture.child, { nowMs: fixture.publishParent(), staleMs: 0 }), true);
+  assert.deepEqual(fixture.original(), original, 'display/reconciliation never clears the immutable uncertainty flag');
+  assert.deepEqual(openEventLog().prepare('SELECT count(*) AS n FROM events WHERE session_id = ?').get(fixture.child.id), before);
+  assert.equal(getSession(fixture.child.id)?.status, 'active', 'this projection does not rewrite session history');
+});
+
+test('completed-parent display accepts answered provider refusal while retaining its no-replay settlement', async () => {
+  resetEventLog();
+  const fixture = await workflowDisplayWriteFixture('answered', true);
+  assert.equal(fixture.audit().status, 'clean');
+  const original = fixture.original();
+  assert.equal(isIgnorableActiveWorkSession(fixture.child, { nowMs: fixture.publishParent(), staleMs: 0 }), true);
+  assert.deepEqual(fixture.original(), original);
 });
 
 test('retention-aged non-chat orphan is failed only after its durable attempt owner has finished', () => {
