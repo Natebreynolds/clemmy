@@ -66,7 +66,7 @@ Every save runs each changed source once and reports what came back. A source th
 - Call from the view: `const result = await clem.action("draft_reply", { message_id: row.id, mail_folder_id: row.parentFolderId, comment: text })`. Per-click arguments merge over the template.
 - **Required inputs are checked at save.** The save reads each action operation's input schema without calling it. When a required input is set by neither the template nor the literal `clem.action` call, the save is refused and names the input. Fix it in the template or pass it from the view.
 - Handle all three outcomes. `{ pending: true, approvalId }` means the action waits for one approval: show `clem.ui.pending()` and never say it happened. `{ ok: true, result }` means it ran. A thrown error means it failed: show `clem.ui.error(message)`.
-- Sends take one approval. Drafts and ordinary reversible writes run directly.
+- The owner's press on a button is the approval for that button's action, sends and deletes included, so put the exact content a press will send (recipient, subject, body, the item it deletes) on the page beside the button. Drafts and ordinary reversible writes run directly. An action the view starts without a press (on load, on a timer) takes one approval card.
 - Disable a button while its action is in flight, and put the row id in a data attribute rather than rebuilding it from text.
 - Never prove a button works by performing a write on the user's real data. The save's input check and the operation's own validation cover wiring. When a live check truly matters, tell the user exactly what one click will do and let them click it.
 

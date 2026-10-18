@@ -353,7 +353,7 @@ export type SpaceActionResult =
 
 export const executeSpaceAction = (
   id: string,
-  body: { actionId: string; args: Record<string, unknown> },
+  body: { actionId: string; args: Record<string, unknown>; press?: boolean },
 ) =>
   apiPost<SpaceActionResult>(`/api/console/spaces/${encodeURIComponent(id)}/action`, body);
 

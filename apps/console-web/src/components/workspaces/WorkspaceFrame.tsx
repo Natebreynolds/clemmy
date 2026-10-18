@@ -127,6 +127,8 @@ async function runWorkspaceOperation(id: string, request: WorkspaceRpcRequest): 
       return executeSpaceAction(id, {
         actionId: payload.actionId as string,
         args: payload.args as Record<string, unknown>,
+        // The bridge saw a trusted click on a button: the press is the approval.
+        ...(payload.press === true ? { press: true } : {}),
       });
   }
 }

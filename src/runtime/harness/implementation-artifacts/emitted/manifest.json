@@ -3456,7 +3456,7 @@
           "bytes": 11449
         },
         "src/spaces/space-action-gate.ts": {
-          "bytes": 22327
+          "bytes": 24495
         },
         "src/spaces/workspace-deliverables-evidence.ts": {
           "bytes": 18115
@@ -3498,7 +3498,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 64880
+          "bytes": 66303
         },
         "src/tools/space-tools.ts": {
           "bytes": 131279
@@ -7389,7 +7389,7 @@
           "bytes": 11449
         },
         "src/spaces/space-action-gate.ts": {
-          "bytes": 22327
+          "bytes": 24495
         },
         "src/spaces/workspace-deliverables-evidence.ts": {
           "bytes": 18115
@@ -7431,7 +7431,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 64880
+          "bytes": 66303
         },
         "src/tools/space-tools.ts": {
           "bytes": 131279

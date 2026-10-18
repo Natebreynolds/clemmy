@@ -109,6 +109,14 @@ test('Workspace RPC accepts a well-formed request from only the expected opaque 
   if (!parsed.ok) return;
   assert.equal(parsed.request.op, 'action');
   assert.deepEqual(parsed.request.payload, { actionId: 'approve-post', args: { postId: 'p1' } });
+  // The bridge's press mark rides the request only as a boolean.
+  const pressed = parseWorkspaceRpcEvent(
+    event(request('action', { actionId: 'send', args: {}, press: true })), source, 'social-calendar');
+  assert.equal(pressed.ok, true);
+  assert.deepEqual(
+    parseWorkspaceRpcEvent(event(request('action', { actionId: 'send', args: {}, press: 'yes' })), source, 'social-calendar'),
+    { ok: false, reason: 'invalid_payload' },
+  );
 });
 
 test('Workspace RPC bootstraps one opaque document identity before moving requests onto its port', () => {

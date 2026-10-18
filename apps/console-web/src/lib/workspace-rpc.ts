@@ -217,9 +217,10 @@ function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unk
       && (payload.maxChars === undefined
         || (Number.isInteger(payload.maxChars) && Number(payload.maxChars) >= 1 && Number(payload.maxChars) <= 20_000));
   }
-  return hasOnlyKeys(payload, ['actionId', 'args'])
+  return hasOnlyKeys(payload, ['actionId', 'args', 'press'])
     && boundedString(payload.actionId, 200)
-    && isRecord(payload.args);
+    && isRecord(payload.args)
+    && (payload.press === undefined || typeof payload.press === 'boolean');
 }
 
 function payloadMatchesGesture(

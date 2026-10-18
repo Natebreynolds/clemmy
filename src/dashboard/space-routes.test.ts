@@ -250,6 +250,12 @@ test('C2: monkey-patched MessagePort cannot capture trusted-click authority', as
   assert.match(html, /gesture\('download'/);
   assert.doesNotMatch(html, /rpc\('open_external'/);
   assert.doesNotMatch(html, /rpc\('download'/);
+  // A press approves its button's action only as a trusted click on a button,
+  // timed by a clock captured before authored code, and only once.
+  assert.match(html, /DATE_NOW=U\(Date\.now\)/);
+  assert.match(html, /if\(GET_TRUSTED\(e\)!==true\|\|GET_TARGET\(e\)===null\|\|!pressable\(e\)\)return;PRESS_AT=DATE_NOW\(Date\);PRESSED=true;/);
+  assert.match(html, /function takePress\(\)\{var fresh=PRESSED&&DATE_NOW\(Date\)-PRESS_AT<=PRESS_MS;PRESSED=false;return fresh;\}/);
+  assert.match(html, /action:function\(actionId,args\)\{return rpc\('action',\{actionId:actionId,args:args\|\|\{\},press:takePress\(\)\}\);\}/);
 });
 
 test('C2: parser-confusing leading comments cannot run authored code before the bridge', async () => {
@@ -903,6 +909,40 @@ test('E1: a SEND-class action is gated behind one approval (default on) — 202 
   const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
   assert.ok(notes.body.notes.some((n: any) => n.meta?.status === 'pending'));
   assert.ok(!notes.body.notes.some((n: any) => /Approved and ran/.test(n.text)));
+});
+
+test('E1: a press on a SEND button is its approval: no card waits, the approval is resolved by the press', async () => {
+  // Owner 2026-10-18: "send and delete buttons should be classified as the
+  // action they are for." Only a request the bridge marked pressed skips the card.
+  installCurrentCapability('OUTLOOK_SEND_EMAIL', 'external_write');
+  const slug = 'action-press';
+  store.spaceStore.save({
+    id: slug, title: 'Press RT',
+    actions: [{ id: 'email', label: 'Email lead', composioSlug: 'OUTLOOK_SEND_EMAIL', argsTemplate: { from: 'me@co' } }],
+  });
+  const res = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actionId: 'email', args: { to: 'lead@acme', subject: 'Hi' }, press: true }),
+  }));
+  assert.notEqual(res.status, 202, JSON.stringify(res.body));
+  assert.notEqual(res.body.pending, true, 'a press never waits on a second card');
+  const { listPending } = await import('../runtime/harness/approval-registry.js');
+  const resolved = listPending({ status: 'resolved' }).filter((row) => row.tool === 'space_execute_action'
+    && row.args?.spaceSlug === slug);
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0]!.resolution, 'approved');
+  assert.equal(resolved[0]!.resolver, 'workspace-button-user');
+  assert.equal(listPending({ status: 'pending' }).some((row) => row.args?.spaceSlug === slug), false);
+  const notes = await j(await fetch(`${base}/api/console/spaces/${slug}/notes`));
+  assert.equal(notes.body.notes.some((n: any) => n.meta?.status === 'pending'), false);
+
+  // The same request without the press still takes its one card.
+  const unpressed = await j(await fetch(`${base}/api/console/spaces/${slug}/action`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ actionId: 'email', args: { to: 'other@acme', subject: 'Hi' } }),
+  }));
+  assert.equal(unpressed.status, 202);
+  assert.equal(unpressed.body.pending, true);
 });
 
 test('E1: confirm:true forces the gate even for a non-send runner action', async () => {

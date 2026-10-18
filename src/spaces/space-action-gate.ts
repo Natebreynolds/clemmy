@@ -23,7 +23,8 @@
  */
 import { createHash } from 'node:crypto';
 import {
-  listPending, onApprovalResolved, registerResumable, type PendingApprovalRow,
+  get as getApproval, listPending, onApprovalResolved, registerResumable, resolve as resolveApproval,
+  type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
 import { getSession, createSession } from '../runtime/harness/eventlog.js';
@@ -268,6 +269,8 @@ export function enqueueSpaceActionApproval(
   rec: SpaceRecord,
   action: SpaceAction,
   callerArgs: Record<string, unknown>,
+  /** False when the owner's press is the approval: no card is shown or noted. */
+  opts: { presented?: boolean } = {},
 ): EnqueueResult {
   const verb = workspaceActionLooksOutbound(action) ? 'Send' : 'Run';
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
@@ -307,7 +310,7 @@ export function enqueueSpaceActionApproval(
       args,
     }),
   });
-  if (registered.created) {
+  if (registered.created && opts.presented !== false) {
     emitApprovalRequestedCard({
       sessionId,
       approvalId: registered.row.approvalId,
@@ -442,6 +445,49 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
   } else {
     recordApprovedActionNotRun(slug, label, actionId, row.approvalId, result.error);
   }
+}
+
+/** The resolver a Space button press writes: a person acting on the button. */
+export const SPACE_BUTTON_PRESS_RESOLVER = 'workspace-button-user';
+
+export interface PressedSpaceActionResult {
+  ok: boolean;
+  approvalId: string;
+  status: 'executed' | 'failed' | 'uncertain' | 'not_approved';
+  text: string;
+}
+
+/**
+ * The owner's press on a Space button is the approval for exactly the action
+ * that button is for (owner 2026-10-18: "send and delete buttons should be
+ * classified as the action they are for"). It takes the same approval row a
+ * card would, bound to this exact action snapshot and arguments, resolved by
+ * the press instead of a second tap, and runs through the one approved path,
+ * which runs an approval at most once. Only a press the view's bridge saw as a
+ * trusted click on a button reaches here; anything else still gets the card.
+ */
+export async function approveSpaceActionByPress(
+  rec: SpaceRecord,
+  action: SpaceAction,
+  callerArgs: Record<string, unknown>,
+): Promise<PressedSpaceActionResult> {
+  const { approvalId } = enqueueSpaceActionApproval(rec, action, callerArgs, { presented: false });
+  const resolved = resolveApproval(approvalId, 'approved', SPACE_BUTTON_PRESS_RESOLVER);
+  const row = resolved.ok ? getApproval(approvalId) : undefined;
+  if (!row || row.resolution !== 'approved') {
+    return { ok: false, approvalId, status: 'not_approved', text: `“${action.label ?? action.id}” was not run: this press could not approve it.` };
+  }
+  await executeApprovedSpaceAction(row);
+  const note = listNotes(rec.id, Number.MAX_SAFE_INTEGER)
+    .filter((candidate) => candidate.meta?.approvalId === approvalId)
+    .pop();
+  const status = note?.meta?.status;
+  return {
+    ok: status === 'executed',
+    approvalId,
+    status: status === 'executed' || status === 'failed' || status === 'uncertain' ? status : 'failed',
+    text: note?.text ?? `“${action.label ?? action.id}” did not report an outcome.`,
+  };
 }
 
 const approvalExecutions = new Map<string, Promise<void>>();

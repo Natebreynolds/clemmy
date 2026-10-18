@@ -77,7 +77,7 @@ import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonica
 import { ensureToolSchema } from '../tools/composio-schema-cache.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
-  spaceActionNeedsApproval, enqueueSpaceActionApproval, initSpaceActionApprovals,
+  spaceActionNeedsApproval, enqueueSpaceActionApproval, approveSpaceActionByPress, initSpaceActionApprovals,
   standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
 import { reengageSpace } from '../spaces/reengage.js';
@@ -337,6 +337,7 @@ var GET_PORTS=PORTS_DESC&&PORTS_DESC.get?U(PORTS_DESC.get):null,GET_DATA=DATA_DE
 var GET_TARGET=TARGET_DESC&&TARGET_DESC.get?U(TARGET_DESC.get):null,GET_TRUSTED=TRUSTED_DESC&&TRUSTED_DESC.get?U(TRUSTED_DESC.get):function(e){return e.isTrusted;};
 var CLOSEST=U(Element.prototype.closest),HAS_ATTR=U(Element.prototype.hasAttribute),GET_ATTR=U(Element.prototype.getAttribute);
 var ARRAY_PUSH=U(Array.prototype.push),ARRAY_INDEX=U(Array.prototype.indexOf),ARRAY_SPLICE=U(Array.prototype.splice),DL=[];
+var DATE_NOW=U(Date.now),PRESS_AT=0,PRESSED=false,PRESS_MS=5000,PRESSABLE='button,[role="button"],input[type="button"],input[type="submit"]';
 var URL_PROTOCOL_DESC=OWN_DESC(URL.prototype,'protocol'),URL_HREF_DESC=OWN_DESC(URL.prototype,'href');
 var GET_URL_PROTOCOL=URL_PROTOCOL_DESC&&URL_PROTOCOL_DESC.get?U(URL_PROTOCOL_DESC.get):null,GET_URL_HREF=URL_HREF_DESC&&URL_HREF_DESC.get?U(URL_HREF_DESC.get):null;
 var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response,BASE_URL=location.href;
@@ -355,17 +356,20 @@ function bootstrap(){parent.postMessage({channel:C,version:1,kind:'bootstrap',wo
 var BOOT=null;if(parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
 function response(body,status){return new RESPONSE_CTOR(JSON_STRINGIFY(body),{status:status||200,headers:{'content-type':'application/json'}});}
 function parsedBody(init){if(!init||init.body===undefined||init.body===null||init.body==='')return {};if(typeof init.body!=='string')throw new TypeError('Workspace compatibility fetch accepts a JSON string body only');var value=JSON_PARSE(init.body);if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('Workspace request body must be a JSON object');return value;}
-function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{}}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
+function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{},press:takePress()}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
 lock('fetch',legacyFetch);
 ['XMLHttpRequest','WebSocket','EventSource','WebTransport','RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){lock(name,undefined);});
 try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
+function pressable(e){var path=PATH(e),i;for(i=0;i<path.length;i++){try{if(CLOSEST(path[i],PRESSABLE))return true;}catch(_){}}return false;}
+ADD(document,'click',function(e){if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||!pressable(e))return;PRESS_AT=DATE_NOW(Date);PRESSED=true;},true);
+function takePress(){var fresh=PRESSED&&DATE_NOW(Date)-PRESS_AT<=PRESS_MS;PRESSED=false;return fresh;}
 function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
 ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
 var REPORTED=[];function report(message,line){var text;if(REPORTED.length>=3||parent===window)return;text=String(message||'').slice(0,300);if(!text||ARRAY_INDEX(REPORTED,text)>=0)return;ARRAY_PUSH(REPORTED,text);rpc('note',{text:text+(line?' (line '+line+')':''),kind:'view_error'}).catch(function(){});}
 ADD(window,'error',function(e){if(e&&typeof e.message==='string'&&e.message)report(e.message,e.lineno);},true);
 ADD(window,'unhandledrejection',function(e){var r=e&&e.reason;report('Unhandled rejection: '+(r&&r.message?r.message:String(r)));},true);
 var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
-window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});},onData:function(cb){if(typeof cb!=='function')return function(){};ARRAY_PUSH(DL,cb);if(DL.length===1)rpc('subscribe',{}).catch(function(){});return function(){var i=ARRAY_INDEX(DL,cb);if(i>=0)ARRAY_SPLICE(DL,i,1);};}});
+window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{},press:takePress()});},onData:function(cb){if(typeof cb!=='function')return function(){};ARRAY_PUSH(DL,cb);if(DL.length===1)rpc('subscribe',{}).catch(function(){});return function(){var i=ARRAY_INDEX(DL,cb);if(i>=0)ARRAY_SPLICE(DL,i,1);};}});
 })();</script>`;
 };
 
@@ -1145,6 +1149,20 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
         }
       }
       try {
+        // The owner's press is the approval for exactly this action (owner
+        // 2026-10-18: a Send or Delete button is the send or delete it is
+        // for). The view's bridge marks a request pressed only for a trusted
+        // click on a button, once per click; a request it did not see pressed
+        // (a view's own script, a load, a timer) still takes the card.
+        if (req.body?.press === true) {
+          const pressed = await approveSpaceActionByPress(rec, action, callerArgs);
+          if (!pressed.ok) {
+            res.status(pressed.status === 'uncertain' ? 409 : 502).json({ ok: false, error: pressed.text });
+            return;
+          }
+          res.json({ ok: true, result: { approvedByPress: true, approvalId: pressed.approvalId, message: pressed.text } });
+          return;
+        }
         const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
         res.status(202).json({ pending: true, approvalId, subject });
       } catch (err) {

@@ -307,6 +307,31 @@ test('enqueueSpaceActionApproval registers an approval + a pending note', () => 
   assert.ok(inlineCard, 'the exact action card is visible inside Workspace chat');
 });
 
+test('a press on a Space button is the approval for exactly that action: no card, resolved by the press, run once', async () => {
+  // Owner 2026-10-18: "send and delete buttons should be classified as the
+  // action they are for." The press takes the same exact approval row a card
+  // would and runs through the one approved path.
+  const slug = 'gate-press';
+  const rec = store.spaceStore.save({
+    id: slug, title: 'Press',
+    actions: [{ id: 'email', label: 'Send email', composioSlug: 'OUTLOOK_SEND_EMAIL' }],
+  });
+  const pressed = await gate.approveSpaceActionByPress(rec, rec.actions[0], { to: 'lead@acme' });
+  const row = registry.get(pressed.approvalId);
+  assert.equal(row?.status, 'resolved');
+  assert.equal(row?.resolution, 'approved');
+  assert.equal(row?.resolver, gate.SPACE_BUTTON_PRESS_RESOLVER);
+  assert.equal(registry.approvalDecidedByPerson(row!), true, 'the press is a person acting on the button');
+  const card = eventlog.listEvents(`space-${slug}`, { types: ['approval_requested'] })
+    .find((event) => (event.data as { approvalId?: string }).approvalId === pressed.approvalId);
+  assert.equal(card, undefined, 'a press shows no second card');
+  const notes = dataStore.listNotes(slug).filter((note) => note.meta?.approvalId === pressed.approvalId);
+  assert.equal(notes.some((note) => note.meta?.status === 'pending'), false, 'nothing waits on the owner');
+  assert.equal(notes.length, 1, 'one outcome: the approved path ran it once');
+  assert.equal(pressed.status, notes[0]!.meta?.status);
+  assert.equal(pressed.text, notes[0]!.text);
+});
+
 test('runner action approval discloses pinned-entrypoint scope but remains zero-process', async () => {
   const slug = 'gate-runner-entrypoint-snapshot';
   const rec = store.spaceStore.save({
