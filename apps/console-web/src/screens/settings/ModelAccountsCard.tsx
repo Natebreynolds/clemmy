@@ -222,7 +222,10 @@ export function ModelAccountsCard() {
 
   const byId = new Map(meters.map((m) => [m.id, m]));
   const notConnected = SIGN_IN_ACCOUNTS.filter((a) => !byId.has(a.id));
-  const outCount = meters.filter((m) => m.outOfCredit).length;
+  // The alarm is for an account doing a job for Clem; an idle one out of
+  // credit says so in its own row (2026-10-18: the same rule as the header dot).
+  const refusing = meters.filter((m) => m.outOfCredit && (m.uses?.length ?? 0) > 0);
+  const outCount = refusing.length;
 
   return (
     <div>
@@ -232,7 +235,7 @@ export function ModelAccountsCard() {
         <p className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-danger/40 bg-danger-tint px-3 py-2 text-small text-danger" role="status">
           <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
           <span>
-            {meters.filter((m) => m.outOfCredit).map((m, i, all) => (
+            {refusing.map((m, i, all) => (
               <span key={m.id}>
                 <a href={`#account-${m.id}`} className="font-semibold underline-offset-2 hover:underline">{m.label}</a>
                 {i < all.length - 1 ? (i === all.length - 2 ? ' and ' : ', ') : ''}
