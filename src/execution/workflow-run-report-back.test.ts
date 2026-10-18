@@ -530,7 +530,7 @@ test('a blocked member is judged before report-back and DELIVER preserves the ex
   const carrier = listNotifications(2_000).find(
     (entry) => entry.metadata?.originObserverId === observerId,
   );
-  assert.equal(carrier?.title, 'Workflow completed: Ack Workflow');
+  assert.equal(carrier?.title, 'Finished: Ack Workflow');
 });
 
 test('blocked origin report-back canonicalizes foreign retained work and acknowledges one idempotent terminal', async () => {
@@ -638,7 +638,7 @@ test('workflow-origin ASK commits typed needs-input and settles the exact carrie
   const carrier = listNotifications(2_000).find(
     (entry) => entry.metadata?.originObserverId === observerId,
   );
-  assert.equal(carrier?.title, 'Workflow needs input: Ack Workflow');
+  assert.equal(carrier?.title, 'Needs your answer: Ack Workflow');
   assert.equal(carrier?.body, question);
 });
 
@@ -1299,7 +1299,7 @@ test('a blocked group reducer keeps the conservative shared fallback when the ju
   const carrier = listNotifications(2_000).find(
     (entry) => entry.metadata?.sourceGroupId === active.sealed.sourceGroupId,
   );
-  assert.equal(carrier?.title, 'Workflow completed: 2 workflows');
+  assert.equal(carrier?.title, 'Finished: 2 workflows');
 });
 
 test('a corrupt member prevents the whole source-group reducer from publishing', () => {
@@ -1601,7 +1601,7 @@ test('one exact cancelled workflow reports and replays as stopped, never failed'
   );
   assert.equal(
     listNotifications(2_000).find((entry) => entry.metadata?.runId === runId)?.title,
-    'Workflow cancelled: Ack Workflow',
+    'Cancelled: Ack Workflow',
   );
 
   const assistant = foldTranscript(listEvents(origin))

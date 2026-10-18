@@ -284,7 +284,7 @@ test('renderSuccessBody prefers synthesis prose, else humanizes steps (no JSON d
 test('renderLegibleOutcome: clean completion when nothing blocked', () => {
   const out = renderLegibleOutcome({ workflowName: 'wf', blockedSteps: [], fallbackBody: 'all good' });
   assert.equal(out.needsAttention, false);
-  assert.equal(out.title, 'Workflow completed: wf');
+  assert.equal(out.title, 'Finished: wf');
   assert.equal(out.body, 'all good');
 });
 
@@ -302,7 +302,7 @@ test('renderLegibleOutcome: blocked + auto-applicable diagnosis offers the fix c
     fallbackBody: 'irrelevant',
   });
   assert.equal(out.needsAttention, true);
-  assert.match(out.title, /needs attention/i);
+  assert.match(out.title, /^Couldn't finish:/);
   assert.match(out.body, /couldn't finish/);
   assert.match(out.body, /apply fix fix-abc123/);
 });

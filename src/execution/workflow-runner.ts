@@ -201,6 +201,7 @@ import {
   revertWorkflowFix,
   judgeHealCrossFamily,
   renderLegibleOutcome,
+  readableWorkflowName,
   renderSuccessBody,
   selfHealEnabled,
   type WorkflowDiagnosis,
@@ -14510,7 +14511,7 @@ function settleWorkflowPreparationFailure(filePath: string, run: QueuedRunRecord
   }
   if (terminal.record.status !== 'error') return;
   if (terminal.publishedTerminal) {
-    addNotification({ id: `workflow-${run.id}-error`, kind: 'workflow', title: `Workflow needs attention: ${run.workflow}`,
+    addNotification({ id: `workflow-${run.id}-error`, kind: 'workflow', title: `Couldn't finish: ${readableWorkflowName(run.workflow)}`,
       body: message, createdAt: new Date().toISOString(), read: false,
       metadata: { workflow: run.workflow, runId: run.id, status: 'error' } });
     markRunNotified(filePath);
@@ -17805,9 +17806,9 @@ async function processOneRunFile(
               // target-miss or goal-miss is needs-attention with no blocked step,
               // so title it honestly.
               : needsAttention && blockedSteps.length === 0
-                ? `⚠️ Workflow needs attention: ${workflow.data.name}`
+                ? `Needs a look: ${readableWorkflowName(workflow.data.name)}`
                 : goalGap && !needsAttention
-                  ? `Done, with a gap: ${workflow.data.name}`
+                  ? `Done, with a gap: ${readableWorkflowName(workflow.data.name)}`
                   : outcome.title,
           // Send the full body. Discord delivery splits long content into
           // multiple messages; previous 2000-char slice cut off workflow
