@@ -1,0 +1,5 @@
+# This file assumes apps/relay is the build context. Keep it an allowlist.
+**
+!server.mjs
+!Dockerfile
+!.dockerignore
