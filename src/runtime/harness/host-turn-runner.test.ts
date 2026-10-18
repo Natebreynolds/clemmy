@@ -11160,6 +11160,14 @@ test('the full review guards writes that reached outside or cannot be restored; 
     tool: 'write_file', execution: 'local_execution', mutating: true, succeeded: false, requirementId: 'cap:local:write_file:replace' });
   assert.equal(sourceWritesAtStake(failedEdit.context), 1, 'a write that did not land keeps the full review: the answer must not claim it');
 
+  const { settledWriteIsAtStake } = await import('./host-completion-work.js');
+  assert.equal(settledWriteIsAtStake({ executionKind: 'refused_pre_dispatch', outcomeKind: 'invalid_arguments', toolName: 'write_file', requirementId: null }), false,
+    'a write refused before dispatch never ran, so it does not call for the full review');
+  assert.equal(settledWriteIsAtStake({ executionKind: 'refused_pre_dispatch', outcomeKind: 'invalid_arguments', toolName: 'slack_send_message', requirementId: null }), false,
+    'nor does an outside write that never dispatched');
+  assert.equal(settledWriteIsAtStake({ executionKind: 'local_execution', outcomeKind: 'tool_error', toolName: 'write_file', requirementId: null }), true,
+    'a dispatched write that failed still does');
+
   const post = acceptJudgedSource('stakes-outside-write', 'TEST FIXTURE: post the summary to the channel');
   settleFixtureCall({ ...post.context, turn: 1 }, 'stakes-outside-write', {
     tool: 'slack_send_message', execution: 'provider_execution', mutating: true, succeeded: true });

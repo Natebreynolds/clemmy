@@ -200,13 +200,23 @@ export function sourceWritesAtStake(input: {
   sourceUserSeq: number;
 }): number {
   try {
-    return mutatingSettlements(input).filter((row) => !(row.toolName && ((row.executionKind === 'local_execution'
-      && row.outcomeKind === 'succeeded'
-      && undoableLocalArtifactWrite(row.toolName, row.requirementId))
-      || isRestorableExecution(row)))).length;
+    return mutatingSettlements(input).filter(settledWriteIsAtStake).length;
   } catch {
     return 1;
   }
+}
+
+/** One settled mutating call that calls for the full review. A write refused
+ *  before dispatch never ran: nothing reached outside or changed, and the
+ *  read-depth review still reads its settlement, so the reply cannot claim it
+ *  happened. Live 2026-10-17 one malformed local file write, refused, sent a
+ *  turn to two full reviews. */
+export function settledWriteIsAtStake(row: MutatingSettlementRow): boolean {
+  if (row.executionKind === 'refused_pre_dispatch') return false;
+  return !(row.toolName && ((row.executionKind === 'local_execution'
+    && row.outcomeKind === 'succeeded'
+    && undoableLocalArtifactWrite(row.toolName, row.requirementId))
+    || isRestorableExecution(row)));
 }
 
 /** Whether this source wrote or created anything: any write other than a
@@ -244,7 +254,7 @@ function settledCalls(input: { sessionId: string; sourceUserSeq: number }): Arra
   `).all(input.sessionId, input.sourceUserSeq) as Array<MutatingSettlementRow & { mutating: number }>;
 }
 
-interface MutatingSettlementRow {
+export interface MutatingSettlementRow {
   executionKind: string | null; outcomeKind: string | null; requirementId: string | null; toolName: string | null;
 }
 
