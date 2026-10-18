@@ -1161,7 +1161,7 @@
           "bytes": 19940
         },
         "src/execution/workflow-run-inventory.ts": {
-          "bytes": 7732
+          "bytes": 8906
         },
         "src/execution/workflow-inputs.ts": {
           "bytes": 3222
@@ -2169,7 +2169,7 @@
           "bytes": 21168
         },
         "src/agents/work-review-runtime.ts": {
-          "bytes": 12873
+          "bytes": 13075
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
@@ -5094,7 +5094,7 @@
           "bytes": 19940
         },
         "src/execution/workflow-run-inventory.ts": {
-          "bytes": 7732
+          "bytes": 8906
         },
         "src/execution/workflow-inputs.ts": {
           "bytes": 3222
@@ -6102,7 +6102,7 @@
           "bytes": 21168
         },
         "src/agents/work-review-runtime.ts": {
-          "bytes": 12873
+          "bytes": 13075
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966

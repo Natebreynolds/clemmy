@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, KeyRound, RotateCw, Loader2, LogOut } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import { xaiDeviceBegin, xaiDevicePoll, xaiAuthStatus, xaiDisconnect } from '@/lib/connect';
 import { addModelProvider, listProviderModels } from '@/lib/settings';
+import { createSignInAttemptOwner, deviceSignInDeadline, deviceSignInPollDelay } from '@/lib/sign-in-attempt';
 
 /**
  * xAI (Grok) subscription sign-in — peer to CodexLoginForm and ClaudeLoginForm,
@@ -20,55 +21,68 @@ export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: (
   const [device, setDevice] = useState<{ uri: string; code: string } | null>(null);
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  const attempts = useRef(createSignInAttemptOwner());
+  useEffect(() => () => attempts.current.stop(), []);
 
   const run = async () => {
+    const attempt = attempts.current.begin();
     setBusy(true); setStatus('Requesting a sign-in code…'); setDevice(null);
+    const cancelBeginTimeout = attempt.later(() => {
+      setStatus('The sign-in code request timed out. Try again.'); setBusy(false); attempt.stop();
+    }, 30_000);
     try {
-      const start = await xaiDeviceBegin();
+      const start = await xaiDeviceBegin(attempt.signal);
+      if (!attempt.isCurrent()) return;
+      cancelBeginTimeout();
       if (!start.loginId || !start.verificationUri || !start.userCode) {
         setStatus(`Couldn't start sign-in: ${start.error || 'unknown error'}`);
         setBusy(false);
         return;
       }
+      const expiresAt = deviceSignInDeadline(start.expiresAt, 1_800_000);
+      if (expiresAt === null) { setStatus('Couldn’t confirm the sign-in code’s expiry. Try again.'); setBusy(false); return; }
       // Prefer the prefilled URL so the code is already entered when it opens.
       setDevice({ uri: start.verificationUriComplete || start.verificationUri, code: start.userCode });
       setStatus('Waiting for approval…');
 
-      let intervalMs = Math.max(3, start.intervalSeconds || 5) * 1000;
-      // Trust the SERVER's deadline. Polling past it only yields confusing
-      // errors, and a user who walked away should see "expired", not a spinner.
-      const expiresAt = start.expiresAt ? Date.parse(start.expiresAt) : Date.now() + 1_800_000;
+      let intervalMs = deviceSignInPollDelay(start.intervalSeconds);
       const loginId = start.loginId;
+      const expired = () => {
+        setStatus('Code expired — click “Connect xAI (Grok)” to try again.'); setBusy(false); attempt.stop();
+      };
+      const cancelExpiry = attempt.later(expired, Math.max(1, expiresAt - Date.now()));
+      const later = () => attempt.later(() => { void poll(); }, Math.min(intervalMs, Math.max(1, expiresAt - Date.now())));
 
       const poll = async () => {
-        if (Date.now() > expiresAt) {
-          setStatus('Code expired — click “Connect xAI (Grok)” to try again.');
-          setBusy(false);
-          return;
-        }
+        if (!attempt.isCurrent()) return;
+        if (Date.now() >= expiresAt) { expired(); return; }
         try {
-          const res = await xaiDevicePoll(loginId);
+          const res = await xaiDevicePoll(loginId, attempt.signal);
+          if (!attempt.isCurrent()) return;
           if (res.status === 'complete') {
+            cancelExpiry();
             setStatus('Connected'); onDone();
-            setTimeout(() => { setDevice(null); setStatus(''); setBusy(false); }, 2500);
+            attempt.later(() => { setDevice(null); setStatus(''); setBusy(false); }, 2500);
             return;
           }
-          if (res.status === 'denied') { setStatus('Sign-in was denied in the browser.'); setBusy(false); return; }
-          if (res.status === 'expired') { setStatus('Code expired — try again.'); setBusy(false); return; }
-          if (res.status === 'error') { setStatus(res.message || 'Sign-in failed.'); setBusy(false); return; }
+          if (res.status === 'denied') { cancelExpiry(); setStatus('Sign-in was denied in the browser.'); setBusy(false); return; }
+          if (res.status === 'expired') { cancelExpiry(); setStatus('Code expired — try again.'); setBusy(false); return; }
+          if (res.status === 'error') { cancelExpiry(); setStatus(res.message || 'Sign-in failed.'); setBusy(false); return; }
           // The server can ask us to back off; honour it rather than hammering.
-          if (res.status === 'slow_down' && res.intervalSeconds) intervalMs = res.intervalSeconds * 1000;
+          if (res.status === 'slow_down') intervalMs = Math.max(intervalMs, deviceSignInPollDelay(res.intervalSeconds, intervalMs));
+          else if (res.status !== 'pending') { cancelExpiry(); setStatus('Sign-in failed. Try again.'); setBusy(false); return; }
           setStatus('Waiting for approval…');
-          setTimeout(poll, intervalMs);
+          later();
         } catch {
           // A dropped request is not a failed sign-in — the grant is still
           // pending upstream, so keep polling instead of discarding it.
-          setStatus('Network hiccup — retrying…');
-          setTimeout(poll, intervalMs);
+          if (attempt.isCurrent()) { setStatus('Network hiccup — retrying…'); later(); }
         }
       };
-      setTimeout(poll, intervalMs);
+      later();
     } catch (e) {
+      if (!attempt.isCurrent()) return;
+      cancelBeginTimeout();
       setStatus(`Sign-in failed: ${(e as Error).message}`);
       setBusy(false);
     }

@@ -3,8 +3,8 @@
  * state, when it ticks, and how it asks Jev to apply the owner's rules.
  *
  * Reads are local files the runtime already writes: workflow run records,
- * the chat run ledger, and the drafts folder. No provider is called, so a
- * quiet tick costs a directory listing and nothing else.
+ * the chat run ledger, and the drafts folder. Observation calls no provider;
+ * unchanged workflow runs reuse their lightweight, generation-checked records.
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { readWorkflowRunInventoryFile } from '../execution/workflow-run-inventory.js';
 import { listRuns } from '../runtime/run-events.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
 import { tryJevHeartbeatItemVerdict } from '../runtime/jev/control-plane.js';
@@ -82,7 +83,10 @@ export function observeWorkflowRuns(limit = RUN_RECORDS_PER_TICK): { runs: WorkR
   let failures = 0;
   for (const file of files) {
     try {
-      const raw = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, file), 'utf-8')) as Record<string, unknown>;
+      const result = readWorkflowRunInventoryFile(file);
+      if (result.kind === 'failed') { failures += 1; continue; }
+      if (result.kind === 'empty') continue;
+      const raw = result.entry.record;
       const id = str(raw.id) ?? file.slice(0, -5);
       const workflow = str(raw.workflow) ?? str(raw.workflowSlug);
       const status = str(raw.status);
