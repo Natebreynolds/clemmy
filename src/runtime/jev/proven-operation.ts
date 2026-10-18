@@ -100,8 +100,9 @@ export interface ProvenOperationPreparation {
   /** How the remembered run was chosen; absent when none was. */
   pickedBy?: ProvenPickSource;
   /** The owner's standing rule that offered the routed operation, so a view of
-   *  remembered tools can say why this one was used. */
-  ownerRule?: { factId: number; text: string };
+   *  remembered tools can say why this one was used. `operation` is set when
+   *  the rule rode beside a picked run rather than being the routed pick. */
+  ownerRule?: { factId: number; text: string; operation?: string };
   /** Existing Date.now elapsed around the decision, when asked. Wall-clock
    *  diagnostic only; not the whole preparation span or a timing guarantee. */
   decisionWaitMs?: number;
@@ -414,7 +415,7 @@ export function renderProvenOperationGuidance(
   invocations: readonly unknown[] = [],
   boundAccounts: readonly ProvenBoundAccount[] = [],
   liveReads: readonly ProvenLiveRead[] = [],
-  opts: { routed?: boolean; likely?: boolean } = {},
+  opts: { routed?: boolean; likely?: boolean; ownerRule?: { operation: string; text: string } } = {},
 ): string {
   const tools = strategy.toolsUsed;
   if (opts.routed === true && tools.every(isHandoverRegistryTool)) {
@@ -462,6 +463,11 @@ export function renderProvenOperationGuidance(
         // fit itself instead of taking the run as the whole job.
         ? `A prior successful run of what looks like the same kind of request used these tools: ${tools.join(', ')}. They are verified and callable now. Use them where they do what this request asks, with this request's own targets and values; anything else this request needs is still yours to find.`
         : `A prior successful run of this same kind of request already proved these tools: ${tools.join(', ')}. Use this request's own targets and values.`,
+    // The run did not use the rule's tool, so say it apart from the run's
+    // tools, and say that it holds inside what the request builds too.
+    ...(opts.ownerRule
+      ? [`The owner's standing rule applies to part of this request: "${opts.ownerRule.text}" Use ${opts.ownerRule.operation} for that part, including inside anything you build for this request, such as a workflow step or a Space source.`]
+      : []),
     skipSearch
       ? 'Call them directly on this turn. tool_search stays available if these operations cannot fulfill the whole request or a call is refused.'
       : callable
@@ -812,6 +818,10 @@ async function prepareProvenOperationInScope(
   // the operation over below.
   let routed = false;
   const ownerRuleFor = new Map<string, { factId: number; text: string }>();
+  // The operation an owner's rule names for part of the work, beside the run
+  // Jev picked. It is provisioned with the run's operations; it never joins
+  // the run's own proven tools, which that run alone proved.
+  let ruleBesideRun: string | null = null;
   if (!strategy) {
     // The candidates exist only for Jev's question. When Jev cannot be asked
     // (turned off, or no key), none are built and nothing waits. With no
@@ -851,6 +861,8 @@ async function prepareProvenOperationInScope(
       if (judged) {
         strategy = judged;
         pickedBy = 'jev';
+        const beside = decision.ownerRule?.operation.id;
+        if (beside && ownerRuleFor.has(beside)) ruleBesideRun = beside;
       }
       const agreed = !strategy && !decision.route.pick && decision.corroborated
         ? familiar.find((row) => row.id === decision.corroborated!.strategy.id) ?? null
@@ -887,7 +899,7 @@ async function prepareProvenOperationInScope(
   let descriptors: HostCapabilityDescriptorV1[] = [];
   let invocations: unknown[] = [];
   let boundAccounts: ProvenBoundAccount[] = [];
-  const composioSlugs = composioSlugsFromStrategy(strategy.toolsUsed);
+  const composioSlugs = composioSlugsFromStrategy(ruleBesideRun ? [...strategy.toolsUsed, ruleBesideRun] : strategy.toolsUsed);
   // A strategy that does not cover the request must not spend the request's
   // time provisioning its operations. Coverage is either the request restating the run
   // (its own keywords), or a turn-start judgement inside the budget that the
@@ -1034,6 +1046,7 @@ async function prepareProvenOperationInScope(
     text: renderProvenOperationGuidance(strategy, schemas, invocations, boundAccounts, liveReads, {
       routed,
       ...(pickedBy === 'jev_corroborated' ? { likely: true } : {}),
+      ...(ruleBesideRun ? { ownerRule: { operation: ruleBesideRun, text: ownerRuleFor.get(ruleBesideRun)!.text } } : {}),
     }),
     strategyId: strategy.id,
     tools: strategy.toolsUsed,
@@ -1052,6 +1065,7 @@ async function prepareProvenOperationInScope(
     liveReadOutcomes,
     ...(pickedBy ? { pickedBy } : {}),
     ...(routed && ownerRuleFor.has(strategy.toolsUsed[0] ?? '') ? { ownerRule: ownerRuleFor.get(strategy.toolsUsed[0]!)! } : {}),
+    ...(ruleBesideRun ? { ownerRule: { ...ownerRuleFor.get(ruleBesideRun)!, operation: ruleBesideRun } } : {}),
     ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}),
   };
 }

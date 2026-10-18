@@ -825,7 +825,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 82127
+          "bytes": 83817
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -2565,7 +2565,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 49100
+          "bytes": 50371
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -4758,7 +4758,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 82127
+          "bytes": 83817
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -6498,7 +6498,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 49100
+          "bytes": 50371
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045

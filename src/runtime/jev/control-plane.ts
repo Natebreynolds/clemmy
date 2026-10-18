@@ -225,6 +225,14 @@ const PROVEN_STRATEGY_FIT_MIN = 0.8;
 // this rule with no pick, and 6 of those turns went on to use the operation.
 const CORROBORATED_CHOICE_MIN = 0.35;
 const CORROBORATED_FIT_MIN = 0.5;
+// An owner's rule names the tool for one part of the work ("read pages with
+// X"), so it rides beside a remembered run instead of losing to it. It never
+// decides the first frame there: the run is already bound and the brain still
+// judges the part the rule covers, so it takes the leaning bar, not the sure one.
+// Live 2026-10-18: Jev picked a workflow run (fit 0.93) and judged the owner's
+// page-read rule to apply (0.79, select 0.88); the rule was dropped, the
+// workflow read the page another way, and two reviews sent it back.
+const OWNER_RULE_BESIDE_RUN_FIT_MIN = 0.5;
 
 export interface RoutableOperation {
   id: string;
@@ -264,6 +272,9 @@ export interface TurnStartDecision<S extends ProvenStrategyCandidate, O extends 
   /** Why the remembered run was or was not taken. Absent when none was offered. */
   strategyJudgement?: StrategyJudgement;
   route: OperationRoute<O>;
+  /** Set only beside a picked run: the owner's rule Jev judged to apply to part
+   *  of this request, for an operation that run did not use. */
+  ownerRule?: { operation: O; confidence: number; fit: number };
   /** Transport/timeout/disabled: the caller may keep its top memory match. */
   failedOpen: boolean;
 }
@@ -426,6 +437,18 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
     return { strategy: run, operation,
       run: { confidence: which.confidence, fit: runFit }, route: { confidence: select.confidence, fit: opFit } };
   })();
+  const ownerRule = ((): TurnStartDecision<S, O>['ownerRule'] => {
+    if (!strategy) return undefined;
+    const select = result.answers.select as ChoiceAnswer | undefined;
+    const index = Number(/^op_(\d+)$/.exec(select?.choice ?? '')?.[1] ?? -1);
+    const operation = ops[index];
+    if (!select || !operation?.rule || select.confidence < OPERATION_ROUTE_CONFIDENCE_MIN) return undefined;
+    const fit = (result.answers[`fit_${index}`] as NoulAnswer | undefined)?.noul;
+    if (typeof fit !== 'number' || fit < OWNER_RULE_BESIDE_RUN_FIT_MIN) return undefined;
+    const named = operation.id.trim().toLowerCase();
+    if (strategy.toolsUsed.some((tool) => tool.trim().toLowerCase() === named)) return undefined;
+    return { operation, confidence: select.confidence, fit };
+  })();
   noteJevDecisionOutcome(
     result.decisionId,
     strategy ? 'strategy' : route.pick ? 'routed' : corroborated ? 'corroborated' : 'none',
@@ -434,11 +457,13 @@ export async function decideTurnStartWithJev<S extends ProvenStrategyCandidate, 
       ...(judged ? { run: judged.judgement.outcome } : {}),
       ...(ops.length > 0 ? { route: route.outcome, ...(route.pick ? { pick: route.pick.id } : {}) } : {}),
       ...(corroborated ? { corroborated: { strategy: corroborated.strategy.id, operation: corroborated.operation.id } } : {}),
+      ...(ownerRule ? { ownerRule: ownerRule.operation.id } : {}),
     },
   );
   return {
     strategy,
     ...(corroborated ? { corroborated } : {}),
+    ...(ownerRule ? { ownerRule } : {}),
     ...(judged ? { strategyJudgement: judged.judgement } : {}),
     route,
     failedOpen: false,

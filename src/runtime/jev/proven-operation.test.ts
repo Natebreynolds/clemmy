@@ -468,6 +468,8 @@ function decideWith(
     strategy?: string; route?: string; failedOpen?: boolean;
     /** Neither answer sure; the run named here used the operation named here. */
     corroborated?: { strategy: string | undefined; operation: string };
+    /** Beside the picked run: the operation whose owner rule Jev judged to apply. */
+    ownerRule?: string;
   },
 ) {
   return async <S extends { id: string; objective: string; toolsUsed: string[] }, O extends { id: string; purpose: string }>(
@@ -483,8 +485,10 @@ function decideWith(
     const agreedRun = strategies.find((row) => row.id === chosen.corroborated?.strategy);
     const agreedOperation = operations.find((row) => row.id === chosen.corroborated?.operation)
       ?? (chosen.corroborated ? { id: chosen.corroborated.operation, purpose: '' } as O : undefined);
+    const ruled = strategy ? operations.find((row) => row.id === chosen.ownerRule) : undefined;
     return {
       strategy,
+      ...(ruled ? { ownerRule: { operation: ruled, confidence: 0.88, fit: 0.79 } } : {}),
       ...(agreedRun && agreedOperation ? { corroborated: { strategy: agreedRun, operation: agreedOperation,
         run: { confidence: 0.56, fit: 0.67 }, route: { confidence: 0.49, fit: 0.63 } } } : {}),
       route: pick ? { pick, outcome: 'picked' as const, confidence: 0.9, fit: 0.9 } : { pick: null, outcome: 'none' as const },
@@ -922,4 +926,44 @@ test("an owner's standing rule that names a tool Clem has used offers that tool'
   assert.ok(calls[0]?.operations.includes('PAGEGRAB_SCRAPE'), JSON.stringify(calls));
   assert.equal(prepared.strategyId, 'route:PAGEGRAB_SCRAPE');
   assert.deepEqual(prepared.ownerRule, scrape!.rule);
+});
+
+test("an owner's rule Jev judges to apply beside a remembered run reaches the brain apart from the run's proven tools", async () => {
+  // Live 2026-10-18: "set up a workflow that reads page 7…" matched a remembered
+  // workflow run; Jev judged the owner's page-read rule to apply too, but only
+  // the run reached the brain, so the workflow read the page another way and
+  // two reviews sent it back.
+  const { rememberToolChoice, listToolProcedures, updateToolProcedureOutcome } = await import('../../memory/tool-choice-store.js');
+  const { rememberFact } = await import('../../memory/facts.js');
+  rememberToolChoice({ intent: 'scrape a web page URL to markdown content', choice: { kind: 'composio', identifier: 'PAGEGRAB_SCRAPE' } });
+  const procedure = listToolProcedures().find((row) => row.choice?.identifier === 'PAGEGRAB_SCRAPE')!;
+  updateToolProcedureOutcome(procedure.procedureId, 'success', 'scrape a web page URL to markdown content');
+  rememberFact({ kind: 'constraint', content: 'Standing rule: when I ask for information from a web page, read it with PageGrab, unless the page needs clicking or a login; then use the browser.' });
+  recordZephyrStrategy('set up a workflow that saves a web page catalogue to a csv file', 'workflow_create', 'workflow-page-csv');
+  const query = 'Set up a workflow that reads page 7 of https://example.test/catalogue and saves every item on that web page to a csv file';
+  const calls: DecisionCall[] = [];
+  const prepared = await prepareProvenOperationForRequest(
+    { query },
+    { decideTurnStart: decideWith(calls, (strategies) => ({
+      strategy: strategies.find((row) => /web page catalogue/.test(row.objective))?.id,
+      ownerRule: 'PAGEGRAB_SCRAPE',
+    })) },
+  );
+  assert.ok(calls[0]?.operations.includes('PAGEGRAB_SCRAPE'), JSON.stringify(calls));
+  assert.equal(prepared.pickedBy, 'jev');
+  assert.deepEqual(prepared.tools, ['workflow_create'], 'the run keeps only the tools it proved');
+  assert.equal(prepared.ownerRule?.operation, 'PAGEGRAB_SCRAPE');
+  assert.match(prepared.ownerRule?.text ?? '', /read it with PageGrab/);
+  const text = prepared.text ?? '';
+  assert.match(text, /already proved these tools: workflow_create\. /, 'the rule\'s tool is never described as proven by the run');
+  assert.match(text, /The owner's standing rule applies to part of this request: "Standing rule: when I ask for information from a web page, read it with PageGrab/);
+  assert.match(text, /Use PAGEGRAB_SCRAPE for that part, including inside anything you build for this request, such as a workflow step or a Space source\./);
+
+  // Without Jev's judgement that the rule applies, the run alone reaches the brain.
+  const runOnly = await prepareProvenOperationForRequest(
+    { query },
+    { decideTurnStart: decideWith([], (strategies) => ({ strategy: strategies.find((row) => /web page catalogue/.test(row.objective))?.id })) },
+  );
+  assert.equal(runOnly.ownerRule, undefined);
+  assert.doesNotMatch(runOnly.text ?? '', /owner's standing rule/);
 });

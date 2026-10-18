@@ -1056,3 +1056,52 @@ test("an operation an owner's standing rule names is asked about by the rule, no
   assert.match(questions.fit_1.instructions, /^Would calling space_preview directly do the core of this request\?/, 'other candidates keep the core question');
   assert.equal(routed.route.pick?.id, 'PAGEGRAB_SCRAPE');
 });
+
+test("an owner's rule Jev judges to apply rides beside the remembered run it picks", async () => {
+  // Live 2026-10-18: a workflow request matched a remembered workflow run
+  // (fit 0.93) and Jev judged the owner's page-read rule to apply (select
+  // 0.88, fit 0.79, under the routed pick's 0.8). The run won, the rule was
+  // dropped, and the workflow read the page another way.
+  _setTypesafeKeyForTests('ts_test');
+  let fit = 0.79;
+  let select = 'op_0';
+  _setSystemOneFetchForTests(async () => ({
+    status: 200,
+    ok: true,
+    text: async () => JSON.stringify({
+      model: 'jev-1.13.0',
+      answers: {
+        which: { type: 'choice', choice: 'strat-workflow', confidence: 0.92, probabilities: { 'strat-workflow': 0.92 } },
+        run_0: { type: 'noul', noul: 0.93 },
+        select: { type: 'choice', choice: select, confidence: 0.88, probabilities: { [select]: 0.88 } },
+        fit_0: { type: 'noul', noul: fit },
+        fit_1: { type: 'noul', noul: fit },
+      },
+      usage: { input_tokens: 90, output_tokens: 8 },
+    }),
+  }));
+  const rule = 'When I ask for information from a web page, read it with PageGrab unless the page needs a login.';
+  const runs = [{ id: 'strat-workflow', objective: 'Set up a workflow that saves a page to a file', toolsUsed: ['workflow_create', 'workflow_run', 'run_shell_command'] }];
+  const operations = [
+    { id: 'PAGEGRAB_SCRAPE', purpose: `Owner's standing rule: "${rule}"`, rule },
+    { id: 'workflow_run', purpose: 'Run a saved workflow' },
+  ];
+  const request = 'Set up a workflow that reads page 7 of https://example.test and saves every item to a CSV';
+  const beside = await decideTurnStartWithJev(request, runs, operations, { timeoutMs: 1_000 });
+  assert.equal(beside.strategy?.id, 'strat-workflow', 'the remembered run still wins');
+  assert.equal(beside.route.pick, null, 'the rule never decides the first frame beside a run');
+  assert.equal(beside.ownerRule?.operation.id, 'PAGEGRAB_SCRAPE');
+  assert.deepEqual({ confidence: beside.ownerRule?.confidence, fit: beside.ownerRule?.fit }, { confidence: 0.88, fit: 0.79 });
+
+  fit = 0.3;
+  assert.equal((await decideTurnStartWithJev(request, runs, operations, { timeoutMs: 1_000 })).ownerRule, undefined,
+    'a rule Jev judges not to apply stays out');
+  fit = 0.79;
+  select = 'op_1';
+  assert.equal((await decideTurnStartWithJev(request, runs, operations, { timeoutMs: 1_000 })).ownerRule, undefined,
+    'only an operation an owner rule names rides beside the run');
+  select = 'op_0';
+  const usedIt = [{ ...runs[0]!, toolsUsed: [...runs[0]!.toolsUsed, 'PAGEGRAB_SCRAPE'] }];
+  assert.equal((await decideTurnStartWithJev(request, usedIt, operations, { timeoutMs: 1_000 })).ownerRule, undefined,
+    'a run that already used the rule\'s tool needs nothing beside it');
+});
