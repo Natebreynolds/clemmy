@@ -36,6 +36,13 @@ export interface WorkflowRunInventorySnapshot {
   signatureFor(workflowNames: readonly string[]): string;
 }
 
+/** A selected file's display projection. Empty decoded values are distinct
+ * from an unreadable generation so observers can retain their read accounting. */
+export type WorkflowRunInventoryFileResult =
+  | { kind: 'record'; entry: WorkflowRunInventoryEntry }
+  | { kind: 'empty' }
+  | { kind: 'failed' };
+
 const HEAVY_FIELDS = new Set(['stepOutputs', 'workflowDefinitionSnapshot', 'output', 'reportBack', 'mutationContractSnapshot']);
 const SNAPSHOT_IDENTITY_FIELDS = ['version', 'scope', 'compilerId', 'definitionHash', 'workflowSlug', 'codeRevision'];
 
@@ -54,10 +61,10 @@ function generation(stat: BigIntStats): string {
 }
 
 function slim(raw: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (!HEAVY_FIELDS.has(key)) out[key] = value;
-  }
+  // Spread defines own data keys, including a decoded `__proto__` key. An
+  // assignment loop could turn that key into inherited workflow/status fields.
+  const out = { ...raw };
+  for (const key of HEAVY_FIELDS) delete out[key];
   const outputs = raw.stepOutputs;
   out.stepOutputKeys = outputs && typeof outputs === 'object' && !Array.isArray(outputs) ? Object.keys(outputs) : [];
   const snapshot = raw.workflowDefinitionSnapshot;
@@ -87,19 +94,24 @@ function ensureCacheDirectory(): void {
   }
 }
 
-function refreshFile(file: string): WorkflowRunInventoryEntry | null {
+function refreshFile(file: string): WorkflowRunInventoryFileResult {
   try {
     const fullPath = path.join(WORKFLOW_RUNS_DIR, file);
     const before = statSync(fullPath, { bigint: true });
-    if (!before.isFile()) { cache.delete(file); return null; }
+    if (!before.isFile()) { cache.delete(file); return { kind: 'failed' }; }
     const revision = generation(before);
     const known = cache.get(file);
-    if (known?.generation === revision) return known.entry;
+    if (known?.generation === revision) return { kind: 'record', entry: known.entry };
     const bytes = readFileSync(fullPath, 'utf-8');
     const after = statSync(fullPath, { bigint: true });
-    if (generation(after) !== revision) { cache.delete(file); return null; }
+    if (generation(after) !== revision) { cache.delete(file); return { kind: 'failed' }; }
     const raw = JSON.parse(bytes) as unknown;
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { cache.delete(file); return null; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      cache.delete(file);
+      // The legacy observer counted a null record as a failed read, while
+      // other decoded primitives/arrays simply had no workflow or status.
+      return { kind: raw === null ? 'failed' : 'empty' };
+    }
     const entry = Object.freeze({
       file,
       mtimeMs: Number(before.mtimeNs) / 1_000_000,
@@ -107,18 +119,29 @@ function refreshFile(file: string): WorkflowRunInventoryEntry | null {
       record: Object.freeze(slim(raw as Record<string, unknown>)),
     });
     cache.set(file, { generation: revision, entry });
-    return entry;
+    return { kind: 'record', entry };
   } catch {
     cache.delete(file);
-    return null;
+    return { kind: 'failed' };
   }
+}
+
+/** Refresh only an already-selected basename, without scanning other runs or
+ * changing its caller's window/order. This is not execution authority. */
+export function readWorkflowRunInventoryFile(file: string): WorkflowRunInventoryFileResult {
+  if (!file.endsWith('.json') || path.basename(file) !== file || file.includes('\0')) {
+    return { kind: 'failed' };
+  }
+  ensureCacheDirectory();
+  return refreshFile(file);
 }
 
 /** A single status projection. It never enumerates other runs or grants authority. */
 export function workflowRunInventoryEntry(runId: string): WorkflowRunInventoryEntry | null {
   if (!runId || !/^[a-zA-Z0-9_.:-]+$/.test(runId)) return null;
   ensureCacheDirectory();
-  return refreshFile(`${runId}.json`);
+  const result = refreshFile(`${runId}.json`);
+  return result.kind === 'record' ? result.entry : null;
 }
 
 /**

@@ -168,6 +168,44 @@ test('exact-run lookup rejects paths without touching storage', (t) => {
   assert.equal(listings.mock.calls.length, 0);
 });
 
+test('selected-basename lookup rejects paths without scanning or touching storage', (t) => {
+  const reads = t.mock.method(fs, 'readFileSync');
+  const stats = t.mock.method(fs, 'statSync');
+  const listings = t.mock.method(fs, 'readdirSync');
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  for (const file of ['', '../foreign.json', 'nested/run.json', 'run.json\0', 'run.txt',
+    ...(process.platform === 'win32' ? ['nested\\run.json'] : [])]) {
+    assert.deepEqual(inventory.readWorkflowRunInventoryFile(file), { kind: 'failed' });
+  }
+  assert.equal(reads.mock.calls.length, 0);
+  assert.equal(stats.mock.calls.length, 0);
+  assert.equal(listings.mock.calls.length, 0);
+});
+
+test('selected basenames retain platform-valid punctuation from the original directory window', () => {
+  if (process.platform === 'win32') return;
+  write('literal\\name', { workflow: 'literal basename', status: 'running' });
+  const result = inventory.readWorkflowRunInventoryFile('literal\\name.json');
+  assert.equal(result.kind, 'record');
+  if (result.kind === 'record') assert.equal(result.entry.record.workflow, 'literal basename');
+});
+
+test('decoded prototype-looking keys remain own data and cannot invent workflow fields', () => {
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'own-keys.json'),
+    '{"__proto__":{"workflow":"not a workflow","status":"failed"},"constructor":"kept own value","stepOutputs":{"read":"large"}}');
+  const record = inventory.workflowRunInventoryEntry('own-keys')!.record;
+  assert.equal(Object.getPrototypeOf(record), Object.prototype);
+  assert.equal(Object.hasOwn(record, '__proto__'), true);
+  assert.deepEqual(record.__proto__, { workflow: 'not a workflow', status: 'failed' });
+  assert.equal(record.constructor, 'kept own value');
+  assert.equal(record.workflow, undefined);
+  assert.equal(record.status, undefined);
+  assert.equal(record.stepOutputs, undefined);
+  assert.deepEqual(record.stepOutputKeys, ['read']);
+});
+
 test('one captured inventory derives every workflow signature without rescanning metadata or parsing records', (t) => {
   for (let i = 0; i < 24; i++) write(`capture-${i}`, {
     workflow: `workflow-${i % 4}`, status: 'running', createdAt: `2026-10-16T01:00:${String(i).padStart(2, '0')}.000Z`,
