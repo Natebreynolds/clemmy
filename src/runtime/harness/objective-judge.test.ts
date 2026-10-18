@@ -1703,6 +1703,109 @@ test('an answer that wrote a local file keeps the second-model review', async ()
   _setTypesafeKeyForTests(undefined);
 });
 
+test('a Jev-only completed abstention retains its exact original reading without becoming a reviewed verdict', async () => {
+  const { createHash } = await import('node:crypto');
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const owner = { sessionId: 'jev-only-original-abstention', sourceUserSeq: 71, attemptId: 'attempt:jev-only-abstention' };
+  const objective = 'Answer from the supplied controlled briefing, cite it, and do not run tools.';
+  const candidate = 'The controlled briefing says ready [controlled-note:r1].';
+  const context = { sessionId: owner.sessionId, reviewInputOwner: { ...owner }, skills: [],
+    toolCallSummary: 'The supplied controlled briefing says ready.', producedNoOutput: true,
+    fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE };
+  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08 };
+  const digest = (value: string) => createHash('sha256').update(value).digest('hex');
+  let calls = 0; let reviewerCalls = 0; let posted = '';
+  _setTypesafeKeyForTests('ts_controlled_abstention');
+  _setSystemOneFetchForTests(async (_url, init) => {
+    calls++; posted = init.body;
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+      answers: Object.fromEntries(Object.entries(scores).map(([key, noul]) => [key, { type: 'noul', noul }])) }) };
+  });
+  _setCompletionJudgeForTests(async () => { reviewerCalls++; return unavailableSettingsJudge(); });
+  const verdict = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(objective, candidate, context));
+  assert.equal(calls, 1); assert.equal(reviewerCalls, 0, 'the owner chose Jev alone for an answer with no produced output');
+  assert.equal(verdict.done, true); assert.equal(verdict.failedOpen, true, 'answer delivery remains explicitly unqualified');
+  assert.equal(verdict.reviewFailure, 'invalid'); assert.equal(verdict.reviewDisposition, 'answered_unqualified');
+  assert.match(verdict.reason, /completed its check.*not confident enough/i);
+  assert.equal(verdict.jevAttempt?.choice, 'abstained'); assert.equal(verdict.jevAttempt?.accepted, false);
+  assert.equal(verdict.jevAttempt?.requirementCoverage, 'uncertain'); assert.equal(verdict.jevAttempt?.reviewerStarted, false);
+  const reading = verdict.jevAttempt?.originalReading;
+  assert.ok(reading); assert.equal(reading.scope, 'diagnostic_only'); assert.deepEqual(reading.owner, owner);
+  assert.equal(reading.objectiveDigest, digest(objective)); assert.equal(reading.candidateDigest, digest(candidate));
+  assert.equal(reading.requestBodySha256, digest(posted));
+  assert.equal(reading.questionnaireSha256, digest(JSON.stringify(JSON.parse(posted).questions)));
+  assert.match(reading.originalResultSha256, /^[a-f0-9]{64}$/); assert.ok(reading.modelCallId);
+  assert.equal(reading.requestedModel, 'jev-1.13.0'); assert.equal(reading.accountBackend, 'unknown');
+  assert.equal(reading.providerResponseIdentity, 'unknown');
+  assert.equal(JSON.parse(posted).state.request, objective); assert.equal(JSON.parse(posted).state.response, candidate);
+  assert.doesNotMatch(JSON.stringify(reading), /controlled briefing|ts_controlled_abstention/);
+
+  // A public diagnostic from a previous candidate is not a reusable witness.
+  _setSystemOneFetchForTests(async () => { calls++; throw new Error('controlled transport unavailable'); });
+  const next = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(
+    `${objective} Explain the remaining uncertainty too.`, 'A different controlled candidate.',
+    { ...context, jevAttempt: verdict.jevAttempt } as typeof context));
+  assert.equal(calls, 2); assert.equal(reviewerCalls, 0);
+  assert.equal(next.reviewFailure, 'unavailable'); assert.equal(next.reviewDisposition, undefined);
+  assert.equal(next.jevAttempt?.originalReading, undefined, 'changed objective/candidate cannot borrow the earlier result');
+});
+
+test('Jev-only transport failure, malformed response and changed source, context or memory cannot claim a completed abstention', async () => {
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { rememberTurnMemoryForJudges } = await import('../../memory/judge-memory.js');
+  const { HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08 };
+  let reviewerCalls = 0;
+  _setCompletionJudgeForTests(async () => { reviewerCalls++; return unavailableSettingsJudge(); });
+  _setTypesafeKeyForTests('ts_controlled_abstention_changes');
+  for (const change of ['transport', 'malformed', 'source', 'context', 'memory'] as const) {
+    const owner = { sessionId: `jev-only-abstention-${change}`, sourceUserSeq: 73, attemptId: `attempt:abstention-${change}` };
+    const context = { sessionId: owner.sessionId, reviewInputOwner: { ...owner }, skills: [],
+      toolCallSummary: 'Controlled exact source context.', producedNoOutput: true,
+      fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE };
+    rememberTurnMemoryForJudges(owner.sessionId, 'Controlled original memory.');
+    let calls = 0;
+    _setSystemOneFetchForTests(async () => {
+      calls++;
+      if (change === 'transport') throw new Error('controlled transport unavailable');
+      if (change === 'source') context.reviewInputOwner.sourceUserSeq++;
+      if (change === 'context') context.toolCallSummary = 'Changed controlled source context.';
+      if (change === 'memory') rememberTurnMemoryForJudges(owner.sessionId, 'Changed controlled memory.');
+      return { status: 200, ok: true, text: async () => change === 'malformed' ? '{' : JSON.stringify({ model: 'jev-1.13.0',
+        answers: Object.fromEntries(Object.entries(scores).map(([key, noul]) => [key, { type: 'noul', noul }])) }) };
+    });
+    const verdict = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(
+      'Answer the controlled briefing question with a citation.', 'Controlled answer [note:r1].', context));
+    assert.equal(calls, 1, change); assert.equal(verdict.failedOpen, true, change);
+    assert.equal(verdict.reviewFailure, 'unavailable', change); assert.equal(verdict.reviewDisposition, undefined, change);
+    assert.equal(verdict.jevAttempt?.originalReading, undefined, change);
+    rememberTurnMemoryForJudges(owner.sessionId, null);
+  }
+  assert.equal(reviewerCalls, 0, 'no case buys a second reviewer or another Jev call');
+});
+
+test('Stop during a Jev-only uncertain reading cancels instead of publishing completed-abstention metadata', async () => {
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const { harnessRunContextStorage } = await import('./brackets.js');
+  const { HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
+  const owner = { sessionId: 'jev-only-cancelled-abstention', sourceUserSeq: 79, attemptId: 'attempt:abstention-stop' };
+  const controller = new AbortController(); let calls = 0; let reviewerCalls = 0;
+  _setTypesafeKeyForTests('ts_controlled_abstention_stop');
+  _setCompletionJudgeForTests(async () => { reviewerCalls++; return unavailableSettingsJudge(); });
+  _setSystemOneFetchForTests(async () => {
+    calls++; controller.abort();
+    return { status: 200, ok: true, text: async () => JSON.stringify(jevCompletionReading('done', 0.15)) };
+  });
+  await assert.rejects(harnessRunContextStorage.run({ sessionId: owner.sessionId, sourceUserSeq: owner.sourceUserSeq,
+    runAttemptId: owner.attemptId, callerCancelSignal: controller.signal } as never,
+  () => modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete('Answer the controlled question.', 'Controlled answer.', {
+    sessionId: owner.sessionId, reviewInputOwner: owner, skills: [], toolCallSummary: 'Controlled source.', producedNoOutput: true,
+    fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
+  }))), { name: 'AbortError' });
+  assert.equal(calls, 1); assert.equal(reviewerCalls, 0);
+});
+
 test('the live completion review weighs an explained judgment call by its basis; the frozen legacy rubric is unchanged', async () => {
   // Live 2026-10-17: three review rounds re-argued a research report's
   // classification of borderline repos and finished work ended blocked.

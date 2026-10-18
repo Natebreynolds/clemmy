@@ -286,7 +286,7 @@ export interface ObjectiveJudgeVerdict {
    */
   failedOpen?: boolean;
   /** Why no review verdict was produced, when none was: the reviewer ran out
-   *  of time, answered unreadably, or could not be reached. */
+   *  of time, answered without a qualifying assessment, or could not be reached. */
   reviewFailure?: 'timeout' | 'invalid' | 'unavailable';
   /** Reached reviewer whose same-call assessment cannot qualify approval. */
   reviewDisposition?: 'answered_unqualified';
@@ -2412,18 +2412,20 @@ export async function judgeObjectiveComplete(
   };
   const screeningInputSnapshot = (context: string, memory: string): string => JSON.stringify(
     Object.assign(Object.create(null), { objective, candidate: assistantResponse, context, memory }));
-  const completedScreenIsCurrent = (): boolean => {
+  const currentCompletedScreenAssessment = (): import('../jev/control-plane.js').JevCompletionAssessmentMetadata | undefined => {
     try {
-      if (!completedScreen || !screeningMemoryReader || callerSignal?.aborted) return false;
+      if (!completedScreen || !screeningMemoryReader || callerSignal?.aborted) return undefined;
       const current = plainScreeningContext();
-      if (current === undefined) return false;
+      if (current === undefined) return undefined;
       const expected = assessmentExpected();
       const assessment = expected && assessmentReader?.(completedScreen.assessment,
         { ...expected, signal: callerSignal });
       return assessment?.outcome === 'abstained'
-        && completedScreen.inputSnapshot === screeningInputSnapshot(current, screeningMemoryReader(skillContext?.sessionId));
-    } catch { return false; }
+        && completedScreen.inputSnapshot === screeningInputSnapshot(current, screeningMemoryReader(skillContext?.sessionId))
+        ? assessment : undefined;
+    } catch { return undefined; }
   };
+  const completedScreenIsCurrent = (): boolean => Boolean(currentCompletedScreenAssessment());
   // screening: the ask ahead of the reviewer, which Jev's record may skip.
   // The late ask, when the reviewer could not run, is never skipped.
   const askJev = async (screening = false): Promise<Awaited<ReturnType<typeof import('../jev/control-plane.js').tryJevCompletionVerdict>>> => {
@@ -2577,6 +2579,34 @@ export async function judgeObjectiveComplete(
         ...(fast.blocked ? { blocked: true } : {}),
         ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
         ...(jevAttempt ? { jevAttempt } : {}),
+      };
+    }
+    // A completed, uncertain reading is not an unreachable reviewer. Only
+    // this invocation's original producer witness and unchanged input/memory
+    // view can qualify that diagnostic; scores or public metadata cannot.
+    const abstention = !fast && currentCompletedScreenAssessment();
+    if (abstention) {
+      const producer = abstention.producer;
+      return {
+        done: true, failedOpen: true, reviewFailure: 'invalid',
+        reviewDisposition: 'answered_unqualified',
+        reason: 'Jev completed its check, but was not confident enough to verify the whole answer; the answer remains unreviewed.',
+        judgeModelId: producer.requestedModel,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
+        jevAttempt: {
+          choice: 'abstained', accepted: false, coverageComplete: coverage.complete,
+          requirementCoverage: 'uncertain', reviewerStarted: false,
+          originalReading: {
+            scope: 'diagnostic_only', modelCallId: producer.modelCallId, physicalAttempt: producer.physicalAttempt,
+            owner: { ...producer.owner }, requestBodySha256: producer.requestBodySha256,
+            questionnaireSha256: abstention.questionnaireSha256, originalResultSha256: producer.originalResultSha256,
+            reviewInvocationId: abstention.reviewInvocationId, objectiveDigest: abstention.objectiveDigest,
+            candidateDigest: abstention.candidateDigest, contextDigest: abstention.contextDigest,
+            requestedModel: producer.requestedModel,
+            ...(producer.providerReportedModel ? { providerReportedModel: producer.providerReportedModel } : {}),
+            accountBackend: producer.accountBackend, providerResponseIdentity: producer.providerResponseIdentity,
+          },
+        },
       };
     }
     return {
