@@ -412,7 +412,7 @@ test('typed failed terminal is labeled failed, never completed', async () => {
     (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
   );
   assert.ok(notification);
-  assert.match(notification.title, /^Chat run failed:/);
+  assert.match(notification.title, /^Something went wrong:/);
   assert.doesNotMatch(notification.title, /completed/i);
   assert.equal(notification.metadata?.status, 'failed');
   assert.equal(notification.metadata?.needsAttention, true);
@@ -819,7 +819,7 @@ test('a run that needs the owner still leads with its status', async () => {
     (item) => item.id === `foreground-report-back-${sessionId}-${source.seq}`,
   );
   assert.ok(notification, 'a run needing the owner reports back');
-  assert.match(notification.title, /^Chat run needs you:/);
+  assert.match(notification.title, /^Needs your answer:/);
   assert.match(notification.title, /send the client export/);
 });
 

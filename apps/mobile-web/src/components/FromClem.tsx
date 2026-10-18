@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useRef, useState } from 'preact/hooks';
-import { appPlaceHref, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
+import { appPlaceHref, currentProactiveReceipt, fromClemSourceName, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { markInboxNotificationRead, replyFromClem, type FromClem as FromClemData, type FromClemReplyOutcome, type FromClemRow } from '../lib/api';
 import { relativeTime } from './Approvals';
 import { haptic } from '../lib/native-bridge';
@@ -75,7 +75,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     run(row, async () => { const result = await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex); return { text: outcomeText(result), settled: proactiveReplySettled(result.outcome) }; });
 
   const meta = (row: FromClemRow) => (
-    <div class="home-row-note">{row.heartbeatTitle} · {relativeTime(row.at)}</div>
+    <div class="home-row-note">{fromClemSourceName(row)} · {relativeTime(row.at)}</div>
   );
   const notice = (row: FromClemRow) => {
     const said = currentProactiveReceipt(notices[row.key], row.voiceDigest);
