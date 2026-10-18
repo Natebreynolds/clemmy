@@ -1230,7 +1230,7 @@
           "bytes": 4174
         },
         "src/runtime/harness/judge-evidence-tools.ts": {
-          "bytes": 15353
+          "bytes": 15421
         },
         "src/runtime/harness/memory-fact-read-evidence.ts": {
           "bytes": 1521
@@ -1350,7 +1350,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52194
+          "bytes": 52206
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
@@ -2163,7 +2163,7 @@
           "bytes": 4318
         },
         "src/runtime/harness/host-completion-work.ts": {
-          "bytes": 86842
+          "bytes": 87355
         },
         "src/runtime/harness/dispatch-streak.ts": {
           "bytes": 3274
@@ -3372,7 +3372,7 @@
           "bytes": 3217
         },
         "src/spaces/space-enforce.ts": {
-          "bytes": 11247
+          "bytes": 11306
         },
         "src/spaces/space-read-authority.ts": {
           "bytes": 12088
@@ -5148,7 +5148,7 @@
           "bytes": 4174
         },
         "src/runtime/harness/judge-evidence-tools.ts": {
-          "bytes": 15353
+          "bytes": 15421
         },
         "src/runtime/harness/memory-fact-read-evidence.ts": {
           "bytes": 1521
@@ -5268,7 +5268,7 @@
           "bytes": 25528
         },
         "src/agents/clem-rubric.ts": {
-          "bytes": 52194
+          "bytes": 52206
         },
         "src/runtime/harness/retained-projection-scope.ts": {
           "bytes": 2533
@@ -6081,7 +6081,7 @@
           "bytes": 4318
         },
         "src/runtime/harness/host-completion-work.ts": {
-          "bytes": 86842
+          "bytes": 87355
         },
         "src/runtime/harness/dispatch-streak.ts": {
           "bytes": 3274
@@ -7290,7 +7290,7 @@
           "bytes": 3217
         },
         "src/spaces/space-enforce.ts": {
-          "bytes": 11247
+          "bytes": 11306
         },
         "src/spaces/space-read-authority.ts": {
           "bytes": 12088
