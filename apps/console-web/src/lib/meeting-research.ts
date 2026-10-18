@@ -63,6 +63,7 @@ export interface MeetingResearchJob {
   reason?: string;
   outcomeUnknown?: boolean;
   reviewState?: 'reviewed' | 'disabled_by_owner' | 'not_required' | 'unverified';
+  answer?: { text: string; sessionId: string; sourceUserSeq: number };
 }
 export interface MeetingResearchState {
   meetingId: string;
@@ -112,8 +113,16 @@ export function parseMeetingResearchState(value: unknown, meetingId: string): Me
       task = { sessionId: accepted.sessionId, sourceUserSeq: accepted.sourceUserSeq, attemptId: accepted.attemptId,
         runId: accepted.runId, clientRequestId: accepted.clientRequestId };
     }
+    let answer: MeetingResearchJob['answer'];
+    if (job.answer !== undefined) {
+      const saved = record(job.answer);
+      if (!saved || !task || job.status !== 'completed' || !boundedText(saved.text, 64_000)
+        || saved.sessionId !== task.sessionId || saved.sourceUserSeq !== task.sourceUserSeq) throw refreshError();
+      answer = { text: saved.text, sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq };
+    }
     return { id: job.id, question: job.question, status: job.status as MeetingResearchJob['status'],
       ...(task ? { task } : {}), ...(job.reason ? { reason: job.reason as string } : {}),
+      ...(answer ? { answer } : {}),
       ...(job.outcomeUnknown !== undefined ? { outcomeUnknown: job.outcomeUnknown as boolean } : {}),
       ...(job.reviewState !== undefined ? { reviewState: ['reviewed', 'disabled_by_owner', 'not_required'].includes(String(job.reviewState))
         ? job.reviewState as MeetingResearchJob['reviewState'] : 'unverified' as const } : {}) };

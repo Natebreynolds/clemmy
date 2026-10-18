@@ -76,6 +76,12 @@ import { classifyTurnText } from '../runtime/harness/turn-decision.js';
 import { getSession as getHarnessSessionRow, createSession as createHarnessSession, appendEvent, listEvents as listHarnessEventsForRefute, getSessionTokensUsed } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import { resolveBackgroundBudgetGrant, type BackgroundBudgetGrant } from './background-budget-grant.js';
+import {
+  meetingAnalysisRequirementSchema,
+  verifyMeetingAnalysisOutput,
+  type MeetingAnalysisRequirement,
+} from '../integrations/recall/meeting-analysis-contract.js';
+import { getUserInputEventAtSequence } from '../runtime/harness/eventlog.js';
 import { budgetLineFor, resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { routeDiagnosticsFromResponse } from '../runtime/harness/response-route.js';
 import { recordOperationalEvent, type OperationalEventSeverity } from '../runtime/operational-telemetry.js';
@@ -250,6 +256,8 @@ export interface BackgroundTaskTerminalReportBack {
 
 export interface BackgroundTaskRecord {
   id: string;
+  /** Host-owned output identity, immutable across retries and continuations. */
+  requiredOutput?: MeetingAnalysisRequirement;
   /** See CreateBackgroundTaskInput.internal — plan-owned reporting. */
   internal?: boolean;
   title: string;
@@ -461,6 +469,8 @@ export interface BackgroundTaskContractRevision {
 export interface CreateBackgroundTaskInput {
   title: string;
   prompt: string;
+  /** Internal callers only; never inferred from the model's prose. */
+  requiredOutput?: MeetingAnalysisRequirement;
   /**
    * An INTERNAL sub-unit of a larger durable plan (a fan-out worker window).
    * The user's contract lives at the plan level — one kickoff, aggregate
@@ -1759,10 +1769,13 @@ export function deriveTaskTitle(raw: string): string {
 }
 
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
+  const requiredOutput = input.requiredOutput === undefined ? undefined
+    : meetingAnalysisRequirementSchema.parse(input.requiredOutput);
   const buildTask = (id: string): BackgroundTaskRecord => {
     const createdAt = nowIso();
     return {
       id,
+      ...(requiredOutput ? { requiredOutput } : {}),
       title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
       prompt: input.prompt.trim(),
       status: 'pending',
@@ -2070,6 +2083,10 @@ function updateBackgroundTaskWhere(
     const task = getBackgroundTask(id);
     if (!task || !predicate(task)) return null;
     const resolvedPatch = typeof patch === 'function' ? patch(task) : patch;
+    if (Object.prototype.hasOwnProperty.call(resolvedPatch, 'requiredOutput')
+      && !isDeepStrictEqual(resolvedPatch.requiredOutput, task.requiredOutput)) {
+      throw new Error('A background task’s required output cannot be changed. Prepare a new task for the current source.');
+    }
     const updated: BackgroundTaskRecord = {
       ...task,
       ...resolvedPatch,
@@ -3157,7 +3174,8 @@ export function markBackgroundTaskDone(
       backgroundEffectLedgerDisposition(task),
     );
     const coverageRefusal = fanoutCoverageBlock(task.runSessionId)?.reason ?? null;
-    settlementRefusalReason = structuralRefusal ?? ledgerRefusal ?? coverageRefusal;
+    settlementRefusalReason = backgroundRequiredOutputRefusal(task)
+      ?? structuralRefusal ?? ledgerRefusal ?? coverageRefusal;
     return settlementRefusalReason === null;
   }, (task) => {
     const resultPath = writeFullResultFile(task, effectiveResult);
@@ -4379,8 +4397,18 @@ export function verifiedOnDiskDeliverables(finalText: string, startedAt?: string
   return count;
 }
 
+function backgroundRequiredOutputRefusal(task: Pick<BackgroundTaskRecord, 'requiredOutput' | 'runSessionId'>): string | null {
+  if (!Object.prototype.hasOwnProperty.call(task, 'requiredOutput')) return null;
+  const proof = verifyMeetingAnalysisOutput({
+    requiredOutput: task.requiredOutput,
+    runSessionId: task.runSessionId,
+    sourceExists: (sessionId, sourceUserSeq) => Boolean(getUserInputEventAtSequence(sessionId, sourceUserSeq)),
+  });
+  return proof.ok ? null : proof.reason;
+}
+
 export async function verifyBackgroundTaskDelivery(
-  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title' | 'startedAt' | 'createdAt'>,
+  task: Pick<BackgroundTaskRecord, 'runSessionId' | 'prompt' | 'title' | 'startedAt' | 'createdAt' | 'requiredOutput'>,
   finalText: string,
   stoppedReason?: RunStoppedReason,
   opts?: { terminalBlockReason?: string },
@@ -4391,6 +4419,8 @@ export async function verifyBackgroundTaskDelivery(
   // run re-verified its own deliverables and the floor rejected them).
   const deliverableFloor = task.createdAt ?? task.startedAt;
   if (backgroundCompletionVerificationPauseForTests) await backgroundCompletionVerificationPauseForTests();
+  const requiredOutputRefusal = backgroundRequiredOutputRefusal(task);
+  if (requiredOutputRefusal) return { outcome: 'blocked', reason: requiredOutputRefusal, blockerType: 'unknown' };
   const acceptedExternal = acceptedTaskExternalEffectAuthority(task.runSessionId);
   const completionEvidence = backgroundCompletionEvidenceWithAuthority(task, acceptedExternal);
   const effectLedger = backgroundEffectLedgerDisposition(task, completionEvidence, acceptedExternal);
@@ -5585,7 +5615,12 @@ async function finishWorkerRun(
     logger.info({ taskId: task.id }, 'Background task cancelled (not blocked)');
   };
   const acceptWorkerTransition = (updated: BackgroundTaskRecord | null, intendedStatus: string): boolean => {
-    if (updated) return true;
+    if (updated?.status === intendedStatus) return true;
+    if (intendedStatus === 'done' && updated?.status === 'blocked') {
+      finishRun(run.id, { status: 'blocked', message: updated.error ?? 'The required output could not be verified.', outputPreview: response.text, needsAttention: true });
+      clearLedger(task.runSessionId);
+      return false;
+    }
     const latest = getBackgroundTask(task.id);
     if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
       settleCancelled(latest);
@@ -6122,7 +6157,12 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	          );
 	        };
 	        const acceptApprovalTransition = (updated: BackgroundTaskRecord | null, intendedStatus: string, outputPreview: string): boolean => {
-	          if (updated) return true;
+	          if (updated?.status === intendedStatus) return true;
+	          if (intendedStatus === 'done' && updated?.status === 'blocked') {
+	            finishRun(run.id, { status: 'blocked', message: updated.error ?? 'The required output could not be verified.', outputPreview, needsAttention: true });
+	            clearLedger(task.runSessionId);
+	            return false;
+	          }
 	          const latest = getBackgroundTask(task.id);
 	          if (latest?.status === 'cancelling' || latest?.status === 'aborted') {
 	            settleApprovalCancellation(latest, outputPreview);

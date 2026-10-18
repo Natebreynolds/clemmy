@@ -42,8 +42,8 @@ const output = await build({
       const openLookup = () => { calls.openLookup++; throw new Error('Render must not open a lookup automatically'); };
       try {
         let content;
-        if (options.component === 'companion') content = <MeetingCompanion meetingId={meetingId} active presentation={options.presentation ?? 'live'} />;
-        else if (options.component === 'research') content = <MeetingResearchControls meetingId={meetingId} active presentation={options.presentation ?? 'live'} onOpenLookup={openLookup} />;
+        if (options.component === 'companion') content = <MeetingCompanion meetingId={meetingId} active={options.active ?? true} presentation={options.presentation ?? 'live'} />;
+        else if (options.component === 'research') content = <MeetingResearchControls meetingId={meetingId} active={options.active ?? true} presentation={options.presentation ?? 'live'} onOpenLookup={openLookup} />;
         else content = <LiveMeetingRoom meetingId={meetingId} title="Controlled meeting" platform="Zoom"
           startedAt="2026-10-17T12:00:00.000Z" capture={{ windowId: 'controlled-window', sdkUploadId: 'controlled-upload' }}
           segments={[{ id: 'saved-one', text: 'A retained conversation line.', speaker: 'Avery', timestamp: '2026-10-17T12:01:00.000Z' }]}
@@ -76,6 +76,7 @@ interface RenderOptions {
   research: MeetingResearchState;
   documents: MeetingResearchDocuments;
   researchError?: boolean;
+  active?: boolean;
 }
 const { render } = createRequire(import.meta.url)(fixtureFile) as {
   render(options: RenderOptions): { html: string; calls: Record<string, number> };
@@ -159,6 +160,23 @@ test('answer review uncertainty and owner review choices remain truthful in the 
     button(html, 'Show answer');
     if (reviewState !== 'reviewed') assert.doesNotMatch(html, />Reviewed<\/p>/);
   }
+});
+
+test('saved private answer is visible inline after Stop, outside permission, without mounting a conversation', () => {
+  const data = { ...fixture(), component: 'companion' as const, presentation: 'default' as const, active: false };
+  addAnswer(data, 'unverified');
+  data.research.jobs[0]!.answer = { text: 'The source says **seven**. <script>unsafe()</script>',
+    sessionId: data.research.jobs[0]!.task!.sessionId, sourceUserSeq: data.research.jobs[0]!.task!.sourceUserSeq };
+  const { html, calls } = render(data);
+  const permission = researchDisclosure(html);
+  assert.match(html, /The source says <strong>seven<\/strong>/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+  assert.ok(html.indexOf('The source says') < html.indexOf(permission));
+  assert.doesNotMatch(permission, /The source says/);
+  assert.match(html, /review couldn’t confirm/);
+  assert.doesNotMatch(html, /Your lookup with Clem|Continue in chat/);
+  assert.deepEqual(calls, { fetch: 0, native: 0, stop: 0, refresh: 0, openLookup: 0 });
 });
 
 test('narrow-view choices have distinct controlled regions and truthful selected state', () => {

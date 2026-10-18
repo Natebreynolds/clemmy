@@ -173,6 +173,17 @@ export interface RecallMeetingAnalysis {
   participants?: string[];
   generatedAt: string;
   source: 'agent' | 'manual';
+  /** Minted by the canonical save handler from the accepted host call, never
+   * accepted from model-authored analysis arguments. */
+  completionEvidence?: {
+    version: 1;
+    meetingId: string;
+    transcriptDigest: string;
+    contentDigest: string;
+    sessionId: string;
+    sourceUserSeq: number;
+    logicalCallId?: string;
+  };
 }
 
 export type RecallMeetingPresentationStatus =
@@ -1520,6 +1531,14 @@ export function recordMeetingTitle(
  * consistent (reindex re-chunks by mtime; no orphaned rows). Returns true
  * when it wrote a changed file (caller can trigger a reindex).
  */
+function meetingArtifactSourceLabel(record: RecallMeetingRecord): string {
+  return record.canonicalStatus === 'ready'
+    ? 'recall.ai async transcript (canonical)'
+    : record.provider === 'local'
+      ? `local whisper (${record.transcriptionModel ?? 'unknown model'})`
+      : 'recall.ai-desktop-sdk (streamed)';
+}
+
 export function rewriteMeetingArtifact(meetingId: string): boolean {
   const record = loadRecallMeetingById(meetingId);
   if (!record) return false;
@@ -1527,11 +1546,7 @@ export function rewriteMeetingArtifact(meetingId: string): boolean {
     ? record.artifactPath
     : (existsSync(defaultArtifactPath(record)) ? defaultArtifactPath(record) : undefined);
   if (!artifactPath) return false;
-  const sourceLabel = record.canonicalStatus === 'ready'
-    ? 'recall.ai async transcript (canonical)'
-    : record.provider === 'local'
-      ? `local whisper (${record.transcriptionModel ?? 'unknown model'})`
-      : 'recall.ai-desktop-sdk (streamed)';
+  const sourceLabel = meetingArtifactSourceLabel(record);
   const body = renderTranscriptArtifactBody(record, sourceLabel, loadRecallMeetingAnalysis(meetingId));
   const existing = readFileSync(artifactPath, 'utf-8');
   if (existing === body) return false;
@@ -1562,6 +1577,16 @@ export function fileMeetingFromAnalysis(meetingId: string): boolean {
     recordMeetingTitle(meetingId, analysis.title, 'analyzer');
   }
   return rewriteMeetingArtifact(meetingId);
+}
+
+/** Passive canonical readback; unlike filing, this cannot retitle a meeting or
+ * repair its note while checking completion. */
+export function meetingArtifactMatchesAnalysis(record: RecallMeetingRecord, analysis: RecallMeetingAnalysis): boolean {
+  if (!record.artifactPath) return false;
+  try {
+    const sourceLabel = meetingArtifactSourceLabel(record);
+    return readFileSync(record.artifactPath, 'utf-8') === renderTranscriptArtifactBody(record, sourceLabel, analysis);
+  } catch { return false; }
 }
 
 /**

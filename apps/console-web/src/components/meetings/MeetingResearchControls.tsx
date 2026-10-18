@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, ChevronRight, Pause, RefreshCw } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { renderMarkdown } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { Field, Input } from '@/components/ui/Field';
 import { getMeetingResearch, getMeetingResearchDocuments, meetingResearchJobLabel, meetingResearchNotice, meetingResearchReviewNotice,
@@ -54,18 +55,26 @@ export function MeetingResearchControls({ meetingId, active, presentation = 'def
   const validLimit = Number.isInteger(limit) && limit >= 1 && limit <= 8;
   const canSave = !!view && draftVersion !== null && active && !research.isError && !documents.isError
     && !!documents.data && selectedCurrent && validLimit && (useMemory || selected.length > 0);
-  const lookupList = !!view?.jobs.length ? <div className="mt-4">
+  const lookupList = !!view?.jobs.length ? <div className={presentation === 'live' ? 'mt-4' : 'mb-4 mt-4'}>
       <h3 className="text-small font-semibold text-fg">Private lookups</h3>
       <ul className="mt-1 divide-y divide-border">{view.jobs.map(job => <li key={job.id} className="flex min-w-0 flex-wrap items-center gap-2 py-3">
         <div className="min-w-0 flex-1"><p className="break-words text-small text-fg">{job.question}</p>
           <p className="mt-1 text-caption text-muted">{meetingResearchJobLabel(job)}</p>
           {meetingResearchReviewNotice(job) && <p className={`mt-1 max-w-prose text-caption ${job.reviewState === 'unverified' || !job.reviewState ? 'text-warning' : 'text-muted'}`}>{meetingResearchReviewNotice(job)}</p>}</div>
-        {job.task && (onOpenLookup ? <Button size="sm" variant="ghost" onClick={() => onOpenLookup(job.task!.sessionId)}>{job.status === 'completed' ? 'Show answer' : 'Show lookup'}</Button> : <Link className="inline-flex min-h-11 shrink-0 items-center gap-1 text-small text-primary hover:underline" to={`/chat/${encodeURIComponent(job.task.sessionId)}`}>
-          {job.status === 'completed' ? 'Open answer' : 'Open lookup'}<ArrowUpRight size={14} aria-hidden />
+        {job.task && (onOpenLookup ? <Button size="sm" variant="ghost" onClick={() => onOpenLookup(job.task!.sessionId)}>{job.status === 'completed' ? job.answer ? 'Open conversation' : 'Show answer' : 'Show lookup'}</Button> : <Link className="inline-flex min-h-11 shrink-0 items-center gap-1 text-small text-primary hover:underline" to={`/chat/${encodeURIComponent(job.task.sessionId)}`}>
+          {job.status === 'completed' ? job.answer ? 'Open conversation' : 'Open answer' : 'Open lookup'}<ArrowUpRight size={14} aria-hidden />
         </Link>)}
+        {job.answer && <div className="min-w-0 basis-full pt-2">
+          <div className="max-h-80 min-w-0 overflow-y-auto rounded-md bg-surface px-3 py-3" role="region" aria-label={`Clem’s saved answer: ${job.question}`} tabIndex={0}>
+            {/* Shared renderer escapes model content before adding markup. No
+                chat composer or run reattachment mounts for this preview. */}
+            <div className="chat-prose min-w-0" dangerouslySetInnerHTML={{ __html: renderMarkdown(job.answer.text, { workspaceLinks: false }) }} />
+          </div>
+          {research.isError && <p className="mt-1 text-caption text-muted">Showing the last saved answer. Its status couldn’t refresh.</p>}
+        </div>}
       </li>)}</ul>
     </div> : null;
-  return <>{presentation === 'live' && lookupList}<details className="group/research mt-5 min-w-0 border-t border-border pt-4">
+  return <>{lookupList}<details className="group/research mt-5 min-w-0 border-t border-border pt-4">
     <summary className="flex min-h-11 cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 text-small font-semibold text-fg">
       <ChevronRight size={16} aria-hidden className="shrink-0 transition-transform group-open/research:rotate-90 motion-reduce:transition-none" />
       Research privately
@@ -115,6 +124,5 @@ export function MeetingResearchControls({ meetingId, active, presentation = 'def
     </form>}
     {error && <p className="mt-3 text-small text-danger" role="alert">{error}</p>}
     {view && <p className="mt-3 text-caption text-muted">{view.usedLookups} of {view.maxLookups} private lookups used</p>}
-    {presentation !== 'live' && lookupList}
   </details><MeetingContext key={meetingId} meetingId={meetingId} state={documents} /></>;
 }

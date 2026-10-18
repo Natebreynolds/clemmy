@@ -47,6 +47,30 @@ export type MeetingLiveNavigation =
   | { kind: 'waiting'; reason: MeetingNavigationReason; target?: MeetingCaptureTarget }
   | { kind: 'unavailable'; reason: MeetingNavigationReason; explicit: boolean; target?: MeetingCaptureTarget };
 
+export interface RetainedMeetingCapture { meetingId: string; windowId: string; startedAt: string }
+
+/** After Stop, a notification can still select its retained recording. This
+ * deliberately does not consult the latest native window: that may already
+ * describe another meeting. A prompt-only URL needs the exact capture that
+ * this same view observed while it was recording. */
+export function retainedMeetingCapture(input: {
+  target: ParsedMeetingCaptureTarget; meetings?: readonly MeetingNavigationRow[];
+  observed?: RetainedMeetingCapture;
+}): RetainedMeetingCapture | null {
+  if (input.target.kind !== 'target' || !input.meetings) return null;
+  const target = input.target.target;
+  const observed = input.observed?.windowId === target.windowId ? input.observed : undefined;
+  const startedAt = target.startedAt ?? observed?.startedAt;
+  if (!instant(startedAt)) return null;
+  const matches = input.meetings.filter(row => row.windowId === target.windowId && row.recordingStartedAt === startedAt
+    && (row.status === 'completed' || row.status === 'cancelled'));
+  if (matches.length !== 1) return null;
+  const match = matches[0]!;
+  if (!id(match.id) || input.meetings.filter(row => row.id === match.id).length !== 1
+    || (!target.startedAt && match.id !== observed?.meetingId)) return null;
+  return { meetingId: match.id, windowId: target.windowId, startedAt };
+}
+
 // Keep these identical to the native popup route's bounded opaque identity.
 const id = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,511}$/.test(value);
 const instant = (value: unknown): value is string => {

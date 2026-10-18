@@ -81,11 +81,24 @@ export function meetingResearchTaskStatus(task: MeetingResearchTask) {
 }
 
 export type MeetingResearchReviewState = 'reviewed' | 'disabled_by_owner' | 'not_required' | 'unverified';
+export interface MeetingResearchAnswer { text: string; sessionId: string; sourceUserSeq: number }
 export type MeetingResearchPublicSnapshot = Omit<MeetingResearchSnapshot, 'jobs'> & {
-  jobs: readonly (MeetingResearchSnapshot['jobs'][number] & { reviewState?: MeetingResearchReviewState })[];
+  jobs: readonly (MeetingResearchSnapshot['jobs'][number] & { reviewState?: MeetingResearchReviewState; answer?: MeetingResearchAnswer })[];
 };
 const asRecord = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === 'object' && !Array.isArray(value)
   ? value as Record<string, unknown> : null;
+
+function readMeetingResearchAnswer(task: MeetingResearchTask, expected: { meetingId: string; jobId: string }) {
+  const binding = readMeetingResearchTaskBinding(task);
+  if (!binding) return null;
+  const reference = asRecord(binding.source.data.meetingResearchReference);
+  if (reference?.meetingId !== expected.meetingId || reference.jobId !== expected.jobId
+    || task.runId !== `meeting-research:${expected.jobId}` || task.clientRequestId !== `meeting-research-${expected.jobId}`) return null;
+  const terminal = exactTerminalForAcceptedSource(binding.source);
+  if (terminal?.presentation.status !== 'done' || terminal.presentation.kind !== 'answer') return null;
+  const reply = parseRetainedWorkCheckpoint(terminal.presentation.text.trim()).head;
+  return { ...binding, terminal, reply };
+}
 
 /** Content-free observation of the review belonging to this exact saved answer.
  * A done terminal is answer availability, never proof that its review passed.
@@ -93,13 +106,15 @@ const asRecord = (value: unknown): Record<string, unknown> | null => value !== n
 export async function meetingResearchResultReview(task: MeetingResearchTask,
   expected: { meetingId: string; jobId: string }): Promise<MeetingResearchReviewState> {
   try {
-    const binding = readMeetingResearchTaskBinding(task);
-    if (!binding) return 'unverified';
-    const reference = asRecord(binding.source.data.meetingResearchReference);
-    if (reference?.meetingId !== expected.meetingId || reference.jobId !== expected.jobId
-      || task.runId !== `meeting-research:${expected.jobId}` || task.clientRequestId !== `meeting-research-${expected.jobId}`) return 'unverified';
-    const terminal = exactTerminalForAcceptedSource(binding.source);
-    if (terminal?.presentation.status !== 'done' || terminal.presentation.kind !== 'answer') return 'unverified';
+    const saved = readMeetingResearchAnswer(task, expected);
+    return saved ? await reviewMeetingResearchAnswer(task, saved) : 'unverified';
+  } catch { return 'unverified'; }
+}
+
+async function reviewMeetingResearchAnswer(task: MeetingResearchTask,
+  saved: NonNullable<ReturnType<typeof readMeetingResearchAnswer>>): Promise<MeetingResearchReviewState> {
+  try {
+    const { terminal, reply } = saved;
     const { readCapturedCompletionPolicy, completionVerdictForAcceptedSource, acceptedObjectiveForSource } = await import('../../runtime/harness/host-turn-runner.js');
     const policy = readCapturedCompletionPolicy(task);
     if (policy.status !== 'captured') return 'unverified';
@@ -114,7 +129,6 @@ export async function meetingResearchResultReview(task: MeetingResearchTask,
       return 'unverified';
     }
     const objective = acceptedObjectiveForSource(task);
-    const reply = parseRetainedWorkCheckpoint(terminal.presentation.text.trim()).head;
     if (!objective?.trim()) return 'unverified';
     const verdict = completionVerdictForAcceptedSource(task);
     if (!verdict && disposition.disposition === 'not_required'
@@ -136,9 +150,25 @@ export async function meetingResearchResultReview(task: MeetingResearchTask,
 
 /** Passive route projection; review state is not persisted into job history. */
 export async function projectMeetingResearchSnapshot(snapshot: MeetingResearchSnapshot): Promise<MeetingResearchPublicSnapshot> {
-  const jobs = await Promise.all(snapshot.jobs.map(async job => job.status === 'completed' && job.task
-    ? { ...job, reviewState: await meetingResearchResultReview(job.task, { meetingId: snapshot.meetingId, jobId: job.id }) }
-    : job));
+  const jobs = await Promise.all(snapshot.jobs.map(async job => {
+    // Project only saved coordinator fields. Never retain an answer copied
+    // from an earlier projection if its current binding is no longer valid.
+    const savedJob = { id: job.id, question: job.question, status: job.status,
+      ...(job.task ? { task: job.task } : {}), ...(job.reason ? { reason: job.reason } : {}),
+      ...(job.outcomeUnknown === undefined ? {} : { outcomeUnknown: job.outcomeUnknown }) };
+    if (job.status !== 'completed' || !job.task) return savedJob;
+    try {
+      const saved = readMeetingResearchAnswer(job.task, { meetingId: snapshot.meetingId, jobId: job.id });
+      if (!saved) return { ...savedJob, reviewState: 'unverified' as const };
+      const reviewState = await reviewMeetingResearchAnswer(job.task, saved);
+      // This authenticated meeting read carries only its exact accepted
+      // answer. Oversized answers stay in the explicit chat door; never
+      // substitute another source or silently truncate what was reviewed.
+      const answer = saved.reply.trim() && saved.reply.length <= 64_000
+        ? { text: saved.reply, sessionId: job.task.sessionId, sourceUserSeq: job.task.sourceUserSeq } : undefined;
+      return { ...savedJob, reviewState, ...(answer ? { answer } : {}) };
+    } catch { return { ...savedJob, reviewState: 'unverified' as const }; }
+  }));
   return { ...snapshot, jobs };
 }
 

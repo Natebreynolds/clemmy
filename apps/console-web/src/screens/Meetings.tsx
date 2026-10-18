@@ -1,12 +1,12 @@
 import { MeetingLiveTranscript } from '@/components/meetings/MeetingLiveTranscript';
 import { MeetingCompanion } from '@/components/meetings/MeetingCompanion';
 import { LiveMeetingRoom } from '@/components/meetings/LiveMeetingRoom';
-import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, type MeetingNavigationSdkStatus } from '@/lib/meeting-live-navigation';
+import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, retainedMeetingCapture, type MeetingNavigationSdkStatus, type RetainedMeetingCapture } from '@/lib/meeting-live-navigation';
 import type { MeetingTranscriptSegment } from '@/lib/meeting-transcript-panel';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, type LucideIcon } from 'lucide-react';
+import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, ChevronRight, type LucideIcon } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
@@ -28,6 +28,9 @@ import {
   retryLocalMeetingTranscription,
   retryRecallMeetingTranscript,
   recallMeetingDetailPollInterval,
+  meetingAnalysisNotice,
+  canRetryMeetingAnalysis,
+  retryRecallMeetingAnalysis,
   recallMeetingTone,
   listMeetings,
   getMeeting,
@@ -86,6 +89,7 @@ export function Meetings() {
   const captureTarget = useMemo(() => parseMeetingCaptureTarget(location.search), [location.search]);
   const [historySelected, setHistorySelected] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
+  const [observedCapture, setObservedCapture] = useState<(RetainedMeetingCapture & { route: string }) | null>(null);
   const desktop = isDesktop();
   const status = usePoll(['recall-status'], getRecallStatus, 15000);
   // Desktop-only: poll the Electron SDK for the real permission/recording state.
@@ -112,6 +116,13 @@ export function Meetings() {
   const [localBusy, setLocalBusy] = useState(false);
   const [retryingMeetingId, setRetryingMeetingId] = useState<string | null>(null);
   const [meetingRetryError, setMeetingRetryError] = useState<string | null>(null);
+  const analysisRetries = useRef(new Set<string>());
+  const [retryingAnalysis, setRetryingAnalysis] = useState<Set<string>>(() => new Set());
+  const [analysisRetryErrors, setAnalysisRetryErrors] = useState<Record<string, string>>({});
+  const analysisReads = useRef(new Set<string>());
+  const [readingAnalysis, setReadingAnalysis] = useState<Set<string>>(() => new Set());
+  const analysisReadRequired = useRef(new Set<string>());
+  const [analysisNeedsRead, setAnalysisNeedsRead] = useState<Set<string>>(() => new Set());
   const [localNotice, setLocalNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
   // The capture is a module-level SINGLETON shared with AppShell's recording
   // pill (2026-07-14 review): recording used to be per-mount state, so any SPA
@@ -160,6 +171,11 @@ export function Meetings() {
     daemon: status.data, meetings: meetings.data?.meetings, historySelected });
   const liveId = liveNavigation.kind === 'recording' ? liveNavigation.meetingId : undefined;
   const liveRoom = liveNavigation.kind === 'recording' ? liveNavigation : undefined;
+  const retainedCapture = retainedMeetingCapture({ target: captureTarget, meetings: meetings.data?.meetings,
+    observed: observedCapture?.route === location.search ? observedCapture : undefined });
+  const retainedCompanion = Boolean(retainedCapture && companionId === retainedCapture.meetingId
+    && detail.data?.record?.windowId === retainedCapture.windowId
+    && detail.data.record.recordingStartedAt === retainedCapture.startedAt);
   const liveRecord = liveRoom && detail.data?.record?.id === liveRoom.meetingId
     && detail.data.record.windowId === liveRoom.windowId && detail.data.record.recordingStartedAt === liveRoom.startedAt
     ? detail.data.record : undefined;
@@ -170,6 +186,11 @@ export function Meetings() {
       ...(typeof segment.timestamp === 'string' ? { timestamp: segment.timestamp } : {}),
       ...(segment.isFinal === false ? { isFinal: false } : {}) } satisfies MeetingTranscriptSegment] : []), [liveRecord?.segments]);
   useEffect(() => { if (liveId) setSelected(liveId); }, [liveId]);
+  useEffect(() => {
+    if (!liveRoom) return;
+    setObservedCapture({ meetingId: liveRoom.meetingId, windowId: liveRoom.windowId, startedAt: liveRoom.startedAt, route: location.search });
+  }, [liveId, liveRoom?.windowId, liveRoom?.startedAt, location.search]);
+  useEffect(() => { if (retainedCapture && !historySelected) setSelected(retainedCapture.meetingId); }, [retainedCapture?.meetingId, historySelected]);
   useEffect(() => { if (location.search) setHistorySelected(false); }, [location.search]);
   useEffect(() => {
     const unsubscribe = clemmy()?.onRecallEvent?.(event => {
@@ -207,6 +228,9 @@ export function Meetings() {
     : (localRecording ? Date.now() - localElapsedSeconds * 1000 : undefined);
   const recallScratchpadWindowId = recording ? status.data?.activeWindowId : undefined;
   const recallStartedAtMs = status.data?.activeStartedAt ? Date.parse(status.data.activeStartedAt) : undefined;
+  const focusSavedMeeting = Boolean(selected && detail.data?.record?.id === selected
+    && ['completed', 'cancelled'].includes(detail.data.record.status ?? '')
+    && credConnected && !recording && !localRecording);
 
   useEffect(() => {
     if (typeof settings.retentionHours === 'number' && Number.isFinite(settings.retentionHours)) {
@@ -395,6 +419,48 @@ export function Meetings() {
     catch { navigate('/chat'); }
   };
 
+  const refreshAnalysis = async (target: string, preserveError = false): Promise<boolean> => {
+    if (analysisReads.current.has(target)) return false;
+    analysisReads.current.add(target); setReadingAnalysis(new Set(analysisReads.current));
+    try {
+      // A fresh exact read is required after an uncertain write. Do not clear
+      // that guard from a cached result or a different meeting's response.
+      const fresh = await getMeeting(target);
+      if (fresh.record?.id !== target || !fresh.analysisState) throw new Error('Summary status is unavailable.');
+      qc.setQueryData(['meeting', target], fresh);
+      analysisReadRequired.current.delete(target); setAnalysisNeedsRead(new Set(analysisReadRequired.current));
+      if (!preserveError) setAnalysisRetryErrors((errors) => { const next = { ...errors }; delete next[target]; return next; });
+      return true;
+    } catch {
+      setAnalysisRetryErrors((errors) => ({ ...errors, [target]: 'Summary status couldn’t be read. Read it again before choosing another attempt.' }));
+      return false;
+    } finally {
+      analysisReads.current.delete(target); setReadingAnalysis(new Set(analysisReads.current));
+    }
+  };
+
+  const retryAnalysis = async () => {
+    const target = selected;
+    const current = detail.data;
+    if (!target || current?.record?.id !== target || !canRetryMeetingAnalysis(current) || detail.isFetching
+      || analysisRetries.current.has(target) || analysisReads.current.has(target) || analysisReadRequired.current.has(target)) return;
+    analysisRetries.current.add(target); setRetryingAnalysis(new Set(analysisRetries.current));
+    analysisReadRequired.current.add(target); setAnalysisNeedsRead(new Set(analysisReadRequired.current));
+    setAnalysisRetryErrors((errors) => { const next = { ...errors }; delete next[target]; return next; });
+    try {
+      await retryRecallMeetingAnalysis(target, current.analysisState?.taskId ?? null);
+      await refreshAnalysis(target);
+    } catch (error: unknown) {
+      const changed = error && typeof error === 'object' && 'status' in error && error.status === 409;
+      setAnalysisRetryErrors((errors) => ({ ...errors, [target]: changed
+        ? 'This summary task changed. Its current status is being read again. Review it before choosing another attempt.'
+        : 'Summary preparation couldn’t be confirmed. Read the status again before choosing another attempt.' }));
+      if (changed) await refreshAnalysis(target, true);
+    } finally {
+      analysisRetries.current.delete(target); setRetryingAnalysis(new Set(analysisRetries.current));
+    }
+  };
+
   return (
     <Page title="Meetings" subtitle={liveRoom ? undefined : 'A little help before, during and after your meeting.'}>
       {liveRoom ? liveRecord ? <LiveMeetingRoom key={liveRoom.meetingId} meetingId={liveRoom.meetingId}
@@ -406,20 +472,26 @@ export function Meetings() {
         busy={stoppingRecording} onStop={() => void stopLive()} onFinal={() => { void qc.invalidateQueries({ queryKey: ['meeting', liveRoom.meetingId] }); }}
         notes={<ScratchpadPanel windowId={liveRoom.windowId} startedAtMs={Date.parse(liveRoom.startedAt)} compact />} />
         : <div className="mb-6" role="status">{detail.isError || (detail.data && selected === liveId) ? <QueryUnavailable title="This meeting couldn’t load" description="Recording controls remain available in the desktop meeting controls. Try loading the transcript again." onRetry={() => { void detail.refetch(); }} /> : <><p className="mb-3 text-small text-muted">Opening your live meeting…</p><Skeleton className="h-80 w-full" /></>}</div>
-        : captureTarget.kind === 'none' && companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={companionActive} />}
+        : (captureTarget.kind === 'none' || retainedCompanion) && companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={retainedCompanion ? false : companionActive} />}
+      {retainedCapture && <p className="mb-5 text-small text-muted" role="status">Recording ended. Your transcript, notes and private answers stay with this meeting.</p>}
       {liveNavigation.kind === 'prompt' && <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-lg bg-subtle p-5">
         <div className="min-w-0"><h2 className="text-h3 text-fg">Your meeting is ready</h2><p className="mt-1 max-w-prose text-small text-muted">Recording is off. Start when everyone in the meeting is aware.</p></div>
         <Button disabled={busy} onClick={() => void recordTarget()}>{busy ? 'Starting…' : 'Record this meeting'}</Button>
       </div>}
       {liveNavigation.kind === 'waiting' && <p className="mb-5 text-small text-muted" role="status">{liveNavigation.reason === 'capture_stopping' ? 'Finishing your recording…' : 'Checking your meeting. The transcript will open when its recording is confirmed.'}</p>}
-      {liveNavigation.kind === 'unavailable' && liveNavigation.explicit && <div className="mb-5 flex flex-wrap items-center gap-3" role="status">
+      {liveNavigation.kind === 'unavailable' && liveNavigation.explicit && !retainedCapture && <div className="mb-5 flex flex-wrap items-center gap-3" role="status">
         <p className="max-w-prose text-small text-warning">That meeting can’t be opened from this notification. Choose a meeting below, or open the current one.</p>
         <Button size="sm" variant="secondary" onClick={() => { setHistorySelected(false); navigate({ pathname: location.pathname, search: '' }, { replace: true }); }}>View current meeting</Button>
       </div>}
       {liveRoom && notice && <p className="mb-4 text-small text-warning" role="status">{notice.text}</p>}
       {liveRoom && <Button className="mb-5" size="sm" variant="ghost" aria-expanded={showLibrary} aria-controls="meeting-library" onClick={() => setShowLibrary(value => !value)}>{showLibrary ? 'Hide settings & history' : 'Settings & meeting history'}</Button>}
       {historySelected && recording && <Button className="mb-5" size="sm" variant="secondary" onClick={() => setHistorySelected(false)}>Back to live meeting</Button>}
-      {(!liveRoom || showLibrary) && <div id="meeting-library">
+      {(!liveRoom || showLibrary) && <div id="meeting-library" className="min-w-0">
+      <details key={focusSavedMeeting ? 'saved-meeting-settings' : 'recording-settings'} open={!focusSavedMeeting} className="group/recording-settings mb-6 min-w-0">
+        <summary className="mb-3 flex min-h-11 cursor-pointer items-center gap-2 text-small font-semibold text-fg">
+          <ChevronRight size={16} aria-hidden className="shrink-0 transition-transform group-open/recording-settings:rotate-90 motion-reduce:transition-none" />
+          Recording setup and permissions
+        </summary>
 
       {/* Local in-person capture */}
       <Card className="mb-4 p-5">
@@ -672,9 +744,11 @@ export function Meetings() {
         )}
       </Card>
 
+      </details>
+
       {/* Recent meetings + detail */}
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
-        <div className="space-y-2">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
+        <div className="min-w-0 space-y-2">
           {meetings.isLoading ? [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)
             : meetings.isError && !meetings.data
               ? <QueryUnavailable title="Meetings are unavailable" description="Clementine couldn’t load your meetings, so this is not an empty-meetings state. Nothing has been deleted." onRetry={() => { void meetings.refetch(); }} />
@@ -682,7 +756,7 @@ export function Meetings() {
               : rows.map((m) => <MeetingRow key={m.id} m={m} selected={selected === m.id} onSelect={() => selectHistory(m.id)} />)}
         </div>
 
-        <div className="rounded-lg border border-border-raised bg-raised p-5">
+        <div className="min-w-0 rounded-lg border border-border-raised bg-raised p-5">
           {!selected ? (
             <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
               <Video className="h-6 w-6 text-faint" aria-hidden />
@@ -697,6 +771,12 @@ export function Meetings() {
                 data={detail.data}
                 retrying={retryingMeetingId === selected}
                 retryError={meetingRetryError}
+                onRefreshAnalysis={() => { void refreshAnalysis(selected); }}
+                readingAnalysis={detail.isFetching || readingAnalysis.has(selected)}
+                analysisNeedsRead={analysisNeedsRead.has(selected)}
+                retryingAnalysis={retryingAnalysis.has(selected)}
+                analysisRetryError={analysisRetryErrors[selected]}
+                onRetryAnalysis={() => void retryAnalysis()}
                 onRetry={() => {
                   if (!selected) return;
                   if (detail.data?.record?.provider === 'local') void retryTranscription(selected);
@@ -849,7 +929,7 @@ function MeetingRow({ m, selected, onSelect }: { m: MeetingSummary; selected: bo
   const tone = m.provider === 'local' ? localTranscriptionTone(m) : recallMeetingTone(m);
   return (
     <button type="button" onClick={onSelect}
-      className={cn('flex w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
+      className={cn('flex min-w-0 w-full items-center gap-3 rounded-md border px-3.5 py-3 text-left transition-colors cursor-pointer',
         selected ? 'border-primary bg-primary-tint' : 'border-border bg-surface hover:bg-hover')}>
       {m.provider === 'local'
         ? <Mic className="h-4 w-4 shrink-0 text-muted" aria-hidden />
@@ -901,17 +981,32 @@ function MeetingDetailView({
   retrying = false,
   retryError,
   onRetry,
+  onRefreshAnalysis,
+  onRetryAnalysis,
+  retryingAnalysis = false,
+  analysisRetryError,
+  readingAnalysis = false,
+  analysisNeedsRead = false,
 }: {
   data?: import('@/lib/meetings').MeetingDetail;
   retrying?: boolean;
   retryError?: string | null;
   onRetry?: () => void;
+  onRefreshAnalysis?: () => void;
+  onRetryAnalysis?: () => void;
+  retryingAnalysis?: boolean;
+  analysisRetryError?: string;
+  readingAnalysis?: boolean;
+  analysisNeedsRead?: boolean;
 }) {
   const [transcriptLimit, setTranscriptLimit] = useState(200);
   useEffect(() => setTranscriptLimit(200), [data?.record?.id]);
   const a = (data?.analysis ?? {}) as Record<string, unknown>;
   const r = (data?.record ?? {}) as Record<string, unknown>;
   const summary = asText(a.summary);
+  const analysisNotice = meetingAnalysisNotice(data);
+  const previousSummary = Boolean(data?.analysis && data.analysisState
+    && data.analysisState.status !== 'complete' && data.analysisState.status !== 'off');
   const actionItems = toList(a.actionItems).map(asText).filter(Boolean);
   const decisions = toList(a.decisions).map(asText).filter(Boolean);
   const topics = toList(a.topics).map(asText).filter(Boolean);
@@ -966,6 +1061,21 @@ function MeetingDetailView({
         </div>
       )}
       {retryError && <p className="mb-4 rounded-md border border-danger/30 bg-danger-tint px-3 py-2 text-small text-danger" role="alert">{retryError}</p>}
+      {analysisNotice && <section className="mb-4 space-y-2 border-t border-border pt-3" aria-label="Meeting summary status">
+        <p className={cn('text-small font-semibold', analysisNotice.attention ? 'text-warning' : 'text-fg')} role="status">{analysisNotice.title}</p>
+        {analysisNotice.description && <p className="max-w-prose text-small text-muted">{analysisNotice.description}</p>}
+        {data?.analysisState?.partialTranscript && <p className="max-w-prose text-small text-warning">The available transcript is incomplete, so the summary may miss part of the meeting.</p>}
+        {(analysisNotice.taskHref || analysisNotice.canRefresh) && <div className="flex flex-wrap items-center gap-3">
+          {analysisNotice.taskHref && <Link className="inline-flex min-h-10 items-center rounded-sm text-small font-semibold text-primary-ink underline underline-offset-4 hover:text-primary-ink-hover" to={analysisNotice.taskHref}>Open summary task</Link>}
+          {analysisNotice.canRefresh && onRefreshAnalysis && <Button size="sm" variant="ghost" disabled={readingAnalysis || retryingAnalysis} onClick={onRefreshAnalysis}>{readingAnalysis ? 'Reading summary status…' : 'Read summary status again'}</Button>}
+          {canRetryMeetingAnalysis(data) && onRetryAnalysis && <Button size="sm" variant="secondary" disabled={retryingAnalysis || readingAnalysis || analysisNeedsRead} onClick={onRetryAnalysis}>{retryingAnalysis ? 'Preparing…' : 'Prepare summary again'}</Button>}
+        </div>}
+        {analysisRetryError && <p className="max-w-prose text-small text-danger" role="alert">{analysisRetryError}</p>}
+      </section>}
+      {previousSummary && <div className="mb-3">
+        <h4 className="text-small font-semibold text-fg">Previous summary</h4>
+        <p className="mt-1 max-w-prose text-small text-muted">This saved summary hasn’t been verified against the current transcript.</p>
+      </div>}
       {summary && <p className="mb-4 whitespace-pre-wrap text-body text-fg">{linkify(summary)}</p>}
 
       {actionItems.length > 0 && (

@@ -61,6 +61,18 @@ test('answer availability never implies a passed review, and unavailable review 
   assert.equal(meetingResearchReviewNotice({ status: 'completed', reviewState: 'reviewed' }), undefined);
 });
 
+test('inline answers require the completed job’s exact accepted source and cannot borrow another private turn', () => {
+  const answer = { text: 'The retained source says seven.', sessionId: task.sessionId, sourceUserSeq: task.sourceUserSeq };
+  const job = { id: 'inline-result', question: 'Which plan is approved?', status: 'completed', task, answer };
+  assert.deepEqual(parseMeetingResearchState({ ...state, jobs: [job] }, meetingId).jobs[0].answer, answer);
+  for (const invalid of [{ ...answer, sourceUserSeq: task.sourceUserSeq + 1 }, { ...answer, sessionId: 'another-private-chat' },
+    { ...answer, text: '' }, { ...answer, text: 'x'.repeat(64_001) }, null]) {
+    assert.throws(() => parseMeetingResearchState({ ...state, jobs: [{ ...job, answer: invalid }] }, meetingId), /couldn’t refresh/);
+  }
+  assert.throws(() => parseMeetingResearchState({ ...state, jobs: [{ ...job, status: 'running' }] }, meetingId), /couldn’t refresh/);
+  assert.throws(() => parseMeetingResearchState({ ...state, jobs: [{ ...job, task: undefined }] }, meetingId), /couldn’t refresh/);
+});
+
 test('context metadata is capture-bound and does not carry pasted text into the display snapshot', () => {
   const parsed = parseMeetingResearchDocuments({ ...documents, documents: [{ ...document, text: 'This must not appear in metadata.' }] }, meetingId);
   assert.deepEqual(parsed, documents);

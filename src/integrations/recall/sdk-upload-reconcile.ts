@@ -9,6 +9,7 @@
  */
 import pino from 'pino';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
+import { captureMeetingAnalysisRequirement } from './meeting-analysis-contract.js';
 import { reindexVault } from '../../memory/indexer.js';
 import { getSdkUpload, type RecallSdkUpload } from './api.js';
 import {
@@ -120,6 +121,7 @@ function queueAnalysisIfReady(record: RecallMeetingRecord): RecallMeetingRecord 
   const task = createBackgroundTask({
     title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
     prompt: buildAnalyzerPrompt(record, record.artifactPath),
+    requiredOutput: captureMeetingAnalysisRequirement(record),
     source: 'daemon',
     channel: 'electron:meeting-capture',
     maxMinutes: 30,

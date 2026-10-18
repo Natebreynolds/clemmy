@@ -195,7 +195,13 @@ test('delivery status updates are authenticated exact-capture metadata and never
     assert.equal(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery!.failedFinalCount, 1);
     await fetch(route, json('POST', { ...payload, unresolvedFinalCount: 0 }));
     assert.equal(recall.loadRecallMeetingById(record.id)!.liveTranscriptDelivery, undefined);
-  } finally { await harness.close(); }
+  } finally {
+    // This ingress fixture does not exercise SDK upload recovery. Leave its
+    // fake upload terminal before the next route boot, rather than starting
+    // recovery against a nonexistent Recall upload.
+    recall.patchMeetingRecord(record.id, { sdkUploadStatus: 'failed' });
+    await harness.close();
+  }
 });
 
 test('Recall routes retain the exact upload-bound native recording epoch without rewriting history timestamps', async () => {

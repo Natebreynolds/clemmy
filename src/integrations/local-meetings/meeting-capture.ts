@@ -15,6 +15,7 @@ import { addNotification } from '../../runtime/notifications.js';
 import { clearLiveTranscript, getLiveTranscriptSnapshot, noteLiveTranscriptOpportunity, sweepOrphanedLiveSlices, type LiveTranscriptSnapshot } from './live-transcript.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
+import { captureMeetingAnalysisRequirement } from '../recall/meeting-analysis-contract.js';
 import { reindexVault } from '../../memory/indexer.js';
 import {
   applyLocalMeetingTranscript,
@@ -277,6 +278,7 @@ function queueAnalysis(record: RecallMeetingRecord, artifactPath?: string): Reca
   const task = analysisTaskCreator({
     title: `Analyze meeting transcript: ${record.title || record.id}`,
     prompt: buildAnalyzerPrompt(record, artifactPath),
+    requiredOutput: captureMeetingAnalysisRequirement(record),
     source: 'daemon',
     channel: 'electron:meeting-capture',
     maxMinutes: 30,

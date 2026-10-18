@@ -44,7 +44,9 @@ import {
   analysisPathFor,
   fileMeetingFromAnalysis,
   recordMeetingMemoryEpisode,
+  patchMeetingRecord,
 } from '../integrations/recall/meeting-capture.js';
+import { captureMeetingAnalysisRequirement } from '../integrations/recall/meeting-analysis-contract.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import { recoverPendingLocalAudioDeletions } from '../integrations/local-meetings/meeting-capture.js';
 import { createBackgroundTask } from '../execution/background-tasks.js';
@@ -907,13 +909,15 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
             });
           }
           if (artifactPath && settings.analyzeOnComplete) {
-            createBackgroundTask({
+            const analysisTask = createBackgroundTask({
               title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
               prompt: buildAnalyzerPrompt(record, artifactPath),
+              requiredOutput: captureMeetingAnalysisRequirement(record),
               source: 'daemon',
               channel: 'electron:meeting-capture',
               maxMinutes: 30,
             });
+            patchMeetingRecord(record.id, { analysisTaskId: analysisTask.id, analysisError: undefined });
           }
         }
         logger.info({ count: finalized.length }, 'recall stuck-recording reaper finalized abandoned captures');

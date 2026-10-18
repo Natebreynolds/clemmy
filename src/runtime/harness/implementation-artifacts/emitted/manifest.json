@@ -138,7 +138,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129863
+          "bytes": 130239
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -3546,10 +3546,13 @@
           "bytes": 8039
         },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 92291
+          "bytes": 93262
+        },
+        "src/integrations/recall/meeting-analysis-contract.ts": {
+          "bytes": 6715
         },
         "src/tools/meeting-analysis-tools.ts": {
-          "bytes": 3302
+          "bytes": 9507
         },
         "src/tools/meeting-read-tools.ts": {
           "bytes": 4736
@@ -3714,7 +3717,7 @@
           "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 316770
+          "bytes": 319185
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -4071,7 +4074,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129863
+          "bytes": 130239
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -7479,10 +7482,13 @@
           "bytes": 8039
         },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 92291
+          "bytes": 93262
+        },
+        "src/integrations/recall/meeting-analysis-contract.ts": {
+          "bytes": 6715
         },
         "src/tools/meeting-analysis-tools.ts": {
-          "bytes": 3302
+          "bytes": 9507
         },
         "src/tools/meeting-read-tools.ts": {
           "bytes": 4736
@@ -7647,7 +7653,7 @@
           "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 316770
+          "bytes": 319185
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -7886,8 +7892,8 @@
       }
     },
     "transport": {
-      "file": "transport-f2ed370feda662a8344240941933d7684faab760ed92bd121ff806fb9423610c.cjs",
-      "sha256": "f2ed370feda662a8344240941933d7684faab760ed92bd121ff806fb9423610c",
+      "file": "transport-35e9e3d458bf00134265e6654cb034f0dd4d807302a9bc149a063b1126a4d6a7.cjs",
+      "sha256": "35e9e3d458bf00134265e6654cb034f0dd4d807302a9bc149a063b1126a4d6a7",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -7965,7 +7971,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 129863
+          "bytes": 130239
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17265
@@ -8093,5 +8099,5 @@
       }
     }
   },
-  "manifestDigest": "540409d4d4a80e0851d435f128b7d9d2dc0bebff050b8a1e12b226a48490a1bf"
+  "manifestDigest": "91c65d23b641cf0715f111045f2f9f62271c8311e69ab85925d87ec0c7379ba3"
 }

@@ -586,6 +586,8 @@ import {
   type RecallMeetingSettings,
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
+import { captureMeetingAnalysisRequirement } from '../integrations/recall/meeting-analysis-contract.js';
+import { projectMeetingAnalysisState, requestMeetingAnalysisRetry } from '../integrations/recall/meeting-analysis-status.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import {
   recoverPendingRecallSdkUploads,
@@ -594,6 +596,7 @@ import {
 } from '../integrations/recall/sdk-upload-reconcile.js';
 import {
   cancelLocalMeeting,
+  loadLocalMeetingSettings,
   getLocalMeetingStatus,
   ingestLocalMeeting,
   recoverFinalizedLocalMeetingSidecars,
@@ -10769,6 +10772,7 @@ export function registerConsoleRoutes(
         ? createBackgroundTask({
           title: `Analyze meeting transcript: ${result.record.title || result.record.platform || result.record.id}`,
           prompt: buildAnalyzerPrompt(result.record, result.artifactPath),
+          requiredOutput: captureMeetingAnalysisRequirement(result.record),
           source: 'daemon',
           channel: 'electron:meeting-capture',
           maxMinutes: 30,
@@ -10865,6 +10869,9 @@ export function registerConsoleRoutes(
       res.json({
         record,
         analysis,
+        analysisState: projectMeetingAnalysisState(record, record.provider === 'local'
+          ? loadLocalMeetingSettings().analyzeOnComplete
+          : loadRecallMeetingSettings().analyzeOnComplete),
         presentation: record.provider === 'local'
           ? undefined
           : deriveRecallMeetingPresentation(record),
@@ -10872,6 +10879,18 @@ export function registerConsoleRoutes(
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.post('/api/console/meetings/recall/:meetingId/analysis/retry', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).some(key => key !== 'expectedTaskId')
+      || !(body.expectedTaskId === null || typeof body.expectedTaskId === 'string')) {
+      res.status(400).json({ error: 'The current summary task is required.' }); return;
+    }
+    try { res.status(202).json(requestMeetingAnalysisRetry(req.params.meetingId, body.expectedTaskId)); }
+    catch { res.status(409).json({ error: 'This meeting changed or its transcript is unavailable. Refresh it before preparing the summary again.' }); }
   });
 
   app.get('/api/console/meetings/recall/:meetingId/chat-prompt', (req, res) => {

@@ -137,12 +137,28 @@ test('saved answer review is passively projected from exact source policy and ve
     const projected = await service.projectMeetingResearchSnapshot(saved);
     assert.equal(projected.jobs[0]!.reviewState, expected, variant);
     assert.deepEqual(projected.jobs[0]!.task, task);
-    assert.equal(JSON.stringify(projected).includes(fixtureAnswerText), false, 'projection contains no copied answer text');
+    assert.deepEqual(projected.jobs[0]!.answer, { text: fixtureAnswerText, sessionId: task!.sessionId, sourceUserSeq: task!.sourceUserSeq },
+      'the private projection carries only this exact source’s saved answer, independently of its review qualification');
     assert.deepEqual(await service.projectMeetingResearchSnapshot(saved), projected, 'polling cannot rejudge or redispatch');
     assert.equal(readFileSync(f.file(), 'utf8'), before); assert.equal(eventlog.listEvents(task!.sessionId).length, eventCount);
     assert.equal(f.calls(), 1);
     assert.equal(await service.meetingResearchResultReview(task!, { meetingId: 'a-different-meeting', jobId: f.job.id }), 'unverified');
+    assert.equal((await service.projectMeetingResearchSnapshot({ ...saved, meetingId: 'a-different-meeting' })).jobs[0]!.answer, undefined,
+      'a foreign meeting cannot borrow the answer');
   }
+});
+
+test('inline meeting answer remains bound to its original source when later conversation turns exist', async () => {
+  let task: MeetingResearchTask | undefined;
+  const f = fixture(async input => { task = taskFromExecution(input); typedTerminal(input, 'done'); });
+  const saved = await f.coordinator.drain(f.record.id);
+  const later = eventlog.appendEvent({ sessionId: task!.sessionId, turn: 9, role: 'user', type: 'user_input_received', data: { text: 'A different controlled question.' } });
+  eventlog.appendEvent({ sessionId: task!.sessionId, turn: 9, role: 'Clem', type: 'conversation_completed',
+    data: { sourceUserSeq: later.seq, reply: 'LATER_PRIVATE_TURN_MUST_NOT_APPEAR' } });
+  const result = await service.projectMeetingResearchSnapshot(saved);
+  assert.equal(result.jobs[0]!.answer?.text, fixtureAnswerText);
+  assert.equal(JSON.stringify(result).includes('LATER_PRIVATE_TURN_MUST_NOT_APPEAR'), false);
+  assert.equal(result.jobs[0]!.reviewState, 'unverified', 'availability never invents a review');
 });
 
 test('dispatch binds the real receipt, active lease and immutable accepted source before execution, with only selected bounded evidence', async () => {
@@ -344,17 +360,22 @@ test('source evidence refuses unpermitted, changed, superseded, inactive or move
 test('retained task status rejects a changed receipt hash or source binding even when a typed done terminal exists', async () => {
   let task: MeetingResearchTask | undefined;
   const f = fixture(async input => { task = taskFromExecution(input); typedTerminal(input, 'done'); });
-  assert.equal((await f.coordinator.drain(f.record.id)).jobs[0]!.status, 'completed');
+  const saved = await f.coordinator.drain(f.record.id);
+  assert.equal(saved.jobs[0]!.status, 'completed');
   assert.equal(service.meetingResearchTaskStatus(task!).status, 'completed');
   const db = eventlog.openEventLog();
   const receipt = eventlog.getHarnessChatRequestReceipt(task!.clientRequestId)!;
   db.prepare('UPDATE harness_chat_requests SET input_hash = ? WHERE request_id = ?').run(sha('Corrupt fixture receipt.'), task!.clientRequestId);
   assert.equal(service.meetingResearchTaskStatus(task!).status, 'unknown');
+  assert.equal((await service.projectMeetingResearchSnapshot(saved)).jobs[0]!.answer, undefined, 'corrupt receipt suppresses answer projection');
+  const copiedProjection = { ...saved, jobs: [{ ...saved.jobs[0]!, answer: { text: 'Untrusted copied response.', sessionId: task!.sessionId, sourceUserSeq: task!.sourceUserSeq } }] };
+  assert.equal((await service.projectMeetingResearchSnapshot(copiedProjection)).jobs[0]!.answer, undefined, 'a previous projection cannot survive a failed current binding check');
   db.prepare('UPDATE harness_chat_requests SET input_hash = ? WHERE request_id = ?').run(receipt.inputHash, task!.clientRequestId);
   const source = eventlog.listEventsAtSequences(task!.sessionId, [task!.sourceUserSeq])[0]!;
   for (const field of ['meetingResearchInputDigest', 'runId', 'attemptId', 'requestId', 'displayText'] as const) {
     db.prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(JSON.stringify({ ...source.data, [field]: 'Corrupt controlled binding.' }), source.seq);
     assert.equal(service.meetingResearchTaskStatus(task!).status, 'unknown', field);
+    assert.equal((await service.projectMeetingResearchSnapshot(saved)).jobs[0]!.answer, undefined, `${field}: corrupt source suppresses answer projection`);
   }
   db.prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(JSON.stringify(source.data), source.seq);
   assert.equal(service.meetingResearchTaskStatus(task!).status, 'completed');

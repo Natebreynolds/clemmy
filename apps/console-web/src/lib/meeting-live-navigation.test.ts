@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation,
+import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, retainedMeetingCapture,
   type MeetingCaptureTarget, type MeetingNavigationSdkStatus, type MeetingNavigationDaemonStatus,
   type MeetingNavigationRow } from './meeting-live-navigation.js';
 
@@ -72,6 +72,31 @@ test('same window reused at a different detection generation cannot select a lat
   input.daemon.activeRecordingStartedAt = input.sdk.recordingStartedAt;
   input.meetings[0]!.recordingStartedAt = input.sdk.recordingStartedAt;
   unavailable(input, 'capture_replaced');
+});
+
+test('an ended notification retains only its exact recording after a new meeting is detected', () => {
+  const input = fixture();
+  input.meetings[0]!.status = 'completed';
+  input.meetings.unshift({ id: 'newer-detected-meeting', windowId: target.windowId, status: 'detected',
+    startedAt: '2026-10-18T11:00:00.000Z' });
+  assert.deepEqual(retainedMeetingCapture(input), { meetingId: 'recall-exact', windowId: target.windowId, startedAt });
+  input.meetings.unshift({ id: 'newer-recording', windowId: target.windowId, status: 'recording', recordingStartedAt: '2026-10-18T11:01:00.000Z' });
+  assert.equal(retainedMeetingCapture(input)?.meetingId, 'recall-exact');
+});
+
+test('retained navigation never guesses a capture from the window, newest row or an ambiguous identity', () => {
+  const input = fixture(); input.meetings[0]!.status = 'completed';
+  const promptTarget = parseMeetingCaptureTarget(query({ windowId: target.windowId, detectedAt }));
+  assert.equal(retainedMeetingCapture({ ...input, target: promptTarget }), null, 'prompt-only URL needs a recording observed by this view');
+  assert.deepEqual(retainedMeetingCapture({ ...input, target: promptTarget,
+    observed: { meetingId: 'recall-exact', windowId: target.windowId, startedAt } }),
+    { meetingId: 'recall-exact', windowId: target.windowId, startedAt });
+  assert.equal(retainedMeetingCapture({ ...input, target: promptTarget,
+    observed: { meetingId: 'another-meeting', windowId: target.windowId, startedAt } }), null);
+  assert.equal(retainedMeetingCapture({ ...input, target: { kind: 'invalid', reason: 'invalid_query' } }), null);
+  assert.equal(retainedMeetingCapture({ ...input, target: { kind: 'none' } }), null);
+  input.meetings.push({ ...input.meetings[0]!, id: 'ambiguous-copy' });
+  assert.equal(retainedMeetingCapture(input), null);
 });
 
 test('canonical start must match exactly at URL, native, daemon and record boundaries', () => {
