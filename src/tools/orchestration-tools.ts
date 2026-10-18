@@ -337,6 +337,19 @@ export function promoteWorkflowFromSession(input: {
   };
 }
 
+/** A run is checked against the goal it started with. Live 2026-10-18: an
+ *  edit changed the steps (a new column, a price filter), the next run was
+ *  checked against the old goal ("every book, three columns") and scored 25%
+ *  for doing exactly what was asked; the goal was updated a call later. An
+ *  edit that leaves the goal shows it, so the author can judge it in time. */
+function unchangedRunGoalNote(def: WorkflowDefinition | null | undefined): string {
+  const kept = def?.goal;
+  if (!kept?.objective) return '';
+  const criteria = kept.successCriteria?.length ? ` Success criteria: ${kept.successCriteria.map((row) => `"${row}"`).join('; ')}.` : '';
+  return `\n\nIts run goal is unchanged, and every run is checked against the goal it starts with: "${kept.objective}"${criteria}`
+    + ' If this change makes it out of date, update the goal with workflow_update before the next run.';
+}
+
 export function renderAuthoringAdvisories(warnings: string[] | undefined): string {
   if (!warnings || warnings.length === 0) return '';
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
@@ -2391,6 +2404,10 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateGaps = renderWorkflowGapQuestions(updatePrep.status === 'readiness_gaps' ? updatePrep.gaps : analyzeWorkflowGaps(savedNext));
       const updateExecutionPlan = buildWorkflowExecutionPlanWithReadiness(savedNext, entry.name);
       const updateContractReport = appendVisualContract(updateExecutionPlan);
+      // What a run does changed and its goal did not: show the goal.
+      const goalNote = !goal && !clear_goal && (steps || description !== undefined || inputsProvided)
+        ? unchangedRunGoalNote(savedNext)
+        : '';
       return textResult(withWorkflowCommit(
         entry.name,
         `Workflow "${name}" updated. Here's what it does now:\n\n${describeWorkflowPlainEnglish(savedNext)}\n\n`
@@ -2398,7 +2415,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           + `${updateContractReport}${updateContractReport ? '\n\n' : ''}`
           + `${updatePrep.status === 'readiness_gaps' ? `${renderReadinessHold(name)}\n\n` : ''}`
           + `${reSmoke ? `${reSmoke.message}\n\n` : ''}`
-          + `${updateBindReport}${updateAdvisories}${updateGaps}`.trim(),
+          + `${updateBindReport}${updateAdvisories}${updateGaps}${goalNote}`.trim(),
         { before: entry.data },
       ));
     },
@@ -2506,9 +2523,10 @@ export function registerOrchestrationTools(server: McpServer): void {
         silent: true,
         metadata: { source: 'workflow_edit_step', workflowName: workflowSlug, stepId: step_id },
       });
+      // A step edit never carries the goal, so the goal is always the old one.
       return textResult(withWorkflowCommit(
         workflowSlug,
-        `${resultMessage}${reSmokeMsg}`,
+        `${resultMessage}${reSmokeMsg}${unchangedRunGoalNote(readWorkflow(workflowSlug)?.data ?? live.after)}`,
         { before: live.before },
       ));
     },

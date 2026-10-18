@@ -391,6 +391,36 @@ test('workflow_update inside Clem\'s own self-improvement turn keeps an enabled 
   assert.equal(workflowRunFiles().length, 0, 'no creation test was queued');
 });
 
+test('a workflow_update that changes the steps and leaves the goal shows the goal its next run is checked against', async () => {
+  // Live 2026-10-18: an edit added a column and a price filter, the next run
+  // was checked against the old goal ("every book, three columns") and scored
+  // 25% for doing exactly what was asked; the goal was updated a call later.
+  const slug = 'page-digest-goal';
+  const goal = {
+    objective: 'The CSV holds a header row plus one row per book on the page.',
+    successCriteria: ['The CSV\'s first row is the header title,price', 'Every book on the page has one row'],
+    maxAttempts: 2,
+  };
+  const step = { id: 'read-page', prompt: 'Read the page and list every book with its title and price.', allowedTools: ['composio_execute_tool'], sideEffect: 'read' as const };
+  writeWorkflow(slug, { name: slug, description: 'Saves one page of books to a CSV.', enabled: false, trigger: { manual: true }, steps: [step], goal } as never);
+  const edited = [{ ...step, prompt: 'Read the page and list every book under £40 with its title, price and stock.' }];
+
+  const kept = resultText(await workflowUpdate()({ name: slug, steps: edited }));
+  assert.match(kept, /Its run goal is unchanged, and every run is checked against the goal it starts with: "The CSV holds a header row plus one row per book on the page\."/);
+  assert.match(kept, /Success criteria: "The CSV's first row is the header title,price"; "Every book on the page has one row"\./);
+  assert.match(kept, /If this change makes it out of date, update the goal with workflow_update before the next run\./);
+  const stepEdit = resultText(await workflowEditStep()({ name: slug, step_id: 'read-page', find: 'with its title', replace: 'with its title only' }));
+  assert.match(stepEdit, /Its run goal is unchanged, and every run is checked against the goal it starts with/, 'a step edit shows the goal too');
+
+  const replaced = resultText(await workflowUpdate()({ name: slug, steps: edited, goal: {
+    objective: 'The CSV holds a header row plus one row per book under £40.',
+    success_criteria: ['Every kept row is under £40'],
+  } }));
+  assert.doesNotMatch(replaced, /Its run goal is unchanged/, 'an update that sets the goal needs no reminder');
+  const scheduleOnly = resultText(await workflowUpdate()({ name: slug, trigger_schedule: '0 9 * * 1' }));
+  assert.doesNotMatch(scheduleOnly, /Its run goal is unchanged/, 'a schedule change does not change what a run does');
+});
+
 test('workflow_edit_step re-smokes an enabled display-named workflow under the same canonical slug', async () => {
   const slug = 'release-enabled-digest';
   const displayName = 'Release Enabled Digest';
