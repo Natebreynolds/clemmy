@@ -7453,6 +7453,7 @@ async function runConversationWithinRuntimeConfig(
                 liveReads: proven.liveReads,
                 liveReadOutcomes: proven.liveReadOutcomes,
                 ...(proven.pickedBy ? { pickedBy: proven.pickedBy } : {}),
+                ...(proven.ownerRule ? { ownerRule: proven.ownerRule } : {}),
                 ...(proven.decisionWaitMs !== undefined ? { decisionWaitMs: proven.decisionWaitMs } : {}),
               },
             });

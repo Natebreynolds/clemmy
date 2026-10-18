@@ -909,4 +909,17 @@ test("an owner's standing rule that names a tool Clem has used offers that tool'
   assert.match(scrape!.purpose, /^Owner's standing rule: "Standing rule: when I ask for information from a web page, read it with PageGrab, unless the page needs clicking or a login/);
   assert.ok(offered.every((row) => row.id !== 'PAGEGRAB_CRAWL'), 'an operation that never succeeded is not offered');
   assert.ok(offered.every((row) => row.id.startsWith('PAGEGRAB_')), 'a rule that names no tool offers nothing');
+  assert.match(scrape!.rule.text, /read it with PageGrab/);
+  assert.ok(Number.isSafeInteger(scrape!.rule.factId) && scrape!.rule.factId > 0);
+
+  // Jev routes to it: the preparation says which rule chose the tool, so a view
+  // of remembered tools can show why it was used.
+  const calls: DecisionCall[] = [];
+  const prepared = await prepareProvenOperationForRequest(
+    { query: 'Get me the key details from https://example.test/item/42' },
+    { decideTurnStart: decideWith(calls, () => ({ route: 'PAGEGRAB_SCRAPE' })) },
+  );
+  assert.ok(calls[0]?.operations.includes('PAGEGRAB_SCRAPE'), JSON.stringify(calls));
+  assert.equal(prepared.strategyId, 'route:PAGEGRAB_SCRAPE');
+  assert.deepEqual(prepared.ownerRule, scrape!.rule);
 });

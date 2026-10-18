@@ -99,6 +99,9 @@ export interface ProvenOperationPreparation {
   narrowSurface: boolean;
   /** How the remembered run was chosen; absent when none was. */
   pickedBy?: ProvenPickSource;
+  /** The owner's standing rule that offered the routed operation, so a view of
+   *  remembered tools can say why this one was used. */
+  ownerRule?: { factId: number; text: string };
   /** Existing Date.now elapsed around the decision, when asked. Wall-clock
    *  diagnostic only; not the whole preparation span or a timing guarantee. */
   decisionWaitMs?: number;
@@ -573,8 +576,8 @@ const OWNER_RULE_OPERATIONS = 3;
  *  exception included, is Jev's choice like any other candidate; the host only
  *  gathers them. Live 2026-10-18: the owner's rule sat in the prompt and the
  *  brain still read the page with the plain web read already in hand. */
-export function ownerRuleOperations(query: string): Array<{ id: string; purpose: string }> {
-  let rules: Array<{ content: string }>;
+export function ownerRuleOperations(query: string): Array<{ id: string; purpose: string; rule: { factId: number; text: string } }> {
+  let rules: Array<{ id: number; content: string }>;
   let procedures: ReturnType<typeof listToolProcedures>;
   try {
     rules = listActiveFacts({ kind: 'constraint', ranking: 'stanford', objective: query, limit: OWNER_RULE_WINDOW });
@@ -588,7 +591,7 @@ export function ownerRuleOperations(query: string): Array<{ id: string; purpose:
     const rows = peekConnectedToolkits().filter((row) => /^active$/i.test(row.status.trim()));
     if (rows.length > 0) connected = new Set(rows.map((row) => row.slug.trim().toLowerCase()));
   } catch { /* unknown connections: provisioning still checks the exact operation */ }
-  const out: Array<{ id: string; purpose: string }> = [];
+  const out: Array<{ id: string; purpose: string; rule: { factId: number; text: string } }> = [];
   const seen = new Set<string>();
   for (const rule of rules) {
     const words = new Set(nameWords(rule.content));
@@ -611,7 +614,7 @@ export function ownerRuleOperations(query: string): Array<{ id: string; purpose:
     for (const row of ranked.slice(0, OWNER_RULE_OPERATIONS)) {
       if (seen.has(row.name)) continue;
       seen.add(row.name);
-      out.push({ id: row.name, purpose: `Owner's standing rule: "${said.length > 190 ? `${said.slice(0, 189)}…` : said}"` });
+      out.push({ id: row.name, purpose: `Owner's standing rule: "${said.length > 190 ? `${said.slice(0, 189)}…` : said}"`, rule: { factId: rule.id, text: said } });
     }
   }
   return out.slice(0, OPERATION_ROUTE_CANDIDATES);
@@ -808,6 +811,7 @@ async function prepareProvenOperationInScope(
   // when Jev is sure of it and of its fit; it is advisory until the host hands
   // the operation over below.
   let routed = false;
+  const ownerRuleFor = new Map<string, { factId: number; text: string }>();
   if (!strategy) {
     // The candidates exist only for Jev's question. When Jev cannot be asked
     // (turned off, or no key), none are built and nothing waits. With no
@@ -822,8 +826,10 @@ async function prepareProvenOperationInScope(
     const familiar = decideTurnStart ? familiarRunStrategiesFromStrategies(input.query, strategyScope, verified) : [];
     // The owner's own rules go first: a tool they named for this kind of work
     // is weighed before anything the request merely shares words with.
+    const ruled = decideTurnStart ? ownerRuleOperations(input.query) : [];
+    for (const row of ruled) if (!ownerRuleFor.has(row.id)) ownerRuleFor.set(row.id, row.rule);
     const operations = decideTurnStart ? [
-      ...ownerRuleOperations(input.query),
+      ...ruled.map(({ id, purpose }) => ({ id, purpose })),
       ...routableOperationsFromStrategies(input.query, strategyScope, verified),
     ].filter((row, index, rows) => rows.findIndex((other) => other.id === row.id) === index) : [];
     if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
@@ -1042,6 +1048,7 @@ async function prepareProvenOperationInScope(
     liveReads,
     liveReadOutcomes,
     ...(pickedBy ? { pickedBy } : {}),
+    ...(routed && ownerRuleFor.has(strategy.toolsUsed[0] ?? '') ? { ownerRule: ownerRuleFor.get(strategy.toolsUsed[0]!)! } : {}),
     ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}),
   };
 }
