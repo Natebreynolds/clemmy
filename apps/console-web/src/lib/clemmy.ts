@@ -36,7 +36,8 @@ interface ClemmyBridge {
   recallConfigure?: (settings: Record<string, unknown>) => Promise<Record<string, unknown> | null>;
   recallRequestPermissions?: () => Promise<Record<string, unknown> | null>;
   recallRecordActive?: () => Promise<Record<string, unknown> | null>;
-  recallStop?: () => Promise<Record<string, unknown> | null>;
+  recallRecordDetected?: (windowId: string, detectedAt?: string) => Promise<Record<string, unknown> | null>;
+  recallStop?: (target?: { windowId: string; recordingStartedAt: string }) => Promise<Record<string, unknown> | null>;
   recallTest?: () => Promise<Record<string, unknown> | null>;
   onRecallEvent?: (cb: (event: Record<string, unknown>) => void) => (() => void) | void;
   // Local/offline in-person meeting capture (Electron-only).

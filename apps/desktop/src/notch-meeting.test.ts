@@ -121,11 +121,11 @@ test('local recorder sanitizer never exposes audio paths to the notch', () => {
 test('native Recall detection alerts use safe provider-specific copy', () => {
   assert.deepEqual(recallMeetingDetectionNotificationCopy('slack-huddle'), {
     title: 'Slack Huddle detected',
-    body: 'Clementine is ready to record it. Click to choose from the notch.',
+    body: 'Clementine is ready to record it. Click to view recording options.',
   });
   assert.deepEqual(recallMeetingDetectionNotificationCopy('microsoft-teams', true), {
     title: 'Microsoft Teams meeting detected',
-    body: 'Clementine is recording it now. Click to open the notch controls.',
+    body: 'Clementine is recording it now. Click to view the meeting.',
   });
   assert.equal(recallMeetingDetectionNotificationCopy('private-custom-provider').title, 'Online meeting detected');
 });

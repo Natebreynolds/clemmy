@@ -53,11 +53,13 @@ const api = {
   recallRecordActive: () => ipcRenderer.invoke('clemmy:recall-record-active') as Promise<Record<string, unknown> | null>,
   /** Start recording a specific window the SDK has detected. Drives
    *  the "Record this meeting" prompt button. */
-  recallRecordDetected: (windowId: string) => ipcRenderer.invoke('clemmy:recall-record-detected', { windowId }) as Promise<Record<string, unknown> | null>,
+  recallRecordDetected: (windowId: string, detectedAt?: string) => ipcRenderer.invoke('clemmy:recall-record-detected',
+    { windowId, ...(detectedAt !== undefined ? { detectedAt } : {}) }) as Promise<Record<string, unknown> | null>,
   /** Flip autoRecord on AND start recording this window — the
    *  "Always record" prompt button. */
   recallAutoRecord: (windowId: string) => ipcRenderer.invoke('clemmy:recall-auto-record', { windowId }) as Promise<Record<string, unknown> | null>,
-  recallStop: () => ipcRenderer.invoke('clemmy:recall-stop') as Promise<Record<string, unknown> | null>,
+  recallStop: (target?: { windowId: string; recordingStartedAt: string }) => (target === undefined
+    ? ipcRenderer.invoke('clemmy:recall-stop') : ipcRenderer.invoke('clemmy:recall-stop', target)) as Promise<Record<string, unknown> | null>,
   /** Forces an SDK init (if enabled) and returns the full status incl.
    *  permissionStatuses + detectedWindows. Use this for the dashboard's
    *  "Test Connection" diagnostic button. */

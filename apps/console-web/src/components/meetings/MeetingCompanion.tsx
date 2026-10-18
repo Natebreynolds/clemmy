@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, BookOpen, Clock3, Pause, RefreshCw } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -6,12 +6,14 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { ConversationThread } from '@/features/conversations/chat/ConversationThread';
 import { MeetingResearchControls } from './MeetingResearchControls';
+import { cn } from '@/lib/cn';
 import { checkMeetingHelp, decideMeetingHelp, getMeetingHelp, meetingHelpNotice, setMeetingHelp, startMeetingHelp,
   type MeetingHelpOffer } from '@/lib/meeting-assistance';
 
 /** Owner-facing companion. Automatic private research needs saved, scoped
  * permission; accepted work keeps the ordinary thread, review and Stop. */
-export function MeetingCompanion({ meetingId, active }: { meetingId: string; active: boolean }) {
+export function MeetingCompanion({ meetingId, active, presentation = 'default' }: { meetingId: string; active: boolean; presentation?: 'default' | 'live' }) {
+  const titleId = useId();
   const qc = useQueryClient();
   const key = ['meeting-assistance', meetingId];
   const state = useQuery({ queryKey: key, queryFn: () => getMeetingHelp(meetingId),
@@ -40,12 +42,12 @@ export function MeetingCompanion({ meetingId, active }: { meetingId: string; act
     }
   });
   const kept = view?.keptOffers ?? view?.recentOffers.filter(o => o.state === 'deferred' || o.state === 'lookup_prepared') ?? [];
-  return <section aria-labelledby="meeting-companion-title" className="mb-5 min-w-0 rounded-xl bg-subtle p-4 sm:p-5 max-sm:[&_button]:min-h-11">
-    <div className="grid grid-cols-[2rem_minmax(0,1fr)] items-start gap-3 sm:flex sm:flex-wrap">
+  return <section aria-labelledby={titleId} className={cn('min-w-0 max-sm:[&_button]:min-h-11', presentation === 'live' ? 'h-full border-t border-border pt-6 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0' : 'mb-5 rounded-xl bg-subtle p-4 sm:p-5')}>
+    <div className={cn("grid grid-cols-[2rem_minmax(0,1fr)] items-start gap-3", presentation !== 'live' && "sm:flex sm:flex-wrap")}>
       <DogMark size={32} aria-hidden />
       <div className="min-w-0 flex-1">
-        <h2 id="meeting-companion-title" className="text-h3 text-fg">Clem, alongside your meeting</h2>
-        <p className="mt-1 max-w-prose text-small text-muted">Suggestions and answers stay here in Clem. Nothing is sent to the meeting.</p>
+        <h2 id={titleId} className="text-h3 text-fg">{presentation === 'live' ? 'From Clem' : 'Clem, alongside your meeting'}</h2>
+        <p className="mt-1 max-w-prose text-small text-muted">{presentation === 'live' ? 'A little help, just for you. Answers stay here in Clem.' : 'Suggestions and answers stay here in Clem. Nothing is sent to the meeting.'}</p>
       </div>
       {view && (active || view.enabled) && <Button className="col-start-2 justify-self-start sm:shrink-0" size="sm" variant="secondary" disabled={pending || state.isError}
         onClick={() => void act(async () => { qc.setQueryData(key, await setMeetingHelp(meetingId, !view.enabled, view.version)); })}>
@@ -85,7 +87,7 @@ export function MeetingCompanion({ meetingId, active }: { meetingId: string; act
         <ConversationThread key={conversation} sessionIdOverride={conversation} />
       </div>
     </div>}
-    <MeetingResearchControls key={`research-${meetingId}`} meetingId={meetingId} active={active} />
+    <MeetingResearchControls key={`research-${meetingId}`} meetingId={meetingId} active={active} presentation={presentation} onOpenLookup={setConversation} />
     {view?.skippedFinalSegments ? <p className="mt-3 text-caption text-muted">Some transcript lines were outside the live check. Suggestions are not a complete meeting review.</p> : null}
   </section>;
 }

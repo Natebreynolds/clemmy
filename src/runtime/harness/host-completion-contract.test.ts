@@ -2365,7 +2365,7 @@ test('every review response carries the output bound, on whichever wire answers'
     judgeFamily: 'byo', brainFamily: 'byo', transport: 'byo_api', selfJudge: false },
     JUDGE_SYSTEM_PROMPT, 'OBJECTIVE: say hello\nRESPONSE: hello', parseCompletionVerdict, false);
   assert.equal(verdict.done, true);
-  assert.equal(seenMaxTokens, judgeMaxOutputTokens(), 'the bound travels on the request the wire receives');
+  assert.equal(seenMaxTokens, judgeMaxOutputTokens('fixture-judge'), 'the effective route bound travels on the request the wire receives');
   assert.ok(judgeMaxOutputTokens() <= 65_536 && judgeMaxOutputTokens() >= 2_048);
 });
 

@@ -1262,6 +1262,223 @@ test('production native MCP definitions drive provider-neutral read, ordinary-wr
   }
 });
 
+test('an approved native MCP operation receives exact source-owned binary bytes through its real preparation and shipped port', async () => {
+  const attachments = await import('../attachments.js');
+  const references = await import('../attachment-file-reference.js');
+  const contexts = await import('./tool-output-context.js');
+  const authored = await import('./authored-call-authority.js');
+  const preview = await import('./approval-call-preview.js');
+  const approvals = await import('./approval-registry.js');
+  const hostConsent = await import('./host-interactive-consent.js');
+  const { HarnessSession } = await import('./session.js');
+  const { HostInterruptState } = await import('./host-turn-runner.js');
+  const { runTurn, resumePendingApproval } = await import('./loop.js');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const brackets = await import('./brackets.js');
+  const { Agent } = await import('@openai/agents');
+  const { EventEmitter } = await import('node:events');
+  const { writeFileSync } = await import('node:fs');
+  const bytes = Buffer.from([0, 1, 2, 9, 255, 0]);
+  const attachment = await attachments.ingestAttachment({ name: 'controlled-asset.mp4', bytes });
+  assert.ok(attachment.file);
+  const assetPath = references.attachmentFilePath(attachment.file);
+  const session = eventlog.createSession({ kind: 'chat' });
+  const originalAttempt = eventlog.beginRunAttempt(session.id);
+  const source = eventlog.recordRunAttemptUserInput(originalAttempt, { turn: 1, role: 'user',
+    data: { text: 'Send the selected controlled asset.', attachmentFiles: references.acceptedAttachmentFiles([attachment]) } });
+  const sourceIdentity = { sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId: `task:${session.id}#${source.seq}` };
+  const server = generated('asset_server').toLowerCase();
+  const tool: ToolState = { name: `${server}__send_asset`, description: 'Send the selected asset bytes to the named connected destination.',
+    inputSchema: { type: 'object', properties: { content: { type: 'string', contentEncoding: 'base64' }, sendNow: { type: 'boolean' }, note: { type: 'string' } },
+      required: ['content', 'sendNow'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } };
+  const runtime = generatedRuntime({ server, objective: 'controlled asset send', tools: [tool] });
+  const { factory } = resetAuthoritySurfaces();
+  const materialized = await mcp.createProductionMcpReadCarrier({ serverName: server, runtime: runtime.runtime })
+    .materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+  assert.equal(materialized.status, 'installed', JSON.stringify(materialized));
+  if (materialized.status !== 'installed') return;
+  const manifest = materialized.manifest;
+  const entry = factory.get(manifest.manifestId)!;
+  const { binding: riskBinding, identity } = exactExternalBinding(entry);
+  const args = { content: assetPath, sendNow: true };
+  for (const carrier of ['call_tool', 'work_call']) for (const name of [tool.name, `mcp__${tool.name}`]) {
+    const cardPreview = preview.approvalCallPreview({ toolName: carrier, rawArgs: '', args: { name, args_json: args } }, true, false, sourceIdentity);
+    assert.equal(cardPreview?.fields.find(field => field.name === 'content')?.label, 'controlled-asset.mp4 · 6 B · in your attached files');
+  }
+  const signals = externalRisk.deriveExternalCapabilityCallSignalsV1({ version: 1, inputSchema: tool.inputSchema, arguments: args });
+  assert.equal(signals.status, 'projected'); if (signals.status !== 'projected') return;
+  const destination = { digest: digest('controlled asset destination'), posture: manifest.destination?.posture ?? 'not_applicable' } as const;
+  const loaded = externalRisk.loadCatalogManifestExternalRiskAttestationV1({ version: 1, binding: riskBinding,
+    inputSchema: tool.inputSchema, destination, callSignals: signals.callSignals, safety: 'admissible' });
+  assert.ok(loaded.ok); if (!loaded.ok) return;
+  const call: CapabilityRiskAttestationV1 = { version: 1, source: { kind: 'accepted_turn', id: source.id, digest: digest(String(source.data.text)) },
+    acceptedTaskId: sourceIdentity.acceptedTaskId, bindingDigest: digest('controlled asset binding'), logicalToolCallId: 'controlled-asset-send',
+    operationId: identity.operationId, argumentDigest: digest(JSON.stringify(args)), schemaFingerprint: identity.schemaDigest,
+    effect: loaded.attestation.projection.effect, accountId: identity.account, destination, cardinality: { kind: 'once' },
+    risk: loaded.attestation.projection.risk, semanticBasis: loaded.attestation.projection.semanticBasis, safety: 'admissible' };
+  const coverage = exactCoverage(call);
+  const baseConsent = { call, coverage, readiness: { kind: 'ready' as const }, crossing: 'not_started' as const, reservationAlreadyClaimed: false };
+  assert.equal(consent.evaluateInteractiveConsentV1({ ...baseConsent, userGrant: null }).kind, 'needs_user', 'attaching the bytes never approves sending them');
+  assert.equal(runtime.counts.call, 0);
+  assert.equal(consent.evaluateInteractiveConsentV1({ ...baseConsent, userGrant: exactGrant(call) }).kind, 'proceed');
+  const port = ports.resolveProductionPortsForManifest(manifest)!;
+  assert.ok(port.prepareInvocation && port.invokeWithPreparation);
+  const binding = { capabilityId: manifest.manifestId, toolName: manifest.operationId, schemaVersion: manifest.operationVersion,
+    schemaDigest: manifest.definitionFingerprint, args, account: manifest.accountId, effect: manifest.effect,
+    manifestDigest: manifests.capabilityManifestDigest(manifest), providerKind: manifest.providerKind, invoke: port.invoke };
+  const invoke = (activeSource: typeof sourceIdentity, canonicalArgs: Record<string, unknown> = args) => port.invoke({ nodeId: 'asset', role: 'send', payload: canonicalArgs, identity: activeSource, binding: { ...binding, args: canonicalArgs },
+    authority: authored.mintHostConsentCallAuthority({ manifest, canonicalArgs, grant: {
+      coverageContractId: `accepted-call:${digest('controlled exact reducer coverage')}`, ...activeSource, logicalCallId: 'controlled-asset-send',
+    } }) });
+  const proof = await port.prepareInvocation!();
+  // The real approval-resume reducer must restore A, even when the accepted
+  // "Yes" belongs to B. Do not give B a general attachment export scope.
+  const carrierArgs = JSON.stringify({ name: tool.name, args_json: args });
+  const subject = { version: 1 as const, sessionId: session.id, sourceUserSeq: source.seq,
+    acceptedTaskId: sourceIdentity.acceptedTaskId, logicalToolCallId: 'controlled-asset-send',
+    decisionSubjectDigest: digest('controlled-asset-decision'), callDigest: digest(carrierArgs),
+    coverageDigest: digest('controlled-asset-coverage'), riskDigest: digest('controlled-asset-risk') };
+  const resumeKey = hostConsent.hostInteractiveConsentApprovalResumeKey(subject);
+  assert.ok(resumeKey);
+  const paused = new HostInterruptState([], [{ callId: subject.logicalToolCallId, name: 'call_tool',
+    rawItem: { name: 'call_tool', arguments: carrierArgs, callId: subject.logicalToolCallId }, consentSubject: subject }], undefined, 'host_v1');
+  const surfaced = await runTurn({ sessionId: session.id, sourceUserSeq: source.seq,
+    input: String(source.data.text), judgeCompletion: false, suppressAutomaticMemoryForRequest: true,
+    skipAutomaticMemoryPrimer: true, plainConversationSurface: true,
+    agent: new Agent({ name: 'ControlledAssetCard', instructions: 'Offline controlled fixture.', tools: [] }),
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async () => ({ history: [], lastResponseId: undefined, finalOutput: undefined,
+      hasInterruptions: true, serializedState: paused.toString(), interruptions: [{
+        toolName: 'call_tool', args: JSON.parse(carrierArgs), rawArgs: carrierArgs,
+        approvalResumeKey: resumeKey, consentCall: call,
+      }] }),
+  });
+  assert.equal(surfaced.status, 'awaiting_approval');
+  const [registeredEvent] = eventlog.listEvents(session.id, { types: ['approval_requested'] });
+  assert.ok(registeredEvent);
+  assert.equal(registeredEvent.data.sourceUserSeq, source.seq);
+  const card = approvals.get(String(registeredEvent.data.approvalId))!;
+  assert.ok(card);
+  const publicCard = projectHarnessEventForPublic(registeredEvent)!;
+  const shownPreview = publicCard.data.preview as { fields: Array<{ name: string; label?: string }> };
+  assert.equal(shownPreview.fields.find(field => field.name === 'content')?.label,
+    'controlled-asset.mp4 · 6 B · in your attached files', 'the registered public card retains the exact source-aware file label');
+  const responseAttempt = eventlog.beginRunAttempt(session.id);
+  const response = eventlog.recordRunAttemptUserInput(responseAttempt, { turn: 2, role: 'user', data: {
+    text: 'Yes.', approvalId: card.approvalId, decision: 'approve', source: 'desktop_approval',
+  } });
+  let resumed = 0;
+  const resumedOutcome = await resumePendingApproval({ sessionId: session.id, sourceUserSeq: response.seq,
+    approvalId: card.approvalId, decision: 'approve', resolver: 'controlled-asset-fixture', judgeCompletion: false,
+    agent: new Agent({ name: 'ControlledAssetApproval', instructions: 'Offline controlled fixture.', tools: [] }),
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async (_runner, _agent, saved) => {
+      resumed++;
+      assert.ok(saved instanceof HostInterruptState);
+      assert.equal(saved.pending[0]?.decision, 'approved');
+      const actual = brackets.harnessRunContextStorage.getStore();
+      assert.equal(actual?.sourceUserSeq, source.seq, 'the exact approved action retains original source A, not response B');
+      assert.equal(actual?.sessionId, session.id);
+      await contexts.withToolOutputContext({ sessionId: actual!.sessionId, sourceUserSeq: actual!.sourceUserSeq,
+        callId: 'controlled-asset-send', toolName: tool.name }, () => port.invokeWithPreparation!(proof, () => invoke(sourceIdentity)));
+      return { history: [], lastResponseId: undefined, finalOutput: 'The exact controlled bytes were sent.' };
+    },
+  });
+  assert.equal(resumedOutcome.status, 'completed');
+  assert.equal(resumed, 1);
+  assert.equal(approvals.get(card.approvalId)?.resolution, 'approved');
+  eventlog.finishRunAttempt(responseAttempt, 'completed');
+  await resumePendingApproval({ sessionId: session.id, sourceUserSeq: response.seq,
+    approvalId: card.approvalId, decision: 'approve', resolver: 'controlled-asset-fixture-replay', judgeCompletion: false,
+    agent: new Agent({ name: 'ControlledAssetApprovalReplay', instructions: 'Offline controlled fixture.', tools: [] }),
+    makeRunner: () => new EventEmitter() as never,
+    runRunner: async () => { throw new Error('A settled approval must not dispatch its action again.'); },
+  });
+  assert.equal(runtime.counts.call, 1);
+  assert.equal(runtime.calls[0]!.name, tool.name);
+  assert.deepEqual(runtime.calls[0]!.args, { content: bytes.toString('base64'), sendNow: true });
+  await assert.rejects(() => port.invokeWithPreparation!(proof, () => invoke(sourceIdentity)), /absent, consumed, or inauthentic/);
+  assert.equal(runtime.counts.call, 1, 'reusing the same prepared crossing does not repeat the send');
+  const unrelated = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'An unrelated controlled request.' } });
+  const otherSource = { sessionId: session.id, sourceUserSeq: unrelated.seq, acceptedTaskId: `task:${session.id}#${unrelated.seq}` };
+  const otherProof = await port.prepareInvocation!();
+  await assert.rejects(() => Promise.resolve(contexts.withToolOutputContext({ ...otherSource, callId: 'foreign-asset', toolName: tool.name },
+    () => port.invokeWithPreparation!(otherProof, () => invoke(otherSource)))), /does not own/);
+  assert.equal(runtime.counts.call, 1, 'an account and operation match never substitutes for source ownership');
+  const plainProof = await port.prepareInvocation!();
+  await assert.rejects(() => Promise.resolve(contexts.withToolOutputContext({ ...otherSource, callId: 'foreign-plain-path', toolName: tool.name },
+    () => port.invokeWithPreparation!(plainProof, () => invoke(otherSource, { content: 'Y29udHJvbGxlZA==', sendNow: true, note: assetPath })))), /does not own/);
+  assert.equal(runtime.counts.call, 1, 'a plain-path field cannot bypass the same native source guard');
+  writeFileSync(assetPath, Buffer.from([8, 1, 2, 9, 255, 0]));
+  const changedProof = await port.prepareInvocation!();
+  await assert.rejects(() => Promise.resolve(contexts.withToolOutputContext({ ...sourceIdentity, callId: 'changed-asset', toolName: tool.name },
+    () => port.invokeWithPreparation!(changedProof, () => invoke(sourceIdentity)))), /Nothing was sent/);
+  assert.equal(runtime.counts.call, 1, 'changed bytes never reach native callTool');
+});
+
+test('registered public attachment cards keep exact source labels for groups and refuse foreign, unsupported and oversize files', async () => {
+  const attachments = await import('../attachments.js');
+  const references = await import('../attachment-file-reference.js');
+  const { MCP_INLINE_FILE_MAX_BYTES } = await import('../mcp-file-inputs.js');
+  const { runTurn } = await import('./loop.js');
+  const { projectHarnessEventForPublic } = await import('./public-presentation.js');
+  const { Agent } = await import('@openai/agents');
+  const { EventEmitter } = await import('node:events');
+  const first = await attachments.ingestAttachment({ name: 'public-first.mp4', bytes: Buffer.from([0, 1, 2]) });
+  const second = await attachments.ingestAttachment({ name: 'public-second.zip', bytes: Buffer.from([9, 1, 2]) });
+  const large = await attachments.ingestAttachment({ name: 'public-large.mp4', bytes: Buffer.alloc(MCP_INLINE_FILE_MAX_BYTES + 1) });
+  assert.ok(first.file && second.file && large.file);
+  const server = generated('asset_cards').toLowerCase();
+  const tool: ToolState = { name: `${server}__send_asset`, description: 'Send selected asset bytes.',
+    inputSchema: { type: 'object', properties: { content: { type: 'string', contentEncoding: 'base64' }, sendNow: { type: 'boolean' } },
+      required: ['content', 'sendNow'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } };
+  const runtime = generatedRuntime({ server, objective: 'controlled public cards', tools: [tool] });
+  resetAuthoritySurfaces();
+  const installed = await mcp.createProductionMcpReadCarrier({ serverName: server, runtime: runtime.runtime })
+    .materializeExact({ operationId: tool.name, inputSchema: tool.inputSchema });
+  assert.equal(installed.status, 'installed');
+  if (installed.status !== 'installed') return;
+  const show = async (selected: typeof first[], paths: string[], operation = tool.name) => {
+    const session = eventlog.createSession({ kind: 'chat' });
+    const source = eventlog.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { text: 'Prepare the controlled selected assets.', attachmentFiles: references.acceptedAttachmentFiles(selected) } });
+    // A newer source owning the file must not lend its ownership to this card.
+    if (selected.length === 0) eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'A later unrelated controlled selection.', attachmentFiles: references.acceptedAttachmentFiles([first]) } });
+    const interruptions = paths.map((content, index) => ({ toolName: 'call_tool',
+      args: { name: operation, args_json: { content, sendNow: true } }, rawArgs: JSON.stringify({ name: operation, args_json: { content, sendNow: true } }),
+      approvalResumeKey: `host-consent:v1:${digest(`${session.id}:${index}`)}`,
+      consentCall: { effect: 'external_write' as const, accountId: installed.manifest.accountId,
+        risk: { consequence: 'send' as const, reversibility: 'irreversible' as const, destructive: false } } }));
+    const result = await runTurn({ sessionId: session.id, sourceUserSeq: source.seq, input: String(source.data.text), judgeCompletion: false,
+      suppressAutomaticMemoryForRequest: true, skipAutomaticMemoryPrimer: true, plainConversationSurface: true,
+      agent: new Agent({ name: 'ControlledPublicAssetCards', instructions: 'Offline controlled fixture.', tools: [] }),
+      makeRunner: () => new EventEmitter() as never,
+      runRunner: async () => ({ history: [], lastResponseId: undefined, finalOutput: undefined, hasInterruptions: true,
+        serializedState: '{"$schema":1,"items":[]}', interruptions }),
+    });
+    assert.equal(result.status, 'awaiting_approval');
+    const [event] = eventlog.listEvents(session.id, { types: ['approval_requested'] });
+    assert.ok(event);
+    assert.equal(event.data.sourceUserSeq, source.seq);
+    const card = projectHarnessEventForPublic(event)!;
+    return card.data.preview as { fields: Array<{ name: string; label?: string }>; items?: Array<{ fields: Array<{ name: string; label?: string }> }> };
+  };
+  const firstPath = references.attachmentFilePath(first.file);
+  const group = await show([first, second], [firstPath, references.attachmentFilePath(second.file)]);
+  assert.equal(group.items?.length, 2);
+  assert.ok(group.items);
+  assert.deepEqual(group.items.map(item => item.fields.find(field => field.name === 'content')?.label),
+    ['public-first.mp4 · 3 B · in your attached files', 'public-second.zip · 3 B · in your attached files']);
+  assert.match((await show([], [firstPath])).fields.find(field => field.name === 'content')?.label ?? '', /cannot be sent/,
+    'an unrelated later selection never lends ownership to the source on the public card');
+  assert.match((await show([large], [references.attachmentFilePath(large.file)])).fields.find(field => field.name === 'content')?.label ?? '', /cannot be sent:.*20MiB/);
+  assert.match((await show([first], [firstPath], 'unsupported__send_asset')).fields.find(field => field.name === 'content')?.label ?? '', /cannot be sent/);
+  assert.equal(runtime.counts.call, 0, 'publishing approval cards performs no native send');
+});
+
 test('unknown declarations, contradictory hints, schema drift, and definition drift stay zero-I/O', async (t) => {
   const cases: Array<{
     name: string;

@@ -168,6 +168,7 @@ import {
   writeWorkflowAndSyncTriggers,
 } from '../execution/workflow-authoring.js';
 import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadInboxAttachment, saveIngestedToInbox, type IngestedAttachment } from '../runtime/attachments.js';
+import { acceptedAttachmentFiles, type AttachmentFileReference } from '../runtime/attachment-file-reference.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
 import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
@@ -570,6 +571,8 @@ import {
   loadRecallMeetingById,
   loadRecallMeetingSettings,
   isRecallRegion,
+  isRecallRecordingEpoch,
+  RecallRecordingEpochConflictError,
   noteRecallMeetingDetected,
   patchMeetingRecord,
   removeMeetingNote,
@@ -10547,6 +10550,7 @@ export function registerConsoleRoutes(
         activeMeetingId: activeRecording?.id,
         activeWindowId: activeRecording?.windowId,
         activeStartedAt: activeRecording?.startedAt,
+        activeRecordingStartedAt: activeRecording?.recordingStartedAt,
         regions: RECALL_REGIONS,
         docsUrl: 'https://docs.recall.ai/docs/desktop-sdk',
         signupUrl: 'https://www.recall.ai/signup',
@@ -10623,10 +10627,16 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
+    const recordingStartedAt: unknown = req.body?.recordingStartedAt;
+    if (recordingStartedAt !== undefined && (!isRecallRecordingEpoch(recordingStartedAt)
+      || typeof req.body?.sdkUploadId !== 'string' || !req.body.sdkUploadId.trim())) {
+      res.status(400).json({ error: 'A canonical recording start requires an exact SDK upload.' }); return;
+    }
     try {
       const record = noteRecallMeetingDetected({
         windowId,
         sdkUploadId: typeof req.body?.sdkUploadId === 'string' ? req.body.sdkUploadId : undefined,
+        ...(recordingStartedAt !== undefined ? { recordingStartedAt: recordingStartedAt as string } : {}),
         sdkUploadRegion: isRecallRegion(req.body?.sdkUploadRegion)
           ? req.body.sdkUploadRegion as RecallRegion
           : undefined,
@@ -10643,6 +10653,7 @@ export function registerConsoleRoutes(
       });
       res.json({ record });
     } catch (err) {
+      if (err instanceof RecallRecordingEpochConflictError) { res.status(409).json({ error: err.message }); return; }
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
@@ -17835,6 +17846,7 @@ export function registerConsoleRoutes(
       }
     }
     let turnInput = input;
+    let attachmentFiles: AttachmentFileReference[] = [];
     if (command === 'continue') {
       const { readLastConversationCompletion } = await import('../channels/discord-harness.js');
       const { isContinueCompletionReason, buildContinueInput } = await import('../runtime/harness/continue-directive.js');
@@ -17852,6 +17864,7 @@ export function registerConsoleRoutes(
       const ingested: IngestedAttachment[] = attachmentIds
         .map((id) => loadInboxAttachment(id))
         .filter((a): a is IngestedAttachment => a !== null);
+      attachmentFiles = acceptedAttachmentFiles(ingested);
       for (const url of extractYouTubeUrls(input).slice(0, 3)) {
         ingested.push(await ingestAttachment({ name: url, url }));
       }
@@ -18141,6 +18154,7 @@ export function registerConsoleRoutes(
           role: 'user',
           data: {
             text: turnInput,
+            ...(attachmentFiles.length ? { attachmentFiles } : {}),
             ...taskModeFields(taskMode),
             ...turnLearningPolicyFields(learningPolicy),
             ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),

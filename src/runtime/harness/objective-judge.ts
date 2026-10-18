@@ -1040,9 +1040,12 @@ function parseCompletionObject(obj: Record<string, unknown>): { done: boolean; r
  *  spending, not deciding, and the bound ends that call instead of letting it
  *  run to the provider's own ceiling. Configurable, with a floor that leaves
  *  room for a provider whose reasoning counts against its output. */
-export function judgeMaxOutputTokens(): number {
+export function judgeMaxOutputTokens(modelId?: string): number {
   const raw = Number.parseInt(getRuntimeEnv('CLEMMY_JUDGE_MAX_OUTPUT_TOKENS', '16384') ?? '16384', 10);
-  return Number.isFinite(raw) && raw >= 2_048 ? Math.min(raw, 65_536) : 16_384;
+  const configured = Number.isFinite(raw) && raw >= 2_048 ? Math.min(raw, 65_536) : 16_384;
+  // The setting bounds review spend; it cannot enlarge the selected model's
+  // declared output capacity. Unknown routes keep the conservative model cap.
+  return modelId ? Math.min(configured, resolveModelCapability(modelId).maxOutput) : configured;
 }
 
 /** How hard a review thinks. Unset leaves the provider's own default. */
@@ -1053,6 +1056,7 @@ function buildJudgeAgent(
   instructions: string = JUDGE_SYSTEM_PROMPT,
   tools: Agent<RuntimeContextValue>['tools'] = [],
   effort?: JudgeReviewEffort,
+  outputBudget = judgeMaxOutputTokens(routing?.modelId ?? codexSafeFast()),
 ): Agent<RuntimeContextValue> {
   return new Agent<RuntimeContextValue>({
     name: 'ObjectiveCompletionJudge',
@@ -1064,7 +1068,7 @@ function buildJudgeAgent(
     // Let the selected provider own its reasoning default. An explicit empty
     // settings object prevents a string fallback from acquiring an SDK-imposed
     // reasoning tier; the harness imposes no tier.
-    modelSettings: { maxTokens: judgeMaxOutputTokens(), ...(effort ? { reasoning: { effort } } : {}) },
+    modelSettings: { maxTokens: outputBudget, ...(effort ? { reasoning: { effort } } : {}) },
     tools,
   });
 }
@@ -1262,10 +1266,18 @@ export function completionJudgeContextAdmission(
   instructions: string,
   prompt: string,
 ): { fits: boolean; estimatedInputTokens: number; outputReserve: number; estimatedTotalTokens: number; contextWindow: number } {
+  return completionJudgeContextAdmissionWithBudget(modelId, instructions, prompt, judgeMaxOutputTokens(modelId));
+}
+
+function completionJudgeContextAdmissionWithBudget(
+  modelId: string,
+  instructions: string,
+  prompt: string,
+  outputReserve: number,
+): ReturnType<typeof completionJudgeContextAdmission> {
   const estimatedInputTokens = estimateMessagesTokens([
     { role: 'system', content: instructions }, { role: 'user', content: prompt },
   ]);
-  const outputReserve = resolveModelCapability(modelId).maxOutput;
   const estimatedTotalTokens = predictTurnCost({
     currentStateTokens: 0, userInputTokens: estimatedInputTokens,
     plannedToolCallCount: 0, expectedOutputTokens: outputReserve, staticOverheadTokens: 0,
@@ -1408,6 +1420,9 @@ export async function runRoutedJudgeAttempt<T>(
   assessment?: SameCallAssessment<T>,
 ): Promise<T> {
   signal?.throwIfAborted();
+  // One immutable budget owns this route's admission, request and any verdict
+  // repair. A fallback enters here again with its own selected model's cap.
+  const outputBudget = judgeMaxOutputTokens(routing.modelId);
   // Keep per-review handles out of tool schemas and stable instructions.
   // Supply them once with the evidence whose handles they identify.
   const evidenceGuidance = evidence ? judgeEvidenceGuidance(evidence) : '';
@@ -1433,10 +1448,10 @@ export async function runRoutedJudgeAttempt<T>(
   }
   let reviewPrompt = evidence ? `${selectedPrompt}${evidenceReferences}` : selectedPrompt;
   if (requireCompletePrompt) {
-    let admission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, reviewPrompt);
+    let admission = completionJudgeContextAdmissionWithBudget(routing.modelId, reviewInstructions, reviewPrompt, outputBudget);
     if (!admission.fits && optional) {
       const without = evidence ? `${optional.without.text}${evidenceReferences}` : optional.without.text;
-      const withoutAdmission = completionJudgeContextAdmission(routing.modelId, reviewInstructions, without);
+      const withoutAdmission = completionJudgeContextAdmissionWithBudget(routing.modelId, reviewInstructions, without, outputBudget);
       if (withoutAdmission.fits) {
         selectedPrompt = optional.without.text;
         reviewPrompt = without;
@@ -1486,8 +1501,8 @@ export async function runRoutedJudgeAttempt<T>(
   if (originalCapture) observedRouting = { ...observedRouting, model: originalCapture.model };
   const agent = evidence
     ? buildJudgeAgent(observedRouting, agentInstructions,
-      judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort)
-    : buildJudgeAgent(observedRouting, instructions, [], reviewEffort);
+      judgeEvidenceTools(evidence, JUDGE_EVIDENCE_LOOKUP_BUDGET, observe?.lookup), reviewEffort, outputBudget)
+    : buildJudgeAgent(observedRouting, instructions, [], reviewEffort, outputBudget);
   signal?.throwIfAborted();
   if (priorOpinionDisposition) try {
     const observed = observe?.priorOpinion?.(priorOpinionDisposition);
@@ -1544,10 +1559,10 @@ export async function runRoutedJudgeAttempt<T>(
           }, { signal, ownerAtEntry: reviewOwnerAtModelEntry });
           repairRouting = { ...routing, model: repairCollector.wrap(routing.model) };
         } catch { /* no observation is authority to retry or alter the request */ }
-        const repairAgent = buildJudgeAgent(repairRouting, repairInstructions, [], VERDICT_RESTATEMENT_EFFORT);
+        const repairAgent = buildJudgeAgent(repairRouting, repairInstructions, [], VERDICT_RESTATEMENT_EFFORT, outputBudget);
         // A missing verdict must not turn an incomplete review excerpt into
         // completion authority. Preserve the whole review or decline repair.
-        const repairAdmission = completionJudgeContextAdmission(routing.modelId, repairInstructions, repairPrompt);
+        const repairAdmission = completionJudgeContextAdmissionWithBudget(routing.modelId, repairInstructions, repairPrompt, outputBudget);
         if (!repairAdmission.fits) throw new JudgeContextUnavailableError('Complete verdict repair exceeds the reviewer context window.');
         signal?.throwIfAborted();
         const repaired = await new Runner({ workflowName: 'clementine-objective-judge-verdict' }).run(

@@ -59,6 +59,7 @@ import {
 import { isolatedTestContractActive } from './isolated-test-contract.js';
 import { ProviderAnsweredError } from './attempt-outcome.js';
 import { mcpArgumentsWithFileContent } from '../mcp-file-inputs.js';
+import { getToolOutputContext } from './tool-output-context.js';
 import {
   capabilityManifestDigest,
   validateCapabilityManifestV1,
@@ -845,7 +846,10 @@ async function executeWithRuntime(
   // way every lane checks a file before it leaves (nothing is sent on refusal).
   const definition = prepared.snapshot.definitions
     .find((entry) => entry.definition.operationId === call.operationId)?.definition;
-  const args = mcpArgumentsWithFileContent(definition?.inputSchema, call.args);
+  const source = getToolOutputContext();
+  const args = mcpArgumentsWithFileContent(definition?.inputSchema, call.args,
+    source?.sessionId && Number.isSafeInteger(source.sourceUserSeq) && Number(source.sourceUserSeq) > 0
+      ? { sessionId: source.sessionId, sourceUserSeq: Number(source.sourceUserSeq) } : undefined);
   const result = runtime.invokePreparedOperation
     ? await runtime.invokePreparedOperation(prepared.snapshot.server, call.operationId, args)
     : await prepared.snapshot.server.callTool(call.operationId, args);

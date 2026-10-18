@@ -114,6 +114,8 @@ import {
   sanitizeRecallEventForNotch,
   sanitizeRecallStatusForNotch,
 } from './notch-meeting.js';
+import { isRecallMeetingNotificationRoute, openRecallMeetingNotification, recallMeetingNotificationTarget } from './meeting-notification.js';
+import { assertRecallMeetingDetectionTarget, assertRecallMeetingStopTarget } from './meeting-control-target.js';
 import {
   ClementineNotchClickHelper,
   resolveNotchClickHelperPath,
@@ -122,6 +124,7 @@ import {
 } from './notch-click-helper.js';
 import {
   advanceWatermark,
+  desktopNotificationRoute,
   DesktopNotificationRetention,
   openDesktopNotification,
   parseDesktopPendingResponse,
@@ -241,6 +244,7 @@ type LocalMeetingCaptureOwner = 'dashboard' | 'live';
 let localMeetingStartOwner: LocalMeetingCaptureOwner | null = null;
 let localMeetingCaptureOwner: { owner: LocalMeetingCaptureOwner; sessionId: string } | null = null;
 const notifiedRecallMeetingWindows = new Set<string>();
+const recallMeetingNotificationRetention = new DesktopNotificationRetention<Notification>(32);
 let quitPrepared = false;
 const RECALL_TRAY_STATE_EVENTS = new Set([
   'recording-start-requested',
@@ -1079,23 +1083,19 @@ function showRecallMeetingDetectionNotification(
   if (!Notification.isSupported()) return;
 
   const copy = recallMeetingDetectionNotificationCopy(event.platform, recording);
+  const target = recallMeetingNotificationTarget(windowId, recallCapture?.status(), recording);
   const notification = new Notification({
     title: copy.title,
     body: copy.body,
     silent: false,
   });
+  recallMeetingNotificationRetention.retain(notification);
   notification.on('click', () => {
-    if (!clementineNotchPreferences.enabled) {
-      revealMainWindow();
-      return;
-    }
-    ensureClementineLiveWindow();
-    clementineLivePendingReveal = 'manual';
-    clementineLivePendingRevealPresentation = 'panel';
-    emitClementineLiveMeetingPresentation(true);
-    if (clementineLiveAvailability === 'ready' && clementineLivePresentation === 'panel') {
-      showClementineLive(true);
-    }
+    void openRecallMeetingNotification(target, {
+      getStatus: () => recallCapture?.status(),
+      revealMainWindow,
+      navigate: focusDesktopNotificationRoute,
+    });
   });
   notification.show();
   notifiedRecallMeetingWindows.add(windowId);
@@ -2558,6 +2558,10 @@ function rememberDesktopNotifiedId(id: string): void {
 }
 
 async function focusDesktopNotificationRoute(route: string): Promise<boolean> {
+  // Notification actions are limited to the existing Inbox destination or an
+  // exact Meetings navigation identity, never an arbitrary dashboard route.
+  if ((!route.startsWith('/console/') || desktopNotificationRoute(route.slice('/console'.length)) !== route)
+    && !isRecallMeetingNotificationRoute(route)) return false;
   const win = mainWindow;
   if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return false;
   const contents = win.webContents;
@@ -3372,12 +3376,13 @@ ipcMain.handle('clemmy:recall-record-active', async (evt: IpcMainInvokeEvent) =>
   }
 });
 
-ipcMain.handle('clemmy:recall-record-detected', async (evt: IpcMainInvokeEvent, payload: { windowId: string }) => {
+ipcMain.handle('clemmy:recall-record-detected', async (evt: IpcMainInvokeEvent, payload: { windowId: string; detectedAt?: unknown }) => {
   assertIpcSender(evt, ['dashboard']);
   const id = (payload?.windowId ?? '').trim();
   if (!id) throw new Error('windowId required');
   try {
-    return await recallCapture?.recordDetectedWindow(id) ?? null;
+    assertRecallMeetingDetectionTarget(id, payload?.detectedAt, recallCapture?.status());
+    return await recallCapture?.recordDetectedWindow(id, typeof payload?.detectedAt === 'string' ? payload.detectedAt : undefined) ?? null;
   } finally {
     rebuildTrayMenu();
   }
@@ -3394,9 +3399,10 @@ ipcMain.handle('clemmy:recall-auto-record', async (evt: IpcMainInvokeEvent, payl
   }
 });
 
-ipcMain.handle('clemmy:recall-stop', async (evt: IpcMainInvokeEvent) => {
+ipcMain.handle('clemmy:recall-stop', async (evt: IpcMainInvokeEvent, target?: unknown) => {
   assertIpcSender(evt, ['dashboard']);
   try {
+    assertRecallMeetingStopTarget(target, recallCapture?.status());
     return await recallCapture?.stopRecording() ?? null;
   } finally {
     rebuildTrayMenu();

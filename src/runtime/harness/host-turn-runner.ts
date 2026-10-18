@@ -12856,8 +12856,9 @@ const runHostTurnBody = async (
           toolName: pending.name,
           args: parsedArgs(pending.rawItem.arguments),
           rawArgs: pending.rawItem.arguments,
+          ...(pending.consentCall ? { consentCall: pending.consentCall } : {}),
         };
-        const preview = approvalCallPreview(info);
+        const preview = approvalCallPreview(info, true, false, approvalIdentity);
         const previewLabels = await approvalPreviewLabels({
           sessionId: approvalIdentity.sessionId,
           sourceUserSeq: approvalIdentity.sourceUserSeq,
@@ -12873,7 +12874,7 @@ const runHostTurnBody = async (
         const previewCheck = await approvalPrecheck({
           sessionId: approvalIdentity.sessionId,
           sourceUserSeq: approvalIdentity.sourceUserSeq,
-          preview: previewLabels ? approvalCallPreview({ ...info, previewLabels }) : preview,
+          preview: previewLabels ? approvalCallPreview({ ...info, previewLabels }, true, false, approvalIdentity) : preview,
           ...(pending.consentCall ? {
             consent: {
               effect: pending.consentCall.effect,

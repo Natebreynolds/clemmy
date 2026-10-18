@@ -68,10 +68,11 @@ test('unsupportedReason flags video + executables, allows real docs', () => {
   assert.equal(unsupportedReason('photo.png'), null);
 });
 
-test('ingestAttachment: video file returns a clean message, never breaks (no conversion)', async () => {
+test('ingestAttachment: video retains exact bytes without claiming conversion', async () => {
   const r = await ingestAttachment({ name: 'demo.mp4', bytes: Buffer.from([0, 1, 2, 3]) });
-  assert.equal(r.markdown, undefined);
-  assert.match(r.error || '', /video is not supported/i);
+  assert.ok(r.file);
+  assert.equal(r.error, undefined);
+  assert.match(r.markdown || '', /No transcript, playback or analysis/);
 });
 
 test('ingestAttachment: empty file is reported, not converted', async () => {
@@ -86,8 +87,9 @@ test('ingestAttachment: oversize bytes are rejected before any conversion', asyn
 
 test('ingestAttachment: binary blob with unknown ext → clean message, not garbage', async () => {
   const r = await ingestAttachment({ name: 'mystery.dat', bytes: Buffer.from([0x00, 0x42, 0x00, 0x7f]) });
-  assert.equal(r.markdown, undefined);
-  assert.match(r.error || '', /binary/i);
+  assert.ok(r.file);
+  assert.equal(r.error, undefined);
+  assert.match(r.markdown || '', /Binary file bytes retained/);
 });
 
 test('ingestAttachment: plain-text file with unknown ext is read directly', async () => {
