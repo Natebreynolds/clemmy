@@ -30,6 +30,8 @@ import {
   type TurnStartDecision,
 } from './control-plane.js';
 import { jevAvailable } from './client.js';
+import { listActiveFacts } from '../../memory/facts.js';
+import { listToolProcedures } from '../../memory/tool-choice-store.js';
 import { DISCOVERY_SIBLING_DOORS, TOOL_SEARCH_ALWAYS_LOADED, rankCatalogEntriesLexically } from '../../agents/tool-catalog.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surface.js';
 
@@ -559,6 +561,62 @@ function nameWords(text: string): string[] {
     .map((word) => (word.length > 3 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word));
 }
 
+/** The owner's standing rules weighed against one request. */
+const OWNER_RULE_WINDOW = 12;
+/** Remembered operations one rule may offer. */
+const OWNER_RULE_OPERATIONS = 3;
+
+/** Operations the owner's own standing rules name for a kind of work. A rule
+ *  names a provider Clem has already used successfully ("read pages with
+ *  Firecrawl"), so that provider's proven operations become candidates, with
+ *  the rule as their purpose. Whether the rule covers this request, its
+ *  exception included, is Jev's choice like any other candidate; the host only
+ *  gathers them. Live 2026-10-18: the owner's rule sat in the prompt and the
+ *  brain still read the page with the plain web read already in hand. */
+export function ownerRuleOperations(query: string): Array<{ id: string; purpose: string }> {
+  let rules: Array<{ content: string }>;
+  let procedures: ReturnType<typeof listToolProcedures>;
+  try {
+    rules = listActiveFacts({ kind: 'constraint', ranking: 'stanford', objective: query, limit: OWNER_RULE_WINDOW });
+    if (rules.length === 0) return [];
+    procedures = listToolProcedures();
+  } catch {
+    return [];
+  }
+  let connected: Set<string> | null = null;
+  try {
+    const rows = peekConnectedToolkits().filter((row) => /^active$/i.test(row.status.trim()));
+    if (rows.length > 0) connected = new Set(rows.map((row) => row.slug.trim().toLowerCase()));
+  } catch { /* unknown connections: provisioning still checks the exact operation */ }
+  const out: Array<{ id: string; purpose: string }> = [];
+  const seen = new Set<string>();
+  for (const rule of rules) {
+    const words = new Set(nameWords(rule.content));
+    const named = procedures.filter((procedure) => {
+      const choice = procedure.choice;
+      const provider = procedure.provider?.trim().toLowerCase();
+      if (!choice || choice.kind !== 'composio' || !provider || !words.has(provider)) return false;
+      // The operation belongs to the provider the rule names; the host still
+      // re-attests the exact operation before handing it over.
+      if (!choice.identifier.toUpperCase().startsWith(`${provider.toUpperCase()}_`)) return false;
+      if ((choice.successCount ?? 0) <= 0) return false;
+      return !connected || connected.has(registeredToolkitOfSlug(choice.identifier).toLowerCase());
+    });
+    if (named.length === 0) continue;
+    const ranked = rankCatalogEntriesLexically(query, named.map((procedure) => ({
+      name: procedure.choice!.identifier,
+      oneLiner: procedure.aliases.map((alias) => alias.intent).join('; '),
+    })));
+    const said = rule.content.replace(/\s+/g, ' ').trim();
+    for (const row of ranked.slice(0, OWNER_RULE_OPERATIONS)) {
+      if (seen.has(row.name)) continue;
+      seen.add(row.name);
+      out.push({ id: row.name, purpose: `Owner's standing rule: "${said.length > 190 ? `${said.slice(0, 189)}…` : said}"` });
+    }
+  }
+  return out.slice(0, OPERATION_ROUTE_CANDIDATES);
+}
+
 /** The operations this request most plausibly needs, from what the host can
  *  hand over before the first frame: registry tools the orchestrator can load,
  *  and provider operations already proven in a successful run. An operation is
@@ -762,7 +820,12 @@ async function prepareProvenOperationInScope(
     // scoped runs once; selected operations are still re-attested below.
     const verified = decideTurnStart ? listVerifiedRunStrategies() : [];
     const familiar = decideTurnStart ? familiarRunStrategiesFromStrategies(input.query, strategyScope, verified) : [];
-    const operations = decideTurnStart ? routableOperationsFromStrategies(input.query, strategyScope, verified) : [];
+    // The owner's own rules go first: a tool they named for this kind of work
+    // is weighed before anything the request merely shares words with.
+    const operations = decideTurnStart ? [
+      ...ownerRuleOperations(input.query),
+      ...routableOperationsFromStrategies(input.query, strategyScope, verified),
+    ].filter((row, index, rows) => rows.findIndex((other) => other.id === row.id) === index) : [];
     if (decideTurnStart && (familiar.length > 0 || operations.length > 0)) {
       const startedAt = Date.now();
       const decision = await decideWithinBudget(() => decideTurnStart(

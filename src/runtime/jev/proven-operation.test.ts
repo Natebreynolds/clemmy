@@ -884,3 +884,29 @@ test('a proven operation is handed over as a complete contract, whole, or with a
   assert.match(fetchFirst, /call tool_search with the exact name records_search for the full schema before calling it/);
   assert.match(fetchFirst, /first fetch the full schema of records_search with tool_search by exact name/);
 });
+
+test("an owner's standing rule that names a tool Clem has used offers that tool's operation for the request, with the rule as its purpose", async () => {
+  const { ownerRuleOperations } = await import('./proven-operation.js');
+  const { rememberToolChoice, listToolProcedures, updateToolProcedureOutcome } = await import('../../memory/tool-choice-store.js');
+  const { rememberFact } = await import('../../memory/facts.js');
+  const remembered = (intent: string, identifier: string, successes: number): void => {
+    rememberToolChoice({ intent, choice: { kind: 'composio', identifier } });
+    const procedure = listToolProcedures().find((row) => row.choice?.identifier === identifier)!;
+    for (let i = 0; i < successes; i += 1) updateToolProcedureOutcome(procedure.procedureId, 'success', intent);
+  };
+  remembered('scrape a web page URL to markdown content', 'PAGEGRAB_SCRAPE', 3);
+  remembered('search the web for pages', 'PAGEGRAB_SEARCH', 2);
+  remembered('never worked', 'PAGEGRAB_CRAWL', 0);
+  assert.ok(listToolProcedures().some((row) => row.choice?.identifier === 'PAGEGRAB_SCRAPE' && row.provider === 'pagegrab'), 'fixture procedure keyed by its provider');
+  // Before the owner says anything, a request that does not name the tool offers nothing.
+  assert.deepEqual(ownerRuleOperations('Get me the key details from https://example.test/item/42'), []);
+  rememberFact({ kind: 'constraint', content: 'Standing rule: when I ask for information from a web page, read it with PageGrab, unless the page needs clicking or a login; then use the browser.' });
+  rememberFact({ kind: 'constraint', content: 'Never send invoices before the 1st of the month.' });
+  const offered = ownerRuleOperations('Get me the key details from https://example.test/item/42');
+  // Jev chooses among them; the rule, exception included, is what it reads.
+  const scrape = offered.find((row) => row.id === 'PAGEGRAB_SCRAPE');
+  assert.ok(scrape, JSON.stringify(offered));
+  assert.match(scrape!.purpose, /^Owner's standing rule: "Standing rule: when I ask for information from a web page, read it with PageGrab, unless the page needs clicking or a login/);
+  assert.ok(offered.every((row) => row.id !== 'PAGEGRAB_CRAWL'), 'an operation that never succeeded is not offered');
+  assert.ok(offered.every((row) => row.id.startsWith('PAGEGRAB_')), 'a rule that names no tool offers nothing');
+});
