@@ -2133,10 +2133,18 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         const paths = [...new Set(parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
           ? issue.keys.map((key) => [...issue.path, key].join('.'))
           : [issue.path.join('.') || '(root)']))].sort();
+        // Name the carrier's own fields and where a stray key belongs. Live
+        // 2026-10-17 the model put an operation argument (tool_slug) on the
+        // carrier itself, was told only to use "this current schema", and
+        // repeated the same call.
+        const carrierFields = Object.keys(inputSchema.shape);
+        const strayRootKeys = [...new Set(parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys' && issue.path.length === 0 ? issue.keys : []))];
         return new InvalidArgumentsPreDispatchResult(JSON.stringify({
           error: 'work_contract_invalid',
           dispatch_state: 'not_started',
           detail: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '),
+          carrier_fields: carrierFields,
+          ...(strayRootKeys.length > 0 ? { move: `${strayRootKeys.join(', ')} ${strayRootKeys.length === 1 ? 'is an argument' : 'are arguments'} of the operation named in name, not a work_call field: put ${strayRootKeys.length === 1 ? 'it' : 'them'} inside args_json.` } : {}),
           repair: requireHostPlan
             ? 'Correct the invalid carrier fields using this current schema and retry the same intended call with its exact requirement_id. No proposal or schema search is needed.'
             : 'Correct the invalid carrier fields using this current schema and retry the same intended call. Preserve the accepted work and its requirement_id; do not rediscover the operation.',

@@ -83,6 +83,17 @@ test('raw JSON-schema tool still refuses invalid outer calls nominally before ta
   }
 });
 
+test('a stray operation argument on the carrier is named with the fields work_call takes and where it belongs', async () => {
+  const configured = buildWorkCall({ requireHostPlan: true }) as unknown as {
+    invoke: (context: unknown, input: string) => Promise<unknown>;
+  };
+  const result = await configured.invoke({}, JSON.stringify({ requirement_id: 'run', name: 'composio_execute_tool', tool_slug: 'GMAIL_FETCH', args_json: {} }));
+  assert.ok(result instanceof InvalidArgumentsPreDispatchResult);
+  const refusal = JSON.parse(result.output);
+  assert.ok(refusal.carrier_fields.includes('args_json') && refusal.carrier_fields.includes('name'));
+  assert.match(refusal.move, /tool_slug is an argument of the operation named in name.*inside args_json/);
+});
+
 test('permission correlation includes opaque JSON data keys and still matches equivalent transport spellings', () => {
   const wire = (value: number) => ({
     name: 'space_save',
