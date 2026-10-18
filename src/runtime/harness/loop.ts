@@ -1,5 +1,7 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { isPermanentActivationError } from './permanent-activation-error.js';
+import { committedMutationVerificationHoldsForSource, type CommittedMutationVerificationHold } from './mutation-verification-executor.js';
+import { planReadContinuationWake } from './read-continuation-wake.js';
 import { assertMeetingResearchModelAllowed, meetingResearchSource } from '../../integrations/recall/meeting-research-boundary.js';
 import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import { approvalCardAsk } from './approval-card-voice.js';
@@ -6471,6 +6473,50 @@ const activeHostConversations = new Map<string, Promise<RunConversationResult>>(
  *  counted; only an activation that cannot even start is. */
 const MAX_THROWN_RECOVERY_ACTIVATIONS = 6;
 
+type VerifierWakeHold = Pick<CommittedMutationVerificationHold,
+  'recoveryKind' | 'verifierOnlyRetryable' | 'nextNotBeforeAtMs'>;
+
+/** Scheduling only. The exact readback kernel still owns every dispatch. */
+export function planCommittedVerifierRecoveryWake(
+  holds: readonly VerifierWakeHold[],
+  nowMs: number,
+): { status: 'ordinary' } | { status: 'waiting'; notBeforeAtMs: number } | { status: 'invalid' } {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) return { status: 'invalid' };
+  if (holds.length === 0 || holds.some(hold =>
+    hold.recoveryKind !== 'automatic' || !hold.verifierOnlyRetryable)) return { status: 'ordinary' };
+  const dueTimes: number[] = [];
+  let ready = false;
+  for (const hold of holds) {
+    // An eligible read without a future cooldown can make progress now.
+    if (hold.nextNotBeforeAtMs === undefined) { ready = true; continue; }
+    const wake = planReadContinuationWake({ anchorAtMs: hold.nextNotBeforeAtMs, delayMs: 0, nowMs });
+    if (wake.status === 'invalid' || wake.status === 'expired') return { status: 'invalid' };
+    if (wake.status === 'ready') ready = true;
+    else dueTimes.push(wake.notBeforeAtMs);
+  }
+  return ready ? { status: 'ordinary' } : { status: 'waiting', notBeforeAtMs: Math.min(...dueTimes) };
+}
+
+function exactCheckpointVerifierWake(
+  sessionId: string,
+  sourceUserSeq: number,
+  recovery?: HostRecoveryState,
+): ReturnType<typeof planCommittedVerifierRecoveryWake> {
+  try {
+    const blob = recovery ? undefined : HarnessSession.load(sessionId)?.loadRecoveryState();
+    const state = recovery ?? (blob ? HostRecoveryState.fromString(blob) : undefined);
+    if (!state || state.phase !== 'continue' || state.sessionId !== sessionId
+      || state.sourceUserSeq !== sourceUserSeq || !state.acceptedModelBatchRef) return { status: 'ordinary' };
+    return planCommittedVerifierRecoveryWake(
+      committedMutationVerificationHoldsForSource({ sessionId, sourceUserSeq }), Date.now(),
+    );
+  } catch {
+    // No time or unreadable checkpoint can authorize an immediate hop. The
+    // existing recovery activation owns its truthful failure projection.
+    return { status: 'invalid' };
+  }
+}
+
 /**
  * A person stopped a held turn while its recovery owned it. Clear only this
  * source's checkpoint, publish the stop once, finish the attempt, and consume
@@ -6526,11 +6572,30 @@ function scheduleHostCheckpointRecovery(
   const key = `${options.sessionId}:${sourceUserSeq}`;
   if (scheduledHostRecoveries.has(key)) return;
   const delayMs = Math.min(30_000, 250 * (2 ** Math.min(attempt, 7)));
-  const timer = setTimeout(() => {
+  const verifierWake = exactCheckpointVerifierWake(options.sessionId, sourceUserSeq);
+  const activationNotBeforeAtMs = verifierWake.status === 'waiting'
+    ? Math.max(Date.now() + delayMs, verifierWake.notBeforeAtMs)
+    : undefined;
+  const wake = (): void => {
     // Retain the scheduled owner while its async activation runs. Removing it
     // at entry let a recovered frame schedule a second timer while the immediate
     // continuation was still awaiting its model response.
     if (scheduledHostRecoveries.get(key) !== scheduled) return;
+    if (activationNotBeforeAtMs !== undefined) {
+      // Keep Stop responsive without re-entering conversation preparation or
+      // buying model/tool work while every eligible verifier is still waiting.
+      // The durable source/checkpoint is re-proved below at the real activation.
+      let stopped = false;
+      let latchUnavailable = false;
+      try { stopped = isKillRequested(options.sessionId, { sourceUserSeq }); }
+      catch { latchUnavailable = true; /* the existing activation below owns unreadable-latch handling */ }
+      const remainingMs = activationNotBeforeAtMs - Date.now();
+      if (!stopped && !latchUnavailable && Number.isFinite(remainingMs) && remainingMs > 0) {
+        scheduled.timer = setTimeout(wake, Math.min(250, remainingMs));
+        scheduled.timer.unref?.();
+        return;
+      }
+    }
     void (async () => {
       let retry = false;
       let failed = false;
@@ -6628,7 +6693,9 @@ function scheduleHostCheckpointRecovery(
         }
       }
     })();
-  }, delayMs);
+  };
+  const timer = setTimeout(wake, activationNotBeforeAtMs === undefined
+    ? delayMs : Math.min(250, Math.max(1, activationNotBeforeAtMs - Date.now())));
   timer.unref?.();
   const scheduled: ScheduledHostRecovery = { timer, attempt };
   scheduledHostRecoveries.set(key, scheduled);
@@ -6930,7 +6997,8 @@ export function checkpointContinuationIsReady(
     return state.phase === 'continue'
       && state.sessionId === options.sessionId
       && state.sourceUserSeq === Number(options.sourceUserSeq)
-      && state.acceptedModelBatchRef !== undefined;
+      && state.acceptedModelBatchRef !== undefined
+      && exactCheckpointVerifierWake(options.sessionId, Number(options.sourceUserSeq), state).status === 'ordinary';
   } catch {
     return false;
   }

@@ -26,9 +26,11 @@ import {
 } from './mutation-verification-proof.js';
 import { verifierLogicalCallAttemptId } from './mutation-verification-contract.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
+import { planReadContinuationWake } from './read-continuation-wake.js';
 
 export type ExecuteFrozenMutationVerificationResult =
   | { status: 'not_applicable' }
+  | { status: 'deferred'; verifierLogicalCallId: string; nextNotBeforeAtMs: number }
   | {
       status: 'verified';
       resourceId: string;
@@ -50,6 +52,8 @@ export interface CommittedMutationVerificationHold {
    * The successful owner mutation is immutable and is never an execution
    * candidate in this continuation. */
   verifierOnlyRetryable: boolean;
+  /** The next readback is eligible only after its prior immutable settlement. */
+  nextNotBeforeAtMs?: number;
 }
 
 export type RecoverCommittedMutationVerificationsResult =
@@ -139,15 +143,37 @@ function verifierAttemptSettlements(
   });
 }
 
-function nextAutomaticVerifierAttemptId(input: {
+const VERIFIER_RETRY_DELAYS_MS = [0, 1_000, 2_500] as const;
+
+type AutomaticVerifierAttempt =
+  | { status: 'ready'; logicalCallId: string }
+  | { status: 'deferred'; logicalCallId: string; nextNotBeforeAtMs: number };
+
+function nextAutomaticVerifierAttempt(input: {
   sessionId: string;
   sourceUserSeq: number;
   candidate: CommittedMutationCandidate;
   baseLogicalCallId: string;
-}): string {
+}): AutomaticVerifierAttempt {
+  let previousSettledAtMs: number | undefined;
   for (const attempt of verifierAttemptSettlements(input, input.candidate, input.baseLogicalCallId)) {
     const prior = attempt.settlement;
-    if (prior.status === 'missing') return attempt.logicalCallId;
+    if (prior.status === 'missing') {
+      // Attempt zero is immediate. Every successor is anchored to the prior
+      // settled read, so a restart cannot reset or bypass its cooldown.
+      if (attempt.ordinal === 0) return { status: 'ready', logicalCallId: attempt.logicalCallId };
+      if (previousSettledAtMs === undefined) throw new FrozenMutationVerificationError('verifier retry has no immutable prior settlement time');
+      const wake = planReadContinuationWake({
+        anchorAtMs: previousSettledAtMs,
+        delayMs: VERIFIER_RETRY_DELAYS_MS[attempt.ordinal]!,
+        nowMs: Date.now(),
+      });
+      if (wake.status === 'waiting') return {
+        status: 'deferred', logicalCallId: attempt.logicalCallId, nextNotBeforeAtMs: wake.notBeforeAtMs,
+      };
+      if (wake.status !== 'ready') throw new FrozenMutationVerificationError(`verifier retry timing is ${wake.status}`);
+      return { status: 'ready', logicalCallId: attempt.logicalCallId };
+    }
     if (prior.status !== 'ok') {
       throw new FrozenMutationVerificationError(
         `verifier settlement is ${prior.status}: ${prior.reason}`,
@@ -157,7 +183,15 @@ function nextAutomaticVerifierAttemptId(input: {
       prior.settlement.outcome.kind === 'succeeded'
       || prior.settlement.outcome.kind === 'empty_result'
       || prior.settlement.outcome.directive.action === 'retry_with_backoff'
-    ) continue;
+    ) {
+      const settledAtMs = Date.parse(prior.settlement.settledAt);
+      if (!Number.isSafeInteger(settledAtMs) || settledAtMs < 0
+        || new Date(settledAtMs).toISOString() !== prior.settlement.settledAt) {
+        throw new FrozenMutationVerificationError('verifier prior settlement time is invalid');
+      }
+      previousSettledAtMs = settledAtMs;
+      continue;
+    }
     if (
       prior.settlement.outcome.directive.action === 'recover_connection'
       || prior.settlement.outcome.directive.action === 'ask_user'
@@ -253,12 +287,23 @@ export function committedMutationVerificationHoldForOwner(input: {
     observedReason
     && /verifier (?:catalog identity|invoke port).*(?:absent|unavailable|changed)/i.test(observedReason),
   );
-  const recoveryKind: CommittedMutationVerificationHold['recoveryKind'] =
+  let recoveryKind: CommittedMutationVerificationHold['recoveryKind'] =
     userAction || userOpenableCatalogGate
       ? 'user_action'
       : !terminalFailure && nextMissing
         ? 'automatic'
         : 'exhausted';
+  let nextNotBeforeAtMs: number | undefined;
+  let timingFailure: unknown;
+  if (recoveryKind === 'automatic') {
+    try {
+      const next = nextAutomaticVerifierAttempt({ ...input, candidate, baseLogicalCallId: proof.verifierLogicalCallId });
+      if (next.status === 'deferred') nextNotBeforeAtMs = next.nextNotBeforeAtMs;
+    } catch (error) {
+      timingFailure = error;
+      recoveryKind = 'exhausted';
+    }
+  }
   const status: CommittedMutationVerificationHold['status'] = recoveryKind === 'exhausted'
     ? 'failed'
     : 'pending';
@@ -278,11 +323,13 @@ export function committedMutationVerificationHoldForOwner(input: {
     effect: candidate.effect_kind,
     resultHandleId: candidate.result_handle_id,
     status,
-    reason: boundedReason(input.observedFailure ?? attemptReason),
+    reason: boundedReason(timingFailure ?? input.observedFailure ?? (nextNotBeforeAtMs === undefined
+      ? attemptReason : 'the next read-only verification attempt is waiting for its retry cooldown')),
     resourceId: proof.resourceId,
     verifierLogicalCallId: nextMissing?.logicalCallId ?? proof.verifierLogicalCallId,
     recoveryKind,
     verifierOnlyRetryable: recoveryKind === 'automatic',
+    ...(nextNotBeforeAtMs === undefined ? {} : { nextNotBeforeAtMs }),
   };
 }
 
@@ -422,12 +469,17 @@ export async function executeFrozenMutationVerification(input: {
   if (!candidate) {
     throw new FrozenMutationVerificationError('successful mutation owner/result is unavailable');
   }
-  const verifierLogicalCallId = nextAutomaticVerifierAttemptId({
+  const nextAttempt = nextAutomaticVerifierAttempt({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,
     candidate,
     baseLogicalCallId: proof.verifierLogicalCallId,
   });
+  if (nextAttempt.status === 'deferred') return {
+    status: 'deferred', verifierLogicalCallId: nextAttempt.logicalCallId,
+    nextNotBeforeAtMs: nextAttempt.nextNotBeforeAtMs,
+  };
+  const verifierLogicalCallId = nextAttempt.logicalCallId;
   const verifierEntry = exactVerifierEntry({
     sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq,

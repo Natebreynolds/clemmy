@@ -48,6 +48,8 @@ import {
   setVerificationPointer,
   verificationTargetDigest,
   verifierLogicalCallId,
+  verifierLogicalCallAttemptId,
+  MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS,
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
 import {
@@ -1283,7 +1285,7 @@ function verifyFrozenMutationWriteReceipt(input: {
     return { ok: false, status: 'conflict', reason: 'frozen verifier target arguments cannot be instantiated' };
   }
   const targetDigest = verificationTargetDigest(intent.resourceId);
-  const verifierCallId = verifierLogicalCallId({
+  const baseVerifierCallId = verifierLogicalCallId({
     acceptedTaskId: recipe.acceptedTaskId,
     workContractId: recipe.workContractId,
     ownerRequirementId: recipe.ownerRequirementId,
@@ -1298,94 +1300,106 @@ function verifyFrozenMutationWriteReceipt(input: {
     verifierArgs,
   );
   if (!logical) return { ok: false, status: 'conflict', reason: 'frozen verifier logical contract is unsafe' };
-  const hostBinding = loadHostCallCapabilityBinding({
-    db: input.db,
-    sessionId: input.sessionId,
-    sourceUserSeq: input.sourceUserSeq,
-    logicalToolCallId: verifierCallId,
-  });
-  if (
-    hostBinding.status !== 'ok'
-    || hostBinding.binding.acceptedTaskId !== input.acceptedTaskId
-    || hostBinding.binding.toolName !== logical.toolName
-    || hostBinding.binding.effectiveArgumentDigest !== logical.argumentDigest
-    || hostBinding.binding.effect !== 'read'
-    || hostBinding.binding.bindingKind !== 'catalog_manifest'
-    || hostBinding.binding.capabilityId !== recipe.verifier.capabilityId
-    || (hostBinding.binding.providerInputSchemaDigest ?? null)
-      !== (recipe.verifier.providerInputSchemaDigest ?? null)
-    || hostBinding.binding.schemaFingerprint !== recipe.verifier.schemaDigest
-    || hostBinding.binding.accountId !== recipe.verifier.account
-    || hostBinding.binding.invokePortId !== recipe.verifier.invokePortId
-    || hostBinding.binding.operationId !== recipe.verifier.operationId
-    || hostBinding.binding.manifestId !== recipe.verifier.manifestId
-    || hostBinding.binding.manifestDigest !== recipe.verifier.manifestDigest
-  ) {
-    return { ok: false, status: 'conflict', reason: 'frozen verifier capability authority is missing or changed' };
+  const verifyAttempt = (verifierCallId: string): TerminalPublicationProofResult => {
+    const hostBinding = loadHostCallCapabilityBinding({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      logicalToolCallId: verifierCallId,
+    });
+    if (
+      hostBinding.status !== 'ok'
+      || hostBinding.binding.acceptedTaskId !== input.acceptedTaskId
+      || hostBinding.binding.toolName !== logical.toolName
+      || hostBinding.binding.effectiveArgumentDigest !== logical.argumentDigest
+      || hostBinding.binding.effect !== 'read'
+      || hostBinding.binding.bindingKind !== 'catalog_manifest'
+      || hostBinding.binding.capabilityId !== recipe.verifier.capabilityId
+      || (hostBinding.binding.providerInputSchemaDigest ?? null)
+        !== (recipe.verifier.providerInputSchemaDigest ?? null)
+      || hostBinding.binding.schemaFingerprint !== recipe.verifier.schemaDigest
+      || hostBinding.binding.accountId !== recipe.verifier.account
+      || hostBinding.binding.invokePortId !== recipe.verifier.invokePortId
+      || hostBinding.binding.operationId !== recipe.verifier.operationId
+      || hostBinding.binding.manifestId !== recipe.verifier.manifestId
+      || hostBinding.binding.manifestDigest !== recipe.verifier.manifestDigest
+    ) {
+      return { ok: false, status: 'conflict', reason: 'frozen verifier capability authority is missing or changed' };
+    }
+    const verifierResult = exactSuccessfulResult({
+      db: input.db,
+      sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq,
+      acceptedTaskId: input.acceptedTaskId,
+      logicalToolCallId: verifierCallId,
+    });
+    if (!verifierResult.ok) {
+      return { ok: false, status: 'conflict', reason: verifierResult.reason };
+    }
+    if (
+      verifierResult.row.logical_tool_name !== logical.toolName
+      || verifierResult.row.execution_kind !== 'provider_execution'
+      || verifierResult.row.dispatch_execution_site === 'host'
+    ) {
+      return { ok: false, status: 'conflict', reason: 'frozen verifier did not settle through its provider authority' };
+    }
+    const projected = projectReadbackVerificationResult({
+      contract: recipe.verifierContract,
+      providerArguments: verifierArgs,
+      authoritativeResult: exactProviderDataPayload(verifierResult.raw),
+      requireContent: recipe.proof === 'exact_content_v1',
+      providerAcknowledged: exactProviderDataEnvelopeAcknowledged(verifierResult.raw),
+    });
+    if (!projected.ok) return { ok: false, status: 'conflict', reason: projected.reason };
+    if (
+      projected.resourceId !== intent.resourceId
+      || (recipe.proof === 'exact_content_v1'
+        && !exactVerificationContentMatches(intent.expectedContent, projected.observedContent))
+    ) {
+      return { ok: false, status: 'conflict', reason: 'frozen verifier result does not match the exact mutation intent' };
+    }
+    const receiptDigest = recipe.proof === 'exact_content_v1' && intent.expectedContent
+      ? digest(intent.expectedContent)
+      : targetDigest;
+    const supportedKind = input.receipt.kind === 'commit'
+      || input.receipt.kind === 'readback'
+      || (input.receipt.kind === 'content_commit' && recipe.proof === 'exact_content_v1');
+    const expectedReceiptId = mutationVerificationReceiptId({
+      recipe,
+      ownerLogicalToolCallId: owner.logicalToolCallId,
+      ownerPhysicalDispatchId: input.mutationResult.row.handle_physical_dispatch_id!,
+      ownerResultHandleId: input.mutationResult.row.handle_id,
+      ownerResultSha256: input.mutationResult.row.raw_payload_sha256!,
+      verifierLogicalCallId: verifierCallId,
+      verifierPhysicalDispatchId: verifierResult.row.handle_physical_dispatch_id!,
+      verifierResultHandleId: verifierResult.row.handle_id,
+      verifierResultSha256: verifierResult.row.raw_payload_sha256!,
+      resourceId: intent.resourceId,
+      targetDigest,
+    });
+    if (
+      !supportedKind
+      || input.receipt.created_id !== intent.resourceId
+      || input.receipt.handle !== intent.resourceId
+      || input.receipt.provider_receipt !== expectedReceiptId
+      || input.receipt.intended_digest !== receiptDigest
+      || input.receipt.observed_digest !== receiptDigest
+      || input.receipt.physical_dispatch_id !== input.mutationResult.row.handle_physical_dispatch_id
+    ) {
+      return { ok: false, status: 'conflict', reason: 'frozen mutation receipt does not match its exact verifier proof' };
+    }
+    return { ok: true };
+  };
+  // A retry is an independently bound read generation, never a second write.
+  // Re-prove the exact receipt against every canonical bounded attempt; an
+  // unrelated successful row cannot substitute for the receipt's own proof.
+  const base = verifyAttempt(baseVerifierCallId);
+  if (base.ok) return base;
+  for (let ordinal = 1; ordinal < MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS; ordinal += 1) {
+    const retried = verifyAttempt(verifierLogicalCallAttemptId(baseVerifierCallId, ordinal));
+    if (retried.ok) return retried;
   }
-  const verifierResult = exactSuccessfulResult({
-    db: input.db,
-    sessionId: input.sessionId,
-    sourceUserSeq: input.sourceUserSeq,
-    acceptedTaskId: input.acceptedTaskId,
-    logicalToolCallId: verifierCallId,
-  });
-  if (!verifierResult.ok) {
-    return { ok: false, status: 'conflict', reason: verifierResult.reason };
-  }
-  if (
-    verifierResult.row.logical_tool_name !== logical.toolName
-    || verifierResult.row.execution_kind !== 'provider_execution'
-    || verifierResult.row.dispatch_execution_site === 'host'
-  ) {
-    return { ok: false, status: 'conflict', reason: 'frozen verifier did not settle through its provider authority' };
-  }
-  const projected = projectReadbackVerificationResult({
-    contract: recipe.verifierContract,
-    providerArguments: verifierArgs,
-    authoritativeResult: exactProviderDataPayload(verifierResult.raw),
-    requireContent: recipe.proof === 'exact_content_v1',
-    providerAcknowledged: exactProviderDataEnvelopeAcknowledged(verifierResult.raw),
-  });
-  if (!projected.ok) return { ok: false, status: 'conflict', reason: projected.reason };
-  if (
-    projected.resourceId !== intent.resourceId
-    || (recipe.proof === 'exact_content_v1'
-      && !exactVerificationContentMatches(intent.expectedContent, projected.observedContent))
-  ) {
-    return { ok: false, status: 'conflict', reason: 'frozen verifier result does not match the exact mutation intent' };
-  }
-  const receiptDigest = recipe.proof === 'exact_content_v1' && intent.expectedContent
-    ? digest(intent.expectedContent)
-    : targetDigest;
-  const supportedKind = input.receipt.kind === 'commit'
-    || input.receipt.kind === 'readback'
-    || (input.receipt.kind === 'content_commit' && recipe.proof === 'exact_content_v1');
-  const expectedReceiptId = mutationVerificationReceiptId({
-    recipe,
-    ownerLogicalToolCallId: owner.logicalToolCallId,
-    ownerPhysicalDispatchId: input.mutationResult.row.handle_physical_dispatch_id!,
-    ownerResultHandleId: input.mutationResult.row.handle_id,
-    ownerResultSha256: input.mutationResult.row.raw_payload_sha256!,
-    verifierLogicalCallId: verifierCallId,
-    verifierPhysicalDispatchId: verifierResult.row.handle_physical_dispatch_id!,
-    verifierResultHandleId: verifierResult.row.handle_id,
-    verifierResultSha256: verifierResult.row.raw_payload_sha256!,
-    resourceId: intent.resourceId,
-    targetDigest,
-  });
-  if (
-    !supportedKind
-    || input.receipt.created_id !== intent.resourceId
-    || input.receipt.handle !== intent.resourceId
-    || input.receipt.provider_receipt !== expectedReceiptId
-    || input.receipt.intended_digest !== receiptDigest
-    || input.receipt.observed_digest !== receiptDigest
-    || input.receipt.physical_dispatch_id !== input.mutationResult.row.handle_physical_dispatch_id
-  ) {
-    return { ok: false, status: 'conflict', reason: 'frozen mutation receipt does not match its exact verifier proof' };
-  }
-  return { ok: true };
+  return base;
 }
 
 function recordsValue(raw: unknown): unknown[] | null {

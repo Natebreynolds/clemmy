@@ -27,7 +27,7 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 const { createSession, appendEvent, closeEventLog } = await import('./eventlog.js');
 const { HarnessSession } = await import('./session.js');
 const { HostRecoveryState } = await import('./host-turn-runner.js');
-const { checkpointContinuationIsReady } = await import('./loop.js');
+const { checkpointContinuationIsReady, planCommittedVerifierRecoveryWake } = await import('./loop.js');
 import type { AgentInputItem } from '@openai/agents';
 
 test.after(() => {
@@ -134,4 +134,41 @@ test('admit/finalize checkpoints keep their in-activation re-entry; a missing or
   assert.equal(checkpointContinuationIsReady(HELD, { sessionId, sourceUserSeq }), false);
   session.saveRecoveryState('{"not":"a host checkpoint"}');
   assert.equal(checkpointContinuationIsReady(HELD, { sessionId, sourceUserSeq }), false);
+});
+
+const automaticVerifier = (nextNotBeforeAtMs?: number) => ({
+  recoveryKind: 'automatic' as const,
+  verifierOnlyRetryable: true,
+  ...(nextNotBeforeAtMs === undefined ? {} : { nextNotBeforeAtMs }),
+});
+
+test('all waiting verifiers select the earliest immutable due time across reopen and clock rollback', () => {
+  const retained = Object.freeze([Object.freeze(automaticVerifier(12_500)), Object.freeze(automaticVerifier(11_000))]);
+  assert.deepEqual(planCommittedVerifierRecoveryWake(retained, 10_000), { status: 'waiting', notBeforeAtMs: 11_000 });
+  const reopened = JSON.parse(JSON.stringify(retained));
+  assert.deepEqual(planCommittedVerifierRecoveryWake(reopened, 10_999), { status: 'waiting', notBeforeAtMs: 11_000 });
+  assert.deepEqual(planCommittedVerifierRecoveryWake(reopened, 9_000), { status: 'waiting', notBeforeAtMs: 11_000 });
+  assert.deepEqual(planCommittedVerifierRecoveryWake(reopened, 11_000), { status: 'ordinary' });
+});
+
+test('one due verifier can progress while another waits; no verifier or a manual/exhausted hold keeps ordinary recovery', () => {
+  for (const holds of [
+    [],
+    [automaticVerifier(12_500), automaticVerifier(10_000)],
+    [automaticVerifier(12_500), automaticVerifier()],
+    [automaticVerifier(12_500), { recoveryKind: 'user_action' as const, verifierOnlyRetryable: false }],
+    [automaticVerifier(12_500), { recoveryKind: 'exhausted' as const, verifierOnlyRetryable: false }],
+  ]) assert.deepEqual(planCommittedVerifierRecoveryWake(holds, 10_000), { status: 'ordinary' });
+});
+
+test('invalid due times or clocks never become scheduling readiness, including mixed ready and corrupt holds', () => {
+  for (const invalid of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '11000', null]) {
+    const corrupt = automaticVerifier(invalid as number);
+    assert.deepEqual(planCommittedVerifierRecoveryWake([corrupt], 10_000), { status: 'invalid' });
+    assert.deepEqual(planCommittedVerifierRecoveryWake([automaticVerifier(9_000), corrupt], 10_000), { status: 'invalid' });
+    assert.deepEqual(planCommittedVerifierRecoveryWake([corrupt, automaticVerifier(9_000)], 10_000), { status: 'invalid' });
+  }
+  for (const invalid of [-1, NaN, Infinity, 0.5]) {
+    assert.deepEqual(planCommittedVerifierRecoveryWake([automaticVerifier(11_000)], invalid), { status: 'invalid' });
+  }
 });

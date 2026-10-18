@@ -15,6 +15,7 @@ import {
   verificationTargetDigest,
   verifierLogicalCallId,
   verifierLogicalCallAttemptId,
+  MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS,
   type CanonicalRangeValuesV1,
   type MutationVerificationRecipeV1,
 } from './mutation-verification-contract.js';
@@ -55,7 +56,7 @@ export interface VerifiedFrozenMutationVerificationV1
   verifierResultSha256: string;
 }
 
-export const MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS = 3;
+export { MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS } from './mutation-verification-contract.js';
 
 export type FrozenMutationVerificationPreparation =
   | { status: 'prepared'; verification: PreparedFrozenMutationVerificationV1 }

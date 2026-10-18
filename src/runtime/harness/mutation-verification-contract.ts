@@ -6,6 +6,9 @@ import type {
   RegisteredHostCapability,
 } from './host-capability-catalog-factory.js';
 
+/** One original readback plus two deterministic read-only retry generations. */
+export const MAX_FROZEN_MUTATION_VERIFICATION_ATTEMPTS = 3;
+
 export type MutationVerificationProofV1 =
   | 'resource_identity_v1'
   | 'exact_content_v1';

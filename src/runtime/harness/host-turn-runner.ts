@@ -5611,6 +5611,7 @@ const runHostTurnBody = async (
   const committedVerificationHoldOutcome = (
     holds: readonly CommittedMutationVerificationHold[],
     ref: AcceptedModelBatchRef | undefined,
+    nextStepIndex = currentHostStepIndex + 1,
   ): RunOutcome => {
     if (
       holds.length > 0
@@ -5620,7 +5621,7 @@ const runHostTurnBody = async (
       // The result frame is already checkpointed. Retain a daemon-wakeable host
       // continuation so the next generation runs only the remaining readback;
       // no user retry or fresh model-authored write is required.
-      return recoveryContinuationOutcome(ref, 'write_verification_retry_pending');
+      return recoveryContinuationOutcome(ref, 'write_verification_retry_pending', nextStepIndex);
     }
     return blockedOutcome(
       committedWriteVerificationHeldText(holds),
@@ -8115,7 +8116,7 @@ const runHostTurnBody = async (
             // the mutation has durably settled; the model emits no readback
             // node or tool call and receives no second dispatch authority.
             try {
-              await executeFrozenMutationVerification({
+              const verification = await executeFrozenMutationVerification({
                 sessionId: exactSource.sessionId,
                 sourceUserSeq: exactSource.sourceUserSeq,
                 ownerLogicalToolCallId: call.callId,
@@ -8125,6 +8126,19 @@ const runHostTurnBody = async (
                 callerSignal: signal,
                 isKillRequested: () => isKillRequested(exactSource.sessionId, killTarget),
               });
+              if (verification.status === 'deferred') {
+                // The successful write remains committed while its readback
+                // waits for the same durable due time across activations.
+                // A deferred verifier is not successful completion and cannot
+                // be dropped merely because the executor returned normally.
+                const hold = committedMutationVerificationHoldForOwner({
+                  sessionId: exactSource.sessionId,
+                  sourceUserSeq: exactSource.sourceUserSeq,
+                  ownerLogicalToolCallId: call.callId,
+                });
+                if (!hold) throw new Error('deferred verifier ownership is unavailable');
+                committedVerificationHolds = [hold];
+              }
             } catch (error) {
               // The owner mutation is already durably successful at this edge.
               // A verifier failure is a separate read-only continuation, never
@@ -10497,9 +10511,6 @@ const runHostTurnBody = async (
     const recoveryFrameThisStep = recoveredToolFrame;
     const consumingRecoveredFrame = recoveryFrameThisStep !== undefined;
     checkpointRecoveryFrameInProgress = consumingRecoveredFrame;
-    if (!consumingRecoveredFrame && stepIndex >= maxTurns) {
-      return blockedOutcome(HOST_MODEL_LIMIT_BLOCKED_TEXT, 'max_turns');
-    }
     try {
       await refreshTools();
     } catch (error) {
@@ -10581,6 +10592,9 @@ const runHostTurnBody = async (
         return committedVerificationHoldOutcome(
           recoveredVerification.holds,
           latestAcceptedModelBatchRef,
+          // No model step or owner action ran in this activation. Waiting for
+          // a durable readback must not consume the task's reasoning budget.
+          currentHostStepIndex,
         );
       }
       if (recoveredVerification.status === 'verified' && recoveredVerification.verified.length > 0) {
@@ -10594,6 +10608,12 @@ const runHostTurnBody = async (
           'Use the retained result already in history and continue only unfinished downstream requirements. Do not issue or retry the owner write.',
         ].filter(Boolean).join(' ');
       }
+    }
+    // Recovery of an already committed write is host-owned readback work, not
+    // another model step. It must run even when the write consumed the final
+    // allowed reasoning step; the limit still forbids a new model request.
+    if (!consumingRecoveredFrame && stepIndex >= maxTurns) {
+      return blockedOutcome(HOST_MODEL_LIMIT_BLOCKED_TEXT, 'max_turns');
     }
     let modelStepSchemas: readonly unknown[] = schemas;
     let permittedNoProgressRecoveryToolNames: ReadonlySet<string> | null = null;

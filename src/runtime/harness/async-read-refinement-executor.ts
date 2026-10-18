@@ -33,6 +33,7 @@ import { invokeHostToolCall } from './host-tool-invocation.js';
 import { durableLogicalCallContract } from './logical-call-contract.js';
 import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
 import { resolveProductionPortsForManifest } from './production-capability-ports.js';
+import { planReadContinuationWake } from './read-continuation-wake.js';
 import type { VerifiedRecentArticlesV1 } from './recent-article-date-evidence.js';
 
 export type ExecuteAsyncReadRefinementResult =
@@ -67,14 +68,21 @@ function exactEntry(
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
+    const cleanup = (): void => signal?.removeEventListener('abort', abort);
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
     const abort = (): void => {
       clearTimeout(timer);
+      cleanup();
       reject(signal?.reason instanceof Error ? signal.reason : new Error('async read refinement cancelled'));
     };
     if (signal?.aborted) return abort();
     signal?.addEventListener('abort', abort, { once: true });
   });
+}
+
+function canonicalTimestampMs(value: string): number | null {
+  const parsed = Date.parse(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 && new Date(parsed).toISOString() === value ? parsed : null;
 }
 
 function providerArgsForOwner(owner: NonNullable<ReturnType<typeof loadAsyncReadRefinementOwner>>) {
@@ -507,7 +515,10 @@ export async function executeAsyncReadRefinement(input: {
   const invocationBudget = Math.min(input.deadlineMs ?? recipe.maximumElapsedMs, recipe.maximumElapsedMs);
   let durableStartEpoch = owner.startRecordedAt === null
     ? null
-    : Date.parse(owner.startRecordedAt);
+    : canonicalTimestampMs(owner.startRecordedAt);
+  if (owner.startRecordedAt !== null && durableStartEpoch === null) {
+    return { status: 'held', reason: 'durable batch start time is invalid' };
+  }
   const remaining = (): number => {
     const invocationRemaining = invocationBudget - (Date.now() - invocationStartedAt);
     const durableRemaining = durableStartEpoch === null
@@ -548,7 +559,7 @@ export async function executeAsyncReadRefinement(input: {
       startLogicalToolCallId: input.ownerLogicalToolCallId,
     });
     durableStartEpoch = refreshed?.startRecordedAt
-      ? Date.parse(refreshed.startRecordedAt)
+      ? canonicalTimestampMs(refreshed.startRecordedAt)
       : null;
   }
   if (durableStartEpoch === null || !Number.isFinite(durableStartEpoch)) {
@@ -556,6 +567,7 @@ export async function executeAsyncReadRefinement(input: {
   }
   const getterArgs = { [recipe.getterIdArgument]: jobId };
   const backoff = [0, 1_000, 2_500, 5_000, 10_000, 20_000] as const;
+  const durableDeadlineAtMs = durableStartEpoch + recipe.maximumElapsedMs;
   for (let ordinal = 0; ordinal < recipe.maximumGetterAttempts; ordinal += 1) {
     const getterLogicalToolCallId = asyncReadGetterLogicalCallId(
       input.ownerLogicalToolCallId,
@@ -589,7 +601,21 @@ export async function executeAsyncReadRefinement(input: {
       // the branch above before elapsed-time policy is consulted. The deadline
       // can forbid only a NEW provider crossing; it can never discard already
       // committed sufficient evidence after a crash.
-      if (Date.now() - durableStartEpoch >= recipe.maximumElapsedMs) {
+      const previous = ordinal === 0 ? null : redeemDurableLogicalCallSettlementForHost({
+        sessionId: input.sessionId,
+        sourceUserSeq: input.sourceUserSeq,
+        acceptedTaskId: input.acceptedTaskId,
+        logicalToolCallId: asyncReadGetterLogicalCallId(input.ownerLogicalToolCallId, ordinal - 1),
+      });
+      if (previous && (previous.status !== 'ok' || previous.settlement.toolName !== durableLogicalCallContract(input.acceptedTaskId, recipe.getter.operationId, getterArgs)?.toolName)) {
+        return { status: 'held', reason: 'previous exact getter settlement cannot anchor the next read' };
+      }
+      const anchorAtMs = previous?.status === 'ok' ? canonicalTimestampMs(previous.settlement.settledAt) : durableStartEpoch;
+      if (anchorAtMs === null) return { status: 'held', reason: 'previous exact getter settlement time is invalid' };
+      const planWake = () => planReadContinuationWake({ anchorAtMs, delayMs: backoff[ordinal]!, nowMs: Date.now(), deadlineAtMs: durableDeadlineAtMs });
+      const wake = planWake();
+      if (wake.status === 'invalid') return { status: 'held', reason: `durable getter timing is invalid: ${wake.reason}` };
+      if (wake.status === 'expired') {
         const terminal = recordAsyncReadRefinementBudgetTerminalOutcome({
           sessionId: input.sessionId,
           sourceUserSeq: input.sourceUserSeq,
@@ -602,15 +628,17 @@ export async function executeAsyncReadRefinement(input: {
         return { status: 'terminal', gate: terminal.gate, duplicate: settled.duplicate };
       }
       if (
-        Date.now() - invocationStartedAt + backoff[ordinal]! >= invocationBudget
+        Date.now() - invocationStartedAt + (wake.status === 'waiting' ? wake.remainingMs : 0) >= invocationBudget
       ) {
         return { status: 'pending', reason: 'bounded getter deadline elapsed before the next read-only attempt' };
       }
       try {
-        await delay(backoff[ordinal]!, input.callerSignal);
+        await delay(wake.status === 'waiting' ? wake.remainingMs : 0, input.callerSignal);
         // Timers can wake late under event-loop pressure. Recheck both clocks at
         // the final provider edge; the pre-delay check is advisory only.
-        if (Date.now() - durableStartEpoch >= recipe.maximumElapsedMs) {
+        const afterWait = planWake();
+        if (afterWait.status === 'invalid') return { status: 'held', reason: `durable getter timing is invalid: ${afterWait.reason}` };
+        if (afterWait.status === 'expired') {
           const terminal = recordAsyncReadRefinementBudgetTerminalOutcome({
             sessionId: input.sessionId,
             sourceUserSeq: input.sourceUserSeq,
@@ -621,6 +649,9 @@ export async function executeAsyncReadRefinement(input: {
           if (terminal.status === 'held') return terminal;
           const settled = settleTerminalOwner({ ...input, args, gate: terminal.gate });
           return { status: 'terminal', gate: terminal.gate, duplicate: settled.duplicate };
+        }
+        if (afterWait.status === 'waiting') {
+          return { status: 'pending', reason: 'durable getter due time remains in the future after waiting' };
         }
         if (Date.now() - invocationStartedAt >= invocationBudget) {
           return { status: 'pending', reason: 'invocation budget elapsed before the next read-only attempt' };

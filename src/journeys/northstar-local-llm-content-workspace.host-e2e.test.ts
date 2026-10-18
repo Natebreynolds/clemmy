@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -1682,6 +1682,7 @@ test('the exact prompt executes Search → verified Batch refinement → one vis
 
 test('a hard crash before HostRecoveryState resumes through boot with GET only, then a third PID replays zero', { timeout: 180_000 }, () => {
   const crashHome = mkdtempSync(path.join(os.tmpdir(), 'clem-northstar-async-hard-cut-'));
+  const timingHome = mkdtempSync(path.join(os.tmpdir(), 'clem-northstar-async-timing-'));
   const childEnvironment = { ...process.env };
   delete childEnvironment.NODE_TEST_CONTEXT;
   try {
@@ -1747,7 +1748,7 @@ test('a hard crash before HostRecoveryState resumes through boot with GET only, 
       [BATCH_SCRAPE_GET_OPERATION]: 1,
     });
 
-    const runFixture = (mode: 'resume' | 'replay') => spawnSync(process.execPath, [
+    const runFixture = (mode: 'resume' | 'replay' | 'timing', fixtureHome = crashHome) => spawnSync(process.execPath, [
       '--import', 'tsx', ASYNC_COLD_RECOVERY_FIXTURE,
     ], {
       cwd: PKG_DIR,
@@ -1755,7 +1756,7 @@ test('a hard crash before HostRecoveryState resumes through boot with GET only, 
       timeout: 90_000,
       env: {
         ...childEnvironment,
-        CLEMENTINE_HOME: crashHome,
+        CLEMENTINE_HOME: fixtureHome,
         CLEMMY_TEST_ISOLATED_HOME: '1',
         CLEMMY_TURN_ENGINE: 'host_v1',
         HARNESS_TOOL_BRACKETS: 'on',
@@ -1778,6 +1779,25 @@ test('a hard crash before HostRecoveryState resumes through boot with GET only, 
         }), 'utf8').toString('base64url'),
       },
     });
+    // A separate executor/kernel control opens a copied crash home, re-proves
+    // its exact persisted binding and enters the normal call lease context.
+    // It proves timing without claiming public restart/Workspace delivery;
+    // unchanged phases B/C below retain that separate end-to-end proof.
+    cpSync(crashHome, timingHome, { recursive: true });
+    const timing = runFixture('timing', timingHome);
+    assert.equal(timing.error, undefined, String(timing.error));
+    assert.equal(timing.status, 0, `stdout=${timing.stdout}\nstderr=${timing.stderr}`);
+    const timingLine = timing.stdout.split('\n').find(line => line.startsWith(ASYNC_COLD_RECOVERY_MARKER));
+    assert.ok(timingLine, `timing fixture emitted no result marker:\n${timing.stdout}\n${timing.stderr}`);
+    const timingResult = JSON.parse(timingLine.slice(ASYNC_COLD_RECOVERY_MARKER.length));
+    assert.equal(timingResult.modelCalls, 0);
+    assert.equal(timingResult.getterCalls, 1);
+    assert.equal(timingResult.futureStatus, 'pending');
+    assert.equal(timingResult.rollbackStatus, 'pending');
+    assert.equal(timingResult.elapsedStatus, 'completed');
+    assert.equal(timingResult.replayDuplicate, true);
+    assert.equal(timingResult.workspaceAbsent, true);
+    assert.notEqual(timingResult.pid, cut.pid);
     const phaseB = runFixture('resume');
     assert.equal(phaseB.error, undefined, String(phaseB.error));
     assert.equal(phaseB.status, 0, `stdout=${phaseB.stdout}\nstderr=${phaseB.stderr}`);
@@ -1843,6 +1863,7 @@ test('a hard crash before HostRecoveryState resumes through boot with GET only, 
     assert.equal(replayed.reply, resumed.reply);
   } finally {
     rmSync(crashHome, { recursive: true, force: true });
+    rmSync(timingHome, { recursive: true, force: true });
   }
 });
 

@@ -6,9 +6,12 @@
  * the next deterministic GET, then the model may author one atomic Workspace.
  * `replay` is a third PID and proves the durable terminal returns before model,
  * provider, catalog, or Workspace execution can reopen.
+ * `timing` is a separate executor/kernel control over a copied crash home. It
+ * re-proves exact persisted bindings and uses the normal call lease context;
+ * it does not enter the public restart dispatcher or deliver a Workspace.
  */
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
 import { workspaceFixtureDay } from './northstar-local-llm-content-workspace.clock.fixture.js';
 
 import { buildOrchestratorAgent } from '../agents/orchestrator.js';
@@ -29,7 +32,16 @@ import {
   listEvents,
   openEventLog,
 } from '../runtime/harness/eventlog.js';
-import { reconcileTerminalRunAttemptDispatchLeasesAtBoot } from '../runtime/harness/dispatch-lease.js';
+import { activateDispatchLease, reconcileTerminalRunAttemptDispatchLeasesAtBoot, revokeDispatchLease, runWithDispatchLease } from '../runtime/harness/dispatch-lease.js';
+import { executeAsyncReadRefinement } from '../runtime/harness/async-read-refinement-executor.js';
+import { asyncReadGetterLogicalCallId, loadAsyncReadRefinementOwner } from '../runtime/harness/async-read-refinement-store.js';
+import { durableLogicalCallContract } from '../runtime/harness/logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
+import { harnessRunContextStorage, ToolCallsCounter } from '../runtime/harness/brackets.js';
+import { registerProofProvisionedCapabilities } from '../runtime/harness/proof-provisioned-catalog.js';
+import { loadExpectedWorkCallBindingState, withExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
+import { acceptedTurnCallAuthorityFor, withHostCallAttestation } from '../runtime/harness/accepted-turn-call-authority.js';
+import { loadHostCallCapabilityBinding } from '../runtime/harness/host-call-capability-binding.js';
 import { claimPendingAsyncReadRefinementRecoveries } from '../runtime/harness/async-read-refinement-recovery.js';
 import { HostRecoveryState } from '../runtime/harness/host-turn-runner.js';
 import { runConversation } from '../runtime/harness/loop.js';
@@ -70,7 +82,7 @@ const RAW_HTML_SENTINEL = RAW_HTML_ONLY_HOSTILE_TOKEN;
 const SELECTED_URLS = ASYNC_SELECTED_URLS;
 
 type Input = {
-  mode: 'resume' | 'replay';
+  mode: 'resume' | 'replay' | 'timing';
   sessionId: string;
   sourceUserSeq: number;
 };
@@ -88,7 +100,7 @@ function parseInput(): Input {
   const encoded = process.env.CLEM_NORTHSTAR_ASYNC_COLD_RECOVERY_INPUT;
   assert.ok(encoded, 'async cold recovery requires exact durable source identity');
   const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Partial<Input>;
-  assert.ok(parsed.mode === 'resume' || parsed.mode === 'replay');
+  assert.ok(parsed.mode === 'resume' || parsed.mode === 'replay' || parsed.mode === 'timing');
   assert.equal(typeof parsed.sessionId, 'string');
   assert.ok(Number.isSafeInteger(parsed.sourceUserSeq) && Number(parsed.sourceUserSeq) > 0);
   return parsed as Input;
@@ -422,7 +434,108 @@ const input = parseInput();
 const getCalls = { n: 0 };
 let modelCalls = 0;
 
-if (input.mode === 'replay') {
+if (input.mode === 'timing') {
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore([], { durable: true }));
+  productionPorts.clearProductionCapabilityPorts();
+  configureProvider(getCalls);
+  interruptOrphanedRunAttemptsAtBoot();
+  reconcileTerminalRunAttemptDispatchLeasesAtBoot();
+  configureTypedExecutionRuntime();
+  await buildOrchestratorAgent({ userInput: PROMPT, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+    acceptedRoute: 'act', allowedToolNames: ['skill_list', 'skill_read', 'tool_search', 'composio_execute_tool', 'space_save'], allowToolJit: true,
+    mcpToolScope: { authority: 'none', reason: 'controlled exact cold timing probe', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 },
+    model: { getResponse: async () => { throw new Error('the timing kernel fixture must never request a model'); } } as never });
+  const persisted = capabilityCatalogs.persistedCatalogSnapshotManifestIdsForSource(input);
+  assert.ok(persisted.ok);
+  const expectedProviders = persisted.identities.filter(identity => identity.providerKind === 'composio');
+  const reconstructed = await registerProofProvisionedCapabilities(input, {
+    allowedIdentifiers: expectedProviders.map(identity => identity.operationId),
+    expectedSchemaDigests: expectedProviders.map(identity => ({ identifier: identity.operationId, schemaDigest: identity.providerInputSchemaDigest! })),
+    recoveryExpectedIdentities: persisted.identities,
+  });
+  assert.equal(reconstructed.refusal, undefined, JSON.stringify(reconstructed));
+  assert.equal(capabilityCatalogs.freezeCatalogSnapshotForSource(input).ok, true);
+  const owner = loadAsyncReadRefinementOwner({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, startLogicalToolCallId: OWNER_CALL_ID });
+  assert.ok(owner?.jobId && owner.startRecordedAt);
+  const previous = redeemDurableLogicalCallSettlementForHost({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: owner.intent.acceptedTaskId, logicalToolCallId: asyncReadGetterLogicalCallId(OWNER_CALL_ID, 0) });
+  assert.equal(previous.status, 'ok');
+  if (previous.status !== 'ok') throw new Error('missing exact prior getter settlement');
+  const settledAt = Date.parse(previous.settlement.settledAt);
+  const args = { urls: owner.intent.candidates.map(candidate => candidate.url), formats: ['rawHtml'] };
+  const logical = durableLogicalCallContract(owner.intent.acceptedTaskId, BATCH_OPERATION, args);
+  assert.ok(logical);
+  const binding = loadExpectedWorkCallBindingState({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, logicalToolCallId: OWNER_CALL_ID });
+  assert.equal(binding.status, 'ok');
+  if (binding.status !== 'ok') throw new Error('missing exact retained work binding');
+  const hostBinding = loadHostCallCapabilityBinding({ db: openEventLog(), sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, logicalToolCallId: OWNER_CALL_ID });
+  assert.equal(hostBinding.status, 'ok', JSON.stringify(hostBinding));
+  if (hostBinding.status !== 'ok') throw new Error('missing exact retained host binding');
+  const attestation = { ...hostBinding.binding, argumentDigest: hostBinding.binding.attestedArgumentDigest,
+    bindingDigest: hostBinding.binding.hostBindingDigest };
+  const lease = activateDispatchLease({ sessionId: input.sessionId, scopeId: 'controlled-async-timing', sourceUserSeq: input.sourceUserSeq,
+    acceptedTaskId: owner.intent.acceptedTaskId, logicalToolCallId: OWNER_CALL_ID,
+    recovery: { effect: 'read', businessCall: true, material: { ...logical, args } } });
+  const realNow = Date.now;
+  let fakeNow = settledAt + 100;
+  const before = physicalRows(input.sessionId);
+  try {
+    Date.now = () => fakeNow;
+    const invoke = (callerSignal?: AbortSignal) => harnessRunContextStorage.run({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      dispatchLease: lease, counter: new ToolCallsCounter(20) }, () => runWithDispatchLease(lease, () => withHostCallAttestation(attestation, () =>
+        withExpectedWorkBinding(binding.binding, () => executeAsyncReadRefinement({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+          acceptedTaskId: owner.intent.acceptedTaskId, ownerLogicalToolCallId: OWNER_CALL_ID, parentLease: lease, deadlineMs: 400, callerSignal })))));
+    const future = await invoke();
+    assert.equal(future.status, 'pending', JSON.stringify(future));
+    assert.equal(getCalls.n, 0, 'a future due time beyond this invocation budget performs no new getter');
+    assert.deepEqual(physicalRows(input.sessionId), before);
+    fakeNow = settledAt - 100;
+    const rollback = await invoke();
+    assert.equal(rollback.status, 'pending', JSON.stringify(rollback));
+    assert.equal(getCalls.n, 0, 'clock rollback cannot dispatch the getter early');
+    assert.equal(loadAsyncReadRefinementOwner({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      startLogicalToolCallId: OWNER_CALL_ID })?.completedEvidence, null, 'the start and processing acknowledgements are not completion proof');
+    fakeNow = settledAt + 999;
+    const completedTimer = new AbortController();
+    const stillFuture = await invoke(completedTimer.signal);
+    assert.equal(stillFuture.status, 'pending', 'a fired timer cannot override a clock that still precedes the due time');
+    assert.equal(getEventListeners(completedTimer.signal, 'abort').length, 0, 'a resolved delay removes its abort listener');
+    fakeNow = settledAt + 900;
+    const stoppedTimer = new AbortController();
+    const stoppedWait = invoke(stoppedTimer.signal);
+    queueMicrotask(() => stoppedTimer.abort(new Error('controlled pending-wait cancellation')));
+    const stopped = await stoppedWait;
+    assert.equal(stopped.status, 'held', JSON.stringify(stopped));
+    assert.equal(getEventListeners(stoppedTimer.signal, 'abort').length, 0, 'an aborted delay removes its listener and timer');
+    assert.equal(getCalls.n, 0, 'neither timer completion nor cancellation can dispatch an early getter');
+    const openAuthority = acceptedTurnCallAuthorityFor(input.sessionId, input.sourceUserSeq);
+    assert.equal(openAuthority.status, 'ok', JSON.stringify(openAuthority));
+    fakeNow = settledAt + 1_001;
+    const elapsed = await invoke().catch(error => {
+      const authority = openEventLog().prepare('SELECT state, close_reason FROM accepted_turn_call_authorities WHERE session_id = ? AND source_user_seq = ?')
+        .get(input.sessionId, input.sourceUserSeq);
+      throw new Error(`controlled elapsed wake failed: ${String(error)}; authority=${JSON.stringify(authority)}`, { cause: error });
+    });
+    assert.equal(elapsed.status, 'completed', JSON.stringify(elapsed));
+    assert.equal(getCalls.n, 1, 'downtime satisfies backoff: the 400ms invocation can execute without another 1000ms delay');
+    if (elapsed.status === 'completed') assert.equal(elapsed.evidence.records.length, 3);
+    const replay = await invoke();
+    assert.equal(replay.status, 'completed');
+    assert.equal(replay.status === 'completed' && replay.duplicate, true);
+    assert.equal(getCalls.n, 1, 'reentry redeems committed evidence without another START or GET');
+    assert.deepEqual(physicalRows(input.sessionId), [
+      { tool: 'firecrawl_batch_scrape', state: 'returned', site: null, n: 1 },
+      { tool: 'firecrawl_batch_scrape', state: 'returned', site: 'host', n: 1 },
+      { tool: 'firecrawl_batch_scrape_get', state: 'returned', site: null, n: 2 },
+      { tool: 'firecrawl_search', state: 'returned', site: null, n: 1 },
+    ]);
+    assert.equal(spaceStore.get(SLUG), undefined, 'this kernel control does not author or deliver a Workspace');
+    process.stdout.write(`${MARKER}${JSON.stringify({ mode: input.mode, pid: process.pid, modelCalls, getterCalls: getCalls.n,
+      futureStatus: future.status, rollbackStatus: rollback.status, elapsedStatus: elapsed.status, replayDuplicate: replay.status === 'completed' && replay.duplicate,
+      physical: physicalRows(input.sessionId), workspaceAbsent: true })}\n`);
+  } finally { Date.now = realNow; revokeDispatchLease(lease); }
+} else if (input.mode === 'replay') {
   const before = physicalRows(input.sessionId);
   _setBridgeImplsForTests({
     configure: (async () => { throw new Error('terminal replay must precede runtime configuration'); }) as never,
