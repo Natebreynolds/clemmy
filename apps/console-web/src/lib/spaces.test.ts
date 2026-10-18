@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkspaceFixPrompt, changeText, feedRunsNotStarted, feedTime, latestRefreshFailures, pageErrors, versionMadeAt, type SpaceAudit, type SpaceNote } from './spaces';
+import { buildWorkspaceFixPrompt, changeText, executeSpaceAction, feedRunsNotStarted, feedTime, latestRefreshFailures, pageErrors, prepareSpaceActionPress, versionMadeAt, type SpaceAudit, type SpaceNote } from './spaces';
 
 const entry = (ts: string, path: string, outcome: string, note?: string): SpaceAudit =>
   ({ ts, method: 'REFRESH', path, outcome, ...(note ? { note } : {}) });
@@ -103,4 +103,44 @@ test('Refresh says plainly when a feed could not start; a started or already-run
   assert.equal(feedRunsNotStarted([{ workflow: 'daily-leads', status: 'queued', id: 'r1' }, { workflow: 'stats', status: 'duplicate' }]), null);
   assert.equal(feedRunsNotStarted([{ workflow: 'daily-leads', status: 'disabled', message: 'It is switched off.' }]),
     'daily-leads did not start: It is switched off.');
+});
+
+test('only the private parent preparation carries its gesture header; action dispatch never invents a press', async () => {
+  const previousFetch = globalThis.fetch; const previousWindow = globalThis.window;
+  Object.assign(globalThis, { window: { __CLEM_BOOTSTRAP__: { token: 'controlled-workspace-test', version: '', flags: {} } } });
+  const calls: Array<{ path: string; headers: Record<string, string>; body: unknown }> = [];
+  const input = { documentId: 'doc_controlled', expectedViewRevision: 'a'.repeat(64), actionId: 'send', args: { recipient: 'sample@example.invalid' } };
+  const proof = { kind: 'prepared', pressToken: `apr-controlled.${'b'.repeat(64)}`, expiresAt: 10_000 };
+  let response: unknown = proof; let status = 200;
+  globalThis.fetch = (async (url, init) => {
+    calls.push({ path: String(url).split('?')[0], headers: init?.headers as Record<string, string>, body: JSON.parse(String(init?.body)) });
+    return new Response(JSON.stringify(response), { status });
+  }) as typeof fetch;
+  try {
+    assert.deepEqual(await prepareSpaceActionPress('controlled/workspace', input), proof);
+    assert.equal(calls[0].path, '/api/console/spaces/controlled%2Fworkspace/action/prepare-press');
+    assert.equal(calls[0].headers['X-Clem-Workspace-Gesture'], 'declared-button-v1');
+    assert.deepEqual(calls[0].body, input);
+    response = { ok: true, result: {} };
+    await executeSpaceAction('controlled/workspace', { actionId: input.actionId, args: input.args });
+    assert.deepEqual(calls[1].body, { actionId: input.actionId, args: input.args });
+    assert.equal(calls[1].headers['X-Clem-Workspace-Gesture'], undefined);
+    await executeSpaceAction('controlled/workspace', { ...input, pressToken: proof.pressToken });
+    assert.deepEqual(calls[2].body, { ...input, pressToken: proof.pressToken });
+    response = { ok: false };
+    await assert.rejects(executeSpaceAction('controlled/workspace', { ...input, pressToken: proof.pressToken }), /couldn’t be confirmed/);
+    for (const invalid of [{}, { kind: 'prepared' }, { ...proof, pressToken: '' }, { ...proof, pressToken: 'unsafe\nproof' },
+      { ...proof, expiresAt: 'soon' }, { ok: false }]) {
+      response = invalid;
+      await assert.rejects(prepareSpaceActionPress('controlled/workspace', input), /couldn’t prepare/);
+    }
+    response = { kind: 'direct' };
+    assert.deepEqual(await prepareSpaceActionPress('controlled/workspace', input), { kind: 'direct' });
+    status = 409; response = { error: 'Controlled stale document.' };
+    const before = calls.length;
+    await assert.rejects(prepareSpaceActionPress('controlled/workspace', input), (error: unknown) => {
+      assert.equal((error as { status: number }).status, 409); return true;
+    });
+    assert.equal(calls.length, before + 1, 'stale preparation is not retried');
+  } finally { Object.assign(globalThis, { fetch: previousFetch, window: previousWindow }); }
 });

@@ -3,7 +3,7 @@
  * routes. Mirrors lib/meetings.ts. The view itself is served at the absolute
  * path /console/spaces/<id>/view (by the daemon, outside the SPA router).
  */
-import { apiGet, apiPost, apiPatch, apiDelete } from './api';
+import { api, apiGet, apiPost, apiPatch, apiDelete } from './api';
 import type { WorkspaceSourceControlRequest, WorkspaceSourceControlResponse, WorkspaceSourceControlView } from '../../../../src/shared/workspace-source-controls';
 export type { WorkspaceSourceControlRequest, WorkspaceSourceControlView };
 
@@ -351,11 +351,42 @@ export type SpaceActionResult =
   | { pending: true; approvalId: string; subject?: string }
   | { ok: true; result: unknown };
 
-export const executeSpaceAction = (
+export const executeSpaceAction = async (
   id: string,
-  body: { actionId: string; args: Record<string, unknown>; press?: boolean },
-) =>
-  apiPost<SpaceActionResult>(`/api/console/spaces/${encodeURIComponent(id)}/action`, body);
+  body: { actionId: string; args: Record<string, unknown>; pressToken?: string; documentId?: string; expectedViewRevision?: string },
+): Promise<SpaceActionResult> => {
+  const result = await apiPost<unknown>(`/api/console/spaces/${encodeURIComponent(id)}/action`, body);
+  if (result && typeof result === 'object') {
+    if ('pending' in result && result.pending === true && 'approvalId' in result && typeof result.approvalId === 'string' && result.approvalId.trim()) {
+      return result as SpaceActionResult;
+    }
+    if ('ok' in result && result.ok === true && 'result' in result) return result as SpaceActionResult;
+  }
+  throw new Error('The action result couldn’t be confirmed. Check its result before trying again.');
+};
+
+export type PreparedSpacePress =
+  | { kind: 'prepared'; pressToken: string; expiresAt: number }
+  | { kind: 'direct' };
+
+/** Only the trusted frame host calls this after an exact private click intent.
+ * The opaque proof never enters authored HTML or the ordinary RPC channel. */
+export async function prepareSpaceActionPress(id: string, body: {
+  actionId: string; args: Record<string, unknown>; expectedViewRevision: string; documentId: string;
+}): Promise<PreparedSpacePress> {
+  const result = await api<unknown>(`/api/console/spaces/${encodeURIComponent(id)}/action/prepare-press`, {
+    method: 'POST', headers: { 'X-Clem-Workspace-Gesture': 'declared-button-v1' }, body: JSON.stringify(body),
+  });
+  if (result && typeof result === 'object' && 'kind' in result) {
+    if (result.kind === 'direct') return { kind: 'direct' };
+    if (result.kind === 'prepared' && 'pressToken' in result && typeof result.pressToken === 'string'
+      && result.pressToken.length <= 512 && /^[A-Za-z0-9_.:-]+$/.test(result.pressToken)
+      && 'expiresAt' in result && typeof result.expiresAt === 'number' && Number.isFinite(result.expiresAt)) {
+      return { kind: 'prepared', pressToken: result.pressToken, expiresAt: result.expiresAt };
+    }
+  }
+  throw new Error('This button couldn’t prepare its action. Reload the Workspace and review it before trying again.');
+}
 
 export const rollbackSpace = (id: string, version: number) =>
   apiPost<{ space: SpaceRecord }>(`/api/console/spaces/${encodeURIComponent(id)}/rollback`, { version });

@@ -22,8 +22,10 @@
  * debug configuration must not turn an approval-required action into a write.
  */
 import { createHash } from 'node:crypto';
+import { SPACE_ACTION_PRESS_FIELD, SPACE_ACTION_PRESS_TTL_MS, readSpaceActionPressBinding,
+  workspacePressViewRevision, type SpaceActionPressBinding } from './space-action-press-binding.js';
 import {
-  get as getApproval, listPending, onApprovalResolved, registerResumable, resolve as resolveApproval,
+  listPending, onApprovalResolved, registerResumable,
   type PendingApprovalRow,
 } from '../runtime/harness/approval-registry.js';
 import { emitApprovalRequestedCard } from '../runtime/harness/approval-card.js';
@@ -270,7 +272,7 @@ export function enqueueSpaceActionApproval(
   action: SpaceAction,
   callerArgs: Record<string, unknown>,
   /** False when the owner's press is the approval: no card is shown or noted. */
-  opts: { presented?: boolean } = {},
+  opts: { presented?: boolean; pressBinding?: SpaceActionPressBinding } = {},
 ): EnqueueResult {
   const verb = workspaceActionLooksOutbound(action) ? 'Send' : 'Run';
   const subject = `${verb} “${action.label ?? action.id}” in workspace “${rec.title}”`;
@@ -279,6 +281,9 @@ export function enqueueSpaceActionApproval(
   const exactV3 = action.composioSlug?.trim()
     ? prepareSpaceActionV3Approval({ slug: rec.id, action, callerArgs })
     : null;
+  if (opts.pressBinding && (!exactV3?.ok || !exactV3.value.contract)) {
+    throw new Error('This action’s exact connection could not be confirmed. Use its normal approval flow.');
+  }
   const args = {
     spaceSlug: rec.id,
     actionId: action.id,
@@ -286,6 +291,7 @@ export function enqueueSpaceActionApproval(
     composioSlug: action.composioSlug ?? null,
     spaceActionExecutionVersion: SPACE_ACTION_EXECUTION_VERSION,
     actionSnapshot: actionApprovalSnapshot(rec, action),
+    ...(opts.pressBinding ? { [SPACE_ACTION_PRESS_FIELD]: opts.pressBinding } : {}),
     ...(exactV3?.ok && exactV3.value.contract
       ? { [SPACE_ACTION_V3_AUTHORIZATION_FIELD]: exactV3.value.contract }
       : {}),
@@ -303,8 +309,9 @@ export function enqueueSpaceActionApproval(
     // expiresAt bounds the reuse window checked by
     // findStandingSpaceActionApproval. Everything else keeps the default
     // decision-window TTL.
-    ...(standingEligible ? { ttlMs: STANDING_ACTION_TRUST_TTL_MS } : {}),
-    resumeKey: spaceActionApprovalResumeKey({
+    ...(opts.pressBinding ? { ttlMs: SPACE_ACTION_PRESS_TTL_MS }
+      : standingEligible ? { ttlMs: STANDING_ACTION_TRUST_TTL_MS } : {}),
+    resumeKey: opts.pressBinding ? `workspace-button-press-v1:${opts.pressBinding.tokenDigest}` : spaceActionApprovalResumeKey({
       sessionId,
       tool: SPACE_ACTION_TOOL,
       args,
@@ -347,9 +354,12 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
   const args = row.args ?? {};
   const slug = typeof args.spaceSlug === 'string' ? args.spaceSlug : '';
   const actionId = typeof args.actionId === 'string' ? args.actionId : '';
+  const pressBinding = readSpaceActionPressBinding(args);
   const callerArgs = (args.callerArgs && typeof args.callerArgs === 'object')
     ? args.callerArgs as Record<string, unknown> : {};
   if (!slug || !actionId) return;
+  if (pressBinding && listNotes(slug, Number.MAX_SAFE_INTEGER).some(note => note.meta?.approvalId === row.approvalId
+    && ['executed', 'failed', 'uncertain'].includes(String(note.meta?.status)))) return;
   const approvedSnapshot = parseActionApprovalSnapshot(args.actionSnapshot);
   const label = approvedSnapshot?.label ?? actionId;
   if (!approvedSnapshot) {
@@ -410,6 +420,15 @@ async function executeApprovedSpaceActionOnce(row: PendingApprovalRow): Promise<
     );
     return;
   }
+  if (pressBinding) {
+    let currentView: string | undefined;
+    try { currentView = workspacePressViewRevision(rec); } catch { /* missing document is not approval */ }
+    if (currentView !== pressBinding.viewRevision) {
+      recordApprovedActionNotRun(slug, label, actionId, row.approvalId,
+        'the page changed after this button press; review the current page and press its button again.');
+      return;
+    }
+  }
   if (rec.manifestErrors && rec.manifestErrors.length > 0) {
     const error = `workspace manifest is invalid; fix with space_save before running actions: ${rec.manifestErrors.join('; ')}`;
     recordApprovedActionNotRun(slug, label, actionId, row.approvalId, error);
@@ -452,41 +471,26 @@ export const SPACE_BUTTON_PRESS_RESOLVER = 'workspace-button-user';
 
 export interface PressedSpaceActionResult {
   ok: boolean;
+  recorded: boolean;
   approvalId: string;
   status: 'executed' | 'failed' | 'uncertain' | 'not_approved';
   text: string;
 }
 
-/**
- * The owner's press on a Space button is the approval for exactly the action
- * that button is for (owner 2026-10-18: "send and delete buttons should be
- * classified as the action they are for"). It takes the same approval row a
- * card would, bound to this exact action snapshot and arguments, resolved by
- * the press instead of a second tap, and runs through the one approved path,
- * which runs an approval at most once. Only a press the view's bridge saw as a
- * trusted click on a button reaches here; anything else still gets the card.
- */
-export async function approveSpaceActionByPress(
-  rec: SpaceRecord,
-  action: SpaceAction,
-  callerArgs: Record<string, unknown>,
-): Promise<PressedSpaceActionResult> {
-  const { approvalId } = enqueueSpaceActionApproval(rec, action, callerArgs, { presented: false });
-  const resolved = resolveApproval(approvalId, 'approved', SPACE_BUTTON_PRESS_RESOLVER);
-  const row = resolved.ok ? getApproval(approvalId) : undefined;
-  if (!row || row.resolution !== 'approved') {
-    return { ok: false, approvalId, status: 'not_approved', text: `“${action.label ?? action.id}” was not run: this press could not approve it.` };
-  }
-  await executeApprovedSpaceAction(row);
-  const note = listNotes(rec.id, Number.MAX_SAFE_INTEGER)
-    .filter((candidate) => candidate.meta?.approvalId === approvalId)
+/** Read an exact occurrence's existing outcome; never mint another approval
+ * or infer that an unconfirmed write is safe to repeat. */
+export function readSpaceActionPressResult(row: PendingApprovalRow): PressedSpaceActionResult {
+  const slug = typeof row.args?.spaceSlug === 'string' ? row.args.spaceSlug : '';
+  const note = listNotes(slug, Number.MAX_SAFE_INTEGER)
+    .filter((candidate) => candidate.meta?.approvalId === row.approvalId)
     .pop();
   const status = note?.meta?.status;
   return {
     ok: status === 'executed',
-    approvalId,
-    status: status === 'executed' || status === 'failed' || status === 'uncertain' ? status : 'failed',
-    text: note?.text ?? `“${action.label ?? action.id}” did not report an outcome.`,
+    recorded: status === 'executed' || status === 'failed' || status === 'uncertain',
+    approvalId: row.approvalId,
+    status: status === 'executed' || status === 'failed' || status === 'uncertain' ? status : 'uncertain',
+    text: note?.text ?? 'This button action has not confirmed its outcome. Its original execution is kept; do not repeat it.',
   };
 }
 

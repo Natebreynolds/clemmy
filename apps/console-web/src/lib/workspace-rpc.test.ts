@@ -109,14 +109,11 @@ test('Workspace RPC accepts a well-formed request from only the expected opaque 
   if (!parsed.ok) return;
   assert.equal(parsed.request.op, 'action');
   assert.deepEqual(parsed.request.payload, { actionId: 'approve-post', args: { postId: 'p1' } });
-  // The bridge's press mark rides the request only as a boolean.
-  const pressed = parseWorkspaceRpcEvent(
-    event(request('action', { actionId: 'send', args: {}, press: true })), source, 'social-calendar');
-  assert.equal(pressed.ok, true);
-  assert.deepEqual(
-    parseWorkspaceRpcEvent(event(request('action', { actionId: 'send', args: {}, press: 'yes' })), source, 'social-calendar'),
-    { ok: false, reason: 'invalid_payload' },
-  );
+  for (const extra of [{ press: true }, { press: false }, { press: 'yes' }, { pressToken: 'borrowed-proof' },
+    { expectedViewRevision: 'a'.repeat(64), documentId: 'doc_7QY6nP' }]) {
+    assert.deepEqual(parseWorkspaceRpcEvent(event(request('action', { actionId: 'send', args: {}, ...extra })), source, 'social-calendar'),
+      { ok: false, reason: 'invalid_payload' }, 'ordinary RPC cannot claim trusted-button authority');
+  }
 });
 
 test('Workspace RPC bootstraps one opaque document identity before moving requests onto its port', () => {
@@ -328,13 +325,29 @@ test('the private gesture capability accepts only bounded document-pinned link e
     [gesture('open_external', { url: 'https://example.com' }, {
       id: '../gesture',
     }), 'invalid_id'],
-    [gesture('action', { actionId: 'send', args: {} }), 'invalid_operation'],
+    [gesture('action', { actionId: 'send', args: {} }), 'invalid_payload'],
   ] as const) {
     assert.deepEqual(
       parseWorkspaceGestureRequest(input, 'social-calendar', 'doc_7QY6nP'),
       { ok: false, reason },
     );
   }
+});
+
+test('a private action intent pins exact args and a server view revision to its existing document', () => {
+  const payload = { actionId: 'send-reply', args: { recipient: 'sample@example.invalid', body: 'Approved sample.' }, expectedViewRevision: 'a'.repeat(64) };
+  const parsed = parseWorkspaceGestureRequest(gesture('action', payload), 'social-calendar', 'doc_7QY6nP');
+  assert.equal(parsed.ok, true);
+  if (parsed.ok) assert.deepEqual(parsed.gesture.payload, payload);
+  for (const invalid of [{ ...payload, expectedViewRevision: '' }, { ...payload, expectedViewRevision: 'newest' },
+    { ...payload, args: [] }, { ...payload, press: true }, { ...payload, pressToken: 'borrowed-proof' },
+    { ...payload, args: { cyclic: undefined }, actionId: '' }]) {
+    assert.deepEqual(parseWorkspaceGestureRequest(gesture('action', invalid), 'social-calendar', 'doc_7QY6nP'),
+      { ok: false, reason: 'invalid_payload' });
+  }
+  assert.deepEqual(parseWorkspaceGestureRequest(gesture('action', payload, { documentId: 'doc_new' }), 'social-calendar', 'doc_7QY6nP'),
+    { ok: false, reason: 'wrong_document' });
+  assert.deepEqual(parseWorkspaceRpcRequest(gesture('action', payload), 'social-calendar'), { ok: false, reason: 'invalid_envelope' });
 });
 
 test('gallery policy is read-only while the full Workspace retains fixed bridge operations', () => {

@@ -3435,7 +3435,7 @@
           "bytes": 18846
         },
         "src/spaces/space-gap-test.ts": {
-          "bytes": 18432
+          "bytes": 21536
         },
         "src/spaces/view-revision-checks.ts": {
           "bytes": 4401
@@ -3455,8 +3455,11 @@
         "src/spaces/workspace-observation-query.ts": {
           "bytes": 11449
         },
+        "src/spaces/space-action-press-binding.ts": {
+          "bytes": 2961
+        },
         "src/spaces/space-action-gate.ts": {
-          "bytes": 24495
+          "bytes": 25049
         },
         "src/spaces/workspace-deliverables-evidence.ts": {
           "bytes": 18115
@@ -3488,6 +3491,9 @@
         "src/spaces/compose.ts": {
           "bytes": 3156
         },
+        "src/spaces/space-action-press.ts": {
+          "bytes": 9410
+        },
         "src/spaces/reengage.ts": {
           "bytes": 4905
         },
@@ -3498,7 +3504,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 66303
+          "bytes": 73281
         },
         "src/tools/space-tools.ts": {
           "bytes": 131279
@@ -7371,7 +7377,7 @@
           "bytes": 18846
         },
         "src/spaces/space-gap-test.ts": {
-          "bytes": 18432
+          "bytes": 21536
         },
         "src/spaces/view-revision-checks.ts": {
           "bytes": 4401
@@ -7391,8 +7397,11 @@
         "src/spaces/workspace-observation-query.ts": {
           "bytes": 11449
         },
+        "src/spaces/space-action-press-binding.ts": {
+          "bytes": 2961
+        },
         "src/spaces/space-action-gate.ts": {
-          "bytes": 24495
+          "bytes": 25049
         },
         "src/spaces/workspace-deliverables-evidence.ts": {
           "bytes": 18115
@@ -7424,6 +7433,9 @@
         "src/spaces/compose.ts": {
           "bytes": 3156
         },
+        "src/spaces/space-action-press.ts": {
+          "bytes": 9410
+        },
         "src/spaces/reengage.ts": {
           "bytes": 4905
         },
@@ -7434,7 +7446,7 @@
           "bytes": 9560
         },
         "src/dashboard/space-routes.ts": {
-          "bytes": 66303
+          "bytes": 73281
         },
         "src/tools/space-tools.ts": {
           "bytes": 131279

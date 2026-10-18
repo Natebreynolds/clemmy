@@ -77,9 +77,11 @@ import { decideAndRunSpaceProviderAction } from '../spaces/space-action-canonica
 import { ensureToolSchema } from '../tools/composio-schema-cache.js';
 import { composeForSpace } from '../spaces/compose.js';
 import {
-  spaceActionNeedsApproval, enqueueSpaceActionApproval, approveSpaceActionByPress, initSpaceActionApprovals,
+  spaceActionNeedsApproval, enqueueSpaceActionApproval, initSpaceActionApprovals,
   standingSpaceActionAuthority,
 } from '../spaces/space-action-gate.js';
+import { prepareSpaceActionPress, consumeSpaceActionPress, SpaceActionPressError } from '../spaces/space-action-press.js';
+import { spaceActionPressInputSchema, workspacePressViewRevision } from '../spaces/space-action-press-binding.js';
 import { reengageSpace } from '../spaces/reengage.js';
 import { buildPublishSnapshot } from '../spaces/publish.js';
 import { injectWorkspaceBootstrap } from '../spaces/view-html.js';
@@ -323,10 +325,15 @@ const CLEM_VIEW_DATA_SEED = (slug: string): string => {
   return `<script>(function(){try{window.__SPACE_DATA__=JSON.parse(${literal});}catch(_){}})();</script>`;
 };
 
-const CLEM_VIEW_BRIDGE = (slug: string): string => {
+const CLEM_VIEW_BRIDGE = (slug: string, servedHtml: string): string => {
   const S = JSON.stringify(slug);
+  const record = spaceStore.get(slug);
+  let viewRevision = '';
+  try { if (record) viewRevision = workspacePressViewRevision(record, servedHtml); } catch { /* ordinary actions still use their approval path */ }
+  const V = JSON.stringify(viewRevision);
+  const A = JSON.stringify((record?.actions ?? []).map(action => action.id)).replace(/</g, '\\u003c');
   return `<script>(function(){'use strict';
-var C='clementine.workspace.rpc.v1',GC='clementine.workspace.gesture.v1',S=${S},N=0,P=new Map(),Q=[],GQ=[],PORT=null,GPORT=null;
+var C='clementine.workspace.rpc.v1',GC='clementine.workspace.gesture.v1',S=${S},V=${V},A=${A},N=0,P=new Map(),Q=[],GQ=[],PORT=null,GPORT=null;
 var U=function(fn){return Function.prototype.call.bind(fn);};
 var ADD=U(EventTarget.prototype.addEventListener),REMOVE=U(EventTarget.prototype.removeEventListener);
 var STOP=U(Event.prototype.stopImmediatePropagation),PREVENT=U(Event.prototype.preventDefault);
@@ -335,20 +342,21 @@ var OWN_DESC=Object.getOwnPropertyDescriptor,PORTS_DESC=OWN_DESC(MessageEvent.pr
 var TARGET_DESC=OWN_DESC(Event.prototype,'target'),TRUSTED_DESC=OWN_DESC(Event.prototype,'isTrusted'),PATH=U(Event.prototype.composedPath);
 var GET_PORTS=PORTS_DESC&&PORTS_DESC.get?U(PORTS_DESC.get):null,GET_DATA=DATA_DESC&&DATA_DESC.get?U(DATA_DESC.get):null,GET_SOURCE=SOURCE_DESC&&SOURCE_DESC.get?U(SOURCE_DESC.get):null;
 var GET_TARGET=TARGET_DESC&&TARGET_DESC.get?U(TARGET_DESC.get):null,GET_TRUSTED=TRUSTED_DESC&&TRUSTED_DESC.get?U(TRUSTED_DESC.get):function(e){return e.isTrusted;};
-var CLOSEST=U(Element.prototype.closest),HAS_ATTR=U(Element.prototype.hasAttribute),GET_ATTR=U(Element.prototype.getAttribute);
+var CLOSEST=U(Element.prototype.closest),MATCHES=U(Element.prototype.matches),HAS_ATTR=U(Element.prototype.hasAttribute),GET_ATTR=U(Element.prototype.getAttribute),SET_ATTR=U(Element.prototype.setAttribute),REMOVE_ATTR=U(Element.prototype.removeAttribute);
 var ARRAY_PUSH=U(Array.prototype.push),ARRAY_INDEX=U(Array.prototype.indexOf),ARRAY_SPLICE=U(Array.prototype.splice),DL=[];
-var DATE_NOW=U(Date.now),PRESS_AT=0,PRESSED=false,PRESS_MS=5000,PRESSABLE='button,[role="button"],input[type="button"],input[type="submit"]';
+var PRESSABLE='button,[role="button"],input[type="button"],input[type="submit"]',BINDINGS=new WeakMap(),RUNNING=new WeakSet(),BGET=U(WeakMap.prototype.get),BSET=U(WeakMap.prototype.set),BDELETE=U(WeakMap.prototype.delete),RHAS=U(WeakSet.prototype.has),RADD=U(WeakSet.prototype.add),RDELETE=U(WeakSet.prototype.delete);
 var URL_PROTOCOL_DESC=OWN_DESC(URL.prototype,'protocol'),URL_HREF_DESC=OWN_DESC(URL.prototype,'href');
 var GET_URL_PROTOCOL=URL_PROTOCOL_DESC&&URL_PROTOCOL_DESC.get?U(URL_PROTOCOL_DESC.get):null,GET_URL_HREF=URL_HREF_DESC&&URL_HREF_DESC.get?U(URL_HREF_DESC.get):null;
-var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response,BASE_URL=location.href;
+var JSON_PARSE=JSON.parse,JSON_STRINGIFY=JSON.stringify,URL_CTOR=URL,RESPONSE_CTOR=Response,EVENT_CTOR=CustomEvent,DISPATCH=U(EventTarget.prototype.dispatchEvent),PROMISE_CTOR=Promise,BASE_URL=location.href;
 function id(){try{if(crypto&&crypto.randomUUID)return crypto.randomUUID();}catch(_){}return Date.now().toString(36)+'-'+(++N).toString(36);}
 var D='doc_'+id(),nav=window.navigation,SAFE_NAV=!!(nav&&typeof nav.addEventListener==='function'&&GET_PORTS&&GET_DATA&&GET_SOURCE&&GET_TARGET&&GET_TRUSTED&&GET_URL_PROTOCOL&&GET_URL_HREF);
 function lock(name,value){try{Object.defineProperty(window,name,{value:value,writable:false,configurable:false});}catch(_){}}
 if(SAFE_NAV){ADD(nav,'navigate',function(e){if(e.hashChange)return;if(e.cancelable)PREVENT(e);},true);}
-function finish(m){var p;if(!m||m.channel!==C||m.version!==1||m.kind!=='response'||m.workspaceId!==S||typeof m.id!=='string')return;p=P.get(m.id);if(!p)return;P.delete(m.id);clearTimeout(p.timer);if(m.ok)p.resolve(m.result);else p.reject(new Error(typeof m.error==='string'?m.error:'Workspace request failed'));}
+function finish(m){var p,error;if(!m||m.channel!==C||m.version!==1||m.kind!=='response'||m.workspaceId!==S||typeof m.id!=='string')return;p=P.get(m.id);if(!p)return;P.delete(m.id);clearTimeout(p.timer);if(m.ok)p.resolve(m.result);else{error=new Error(typeof m.error==='string'?m.error:'Workspace request failed');if(m.effectState==='not_started')error.effectState='not_started';p.reject(error);}}
 function onPort(m){var i,l;if(m&&m.channel===C&&m.version===1&&m.kind==='push'&&m.workspaceId===S&&m.op==='data'){try{window.__SPACE_DATA__=m.data;}catch(_){}l=DL.slice();for(i=0;i<l.length;i++){try{l[i](m.data);}catch(_){}}return;}finish(m);}
 function send(m){if(PORT)PORT_POST(PORT,m);else ARRAY_PUSH(Q,m);}
-function gesture(op,payload){var m;if(!SAFE_NAV)return;m={channel:GC,version:1,kind:'gesture',workspaceId:S,documentId:D,id:id(),op:op,payload:payload||{}};if(GPORT)PORT_POST(GPORT,m);else if(GQ.length<8)ARRAY_PUSH(GQ,m);}
+function gesture(op,payload,rid){var m;if(!SAFE_NAV)return false;m={channel:GC,version:1,kind:'gesture',workspaceId:S,documentId:D,id:rid||id(),op:op,payload:payload||{}};if(GPORT)PORT_POST(GPORT,m);else if(GQ.length<8)ARRAY_PUSH(GQ,m);else return false;return true;}
+function pressedAction(payload,onWait){return new PROMISE_CTOR(function(resolve,reject){if(parent===window||P.size>=64){reject(new Error('This Workspace cannot start another action yet'));return;}var rid=id(),timer=setTimeout(function(){if(P.has(rid))onWait(new Error('The action result is not confirmed yet. This button stays paused while its original result is checked.'));},30000);P.set(rid,{resolve:resolve,reject:reject,timer:timer});if(!gesture('action',payload,rid)){P.delete(rid);clearTimeout(timer);reject(new Error('This Workspace cannot prepare that button yet'));}});}
 function rpc(op,payload){return new Promise(function(resolve,reject){if(!SAFE_NAV){reject(new Error('This browser cannot safely isolate Workspace navigation'));return;}if(parent===window){reject(new Error('Workspace bridge requires the Clementine shell'));return;}if(P.size>=64){reject(new Error('Too many Workspace requests'));return;}var rid=id(),timer=setTimeout(function(){P.delete(rid);reject(new Error('Workspace request timed out'));},30000);P.set(rid,{resolve:resolve,reject:reject,timer:timer});send({channel:C,version:1,kind:'request',workspaceId:S,id:rid,op:op,payload:payload||{}});});}
 function onAck(e){var m,p,g,i,ports;if(GET_TRUSTED(e)!==true||GET_SOURCE(e)!==parent)return;m=GET_DATA(e);ports=GET_PORTS(e);if(!m||m.channel!==C||m.version!==1||m.kind!=='bootstrap_ack'||m.workspaceId!==S||m.documentId!==D||!ports||!ports[0]||!ports[1])return;STOP(e);PORT=ports[0];GPORT=ports[1];ADD(PORT,'message',function(pe){onPort(GET_DATA(pe));});PORT_START(PORT);for(i=0;i<Q.length;i++){p=Q[i];PORT_POST(PORT,p);}Q.length=0;for(i=0;i<GQ.length;i++){g=GQ[i];PORT_POST(GPORT,g);}GQ.length=0;if(BOOT)clearInterval(BOOT);REMOVE(window,'message',onAck,true);}
 ADD(window,'message',onAck,true);
@@ -356,20 +364,22 @@ function bootstrap(){parent.postMessage({channel:C,version:1,kind:'bootstrap',wo
 var BOOT=null;if(parent!==window){bootstrap();BOOT=setInterval(bootstrap,250);setTimeout(function(){if(BOOT){clearInterval(BOOT);BOOT=null;}},5000);}
 function response(body,status){return new RESPONSE_CTOR(JSON_STRINGIFY(body),{status:status||200,headers:{'content-type':'application/json'}});}
 function parsedBody(init){if(!init||init.body===undefined||init.body===null||init.body==='')return {};if(typeof init.body!=='string')throw new TypeError('Workspace compatibility fetch accepts a JSON string body only');var value=JSON_PARSE(init.body);if(!value||typeof value!=='object'||Array.isArray(value))throw new TypeError('Workspace request body must be a JSON object');return value;}
-function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{},press:takePress()}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
+function legacyFetch(input,init){return Promise.resolve().then(function(){var raw=typeof input==='string'?input:(input&&typeof input.url==='string'?input.url:String(input));var u=new URL_CTOR(raw,location.href),here=new URL_CTOR(location.href),prefix='/api/console/spaces/'+encodeURIComponent(S)+'/',method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase(),body=parsedBody(init),tail;if(u.origin!==here.origin||u.search||u.hash||u.pathname.indexOf(prefix)!==0)throw new TypeError('Workspace fetch is limited to this Workspace RPC surface');tail=u.pathname.slice(prefix.length);if(tail==='data'&&method==='GET')return rpc('data',{}).then(function(r){return response({data:r},200);});if(tail==='refresh'&&method==='POST')return rpc('refresh',typeof body.sourceId==='string'?{sourceId:body.sourceId}:{}).then(function(r){return response(r,200);});if(tail==='notes'&&method==='POST')return rpc('note',{text:body.text,kind:body.kind,meta:body.meta}).then(function(r){return response(r,201);});if(tail==='compose'&&method==='POST')return rpc('compose',{instructions:body.instructions,context:body.context,maxChars:body.maxChars}).then(function(r){return response({text:r},200);});if(tail==='action'&&method==='POST')return rpc('action',{actionId:body.actionId,args:body.args||{}}).then(function(r){return response(r,r&&r.pending?202:200);});throw new TypeError('Workspace fetch operation is not allowed');}).catch(function(error){return response({error:error&&error.message?String(error.message):'Workspace request failed'},500);});}
 lock('fetch',legacyFetch);
 ['XMLHttpRequest','WebSocket','EventSource','WebTransport','RTCPeerConnection','webkitRTCPeerConnection'].forEach(function(name){lock(name,undefined);});
 try{Object.defineProperty(navigator,'sendBeacon',{value:function(){return false;},writable:false,configurable:false});}catch(_){}
-function pressable(e){var path=PATH(e),i;for(i=0;i<path.length;i++){try{if(CLOSEST(path[i],PRESSABLE))return true;}catch(_){}}return false;}
-ADD(document,'click',function(e){if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||!pressable(e))return;PRESS_AT=DATE_NOW(Date);PRESSED=true;},true);
-function takePress(){var fresh=PRESSED&&DATE_NOW(Date)-PRESS_AT<=PRESS_MS;PRESSED=false;return fresh;}
+function actionButton(e){var path=PATH(e),i,b;for(i=0;i<path.length;i++){try{b=CLOSEST(path[i],PRESSABLE);if(b)return b;}catch(_){}}return null;}
+function actionPayload(button){var actionId=GET_ATTR(button,'data-clem-action'),args;if(typeof actionId!=='string'||!actionId||actionId.length>200||ARRAY_INDEX(A,actionId)<0)return null;try{args=JSON_PARSE(GET_ATTR(button,'data-clem-args')||'{}');}catch(_){return null;}if(!args||typeof args!=='object'||Array.isArray(args))return null;return {actionId:actionId,args:args,expectedViewRevision:V};}
+function bindAction(button,actionId,args,handlers){var encoded,binding;if(!button||!MATCHES(button,PRESSABLE)||typeof actionId!=='string'||ARRAY_INDEX(A,actionId)<0)throw new TypeError('Bind a declared action to its exact button');if(!args||typeof args!=='object'||Array.isArray(args))throw new TypeError('Button arguments must be an object');encoded=JSON_STRINGIFY(args);if(typeof encoded!=='string'||encoded.length>100000)throw new TypeError('Button arguments are too large');SET_ATTR(button,'data-clem-action',actionId);SET_ATTR(button,'data-clem-args',encoded);binding={onResult:handlers&&typeof handlers.onResult==='function'?handlers.onResult:null,onError:handlers&&typeof handlers.onError==='function'?handlers.onError:null};BSET(BINDINGS,button,binding);return function(){if(BGET(BINDINGS,button)!==binding)return;BDELETE(BINDINGS,button);REMOVE_ATTR(button,'data-clem-action');REMOVE_ATTR(button,'data-clem-args');};}
+function actionResult(button,binding,result,error){var refused=error&&error.effectState==='not_started',settled=!error&&result&&result.ok===true;if(settled||refused){RDELETE(RUNNING,button);REMOVE_ATTR(button,'aria-busy');SET_ATTR(button,'data-clem-action-state',refused?'refused':'ready');}else SET_ATTR(button,'data-clem-action-state',error?'needs-checking':'pending');try{DISPATCH(button,new EVENT_CTOR('clem:action-result',{detail:error?{ok:false,error:error.message,needsChecking:!refused}:{ok:true,result:result}}));}catch(_){}try{if(error){if(binding&&binding.onError)binding.onError(error);}else if(binding&&binding.onResult)binding.onResult(result);}catch(_){} }
+ADD(document,'click',function(e){var button,payload,binding,work;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(button=actionButton(e))===null||HAS_ATTR(button,'disabled')||GET_ATTR(button,'aria-disabled')==='true')return;payload=actionPayload(button);if(!payload)return;PREVENT(e);STOP(e);if(RHAS(RUNNING,button))return;RADD(RUNNING,button);SET_ATTR(button,'aria-busy','true');SET_ATTR(button,'data-clem-action-state','pending');binding=BGET(BINDINGS,button);work=V?pressedAction(payload,function(error){actionResult(button,binding,null,error);}):rpc('action',{actionId:payload.actionId,args:payload.args});work.then(function(result){actionResult(button,binding,result,null);},function(error){actionResult(button,binding,null,error);});},true);
 function anchor(e){var path=PATH(e),i,a;for(i=0;i<path.length;i++){try{a=CLOSEST(path[i],'a');if(a)return a;}catch(_){}}return null;}
 ADD(document,'click',function(e){var a,raw,parsed,url,protocol;if(GET_TRUSTED(e)!==true||GET_TARGET(e)===null||(a=anchor(e))===null)return;if(HAS_ATTR(a,'download')){PREVENT(e);STOP(e);gesture('download',{filename:GET_ATTR(a,'download')||'download',dataUrl:GET_ATTR(a,'href')||''});return;}raw=GET_ATTR(a,'href');if(typeof raw!=='string'||!raw)return;try{parsed=new URL_CTOR(raw,BASE_URL);url=GET_URL_HREF(parsed);protocol=GET_URL_PROTOCOL(parsed);}catch(_){return;}if(ARRAY_INDEX(['https:','http:','mailto:','tel:','callto:','sms:','facetime:','facetime-audio:','maps:','webcal:','zoommtg:','msteams:'],protocol)<0)return;PREVENT(e);STOP(e);gesture('open_external',{url:url});},true);
 var REPORTED=[];function report(message,line){var text;if(REPORTED.length>=3||parent===window)return;text=String(message||'').slice(0,300);if(!text||ARRAY_INDEX(REPORTED,text)>=0)return;ARRAY_PUSH(REPORTED,text);rpc('note',{text:text+(line?' (line '+line+')':''),kind:'view_error'}).catch(function(){});}
 ADD(window,'error',function(e){if(e&&typeof e.message==='string'&&e.message)report(e.message,e.lineno);},true);
 ADD(window,'unhandledrejection',function(e){var r=e&&e.reason;report('Unhandled rejection: '+(r&&r.message?r.message:String(r)));},true);
 var K=window.__clemKit||{};try{delete window.__clemKit;}catch(_){}
-window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{},press:takePress()});},onData:function(cb){if(typeof cb!=='function')return function(){};ARRAY_PUSH(DL,cb);if(DL.length===1)rpc('subscribe',{}).catch(function(){});return function(){var i=ARRAY_INDEX(DL,cb);if(i>=0)ARRAY_SPLICE(DL,i,1);};}});
+window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pick:K.pick,rows:K.rows,mail:K.mail,slug:S,data:function(){return rpc('data',{});},history:function(opts){return rpc('history',opts&&typeof opts==='object'?opts:{});},diff:function(opts){return rpc('diff',opts&&typeof opts==='object'?opts:{});},refresh:function(sourceId){return rpc('refresh',typeof sourceId==='string'?{sourceId:sourceId}:{});},note:function(text,kind,meta){return rpc('note',{text:text,kind:kind,meta:meta});},compose:function(instructions,context,maxChars){return rpc('compose',{instructions:instructions,context:context,maxChars:maxChars});},action:function(actionId,args){return rpc('action',{actionId:actionId,args:args||{}});},bindAction:bindAction,onData:function(cb){if(typeof cb!=='function')return function(){};ARRAY_PUSH(DL,cb);if(DL.length===1)rpc('subscribe',{}).catch(function(){});return function(){var i=ARRAY_INDEX(DL,cb);if(i>=0)ARRAY_SPLICE(DL,i,1);};}});
 })();</script>`;
 };
 
@@ -382,7 +392,7 @@ window.clem=Object.freeze({fmt:K.fmt,ui:K.ui,sources:K.sources,theme:K.theme,pic
 export function composeServedWorkspaceView(slug: string, html: string): string {
   const wiring = spaceWiringHealth(spaceStore.get(slug) ?? { title: slug, dataSources: [], actions: [] });
   return appendWiringHealthBanner(
-    injectWorkspaceBootstrap(html, clemViewDesignLayer() + CLEM_VIEW_BRIDGE(slug) + CLEM_VIEW_DATA_SEED(slug)),
+    injectWorkspaceBootstrap(html, clemViewDesignLayer() + CLEM_VIEW_BRIDGE(slug, html) + CLEM_VIEW_DATA_SEED(slug)),
     wiring,
   );
 }
@@ -1086,15 +1096,65 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   // runner) with caller-supplied args merged over the declared template.
   // Credentials resolve server-side; the action is audited + recorded as a
   // note so the dock's Clem knows what the user did.
+  app.post('/api/console/spaces/:id/action/prepare-press', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    // Only the trusted same-origin parent invokes this after its private exact
+    // declared-button gesture. No ordinary authored RPC/tool exposes issuance.
+    // Fetch metadata is a browser boundary, not attestation against an owner
+    // client already holding the application's complete HTTP credentials.
+    if (req.get('X-Clem-Workspace-Gesture') !== 'declared-button-v1'
+      || req.get('Sec-Fetch-Site') !== 'same-origin'
+      || req.get('Origin') !== `${req.protocol}://${req.get('host')}`) {
+      res.status(403).json({ error: 'Use the current Workspace button to approve this action.' }); return;
+    }
+    const slug = String(req.params.id ?? '');
+    if (!isValidSpaceSlug(slug)) { res.status(404).json({ error: 'not found' }); return; }
+    try { res.json(prepareSpaceActionPress(slug, req.body)); }
+    catch (error) { res.status(error instanceof SpaceActionPressError ? error.status : 409)
+      .json({ ...(error instanceof SpaceActionPressError ? { effectState: error.effectState } : {}),
+        error: error instanceof SpaceActionPressError ? error.message : 'This button’s exact action could not be prepared. Use its normal approval flow.' }); }
+  });
+
   app.post('/api/console/spaces/:id/action', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const slug = String(req.params.id ?? '');
+    if (req.body?.press !== undefined) {
+      res.status(400).json({ error: 'A button approval must name its exact prepared occurrence.' }); return;
+    }
+    if (req.body?.pressToken !== undefined) {
+      const body = req.body;
+      if (!isValidSpaceSlug(slug) || !body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).some(key => !['actionId', 'args', 'documentId', 'expectedViewRevision', 'pressToken'].includes(key))) {
+        res.status(400).json({ error: 'This button request could not be read.' }); return;
+      }
+      try {
+        const pressed = await consumeSpaceActionPress(slug, { actionId: body.actionId, args: body.args,
+          documentId: body.documentId, expectedViewRevision: body.expectedViewRevision }, body.pressToken);
+        res.status(pressed.ok ? 200 : pressed.status === 'uncertain' ? 409 : 502)
+          .json({ ok: pressed.ok, result: { approvedByPress: true, ...pressed } });
+      } catch (error) { res.status(error instanceof SpaceActionPressError ? error.status : 409)
+        .json({ ok: false, ...(error instanceof SpaceActionPressError ? { effectState: error.effectState } : {}),
+          error: error instanceof SpaceActionPressError ? error.message : 'This button action could not confirm its outcome. Its original approval is kept.' }); }
+      return;
+    }
     const rec = spaceStore.get(slug);
     if (!isValidSpaceSlug(slug) || !rec) { res.status(404).json({ error: 'not found' }); return; }
     if (rec.status !== 'active') { res.status(423).json({ error: `workspace is ${rec.status}` }); return; }
     if (rec.manifestErrors && rec.manifestErrors.length > 0) {
       res.status(409).json({ error: `workspace manifest is invalid; fix with space_save before running actions: ${rec.manifestErrors.join('; ')}` });
       return;
+    }
+    if (req.body?.documentId !== undefined || req.body?.expectedViewRevision !== undefined) {
+      const gesture = spaceActionPressInputSchema.safeParse({ documentId: req.body?.documentId,
+        expectedViewRevision: req.body?.expectedViewRevision, actionId: req.body?.actionId, args: req.body?.args });
+      if (!gesture.success) { res.status(400).json({ effectState: 'not_started', error: 'This button request could not be read.' }); return; }
+      let currentView: string | undefined;
+      try { currentView = workspacePressViewRevision(rec); } catch { /* missing view is not current */ }
+      if (gesture.data.expectedViewRevision !== currentView) {
+        res.status(409).json({ effectState: 'not_started', error: 'The page changed. Review its current button before trying again.' }); return;
+      }
     }
     const actionId = typeof req.body?.actionId === 'string' ? req.body.actionId : '';
     const action = rec.actions.find((a) => a.id === actionId);
@@ -1149,20 +1209,6 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
         }
       }
       try {
-        // The owner's press is the approval for exactly this action (owner
-        // 2026-10-18: a Send or Delete button is the send or delete it is
-        // for). The view's bridge marks a request pressed only for a trusted
-        // click on a button, once per click; a request it did not see pressed
-        // (a view's own script, a load, a timer) still takes the card.
-        if (req.body?.press === true) {
-          const pressed = await approveSpaceActionByPress(rec, action, callerArgs);
-          if (!pressed.ok) {
-            res.status(pressed.status === 'uncertain' ? 409 : 502).json({ ok: false, error: pressed.text });
-            return;
-          }
-          res.json({ ok: true, result: { approvedByPress: true, approvalId: pressed.approvalId, message: pressed.text } });
-          return;
-        }
         const { approvalId, subject } = enqueueSpaceActionApproval(rec, action, callerArgs);
         res.status(202).json({ pending: true, approvalId, subject });
       } catch (err) {

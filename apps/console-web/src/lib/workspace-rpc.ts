@@ -27,7 +27,7 @@ export type WorkspaceRpcOp =
  * injected bridge receives a second capability port and uses it only from its
  * capture-phase `isTrusted` click handler.
  */
-export type WorkspaceGestureOp = 'open_external' | 'download';
+export type WorkspaceGestureOp = 'open_external' | 'download' | 'action';
 
 interface WorkspaceRpcBase {
   channel: typeof WORKSPACE_RPC_CHANNEL;
@@ -79,6 +79,7 @@ export interface WorkspaceRpcFailure extends WorkspaceRpcBase {
   kind: 'response';
   ok: false;
   error: string;
+  effectState?: 'not_started' | 'uncertain';
 }
 
 export type WorkspaceRpcResponse = WorkspaceRpcSuccess | WorkspaceRpcFailure;
@@ -111,7 +112,7 @@ const OPS = new Set<WorkspaceRpcOp>([
   'compose',
   'action',
 ]);
-const GESTURE_OPS = new Set<WorkspaceGestureOp>(['open_external', 'download']);
+const GESTURE_OPS = new Set<WorkspaceGestureOp>(['open_external', 'download', 'action']);
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const MAX_PAYLOAD_BYTES = 100_000;
 const SAFE_DOWNLOAD_NAME_RE = /^(?!\.{1,2}$)[^/\\\0]{1,180}$/;
@@ -217,10 +218,9 @@ function payloadMatchesOperation(op: WorkspaceRpcOp, payload: Record<string, unk
       && (payload.maxChars === undefined
         || (Number.isInteger(payload.maxChars) && Number(payload.maxChars) >= 1 && Number(payload.maxChars) <= 20_000));
   }
-  return hasOnlyKeys(payload, ['actionId', 'args', 'press'])
+  return hasOnlyKeys(payload, ['actionId', 'args'])
     && boundedString(payload.actionId, 200)
-    && isRecord(payload.args)
-    && (payload.press === undefined || typeof payload.press === 'boolean');
+    && isRecord(payload.args);
 }
 
 function payloadMatchesGesture(
@@ -228,6 +228,13 @@ function payloadMatchesGesture(
   payload: Record<string, unknown>,
 ): boolean {
   if (!payloadIsBounded(payload)) return false;
+  if (op === 'action') {
+    return hasOnlyKeys(payload, ['actionId', 'args', 'expectedViewRevision'])
+      && boundedString(payload.actionId, 200)
+      && isRecord(payload.args)
+      && typeof payload.expectedViewRevision === 'string'
+      && /^[a-f0-9]{64}$/.test(payload.expectedViewRevision);
+  }
   if (op === 'open_external') {
     if (!hasOnlyKeys(payload, ['url']) || !boundedString(payload.url, 4_096)) return false;
     try {
@@ -472,7 +479,7 @@ export function workspaceRpcSuccess(request: WorkspaceRpcRequest, result: unknow
   };
 }
 
-export function workspaceRpcFailure(request: WorkspaceRpcRequest, error: string): WorkspaceRpcFailure {
+export function workspaceRpcFailure(request: WorkspaceRpcRequest, error: string, effectState?: 'not_started' | 'uncertain'): WorkspaceRpcFailure {
   return {
     channel: WORKSPACE_RPC_CHANNEL,
     version: 1,
@@ -481,5 +488,6 @@ export function workspaceRpcFailure(request: WorkspaceRpcRequest, error: string)
     id: request.id,
     ok: false,
     error: error.slice(0, 1_000),
+    ...(effectState ? { effectState } : {}),
   };
 }

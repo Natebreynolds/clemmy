@@ -4,6 +4,7 @@ import {
   addSpaceNote,
   composeSpace,
   executeSpaceAction,
+  prepareSpaceActionPress,
   getSpaceData,
   getSpaceDiff,
   getSpaceHistory,
@@ -127,15 +128,35 @@ async function runWorkspaceOperation(id: string, request: WorkspaceRpcRequest): 
       return executeSpaceAction(id, {
         actionId: payload.actionId as string,
         args: payload.args as Record<string, unknown>,
-        // The bridge saw a trusted click on a button: the press is the approval.
-        ...(payload.press === true ? { press: true } : {}),
       });
   }
 }
 
-async function runWorkspaceGesture(request: WorkspaceGestureRequest): Promise<unknown> {
+async function runWorkspaceGesture(request: WorkspaceGestureRequest, isCurrent: () => boolean): Promise<unknown> {
   const payload = request.payload;
   switch (request.op) {
+    case 'action': {
+      const actionId = payload.actionId as string;
+      const args = payload.args as Record<string, unknown>;
+      const proof = await prepareSpaceActionPress(request.workspaceId, {
+        actionId, args, expectedViewRevision: payload.expectedViewRevision as string, documentId: request.documentId,
+      }).catch((error: unknown) => {
+        const body = error && typeof error === 'object' && 'body' in error ? error.body : undefined;
+        const unresolvedPrior = body && typeof body === 'object' && 'effectState' in body && body.effectState === 'uncertain';
+        throw Object.assign(error instanceof Error ? error : new Error('This button couldn’t prepare its action.'), { effectState: unresolvedPrior ? 'uncertain' : 'not_started' });
+      });
+      // A replaced/revoked frame cannot spend a proof prepared for its old
+      // document. Never retry preparation or dispatch on an uncertain reply.
+      if (!isCurrent()) throw Object.assign(new Error('This Workspace changed. Reload it before using that button.'), { effectState: 'not_started' });
+      return executeSpaceAction(request.workspaceId, { actionId, args,
+        documentId: request.documentId, expectedViewRevision: payload.expectedViewRevision as string,
+        ...(proof.kind === 'prepared' ? { pressToken: proof.pressToken } : {}) })
+        .catch((error: unknown) => {
+          const body = error && typeof error === 'object' && 'body' in error ? error.body : undefined;
+          const beforeDispatch = body && typeof body === 'object' && 'effectState' in body && body.effectState === 'not_started';
+          throw Object.assign(error instanceof Error ? error : new Error('The action result could not be confirmed.'), { effectState: beforeDispatch ? 'not_started' : 'uncertain' });
+        });
+    }
     case 'open_external':
       return openWorkspaceExternal(payload.url as string);
     case 'download':
@@ -292,22 +313,40 @@ export function WorkspaceFrame({
         revoked
         || !gesturePort
         || !pinnedDocumentId
-        || !workspaceGestureAllowed(readOnly)
       ) return;
       const parsed = parseWorkspaceGestureRequest(event.data, id, pinnedDocumentId);
       if (!parsed.ok) return;
-      if (!rememberGesture(parsed.gesture.id) || gestureInFlight) return;
+      const gesture = parsed.gesture;
+      const actionRequest: WorkspaceRpcRequest | null = gesture.op === 'action' ? {
+        channel: WORKSPACE_RPC_CHANNEL, version: 1, kind: 'request', workspaceId: id,
+        id: gesture.id, op: 'action', payload: gesture.payload,
+      } : null;
+      if (!workspaceGestureAllowed(readOnly)) {
+        if (actionRequest) reply(workspaceRpcFailure(actionRequest, 'Workspace preview is read-only', 'not_started'));
+        return;
+      }
+      if (!rememberGesture(gesture.id) || gestureInFlight) {
+        if (actionRequest) reply(workspaceRpcFailure(actionRequest, 'Workspace is busy; wait for the current action.', 'not_started'));
+        return;
+      }
       gestureInFlight = true;
-      void runWorkspaceGesture(parsed.gesture)
+      void runWorkspaceGesture(gesture, () => !revoked && pinnedDocumentId === gesture.documentId && Boolean(port && gesturePort))
+        .then((result) => {
+          if (actionRequest) {
+            reply(workspaceRpcSuccess(actionRequest, result));
+            if (!revoked) onMutationRef.current?.();
+          }
+        })
         .catch((error: unknown) => {
+          const message = error instanceof Error && error.message.trim() ? error.message : 'That action didn’t complete.';
+          const effectState = error && typeof error === 'object' && 'effectState' in error && error.effectState === 'not_started' ? 'not_started' : 'uncertain';
+          if (actionRequest) reply(workspaceRpcFailure(actionRequest, message, effectState));
           // The iframe still gets no response channel — this reports to the
           // HOST, exactly as the RPC path above does, so the invariant holds.
           // Reporting nowhere at all meant an "Open in…" or "Download CSV" that
           // failed looked identical to one that worked, and the owner concluded
           // the Space Clementine built was broken.
-          onErrorRef.current?.(error instanceof Error && error.message.trim()
-            ? error.message
-            : 'That action didn’t complete.');
+          if (!revoked) onErrorRef.current?.(message);
         })
         .finally(() => { gestureInFlight = false; });
     };

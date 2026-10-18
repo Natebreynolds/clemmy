@@ -355,3 +355,33 @@ test('unused JSON or a different object does not prove source rendering', () => 
 test('whole-dataset renderer still needs its display element', () => {
   assert.equal(analyzeSpaceGaps(rec({ dataSources: [{ id: 'calendar' }] }), `<script>clem.data().then(data=>{document.getElementById('missing').textContent=JSON.stringify(data);});</script>`).some(g => g.unreferenced === 'source'), true);
 });
+
+test('declared button helpers and static attributes keep required-input checks without inventing dynamic args', () => {
+  const record = { dataSources: [], actions: [{ id: 'draft_reply', composioSlug: 'OUTLOOK_CREATE_DRAFT_REPLY', argsTemplate: { user_id: 'me' } }] } as never;
+  const requirements = { actionInputRequirements: { draft_reply: ['user_id', 'message_id', 'mail_folder_id', 'comment'] } };
+  const requiredGap = (html: string) => analyzeSpaceGaps(record, html, [], requirements).find(g => g.actionId === 'draft_reply' && g.question.includes('requires'));
+  const helpers = [
+    `<script>clem.bindAction(button, 'draft_reply', { message_id: row.id, mail_folder_id: row.folder, comment: text });</script>`,
+    `<script>clem.bindAction(document.getElementById('send'), 'draft_reply', { message_id: row.id, mail_folder_id: row.folder, comment: text }, {onResult(result){ show(result); }});</script>`,
+    `<button data-clem-action="draft_reply" data-clem-args='{ "message_id": "sample", "mail_folder_id": "inbox", "comment": "Approved." }'>Draft</button>`,
+    `<input type="button" data-clem-action="draft_reply" data-clem-args="{&quot;message_id&quot;:&quot;sample&quot;,&quot;mail_folder_id&quot;:&quot;inbox&quot;,&quot;comment&quot;:&quot;Approved.&quot;}" value="Draft">`,
+  ];
+  for (const html of helpers) {
+    assert.equal(requiredGap(html), undefined, html);
+    assert.equal(analyzeSpaceGaps(record, html).some(g => /never fires one/.test(g.question)), false, 'new forms are recognized as action wiring');
+  }
+  for (const html of [
+    `<script>clem.bindAction(button, 'draft_reply', { message_id: row.id, comment: text });</script>`,
+    `<button data-clem-action="draft_reply" data-clem-args='{"message_id":"sample","comment":"Approved."}'>Draft</button>`,
+    `<button data-clem-action="draft_reply">Draft</button>`,
+  ]) assert.match(requiredGap(html)!.question, /mail_folder_id/, html);
+  for (const html of [
+    `<script>clem.bindAction(button, 'draft_reply', args);</script>`,
+    `<script>clem.bindAction(button, 'draft_reply', {...args, comment: text});</script>`,
+    `<script>clem.bindAction(button, 'draft_reply', {[key]: value});</script>`,
+    `<button data-clem-action="draft_reply" data-clem-args="{{dynamicArgs}}">Draft</button>`,
+  ]) assert.equal(requiredGap(html), undefined, 'dynamic arguments remain unproven rather than refused');
+  const two = `${helpers[0]}<button data-clem-action="draft_reply" data-clem-args='{"message_id":"sample","comment":"Approved."}'>Another draft</button>`;
+  assert.match(requiredGap(two)!.question, /mail_folder_id/, 'one incomplete static button is still broken');
+  assert.equal(requiredGap('<button not-data-clem-action="draft_reply">A label</button>'), undefined, 'lookalike attributes do not prove an action call');
+});

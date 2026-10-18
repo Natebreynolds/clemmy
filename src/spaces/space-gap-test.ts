@@ -102,7 +102,39 @@ function literalTopLevelKeys(literal: string): Set<string> | null {
   return flush() ? keys : null;
 }
 
-/** Keys passed at every literal `clem.action('<id>', {…})` call site, or null
+/** Find the first argument's boundary, without interpreting its expression.
+ * Unreadable/commented forms stay unproven rather than guessing a binding. */
+function firstArgumentEnd(source: string, from: number): number | null {
+  const stack: string[] = [];
+  let quote: string | null = null;
+  for (let index = from; index < source.length; index += 1) {
+    const char = source[index]!;
+    if (quote) {
+      if (char === '\\') { index += 1; continue; }
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '/' || char === '`') return null;
+    if (char === '"' || char === "'") { quote = char; continue; }
+    if ('([{'.includes(char)) stack.push(char);
+    else if (')]}'.includes(char)) {
+      if (stack.pop() !== ({ ')': '(', ']': '[', '}': '{' } as Record<string, string>)[char]) return null;
+    } else if (char === ',' && stack.length === 0) return index + 1;
+  }
+  return null;
+}
+
+function htmlAttributeText(value: string): string {
+  return value.replace(/&(?:quot|apos|amp|lt|gt|#(?:x[0-9a-f]+|[0-9]+));/gi, entity => {
+    const named: Record<string, string> = { '&quot;': '"', '&apos;': "'", '&amp;': '&', '&lt;': '<', '&gt;': '>' };
+    const lower = entity.toLowerCase();
+    if (Object.hasOwn(named, lower)) return named[lower]!;
+    const point = lower.startsWith('&#x') ? Number.parseInt(lower.slice(3, -1), 16) : Number.parseInt(lower.slice(2, -1), 10);
+    return Number.isInteger(point) && point >= 0 && point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+  });
+}
+
+/** Keys passed at every literal action/helper or static button declaration, or null
  *  when any call site cannot be read statically (a variable argument, a
  *  spread, a computed key) or none exists. Null means "cannot prove". */
 function literalActionCallKeys(html: string, actionId: string): Array<Set<string>> | null {
@@ -117,6 +149,33 @@ function literalActionCallKeys(html: string, actionId: string): Array<Set<string
     const keys = literalTopLevelKeys(literal);
     if (!keys) return null;
     sites.push(keys);
+  }
+  for (const match of html.matchAll(/\bclem\s*\.\s*bindAction\s*\(/g)) {
+    const afterButton = firstArgumentEnd(html, (match.index ?? 0) + match[0].length);
+    if (afterButton === null) return null;
+    const name = /^\s*(['"])([^'"\\\r\n]+)\1\s*,\s*/.exec(html.slice(afterButton));
+    if (!name) return null;
+    if (name[2] !== actionId) continue;
+    const open = afterButton + name[0].length;
+    if (html[open] !== '{') return null;
+    const literal = balancedObjectLiteral(html, open);
+    const keys = literal ? literalTopLevelKeys(literal) : null;
+    if (!keys) return null;
+    sites.push(keys);
+  }
+  // Only literal quoted attributes on a native action button are understood.
+  // Dynamic templates/variables are not executed or treated as empty args.
+  for (const match of html.matchAll(/<(?:button|input)\b(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi)) {
+    const attribute = (name: string) => new RegExp(`(?:^|\\s)${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, 'i').exec(match[0]);
+    if (/^<input\b/i.test(match[0]) && !['button', 'submit'].includes(attribute('type')?.[2]?.toLowerCase() ?? '')) continue;
+    const declared = attribute('data-clem-action');
+    if (!declared || htmlAttributeText(declared[2]!) !== actionId) continue;
+    try {
+      const raw = attribute('data-clem-args');
+      const args: unknown = JSON.parse(raw ? htmlAttributeText(raw[2]!) : '{}');
+      if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+      sites.push(new Set(Object.keys(args)));
+    } catch { return null; }
   }
   return sites.length > 0 ? sites : null;
 }
@@ -271,7 +330,7 @@ export function analyzeSpaceGaps(
   // it fires actions but never references THIS id. The bridge's canonical shape
   // is clem.action('<id>', …); a hand-rolled view POSTs …/action directly.
   const actions = record.actions ?? [];
-  const firesActions = /clem\.action\b/.test(html) || /\/action\b/.test(html);
+  const firesActions = /\bclem\s*\.\s*(?:action|bindAction)\b/.test(html) || /\bdata-clem-action\s*=/.test(html) || /\/action\b/.test(html);
   if (html && actions.length > 0 && !firesActions) {
     gaps.push({
       severity: 'clarify',
@@ -312,7 +371,7 @@ export function analyzeSpaceGaps(
       severity: 'clarify',
       resolution: 'fix',
       actionId: a.id,
-      question: `Action "${a.id}"${a.composioSlug ? ` (${a.composioSlug})` : ''} requires ${missing.map((name) => `\`${name}\``).join(', ')}, but its args template does not set ${missing.length === 1 ? 'it' : 'them'} and the view's clem.action('${a.id}', {…}) call does not pass ${missing.length === 1 ? 'it' : 'them'}. Add ${missing.length === 1 ? 'it' : 'them'} to args_template_json or pass ${missing.length === 1 ? 'it' : 'them'} from the view.`,
+      question: `Action "${a.id}"${a.composioSlug ? ` (${a.composioSlug})` : ''} requires ${missing.map((name) => `\`${name}\``).join(', ')}, but its args template does not set ${missing.length === 1 ? 'it' : 'them'} and the view's action binding does not pass ${missing.length === 1 ? 'it' : 'them'}. Add ${missing.length === 1 ? 'it' : 'them'} to args_template_json or pass ${missing.length === 1 ? 'it' : 'them'} from the view.`,
       why: 'The operation refuses a call missing a required input, so the button would fail every time it is clicked.',
     });
   }
