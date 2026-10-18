@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import path from 'node:path';
 import {
   MAX_ATTACHMENT_BYTES,
   extractYouTubeUrls,
@@ -96,6 +97,18 @@ test('ingestAttachment: plain-text file with unknown ext is read directly', asyn
   const r = await ingestAttachment({ name: 'server.log', bytes: Buffer.from('INFO ready\nWARN slow') });
   assert.equal(r.error, undefined);
   assert.match(r.markdown || '', /INFO ready/);
+});
+
+test('a saved attachment reads back by its stored path, as read_file opens it; only the new save carries a send reference', async () => {
+  const saved = await ingestAttachment({ name: 'server.log', bytes: Buffer.from('INFO ready\nWARN slow') });
+  assert.equal(saved.error, undefined);
+  assert.ok(saved.file, 'the snapshot this call saved gets a reference');
+  const { attachmentFilePath } = await import('./attachment-file-reference.js');
+  const stored = attachmentFilePath(saved.file!);
+  const again = await ingestAttachment({ name: path.basename(stored), sourcePath: stored });
+  assert.equal(again.error, undefined, 'reading an earlier snapshot is not a new capture');
+  assert.match(again.markdown || '', /INFO ready/);
+  assert.equal(again.file, undefined, 'a read confers nothing to send');
 });
 
 // ── Paste-to-see images (2026-08-07): the pixels, not a description ──

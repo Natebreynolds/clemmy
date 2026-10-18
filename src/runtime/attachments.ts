@@ -191,7 +191,12 @@ export async function ingestAttachment(input: IngestInput): Promise<IngestedAtta
     // useful to a schema-declared file operation without being a document.
     let file: AttachmentFileReference | undefined;
     const attachmentStore = path.join(BASE_DIR, 'state', 'attachments-files');
-    if (existsSync(attachmentStore) && path.dirname(realpathSync(target)) === realpathSync(attachmentStore)) {
+    // A snapshot is stored as <snapshot id>__<name>. read_file of an earlier
+    // snapshot passes that stored name itself: it is read as before and
+    // confers nothing to send.
+    const storedName = path.basename(target);
+    if (storedName === `${storedName.slice(0, 36)}__${name}`
+      && existsSync(attachmentStore) && path.dirname(realpathSync(target)) === realpathSync(attachmentStore)) {
       file = captureAttachmentFileReference(target, name);
     }
     if (isVideo || OPAQUE_ARCHIVES.has(path.extname(name).toLowerCase())) return file
