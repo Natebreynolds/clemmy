@@ -2562,7 +2562,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 48153
+          "bytes": 48863
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -2835,7 +2835,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830137
+          "bytes": 830215
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -6492,7 +6492,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 48153
+          "bytes": 48863
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -6765,7 +6765,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830137
+          "bytes": 830215
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
