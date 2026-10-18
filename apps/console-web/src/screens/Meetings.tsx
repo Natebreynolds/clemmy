@@ -3,7 +3,7 @@ import { MeetingCompanion } from '@/components/meetings/MeetingCompanion';
 import { LiveMeetingRoom } from '@/components/meetings/LiveMeetingRoom';
 import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, type MeetingNavigationSdkStatus } from '@/lib/meeting-live-navigation';
 import type { MeetingTranscriptSegment } from '@/lib/meeting-transcript-panel';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Video, Circle, Square, ShieldCheck, Mic, ListChecks, Users, Hash, MessageCircle, AlertTriangle, Check, HardDrive, Trash2, StickyNote, X, Star, CircleHelp, Flag, type LucideIcon } from 'lucide-react';
@@ -104,6 +104,8 @@ export function Meetings() {
   const meetings = usePoll(['meetings'], listMeetings, 12000);
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stoppingRecording, setStoppingRecording] = useState(false);
+  const recordingStopLock = useRef(false);
   const [notice, setNotice] = useState<{ tone: 'info' | 'warn' | 'error'; text: string } | null>(null);
   const [retentionHoursDraft, setRetentionHoursDraft] = useState('24');
   const [localTitle, setLocalTitle] = useState('');
@@ -258,20 +260,21 @@ export function Meetings() {
   };
 
   const stop = async () => {
-    setBusy(true);
+    if (recordingStopLock.current) return;
+    recordingStopLock.current = true; setStoppingRecording(true);
     try { await clemmy()?.recallStop?.(); }
     catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
-    finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
+    finally { recordingStopLock.current = false; setStoppingRecording(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
   };
 
   const stopLive = async () => {
-    if (!liveRoom) return;
-    setBusy(true); setNotice(null);
+    if (!liveRoom || recordingStopLock.current) return;
+    recordingStopLock.current = true; setStoppingRecording(true); setNotice(null);
     try {
       if (!clemmy()?.recallStop) throw new Error('Recording controls are unavailable. Use the desktop meeting controls.');
       await clemmy()!.recallStop!({ windowId: liveRoom.windowId, recordingStartedAt: liveRoom.startedAt });
     } catch (e) { setNotice({ tone: 'error', text: (e as Error).message }); }
-    finally { setBusy(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
+    finally { recordingStopLock.current = false; setStoppingRecording(false); refresh(); void qc.invalidateQueries({ queryKey: ['meetings'] }); }
   };
 
   const recordTarget = async () => {
@@ -400,7 +403,7 @@ export function Meetings() {
         capture={{ windowId: liveRoom.windowId, sdkUploadId: liveRecord.sdkUploadId, recordingId: liveRecord.recordingId }}
         segments={liveSegments} connection={sdk.isError ? 'unknown' : sdkData?.networkStatus === 'disconnected' ? 'disconnected' : sdkData?.networkStatus === 'reconnected' ? 'connected' : 'unknown'}
         transcriptReadError={detail.isError} statusReadError={sdk.isError || status.isError || meetings.isError} deliveryIncomplete={(liveRecord as { liveTranscriptDelivery?: { status?: string } }).liveTranscriptDelivery?.status === 'incomplete'}
-        busy={busy} onStop={() => void stopLive()} onFinal={() => { void qc.invalidateQueries({ queryKey: ['meeting', liveRoom.meetingId] }); }}
+        busy={stoppingRecording} onStop={() => void stopLive()} onFinal={() => { void qc.invalidateQueries({ queryKey: ['meeting', liveRoom.meetingId] }); }}
         notes={<ScratchpadPanel windowId={liveRoom.windowId} startedAtMs={Date.parse(liveRoom.startedAt)} compact />} />
         : <div className="mb-6" role="status">{detail.isError || (detail.data && selected === liveId) ? <QueryUnavailable title="This meeting couldn’t load" description="Recording controls remain available in the desktop meeting controls. Try loading the transcript again." onRetry={() => { void detail.refetch(); }} /> : <><p className="mb-3 text-small text-muted">Opening your live meeting…</p><Skeleton className="h-80 w-full" /></>}</div>
         : captureTarget.kind === 'none' && companionId && <MeetingCompanion key={companionId} meetingId={companionId} active={companionActive} />}
@@ -581,7 +584,7 @@ export function Meetings() {
               <>
                 <div className="flex flex-wrap items-center gap-2">
                   {recording
-                    ? <Button variant="danger" onClick={stop} disabled={busy}><Square className="h-4 w-4" aria-hidden /> Stop recording</Button>
+                    ? <Button variant="danger" onClick={stop} disabled={stoppingRecording}><Square className="h-4 w-4" aria-hidden />{stoppingRecording ? 'Stopping…' : 'Stop recording'}</Button>
                     : <Button onClick={record} disabled={busy}><Circle className="h-4 w-4" aria-hidden /> Record this meeting</Button>}
                   <Button variant="secondary" size="sm" onClick={grant} disabled={busy}><ShieldCheck className="h-4 w-4" aria-hidden /> Grant permissions</Button>
                   <div className="mx-2 h-6 w-px bg-border" />
