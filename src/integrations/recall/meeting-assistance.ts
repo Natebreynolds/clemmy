@@ -51,7 +51,7 @@ const offerSchema = z.object({
   segmentIds: z.array(text(512)).min(1).max(MAX_WINDOW_SEGMENTS),
   evidence: z.array(segmentSchema).min(1).max(MAX_WINDOW_SEGMENTS),
   createdAt: z.number().finite(), expiresAt: z.number().finite(),
-  state: z.enum(['open', 'lookup_prepared', 'dismissed', 'deferred', 'expired']),
+  state: z.enum(['open', 'lookup_prepared', 'dismissed', 'deferred', 'expired', 'research_queued']),
   packet: packetSchema.optional(), preparedAt: z.number().finite().optional(), modelIdentity: z.string().max(512).optional(), modelAccountingJobId: z.string().max(512).optional(),
 }).strict();
 type StoredOffer = z.infer<typeof offerSchema>;
@@ -153,6 +153,8 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
   const schedule = options.schedule ?? ((callback, delay) => { const timer = setTimeout(callback, delay); timer.unref(); return timer; });
   const cancelSchedule = options.cancelSchedule ?? clearTimeout;
   let port: MeetingAssistanceScanPort | null = null;
+  let listener: ((id: string) => void) | null = null;
+  const notify = (id: string) => { try { listener?.(id); } catch { /* optional research never owns capture */ } };
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const running = new Map<string, Promise<MeetingAssistanceSnapshot>>();
   const controllers = new Map<string, AbortController>();
@@ -238,6 +240,7 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
       controllers.get(id)?.abort();
       const timer = timers.get(id); if (timer) cancelSchedule(timer); timers.delete(id); dirty.delete(id);
     }
+    notify(id);
     return get(id);
   };
   const windowFor = (state: State, record: RecallMeetingRecord): MeetingAssistanceSegment[] => {
@@ -345,7 +348,8 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
   const check = (id: string): Promise<MeetingAssistanceSnapshot> => {
     const existing = running.get(id); if (existing) { dirty.add(id); return existing; }
     dirty.delete(id);
-    const promise = scan(id).finally(() => { running.delete(id); if (dirty.delete(id)) request(id); });
+    const promise = scan(id).then(snapshot => { notify(id); return snapshot; })
+      .finally(() => { running.delete(id); if (dirty.delete(id)) request(id); });
     running.set(id, promise); return promise;
   };
   const selectedOffer = (state: State, offerId: string, offerDigest: string): StoredOffer => {
@@ -403,11 +407,24 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
     });
     return get(id);
   };
+  const markResearchQueued = (id: string, offerId: string, offerDigest: string): void => {
+    mutate(id, (state, record) => {
+      const offer = selectedOffer(state, offerId, offerDigest);
+      if (offer.state === 'research_queued') return;
+      if (!state.enabled || record.status !== 'recording' || state.captureDigest !== captureDigest(record)
+        || offer.state !== 'open' || offer.expiresAt <= now() || !equalEvidence(record, offer.evidence)) throw new Error('Meeting question changed.');
+      offer.state = 'research_queued';
+    });
+    request(id);
+  };
   return { getMeetingAssistance: get, setMeetingAssistance: set, requestMeetingAssistanceCheck: request,
     checkMeetingAssistance: check, prepareMeetingLookup: prepare, readPreparedMeetingLookup: readPrepared,
-    decideMeetingAssistanceOffer: decide, registerMeetingAssistanceScanPort: (value: MeetingAssistanceScanPort | null) => { port = value; } };
+    decideMeetingAssistanceOffer: decide, markMeetingOfferResearchQueued: markResearchQueued,
+    registerMeetingAssistanceListener: (value: ((id: string) => void) | null) => { listener = value; },
+    registerMeetingAssistanceScanPort: (value: MeetingAssistanceScanPort | null) => { port = value; } };
 }
 
 const coordinator = createMeetingAssistanceCoordinator({ directory: path.join(BASE_DIR, 'state', 'meeting-capture', 'assistance'), readMeeting: loadRecallMeetingById });
 export const { getMeetingAssistance, setMeetingAssistance, requestMeetingAssistanceCheck, checkMeetingAssistance,
-  prepareMeetingLookup, readPreparedMeetingLookup, decideMeetingAssistanceOffer, registerMeetingAssistanceScanPort } = coordinator;
+  prepareMeetingLookup, readPreparedMeetingLookup, decideMeetingAssistanceOffer, registerMeetingAssistanceScanPort,
+  markMeetingOfferResearchQueued, registerMeetingAssistanceListener } = coordinator;

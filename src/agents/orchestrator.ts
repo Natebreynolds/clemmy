@@ -35,6 +35,7 @@ import {
   workerPacketMcpToolScope,
 } from './external-mcp-scope-lock.js';
 import { harnessInstructions } from './harness-context.js';
+import { meetingResearchSource } from '../integrations/recall/meeting-research-boundary.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { bindAgentRebuildContext } from './agent-rebuild-context.js';
 import { bindAgentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
@@ -2065,6 +2066,8 @@ export function projectNativeHintPresentation(input: {
 export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOptions = {}): Promise<
   Agent<RuntimeContextValue, any>
 > {
+  const researchEvidenceOnly = Boolean(options.sessionId && meetingResearchSource(options.sessionId, options.sourceUserSeq));
+  if (researchEvidenceOnly) options = { ...options, allowedToolNames: [], allowToolJit: false, hostPlainConversation: true };
   // Phase 3 architecture (2026-05-20, "single agent"): the Orchestrator
   // IS the agent. Sub-agents are gone. The Orchestrator carries the
   // union of action tools that used to be split across Researcher /
@@ -4565,6 +4568,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
     ? ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN
     : rubricChoice.instructions;
   const instructions = harnessInstructions(acceptedActionRubric, {
+    ...(researchEvidenceOnly ? { evidenceOnly: true as const } : {}),
     // The agent this session works in: stable for the session, so it sits
     // with the rubric before the cache boundary.
     agentInstructions: sessionMountContext(sessionMount) || undefined,

@@ -1,4 +1,6 @@
 import { registerMeetingAssistanceRoutes } from './meeting-assistance-routes.js';
+import { registerMeetingResearchRoutes } from './meeting-research-routes.js';
+import { installMeetingResearchService } from '../integrations/recall/meeting-research-service.js';
 import { installMeetingAssistanceModel } from '../integrations/recall/meeting-assistance-model.js';
 import { requestMeetingAssistanceCheck, readPreparedMeetingLookup, type PreparedMeetingLookup } from '../integrations/recall/meeting-assistance.js';
 import { verifyMeetingLookupChat, isAcceptedMeetingLookup } from '../integrations/recall/meeting-assistance-chat.js';
@@ -10511,6 +10513,8 @@ export function registerConsoleRoutes(
   try { recoverPendingRecallSdkUploads(); } catch { /* completion/status can retry */ }
 
   installMeetingAssistanceModel();
+  installMeetingResearchService();
+  registerMeetingResearchRoutes(app, isAuthorized);
   const isLookupAccepted = (packet: PreparedMeetingLookup): boolean => {
     const receipt = getHarnessChatRequestReceipt(packet.clientRequestId);
     const attempt = receipt ? getLatestHarnessRunAttemptByRunId(receipt.sessionId, receipt.runId) : null;

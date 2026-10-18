@@ -525,6 +525,32 @@ function meetingLookupOwnerQuestion(value: unknown, sessionId?: string): string 
   return shown.question;
 }
 
+/** A host-created private research source displays its question, while every
+ * acceptance, replay and objective reader keeps the full evidence packet. */
+function meetingResearchOwnerQuestion(value: unknown, sessionId?: string): string | null {
+  if (!sessionId || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const data = value as Record<string, unknown>;
+  if (data.source !== 'meeting_research' || data.synthetic === true || typeof data.text !== 'string'
+    || data.text !== data.displayText || data.text.length > 100_000) return null;
+  const reference = data.meetingResearchReference as Record<string, unknown> | undefined;
+  const hash = (input: string) => createHash('sha256').update(input).digest('hex');
+  if (!reference || typeof reference !== 'object' || Array.isArray(reference)
+    || Object.keys(reference).sort().join(',') !== 'grantDigest,grantRevision,jobId,meetingId'
+    || typeof reference.meetingId !== 'string' || !reference.meetingId || reference.meetingId.length > 512
+    || typeof reference.jobId !== 'string' || !/^[a-f0-9]{64}$/.test(reference.jobId)
+    || typeof reference.grantDigest !== 'string' || !/^[a-f0-9]{64}$/.test(reference.grantDigest)
+    || !Number.isSafeInteger(reference.grantRevision) || Number(reference.grantRevision) <= 0
+    || data.clientRequestId !== `meeting-research-${reference.jobId}` || data.requestId !== data.clientRequestId
+    || sessionId !== `sess-desktop-${hash(JSON.stringify(data.clientRequestId)).slice(0, 24)}`
+    || data.meetingResearchInputDigest !== hash(data.text)) return null;
+  try {
+    const packet = JSON.parse(data.text.slice(data.text.lastIndexOf('\n') + 1)) as Record<string, unknown>;
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet) || packet.meetingId !== reference.meetingId
+      || typeof packet.question !== 'string' || !packet.question.trim() || packet.question.length > 500) return null;
+    return packet.question;
+  } catch { return null; }
+}
+
 /** The owner's message as a reopened conversation shows it. Display only —
  *  replay and resume compare the recorded text through publicUserInputText.
  *  A card answer (a button, not written words) reads as the owner's answer;
@@ -537,7 +563,7 @@ export function ownerBubbleText(value: unknown, sessionId?: string): string {
       if (data.decision === 'reject') return APPROVAL_ANSWER_WORDS.reject;
     }
   }
-  return meetingLookupOwnerQuestion(value, sessionId) ?? publicUserInputText(value);
+  return meetingLookupOwnerQuestion(value, sessionId) ?? meetingResearchOwnerQuestion(value, sessionId) ?? publicUserInputText(value);
 }
 
 function compactKey(value: string): string {
@@ -1323,7 +1349,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         return { ...selected(data, ['synthetic', 'source', 'sourceId', 'sourceLabel', 'deliveryPhase']),
           ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
       }
-      const input = meetingLookupOwnerQuestion(data, event.sessionId) ?? publicUserInputText(data);
+      const input = meetingLookupOwnerQuestion(data, event.sessionId) ?? meetingResearchOwnerQuestion(data, event.sessionId) ?? publicUserInputText(data);
       const taskMode = publicTaskMode(data.taskMode);
       return input ? { text: input, ...answerWords(input), ...(taskMode ? { taskMode } : {}) } : null;
     }

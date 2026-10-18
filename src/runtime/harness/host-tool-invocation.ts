@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { meetingResearchToolRefusal } from '../../integrations/recall/meeting-research-boundary.js';
 import type { McpToolScope } from '../mcp-tool-scope.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import pino from 'pino';
@@ -1208,6 +1209,8 @@ export async function invokeHostToolCall<T>(
   input: InvokeHostToolCallInput<T>,
 ): Promise<HostToolInvocationResult<T>> {
   assertRecoveryActivationOwned();
+  const researchRefusal = meetingResearchToolRefusal(input.identity.sessionId, input.identity.sourceUserSeq);
+  if (researchRefusal) throw new HostToolInvocationAuthorityError(researchRefusal);
   const modelCallId = exactModelCallId(input.identity.modelCallId);
   if (
     !input.identity.sessionId.trim()

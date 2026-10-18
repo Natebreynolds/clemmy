@@ -1,4 +1,5 @@
 import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
+import { meetingResearchToolRefusal } from '../../integrations/recall/meeting-research-boundary.js';
 import { retainedResultWayThrough } from './retained-result-routes.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4363,6 +4364,9 @@ export function wrapToolForHarness<T extends WrappableTool>(
       input: unknown,
       details?: unknown,
     ): Promise<unknown> => {
+      const researchContext = harnessRunContextStorage.getStore();
+      const researchRefusal = researchContext && meetingResearchToolRefusal(researchContext.sessionId, researchContext.sourceUserSeq);
+      if (researchRefusal) throw new Error(researchRefusal);
       // SDK passes raw JSON string to invoke. Parse for our internal
       // classification (gate + guardrail). Fail-open on parse error.
       let parsedInput: unknown = input;
@@ -5050,6 +5054,8 @@ export function wrapToolForHarness<T extends WrappableTool>(
   const originalExecute = tool.execute!;
   const wrappedExecute = async (input: unknown, runContext?: unknown): Promise<unknown> => {
     const ctx = harnessRunContextStorage.getStore();
+    const researchRefusal = ctx && meetingResearchToolRefusal(ctx.sessionId, ctx.sourceUserSeq);
+    if (researchRefusal) throw new Error(researchRefusal);
     const executeCallId = `harness-${randomUUID()}`;
     const settlementNonce = settlementNonceForInvocation(
       ctx?.sessionId,

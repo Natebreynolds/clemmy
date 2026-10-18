@@ -21,6 +21,27 @@ import {
 import { BoundaryError } from '../boundary-error.js';
 import { __setToolkitCatalogForTests } from '../../integrations/composio/toolkit-identity.js';
 
+test('private meeting research shows the question without changing its accepted objective or evidence', () => {
+  const hash = (input: string) => createHash('sha256').update(input).digest('hex');
+  const meetingId = 'controlled-meeting'; const question = 'What is the approved fixture launch date?';
+  const jobId = 'c'.repeat(64); const clientRequestId = `meeting-research-${jobId}`;
+  const sessionId = `sess-desktop-${hash(JSON.stringify(clientRequestId)).slice(0, 24)}`;
+  const input = `Exact complete permission and task.\n${JSON.stringify({ meetingId, question, evidence: { documents: ['retained evidence'] } })}`;
+  const data = { source: 'meeting_research', text: input, displayText: input, requestId: clientRequestId, clientRequestId,
+    meetingResearchInputDigest: hash(input), meetingResearchReference: { meetingId, jobId, grantRevision: 1, grantDigest: 'a'.repeat(64) } };
+  const before = structuredClone(data);
+  assert.equal(ownerBubbleText(data, sessionId), question);
+  assert.equal(publicUserInputText(data), input);
+  assert.equal(ownerBubbleText(data, 'foreign'), input);
+  for (const change of [{ source: 'desktop' }, { meetingResearchInputDigest: 'b'.repeat(64) }, { clientRequestId: 'other' },
+    { meetingResearchReference: { ...data.meetingResearchReference, grantRevision: 0 } }, { displayText: 'changed' }]) {
+    assert.notEqual(ownerBubbleText({ ...data, ...change }, sessionId), question);
+  }
+  const projected = projectHarnessEventForPublic({ ...event('user_input_received', data), sessionId, role: 'user' });
+  assert.deepEqual(projected?.data, { text: question });
+  assert.deepEqual(data, before);
+});
+
 test('typed empty stop accepts only the closed host boundary reason and publishes no raw diagnostic', () => {
   const known = new BoundaryError({ kind: 'model.empty_completion', retryable: true,
     userMessage: 'private or misleading provider words', operatorMessage: 'PRIVATE DIAGNOSTIC' });

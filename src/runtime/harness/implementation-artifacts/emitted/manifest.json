@@ -482,6 +482,9 @@
         "src/runtime/harness/accepted-task-mode.ts": {
           "bytes": 7458
         },
+        "src/integrations/recall/meeting-research-boundary.ts": {
+          "bytes": 3095
+        },
         "src/shared/workflow-conversation.ts": {
           "bytes": 1692
         },
@@ -1203,7 +1206,7 @@
           "bytes": 6165
         },
         "src/runtime/harness/byo-prompt-layout.ts": {
-          "bytes": 17638
+          "bytes": 20141
         },
         "src/runtime/harness/byo-model.ts": {
           "bytes": 70024
@@ -1284,7 +1287,7 @@
           "bytes": 114643
         },
         "src/memory/facts.ts": {
-          "bytes": 126405
+          "bytes": 126838
         },
         "src/memory/authoritative-sources.ts": {
           "bytes": 6163
@@ -1950,7 +1953,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 47394
+          "bytes": 48439
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -2016,7 +2019,7 @@
           "bytes": 1655
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 112556
+          "bytes": 112851
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 27688
@@ -2370,7 +2373,7 @@
           "bytes": 44828
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 45211
+          "bytes": 46211
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -2598,7 +2601,7 @@
           "bytes": 2115
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 266886
+          "bytes": 267301
         },
         "src/runtime/harness/connection-agent-rebuild.ts": {
           "bytes": 5591
@@ -2820,7 +2823,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 823846
+          "bytes": 825449
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -3858,13 +3861,13 @@
           "bytes": 9567
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 257490
+          "bytes": 258330
         },
         "src/runtime/codex-dispatcher.ts": {
           "bytes": 5534
         },
         "src/runtime/harness/codex-model.ts": {
-          "bytes": 98815
+          "bytes": 99904
         },
         "src/runtime/harness/router-model.ts": {
           "bytes": 24033
@@ -3882,7 +3885,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 98350
+          "bytes": 100448
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823
@@ -4400,6 +4403,9 @@
         "src/runtime/harness/accepted-task-mode.ts": {
           "bytes": 7458
         },
+        "src/integrations/recall/meeting-research-boundary.ts": {
+          "bytes": 3095
+        },
         "src/shared/workflow-conversation.ts": {
           "bytes": 1692
         },
@@ -5121,7 +5127,7 @@
           "bytes": 6165
         },
         "src/runtime/harness/byo-prompt-layout.ts": {
-          "bytes": 17638
+          "bytes": 20141
         },
         "src/runtime/harness/byo-model.ts": {
           "bytes": 70024
@@ -5202,7 +5208,7 @@
           "bytes": 114643
         },
         "src/memory/facts.ts": {
-          "bytes": 126405
+          "bytes": 126838
         },
         "src/memory/authoritative-sources.ts": {
           "bytes": 6163
@@ -5868,7 +5874,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 47394
+          "bytes": 48439
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -5934,7 +5940,7 @@
           "bytes": 1655
         },
         "src/runtime/harness/host-tool-invocation.ts": {
-          "bytes": 112556
+          "bytes": 112851
         },
         "src/runtime/harness/async-read-refinement-executor.ts": {
           "bytes": 27688
@@ -6288,7 +6294,7 @@
           "bytes": 44828
         },
         "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 45211
+          "bytes": 46211
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -6516,7 +6522,7 @@
           "bytes": 2115
         },
         "src/agents/orchestrator.ts": {
-          "bytes": 266886
+          "bytes": 267301
         },
         "src/runtime/harness/connection-agent-rebuild.ts": {
           "bytes": 5591
@@ -6738,7 +6744,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 823846
+          "bytes": 825449
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -7776,13 +7782,13 @@
           "bytes": 9567
         },
         "src/runtime/harness/brackets.ts": {
-          "bytes": 257490
+          "bytes": 258330
         },
         "src/runtime/codex-dispatcher.ts": {
           "bytes": 5534
         },
         "src/runtime/harness/codex-model.ts": {
-          "bytes": 98815
+          "bytes": 99904
         },
         "src/runtime/harness/router-model.ts": {
           "bytes": 24033
@@ -7800,7 +7806,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 98350
+          "bytes": 100448
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 95823

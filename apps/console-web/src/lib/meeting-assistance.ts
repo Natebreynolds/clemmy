@@ -4,7 +4,7 @@ import { postChat } from './chat';
 export interface MeetingHelpOffer {
   id: string; digest: string; question: string; why: string; quote: string;
   segmentIds: string[]; sourceDigest: string; createdAt: number; expiresAt: number;
-  state: 'open' | 'lookup_prepared' | 'dismissed' | 'deferred' | 'expired';
+  state: 'open' | 'lookup_prepared' | 'dismissed' | 'deferred' | 'expired' | 'research_queued';
   lookup?: { sessionId: string; clientRequestId: string; accepted?: boolean | null };
 }
 export interface MeetingHelpState {

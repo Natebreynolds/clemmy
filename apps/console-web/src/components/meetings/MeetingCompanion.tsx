@@ -5,11 +5,12 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { ConversationThread } from '@/features/conversations/chat/ConversationThread';
+import { MeetingResearchControls } from './MeetingResearchControls';
 import { checkMeetingHelp, decideMeetingHelp, getMeetingHelp, meetingHelpNotice, setMeetingHelp, startMeetingHelp,
   type MeetingHelpOffer } from '@/lib/meeting-assistance';
 
-/** Owner-facing companion. No audio output, participant messages or automatic
- * lookups; accepted work uses the same thread, review and Stop as ordinary chat. */
+/** Owner-facing companion. Automatic private research needs saved, scoped
+ * permission; accepted work keeps the ordinary thread, review and Stop. */
 export function MeetingCompanion({ meetingId, active }: { meetingId: string; active: boolean }) {
   const qc = useQueryClient();
   const key = ['meeting-assistance', meetingId];
@@ -44,7 +45,7 @@ export function MeetingCompanion({ meetingId, active }: { meetingId: string; act
       <DogMark size={32} aria-hidden />
       <div className="min-w-0 flex-1">
         <h2 id="meeting-companion-title" className="text-h3 text-fg">Clem, alongside your meeting</h2>
-        <p className="mt-1 max-w-prose text-small text-muted">Suggestions stay here in Clem. A lookup uses memory and connected tools; nothing is sent to the meeting.</p>
+        <p className="mt-1 max-w-prose text-small text-muted">Suggestions and answers stay here in Clem. Nothing is sent to the meeting.</p>
       </div>
       {view && (active || view.enabled) && <Button className="col-start-2 justify-self-start sm:shrink-0" size="sm" variant="secondary" disabled={pending || state.isError}
         onClick={() => void act(async () => { qc.setQueryData(key, await setMeetingHelp(meetingId, !view.enabled, view.version)); })}>
@@ -84,6 +85,7 @@ export function MeetingCompanion({ meetingId, active }: { meetingId: string; act
         <ConversationThread key={conversation} sessionIdOverride={conversation} />
       </div>
     </div>}
+    <MeetingResearchControls key={`research-${meetingId}`} meetingId={meetingId} active={active} />
     {view?.skippedFinalSegments ? <p className="mt-3 text-caption text-muted">Some transcript lines were outside the live check. Suggestions are not a complete meeting review.</p> : null}
   </section>;
 }

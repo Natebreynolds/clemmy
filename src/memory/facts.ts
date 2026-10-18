@@ -2026,8 +2026,12 @@ interface PromptPolicies {
 
 /** The compiled standing policies as the prompt renders them, in the store's
  *  own deterministic order. */
-function loadPromptPolicies(): PromptPolicies {
+function loadPromptPolicies(strict = false): PromptPolicies {
   try {
+    // An evidence-only reader cannot treat an unreadable scope as permission
+    // to import another project's rules. Ordinary turns retain their existing
+    // conservative rule fallback below.
+    if (strict && currentMemoryReadScope() !== 'unrestricted') scopedRecords('fact');
     // A standing rule that cannot be checked against a scope still applies.
     const policies = listMemoryPolicies()
       .filter((policy) => recordVisible('fact', policy.fact_id, currentMemoryReadScope(), 'everything'))
@@ -2043,7 +2047,8 @@ function loadPromptPolicies(): PromptPolicies {
         .map((policy) => policy.fact_id)),
       pinned: policies.map((policy) => getFactWhateverItsScope(policy.fact_id)).filter((fact): fact is ConsolidatedFact => Boolean(fact)),
     };
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // Partially migrated fallback: keep prompt assembly available, but never
     // claim deterministic enforcement without the persisted compiled contract.
     let pinned: ConsolidatedFact[] = [];
@@ -2143,14 +2148,14 @@ function fitPolicyRows(
  * an impression: the same bytes ride every request, and counting them would
  * inflate every rule's exposure by the number of turns.
  */
-export function renderCorePoliciesForInstructions(): CorePolicyRender {
+export function renderCorePoliciesForInstructions(options: { strict?: boolean } = {}): CorePolicyRender {
   const empty: CorePolicyRender = {
     text: '',
     refs: [],
     counts: { dispatchConstraint: 0, coreProfile: 0, promptInstruction: 0, standingPreference: 0 },
   };
   let policies: PromptPolicies;
-  try { policies = loadPromptPolicies(); } catch { return empty; }
+  try { policies = loadPromptPolicies(options.strict === true); } catch (error) { if (options.strict) throw error; return empty; }
   const byGroup: Record<PolicyGroup, ConsolidatedFact[]> = {
     dispatch_constraint: [], prompt_instruction: [], core_profile: [], standing_preference: [],
   };

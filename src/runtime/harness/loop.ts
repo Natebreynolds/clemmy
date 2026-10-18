@@ -1,5 +1,6 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { isPermanentActivationError } from './permanent-activation-error.js';
+import { assertMeetingResearchModelAllowed, meetingResearchSource } from '../../integrations/recall/meeting-research-boundary.js';
 import { priorTerminalDeliveryResumes } from './terminal-delivery-resume-ledger.js';
 import { approvalCardAsk } from './approval-card-voice.js';
 import { MODEL_REFUSED_BLOCKED_REASON, refusedModelPublicText, refusedRequestedModel } from './model-refusal.js';
@@ -6764,7 +6765,13 @@ export async function runConversation(
       // promise lets a selection change in the intervening microtask rewrite
       // what the newly accepted request began with.
       if (!replaySource) captureFreshSourceSessionContext({ sessionId: options.sessionId, sourceUserSeq });
-      const acceptedOptions = { ...options, sourceUserSeq };
+      const research = meetingResearchSource(options.sessionId, sourceUserSeq);
+      if (research) assertMeetingResearchModelAllowed(options.sessionId, sourceUserSeq);
+      const acceptedOptions = { ...options, sourceUserSeq, ...(research ? {
+        suppressAutomaticMemoryForRequest: true as const, suppressMemoryCapture: true as const,
+        learningPolicy: { version: 1 as const, mode: 'exclude' as const, reason: 'owner_opt_out' as const },
+        mcpToolScope: null,
+      } : {}) };
       const key = `${options.sessionId}:${sourceUserSeq}`;
       const prior = activeHostConversations.get(key);
       if (prior) return prior;
@@ -7013,7 +7020,7 @@ async function runConversationWithinRuntimeConfig(
       };
     }
   }
-  const hostPlainConversation = hostOwnsFreshTurn && !['plan', 'execute'].includes(acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind ?? 'normal')
+  const hostPlainConversation = Boolean(meetingResearchSource(options.sessionId, sourceUserSeq)) || hostOwnsFreshTurn && !['plan', 'execute'].includes(acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind ?? 'normal')
     && freshHostConversationSurfaceOnly({
     sessionId: options.sessionId,
     sourceUserSeq,
@@ -11355,6 +11362,11 @@ export function goalObjectiveString(goal: PlanProposal): string | undefined {
 }
 
 export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
+  if (meetingResearchSource(options.sessionId, options.sourceUserSeq)) {
+    assertMeetingResearchModelAllowed(options.sessionId, options.sourceUserSeq);
+    options = { ...options, suppressAutomaticMemoryForRequest: true, suppressMemoryCapture: true,
+      skipAutomaticMemoryPrimer: true, plainConversationSurface: true, mcpToolScope: null };
+  }
   const activeOptions = { ...options, hostActivationStartedAt: options.hostActivationStartedAt ?? Date.now() };
   if (options.runRunner === undefined && options.sourceUserSeq
     && isHostTurnEngine(options.turnEngine ?? selectTurnEngine({ sessionKind: getSession(options.sessionId)?.kind ?? '' }))) {
@@ -11366,6 +11378,7 @@ export async function runTurn(options: RunTurnOptions): Promise<RunTurnResult> {
 }
 
 async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTurnResult> {
+  const researchEvidenceOnly = Boolean(meetingResearchSource(options.sessionId, options.sourceUserSeq));
   const row = getSession(options.sessionId);
   if (!row) throw new Error(`unknown session: ${options.sessionId}`);
   const session = HarnessSession.load(options.sessionId);
@@ -12320,7 +12333,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   // specific.
   rememberTurnMemoryForJudges(options.sessionId, turnMemoryPrimer.text);
   const contextPacket = canonicalContext.turn;
-  if (contextPacket.skills.length > 1) {
+  if (!researchEvidenceOnly && contextPacket.skills.length > 1) {
     markTurnClock(options.sessionId, 'skill_rerank_started');
     try {
       const { rerankNamedCandidatesWithJev } = await import('../jev/control-plane.js');
@@ -12342,7 +12355,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
     port: PreflightConversationPort;
     settledProceedAuthor?: Promise<string>;
   } | null = null;
-  if ((!usesHostTurnEngine || hostSourceConfirmationRequired)
+  if (!researchEvidenceOnly && (!usesHostTurnEngine || hostSourceConfirmationRequired)
     && options.internalContinuation !== true
     && (contextPacket.preflightPhase === 'align' || hostSourceConfirmationRequired)) {
     if (Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0) {
@@ -12399,7 +12412,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   // never delay or break it.
   let turnOpenness: TurnOpenness | null = null;
   if (
-    !usesHostTurnEngine
+    !researchEvidenceOnly && !usesHostTurnEngine
     &&
     session.sessionRow.kind === 'chat'
     && !declinedContinuation
@@ -12554,6 +12567,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
      *  the reading is published here. */
     holdReading?: (publish: PromptReadingPublisher) => void;
   }) => {
+    assertMeetingResearchModelAllowed(options.sessionId, sourceUserSeq);
     let modelData = args.modelData;
     // Estimated tokens per component, measured BEFORE any per-round append so
     // history is only the transcript; every appended item is its own entry.
@@ -12798,7 +12812,7 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
         composedTexts.currentMessage = typeof options.input === 'string' ? options.input : '';
       }
 
-      const contextPacketText = [
+      const contextPacketText = researchEvidenceOnly ? options.continuationSteer ?? '' : [
         contextPacket.text,
         opennessBlock,
         sameTurnPreamble

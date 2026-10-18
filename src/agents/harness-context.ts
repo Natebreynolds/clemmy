@@ -1,4 +1,4 @@
-import { withSessionMemoryScope } from '../memory/memory-scope.js';
+import { withSessionMemoryScope, withMemoryReadScope } from '../memory/memory-scope.js';
 import { renderHostExecutionContext } from '../runtime/host-execution-context.js';
 import { delegatedWorkPointers } from '../projects/delegated-work-pointers.js';
 import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
@@ -667,6 +667,9 @@ export function renderMemoryCore(loaded?: LoadedMemoryContext): MemoryCore {
  * immediately on the next turn.
  */
 export function harnessInstructions(roleInstructions: string, opts?: {
+  /** Host-selected, evidence-fed meeting research. Retains standing rules but
+   * never loads vault/profile/focus/task facts or registers a memory tail. */
+  evidenceOnly?: true;
   sessionId?: string;
   sourceUserSeq?: number;
   focusInput?: string;
@@ -684,6 +687,17 @@ export function harnessInstructions(roleInstructions: string, opts?: {
    *  than masquerading as current-turn policy. */
   volatileMemoryInstructions?: string;
 }): () => string {
+  if (opts?.evidenceOnly) {
+    const policies = withMemoryReadScope({ projectId: null, agentKey: null, exact: true },
+      () => renderCorePoliciesForInstructions({ strict: true }));
+    const rendered = [roleInstructions, section('Autonomy', renderAutonomy()),
+      section('Standing instructions', policies.text),
+      'This meeting research turn uses only the evidence in its accepted request. No tool execution or automatic learning is authorized.',
+      'Saved standing instructions and profile guide behavior; they are not sources for answering the meeting question unless that fact is also in the selected evidence.',
+    ].filter(Boolean).join('\n\n');
+    return withInstructionMemory(() => rendered, [{ text: policies.text,
+      manifest: [manifestEntry('Standing instructions', 'core', policies.text, policies.refs)] }]);
+  }
   // One constructed Agent represents one accepted turn/step activation but
   // may make several model calls. Snapshot memory at construction so tool
   // results appended during that activation cannot silently rewrite the
