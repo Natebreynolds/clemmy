@@ -321,6 +321,7 @@ export function attemptSignalsFromShellExecutionOutcome(
       hostExecuted: true,
       mutating: shell.externalMutation,
       ...(shell.externalMutation ? { acknowledged: true } : {}),
+      ...((shell.savedLocalFiles ?? 0) > 0 ? { hostSavedLocalFiles: true } : {}),
     };
   }
   return {};

@@ -11118,6 +11118,7 @@ function settleFixtureBusinessCall(input: { sessionId: string; sourceUserSeq: nu
 /** Records one settled call with its executing tool and capability, as the ledger does. */
 function settleFixtureCall(input: { sessionId: string; sourceUserSeq: number; turn: number }, label: string, call: {
   tool: string; execution: 'provider_execution' | 'local_execution'; mutating: boolean; succeeded: boolean; requirementId?: string;
+  signals?: Parameters<typeof outcomes.classifyAttemptOutcome>[0];
 }) {
   const task = { ...input, acceptedTaskId: identities.acceptedTaskIdFor(input.sessionId, input.sourceUserSeq) };
   shadow.recordTurnGraphShadow({ identity: task });
@@ -11135,7 +11136,7 @@ function settleFixtureCall(input: { sessionId: string; sourceUserSeq: number; tu
     contract: { toolName: call.tool, args: { label } },
     execution: { kind: call.execution },
     result: { payload: call.succeeded ? { successful: true, data: {} } : { successful: false, error: { code: 'UPSTREAM_FAILURE' } } },
-    outcome: outcomes.classifyAttemptOutcome({ envelopeSuccessful: call.succeeded }),
+    outcome: outcomes.classifyAttemptOutcome(call.signals ?? { envelopeSuccessful: call.succeeded }),
     recovery: { businessCall: true, mutating: call.mutating, ...(call.requirementId ? { requirementId: call.requirementId } : {}) },
     observer: { lane: call.execution === 'local_execution' ? 'byo' : 'composio', turn: task.turn },
   } as never);
@@ -11198,6 +11199,21 @@ test('a browser page visit is reviewed at the read depth; a shell command or a w
   settleFixtureCall({ ...shell.context, turn: 1 }, 'stakes-shell', {
     tool: 'run_shell_command', execution: 'local_execution', mutating: true, succeeded: true });
   assert.equal(sourceWritesAtStake(shell.context), 1);
+
+  // Admitted as compute, seen to save a file: a write however it was spelled.
+  const script = acceptJudgedSource('stakes-shell-saved', 'TEST FIXTURE: save page 9 as a CSV');
+  settleFixtureCall({ ...script.context, turn: 1 }, 'stakes-shell-saved', {
+    tool: 'run_shell_command', execution: 'local_execution', mutating: false, succeeded: true,
+    requirementId: 'cap:local:run_shell_command:ordinary',
+    signals: { hostExecuted: true, mutating: false, hostSavedLocalFiles: true } });
+  assert.equal(sourceAttemptedWrites(script.context), 1, 'the review gets a write deadline');
+  assert.equal(sourceWritesAtStake(script.context), 1, 'and the full review: nothing kept the earlier bytes');
+  const read = acceptJudgedSource('stakes-shell-read', 'TEST FIXTURE: count the rows in the CSV');
+  settleFixtureCall({ ...read.context, turn: 1 }, 'stakes-shell-read', {
+    tool: 'run_shell_command', execution: 'local_execution', mutating: false, succeeded: true,
+    requirementId: 'cap:local:run_shell_command:ordinary', signals: { hostExecuted: true, mutating: false } });
+  assert.equal(sourceAttemptedWrites(read.context), 0);
+  assert.equal(sourceWritesAtStake(read.context), 0, 'a command that saved nothing stays a read');
 
   const created = acceptJudgedSource('stakes-workflow', 'TEST FIXTURE: create a weekly digest workflow');
   settleFixtureCall({ ...created.context, turn: 1 }, 'stakes-workflow', {

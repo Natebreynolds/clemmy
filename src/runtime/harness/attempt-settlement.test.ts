@@ -62,6 +62,22 @@ test('a command that leaves the machine and exits with its own failure answered;
   assert.notEqual(local.kind, 'uncertain_write', 'a local command that failed is not a write');
 });
 
+test('a command seen to save files settles with that fact; one that saved nothing settles as before', async () => {
+  const { attemptSignalsFromShellExecutionOutcome } = await import('./attempt-settlement.js');
+  const { classifyAttemptOutcome, HOST_EXECUTION_SAVED_LOCAL_FILES } = await import('./attempt-outcome.js');
+  const { classifyShellExecutionOutcome } = await import('../shell-execution-outcome.js');
+  const saved = classifyShellExecutionOutcome({ command: 'python3 - <<PY', externalMutation: false, exitCode: 0, savedLocalFiles: 1 });
+  assert.equal(saved.savedLocalFiles, 1);
+  const settled = classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome(saved));
+  assert.equal(settled.kind, 'succeeded');
+  assert.equal(settled.detail, HOST_EXECUTION_SAVED_LOCAL_FILES);
+  const read = classifyShellExecutionOutcome({ command: 'wc -l books.csv', externalMutation: false, exitCode: 0, savedLocalFiles: 0 });
+  assert.equal(read.savedLocalFiles, undefined);
+  assert.equal(classifyAttemptOutcome(attemptSignalsFromShellExecutionOutcome(read)).detail, 'host_execution');
+  const failed = classifyShellExecutionOutcome({ command: 'python3 x.py', externalMutation: false, exitCode: 1, stderr: 'Traceback', savedLocalFiles: 1 });
+  assert.equal(failed.savedLocalFiles, undefined, 'only a command that exited cleanly reports what it saved');
+});
+
 // "A string payload never settles success" is right about PROSE and wrong about
 // a serialized envelope. negativeStringEnvelope already parsed a JSON string to
 // settle successful:false, so an envelope claiming failure was trusted while the

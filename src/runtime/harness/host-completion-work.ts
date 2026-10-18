@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { getRunAttemptSourceUserEvent, openEventLog } from './eventlog.js';
 import { isToolMediaImageBlock } from './tool-media-content.js';
 import { acceptedTaskIdFor } from './attempt-identity.js';
+import { HOST_EXECUTION_SAVED_LOCAL_FILES } from './attempt-outcome.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { redeemSuccessfulSettlementResultForHost, redeemedReadIsExhausted } from './result-handle.js';
 import { TOOL_REGISTRY, toolReadsRetainedOutput, type LocalPlanningSemantics } from '../../tools/tool-registry.js';
@@ -139,8 +140,9 @@ export function sourceAttemptedWrites(input: {
   try {
     const row = openEventLog().prepare(`
       SELECT COUNT(*) AS n FROM logical_call_settlements
-       WHERE session_id = ? AND source_user_seq = ? AND mutating = 1
-    `).get(input.sessionId, input.sourceUserSeq) as { n: number } | undefined;
+       WHERE session_id = ? AND source_user_seq = ?
+         AND (mutating = 1 OR outcome_detail = ?)
+    `).get(input.sessionId, input.sourceUserSeq, HOST_EXECUTION_SAVED_LOCAL_FILES) as { n: number } | undefined;
     return row?.n ?? 0;
   } catch {
     // Unknown is read as a write: the full review is the safe side.
@@ -192,18 +194,29 @@ function everyWayItRan(
  * that succeeded and kept the file's earlier bytes is not among them. Nor is
  * a restorable local execution such as a browser page visit, whatever its
  * outcome short of an uncertain write: it produced nothing to guard, and the
- * read-depth review still reads its receipt. An unreadable ledger counts as
- * one, so the full review is the safe side.
+ * read-depth review still reads its receipt. A command seen to save files is
+ * among them however its admission read it: nothing kept the files' earlier
+ * bytes. An unreadable ledger counts as one, so the full review is the safe
+ * side.
  */
 export function sourceWritesAtStake(input: {
   sessionId: string;
   sourceUserSeq: number;
 }): number {
   try {
-    return mutatingSettlements(input).filter(settledWriteIsAtStake).length;
+    return mutatingSettlements(input).filter(settledWriteIsAtStake).length + commandsThatSavedFiles(input);
   } catch {
     return 1;
   }
+}
+
+/** Calls admitted as compute that were seen to save local files. */
+function commandsThatSavedFiles(input: { sessionId: string; sourceUserSeq: number }): number {
+  const row = openEventLog().prepare(`
+    SELECT COUNT(*) AS n FROM logical_call_settlements
+     WHERE session_id = ? AND source_user_seq = ? AND mutating = 0 AND outcome_detail = ?
+  `).get(input.sessionId, input.sourceUserSeq, HOST_EXECUTION_SAVED_LOCAL_FILES) as { n: number } | undefined;
+  return row?.n ?? 0;
 }
 
 /** One settled mutating call that calls for the full review. A write refused

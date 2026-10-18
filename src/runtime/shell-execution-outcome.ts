@@ -74,6 +74,10 @@ export interface ShellExecutionOutcome {
   /** The same read with its reason on stderr only (a traceback, its own
    * check failing): answered, though it carries no evidence. */
   answeredOnStderr?: boolean;
+  /** Files a zero-exit command was seen to save on this machine: a path it
+   * names that appeared or changed while it ran. Observed, never inferred
+   * from the command's spelling. */
+  savedLocalFiles?: number;
 }
 
 export interface ClassifyShellExecutionInput {
@@ -84,6 +88,7 @@ export interface ClassifyShellExecutionInput {
   stderr?: string;
   timedOut?: boolean;
   spawnErrorCode?: string;
+  savedLocalFiles?: number;
 }
 
 const PACKAGE_RUNNER_RE = /(?:^|[;&|\n]\s*)(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?(?:npx(?:\s|$)|npm\s+exec(?:\s|$)|pnpm\s+(?:dlx|exec)(?:\s|$)|yarn\s+dlx(?:\s|$)|bunx(?:\s|$))/i;
@@ -216,6 +221,7 @@ export function classifyShellExecutionOutcome(input: ClassifyShellExecutionInput
     externalMutation: input.externalMutation,
     exitCode,
     executable,
+    ...((input.savedLocalFiles ?? 0) > 0 ? { savedLocalFiles: input.savedLocalFiles } : {}),
   };
 }
 
