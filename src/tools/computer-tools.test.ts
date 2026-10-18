@@ -553,6 +553,27 @@ test('shellWriteLeadPaths: a file written through a variable or an output flag i
   assert.deepEqual(shellWriteLeadPaths('make build 2>&1', '/spawn/cwd'), []);
 });
 
+test('a script that saves a file it names in its own code is seen to save it; a path it only reads is not', async () => {
+  const { shellWriteLeads, markShellNamedLeads, savedShellLeadFiles, shellSavedFileIsScratch } = await import('./computer-tools.js');
+  const dir = path.join(tmpHome, 'script-saves');
+  mkdirSync(dir, { recursive: true });
+  const input = path.join(dir, 'books.csv');
+  writeFileSync(input, 'title,price\n');
+  const out = path.join(dir, 'page9-books.csv');
+  // The live 2026-10-17 shape: the output path lives only inside the heredoc.
+  const command = `cd /tmp && python3 - <<'PY'\nimport csv\nrows=list(csv.reader(open('${input}')))\n`
+    + `with open('${out}','w',newline='',encoding='utf-8') as f:\n    csv.writer(f).writerows(rows)\nPY`;
+  const leads = shellWriteLeads(command, tmpHome);
+  assert.ok(leads.some((lead) => lead.role === 'named' && lead.candidates.includes(out)), JSON.stringify(leads));
+  const marks = markShellNamedLeads(leads);
+  const started = Date.now();
+  writeFileSync(out, 'title,price\n');
+  assert.deepEqual(savedShellLeadFiles(leads, marks, started), [out], 'the file the script wrote, not the one it read');
+  assert.equal(shellSavedFileIsScratch(path.join(os.tmpdir(), 'page.html')), true);
+  assert.equal(shellSavedFileIsScratch('/tmp/page.html'), true);
+  assert.equal(shellSavedFileIsScratch('/Users/owner/clem-fixtures/out/page9.csv'), false);
+});
+
 test('a file a shell command writes through a variable is recorded as saved; its stderr log is not', async () => {
   const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
   const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');

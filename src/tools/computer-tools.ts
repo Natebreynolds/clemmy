@@ -982,6 +982,28 @@ export interface ShellWriteLead {
   role: 'redirect' | 'named';
 }
 
+/** Absolute or home paths a script spells in quotes inside its own code (a
+ *  heredoc body, an inline program): `open('/…/out.csv', 'w')`. Live
+ *  2026-10-17: every page-scrape script saved its CSV this way and the shell
+ *  saw no file. Like any named path, one counts only when it appeared or
+ *  changed while the command ran. */
+function quotedScriptPaths(command: string): string[] {
+  return [...command.matchAll(/(['"])((?:~\/|\/)[^'"\n]{1,1022})\1/g)]
+    .map((match) => match[2]!)
+    .filter(pathLikeArgument)
+    .slice(0, 12);
+}
+
+/** A file in the system's temporary folders: a script's scratch (a page it
+ *  downloaded to parse), not something it made for the owner. */
+export function shellSavedFileIsScratch(file: string): boolean {
+  const resolved = path.resolve(file);
+  return [os.tmpdir(), '/tmp', '/private/tmp'].some((root) => {
+    const base = path.resolve(root);
+    return resolved.startsWith(base.endsWith(path.sep) ? base : base + path.sep);
+  });
+}
+
 export function shellWriteLeadPaths(command: string, cwd: string): string[][] {
   return shellWriteLeads(command, cwd).map((lead) => lead.candidates);
 }
@@ -1001,9 +1023,9 @@ export function shellWriteLeads(command: string, cwd: string): ShellWriteLead[] 
     .filter(pathLikeArgument);
   const assigned = [...variables.values()].filter(pathLikeArgument);
   const redirects = new Set(outputRedirectionTargets(body).slice(0, 10).map(expand));
-  const tokens = [...new Set([...redirects, ...[...named, ...assigned].map(expand)])]
+  const tokens = [...new Set([...redirects, ...quotedScriptPaths(command), ...[...named, ...assigned].map(expand)])]
     .filter((token) => !errorLogs.has(token))
-    .slice(0, 24);
+    .slice(0, 32);
   return tokens.flatMap((token) => {
     const candidates: string[] = [];
     for (const base of bases) {
@@ -1487,9 +1509,14 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
       // are LEADS, not truth: a redirect target counts when it exists with an
       // mtime at/after command start, and a path the command only names counts
       // only when it appeared or changed while the command ran.
+      // The same observed files, outside the temp folders, tell the
+      // settlement this command saved something, so its review weighs a
+      // write, whatever the command's spelling suggested before it ran.
+      let savedLocalFiles = 0;
       if ((code ?? 0) === 0) {
         try {
           for (const saved of savedShellLeadFiles(deliverableLeads, namedLeadMarks, commandStartedAtMs)) {
+            if (!shellSavedFileIsScratch(saved)) savedLocalFiles += 1;
             teeFileDeliverable(saved);
           }
         } catch { /* visibility must never affect the command result */ }
@@ -1526,6 +1553,7 @@ function runCommand(command: string, cwd: string, timeoutMs: number, runtime: Sh
           exitCode: code,
           stdout,
           stderr,
+          savedLocalFiles,
         }),
       });
     });

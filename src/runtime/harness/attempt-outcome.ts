@@ -269,6 +269,9 @@ export interface AttemptSignals {
    * only by the settlement seam, and only when no crossing left the machine.
    */
   hostExecuted?: boolean;
+  /** A command the host ran was seen to save files on this machine while it
+   * ran (observed on disk, not read from the command's spelling). */
+  hostSavedLocalFiles?: boolean;
   /** Nominal local read completion: returned bytes are content, not an error envelope. */
   hostReadCompleted?: boolean;
   /**
@@ -323,6 +326,10 @@ function outcome(
  * structural facts first, and text last — where it can only ever say "I don't
  * know", which authorizes nothing.
  */
+/** Settlement detail of a host-run command seen to save local files: a write
+ *  for the completion review, though its admission read it as compute. */
+export const HOST_EXECUTION_SAVED_LOCAL_FILES = 'host_execution_saved_files';
+
 export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome {
   // Nominal — the lane told us directly what happened.
   if (signals.cancelled) {
@@ -504,9 +511,10 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     // `hostExecuted` proves the CALL completed, not that the OPERATION did. A
     // typed non-write is already handled in the nominal section above, before
     // the generic MCP error flag could flatten it to `unknown`.
+    const detail = signals.hostSavedLocalFiles === true ? HOST_EXECUTION_SAVED_LOCAL_FILES : 'host_execution';
     return signals.emptyResult
-      ? outcome('empty_result', 'nominal', 'host_execution')
-      : outcome('succeeded', 'nominal', 'host_execution');
+      ? outcome('empty_result', 'nominal', detail)
+      : outcome('succeeded', 'nominal', detail);
   }
 
   // Text is last and cannot produce anything actionable — by design.
