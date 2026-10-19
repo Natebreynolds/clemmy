@@ -449,3 +449,25 @@ test('one request gets one card per distinct payload hash and collapses same-pay
     'reconciliation remains idempotent after both cards are surfaced',
   );
 });
+
+test('an approval decision on another card does not supersede the resumed task\'s queued action', () => {
+  // Windows tester trace 2026-10-19: the owner approved one step from the
+  // desktop chat ("Approve apr-…", stamped desktop_approval, not synthetic),
+  // the resumed task queued its next step, and that step's card never opened:
+  // the approval read as a newer request, so the queue was skipped.
+  for (const decision of [
+    { approvalId: 'apr-fixture-desktop', decision: 'approve', source: 'desktop_approval' },
+    { approvalId: 'apr-fixture-phone', decision: 'approve', source: 'mobile_approval' },
+    { approvalId: 'apr-fixture-resume', decision: 'approve', source: 'approval_resume', synthetic: true },
+  ]) {
+    const { session, source, record } = queueRequestOwnedSend('request_now');
+    appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received',
+      data: { text: `Approve ${decision.approvalId}.`, displayText: `Approve ${decision.approvalId}`, ...decision } });
+    const transitions = queuedApprovalTransitionsForRequest(session.id, source.seq);
+    assert.deepEqual(transitions.map((transition) => transition.record.id), [record.id], decision.source);
+    appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'Actually, start something new.' } });
+    assert.deepEqual(queuedApprovalTransitionsForRequest(session.id, source.seq), [],
+      `${decision.source}: a genuinely new request still supersedes`);
+  }
+});

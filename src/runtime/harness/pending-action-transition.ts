@@ -112,6 +112,19 @@ function exactPendingApprovalRow(
     : null;
 }
 
+/** A decision on an approval card resumes work; it is not a newer request.
+ * The shapes admission reads as an approval decision: a resume source the
+ * host minted, or the owner's own words stamped as a decision on one card.
+ * Windows tester trace 2026-10-19: an approval typed in the desktop chat read
+ * as a newer request, so the resumed task's next queued step never got its
+ * card and Clem asked the owner for details she already had. */
+function isApprovalDecisionInput(data: Record<string, unknown>): boolean {
+  if (typeof data.approvalId !== 'string' || !data.approvalId) return false;
+  if (data.synthetic === true && data.source === 'approval_resume') return true;
+  return (data.decision === 'approve' || data.decision === 'reject')
+    && (data.source === 'desktop_approval' || data.source === 'mobile_approval');
+}
+
 /**
  * Return one transition per distinct approval-bound payload queued by the
  * current user request. Same-payload retries are folded into the transition's
@@ -130,6 +143,7 @@ export function queuedApprovalTransitionsForRequest(
     }).some((event) => (
       event.seq > sourceUserSeq
       && event.data.synthetic !== true
+      && !isApprovalDecisionInput(event.data)
     ));
     if (newerUserRequestExists) return [];
 
