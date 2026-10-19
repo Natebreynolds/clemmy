@@ -488,6 +488,7 @@ import { HarnessSession } from '../runtime/harness/session.js';
 
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
 import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
+import { readInstallQuiescence, unverifiedInstallQuiescence } from './install-quiescence.js';
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { approvalConfirmationAlreadyAsked, approvalInquiryQuestion, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
@@ -9304,20 +9305,16 @@ export function registerConsoleRoutes(
   });
 
   /**
-   * Returns a snapshot of "is Clementine actively working right now?"
-   * Used by the desktop auto-updater to decide whether `quitAndInstall`
-   * would interrupt user work. Counts:
-   *   - Non-chat sessions with status active/paused (workflow + execution + agent)
-   *   - Pending harness approvals
-   *   - Background tasks in flight (running / pending / awaiting_approval)
-   *
-   * Chat sessions are excluded — they stay `active` between turns by
-   * design (see project_session_status_semantics) and would otherwise
-   * always block the update. A multi-hour workflow IS something we
-   * want to preserve; a quiet chat dock isn't.
+   * The installed updater's total/summary describe current durable work
+   * owners across all session kinds, with an explicit warning on incomplete
+   * evidence. The retained session/activity fields remain for display only:
+   * an active/paused session row alone never establishes current execution.
    */
   app.get('/api/console/active-work', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    let install: ReturnType<typeof readInstallQuiescence>;
+    try { install = readInstallQuiescence(); }
+    catch { install = unverifiedInstallQuiescence('install_inventory_unreadable'); }
     try {
       const pendingApprovals = approvalRegistry.listPending({ status: 'pending' })
         .filter(approvalRegistry.isFormalApprovalSurface);
@@ -9326,7 +9323,6 @@ export function registerConsoleRoutes(
       const activeBackgroundTasks = listBackgroundTasks().filter(
         (task) => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval',
       );
-      const total = activeNonChatSessions.length + pendingApprovals.length + activeBackgroundTasks.length;
       const activeWorkItems = [
         ...activeNonChatSessions.map((session) => ({
           type: 'session',
@@ -9369,15 +9365,21 @@ export function registerConsoleRoutes(
         summaryParts.push(`${activeBackgroundTasks.length} background task${activeBackgroundTasks.length === 1 ? '' : 's'}`);
       }
       res.json({
-        total,
+        // The native updater already consumes total/summary. Keep retained
+        // activity fields for their display consumers, but never call those
+        // historical sessions current execution ownership.
+        ...install,
         activeSessions: activeNonChatSessions.length,
         pendingApprovals: pendingApprovals.length,
         activeBackgroundTasks: activeBackgroundTasks.length,
         items: activeWorkItems,
-        summary: summaryParts.join(', ') || 'no active work',
+        trackedActivitySummary: summaryParts.join(', ') || 'no tracked activity',
       });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    } catch {
+      // Shipped native clients fail open on HTTP/probe failure. An unreadable
+      // activity store must therefore be an explicit conservative 200 warning.
+      res.json({ ...unverifiedInstallQuiescence('tracked_activity_unreadable', install),
+        activeSessions: 0, pendingApprovals: 0, activeBackgroundTasks: 0, items: [], activityAvailable: false });
     }
   });
 
