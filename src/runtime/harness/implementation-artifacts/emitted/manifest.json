@@ -621,7 +621,7 @@
           "bytes": 417
         },
         "src/runtime/harness/local-file-revision.ts": {
-          "bytes": 16574
+          "bytes": 20476
         },
         "src/runtime/harness/host-local-write-commit.ts": {
           "bytes": 47691
@@ -2889,7 +2889,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 741910
+          "bytes": 744609
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3861,7 +3861,7 @@
           "bytes": 152352
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 111064
+          "bytes": 114263
         },
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3782
@@ -4584,7 +4584,7 @@
           "bytes": 417
         },
         "src/runtime/harness/local-file-revision.ts": {
-          "bytes": 16574
+          "bytes": 20476
         },
         "src/runtime/harness/host-local-write-commit.ts": {
           "bytes": 47691
@@ -6852,7 +6852,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 741910
+          "bytes": 744609
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7824,7 +7824,7 @@
           "bytes": 152352
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 111064
+          "bytes": 114263
         },
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3782
