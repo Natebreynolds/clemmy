@@ -1858,6 +1858,28 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
           frame.refusalKind = 'work_authority_unavailable';
           return refuse(frame.refusalKind, fallbackAuthority.reason);
         }
+        // A REVERSIBLE LOCAL CHANGE THE FROZEN PLAN DID NOT LIST IS SHAPE,
+        // NOT SAFETY (owner 2026-09-04: "a SHAPE failure must not terminate a
+        // turn"). Live 2026-10-16: a Space build froze two steps, then needed
+        // a workflow for its approve buttons; 52 workflow_create calls were
+        // refused as "not in the frozen proposal" over 48 minutes while the
+        // next edge said to correct the arguments. The host's exact per-call
+        // local admission, the same one a plan-free local write runs on,
+        // still decides this call; it runs unbound and discharges no frozen
+        // step. Outside, irreversible and unadmitted work keeps the plan.
+        if (
+          resolvedRuntimeEffect === 'local_write'
+          && admission.kind === 'work_requirement_unknown'
+          && inspectCurrentExactLocalCallAdmission({
+            sessionId: resolved.sessionId,
+            sourceUserSeq: resolved.sourceUserSeq as number,
+            logicalToolCallId: resolved.logicalToolCallId,
+            toolName: resolved.targetName,
+            args: resolved.targetArgs,
+          })
+        ) {
+          return withUnboundWorkRequirement(frame.input.requirement_id, dispatch);
+        }
         frame.refusalKind = admission.kind;
         return refuse(admission.kind, admission.reason, admission.plan ? { plan: admission.plan } : undefined);
       }

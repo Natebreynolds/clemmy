@@ -8797,6 +8797,12 @@ const runHostTurnBody = async (
             // with this write named as not done and the objection quoted.
             ? nextEdge({ tool: innerTool, change: 'publish_partial',
               say: 'The constraint checker still objected after two corrections. Do not retry this write and do not route around it: finish the step and report this write as not done, with the values it would have written and the checker\'s objection, so the owner can decide.' })
+          : input.diagnostic && input.diagnostic.includes('"work_requirement_unknown"')
+            // The request's frozen plan has no step for this change. No
+            // argument can fix that (live 2026-10-16: 52 rewordings of one
+            // call in 48 minutes under a "correct the arguments" edge).
+            ? nextEdge({ tool: innerTool, change: 'publish_partial',
+              say: 'This request\'s plan has no step for this change, so changing its arguments cannot fix it. Bind it to an open step in `plan` only if it is that step\'s own work; otherwise do not retry it: finish the open steps and tell the owner in one line what is left and why.' })
           : input.diagnostic && input.diagnostic.includes('workflow_write_authority_changed_during_review')
             // This attempt no longer owns the step: another attempt took it
             // over while the write was under review. Nothing here is wrong
