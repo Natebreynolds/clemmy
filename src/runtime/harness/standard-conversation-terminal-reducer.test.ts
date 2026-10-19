@@ -13,6 +13,7 @@ const eventlog = await import('./eventlog.js');
 const {
   _testOnly_reduceStandardConversationTerminal: reduceStandardConversationTerminal,
   modelCheckInForExhaustedTurn,
+  narratedStopQuestionForTurn,
   runConversation,
 } = await import('./loop.js');
 const { MISSING_REPLY_USER_FALLBACK } = await import('./turn-decision.js');
@@ -567,4 +568,42 @@ test('a narration that asks nothing falls through to the check-in, which must en
   assert.match(steers[0]!, /End with ONE specific question/);
   assert.match(steers[0]!, /without host or tool terms/);
   assert.equal(asked.status, 'awaiting_user_input');
+});
+
+test('any stop Clem narrated ending on a question is her question; the harness never retypes its own words', () => {
+  // Live 2026-10-18: a pending memory save was narrated as a three-way question
+  // and still ended blocked under "Stopped here".
+  const sessionId = 'narrated-memory-stop-question';
+  const source = acceptedSource(sessionId);
+  const narration = 'Your preference is captured, but the save is still settling. Should I check it once it lands, or leave it captured as is?';
+  const narrate = (reason: string) => eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'host_stop_narrated', sourceUserSeq: source.sourceUserSeq, reason } });
+  const stop = (finalOutput: string, blockedReason = 'memory_consolidation_pending') => ({ sessionId, turn: source.turn,
+    status: 'blocked' as const, finalOutput, error: finalOutput, blockedReason, toolCalls: 2 });
+  const input = { sessionId, sourceUserSeq: source.sourceUserSeq };
+  const unnarrated = stop(narration);
+  assert.equal(narratedStopQuestionForTurn(unnarrated, input), unnarrated, 'no narration record: the stop is not Clem\'s words');
+  narrate('memory_consolidation_pending');
+  const statement = stop('Is it saved? Not yet, and I will look again later.');
+  assert.equal(narratedStopQuestionForTurn(statement, input), statement, 'a narration that ends on a statement keeps the typed stop');
+  const otherReason = stop(narration, 'local_work_incomplete');
+  assert.equal(narratedStopQuestionForTurn(otherReason, input), otherReason, 'the record names this exact stop');
+  const asked = narratedStopQuestionForTurn(stop(`${narration}\n\n${RETAINED_FIXTURE_CHECKPOINT}`), input);
+  assert.equal(asked.status, 'awaiting_user_input');
+  assert.equal(asked.finalOutput, narration);
+  assert.equal(asked.blockedReason, undefined);
+  assert.equal(asked.error, undefined);
+  const awaiting = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1);
+  assert.equal(awaiting?.data.question, narration);
+  assert.equal(awaiting?.data.source, 'host_stop_narration');
+  assert.ok(eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .some((event) => event.data.kind === 'host_stop_question' && event.data.reason === 'memory_consolidation_pending'));
+  const worker = 'narrated-stop-in-a-workflow-step';
+  eventlog.createSession({ id: worker, kind: 'workflow' } as never);
+  const step = eventlog.appendEvent({ sessionId: worker, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Step.' } });
+  eventlog.appendEvent({ sessionId: worker, turn: 0, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'host_stop_narrated', sourceUserSeq: step.seq, reason: 'memory_consolidation_pending' } });
+  const stepStop = { ...stop(narration), sessionId: worker };
+  assert.equal(narratedStopQuestionForTurn(stepStop, { sessionId: worker, sourceUserSeq: step.seq }), stepStop,
+    'no one is adjacent to answer a workflow step');
 });

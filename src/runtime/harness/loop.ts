@@ -1,6 +1,7 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { isPermanentActivationError } from './permanent-activation-error.js';
 import { parseRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
+import { replyEndsOnQuestion } from './review-after-delivery.js';
 import { committedMutationVerificationHoldsForSource, type CommittedMutationVerificationHold } from './mutation-verification-executor.js';
 import { planReadContinuationWake } from './read-continuation-wake.js';
 import { asyncReadRefinementRecoveryWake } from './async-read-refinement-store.js';
@@ -1781,6 +1782,59 @@ export function noProgressCheckInSteerFor(blockedDetail: string | undefined): st
 }
 
 /**
+ * A STOP CLEM ALREADY TURNED INTO A QUESTION IS HER QUESTION.
+ *
+ * The runner hands a host stop to one tool-free request that answers the
+ * owner in Clem's words and ends with one question whose answer resumes the
+ * task (hostStopNarrationDirective). Typing that reply blocked put "Stopped
+ * here" under a question she had asked (live 2026-10-18: a pending memory
+ * save and a frozen send both asked and both ended blocked; owner 2026-10-18:
+ * no turn ends blocked). A narration that ends on a question is the turn's
+ * needs_input terminal, with its own awaiting row so the next answer is
+ * adjacent and consumable, as the no-progress check-in does. One that ends on
+ * a statement keeps the typed stop. Only where a person is adjacent, and read
+ * from the runner's own narration record for this exact stop.
+ */
+export function narratedStopQuestionForTurn(
+  turnResult: RunTurnResult,
+  input: { sessionId: string; sourceUserSeq: number | undefined; source?: string },
+): RunTurnResult {
+  if (turnResult.status !== 'blocked' || !turnResult.blockedReason) return turnResult;
+  const sourceUserSeq = input.sourceUserSeq;
+  if (!Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return turnResult;
+  try {
+    if (getSession(input.sessionId)?.kind !== 'chat' && !sessionIsDelegatedJob(input.sessionId)) return turnResult;
+    const narrated = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
+      .some((event) => event.data.kind === 'host_stop_narrated'
+        && event.data.sourceUserSeq === sourceUserSeq && event.data.reason === turnResult.blockedReason);
+    if (!narrated) return turnResult;
+  } catch {
+    return turnResult;
+  }
+  const narration = publicReplyText(parseRetainedWorkCheckpoint(String(turnResult.finalOutput ?? '')).head, '').trim();
+  if (!narration || !replyEndsOnQuestion(narration)) return turnResult;
+  const source = input.source ?? 'host_stop_narration';
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: turnResult.turn,
+    role: 'system',
+    type: 'guardrail_tripped',
+    data: source === 'no_progress_check_in'
+      ? { kind: 'no_progress_check_in_result', sourceUserSeq, status: 'narrated', replyBytes: narration.length, asks: true }
+      : { kind: 'host_stop_question', sourceUserSeq, reason: turnResult.blockedReason, replyBytes: narration.length },
+  });
+  appendEvent({
+    sessionId: input.sessionId,
+    turn: turnResult.turn,
+    role: 'Clem',
+    type: 'awaiting_user_input',
+    data: { question: narration, purpose: 'clarification', source, sourceUserSeq },
+  });
+  const { blockedReason: _reason, blockedDetail: _detail, blockedResumable: _resumable, error: _error, ...asked } = turnResult;
+  return { ...asked, status: 'awaiting_user_input', finalOutput: narration };
+}
+
+/**
  * NO PROGRESS IS A CONVERSATION, NOT A PARK.
  *
  * When the no-progress governor exhausts a turn and the host does NOT hold the
@@ -1855,28 +1909,9 @@ export async function modelCheckInForExhaustedTurn(
   // 2026-10-19: two model calls for one stop; the second leaked host codes,
   // asked nothing, and left the turn blocked). A narration that asks is the
   // turn's question; one that does not falls through to the check-in.
-  const narrated = recentGuards.some((event) => event.data.kind === 'host_stop_narrated'
-    && event.data.sourceUserSeq === sourceUserSeq && event.data.reason === 'control_no_progress_exhausted');
-  const narration = narrated
-    ? publicReplyText(parseRetainedWorkCheckpoint(String(turnResult.finalOutput ?? '')).head, '').trim() : '';
-  if (narration && /\?/.test(narration)) {
-    appendEvent({
-      sessionId: input.sessionId,
-      turn: turnResult.turn,
-      role: 'system',
-      type: 'guardrail_tripped',
-      data: { kind: 'no_progress_check_in_result', sourceUserSeq, status: 'narrated', replyBytes: narration.length, asks: true },
-    });
-    appendEvent({
-      sessionId: input.sessionId,
-      turn: turnResult.turn,
-      role: 'Clem',
-      type: 'awaiting_user_input',
-      data: { question: narration, purpose: 'clarification', source: 'no_progress_check_in', sourceUserSeq },
-    });
-    const { blockedReason: _r, blockedDetail: _d, blockedResumable: _x, error: _e, ...asked } = turnResult;
-    return { ...asked, status: 'awaiting_user_input', finalOutput: narration };
-  }
+  const narratedQuestion = narratedStopQuestionForTurn(turnResult, {
+    sessionId: input.sessionId, sourceUserSeq, source: 'no_progress_check_in' });
+  if (narratedQuestion !== turnResult) return narratedQuestion;
   appendEvent({
     sessionId: input.sessionId,
     turn: turnResult.turn,
@@ -7544,7 +7579,7 @@ async function runConversationWithinRuntimeConfig(
           : {}),
         ...(provenOperationText ? { provenOperationText } : {}),
       };
-      const turnResult = await modelCheckInForExhaustedTurn(
+      const turnResult = narratedStopQuestionForTurn(await modelCheckInForExhaustedTurn(
         hostAccountQuestionForExhaustedTurn(await runTurn(hostTurnOptions), { sessionId: options.sessionId, sourceUserSeq }),
         {
           sessionId: options.sessionId,
@@ -7560,7 +7595,7 @@ async function runConversationWithinRuntimeConfig(
             hostConversationalCheckIn: true as const,
           }),
         },
-      );
+      ), { sessionId: options.sessionId, sourceUserSeq });
       const result = hostActivationConversationResult(turnResult, sourceUserSeq);
       if (result.status === 'held') {
         scheduleHostCheckpointRecovery(options, sourceUserSeq);
@@ -14997,6 +15032,10 @@ async function runConversationFromResumeCore(opts: {
         turnEngine: opts.turnEngine, makeRunner: opts.makeRunner, runRunner: opts.runRunner,
       }),
     });
+  }
+  // A stop Clem narrated as a question on the resume lane is her question too.
+  if (activeSourceUserSeq && firstResult.status === 'blocked') {
+    firstResult = narratedStopQuestionForTurn(firstResult, { sessionId: opts.sessionId, sourceUserSeq: activeSourceUserSeq });
   }
   lastTurn = firstResult.turn;
 
