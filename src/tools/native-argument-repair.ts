@@ -18,6 +18,9 @@
  *    value ("1440", "0", "true"). The text and the value are the same datum,
  *    so reads and ordinary writes take it; a value that is not the exact
  *    canonical spelling ("1e3", "01", " 5") keeps the refusal.
+ *  - UNWRAP: the arguments arrived in a carrier's shape (args_json holding
+ *    them as JSON text, with the tool's own name beside it). The JSON text is
+ *    the arguments, so reads and ordinary writes take it.
  *
  * Every other invalid call keeps its ordinary refusal.
  */
@@ -26,7 +29,7 @@ import type { ToolSideEffect } from './tool-registry.js';
 
 export type NativeArgumentRepair = {
   args: Record<string, unknown>;
-  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar' | 'json_text_sibling';
+  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar' | 'json_text_sibling' | 'carrier_unwrapped';
   detail: string;
 };
 
@@ -182,6 +185,21 @@ export function repairNativeArguments(
       continue;
     }
     return null;
+  }
+  // UNWRAP. Live 2026-10-18: workflow_run_status received {name, args_json}.
+  const carrierKeys = new Set(['args_json', 'name']);
+  if (unrecognized.includes('args_json') && unrecognized.every((key) => carrierKeys.has(key))
+    && typeof args.args_json === 'string') {
+    let carried: unknown;
+    try { carried = JSON.parse(args.args_json); } catch { carried = undefined; }
+    if (plainObject(carried)) {
+      const unwrapped: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(args)) if (!carrierKeys.has(key) || !unrecognized.includes(key)) unwrapped[key] = value;
+      for (const [key, value] of Object.entries(carried)) if (!(key in unwrapped) || unwrapped[key] === null) unwrapped[key] = value;
+      if (schema.safeParse(unwrapped).success) {
+        return { args: unwrapped, repair: 'carrier_unwrapped', detail: withScalarDetail('the arguments in "args_json" were read as the call\'s own') };
+      }
+    }
   }
   if (missing.length !== 1 || unrecognized.length === 0) return null;
   const target = missing[0]!;

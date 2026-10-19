@@ -100,3 +100,17 @@ test('an object whose strict schema types it as text moves whole into its JSON-t
   const noSibling = z.strictObject({ options: z.record(z.string(), z.string()) });
   assert.equal(repairNativeArguments(noSibling, { options: { limit: 3 } }, { sideEffect: 'write' }), null);
 });
+
+test('arguments sent in a carrier\'s shape are read as the call\'s own, for a read or an ordinary write', () => {
+  // Live 2026-10-18: workflow_run_status received {name, args_json}.
+  const status = z.strictObject({ run_id: z.string().min(1), step_id: z.string().nullable() });
+  const carried = { name: 'workflow_run_status', args_json: JSON.stringify({ run_id: 'run-1', step_id: null }) };
+  const repaired = repairNativeArguments(status, carried, { sideEffect: 'read' });
+  assert.deepEqual(repaired?.args, { run_id: 'run-1', step_id: null });
+  assert.equal(repaired?.repair, 'carrier_unwrapped');
+  assert.equal(repairNativeArguments(status, carried, { sideEffect: 'write' })?.repair, 'carrier_unwrapped');
+  assert.equal(repairNativeArguments(status, carried, { sideEffect: 'send' }), null, 'a send keeps its refusal');
+  assert.equal(repairNativeArguments(status, { ...carried, args_json: '{not json' }, { sideEffect: 'read' }), null);
+  assert.equal(repairNativeArguments(status, { ...carried, other: 1 }, { sideEffect: 'read' }), null,
+    'any field beyond the carrier\'s two keeps the refusal');
+});
