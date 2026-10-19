@@ -5,7 +5,7 @@ import { Brain, ChevronDown, Cpu, Wrench } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import {
   getTaskDetails, plainRecordName, recordedCount, recordedDuration, taskModelIdentity, taskModelProvider, taskModelRole,
-  taskMemorySections, taskModelStatus, taskToolEvidence, taskToolName, taskToolReason, taskToolStatus, taskUsageNotes,
+  taskMemorySections, taskProvidedMemoryLinks, taskModelStatus, taskToolEvidence, taskToolName, taskToolReason, taskToolStatus, taskUsageNotes,
   type TaskHandlingDetails,
 } from '@/lib/task-details';
 import { cn } from '@/lib/cn';
@@ -97,6 +97,7 @@ function DetailSection({ title, icon: Icon, children }: { title: string; icon: t
 export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) {
   const { tools, models, memory, usage } = detail;
   const sections = taskMemorySections(detail);
+  const providedLinks = taskProvidedMemoryLinks(detail);
   const hasMemory = Boolean(memory.provided?.manifest.length || memory.recall.some((run) => run.refs.length));
   return (
     <div className="min-w-0 space-y-5 pb-2 text-small">
@@ -158,6 +159,12 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
                 {sections.map((section) => <li key={section} className="max-w-full break-words [overflow-wrap:anywhere]">{section}</li>)}
               </ul>
             )}
+            {providedLinks.length > 0 && <div>
+              <p className="text-caption text-muted">Saved memories made available</p>
+              <div className="flex flex-wrap gap-x-4 gap-y-1">
+                {providedLinks.map(({ id, href }, index) => <Link key={id} to={href} className="inline-flex min-h-9 items-center rounded-sm text-caption font-medium text-primary-ink underline underline-offset-4 hover:text-primary-ink-hover">{providedLinks.length === 1 ? 'View saved memory' : `View saved memory ${index + 1}`}</Link>)}
+              </div>
+            </div>}
             {memory.recall.map((run) => (
               <ul key={run.id} className="space-y-2" aria-label="Recorded memory recall">
                 {run.refs.map((ref, index) => (

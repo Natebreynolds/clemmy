@@ -505,6 +505,45 @@ export function verifiedMemoryConsolidationEvidence(input: { sessionId: string; 
   } catch { return null; }
 }
 
+/** Passive bounded diagnostics for an exact request's asynchronous memory UI.
+ * Uses the same immutable source/candidate/canonical checks as completion, but
+ * never issues a receipt, promotes memory, or changes a terminal outcome. */
+export function readMemoryConsolidationStatusEvidence(input: { sessionId: string; sourceUserSeq: number }) {
+  try {
+    return openMemoryDb().transaction(() => {
+      const db = openMemoryDb();
+      const callId = `auto-capture:user-source:${input.sourceUserSeq}`;
+      const episodes = db.prepare('SELECT id FROM memory_episodes WHERE session_id = ? AND call_id = ? LIMIT 2')
+        .all(input.sessionId, callId);
+      if (episodes.length > 1) return { status: 'conflict' as const };
+      const candidates = db.prepare(`SELECT resulting_fact_id, episode_id, source_uri FROM memory_reflection_candidates
+        WHERE session_id = ? AND call_id = ? LIMIT 21`).all(input.sessionId, callId) as
+        Array<{ resulting_fact_id: number | null; episode_id: string | null; source_uri: string | null }>;
+      if (candidates.length > 20) return { status: 'bounded' as const };
+      // Reopening the same transaction below cannot race another process into
+      // an unbounded candidate/evidence read after the cap was checked.
+      for (const row of candidates) if (row.resulting_fact_id) {
+        const links = db.prepare(`SELECT ordinal FROM fact_evidence WHERE fact_id = ? AND episode_id = ? AND source_uri = ? LIMIT 101`)
+          .all(row.resulting_fact_id, row.episode_id, row.source_uri);
+        if (links.length > 100) return { status: 'bounded' as const };
+      }
+      const loaded = readVerifiedIntake(input);
+      if (loaded.status !== 'ok') return { status: loaded.status };
+      const results = loaded.intake.rows.map(row => {
+        const result = canonicalResult(loaded.intake, row);
+        const current = result.fact ? db.prepare('SELECT superseded_by_fact_id FROM consolidated_facts WHERE id = ?')
+          .get(result.fact.id) as { superseded_by_fact_id: number | null } | undefined : undefined;
+        return { candidateId: row.id, ownerStated: statedToKeep(row.intake_reason), status: row.status,
+          disposition: row.reason ?? null, destinationStatus: result.destination.status,
+          verified: result.verified && current?.superseded_by_fact_id == null,
+          fact: result.fact ? { id: result.fact.id, active: result.fact.active === 1,
+            superseded: current?.superseded_by_fact_id != null } : null };
+      });
+      return { status: 'ok' as const, results };
+    })();
+  } catch { return { status: 'storage_error' as const }; }
+}
+
 function exactReceiptRow(
   row: HostReceiptRow,
   evidence: DerivedEvidence,

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getTaskDetails, recordedCount, recordedDuration, taskDetailsPath, taskModelIdentity,
-  taskMemorySections, taskModelProvider, taskModelRole, taskModelStatus, taskToolEvidence, taskToolReason, taskToolStatus, taskUsageNotes,
+  taskMemorySections, taskProvidedMemoryLinks, taskModelProvider, taskModelRole, taskModelStatus, taskToolEvidence, taskToolReason, taskToolStatus, taskUsageNotes,
   type TaskHandlingDetails, type TaskModelRecord, type TaskToolRecord,
 } from './task-details.js';
 
@@ -28,6 +28,22 @@ test('unfamiliar role and section names remain text rather than inherited object
       manifest: [{ section: value, tier: 'relevant', tokens: 0, bytes: 0, refs: [] }] };
     assert.deepEqual(taskMemorySections(detail), ['Other saved context']);
   }
+});
+
+test('a judge role records a review call without attesting an independent or passed review', () => {
+  assert.equal(taskModelRole('judge'), 'Review call');
+});
+
+test('provided policy and fact references link exact memories once without fetching or claiming use', () => {
+  const detail = details();
+  detail.memory.provided = { recordedAt: detail.observedAt, sourceUserSeq: 41, manifest: [{
+    section: 'standing_policies', tier: 'core', tokens: 10, bytes: 30,
+    refs: [{ type: 'policy', id: '5019' }, { type: 'fact', id: '5019' }, { type: 'policy', id: '0' },
+      { type: 'fact', id: '42junk' }, { type: 'entity', id: '43' }, { type: 'fact', id: '44' }],
+  }] };
+  assert.deepEqual(taskProvidedMemoryLinks(detail), [{ id: 5019, href: '/memory?fact=5019' }, { id: 44, href: '/memory?fact=44' }]);
+  detail.memory.provided.manifest[0]!.refs = Array.from({ length: 30 }, (_, i) => ({ type: 'policy', id: String(i + 1) }));
+  assert.equal(taskProvidedMemoryLinks(detail).length, 12);
 });
 
 test('details require an exact source and safely encode session names; no temporal fallback', () => {

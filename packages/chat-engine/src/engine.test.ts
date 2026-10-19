@@ -56,6 +56,36 @@ const ev = (seq: number, type: string, data: Record<string, unknown> = {}): Harn
 
 const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+const memoryPendingTerminal = (sourceUserSeq: number) => ({ sourceUserSeq, blockedReason: 'memory_consolidation_pending', reply: 'I submitted the requested memory for checking.',
+  presentation: { version: 1, status: 'blocked', kind: 'answer' }, turnOutcome: { version: 2, status: 'blocked', resumable: true } });
+
+test('memory subwork survives reopened history without leaking onto the next reply or a check-in', () => {
+  const messages = foldTranscript([ev(1, 'user_input_received', { text: 'Remember the fixture.' }),
+    ev(2, 'conversation_completed', memoryPendingTerminal(1)), ev(3, 'user_input_received', { text: 'Another request.' }),
+    ev(4, 'conversation_check_in', { text: 'Still checking.' }),
+    ev(5, 'conversation_completed', { sourceUserSeq: 3, reply: 'Another answer.', presentation: { status: 'done', kind: 'answer' }, turnOutcome: { status: 'done' } })], 'memory-reopened');
+  const original = messages.find((m) => m.text === 'I submitted the requested memory for checking.');
+  assert.deepEqual(original?.terminal?.memoryWork, { sourceUserSeq: 1, reason: 'memory_consolidation_pending' });
+  for (const message of messages.filter((m) => m !== original)) assert.equal(message.terminal?.memoryWork, undefined);
+});
+
+test('memory subwork missed during disconnect is recovered by the exact-source terminal', async () => {
+  const transport = new FakeTransport();
+  const engine = new ChatEngine({ sessionId: 'memory-reconnect', transport, api: {
+    send: async () => ({ sessionId: 'memory-reconnect', accepted: true }),
+    loadSession: async () => ({ latestSeq: 1, events: [{ ...ev(1, 'user_input_received', { text: 'Remember the fixture.' }), role: 'user', turn: 1 }] }),
+  }, streamTimings: { reconnectBaseDelayMs: 5, reconnectMaxDelayMs: 10 } });
+  try {
+    await engine.open(); await wait(10);
+    transport.recentPayloads.push({ events: [ev(2, 'conversation_completed', memoryPendingTerminal(1))] });
+    transport.live!.onError(); await wait(50);
+    const reply = engine.snapshot().messages.at(-1);
+    assert.deepEqual(reply?.terminal?.memoryWork, { sourceUserSeq: 1, reason: 'memory_consolidation_pending' });
+    assert.equal(reply?.acceptedSource?.sourceUserSeq, 1);
+    assert.equal(engine.snapshot().busy, false);
+  } finally { engine.dispose(); }
+});
+
 test('a reopened Stop/Continue conversation shows historical messages and attaches only the validated physical head', async () => {
   const transport = new FakeTransport();
   const oldSource = { ...ev(1, 'user_input_received', { text: 'Keep the draft.' }), sessionId: 'old-head', role: 'user', turn: 1 };

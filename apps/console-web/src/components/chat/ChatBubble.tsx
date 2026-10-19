@@ -12,7 +12,9 @@ import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { ActivityCard } from '@/components/chat/ActivityCard';
 import { TaskDetails } from '@/components/chat/TaskDetails';
+import { TaskMemoryStatus } from '@/components/chat/TaskMemoryStatus';
 import { taskHandlingSource } from '@/lib/task-handling-source';
+import { hasExactMemoryWork } from '@/lib/task-memory-status';
 import { useNowTick } from '@/components/chat/ActivityFeed';
 import { TaskEvidenceFooter } from '@/components/chat/TaskEvidenceFooter';
 import { OutsideWorkCards, TurnReceipt } from '@/components/chat/TurnReceipt';
@@ -583,6 +585,8 @@ export function ChatBubble({
 
   const thinking = message.status === 'thinking';
   const live = thinking || Boolean(message.workflowLive);
+  const handlingSource = !live ? taskHandlingSource(message, sessionId) : null;
+  const currentMemoryWork = hasExactMemoryWork(message.terminal, handlingSource);
   const pendingAction = message.approval?.pendingAction;
   // A decision needs somewhere to go. Without both handlers this thread is a
   // replay, and the card is a record rather than a control.
@@ -928,7 +932,7 @@ export function ChatBubble({
           const pill = terminalStatusPill(t, { wordless: !hasReplyText });
           if (pill) return row(<>
             <StatusPill tone={pill.tone}>{pill.label}</StatusPill>
-            {onContinue && !executionBusy && !live && canContinueTerminal(message) && (
+            {onContinue && !executionBusy && !live && !currentMemoryWork && canContinueTerminal(message) && (
               <TerminalContinueButton key={message.id} onContinue={onContinue} />
             )}
           </>);
@@ -950,10 +954,8 @@ export function ChatBubble({
         {live
           ? <OutsideWorkCards activity={message.activity} />
           : <TurnReceipt activity={message.activity} terminal={message.terminal} text={hasReplyText ? message.text : ''} sessionId={sessionId} />}
-        {!live && (() => {
-          const source = taskHandlingSource(message, sessionId);
-          return source ? <TaskDetails key={`${source.sessionId}:${source.sourceUserSeq}`} {...source} /> : null;
-        })()}
+        {currentMemoryWork && handlingSource && <TaskMemoryStatus key={`memory:${handlingSource.sessionId}:${handlingSource.sourceUserSeq}`} {...handlingSource} />}
+        {handlingSource && <TaskDetails key={`${handlingSource.sessionId}:${handlingSource.sourceUserSeq}`} {...handlingSource} />}
     </article>
   );
 }

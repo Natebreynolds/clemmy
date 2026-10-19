@@ -11,6 +11,7 @@ import { readAcceptedSourceUsage } from '../runtime/accepted-source-usage.js';
 import { listRecallUses, readRecallRun } from '../memory/recall-usage.js';
 import { openMemoryDb } from '../memory/db.js';
 import { redactSensitiveText } from '../runtime/security.js';
+import { readTaskMemoryStatus } from './task-memory-status-read.js';
 
 const CAP = 100;
 const clean = (value: unknown, max = 240): string | undefined => typeof value === 'string' && value.trim()
@@ -178,6 +179,7 @@ export function readTaskHandlingDetails(
     } catch { result.limitations.push('A retained recall record is unavailable.'); }
   }
   if (result.memory.provided || result.memory.recall.length) result.limitations.push('Memory made available and detected recall use do not prove why a tool or model was chosen.');
+  result.memory.consolidation = readTaskMemoryStatus(identity, now)?.memory ?? null;
   readModels(result, attemptIds, accepted.created_at, now);
   result.attemptIds = [...attemptIds];
   return result;

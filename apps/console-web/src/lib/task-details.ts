@@ -2,6 +2,8 @@
  * session-wide or time-based lookup. These are records, not inferred reasons. */
 import { humanToolLabel, modelDisplayName, type TaskHandlingDetails } from '@clem/chat-engine';
 import { api } from './api';
+import { memoryFactHref, memoryFactId } from './memory-fact-links';
+import { validMemoryWork } from './task-memory-status';
 
 export type { TaskHandlingDetails } from '@clem/chat-engine';
 export type TaskModelRecord = TaskHandlingDetails['models'][number];
@@ -54,7 +56,8 @@ function validDetails(value: unknown): value is TaskHandlingDetails {
     || typeof value.usage.sourcePredatesMetering !== 'boolean' || !usageTotals(value.usage.totals)
     || !record(value.usage.byRole) || !Object.values(value.usage.byRole).every(usageTotals))) return false;
   const memory = value.memory;
-  if (!record(memory) || !Array.isArray(memory.recall) || !memory.recall.every((run) => record(run) && text(run.id)
+  if (!record(memory) || (memory.consolidation !== undefined && !validMemoryWork(memory.consolidation))
+    || !Array.isArray(memory.recall) || !memory.recall.every((run) => record(run) && text(run.id)
     && text(run.surface) && text(run.createdAt) && Array.isArray(run.refs) && run.refs.every((ref: unknown) => memoryRef(ref)
       && record(ref) && optionalText(ref.text) && oneOf(ref.outcome, ['offered', 'used', 'not_useful'])))) return false;
   const provided = memory.provided;
@@ -92,7 +95,7 @@ export function recordedDuration(ms: number | undefined): string | null {
 }
 
 const ROLE_WORDS: Record<string, string> = {
-  brain: 'Did the work', worker: 'Helped in parallel', judge: 'Checked the work',
+  brain: 'Did the work', worker: 'Helped in parallel', judge: 'Review call',
   writer: 'Wrote the reply', memory: 'Memory work', quick: 'Quick check',
 };
 export function taskModelRole(role: string): string {
@@ -181,6 +184,22 @@ export function taskMemorySections(detail: TaskHandlingDetails): string[] {
     if (key === 'header') return [];
     return [Object.hasOwn(MEMORY_SECTION_WORDS, key) ? MEMORY_SECTION_WORDS[key]! : 'Other saved context'];
   }))];
+}
+
+/** Manifest references say what was made available, not what influenced an
+ * answer. Policy refs point at the same exact saved-fact detail as fact refs. */
+export function taskProvidedMemoryLinks(detail: TaskHandlingDetails): Array<{ id: number; href: string }> {
+  const links = new Map<number, string>();
+  for (const section of detail.memory.provided?.manifest ?? []) {
+    for (const ref of section.refs) {
+      if (ref.type !== 'fact' && ref.type !== 'policy') continue;
+      const id = memoryFactId(ref.id);
+      const href = memoryFactHref(id);
+      if (id && href && !links.has(id)) links.set(id, href);
+      if (links.size >= 12) return [...links].map(([id, href]) => ({ id, href }));
+    }
+  }
+  return [...links].map(([id, href]) => ({ id, href }));
 }
 
 export function taskUsageNotes(detail: TaskHandlingDetails): string[] {

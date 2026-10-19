@@ -1935,12 +1935,13 @@ const STANDING_PREFERENCE_BUDGET = 1000;
 // reads the compiled contract, never this rendering.
 export const POLICY_LINE_MAX_CHARS = 600;
 
-/** A standing rule as the model sees it: verbatim when it fits the display
- * bound, otherwise its opening with an explicit pointer to the full text. */
+/** A standing rule as the model sees it, with its exact saved-fact identity.
+ * The marker identifies supplied context, never proof the model used it. */
 export function presentPolicyText(fact: Pick<ConsolidatedFact, 'id' | 'content'>): string {
-  if (fact.content.length <= POLICY_LINE_MAX_CHARS) return fact.content;
+  const identity = `[fact:${fact.id}] `;
+  if (fact.content.length <= POLICY_LINE_MAX_CHARS) return identity + fact.content;
   const head = fact.content.replace(/\s+/g, ' ').trim().slice(0, POLICY_LINE_MAX_CHARS).trimEnd();
-  return `${head}… _(rule #${fact.id} shortened for display; memory_recall_all returns it in full)_`;
+  return `${identity}${head}… _(rule #${fact.id} shortened for display; memory_recall_all returns it in full)_`;
 }
 
 /** Candidate refs for the STABLE Persistent-Facts block (COMPOUNDING wave):
@@ -2120,7 +2121,7 @@ function policyGroupBudgets(
 function fitPolicyRows(
   group: readonly ConsolidatedFact[],
   budget: number,
-  present: (fact: ConsolidatedFact) => string = (fact) => fact.content,
+  present: (fact: ConsolidatedFact) => string = (fact) => `[fact:${fact.id}] ${fact.content}`,
 ): { lines: string[]; shown: ConsolidatedFact[] } {
   const lines: string[] = [];
   const shown: ConsolidatedFact[] = [];
@@ -2170,10 +2171,13 @@ export function renderCorePoliciesForInstructions(options: { strict?: boolean } 
   const dispatchLines: string[] = [];
   const seenDispatch = new Set<string>();
   for (const fact of byGroup.dispatch_constraint) {
+    // Identity must not defeat the existing duplicate-content compaction.
+    // Only the retained displayed row belongs in the supplied-context refs.
+    const contentKey = fact.content.replace(/\s+/g, ' ').trim();
+    if (seenDispatch.has(contentKey)) continue;
+    seenDispatch.add(contentKey);
     const line = `- ${presentPolicyText(fact).replace(/\s+/g, ' ').trim()}`;
     refs.push({ type: 'policy', id: String(fact.id) });
-    if (seenDispatch.has(line)) continue;
-    seenDispatch.add(line);
     dispatchLines.push(line);
   }
   const group = (
@@ -2343,7 +2347,7 @@ export function renderFactsForInstructions(
       group: ConsolidatedFact[],
       budget: number,
       suffix: (omitted: number) => string,
-      present: (fact: ConsolidatedFact) => string = (fact) => fact.content,
+      present: (fact: ConsolidatedFact) => string = (fact) => `[fact:${fact.id}] ${fact.content}`,
     ): string => {
       if (group.length === 0) return '';
       const { lines, shown } = fitPolicyRows(group, budget, present);

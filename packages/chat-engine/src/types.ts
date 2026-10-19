@@ -327,6 +327,9 @@ export interface ModelRuleOffer {
  */
 export interface TerminalFacts {
   status: 'done' | 'needs_input' | 'blocked' | 'cancelled' | 'failed' | 'transferred' | 'uncertain';
+  /** Host-typed memory subwork left behind by this exact accepted request.
+   * Read its current status separately; never replay the request to resolve it. */
+  memoryWork?: { sourceUserSeq: number; reason: 'memory_consolidation_pending' | 'memory_work_unverified' };
   kind?: 'answer' | 'question' | 'approval' | 'continue';
   needs?: 'input' | 'approval' | 'continue';
   resumable?: boolean;

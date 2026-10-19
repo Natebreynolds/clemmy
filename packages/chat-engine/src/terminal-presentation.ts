@@ -74,6 +74,11 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   const needs = outcome.needs && typeof outcome.needs === 'object'
     ? (outcome.needs as Record<string, unknown>).kind : undefined;
   const facts: TerminalFacts = { status };
+  if ((status === 'blocked' || status === 'failed')
+    && (data.blockedReason === 'memory_consolidation_pending' || data.blockedReason === 'memory_work_unverified')
+    && Number.isSafeInteger(data.sourceUserSeq) && (data.sourceUserSeq as number) > 0) {
+    facts.memoryWork = { sourceUserSeq: data.sourceUserSeq as number, reason: data.blockedReason };
+  }
   if (typeof presentation.kind === 'string' && PRESENTATION_KINDS.has(presentation.kind)) {
     facts.kind = presentation.kind as TerminalFacts['kind'];
   }

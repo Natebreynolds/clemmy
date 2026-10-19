@@ -5,6 +5,22 @@ export interface TaskHandlingUsageTotals {
   promptTokens: number; cachedReadTokens: number; uncachedWorkTokens: number;
   outputTokens: number; reportedTotalTokens: number; modelMs: number;
 }
+/** Current memory subwork only; it does not revise a task's historical outcome. */
+export type TaskMemoryState = 'pending' | 'saved' | 'refused' | 'needs_choice' | 'unavailable';
+export interface TaskMemoryStatus {
+  version: 1;
+  sessionId: string;
+  sourceUserSeq: number;
+  observedAt: string;
+  memory: null | {
+    state: TaskMemoryState | 'mixed';
+    candidates: Array<{ candidateId: number; state: TaskMemoryState; factId?: number;
+      reason?: 'inactive' | 'superseded' | 'unverified' | 'retry_exhausted' | 'destination_unresolved' }>;
+    counts: { pending: number; saved: number; refused: number; needsChoice: number; unavailable: number };
+    nextStep: 'wait' | 'review_memory' | 'clarify_destination' | 'check_again' | 'none';
+    pollAfterMs: number | null;
+  };
+}
 export interface TaskHandlingDetails {
   version: 1;
   sessionId: string;
@@ -31,6 +47,7 @@ export interface TaskHandlingDetails {
     totals: TaskHandlingUsageTotals; byRole: Record<string, TaskHandlingUsageTotals>;
   } | null;
   memory: {
+    consolidation?: TaskMemoryStatus['memory'];
     provided: {
       recordedAt: string; sourceUserSeq: number;
       totals?: { tokens: number; bytes: number; coreTokens: number; relevantTokens: number; nowTokens: number };

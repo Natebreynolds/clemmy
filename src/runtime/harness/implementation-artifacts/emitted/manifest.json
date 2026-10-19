@@ -1290,7 +1290,7 @@
           "bytes": 114643
         },
         "src/memory/facts.ts": {
-          "bytes": 126838
+          "bytes": 127177
         },
         "src/memory/authoritative-sources.ts": {
           "bytes": 6163
@@ -2223,7 +2223,7 @@
           "bytes": 14945
         },
         "src/runtime/harness/durable-memory-intake-receipt.ts": {
-          "bytes": 42204
+          "bytes": 44835
         },
         "src/runtime/harness/host-model-output-preview.ts": {
           "bytes": 1227
@@ -5232,7 +5232,7 @@
           "bytes": 114643
         },
         "src/memory/facts.ts": {
-          "bytes": 126838
+          "bytes": 127177
         },
         "src/memory/authoritative-sources.ts": {
           "bytes": 6163
@@ -6165,7 +6165,7 @@
           "bytes": 14945
         },
         "src/runtime/harness/durable-memory-intake-receipt.ts": {
-          "bytes": 42204
+          "bytes": 44835
         },
         "src/runtime/harness/host-model-output-preview.ts": {
           "bytes": 1227

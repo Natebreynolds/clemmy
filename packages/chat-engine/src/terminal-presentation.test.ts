@@ -63,6 +63,19 @@ test('unknown kinds and needs are dropped, never invented', () => {
   assert.deepEqual(facts, { status: 'done' });
 });
 
+test('only the exact host-typed blocked memory reason carries a current-memory read hint', () => {
+  const pending = { ...typed('blocked', 'answer'), sourceUserSeq: 41, blockedReason: 'memory_consolidation_pending' };
+  assert.deepEqual(terminalFactsFrom(pending)?.memoryWork, { sourceUserSeq: 41, reason: 'memory_consolidation_pending' });
+  assert.deepEqual(terminalFactsFrom({ ...pending, blockedReason: 'memory_work_unverified' })?.memoryWork, { sourceUserSeq: 41, reason: 'memory_work_unverified' });
+  for (const data of [{ ...pending, sourceUserSeq: 0 }, { ...pending, sourceUserSeq: '41' }, { ...pending, sourceUserSeq: undefined },
+    { ...pending, blockedReason: undefined, reply: 'memory_consolidation_pending' }, { ...typed('done', 'answer'), sourceUserSeq: 41, blockedReason: pending.blockedReason },
+    { ...typed('cancelled', 'answer'), sourceUserSeq: 41, blockedReason: pending.blockedReason }]) {
+    assert.equal(terminalFactsFrom(data)?.memoryWork, undefined);
+  }
+  const next = terminalCompletionPresentation({ ...typed('done', 'answer'), sourceUserSeq: 42 }, '');
+  assert.equal(next.terminal?.memoryWork, undefined, 'a new terminal is freshly projected and does not inherit an earlier hint');
+});
+
 // Live 2026-09-25: an approval turn showed the host's filler as prose
 // ("Approval required for Slack open dm. Review apr-k42z to continue.") under
 // which its own card also appeared, and, typed as awaiting a reply, invited the
