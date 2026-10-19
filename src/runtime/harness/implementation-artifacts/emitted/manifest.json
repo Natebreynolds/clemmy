@@ -138,7 +138,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 130239
+          "bytes": 130991
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -1848,7 +1848,7 @@
           "bytes": 38296
         },
         "src/runtime/harness/next-edge.ts": {
-          "bytes": 8325
+          "bytes": 13656
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 26362
@@ -2883,13 +2883,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830470
+          "bytes": 832694
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740835
+          "bytes": 741910
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -4101,7 +4101,7 @@
           "bytes": 3760
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 130239
+          "bytes": 130991
         },
         "src/runtime/harness/destination-gate.ts": {
           "bytes": 48804
@@ -5811,7 +5811,7 @@
           "bytes": 38296
         },
         "src/runtime/harness/next-edge.ts": {
-          "bytes": 8325
+          "bytes": 13656
         },
         "src/runtime/harness/host-model-result-receipt.ts": {
           "bytes": 26362
@@ -6846,13 +6846,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830470
+          "bytes": 832694
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740835
+          "bytes": 741910
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7946,8 +7946,8 @@
       }
     },
     "transport": {
-      "file": "transport-35e9e3d458bf00134265e6654cb034f0dd4d807302a9bc149a063b1126a4d6a7.cjs",
-      "sha256": "35e9e3d458bf00134265e6654cb034f0dd4d807302a9bc149a063b1126a4d6a7",
+      "file": "transport-5da99b548ec1a7bb66af3e1b863008e0f30a4762a8fb8ab52a9b3f2a2a58e46e.cjs",
+      "sha256": "5da99b548ec1a7bb66af3e1b863008e0f30a4762a8fb8ab52a9b3f2a2a58e46e",
       "inputs": {
         "src/runtime/harness/implementation-artifacts/transport-support.ts": {
           "bytes": 133
@@ -8025,7 +8025,7 @@
           "bytes": 20819
         },
         "src/tools/tool-registry.ts": {
-          "bytes": 130239
+          "bytes": 130991
         },
         "src/tools/artifact-bundle-core.ts": {
           "bytes": 17265
@@ -8153,5 +8153,5 @@
       }
     }
   },
-  "manifestDigest": "91c65d23b641cf0715f111045f2f9f62271c8311e69ab85925d87ec0c7379ba3"
+  "manifestDigest": "09ea96bc3ad78b40022704b769738d493ca20da4fbedce64ec4a0c2b590ac46c"
 }
