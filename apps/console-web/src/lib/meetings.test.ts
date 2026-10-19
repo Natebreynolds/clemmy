@@ -142,6 +142,12 @@ test('summary reads stay passive and explicit recovery binds the exact meeting a
     assert.deepEqual(calls[1], { url: '/api/console/meetings/recall/controlled%2Fmeeting/analysis/retry', method: 'POST', body: { expectedTaskId: 'bg-original' } });
     await retryRecallMeetingAnalysis('controlled/meeting', null);
     assert.deepEqual(calls[2].body, { expectedTaskId: null });
+    await retryRecallMeetingAnalysis('controlled/meeting', 'bg-original', false);
+    assert.deepEqual(calls[3].body, { expectedTaskId: 'bg-original' }, 'false preserves the original request shape and owned model');
+    await retryRecallMeetingAnalysis('controlled/meeting', 'bg-original', true);
+    assert.deepEqual(calls[4], { url: '/api/console/meetings/recall/controlled%2Fmeeting/analysis/retry', method: 'POST',
+      body: { expectedTaskId: 'bg-original', useCurrentModel: true } }, 'only an explicit choice requests the current model for a fresh attempt');
+    assert.deepEqual(Object.keys(calls[4].body as object).sort(), ['expectedTaskId', 'useCurrentModel'], 'no recording, context or research permission is added');
     for (const invalid of [{}, { taskId: '' }, { taskId: 'x'.repeat(201) }, { taskId: 'bad\nidentity' }, { ok: false }]) {
       response = invalid;
       await assert.rejects(retryRecallMeetingAnalysis('controlled/meeting', 'bg-original'), /could not be confirmed/);
@@ -152,5 +158,8 @@ test('summary reads stay passive and explicit recovery binds the exact meeting a
       assert.equal((error as { status: number }).status, 409); return true;
     });
     assert.equal(calls.length, before + 1, 'a stale recovery is never replayed automatically');
+    const beforeCurrentModel = calls.length;
+    await assert.rejects(retryRecallMeetingAnalysis('controlled/meeting', 'bg-original', true));
+    assert.equal(calls.length, beforeCurrentModel + 1, 'the new-model choice cannot automatically resubmit a stale occurrence');
   } finally { Object.assign(globalThis, { fetch: previousFetch, window: previousWindow }); }
 });

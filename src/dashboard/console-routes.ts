@@ -10923,11 +10923,12 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)
-      || Object.keys(body).some(key => key !== 'expectedTaskId')
-      || !(body.expectedTaskId === null || typeof body.expectedTaskId === 'string')) {
+      || Object.keys(body).some(key => key !== 'expectedTaskId' && key !== 'useCurrentModel')
+      || !(body.expectedTaskId === null || typeof body.expectedTaskId === 'string')
+      || (body.useCurrentModel !== undefined && typeof body.useCurrentModel !== 'boolean')) {
       res.status(400).json({ error: 'The current summary task is required.' }); return;
     }
-    try { res.status(202).json(await requestMeetingAnalysisRetry(req.params.meetingId, body.expectedTaskId)); }
+    try { res.status(202).json(await requestMeetingAnalysisRetry(req.params.meetingId, body.expectedTaskId, { useCurrentModel: body.useCurrentModel })); }
     catch { res.status(409).json({ error: 'This meeting changed or its transcript is unavailable. Refresh it before preparing the summary again.' }); }
   });
 

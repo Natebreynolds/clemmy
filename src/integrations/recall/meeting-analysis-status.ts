@@ -50,7 +50,9 @@ export function projectMeetingAnalysisState(record: RecallMeetingRecord, enabled
 
 /** Explicit owner retry only. Replays rejoin one prepared task; an active or
  * parked worker retains its ownership instead of gaining a duplicate. */
-export async function requestMeetingAnalysisRetry(meetingId: string, expectedTaskId: string | null): Promise<{ taskId: string }> {
+export async function requestMeetingAnalysisRetry(meetingId: string, expectedTaskId: string | null,
+  options: { useCurrentModel?: boolean } = {}): Promise<{ taskId: string }> {
+  if (options.useCurrentModel !== undefined && typeof options.useCurrentModel !== 'boolean') throw new Error('Choose whether to use the current meeting model.');
   const record = loadRecallMeetingById(meetingId);
   if (!record || (record.analysisTaskId ?? null) !== expectedTaskId) {
     throw new Error('This meeting changed. Refresh it before preparing the summary again.');
@@ -68,15 +70,20 @@ export async function requestMeetingAnalysisRetry(meetingId: string, expectedTas
   }
   if (prior && !['done', 'failed', 'blocked', 'aborted'].includes(prior.status)) return { taskId: prior.id };
   const requiredOutput = captureMeetingAnalysisRequirement(record);
-  const key = createHash('sha256').update(JSON.stringify({ meetingId, prior: expectedTaskId, requiredOutput })).digest('hex');
   const priorPin = prior && Object.prototype.hasOwnProperty.call(prior, 'meetingModelPin')
     ? MeetingModelPinSchema.parse(prior.meetingModelPin) : undefined;
   const priorRequired = meetingAnalysisRequirementSchema.safeParse(prior?.requiredOutput);
   // An explicit retry of the same source keeps the accepted context and model,
   // even if meeting preferences or live lookup state changed in the meantime.
-  const prepared = priorPin && priorRequired.success && priorRequired.data.transcriptDigest === requiredOutput.transcriptDigest
+  const prepared = !options.useCurrentModel && priorPin && priorRequired.success && priorRequired.data.transcriptDigest === requiredOutput.transcriptDigest
     ? { prompt: prior!.prompt, requiredOutput, meetingModelPin: priorPin, model: priorPin.modelId }
-    : await prepareMeetingAnalysisRequest(record, record.artifactPath!, { ...(priorPin ? { modelPin: priorPin } : {}) });
+    : await prepareMeetingAnalysisRequest(record, record.artifactPath!, {
+      ...(!options.useCurrentModel && priorPin ? { modelPin: priorPin } : {}),
+    });
+  const identity = options.useCurrentModel
+    ? { meetingId, prior: expectedTaskId, requiredOutput, mode: 'current_meeting_model', meetingModelPin: prepared.meetingModelPin }
+    : { meetingId, prior: expectedTaskId, requiredOutput };
+  const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
   const task = queuePreparedMeetingAnalysis(record.id, {
     title: `Prepare meeting summary: ${record.title || record.platform || record.id}`,
     ...prepared,

@@ -121,6 +121,38 @@ test('explicit summary retry binds the current transcript and reuses active owne
   assert.equal(capture.loadRecallMeetingById(f.record.id)?.analysisTaskId, current.id);
 });
 
+test('explicit current-model recovery makes a fresh pinned attempt without changing or bypassing the previous owner', async () => {
+  const settings = { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'http://127.0.0.1:9',
+    BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]', CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off' };
+  const previous = new Map(Object.keys(settings).map(key => [key, process.env[key]])); Object.assign(process.env, settings);
+  try {
+    const f = fixture();
+    assert.equal((await status.requestMeetingAnalysisRetry(f.record.id, f.task.id, { useCurrentModel: true })).taskId, f.task.id,
+      'a current-model request cannot replace an active task');
+    const policy = await import('./meeting-assistant-policy.js'); const saved = policy.loadMeetingAssistantPolicy();
+    const changed = policy.saveMeetingAssistantPolicy({ expectedRevision: saved.revision,
+      before: saved.before, during: saved.during, after: { modelId: null } });
+    tasks.markBackgroundTaskBlocked(f.task.id, 'Controlled retired model.', 'Controlled prior work.');
+    const oldPath = path.join(home, 'state', 'background-tasks', `${f.task.id}.json`); const oldBytes = readFileSync(oldPath, 'utf8');
+    const replacement = await status.requestMeetingAnalysisRetry(f.record.id, f.task.id, { useCurrentModel: true });
+    const fresh = tasks.getBackgroundTask(replacement.taskId)!;
+    assert.notEqual(fresh.id, f.task.id); assert.equal(fresh.model, 'deepseek-chat');
+    assert.equal(fresh.meetingModelPin?.profileRevision, changed.revision);
+    assert.equal(fresh.meetingModelPin?.selection, 'inherited');
+    assert.match(fresh.prompt, /Historical live assistance handoff/); assert.notEqual(fresh.prompt, f.task.prompt);
+    assert.equal(readFileSync(oldPath, 'utf8'), oldBytes, 'retired task, original choice and source remain untouched');
+    const identity = { meetingId: f.record.id, prior: f.task.id, requiredOutput: f.requiredOutput,
+      mode: 'current_meeting_model', meetingModelPin: fresh.meetingModelPin };
+    const { createHash } = await import('node:crypto');
+    assert.equal(fresh.id, `bg-meeting-${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`);
+    assert.equal((await status.requestMeetingAnalysisRetry(f.record.id, fresh.id, { useCurrentModel: true })).taskId, fresh.id);
+    await assert.rejects(status.requestMeetingAnalysisRetry(f.record.id, f.task.id, { useCurrentModel: true }), /changed/);
+    tasks.markBackgroundTaskBlocked(fresh.id, 'Controlled pause.', 'Controlled saved work.');
+    const ordinary = tasks.getBackgroundTask((await status.requestMeetingAnalysisRetry(f.record.id, fresh.id, { useCurrentModel: false })).taskId)!;
+    assert.deepEqual(ordinary.meetingModelPin, fresh.meetingModelPin); assert.equal(ordinary.prompt, fresh.prompt);
+  } finally { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
+});
+
 test('analysis progress follows its exact task and partial transcript remains explicit', () => {
   const f = fixture();
   assert.equal(status.projectMeetingAnalysisState(capture.loadRecallMeetingById(f.record.id)!, true).status, 'queued');

@@ -209,6 +209,42 @@ test('Recall completion queues one exact pinned recap with handoff and repeat co
   } finally { recall.saveRecallMeetingSettings(settings); await harness.close(); }
 });
 
+test('summary current-model recovery requires an explicit boolean and exact terminal owner; active work only rejoins', async () => {
+  const authorized = { value: false }; const harness = await boot(authorized);
+  const detected = recall.noteRecallMeetingDetected({ windowId: 'controlled-summary-current-choice', status: 'recording' });
+  recall.appendRecallTranscriptSegment({ windowId: detected.windowId, event: 'transcript.data', text: 'Controlled recovery transcript.', isFinal: true });
+  const { record } = recall.finalizeRecallMeeting({ windowId: detected.windowId, retentionMode: 'zero' });
+  const { captureMeetingAnalysisRequirement } = await import('../integrations/recall/meeting-analysis-contract.js');
+  const tasks = await import('../execution/background-tasks.js');
+  const old = tasks.createBackgroundTask({ title: 'Controlled retired summary', prompt: 'Controlled original accepted summary context.',
+    requiredOutput: captureMeetingAnalysisRequirement(record), meetingModelPin: { version: 1, modelId: 'controlled-retired-model',
+      provider: 'byo', role: 'brain', profileRevision: 1, selection: 'explicit', fallback: 'none' } });
+  recall.patchMeetingRecord(record.id, { analysisTaskId: old.id });
+  const route = `${harness.url}/api/console/meetings/recall/${encodeURIComponent(record.id)}/analysis/retry`;
+  const send = (body: unknown) => fetch(route, json('POST', body));
+  try {
+    assert.equal((await send({ expectedTaskId: old.id, useCurrentModel: true })).status, 401); authorized.value = true;
+    const oldPath = path.join(TMP_HOME, 'state', 'background-tasks', `${old.id}.json`);
+    const beforeInvalid = readFileSync(oldPath, 'utf8');
+    for (const useCurrentModel of [null, 'true', 1, {}, []]) assert.equal((await send({ expectedTaskId: old.id, useCurrentModel })).status, 400);
+    assert.equal((await send({ useCurrentModel: true })).status, 400);
+    assert.equal((await send({ expectedTaskId: old.id, useCurrentModel: true, extra: true })).status, 400);
+    assert.equal(readFileSync(oldPath, 'utf8'), beforeInvalid);
+    const active = await send({ expectedTaskId: old.id, useCurrentModel: true }); assert.equal(active.status, 202);
+    assert.equal((await active.json() as { taskId: string }).taskId, old.id);
+    tasks.markBackgroundTaskBlocked(old.id, 'Controlled retired model.', 'Controlled prior work.');
+    const oldBytes = readFileSync(oldPath, 'utf8');
+    const recovery = await send({ expectedTaskId: old.id, useCurrentModel: true }); assert.equal(recovery.status, 202);
+    const freshId = (await recovery.json() as { taskId: string }).taskId; const fresh = tasks.getBackgroundTask(freshId)!;
+    assert.notEqual(freshId, old.id); assert.equal(fresh.model, 'deepseek-chat'); assert.equal(fresh.meetingModelPin?.role, 'brain');
+    assert.match(fresh.prompt, /Historical live assistance handoff/); assert.equal(readFileSync(oldPath, 'utf8'), oldBytes);
+    const joined = await send({ expectedTaskId: freshId, useCurrentModel: true }); assert.equal(joined.status, 202);
+    assert.equal((await joined.json() as { taskId: string }).taskId, freshId);
+    assert.equal((await send({ expectedTaskId: old.id, useCurrentModel: true })).status, 409);
+    assert.equal(recall.loadRecallMeetingById(record.id)?.analysisTaskId, freshId);
+  } finally { await harness.close(); }
+});
+
 test('delivery status updates are authenticated exact-capture metadata and never restart a completed meeting', async () => {
   const auth = { value: false }; const harness = await boot(auth);
   const record = recall.noteRecallMeetingDetected({ windowId: 'controlled-delivery-route', sdkUploadId: 'controlled-delivery-upload', status: 'recording' });

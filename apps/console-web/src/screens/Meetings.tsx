@@ -440,7 +440,7 @@ export function Meetings() {
     }
   };
 
-  const retryAnalysis = async () => {
+  const retryAnalysis = async (useCurrentModel = false) => {
     const target = selected;
     const current = detail.data;
     if (!target || current?.record?.id !== target || !canRetryMeetingAnalysis(current) || detail.isFetching
@@ -449,7 +449,7 @@ export function Meetings() {
     analysisReadRequired.current.add(target); setAnalysisNeedsRead(new Set(analysisReadRequired.current));
     setAnalysisRetryErrors((errors) => { const next = { ...errors }; delete next[target]; return next; });
     try {
-      await retryRecallMeetingAnalysis(target, current.analysisState?.taskId ?? null);
+      await retryRecallMeetingAnalysis(target, current.analysisState?.taskId ?? null, useCurrentModel);
       await refreshAnalysis(target);
     } catch (error: unknown) {
       const changed = error && typeof error === 'object' && 'status' in error && error.status === 409;
@@ -778,7 +778,7 @@ export function Meetings() {
                 analysisNeedsRead={analysisNeedsRead.has(selected)}
                 retryingAnalysis={retryingAnalysis.has(selected)}
                 analysisRetryError={analysisRetryErrors[selected]}
-                onRetryAnalysis={() => void retryAnalysis()}
+                onRetryAnalysis={(useCurrentModel) => void retryAnalysis(useCurrentModel)}
                 onRetry={() => {
                   if (!selected) return;
                   if (detail.data?.record?.provider === 'local') void retryTranscription(selected);
@@ -995,7 +995,7 @@ function MeetingDetailView({
   retryError?: string | null;
   onRetry?: () => void;
   onRefreshAnalysis?: () => void;
-  onRetryAnalysis?: () => void;
+  onRetryAnalysis?: (useCurrentModel?: boolean) => void;
   retryingAnalysis?: boolean;
   analysisRetryError?: string;
   readingAnalysis?: boolean;
@@ -1070,8 +1070,12 @@ function MeetingDetailView({
         {(analysisNotice.taskHref || analysisNotice.canRefresh) && <div className="flex flex-wrap items-center gap-3">
           {analysisNotice.taskHref && <Link className="inline-flex min-h-10 items-center rounded-sm text-small font-semibold text-primary-ink underline underline-offset-4 hover:text-primary-ink-hover" to={analysisNotice.taskHref}>Open summary task</Link>}
           {analysisNotice.canRefresh && onRefreshAnalysis && <Button size="sm" variant="ghost" disabled={readingAnalysis || retryingAnalysis} onClick={onRefreshAnalysis}>{readingAnalysis ? 'Reading summary status…' : 'Read summary status again'}</Button>}
-          {canRetryMeetingAnalysis(data) && onRetryAnalysis && <Button size="sm" variant="secondary" disabled={retryingAnalysis || readingAnalysis || analysisNeedsRead} onClick={onRetryAnalysis}>{retryingAnalysis ? 'Preparing…' : 'Prepare summary again'}</Button>}
+          {canRetryMeetingAnalysis(data) && onRetryAnalysis && <>
+            <Button size="sm" variant="secondary" disabled={retryingAnalysis || readingAnalysis || analysisNeedsRead} onClick={() => onRetryAnalysis()}>{retryingAnalysis ? 'Preparing…' : 'Prepare summary again'}</Button>
+            <Button size="sm" variant="secondary" disabled={retryingAnalysis || readingAnalysis || analysisNeedsRead} onClick={() => onRetryAnalysis(true)}>Use current meeting model</Button>
+          </>}
         </div>}
+        {canRetryMeetingAnalysis(data) && onRetryAnalysis && <p className="max-w-prose text-caption text-muted">Changed your meeting model? Use it for a fresh attempt.</p>}
         {analysisRetryError && <p className="max-w-prose text-small text-danger" role="alert">{analysisRetryError}</p>}
       </section>}
       {previousSummary && <div className="mb-3">

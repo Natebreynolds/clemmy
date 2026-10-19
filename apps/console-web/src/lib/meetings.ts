@@ -149,9 +149,9 @@ export const retryRecallMeetingTranscript = (meetingId: string) =>
   });
 
 /** Explicit owner recovery only; reading a meeting never reaches this door. */
-export async function retryRecallMeetingAnalysis(meetingId: string, expectedTaskId: string | null): Promise<{ taskId: string }> {
+export async function retryRecallMeetingAnalysis(meetingId: string, expectedTaskId: string | null, useCurrentModel = false): Promise<{ taskId: string }> {
   const result = await api<unknown>(`/api/console/meetings/recall/${encodeURIComponent(meetingId)}/analysis/retry`, {
-    method: 'POST', body: JSON.stringify({ expectedTaskId }),
+    method: 'POST', body: JSON.stringify({ expectedTaskId, ...(useCurrentModel === true ? { useCurrentModel: true } : {}) }),
   });
   const taskId = result && typeof result === 'object' && 'taskId' in result ? result.taskId : undefined;
   if (typeof taskId !== 'string' || !taskId.trim() || taskId.length > 200 || /[\u0000-\u001f\u007f]/.test(taskId)) throw new Error('Summary recovery could not be confirmed.');
