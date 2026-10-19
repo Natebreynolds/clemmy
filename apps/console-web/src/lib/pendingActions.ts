@@ -9,9 +9,10 @@ import type { PendingActionApprovalView } from './types';
 
 export interface PendingActionExecuteResult {
   ok: boolean;
-  /** Durable executor outcome: the send fired, was refused/failed, or was
+  /** Durable executor outcome: the send fired, was refused/failed, is queued
+   *  behind a live run in the chat (it runs once that run ends), or was
    *  skipped because the record wasn't in an executable (approved) state. */
-  status: 'executed' | 'failed' | 'skipped';
+  status: 'executed' | 'failed' | 'queued' | 'skipped';
   resultSummary: string;
   /** Grant-at-card: present only when alwaysAllow was requested — true means a
    *  narrow send-trust grant (these recipients, this toolkit) was stored. */
@@ -50,6 +51,7 @@ export function canOfferStandingSendTrust(
 }
 
 export type PendingActionExecutionPhase =
+  | 'queued'
   | 'running'
   | 'executed'
   | 'failed'
@@ -156,6 +158,9 @@ export async function resolvePendingActionExecutionPresentation(
     const note = (result.resultSummary || result.record?.resultSummary || '').trim();
     return durablePresentation(result.status, note);
   }
+  // The approval is recorded and its exact resume is waiting for the chat's
+  // live run. Never fall through to a conversational "approve" turn here.
+  if (result.status === 'queued') return durablePresentation('queued', result.resultSummary);
 
   const initialPhase = durablePhase(result.record?.status);
   if (!initialPhase) return { mode: 'conversational', phase: 'idle' };
@@ -169,6 +174,16 @@ export async function resolvePendingActionExecutionPresentation(
     );
   }
   return waitForDurableTerminalStatus(refresh, options);
+}
+
+/** A queued card's durable truth once its resume has picked it up: running
+ * while it executes, then its terminal. Null while it still waits. */
+export function queuedPendingActionProgress(
+  snapshot: PendingActionStatusSnapshot,
+): PendingActionExecutionPresentation | null {
+  const phase = durablePhase(snapshot.status);
+  if (!phase) return null;
+  return phase === 'running' ? { mode: 'durable', phase } : durablePresentation(phase, snapshot.resultSummary);
 }
 
 /**

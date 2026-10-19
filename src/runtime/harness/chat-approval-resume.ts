@@ -19,7 +19,9 @@
  *    event (a live wait loop — user answered in time — never parked, so the
  *    in-flight run owns the resolution and this listener stays out).
  *  - Never dispatches into a session with a run in flight (runInFlightSince):
- *    the running turn will see the resolution itself.
+ *    the running turn will see the resolution itself. The one exception is an
+ *    exact stored action behind a marker no live foreground run owns
+ *    (runMarkerHasNoLiveForegroundOwner); it runs without touching that marker.
  *  - Approval is the ONLY resolution that re-drives. A rejection/expiry stops
  *    quietly — the reaper and the gate's deny message already tell the user —
  *    so a declined action can never come back on its own.
@@ -48,6 +50,7 @@ import {
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
+import { runMarkerHasNoLiveForegroundOwner } from './restart-recovery.js';
 import { getPendingAction, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
 import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
@@ -625,6 +628,7 @@ function settleConversationalApprovalDecisionInBackground(
  */
 function prepareApprovalResumeSource(
   row: approvalRegistry.PendingApprovalRow,
+  options: { armRunInFlight?: boolean } = {},
 ): ChatApprovalResumeSource | null {
   const runId = approvalResumeRunId(row.approvalId);
   const accepted = taggedApprovalResponse(row);
@@ -652,7 +656,7 @@ function prepareApprovalResumeSource(
     },
   }, {
     ...(accepted ? { existingEventSeq: accepted.seq } : {}),
-    armRunInFlight: true,
+    armRunInFlight: options.armRunInFlight ?? true,
   });
   return {
     sourceUserSeq: source.seq,
@@ -712,7 +716,8 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
     }
     return;
   }
-  if (activeResumeSessions.has(sessionId) || getActiveRunAttempt(sessionId) || session.runInFlightSince()) {
+  if (activeResumeSessions.has(sessionId) || getActiveRunAttempt(sessionId)
+    || (session.runInFlightSince() && !runMarkerHasNoLiveForegroundOwner(sessionId))) {
     scheduleResumeDrain(sessionId);
     return;
   }
@@ -978,12 +983,22 @@ export async function handleResolvedApprovalForChatResume(
       return false;
     }
     const activeAttempt = getActiveRunAttempt(row.sessionId);
+    const behindMarkerOnly = !activeAttempt && Boolean(session.runInFlightSince()) && !taggedApprovalResponse(row);
+    // An exact stored action needs no model turn, so a marker with no live
+    // foreground run behind it (a dead process's, an ended request's, or one a
+    // queued workflow dispatch holds) is not a reason to wait. Windows tester
+    // 2026-10-19: approved writes sat "approved" forever behind such a marker
+    // while the button's chat fallback looped Clem on refused executes.
+    const runsBesideMarker = behindMarkerOnly
+      && exactLinkedPendingAction
+      && pendingAction?.toolName !== 'run_batch'
+      && runMarkerHasNoLiveForegroundOwner(row.sessionId);
     if (
       activeResumeSessions.has(row.sessionId)
       || (activeAttempt && !activeAttemptOwnsApprovalResume(activeAttempt, row))
       // A pre-attempt legacy executor can still own the coarse marker. Once an
       // attempt-backed approval resume exists, that exact owner wins instead.
-      || (!activeAttempt && session.runInFlightSince() && !taggedApprovalResponse(row))
+      || (behindMarkerOnly && !runsBesideMarker)
     ) {
       // The current turn may own this resolution; if so its durable consume or
       // pending-action terminal state makes the queued row inert. Otherwise
@@ -1001,7 +1016,9 @@ export async function handleResolvedApprovalForChatResume(
       session.clearRunInFlight();
       if (session.runInFlightSince()) return false;
     }
-    const source = prepareApprovalResumeSource(row);
+    // Beside a marker this resume does not own, arming would take that owner
+    // over and the settle would then clear it, erasing a workflow's hold.
+    const source = prepareApprovalResumeSource(row, { armRunInFlight: !runsBesideMarker });
     if (!source) {
       logger.warn({ approvalId: row.approvalId, sessionId: row.sessionId },
         'parked approval resume has ambiguous accepted response ownership');
@@ -1082,6 +1099,12 @@ function trackResumeFlight(approvalId: string, flight: Promise<boolean>): Promis
  * null when none is in flight. */
 export function approvalResumeInFlight(approvalId: string): Promise<boolean> | null {
   return resumeFlights.get(approvalId) ?? null;
+}
+
+/** True while this approved card's exact resume waits for a live run in its
+ * chat to end; the drain runs it once that run lets go. */
+export function approvalResumeQueued(approvalId: string): boolean {
+  return queuedApprovalResumes.has(approvalId);
 }
 
 /** The resolver may return while its exact stored action is still running.

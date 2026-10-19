@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canOfferStandingSendTrust,
+  queuedPendingActionProgress,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecuteResult,
@@ -176,4 +177,23 @@ test('lost approve-execute response with unavailable durable truth is bounded un
   assert.equal(presentation.phase, 'uncertain');
   assert.match(presentation.note ?? '', /do not retry/i);
   assert.doesNotMatch(presentation.note ?? '', /refused|didn.t send/i);
+});
+
+test('a card queued behind a live run shows that and never sends the decision again as chat', async () => {
+  // Windows tester 2026-10-19: a skipped answer fell back to chat text, which
+  // started a model turn that looped on refused executes.
+  let refreshes = 0;
+  const presentation = await resolvePendingActionExecutionPresentation({
+    ok: true,
+    status: 'queued',
+    resultSummary: 'Approved. It runs once the current work in this chat ends.',
+    record: { id: 'pa-one', status: 'approved', resultSummary: null, payloadHash: 'sha256:one' },
+  }, async () => { refreshes += 1; return { ok: true, status: 'approved', resultSummary: null }; });
+  assert.deepEqual(presentation, { mode: 'durable', phase: 'queued', note: 'Approved. It runs once the current work in this chat ends.' });
+  assert.equal(refreshes, 0);
+
+  assert.equal(queuedPendingActionProgress({ ok: true, status: 'approved', resultSummary: null }), null);
+  assert.deepEqual(queuedPendingActionProgress({ ok: true, status: 'executing', resultSummary: null }), { mode: 'durable', phase: 'running' });
+  assert.deepEqual(queuedPendingActionProgress({ ok: true, status: 'executed', resultSummary: 'Updated 1 record.' }),
+    { mode: 'durable', phase: 'executed', note: 'Updated 1 record.' });
 });
