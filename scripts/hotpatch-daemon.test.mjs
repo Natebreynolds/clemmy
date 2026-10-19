@@ -856,7 +856,7 @@ test('bounded ordered receipt chain proves three installed rounds and privately 
   assert.throws(() => g.proveRepeat({ priorProof: proof }), /retained rollback footprint/);
 });
 
-for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) test(`exact ${ancestors}-ancestor no-active chain retains every rollback through four replacements`, t => {
+for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 40]) test(`exact ${ancestors}-ancestor no-active chain retains every rollback through four replacements`, t => {
   const g = noActiveRepeatFixture(t, ancestors + 1);
   assert.equal(g.manifest.receipts.length, ancestors);
   assert.equal(new Set(g.chain.map(item => item.receipt.sourceFingerprint)).size, ancestors + 1);
@@ -897,10 +897,10 @@ for (const ancestors of [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) test(`exac
   }
 });
 
-test('27 unique complete ancestors refuse at the bound before any write', t => {
-  const g = noActiveRepeatFixture(t, 28);
-  assert.equal(g.manifest.receipts.length, 27);
-  assert.equal(new Set(g.manifest.receipts.map(item => item.sha256)).size, 27);
+test('41 unique complete ancestors refuse at the bound before any write', t => {
+  const g = noActiveRepeatFixture(t, 42);
+  assert.equal(g.manifest.receipts.length, 41);
+  assert.equal(new Set(g.manifest.receipts.map(item => item.sha256)).size, 41);
   const namesBefore = Object.values(g.parts).map(relative => [path.dirname(path.join(g.app, relative)),
     fs.readdirSync(path.dirname(path.join(g.app, relative))).sort()]);
   const writes = [];
