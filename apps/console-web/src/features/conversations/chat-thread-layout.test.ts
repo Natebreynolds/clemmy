@@ -13,7 +13,8 @@ const THREAD = readFileSync(new URL('./chat/ConversationThread.tsx', import.meta
 const SHELL = readFileSync(new URL('../../components/AppShell.tsx', import.meta.url), 'utf8');
 
 test('the live chat thread packs against the composer on a column that fills the window', () => {
-  assert.match(CHAT_THREAD, /max-w-\[60rem\]/);
+  // At least 60rem where there is room, 90% of the pane on a wide screen.
+  assert.match(CHAT_THREAD, /max-w-\[max\(60rem,90%\)\]/);
   assert.match(CHAT_THREAD, /justify-end/);
   assert.match(CHAT_THREAD, /gap-7/);
   assert.doesNotMatch(CHAT_THREAD, /space-y-/);

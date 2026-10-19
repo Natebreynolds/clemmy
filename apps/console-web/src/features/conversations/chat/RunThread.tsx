@@ -137,7 +137,7 @@ export function RunThread({ session }: { session: Session }) {
         stopping={stopping}
       />
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl space-y-3 px-6 py-6">
+        <div className="mx-auto w-full max-w-[max(60rem,90%)] space-y-3 px-6 py-6">
           {stopNotice && (
             <p className="rounded-md border border-warning bg-warning-tint px-3 py-2 text-body text-fg">
               {stopNotice}
@@ -210,7 +210,7 @@ function RunFooter({ session }: { session: Session }) {
 
   return (
     <div className="border-t border-border bg-subtle px-5 py-2.5">
-      <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-x-4 gap-y-1">
+      <div className="mx-auto flex w-full max-w-[max(60rem,90%)] flex-wrap items-center gap-x-4 gap-y-1">
         {originSessionId && (
           <Link
             to={conversationHref(originSessionId)}
