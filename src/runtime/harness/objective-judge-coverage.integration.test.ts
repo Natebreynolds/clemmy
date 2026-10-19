@@ -25,6 +25,9 @@ const { judgeObjectiveComplete, HOST_COMPLETION_EVIDENCE_GUIDANCE } = await impo
 const { resetJudgeMetricsForTests } = await import('./judge-family.js');
 const { _setDiscoveredModelsForTest } = await import('./model-discovery.js');
 const { closeEventLog } = await import('./eventlog.js');
+// A pass after a bounce also teaches a lesson through the memory model
+// (check-lessons.ts); these cases count the reviewer's requests only.
+(await import('../../memory/check-lessons.js'))._setCheckLessonModelForTests(async () => '{"lessons": []}');
 
 /** One scripted reviewer turn: a verdict, or a lookup the runner executes. */
 type Step = string | Error | { tool: 'open_evidence' | 'query_evidence'; args: Record<string, unknown> };

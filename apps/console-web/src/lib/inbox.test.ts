@@ -77,9 +77,16 @@ test('desktop Inbox makes workflow gates actionable and never approves a plan th
   assert.match(source, /\{needsInput\s+\? conversation && <Link[^\n]*Answer in the conversation<\/Link>\s+: <Button disabled=\{busy\} onClick=\{onApprove\}>/);
   assert.match(source, /to=\{`\/chat\/\$\{encodeURIComponent\(row\.sessionId\)\}`\}/);
   assert.match(source, /Decline it and ask Clem for a new plan/);
-  assert.match(automate, /Open exact Needs You gate/);
+  // Plain words (2026-10-16); the link still opens that exact item.
+  assert.match(automate, /Open in Needs you/);
+  assert.match(automate, /navigate\(`\/inbox\?tab=needs&select=\$\{encodeURIComponent\(`workflow-\$\{selectedRun\.id\}-capability-/);
   assert.match(automate, /Choose an exact account/);
-  assert.doesNotMatch(automate, /resumeWorkflowCapability/);
+  // A connection check the service did not answer is retried in place
+  // (2026-10-16): no account choice or authorization. Every gate that needs
+  // one still opens in Needs you.
+  assert.equal((automate.match(/resumeWorkflowCapability\(/g) ?? []).length, 1, 'one resume: the connection-check retry');
+  assert.match(automate, /const retryCheckNow = async \(\) => \{[\s\S]{0,200}await resumeWorkflowCapability\(workflow, selectedRunId\)/);
+  assert.match(automate, /reason === 'connection-check-unavailable' \? \([\s\S]{0,1500}onClick=\{retryCheckNow\}/);
 });
 
 test('queued-action approval copy never claims the external action executed', () => {

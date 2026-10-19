@@ -193,7 +193,9 @@ test('an answered Noticing handoff stays open as progress without being presente
   const createdAt = new Date(Date.now() - 1_000).toISOString();
   for (const handoffState of ['not_started', 'needs_attention', 'dispatched'] as const) {
     state.proposals[handoffState] = { id: handoffState, shapeKey: handoffState, title: 'Controlled accepted proposal',
-      why: 'Controlled retained handoff.', action: 'Prepare a controlled draft.', evidence: [], goalId: null, confidence: 1,
+      // A proposal rests on at least one observation; one without is set
+      // aside as unreadable (7da26b8bd).
+      why: 'Controlled retained handoff.', action: 'Prepare a controlled draft.', evidence: ['Controlled observation.'], goalId: null, confidence: 1,
       createdAt, status: 'answered', answer: { text: 'Prepare the draft.', decision: 'do_it', at: createdAt },
       handoff: { version: 1, answerDigest: 'private-answer-digest', state: handoffState, updatedAt: createdAt,
         sessionId: 'controlled-handoff-chat', reason: 'Controlled progress.' } };

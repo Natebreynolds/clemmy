@@ -30,14 +30,17 @@ test('Home renders the command center instead of redirecting to Chat', () => {
   assert.match(HOME, /headingId="home-needs-you"/);
   assert.match(HOME, /headingId="home-made"/);
   assert.match(HOME, /MadePane/);
-  assert.match(HOME, /max-w-\[1240px\]/);
+  // One calm column (2026-10-17).
+  assert.match(HOME, /max-w-\[960px\]/);
 });
 
 test('two styles the owner picks, Clem\'s work as a live band, each Space summary or full', () => {
-  assert.match(HOME, /prefs\.style === 'briefing' \? briefing : dashboard/);
-  assert.match(HOME, /needsPane\('strip', 3\)/, 'Briefing leads with decisions as cards');
-  assert.match(HOME, /recentPane\('timeline'\)/);
-  assert.match(HOME, /\[showToday && todayPane, showNeeds && needsPane\('list', 2\), showRecent && recentPane\('list'\)\]/, 'Dashboard: Today, Needs you, what came back');
+  // One ordered column for either style (2026-10-17); the style chooses how
+  // each pane reads.
+  assert.match(HOME, /const contentLayout = buildHomeContentLayout\(panes\.filter\(id => Boolean\(paneContent\.get\(id\)\)\), prefs\.style\);/);
+  assert.match(HOME, /needsPane\(prefs\.style === 'briefing' \? 'strip' : 'list', prefs\.style === 'briefing' \? 3 : 2\)/, 'Briefing leads with decisions as cards');
+  assert.match(HOME, /recentPane\(prefs\.style === 'briefing' \? 'timeline' : 'list'\)/);
+  assert.match(HOME, /\['today', showToday \? todayPane : null\]/, 'Today, Needs you and what came back');
   // The live band left Today for the header (owner 09-26): the shell feeds it
   // and the bar renders it, in the owner's chosen style.
   assert.doesNotMatch(HOME, /<LiveStatus/);

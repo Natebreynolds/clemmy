@@ -25,7 +25,9 @@ test('fresh action keeps its budget and the inline/missing-detail cue without cl
   // 6_691 → 6_890 (2026-10-17): the FINAL REPORT rule joined the action lane
   // and names the claims completion reviews reject (unsupported comparisons,
   // absence beyond what was checked, unmarked estimates, unmeasured asides).
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 6_890, 'the lean action prompt does not grow');
+  // 6_890 → 6_895 (2026-10-18): FINAL REPORT says "Answer the ask, then stop"
+  // and names unasked options and method notes, the extras reviews bounced most.
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 6_895, 'the lean action prompt does not grow');
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /honor constraints; verify stale\/conflicting claims/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /Use inline results; recall missing detail by exact full call_id\/handle/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /exact host-authenticated retained success/);

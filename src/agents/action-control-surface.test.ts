@@ -328,7 +328,10 @@ test('resolved control capabilities load directly without an extra discovery dec
     estFirstClassTokens?: number;
   } | undefined;
   assert.ok((scope?.firstClassCount ?? 999) <= 18, `resolved-control surface regrew to ${scope?.firstClassCount}`);
-  assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 10_000);
+  // 10_000 → 10_100 (2026-10-17, 9bce8c4ff): workflow_create tells a watch it
+  // needs no saved goal or seen-ledger (the first live watch setup spent 61
+  // calls and 1.1M prompt tokens rehearsing both); measured 10_032.
+  assert.ok((scope?.estFirstClassTokens ?? 99_999) <= 10_100, `resolved-control surface tokens ${scope?.estFirstClassTokens}`);
 });
 
 test('exact capability selection bypasses semantic discovery ranking', async () => {

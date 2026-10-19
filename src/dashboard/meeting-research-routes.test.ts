@@ -110,6 +110,10 @@ test('all six research/context routes authenticate before reads, validation, mut
 
 test('research and document GETs are passive before and after permission, without jobs, accepted tasks or scan scheduling', async () => {
   const f = fixture(); const harness = await boot(); const url = `${harness.url}${f.route}`;
+  // A check needs a finished transcript line to look at; partial-only speech
+  // owns no wakeup (d2c3479b7).
+  capture.appendRecallTranscriptSegment({ windowId: f.record.windowId, sdkUploadId: f.record.sdkUploadId,
+    event: 'transcript.data', text: 'What is the approved controlled version?', isFinal: true, timestamp: '2026-10-17T12:00:00.000Z' });
   try {
     const before = snapshotFiles(); const scans = scheduledScans;
     const initial = await readResearch(url); const sources = await readDocuments(url);
@@ -287,7 +291,9 @@ test('GET preserves a saved answer while honestly projecting reviewed, failed-op
       const eventCount = eventlog.listEvents(result.jobs[0]!.task!.sessionId).length;
       const state = await readResearch(url) as MeetingResearchSnapshot & { jobs: { reviewState: string; task: unknown }[] };
       assert.equal(state.jobs[0]!.reviewState, variant === 'reviewed' ? 'reviewed' : variant === 'owner_off' ? 'disabled_by_owner' : 'unverified');
-      assert.deepEqual(state.jobs[0]!.task, result.jobs[0]!.task); assert.equal(JSON.stringify(state).includes(answer), false);
+      assert.deepEqual(state.jobs[0]!.task, result.jobs[0]!.task);
+      // The saved private answer is shown with its review state (076cf2990).
+      assert.equal((state.jobs[0] as { answer?: { text: string } }).answer?.text, answer);
       assert.deepEqual(await readResearch(url), state); assert.equal(executions, 1);
       assert.equal(eventlog.listEvents(result.jobs[0]!.task!.sessionId).length, eventCount, 'GET never adds a review or executor event');
     }
