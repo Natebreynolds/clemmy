@@ -105,6 +105,47 @@ test('Jev snapshots nested accounting parent, detached job and prompt estimates 
   assert.equal(usage.channel, 'jev'); assert.deepEqual(usage.promptComponents, { instructions: 8, history: 4 });
 });
 
+test('host call stage is captured before key resolution and remains aligned with its usage record', async () => {
+  _setTypesafeKeyForTests('test-key'); let calls = 0;
+  const rows: Readonly<Record<string, unknown>>[] = [];
+  _setSystemOneFetchForTests(async () => { calls++; return { status: 200, ok: true, text: async () => JSON.stringify({
+    model: 'jev-1.13.0', answers: { a: { type: 'noul', noul: 0.7 } }, usage: { input_tokens: 5, output_tokens: 2 },
+  }) }; });
+  const input: Parameters<typeof evaluateSystemOne>[0] = { state: 'PRIVATE_STAGE_STATE',
+    questions: { a: { type: 'noul', instructions: 'Check.' } }, channel: 'jev-turn-start', sessionId: 'jev-stage-owner' };
+  const pending = withModelTransportRecorder(row => rows.push(row), () => modelUsageAttributionStorage.run({
+    sessionId: input.sessionId!, sourceUserSeq: 470, attemptId: 'attempt-stage-owner',
+  }, () => evaluateSystemOne(input)));
+  input.channel = 'jev-completion';
+  const result = await pending;
+  assert.ok(result.ok); assert.equal(calls, 1);
+  assert.ok(rows.length > 0 && rows.every(row => row.callPurpose === 'jev-turn-start'
+    && row.sourceUserSeq === 470 && row.runAttemptId === 'attempt-stage-owner'));
+  const usage = readUsageEventsForDate().filter(row => row.trace?.modelCallId === rows[0].modelCallId);
+  assert.equal(usage.length, 1); assert.equal(usage[0].channel, 'jev-turn-start');
+  assert.equal(usage[0].role, 'router'); assert.equal(usage[0].inputTokens, 5); assert.equal(usage[0].outputTokens, 2);
+  assert.doesNotMatch(JSON.stringify(rows), /PRIVATE_STAGE_STATE|test-key/);
+});
+
+test('unknown stage text stays absent and a known stage cannot give an unowned call a source', async () => {
+  _setTypesafeKeyForTests('test-key'); let calls = 0;
+  _setSystemOneFetchForTests(async () => { calls++; return { status: 200, ok: true, text: async () => JSON.stringify({
+    answers: { a: { type: 'noul', noul: 0.7 } }, usage: { input_tokens: 2, output_tokens: 1 },
+  }) }; });
+  const owned: Readonly<Record<string, unknown>>[] = [], unowned: Readonly<Record<string, unknown>>[] = [];
+  const result = await withModelTransportRecorder(row => owned.push(row), () => modelUsageAttributionStorage.run({
+    sessionId: 'jev-unknown-stage-owner', sourceUserSeq: 471, attemptId: 'attempt-unknown-stage-owner',
+  }, () => evaluateSystemOne({ state: 'x', questions: { a: { type: 'noul', instructions: 'Check.' } },
+    channel: 'PRIVATE_UNKNOWN_STAGE', sessionId: 'jev-unknown-stage-owner' })));
+  assert.ok(result.ok); assert.ok(owned.length > 0);
+  assert.ok(owned.every(row => !Object.hasOwn(row, 'callPurpose')));
+  assert.doesNotMatch(JSON.stringify(owned), /PRIVATE_UNKNOWN_STAGE/);
+  await withModelTransportRecorder(row => unowned.push(row), () => modelUsageAttributionStorage.run({
+    sessionId: 'unknown', sourceUserSeq: 0,
+  }, () => evaluateSystemOne({ state: 'x', questions: { a: { type: 'noul', instructions: 'Check.' } }, channel: 'jev-completion' })));
+  assert.equal(calls, 2); assert.deepEqual(unowned, []);
+});
+
 test('initially unowned or unavailable capture cannot borrow a later source while ordinary Jev work continues', async () => {
   _setTypesafeKeyForTests('test-key'); let calls = 0, getterCalls = 0;
   _setSystemOneFetchForTests(async () => { calls++; return { status: 200, ok: true, text: async () => JSON.stringify({

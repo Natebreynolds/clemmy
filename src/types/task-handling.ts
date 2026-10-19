@@ -5,6 +5,19 @@ export interface TaskHandlingUsageTotals {
   promptTokens: number; cachedReadTokens: number; uncachedWorkTokens: number;
   outputTokens: number; reportedTotalTokens: number; modelMs: number;
 }
+/** An observed SystemOne request, separate from model route choices and token totals. */
+export interface TaskAuxiliaryModel {
+  callId: string; attemptId: string; physicalAttempt: number;
+  transport: 'typesafe_systemone';
+  role: 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory' | 'unknown';
+  callPurpose?: import('../runtime/model-call-purpose.js').ModelCallPurpose;
+  requestedModel?: string; providerReportedModel?: string;
+  responseCompleted: boolean;
+  status: 'started' | 'returned' | 'failed' | 'cancelled' | 'unconfirmed';
+  dispatchCount: number; usage: 'reported' | 'unknown';
+  evidence: 'parsed_response' | 'incomplete' | 'conflicting';
+  durationMs?: number;
+}
 /** Current memory subwork only; it does not revise a task's historical outcome. */
 export type TaskMemoryState = 'pending' | 'saved' | 'refused' | 'needs_choice' | 'unavailable';
 export interface TaskMemoryStatus {
@@ -42,6 +55,7 @@ export interface TaskHandlingDetails {
     attemptId?: string; status: 'started' | 'success' | 'failed' | 'fallback' | 'cancelled';
     responseCompleted: boolean; fallbackToModel?: string; durationMs?: number;
   }>;
+  auxiliaryModels?: TaskAuxiliaryModel[];
   usage: {
     scope: 'accepted_source'; meteringStartedAt: string; sourcePredatesMetering: boolean;
     totals: TaskHandlingUsageTotals; byRole: Record<string, TaskHandlingUsageTotals>;
@@ -56,6 +70,6 @@ export interface TaskHandlingDetails {
     recall: Array<{ id: string; surface: string; createdAt: string;
       refs: Array<{ type: string; id: string; text?: string; outcome: 'offered' | 'used' | 'not_useful' }> }>;
   };
-  limits: { toolsTruncated: boolean; modelsTruncated: boolean; memoryTruncated: boolean };
+  limits: { toolsTruncated: boolean; modelsTruncated: boolean; memoryTruncated: boolean; auxiliaryModelsTruncated?: boolean };
   limitations: string[];
 }

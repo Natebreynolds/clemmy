@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   getTaskDetails, recordedCount, recordedDuration, taskDetailsPath, taskModelIdentity,
-  taskMemorySections, taskProvidedMemoryLinks, taskModelProvider, taskModelRole, taskModelStatus, taskToolEvidence, taskToolReason, taskToolStatus, taskUsageNotes,
-  type TaskHandlingDetails, type TaskModelRecord, type TaskToolRecord,
+  taskAuxiliaryIdentity, taskAuxiliaryPurpose, taskAuxiliaryStatus, taskMemorySections, taskProvidedMemoryLinks, taskModelProvider, taskModelRole, taskModelStatus, taskToolEvidence, taskToolReason, taskToolStatus, taskUsageNotes, taskUsageRoles,
+  type TaskHandlingDetails, type TaskAuxiliaryModelRecord, type TaskModelRecord, type TaskToolRecord,
 } from './task-details.js';
 
 function details(): TaskHandlingDetails {
@@ -18,6 +18,10 @@ const model = (patch: Partial<TaskModelRecord> = {}): TaskModelRecord => ({
 });
 const tool = (patch: Partial<TaskToolRecord> = {}): TaskToolRecord => ({
   callId: 'tool-a', eventSeq: 50, name: 'read_file', status: 'returned', dispatchEvidence: 'lifecycle', startedAt: '2026-10-18T10:00:00Z', ...patch,
+});
+const auxiliary = (patch: Partial<TaskAuxiliaryModelRecord> = {}): TaskAuxiliaryModelRecord => ({
+  callId: 'auxiliary-a', attemptId: 'attempt-a', physicalAttempt: 1, transport: 'typesafe_systemone', role: 'router',
+  responseCompleted: false, status: 'started', dispatchCount: 1, usage: 'unknown', evidence: 'incomplete', ...patch,
 });
 
 test('unfamiliar role and section names remain text rather than inherited object properties', () => {
@@ -84,8 +88,65 @@ test('identity-correct malformed payloads become read errors instead of crashing
     { ...details(), tools: [tool({ selection: { kind: 'owner_preference', text: [] as unknown as string } })] },
     { ...details(), models: [model({ servedProvider: 42 as unknown as string })] },
     { ...details(), models: [model({ role: null as unknown as string })] },
+    { ...details(), auxiliaryModels: null },
+    { ...details(), auxiliaryModels: [auxiliary({ attemptId: 42 as unknown as string })] },
+    { ...details(), auxiliaryModels: [auxiliary({ physicalAttempt: 0 })] },
+    { ...details(), auxiliaryModels: [auxiliary({ dispatchCount: 1.5 })] },
+    { ...details(), auxiliaryModels: [auxiliary({ callPurpose: 'raw_private_purpose' as TaskAuxiliaryModelRecord['callPurpose'] })] },
+    { ...details(), limits: { ...details().limits, auxiliaryModelsTruncated: 'yes' } },
   ];
   for (const payload of malformed) await assert.rejects(getTaskDetails('task-a', 41, undefined, async () => payload), /could not be read/);
+});
+
+test('auxiliary records remain optional for old receipts and validated separately for new receipts', async () => {
+  assert.equal((await getTaskDetails('task-a', 41, undefined, async () => details())).auxiliaryModels, undefined);
+  const detail = details();
+  detail.auxiliaryModels = [auxiliary({ callPurpose: 'jev-turn-start' })];
+  detail.limits.auxiliaryModelsTruncated = false;
+  const loaded = await getTaskDetails('task-a', 41, undefined, async () => detail);
+  assert.equal(loaded.auxiliaryModels?.[0]?.callPurpose, 'jev-turn-start');
+});
+
+test('historical generic routing does not invent a specific helper purpose', () => {
+  assert.equal(taskAuxiliaryPurpose(auxiliary({ role: 'router', requestedModel: 'Jev' })), 'Purpose not recorded');
+  assert.equal(taskAuxiliaryPurpose(auxiliary({ callPurpose: 'jev-turn-start' })), 'Assessing how to start');
+  assert.equal(taskAuxiliaryPurpose(auxiliary({ callPurpose: 'jev-completion' })), 'Reviewing completion');
+  assert.equal(taskAuxiliaryPurpose(auxiliary({ callPurpose: 'jev-completion', evidence: 'conflicting' })), 'Purpose not recorded');
+  for (const value of ['constructor', '__proto__', 'toString', 'private-stage']) {
+    assert.equal(taskAuxiliaryPurpose(auxiliary({ callPurpose: value as TaskAuxiliaryModelRecord['callPurpose'] })), 'Purpose not recorded');
+  }
+});
+
+test('a requested helper model never becomes a provider-confirmed response model', () => {
+  const requested = taskAuxiliaryIdentity(auxiliary({ requestedModel: 'requested-helper', providerReportedModel: 'unconfirmed-helper' }));
+  assert.equal(requested.name, 'Requested Helper'); assert.match(requested.note, /Requested model.*not confirmed/);
+  const parsed = auxiliary({ requestedModel: 'requested-helper', providerReportedModel: 'actual-helper', responseCompleted: true, status: 'returned', evidence: 'parsed_response' });
+  assert.deepEqual(taskAuxiliaryIdentity(parsed), { name: 'Actual Helper', note: 'Response model reported', requested: 'Requested Helper' });
+  for (const patch of [{ evidence: 'conflicting' as const }, { evidence: 'incomplete' as const }, { status: 'failed' as const }, { responseCompleted: false }]) {
+    assert.equal(taskAuxiliaryIdentity({ ...parsed, ...patch }).name, 'Requested Helper');
+  }
+  assert.equal(taskAuxiliaryIdentity(auxiliary()).name, 'Model not recorded');
+});
+
+test('a parsed helper response is not a passed review or a completed task', () => {
+  assert.equal(taskAuxiliaryStatus(auxiliary({ responseCompleted: true, status: 'returned', evidence: 'parsed_response', callPurpose: 'jev-completion' })), 'Result parsed');
+  assert.equal(taskAuxiliaryStatus(auxiliary({ status: 'returned' })), 'Result unconfirmed');
+  assert.equal(taskAuxiliaryStatus(auxiliary({ evidence: 'conflicting' })), 'Observations disagree');
+  assert.equal(taskAuxiliaryStatus(auxiliary({ status: 'failed' })), 'Request failed');
+  assert.equal(taskAuxiliaryStatus(auxiliary({ status: 'cancelled' })), 'Cancelled');
+});
+
+test('call counts come only from canonical role totals, not route and observation array sizes', () => {
+  const total = { calls: 3, failedCalls: 0, uncertifiedCalls: 1, unknownCostCalls: 1, promptTokens: 100,
+    cachedReadTokens: 10, uncachedWorkTokens: 110, outputTokens: 20, reportedTotalTokens: 120, modelMs: 4000 };
+  const detail = details(); detail.models = [model()]; detail.auxiliaryModels = [auxiliary(), auxiliary({ callId: 'auxiliary-b' })];
+  detail.usage = { scope: 'accepted_source', meteringStartedAt: detail.acceptedAt, sourcePredatesMetering: false, totals: total,
+    byRole: { brain: { ...total, calls: 1 }, router: { ...total, calls: 2 } } };
+  assert.deepEqual(taskUsageRoles(detail), [{ label: 'Task work', calls: 1 }, { label: 'Routing', calls: 2 }]);
+  detail.models.push(model({ callId: 'second-route' })); detail.auxiliaryModels.push(auxiliary({ callId: 'auxiliary-c' }));
+  assert.deepEqual(taskUsageRoles(detail), [{ label: 'Task work', calls: 1 }, { label: 'Routing', calls: 2 }]);
+  assert.match(taskUsageNotes(detail).join(' '), /do not have complete usage records.*Cost is unknown/);
+  assert.deepEqual(taskUsageRoles({ ...detail, usage: null }), []);
 });
 
 test('route selection and a configured model never become proof of the answering model', () => {

@@ -134,8 +134,10 @@ test('nominal unavailable capture never adopts a later accepted owner or wire ex
   const captured = withModelTransportRecorder(row => rows.push(row), () => captureUnavailableModelTransportOwner());
   await withModelUsageAttribution({ sessionId: 'later-owner', sourceUserSeq: 333, attemptId: 'attempt-later' }, async () => {
     for (const owner of [captured, { ...captured }]) {
-      const scope = createModelTransportAttempt('unavailable-owner-call', 1, owner);
+      const scope = createModelTransportAttempt('unavailable-owner-call', 1, owner, 'jev-completion');
       assert.equal(scope.owner, undefined); assert.equal(scope.purpose, 'unknown');
+      assert.equal(scope.callPurpose, 'jev-completion');
+      assert.equal(Reflect.set(scope, 'callPurpose', 'jev-turn-start'), false);
       await withModelTransportAttempt(scope, () => observeModelTransportFetch('typesafe_systemone', 'jev-1.13.0',
         async () => ({ status: 200, ok: true })));
       finishModelTransportAttempt(scope, 'returned');

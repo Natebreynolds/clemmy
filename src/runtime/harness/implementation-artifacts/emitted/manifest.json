@@ -434,6 +434,9 @@
         "src/runtime/harness/model-response-binding.ts": {
           "bytes": 3076
         },
+        "src/runtime/model-call-purpose.ts": {
+          "bytes": 1257
+        },
         "src/runtime/trace-envelope.ts": {
           "bytes": 4749
         },
@@ -453,7 +456,7 @@
           "bytes": 37393
         },
         "src/runtime/harness/model-transport-observation.ts": {
-          "bytes": 26195
+          "bytes": 26680
         },
         "src/shared/provider-internal-generation.ts": {
           "bytes": 953
@@ -816,7 +819,7 @@
           "bytes": 5577
         },
         "src/runtime/jev/client.ts": {
-          "bytes": 17227
+          "bytes": 17988
         },
         "src/runtime/harness/historical-completion-evidence.ts": {
           "bytes": 7228
@@ -4376,6 +4379,9 @@
         "src/runtime/harness/model-response-binding.ts": {
           "bytes": 3076
         },
+        "src/runtime/model-call-purpose.ts": {
+          "bytes": 1257
+        },
         "src/runtime/trace-envelope.ts": {
           "bytes": 4749
         },
@@ -4395,7 +4401,7 @@
           "bytes": 37393
         },
         "src/runtime/harness/model-transport-observation.ts": {
-          "bytes": 26195
+          "bytes": 26680
         },
         "src/shared/provider-internal-generation.ts": {
           "bytes": 953
@@ -4758,7 +4764,7 @@
           "bytes": 5577
         },
         "src/runtime/jev/client.ts": {
-          "bytes": 17227
+          "bytes": 17988
         },
         "src/runtime/harness/historical-completion-evidence.ts": {
           "bytes": 7228

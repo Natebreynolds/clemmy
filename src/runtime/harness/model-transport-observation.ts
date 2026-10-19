@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { completedModelResponseBinding } from './model-response-binding.js';
+import { modelCallPurpose, type ModelCallPurpose } from '../model-call-purpose.js';
 import { modelUsageAttributionStorage, captureModelUsageProvenance, capturedModelUsageAttribution,
   standaloneModelAccountingJobFromContext, standaloneModelAccountingJobBinding,
   type StandaloneModelAccountingJob, type StandaloneModelAccountingJobBinding,
@@ -25,6 +26,7 @@ export interface ModelTransportAttempt {
   readonly owner?: Readonly<ObservationOwner>;
   readonly accountingJob?: Readonly<StandaloneModelAccountingJobBinding>;
   readonly purpose: 'brain' | 'worker' | 'reviewer' | 'router' | 'writer' | 'memory' | 'unknown';
+  readonly callPurpose?: ModelCallPurpose;
 }
 /** A nominal snapshot taken at the public model call, including an explicit
  * absent owner. A lazy stream must never borrow its later drainer's scope. */
@@ -154,6 +156,7 @@ function emit(scope: ModelTransportAttempt, fields: Record<string, unknown>): vo
       ...(scope.owner!.runAttemptId ? { runAttemptId: scope.owner!.runAttemptId } : {}),
     }), modelCallId: scope.modelCallId,
     physicalAttempt: scope.physicalAttempt, purpose: scope.purpose,
+    ...(scope.callPurpose ? { callPurpose: scope.callPurpose } : {}),
     at: Date.now(), clock: 'host_epoch_ms', journalFailed: state.journalFailed });
     const returned = state.record(data);
     if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
@@ -208,13 +211,18 @@ export function withPublicModelTransportUsageOwner<T>(owner: CapturedModelTransp
 /** An adapter attempt is not a wire request. Capture its owner before any
  * transport work; actual fetches mint their own IDs under this immutable scope. */
 export function createModelTransportAttempt(modelCallId: string, physicalAttempt: number,
-  captured: CapturedModelTransportOwner = captureModelTransportOwner()): ModelTransportAttempt {
+  captured: CapturedModelTransportOwner = captureModelTransportOwner(),
+  requestPurpose?: ModelCallPurpose): ModelTransportAttempt {
   const nominal = capturedOwners.has(captured);
   const purpose = nominal ? captured.purpose : 'unknown';
   const owner = nominal ? captured.owner : undefined;
   const accountingJob = nominal ? captured.accountingJob : undefined;
+  // A stage is advisory metadata. It cannot supply an absent nominal owner,
+  // and a later async drainer cannot rename an already-created request.
+  const callPurpose = modelCallPurpose(requestPurpose);
   const scope = Object.freeze({ modelCallId, physicalAttempt, ...(owner ? { owner } : {}),
-    ...(accountingJob ? { accountingJob } : {}), purpose }) as ModelTransportAttempt;
+    ...(accountingJob ? { accountingJob } : {}), purpose,
+    ...(callPurpose ? { callPurpose } : {}) }) as ModelTransportAttempt;
   const capturedState = nominal ? capturedOwners.get(captured) : undefined;
   const record = capturedState?.record ?? ((data: Readonly<Record<string, unknown>>) => {
     if (accountingJob) recordOperationalEvent({ source: 'model', type: 'model_accounting_observed',

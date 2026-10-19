@@ -12,6 +12,7 @@ import { listRecallUses, readRecallRun } from '../memory/recall-usage.js';
 import { openMemoryDb } from '../memory/db.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { readTaskMemoryStatus } from './task-memory-status-read.js';
+import { readTaskAuxiliaryModels, type ExactRouteCallObservation } from './task-auxiliary-model-read.js';
 
 const CAP = 100;
 const clean = (value: unknown, max = 240): string | undefined => typeof value === 'string' && value.trim()
@@ -180,20 +181,32 @@ export function readTaskHandlingDetails(
   }
   if (result.memory.provided || result.memory.recall.length) result.limitations.push('Memory made available and detected recall use do not prove why a tool or model was chosen.');
   result.memory.consolidation = readTaskMemoryStatus(identity, now)?.memory ?? null;
-  readModels(result, attemptIds, accepted.created_at, now);
+  const routeCalls = readModels(result, attemptIds, accepted.created_at, now);
+  try {
+    const auxiliary = readTaskAuxiliaryModels(identity, routeCalls);
+    result.auxiliaryModels = auxiliary.models;
+    result.limits.auxiliaryModelsTruncated = auxiliary.truncated;
+    result.limitations.push(...auxiliary.limitations);
+  } catch {
+    result.auxiliaryModels = [];
+    result.limits.auxiliaryModelsTruncated = false;
+    result.limitations.push('Auxiliary model observations could not be verified.');
+  }
   result.attemptIds = [...attemptIds];
   return result;
 }
 
-function readModels(result: TaskHandlingDetails, attempts: Set<string>, acceptedAt: string, now: Date): void {
+function readModels(result: TaskHandlingDetails, attempts: Set<string>, acceptedAt: string, now: Date): ExactRouteCallObservation[] {
+  const exactCalls: ExactRouteCallObservation[] = [];
   const file = path.join(BASE_DIR, 'state', 'model-route-metrics.db');
-  if (!existsSync(file)) { result.limitations.push('Model details are unavailable; usage by role may still be recorded.'); return; }
+  if (!existsSync(file)) { result.limitations.push('Model details are unavailable; usage by role may still be recorded.'); return exactCalls; }
   let db: Database.Database | undefined;
   try {
     // Read-only, no schema initialization or metrics writes on UI expansion.
     db = new Database(file, { readonly: true, fileMustExist: true });
     const rows = db.prepare(`SELECT d.id, d.role, d.provider, d.requested_model, d.resolved_model,
       json_extract(d.reason_json, '$.runAttemptId') AS attempt_id,
+      json_extract(d.reason_json, '$.physicalAttempt') AS physical_attempt,
       o.status, o.latency_ms, o.fallover_to_model,
       CASE WHEN json_valid(o.metadata_json) THEN json_extract(o.metadata_json, '$.responseCompleted') END AS response_completed,
       CASE WHEN json_valid(o.metadata_json) THEN json_extract(o.metadata_json, '$.actualModel') END AS actual_model,
@@ -208,6 +221,7 @@ function readModels(result: TaskHandlingDetails, attempts: Set<string>, accepted
       const callId = clean(row.id), model = clean(row.resolved_model), role = clean(row.role), provider = clean(row.provider);
       if (!callId || !model || !role || !provider) return [];
       const attemptId = clean(row.attempt_id);
+      if (attemptId && positive(row.physical_attempt)) exactCalls.push({ callId, attemptId, physicalAttempt: Number(row.physical_attempt) });
       if (attemptId) attempts.add(attemptId);
       const status = ['success', 'failed', 'fallback', 'cancelled'].includes(String(row.status))
         ? row.status as 'success' | 'failed' | 'fallback' | 'cancelled' : 'started';
@@ -225,4 +239,5 @@ function readModels(result: TaskHandlingDetails, attempts: Set<string>, accepted
     result.limitations.push('Model details cover recorded calls and may omit some helpers. Token totals come from the separate request meter.');
   } catch { result.limitations.push('Model details could not be read.'); }
   finally { db?.close(); }
+  return exactCalls;
 }

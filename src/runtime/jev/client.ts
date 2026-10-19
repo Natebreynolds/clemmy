@@ -5,6 +5,7 @@
 import { getRuntimeEnv } from '../../config.js';
 import { getSecretStore } from '../secrets/index.js';
 import { recordModelUsage } from '../usage-log.js';
+import { modelCallPurpose } from '../model-call-purpose.js';
 import { compactJevAnswers, recordJevDecision } from './decision-log.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { modelUsageAttributionStorage, withOwnModelRequestAttribution, type ModelUsageAttributionContext } from '../usage-log.js';
@@ -214,12 +215,22 @@ export async function evaluateSystemOne(input: {
   // Capture the whole request-local tuple and sink before asynchronous key
   // resolution. Missing-key/disabled paths still create no adapter attempt.
   const usageAttribution = captureUsageAttribution();
+  // Snapshot ordinary host data without invoking accessors on preflight exits.
+  // An accessor-backed stage remains unclassified; it is read in the existing
+  // request path only after a key is available.
+  let channelAtEntry: { value: string | undefined } | undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(input, 'channel');
+    if (descriptor && 'value' in descriptor) channelAtEntry = { value: descriptor.value };
+  } catch { /* optional diagnostics never introduce a preflight failure */ }
+  const callPurpose = modelCallPurpose(channelAtEntry?.value);
   let transportOwner;
   try {
     transportOwner = modelUsageAttributionStorage.run(usageAttribution,
       () => withOwnModelRequestAttribution({ role: 'router' }, () => captureModelTransportOwner()));
   } catch { transportOwner = captureUnavailableModelTransportOwner(); }
-  const capturedOwner = input.captureOriginalWitness && input.channel === 'jev-completion'
+  const capturedOwner = input.captureOriginalWitness
+    && (channelAtEntry ? channelAtEntry.value : input.channel) === 'jev-completion'
     ? directAssessmentOwner() : undefined;
   let expectedBody: string | undefined;
   let questionnaireSha256: string | undefined;
@@ -232,13 +243,14 @@ export async function evaluateSystemOne(input: {
   if (!jevEnabled()) return { ok: false, reason: 'disabled' };
   const key = await resolveTypesafeApiKey();
   if (!key) return { ok: false, reason: 'missing_key' };
+  const channel = channelAtEntry ? channelAtEntry.value : input.channel;
   const started = Date.now();
   let observation!: ModelTransportAttempt;
   let actualBodies = 0; let bodyMatched = false;
   let result: SystemOneResult;
   try {
-    result = await withOwnModelRequestAttribution({ role: 'router', channel: input.channel ?? 'jev' }, () => {
-      observation = createModelTransportAttempt(randomUUID(), 1, transportOwner);
+    result = await withOwnModelRequestAttribution({ role: 'router', channel: channel ?? 'jev' }, () => {
+      observation = createModelTransportAttempt(randomUUID(), 1, transportOwner, callPurpose);
       const fetchImpl = fetchOverride ?? (globalThis.fetch as unknown as SystemOneFetch);
       return withModelTransportAttempt(observation, () => postSystemOne({
       apiKey: key.value,
@@ -264,7 +276,7 @@ export async function evaluateSystemOne(input: {
   try {
     modelUsageAttributionStorage.run(usageAttribution, () => recordModelUsage({
       sessionId: input.sessionId?.trim() || 'jev',
-      channel: input.channel ?? 'jev',
+      channel: channel ?? 'jev',
       role: 'router',
       account: JEV_ACCOUNT_ID,
       model: result.ok ? result.model : TYPESAFE_MODEL,
@@ -283,7 +295,7 @@ export async function evaluateSystemOne(input: {
     }));
   } catch { /* usage must never break the decision path */ }
   const decisionId = recordJevDecision({
-    lane: input.channel ?? 'jev',
+    lane: channel ?? 'jev',
     ...(input.sessionId?.trim() ? { sessionId: input.sessionId.trim() } : {}),
     requestedModel: TYPESAFE_MODEL,
     ...(result.ok && result.providerReportedModel ? { servedModel: result.providerReportedModel } : {}),

@@ -4,8 +4,8 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Brain, ChevronDown, Cpu, Wrench } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import {
-  getTaskDetails, plainRecordName, recordedCount, recordedDuration, taskModelIdentity, taskModelProvider, taskModelRole,
-  taskMemorySections, taskProvidedMemoryLinks, taskModelStatus, taskToolEvidence, taskToolName, taskToolReason, taskToolStatus, taskUsageNotes,
+  getTaskDetails, plainRecordName, recordedCount, recordedDuration, taskAuxiliaryIdentity, taskAuxiliaryPurpose, taskAuxiliaryStatus, taskModelIdentity, taskModelProvider, taskModelRole,
+  taskMemorySections, taskProvidedMemoryLinks, taskModelStatus, taskToolEvidence, taskToolName, taskToolReason, taskToolStatus, taskUsageNotes, taskUsageRoles,
   type TaskHandlingDetails,
 } from '@/lib/task-details';
 import { cn } from '@/lib/cn';
@@ -98,11 +98,13 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
   const { tools, models, memory, usage } = detail;
   const sections = taskMemorySections(detail);
   const providedLinks = taskProvidedMemoryLinks(detail);
+  const usageRoles = taskUsageRoles(detail);
   const hasMemory = Boolean(memory.provided?.manifest.length || memory.recall.some((run) => run.refs.length));
   return (
     <div className="min-w-0 space-y-5 pb-2 text-small">
-      <DetailSection title="Recorded model activity" icon={Cpu}>
-        {models.length === 0 ? <p className="text-muted">No model activity was retained for this reply.</p> : (
+      <DetailSection title="Model route details" icon={Cpu}>
+        <p className="text-caption text-muted">These are recorded model selections. Some helper requests have separate records, and not every call has route details.</p>
+        {models.length === 0 ? <p className="text-muted">No model route details were retained for this reply.</p> : (
           <ul className="divide-y divide-border">
             {models.map((row, index) => {
               const model = taskModelIdentity(row);
@@ -123,8 +125,29 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
             })}
           </ul>
         )}
-        {detail.limits.modelsTruncated && <p className="text-caption text-muted">Showing part of the retained model activity.</p>}
+        {detail.limits.modelsTruncated && <p className="text-caption text-muted">Showing part of the retained model route details.</p>}
       </DetailSection>
+
+      {detail.auxiliaryModels !== undefined && <DetailSection title="Other recorded model requests" icon={Cpu}>
+        <p className="text-caption text-muted">These request records are separate from model selections. A parsed result does not mean a review passed. Call totals come from the usage record below.</p>
+        {detail.auxiliaryModels.length === 0 ? <p className="text-muted">No additional model request details were retained.</p> : <ul className="divide-y divide-border">
+          {detail.auxiliaryModels.map((row) => {
+            const model = taskAuxiliaryIdentity(row);
+            const duration = recordedDuration(row.durationMs);
+            return <li key={JSON.stringify([row.callId, row.attemptId, row.physicalAttempt])} className="min-w-0 py-2 first:pt-0 last:pb-0">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5">
+                <span className="min-w-0 break-words font-medium text-fg [overflow-wrap:anywhere]">{model.name}</span>
+                <span className={row.status === 'failed' ? 'text-caption text-danger' : 'text-caption text-muted'}>{taskAuxiliaryStatus(row)}</span>
+              </div>
+              <p className="break-words text-caption text-muted [overflow-wrap:anywhere]">{taskAuxiliaryPurpose(row)}</p>
+              <p className="break-words text-caption text-muted [overflow-wrap:anywhere]">Through Jev · {model.note}{duration ? ` · ${duration} request time` : ''}</p>
+              {model.requested && <p className="break-words text-caption text-muted [overflow-wrap:anywhere]">Requested model: {model.requested}</p>}
+              <p className="text-caption text-muted">{row.usage === 'reported' ? 'Response included usage. The request meter is separate.' : 'Response usage wasn’t confirmed.'}</p>
+            </li>;
+          })}
+        </ul>}
+        {detail.limits.auxiliaryModelsTruncated && <p className="text-caption text-muted">Showing part of the retained helper request records.</p>}
+      </DetailSection>}
 
       <DetailSection title="Recorded tool activity" icon={Wrench}>
         {tools.length === 0 ? <p className="text-muted">No tool calls were retained for this reply.</p> : (
@@ -196,6 +219,16 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
             ))}
           </dl>
         )}
+        {usageRoles.length > 0 && <div className="space-y-1.5 pt-1">
+          <p className="text-caption font-medium text-fg">Recorded calls by role</p>
+          <ul className="space-y-1 text-caption" aria-label="Recorded model calls by role">
+            {usageRoles.map((row, index) => <li key={`${row.label}:${index}`} className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5">
+              <span className="min-w-0 break-words text-muted [overflow-wrap:anywhere]">{row.label}</span>
+              <span className="font-medium tabular-nums text-fg">{recordedCount(row.calls)} {row.calls === 1 ? 'call' : 'calls'}</span>
+            </li>)}
+          </ul>
+          <p className="text-caption text-muted">Roles describe the type of work, not its result. A routing role doesn’t identify the exact purpose of a request.</p>
+        </div>}
         {usage && usage.totals.failedCalls > 0 && <p className="text-caption text-muted">Includes {recordedCount(usage.totals.failedCalls)} failed {usage.totals.failedCalls === 1 ? 'call' : 'calls'}.</p>}
         <div className="space-y-1 text-caption text-muted">{taskUsageNotes(detail).map((note) => <p key={note}>{note}</p>)}</div>
       </section>

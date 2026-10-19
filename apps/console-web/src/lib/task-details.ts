@@ -7,6 +7,7 @@ import { validMemoryWork } from './task-memory-status';
 
 export type { TaskHandlingDetails } from '@clem/chat-engine';
 export type TaskModelRecord = TaskHandlingDetails['models'][number];
+export type TaskAuxiliaryModelRecord = NonNullable<TaskHandlingDetails['auxiliaryModels']>[number];
 export type TaskToolRecord = TaskHandlingDetails['tools'][number];
 
 export function taskDetailsPath(sessionId: string, sourceUserSeq: number): string {
@@ -39,6 +40,7 @@ function validDetails(value: unknown): value is TaskHandlingDetails {
     || !strings(value.limitations) || !record(value.limits)) return false;
   const limits = value.limits;
   if (!['toolsTruncated', 'modelsTruncated', 'memoryTruncated'].every((key) => typeof limits[key] === 'boolean')) return false;
+  if (limits.auxiliaryModelsTruncated !== undefined && typeof limits.auxiliaryModelsTruncated !== 'boolean') return false;
   if (!Array.isArray(value.tools) || !value.tools.every((row) => record(row) && text(row.callId) && count(row.eventSeq)
     && text(row.name) && optionalText(row.attemptId) && text(row.startedAt) && optionalText(row.finishedAt) && optionalText(row.effect)
     && oneOf(row.status, ['started', 'returned', 'failed', 'reused'])
@@ -52,6 +54,14 @@ function validDetails(value: unknown): value is TaskHandlingDetails {
     && ['requestedModel', 'servedModel', 'servedProvider', 'providerReportedModel', 'attemptId', 'fallbackToModel'].every((key) => optionalText(row[key]))
     && oneOf(row.status, ['started', 'success', 'failed', 'fallback', 'cancelled'])
     && (row.durationMs === undefined || count(row.durationMs)))) return false;
+  if (value.auxiliaryModels !== undefined && (!Array.isArray(value.auxiliaryModels) || !value.auxiliaryModels.every((row) => record(row)
+    && text(row.callId) && text(row.attemptId) && Number.isSafeInteger(row.physicalAttempt) && Number(row.physicalAttempt) > 0
+    && row.transport === 'typesafe_systemone' && oneOf(row.role, ['brain', 'worker', 'reviewer', 'router', 'writer', 'memory', 'unknown'])
+    && (row.callPurpose === undefined || (text(row.callPurpose) && Object.hasOwn(CALL_PURPOSE_WORDS, row.callPurpose)))
+    && optionalText(row.requestedModel) && optionalText(row.providerReportedModel) && typeof row.responseCompleted === 'boolean'
+    && oneOf(row.status, ['started', 'returned', 'failed', 'cancelled', 'unconfirmed']) && oneOf(row.usage, ['reported', 'unknown'])
+    && oneOf(row.evidence, ['parsed_response', 'incomplete', 'conflicting']) && Number.isSafeInteger(row.dispatchCount) && Number(row.dispatchCount) >= 0
+    && (row.durationMs === undefined || count(row.durationMs))))) return false;
   if (value.usage !== null && (!record(value.usage) || value.usage.scope !== 'accepted_source' || !text(value.usage.meteringStartedAt)
     || typeof value.usage.sourcePredatesMetering !== 'boolean' || !usageTotals(value.usage.totals)
     || !record(value.usage.byRole) || !Object.values(value.usage.byRole).every(usageTotals))) return false;
@@ -96,7 +106,7 @@ export function recordedDuration(ms: number | undefined): string | null {
 
 const ROLE_WORDS: Record<string, string> = {
   brain: 'Did the work', worker: 'Helped in parallel', judge: 'Review call',
-  writer: 'Wrote the reply', memory: 'Memory work', quick: 'Quick check',
+  reviewer: 'Review call', router: 'Routing', writer: 'Wrote the reply', memory: 'Memory work', quick: 'Quick check',
 };
 export function taskModelRole(role: string): string {
   return Object.hasOwn(ROLE_WORDS, role) ? ROLE_WORDS[role]! : plainRecordName(role);
@@ -135,6 +145,60 @@ export function taskModelStatus(row: TaskModelRecord): string {
     case 'fallback': return 'Switched to a backup';
     case 'started': return 'Completion not recorded';
   }
+}
+
+const CALL_PURPOSE_WORDS: Record<NonNullable<TaskAuxiliaryModelRecord['callPurpose']>, string> = {
+  'jev-read-nomination': 'Choosing a read-only tool', 'jev-prepare': 'Preparing a tool request',
+  'jev-rank': 'Comparing available tools', 'jev-primer': 'Preparing relevant context',
+  'jev-turn-start': 'Assessing how to start', 'jev-open-question-reply': 'Understanding an answer',
+  'jev-approval-reply': 'Understanding an approval response', 'jev-requested-write': 'Checking a requested change',
+  'jev-owner-choice': 'Understanding your choice', 'jev-approval-label': 'Describing an approval',
+  'jev-resolution-name': 'Naming a resolved choice', 'jev-agent-select': 'Selecting an assistant',
+  'jev-grounding': 'Checking supporting evidence', 'jev-trajectory': 'Checking progress',
+  'jev-completion': 'Reviewing completion', 'jev-watch': 'Reviewing a watch',
+  'jev-heartbeat': 'Reviewing a proactive check', 'jev-output-grounding': 'Checking the answer’s evidence',
+  'jev-revision': 'Reviewing a revision', 'jev-request-effect': 'Assessing an action’s effect',
+  'jev-quantified-universe': 'Checking the scope of a count', 'jev-operation-delivery': 'Checking the delivery method',
+  'jev-worker-route': 'Routing delegated work', 'jev-operation-variant-read': 'Checking a tool option',
+  'jev-operation-effect': 'Assessing a tool’s effect', 'jev:clarification_answer_completeness': 'Checking a clarification',
+  'jev:clarification_revision': 'Reviewing a clarification change',
+};
+
+/** Generic routing and a model name do not establish a historical stage. */
+export function taskAuxiliaryPurpose(row: TaskAuxiliaryModelRecord): string {
+  const purpose = row.evidence !== 'conflicting' ? row.callPurpose : undefined;
+  return purpose && Object.hasOwn(CALL_PURPOSE_WORDS, purpose) ? CALL_PURPOSE_WORDS[purpose] : 'Purpose not recorded';
+}
+
+export function taskAuxiliaryIdentity(row: TaskAuxiliaryModelRecord): { name: string; note: string; requested: string | null } {
+  const completed = row.responseCompleted && row.status === 'returned' && row.evidence === 'parsed_response';
+  const actual = completed ? row.providerReportedModel?.trim() : '';
+  const requested = row.requestedModel?.trim();
+  return {
+    name: modelDisplayName(actual || requested || '') || 'Model not recorded',
+    note: actual ? 'Response model reported' : requested ? 'Requested model; response model not confirmed' : 'Response model not confirmed',
+    requested: actual && requested ? modelDisplayName(requested) || requested : null,
+  };
+}
+
+export function taskAuxiliaryStatus(row: TaskAuxiliaryModelRecord): string {
+  if (row.evidence === 'conflicting') return 'Observations disagree';
+  if (row.status === 'failed') return 'Request failed';
+  if (row.status === 'cancelled') return 'Cancelled';
+  if (row.responseCompleted && row.status === 'returned' && row.evidence === 'parsed_response') return 'Result parsed';
+  return row.status === 'started' ? 'Result not recorded' : 'Result unconfirmed';
+}
+
+const USAGE_ROLE_WORDS: Record<string, string> = {
+  brain: 'Task work', worker: 'Delegated work', reviewer: 'Review', judge: 'Review', router: 'Routing',
+  writer: 'Reply writing', memory: 'Memory work', quick: 'Quick checks',
+};
+/** Only the canonical request meter supplies call counts. Route selections
+ * and transport observations are not additional usage or elapsed time. */
+export function taskUsageRoles(detail: TaskHandlingDetails): Array<{ label: string; calls: number }> {
+  return Object.entries(detail.usage?.byRole ?? {}).map(([role, totals]) => ({
+    label: Object.hasOwn(USAGE_ROLE_WORDS, role) ? USAGE_ROLE_WORDS[role]! : 'Other recorded work', calls: totals.calls,
+  }));
 }
 
 export function taskToolName(row: TaskToolRecord): string {
