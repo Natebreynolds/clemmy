@@ -1170,7 +1170,7 @@
           "bytes": 2537
         },
         "src/execution/inline-creation-test-delivery.ts": {
-          "bytes": 19940
+          "bytes": 21409
         },
         "src/execution/workflow-run-inventory.ts": {
           "bytes": 8906
@@ -2883,7 +2883,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 832694
+          "bytes": 835025
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -3126,7 +3126,7 @@
           "bytes": 7317
         },
         "src/execution/workflow-origin-terminal.ts": {
-          "bytes": 21799
+          "bytes": 23360
         },
         "src/execution/workflow-run-report-back.ts": {
           "bytes": 63119
@@ -5133,7 +5133,7 @@
           "bytes": 2537
         },
         "src/execution/inline-creation-test-delivery.ts": {
-          "bytes": 19940
+          "bytes": 21409
         },
         "src/execution/workflow-run-inventory.ts": {
           "bytes": 8906
@@ -6846,7 +6846,7 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 832694
+          "bytes": 835025
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
@@ -7089,7 +7089,7 @@
           "bytes": 7317
         },
         "src/execution/workflow-origin-terminal.ts": {
-          "bytes": 21799
+          "bytes": 23360
         },
         "src/execution/workflow-run-report-back.ts": {
           "bytes": 63119
