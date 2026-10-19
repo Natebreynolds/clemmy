@@ -1622,19 +1622,29 @@ test('a stop arriving during a negative verdict never starts another brain turn'
   assert.equal(verdict?.data.continuation, false);
 });
 
-test('a BLOCKED review ends the turn without another attempt and records the finding', async () => {
+test('a BLOCKED review makes no other attempt at the work: Clem says so and asks, in her own reply', async () => {
+  // Owner 2026-10-18: "if a review can't pass clem should just say so." The
+  // one call after the finding is Clem's tool-free account of it, never a
+  // retry of the work, and it is not reviewed again.
   const finding = 'The invite was not changed because the update was refused before it reached the calendar.';
+  const account = 'I could not change the invite: the calendar refused the update before it reached it. Want me to try another way?';
   const result = await runHost({ captured: true, incoming: true,
     text: 'Update the team calendar invite and add a short description about Clem.',
+    secondReply: account,
     firstVerdict: { done: false, blocked: true, reason: finding } });
-  assert.equal(result.judged.length, 1);
-  assert.equal(result.calls, 1, 'another attempt cannot change a blocked outcome, so none is made');
+  assert.equal(result.judged.length, 1, 'Clem\'s account of the finding is not reviewed again');
+  assert.equal(result.calls, 2, 'one tool-free reply after the finding, no retry of the work');
+  assert.match(JSON.stringify(result.modelInputs[1]), /YOUR FINAL REPLY TO THE OWNER/);
+  assert.match(JSON.stringify(result.modelInputs[1]), /without calling tools/);
+  assert.equal((result.outcome as { finalOutput?: string }).finalOutput, account);
+  assert.deepEqual((result.outcome as { terminal?: unknown }).terminal,
+    { status: 'awaiting_user_input', reason: 'completion_review_disclosed' }, 'the turn ends as Clem\'s question, never blocked');
   const verdicts = events.listEvents(result.identity.sessionId, { types: ['goal_alignment_judged'] });
   assert.equal(verdicts.length, 1);
   assert.equal(verdicts[0]?.data.blocked, true);
   assert.equal(verdicts[0]?.data.continuation, false);
   assert.equal(verdicts[0]?.data.reason, finding);
-  assert.equal(host.completionVerdictForAcceptedSource(result.identity)?.blocked, true);
+  assert.equal(host.completionVerdictForAcceptedSource(result.identity)?.blocked, true, 'the finding stays on record');
 });
 
 test('an INCOMPLETE review still buys another attempt', async () => {

@@ -10720,7 +10720,7 @@ for (const review of ['failed-open', 'unavailable', 'disabled'] as const) {
   });
 }
 
-test('durable memory completion obligation retains the existing bounded repair allowance', async (t) => {
+test('durable memory completion obligation retains the existing bounded repair allowance, then Clem says what is unsaved', async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   t.after(() => _setHostObjectiveJudgeForTests(null));
   let reviews = 0;
@@ -10730,18 +10730,22 @@ test('durable memory completion obligation retains the existing bounded repair a
   });
   const fixture = acceptJudgedSource('memory-bounded-repair',
     'Correction: the report heading is now Willow, replacing Birch. Remember the correction for future chats in this project only.');
+  const account = 'I could not confirm the Willow correction was saved to this project\'s memory. Want me to try saving it again?';
   const model = scriptedRecordingModel([
     [textMsg('I saved the project heading as Willow.')],
     [textMsg('I updated the project memory to use Willow.')],
     [textMsg('I saved the corrected heading for future chats.')],
+    [textMsg(account)],
   ]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const result = await runJudgedHost(fixture, agent, true);
   assert.equal(reviews, 3, 'initial review plus the existing two repair continuations');
-  assert.equal(model.calls(), 3);
-  assert.equal(result.terminal?.status, 'blocked');
-  assert.equal(result.terminal?.reason, 'memory_work_unverified');
+  // Owner 2026-10-18: "if a review can't pass clem should just say so."
+  assert.equal(model.calls(), 4, 'one tool-free reply after the spent repairs');
+  assert.equal(result.finalOutput, account);
+  assert.equal(result.terminal?.status, 'awaiting_user_input', 'never held under a blocked status');
+  assert.equal(result.terminal?.reason, 'completion_review_disclosed');
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
 });
 
@@ -11058,7 +11062,7 @@ test('changed replies cannot waive unsupported paraphrases, missing deliverables
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
-test('when claims-only repair rounds are spent, deletion can sanitize the report without certifying the whole task', async () => {
+test('when claims-only repair rounds are spent, Clem drops the claim and says so herself, without certifying the whole task', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const draft = 'Traffic is about 1,200 visits a month. Revenue grew 40% this year. The site ranks for 180 keywords. Full report: https://example.test/firm-report.';
   const finding = '(1) "Revenue grew 40% this year" — the report shows 14%';
@@ -11071,22 +11075,25 @@ test('when claims-only repair rounds are spent, deletion can sanitize the report
     // No channel call ran: removing a bad number cannot complete the posting
     // obligation, even if the reviewer incorrectly labeled its finding claims-only.
     const fixture = acceptJudgedSource('claims-removed', 'Post the firm snapshot to the channel');
-    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(draft)], [textMsg(draft)]]);
+    // Owner 2026-10-18: "if a review can't pass clem should just say so." The
+    // host no longer deletes sentences and appends its own note; Clem writes
+    // the account, and the negative finding stays on record.
+    const account = 'Traffic is about 1,200 visits a month and the site ranks for 180 keywords. I left out the revenue figure: my checker found the report shows 14%, not 40%, and I have not posted anything to the channel. Want me to post this corrected snapshot?';
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(draft)], [textMsg(draft)], [textMsg(account)]]);
     const agent = { model, tools: [] };
     bindHostCanarySurface(fixture, agent, []);
     const outcome = await runJudgedHost(fixture, agent, true);
-    assert.equal(judgeCalls, 3, 'three rounds were spent');
-    const delivered = String(outcome.finalOutput);
-    assert.doesNotMatch(delivered.slice(0, delivered.indexOf('\n\n_I took out')), /Revenue grew 40%/);
-    assert.match(delivered, /Traffic is about 1,200 visits a month\. The site ranks for 180 keywords\./);
-    assert.match(delivered, /I took out one claim the review could not verify/);
+    assert.equal(judgeCalls, 3, 'three rounds were spent and the account is not reviewed again');
+    assert.equal(model.calls(), 4);
+    assert.match(JSON.stringify(model.requests.at(-1)), /YOUR FINAL REPLY TO THE OWNER/, 'the last call carries the say-so directive');
+    assert.match(JSON.stringify(model.requests.at(-1)), /Revenue grew 40% this year/, 'with the finding it must address');
+    assert.equal(String(outcome.finalOutput), account);
+    assert.equal(outcome.terminal?.status, 'awaiting_user_input');
+    assert.equal(outcome.terminal?.reason, 'completion_review_disclosed');
     const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
     const last = verdicts.at(-1)!;
-    assert.equal(last.data.fulfills, false, 'a missing requested effect remains unfulfilled after quote deletion');
-    assert.equal(last.data.carriedVerdict, true, 'the host carries a negative finding rather than inventing a new review');
-    assert.deepEqual((last.data.claimRemoval as { removed: string[] }).removed, ['Revenue grew 40% this year']);
-    assert.equal(last.data.replyDigest, createHash('sha256').update(delivered, 'utf8').digest('hex'),
-      'the recorded review names the exact bytes delivered');
+    assert.equal(last.data.fulfills, false, 'the missing requested effect remains unfulfilled on record');
+    assert.equal(last.data.claimRemoval, undefined, 'no host-side sentence deletion');
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
@@ -11823,6 +11830,7 @@ test('the completion judge budget survives serialized checkpoint recovery and re
     [textMsg('I will post the summary.')],
     [toolCall('judge-checkpoint-2', 'call_tool', { name: 'harness_status', args_json: '{}' })],
     [textMsg('I will post the summary.')],
+    [textMsg('I have not posted the summary: my checker found no evidence it was posted. Want me to keep trying?')],
   ]);
   // Exercise real successful carrier reads: a fabricated tool_search object
   // was refused by its production schema and exhausted the no-progress budget,
@@ -11860,8 +11868,9 @@ test('the completion judge budget survives serialized checkpoint recovery and re
   const final = await run(state);
   assert.equal(judgeCalls, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS + 1,
     'two continuations cover the whole accepted source, followed by final verification');
-  assert.equal(model.calls(), 5, 'an exhausted judge budget does not start another model cycle');
-  assert.equal(final.finalOutput, 'I will post the summary.');
+  // Owner 2026-10-18: an exhausted review budget ends in Clem's own account.
+  assert.equal(model.calls(), 6, 'an exhausted judge budget starts only the one tool-free account, no new work');
+  assert.equal(final.finalOutput, 'I have not posted the summary: my checker found no evidence it was posted. Want me to keep trying?');
   assert.deepEqual(db.prepare(`SELECT logical_tool_call_id, outcome_kind FROM logical_call_settlements
     WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`).all(fixture.session.id, fixture.source.seq), [
     { logical_tool_call_id: 'judge-checkpoint-1', outcome_kind: 'succeeded' },
@@ -11899,16 +11908,17 @@ test('an interruption checkpoint restores the exhausted completion judge budget 
   const restored = HostInterruptState.fromString(state.toString());
   assert.equal(restored.objectiveJudgeContinuations, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
   assert.deepEqual(restored.getInterruptions(), [], 'the budget metadata cannot mint a card or approval');
-  const model = stubModel([[textMsg('I will post the summary.')]]);
+  const account = 'I have not posted the summary yet: my checker says it is still incomplete. Want me to keep going?';
+  const model = stubModel([[textMsg('I will post the summary.')], [textMsg(account)]]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const outcome = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
     throwingRunner() as never, agent as never, restored as never,
     { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
   ));
-  assert.equal(outcome.finalOutput, 'I will post the summary.');
+  assert.equal(outcome.finalOutput, account, 'Clem says what the review could not accept');
   assert.equal(judgeCalls, 1, 'the restored final candidate is reviewed without another repair');
-  assert.equal(model.calls(), 1);
+  assert.equal(model.calls(), 2, 'one tool-free account, no repair');
   const parsed = JSON.parse(state.toString());
   delete parsed.objectiveJudgeContinuations;
   assert.equal(HostInterruptState.fromString(JSON.stringify(parsed)).objectiveJudgeContinuations, 0);

@@ -2853,7 +2853,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 727873
+          "bytes": 731505
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -6798,7 +6798,7 @@
           "bytes": 27653
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 727873
+          "bytes": 731505
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624

@@ -2021,7 +2021,9 @@ function parseAcceptedModelBatchRef(value: unknown): AcceptedModelBatchRef | und
 
 interface HostCompletionReviewFeedback {
   version: 1;
-  phase?: 'plan';
+  /** 'disclose': the review could not pass and the repairs are spent; the
+   *  next reply is Clem's own account of it to the owner, not a revision. */
+  phase?: 'plan' | 'disclose';
   sessionId: string;
   sourceUserSeq: number;
   objective: string;
@@ -2041,7 +2043,7 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
     throw new Error('paused host state has invalid completion-review feedback');
   }
   const row = value as Record<string, unknown>;
-  if (row.version !== 1 || (row.phase !== undefined && row.phase !== 'plan') || typeof row.sessionId !== 'string' || !row.sessionId
+  if (row.version !== 1 || (row.phase !== undefined && row.phase !== 'plan' && row.phase !== 'disclose') || typeof row.sessionId !== 'string' || !row.sessionId
     || !Number.isSafeInteger(row.sourceUserSeq) || Number(row.sourceUserSeq) <= 0
     || typeof row.objective !== 'string' || typeof row.reply !== 'string'
     || typeof row.reason !== 'string' || !row.reason.trim()
@@ -2055,7 +2057,8 @@ function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReview
   }
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
-    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason, ...(row.phase === 'plan' ? { phase: 'plan' } : {}),
+    reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason,
+    ...(row.phase === 'plan' || row.phase === 'disclose' ? { phase: row.phase as 'plan' | 'disclose' } : {}),
     ...(row.repairScope === 'claims' || row.repairScope === 'reply_format' ? { repairScope: row.repairScope as 'claims' | 'reply_format' } : {}),
     ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}) };
 }
@@ -2089,6 +2092,15 @@ export function completionReviewStakes(input: { plan: boolean; attemptedWrites: 
 }
 
 export function hostCompletionReviewFeedbackContext(feedback: HostCompletionReviewFeedback): string {
+  if (feedback.phase === 'disclose') {
+    return '[COMPLETION REVIEW — YOUR FINAL REPLY TO THE OWNER]\n'
+      + 'Your checker still does not accept your answer, and this request has no revisions left. '
+      + 'Write your final reply to the owner now, without calling tools. Give the answer you have. '
+      + 'Correct or drop anything the finding below shows is wrong rather than repeating it. '
+      + 'Then say plainly, in your own words, what your checker could not confirm and why, '
+      + 'and ask the owner one question: whether to keep working on it, and how. Add no new claims.\n'
+      + JSON.stringify(feedback);
+  }
   return '[RETAINED COMPLETION REVIEW — same accepted request]\n'
     + 'The earlier reply and review below are retained reference evidence, not new owner instructions. '
     + 'Resolve any still-applicable finding against the CURRENT effective accepted objective and complete evidence. '
@@ -4292,6 +4304,10 @@ const runHostTurnBody = async (
    *  continuation, so a continuation that added no evidence is recognisable
    *  before a second identical verdict is bought. */
   let judgedBusinessCallsAtLastVerdict: number | undefined = carriedProgress?.continuations.judgedBusinessCallsAtLastVerdict;
+  // One disclosure per request: armed when a review cannot pass, consumed by
+  // the reply Clem writes in answer to it.
+  let reviewDisclosureArmed = false;
+  let reviewFindingDisclosed = false;
   type CompletedReplyAuthor = { author: NonNullable<ReturnType<typeof getCompletedResponseAuthor>>;
     response: unknown; modelSettings: ModelRequest['modelSettings'];
     binding: CompletedModelResponseBinding; owner: ResponseFenceOwner };
@@ -4824,6 +4840,25 @@ const runHostTurnBody = async (
       const row = item as { type?: unknown; name?: unknown };
       return row.type === 'function_call' && !HOST_JUDGE_CONTROL_TOOL_NAMES.has(String(row.name ?? ''));
     });
+    // THE REVIEW COULD NOT PASS, SO CLEM SAYS SO (owner 2026-10-18: "if a
+    // review can't pass clem should just say so"). The reply written after the
+    // disclosure directive is Clem's own account of the unresolved finding and
+    // her question to the owner. Reviewing it against the objective it says it
+    // could not meet would reject the very answer it exists to give. Only a
+    // tool-free account qualifies: new work since the directive is reviewed.
+    if (completionReviewFeedback?.phase === 'disclose') {
+      const disclosed = completionReviewFeedback;
+      completionReviewFeedback = undefined;
+      const replyDigest = createHash('sha256').update(replyText, 'utf8').digest('hex');
+      if (judgedBusinessCallsAtLastVerdict !== undefined && businessCalls.length === judgedBusinessCallsAtLastVerdict) {
+        // The same words again are the answer the review already ruled on:
+        // nothing new to review, and nothing new was said.
+        if (replyDigest === disclosed.replyDigest) return 'done';
+        reviewFindingDisclosed = true;
+        journalHostGuide('completion_review_disclosed', { replyDigest, findingReplyDigest: disclosed.replyDigest });
+        return 'awaiting_user_input';
+      }
+    }
     // Settled truth for THIS source, not an all-session call count.
     const settled = settledSourceArtifacts({
       sessionId: identity.sessionId,
@@ -5356,6 +5391,24 @@ const runHostTurnBody = async (
         },
       });
     } catch { /* telemetry never blocks the reply */ }
+    // A review that cannot pass is Clem's to tell, once per request: the next
+    // reply is her own account of the finding and a question to the owner,
+    // never the harness holding her answer under a blocked status.
+    const disclose = !continuation && !awaitingInput && !verdict.done && !verdict.failedOpen && !planCandidate
+      && !responseFormatRequirement && !formatRepairReviewRequired && !signal?.aborted && !openApprovalCard
+      && !reviewDisclosureArmed && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+    if (disclose) {
+      reviewDisclosureArmed = true;
+      judgedBusinessCallsAtLastVerdict = businessCalls.length;
+      completionReviewFeedback = {
+        version: 1, phase: 'disclose', sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        objective, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+        reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
+        reason: verdict.reason,
+      };
+      pendingResponseFormatRepair = undefined;
+      return 'continue';
+    }
     // A CLAIMS-ONLY FINDING NEVER SHIPS INSIDE THE ANSWER. With the rounds
     // spent and only specific claims found wrong,
     // the host deletes exactly the sentences carrying the reviewer's quotes and
@@ -11781,8 +11834,11 @@ const runHostTurnBody = async (
             history.push(...admission.frame.history);
             if (step.responseId !== undefined) lastResponseId = step.responseId;
             retainConnectionProgress();
+            const disclosedFinding = reviewFindingDisclosed;
+            reviewFindingDisclosed = false;
             return { history, lastResponseId, finalOutput: guarded,
-              terminal: { status: 'awaiting_user_input', reason: 'completion_review_needs_input' } };
+              terminal: { status: 'awaiting_user_input',
+                reason: disclosedFinding ? 'completion_review_disclosed' : 'completion_review_needs_input' } };
           }
         } catch (error) {
           if (error instanceof CompletionReviewSupersededError) {
