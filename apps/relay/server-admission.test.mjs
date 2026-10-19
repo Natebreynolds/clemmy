@@ -11,6 +11,8 @@ import { createHash, createSign } from 'node:crypto';
 import { FRAME, encodeFrame, frameReader } from './server.mjs';
 
 const BASE = 'relay-admission.test';
+/** Larger than either write cap below, far smaller than a relay frame. */
+const OVERSIZE_REPLY_BYTES = 32_768;
 const TEMP = mkdtempSync(path.join(os.tmpdir(), 'clem-relay-admission-'));
 let identity;
 test.before(() => {
@@ -107,7 +109,7 @@ async function registered({ port, track }, { postProof = null, firstPhone = null
       else if (frame.type === FRAME.OPEN) {
         if (firstPhone && !specialPhoneUsed) {
           specialPhoneUsed = true;
-          socket.write(encodeFrame(FRAME.DATA, frame.streamId, firstPhone === 'empty' ? Buffer.alloc(0) : Buffer.alloc(2_048, 0x42)));
+          socket.write(encodeFrame(FRAME.DATA, frame.streamId, firstPhone === 'empty' ? Buffer.alloc(0) : Buffer.alloc(OVERSIZE_REPLY_BYTES, 0x42)));
           continue;
         }
         const local = track(net.connect(app.address().port, '127.0.0.1'));
@@ -229,9 +231,15 @@ async function queuesReleased(context) {
 }
 
 test('per-phone and aggregate write caps close only the overflowing phone and release accounting', async t => {
+  // The caps sit well above a real TLS handshake flight and below the
+  // oversize reply. With 1 KB caps, OpenSSL 3.5's post-quantum hybrid key
+  // share (a 1,568-byte ClientHello, a 1,828-byte server flight) tripped them
+  // on the healthy traffic instead: the aggregate cap closed the daemon's
+  // tunnel while forwarding the phone's hello, and the per-phone cap closed
+  // the second, healthy phone on the server's reply.
   for (const [name, limits] of [
-    ['per-phone', { maxQueuedBytesPerPhone: 1_024, maxQueuedBytesTotal: 4_096 }],
-    ['aggregate', { maxQueuedBytesPerPhone: 4_096, maxQueuedBytesTotal: 1_024 }],
+    ['per-phone', { maxQueuedBytesPerPhone: 16_384, maxQueuedBytesTotal: 65_536 }],
+    ['aggregate', { maxQueuedBytesPerPhone: 65_536, maxQueuedBytesTotal: 16_384 }],
   ]) {
     await t.test(name, async () => fixture(async context => {
       const daemon = await registered(context, { firstPhone: 'oversize' });
