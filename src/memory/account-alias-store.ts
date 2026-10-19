@@ -172,12 +172,28 @@ export function listAccountAliases(toolkit?: string): AccountAlias[] {
   return load().filter((a) => !tk || a.toolkit === tk).map((a) => ({ ...a }));
 }
 
-/** The alias label for a given mailbox/connection, for display. */
+/** The alias label under which an answered "which account?" for a READ is
+ *  remembered, so the same question is never asked twice for that toolkit. */
+export const READ_DEFAULT_ACCOUNT_LABEL = 'default read account';
+/** The alias label under which an answered "which account should send?" for a
+ *  WRITE is remembered. */
+export const SEND_DEFAULT_ACCOUNT_LABEL = 'default send account';
+
+/** A remembered-default bookmark records the account's role, not its name. */
+export function isAccountRoleLabel(label: string): boolean {
+  const clean = label.trim().toLowerCase();
+  return clean === READ_DEFAULT_ACCOUNT_LABEL || clean === SEND_DEFAULT_ACCOUNT_LABEL;
+}
+
+/** The alias label for a given mailbox/connection, for display. A role
+ *  bookmark is never the account's name (live 2026-10-19: the one Outlook
+ *  account was offered as "default send account"). */
 export function aliasLabelFor(toolkit: string, email?: string, connectionId?: string): string | undefined {
   const tk = toolkit.trim().toLowerCase();
   const em = normalizeEmail(email);
   return load().find((a) =>
-    a.toolkit === tk && ((em && a.email === em) || (connectionId && a.connectionId === connectionId)),
+    a.toolkit === tk && !isAccountRoleLabel(a.label)
+    && ((em && a.email === em) || (connectionId && a.connectionId === connectionId)),
   )?.label;
 }
 

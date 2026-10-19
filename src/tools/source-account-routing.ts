@@ -9,7 +9,10 @@ import { adoptedSteerNotesForSource, objectiveWithAdoptedSteering } from '../run
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import type { SourceAccountJudgeCall, SourceAccountJudgeResult } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { readConsumedTaskContinuityPacket } from '../memory/task-continuity.js';
-import { aliasLabelFor, listAccountAliases, resolveAccountAlias, rememberAccountAlias } from '../memory/account-alias-store.js';
+import {
+  aliasLabelFor, isAccountRoleLabel, listAccountAliases, resolveAccountAlias, rememberAccountAlias,
+  READ_DEFAULT_ACCOUNT_LABEL, SEND_DEFAULT_ACCOUNT_LABEL,
+} from '../memory/account-alias-store.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { structuralDestinationPosture } from '../runtime/harness/external-capability-risk.js';
 import pino from 'pino';
@@ -63,14 +66,11 @@ export type SourceAccountRoutingResolution =
     }
   | { kind: 'resolved'; connection: Connection; evidence: SourceAccountRoutingEvidence };
 
-/** The alias label under which an answered "which account?" for a READ is
- *  remembered, so the same question is never asked twice for that toolkit. */
-export const READ_DEFAULT_ACCOUNT_LABEL = 'default read account';
-/** The alias label under which an answered "which account should send?" for a
- *  WRITE is remembered. Unlike the read default it never routes by itself:
- *  the account judge reviews the current wording against it (2026-09-14:
- *  the owner answered "Scorpion" for invites three times in four days). */
-export const SEND_DEFAULT_ACCOUNT_LABEL = 'default send account';
+/** The remembered read/send defaults. Unlike the read default, the send
+ *  default never routes by itself: the account judge reviews the current
+ *  wording against it (2026-09-14: the owner answered "Scorpion" for invites
+ *  three times in four days). */
+export { READ_DEFAULT_ACCOUNT_LABEL, SEND_DEFAULT_ACCOUNT_LABEL };
 const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
 const emailOf = (connection: Connection): string => String(connection.accountEmail ?? '')
   .trim().toLowerCase().replace(/^smtp:/, '');
@@ -711,7 +711,6 @@ function namesAnotherConnectedAccount(
 ): boolean {
   const haystack = text.toLowerCase();
   const chosenIdentity = identityOf(chosen);
-  const reserved = new Set([SEND_DEFAULT_ACCOUNT_LABEL, READ_DEFAULT_ACCOUNT_LABEL].map((label) => label.toLowerCase()));
   const aliases = listAccountAliases(toolkit);
   for (const connection of connections) {
     if (identityOf(connection) === chosenIdentity) continue;
@@ -721,7 +720,7 @@ function namesAnotherConnectedAccount(
       .filter((alias) => (alias.connectionId && alias.connectionId === connection.connectionId)
         || (alias.email && email && alias.email.toLowerCase() === email.toLowerCase()))
       .map((alias) => alias.label.trim().toLowerCase())
-      .filter((label) => label.length >= 3 && !reserved.has(label));
+      .filter((label) => label.length >= 3 && !isAccountRoleLabel(label));
     if (labels.some((label) => haystack.includes(label))) return true;
   }
   return false;

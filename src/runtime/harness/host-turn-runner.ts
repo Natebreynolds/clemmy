@@ -1536,7 +1536,7 @@ export function hostProvenOperationRepair(input: {
     return ` ${requested} is available, but it still needs a checked source-account selection.`
       + ` The current connected choices are exactly: ${accountChoices.map((choice) => (input.accountChoiceLabels?.[choice] && input.accountChoiceLabels[choice] !== choice ? `${input.accountChoiceLabels[choice]} (${choice})` : choice)).join(', ')}.`
       + ' If the accepted user request already named the operating account, repeat tool_search with account_selection containing its exact toolkit, identity, and a verbatim source_quote from accepted user wording in this conversation.'
-      + ' If the user did not select an account or the choice remains unclear, ask_user_question with those exact choices.'
+      + ' If the user did not select an account or the choice remains unclear, ask_user_question offering each choice by its name; the id in parentheses is for account_selection only, never for the owner.'
       + ' Do not substitute another provider, another operation, or a recipient address for that choice.';
   }
   const requestedIsProven = requested.length > 0
