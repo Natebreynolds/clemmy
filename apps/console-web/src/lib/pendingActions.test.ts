@@ -113,7 +113,9 @@ test('queued polling backs off failed reads, recovers from durable truth, and ne
     return statusSnapshot(reads === 2 ? 'executing' : 'failed');
   }, (value) => progress.push(value), { schedule: clock.schedule });
   assert.equal(clock.next().delay, 2_500); await finishRead();
-  assert.deepEqual(progress, []);
+  // Assert this moment's snapshot without narrowing the callback-owned array
+  // to never[] before later asynchronous progress arrives.
+  assert.deepEqual([...progress], []);
   assert.equal(clock.next().delay, 5_000); await finishRead();
   assert.equal(progress.at(-1)?.phase, 'running');
   assert.equal(clock.next().delay, 2_500); await finishRead();
