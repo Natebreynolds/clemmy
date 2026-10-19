@@ -5,7 +5,7 @@
  */
 import { createRequire } from 'node:module';
 import { createHash as shaCreateHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,9 +230,75 @@ function readBuildStamps(root: string, moduleDir = MODULE_DIR): Array<BuildStamp
   return stamps;
 }
 
+type VerifiedShippedIdentity = { ok: true; digests: Record<ShippedImplementationKind, string>; manifestDigest: string };
+
+/**
+ * One full read-and-hash per artifact generation. Every call re-stats the
+ * exact files that verification read (manifest, every stamp location, the five
+ * artifacts); any replacement of one (device, inode, size, mtime or ctime,
+ * including appearing or disappearing) runs the full check again. Live
+ * 2026-10-19: the catalog rebuild verified once per stored capability, so the
+ * first chat after start or after a model switch held the service thread
+ * 18-62 s re-reading and re-hashing the same unchanged files.
+ */
+const verifiedByRoot = new Map<string, { files: readonly string[]; signature: string; result: VerifiedShippedIdentity }>();
+let fullVerifications = 0;
+
+export function _fullIdentityVerificationsForTests(): number {
+  return fullVerifications;
+}
+
+function filesSignature(files: readonly string[]): string {
+  return files.map((file) => {
+    try {
+      const stat = statSync(file, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch {
+      return 'absent';
+    }
+  }).join('|');
+}
+
+function identityFiles(root: string, manifest?: ShippedImplementationManifestV3): string[] {
+  return [
+    implementationManifestPath(root),
+    path.join(root, 'build-stamp.json'),
+    ...(path.resolve(root) === path.resolve(SRC_ARTIFACT_ROOT)
+      ? [path.join(MODULE_DIR, '../build-stamp.json'), path.join(MODULE_DIR, 'build-stamp.json')]
+      : []),
+    ...(manifest ? Object.values(manifest.artifacts).map((artifact) => path.join(root, artifact.file)) : []),
+  ];
+}
+
 export function verifyShippedImplementationIdentity(
   root = implementationArtifactRoot(),
-): { ok: true; digests: Record<ShippedImplementationKind, string>; manifestDigest: string } | { ok: false; reason: string } {
+): VerifiedShippedIdentity | { ok: false; reason: string } {
+  const resolved = path.resolve(root);
+  const cached = verifiedByRoot.get(resolved);
+  if (cached && filesSignature(cached.files) === cached.signature) {
+    if (pinnedGeneration && (pinnedGeneration.manifestDigest !== cached.result.manifestDigest || pinnedGeneration.root !== resolved)) {
+      return { ok: false, reason: 'implementation artifact generation changed; restart required' };
+    }
+    return { ...cached.result, digests: { ...cached.result.digests } };
+  }
+  verifiedByRoot.delete(resolved);
+  // Every file is signed before the full check reads it, and the result is
+  // kept only when nothing moved while it was read.
+  let manifest: ShippedImplementationManifestV3 | undefined;
+  try { manifest = JSON.parse(readFileSync(implementationManifestPath(root), 'utf8')) as ShippedImplementationManifestV3; } catch { manifest = undefined; }
+  const files = identityFiles(root, manifest?.artifacts && typeof manifest.artifacts === 'object' ? manifest : undefined);
+  const signature = filesSignature(files);
+  const result = verifyShippedImplementationIdentityUncached(root);
+  if (result.ok && manifest?.manifestDigest === result.manifestDigest && filesSignature(files) === signature) {
+    verifiedByRoot.set(resolved, { files, signature, result: { ...result, digests: { ...result.digests } } });
+  }
+  return result;
+}
+
+function verifyShippedImplementationIdentityUncached(
+  root: string,
+): VerifiedShippedIdentity | { ok: false; reason: string } {
+  fullVerifications += 1;
   const parsed = readManifest(root);
   if (!parsed.ok) return parsed;
   const { manifest } = parsed;

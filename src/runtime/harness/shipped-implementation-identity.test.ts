@@ -131,6 +131,44 @@ test('missing tampered or stale manifest or artifact refuses before I/O', () => 
   assert.equal(verifyShippedImplementationIdentity(clean).ok, false);
 });
 
+test('an unchanged artifact set is verified once, and a change after that is still refused', () => {
+  // Live 2026-10-19: the first chat after start (or after a model switch) held
+  // the service thread 18-62 s re-reading and re-hashing these same files once
+  // per stored capability. The check must stay exact without that cost. Runs
+  // in a child process because loading pins one generation.
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-shipped-cached-'));
+  const script = `
+    import { readFileSync, writeFileSync } from 'node:fs';
+    import path from 'node:path';
+    import { emitShippedImplementationArtifacts, implementationArtifactPath, verifyShippedImplementationIdentity,
+      _fullIdentityVerificationsForTests } from ${JSON.stringify(path.join(repoRoot, 'src/runtime/harness/shipped-implementation-identity.ts'))};
+    const root = process.env.CACHED_ROOT;
+    emitShippedImplementationArtifacts(root);
+    const before = _fullIdentityVerificationsForTests();
+    const first = verifyShippedImplementationIdentity(root);
+    if (!first.ok) { process.stderr.write(first.reason); process.exit(3); }
+    for (let index = 0; index < 1000; index += 1) {
+      if (JSON.stringify(verifyShippedImplementationIdentity(root)) !== JSON.stringify(first)) process.exit(4);
+    }
+    if (_fullIdentityVerificationsForTests() - before > 1) process.exit(5);
+    const observer = implementationArtifactPath('observer', root);
+    writeFileSync(observer, readFileSync(observer, 'utf8') + '\\n// tampered after verification\\n');
+    if (verifyShippedImplementationIdentity(root).ok) process.exit(6);
+    emitShippedImplementationArtifacts(root);
+    if (!verifyShippedImplementationIdentity(root).ok) process.exit(7);
+    writeFileSync(path.join(root, 'build-stamp.json'), JSON.stringify({ implementationManifestDigest: 'f'.repeat(64) }));
+    if (verifyShippedImplementationIdentity(root).ok) process.exit(8);
+  `;
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    cwd: repoRoot,
+    env: { ...process.env, CACHED_ROOT: root, CLEMENTINE_HOME: mkdtempSync(path.join(os.tmpdir(), 'clem-shipped-cached-home-')) },
+  });
+  // 4: a cached read differed; 5: more than one full read and hash; 6/8: a
+  // change after verification was accepted; 7: a fresh set was refused.
+  assert.equal(child.status, 0, `${child.status} ${child.stderr}`);
+});
+
 test('identical artifacts remain deterministic across two child processes', () => {
   const script = `
     import { shippedImplementationDigest } from ${JSON.stringify(path.join(repoRoot, 'src/runtime/harness/shipped-implementation-identity.ts'))};
