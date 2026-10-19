@@ -106,6 +106,18 @@ test('an account choice is labelled with something a person can answer, never a 
     `only the account with nothing human should fall back to its id: ${JSON.stringify(labels)}`);
 });
 
+test('Clem\'s remembered-default bookmark is never shown as the account\'s name', () => {
+  // Live 2026-10-19: the one Outlook account was offered as "default send
+  // account", the role Clem remembered for it, instead of its name.
+  const mailbox = [{ slug: 'outlook', connectionId: 'fixture-role-only', status: 'ACTIVE', accountEmail: 'role-only@x.invalid' }] as
+    Parameters<typeof routing.accountChoiceLabels>[0];
+  aliases.rememberAccountAlias({ toolkit: 'outlook', label: routing.SEND_DEFAULT_ACCOUNT_LABEL, email: 'role-only@x.invalid', connectionId: 'fixture-role-only' });
+  assert.deepEqual(routing.accountChoiceLabels(mailbox), { 'role-only@x.invalid': 'role-only@x.invalid' });
+  aliases.rememberAccountAlias({ toolkit: 'outlook', label: 'Fixture Work', email: 'role-only@x.invalid', connectionId: 'fixture-role-only' });
+  assert.deepEqual(routing.accountChoiceLabels(mailbox), { 'role-only@x.invalid': 'fixture work' });
+  assert.equal(aliases.aliasLabelFor('outlook', 'role-only@x.invalid'), 'fixture work');
+});
+
 test('original phone wording resolves through typed source evidence, without phrase grammar or a user question', async () => {
   const identity = source(ORIGINAL);
   const calls = installJudge();
