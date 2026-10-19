@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import os from 'node:os';
+import { BASE_DIR } from '../../config.js';
 
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { resolveWorkflowRunDefinitionSnapshot } from '../../execution/workflow-run-definition.js';
@@ -1552,6 +1554,30 @@ async function authoredLocalWriteRisk(input: {
   };
 }
 
+/** Whether this local write's one declared target (the registry row's
+ *  resource argument) is a file in the system's temporary folders. A write
+ *  whose target is not declared, or is anywhere else, is not scratch, and
+ *  nothing under the owner's home or Clementine's home ever is, wherever
+ *  those folders live. */
+export function localWriteTargetsOnlyScratch(toolName: string, args: Record<string, unknown>): boolean {
+  const effective = unwrapRuntimeEffectiveToolIdentity(toolName, args);
+  const row = TOOL_REGISTRY.find((entry) => entry.name === effective.toolName?.trim());
+  const argument = row?.resourceIdentityArgument;
+  const target = argument && effective.args && typeof effective.args === 'object' && !Array.isArray(effective.args)
+    ? (effective.args as Record<string, unknown>)[argument]
+    : undefined;
+  if (typeof target !== 'string' || !target.trim()) return false;
+  const expanded = target.trim().startsWith('~/') ? path.join(os.homedir(), target.trim().slice(2)) : target.trim();
+  if (!path.isAbsolute(expanded)) return false;
+  const resolved = path.resolve(expanded);
+  const within = (root: string): boolean => {
+    const base = path.resolve(root);
+    return resolved.startsWith(base.endsWith(path.sep) ? base : base + path.sep);
+  };
+  if (within(os.homedir()) || within(BASE_DIR)) return false;
+  return [os.tmpdir(), '/tmp', '/private/tmp'].some(within);
+}
+
 /**
  * Local-envelope branch: a reversible registry write inside the authored step
  * is the accepted work. The reducer is handed exact coverage (never a user
@@ -1617,9 +1643,15 @@ async function evaluateAuthoredLocalWrite(input: {
   if (decision.basis !== 'settled_replay') {
     const landed = landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
     if (landed) return landed;
-    // This branch admits only exact reversible / ordinary local work.
-    const refusal = await reviewAuthoredWriteConstraints({ ...input, stakes: 'ordinary' });
-    if (refusal) return refusal;
+    // This branch admits only exact reversible / ordinary local work. A
+    // file in the system's temporary folders is the step's scratch: the
+    // owner receives its content only through a later write, which is
+    // reviewed. Live 2026-10-18: a step that saved four branch results to
+    // /tmp before writing its CSV spent six constraint reviews (~45 s).
+    if (!localWriteTargetsOnlyScratch(attestation.toolName, input.args)) {
+      const refusal = await reviewAuthoredWriteConstraints({ ...input, stakes: 'ordinary' });
+      if (refusal) return refusal;
+    }
   }
   return { status: 'decided', decision, call, coverage };
 }

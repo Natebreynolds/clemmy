@@ -1170,7 +1170,7 @@
           "bytes": 3222
         },
         "src/execution/workflow-events.ts": {
-          "bytes": 39106
+          "bytes": 39204
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -2346,7 +2346,7 @@
           "bytes": 18099
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 72667
+          "bytes": 74517
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -3177,7 +3177,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 871318
+          "bytes": 872155
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
@@ -5115,7 +5115,7 @@
           "bytes": 3222
         },
         "src/execution/workflow-events.ts": {
-          "bytes": 39106
+          "bytes": 39204
         },
         "src/tools/catalog.ts": {
           "bytes": 843
@@ -6291,7 +6291,7 @@
           "bytes": 18099
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 72667
+          "bytes": 74517
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -7122,7 +7122,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 871318
+          "bytes": 872155
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
