@@ -476,6 +476,57 @@ test('default judgments are source/principal/connection scoped and use a distinc
   assert.equal((await routing.resolveSourceAccountRouting(input(source(ORIGINAL)))).kind, 'account_selection_required', 'no preference cannot stand in for an explicit selection');
 });
 
+test('an account the owner names in the current message is judged on those words when an older route\'s history is too long to recheck', async () => {
+  // Live 2026-10-19 (Windows install, long chat, one Outlook connection): the
+  // owner named the account twice and answered Clem's question with it; every
+  // read and write stayed account_selection_required with no reason, because
+  // the nomination adopted an older route whose 33+ intervening messages
+  // could not be rechecked.
+  const single = connections.slice(0, 1);
+  const first = source(ORIGINAL);
+  const calls = installJudge();
+  persist(first, ORIGINAL, await routing.resolveSourceAccountRouting({ ...input(first), connections: single }));
+  for (let index = 0; index < 33; index += 1) source(`Revision ${index}.`, first.sessionId);
+  const namedText = 'Use the default Outlook connection that\'s labeled Scorpion (always)';
+  const named = source(namedText, first.sessionId);
+  const nominated = { toolkit: 'outlook', identity: SCORPION, source_quote: namedText };
+  const write = await routing.resolveSourceAccountRouting({ ...input(named), connections: single, nomination: nominated, effect: 'write' });
+  assert.equal(write.kind, 'resolved', JSON.stringify(write));
+  assert.equal(calls.at(-1)?.acceptedText, namedText);
+  assert.equal(calls.at(-1)?.establishedSource, null, 'the current words are judged on their own');
+  assert.deepEqual(calls.at(-1)?.interveningAcceptedSources, []);
+  const read = await routing.resolveSourceAccountRouting({ ...input(named), connections: single, nomination: nominated,
+    operation: 'OUTLOOK_GET_MAIL_FOLDER_MESSAGE', effect: 'read' });
+  assert.equal(read.kind, 'resolved', JSON.stringify(read));
+  if (read.kind === 'resolved') assert.equal(read.evidence.judgeModelIdentity, 'host:read_route');
+
+  // A quote from the old route still needs its whole history rechecked.
+  const retry = source('Save them now.', first.sessionId);
+  const judged = calls.length;
+  assert.equal((await routing.resolveSourceAccountRouting({ ...input(retry), connections: single })).kind, 'account_selection_required');
+  assert.equal(calls.length, judged, 'no judge sees a truncated context range');
+});
+
+test('a long chat keeps its checked account: each check covers only the messages since the last one', async () => {
+  const first = source(ORIGINAL);
+  const calls = installJudge();
+  persist(first, ORIGINAL, await routing.resolveSourceAccountRouting(input(first)));
+  for (let index = 0; index < 20; index += 1) source(`Revision ${index}.`, first.sessionId);
+  const middleText = 'Add one more draft there please.';
+  const middle = source(middleText, first.sessionId);
+  persist(middle, middleText, await routing.resolveSourceAccountRouting({ ...input(middle), nomination: null }));
+  assert.equal(calls.at(-1)?.interveningAcceptedSources.length, 20);
+  const later = [];
+  for (let index = 0; index < 20; index += 1) later.push(source(`Later revision ${index}.`, first.sessionId));
+  const next = source('And one more there.', first.sessionId);
+  const kept = await routing.resolveSourceAccountRouting({ ...input(next), nomination: null });
+  assert.equal(kept.kind, 'resolved', JSON.stringify(kept));
+  assert.equal(calls.at(-1)?.establishedSource?.acceptedText, ORIGINAL, 'the original selection is still the evidence');
+  assert.equal(calls.at(-1)?.establishedSource?.previouslyChecked, true);
+  assert.deepEqual(calls.at(-1)?.interveningAcceptedSources.map(item => item.sourceUserSeq), later.map(item => item.sourceUserSeq),
+    'only the messages after the last check are rechecked');
+});
+
 test('defaults do not inherit, and earlier account constraints survive no-tool continuations', async () => {
   const firstText = 'Draft a note using my outbound email skill.';
   const first = source(firstText);

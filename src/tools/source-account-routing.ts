@@ -560,8 +560,16 @@ export async function resolveSourceAccountRouting(input: {
   // A current quote can refer back to work without repeating its account. A
   // same-identity nomination must not hide the host's checked earlier choice.
   // This does not repair invented quotes or borrow a different account's route.
+  // Adopted only while that route's history can still be rechecked: past that
+  // window the owner's current words are judged on their own, exactly as with
+  // no earlier route. Live 2026-10-19: in a long chat the owner named the one
+  // Outlook account twice and still got account_selection_required on every
+  // read and write, because adopting the old route failed its history check.
   if (nomination && source.text.includes(nomination.source_quote)
-    && latest !== 'conflict' && latest?.identity === identity) established = latest;
+    && latest !== 'conflict' && latest?.identity === identity
+    && interveningSources({ sessionId: input.sessionId, principalId, originSeq: latest.checkedForSourceUserSeq, currentSeq: source.seq })) {
+    established = latest;
+  }
   const sourceQuote = established?.sourceQuote ?? nomination?.source_quote ?? null;
   const origin = defaultMode ? source : established
     ? acceptedSource(established.sourceSessionId, established.sourceUserSeq) : (() => {
@@ -585,8 +593,13 @@ export async function resolveSourceAccountRouting(input: {
     && established.checkedForSourceDigest === source.digest) {
     return { kind: 'resolved', connection, evidence: established };
   }
+  // A checked route was reviewed through its last check, so only the sources
+  // after that check are new. Rechecking from its origin grew the window with
+  // every message until a long chat failed closed and asked again on every
+  // write, however many times the owner had answered.
   const interveningAcceptedSources = interveningSources({
-    sessionId: input.sessionId, principalId, originSeq: defaultMode ? 0 : origin.seq, currentSeq: source.seq,
+    sessionId: input.sessionId, principalId, currentSeq: source.seq,
+    originSeq: defaultMode ? 0 : established?.checkedForSourceUserSeq ?? origin.seq,
   });
   if (!interveningAcceptedSources) return blocked();
   const mode = defaultMode ? 'current_source_default' : 'explicit_selection';
