@@ -398,6 +398,8 @@ export interface SourceArtifactEvidence {
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
     /** A later generation written by a workflow run this request started. */
     writtenByRun?: string;
+    /** A later generation: bytes this request's own shell command wrote. */
+    writtenByCommand?: string;
   }>;
 }
 
@@ -488,6 +490,35 @@ export function dispatchedRunGenerations(
   return [...found.values()];
 }
 
+/**
+ * LATER GENERATIONS A REQUEST'S OWN SHELL COMMAND WROTE.
+ *
+ * A file this request wrote and then changed with its own shell command (a
+ * line fixed with sed, a row appended) read as drift: its receipt no longer
+ * matched although the review judged the file as it stood (live 2026-10-18,
+ * a reviewed, correct read log ended the turn blocked). The shell tool records
+ * such a change as the file's next revision when it saw the file at its
+ * recorded revision just before the command (recordLocalFileRevisionAfterCommand).
+ * Only files this request wrote count, and only while the file still is that
+ * revision.
+ */
+export function commandRevisionGenerations(
+  input: { sessionId: string; sourceUserSeq: number },
+  own: ReadonlyArray<{ handle: string; facts: unknown }>,
+): Array<{ callId: string; facts: NonNullable<ReturnType<typeof parseHostLocalWriteCommitFacts>> }> {
+  const ownHandles = new Set(own.filter((entry) => entry.facts && entry.handle).map((entry) => entry.handle));
+  if (ownHandles.size === 0) return [];
+  const found = new Map<string, { callId: string; facts: NonNullable<ReturnType<typeof parseHostLocalWriteCommitFacts>> }>();
+  for (const event of listEvents(input.sessionId, { sinceSeq: input.sourceUserSeq - 1, types: ['guardrail_tripped'] })) {
+    if (event.role !== 'system' || event.data.kind !== 'own_file_revision_after_command'
+      || event.data.sourceUserSeq !== input.sourceUserSeq) continue;
+    const facts = parseHostLocalWriteCommitFacts(`${String(event.data.receipt ?? '')}\n`);
+    if (!facts || !ownHandles.has(facts.handle) || !readCommittedArtifactContent(facts).verified) continue;
+    found.set(facts.handle, { callId: typeof event.data.callId === 'string' ? event.data.callId : '', facts });
+  }
+  return [...found.values()];
+}
+
 export function settledSourceArtifacts(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -499,6 +530,7 @@ export function settledSourceArtifacts(input: {
     evidenceContract: 'file' | 'none' | 'unknown' | 'undeclared';
     facts: ReturnType<typeof parseHostLocalWriteCommitFacts> | null;
     writtenByRun?: string;
+    writtenByCommand?: string;
   }> = [];
   try {
     const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
@@ -666,6 +698,20 @@ export function settledSourceArtifacts(input: {
         writtenByRun: generation.runId,
       });
     }
+    for (const generation of commandRevisionGenerations(input, collected)) {
+      ordinal += 1;
+      collected.push({
+        createdId: generation.facts.createdId,
+        handle: generation.facts.handle,
+        contentDigest: generation.facts.contentDigest,
+        writeOrdinal: ordinal,
+        digestMatches: null,
+        superseded: false,
+        evidenceContract: 'file',
+        facts: generation.facts,
+        writtenByCommand: generation.callId || 'shell command',
+      });
+    }
   } catch {
     // The spine was unreadable. Say so; never present it as "wrote nothing".
     return { count: 0, evidenceAvailable: false, summary: '', artifacts: [] };
@@ -709,6 +755,9 @@ export function settledSourceArtifacts(input: {
       entry.writtenByRun
         ? `  written by workflow run ${entry.writtenByRun}, which THIS request started, after this request's own `
           + `write of it; receipt digest ${entry.contentDigest.slice(0, 16)}. This is the file's final state.`
+        : entry.writtenByCommand
+        ? `  changed by THIS request's own shell command after its write of it; the host recorded those bytes `
+          + `as the file's next revision, receipt digest ${entry.contentDigest.slice(0, 16)}. This is the file's final state.`
         : `  written by THIS request as its write #${entry.writeOrdinal}; receipt digest ${entry.contentDigest.slice(0, 16)}`,
     ];
     const content = entry.facts

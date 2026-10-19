@@ -1,7 +1,7 @@
 import { READ_FILE_PARAMS } from './local-file-read-contract.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
 import { currentToolAbortSignal } from '../runtime/tool-abort-context.js';
-import { appendEvent, isKillRequested, type AppendEventInput } from '../runtime/harness/eventlog.js';
+import { appendEvent, isKillRequested, listEvents, type AppendEventInput } from '../runtime/harness/eventlog.js';
 import { WRITE_FILE_PARAMS } from './local-file-write-contract.js';
 import { spawn } from 'node:child_process';
 import { CLI_CATALOG } from '../integrations/cli-catalog/catalog.js';
@@ -13,10 +13,10 @@ import { performance } from 'node:perf_hooks';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
-import { canonicalLocalFileTarget, commitLocalFileRevision, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
+import { canonicalLocalFileTarget, commitLocalFileRevision, isLocalFileRevisionHandle, recordedLocalFileAtRevision, recordLocalFileRevisionAfterCommand, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
 import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { reviewedFileCorrectionPrecondition } from '../runtime/harness/reviewed-file-correction.js';
-import { withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+import { parseHostLocalWriteCommitFacts, withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENTS_DIR,
@@ -1300,6 +1300,53 @@ export function shellOutputLooksInteractive(exitCode: number, stdout: string, st
   return /\(Use arrow keys\)|\u276f|\? +[A-Z][^\n]*[:?] *(\(| |$)|\[y\/N\]|press enter to/i.test(`${stdout}\n${stderr}`);
 }
 
+/** Files this request already wrote, as they stand at their recorded
+ * revisions just before one of its shell commands runs. A command that then
+ * changes one records its bytes as the file's next revision, so a request that
+ * writes a file and fixes it in the shell is checked against the file it
+ * finished with, not reported as drifted (live 2026-10-18: a reviewed,
+ * correct file ended the turn blocked). Bounded and best effort: a file not
+ * seen here simply keeps its earlier revision. */
+const OWN_FILES_PER_COMMAND = 20;
+const OWN_FILE_MAX_BYTES = 8 * 1024 * 1024;
+type OwnFileBeforeCommand = { handle: string; descriptorDigest: string; bytes: Buffer; mode: number };
+function ownRecordedFilesBeforeCommand(sessionId: string | undefined, sourceUserSeq: number | undefined): OwnFileBeforeCommand[] {
+  if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || (sourceUserSeq ?? 0) <= 0) return [];
+  try {
+    const handles = new Set<string>();
+    for (const event of listEvents(sessionId, { sinceSeq: sourceUserSeq! - 1, types: ['tool_returned', 'guardrail_tripped'] })) {
+      if (event.data.sourceUserSeq !== sourceUserSeq) continue;
+      const text = event.type === 'tool_returned' ? event.data.result
+        : event.data.kind === 'own_file_revision_after_command' && event.role === 'system' ? `${String(event.data.receipt ?? '')}\n` : undefined;
+      const facts = parseHostLocalWriteCommitFacts(text);
+      if (facts && isLocalFileRevisionHandle(facts.handle)) handles.add(facts.handle);
+    }
+    const files: OwnFileBeforeCommand[] = [];
+    for (const handle of [...handles].slice(0, OWN_FILES_PER_COMMAND)) {
+      const file = recordedLocalFileAtRevision(handle);
+      if (file && file.bytes.length <= OWN_FILE_MAX_BYTES) files.push({ handle, ...file });
+    }
+    return files;
+  } catch { return []; }
+}
+
+function recordOwnFilesChangedByCommand(files: OwnFileBeforeCommand[], input: {
+  sessionId: string | undefined; sourceUserSeq: number | undefined; callId: string | undefined;
+}): void {
+  if (!input.sessionId || files.length === 0) return;
+  for (const file of files) {
+    try {
+      const committed = recordLocalFileRevisionAfterCommand({ handle: file.handle, before: file,
+        command: { tool: 'run_shell_command', callId: input.callId ?? '' } });
+      if (!committed) continue;
+      const receipt = withHostLocalWriteCommitFromFile({ ...committed, result: '' }).split('\n')[0];
+      appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+        data: { kind: 'own_file_revision_after_command', sourceUserSeq: input.sourceUserSeq,
+          callId: input.callId ?? null, tool: 'run_shell_command', receipt } });
+    } catch { /* the earlier revision stands */ }
+  }
+}
+
 let windowsShellStopping = 0;
 let windowsShellCleanupUnconfirmed = false;
 interface ShellProcessRuntime {
@@ -2081,6 +2128,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
         );
       }
       const callId = callIdFromToolDetails(details);
+      const owner = { sessionId: sessionIdFromRunContext(runContext), sourceUserSeq: sourceUserSeqFromRunContext(runContext), callId };
+      const ownFiles = ownRecordedFilesBeforeCommand(owner.sessionId, owner.sourceUserSeq);
       try {
         const execution = await runCommand(input.command, cwd, input.timeout_ms ?? DEFAULT_TIMEOUT_MS);
         recordShellExecutionOutcome(callId, execution.outcome);
@@ -2095,6 +2144,8 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
           recordShellExecutionOutcome(callId, error.outcome);
         }
         throw error;
+      } finally {
+        recordOwnFilesChangedByCommand(ownFiles, owner);
       }
     },
   });

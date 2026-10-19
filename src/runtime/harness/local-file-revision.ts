@@ -77,6 +77,8 @@ type Revision = {
   bytes: number;
   previous: { handle: string; contentDigest: string; bytes: number; mode: number } | null;
   operation?: { key: string; requestDigest: string; previousRevisionDigest: string | null };
+  /** Set when the host recorded bytes a command changed, not a file tool. */
+  observedAfter?: { tool: string; callId: string };
 };
 
 /** One registered file-tool execution: retain the exact previous bytes before
@@ -215,6 +217,68 @@ function replacedBytes(target: string, prior: Buffer | null, find: string, repla
 
 export function isLocalFileRevisionHandle(handle: string): boolean {
   return /^state\/local-file-revisions\/[a-f0-9]{64}\/current\.json$/.test(handle);
+}
+
+/** A recorded file as its current revision describes it, with the file's
+ * present bytes when they are still exactly that revision; null otherwise. */
+export function recordedLocalFileAtRevision(handle: string): {
+  descriptorDigest: string; bytes: Buffer; mode: number;
+} | null {
+  if (!isLocalFileRevisionHandle(handle)) return null;
+  try {
+    const root = realpathSync(BASE_DIR);
+    const descriptor = readDirectFile(path.join(root, handle)).bytes;
+    const revision = JSON.parse(descriptor.toString('utf8')) as Revision;
+    if (revision.version !== 1 || revision.kind !== 'local_file_revision_v1' || typeof revision.target !== 'string'
+      || canonicalLocalFileTarget(revision.target) !== revision.target
+      || handle !== `${PREFIX}${digest(revision.target)}/current.json`) return null;
+    const file = readDirectFile(revision.target);
+    if (file.bytes.length !== revision.bytes || digest(file.bytes) !== revision.contentDigest) return null;
+    return { descriptorDigest: digest(descriptor), bytes: file.bytes, mode: file.mode };
+  } catch { return null; }
+}
+
+/** A recorded file changed by a command run in the same request. The host saw
+ * the file at its recorded revision just before the command and sees other
+ * bytes after it, so the change is the command's: record those bytes as the
+ * file's next revision, keeping the earlier bytes as its previous state, as a
+ * file write does. A revision recorded in between, a file that is gone or no
+ * longer plain, or bytes still moving record nothing. */
+export function recordLocalFileRevisionAfterCommand(input: {
+  handle: string;
+  before: { descriptorDigest: string; bytes: Buffer; mode: number };
+  command: { tool: string; callId: string };
+}): { createdId: string; committedPath: string } | null {
+  if (!isLocalFileRevisionHandle(input.handle)) return null;
+  const root = realpathSync(BASE_DIR);
+  const current = path.join(root, input.handle);
+  const dir = path.dirname(current);
+  if (realpathSync(dir) !== dir) return null;
+  return withFileLockSyncStrict(current, () => {
+    const descriptor = readDirectFile(current).bytes;
+    if (digest(descriptor) !== input.before.descriptorDigest) return null;
+    const recorded = JSON.parse(descriptor.toString('utf8')) as Revision;
+    const target = recorded.target;
+    if (recorded.version !== 1 || recorded.kind !== 'local_file_revision_v1' || typeof target !== 'string'
+      || canonicalLocalFileTarget(target) !== target || recorded.createdId !== `file-${digest(target)}`
+      || current !== path.join(root, PREFIX, digest(target), 'current.json')
+      || digest(input.before.bytes) !== recorded.contentDigest || !existsSync(target)) return null;
+    const after = readDirectFile(target);
+    if (after.bytes.equals(input.before.bytes)) return null;
+    const revisionId = randomUUID();
+    const previousPath = path.join(dir, `${revisionId}.before`);
+    writeDurable(previousPath, input.before.bytes, 0o600, true);
+    const revision: Revision = { version: 1, kind: 'local_file_revision_v1', createdId: recorded.createdId, revisionId, target,
+      contentDigest: digest(after.bytes), bytes: after.bytes.length,
+      previous: { handle: path.relative(root, previousPath).split(path.sep).join('/'),
+        contentDigest: recorded.contentDigest, bytes: input.before.bytes.length, mode: input.before.mode },
+      observedAfter: { tool: input.command.tool, callId: input.command.callId } };
+    const encoded = Buffer.from(JSON.stringify(revision));
+    writeDurable(path.join(dir, `${revisionId}.prepared.json`), encoded, 0o600, true);
+    if (!readDirectFile(target).bytes.equals(after.bytes)) return null;
+    writeDurable(current, encoded, 0o600);
+    return { createdId: recorded.createdId, committedPath: current };
+  });
 }
 
 /** Verify historical replacement from immutable descriptors and retained prior
