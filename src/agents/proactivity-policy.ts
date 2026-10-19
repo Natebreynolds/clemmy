@@ -238,7 +238,8 @@ export function loadProactivityPolicy(): ProactivityPolicy {
 
 /** Preparation alone uses strict opt-in gates. Legacy monitors keep their
  * existing fallback, but a damaged owner policy cannot revive a disabled
- * preparation/watch/suggestion gate or erase quiet hours. */
+ * preparation/watch/suggestion gate or erase quiet hours. Profiles predating
+ * Noticing may omit only those newer fields and inherit their existing defaults. */
 export function loadMeetingPreparationProactivityPolicy(): ProactivityPolicy {
   let text: string;
   try { text = readFileSync(POLICY_FILE, 'utf8'); }
@@ -250,12 +251,15 @@ export function loadMeetingPreparationProactivityPolicy(): ProactivityPolicy {
   try { raw = JSON.parse(text); } catch { throw new Error('Meeting preparation policy is unavailable.'); }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Meeting preparation policy is unavailable.');
   const policy = raw as Record<string, unknown>;
-  const booleans = ['noticingEnabled', 'calendarWatchEnabled', 'quietHoursEnabled'];
-  const numeric: Array<[string, number, number]> = [['noticingMinutes', 30, 1440], ['noticingDailyCap', 1, 10], ['calendarWatchMinutes', 5, 240]];
+  const booleans = ['calendarWatchEnabled', 'quietHoursEnabled'];
+  const optionalNumeric: Array<[string, number, number]> = [['noticingMinutes', 30, 1440], ['noticingDailyCap', 1, 10]];
+  const validInteger = (key: string, min: number, max: number): boolean => Number.isInteger(policy[key])
+    && Number(policy[key]) >= min && Number(policy[key]) <= max;
   const validTime = (value: unknown): boolean => typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
   if (!booleans.every(key => Object.hasOwn(policy, key) && typeof policy[key] === 'boolean')
-    || !numeric.every(([key, min, max]) => Object.hasOwn(policy, key) && Number.isInteger(policy[key])
-      && Number(policy[key]) >= min && Number(policy[key]) <= max)
+    || (Object.hasOwn(policy, 'noticingEnabled') && typeof policy.noticingEnabled !== 'boolean')
+    || !optionalNumeric.every(([key, min, max]) => !Object.hasOwn(policy, key) || validInteger(key, min, max))
+    || !Object.hasOwn(policy, 'calendarWatchMinutes') || !validInteger('calendarWatchMinutes', 5, 240)
     || !validTime(policy.quietHoursStart) || !validTime(policy.quietHoursEnd)) {
     throw new Error('Meeting preparation policy is unavailable.');
   }
