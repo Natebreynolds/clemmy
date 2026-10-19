@@ -739,7 +739,8 @@ test('the memory core is content-addressed: requests, sessions and later facts l
   const rule = 'Email sending constraint: ALWAYS send email via the Outlook mailbox desk@example.com. NEVER send from any other connected mailbox unless explicitly directed in the current conversation.';
   rememberFact({ kind: 'constraint', content: rule });
   const first = renderMemoryCore();
-  assert.match(first.text, /## Standing Policies\n\*\*Dispatch-enforced constraints\*\*\n- Email sending constraint/);
+  // Each rule carries its saved-fact identity (0a0b3f0ec), which is part of its content-addressed bytes.
+  assert.match(first.text, /## Standing Policies\n\*\*Dispatch-enforced constraints\*\*\n- \[fact:\d+\] Email sending constraint/);
   assert.equal(first.sha256.length, 64);
   assert.deepEqual(first.manifest.map((entry) => entry.tier), first.manifest.map(() => 'core'));
   assert.ok(first.manifest.find((entry) => entry.section === 'Standing Policies')?.refs.length === 1);

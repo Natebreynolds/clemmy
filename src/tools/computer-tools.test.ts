@@ -571,7 +571,7 @@ test('a script that saves a file it names in its own code is seen to save it; a 
   assert.deepEqual(savedShellLeadFiles(leads, marks, started), [out], 'the file the script wrote, not the one it read');
   assert.equal(shellSavedFileIsScratch(path.join(os.tmpdir(), 'page.html')), true);
   assert.equal(shellSavedFileIsScratch('/tmp/page.html'), true);
-  assert.equal(shellSavedFileIsScratch('/Users/owner/clem-fixtures/out/page9.csv'), false);
+  assert.equal(shellSavedFileIsScratch('/Users/user/clem-fixtures/out/page9.csv'), false);
 });
 
 test('a file a shell command writes through a variable is recorded as saved; its stderr log is not', async () => {

@@ -6822,7 +6822,9 @@ test('production named workflow coordinator reaches the real source-bound queue 
         bindHostCanarySurface(fixture, agent, [carrier]);
         const outcome = await runProductionHost(fixture, agent);
         const prepared = eventlog.listEvents(fixture.session.id, { types: ['async_work_dispatch_prepared'] });
-        assert.equal(prepared.length, variant === 'normal' ? 1 : 0,
+        // A named run of a workflow left off is a one-shot run that leaves it
+        // off ("run it once and leave it off", 5e57cb804), not a refusal.
+        assert.equal(prepared.length, variant === 'normal' || variant === 'disabled' ? 1 : 0,
           JSON.stringify({ variant, terminal: outcome.terminal, output: outcome.finalOutput,
             history: outcome.history }));
         assert.equal(eventlog.getTurnGraphEventForSource(fixture.session.id, fixture.source.seq), null,

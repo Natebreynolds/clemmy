@@ -11,16 +11,16 @@ import os from 'node:os';
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 const { workflowEndingKeepsFacts, workflowEndingInClemsWords } = await import('./workflow-ending-voice.js');
 
-const report = 'Saved 20 books to /Users/owner/clem-fixtures/out/page7-books.csv from https://books.toscrape.com/catalogue/page-7.html.';
+const report = 'Saved 20 books to /Users/user/clem-fixtures/out/page7-books.csv from https://books.toscrape.com/catalogue/page-7.html.';
 
 test('a faithful retelling keeps the facts, home-relative paths included', () => {
-  assert.equal(workflowEndingKeepsFacts('All 20 books from page 7 are in /Users/owner/clem-fixtures/out/page7-books.csv.', report, 'done'), true);
+  assert.equal(workflowEndingKeepsFacts('All 20 books from page 7 are in /Users/user/clem-fixtures/out/page7-books.csv.', report, 'done'), true);
   const home = `${os.homedir()}/clem-fixtures/out/x.csv`;
   assert.equal(workflowEndingKeepsFacts('It is in ~/clem-fixtures/out/x.csv.', `Wrote ${home}.`, 'done'), true);
 });
 
 test('a link or file the report never named, or a blocked run told as done, keeps the report', () => {
-  assert.equal(workflowEndingKeepsFacts('Saved to /Users/owner/Desktop/books.csv.', report, 'done'), false, 'an invented location');
+  assert.equal(workflowEndingKeepsFacts('Saved to /Users/user/Desktop/books.csv.', report, 'done'), false, 'an invented location');
   assert.equal(workflowEndingKeepsFacts('See https://example.com/run for details.', report, 'done'), false, 'an invented link');
   assert.equal(workflowEndingKeepsFacts('All done — the page is saved.', 'One step stopped: the page did not load.', 'blocked'), false);
   assert.equal(workflowEndingKeepsFacts('   ', report, 'done'), false);

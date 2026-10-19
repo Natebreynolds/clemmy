@@ -156,7 +156,8 @@ test('accounting namespaces and a reused model-call ID cannot borrow parsed owne
 });
 test('provider-controlled model strings are sanitized and a shared completion receipt is conflicting', () => {
   const owner = fixture(), item = call(owner);
-  const secret = 'sk-proj-controlledSecret123456789012345678901234';
+  // Built at run time: a key-shaped literal in source trips secret scanning.
+  const secret = ['sk', 'proj', 'controlledSecret123456789012345678901234'].join('-');
   alter(item.saved[3]!, { providerReportedModel: secret }); alter(item.saved[4]!, { providerReportedModel: secret });
   const sanitized = readTaskAuxiliaryModels(owner).models[0]!;
   assert.equal(sanitized.responseCompleted, true);

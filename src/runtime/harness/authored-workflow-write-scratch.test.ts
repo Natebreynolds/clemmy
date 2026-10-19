@@ -22,7 +22,7 @@ test('a declared target in the system temporary folders is scratch; anywhere els
     'Clementine\'s home is never scratch, even when it lives in a temporary folder');
   assert.equal(localWriteTargetsOnlyScratch('write_file', { path: '~/clem-fixtures/out/under20.csv', content: 'a' }), false,
     'the deliverable is still reviewed');
-  assert.equal(localWriteTargetsOnlyScratch('write_file', { path: '/tmp/../Users/owner/notes.md', content: 'a' }), false,
+  assert.equal(localWriteTargetsOnlyScratch('write_file', { path: '/tmp/../Users/user/notes.md', content: 'a' }), false,
     'a path that only starts in a temporary folder is not scratch');
   assert.equal(localWriteTargetsOnlyScratch('write_file', { path: 'tmp/p5.json', content: 'a' }), false, 'a relative path is not scratch');
   assert.equal(localWriteTargetsOnlyScratch('write_file', { path: '/tmpfiles/p5.json', content: 'a' }), false);
