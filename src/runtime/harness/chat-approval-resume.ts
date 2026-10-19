@@ -20,8 +20,8 @@
  *    in-flight run owns the resolution and this listener stays out).
  *  - Never dispatches into a session with a run in flight (runInFlightSince):
  *    the running turn will see the resolution itself. The one exception is an
- *    exact stored action behind a marker no live foreground run owns
- *    (runMarkerHasNoLiveForegroundOwner); it runs without touching that marker.
+ *    exact stored action beside a verified idle workflow/approval owner; it
+ *    runs without touching that owner's marker.
  *  - Approval is the ONLY resolution that re-drives. A rejection/expiry stops
  *    quietly — the reaper and the gate's deny message already tell the user —
  *    so a declined action can never come back on its own.
@@ -44,17 +44,18 @@ import {
   getRunAttemptBySourceUserSeq,
   getUserInputEventAtSequence,
   isKillRequested,
+  listActiveRunAttemptOwnership,
   listEvents,
+  openEventLog,
   recordRunAttemptUserInput,
   type EventRow,
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
-import { runMarkerHasNoLiveForegroundOwner } from './restart-recovery.js';
 import { getPendingAction, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
 import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
-import { publicUserInputText } from './public-presentation.js';
+import { publicAsyncWorkDispatchedData, publicUserInputText } from './public-presentation.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
 import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, PENDING_ACTION_TOOL_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
@@ -63,6 +64,9 @@ import { CLEM_VOICE_PURPOSE } from '../semantic-boundary/turn-semantic-model-por
 import { withOwnModelRequestAttribution } from '../usage-log.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
+import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
+import { readActiveWorkflowOriginGroup, workflowOriginSourceGroupId } from '../../tools/workflow-run-queue.js';
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { reprojectUndeliveredConversationalApproval } from './claude-agent-approval.js';
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
@@ -288,6 +292,163 @@ function activeAttemptOwnsApprovalResume(
   const accepted = taggedApprovalResponse(row);
   const source = getRunAttemptSourceUserEvent(attempt);
   return Boolean(accepted && source?.seq === accepted.seq);
+}
+
+interface ApprovalResumeOccupancy { blocked: boolean; preserveMarker: boolean }
+
+function verifiedWorkflowTransfer(sessionId: string, sourceUserSeq: number): boolean {
+  const source = getUserInputEventAtSequence(sessionId, sourceUserSeq);
+  if (!source || source.role !== 'user' || source.data.synthetic === true
+    || resolveExactTerminalForAcceptedSource(source).kind !== 'absent') return false;
+  const active = readActiveWorkflowOriginGroup(workflowOriginSourceGroupId({ sessionId, sourceUserSeq }));
+  if (!active || active.sealed.originSessionId !== sessionId || active.sealed.sourceUserSeq !== sourceUserSeq) return false;
+  const edges = listEvents(sessionId, { types: ['async_work_dispatched'] }).filter(event =>
+    event.role === 'system' && event.parentEventId === source.id && event.turn === source.turn
+    && event.data.sourceUserSeq === source.seq);
+  if (edges.length !== 1 || edges[0]!.seq <= source.seq) return false;
+  const projection = publicAsyncWorkDispatchedData(edges[0]!.data);
+  if (!projection) return false;
+  const { text: _displayText, ...identity } = projection;
+  return closedCanonicalJson(identity) === closedCanonicalJson(active.publicDispatch);
+}
+
+function exactMarkerOwner(session: HarnessSession): { sourceUserSeq: number; attemptId: string } | null {
+  const raw = session.sessionRow.metadata.__run_in_flight_owner as
+    { sourceUserSeq?: unknown; attemptId?: unknown } | null | undefined;
+  return raw && Number.isSafeInteger(raw.sourceUserSeq) && Number(raw.sourceUserSeq) > 0
+    && typeof raw.attemptId === 'string' && raw.attemptId
+    ? { sourceUserSeq: Number(raw.sourceUserSeq), attemptId: raw.attemptId } : null;
+}
+
+function originalActionAllowsSideExecution(sessionId: string, action: PendingActionRecord | null): boolean {
+  if (!action || !Number.isSafeInteger(action.sourceUserSeq) || Number(action.sourceUserSeq) <= 0) return false;
+  const original = getUserInputEventAtSequence(sessionId, action.sourceUserSeq!);
+  const attempt = getRunAttemptBySourceUserSeq(sessionId, action.sourceUserSeq!);
+  if (!original || original.role !== 'user' || isKillRequested(sessionId, { sourceUserSeq: action.sourceUserSeq! })
+    || attempt?.status === 'cancelled' || attempt?.status === 'superseded') return false;
+  const terminal = resolveExactTerminalForAcceptedSource(original);
+  return terminal.kind === 'absent' || (terminal.kind === 'terminal'
+    && terminal.presentation.status !== 'cancelled' && terminal.presentation.status !== 'uncertain');
+}
+
+/** An ended exact owner may leave bookkeeping behind. Unlike an uptime or
+ * marker-only guess, its matching attempt and typed ending/activated handoff
+ * prove that no foreground executor owns it. Preserve the marker, never clear
+ * another source's retained checkpoint to make a decision callback run. */
+function idleForeignMarkerOwner(
+  session: HarnessSession,
+  row: approvalRegistry.PendingApprovalRow,
+): boolean {
+  const owner = exactMarkerOwner(session);
+  if (!owner || isKillRequested(row.sessionId, owner)) return false;
+  const attempt = openEventLog().prepare(`SELECT status, finished_at FROM run_attempts
+    WHERE session_id = ? AND attempt_id = ? AND source_user_seq = ?`)
+    .get(row.sessionId, owner.attemptId, owner.sourceUserSeq) as { status: string; finished_at: string | null } | undefined;
+  if (!attempt?.finished_at || !['completed', 'interrupted', 'failed'].includes(attempt.status)) return false;
+  const source = getUserInputEventAtSequence(row.sessionId, owner.sourceUserSeq);
+  if (!source) return false;
+  const terminal = resolveExactTerminalForAcceptedSource(source);
+  if (terminal.kind === 'terminal') return terminal.presentation.status === 'done'
+    || (terminal.presentation.status === 'needs_input' && terminal.presentation.kind === 'approval'
+      && terminal.presentation.approvalId === row.approvalId);
+  return terminal.kind === 'absent' && verifiedWorkflowTransfer(row.sessionId, owner.sourceUserSeq);
+}
+
+/** A definitive owner Stop/supersession is not a wait condition. Reuse the
+ * pending-action record's locked cancellation transition; an executing or
+ * uncertain action cannot be overwritten by this pre-dispatch cleanup. */
+async function retireObsoleteApprovedAction(
+  row: approvalRegistry.PendingApprovalRow,
+  action: PendingActionRecord | null,
+): Promise<boolean> {
+  if (!action || action.sessionId !== row.sessionId || action.approvalId !== row.approvalId
+    || action.status !== 'approved' || action.approvedBy !== 'human' || action.toolName === 'run_batch') return false;
+  const decision = taggedApprovalResponse(row);
+  const obsolete = (source: number | null | undefined): 'stopped' | 'superseded' | null => {
+    if (!Number.isSafeInteger(source) || Number(source) <= 0) return null;
+    if (isKillRequested(row.sessionId, { sourceUserSeq: source! })) return 'stopped';
+    const attempt = getRunAttemptBySourceUserSeq(row.sessionId, source!);
+    if (attempt?.status === 'cancelled') return 'stopped';
+    if (attempt?.status === 'superseded') return 'superseded';
+    const accepted = getUserInputEventAtSequence(row.sessionId, source!);
+    const terminal = accepted ? resolveExactTerminalForAcceptedSource(accepted) : null;
+    return terminal?.kind === 'terminal' && terminal.presentation.status === 'cancelled' ? 'stopped' : null;
+  };
+  const reason = obsolete(decision?.seq) ?? obsolete(action.sourceUserSeq);
+  if (!reason || !approvalSourceIsSafeToDispatch(row)) return false;
+  const text = reason === 'stopped'
+    ? 'Not run: you stopped the request. This stored action will not run on its own.'
+    : 'Not run: a newer request replaced the original request. This stored action will not run on its own.';
+  const cancelled = recordPendingActionResult(action.id, 'cancelled', text, 'chat-approval-resume');
+  if (cancelled?.status !== 'cancelled') return false;
+  queuedApprovalResumes.delete(row.approvalId);
+  clearConversationalDecisionRetry(row.approvalId);
+  handledApprovalIds.add(row.approvalId);
+  if ([...queuedApprovalResumes.values()].some(queued => queued.row.sessionId === row.sessionId)) scheduleResumeDrain(row.sessionId);
+  if (decision && !approvalSourceAlreadySettled(row)) await settleConversationalSource(row, decision, {
+    status: 'cancelled', text, ...(reason === 'stopped' ? { hostNotice: { code: 'stopped' as const } } : {}),
+  });
+  return true;
+}
+
+/** Scheduling only. A public workflow handoff keeps its attempt unfinished,
+ * but is not a foreground executor after its HTTP/parent lease is released.
+ * The immutable group and its exact public edge must still agree. This never
+ * grants call authority, retires the parent, or releases a prepared dispatch. */
+function approvalResumeOccupancy(
+  session: HarnessSession,
+  row: approvalRegistry.PendingApprovalRow,
+  action: PendingActionRecord | null,
+  exactLinkedSingleAction: boolean,
+): ApprovalResumeOccupancy {
+  const blocked = { blocked: true, preserveMarker: false };
+  try {
+    // Obsolete-action cleanup can yield before this admission check. Refresh
+    // the marker with the attempt inventory so a newly armed foreground
+    // cannot disappear behind the caller's earlier session snapshot.
+    session.refresh();
+    const accepted = taggedApprovalResponse(row);
+    if (accepted && isKillRequested(row.sessionId, { sourceUserSeq: accepted.seq })) return blocked;
+    const owners = listActiveRunAttemptOwnership(row.sessionId);
+    // The canonical list includes active rows. An unfinished row in another
+    // state is unknown/cancelling, never free space. Read only this indexed
+    // session's owners without imposing a new workflow admission limit.
+    const attempts = openEventLog().prepare(`SELECT attempt_id, run_id, source_user_seq, started_at,
+      status, lease_owner, lease_expires_at FROM run_attempts
+      WHERE session_id = ? AND finished_at IS NULL`).all(row.sessionId) as Array<{
+        attempt_id: string; run_id: string | null; source_user_seq: number | null; started_at: string;
+        status: string; lease_owner: string | null; lease_expires_at: string | null;
+      }>;
+    if (owners.length !== attempts.length) return blocked;
+    const transferred = [] as typeof owners;
+    for (const attempt of attempts) {
+      const owner = owners.find(candidate => candidate.attemptId === attempt.attempt_id);
+      if (!owner || attempt.status !== 'active' || owner.sourceUserSeq !== attempt.source_user_seq
+        || owner.runId !== attempt.run_id) return blocked;
+      const ref = { sessionId: row.sessionId, attemptId: owner.attemptId,
+        runId: owner.runId, startedAt: attempt.started_at };
+      if (isKillRequested(row.sessionId, { attemptId: owner.attemptId, sourceUserSeq: owner.sourceUserSeq ?? undefined })) return blocked;
+      if (activeAttemptOwnsApprovalResume(ref, row)) continue;
+      if (!exactLinkedSingleAction || !owner.workflowHandoff || !owner.sourceUserSeq
+        || attempt.lease_owner !== null || attempt.lease_expires_at !== null) return blocked;
+      if (!verifiedWorkflowTransfer(row.sessionId, owner.sourceUserSeq)) return blocked;
+      transferred.push(owner);
+    }
+    const marker = session.runInFlightSince();
+    const markerOwner = marker ? exactMarkerOwner(session) : null;
+    const ownMarker = markerOwner && accepted && markerOwner.sourceUserSeq === accepted.seq
+      && Boolean(openEventLog().prepare(`SELECT 1 FROM run_attempts
+        WHERE session_id = ? AND attempt_id = ? AND source_user_seq = ?`)
+        .get(row.sessionId, markerOwner.attemptId, accepted.seq));
+    if (transferred.length || (marker && !ownMarker)) {
+      if (!exactLinkedSingleAction || !originalActionAllowsSideExecution(row.sessionId, action)) return blocked;
+      if (marker && !ownMarker && (!markerOwner || (!transferred.some(candidate =>
+        candidate.sourceUserSeq === markerOwner.sourceUserSeq && candidate.attemptId === markerOwner.attemptId)
+        && !idleForeignMarkerOwner(session, row)))) return blocked;
+      return { blocked: false, preserveMarker: true };
+    }
+    return { blocked: false, preserveMarker: false };
+  } catch { return blocked; }
 }
 
 /** True when this logical approval-response source already has a public
@@ -638,7 +799,8 @@ function prepareApprovalResumeSource(
     }).filter((event) => event.data.approvalId === row.approvalId);
     if (existingMatches.length > 0) return null;
   }
-  const active = getActiveRunAttempt(row.sessionId);
+  const bound = accepted ? getRunAttemptBySourceUserSeq(row.sessionId, accepted.seq) : null;
+  const active = bound?.status === 'active' && !bound.finishedAt ? bound : getActiveRunAttempt(row.sessionId);
   const activeSource = active ? getRunAttemptSourceUserEvent(active) : null;
   const attempt = active && accepted && activeSource?.seq === accepted.seq
     ? active
@@ -716,8 +878,7 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
     }
     return;
   }
-  if (activeResumeSessions.has(sessionId) || getActiveRunAttempt(sessionId)
-    || (session.runInFlightSince() && !runMarkerHasNoLiveForegroundOwner(sessionId))) {
+  if (activeResumeSessions.has(sessionId)) {
     scheduleResumeDrain(sessionId);
     return;
   }
@@ -727,8 +888,19 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
       left.row.requestedAt.localeCompare(right.row.requestedAt)
       || left.row.approvalId.localeCompare(right.row.approvalId))[0];
   if (!next) return;
-  queuedApprovalResumes.delete(next.row.approvalId);
   const current = queuedResumeStillActionable(next.row);
+  if (current) {
+    const actionId = pendingActionIdFromArgs(current.args);
+    const action = actionId ? getPendingAction(actionId) : null;
+    if (await retireObsoleteApprovedAction(current, action)) return;
+    if (approvalResumeOccupancy(session, current, action, Boolean(action && action.toolName !== 'run_batch'
+      && action.sessionId === sessionId && action.approvalId === current.approvalId
+      && action.status === 'approved' && action.approvedBy === 'human')).blocked) {
+      scheduleResumeDrain(sessionId);
+      return;
+    }
+  }
+  queuedApprovalResumes.delete(next.row.approvalId);
   if (current) await handleResolvedApprovalForChatResume(current, next.dispatch);
   if ([...queuedApprovalResumes.values()].some((queued) => queued.row.sessionId === sessionId)) {
     scheduleResumeDrain(sessionId);
@@ -973,6 +1145,7 @@ export async function handleResolvedApprovalForChatResume(
     if (!parked && !exactLinkedPendingAction) return false;
     const session = HarnessSession.load(row.sessionId);
     if (!session || session.kind !== 'chat') return false;
+    if (await retireObsoleteApprovedAction(row, pendingAction)) return true;
     if (approvalSourceAlreadySettled(row)) {
       handledApprovalIds.add(row.approvalId);
       return false;
@@ -983,22 +1156,12 @@ export async function handleResolvedApprovalForChatResume(
       return false;
     }
     const activeAttempt = getActiveRunAttempt(row.sessionId);
-    const behindMarkerOnly = !activeAttempt && Boolean(session.runInFlightSince()) && !taggedApprovalResponse(row);
-    // An exact stored action needs no model turn, so a marker with no live
-    // foreground run behind it (a dead process's, an ended request's, or one a
-    // queued workflow dispatch holds) is not a reason to wait. Windows tester
-    // 2026-10-19: approved writes sat "approved" forever behind such a marker
-    // while the button's chat fallback looped Clem on refused executes.
-    const runsBesideMarker = behindMarkerOnly
-      && exactLinkedPendingAction
-      && pendingAction?.toolName !== 'run_batch'
-      && runMarkerHasNoLiveForegroundOwner(row.sessionId);
+    const occupancy = approvalResumeOccupancy(session, row, pendingAction,
+      exactLinkedPendingAction && pendingAction?.toolName !== 'run_batch');
+    const runsBesideMarker = occupancy.preserveMarker;
     if (
       activeResumeSessions.has(row.sessionId)
-      || (activeAttempt && !activeAttemptOwnsApprovalResume(activeAttempt, row))
-      // A pre-attempt legacy executor can still own the coarse marker. Once an
-      // attempt-backed approval resume exists, that exact owner wins instead.
-      || (behindMarkerOnly && !runsBesideMarker)
+      || occupancy.blocked
     ) {
       // The current turn may own this resolution; if so its durable consume or
       // pending-action terminal state makes the queued row inert. Otherwise
@@ -1007,7 +1170,7 @@ export async function handleResolvedApprovalForChatResume(
       enqueueApprovalResume(row, dispatch);
       return false;
     }
-    if (!activeAttempt && taggedApprovalResponse(row) && session.runInFlightSince()) {
+    if (!activeAttempt && !runsBesideMarker && taggedApprovalResponse(row) && session.runInFlightSince()) {
       // Boot already retired the dead physical attempt. Replace (rather than
       // inherit) its pre-boot coarse marker so generic restart recovery cannot
       // race this approval-specific reclaim. A crash in this small clear→bind

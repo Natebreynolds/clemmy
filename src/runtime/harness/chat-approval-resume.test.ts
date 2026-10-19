@@ -25,6 +25,8 @@ const {
   openEventLog,
   beginRunAttempt,
   recordRunAttemptUserInput,
+  requestKill,
+  listActiveRunAttemptOwnership,
 } = await import('./eventlog.js');
 const approvalRegistry = await import('./approval-registry.js');
 const {
@@ -35,6 +37,12 @@ const {
 const { _setApprovedCallDispatchForTests } = await import('../../execution/pending-action-executor.js');
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { HarnessSession } = await import('./session.js');
+const { writeWorkflow } = await import('../../memory/workflow-store.js');
+const workflowQueue = await import('../../tools/workflow-run-queue.js');
+const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+const { exactOriginDeliveryTargetDigest } = await import('../exact-origin-delivery.js');
+const { commitTurnOutcome } = await import('./delivery-committer.js');
+const { turnOutcomeId } = await import('./turn-outcome.js');
 const { recordTurnGraphShadow, turnGraphFromShadowEvent } = await import('../graph/turn-graph-shadow.js');
 const workContracts = await import('./expected-work-contract.js');
 const workAdmission = await import('./expected-work-admission.js');
@@ -361,7 +369,246 @@ function recordingDispatch() {
   });
   return dispatched;
 }
-test.afterEach(() => _setApprovedCallDispatchForTests(null));
+test.afterEach(() => { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); });
+
+let workflowFixtureNumber = 0;
+function workflowHold(activate = true) {
+  const name = `approval-owned-workflow-${++workflowFixtureNumber}`;
+  writeWorkflow(name, { name, description: 'Controlled approval scheduling fixture.', enabled: true,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Perform the controlled read.', sideEffect: 'read' }] });
+  const session = createSession({ kind: 'chat', channel: 'desktop' });
+  const run = beginRunAttempt(session.id, { runId: `${name}:parent` });
+  const originReplyTarget = { type: 'origin_chat' } as const;
+  const source = recordRunAttemptUserInput(run, { turn: 1, role: 'user', data: {
+    text: `Run the workflow named ${name}.`, originReplyTarget,
+    originReplyTargetDigest: exactOriginDeliveryTargetDigest(originReplyTarget),
+  } }, { armRunInFlight: true });
+  const queued = workflowQueue.queueWorkflowRun(name, {}, { originSessionId: session.id,
+    originObserver: { sessionId: session.id, sourceUserSeq: source.seq, replyTarget: originReplyTarget },
+    prepareChatDispatch: authority => {
+      const prepared = appendEvent({ sessionId: session.id, turn: source.turn, role: 'system',
+        type: 'async_work_dispatch_prepared', parentEventId: source.id, data: { ...authority } });
+      return workflowQueue.recordWorkflowChatDispatchPreparation(workflowQueue.createWorkflowChatDispatchPreparedReceipt(authority,
+        { eventId: prepared.id, eventSeq: prepared.seq, preparedAt: prepared.createdAt }));
+    } });
+  assert.equal(queued.status, 'held');
+  if (activate) assert.ok(finalizePreparedWorkflowDispatchForSource(session.id, source.seq));
+  assert.equal(listActiveRunAttemptOwnership(session.id).find(owner => owner.attemptId === run.attemptId)?.workflowHandoff, activate);
+  return { session, run, source };
+}
+
+function storedApproval(sessionId: string, sourceUserSeq: number | null) {
+  const action = queuePendingAction({ title: 'Run the exact reviewed command', summary: 'Controlled exact stored action.',
+    kind: 'shell_command', toolName: 'run_shell_command', payload: { command: 'echo approved', cwd: '/tmp' },
+    sessionId, sourceUserSeq });
+  const row = approvalRegistry.register({ sessionId, subject: action.title, tool: 'request_approval',
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id } });
+  return { action, row };
+}
+
+function parentMarkers(sessionId: string) {
+  const metadata = HarnessSession.load(sessionId)!.sessionRow.metadata;
+  return Object.fromEntries(['__run_in_flight', '__run_in_flight_owner', '__host_recovery_state', '__host_recovery_owner',
+    '__continuation_owner', '__source_approval_checkpoints'].map(key => [key, metadata[key]]));
+}
+
+async function until(predicate: () => boolean) {
+  const end = Date.now() + 15_000;
+  while (!predicate() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(predicate(), 'controlled approval reached its expected state');
+}
+
+test('production approval ingress runs one stored action beside its retained workflow handoff without stealing the parent', async () => {
+  const held = workflowHold();
+  const { action, row } = storedApproval(held.session.id, held.source.seq);
+  const markers = parentMarkers(held.session.id);
+  const calls = recordingDispatch();
+  let modelCalls = 0;
+  await startChatApprovalResume(async () => { modelCalls += 1; });
+  assert.equal(approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').ok, true);
+  await until(() => getPendingAction(action.id)?.status === 'executed');
+  const decision = listEvents(held.session.id, { types: ['user_input_received'] }).find(event => event.data.approvalId === row.approvalId);
+  assert.ok(decision);
+  await until(() => listEvents(held.session.id, { types: ['conversation_completed'] }).some(event => event.data.sourceUserSeq === decision.seq));
+  assert.deepEqual(calls, [{ tool: action.toolName, payload: action.payload, sessionId: held.session.id }]);
+  assert.equal(modelCalls, 0);
+  assert.deepEqual(parentMarkers(held.session.id), markers);
+  const parent = openEventLog().prepare('SELECT status, finished_at FROM run_attempts WHERE attempt_id = ?').get(held.run.attemptId);
+  assert.deepEqual(parent, { status: 'active', finished_at: null });
+  _resetChatApprovalResumeForTest();
+  await startChatApprovalResume(async () => { modelCalls += 1; });
+  assert.equal(calls.length, 1, 'startup replay cannot dispatch the settled action again');
+  assert.equal(modelCalls, 0);
+});
+
+test('queued approval drain ignores only the retained workflow after the actual foreground finishes', async () => {
+  const held = workflowHold();
+  const { action, row } = storedApproval(held.session.id, held.source.seq);
+  const foreground = beginRunAttempt(held.session.id, { runId: 'controlled-live-foreground' });
+  const source = recordRunAttemptUserInput(foreground, { turn: 2, role: 'user', data: { text: 'Controlled foreground request.' } },
+    { armRunInFlight: true });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const calls = recordingDispatch();
+  let modelCalls = 0;
+  assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { modelCalls += 1; }), false);
+  assert.equal(calls.length, 0);
+  const identity = { sessionId: held.session.id, sourceUserSeq: source.seq, turn: source.turn,
+    attemptId: foreground.attemptId, runId: foreground.runId ?? undefined };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+    presentation: { kind: 'answer', text: 'The controlled foreground request is complete.' } });
+  await until(() => getPendingAction(action.id)?.status === 'executed');
+  assert.equal(calls.length, 1);
+  assert.equal(modelCalls, 0);
+  assert.equal(listActiveRunAttemptOwnership(held.session.id).find(owner => owner.attemptId === held.run.attemptId)?.workflowHandoff, true);
+});
+
+test('a foreground marker armed while approval cleanup yields keeps the approved action queued', async () => {
+  const session = createSession({ kind: 'chat' });
+  const original = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Run the exact controlled action.' } });
+  const { action, row } = storedApproval(session.id, original.seq);
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const calls = recordingDispatch();
+  const handling = handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); });
+  // The handler has read its session and yielded to obsolete-action cleanup;
+  // a real ingress may arm this marker before it creates its physical attempt.
+  const current = HarnessSession.load(session.id)!;
+  current.setRunInFlight('2026-10-19T23:30:00.000Z');
+  const before = parentMarkers(session.id);
+  assert.equal(getActiveRunAttempt(session.id), null, 'the foreground has not created its attempt yet');
+  assert.equal(await handling, false);
+  assert.equal(calls.length, 0);
+  assert.equal(getPendingAction(action.id)?.status, 'approved');
+  assert.deepEqual(parentMarkers(session.id), before);
+  assert.equal(listEvents(session.id, { types: ['user_input_received'] }).length, 1, 'no approval source is minted');
+});
+
+test('prepared, parent-reacquired, stopped and unknown owners cannot use the workflow side-execution exemption', async () => {
+  for (const mode of ['prepared', 'parent-lease', 'stopped', 'superseded', 'unknown', 'missing-action-source'] as const) {
+    const held = workflowHold(mode !== 'prepared');
+    const { action, row } = storedApproval(held.session.id, mode === 'missing-action-source' ? null : held.source.seq);
+    if (mode === 'parent-lease') openEventLog().prepare('UPDATE run_attempts SET lease_owner = ?, lease_expires_at = ? WHERE attempt_id = ?')
+      .run('workflow-parent:controlled', new Date(Date.now() + 60_000).toISOString(), held.run.attemptId);
+    if (mode === 'stopped') requestKill(held.session.id, 'Controlled owner Stop.', { sourceUserSeq: held.source.seq });
+    if (mode === 'superseded') finishRunAttempt(held.run, 'superseded');
+    if (mode === 'unknown') openEventLog().prepare("UPDATE run_attempts SET status = 'interrupted' WHERE attempt_id = ?").run(held.run.attemptId);
+    const before = parentMarkers(held.session.id);
+    const sources = listEvents(held.session.id, { types: ['user_input_received'] }).length;
+    const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+    const calls = recordingDispatch();
+    const obsolete = mode === 'stopped' || mode === 'superseded';
+    assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); }), obsolete, mode);
+    assert.equal(calls.length, 0, mode);
+    assert.equal(getPendingAction(action.id)?.status, obsolete ? 'cancelled' : 'approved', mode);
+    if (obsolete) {
+      assert.match(getPendingAction(action.id)?.resultSummary ?? '', /Not run:/);
+      assert.equal(await handleResolvedApprovalForChatResume(approvalRegistry.get(row.approvalId)!,
+        async () => { throw new Error('No model handoff'); }), false);
+    }
+    assert.deepEqual(parentMarkers(held.session.id), before, mode);
+    assert.equal(listEvents(held.session.id, { types: ['user_input_received'] }).length, sources, mode);
+    _resetChatApprovalResumeForTest();
+  }
+});
+
+test('a tagged decision can retry beside its exact retired workflow marker without clearing that owner', async () => {
+  const held = workflowHold();
+  finishRunAttempt(held.run, 'interrupted');
+  const { action, row } = storedApproval(held.session.id, held.source.seq);
+  const decision = appendEvent({ sessionId: held.session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Approve the exact controlled card.', source: 'desktop_approval', approvalId: row.approvalId, decision: 'approve' } });
+  const before = parentMarkers(held.session.id);
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const calls = recordingDispatch();
+  assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); }), true);
+  assert.equal(calls.length, 1);
+  assert.equal(getPendingAction(action.id)?.status, 'executed');
+  assert.deepEqual(parentMarkers(held.session.id), before);
+  assert.equal(listEvents(held.session.id, { types: ['user_input_received'] }).filter(event =>
+    event.data.approvalId === row.approvalId).length, 1, 'the exact accepted decision is reused');
+  assert.ok(listEvents(held.session.id, { types: ['conversation_completed'] }).some(event => event.data.sourceUserSeq === decision.seq));
+});
+
+test('Stop on an existing decision cancels its unexecuted action without stealing a workflow marker', async () => {
+  const held = workflowHold();
+  const { action, row } = storedApproval(held.session.id, held.source.seq);
+  const decisionRun = beginRunAttempt(held.session.id, { runId: `approval-resume:${row.approvalId}` });
+  const decision = recordRunAttemptUserInput(decisionRun, { turn: 2, role: 'user', data: {
+    text: 'Approve the exact controlled card.', source: 'desktop_approval', approvalId: row.approvalId, decision: 'approve',
+  } }, { armRunInFlight: false });
+  requestKill(held.session.id, 'Controlled decision Stop.', { sourceUserSeq: decision.seq });
+  const before = parentMarkers(held.session.id);
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const calls = recordingDispatch();
+  assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); }), true);
+  assert.equal(calls.length, 0);
+  assert.equal(getPendingAction(action.id)?.status, 'cancelled');
+  assert.deepEqual(parentMarkers(held.session.id), before);
+  assert.ok(listEvents(held.session.id, { types: ['conversation_completed'] }).some(event =>
+    event.data.sourceUserSeq === decision.seq && (event.data.turnOutcome as { status?: string })?.status === 'cancelled'));
+});
+
+test('an uncertain one-dispatch action is not retried by card callbacks or startup beside a workflow owner', async () => {
+  const held = workflowHold();
+  const { action, row } = storedApproval(held.session.id, held.source.seq);
+  const before = parentMarkers(held.session.id);
+  let calls = 0;
+  _setApprovedCallDispatchForTests(async () => { calls += 1; throw new Error('Controlled return was lost after dispatch.'); });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); });
+  assert.equal(calls, 1);
+  assert.equal(getPendingAction(action.id)?.status, 'failed');
+  assert.deepEqual(parentMarkers(held.session.id), before);
+  _resetChatApprovalResumeForTest();
+  assert.equal(await handleResolvedApprovalForChatResume(approvalRegistry.get(row.approvalId)!,
+    async () => { throw new Error('No model handoff'); }), false);
+  await startChatApprovalResume(async () => { throw new Error('No model handoff'); });
+  assert.equal(calls, 1);
+  assert.equal(getPendingAction(action.id)?.status, 'failed');
+});
+
+test('an existing tagged approval retry never clears a foreign prepared or unknown marker', async () => {
+  for (const mode of ['prepared', 'unknown'] as const) {
+    const held = workflowHold(false);
+    finishRunAttempt(held.run, 'interrupted');
+    const { action, row } = storedApproval(held.session.id, held.source.seq);
+    appendEvent({ sessionId: held.session.id, turn: 2, role: 'user', type: 'user_input_received',
+      data: { text: 'Approve the exact controlled card.', source: 'desktop_approval', approvalId: row.approvalId, decision: 'approve' } });
+    if (mode === 'unknown') {
+      const metadata = HarnessSession.load(held.session.id)!.sessionRow.metadata;
+      delete metadata.__run_in_flight_owner;
+      openEventLog().prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), held.session.id);
+    }
+    const before = parentMarkers(held.session.id);
+    const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+    const calls = recordingDispatch();
+    assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); }), false, mode);
+    assert.equal(calls.length, 0, mode);
+    assert.equal(getPendingAction(action.id)?.status, 'approved', mode);
+    assert.deepEqual(parentMarkers(held.session.id), before, mode);
+    _resetChatApprovalResumeForTest();
+  }
+});
+
+test('retiring one stopped queued card does not strand its stopped sibling as approved forever', async () => {
+  const held = workflowHold();
+  const cards = [storedApproval(held.session.id, held.source.seq), storedApproval(held.session.id, held.source.seq)];
+  const foreground = beginRunAttempt(held.session.id, { runId: 'controlled-foreground-before-stop' });
+  recordRunAttemptUserInput(foreground, { turn: 2, role: 'user', data: { text: 'Controlled active foreground.' } },
+    { armRunInFlight: false });
+  const calls = recordingDispatch();
+  for (const card of cards) {
+    const resolved = approvalRegistry.resolve(card.row.approvalId, 'approved', 'desktop-chat-card').row!;
+    assert.equal(await handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model handoff'); }), false);
+  }
+  requestKill(held.session.id, 'Controlled owner Stop.', { sourceUserSeq: held.source.seq });
+  finishRunAttempt(foreground, 'completed');
+  await until(() => cards.every(card => getPendingAction(card.action.id)?.status === 'cancelled'));
+  assert.equal(calls.length, 0);
+  assert.ok(cards.every(card => /Not run:/.test(getPendingAction(card.action.id)?.resultSummary ?? '')));
+});
 
 test('a parked pending-action card runs its exact stored action on approval, with no model turn', async () => {
   const sess = createSession({ kind: 'chat' });
