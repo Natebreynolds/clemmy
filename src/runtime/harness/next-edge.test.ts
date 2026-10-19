@@ -179,3 +179,19 @@ test('the refusal site actually carries the edge — the wiring, not the helper'
   assert.match(source, /renderNextEdge\(edge\)/, 'and says it in the message the model reads');
   assert.match(source, /'publish_partial'/, 'the partial-publish path is named');
 });
+
+test('a change the request\'s plan has no step for gets the truth, never "correct the arguments"', async () => {
+  const { planScopeRefusalEdge } = await import('./next-edge.js');
+  // The live 2026-10-16 diagnostic, as the carrier returned it.
+  const diagnostic = JSON.stringify({ error: 'work_requirement_unknown', dispatch_state: 'not_started',
+    detail: 'requirement cap:local:workflow_create:reversible is not in the frozen proposal' });
+  const edge = planScopeRefusalEdge(diagnostic, 'workflow_create');
+  assert.equal(edge?.change, 'publish_partial');
+  assert.equal(edge?.tool, 'workflow_create');
+  assert.match(edge!.say, /plan has no step for this change, so changing its arguments cannot fix it/);
+  assert.match(edge!.say, /tell the owner in one line what is left/);
+  assert.doesNotMatch(edge!.say, /Correct the named argument fields/);
+  for (const other of [undefined, '', JSON.stringify({ error: 'work_dependency_pending' }), 'work_requirement_unknown without its code quoted']) {
+    assert.equal(planScopeRefusalEdge(other, 'workflow_create'), undefined, String(other));
+  }
+});

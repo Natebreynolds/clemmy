@@ -521,6 +521,20 @@ export function isReadComputeSemanticRefusal(
  * proposal validation. This keeps a malformed/conflicting proposal from
  * masking missing storage, a closed accepted task, or a poisoned logical id.
  * Dispatch leases and provider authority remain downstream and fail closed. */
+/** A reversible local change the request's frozen plan did not list is shape,
+ *  not safety (owner 2026-09-04), so it runs on the host's exact per-call
+ *  local admission instead of being refused. Only "the plan has no step for
+ *  this": a call naming a step with the wrong effect or cardinality, any
+ *  outside or unknown effect, and a call without exact local admission keep
+ *  the plan's refusal. */
+export function unplannedLocalChangeMayRun(input: {
+  effect: string | undefined;
+  refusal: ExpectedWorkAdmissionFailureKind;
+  exactLocalAdmission: () => boolean;
+}): boolean {
+  return input.effect === 'local_write' && input.refusal === 'work_requirement_unknown' && input.exactLocalAdmission();
+}
+
 export function unboundReadComputeAuthority(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1867,17 +1881,18 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         // local admission, the same one a plan-free local write runs on,
         // still decides this call; it runs unbound and discharges no frozen
         // step. Outside, irreversible and unadmitted work keeps the plan.
-        if (
-          resolvedRuntimeEffect === 'local_write'
-          && admission.kind === 'work_requirement_unknown'
-          && inspectCurrentExactLocalCallAdmission({
-            sessionId: resolved.sessionId,
-            sourceUserSeq: resolved.sourceUserSeq as number,
-            logicalToolCallId: resolved.logicalToolCallId,
-            toolName: resolved.targetName,
-            args: resolved.targetArgs,
-          })
-        ) {
+        const exactLocalCall = {
+          sessionId: resolved.sessionId,
+          sourceUserSeq: resolved.sourceUserSeq as number,
+          logicalToolCallId: resolved.logicalToolCallId,
+          toolName: resolved.targetName,
+          args: resolved.targetArgs,
+        };
+        if (unplannedLocalChangeMayRun({
+          effect: resolvedRuntimeEffect,
+          refusal: admission.kind,
+          exactLocalAdmission: () => inspectCurrentExactLocalCallAdmission(exactLocalCall),
+        })) {
           return withUnboundWorkRequirement(frame.input.requirement_id, dispatch);
         }
         frame.refusalKind = admission.kind;

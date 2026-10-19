@@ -139,6 +139,18 @@ export function defaultDispositionEdge(input: {
   return nextEdge({ tool: input.toolName, change: 'repair_arguments' });
 }
 
+/** The edge for a refusal whose cause no argument can fix: the request's
+ *  frozen plan has no step for this change (live 2026-10-16: 52 rewordings
+ *  of one call in 48 minutes under a "correct the arguments" edge). */
+export function planScopeRefusalEdge(diagnostic: string | undefined, toolName: string): HostNextEdgeV1 | undefined {
+  if (!diagnostic || !diagnostic.includes('"work_requirement_unknown"')) return undefined;
+  return nextEdge({
+    tool: toolName,
+    change: 'publish_partial',
+    say: 'This request\'s plan has no step for this change, so changing its arguments cannot fix it. Bind it to an open step in `plan` only if it is that step\'s own work; otherwise do not retry it: finish the open steps and tell the owner in one line what is left and why.',
+  });
+}
+
 const WRAPPER_EDGE_TOOLS = new Set(['call_tool', 'work_call', 'composio_execute_tool']);
 
 /** The tool an edge should name: the inner refused operation, never the
