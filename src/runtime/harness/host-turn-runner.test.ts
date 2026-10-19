@@ -10732,22 +10732,21 @@ test('durable memory completion obligation retains the existing bounded repair a
   });
   const fixture = acceptJudgedSource('memory-bounded-repair',
     'Correction: the report heading is now Willow, replacing Birch. Remember the correction for future chats in this project only.');
-  const account = 'I could not confirm the Willow correction was saved to this project\'s memory. Want me to try saving it again?';
   const model = scriptedRecordingModel([
     [textMsg('I saved the project heading as Willow.')],
     [textMsg('I updated the project memory to use Willow.')],
     [textMsg('I saved the corrected heading for future chats.')],
-    [textMsg(account)],
   ]);
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const result = await runJudgedHost(fixture, agent, true);
   assert.equal(reviews, 3, 'initial review plus the existing two repair continuations');
-  // Owner 2026-10-18: "if a review can't pass clem should just say so."
-  assert.equal(model.calls(), 4, 'one tool-free reply after the spent repairs');
-  assert.equal(result.finalOutput, account);
-  assert.equal(result.terminal?.status, 'awaiting_user_input', 'never held under a blocked status');
-  assert.equal(result.terminal?.reason, 'completion_review_disclosed');
+  // An unverified memory change ends on the memory hold, which the loop
+  // narrates as Clem's own question (narratedStopQuestionForTurn; live p1v29).
+  // No review-cannot-pass account is written here only to be discarded.
+  assert.equal(model.calls(), 3, 'no reply after the spent repairs that the hold would discard');
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_work_unverified');
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
 });
 
