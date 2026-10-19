@@ -444,7 +444,7 @@
           "bytes": 580
         },
         "src/memory/memory-jobs.ts": {
-          "bytes": 4454
+          "bytes": 4660
         },
         "src/runtime/accepted-source-usage.ts": {
           "bytes": 5820
@@ -1317,10 +1317,10 @@
           "bytes": 24907
         },
         "src/memory/memory-model-route.ts": {
-          "bytes": 20981
+          "bytes": 21014
         },
         "src/memory/memory-work-types.ts": {
-          "bytes": 7568
+          "bytes": 7673
         },
         "src/memory/memory-work-journal.ts": {
           "bytes": 28648
@@ -1506,7 +1506,7 @@
           "bytes": 7977
         },
         "src/execution/workflow-enforce.ts": {
-          "bytes": 41291
+          "bytes": 42699
         },
         "src/dashboard/workflow-execution-plan.ts": {
           "bytes": 54487
@@ -2240,8 +2240,11 @@
         "src/runtime/harness/completion-review-steering.ts": {
           "bytes": 6462
         },
+        "src/memory/check-lessons.ts": {
+          "bytes": 9063
+        },
         "src/runtime/harness/review-after-delivery.ts": {
-          "bytes": 10012
+          "bytes": 10521
         },
         "src/runtime/harness/host-stop-narration-lifecycle.ts": {
           "bytes": 2304
@@ -2883,7 +2886,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 739789
+          "bytes": 740676
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3708,7 +3711,7 @@
           "bytes": 20476
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 98794
+          "bytes": 99390
         },
         "src/runtime/outcome.ts": {
           "bytes": 35914
@@ -4401,7 +4404,7 @@
           "bytes": 580
         },
         "src/memory/memory-jobs.ts": {
-          "bytes": 4454
+          "bytes": 4660
         },
         "src/runtime/accepted-source-usage.ts": {
           "bytes": 5820
@@ -5274,10 +5277,10 @@
           "bytes": 24907
         },
         "src/memory/memory-model-route.ts": {
-          "bytes": 20981
+          "bytes": 21014
         },
         "src/memory/memory-work-types.ts": {
-          "bytes": 7568
+          "bytes": 7673
         },
         "src/memory/memory-work-journal.ts": {
           "bytes": 28648
@@ -5463,7 +5466,7 @@
           "bytes": 7977
         },
         "src/execution/workflow-enforce.ts": {
-          "bytes": 41291
+          "bytes": 42699
         },
         "src/dashboard/workflow-execution-plan.ts": {
           "bytes": 54487
@@ -6197,8 +6200,11 @@
         "src/runtime/harness/completion-review-steering.ts": {
           "bytes": 6462
         },
+        "src/memory/check-lessons.ts": {
+          "bytes": 9063
+        },
         "src/runtime/harness/review-after-delivery.ts": {
-          "bytes": 10012
+          "bytes": 10521
         },
         "src/runtime/harness/host-stop-narration-lifecycle.ts": {
           "bytes": 2304
@@ -6840,7 +6846,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 739789
+          "bytes": 740676
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7665,7 +7671,7 @@
           "bytes": 20476
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 98794
+          "bytes": 99390
         },
         "src/runtime/outcome.ts": {
           "bytes": 35914
