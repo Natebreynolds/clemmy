@@ -40,3 +40,12 @@ test('every other exhaustion keeps the explain-and-ask check-in', () => {
     assert.equal(loop.noProgressCheckInSteerFor(detail), loop.NO_PROGRESS_CHECK_IN_STEER, String(detail));
   }
 });
+
+test('every check-in ends in the owner\'s hands with one question, and never in host terms', () => {
+  for (const steer of [loop.NO_PROGRESS_CHECK_IN_STEER, loop.PROVIDER_REFUSAL_ANSWER_STEER, loop.PROVIDER_REFUSAL_REPLAN_STEER]) {
+    assert.match(steer, /question|Ask whether/, 'a stop ends asking the owner something');
+    assert.match(steer, /without host or tool terms/);
+  }
+  assert.doesNotMatch(loop.NO_PROGRESS_CHECK_IN_STEER, /say plainly that you have stopped/, 'a stop is not a statement');
+  assert.match(loop.NO_PROGRESS_CHECK_IN_STEER, /Never end on a statement/);
+});

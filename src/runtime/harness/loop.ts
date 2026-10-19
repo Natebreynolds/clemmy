@@ -1,5 +1,6 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { isPermanentActivationError } from './permanent-activation-error.js';
+import { parseRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import { committedMutationVerificationHoldsForSource, type CommittedMutationVerificationHold } from './mutation-verification-executor.js';
 import { planReadContinuationWake } from './read-continuation-wake.js';
 import { asyncReadRefinementRecoveryWake } from './async-read-refinement-store.js';
@@ -1734,7 +1735,11 @@ function judgedReplyDigest(text: string): string {
 
 export const NO_PROGRESS_CHECK_IN_STEER = [
   'You have stopped making progress on this request: your recent tool calls were refused or returned nothing new, and repeating them will not change that.',
-  'Do not call tools now. In your own voice, tell the user what you completed and what stopped you. If a specific missing fact or decision from them would let you continue, ask for exactly that in one question. If nothing from them would help, say plainly that you have stopped and what would need to change. Keep it short.',
+  // A stop ends in the owner's hands (owner 2026-10-16: "if she stops she
+  // asks for clarification vs just stopping or looping"; 2026-10-18: no turn
+  // ends blocked). Live 2026-10-19 a check-in allowed to "say plainly that
+  // you have stopped" asked nothing, quoted host codes, and stayed blocked.
+  'Do not call tools now. In your own voice, tell the user what you completed and what stopped you, without host or tool terms, codes, ids or handles. End with ONE specific question they can answer to move this forward: the one fact or decision only they have, a choice between two or three concrete ways to proceed (name them), or whether to try again with a stated change. Never end on a statement. Keep it short.',
 ].join('\n\n');
 
 /**
@@ -1750,7 +1755,7 @@ export const NO_PROGRESS_CHECK_IN_STEER = [
  */
 export const PROVIDER_REFUSAL_ANSWER_STEER = [
   'The provider processed your request and refused it; its reason is in the tool result you already have, and nothing was changed. Repeating the call, or varying it, will not change that answer.',
-  'Do not call tools now. In your own voice, tell the user what you tried, what the provider said, and what that means for what they asked (for example: the item was already gone, so there was nothing to delete). Do not propose workarounds that depend on tools, accounts or facts you have not verified in this conversation. Ask a question only if a decision from them is genuinely required. Keep it short.',
+  'Do not call tools now. In your own voice, tell the user what you tried, what the provider said, and what that means for what they asked (for example: the item was already gone, so there was nothing to delete), without host or tool terms, codes or ids. Do not propose workarounds that depend on tools, accounts or facts you have not verified in this conversation. End with one short question: whether that settles what they wanted, or which option already verified in this conversation they would like instead. Keep it short.',
 ].join('\n\n');
 
 /**
@@ -1762,7 +1767,7 @@ export const PROVIDER_REFUSAL_ANSWER_STEER = [
  */
 export const PROVIDER_REFUSAL_REPLAN_STEER = [
   'The app you were writing to refused the request; its reply is in the tool result you already have. The refused request is not resent on its own.',
-  'Do not call tools now. In your own voice, tell the user what you tried, what the app said, and what you would change to get it done: a corrected request, a different way, or the one detail only they can give (for example which file or which recipient). Ask whether to go ahead with that change. Do not propose changes that depend on tools, accounts or facts you have not verified in this conversation. Keep it short.',
+  'Do not call tools now. In your own voice, tell the user what you tried, what the app said, and what you would change to get it done: a corrected request, a different way, or the one detail only they can give (for example which file or which recipient), without host or tool terms, codes or ids. Ask whether to go ahead with that change. Do not propose changes that depend on tools, accounts or facts you have not verified in this conversation. Keep it short.',
 ].join('\n\n');
 
 /** The steer for a no-progress check-in follows the kind of stop: a provider
@@ -1840,9 +1845,38 @@ export async function modelCheckInForExhaustedTurn(
   } catch (error) {
     logger.warn({ err: error }, 'retained plan publication unavailable');
   }
-  const alreadyAsked = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 })
+  const recentGuards = listEvents(input.sessionId, { types: ['guardrail_tripped'], desc: true, limit: 40 });
+  const alreadyAsked = recentGuards
     .some((event) => event.data.kind === 'no_progress_check_in' && event.data.sourceUserSeq === sourceUserSeq);
   if (alreadyAsked) return turnResult;
+  // THE RUNNER ALREADY SPOKE FOR THIS STOP. Its narration is Clem's own
+  // account, required to end with one question (hostStopNarrationDirective).
+  // Asking the model again repeated it at the cost of a request (live
+  // 2026-10-19: two model calls for one stop; the second leaked host codes,
+  // asked nothing, and left the turn blocked). A narration that asks is the
+  // turn's question; one that does not falls through to the check-in.
+  const narrated = recentGuards.some((event) => event.data.kind === 'host_stop_narrated'
+    && event.data.sourceUserSeq === sourceUserSeq && event.data.reason === 'control_no_progress_exhausted');
+  const narration = narrated
+    ? publicReplyText(parseRetainedWorkCheckpoint(String(turnResult.finalOutput ?? '')).head, '').trim() : '';
+  if (narration && /\?/.test(narration)) {
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: turnResult.turn,
+      role: 'system',
+      type: 'guardrail_tripped',
+      data: { kind: 'no_progress_check_in_result', sourceUserSeq, status: 'narrated', replyBytes: narration.length, asks: true },
+    });
+    appendEvent({
+      sessionId: input.sessionId,
+      turn: turnResult.turn,
+      role: 'Clem',
+      type: 'awaiting_user_input',
+      data: { question: narration, purpose: 'clarification', source: 'no_progress_check_in', sourceUserSeq },
+    });
+    const { blockedReason: _r, blockedDetail: _d, blockedResumable: _x, error: _e, ...asked } = turnResult;
+    return { ...asked, status: 'awaiting_user_input', finalOutput: narration };
+  }
   appendEvent({
     sessionId: input.sessionId,
     turn: turnResult.turn,

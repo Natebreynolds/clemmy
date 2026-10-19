@@ -16,6 +16,8 @@ const {
   runConversation,
 } = await import('./loop.js');
 const { MISSING_REPLY_USER_FALLBACK } = await import('./turn-decision.js');
+const { RETAINED_WORK_TERMINAL_HEADER } = await import('./retained-work-checkpoint.js');
+const RETAINED_FIXTURE_CHECKPOINT = `${RETAINED_WORK_TERMINAL_HEADER}\n- 2 results kept`;
 const { BoundaryError } = await import('../boundary-error.js');
 const { CodexModelError } = await import('./codex-model.js');
 const { projectHarnessEventForPublic, PUBLIC_CODEX_AUTH_EXPIRED_TEXT, PUBLIC_BLOCKED_NEXT_STEP_TEXT } = await import('./public-presentation.js');
@@ -527,4 +529,42 @@ test('a stop explained as a question reaches the owner without the decision mark
   assert.equal(asked.finalOutput, 'Can I run the remaining pulls myself?');
   const question = eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1)?.data.question;
   assert.equal(question, 'Can I run the remaining pulls myself?');
+});
+
+test('a stop the runner already narrated as a question is the turn\'s question, with no second model call', async () => {
+  // Live 2026-10-19: the runner narrated the stop, the loop paid for a second
+  // check-in that quoted host codes and asked nothing, and the turn ended blocked.
+  const sessionId = 'narrated-stop-is-the-question';
+  const source = acceptedSource(sessionId);
+  const narration = 'I could not refresh the Space just now, and nothing in it changed. Should I try once more, or rebuild its data from the file instead?';
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'host_stop_narrated', sourceUserSeq: source.sourceUserSeq, reason: 'control_no_progress_exhausted' } });
+  const stopped = { sessionId, turn: source.turn, status: 'blocked' as const,
+    finalOutput: `${narration}\n\n${RETAINED_FIXTURE_CHECKPOINT}`, error: narration,
+    blockedReason: 'control_no_progress_exhausted', blockedDetail: 'schema_invalid:call:0123456789abcdef', toolCalls: 8 };
+  let calls = 0;
+  const asked = await modelCheckInForExhaustedTurn(stopped, { sessionId, sourceUserSeq: source.sourceUserSeq,
+    run: async () => { calls += 1; return { sessionId, turn: source.turn + 1, status: 'completed', finalOutput: 'unused', toolCalls: 0 }; } });
+  assert.equal(calls, 0, 'the narration already spoke for this stop');
+  assert.equal(asked.status, 'awaiting_user_input');
+  assert.equal(asked.finalOutput, narration, 'her words, without the retained-work footer');
+  assert.equal(asked.blockedReason, undefined);
+  assert.equal(eventlog.listEvents(sessionId, { types: ['awaiting_user_input'] }).at(-1)?.data.question, narration);
+});
+
+test('a narration that asks nothing falls through to the check-in, which must end with a question', async () => {
+  const sessionId = 'narrated-stop-without-question';
+  const source = acceptedSource(sessionId);
+  eventlog.appendEvent({ sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+    data: { kind: 'host_stop_narrated', sourceUserSeq: source.sourceUserSeq, reason: 'control_no_progress_exhausted' } });
+  const stopped = { sessionId, turn: source.turn, status: 'blocked' as const, finalOutput: 'I stopped here.', error: 'I stopped here.',
+    blockedReason: 'control_no_progress_exhausted', blockedDetail: 'execution:unknown', toolCalls: 4 };
+  const steers: string[] = [];
+  const asked = await modelCheckInForExhaustedTurn(stopped, { sessionId, sourceUserSeq: source.sourceUserSeq,
+    run: async (steer) => { steers.push(steer); return { sessionId, turn: source.turn + 1, status: 'completed',
+      finalOutput: 'I could not finish the audit. Should I continue with the two sources that worked?', toolCalls: 0 }; } });
+  assert.equal(steers.length, 1);
+  assert.match(steers[0]!, /End with ONE specific question/);
+  assert.match(steers[0]!, /without host or tool terms/);
+  assert.equal(asked.status, 'awaiting_user_input');
 });

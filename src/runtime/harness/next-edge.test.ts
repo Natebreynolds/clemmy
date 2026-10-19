@@ -195,3 +195,43 @@ test('a change the request\'s plan has no step for gets the truth, never "correc
     assert.equal(planScopeRefusalEdge(other, 'workflow_create'), undefined, String(other));
   }
 });
+
+test('every typed refusal before dispatch gets its real cause and a move that can succeed, never "correct the arguments"', async () => {
+  const { truthfulRefusalEdge, HOST_CALL_STOPPED_MARK, defaultDispositionEdge } = await import('./next-edge.js');
+  const consent = (code: string) => `Host refused call_tool before dispatch (${code}).`;
+  // Live 2026-10-19: space_refresh through call_tool, refused this way 8 times.
+  const viaCallTool = truthfulRefusalEdge({ diagnostic: consent('coverage_missing'), toolName: 'space_refresh', carrier: 'call_tool' });
+  assert.equal(viaCallTool?.tool, 'work_call');
+  assert.match(viaCallTool!.say, /only work_call binds a change to this request's work; its arguments are not the problem/);
+  assert.match(viaCallTool!.say, /name "space_refresh".*"space_refresh" as requirement_id/);
+  const viaWorkCall = truthfulRefusalEdge({ diagnostic: consent('coverage_missing'), toolName: 'space_refresh', carrier: 'work_call' });
+  assert.equal(viaWorkCall?.change, 'publish_partial', 'work_call cannot send itself back to work_call');
+  const cases: Array<[string, string, RegExp]> = [
+    ['scope_mismatch', 'publish_partial', /beyond the work this request accepted/],
+    ['cardinality_spent', 'publish_partial', /already ran for this request\. Do not repeat it/],
+    ['schema_stale', 'discover_capability', /definition of space_refresh changed/],
+    ['risk_unknown', 'discover_capability', /could not read what space_refresh would do/],
+    ['authority_conflict', 'publish_partial', /Another record already owns this change/],
+    ['consent_preparation_unavailable', 'reissue_unstarted', /once more unchanged/],
+  ];
+  for (const [code, change, say] of cases) {
+    const edge = truthfulRefusalEdge({ diagnostic: consent(code), toolName: 'space_refresh', carrier: 'call_tool' });
+    assert.equal(edge?.change, change, code);
+    assert.match(edge!.say, say, code);
+  }
+  const unreachable = truthfulRefusalEdge({ toolName: 'meeting_analysis_save', carrier: 'work_call',
+    diagnostic: JSON.stringify({ error: 'not_reachable', detail: 'not on this turn\'s surface' }) });
+  assert.equal(unreachable?.tool, 'tool_search');
+  const stopped = truthfulRefusalEdge({ toolName: 'workflow_step_result', carrier: 'workflow_step_result',
+    diagnostic: `${HOST_CALL_STOPPED_MARK}: child lease activation failed` });
+  assert.equal(stopped?.change, 'reissue_unstarted');
+  assert.match(stopped!.say, /fails the same way again, do not retry it/);
+  // A genuine argument fault, or an unknown cause, keeps the default edge,
+  // which names no cause and still says when to stop.
+  assert.equal(truthfulRefusalEdge({ toolName: 'space_save', carrier: 'work_call',
+    diagnostic: JSON.stringify({ error: 'arg_validation', detail: 'slug: Required' }) }), undefined);
+  assert.equal(truthfulRefusalEdge({ toolName: 'x', carrier: 'x', diagnostic: undefined }), undefined);
+  const generic = defaultDispositionEdge({ disposition: 'refused_pre_dispatch', toolName: 'space_save' });
+  assert.doesNotMatch(generic.say, /Correct the named argument fields/);
+  assert.match(generic.say, /If it names something no argument can change, do not retry it/);
+});
