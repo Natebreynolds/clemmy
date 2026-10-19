@@ -1964,6 +1964,9 @@
         "src/memory/run-strategy-store.ts": {
           "bytes": 26475
         },
+        "src/memory/check-lesson-context.ts": {
+          "bytes": 2071
+        },
         "src/runtime/harness/published-destinations.ts": {
           "bytes": 6998
         },
@@ -1971,7 +1974,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 48439
+          "bytes": 49131
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -2241,7 +2244,7 @@
           "bytes": 6462
         },
         "src/memory/check-lessons.ts": {
-          "bytes": 9063
+          "bytes": 9291
         },
         "src/runtime/harness/review-after-delivery.ts": {
           "bytes": 10521
@@ -5924,6 +5927,9 @@
         "src/memory/run-strategy-store.ts": {
           "bytes": 26475
         },
+        "src/memory/check-lesson-context.ts": {
+          "bytes": 2071
+        },
         "src/runtime/harness/published-destinations.ts": {
           "bytes": 6998
         },
@@ -5931,7 +5937,7 @@
           "bytes": 19727
         },
         "src/agents/harness-context.ts": {
-          "bytes": 48439
+          "bytes": 49131
         },
         "src/agents/external-mcp-scope-lock.ts": {
           "bytes": 17601
@@ -6201,7 +6207,7 @@
           "bytes": 6462
         },
         "src/memory/check-lessons.ts": {
-          "bytes": 9063
+          "bytes": 9291
         },
         "src/runtime/harness/review-after-delivery.ts": {
           "bytes": 10521
