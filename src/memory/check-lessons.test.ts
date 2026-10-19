@@ -93,3 +93,19 @@ test('a refused tool call that a later call got right is found from the request\
   assert.match(fixes[0]!.after, /"status"/);
   assert.deepEqual(toolFixesForSource('lesson-tools', seq + 100), []);
 });
+
+test('lessons ride at turn start in their own short section, said to come from a check, never the owner\'s own feedback', async () => {
+  const { renderCheckLessonsForContext } = await import('./check-lesson-context.js');
+  const { rememberFact } = await import('./facts.js');
+  assert.equal(renderCheckLessonsForContext('TEST FIXTURE: compare crawling libraries'), '', 'no lesson, no section');
+  rememberFact({ kind: 'feedback', content: 'Owner prefers short replies.' });
+  _setCheckLessonModelForTests(async () => '{"lessons": ["When stating a project\'s maintenance status, verify it with the host\'s API rather than asserting an impression."]}');
+  await learnFromCheck({ sessionId: 'lesson-context', sourceUserSeq: 9, request: 'TEST FIXTURE: which libraries are maintained',
+    kind: 'review', cases: [reviewCase] });
+  const section = renderCheckLessonsForContext('TEST FIXTURE: compare crawling libraries and note which are maintained');
+  assert.match(section, /^## Lessons From Past Checks\n/);
+  assert.match(section, /not said by the owner/);
+  assert.match(section, /\n- When stating a project's maintenance status, verify it/);
+  assert.doesNotMatch(section, /Owner prefers short replies/);
+  assert.doesNotMatch(section, new RegExp(CHECK_LESSON_PREFIX), 'the stored marker is not repeated to the model');
+});

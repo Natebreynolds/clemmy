@@ -37,6 +37,7 @@ import { getFocusSnapshot } from '../memory/focus.js';
 import { renderRelevantSkillsForPrompt, renderSkillDiscoveryPrompt } from '../memory/skill-store.js';
 import { renderToolChoicesForContext } from '../memory/tool-choice-store.js';
 import { renderRunStrategiesForContext } from '../memory/run-strategy-store.js';
+import { renderCheckLessonsForContext } from '../memory/check-lesson-context.js';
 import { renderEstablishedDestinationsForContext } from '../runtime/harness/published-destinations.js';
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
@@ -229,6 +230,10 @@ export function renderLearnedBlocks(
     const strategies = section('Proven Run Strategies', renderRunStrategiesForContext(objective, 2, options.request));
     if (strategies) toolChoices = [toolChoices, strategies].filter(Boolean).join('\n\n');
   } catch { /* strategy recall is best-effort */ }
+  // What earlier checks taught about this kind of work rides beside them.
+  const lessonFocus = (options.request ?? objective ?? '').trim();
+  const lessons = lessonFocus ? renderCheckLessonsForContext(lessonFocus) : '';
+  if (lessons) toolChoices = [toolChoices, lessons].filter(Boolean).join('\n\n');
   // Established deploy targets for the project under active focus — the AGENT
   // side of the destination gate↔recall unification (2026-06-21): surface WHERE
   // this project deploys so the agent updates the same site explicitly instead
@@ -892,6 +897,9 @@ function renderTurnMemoryTailInScope(
       ? renderRunStrategiesForContext(options.request, 2, options.request)
       : '';
     if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
+    // What earlier checks taught about this kind of work (check-lesson-context.ts).
+    const lessons = signal.kind === 'ranked' && options.request ? renderCheckLessonsForContext(options.request) : '';
+    if (lessons) parts.push({ section: 'Lessons From Past Checks', tier: 'relevant', text: lessons });
     const visibleFacts = signal.kind === 'ranked'
       ? new Set(signal.refs.filter((ref) => ref.type === 'fact').map((ref) => ref.id)).size
       : 0;
