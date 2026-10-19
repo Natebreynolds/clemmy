@@ -187,9 +187,12 @@ export function truthfulRefusalEdge(input: {
     case 'scope_mismatch':
       return nextEdge({ tool: input.toolName, change: 'publish_partial',
         say: 'This call reaches beyond the work this request accepted (another target, account, amount or operation), so new arguments for it will be refused the same way. Do the accepted work; for anything beyond it, tell the owner in one line what else is needed.' });
+    // The one run this request allows is claimed, by an earlier call or by a
+    // sibling in this same step that may never have run. Claiming it done is
+    // only true when that call's own result shows it.
     case 'cardinality_spent':
       return nextEdge({ tool: input.toolName, change: 'publish_partial',
-        say: 'This change already ran for this request. Do not repeat it: use its result, and report it as done.' });
+        say: 'This change\'s one run for this request is already claimed, by an earlier call or by another call in this same step. Do not send it again. Say it is done only from that call\'s own result showing it succeeded; without one, tell the owner it has not been confirmed and what is left.' });
     case 'schema_stale':
       return nextEdge({ tool: 'tool_search', change: 'discover_capability',
         say: `The definition of ${input.toolName} changed since it was disclosed. Disclose it again with tool_search, called directly, then call it with its current schema.` });

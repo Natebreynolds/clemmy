@@ -208,7 +208,9 @@ test('every typed refusal before dispatch gets its real cause and a move that ca
   assert.equal(viaWorkCall?.change, 'publish_partial', 'work_call cannot send itself back to work_call');
   const cases: Array<[string, string, RegExp]> = [
     ['scope_mismatch', 'publish_partial', /beyond the work this request accepted/],
-    ['cardinality_spent', 'publish_partial', /already ran for this request\. Do not repeat it/],
+    // Audit 2026-10-19: the slot can be held by a sibling in the same step
+    // that never ran, so the edge never says the change ran or is done.
+    ['cardinality_spent', 'publish_partial', /^(?!.*already ran)(?!.*report it as done).*already claimed.*only from that call's own result/],
     ['schema_stale', 'discover_capability', /definition of space_refresh changed/],
     ['risk_unknown', 'discover_capability', /could not read what space_refresh would do/],
     ['authority_conflict', 'publish_partial', /Another record already owns this change/],
