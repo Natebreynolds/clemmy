@@ -25,12 +25,15 @@ import {
   approveExecutePendingAction,
   canOfferStandingSendTrust,
   getPendingActionStatus,
+  queuedPendingActionProgress,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecutionPhase,
   type PendingActionExecutionPresentation,
 } from '@/lib/pendingActions';
 import type { ChatMessage } from '@/lib/useChat';
+
+const QUEUED_RUNNING_NOTE = 'Running the approved action now.';
 import { snoozeNeedsYou } from '@/lib/inbox';
 import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
 
@@ -425,6 +428,7 @@ export function ChatBubble({
     if (presentation.mode !== 'durable') return false;
     const note = presentation.note?.trim();
     const defaultNote: Partial<Record<PendingActionExecutionPhase, string>> = {
+      queued: 'Approved. It runs once the current work in this chat ends.',
       running: 'This exact queued action already has an execution claim. No second dispatch was attempted.',
       failed: 'The action failed or its final provider outcome needs review. Check the durable action before retrying.',
       rejected: 'You rejected this action. It was not dispatched.',
@@ -438,6 +442,23 @@ export function ChatBubble({
     });
     return true;
   };
+  // A queued card follows its durable record until the resume picks it up,
+  // so the label moves from "Up next" to the real outcome by itself.
+  const followingQueued = exec.phase === 'queued' || (exec.phase === 'running' && exec.note === QUEUED_RUNNING_NOTE);
+  useEffect(() => {
+    if (!pendingActionId || !followingQueued) return;
+    let stopped = false;
+    const timer = setInterval(() => {
+      void getPendingActionStatus(pendingActionId).then((snapshot) => {
+        if (stopped) return;
+        const progress = queuedPendingActionProgress(snapshot);
+        if (!progress || progress.mode !== 'durable') return;
+        if (progress.phase === 'running') setExec({ phase: 'running', note: QUEUED_RUNNING_NOTE });
+        else showDurablePresentation(progress);
+      }).catch(() => { /* the next tick reads again */ });
+    }, 2_500);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [pendingActionId, followingQueued]);
   const runExecute = async () => {
     if (!pendingActionId || resolved || decisionBusy || editing || message.approval?.resolution) return;
     await decisionGate.current.run(async () => {
@@ -869,7 +890,8 @@ export function ChatBubble({
                   real result). */}
               {pendingAction ? (
                 <span role="status" aria-live="polite" aria-atomic="true">
-                  {exec.phase === 'running' ? <span className="text-caption text-muted">Running…</span>
+                  {exec.phase === 'queued' ? <span className="text-caption font-semibold text-muted">Approved — up next</span>
+                    : exec.phase === 'running' ? <span className="text-caption text-muted">Running…</span>
                     : exec.phase === 'executed' ? <span className="text-caption font-semibold text-success">Done ✓</span>
                       : exec.phase === 'failed' ? <span className="text-caption font-semibold text-danger">Didn't go through — needs a look</span>
                         : exec.phase === 'rejected' ? <span className="text-caption font-semibold text-muted">Skipped — nothing ran</span>

@@ -552,6 +552,52 @@ export function clearRunInFlightAfterTerminal(
   }
 }
 
+/** True only when the chat's coarse marker provably has no foreground run
+ * behind it: it was armed before this process started, its owner attempt has
+ * finished, its owner request already published an ending, or its owner
+ * request is held by a queued workflow dispatch that runs in its own session.
+ * An ownerless marker armed in this process, a live owner, or any read error
+ * answers false, so callers keep waiting. Caller has already seen no active
+ * run attempt for the session. */
+export function runMarkerHasNoLiveForegroundOwner(sessionId: string): boolean {
+  try {
+    const row = openEventLog().prepare(
+      `SELECT json_extract(metadata_json, '$.__run_in_flight') AS armed_at,
+              json_extract(metadata_json, '$.__run_in_flight_owner.attemptId') AS attempt_id,
+              json_extract(metadata_json, '$.__run_in_flight_owner.sourceUserSeq') AS source_user_seq
+         FROM sessions
+        WHERE id = ? AND kind = 'chat' AND json_valid(metadata_json)`,
+    ).get(sessionId) as { armed_at: unknown; attempt_id: unknown; source_user_seq: unknown } | undefined;
+    if (!row || typeof row.armed_at !== 'string') return false;
+    const armedMs = Date.parse(row.armed_at);
+    if (Number.isFinite(armedMs) && armedMs < Date.now() - process.uptime() * 1000) return true;
+    if (typeof row.attempt_id === 'string' && row.attempt_id) {
+      const live = openEventLog().prepare(
+        `SELECT 1 FROM run_attempts WHERE attempt_id = ? AND finished_at IS NULL LIMIT 1`,
+      ).get(row.attempt_id);
+      if (!live) return true;
+    }
+    const sourceUserSeq = Number(row.source_user_seq);
+    if (!Number.isSafeInteger(sourceUserSeq) || sourceUserSeq < 1) return false;
+    const ended = openEventLog().prepare(
+      `SELECT 1
+         FROM events
+        WHERE session_id = ?
+          AND type = 'conversation_completed'
+          AND (
+            json_extract(data_json, '$.sourceUserSeq') = ?
+            OR json_extract(data_json, '$.presentation.identity.sourceUserSeq') = ?
+            OR json_extract(data_json, '$.terminalKey') = ?
+          )
+        LIMIT 1`,
+    ).get(sessionId, sourceUserSeq, sourceUserSeq, `turn:${sourceUserSeq}`);
+    if (ended) return true;
+    return Boolean(readPendingWorkflowChatDispatchOwnership({ sessionId, sourceUserSeq }));
+  } catch {
+    return false;
+  }
+}
+
 /** Release the foreground chat owner only after the exact accepted source has
  * durably transferred to an activated workflow group. This is deliberately not
  * a terminal clear: the workflow reducer still owes the eventual public

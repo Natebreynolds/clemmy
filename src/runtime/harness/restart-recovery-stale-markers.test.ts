@@ -45,6 +45,7 @@ const {
   recoverInterruptedChatRuns,
   reportInterruptedChatRuns,
   restartRecoveryPrimerPrefixForTests,
+  runMarkerHasNoLiveForegroundOwner,
 } = await import('./restart-recovery.js');
 const queue = await import('../../tools/workflow-run-queue.js');
 const { WORKFLOW_RUNS_DIR } = await import('../../tools/shared.js');
@@ -792,4 +793,23 @@ test('a resume that fails after a newer turn armed leaves the newer owner in pla
     presentation: { kind: 'answer', text: 'Here are the top three vendors.' },
   }, 'success');
   assert.equal(markerSince(session.id), null, 'the newer turn settles its own marker');
+});
+
+test('a marker a queued workflow dispatch holds has no live foreground owner; an unended request\'s marker does', () => {
+  // An approved card's exact stored action may run beside the first marker,
+  // never beside the second (chat-approval-resume).
+  writeManualWorkflow('marker-held-by-dispatch');
+  const held = HarnessSession.create({ id: 'console:marker-held-by-dispatch', kind: 'chat', channel: 'desktop', title: 'held' });
+  const heldSource = eventlog.recordRunAttemptUserInput(eventlog.beginRunAttempt(held.id, { runId: 'run-marker-held' }), {
+    turn: 1, role: 'user', data: { text: 'run the workflow named marker-held-by-dispatch', ...originData() },
+  }, { armRunInFlight: true });
+  assert.equal(preparedDispatchFor(held.id, heldSource, 'marker-held-by-dispatch').status, 'held');
+  assert.equal(runMarkerHasNoLiveForegroundOwner(held.id), true);
+
+  const live = HarnessSession.create({ id: 'console:marker-live-owner', kind: 'chat', channel: 'desktop', title: 'live' });
+  eventlog.recordRunAttemptUserInput(eventlog.beginRunAttempt(live.id, { runId: 'run-marker-live' }), {
+    turn: 1, role: 'user', data: { text: 'TEST FIXTURE live request.', ...originData() },
+  }, { armRunInFlight: true });
+  assert.equal(runMarkerHasNoLiveForegroundOwner(live.id), false);
+  assert.equal(runMarkerHasNoLiveForegroundOwner('console:no-such-session'), false);
 });

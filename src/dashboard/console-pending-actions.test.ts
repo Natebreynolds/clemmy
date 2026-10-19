@@ -730,3 +730,78 @@ test('both routes fail closed when unauthorized', async () => {
     await h.close();
   }
 });
+
+function setRunMarker(sessionId: string, at: string, owner: Record<string, unknown> | null): void {
+  openEventLog().prepare(`UPDATE sessions SET metadata_json = json_set(json_set(metadata_json, '$.__run_in_flight', ?), '$.__run_in_flight_owner', json(?)) WHERE id = ?`)
+    .run(at, owner ? JSON.stringify(owner) : 'null', sessionId);
+}
+function runMarker(sessionId: string): unknown {
+  return (openEventLog().prepare(`SELECT json_extract(metadata_json, '$.__run_in_flight') AS at, json_extract(metadata_json, '$.__run_in_flight_owner') AS owner FROM sessions WHERE id = ?`).get(sessionId));
+}
+
+test('an approved card runs when only a marker no live run owns holds the chat, and leaves that marker alone', async () => {
+  // Windows tester traces 2026-10-19: approved Salesforce updates sat
+  // "approved" forever. The chat carried a run marker no live run owned, so
+  // the resume waited for it; the button then fell back to chat text and
+  // Clem looped on refused pending_action_execute calls.
+  for (const holder of ['earlier_process', 'finished_attempt', 'ended_request'] as const) {
+    _resetChatApprovalResumeForTest();
+    startChatApprovalResume(async () => { throw new Error('a linked card never resumes the model'); });
+    const dispatched: unknown[] = [];
+    _setApprovedCallDispatchForTests(async (_tool, payload) => { dispatched.push(payload); return 'ok'; });
+    const sessionId = createSession({ kind: 'chat', channel: 'desktop' }).id;
+    const record = queuePendingAction({ title: `TEST FIXTURE ${holder}`, summary: 'One fixture POST.', kind: 'shell_command',
+      toolName: 'run_shell_command', payload: { command: "curl -sS -X POST -d 'x=1' http://127.0.0.1:1/hook", cwd: '/tmp' }, sessionId });
+    const card = approvalRegistry.register({ sessionId, subject: record.title, tool: 'request_approval',
+      args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record) } });
+    if (holder === 'earlier_process') {
+      setRunMarker(sessionId, new Date(Date.now() - 3_600_000).toISOString(), { attemptId: 'attempt:gone', sourceUserSeq: 1 });
+    } else if (holder === 'finished_attempt') {
+      const lease = claimRunAttemptLease({ sessionId, runId: 'finished-fixture', ownerId: 'fixture-owner', leaseMs: 60_000 });
+      finishRunAttempt(lease.attempt!);
+      setRunMarker(sessionId, new Date().toISOString(), { attemptId: lease.attempt!.attemptId, sourceUserSeq: 999_998 });
+    } else {
+      const lease = claimRunAttemptLease({ sessionId, runId: 'ended-fixture', ownerId: 'fixture-owner', leaseMs: 60_000 });
+      const ended = recordRunAttemptUserInput(lease.attempt!, { turn: 1, role: 'user', data: { text: 'TEST FIXTURE ended request.', runId: 'ended-fixture' } });
+      finishRunAttempt(lease.attempt!);
+      openEventLog().prepare(`INSERT INTO events (id, session_id, turn, role, type, parent_event_id, data_json, created_at) VALUES (?, ?, 1, 'system', 'conversation_completed', NULL, ?, ?)`)
+        .run(`ended-${sessionId}`, sessionId, JSON.stringify({ sourceUserSeq: ended.seq, reply: 'Done.' }), new Date().toISOString());
+      setRunMarker(sessionId, new Date().toISOString(), { sourceUserSeq: ended.seq });
+    }
+    const before = JSON.stringify(runMarker(sessionId));
+    const h = await boot();
+    try {
+      const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }) });
+      const body = await res.json() as { status: string };
+      assert.equal(body.status, 'executed', `${holder}: ${JSON.stringify(body)}`);
+      assert.equal(dispatched.length, 1, `${holder}: the stored payload ran exactly once`);
+      assert.equal(getPendingAction(record.id)?.status, 'executed');
+      assert.equal(JSON.stringify(runMarker(sessionId)), before, `${holder}: the marker it did not own is left as it was`);
+    } finally { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); await h.close(); }
+  }
+});
+
+test('an approved card still waits for a run in this process that has not ended, then runs once', async () => {
+  _resetChatApprovalResumeForTest();
+  startChatApprovalResume(async () => { throw new Error('a linked card never resumes the model'); });
+  const dispatched: unknown[] = [];
+  _setApprovedCallDispatchForTests(async (_tool, payload) => { dispatched.push(payload); return 'ok'; });
+  const sessionId = createSession({ kind: 'chat', channel: 'desktop' }).id;
+  const record = queuePendingAction({ title: 'TEST FIXTURE live owner', summary: 'One fixture POST.', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: "curl -sS -X POST -d 'x=1' http://127.0.0.1:1/hook", cwd: '/tmp' }, sessionId });
+  const card = approvalRegistry.register({ sessionId, subject: record.title, tool: 'request_approval',
+    args: { pendingActionId: record.id, pendingAction: pendingActionApprovalView(record) } });
+  setRunMarker(sessionId, new Date().toISOString(), { sourceUserSeq: 999_999 });
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }) });
+    assert.equal((await res.json() as { status: string }).status, 'queued', 'the card says it is up next instead of falling back to chat text');
+    assert.equal(dispatched.length, 0, 'a run that may be live keeps its turn');
+    HarnessSession.load(sessionId)!.clearRunInFlight();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(dispatched.length, 1, 'it runs once the owner releases the chat');
+    assert.equal(getPendingAction(record.id)?.status, 'executed');
+  } finally { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); await h.close(); }
+});

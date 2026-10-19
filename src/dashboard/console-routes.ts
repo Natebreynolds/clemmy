@@ -553,7 +553,7 @@ import {
   type PendingActionApprovalPreflight,
 } from '../runtime/harness/pending-action-approval.js';
 import { executeApprovedPendingActionCall } from '../execution/pending-action-executor.js';
-import { approvalResumeInFlight, approvalResumeOwnsAttempt } from '../runtime/harness/chat-approval-resume.js';
+import { approvalResumeInFlight, approvalResumeOwnsAttempt, approvalResumeQueued } from '../runtime/harness/chat-approval-resume.js';
 import {
   listOperationalEvents,
   isOperationalEventType,
@@ -14309,14 +14309,21 @@ export function registerConsoleRoutes(
       // an inline dispatch here: an inline run has no turn of its own, so the
       // local lane refused it for lacking a live attestation and, having
       // claimed first, left the real resume to find a failed record.
+      // A resume that waits for a live run in this chat answers "queued", so
+      // the card shows that truth instead of sending the decision again as
+      // chat text, which started a model turn that could only refuse.
       const resumeFlight = approvalId ? approvalResumeInFlight(approvalId) : null;
       const exec = resumeFlight
         ? await resumeFlight.then(() => {
             const settled = getPendingAction(id);
+            const queued = settled?.status === 'approved' && approvalResumeQueued(approvalId!);
             return {
-              ok: settled?.status === 'executed',
-              status: settled?.status === 'executed' ? 'executed' as const : settled?.status === 'failed' ? 'failed' as const : 'skipped' as const,
-              resultSummary: settled?.resultSummary ?? `Pending action ${id} is ${settled?.status ?? 'missing'}.`,
+              ok: settled?.status === 'executed' || queued,
+              status: settled?.status === 'executed' ? 'executed' as const
+                : settled?.status === 'failed' ? 'failed' as const
+                  : queued ? 'queued' as const : 'skipped' as const,
+              resultSummary: settled?.resultSummary
+                ?? (queued ? 'Approved. It runs once the current work in this chat ends.' : `Pending action ${id} is ${settled?.status ?? 'missing'}.`),
               record: settled,
             };
           })
