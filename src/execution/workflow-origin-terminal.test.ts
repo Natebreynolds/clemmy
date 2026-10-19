@@ -13,6 +13,9 @@ const {
   commitWorkflowOriginTerminal,
   renderWorkflowOriginTerminalText,
   resolveWorkflowOriginReplyTarget,
+  workflowOriginTerminalCommitMatches,
+  workflowOriginTerminalExpectedText,
+  workflowOriginTerminalNeedsAsyncJudge,
 } = await import('./workflow-origin-terminal.js');
 const { workflowRunOriginObserverId } = await import('../tools/workflow-run-queue.js');
 const { exactOriginDeliveryTargetDigest } = await import('../runtime/exact-origin-delivery.js');
@@ -284,6 +287,37 @@ test('a precomputed blocked workflow with no successful work takes the shared hu
   assert.equal(held?.presentation.text, authored);
   assert.match(String(held?.event.data.blockedReason), /workflow checkpoint/i);
   assert.match(String(held?.event.data.verificationDetail), /workflow checkpoint/i);
+});
+
+test('a blocked workflow whose own report ends by asking the owner is that question, never a hold', () => {
+  // Live 2026-10-19 (source 566417): the report said what landed and what it
+  // could not confirm, asked whether to re-run or keep the CSV, and ended blocked.
+  const source = acceptedSource({
+    sessionId: 'origin-terminal-blocked-asks',
+    channel: 'desktop',
+    metadata: {},
+  });
+  settleBusinessCall(source, 'workflow-blocked-asks-write', false);
+  const authored = 'The CSV was written with 17 rows, but I could not confirm the page files were saved exactly as returned. '
+    + 'Should I re-run it with the page files saved exactly, or is the CSV good as it stands?';
+  const input = {
+    observer: observerFor(source, 'run-blocked-asks'),
+    runId: 'run-blocked-asks',
+    outcome: 'blocked' as const,
+    detail: authored,
+  };
+  assert.equal(workflowOriginTerminalNeedsAsyncJudge(input), false, 'her question needs no judge rewrite');
+  const asked = commitWorkflowOriginTerminal(input);
+  assert.equal(asked?.presentation.status, 'needs_input');
+  assert.equal(asked?.presentation.text, authored);
+  assert.equal(asked?.event.data.reason, 'awaiting_user_input');
+  assert.equal(asked?.event.data.blockedReason, undefined);
+  assert.equal(workflowOriginTerminalCommitMatches({
+    committed: asked!, outcome: 'blocked', expectedText: workflowOriginTerminalExpectedText(input)!,
+  }), true, 'report-back recognizes its own winner');
+  assert.equal(workflowOriginTerminalCommitMatches({
+    committed: asked!, outcome: 'blocked', expectedText: `${authored} (changed)`,
+  }), false);
 });
 
 test('a forged observer cannot promote a synthetic relay into a human-owned terminal', () => {

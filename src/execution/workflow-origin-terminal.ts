@@ -40,6 +40,7 @@ import {
   renderFailureWithRetainedWork,
 } from '../runtime/harness/retained-work-terminal.js';
 import { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT } from '../runtime/harness/terminal-notice.js';
+import { replyEndsOnQuestion } from '../runtime/harness/review-after-delivery.js';
 export { resolveWorkflowOriginReplyTarget } from '../runtime/workflow-origin-authority.js';
 
 export type WorkflowOriginReplyTarget = ExactOriginDeliveryTarget;
@@ -264,11 +265,28 @@ function workflowOriginTerminalRowExists(
     && event.data.sourceUserSeq === prepared.identity.sourceUserSeq);
 }
 
+/** A blocked checkpoint whose own report ends by asking the owner is that
+ * question, not a hold. Live 2026-10-19 (source 566417): the run's report said
+ * what landed and what it could not confirm, then asked whether to re-run or
+ * keep the result; entering the committer as a completion with a concern
+ * typed it blocked, "Stopped here" under her question (owner 2026-10-18: no
+ * turn ends blocked). Read from the words the owner will see, so a report cut
+ * short of its question keeps the committer's decision. */
+function blockedReportAsksOwner(
+  input: WorkflowOriginTerminalInput,
+  prepared: PreparedWorkflowOriginTerminal,
+): boolean {
+  if (input.outcome !== 'blocked' || !prepared.renderedDetail) return false;
+  const retainedAt = prepared.text.indexOf(RETAINED_WORK_TERMINAL_HEADER);
+  return replyEndsOnQuestion(retainedAt >= 0 ? prepared.text.slice(0, retainedAt) : prepared.text);
+}
+
 function workflowOriginTerminalAssessment(
   prepared: PreparedWorkflowOriginTerminal,
   input: WorkflowOriginTerminalInput,
 ) {
-  if (!prepared.renderedDetail || workflowTerminalProposalOutcome(input.outcome) !== 'done') {
+  if (!prepared.renderedDetail || workflowTerminalProposalOutcome(input.outcome) !== 'done'
+    || blockedReportAsksOwner(input, prepared)) {
     return null;
   }
   return assessAcceptedSourceDelivery({
@@ -324,6 +342,12 @@ export function workflowOriginTerminalCommitMatches(input: {
     && input.expectedText === PUBLIC_RUN_FAILURE_TEXT
   ) return true;
   if (input.outcome === 'failed' || input.outcome === 'cancelled') return false;
+  // A blocked report that asks the owner publishes as exactly that question.
+  if (
+    input.outcome === 'blocked'
+    && presentation.status === 'needs_input'
+    && presentation.text === input.expectedText
+  ) return true;
 
   if (
     presentation.status === 'needs_input'
@@ -408,6 +432,14 @@ export function commitWorkflowOriginTerminal(
     && (workflowOriginCompletionReviewRequired(input, prepared.text)
       || readPendingWorkflowParentContinuation(input, prepared.text)
       || readWorkflowParentContinuation(input, prepared.text))) return null;
+  if (blockedReportAsksOwner(input, prepared)) {
+    return commitTurnOutcome(workflowTurnOutcome(
+      prepared.identity, 'needs_input', prepared.text, prepared.evidenceRunIds,
+    ), {
+      legacyReason: 'awaiting_user_input',
+      metadata: { transport: 'workflow_report_back' },
+    });
+  }
   return commitTurnOutcome(workflowTurnOutcome(
     prepared.identity,
     prepared.renderedDetail ? workflowTerminalProposalOutcome(input.outcome) : 'failed',
