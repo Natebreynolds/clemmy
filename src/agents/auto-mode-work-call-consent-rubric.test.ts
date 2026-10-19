@@ -26,32 +26,32 @@ test('every flagship brain routes plan-bound work directly through one canonical
   ] as const) {
     assert.match(
       rubric,
-      /accepted(?: plan-bound)? (?:action|work)[^.]*work_call[^.]*(?:directly|canonical consent|formal card)/i,
+      /accepted plan-bound work[^.]*work_call[^.]*consent/i,
       `${lane}: accepted work has one direct carrier and consent owner`,
     );
     assert.match(
       rubric,
-      /Never wrap that sealed call in `pending_action_queue`/,
+      /never requeue its sealed call/i,
       `${lane}: an existing sealed call keeps its consent owner`,
     );
     assert.match(
       rubric,
-      /prepared action needing a formal card[^.]*discover `pending_action_queue` if its schema is missing[^.]*exact payload[^.]*request_now[^.]*do not attempt execution or ask a generic approval question first/i,
+      /Prepared formal card[^.]*discover missing `pending_action_queue` schema[^.]*queue exact payload[^.]*request_now[^.]*before execution or a generic approval question/i,
       `${lane}: a prepared formal approval does not require a refused execution or generic ask first`,
     );
     assert.match(
       rubric,
-      /`queue_only` solely for explicit stage-for-later requests/,
+      /`approvalIntent:"queue_only"` only stages/,
       `${lane}: staging without a card retains its separate intent`,
     );
     assert.match(
       rubric,
-      /The host validates consent; approval executes stored authority only\./,
+      /Approval executes stored authority only\./,
       `${lane}: prose grants no execution authority`,
     );
     assert.match(
       rubric,
-      /Reads and exact reversible creates\/updates need no card/,
+      /Reads\/exact reversible creates\/updates need no card/,
       `${lane}: ordinary work acquires no extra approval requirement`,
     );
     assert.doesNotMatch(

@@ -203,14 +203,15 @@ test('Autonomy section: Auto describes local work and the actual connected-write
     const context = renderHarnessMemoryContext();
     assert.match(context, /## Autonomy/);
     assert.match(context, /accepted reversible local work[^.]*runs without asking/);
-    assert.match(context, /do NOT add your own approval steps or use ask_user_question to seek sign-off/i);
+    assert.match(context, /do NOT add a generic approval question/i);
     assert.match(context, /connected app waits for the owner the first time, in Auto as well as Ask/);
     assert.match(context, /operation on that account/);
     assert.match(context, /Destructive, irreversible and administrative actions require exact approval unless an approved workflow covers them/);
-    assert.match(context, /shell call classified as changing something outside this machine uses one card for its exact command/);
+    assert.match(context, /shell call classified as changing something outside this machine needs one card for its exact command/);
     assert.match(context, /reviewer advice and a request to modify a queued payload never substitute for exact execution consent/);
     assert.doesNotMatch(context, /STANDING APPROVAL for[^.]*recoverable API writes/);
-    assert.match(context, /one approval card own the pause/);
+    assert.match(context, /Prepared formal card[^.]*pending_action_queue[^.]*request_now[^.]*before execution or a generic approval question/);
+    assert.match(context, /legacy approval-shaped question creates no card or execution consent/i);
   } finally {
     saveProactivityPolicy({ autoApproveScope: 'balanced' });
   }
@@ -222,7 +223,8 @@ test('Autonomy section: legacy "balanced" reads as Ask mode, which still never a
   assert.match(context, /ASK MODE/);
   assert.match(context, /local work \(files, the shell, reads\) and anything non-disruptive runs without asking/);
   assert.match(context, /approval teaches that kind of change/);
-  assert.match(context, /let the card own the pause/);
+  assert.match(context, /Prepared formal card[^.]*pending_action_queue[^.]*request_now[^.]*before execution or a generic approval question/);
+  assert.match(context, /genuine clarifying question[^.]*purpose:"clarification"/);
 });
 
 test('stable context carries compact skill discovery while the volatile query gets only relevant skills', () => {

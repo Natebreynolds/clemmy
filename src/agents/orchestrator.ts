@@ -7,6 +7,7 @@ import { buildPublishPlanTool } from '../tools/publish-plan.js';
 import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
+import { CLARIFICATION_APPROVAL_GUIDANCE, FORMAL_APPROVAL_PREPARATION_GUIDANCE, SEALED_APPROVAL_GUIDANCE } from '../shared/approval-preparation-guidance.js';
 import { getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
@@ -1650,7 +1651,7 @@ const askUserQuestionParams = z.object({
   purpose: z
     .enum(['clarification', 'approval'])
     .nullable()
-    .describe('"clarification" (pause for a fact or a choice only the user has) or "approval" (a yes/no sign-off for work the user already asked for, at most two options; auto-proceeds in autonomous mode); null if neither.'),
+    .describe('Use "clarification" for a missing fact or choice only the user has; null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
 });
 
 export function buildAskUserQuestionTool() {
@@ -1663,8 +1664,8 @@ export function buildAskUserQuestionTool() {
       + 'out yourself, what would not change the outcome, or what this session already settled. Do the unblocked part '
       + 'first; ask ONE targeted question with 2-5 concrete options, recommendation first, no "other" option; batch '
       + 'independent questions. `purpose`: "clarification" = a fact only they have, or a choice between different '
-      + 'ways forward; "approval" = a yes/no sign-off for requested work (autonomous mode proceeds with your best '
-      + 'default; more than two options always reaches the user). Safety gates live elsewhere.',
+      + 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. '
+      + CLARIFICATION_APPROVAL_GUIDANCE,
     parameters: askUserQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
@@ -1717,9 +1718,9 @@ export function buildAskUserQuestionTool() {
           });
         } catch { /* audit note is best-effort; never block the proceed path */ }
         return formatAutoResolvedAskUserQuestionOutput(
-          'YOLO standing approval is in effect — NOT pausing for sign-off on an action you were already asked to do. '
-          + 'Proceed now with your best default (reuse the approved copy/template the already-handled items used, or the same approach), '
-          + `then report what you did and the assumption you made. (Noted, not waiting: "${args.question}")`
+          'This generic question created no approval card and granted no execution consent. Standing approval never replaces an exact formal card. '
+          + FORMAL_APPROVAL_PREPARATION_GUIDANCE + ' ' + SEALED_APPROVAL_GUIDANCE
+          + ' For work requiring no card, continue through its ordinary execution boundary; this question supplies no authority.'
         );
       }
       if (sessionId) {

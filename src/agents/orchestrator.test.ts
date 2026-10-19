@@ -3202,6 +3202,10 @@ test('YOLO + purpose:"approval" does NOT halt — proceeds (typed signal)', asyn
       { sessionId: sess.id, turn: 1 },
     );
     assert.match(result, /standing approval|NOT pausing/i);
+    assert.match(result, /created no approval card and granted no execution consent/);
+    assert.match(result, /pending_action_queue[^.]*request_now[^.]*before execution or a generic approval question/);
+    assert.doesNotMatch(result, /Proceed now with your best default/);
+    assert.match(t.description, /does not create a formal execution card or grant execution consent/);
     const arbitration = userChoiceToolUseBehavior({ context: { sessionId: sess.id, turn: 1 } }, [{
       type: 'function_output',
       tool: { name: 'ask_user_question' },

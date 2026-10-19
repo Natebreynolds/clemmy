@@ -13,6 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { FORMAL_APPROVAL_PREPARATION_GUIDANCE, SEALED_APPROVAL_GUIDANCE } from '../shared/approval-preparation-guidance.js';
 
 const SRC = readFileSync(new URL('./call-tool.ts', import.meta.url), 'utf8');
 
@@ -30,14 +31,16 @@ test('the carrier refusal offers work_call for reads, not writes only', () => {
 });
 
 test('both initial carrier descriptions offer prepared formal approval before an execution refusal', () => {
-  const guidance = SRC.match(/const FORMAL_APPROVAL_PREPARATION_GUIDANCE =\s*'([^\n]+)'/u)?.[1];
-  assert.ok(guidance, 'the initial approval preparation guidance must exist');
-  assert.match(guidance, /prepared action needing a formal card/);
-  assert.match(guidance, /discover `pending_action_queue` if its schema is missing/);
-  assert.match(guidance, /exact payload[^.]*request_now[^.]*before execution or a generic sign-off question/);
-  assert.match(guidance, /Already sealed work stays on `work_call`; the target still validates consent/);
+  const guidance = FORMAL_APPROVAL_PREPARATION_GUIDANCE;
+  assert.match(SRC, /import \{ FORMAL_APPROVAL_PREPARATION_GUIDANCE, SEALED_APPROVAL_GUIDANCE \} from '..\/shared\/approval-preparation-guidance.js'/u);
+  assert.match(guidance, /Prepared formal card/);
+  assert.match(guidance, /discover missing `pending_action_queue` schema/);
+  assert.match(guidance, /exact payload[^.]*request_now[^.]*before execution or a generic approval question/);
+  assert.match(SEALED_APPROVAL_GUIDANCE, /Already sealed work stays on `work_call`; never queue it again/);
+  assert.match(SEALED_APPROVAL_GUIDANCE, /host validates consent/);
   for (const name of ['DESCRIPTION', 'CONTROL_ONLY_DESCRIPTION']) {
     const block = SRC.match(new RegExp(`const ${name} = \\[([\\s\\S]*?)\\]\\.join`))?.[1];
     assert.ok(block?.includes('FORMAL_APPROVAL_PREPARATION_GUIDANCE'), `${name}: the initial callable must carry the guidance`);
+    assert.ok(block?.includes('SEALED_APPROVAL_GUIDANCE'), `${name}: sealed calls must keep their existing consent owner`);
   }
 });

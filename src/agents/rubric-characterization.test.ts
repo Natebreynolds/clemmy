@@ -206,10 +206,14 @@ const GOLDEN = {
   // 2026-10-18 (Pi comparison): FINAL REPORT says "Answer the ask, then stop"
   // and names the extras reviews kept catching (unasked options, method notes);
   // 37 of 60 reviewed requests had bounced, 32 of them on unsupported extras.
-  instructions: { len: 34365, sha16: '1b3f0f8ef413c2f7' },
-  native: { len: 33472, sha16: '4ed5fcea62c0284e' },
-  claudeBrain: { len: 11450, sha16: 'cfbe5ece004a177c' },
-  lean: { len: 13455, sha16: 'ce86b58033007e8e' },
+  // 2026-10-19: one compact consent rule separates prepared formal cards,
+  // sealed work and stage-only intent. Retain every account/effect/consent
+  // floor; replace the contradictory prepare/execute advice, without growing
+  // the pre-refinement stable rubric or relaxing fresh-action/lean budgets.
+  instructions: { len: 34360, sha16: '931f2dd5b5787c41' },
+  native: { len: 33467, sha16: '8ffbb0a8af8831e7' },
+  claudeBrain: { len: 11445, sha16: 'b34264fd002848e3' },
+  lean: { len: 13450, sha16: '40e042fa7490a63b' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {

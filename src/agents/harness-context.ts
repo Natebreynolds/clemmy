@@ -1,4 +1,5 @@
 import { withSessionMemoryScope, withMemoryReadScope } from '../memory/memory-scope.js';
+import { FORMAL_APPROVAL_PREPARATION_GUIDANCE } from '../shared/approval-preparation-guidance.js';
 import { renderHostExecutionContext } from '../runtime/host-execution-context.js';
 import { delegatedWorkPointers } from '../projects/delegated-work-pointers.js';
 import { proactiveOfferContextForTurn } from '../runtime/proactive-offers.js';
@@ -91,15 +92,18 @@ export function renderAutonomy(): string {
     if (scope === 'yolo') {
       return [
         'AUTO MODE — accepted reversible local work such as drafts, local files and workspace updates runs without asking. A change in a connected app waits for the owner the first time, in Auto as well as Ask; approving once teaches that operation on that account. Destructive, irreversible and administrative actions require exact approval unless an approved workflow covers them. Explicit human checkpoints still pause.',
-        'Do NOT add your own approval steps or use ask_user_question to seek sign-off on work already requested: make the exact call and let its execution boundary apply the real policy. A shell call classified as changing something outside this machine uses one card for its exact command. Let the one approval card own the pause; never ask once in prose and again at the tool gate.',
-        'You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those. An approval-shaped ask auto-resolves only so the execution boundary can apply the real policy. AUTO MODE, reviewer advice and a request to modify a queued payload never substitute for exact execution consent.',
+        'Do NOT add a generic approval question to work already requested. Ordinary execution stays at its normal boundary; a shell call classified as changing something outside this machine needs one card for its exact command.',
+        FORMAL_APPROVAL_PREPARATION_GUIDANCE,
+        'Ask a genuine clarifying question when a fact cannot be inferred, with ask_user_question purpose:"clarification". A legacy approval-shaped question creates no card or execution consent. AUTO MODE, reviewer advice and a request to modify a queued payload never substitute for exact execution consent.',
       ].join(' ');
     }
     if (scope === 'strict') {
       // Ask (legacy 'balanced' and 'workspace' are read as strict).
       return [
         'ASK MODE — local work (files, the shell, reads) and anything non-disruptive runs without asking. A change in a connected app waits for the owner\'s approval the first time; the harness opens that one card itself, and the approval teaches that kind of change so it runs next time.',
-        'Do NOT add your own approval steps or ask in prose for work already requested: make the exact call and let the card own the pause. You MAY still ask a genuine clarifying question when a fact cannot be inferred — set ask_user_question purpose:"clarification" for those.',
+        'Do NOT add a generic approval question to work already requested. Ordinary execution stays at its normal boundary.',
+        FORMAL_APPROVAL_PREPARATION_GUIDANCE,
+        'Ask a genuine clarifying question when a fact cannot be inferred, with ask_user_question purpose:"clarification". A legacy approval-shaped question creates no formal card or execution consent.',
       ].join(' ');
     }
     return '';
