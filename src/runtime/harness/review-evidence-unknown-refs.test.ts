@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assessReviewCoverage, parseNeedsAllOf, reviewCoverageFinding,
+import { assessReviewCoverage, parseNeedsAllOf, reviewCoverageFinding, reviewCoverageLedger,
   reviewCoverageFollowUp, type ReviewedEvidenceRow } from './review-evidence-coverage.js';
 
 const whole: ReviewedEvidenceRow = { logicalToolCallId: 'call_whole', resultHandleId: 'rh_whole',
@@ -77,4 +77,16 @@ test('lookup receipts inspect only their exact retained owner and unknown lookup
   assert.deepEqual(unknown.unsupported.map(row => row.ref), ['call_bounded']);
   assert.deepEqual(unknown.unknownRefs, ['call_invented']);
   assert.match(reviewCoverageFinding(unknown), /\(1\).*call_bounded.*\(2\).*call_invented/);
+});
+
+test('the reviewer is told the coverage line stands alone, exactly as the parser reads it', () => {
+  // Live 2026-10-19: a workflow run's reviewer said DONE twice and both
+  // acceptances were discarded as unattested. Only a lone none or refs alone
+  // parse, so both the ledger and its one follow-up say so.
+  const partial: ReviewedEvidenceRow = { ...bounded, rawByteCount: 40_000, shownByteCount: 4_000, recordCount: 60 };
+  const ledger = reviewCoverageLedger([partial]) ?? '';
+  assert.match(ledger, /Write that line exactly as shown, with nothing else on it and no line after it: the refs alone, or none alone\./);
+  const followUp = reviewCoverageFollowUp(assessReviewCoverage({ results: [partial], needsAllOf: null }));
+  assert.match(followUp, /NEEDS ALL OF line written exactly as "NEEDS ALL OF: <ref>, <ref>" or "NEEDS ALL OF: none", with nothing else on that line and no line after it/);
+  assert.deepEqual(parseNeedsAllOf('DONE: reviewed.\nNEEDS ALL OF: none'), [], 'the form the reviewer is told to write parses');
 });

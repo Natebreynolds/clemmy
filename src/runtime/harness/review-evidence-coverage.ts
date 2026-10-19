@@ -281,6 +281,10 @@ export function reviewCoverageLedger(results: readonly ReviewedEvidenceRow[]): s
     // Asked for only here, where a result is held in part: a review that was
     // shown everything has nothing to declare.
     'After a DONE verdict line add one more line naming, by ref, each of these results your verdict needs the whole of, because something must be absent from it or true of every record in it: "NEEDS ALL OF: <ref>, <ref>". When the verdict rests only on what you were shown, including a result\'s stated record count, write "NEEDS ALL OF: none".',
+    // Live 2026-10-19: a workflow run's reviewer said DONE twice and both
+    // acceptances were discarded as unattested; an explained none ("none,
+    // because ...") or a note after the line does not parse.
+    'Write that line exactly as shown, with nothing else on it and no line after it: the refs alone, or none alone.',
   ].join('\n');
 }
 
@@ -299,7 +303,7 @@ export function reviewCoverageFollowUp(assessment: ReviewCoverageAssessment): st
     'Decide whether the response, or your verdict, states that something is absent from one of these results, is true of all of it, or that so many of its records match something. If so, inspect that result now with the evidence tools: query every record for the criterion, or open the rest.',
     'Where a result reports more at its source, no inspection of what was returned can show what the source holds beyond it.',
     'A verdict that rests only on what you were shown of a result does not need the whole of it.',
-    'Then give the verdict again in the required format, with its NEEDS ALL OF line. When the response makes such a statement and what you inspected does not support it, the verdict is CORRECT, quoting the words.',
+    'Then give the verdict again in the required format, with its NEEDS ALL OF line written exactly as "NEEDS ALL OF: <ref>, <ref>" or "NEEDS ALL OF: none", with nothing else on that line and no line after it. When the response makes such a statement and what you inspected does not support it, the verdict is CORRECT, quoting the words.',
   ].join('\n');
 }
 

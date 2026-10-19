@@ -1365,7 +1365,7 @@
           "bytes": 2533
         },
         "src/runtime/harness/review-evidence-coverage.ts": {
-          "bytes": 17067
+          "bytes": 17522
         },
         "src/runtime/harness/judge-verdict-repair-contract.ts": {
           "bytes": 3405
@@ -5310,7 +5310,7 @@
           "bytes": 2533
         },
         "src/runtime/harness/review-evidence-coverage.ts": {
-          "bytes": 17067
+          "bytes": 17522
         },
         "src/runtime/harness/judge-verdict-repair-contract.ts": {
           "bytes": 3405
