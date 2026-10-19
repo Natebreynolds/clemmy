@@ -950,7 +950,7 @@ import {
   type HostToolDisposition,
   type HostToolDispositionOutput,
 } from './host-model-result-receipt.js';
-import { planScopeRefusalEdge, defaultDispositionEdge, edgeToolName, nextEdge } from './next-edge.js';
+import { HOST_CALL_STOPPED_MARK, truthfulRefusalEdge, defaultDispositionEdge, edgeToolName, nextEdge } from './next-edge.js';
 import {
   recordLogicalModelResultProjectionReceipt,
 } from './logical-model-result-projection-receipt.js';
@@ -8797,8 +8797,8 @@ const runHostTurnBody = async (
             // with this write named as not done and the objection quoted.
             ? nextEdge({ tool: innerTool, change: 'publish_partial',
               say: 'The constraint checker still objected after two corrections. Do not retry this write and do not route around it: finish the step and report this write as not done, with the values it would have written and the checker\'s objection, so the owner can decide.' })
-          : planScopeRefusalEdge(input.diagnostic, innerTool)
-            // The request's frozen plan has no step for this change.
+          : truthfulRefusalEdge({ diagnostic: input.diagnostic, toolName: innerTool, carrier: input.call.name })
+            // A refusal no argument can fix says so, with the move that can succeed.
             ?? (input.diagnostic && input.diagnostic.includes('workflow_write_authority_changed_during_review')
             // This attempt no longer owns the step: another attempt took it
             // over while the write was under review. Nothing here is wrong
@@ -9026,6 +9026,13 @@ const runHostTurnBody = async (
       if (crossing === 'zero_crossing') {
         const countsRefusal = !effectUnknown && !refusalMarkerWritten;
         refusalMarkerWritten = true;
+        // Say what stopped it. With no words the model read only the default
+        // edge and "corrected" arguments that were never at fault (live
+        // 2026-10-14: a lapsed child lease, refused five times).
+        const failure = attempt?.status === 'failed' ? attempt.error : undefined;
+        const said = failure === undefined ? ''
+          : redactSensitiveText(failure instanceof Error ? failure.message : String(failure))
+            .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 400);
         return dispositionResult({
           call,
           disposition: 'refused_pre_dispatch',
@@ -9033,6 +9040,7 @@ const runHostTurnBody = async (
           frameIndex: index,
           frameSize: calls.length,
           countsRefusal,
+          ...(said ? { diagnostic: `${HOST_CALL_STOPPED_MARK}: ${said}` } : {}),
         });
       }
       if (crossing === 'answered_refusal' && attempt?.status === 'failed') {
@@ -12581,6 +12589,9 @@ const runHostTurnBody = async (
       string,
       { diagnostic: string; repairKey?: string }
     >();
+    // The refused call's own consent reason, so its settlement records why it
+    // was refused rather than the label its innocent siblings carry.
+    const preApprovalOwnReasons = new Map<string, string>();
     const preApprovalTypedRefusals = new Map<
       string,
       'repair_arguments' | 'stop_and_explain'
@@ -12916,6 +12927,7 @@ const runHostTurnBody = async (
                   ?? `Host refused ${call.name} before dispatch (${consent.decision.reason}).`,
               });
             }
+            preApprovalOwnReasons.set(call.callId, `consent_${consent.decision.kind}_${consent.decision.reason}`);
             preApprovalRefused = true;
             break;
         }
@@ -13010,7 +13022,7 @@ const runHostTurnBody = async (
           name: call.name, callId: call.callId,
           arguments: materializedArgumentsJson(call.name, call.argumentsJson),
         },
-      }, 'sibling_frame_replanned_before_dispatch'));
+      }, preApprovalOwnReasons.get(call.callId) ?? 'sibling_frame_replanned_before_dispatch'));
       for (const call of canonicalCalls) {
         nestedCallAdmissions.delete(call.callId);
         consentBases.delete(call.callId);

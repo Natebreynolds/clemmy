@@ -767,6 +767,21 @@ test('exact tool_search rows disclose bounded durable local refs; a destructive 
   assert.equal(externalCoverage, 'authorized_external_v1');
 });
 
+test('refreshing a Space is ordinary local work that work_call carries, never a dead end on call_tool', async () => {
+  assert.equal(local.isRegistryDeclaredLocalPlanningMutation('space_refresh'), true);
+  const observed = await local.observeCurrentLocalPlanningDefinition({ name: 'space_refresh', carrier: 'work_call' });
+  assert.equal(observed.ok, true, observed.ok ? '' : observed.reason);
+  if (!observed.ok) return;
+  assert.equal(observed.definition.descriptor.effect, 'local_write');
+  assert.equal(observed.definition.capabilityRef, 'cap:local:space_refresh:ordinary');
+  const run = await createPlanningSource('space-refresh', 'Refresh the data of my fixture Space now.');
+  const body = await searchExact(run.planning, new Set(['space_refresh']), 'space_refresh');
+  const row = body.results.find((entry) => entry.name === 'space_refresh');
+  assert.ok(row, JSON.stringify(body));
+  assert.equal(row.carrier, 'work_call', 'a change is routed to the carrier that can bind it');
+  assert.equal(row.capabilityRef, 'cap:local:space_refresh:ordinary');
+});
+
 test('ordinary Workspace creation compiles to exactly one semantic space_save mutation', async () => {
   eventlog.resetEventLog();
   catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());

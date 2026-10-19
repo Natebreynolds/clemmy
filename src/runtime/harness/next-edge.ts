@@ -76,7 +76,11 @@ export interface HostNextEdgeV1 {
 
 const DEFAULT_SAY: Record<NextEdgeChange, string> = {
   reissue_unstarted: 'Continue the unfinished work with a fresh call ID and the same arguments; reuse completed results.',
-  repair_arguments: 'Correct the named argument fields on this same call and retry it once.',
+  // Never a claim that the arguments are wrong: the refusal's own words name
+  // the cause, and most refusals before dispatch are not argument faults
+  // (live 2026-10-12..18: 13 runaway loops, 63 rewordings in one, each told
+  // to "correct the named argument fields" of a call no argument could fix).
+  repair_arguments: 'Change only what this refusal names on this same call, and retry it once. If it names something no argument can change, do not retry it: finish what you can and tell the owner in one line what is left.',
   discover_capability: 'Disclose the exact operation with tool_search first, then call it by its published ref.',
   choose_account: 'Resolve which connected account this acts as, then retry with that exact account.',
   publish_partial: 'The work is unresolved — publish the honest partial with its gaps named rather than gathering more.',
@@ -150,6 +154,71 @@ export function planScopeRefusalEdge(diagnostic: string | undefined, toolName: s
     say: 'This request\'s plan has no step for this change, so changing its arguments cannot fix it. Bind it to an open step in `plan` only if it is that step\'s own work; otherwise do not retry it: finish the open steps and tell the owner in one line what is left and why.',
   });
 }
+
+/** The code a host consent refusal writes: `before dispatch (<code>).` */
+const CONSENT_REFUSAL_CODE = /before dispatch \((coverage_missing|scope_mismatch|risk_unknown|schema_stale|authority_conflict|cardinality_spent|consent_preparation_unavailable)\)/;
+
+/** A host refusal before dispatch, said as what it is: the real cause and the
+ *  move that can succeed. The host writes every code read here; a refusal it
+ *  does not recognise keeps the default edge, which claims no cause.
+ *  `carrier` is the tool the model called (call_tool, work_call, or the
+ *  operation itself); `toolName` is the operation it carried. */
+export function truthfulRefusalEdge(input: {
+  diagnostic: string | undefined;
+  toolName: string;
+  carrier: string;
+}): HostNextEdgeV1 | undefined {
+  const diagnostic = input.diagnostic ?? '';
+  if (!diagnostic) return undefined;
+  const planScope = planScopeRefusalEdge(diagnostic, input.toolName);
+  if (planScope) return planScope;
+  const consent = CONSENT_REFUSAL_CODE.exec(diagnostic)?.[1];
+  switch (consent) {
+    case 'coverage_missing':
+      // Live 2026-10-18: space_refresh, workflow_state (a "get") and a
+      // meeting save each sent through call_tool and refused this way 5-19
+      // times. work_call binds a call to this request's work, and runs one
+      // that only reads at once.
+      return input.carrier === 'work_call'
+        ? nextEdge({ tool: input.toolName, change: 'publish_partial',
+          say: 'This change is not part of this request\'s accepted work, and changing its arguments cannot make it so. Do not retry it: finish the accepted work and tell the owner in one line what is left.' })
+        : nextEdge({ tool: 'work_call', change: 'repair_arguments',
+          say: `This call is a change, and only work_call binds a change to this request's work; its arguments are not the problem. Send this same call once through work_call, with name "${input.toolName}", the same arguments as args_json, and "${input.toolName}" as requirement_id. A call that only reads runs at once there.` });
+    case 'scope_mismatch':
+      return nextEdge({ tool: input.toolName, change: 'publish_partial',
+        say: 'This call reaches beyond the work this request accepted (another target, account, amount or operation), so new arguments for it will be refused the same way. Do the accepted work; for anything beyond it, tell the owner in one line what else is needed.' });
+    case 'cardinality_spent':
+      return nextEdge({ tool: input.toolName, change: 'publish_partial',
+        say: 'This change already ran for this request. Do not repeat it: use its result, and report it as done.' });
+    case 'schema_stale':
+      return nextEdge({ tool: 'tool_search', change: 'discover_capability',
+        say: `The definition of ${input.toolName} changed since it was disclosed. Disclose it again with tool_search, called directly, then call it with its current schema.` });
+    case 'risk_unknown':
+      return nextEdge({ tool: 'tool_search', change: 'discover_capability',
+        say: `The host could not read what ${input.toolName} would do from its current definition. Disclose the exact operation with tool_search, called directly, then call it by its published ref.` });
+    case 'authority_conflict':
+      return nextEdge({ tool: input.toolName, change: 'publish_partial',
+        say: 'Another record already owns this change for this request, so no retry of it can run. Do not retry it: finish and tell the owner in one line what is left.' });
+    case 'consent_preparation_unavailable':
+      return nextEdge({ tool: input.toolName, change: 'reissue_unstarted',
+        say: 'The host could not prepare this call\'s check; nothing ran and its arguments are not the problem. Send it once more unchanged; if it is refused the same way again, do not retry it: finish and tell the owner what is left.' });
+    default:
+      break;
+  }
+  if (diagnostic.includes('"error":"not_reachable"')) {
+    return nextEdge({ tool: 'tool_search', change: 'discover_capability',
+      say: `${input.toolName} is not carried on this turn as called, and changing its arguments cannot change that. Do what the refusal says: call tool_search directly, as its own tool call, to disclose the exact operation, then call it as disclosed.` });
+  }
+  if (diagnostic.includes(HOST_CALL_STOPPED_MARK)) {
+    return nextEdge({ tool: input.toolName, change: 'reissue_unstarted',
+      say: 'It changed nothing. If the error names an argument, fix that once; otherwise send it once more unchanged. If it fails the same way again, do not retry it: finish and tell the owner in one line what is left.' });
+  }
+  return undefined;
+}
+
+/** The mark a call that stopped before completing carries in its diagnostic
+ *  (a host start failure, or a read that failed), with its own error. */
+export const HOST_CALL_STOPPED_MARK = 'This call stopped before it completed';
 
 const WRAPPER_EDGE_TOOLS = new Set(['call_tool', 'work_call', 'composio_execute_tool']);
 
