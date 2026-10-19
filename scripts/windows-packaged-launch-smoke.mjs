@@ -645,10 +645,12 @@ async function startInstalledApp(context, firstLaunch) {
   const page = new CDP(assertCDPUrl(target.webSocketDebuggerUrl, port, 'page'));
   app.page = page;
   await page.send('Page.enable'); await page.send('Runtime.enable');
+  // Finishing first-run onboarding opens a new chat (v3.18.43); a later
+  // launch opens Today. Either way the composer is mounted.
   const assets = await withLaunchDiagnostics(() => waitFor(async () => page.evaluate(`(() => {
     const root = document.getElementById('root'); const main = root?.querySelector('#main');
     if (document.readyState !== 'complete' || !main || root.children.length === 0
-      || !main.querySelector('[aria-label="Today overview"]')
+      || (${JSON.stringify(!firstLaunch)} && !main.querySelector('[aria-label="Today overview"]'))
       || !main.querySelector('textarea[aria-label="Message Clementine"]')
       || (root.innerText || '').length < 50 || (root.innerText || '').includes('Session expired')
       || (root.innerText || '').includes('This view hit a snag')) return null;
