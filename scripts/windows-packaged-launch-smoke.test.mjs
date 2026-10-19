@@ -13,7 +13,7 @@ import {
   isolatedChildEnvironment, assertBuildStamp, assertServedIdentity,
   assertCDPUrl, consoleAssetRelative, exactOwnedProcess,
   assertFailureCleanupIdentity,
-  isDashboardTarget,
+  isDashboardTarget, isOnboardingTarget,
   INSTALLED_STORAGE_PROBE,
   pinnedLoopbackTlsHandshake, publicStorageReceipt,
   _testOnly_createOwnedChildRunner,
@@ -275,6 +275,16 @@ test('actual console landing redirect remains observable but remote or unrelated
   for (const value of ['http://localhost:8520/console', 'https://example.test/console/chat', 'file:///console/chat',
     'http://127.0.0.1/console', 'http://user:password@127.0.0.1:8520/console',
     'http://127.0.0.1:8520/console/notch', 'http://127.0.0.1:8520/admin']) assert.equal(isDashboardTarget(value), false);
+});
+
+test('first-run onboarding is found in the installed app\'s own main window, never a remote or unrelated page', () => {
+  assert.equal(isOnboardingTarget('http://127.0.0.1:8520/console/onboarding'), true);
+  assert.equal(isOnboardingTarget('http://127.0.0.1:8520/console/onboarding?token=private'), true);
+  for (const value of ['http://localhost:8520/console/onboarding', 'https://example.test/console/onboarding',
+    'file:///console/onboarding', 'http://127.0.0.1/console/onboarding', 'http://user:password@127.0.0.1:8520/console/onboarding',
+    'http://127.0.0.1:8520/console/chat', 'http://127.0.0.1:8520/console']) assert.equal(isOnboardingTarget(value), false);
+  // Finishing onboarding opens chat, which the dashboard gate already accepts.
+  assert.equal(isDashboardTarget('http://127.0.0.1:8520/console/chat'), true);
 });
 
 test('owned daemon proof requires its exact PID, executable, creation identity and app parent', () => {

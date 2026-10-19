@@ -132,6 +132,15 @@ export function consoleAssetRelative(value, origin) {
   return url.pathname.slice('/console/'.length);
 }
 
+/** First-run onboarding in the installed app's own main window. */
+export function isOnboardingTarget(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && url.hostname === '127.0.0.1' && Number(url.port) > 0
+      && !url.username && !url.password && /^\/console\/onboarding\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+
 export function isDashboardTarget(value) {
   try {
     const url = new URL(value);
@@ -463,48 +472,29 @@ async function findPage(port, predicate) {
 }
 
 async function skipSetup(app) {
-  const target = await waitFor(() => findPage(app.port, (value) => {
-    try {
-      const url = new URL(value);
-      return url.protocol === 'file:' && isOwnedPath(fileURLToPath(url), app.profile)
-        && /[\\/]wizard[\\/]setup\.html$/i.test(fileURLToPath(url));
-    } catch { return false; }
-  }), 'first_launch_setup_missing');
+  // First run starts the daemon and opens onboarding in the main window
+  // (09dde2b0b, v3.18.43); there is no separate setup window any more. Its
+  // own skips lead to "Explore without a model", which writes the same
+  // skipped setup marker the old wizard's Skip did, then opens chat.
+  const target = await waitFor(() => findPage(app.port, isOnboardingTarget), 'first_launch_setup_missing');
   const page = new CDP(assertCDPUrl(target.webSocketDebuggerUrl, app.port, 'page'));
   try {
     await page.send('Page.enable'); await page.send('Runtime.enable');
-    const bounds = await waitFor(async () => page.evaluate(`(() => {
-      const button = document.querySelector('[data-wiz-skip]');
-      if (document.readyState !== 'complete' || !button || typeof window.clemmy?.setupSkip !== 'function') return null;
-      const box = button.getBoundingClientRect();
-      return !button.disabled && box.width > 0 && box.height > 0 ? { x: box.x + box.width/2, y: box.y + box.height/2 } : null;
-    })()`), 'setup_preload_or_button_missing', 30_000);
-    let dialogAccepted = false;
-    let dialogFailure;
-    page.on('Page.javascriptDialogOpening', (params) => {
-      if (params.type !== 'confirm') { dialogFailure = new SmokeError('unexpected_setup_dialog'); return; }
-      page.send('Page.handleJavaScriptDialog', { accept: true }).then(() => { dialogAccepted = true; }, () => {
-        // Closing the setup target after successful skip can race the reply;
-        // only an observed accepted dialog plus the app marker is evidence.
-        dialogFailure = new SmokeError('setup_confirmation_failed');
-      });
-    });
-    // The skip can complete and the app close the setup window before the
-    // click's own reply arrives (run 37735935514: cdp_closed with the app's
-    // setup-complete marker already written). After the click is dispatched,
-    // a closed window is not a verdict: the app's marker is the evidence.
-    let setupWindowClosed = false;
-    try {
-      await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...bounds });
-      await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...bounds });
-    } catch (error) {
-      if (!(error instanceof SmokeError && error.code === 'cdp_closed')) throw error;
-      setupWindowClosed = true;
-    }
+    const press = (label, code) => waitFor(async () => page.evaluate(`(() => {
+      if (document.readyState !== 'complete' || typeof window.clemmy?.onboardingComplete !== 'function') return null;
+      const button = [...document.querySelectorAll('button')].find((candidate) => !candidate.disabled
+        && candidate.getClientRects().length > 0 && candidate.textContent.trim().startsWith(${JSON.stringify(label)}));
+      if (!button) return null;
+      button.click();
+      return true;
+    })()`), code, 60_000);
+    await press('Connect a model later', 'setup_preload_or_button_missing');
+    await press('Skip Jev for now', 'onboarding_jev_skip_missing');
+    await press('Skip voice for now', 'onboarding_voice_skip_missing');
+    await press('Explore without a model', 'onboarding_explore_missing');
     await waitFor(async () => {
-      if (dialogFailure && !setupWindowClosed) throw dialogFailure;
       const marker = path.join(app.env.CLEMENTINE_HOME, 'state', 'setup-complete.json');
-      if (!(dialogAccepted || setupWindowClosed) || !existsSync(marker)) return null;
+      if (!existsSync(marker)) return null;
       const record = jsonFile(marker);
       if (record.version !== 'v1' || record.configured?.auth !== 'skipped') refuse('setup_marker_not_app_skip');
       return true;
