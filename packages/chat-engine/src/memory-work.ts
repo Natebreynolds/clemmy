@@ -21,6 +21,7 @@ export type MemoryJobId =
   | 'reconcile'
   | 'patterns'
   | 'skills'
+  | 'lessons'
   | 'identity'
   | 'import'
   | 'standing'
@@ -43,6 +44,7 @@ export type MemoryJobTrigger =
   | 'on_save'
   | 'after_success'
   | 'after_correction'
+  | 'after_check'
   | 'every_few_minutes'
   | 'hourly'
   | 'daily'
@@ -172,6 +174,7 @@ export interface MemoryWorkProduced {
   agedOut?: number;
   patterns?: number;
   skills?: number;
+  lessons?: number;
   proposals?: number;
   embedded?: number;
   entities?: number;
@@ -277,6 +280,11 @@ export const MEMORY_JOB_WORDS: Record<MemoryJobId, MemoryJobWords> = {
     doing: 'Writing down how a task was done',
     blurb: 'After a task succeeds, writes down how it was done so it goes faster next time.',
   },
+  lessons: {
+    title: 'Learning from checks',
+    doing: 'Turning a check’s finding into a lesson',
+    blurb: 'When a check catches a problem in Clem’s work and she fixes it, keeps the lesson so the same mistake does not happen again.',
+  },
   identity: {
     title: 'Updating your profile',
     doing: 'Reviewing what Clem knows about you',
@@ -313,7 +321,7 @@ export const MEMORY_JOB_WORDS: Record<MemoryJobId, MemoryJobWords> = {
 
 /** The display order: learning first, upkeep last. */
 export const MEMORY_JOB_ORDER: readonly MemoryJobId[] = [
-  'learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing', 'verify', 'index', 'tidy', 'backup', 'connect',
+  'learn', 'reconcile', 'patterns', 'skills', 'lessons', 'identity', 'import', 'standing', 'verify', 'index', 'tidy', 'backup', 'connect',
 ];
 
 /** Settings → Models wording for the memory role. Both apps use these strings. */
@@ -378,6 +386,7 @@ const TRIGGER_WORDS: Record<MemoryJobTrigger, string> = {
   on_save: 'Whenever a memory is saved',
   after_success: 'After a task succeeds',
   after_correction: 'After you correct Clem',
+  after_check: 'After a check catches a problem',
   every_few_minutes: 'Every few minutes',
   hourly: 'About every hour',
   daily: 'About once a day',
@@ -528,6 +537,7 @@ export function memoryEventSentence(event: MemoryWorkEvent): string {
     }
     case 'patterns': if (p.patterns) parts.push(`found ${plural(p.patterns, 'pattern', 'patterns')}`); break;
     case 'skills': if (p.skills) parts.push(`wrote ${plural(p.skills, 'skill', 'skills')}`); break;
+    case 'lessons': if (p.lessons) parts.push(`kept ${plural(p.lessons, 'lesson', 'lessons')}`); break;
     case 'identity': if (p.proposals) parts.push(`suggested ${plural(p.proposals, 'profile update', 'profile updates')}`); break;
     case 'import': if (p.learned) parts.push(`imported ${plural(p.learned, 'memory', 'memories')}`); break;
     case 'index': if (p.embedded) parts.push(`indexed ${plural(p.embedded, 'memory', 'memories')}`); break;

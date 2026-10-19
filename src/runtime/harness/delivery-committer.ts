@@ -1977,6 +1977,15 @@ export function commitTurnOutcome(
     const identity = { sessionId: persisted.identity.sessionId, sourceUserSeq: persisted.identity.sourceUserSeq };
     const published = terminal.event;
     scheduleRouteOutcomeJoin(() => joinRouteOutcomeVerdict({ ...identity, terminal: published }));
+    // A call a tool refused and a later call got right is a lesson for the
+    // next time that tool is used (check-lessons.ts). Off the terminal's path.
+    if (acceptedObjective) {
+      const workSource = reviewIdentity.sourceUserSeq;
+      void import('../../memory/check-lessons.js').then(({ learnFromCheck, toolFixesForSource }) => learnFromCheck({
+        sessionId: identity.sessionId, sourceUserSeq: workSource, request: acceptedObjective, kind: 'tool',
+        cases: toolFixesForSource(identity.sessionId, workSource),
+      })).catch(() => { /* learning stays additive */ });
+    }
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
   // same transaction (eventlog `terminalOwner` branch). A best-effort finish

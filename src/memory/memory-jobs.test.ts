@@ -18,7 +18,7 @@ test('the standing check follows the memory model; verify stays on the checker; 
   assert.equal(MEMORY_JOBS.standing.modelOwner, 'memory');
   assert.equal(MEMORY_JOBS.verify.modelOwner, 'checker');
   assert.equal(MEMORY_JOBS.index.modelOwner, 'local');
-  assert.deepEqual(MEMORY_JOB_IDS.filter(memoryJobUsesMemoryModel), ['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import', 'standing']);
+  assert.deepEqual(MEMORY_JOB_IDS.filter(memoryJobUsesMemoryModel), ['learn', 'reconcile', 'patterns', 'skills', 'lessons', 'identity', 'import', 'standing']);
 });
 
 test('the nightly jobs keep their clock; jobs started by an event have none', async () => {

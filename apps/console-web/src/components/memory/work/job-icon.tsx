@@ -2,7 +2,7 @@
  *  talk about the same job look alike. */
 import type { LucideIcon } from 'lucide-react';
 import {
-  Archive, Brain, Download, Link2, Fingerprint, GraduationCap, Leaf, MessageSquareText, Scale, ScrollText, Search, ShieldCheck, Waypoints,
+  Archive, Brain, Download, Link2, Fingerprint, GraduationCap, Leaf, Lightbulb, MessageSquareText, Scale, ScrollText, Search, ShieldCheck, Waypoints,
 } from 'lucide-react';
 import type { MemoryJobId } from '@/lib/memory-work';
 
@@ -11,6 +11,7 @@ export const JOB_ICON: Record<MemoryJobId, LucideIcon> = {
   reconcile: Scale,
   patterns: Waypoints,
   skills: GraduationCap,
+  lessons: Lightbulb,
   identity: Fingerprint,
   import: Download,
   standing: ScrollText,

@@ -19,6 +19,7 @@ export type MemoryJobId =
   | 'reconcile'
   | 'patterns'
   | 'skills'
+  | 'lessons'
   | 'identity'
   | 'import'
   | 'standing'
@@ -36,6 +37,7 @@ export type MemoryJobTrigger =
   | 'on_save'
   | 'after_success'
   | 'after_correction'
+  | 'after_check'
   | 'every_few_minutes'
   | 'hourly'
   | 'daily'
@@ -54,6 +56,9 @@ export const MEMORY_JOBS: Readonly<Record<MemoryJobId, MemoryJobSpec>> = Object.
   reconcile: { id: 'reconcile', modelOwner: 'memory', trigger: 'on_save' },
   patterns: { id: 'patterns', modelOwner: 'memory', trigger: 'nightly' },
   skills: { id: 'skills', modelOwner: 'memory', trigger: 'after_success' },
+  // A check caught a problem and Clem fixed it: keep the general lesson
+  // (check-lessons.ts).
+  lessons: { id: 'lessons', modelOwner: 'memory', trigger: 'after_check' },
   identity: { id: 'identity', modelOwner: 'memory', trigger: 'daily' },
   import: { id: 'import', modelOwner: 'memory', trigger: 'on_request' },
   // The owner's memory model reads each message for a standing preference;

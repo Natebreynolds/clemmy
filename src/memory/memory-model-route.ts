@@ -4,7 +4,7 @@
  *
  * The "Keeps your memory" role (`memory` in the role registry, Settings-only)
  * governs the jobs whose `modelOwner` is `memory` in memory-jobs.ts: learn,
- * reconcile, patterns, skills, identity and import. Two ways to be served:
+ * reconcile, patterns, skills, lessons, identity and import. Two ways to be served:
  *
  *   chosen    — the owner bound a model to the role. Every governed job asks
  *               for exactly that model (buildExactRoleModel): no downshift, no
@@ -13,7 +13,7 @@
  *               route is null and learning WAITS; nothing stands in silently.
  *   automatic — nothing bound. Each job keeps the model it ran on before the
  *               role existed: learn / reconcile / patterns take exactly the
- *               model resolveBoundaryJudge() selects (explicit checker pins
+ *               model resolveBoundaryJudge() selects (lessons too; explicit checker pins
  *               included); skills / identity / import take exactly the
  *               model the owner chose to do the work. A model the owner never
  *               chose never serves memory because it happens to be signed in
@@ -107,7 +107,7 @@ export type MemoryModelAvailability =
   | { ok: false; reason: 'model_paused' | 'model_unavailable'; problem?: MemoryModelProblem; until?: string };
 
 /** Jobs whose automatic model is the boundary checker's selection. */
-const BOUNDARY_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns', 'standing']);
+const BOUNDARY_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns', 'standing', 'lessons']);
 
 /** The job that stands for "memory's model" on Settings and the Memory tab:
  *  the learning extractor, which makes most memory calls. */

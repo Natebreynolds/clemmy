@@ -5507,6 +5507,17 @@ const runHostTurnBody = async (
       deliveredReviewRun.verdict = verdict;
       if (judgedVerdictRow) deliveredReviewRun.verdictEventId = judgedVerdictRow.id;
     }
+    // A finding this turn went back and fixed is a lesson for the next request
+    // of its kind (check-lessons.ts). Kept off the turn's path.
+    const fixedFinding = !deliveredReviewRun && !planCandidate && completionReviewFeedback?.phase === undefined
+      && completionReviewFeedback?.repairScope !== 'reply_format' ? completionReviewFeedback : undefined;
+    if (fixedFinding && verdict.done && !verdict.awaitingUser && !verdict.failedOpen
+      && verdict.reviewDisposition !== 'answered_unqualified') {
+      void import('../../memory/check-lessons.js').then(({ learnFromCheck }) => learnFromCheck({
+        sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, request: objective, kind: 'review',
+        cases: [{ finding: fixedFinding.reason, before: fixedFinding.reply, after: judgedReply }],
+      })).catch(() => { /* learning stays additive */ });
+    }
     // A review that cannot pass is Clem's to tell, once per request: the next
     // reply is her own account of the finding and a question to the owner,
     // never the harness holding her answer under a blocked status.

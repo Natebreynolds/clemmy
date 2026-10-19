@@ -134,6 +134,8 @@ export interface MemoryWorkProduced {
   agedOut?: number;
   patterns?: number;
   skills?: number;
+  /** Lessons kept from a check that caught a problem Clem then fixed. */
+  lessons?: number;
   proposals?: number;
   embedded?: number;
   entities?: number;
@@ -146,7 +148,7 @@ export interface MemoryWorkProduced {
 /** Every count a memory-work record may carry, in one list. */
 export const MEMORY_WORK_PRODUCED_KEYS: readonly (keyof MemoryWorkProduced)[] = Object.freeze([
   'claims', 'learned', 'updated', 'reinforced', 'leftOut', 'setAside', 'faded',
-  'restored', 'agedOut', 'patterns', 'skills', 'proposals', 'embedded', 'entities', 'approved', 'declined',
+  'restored', 'agedOut', 'patterns', 'skills', 'lessons', 'proposals', 'embedded', 'entities', 'approved', 'declined',
 ]);
 
 export interface MemoryWorkFact {

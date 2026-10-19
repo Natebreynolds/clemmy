@@ -409,7 +409,7 @@ export interface MemoryWorkView {
   retentionText: string;
 }
 
-const LEARNING_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns', 'skills', 'identity', 'import']);
+const LEARNING_JOBS: ReadonlySet<MemoryJobId> = new Set(['learn', 'reconcile', 'patterns', 'skills', 'lessons', 'identity', 'import']);
 
 const CHANGE_LABEL: Record<MemoryWorkFact['change'], string> = {
   learned: 'New',

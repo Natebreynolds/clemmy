@@ -29,6 +29,7 @@ export interface DeliveredReview {
 }
 
 interface PendingReview {
+  objective: string;
   objectiveDigest: string;
   registeredAt: number;
   review: (publishedText: string) => Promise<DeliveredReview>;
@@ -82,7 +83,7 @@ export function registerReviewAfterDelivery(input: {
     });
   } catch { return false; }
   pending.set(keyOf(input.sessionId, input.sourceUserSeq), {
-    objectiveDigest, registeredAt: now, review: input.review, correct: input.correct,
+    objective: input.objective, objectiveDigest, registeredAt: now, review: input.review, correct: input.correct,
   });
   return true;
 }
@@ -170,7 +171,14 @@ export function launchReviewAfterDelivery(input: {
         sourceLabel: 'answer check',
         sourceId: `answer-check:${input.sourceUserSeq}`,
       });
-    } catch { /* the finding stays on the chip */ }
+    } catch { return; /* the finding stays on the chip */ }
+    // What she corrected is a lesson for the next request of its kind.
+    try {
+      const { learnFromCheck } = await import('../../memory/check-lessons.js');
+      await learnFromCheck({ sessionId: input.sessionId, sourceUserSeq: input.workSourceUserSeq,
+        request: entry.objective, kind: 'review',
+        cases: [{ finding: ruling.finding, before: input.publishedText, after: correction }] });
+    } catch { /* learning stays additive */ }
   })();
 }
 
