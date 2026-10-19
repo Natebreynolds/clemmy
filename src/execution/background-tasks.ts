@@ -20,6 +20,8 @@ import {
 import path from 'node:path';
 import os from 'node:os';
 import { isDeepStrictEqual } from 'node:util';
+import { MeetingModelPinSchema, type MeetingModelPin } from '../integrations/recall/meeting-assistant-policy.js';
+import { validateMeetingModelPin } from '../integrations/recall/meeting-model-execution.js';
 import pino from 'pino';
 import { extractDeliverablePointers } from '../runtime/harness/claim-grounding.js';
 import {
@@ -119,7 +121,7 @@ const logger = pino({ name: 'clementine-next.background-tasks' });
 type BackgroundResponseExecutor = (
   assistant: ClementineAssistant,
   request: Parameters<typeof respondPreferHarness>[1],
-  executionModelPin?: BackgroundTaskDelegation['executionModelPin'],
+  executionModelPin?: BackgroundTaskDelegation['executionModelPin'] | MeetingModelPin,
 ) => Promise<AssistantResponse>;
 
 const defaultBackgroundResponseExecutor: BackgroundResponseExecutor = (assistant, request, executionModelPin) =>
@@ -258,6 +260,8 @@ export interface BackgroundTaskRecord {
   id: string;
   /** Host-owned output identity, immutable across retries and continuations. */
   requiredOutput?: MeetingAnalysisRequirement;
+  /** Host-owned meeting choice, immutable across restart/retry. */
+  meetingModelPin?: MeetingModelPin;
   /** See CreateBackgroundTaskInput.internal — plan-owned reporting. */
   internal?: boolean;
   title: string;
@@ -471,6 +475,7 @@ export interface CreateBackgroundTaskInput {
   prompt: string;
   /** Internal callers only; never inferred from the model's prose. */
   requiredOutput?: MeetingAnalysisRequirement;
+  meetingModelPin?: MeetingModelPin;
   /**
    * An INTERNAL sub-unit of a larger durable plan (a fan-out worker window).
    * The user's contract lives at the plan level — one kickoff, aggregate
@@ -1771,11 +1776,17 @@ export function deriveTaskTitle(raw: string): string {
 export function createBackgroundTask(input: CreateBackgroundTaskInput): BackgroundTaskRecord {
   const requiredOutput = input.requiredOutput === undefined ? undefined
     : meetingAnalysisRequirementSchema.parse(input.requiredOutput);
+  const meetingModelPin = input.meetingModelPin === undefined ? undefined : MeetingModelPinSchema.parse(input.meetingModelPin);
+  if (meetingModelPin && (!requiredOutput || meetingModelPin.role !== 'brain' || input.delegation || input.foregroundHandoff
+    || (input.model !== undefined && input.model !== meetingModelPin.modelId))) {
+    throw new Error('A meeting model choice needs its exact meeting analysis task.');
+  }
   const buildTask = (id: string): BackgroundTaskRecord => {
     const createdAt = nowIso();
     return {
       id,
       ...(requiredOutput ? { requiredOutput } : {}),
+      ...(meetingModelPin ? { meetingModelPin } : {}),
       title: deriveTaskTitle(clean(input.title || input.prompt, 200)),
       prompt: input.prompt.trim(),
       status: 'pending',
@@ -1792,8 +1803,8 @@ export function createBackgroundTask(input: CreateBackgroundTaskInput): Backgrou
       channel: input.channel,
       reportBackTarget: normalizeReportBackTarget(input.reportBackTarget)
         ?? defaultReportBackTarget({ source: input.source ?? 'gateway', userId: input.userId, channel: input.channel, originSessionId: input.originSessionId }),
-      requestedModel: input.model,
-      model: input.model,
+      requestedModel: input.model ?? meetingModelPin?.modelId,
+      model: input.model ?? meetingModelPin?.modelId,
       maxMinutes: Math.max(1, Math.min(240, Math.floor(input.maxMinutes ?? 60))),
       ...(typeof input.maxTokens === 'number' && Number.isFinite(input.maxTokens) && input.maxTokens > 0
         ? { maxTokens: Math.max(100_000, Math.min(1_000_000_000, Math.trunc(input.maxTokens))) }
@@ -2086,6 +2097,10 @@ function updateBackgroundTaskWhere(
     if (Object.prototype.hasOwnProperty.call(resolvedPatch, 'requiredOutput')
       && !isDeepStrictEqual(resolvedPatch.requiredOutput, task.requiredOutput)) {
       throw new Error('A background task’s required output cannot be changed. Prepare a new task for the current source.');
+    }
+    if (Object.prototype.hasOwnProperty.call(resolvedPatch, 'meetingModelPin')
+      && !isDeepStrictEqual(resolvedPatch.meetingModelPin, task.meetingModelPin)) {
+      throw new Error('A meeting task’s model choice cannot be changed.');
     }
     const updated: BackgroundTaskRecord = {
       ...task,
@@ -6491,7 +6506,11 @@ export async function processBackgroundTasks(assistant: ClementineAssistant, lim
 	        const { resolveRoleModel } = await import('../runtime/harness/model-roles.js');
 	        // A genuine handoff already owns a frozen accepted checkpoint model.
 	        // Fresh delegated work carries its saved specialist pin instead.
-	        const executionModelPin = task.foregroundHandoff ? undefined : task.delegation?.executionModelPin;
+	        const meetingPin = Object.prototype.hasOwnProperty.call(task, 'meetingModelPin')
+              ? validateMeetingModelPin(task.meetingModelPin, 'brain') : undefined;
+            if (meetingPin && (!meetingAnalysisRequirementSchema.safeParse(task.requiredOutput).success
+              || task.delegation || task.foregroundHandoff || task.model !== meetingPin.modelId)) throw new Error('The saved meeting model binding is invalid.');
+	        const executionModelPin = meetingPin ?? (task.foregroundHandoff ? undefined : task.delegation?.executionModelPin);
 	        const requestedModel = executionModelPin?.modelId ?? task.model ?? resolveRoleModel('brain').modelId;
 	        response = await backgroundResponseExecutor(assistant, {
 	          sessionId: task.runSessionId,

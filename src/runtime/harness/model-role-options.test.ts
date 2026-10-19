@@ -18,6 +18,8 @@ const {
   validateJudgeFallbackModelBinding,
   validateRoleModelBinding,
   brainOptions,
+  connectedBrainModelCapability,
+  connectedTaskBrainOptions,
   effectiveBrain,
   effectiveBrainValue,
   falloverBrainModelIds,
@@ -157,6 +159,26 @@ test('connected model catalog includes authenticated Codex/Claude and configured
     // an id no connected provider offers still rejects (no over-acceptance)
     assert.equal(validateRoleModelBinding('judge', 'not-connected').ok, false);
     assert.equal(validateRoleModelBinding('worker', 'not-connected').ok, false);
+  });
+});
+
+test('task-specific brain choice validates connected route without mutating the global brain switch', () => {
+  writeAuthFiles();
+  withEnv({ BYO_MODEL_BASE_URL: 'https://api.example.test', BYO_MODEL_API_KEY: 'controlled-key',
+    BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]', MODEL_ROUTING_MODE: 'off' }, () => {
+    const before = JSON.stringify({ ...process.env });
+    assert.deepEqual(connectedBrainModelCapability('deepseek-chat'), { ok: true, provider: 'byo' });
+    assert.deepEqual(connectedBrainModelCapability('claude-sonnet-4-6'), { ok: true, provider: 'claude' });
+    assert.equal(connectedBrainModelCapability('not-connected').ok, false);
+    assert.equal(validateRoleModelBinding('brain', 'deepseek-chat').ok, false, 'the global brain role-binding door stays closed');
+    const observations: number[] = [];
+    _setModelOptionSnapshotObserverForTest(snapshot => observations.push(snapshot.modelCount));
+    try {
+      const options = connectedTaskBrainOptions();
+      assert.ok(options.some(option => option.modelId === 'deepseek-chat' && option.available));
+      assert.equal(observations.length, 1, 'large task-model catalogs capture routing only once');
+    } finally { _setModelOptionSnapshotObserverForTest(null); }
+    assert.ok(JSON.stringify({ ...process.env }) === before, 'checking a task model never changes settings');
   });
 });
 

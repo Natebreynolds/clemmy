@@ -68,3 +68,34 @@ test('default research adapter follows OFF, ON and default owner policy without 
   }
   assert.equal(loaded, 3, 'each accepted execution reads current owner policy, not factory-time policy');
 });
+
+test('live answer uses its frozen economical model through lazy construction and refuses a disconnected choice before execution', async () => {
+  const settings = { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'http://127.0.0.1:9',
+    BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]' };
+  const previous = new Map(Object.keys(settings).map(key => [key, process.env[key]]));
+  Object.assign(process.env, settings);
+  const { isPinnedWorkerModel } = await import('../../runtime/harness/pinned-worker-model.js');
+  const { withModelUsageAttribution } = await import('../../runtime/usage-log.js');
+  const { resolveRoleModel } = await import('../../runtime/harness/model-roles.js');
+  const input = { sessionId: 'sess-controlled-meeting-pinned', sourceUserSeq: 43, runAttemptId: 'attempt:pinned', input: 'Controlled evidence.',
+    modelPin: { version: 1 as const, modelId: 'deepseek-chat', provider: 'byo' as const, role: 'quick' as const,
+      profileRevision: 7, selection: 'explicit' as const, fallback: 'none' as const } };
+  let loaded = 0; let ran = 0;
+  const agent = new Agent<RuntimeContextValue, any>({ name: 'Controlled', instructions: 'Controlled', tools: [] });
+  const execute = createMeetingResearchExecutor(async () => { loaded++; return {
+    runConversation: async options => {
+      ran++; assert.equal(isPinnedWorkerModel(input.modelPin.modelId), true);
+      await withModelUsageAttribution({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq }, async () => {
+        assert.equal(resolveRoleModel('brain').modelId, input.modelPin.modelId);
+      });
+      await options.buildAgent!({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq });
+    },
+    buildOrchestratorAgent: async options => { assert.equal(options.model, input.modelPin.modelId); assert.deepEqual(options.allowedToolNames, []); return agent; },
+  }; });
+  try {
+    await execute(input); assert.deepEqual([loaded, ran], [1, 1]);
+    process.env.BYO_MODEL_API_KEY = '';
+    await assert.rejects(execute(input), /No substitute/);
+    assert.deepEqual([loaded, ran], [1, 1], 'no fallback, provider or new task starts for an unavailable saved model');
+  } finally { for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } }
+});

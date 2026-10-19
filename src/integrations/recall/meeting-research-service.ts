@@ -20,6 +20,7 @@ import { createMeetingResearchCoordinator, type MeetingResearchBoundary, type Me
 import { installMeetingResearchBoundary } from './meeting-research-boundary.js';
 import { createMeetingResearchController } from './meeting-research-controller.js';
 import { createMeetingResearchExecutor } from './meeting-research-executor.js';
+import { resolveMeetingModelPin, type MeetingModelPin } from './meeting-assistant-policy.js';
 
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 const factRefs = z.array(z.object({ id: z.number().int().positive(), digest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -172,8 +173,32 @@ export async function projectMeetingResearchSnapshot(snapshot: MeetingResearchSn
   return { ...snapshot, jobs };
 }
 
+/** Passive, exact-capture handoff. This does not renew a grant, launch work,
+ * or reinterpret a stopped lookup as completed. */
+export async function readMeetingResearchHandoff(meetingId: string,
+  read: (id: string) => ReturnType<typeof meetingResearch.readHandoff> = id => meetingResearch.readHandoff(id)) {
+  const retained = read(meetingId);
+  return { captureDigest: retained.captureDigest, unavailableJobs: retained.jobs.filter(job => !job.exactCapture).length,
+    jobs: await Promise.all(retained.jobs.filter(job => job.exactCapture).map(async job => {
+    const result = { id: job.id, offerId: job.question.offerId, question: job.question.question,
+      quote: job.question.quote, segmentIds: [...job.question.segmentIds], sourceDigest: job.question.sourceDigest,
+      status: job.state, exactCapture: job.exactCapture, outcomeUnknown: job.outcomeUnknown === true };
+    if (!job.task || job.state !== 'completed') return result;
+    try {
+      const saved = readMeetingResearchAnswer(job.task, { meetingId, jobId: job.id });
+      if (!saved || (saved.source.data.meetingResearchCaptureDigest !== undefined
+        && saved.source.data.meetingResearchCaptureDigest !== retained.captureDigest)) return result;
+      const reviewState = await reviewMeetingResearchAnswer(job.task, saved);
+      return { ...result, reviewState,
+        ...(reviewState !== 'unverified' ? { answer: { text: saved.reply, digest: sha(saved.reply),
+          sessionId: job.task.sessionId, sourceUserSeq: job.task.sourceUserSeq } } : {}) };
+    } catch { return result; }
+  })) };
+}
+
 export type MeetingResearchExecutionPort = (input: {
   sessionId: string; sourceUserSeq: number; runAttemptId: string; input: string;
+  modelPin?: MeetingModelPin;
 }) => Promise<unknown>;
 
 async function closeResearchFailure(task: MeetingResearchTask, cancelled: boolean): Promise<void> {
@@ -236,6 +261,8 @@ export function createMeetingResearchTaskDispatch(execute: MeetingResearchExecut
       const source = recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
         text, displayText: text, source: 'meeting_research',
         meetingResearchReference: input.reference, meetingResearchInputDigest: sha(text),
+        ...(boundary.job.captureDigest ? { meetingResearchCaptureDigest: boundary.job.captureDigest } : {}),
+        ...(boundary.job.modelPin ? { meetingResearchModelPin: boundary.job.modelPin } : {}),
         meetingResearchFactRefs: evidence.facts.map(({ id, digest, updatedAt }) => ({ id, digest, updatedAt })),
         learningPolicy: { version: 1, mode: 'exclude', reason: 'owner_opt_out' },
         requestId: boundary.job.clientRequestId, clientRequestId: boundary.job.clientRequestId,
@@ -245,7 +272,8 @@ export function createMeetingResearchTaskDispatch(execute: MeetingResearchExecut
       input.bindTask(task);
       captureFreshSourceSessionContext({ sessionId, sourceUserSeq: source.seq });
       input.verify(); input.signal.throwIfAborted();
-      await execute({ sessionId, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId, input: text });
+      await execute({ sessionId, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId, input: text,
+        ...(boundary.job.modelPin ? { modelPin: boundary.job.modelPin } : {}) });
       input.verify(); input.signal.throwIfAborted();
       const status = meetingResearchTaskStatus(task);
       if (status.status === 'cancelled') { finished = 'cancelled'; return { status: 'cancelled', task }; }
@@ -267,6 +295,7 @@ export function createMeetingResearchTaskDispatch(execute: MeetingResearchExecut
 
 export const meetingResearch = createMeetingResearchCoordinator({
   directory: path.join(BASE_DIR, 'state', 'meeting-capture', 'research'), readMeeting: loadRecallMeetingById,
+  resolveModelPin: id => resolveMeetingModelPin(id, 'live'),
   readDocumentRefs: id => meetingDocuments.getMeetingDocuments(id).documents.map(({ id, revision, digest }) => ({ id, revision, digest })),
   dispatch: createMeetingResearchTaskDispatch(), observe: async task => meetingResearchTaskStatus(task),
 });

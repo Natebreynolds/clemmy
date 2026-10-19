@@ -1,6 +1,7 @@
 import { MeetingLiveTranscript } from '@/components/meetings/MeetingLiveTranscript';
 import { MeetingCompanion } from '@/components/meetings/MeetingCompanion';
 import { LiveMeetingRoom } from '@/components/meetings/LiveMeetingRoom';
+import { MeetingPolicy } from '@/components/meetings/MeetingPolicy';
 import { parseMeetingCaptureTarget, resolveMeetingLiveNavigation, retainedMeetingCapture, type MeetingNavigationSdkStatus, type RetainedMeetingCapture } from '@/lib/meeting-live-navigation';
 import type { MeetingTranscriptSegment } from '@/lib/meeting-transcript-panel';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -463,6 +464,7 @@ export function Meetings() {
 
   return (
     <Page title="Meetings" subtitle={liveRoom ? undefined : 'A little help before, during and after your meeting.'}>
+      <MeetingPolicy />
       {liveRoom ? liveRecord ? <LiveMeetingRoom key={liveRoom.meetingId} meetingId={liveRoom.meetingId}
         title={detail.data?.analysis?.title || rows.find(row => row.id === liveRoom.meetingId)?.title || 'Your meeting'}
         platform={liveRecord.platform ? sentence(liveRecord.platform) : undefined} startedAt={liveRoom.startedAt}

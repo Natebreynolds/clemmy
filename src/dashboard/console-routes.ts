@@ -1,4 +1,5 @@
 import { registerMeetingAssistanceRoutes } from './meeting-assistance-routes.js';
+import { registerMeetingAssistantPolicyRoutes } from './meeting-assistant-policy-routes.js';
 import { registerMeetingResearchRoutes } from './meeting-research-routes.js';
 import { installMeetingResearchService } from '../integrations/recall/meeting-research-service.js';
 import { installMeetingAssistanceModel } from '../integrations/recall/meeting-assistance-model.js';
@@ -562,7 +563,6 @@ import {
   appendMeetingNote,
   ingestRecallTranscriptSegment,
   updateRecallTranscriptDelivery,
-  buildAnalyzerPrompt,
   buildMeetingChatPrompt,
   createRecallSdkUpload,
   deriveRecallMeetingPresentation,
@@ -588,7 +588,8 @@ import {
   type RecallMeetingSettings,
   type RecallRegion,
 } from '../integrations/recall/meeting-capture.js';
-import { captureMeetingAnalysisRequirement } from '../integrations/recall/meeting-analysis-contract.js';
+import { prepareMeetingAnalysisRequest } from '../integrations/recall/meeting-analysis-handoff.js';
+import { queuePreparedMeetingAnalysis } from '../integrations/recall/meeting-analysis-queue.js';
 import { projectMeetingAnalysisState, requestMeetingAnalysisRetry } from '../integrations/recall/meeting-analysis-status.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
 import {
@@ -10568,6 +10569,7 @@ export function registerConsoleRoutes(
     const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
     return isAcceptedMeetingLookup(packet, harnessChatPayloadHash(packet.input, []), receipt, source);
   };
+  registerMeetingAssistantPolicyRoutes(app, isAuthorized);
   registerMeetingAssistanceRoutes(app, isAuthorized, {
     isLookupAccepted,
   });
@@ -10754,7 +10756,7 @@ export function registerConsoleRoutes(
     } catch { res.status(409).json({ error: 'This capture changed. Transcript delivery status was not updated.' }); }
   });
 
-  app.post('/api/console/meetings/recall/complete', (req, res) => {
+  app.post('/api/console/meetings/recall/complete', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const windowId = typeof req.body?.windowId === 'string' ? req.body.windowId : '';
     if (!windowId) { res.status(400).json({ error: 'windowId required' }); return; }
@@ -10808,18 +10810,15 @@ export function registerConsoleRoutes(
       const deferAnalysisUntilCanonical = Boolean(result.record.sdkUploadId)
         && effectiveRetentionMode === 'timed';
       const task = result.artifactPath && settings.analyzeOnComplete && !deferAnalysisUntilCanonical
-        ? createBackgroundTask({
+        ? queuePreparedMeetingAnalysis(result.record.id, {
           title: `Analyze meeting transcript: ${result.record.title || result.record.platform || result.record.id}`,
-          prompt: buildAnalyzerPrompt(result.record, result.artifactPath),
-          requiredOutput: captureMeetingAnalysisRequirement(result.record),
+          ...await prepareMeetingAnalysisRequest(result.record, result.artifactPath),
           source: 'daemon',
           channel: 'electron:meeting-capture',
           maxMinutes: 30,
         })
         : undefined;
-      const responseRecord = task
-        ? (patchMeetingRecord(result.record.id, { analysisTaskId: task.id }) ?? result.record)
-        : result.record;
+      const responseRecord = task ? loadRecallMeetingById(result.record.id) ?? result.record : result.record;
       res.json({
         record: responseRecord,
         artifactPath: result.artifactPath,
@@ -10920,7 +10919,7 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/meetings/recall/:meetingId/analysis/retry', (req, res) => {
+  app.post('/api/console/meetings/recall/:meetingId/analysis/retry', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)
@@ -10928,7 +10927,7 @@ export function registerConsoleRoutes(
       || !(body.expectedTaskId === null || typeof body.expectedTaskId === 'string')) {
       res.status(400).json({ error: 'The current summary task is required.' }); return;
     }
-    try { res.status(202).json(requestMeetingAnalysisRetry(req.params.meetingId, body.expectedTaskId)); }
+    try { res.status(202).json(await requestMeetingAnalysisRetry(req.params.meetingId, body.expectedTaskId)); }
     catch { res.status(409).json({ error: 'This meeting changed or its transcript is unavailable. Refresh it before preparing the summary again.' }); }
   });
 

@@ -8,8 +8,8 @@
  * meeting record so daemon restarts resume rather than lose the handoff.
  */
 import pino from 'pino';
-import { createBackgroundTask } from '../../execution/background-tasks.js';
-import { captureMeetingAnalysisRequirement } from './meeting-analysis-contract.js';
+import { prepareMeetingAnalysisRequest } from './meeting-analysis-handoff.js';
+import { queuePreparedMeetingAnalysis } from './meeting-analysis-queue.js';
 import { reindexVault } from '../../memory/indexer.js';
 import { getSdkUpload, type RecallSdkUpload } from './api.js';
 import {
@@ -18,7 +18,6 @@ import {
   type BackfillResult,
 } from './backfill.js';
 import {
-  buildAnalyzerPrompt,
   deriveRecallMeetingPresentation,
   findRecallMeetingRecord,
   listAllRecallMeetingRecords,
@@ -114,19 +113,18 @@ function retentionModeFor(record: RecallMeetingRecord): 'zero' | 'timed' {
   return record.recallRetentionMode ?? loadRecallMeetingSettings().retentionMode;
 }
 
-function queueAnalysisIfReady(record: RecallMeetingRecord): RecallMeetingRecord {
+async function queueAnalysisIfReady(record: RecallMeetingRecord): Promise<RecallMeetingRecord> {
   if (!record.artifactPath || record.analysisTaskId || loadRecallMeetingAnalysis(record.id)) return record;
   if (!loadRecallMeetingSettings().analyzeOnComplete) return record;
   try { reindexVault(); } catch { /* maintenance will retry indexing */ }
-  const task = createBackgroundTask({
+  queuePreparedMeetingAnalysis(record.id, {
     title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
-    prompt: buildAnalyzerPrompt(record, record.artifactPath),
-    requiredOutput: captureMeetingAnalysisRequirement(record),
+    ...await prepareMeetingAnalysisRequest(record, record.artifactPath),
     source: 'daemon',
     channel: 'electron:meeting-capture',
     maxMinutes: 30,
   });
-  return patchMeetingRecord(record.id, { analysisTaskId: task.id }) ?? record;
+  return loadRecallMeetingById(record.id) ?? record;
 }
 
 async function finishTimedRetentionFlow(
@@ -135,7 +133,7 @@ async function finishTimedRetentionFlow(
 ): Promise<SdkUploadReconcileResult> {
   if (!record.recordingId) return { status: 'failed', reason: 'SDK upload completed without recording id' };
   if (record.canonicalStatus === 'ready') {
-    queueAnalysisIfReady(record);
+    await queueAnalysisIfReady(record);
     return { status: 'complete', recordingId: record.recordingId, backfillStatus: 'ready' };
   }
   const result = await backfill({
@@ -147,7 +145,7 @@ async function finishTimedRetentionFlow(
   // fallback: if canonical retrieval fails and streamed segments produced an
   // artifact, analysis can still run against that partial transcript.
   const refreshed = loadRecallMeetingById(record.id);
-  if (refreshed) queueAnalysisIfReady(refreshed);
+  if (refreshed) await queueAnalysisIfReady(refreshed);
   return {
     status: 'complete',
     recordingId: record.recordingId,

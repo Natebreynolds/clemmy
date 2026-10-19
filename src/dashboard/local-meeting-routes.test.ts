@@ -11,6 +11,8 @@ import express from 'express';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-local-routes-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'http://127.0.0.1:9',
+  BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]', CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off' });
 process.env.NODE_ENV = 'test';
 
 const { registerConsoleRoutes } = await import('./console-routes.js');
@@ -172,6 +174,39 @@ test('Recall final ingress acknowledges only exact persisted events, even if opt
     assert.equal((await unknown.json() as { status: string }).status, 'ignored');
     assert.equal(readFileSync(statePath, 'utf8'), '{ controlled corrupt optional state');
   } finally { await harness.close(); }
+});
+
+test('Recall completion queues one exact pinned recap with handoff and repeat completion rejoins it', async () => {
+  const harness = await boot({ value: true });
+  const settings = recall.loadRecallMeetingSettings(); recall.saveRecallMeetingSettings({ analyzeOnComplete: true });
+  const record = recall.noteRecallMeetingDetected({ windowId: 'controlled-complete-queue', status: 'recording' });
+  recall.appendRecallTranscriptSegment({ windowId: record.windowId, event: 'transcript.data', text: 'Controlled meeting queue transcript.', isFinal: true });
+  try {
+    const complete = () => fetch(`${harness.url}/api/console/meetings/recall/complete`, json('POST', { windowId: record.windowId, recallRetentionMode: 'zero' }));
+    const first = await complete(); assert.equal(first.status, 200);
+    const result = await first.json() as { queuedTask: { id: string }; record: { analysisTaskId: string } };
+    const { getBackgroundTask } = await import('../execution/background-tasks.js');
+    const task = getBackgroundTask(result.queuedTask.id)!;
+    assert.equal(result.record.analysisTaskId, task.id); assert.equal(task.requiredOutput?.meetingId, record.id);
+    assert.equal(task.meetingModelPin?.role, 'brain'); assert.equal(task.model, 'deepseek-chat');
+    assert.match(task.prompt, /Historical live assistance handoff/);
+    const before = recall.loadRecallMeetingById(record.id)!;
+    const { persistMeetingAnalysis } = await import('../tools/meeting-analysis-tools.js');
+    persistMeetingAnalysis({ meeting_id: record.id, analysis: { title: 'Controlled retained recap', summary: 'The controlled recap must survive repeated completion.',
+      decisions: [], actionItems: [], topics: ['Controlled'], participants: [] } });
+    const repeat = await complete(); assert.equal(repeat.status, 200);
+    assert.equal((await repeat.json() as typeof result).queuedTask.id, task.id);
+    const after = recall.loadRecallMeetingById(record.id)!;
+    assert.equal(after.endedAt, before.endedAt);
+    assert.match(readFileSync(after.artifactPath!, 'utf8'), /controlled recap must survive/);
+    assert.equal(recall.loadRecallMeetingAnalysis(record.id)?.summary, 'The controlled recap must survive repeated completion.');
+    const { verifyMeetingAnalysisRequirementTranscript } = await import('../integrations/recall/meeting-analysis-contract.js');
+    assert.equal(verifyMeetingAnalysisRequirementTranscript(task.requiredOutput!, after), true);
+    const revised = recall.applyCanonicalTranscript(after, [{ id: 'controlled-real-canonical-revision', windowId: after.windowId,
+      event: 'transcript.canonical', text: 'A genuinely corrected canonical transcript.', timestamp: after.startedAt, isFinal: true }]);
+    assert.equal(verifyMeetingAnalysisRequirementTranscript(task.requiredOutput!, revised.record), false,
+      'a real canonical correction does not inherit the old transcript acceptance');
+  } finally { recall.saveRecallMeetingSettings(settings); await harness.close(); }
 });
 
 test('delivery status updates are authenticated exact-capture metadata and never restart a completed meeting', async () => {

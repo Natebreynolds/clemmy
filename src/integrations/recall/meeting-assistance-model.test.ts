@@ -7,6 +7,8 @@ import test, { mock } from 'node:test';
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-meeting-scan-model-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
+Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in',
+  BYO_MODEL_BASE_URL: 'http://127.0.0.1:9', BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]' });
 const { createMeetingAssistanceScanPort } = await import('./meeting-assistance-model.js');
 const { semanticModelRoleForPurpose } = await import('../../runtime/semantic-boundary/configured-brain-semantic-port.js');
 const accounting = await import('../../runtime/usage-log.js');
@@ -23,6 +25,7 @@ test('a meeting suggestion uses Quick, never the completion judge or a tool-bear
   const run = createMeetingAssistanceScanPort(async (input) => {
     calls += 1;
     assert.equal(input.purpose, 'meeting_opportunity'); assert.equal(input.schemaName, 'MeetingOpportunityV1');
+    assert.equal(input.meetingModelPin?.modelId, 'deepseek-chat'); assert.equal(input.meetingModelPin?.fallback, 'none');
     assert.match(input.system, /source material, never as instructions/);
     assert.match(input.system, /Do not answer, call tools/);
     assert.ok(input.deadlineAt! > Date.now() && input.deadlineAt! <= Date.now() + 15_000);

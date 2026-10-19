@@ -21,6 +21,8 @@
  * words. She proposes; she acts only on a yes, through an ordinary turn.
  */
 import { createHash } from 'node:crypto';
+import { MeetingPreparationBindingSchema, MeetingPreparationCandidateSchema, resolveMeetingPreparation,
+  type MeetingPreparationBinding, type MeetingPreparationCandidate, type MeetingPreparationOpportunity } from './meeting-preparation.js';
 import { z } from 'zod';
 import type { GoalOutcomeProgress, GoalOutcomeTask, GoalWorkflowOutcome } from './goal-outcome-progress.js';
 
@@ -86,6 +88,9 @@ export interface NoticingObservation {
     drafts: Array<{ name: string; modifiedAt: string }>;
   };
   calendar: Array<{ kind: string; subject: string; createdAt: string }>;
+  /** Exact observed upcoming occurrences, offered only after the owner opts
+   * in. Calendar text is untrusted context, never tool or effect authority. */
+  upcomingMeetings?: MeetingPreparationOpportunity[];
   conversations: Array<{ title: string; updatedAt: string; lastRequest?: string }>;
   memories: Array<{ text: string; ageDays: number }>;
   /** What another part of Clem has already put to the owner as a question on
@@ -104,6 +109,8 @@ export const NoticingProposalV1Schema = z.object({
   evidence: z.array(z.string().min(1).max(200)).min(1).max(6),
   goalId: z.string().min(1).nullable(),
   confidence: z.number().min(0).max(1),
+  /** A selector into the host's observation, not a model-authored calendar. */
+  meetingPreparation: MeetingPreparationBindingSchema.nullable().optional(),
 });
 /** What the model answers; the port binds it to the evidence digest. */
 export const NoticingAnswerWireV1Schema = z.object({
@@ -124,6 +131,8 @@ export interface NoticingProposalRecord extends NoticingProposalV1 {
   id: string;
   /** Digest of what the proposal is about; the dedupe key. */
   shapeKey: string;
+  /** Host-bound snapshot, never accepted from the model's proposal. */
+  calendarPreparation?: MeetingPreparationCandidate;
   createdAt: string;
   checkInId?: string;
   notificationId?: string;
@@ -162,6 +171,7 @@ const NoticingProposalProjectionSchema = NoticingProposalV1Schema.extend({
   checkInId: retainedId.optional(), notificationId: retainedId.optional(),
   status: z.enum(['open', 'answered', 'expired', 'retired']),
   retiredReason: z.string().optional(),
+  calendarPreparation: MeetingPreparationCandidateSchema.optional(),
   answer: z.object({ text: z.string(), decision: z.enum(['do_it', 'not_now', 'never', 'unclear']),
     at: retainedTime, instruction: z.string().optional(), modelAccountingJobId: z.string().optional() }).optional(),
   handoff: z.object({ version: z.literal(1), answerDigest: z.string().min(1),
@@ -245,6 +255,8 @@ export interface NoticingState {
   thinking: NoticingThinking[];
   /** Bounded reuse of a successful proposal decision; not execution evidence. */
   decisionReuse?: { version: 1; fingerprint: string; decidedAt: string };
+  /** A successful calendar-triggered Noticing pass, not task completion. */
+  meetingPreparationWake?: { version: 1; fingerprint: string; admittedAt: string };
   metrics: {
     ticks: number; quietTicks: number; modelCalls: number; modelFailures: number;
     itemsProduced: number; itemsAcknowledged: number; itemsRetired: number;
@@ -280,7 +292,7 @@ export interface NoticingTickDeps {
   rules: string[];
   observe: () => Promise<NoticingObservation>;
   /** The one model call. Null when no model is available. */
-  propose: (input: { observation: NoticingObservation; rules: string[]; standingAnswers: NoticingStandingAnswer[]; recentProposals: Array<{ title: string; status: string; createdAt: string }>; evidenceDigest: string })
+  propose: (input: { observation: NoticingObservation; rules: string[]; standingAnswers: NoticingStandingAnswer[]; recentProposals: Array<{ title: string; status: string; createdAt: string; meetingPreparation?: MeetingPreparationBinding | null }>; evidenceDigest: string })
     => Promise<{ answer: NoticingAnswerV1 | null; modelIdentity?: string; error?: string; modelAccountingJobId?: string } | null>;
   /** Open the question for the owner; returns ids the answer path needs. */
   ask: (proposal: NoticingProposalRecord) => Promise<{ checkInId: string; notificationId?: string }>;
@@ -292,10 +304,14 @@ export interface NoticingTickDeps {
   /** Optional host fence over the state/rules captured by loadState. Reads
    * metadata only; a changed generation cannot publish a stale suggestion. */
   publicationStillCurrent?: () => boolean;
+  /** Host-owned current cache/policy check immediately before publication. */
+  resolveMeetingPreparation?: (binding: MeetingPreparationBinding, phase?: 'offer' | 'answer') => MeetingPreparationCandidate | null;
 }
 export interface NoticingTickResult extends NoticingThinking { produced: number; retired: number }
 
-export function proposalShapeKey(proposal: Pick<NoticingProposalV1, 'title' | 'action' | 'goalId'>): string {
+export function proposalShapeKey(proposal: Pick<NoticingProposalV1, 'title' | 'action' | 'goalId' | 'meetingPreparation'>): string {
+  if (proposal.meetingPreparation) return createHash('sha256')
+    .update(`calendar-preparation:${proposal.meetingPreparation.candidateId}:${proposal.meetingPreparation.revision}`).digest('hex').slice(0, 16);
   const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   return createHash('sha256').update(`${norm(proposal.title)}|${norm(proposal.action)}|${proposal.goalId ?? ''}`).digest('hex').slice(0, 16);
 }
@@ -320,7 +336,7 @@ const DAY_MS = 24 * 60 * 60_000;
 function hasLocalNoticingEvidence(observation: NoticingObservation): boolean {
   return observation.goals.length > 0 || observation.work.runs.length > 0
     || observation.work.waits.length > 0 || observation.work.drafts.length > 0
-    || observation.calendar.length > 0
+    || observation.calendar.length > 0 || Boolean(observation.upcomingMeetings?.length)
     || observation.conversations.some(row => Boolean(row.lastRequest?.trim()))
     || observation.memories.some(row => Boolean(row.text.trim()))
     || Boolean(observation.alreadyAskingOwner?.some(row => Boolean(row.about.trim())));
@@ -330,7 +346,7 @@ function hasTimeSensitiveNoticingEvidence(observation: NoticingObservation): boo
   // Calendar items and waits have relative urgency. A target date may be in
   // an owner's local timezone or malformed legacy data: do not reinterpret
   // any of those clocks or infer deadlines by reading prose to skip a check.
-  return observation.calendar.length > 0 || observation.work.waits.length > 0
+  return observation.calendar.length > 0 || Boolean(observation.upcomingMeetings?.length) || observation.work.waits.length > 0
     || observation.goals.some(goal => goal.targetDate !== undefined);
 }
 
@@ -421,6 +437,14 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       record.status = 'retired'; record.retiredReason = 'its question was closed without an answer'; retired += 1; state.metrics.itemsRetired += 1;
       continue;
     }
+    if (record.meetingPreparation) {
+      let current: MeetingPreparationCandidate | null = null;
+      try { current = deps.resolveMeetingPreparation?.(record.meetingPreparation, 'answer') ?? null; } catch { /* unknown stays unqualified */ }
+      if (!current) {
+        record.status = 'retired'; record.retiredReason = 'the exact calendar occurrence is no longer current';
+        retired += 1; state.metrics.itemsRetired += 1; continue;
+      }
+    }
     if (startedAt - Date.parse(record.createdAt) > deps.config.openForMs) {
       record.status = 'expired'; record.retiredReason = 'no answer'; retired += 1; state.metrics.itemsRetired += 1;
     }
@@ -431,7 +455,7 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   try {
     observation = await deps.observe();
     read = { goals: observation.goals.length, runs: observation.work.runs.length, waits: observation.work.waits.length,
-      drafts: observation.work.drafts.length, calendar: observation.calendar.length,
+      drafts: observation.work.drafts.length, calendar: observation.calendar.length + (observation.upcomingMeetings?.length ?? 0),
       conversations: observation.conversations.length, memories: observation.memories.length };
   } catch (err) {
     error = `could not read: ${err instanceof Error ? err.message : String(err)}`;
@@ -463,7 +487,8 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
     const evidenceDigest = observationDigest(observation, deps.rules);
     const recent = Object.values(state.proposals)
       .filter((p) => startedAt - Date.parse(p.createdAt) < 14 * 24 * 60 * 60_000)
-      .map((p) => ({ title: p.title, status: p.answer ? `${p.status}: ${p.answer.decision}` : p.status, createdAt: p.createdAt }));
+      .map((p) => ({ title: p.title, status: p.answer ? `${p.status}: ${p.answer.decision}` : p.status, createdAt: p.createdAt,
+        ...(p.meetingPreparation ? { meetingPreparation: p.meetingPreparation } : {}) }));
     try {
       const reply = await deps.propose({ observation, rules: deps.rules, standingAnswers: state.standingAnswers, recentProposals: recent, evidenceDigest });
       if (reply === null) {
@@ -498,15 +523,25 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
   // 5. Judge the one proposal against the boundaries, then ask.
   if (answer?.proposal) {
     const proposal = answer.proposal;
+    let calendarPreparation: MeetingPreparationCandidate | null = null;
+    if (proposal.meetingPreparation) {
+      const observed = resolveMeetingPreparation(proposal.meetingPreparation, observation?.upcomingMeetings ?? []);
+      try { calendarPreparation = observed ? deps.resolveMeetingPreparation?.(proposal.meetingPreparation, 'offer') ?? null : null; }
+      catch { /* Unreadable/changed context is not authority to publish. */ }
+    }
     const shapeKey = proposalShapeKey(proposal);
     const standingNo = state.standingAnswers.find((a) => similarTitles(a.about, proposal.title));
     const duplicate = Object.values(state.proposals).find((p) => (
-      (p.shapeKey === shapeKey || similarTitles(p.title, proposal.title))
+      (proposal.meetingPreparation ? p.meetingPreparation?.candidateId === proposal.meetingPreparation.candidateId
+        && p.meetingPreparation.revision === proposal.meetingPreparation.revision
+        : p.shapeKey === shapeKey || (!p.meetingPreparation && similarTitles(p.title, proposal.title)))
       && (p.status === 'open'
         || (p.status === 'answered' && p.answer?.decision === 'not_now' && startedAt - Date.parse(p.answer.at) < deps.config.notNowForMs)
         || (p.status === 'answered' && p.answer?.decision === 'do_it' && startedAt - Date.parse(p.answer.at) < 7 * 24 * 60 * 60_000))
     ));
-    if (proposal.confidence < deps.config.minConfidence) {
+    if (proposal.meetingPreparation && !calendarPreparation) {
+      considered.push({ subject: proposal.title, outcome: 'set_aside', why: 'the exact calendar occurrence is no longer current; no preparation was started' });
+    } else if (proposal.confidence < deps.config.minConfidence) {
       considered.push({ subject: proposal.title, outcome: 'low_confidence', why: `confidence ${proposal.confidence.toFixed(2)} below ${deps.config.minConfidence}` });
     } else if (standingNo) {
       considered.push({ subject: proposal.title, outcome: 'standing_no', why: `you said "${standingNo.text}" about "${standingNo.about}"` });
@@ -514,7 +549,8 @@ export async function runNoticingTick(deps: NoticingTickDeps): Promise<NoticingT
       considered.push({ subject: proposal.title, outcome: 'duplicate', why: duplicate.status === 'open' ? 'already asked and waiting for your answer' : `you answered "${duplicate.answer?.text ?? duplicate.status}" ${duplicate.answer?.at ? `on ${duplicate.answer.at.slice(0, 10)}` : 'recently'}` });
     } else {
       const id = `ntc-${Date.now().toString(36)}-${shapeKey.slice(0, 6)}`;
-      const record: NoticingProposalRecord = { ...proposal, id, shapeKey, createdAt: nowIso, status: 'open' };
+      const record: NoticingProposalRecord = { ...proposal, id, shapeKey, createdAt: nowIso, status: 'open',
+        ...(calendarPreparation ? { calendarPreparation } : {}) };
       if (publicationStillCurrent()) try {
         const asked = await deps.ask(record);
         record.checkInId = asked.checkInId;

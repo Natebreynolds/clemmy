@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { BASE_DIR } from '../../config.js';
 import { withFileLockSyncStrict } from '../../runtime/atomic-json.js';
 import { loadRecallMeetingById, type RecallMeetingRecord } from './meeting-capture.js';
+import { MeetingModelPinSchema, type MeetingModelPin } from './meeting-assistant-policy.js';
 
 const DEBOUNCE_MS = 1_500;
 const MIN_SCAN_INTERVAL_MS = 20_000;
@@ -36,6 +37,7 @@ export interface MeetingAssistanceScanResult {
   candidate: MeetingAssistanceCandidate | null;
   modelIdentity?: string;
   modelAccountingJobId?: string;
+  modelPin?: MeetingModelPin;
 }
 export type MeetingAssistanceScanPort = (input: MeetingAssistanceScanInput) => Promise<MeetingAssistanceScanResult>;
 
@@ -53,9 +55,10 @@ const offerSchema = z.object({
   createdAt: z.number().finite(), expiresAt: z.number().finite(),
   state: z.enum(['open', 'lookup_prepared', 'dismissed', 'deferred', 'expired', 'research_queued']),
   packet: packetSchema.optional(), preparedAt: z.number().finite().optional(), modelIdentity: z.string().max(512).optional(), modelAccountingJobId: z.string().max(512).optional(),
+  modelPin: MeetingModelPinSchema.optional(),
 }).strict();
 type StoredOffer = z.infer<typeof offerSchema>;
-export type MeetingAssistanceOffer = Omit<StoredOffer, 'evidence' | 'packet' | 'preparedAt' | 'modelIdentity' | 'modelAccountingJobId'> & {
+export type MeetingAssistanceOffer = Omit<StoredOffer, 'evidence' | 'packet' | 'preparedAt' | 'modelIdentity' | 'modelAccountingJobId' | 'modelPin'> & {
   lookup?: { sessionId: string; clientRequestId: string };
 };
 const stateSchema = z.object({
@@ -129,7 +132,7 @@ function packetFor(id: string, offer: StoredOffer, choice: {
     segmentIds: [...offer.segmentIds], question: offer.question, why: offer.why, quote: offer.quote, input, clientRequestId, privateOriginSessionId, ...choice }));
 }
 function publicOffer(offer: StoredOffer, now: number): MeetingAssistanceOffer {
-  const { evidence: _evidence, packet, preparedAt: _preparedAt, modelIdentity: _modelIdentity, modelAccountingJobId: _jobId, ...publicFields } = offer;
+  const { evidence: _evidence, packet, preparedAt: _preparedAt, modelIdentity: _modelIdentity, modelAccountingJobId: _jobId, modelPin: _pin, ...publicFields } = offer;
   return { ...publicFields, state: offer.state === 'open' && offer.expiresAt <= now ? 'expired' : offer.state,
     ...(packet ? { lookup: { sessionId: packet.privateOriginSessionId, clientRequestId: packet.clientRequestId } } : {}) };
 }
@@ -340,6 +343,7 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
       const offer: StoredOffer = { ...candidate, id: randomUUID(), digest: '', sourceDigest: claim.sourceDigest, evidence: claim.segments,
         createdAt: now(), expiresAt: now() + OFFER_TTL_MS, state: 'open',
         ...(typeof response.modelIdentity === 'string' ? { modelIdentity: response.modelIdentity.slice(0, 512) } : {}),
+        ...(response.modelPin ? { modelPin: MeetingModelPinSchema.parse(response.modelPin) } : {}),
         ...(typeof response.modelAccountingJobId === 'string' ? { modelAccountingJobId: response.modelAccountingJobId.slice(0, 512) } : {}) };
       offer.digest = offerIdentity(offer); state.offers.push(offer);
     });
@@ -417,7 +421,17 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
     });
     request(id);
   };
-  return { getMeetingAssistance: get, setMeetingAssistance: set, requestMeetingAssistanceCheck: request,
+  const readHandoff = (id: string) => {
+    const record = recordFor(id); const state = read(id, record);
+    if (state.captureDigest !== captureDigest(record)) throw new Error('Meeting assistance capture changed.');
+    // Historical stream evidence remains historical after canonical corrections.
+    return freeze({ captureDigest: state.captureDigest, version: state.version,
+      offers: state.offers.filter(offer => offer.state !== 'dismissed').map(offer => ({
+        id: offer.id, digest: offer.digest, question: offer.question, quote: offer.quote,
+        sourceDigest: offer.sourceDigest, segmentIds: [...offer.segmentIds], state: offer.state,
+      })) });
+  };
+  return { getMeetingAssistance: get, readMeetingAssistanceHandoff: readHandoff, setMeetingAssistance: set, requestMeetingAssistanceCheck: request,
     checkMeetingAssistance: check, prepareMeetingLookup: prepare, readPreparedMeetingLookup: readPrepared,
     decideMeetingAssistanceOffer: decide, markMeetingOfferResearchQueued: markResearchQueued,
     registerMeetingAssistanceListener: (value: ((id: string) => void) | null) => { listener = value; },
@@ -425,6 +439,6 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
 }
 
 const coordinator = createMeetingAssistanceCoordinator({ directory: path.join(BASE_DIR, 'state', 'meeting-capture', 'assistance'), readMeeting: loadRecallMeetingById });
-export const { getMeetingAssistance, setMeetingAssistance, requestMeetingAssistanceCheck, checkMeetingAssistance,
+export const { getMeetingAssistance, readMeetingAssistanceHandoff, setMeetingAssistance, requestMeetingAssistanceCheck, checkMeetingAssistance,
   prepareMeetingLookup, readPreparedMeetingLookup, decideMeetingAssistanceOffer, registerMeetingAssistanceScanPort,
   markMeetingOfferResearchQueued, registerMeetingAssistanceListener } = coordinator;

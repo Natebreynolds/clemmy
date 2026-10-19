@@ -705,7 +705,7 @@
           "bytes": 86552
         },
         "src/agents/proactivity-policy.ts": {
-          "bytes": 12867
+          "bytes": 14535
         },
         "src/runtime/semantic-boundary/admitted-capability-ref.ts": {
           "bytes": 432
@@ -764,8 +764,11 @@
         "src/spaces/read-preparation-source.ts": {
           "bytes": 4042
         },
+        "src/agents/meeting-preparation.ts": {
+          "bytes": 11187
+        },
         "src/agents/calendar-watch.ts": {
-          "bytes": 35327
+          "bytes": 37326
         },
         "src/agents/calendar-read-recipe.ts": {
           "bytes": 13937
@@ -954,7 +957,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 31436
+          "bytes": 34558
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -962,8 +965,14 @@
         "src/integrations/recall/meeting-opportunity.ts": {
           "bytes": 1789
         },
+        "src/integrations/recall/meeting-assistant-policy.ts": {
+          "bytes": 10414
+        },
+        "src/integrations/recall/meeting-model-execution.ts": {
+          "bytes": 1231
+        },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 72167
+          "bytes": 73633
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 31707
@@ -1104,7 +1113,7 @@
           "bytes": 4648
         },
         "src/runtime/harness/noticing-approved-task.ts": {
-          "bytes": 8004
+          "bytes": 8164
         },
         "src/runtime/harness/reviewed-local-null-arguments.ts": {
           "bytes": 1138
@@ -2174,6 +2183,36 @@
         "src/agents/work-review-runtime.ts": {
           "bytes": 13075
         },
+        "src/execution/workflow-capability-digest.ts": {
+          "bytes": 645
+        },
+        "src/execution/workflow-live-call-compiler.ts": {
+          "bytes": 27653
+        },
+        "src/execution/workflow-node-invocation-admission.ts": {
+          "bytes": 18493
+        },
+        "src/runtime/harness/canonical-graph-node-lease.ts": {
+          "bytes": 6397
+        },
+        "src/runtime/harness/physical-io-claim.ts": {
+          "bytes": 16323
+        },
+        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
+          "bytes": 61144
+        },
+        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
+          "bytes": 24685
+        },
+        "src/execution/workflow-node-invocation-executor.ts": {
+          "bytes": 46337
+        },
+        "src/execution/workflow-step-external-catalog.ts": {
+          "bytes": 36674
+        },
+        "src/agents/calendar-watch-runtime.ts": {
+          "bytes": 53047
+        },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
         },
@@ -2765,14 +2804,8 @@
         "src/runtime/graph/capability-edge-kinds.ts": {
           "bytes": 2175
         },
-        "src/runtime/harness/canonical-graph-node-lease.ts": {
-          "bytes": 6397
-        },
         "src/runtime/harness/physical-crossing-identity.ts": {
           "bytes": 896
-        },
-        "src/runtime/harness/physical-io-claim.ts": {
-          "bytes": 16323
         },
         "src/runtime/harness/activation-liveness.ts": {
           "bytes": 2537
@@ -2846,12 +2879,6 @@
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
-        "src/execution/workflow-capability-digest.ts": {
-          "bytes": 645
-        },
-        "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 27653
-        },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 731505
         },
@@ -2863,24 +2890,6 @@
         },
         "src/agents/goal-outcome-progress.ts": {
           "bytes": 26486
-        },
-        "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18493
-        },
-        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 61144
-        },
-        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
-          "bytes": 24685
-        },
-        "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 46337
-        },
-        "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 36674
-        },
-        "src/agents/calendar-watch-runtime.ts": {
-          "bytes": 49624
         },
         "src/dashboard/from-clem.ts": {
           "bytes": 14415
@@ -3000,7 +3009,7 @@
           "bytes": 29535
         },
         "src/agents/noticing-runtime.ts": {
-          "bytes": 39103
+          "bytes": 46183
         },
         "src/agents/workflow-suggestions.ts": {
           "bytes": 34442
@@ -3555,7 +3564,7 @@
           "bytes": 8039
         },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 93262
+          "bytes": 94555
         },
         "src/integrations/recall/meeting-analysis-contract.ts": {
           "bytes": 6715
@@ -3726,7 +3735,7 @@
           "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 319185
+          "bytes": 320790
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -3900,7 +3909,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27814
+          "bytes": 29490
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444
@@ -4650,7 +4659,7 @@
           "bytes": 86552
         },
         "src/agents/proactivity-policy.ts": {
-          "bytes": 12867
+          "bytes": 14535
         },
         "src/runtime/semantic-boundary/admitted-capability-ref.ts": {
           "bytes": 432
@@ -4709,8 +4718,11 @@
         "src/spaces/read-preparation-source.ts": {
           "bytes": 4042
         },
+        "src/agents/meeting-preparation.ts": {
+          "bytes": 11187
+        },
         "src/agents/calendar-watch.ts": {
-          "bytes": 35327
+          "bytes": 37326
         },
         "src/agents/calendar-read-recipe.ts": {
           "bytes": 13937
@@ -4899,7 +4911,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 31436
+          "bytes": 34558
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -4907,8 +4919,14 @@
         "src/integrations/recall/meeting-opportunity.ts": {
           "bytes": 1789
         },
+        "src/integrations/recall/meeting-assistant-policy.ts": {
+          "bytes": 10414
+        },
+        "src/integrations/recall/meeting-model-execution.ts": {
+          "bytes": 1231
+        },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 72167
+          "bytes": 73633
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 31707
@@ -5049,7 +5067,7 @@
           "bytes": 4648
         },
         "src/runtime/harness/noticing-approved-task.ts": {
-          "bytes": 8004
+          "bytes": 8164
         },
         "src/runtime/harness/reviewed-local-null-arguments.ts": {
           "bytes": 1138
@@ -6119,6 +6137,36 @@
         "src/agents/work-review-runtime.ts": {
           "bytes": 13075
         },
+        "src/execution/workflow-capability-digest.ts": {
+          "bytes": 645
+        },
+        "src/execution/workflow-live-call-compiler.ts": {
+          "bytes": 27653
+        },
+        "src/execution/workflow-node-invocation-admission.ts": {
+          "bytes": 18493
+        },
+        "src/runtime/harness/canonical-graph-node-lease.ts": {
+          "bytes": 6397
+        },
+        "src/runtime/harness/physical-io-claim.ts": {
+          "bytes": 16323
+        },
+        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
+          "bytes": 61144
+        },
+        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
+          "bytes": 24685
+        },
+        "src/execution/workflow-node-invocation-executor.ts": {
+          "bytes": 46337
+        },
+        "src/execution/workflow-step-external-catalog.ts": {
+          "bytes": 36674
+        },
+        "src/agents/calendar-watch-runtime.ts": {
+          "bytes": 53047
+        },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
         },
@@ -6710,14 +6758,8 @@
         "src/runtime/graph/capability-edge-kinds.ts": {
           "bytes": 2175
         },
-        "src/runtime/harness/canonical-graph-node-lease.ts": {
-          "bytes": 6397
-        },
         "src/runtime/harness/physical-crossing-identity.ts": {
           "bytes": 896
-        },
-        "src/runtime/harness/physical-io-claim.ts": {
-          "bytes": 16323
         },
         "src/runtime/harness/activation-liveness.ts": {
           "bytes": 2537
@@ -6791,12 +6833,6 @@
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
-        "src/execution/workflow-capability-digest.ts": {
-          "bytes": 645
-        },
-        "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 27653
-        },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 731505
         },
@@ -6808,24 +6844,6 @@
         },
         "src/agents/goal-outcome-progress.ts": {
           "bytes": 26486
-        },
-        "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18493
-        },
-        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 61144
-        },
-        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
-          "bytes": 24685
-        },
-        "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 46337
-        },
-        "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 36674
-        },
-        "src/agents/calendar-watch-runtime.ts": {
-          "bytes": 49624
         },
         "src/dashboard/from-clem.ts": {
           "bytes": 14415
@@ -6945,7 +6963,7 @@
           "bytes": 29535
         },
         "src/agents/noticing-runtime.ts": {
-          "bytes": 39103
+          "bytes": 46183
         },
         "src/agents/workflow-suggestions.ts": {
           "bytes": 34442
@@ -7500,7 +7518,7 @@
           "bytes": 8039
         },
         "src/integrations/recall/meeting-capture.ts": {
-          "bytes": 93262
+          "bytes": 94555
         },
         "src/integrations/recall/meeting-analysis-contract.ts": {
           "bytes": 6715
@@ -7671,7 +7689,7 @@
           "bytes": 8507
         },
         "src/execution/background-tasks.ts": {
-          "bytes": 319185
+          "bytes": 320790
         },
         "src/execution/continuation-capsule.ts": {
           "bytes": 38919
@@ -7845,7 +7863,7 @@
           "bytes": 15631
         },
         "src/runtime/harness/model-role-options.ts": {
-          "bytes": 27814
+          "bytes": 29490
         },
         "src/runtime/harness/model-role-settings.ts": {
           "bytes": 4444

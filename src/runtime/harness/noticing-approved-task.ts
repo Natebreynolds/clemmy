@@ -5,12 +5,14 @@ import { z } from 'zod';
 import { getHarnessChatRequestReceipt, listEvents, openEventLog } from './eventlog.js';
 import { MAX_CLARIFICATION_SOURCE_CHAIN_PACKETS, readConsumedTaskContinuityPacket } from '../../memory/task-continuity.js';
 import type { TaskContinuationContext } from '../../types.js';
+import { MeetingPreparationCandidateSchema } from '../../agents/meeting-preparation.js';
 
 const string = z.string();
 const packetSchema = z.object({
   version: z.literal(1),
   proposal: z.object({ id: string, checkInId: string, title: string, action: string,
-    why: string, evidence: z.array(string), goalId: string.nullable(), createdAt: string }).strict(),
+    why: string, evidence: z.array(string), goalId: string.nullable(), createdAt: string,
+    calendarPreparation: MeetingPreparationCandidateSchema.optional() }).strict(),
   checkIn: z.object({ id: string, question: string, contextSummary: string.optional(),
     answer: string, answeredAt: string }).strict(),
   decision: z.object({ kind: z.literal('do_it'), instruction: string.optional(), modelIdentity: string.optional() }).strict(),

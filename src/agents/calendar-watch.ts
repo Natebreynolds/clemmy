@@ -31,6 +31,8 @@
  */
 import { createHash } from 'node:crypto';
 import type { NotificationRecord } from '../runtime/notifications.js';
+import { CalendarPreparationReadSchema, calendarPreparationEventsDigest,
+  type CalendarPreparationRead, type CalendarPreparationSnapshot } from './meeting-preparation.js';
 
 export interface CalEvent {
   id: string;
@@ -53,6 +55,8 @@ export interface CalendarWatchAccountRead {
   accountId: string;
   accountLabel: string;
   events: CalEvent[];
+  /** Successful exact read context only, never execution authority. */
+  preparationEvidence?: CalendarPreparationRead;
 }
 
 export interface CalendarWatchReadFailure {
@@ -149,6 +153,9 @@ export interface CalendarWatchState {
   snapshotAt?: string;
   /** accountId → eventId → event, for the last successfully read window. */
   snapshot: Record<string, Record<string, CalEvent>>;
+  /** Per-account evidence. A later successful account cannot freshen a failed
+   * account; older caches without this field cannot seed preparation. */
+  snapshotEvidence?: Record<string, CalendarPreparationSnapshot>;
   items: Record<string, CalendarWatchItem>;
   metrics: CalendarWatchMetrics;
   lastFinding?: CalendarWatchFinding;
@@ -639,6 +646,7 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
   // 1. Deterministic diff per account that was read successfully.
   const changes: CalendarWatchChange[] = [];
   const currentByAccount: Record<string, Record<string, CalEvent>> = {};
+  const evidenceByAccount: Record<string, CalendarPreparationSnapshot> = {};
   const eventsSeen: Array<CalEvent & { accountId: string }> = [];
   for (const read of reads) {
     const current: Record<string, CalEvent> = {};
@@ -647,6 +655,14 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
       eventsSeen.push({ ...ev, accountId: read.accountId });
     }
     currentByAccount[read.accountId] = current;
+    const proof = CalendarPreparationReadSchema.safeParse(read.preparationEvidence);
+    // An unexpanded series or ambiguous repeated provider id cannot identify
+    // the particular occurrence represented by this keyed cache.
+    if (proof.success && proof.data.operationId === read.operationId && proof.data.accountId === read.accountId
+      && new Set(read.events.map(event => event.id)).size === read.events.length) {
+      try { evidenceByAccount[read.accountId] = { ...proof.data, eventsDigest: calendarPreparationEventsDigest(current) }; }
+      catch { /* Optional preparation context never breaks the ordinary watch. */ }
+    }
     changes.push(...detectCalendarChanges({
       operationId: read.operationId,
       accountId: read.accountId,
@@ -829,6 +845,19 @@ export async function processCalendarWatchTick(deps: CalendarWatchDeps): Promise
 
   // 6. Snapshot advances only for accounts read this tick; prune old items.
   for (const [accountId, current] of Object.entries(currentByAccount)) state.snapshot[accountId] = current;
+  state.snapshotEvidence ??= {};
+  for (const [accountId] of Object.entries(currentByAccount)) {
+    delete state.snapshotEvidence[accountId];
+    if (evidenceByAccount[accountId]) state.snapshotEvidence[accountId] = evidenceByAccount[accountId]!;
+  }
+  // A failed attempted account is not current preparation evidence even
+  // though its old snapshot remains useful for ordinary watch diffs.
+  for (const failure of failures) {
+    if (failure.accountId) delete state.snapshotEvidence[failure.accountId];
+    else for (const [accountId, proof] of Object.entries(state.snapshotEvidence)) {
+      if (!currentByAccount[accountId] && (proof.operationId === failure.operationId || failure.operationId === 'calendar')) delete state.snapshotEvidence[accountId];
+    }
+  }
   if (reads.length > 0) state.snapshotAt = new Date(nowMs).toISOString();
   const keepAfter = nowMs - 7 * 24 * 60 * 60 * 1000;
   for (const [key, item] of Object.entries(state.items)) {

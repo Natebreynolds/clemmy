@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { createBackgroundTask, getBackgroundTask } from '../../execution/background-tasks.js';
+import { getBackgroundTask } from '../../execution/background-tasks.js';
 import { getUserInputEventAtSequence } from '../../runtime/harness/eventlog.js';
 import { captureMeetingAnalysisRequirement, MEETING_ANALYSIS_CONTENT, meetingAnalysisRequirementSchema, verifyMeetingAnalysisOutput } from './meeting-analysis-contract.js';
-import { analysisPathFor, buildAnalyzerPrompt, loadRecallMeetingAnalysis, loadRecallMeetingById, meetingArtifactMatchesAnalysis, patchMeetingRecord, type RecallMeetingRecord } from './meeting-capture.js';
+import { analysisPathFor, loadRecallMeetingAnalysis, loadRecallMeetingById, meetingArtifactMatchesAnalysis, type RecallMeetingRecord } from './meeting-capture.js';
+import { prepareMeetingAnalysisRequest } from './meeting-analysis-handoff.js';
+import { MeetingModelPinSchema } from './meeting-assistant-policy.js';
+import { queuePreparedMeetingAnalysis } from './meeting-analysis-queue.js';
 
 export interface MeetingAnalysisState {
   status: 'off' | 'queued' | 'running' | 'complete' | 'failed' | 'incomplete' | 'unavailable';
@@ -47,7 +50,7 @@ export function projectMeetingAnalysisState(record: RecallMeetingRecord, enabled
 
 /** Explicit owner retry only. Replays rejoin one prepared task; an active or
  * parked worker retains its ownership instead of gaining a duplicate. */
-export function requestMeetingAnalysisRetry(meetingId: string, expectedTaskId: string | null): { taskId: string } {
+export async function requestMeetingAnalysisRetry(meetingId: string, expectedTaskId: string | null): Promise<{ taskId: string }> {
   const record = loadRecallMeetingById(meetingId);
   if (!record || (record.analysisTaskId ?? null) !== expectedTaskId) {
     throw new Error('This meeting changed. Refresh it before preparing the summary again.');
@@ -66,13 +69,19 @@ export function requestMeetingAnalysisRetry(meetingId: string, expectedTaskId: s
   if (prior && !['done', 'failed', 'blocked', 'aborted'].includes(prior.status)) return { taskId: prior.id };
   const requiredOutput = captureMeetingAnalysisRequirement(record);
   const key = createHash('sha256').update(JSON.stringify({ meetingId, prior: expectedTaskId, requiredOutput })).digest('hex');
-  const task = createBackgroundTask({
-    explicitId: `bg-meeting-${key}`,
+  const priorPin = prior && Object.prototype.hasOwnProperty.call(prior, 'meetingModelPin')
+    ? MeetingModelPinSchema.parse(prior.meetingModelPin) : undefined;
+  const priorRequired = meetingAnalysisRequirementSchema.safeParse(prior?.requiredOutput);
+  // An explicit retry of the same source keeps the accepted context and model,
+  // even if meeting preferences or live lookup state changed in the meantime.
+  const prepared = priorPin && priorRequired.success && priorRequired.data.transcriptDigest === requiredOutput.transcriptDigest
+    ? { prompt: prior!.prompt, requiredOutput, meetingModelPin: priorPin, model: priorPin.modelId }
+    : await prepareMeetingAnalysisRequest(record, record.artifactPath!, { ...(priorPin ? { modelPin: priorPin } : {}) });
+  const task = queuePreparedMeetingAnalysis(record.id, {
     title: `Prepare meeting summary: ${record.title || record.platform || record.id}`,
-    prompt: buildAnalyzerPrompt(record, record.artifactPath!),
-    requiredOutput,
+    ...prepared,
+    explicitId: `bg-meeting-${key}`,
     source: 'daemon', channel: 'electron:meeting-capture', maxMinutes: 30,
-  });
-  patchMeetingRecord(record.id, { analysisTaskId: task.id, analysisError: undefined, analysisUpdatedAt: new Date().toISOString() });
+  }, { expectedTaskId });
   return { taskId: task.id };
 }

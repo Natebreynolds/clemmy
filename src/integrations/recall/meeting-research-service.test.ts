@@ -140,12 +140,39 @@ test('saved answer review is passively projected from exact source policy and ve
     assert.deepEqual(projected.jobs[0]!.answer, { text: fixtureAnswerText, sessionId: task!.sessionId, sourceUserSeq: task!.sourceUserSeq },
       'the private projection carries only this exact source’s saved answer, independently of its review qualification');
     assert.deepEqual(await service.projectMeetingResearchSnapshot(saved), projected, 'polling cannot rejudge or redispatch');
+    const handoff = await service.readMeetingResearchHandoff(f.record.id, f.coordinator.readHandoff);
+    const handoffJob = handoff.jobs[0]!;
+    assert.equal(handoffJob.exactCapture, true);
+    assert.equal(handoffJob.reviewState, expected);
+    assert.equal(handoffJob.answer?.text, expected === 'unverified' ? undefined : fixtureAnswerText,
+      'only the exact saved source with a known review disposition supplies postmeeting answer context');
     assert.equal(readFileSync(f.file(), 'utf8'), before); assert.equal(eventlog.listEvents(task!.sessionId).length, eventCount);
     assert.equal(f.calls(), 1);
     assert.equal(await service.meetingResearchResultReview(task!, { meetingId: 'a-different-meeting', jobId: f.job.id }), 'unverified');
     assert.equal((await service.projectMeetingResearchSnapshot({ ...saved, meetingId: 'a-different-meeting' })).jobs[0]!.answer, undefined,
       'a foreign meeting cannot borrow the answer');
   }
+});
+
+test('postmeeting context keeps stopped and foreign capture work unresolved and never borrows a later answer', async () => {
+  let task: MeetingResearchTask | undefined;
+  const f = fixture(async input => {
+    task = taskFromExecution(input);
+    host.captureEffectiveCompletionPolicyOnce({ ...task, enabled: false, ownerEnabled: false });
+    typedTerminal(input, 'done', { completionReview: { version: 1, policyEvidence: 'captured', disposition: 'disabled_by_owner' } });
+  });
+  await f.coordinator.drain(f.record.id);
+  f.coordinator.stop(f.record.id);
+  capture.finalizeRecallMeeting({ windowId: f.record.windowId, sdkUploadId: f.record.sdkUploadId, retentionMode: 'zero' });
+  const before = readFileSync(f.file(), 'utf8'); const eventsBefore = eventlog.listEvents(task!.sessionId).length;
+  const retained = await service.readMeetingResearchHandoff(f.record.id, f.coordinator.readHandoff);
+  assert.equal(retained.jobs[0]?.answer?.text, fixtureAnswerText);
+  assert.equal(retained.jobs[0]?.reviewState, 'disabled_by_owner');
+  capture.patchMeetingRecord(f.record.id, { sdkUploadId: 'different-controlled-capture' });
+  const foreign = await service.readMeetingResearchHandoff(f.record.id, f.coordinator.readHandoff);
+  assert.deepEqual(foreign.jobs, []); assert.equal(foreign.unavailableJobs, 1);
+  assert.equal(readFileSync(f.file(), 'utf8'), before); assert.equal(eventlog.listEvents(task!.sessionId).length, eventsBefore);
+  assert.equal(f.calls(), 1);
 });
 
 test('inline meeting answer remains bound to its original source when later conversation turns exist', async () => {

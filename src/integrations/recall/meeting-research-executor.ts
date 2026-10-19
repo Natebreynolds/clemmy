@@ -2,6 +2,9 @@ import type { BuildOrchestratorAgentOptions } from '../../agents/orchestrator.js
 import type { RunConversationOptions } from '../../runtime/harness/loop.js';
 import { completionReviewEnabled } from '../../runtime/harness/completion-review-setting.js';
 import type { MeetingResearchExecutionPort } from './meeting-research-service.js';
+import { validateMeetingModelPin } from './meeting-model-execution.js';
+import { withPinnedWorkerModel } from '../../runtime/harness/pinned-worker-model.js';
+import { withAcceptedTurnBrainModel } from '../../runtime/harness/model-roles.js';
 
 type ResearchAgent = Awaited<ReturnType<typeof import('../../agents/orchestrator.js').buildOrchestratorAgent>>;
 export interface MeetingResearchExecutorPorts {
@@ -20,14 +23,17 @@ export function createMeetingResearchExecutor(
   },
 ): MeetingResearchExecutionPort {
   return async input => {
+    const pin = input.modelPin ? validateMeetingModelPin(input.modelPin, 'quick') : undefined;
     const { runConversation, buildOrchestratorAgent } = await load();
-    return runConversation({ ...input, sourceUserSeq: input.sourceUserSeq, reuseRecordedUserInput: true,
+    const run = () => runConversation({ ...input, sourceUserSeq: input.sourceUserSeq, reuseRecordedUserInput: true,
       learningPolicy: { version: 1, mode: 'exclude', reason: 'owner_opt_out' },
       suppressMemoryCapture: true, suppressAutomaticMemoryForRequest: true, mcpToolScope: null,
       maxSteps: 1, maxTurns: 2, maxWallClockMs: 90_000, maxRunTokens: 32_000, callerOwnsRecovery: true,
       judgeCompletion: completionReviewEnabled(),
       buildAgent: identity => buildOrchestratorAgent({ sessionId: input.sessionId, sourceUserSeq: identity.sourceUserSeq,
-        userInput: input.input, allowedToolNames: [], allowToolJit: false }),
+        userInput: input.input, allowedToolNames: [], allowToolJit: false, ...(pin ? { model: pin.modelId } : {}) }),
     });
+    return pin ? withAcceptedTurnBrainModel({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, modelId: pin.modelId },
+      () => withPinnedWorkerModel(pin.modelId, run)) : run();
   };
 }

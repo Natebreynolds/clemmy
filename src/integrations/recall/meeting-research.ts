@@ -4,6 +4,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { withFileLockSyncStrict } from '../../runtime/atomic-json.js';
 import type { RecallMeetingRecord } from './meeting-capture.js';
+import { MeetingModelPinSchema, type MeetingModelPin } from './meeting-assistant-policy.js';
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const hex = z.string().regex(/^[a-f0-9]{64}$/);
@@ -23,6 +24,7 @@ const taskSchema = z.object({ sessionId: name(120), sourceUserSeq: z.number().in
   runId: name(200), clientRequestId: name(120) }).strict();
 export type MeetingResearchTask = z.infer<typeof taskSchema>;
 const jobSchema = z.object({ id: hex, key: hex, grantRevision: z.number().int().positive(), grantDigest: hex,
+  captureDigest: hex.optional(), modelPin: MeetingModelPinSchema.optional(),
   question: questionSchema, evidenceDigest: hex, clientRequestId: name(120), privateOriginSessionId: name(120),
   state: z.enum(['queued', 'running', 'completed', 'blocked', 'cancelled']), createdAt: z.number().finite(),
   startedAt: z.number().finite().optional(), settledAt: z.number().finite().optional(),
@@ -52,6 +54,8 @@ export interface MeetingResearchCoordinatorOptions {
   readMeeting(id: string): RecallMeetingRecord | null;
   /** Host-owned current selection, not model-authored references. Throw if unavailable. */
   readDocumentRefs(id: string): readonly MeetingResearchDocumentRef[];
+  /** Production freezes this host-owned choice before reserving a lookup. */
+  resolveModelPin?(id: string): MeetingModelPin;
   dispatch(input: { reference: MeetingResearchReference; job: MeetingResearchJob; signal: AbortSignal;
     verify(): MeetingResearchBoundary;
     /** Persist the exact canonical source immediately after acceptance, before
@@ -81,6 +85,10 @@ function refsOf(value: readonly MeetingResearchDocumentRef[]): MeetingResearchDo
 }
 const processDrains = new Map<string, Promise<MeetingResearchSnapshot>>();
 const processActive = new Map<string, { jobId: string; controller: AbortController }>();
+const jobIntentKey = (job: Pick<MeetingResearchJob, 'grantRevision' | 'grantDigest' | 'question' | 'evidenceDigest'>) =>
+  hash([job.grantRevision, job.grantDigest, job.question.offerId, job.question.offerDigest, job.question.sourceDigest, job.question.question, job.evidenceDigest]);
+const jobKey = (job: Pick<MeetingResearchJob, 'grantRevision' | 'grantDigest' | 'question' | 'evidenceDigest' | 'captureDigest' | 'modelPin'>) =>
+  job.captureDigest ? hash([jobIntentKey(job), job.captureDigest, job.modelPin ?? null]) : jobIntentKey(job);
 function processIsPresent(pid: number | undefined): boolean {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
@@ -111,7 +119,7 @@ export function createMeetingResearchCoordinator(options: MeetingResearchCoordin
       || new Set(state.jobs.map(job => job.id)).size !== state.jobs.length
       || state.jobs.filter(job => job.state === 'running').length > 1) fail('state_corrupt');
     for (const job of state.jobs) {
-      if (job.key !== hash([job.grantRevision, job.grantDigest, job.question.offerId, job.question.offerDigest, job.question.sourceDigest, job.question.question, job.evidenceDigest])
+      if (job.key !== jobKey(job)
         || job.id !== hash([id, job.key]) || job.clientRequestId !== `meeting-research-${job.id}`
         || job.privateOriginSessionId !== `sess-desktop-${hash(job.clientRequestId).slice(0, 24)}`
         || (job.task && (job.task.clientRequestId !== job.clientRequestId || job.task.sessionId !== job.privateOriginSessionId))) fail('state_corrupt');
@@ -210,12 +218,16 @@ export function createMeetingResearchCoordinator(options: MeetingResearchCoordin
     return freeze(mutate(id, state => {
       const reason = invalidReason(id, state.grant); if (reason) fail(reason); const grant = state.grant!;
       const evidence = evidenceDigest(id, question);
-      const key = hash([grant.revision, grant.digest, question.offerId, question.offerDigest, question.sourceDigest, question.question, evidence]);
-      const existing = state.jobs.find(job => job.key === key); if (existing) return structuredClone(existing);
+      const identity = { grantRevision: grant.revision, grantDigest: grant.digest, question, evidenceDigest: evidence };
+      const existing = state.jobs.find(job => jobIntentKey(job) === jobIntentKey(identity)); if (existing) return structuredClone(existing);
       if (state.jobs.length >= grant.maxLookups) fail('lookup_budget_exhausted');
       if (state.jobs.length >= 128) fail('research_history_capacity');
+      const modelPin = options.resolveModelPin ? MeetingModelPinSchema.parse(options.resolveModelPin(id)) : undefined;
+      const key = jobKey({ ...identity, captureDigest: grant.captureDigest, modelPin });
       const jobId = hash([id, key]); const clientRequestId = `meeting-research-${jobId}`;
       const job: z.infer<typeof jobSchema> = { id: jobId, key, grantRevision: grant.revision, grantDigest: grant.digest,
+        captureDigest: grant.captureDigest,
+        ...(modelPin ? { modelPin } : {}),
         question, evidenceDigest: evidence, clientRequestId, privateOriginSessionId: `sess-desktop-${hash(clientRequestId).slice(0, 24)}`,
         state: 'queued', createdAt: now() };
       state.jobs.push(job); return structuredClone(job);
@@ -329,5 +341,16 @@ export function createMeetingResearchCoordinator(options: MeetingResearchCoordin
       return snapshot;
     })().finally(() => { if (processDrains.get(processKey) === promise) processDrains.delete(processKey); }); processDrains.set(processKey, promise); return promise;
   };
-  return { get, set, enqueue, drain, stop, verifyResearchBoundary };
+  const readHandoff = (id: string) => {
+    const record = recordFor(id); const state = read(id); const captureDigest = meetingResearchCaptureDigest(record);
+    return freeze({ captureDigest, version: state.version, jobs: state.jobs.map(job => {
+      // Legacy permission changes may have removed the original capture proof.
+      const exactCapture = job.captureDigest ? job.captureDigest === captureDigest
+        : state.grant?.digest === job.grantDigest && state.grant.captureDigest === captureDigest;
+      return { id: job.id, question: job.question, state: job.state, exactCapture,
+        ...(job.task ? { task: job.task } : {}), ...(job.reason ? { reason: job.reason } : {}),
+        ...(job.outcomeUnknown ? { outcomeUnknown: true } : {}) };
+    }) });
+  };
+  return { get, set, enqueue, drain, stop, verifyResearchBoundary, readHandoff };
 }

@@ -15,11 +15,11 @@ import { addNotification } from '../../runtime/notifications.js';
 import { clearLiveTranscript, getLiveTranscriptSnapshot, noteLiveTranscriptOpportunity, sweepOrphanedLiveSlices, type LiveTranscriptSnapshot } from './live-transcript.js';
 import { BASE_DIR } from '../../config.js';
 import { createBackgroundTask } from '../../execution/background-tasks.js';
-import { captureMeetingAnalysisRequirement } from '../recall/meeting-analysis-contract.js';
+import { prepareMeetingAnalysisRequest } from '../recall/meeting-analysis-handoff.js';
+import { queuePreparedMeetingAnalysis } from '../recall/meeting-analysis-queue.js';
 import { reindexVault } from '../../memory/indexer.js';
 import {
   applyLocalMeetingTranscript,
-  buildAnalyzerPrompt,
   deleteMeetingRecord,
   findRecallMeetingRecord,
   listAllRecallMeetingRecords,
@@ -273,21 +273,16 @@ export function getLocalMeetingQueueSnapshot(): LocalMeetingQueueSnapshot {
   return { activeMeetingId, queuedMeetingIds: [...queuedMeetingIds] };
 }
 
-function queueAnalysis(record: RecallMeetingRecord, artifactPath?: string): RecallMeetingRecord {
+async function queueAnalysis(record: RecallMeetingRecord, artifactPath?: string): Promise<RecallMeetingRecord> {
   if (!artifactPath || !loadLocalMeetingSettings().analyzeOnComplete || record.analysisTaskId) return record;
-  const task = analysisTaskCreator({
+  queuePreparedMeetingAnalysis(record.id, {
     title: `Analyze meeting transcript: ${record.title || record.id}`,
-    prompt: buildAnalyzerPrompt(record, artifactPath),
-    requiredOutput: captureMeetingAnalysisRequirement(record),
+    ...await prepareMeetingAnalysisRequest(record, artifactPath),
     source: 'daemon',
     channel: 'electron:meeting-capture',
     maxMinutes: 30,
-  });
-  return patchMeetingRecord(record.id, {
-    analysisTaskId: task.id,
-    analysisError: undefined,
-    analysisUpdatedAt: new Date().toISOString(),
-  }) ?? record;
+  }, { createTask: analysisTaskCreator });
+  return loadRecallMeetingById(record.id) ?? record;
 }
 
 function errorMessage(error: unknown): string {
@@ -480,7 +475,7 @@ async function transcribeOne(meetingId: string): Promise<void> {
       try { reindexVault(); } catch { /* maintenance will retry */ }
     }
     try {
-      ready = queueAnalysis(ready, applied.artifactPath);
+      ready = await queueAnalysis(ready, applied.artifactPath);
     } catch (error) {
       // Analysis is an optional follow-on. Preserve the ready transcript and
       // surface the scheduling error independently for diagnosis/retry.

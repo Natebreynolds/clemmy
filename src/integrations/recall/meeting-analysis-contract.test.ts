@@ -18,6 +18,8 @@ after(() => { events.closeEventLog(); closeMemoryDb(); rmSync(home, { recursive:
 const content = { title: 'Controlled meeting summary', summary: 'The fixture team agreed to review a draft.',
   decisions: ['Review the draft'], actionItems: [{ text: 'Review draft', owner: null, dueDate: null }],
   topics: ['Draft'], participants: ['Fixture speaker'] };
+const modelPin = { version: 1 as const, modelId: 'controlled-summary-model', provider: 'byo' as const,
+  role: 'brain' as const, profileRevision: 2, selection: 'explicit' as const, fallback: 'none' as const };
 let number = 0;
 function fixture() {
   const windowId = `summary-output-${++number}`;
@@ -25,7 +27,7 @@ function fixture() {
   capture.appendRecallTranscriptSegment({ windowId, event: 'transcript.data', text: 'Review the draft.', isFinal: true });
   const { record } = capture.finalizeRecallMeeting({ windowId, retentionMode: 'zero' });
   const requiredOutput = contract.captureMeetingAnalysisRequirement(record);
-  const task = tasks.createBackgroundTask({ title: 'Controlled summary', prompt: 'Save structured analysis for this fixture.', requiredOutput });
+  const task = tasks.createBackgroundTask({ title: 'Controlled summary', prompt: 'Save structured analysis for this fixture.', requiredOutput, meetingModelPin: modelPin });
   events.createSession({ id: task.runSessionId, kind: 'execution', channel: 'electron:meeting-capture' });
   const source = events.appendEvent({ sessionId: task.runSessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: task.prompt } });
   capture.patchMeetingRecord(record.id, { analysisTaskId: task.id });
@@ -89,6 +91,10 @@ test('stale transcript, foreign source, malformed analysis, broken record link a
 test('required output is immutable and malformed retained output never falls back to generic success', async () => {
   const f = fixture();
   assert.throws(() => tasks.updateBackgroundTask(f.task.id, { requiredOutput: { ...f.requiredOutput, meetingId: 'foreign' } }), /cannot be changed/);
+  assert.throws(() => tasks.updateBackgroundTask(f.task.id, { meetingModelPin: { ...modelPin, modelId: 'different-model' } }), /cannot be changed/);
+  assert.throws(() => tasks.createBackgroundTask({ title: 'Unbound pin', prompt: 'Controlled only.', meetingModelPin: modelPin }), /exact meeting/);
+  assert.throws(() => tasks.createBackgroundTask({ title: 'Wrong role', prompt: 'Controlled only.', requiredOutput: f.requiredOutput,
+    meetingModelPin: { ...modelPin, role: 'quick' } }), /exact meeting/);
   const taskPath = path.join(home, 'state', 'background-tasks', `${f.task.id}.json`);
   const retained = JSON.parse(readFileSync(taskPath, 'utf8')); retained.requiredOutput = null;
   writeFileSync(taskPath, JSON.stringify(retained));
@@ -100,16 +106,18 @@ test('required output is immutable and malformed retained output never falls bac
   assert.equal(tasks.markBackgroundTaskDone(legacy.id, 'An answer is ready.')?.status, 'done');
 });
 
-test('explicit summary retry binds the current transcript and reuses active ownership', () => {
+test('explicit summary retry binds the current transcript and reuses active ownership', async () => {
   const f = fixture();
-  assert.equal(status.requestMeetingAnalysisRetry(f.record.id, f.task.id).taskId, f.task.id);
+  assert.equal((await status.requestMeetingAnalysisRetry(f.record.id, f.task.id)).taskId, f.task.id);
   tasks.markBackgroundTaskBlocked(f.task.id, 'Canonical save was not confirmed.', 'Partial summary work is kept.');
-  const retried = status.requestMeetingAnalysisRetry(f.record.id, f.task.id);
+  const retried = await status.requestMeetingAnalysisRetry(f.record.id, f.task.id);
   assert.notEqual(retried.taskId, f.task.id);
   const current = tasks.getBackgroundTask(retried.taskId)!;
   assert.deepEqual(current.requiredOutput, f.requiredOutput);
-  assert.equal(status.requestMeetingAnalysisRetry(f.record.id, current.id).taskId, current.id);
-  assert.throws(() => status.requestMeetingAnalysisRetry(f.record.id, f.task.id), /changed/);
+  assert.deepEqual(current.meetingModelPin, modelPin);
+  assert.equal(current.prompt, f.task.prompt, 'the same accepted transcript retains its original handoff and chosen model');
+  assert.equal((await status.requestMeetingAnalysisRetry(f.record.id, current.id)).taskId, current.id);
+  await assert.rejects(status.requestMeetingAnalysisRetry(f.record.id, f.task.id), /changed/);
   assert.equal(capture.loadRecallMeetingById(f.record.id)?.analysisTaskId, current.id);
 });
 
@@ -125,26 +133,26 @@ test('analysis progress follows its exact task and partial transcript remains ex
   assert.equal(contract.meetingAnalysisRequirementSchema.safeParse({ ...f.requiredOutput, extra: true }).success, false);
 });
 
-test('missing or corrupt task ownership cannot promote a retained summary to complete or mint a retry', () => {
+test('missing or corrupt task ownership cannot promote a retained summary to complete or mint a retry', async () => {
   const f = fixture(); saveCheckerFixture(f);
   const taskPath = path.join(home, 'state', 'background-tasks', `${f.task.id}.json`);
   const bytes = readFileSync(taskPath, 'utf8');
   for (const corrupt of [true, false]) {
     if (corrupt) writeFileSync(taskPath, '{'); else unlinkSync(taskPath);
     assert.equal(status.projectMeetingAnalysisState(capture.loadRecallMeetingById(f.record.id)!, true).status, 'unavailable');
-    assert.throws(() => status.requestMeetingAnalysisRetry(f.record.id, f.task.id), /could not be read/);
+    await assert.rejects(status.requestMeetingAnalysisRetry(f.record.id, f.task.id), /could not be read/);
     writeFileSync(taskPath, bytes);
   }
   assert.equal(status.projectMeetingAnalysisState(capture.loadRecallMeetingById(f.record.id)!, true).status, 'complete');
 });
 
-test('retry never adopts an active task with a foreign or malformed meeting contract', () => {
+test('retry never adopts an active task with a foreign or malformed meeting contract', async () => {
   const f = fixture(); const foreign = fixture();
   capture.patchMeetingRecord(f.record.id, { analysisTaskId: foreign.task.id });
-  assert.throws(() => status.requestMeetingAnalysisRetry(f.record.id, foreign.task.id), /does not belong/);
+  await assert.rejects(status.requestMeetingAnalysisRetry(f.record.id, foreign.task.id), /does not belong/);
   const taskPath = path.join(home, 'state', 'background-tasks', `${foreign.task.id}.json`);
   const retained = JSON.parse(readFileSync(taskPath, 'utf8')); retained.requiredOutput = null;
   writeFileSync(taskPath, JSON.stringify(retained));
-  assert.throws(() => status.requestMeetingAnalysisRetry(f.record.id, foreign.task.id), /does not belong/);
+  await assert.rejects(status.requestMeetingAnalysisRetry(f.record.id, foreign.task.id), /does not belong/);
   assert.equal(tasks.getBackgroundTask(f.task.id)?.status, 'pending');
 });

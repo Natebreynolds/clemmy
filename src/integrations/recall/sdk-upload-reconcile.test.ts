@@ -9,6 +9,8 @@ import path from 'node:path';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-sdk-upload-reconcile-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'http://127.0.0.1:9',
+  BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]', CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off' });
 process.env.NODE_ENV = 'test';
 
 const meetings = await import('./meeting-capture.js');
@@ -91,6 +93,11 @@ test('no realtime transcript reconciles SDK upload, migrates record, backfills, 
   assert.equal(migrated.segments.length, 1);
   assert.ok(migrated.artifactPath && existsSync(migrated.artifactPath));
   assert.ok(migrated.analysisTaskId, 'post-backfill analysis was queued');
+  const { getBackgroundTask } = await import('../../execution/background-tasks.js');
+  const analysisTask = getBackgroundTask(migrated.analysisTaskId!)!;
+  assert.equal(analysisTask.requiredOutput?.meetingId, migrated.id);
+  assert.equal(analysisTask.meetingModelPin?.role, 'brain'); assert.equal(analysisTask.model, 'deepseek-chat');
+  assert.match(analysisTask.prompt, /Historical live assistance handoff/);
   assert.equal(meetings.findRecallMeetingRecord({ windowId: seeded.record.windowId }), null, 'window-key placeholder migrated away');
   assert.equal(meetings.findRecallMeetingRecord({ recordingId: 'recording-final-1' })?.id, seeded.record.id);
 });

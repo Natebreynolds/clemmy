@@ -12,8 +12,8 @@ import { BASE_DIR } from '../config.js';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { listGoalRecords } from '../memory/goals-list.js';
 import { listActiveFacts } from '../memory/facts.js';
-import { createCheckIn, getCheckIn, type CheckInRecord } from './check-ins.js';
-import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy } from './proactivity-policy.js';
+import { createCheckIn, getCheckIn, closeCheckIn, type CheckInRecord } from './check-ins.js';
+import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy, loadMeetingPreparationProactivityPolicy } from './proactivity-policy.js';
 import { acceptUserInputForRun, claimHarnessChatRequestInTransaction, createSession,
   getHarnessChatRequestReceipt, getLatestEventSeq, getRunAttemptBySourceUserSeq, getSession,
   isKillRequested, listSessions, listEvents, openEventLog, withEventPublicationTransaction,
@@ -28,6 +28,12 @@ import { createStandaloneModelAccountingJob, standaloneModelAccountingJobBinding
   type StandaloneModelAccountingJob, type StandaloneModelAccountingJobBinding } from '../runtime/usage-log.js';
 import { recordStandaloneModelAccountingJobObservation } from '../runtime/harness/model-transport-observation.js';
 import { NOTICING_ANSWER_PURPOSE, NOTICING_PROPOSAL_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
+import { loadMeetingAssistantPolicy } from '../integrations/recall/meeting-assistant-policy.js';
+import { cachedMeetingPreparationCandidates, connectedCalendarOperations } from './calendar-watch-runtime.js';
+import { peekCurrentConnectedToolkits } from '../integrations/composio/client.js';
+import { createMeetingPreparationWake, meetingPreparationWakeFingerprint, resolveMeetingPreparation,
+  validMeetingPreparationOrigin, meetingPreparationOpportunity, projectMeetingPreparationReadiness,
+  type MeetingPreparationBinding, type MeetingPreparationCandidate, type MeetingPreparationReadiness } from './meeting-preparation.js';
 import {
   DEFAULT_NOTICING_CONFIG,
   NOTICING_ID,
@@ -112,7 +118,9 @@ function writeNoticingState(state: NoticingState): void {
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function proposalIdentity(record: NoticingProposalRecord): string {
   return digest({ id: record.id, checkInId: record.checkInId, title: record.title, action: record.action,
-    why: record.why, evidence: record.evidence, goalId: record.goalId, createdAt: record.createdAt });
+    why: record.why, evidence: record.evidence, goalId: record.goalId, createdAt: record.createdAt,
+    ...(record.meetingPreparation ? { meetingPreparation: record.meetingPreparation } : {}),
+    ...(record.calendarPreparation ? { calendarPreparation: record.calendarPreparation } : {}) });
 }
 
 /** A slow tick cannot erase an answer/handoff committed while it was thinking. */
@@ -138,6 +146,10 @@ export function saveNoticingState(state: NoticingState): void {
       .filter((item, index, all) => all.findIndex(other => digest(other) === digest(item)) === index).slice(0, 100);
     for (const key of ['itemsAcknowledged', 'doIt', 'notNow', 'never'] as const) {
       state.metrics[key] = Math.max(state.metrics[key], current.metrics[key]);
+    }
+    if (current.meetingPreparationWake && (!state.meetingPreparationWake
+      || current.meetingPreparationWake.admittedAt > state.meetingPreparationWake.admittedAt)) {
+      state.meetingPreparationWake = current.meetingPreparationWake;
     }
     if (digest({ proposals: state.proposals, standingAnswers: state.standingAnswers }) !== incomingGeneration) {
       delete state.decisionReuse;
@@ -176,6 +188,34 @@ const clip = (value: unknown, max = MAX_TEXT): string => {
   const text = typeof value === 'string' ? value : value == null ? '' : String(value);
   return text.length > max ? `${text.slice(0, max)}…` : text;
 };
+
+function upcomingMeetingPreparations(now = Date.now(), phase: 'offer' | 'answer' = 'offer'): MeetingPreparationCandidate[] {
+  try {
+    const policy = loadMeetingAssistantPolicy();
+    const proactivity = loadMeetingPreparationProactivityPolicy();
+    if (!policy.before.calendarPrepSuggestions || !proactivity.noticingEnabled || isQuietHoursActive(proactivity, new Date(now))) return [];
+    return cachedMeetingPreparationCandidates(true, now, phase);
+  } catch { return []; }
+}
+function currentMeetingPreparation(binding: MeetingPreparationBinding, now = Date.now(), phase: 'offer' | 'answer' = 'offer'): MeetingPreparationCandidate | null {
+  return resolveMeetingPreparation(binding, upcomingMeetingPreparations(now, phase));
+}
+
+/** Passive readiness only. This never enables a watch, connects an account,
+ * refreshes its health, or schedules a model. */
+export function meetingPreparationReadiness(): MeetingPreparationReadiness {
+  try {
+    const proactivity = loadMeetingPreparationProactivityPolicy();
+    const optedIn = loadMeetingAssistantPolicy().before.calendarPrepSuggestions;
+    const watchEnabled = proactivity.calendarWatchEnabled;
+    const connections = peekCurrentConnectedToolkits();
+    const quietHours = isQuietHoursActive(proactivity);
+    return projectMeetingPreparationReadiness({ optedIn, noticingEnabled: proactivity.noticingEnabled, quietHours,
+      watchEnabled, connection: !connections ? 'unknown' : connections.length ? 'present' : 'none',
+      calendarReadKnown: connectedCalendarOperations().length > 0,
+      candidates: optedIn && proactivity.noticingEnabled && !quietHours && watchEnabled ? cachedMeetingPreparationCandidates(true).length : 0 });
+  } catch { return { state: 'unavailable', message: 'Meeting preparation readiness could not be read. No preparation was started.' }; }
+}
 
 export async function observeForNoticing(now = Date.now()): Promise<NoticingObservation> {
   const since = new Date(now - 3 * 24 * 60 * 60_000).toISOString();
@@ -223,6 +263,7 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
     memories = listActiveFacts({ limit: 16, ranking: 'stanford' })
       .map((f) => ({ text: clip(f.content), ageDays: Math.max(0, Math.round((now - Date.parse(f.updatedAt)) / 86_400_000)) }));
   } catch { memories = []; }
+  const upcomingMeetings = upcomingMeetingPreparations(now);
   return {
     at: new Date(now).toISOString(),
     goals,
@@ -233,6 +274,7 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
       drafts: work.drafts.slice(0, 10).map((d) => ({ name: clip(d.name, 120), modifiedAt: d.modifiedAt })),
     },
     calendar,
+    ...(upcomingMeetings.length ? { upcomingMeetings: upcomingMeetings.map(meetingPreparationOpportunity) } : {}),
     conversations,
     memories,
     ...(alreadyAskingOwner.length > 0 ? { alreadyAskingOwner } : {}),
@@ -293,6 +335,10 @@ export async function readNoticingAnswer(proposal: Pick<NoticingProposalRecord, 
 
 // ── asking ────────────────────────────────────────────────────────────────────
 function askViaCheckIn(record: NoticingProposalRecord): Promise<{ checkInId: string; notificationId?: string }> {
+  if ((record.meetingPreparation || record.calendarPreparation) && (!validMeetingPreparationOrigin(record.calendarPreparation, record.meetingPreparation)
+    || !record.meetingPreparation || !currentMeetingPreparation(record.meetingPreparation))) {
+    throw new Error('The calendar occurrence changed before the suggestion could be published.');
+  }
   const goalLine = record.goalId ? ` (for your goal ${record.goalId})` : '';
   const question = [
     `${record.title}${goalLine}`,
@@ -346,6 +392,22 @@ async function settleNoticingAnswersOnce(now: number): Promise<number> {
   for (const record of Object.values(loadNoticingState().proposals)) {
     if (!record.checkInId) continue;
     if (record.status !== 'open' && record.status !== 'answered') continue;
+    if (record.status === 'open' && record.meetingPreparation && record.calendarPreparation
+      && !currentMeetingPreparation(record.meetingPreparation, Date.now(), 'answer') && record.checkInId) {
+      const currentCheckIn = getCheckIn(record.checkInId);
+      if (currentCheckIn?.status === 'open' && currentCheckIn.contextSummary === `noticing:${record.id}`) {
+        updateNoticingState(state => {
+          const current = state.proposals[record.id];
+          if (current && current.status === 'open' && proposalIdentity(current) === proposalIdentity(record)
+            && getCheckIn(record.checkInId!)?.status === 'open') {
+            current.status = 'retired'; current.retiredReason = 'The calendar occurrence or preparation permission is no longer current.';
+            state.metrics.itemsRetired += 1;
+            closeCheckIn(record.checkInId!, 'The calendar occurrence or preparation permission is no longer current.');
+          }
+        });
+        continue;
+      }
+    }
     const checkIn = getCheckIn(record.checkInId);
     if (!checkIn || typeof checkIn.answer !== 'string' || !checkIn.answeredAt
       || !exactAnsweredCheckIn(record, checkIn)) continue;
@@ -473,11 +535,19 @@ async function startProposalTurn(record: NoticingProposalRecord, checkIn: CheckI
           || !readAcceptedNoticingTask({ sessionId, sourceUserSeq: source.seq })) throw new Error('Approved task receipt has no exact retained source.');
         return { inserted: false, source, runId };
       }
+      const calendarPreparation = current.meetingPreparation ? currentMeetingPreparation(current.meetingPreparation, Date.now(), 'answer') : null;
+      if ((current.meetingPreparation || current.calendarPreparation) && (!current.meetingPreparation || !current.calendarPreparation
+        || !validMeetingPreparationOrigin(current.calendarPreparation, current.meetingPreparation) || !calendarPreparation)) {
+        setHandoff(current, answerDigest, 'needs_attention', Date.now(),
+          { reason: 'The meeting or preparation permission changed before work started. No task was started; review the current calendar before asking again.' });
+        return null;
+      }
       const goal = current.goalId ? listGoalRecords().find(goal => goal.id === current.goalId) ?? null : null;
       const packet: NoticingApprovedTaskPacket = {
         version: 1,
         proposal: { id: current.id, checkInId: checkIn.id, title: current.title, action: current.action,
-          why: current.why, evidence: [...current.evidence], goalId: current.goalId, createdAt: current.createdAt },
+          why: current.why, evidence: [...current.evidence], goalId: current.goalId, createdAt: current.createdAt,
+          ...(calendarPreparation ? { calendarPreparation } : {}) },
         checkIn: { id: checkIn.id, question: checkIn.question,
           ...(checkIn.contextSummary ? { contextSummary: checkIn.contextSummary } : {}),
           answer: checkIn.answer!, answeredAt: checkIn.answeredAt! },
@@ -552,6 +622,7 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
     },
     publicationStillCurrent: () => publicationGeneration !== undefined
       && publicationGeneration === generation(readNoticingStateStrict(), readNoticingRulesStrict()),
+    resolveMeetingPreparation: (binding, phase) => currentMeetingPreparation(binding, Date.now(), phase),
     saveState: saveNoticingState,
   })).then((result) => {
     if (tickJob && result.modelAccountingJobId) {
@@ -568,6 +639,36 @@ export function runNoticingTickNow(options: { source: string } = { source: 'hear
   }).finally(() => { inFlight = null; });
   return inFlight;
 }
+
+/** One existing Noticing pass per unchanged candidate/revision set, after a
+ * successful calendar tick. No timer/read/model side path is introduced. */
+const wakeForMeetingPreparation = createMeetingPreparationWake({
+  now: Date.now,
+  read: () => {
+    const proactivity = loadMeetingPreparationProactivityPolicy();
+    const state = readNoticingStateStrict().state;
+    const candidates = upcomingMeetingPreparations();
+    const last = state.thinking[0];
+    const failedCalendarPass = last?.source === 'calendar_preparation' && (Boolean(last.error) || !last.model);
+    const attemptedAt = Date.parse(last?.at ?? '');
+    return { enabled: proactivity.noticingEnabled && !isQuietHoursActive(proactivity),
+      fingerprint: meetingPreparationWakeFingerprint(candidates), admittedFingerprint: state.meetingPreparationWake?.fingerprint,
+      ...(failedCalendarPass && Number.isFinite(attemptedAt) ? { retryAt: attemptedAt + proactivity.noticingMinutes * 60_000 } : {}) };
+  },
+  run: async () => {
+    // An unrelated pass may have captured its observation before this
+    // calendar read. Do not claim that pass considered these candidates.
+    if (inFlight) return false;
+    const result = await runNoticingTickNow({ source: 'calendar_preparation' });
+    const retained = readNoticingStateStrict().state;
+    return result.modelCheck === 'fresh' && Boolean(result.model) && !result.error
+      && retained.lastTickId === result.tickId && Boolean(retained.decisionReuse);
+  },
+  retain: fingerprint => updateNoticingState(state => {
+    state.meetingPreparationWake = { version: 1, fingerprint, admittedAt: new Date().toISOString() };
+  }),
+});
+export const requestMeetingPreparationNoticingWake = (): Promise<boolean> => wakeForMeetingPreparation();
 
 export function isNoticingDue(nowMs = Date.now()): { due: boolean; reason: string; nextAt?: string } {
   const policy = noticingPolicy();

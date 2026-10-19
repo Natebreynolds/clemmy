@@ -10,6 +10,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-local-meeting-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
+Object.assign(process.env, { AUTH_MODE: 'api_key', MODEL_ROUTING_MODE: 'all_in', BYO_MODEL_BASE_URL: 'http://127.0.0.1:9',
+  BYO_MODEL_API_KEY: 'controlled-unused', BYO_MODEL_ID: 'deepseek-chat', BYO_PROVIDERS: '[]', CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off' });
 
 const local = await import('./meeting-capture.js');
 const shared = await import('../recall/meeting-capture.js');
@@ -221,7 +223,9 @@ test('analysis scheduling failure never downgrades a ready transcript', async ()
     const started = local.startLocalMeeting({ sessionId: 'analysis-schedule-failure' });
     writeFakeWav(started.audioPath);
     local.ingestLocalMeeting({ sessionId: 'analysis-schedule-failure', audioPath: started.audioPath });
-    const ready = await waitForStatus(started.record.id, 'ready');
+    let ready = await waitForStatus(started.record.id, 'ready');
+    const deadline = Date.now() + 3_000;
+    while (!ready?.analysisError && Date.now() < deadline) { await delay(10); ready = shared.loadRecallMeetingById(started.record.id); }
     assert.equal(ready?.transcriptionStatus, 'ready');
     assert.equal(ready?.segments[0]?.text, 'The transcript succeeded before optional analysis.');
     assert.equal(ready?.analysisTaskId, undefined);
@@ -232,6 +236,26 @@ test('analysis scheduling failure never downgrades a ready transcript', async ()
     local._setLocalMeetingAnalysisTaskCreatorForTests(null);
     local.saveLocalMeetingSettings({ analyzeOnComplete: false, keepAudio: true });
   }
+});
+
+test('ready local transcript queues one pinned recap with the bounded historical handoff', async () => {
+  local.saveLocalMeetingSettings({ analyzeOnComplete: true, keepAudio: true });
+  local._setLocalMeetingTranscriberForTests(async () => ({ text: 'Controlled local recap transcript.',
+    segments: [{ text: 'Controlled local recap transcript.', startSeconds: 0, endSeconds: 1 }], model: 'base.en', language: 'en' }));
+  try {
+    const started = local.startLocalMeeting({ sessionId: 'controlled-local-recap-pin' }); writeFakeWav(started.audioPath);
+    local.ingestLocalMeeting({ sessionId: 'controlled-local-recap-pin', audioPath: started.audioPath });
+    let ready = await waitForStatus(started.record.id, 'ready'); const deadline = Date.now() + 3_000;
+    while (!ready?.analysisTaskId && Date.now() < deadline) { await delay(10); ready = shared.loadRecallMeetingById(started.record.id); }
+    const { getBackgroundTask } = await import('../../execution/background-tasks.js');
+    const task = getBackgroundTask(ready!.analysisTaskId!)!;
+    assert.equal(task.requiredOutput?.meetingId, started.record.id);
+    assert.equal(task.meetingModelPin?.role, 'brain'); assert.equal(task.model, 'deepseek-chat');
+    assert.match(task.prompt, /Historical live assistance handoff/);
+    assert.match(task.prompt, /final transcript win/);
+    const replay = local.ingestLocalMeeting({ sessionId: 'controlled-local-recap-pin', audioPath: started.audioPath });
+    assert.equal(replay.record.analysisTaskId, task.id);
+  } finally { local.saveLocalMeetingSettings({ analyzeOnComplete: false, keepAudio: true }); }
 });
 
 test('the transcription queue runs only one local model at a time', async () => {

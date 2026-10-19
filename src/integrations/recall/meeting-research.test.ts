@@ -58,6 +58,33 @@ test('GET is passive, permission defaults off, exact selected sources and stale 
   assert.equal(f.calls(), 0);
 });
 
+test('new model choice is frozen in reservation identity and duplicate/restarted work keeps the original pin', () => {
+  const f = fixture(); f.enable();
+  let chosen = 'controlled-live-a';
+  const coordinator = createMeetingResearchCoordinator({ ...f.options, resolveModelPin: () => ({ version: 1,
+    modelId: chosen, provider: 'byo', role: 'quick', profileRevision: 4, selection: 'explicit', fallback: 'none' }) });
+  const original = coordinator.enqueue(f.record.id, f.question());
+  assert.equal(original.modelPin?.modelId, 'controlled-live-a');
+  assert.equal(original.captureDigest, meetingResearchCaptureDigest(f.record));
+  chosen = 'controlled-live-b';
+  assert.deepEqual(coordinator.enqueue(f.record.id, f.question()), original, 'a preference change cannot create a duplicate or reroute the reserved question');
+  assert.deepEqual(f.reopen().enqueue(f.record.id, f.question()), original);
+  const saved = JSON.parse(readFileSync(f.file(), 'utf8'));
+  saved.jobs[0].modelPin.modelId = chosen; writeFileSync(f.file(), JSON.stringify(saved));
+  assert.throws(() => coordinator.get(f.record.id), /state_corrupt/, 'a different retained selection does not inherit the old reservation identity');
+});
+
+test('postmeeting handoff is passive and preserves original capture ownership after permission changes', () => {
+  const f = fixture(); f.enable(); const job = f.coordinator.enqueue(f.record.id, f.question());
+  f.coordinator.stop(f.record.id); f.record.status = 'completed';
+  const before = readFileSync(f.file(), 'utf8');
+  const handoff = f.reopen().readHandoff(f.record.id);
+  assert.equal(handoff.jobs[0]?.id, job.id); assert.equal(handoff.jobs[0]?.exactCapture, true);
+  assert.equal(handoff.jobs[0]?.state, 'cancelled'); assert.equal(readFileSync(f.file(), 'utf8'), before);
+  f.record.sdkUploadId = 'another-capture';
+  assert.equal(f.reopen().readHandoff(f.record.id).jobs[0]?.exactCapture, false);
+});
+
 test('reservation is durable before dispatch, identity is stable and duplicate questions do not spend again', async () => {
   const f = fixture(); f.enable({ maxLookups: 1 });
   const job = f.coordinator.enqueue(f.record.id, f.question());

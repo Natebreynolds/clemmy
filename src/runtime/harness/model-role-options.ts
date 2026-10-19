@@ -554,6 +554,35 @@ export function brainOptions(): BrainOption[] {
   return brainOptionsFromContext(context);
 }
 
+/** Validate a per-task brain choice without changing the global auth/provider
+ * switch. The role-binding API deliberately refuses `brain`; task pins need
+ * the connected brain catalog and the actual route to agree instead. */
+export function connectedBrainModelCapability(modelId: string): RoleModelCapability {
+  const context = captureModelOptionContext();
+  const clean = modelId.trim();
+  const capability = roleModelCapabilityFromContext('worker', clean, context);
+  if (!capability.ok) return capability;
+  const expectedAuth = capability.provider === 'codex' ? 'codex_oauth'
+    : capability.provider === 'claude' ? 'claude_oauth' : 'api_key';
+  if (!brainOptionsFromContext(context).some(option => option.available && option.id === expectedAuth && option.modelId === clean)) {
+    return { ok: false, reason: 'This model is not a connected brain choice on its current route.' };
+  }
+  return capability;
+}
+
+/** One coherent read for a task-specific picker; do not recapture credentials
+ * or routing once for every model in a large connected provider catalog. */
+export function connectedTaskBrainOptions(): BrainOption[] {
+  const context = captureModelOptionContext();
+  return brainOptionsFromContext(context).map(option => {
+    if (!option.modelId || !option.available) return { ...option, available: false };
+    const capability = roleModelCapabilityFromContext('worker', option.modelId, context);
+    if (!capability.ok) return { ...option, available: false };
+    const auth = capability.provider === 'codex' ? 'codex_oauth' : capability.provider === 'claude' ? 'claude_oauth' : 'api_key';
+    return { ...option, available: option.id === auth };
+  });
+}
+
 export interface ModelRoleOptionCatalogSnapshot {
   available: AvailableModelGroup[];
   judgeFallbackOptions: AvailableModelGroup[];

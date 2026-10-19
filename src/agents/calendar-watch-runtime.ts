@@ -30,7 +30,7 @@ import { nextWorkflowNodeAttempt } from '../runtime/harness/accepted-turn-call-a
 import { peekCapabilityManifestStore } from '../runtime/harness/capability-manifest-store.js';
 import { refreshIndependentCapabilityObservation } from '../runtime/harness/independent-capability-observation.js';
 import { peekProductionCapabilityAdapter } from '../runtime/harness/production-capability-adapter.js';
-import { listComposioToolkitTools, listConnectedToolkits, peekConnectedToolkits } from '../integrations/composio/client.js';
+import { listComposioToolkitTools, listConnectedToolkits, peekConnectedToolkits, peekCurrentConnectedToolkits } from '../integrations/composio/client.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CALENDAR_READ_OPERATION_PURPOSE, CALENDAR_READ_RECIPE_PURPOSE } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import {
@@ -72,7 +72,9 @@ import {
   type CalendarWatchState,
   type CalendarWatchTickResult,
 } from './calendar-watch.js';
-import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy } from './proactivity-policy.js';
+import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy, loadMeetingPreparationProactivityPolicy } from './proactivity-policy.js';
+import { calendarPreparationConnectionKey, projectMeetingPreparationCandidates, meetingPreparationMaxObservationAgeMs,
+  type CalendarPreparationRead, type MeetingPreparationCandidate } from './meeting-preparation.js';
 
 const logger = pino({ name: 'clementine-next.calendar-watch' });
 
@@ -511,7 +513,7 @@ function explainMissingCandidates(operation: ConnectedCalendarOperation): string
 }
 
 type AccountRead =
-  | { ok: true; accountId: string; payload: unknown }
+  | { ok: true; accountId: string; payload: unknown; preparationEvidence?: Omit<CalendarPreparationRead, 'windowStartMs' | 'windowEndMs'> }
   | { ok: false; accountId?: string; reason: string; choiceSet?: { candidates: readonly { capabilityId: string; accountId: string }[]; digest: string } };
 
 async function readOneAccount(input: {
@@ -581,7 +583,17 @@ async function readOneAccount(input: {
   if (!result.ok) {
     return { ok: false, accountId, reason: `${result.block.code}: ${result.block.message}` };
   }
-  return { ok: true, accountId, payload: result.result };
+  const resultRef = result.executionKind === 'paginated_read' ? result.aggregate.aggregateReceiptId : result.resultHandleId;
+  // Replayed/rowless reads are still handled by the watch normally, but they
+  // cannot be relabelled as a newly observed calendar for preparation.
+  const preparationEvidence = result.status === 'completed' && resultRef ? {
+    version: 1 as const, operationId: input.operationId, accountId, tickId: input.tickId,
+    observedAt: new Date().toISOString(), activationId: result.activationId, authorityRootId: result.authorityRootId,
+    invocationPlanDigest: result.prepared.invocationPlanDigest, bindingSnapshotDigest: result.prepared.bindingSnapshotDigest,
+    definitionFingerprint: result.prepared.observation.definitionFingerprint,
+    resultRef, resultKind: result.executionKind,
+  } : undefined;
+  return { ok: true, accountId, payload: result.result, ...(preparationEvidence ? { preparationEvidence } : {}) };
 }
 
 type CalendarReadPreparer = typeof prepareWorkflowStepExternalCatalog;
@@ -704,10 +716,34 @@ export async function readCalendarAccountsAttested(
         accountId: read.accountId,
         accountLabel: accountLabels.get(read.accountId) ?? read.accountId,
         events,
+        ...(read.preparationEvidence ? { preparationEvidence: {
+          ...read.preparationEvidence, windowStartMs: Date.parse(window.startIso), windowEndMs: Date.parse(window.endIso),
+        } } : {}),
       });
     }
   }
   return { reads, failures };
+}
+
+/** Cached observation only. Unknown/stale connection health never becomes
+ * readiness and this reader cannot start account discovery or a provider read. */
+export function cachedMeetingPreparationCandidates(enabled: boolean, now = Date.now(), phase: 'offer' | 'answer' = 'offer'): MeetingPreparationCandidate[] {
+  if (!enabled) return [];
+  const policy = loadMeetingPreparationProactivityPolicy();
+  if (!policy.calendarWatchEnabled || !policy.noticingEnabled || isQuietHoursActive(policy, new Date(now))) return [];
+  const connections = peekCurrentConnectedToolkits(now);
+  if (!connections) return [];
+  const active = new Set(connections.filter(row => ['active', 'connected'].includes(row.status.toLowerCase())).map(row => row.connectionId));
+  const connected = new Set<string>();
+  for (const operation of connectedCalendarOperations()) for (const manifest of operation.manifests) {
+    if (active.has(manifest.accountId)) connected.add(calendarPreparationConnectionKey(operation.operationId, manifest.accountId, manifest.definitionFingerprint));
+  }
+  const raw = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')) : emptyCalendarWatchState();
+  if (!raw || raw.version !== 1 || !raw.snapshot || typeof raw.snapshot !== 'object' || Array.isArray(raw.snapshot)) {
+    throw new Error('Calendar preparation observations are unavailable.');
+  }
+  return projectMeetingPreparationCandidates({ state: raw, enabled, now, connected, phase,
+    maxObservationAgeMs: meetingPreparationMaxObservationAgeMs(policy.calendarWatchMinutes) });
 }
 
 function accountLabelsByConnectionId(): Map<string, string> {
@@ -858,6 +894,12 @@ export function runCalendarWatchTick(options: { source: string; force?: boolean 
       saveState: saveCalendarWatchState,
     });
   })().then((result) => {
+    if (result.accounts > 0) {
+      // The existing Noticing gates and single flight own the suggestion.
+      // This is not a second calendar reader or an automatic preparation.
+      void import('./noticing-runtime.js').then(runtime => runtime.requestMeetingPreparationNoticingWake())
+        .catch(() => { logger.debug('meeting preparation suggestion wake was not admitted'); });
+    }
     logger.info(
       {
         tickId,

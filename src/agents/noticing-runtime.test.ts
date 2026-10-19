@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import type { AssistantRequest } from '../types.js';
+import { calendarPreparationEventsDigest, projectMeetingPreparationCandidates, calendarPreparationConnectionKey } from './meeting-preparation.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-noticing-handoff-'));
 process.env.CLEMENTINE_HOME = home;
@@ -20,6 +21,13 @@ const contracts = await import('./heartbeat-contracts.js');
 const { upsertGoalRecord } = await import('../memory/goals-list.js');
 const accounting = await import('../runtime/usage-log.js');
 const { listOperationalEvents } = await import('../runtime/operational-telemetry.js');
+const connections = await import('../integrations/composio/client.js');
+const manifests = await import('../runtime/harness/capability-manifest-store.js');
+const calendarRuntime = await import('./calendar-watch-runtime.js');
+const calendarState = await import('./calendar-watch.js');
+const calendarRecipes = await import('./calendar-read-recipe.js');
+const proactivity = await import('./proactivity-policy.js');
+const meetingPolicy = await import('../integrations/recall/meeting-assistant-policy.js');
 const stateFile = path.join(home, 'state', 'noticing.json');
 let sequence = 0;
 
@@ -166,6 +174,132 @@ function bindAttempt(request: AssistantRequest) {
     { existingEventSeq: request.sourceUserSeq });
   return { attempt, source };
 }
+
+test('a stale calendar preparation answer cannot accept a task or turn the same answer into replay permission', async () => {
+  const f = fixture('Do it. Prepare only a private controlled brief.');
+  const now = Date.now();
+  const calendarEvent = { id: 'controlled-calendar-occurrence', subject: 'Controlled meeting', startMs: now + 60 * 60_000, endMs: now + 90 * 60_000,
+    isAllDay: false, isCancelled: false, showAs: 'busy', myResponse: 'accepted', attendeeCount: 2 };
+  const fingerprint = createHash('sha256').update('controlled-calendar').digest('hex');
+  const snapshot = { [calendarEvent.id]: calendarEvent };
+  const candidates = projectMeetingPreparationCandidates({ enabled: true, now,
+    connected: new Set([calendarPreparationConnectionKey('controlled_calendar_read', 'controlled-calendar-account', fingerprint)]),
+    state: { snapshot: { 'controlled-calendar-account': snapshot }, snapshotEvidence: { 'controlled-calendar-account': {
+      version: 1, operationId: 'controlled_calendar_read', accountId: 'controlled-calendar-account', tickId: 'controlled-tick',
+      observedAt: new Date(now).toISOString(), windowStartMs: now, windowEndMs: now + 24 * 60 * 60_000,
+      activationId: 'controlled-activation', authorityRootId: 'controlled-root', invocationPlanDigest: fingerprint, bindingSnapshotDigest: fingerprint,
+      definitionFingerprint: fingerprint, resultRef: 'controlled-result', resultKind: 'single_read', eventsDigest: calendarPreparationEventsDigest(snapshot),
+    } } } });
+  const candidate = candidates[0]!; assert.ok(candidate);
+  const state = runtime.loadNoticingState();
+  state.proposals[f.id]!.meetingPreparation = { candidateId: candidate.candidateId, revision: candidate.revision };
+  state.proposals[f.id]!.calendarPreparation = candidate;
+  runtime.saveNoticingState(state);
+  const calls = installReader('do_it');
+  const requests: AssistantRequest[] = [];
+  runtime.bindNoticingRespond(async request => { requests.push(request); });
+  await runtime.settleNoticingAnswers();
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 0); assert.equal(calls.length, 1);
+  const retained = f.record();
+  assert.equal(retained.handoff?.state, 'needs_attention'); assert.equal(retained.handoff?.sourceUserSeq, undefined);
+  assert.equal(retained.answer?.text, f.answer);
+  assert.equal(log.getHarnessChatRequestReceipt(`noticing-answer:${retained.handoff?.answerDigest}`), null);
+  assert.equal(runtime.meetingPreparationReadiness().state, 'suggestions_off');
+});
+
+/** Cache ingress fixture only: no catalog authorization, provider dispatch or
+ * real calendar read is claimed by these synthetic retained observations. */
+function preparationFixture(t: { after: (fn: () => void) => void }, leadMinutes: number) {
+  const files = ['state/proactivity-policy.json', 'state/meeting-capture/assistant-policy.json',
+    'state/calendar-read-recipes.json', 'state/calendar-watch.json'].map(name => path.join(home, name));
+  const before = files.map(file => existsSync(file) ? readFileSync(file) : null);
+  const previousStore = manifests.peekCapabilityManifestStore();
+  const previousConnections = connections.peekCurrentConnectedToolkits();
+  t.after(() => {
+    files.forEach((file, index) => {
+      if (before[index]) writeFileSync(file, before[index]!); else rmSync(file, { force: true });
+    });
+    manifests.installCapabilityManifestStore(previousStore);
+    connections._setConnectedToolkitsSnapshotForTests(previousConnections);
+  });
+  proactivity.saveProactivityPolicy({ noticingEnabled: true, calendarWatchEnabled: true, quietHoursEnabled: false });
+  const policy = meetingPolicy.loadMeetingAssistantPolicy();
+  meetingPolicy.saveMeetingAssistantPolicy({ expectedRevision: policy.revision, before: { calendarPrepSuggestions: true },
+    during: { modelId: null }, after: { modelId: null } });
+  const now = Date.now(), offeredAt = now - 6 * 60_000;
+  const operationId = 'controlled_calendar_list', accountId = 'controlled-calendar-account';
+  const fingerprint = createHash('sha256').update('controlled-calendar-cache').digest('hex');
+  const event = { id: 'controlled-cached-occurrence', subject: 'Controlled meeting', startMs: now + leadMinutes * 60_000,
+    endMs: now + (leadMinutes + 30) * 60_000, isAllDay: false, isCancelled: false, showAs: 'busy', myResponse: 'accepted', attendeeCount: 2 };
+  const snapshot = { [event.id]: event };
+  const state = { ...calendarState.emptyCalendarWatchState(), snapshot: { [accountId]: snapshot }, snapshotEvidence: { [accountId]: {
+    version: 1 as const, operationId, accountId, tickId: 'controlled-calendar-cache-tick', observedAt: new Date(offeredAt).toISOString(),
+    windowStartMs: offeredAt, windowEndMs: now + 24 * 60 * 60_000, activationId: 'controlled-activation', authorityRootId: 'controlled-root',
+    invocationPlanDigest: fingerprint, bindingSnapshotDigest: fingerprint, definitionFingerprint: fingerprint,
+    resultRef: 'controlled-result', resultKind: 'single_read' as const, eventsDigest: calendarPreparationEventsDigest(snapshot),
+  } } };
+  calendarRuntime.saveCalendarWatchState(state);
+  calendarRecipes.rememberCalendarRead({ recipe: { version: 1, operationId,
+    window: { start: 'from', end: 'to', limit: null, timezone: null, fixed: null },
+    fields: { id: 'id', title: 'title', start: 'start', end: 'end', allDay: null, cancelled: null, showAs: null,
+      myResponse: null, myResponseFromAttendee: null, attendees: null, organizer: null, location: null } },
+    toolkit: 'controlledcalendar', definitionFingerprint: fingerprint, basis: { learnedAt: new Date(offeredAt).toISOString(), modelIdentity: 'controlled-cache' } });
+  const store = manifests.createCapabilityManifestStore();
+  store.list = () => [{ digest: fingerprint, manifest: { manifestId: 'controlled-calendar-manifest', operationId, accountId,
+    definitionFingerprint: fingerprint, providerKind: 'composio', providerVersion: 'fixture', operationVersion: 'fixture', lifecycle: { state: 'current' } } }] as unknown as ReturnType<typeof store.list>;
+  manifests.installCapabilityManifestStore(store);
+  connections._setConnectedToolkitsSnapshotForTests([{ slug: 'controlledcalendar', connectionId: accountId, status: 'ACTIVE' }]);
+  const candidate = projectMeetingPreparationCandidates({ state, enabled: true, now: offeredAt,
+    connected: new Set([calendarPreparationConnectionKey(operationId, accountId, fingerprint)]) })[0]!;
+  assert.ok(candidate);
+  return { candidate, now: Date.now(), state, policyFile: files[0]! };
+}
+test('an unchanged offer made fifteen minutes before start is accepted nine minutes before start through the ordinary task path', async t => {
+  const { candidate, now } = preparationFixture(t, 9);
+  assert.equal(calendarRuntime.cachedMeetingPreparationCandidates(true, now).length, 0, 'no new offer below ten minutes');
+  assert.equal(calendarRuntime.cachedMeetingPreparationCandidates(true, now, 'answer')[0]?.candidateId, candidate.candidateId);
+  const f = fixture('Do it. Prepare only a private controlled brief.');
+  const state = runtime.loadNoticingState();
+  Object.assign(state.proposals[f.id]!, { meetingPreparation: { candidateId: candidate.candidateId, revision: candidate.revision }, calendarPreparation: candidate });
+  runtime.saveNoticingState(state);
+  const calls = installReader('do_it');
+  const requests: AssistantRequest[] = [];
+  runtime.bindNoticingRespond(async request => { requests.push(request); bindAttempt(request); });
+  await runtime.settleNoticingAnswers();
+  assert.equal(calls.length, 1); assert.equal(requests.length, 1);
+  const request = requests[0]!;
+  const accepted = approved.readAcceptedNoticingTask({ sessionId: request.sessionId, sourceUserSeq: request.sourceUserSeq! });
+  assert.equal(accepted?.packet.proposal.calendarPreparation?.candidateId, candidate.candidateId);
+  assert.equal(f.record().handoff?.state, 'dispatched');
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 1, 'the same owner answer never starts a second task');
+});
+
+test('an opted-in profile with damaged proactivity gates cannot offer, wake or accept preparation work', async t => {
+  const { candidate, policyFile } = preparationFixture(t, 60);
+  assert.equal(runtime.meetingPreparationReadiness().state, 'ready');
+  writeFileSync(policyFile, '{');
+  assert.equal(runtime.meetingPreparationReadiness().state, 'unavailable');
+  assert.throws(() => calendarRuntime.cachedMeetingPreparationCandidates(true), /policy is unavailable/);
+  assert.equal((await runtime.observeForNoticing()).upcomingMeetings, undefined);
+  const before = runtime.loadNoticingState().meetingPreparationWake;
+  await assert.rejects(runtime.requestMeetingPreparationNoticingWake(), /policy is unavailable/);
+  assert.deepEqual(runtime.loadNoticingState().meetingPreparationWake, before);
+  const f = fixture('Do it. Prepare only a private controlled brief.');
+  const state = runtime.loadNoticingState();
+  Object.assign(state.proposals[f.id]!, { meetingPreparation: { candidateId: candidate.candidateId, revision: candidate.revision }, calendarPreparation: candidate });
+  runtime.saveNoticingState(state);
+  const calls = installReader('do_it');
+  const requests: AssistantRequest[] = [];
+  runtime.bindNoticingRespond(async request => { requests.push(request); });
+  await runtime.settleNoticingAnswers(); await runtime.settleNoticingAnswers();
+  assert.equal(calls.length, 1); assert.equal(requests.length, 0);
+  assert.equal(f.record().handoff?.state, 'needs_attention');
+  assert.equal(f.record().handoff?.sourceUserSeq, undefined);
+  assert.equal(log.getHarnessChatRequestReceipt(`noticing-answer:${f.record().handoff?.answerDigest}`), null);
+  assert.equal(readFileSync(policyFile, 'utf8'), '{', 'the strict path never rewrites owner settings');
+});
 
 test('approved noticing overlap owns one literal accepted source and the complete proposal context', async () => {
   const f = fixture();
