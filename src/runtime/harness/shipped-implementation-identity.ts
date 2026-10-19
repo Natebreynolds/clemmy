@@ -23,6 +23,7 @@ import {
 } from './implementation-artifacts/host-local-write-carrier.js';
 
 export type ShippedImplementationKind = 'invoke' | 'reconcile' | 'observer' | 'transport' | 'transportIsolated';
+const IMPLEMENTATION_KINDS = ['invoke', 'reconcile', 'observer', 'transport', 'transportIsolated'] as const;
 
 export interface ShippedImplementationManifestV3 {
   version: 3;
@@ -150,20 +151,60 @@ export function implementationArtifactDigest(kind: ShippedImplementationKind, ro
   return sha256Bytes(readFileSync(artifactPath));
 }
 
-function readManifest(root: string): { ok: true; manifest: ShippedImplementationManifestV3 } | { ok: false; reason: string } {
+type ParsedManifest = { ok: true; manifest: ShippedImplementationManifestV3 } | { ok: false; reason: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Validate before either digest projection or cache path enumeration reads entries. */
+function validateManifestShape(value: unknown): ParsedManifest {
+  if (!isRecord(value) || value.version !== 3 || !isRecord(value.artifacts)
+    || typeof value.manifestDigest !== 'string' || !/^[a-f0-9]{64}$/i.test(value.manifestDigest)) {
+    return { ok: false, reason: 'implementation manifest is malformed' };
+  }
+  const artifacts = value.artifacts;
+  for (const kind of IMPLEMENTATION_KINDS) {
+    if (!Object.hasOwn(artifacts, kind)) {
+      return { ok: false, reason: `implementation manifest ${kind} entry is malformed` };
+    }
+  }
+  // The digest covers every entry, including any additional artifact entries.
+  // They must also be safe to project and enumerate, even though only the five
+  // required implementations can acquire execution authority.
+  for (const [kind, entry] of Object.entries(artifacts)) {
+    if (!isRecord(entry) || typeof entry.file !== 'string' || entry.file.length === 0
+      || typeof entry.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(entry.sha256)) {
+      return { ok: false, reason: `implementation manifest ${kind} entry is malformed` };
+    }
+  }
+  const manifest = value as unknown as ShippedImplementationManifestV3;
+  for (const kind of IMPLEMENTATION_KINDS) {
+    const entry = manifest.artifacts[kind];
+    if (!entry.file.startsWith(`${kind}-`) || !entry.file.endsWith('.cjs')) {
+      return { ok: false, reason: `implementation manifest ${kind} entry is malformed` };
+    }
+    if (!entry.file.includes(entry.sha256)) {
+      return { ok: false, reason: `implementation manifest ${kind} file is not digest-addressed` };
+    }
+  }
+  return { ok: true, manifest };
+}
+
+function readManifest(root: string): ParsedManifest {
   const manifestFile = implementationManifestPath(root);
   if (!existsSync(manifestFile)) {
     return { ok: false, reason: 'implementation manifest is missing' };
   }
-  let manifest: ShippedImplementationManifestV3;
+  let value: unknown;
   try {
-    manifest = JSON.parse(readFileSync(manifestFile, 'utf8')) as ShippedImplementationManifestV3;
+    value = JSON.parse(readFileSync(manifestFile, 'utf8'));
   } catch {
     return { ok: false, reason: 'implementation manifest is not reconstructable' };
   }
-  if (manifest.version !== 3 || !manifest.artifacts || !/^[a-f0-9]{64}$/i.test(manifest.manifestDigest ?? '')) {
-    return { ok: false, reason: 'implementation manifest is malformed' };
-  }
+  const parsed = validateManifestShape(value);
+  if (!parsed.ok) return parsed;
+  const { manifest } = parsed;
   if (manifestBodyDigest(manifest) !== manifest.manifestDigest.toLowerCase()) {
     return { ok: false, reason: 'implementation manifest digest does not match the artifact set' };
   }
@@ -259,14 +300,14 @@ function filesSignature(files: readonly string[]): string {
   }).join('|');
 }
 
-function identityFiles(root: string, manifest?: ShippedImplementationManifestV3): string[] {
+function identityFiles(root: string, manifest: ShippedImplementationManifestV3): string[] {
   return [
     implementationManifestPath(root),
     path.join(root, 'build-stamp.json'),
     ...(path.resolve(root) === path.resolve(SRC_ARTIFACT_ROOT)
       ? [path.join(MODULE_DIR, '../build-stamp.json'), path.join(MODULE_DIR, 'build-stamp.json')]
       : []),
-    ...(manifest ? Object.values(manifest.artifacts).map((artifact) => path.join(root, artifact.file)) : []),
+    ...Object.values(manifest.artifacts).map((artifact) => path.join(root, artifact.file)),
   ];
 }
 
@@ -284,12 +325,13 @@ export function verifyShippedImplementationIdentity(
   verifiedByRoot.delete(resolved);
   // Every file is signed before the full check reads it, and the result is
   // kept only when nothing moved while it was read.
-  let manifest: ShippedImplementationManifestV3 | undefined;
-  try { manifest = JSON.parse(readFileSync(implementationManifestPath(root), 'utf8')) as ShippedImplementationManifestV3; } catch { manifest = undefined; }
-  const files = identityFiles(root, manifest?.artifacts && typeof manifest.artifacts === 'object' ? manifest : undefined);
+  const parsed = readManifest(root);
+  if (!parsed.ok) return parsed;
+  const { manifest } = parsed;
+  const files = identityFiles(root, manifest);
   const signature = filesSignature(files);
   const result = verifyShippedImplementationIdentityUncached(root);
-  if (result.ok && manifest?.manifestDigest === result.manifestDigest && filesSignature(files) === signature) {
+  if (result.ok && manifest.manifestDigest === result.manifestDigest && filesSignature(files) === signature) {
     verifiedByRoot.set(resolved, { files, signature, result: { ...result, digests: { ...result.digests } } });
   }
   return result;
@@ -313,14 +355,8 @@ function verifyShippedImplementationIdentityUncached(
     }
   }
   const digests = {} as Record<ShippedImplementationKind, string>;
-  for (const kind of ['invoke', 'reconcile', 'observer', 'transport', 'transportIsolated'] as const) {
+  for (const kind of IMPLEMENTATION_KINDS) {
     const expected = manifest.artifacts[kind];
-    if (!expected || !expected.file.startsWith(`${kind}-`) || !expected.file.endsWith('.cjs') || !/^[a-f0-9]{64}$/i.test(expected.sha256)) {
-      return { ok: false, reason: `implementation manifest ${kind} entry is malformed` };
-    }
-    if (!expected.file.includes(expected.sha256)) {
-      return { ok: false, reason: `implementation manifest ${kind} file is not digest-addressed` };
-    }
     const artifactPath = path.join(root, expected.file);
     if (!existsSync(artifactPath)) {
       return { ok: false, reason: `shipped ${kind} artifact is missing` };

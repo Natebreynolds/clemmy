@@ -68,6 +68,110 @@ const { attachSemanticContract } = await import('./capability-manifest.js');
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
+const manifestFixtureScript = `
+  import assert from 'node:assert/strict';
+  import { createHash } from 'node:crypto';
+  import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+  import os from 'node:os';
+  import path from 'node:path';
+  import { implementationArtifactPath, implementationManifestPath, verifyShippedImplementationIdentity,
+    _fullIdentityVerificationsForTests } from ${JSON.stringify(path.join(repoRoot, 'src/runtime/harness/shipped-implementation-identity.ts'))};
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clem-manifest-shape-'));
+  const kinds = ['invoke', 'reconcile', 'observer', 'transport', 'transportIsolated'];
+  const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  const artifacts = Object.fromEntries(kinds.map((kind) => {
+    const bytes = '// distinct fixture artifact: ' + kind;
+    const sha256 = digest(bytes);
+    const file = kind + '-' + sha256 + '.cjs';
+    writeFileSync(path.join(root, file), bytes);
+    return [kind, { file, sha256 }];
+  }));
+  const valid = { version: 3, artifacts, manifestDigest: digest(JSON.stringify({ version: 3, artifacts })) };
+  const copy = () => JSON.parse(JSON.stringify(valid));
+  const writeManifest = (manifest) => writeFileSync(implementationManifestPath(root), JSON.stringify(manifest));
+`;
+
+function runManifestFixture(script: string): void {
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', manifestFixtureScript + script], {
+    encoding: 'utf8',
+    cwd: repoRoot,
+    env: { ...process.env, CLEMENTINE_HOME: mkdtempSync(path.join(os.tmpdir(), 'clem-manifest-shape-home-')) },
+  });
+  assert.equal(child.status, 0, `${child.status} ${child.stderr}`);
+}
+
+test('malformed manifest shapes refuse before cache enumeration or digesting', () => {
+  runManifestFixture(`
+    const cases = [
+      ['null manifest', null], ['array manifest', []], ['number manifest', 3], ['string manifest', 'manifest'],
+      ['unsupported version with malformed entry', { ...valid, version: 2, artifacts: { invoke: {} } }],
+      ['null artifacts', { ...valid, artifacts: null }],
+      ['array artifacts', { ...valid, artifacts: [] }],
+      ['string artifacts', { ...valid, artifacts: 'artifacts' }],
+      ['non-string manifest digest', { ...valid, manifestDigest: 12 }],
+    ];
+    for (const kind of kinds) {
+      const missing = copy();
+      delete missing.artifacts[kind];
+      cases.push(['missing ' + kind, missing]);
+      for (const entry of [null, [], false, 7, 'entry', {}, { file: artifacts[kind].file }]) {
+        const malformed = copy();
+        malformed.artifacts[kind] = entry;
+        cases.push(['invalid ' + kind + ' entry ' + JSON.stringify(entry), malformed]);
+      }
+      for (const field of ['file', 'sha256']) {
+        for (const value of [null, [], {}, 7, true, '']) {
+          const malformed = copy();
+          malformed.artifacts[kind][field] = value;
+          cases.push(['invalid ' + kind + '.' + field + ' ' + JSON.stringify(value), malformed]);
+        }
+      }
+    }
+    for (const entry of [null, [], 7, {}, { file: 7, sha256: 'a'.repeat(64) }]) {
+      const malformed = copy();
+      malformed.artifacts.extra = entry;
+      cases.push(['malformed additional entry ' + JSON.stringify(entry), malformed]);
+    }
+    for (const [label, manifest] of cases) {
+      writeManifest(manifest);
+      const result = verifyShippedImplementationIdentity(root);
+      assert.equal(result.ok, false, label);
+      assert.match(result.reason, /implementation manifest .*malformed/, label);
+      assert.throws(() => implementationArtifactPath('invoke', root), /implementation manifest .*malformed/, label);
+    }
+  `);
+});
+
+test('manifest cache recovers from a malformed replacement without reusing prior success', () => {
+  runManifestFixture(`
+    writeManifest(valid);
+    const first = verifyShippedImplementationIdentity(root);
+    assert.equal(first.ok, true);
+    const baseline = _fullIdentityVerificationsForTests();
+    for (let index = 0; index < 1000; index += 1) {
+      assert.deepEqual(verifyShippedImplementationIdentity(root), first);
+    }
+    assert.equal(_fullIdentityVerificationsForTests(), baseline, 'warm verification remains stat-only');
+
+    for (const replacement of [null, { ...valid, artifacts: { ...artifacts, invoke: {} } }]) {
+      writeManifest(replacement);
+      assert.equal(verifyShippedImplementationIdentity(root).ok, false, 'changed malformed bytes invalidate success');
+      writeManifest(valid);
+      const before = _fullIdentityVerificationsForTests();
+      assert.deepEqual(verifyShippedImplementationIdentity(root), first, 'restored exact generation verifies again');
+      assert.equal(_fullIdentityVerificationsForTests(), before + 1, 'recovery performs a full verification');
+      assert.deepEqual(verifyShippedImplementationIdentity(root), first);
+      assert.equal(_fullIdentityVerificationsForTests(), before + 1, 'recovered success is cached');
+    }
+
+    const artifact = path.join(root, artifacts.invoke.file);
+    writeFileSync(artifact, readFileSync(artifact, 'utf8') + '\\n// tampered');
+    const tampered = verifyShippedImplementationIdentity(root);
+    assert.equal(tampered.ok, false);
+    assert.match(tampered.reason, /artifact does not match the implementation manifest/);
+  `);
+});
+
 test('emitted artifacts are executable javascript with distinct identities', () => {
   const verified = verifyShippedImplementationIdentity();
   assert.equal(verified.ok, true, JSON.stringify(verified));
@@ -141,6 +245,7 @@ test('an unchanged artifact set is verified once, and a change after that is sti
     import { readFileSync, writeFileSync } from 'node:fs';
     import path from 'node:path';
     import { emitShippedImplementationArtifacts, implementationArtifactPath, verifyShippedImplementationIdentity,
+      installImplementationArtifactRoot, loadShippedImplementations,
       _fullIdentityVerificationsForTests } from ${JSON.stringify(path.join(repoRoot, 'src/runtime/harness/shipped-implementation-identity.ts'))};
     const root = process.env.CACHED_ROOT;
     emitShippedImplementationArtifacts(root);
@@ -158,6 +263,15 @@ test('an unchanged artifact set is verified once, and a change after that is sti
     if (!verifyShippedImplementationIdentity(root).ok) process.exit(7);
     writeFileSync(path.join(root, 'build-stamp.json'), JSON.stringify({ implementationManifestDigest: 'f'.repeat(64) }));
     if (verifyShippedImplementationIdentity(root).ok) process.exit(8);
+    emitShippedImplementationArtifacts(root);
+    const otherRoot = root + '-other';
+    emitShippedImplementationArtifacts(otherRoot);
+    if (!verifyShippedImplementationIdentity(otherRoot).ok) process.exit(9);
+    installImplementationArtifactRoot(root);
+    loadShippedImplementations();
+    if (!verifyShippedImplementationIdentity(root).ok) process.exit(10);
+    const otherGeneration = verifyShippedImplementationIdentity(otherRoot);
+    if (otherGeneration.ok || !otherGeneration.reason.includes('generation changed')) process.exit(11);
   `;
   const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
     encoding: 'utf8',
@@ -165,7 +279,8 @@ test('an unchanged artifact set is verified once, and a change after that is sti
     env: { ...process.env, CACHED_ROOT: root, CLEMENTINE_HOME: mkdtempSync(path.join(os.tmpdir(), 'clem-shipped-cached-home-')) },
   });
   // 4: a cached read differed; 5: more than one full read and hash; 6/8: a
-  // change after verification was accepted; 7: a fresh set was refused.
+  // change after verification was accepted; 7: a fresh set was refused;
+  // 9/10: an unchanged set was refused; 11: a warm cache bypassed the process pin.
   assert.equal(child.status, 0, `${child.status} ${child.stderr}`);
 });
 

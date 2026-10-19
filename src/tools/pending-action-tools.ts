@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, getSession, listEvents, type SessionKind } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { pendingActionAsk } from '../runtime/harness/pending-action-view.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -45,6 +45,40 @@ const kindEnum = z.enum(PENDING_ACTION_KINDS);
 const approvalIntentEnum = z.enum(['request_now', 'queue_only']);
 
 export type PendingActionApprovalIntent = z.infer<typeof approvalIntentEnum>;
+
+export type PendingActionContinuationMode = 'host_chat' | 'batch' | 'caller' | 'unowned';
+
+/** Select guidance for the continuation that will own a valid human decision.
+ * This is not execution authority: the registry, immutable card linkage and
+ * executor still validate approval, source, account and payload at dispatch.
+ * A staged ordinary action retains its caller until a human card owns it. */
+export function pendingActionContinuationMode(input: {
+  toolName: string;
+  actionSessionId: string | null;
+  contextSessionId: string | null;
+  contextSessionKind: SessionKind | null;
+  humanApprovalBound: boolean;
+}): PendingActionContinuationMode {
+  if (!input.actionSessionId || !input.contextSessionId || !input.contextSessionKind
+    || input.actionSessionId !== input.contextSessionId) return 'unowned';
+  if (input.toolName === 'run_batch') return 'batch';
+  return input.humanApprovalBound && input.contextSessionKind === 'chat' ? 'host_chat' : 'caller';
+}
+
+function continuationModeFor(record: PendingActionRecord, approvalRequired: boolean): PendingActionContinuationMode {
+  const sessionId = ownedSessionId();
+  let sessionKind: SessionKind | null = null;
+  try { sessionKind = sessionId ? getSession(sessionId)?.kind ?? null : null; } catch {
+    // An unreadable owner cannot justify either a host promise or caller replay.
+  }
+  return pendingActionContinuationMode({
+    toolName: record.toolName,
+    actionSessionId: record.sessionId,
+    contextSessionId: sessionId,
+    contextSessionKind: sessionKind,
+    humanApprovalBound: approvalRequired || (record.approvedBy === 'human' && Boolean(record.approvalId)),
+  });
+}
 
 function normalizeSessionId(value?: string | null): string | null {
   const clean = value?.trim();
@@ -181,13 +215,24 @@ function queuedActionNextStep(
   approvalRequired: boolean,
   approvalIntent?: PendingActionApprovalIntent,
 ): string {
+  const continuationMode = continuationModeFor(record, approvalRequired);
+  const afterApproval = continuationMode === 'host_chat'
+    ? 'After the owner approves the one exact card, the chat host runs the stored payload once and returns its durable result. Do not call pending_action_execute, repeat the underlying call, or reconstruct its arguments.'
+    : continuationMode === 'batch'
+      ? `After approval, call run_batch once with action="execute" and pending_action_id="${record.id}"; it consumes the certified stored plan. Do not call pending_action_execute or reconstruct any item.`
+      : continuationMode === 'caller'
+        ? 'After approval, this session\'s caller retains execution: call pending_action_execute once with this id; never reconstruct the underlying call.'
+        : 'No authoritative session owner is available for this continuation. Do not execute or reconstruct the action; its owning session must handle the decision.';
   const voice = 'Speak to the owner as you would in person: say what you need to do and why, and that you are waiting on their go-ahead. '
     + 'Never mention ids, hashes, cards, graphs, tools or the harness; the id below is for your tool calls only.';
   if (record.status === 'approval_requested') {
     return `The owner already has the one card for this. Do not queue or request another; wait for their decision. ${voice}`;
   }
   if (record.status === 'approved') {
-    return 'The owner approved this exact action. Call pending_action_execute once with this id; do not reconstruct the underlying call.';
+    if (approvalRequired && record.approvedBy !== 'human') {
+      return 'This action still requires a verified human decision on its exact card. Do not execute it or treat a policy approval as the owner\'s consent.';
+    }
+    return `This exact action is approved. ${afterApproval}`;
   }
   if (record.status === 'executing' || record.status === 'executed') {
     return `This exact action is already ${record.status}. Do not dispatch or queue it again; report the durable result in your own words.`;
@@ -196,12 +241,12 @@ function queuedActionNextStep(
     return `This exact action is already ${record.status}. Do not retry or create a replacement from this same request; tell the owner plainly.`;
   }
   return approvalRequired && approvalIntent === 'request_now'
-    ? `QUEUED FOR APPROVAL: the exact payload is stored with the question "${pendingActionAsk(record)}". The card is not open yet and nothing has run. Return your proposed-action reply; the host turn boundary handles registration of this exact payload's card. Do not search for or create another approval. ${voice} After their yes, the exact stored payload runs once; do not re-read and reconstruct the underlying tool call.`
+    ? `QUEUED FOR APPROVAL: the exact payload is stored with the question "${pendingActionAsk(record)}". The card is not open yet and nothing has run. Return your proposed-action reply; the host turn boundary handles registration of this exact payload's card. Do not search for or create another approval. ${voice} ${afterApproval}`
     : approvalRequired && approvalIntent === 'queue_only'
       ? 'STAGED ONLY: stored without a card. Do not ask the owner to run it this turn. A later explicit request can open its one card for the same exact payload.'
       : approvalRequired
-        ? `NEXT: end this turn with one plain question to the owner naming what you would do (for example, "Should I send it?"). The harness opens the one card from this record; do not search for or create another approval. ${voice} After their yes, call pending_action_execute with this id so the exact stored payload runs once.`
-    : 'Next: ask the owner whether to go ahead. If it needs a formal card, call request_approval with pendingActionId set to this id and a plain-language preview. After approval, call pending_action_execute with this id so the exact stored payload runs once.';
+        ? `NEXT: end this turn with one plain question to the owner naming what you would do (for example, "Should I send it?"). The harness opens the one card from this record; do not search for or create another approval. ${voice} ${afterApproval}`
+    : `Next: ask the owner whether to go ahead. If it needs a formal card, call request_approval with pendingActionId set to this id and a plain-language preview. ${afterApproval}`;
 }
 
 /**
@@ -223,15 +268,16 @@ export function registerPendingActionTools(server: McpServer): void {
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
       'Do not queue an exact ordinary reversible write merely because it changes external state; execute that through the normal work boundary without a separate approval ceremony.',
       'State the graph edge with approvalIntent: request_now opens the one exact formal card this turn; queue_only stores it without a card. Use queue_only when the user explicitly asked to stage only, and do not queue at all while required scope is unresolved.',
-      'After approval, call pending_action_execute with this id; it dispatches the exact queued payload once and records the outcome.',
+      'Required fields include toolName (the exact inner tool, never its carrier) and payloadJson (its exact JSON arguments). If supplied, ask must be 12–200 characters; put longer context in summary, not ask.',
+      'Follow the returned continuation guidance: the chat host executes a human-approved single-call card itself; do not call pending_action_execute for that host-owned continuation. A batch retains run_batch action=execute; other session owners retain their existing execution path.',
     ].join(' '),
     {
       title: z.string().min(3).max(160).describe('Short name for lists, e.g. "Run the backup on the server".'),
       summary: z.string().min(8).max(2000).describe('Plain-language summary of what is queued and why.'),
-      ask: z.string().min(12).max(200).optional().describe('Your words to the owner, as you would say them in person: what you need to do and why their request needs it, ending with the go-ahead question. Example: "To finish step 2 I need to run one command on your computer. It only prints your SSH settings; nothing leaves the machine. OK to run it?" No tool names, ids, hashes or harness terms. The exact command or content is shown under your words automatically.'),
+      ask: z.string().min(12).max(200).optional().describe('Optional question of 12–200 characters. In your own words, say what you need to do and ask for the go-ahead. Put longer reasoning in summary. No tool names, ids, hashes or harness terms. The exact command or content is shown below automatically.'),
       why: z.string().max(260).optional().describe('One optional extra line of context for the owner, in plain words (what it touches, what it does not).'),
       kind: kindEnum.describe('Descriptive action class only; the host derives approval from the exact tool and payload. external_write alone does not imply approval.'),
-      toolName: z.string().min(1).max(160).describe('The exact tool to call after approval, e.g. composio_execute_tool or run_shell_command.'),
+      toolName: z.string().min(1).max(160).describe('REQUIRED: exact inner tool stored for execution after approval, e.g. composio_execute_tool or run_shell_command. Do not omit it or name call_tool/work_call.'),
       payloadJson: z.string().min(2).max(100000).describe('Exact JSON payload for the execution tool. Use the tool schema shape, not prose.'),
       approvalIntent: approvalIntentEnum.optional().describe('request_now = exact payload is complete and the graph should open its one formal card now; queue_only = store it without opening a card this turn. Optional only for pre-3.0 callers, which retain the narrow legacy prose bridge.'),
       targetSummary: z.string().max(1000).optional().describe('Human-readable destination/recipient/resource.'),
@@ -434,7 +480,7 @@ export function registerPendingActionTools(server: McpServer): void {
 
   server.tool(
     'pending_action_list',
-    'List durable pending actions. Use before executing a user approval like "yes, send it" so you execute the queued payload, not a reconstructed guess.',
+    'Inspect durable pending-action status and results. A human-approved single-call chat card is executed by the host; do not list actions merely to replay that decision or reconstruct its payload. Other session execution owners keep their existing approval path.',
     {
       status: statusEnum.or(z.literal('all')).optional(),
       sessionId: z.string().optional(),
@@ -473,8 +519,9 @@ export function registerPendingActionTools(server: McpServer): void {
   server.tool(
     'pending_action_execute',
     [
-      'Fire the exact stored tool call of an APPROVED single-call pending action (e.g. a card minted because a fidelity judge could not verify a send).',
-      'The server executes the byte-identical queued payload through the gated write boundary — you cannot alter it. Use this after the user approves such a card; do NOT re-issue the underlying send yourself.',
+      'Compatibility executor for an APPROVED single-call pending action when this session\'s execution owner explicitly directs the caller to run it.',
+      'A human-approved exact single-call card in chat is executed by the host automatically; do NOT call this tool for that continuation or re-issue its underlying call.',
+      'For caller-owned execution the server dispatches the byte-identical stored payload through the gated write boundary; you cannot alter it.',
       'This call returns the authoritative provider result AND records the outcome. After it succeeds, report that result directly; do NOT call pending_action_get or pending_action_record_result.',
       'run_batch plans are executed via run_batch action=execute instead.',
     ].join(' '),

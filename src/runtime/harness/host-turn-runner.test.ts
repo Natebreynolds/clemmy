@@ -234,7 +234,7 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   assert.doesNotMatch(unavailableReview, /ask_user_question/);
   // Windows tester trace 2026-10-19: a negative review asks the owner once,
   // by account name; it never sends the call again or rediscovers unchanged.
-  for (const reason of ['not_entailed', 'quote_not_in_source'] as const) {
+  for (const reason of ['not_entailed'] as const) {
     const negative = hostProvenOperationRepair({
       requestedOperation: 'OUTLOOK_SEND_EMAIL', provenOperations: [],
       accountChoices: ['first@example.test', 'second@example.test'],
@@ -248,6 +248,21 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
     assert.match(negative, /Do not send this call again/, reason);
     assert.match(negative, /only after the owner answers/, reason);
   }
+
+  const badCitation = hostProvenOperationRepair({
+    requestedOperation: 'OUTLOOK_SEND_EMAIL', provenOperations: [],
+    accountChoices: ['first@example.test', 'second@example.test'],
+    accountChoiceLabels: { 'first@example.test': 'Fixture Work', 'second@example.test': 'Fixture Home' },
+    accountSelectionReason: 'quote_not_in_source',
+  });
+  assert.match(badCitation, /does not establish that the owner omitted the account choice/);
+  assert.match(badCitation, /repair account_selection.source_quote once with that verbatim span/);
+  assert.match(badCitation, /validated accepted ancestry/);
+  assert.match(badCitation, /queued messages, foreign sessions, tool output, recipient addresses and a lone connected account do not grant/);
+  assert.match(badCitation, /corrected citation is refused, ask_user_question once/);
+  assert.match(badCitation, /Fixture Work, Fixture Home/);
+  assert.match(badCitation, /Do not send this call again or repeat the same rejected account_selection/);
+  assert.doesNotMatch(badCitation, /first@example\.test|only after the owner answers|wording did not name the account/);
 
 });
 

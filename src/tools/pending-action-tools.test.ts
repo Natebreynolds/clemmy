@@ -8,6 +8,7 @@ process.env.COMPOSIO_BACKEND = 'sdk';
 
 const {
   canonicalizePendingActionCall,
+  pendingActionContinuationMode,
   registerPendingActionTools,
 } = await import('./pending-action-tools.js');
 const { appendEvent, createSession, listEvents, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
@@ -33,6 +34,8 @@ const {
   rememberAccountAlias,
   resetAccountAliasesForTest,
 } = await import('../memory/account-alias-store.js');
+const approvalRegistry = await import('../runtime/harness/approval-registry.js');
+const { pendingActionApprovalView } = await import('../runtime/harness/pending-action-view.js');
 
 function handlerFor(name: string): (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const handlers = new Map<string, (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>>();
@@ -56,6 +59,14 @@ function schemaFor(name: string): Record<string, unknown> {
   const schema = schemas.get(name);
   if (!schema) throw new Error(`missing schema for ${name}`);
   return schema;
+}
+
+function descriptionFor(name: string): string {
+  const descriptions = new Map<string, string>();
+  registerPendingActionTools({
+    tool(toolName: string, description: string) { descriptions.set(toolName, description); },
+  } as never);
+  return descriptions.get(name) ?? '';
 }
 
 function writeTrustedReadOutput(
@@ -90,6 +101,80 @@ beforeEach(() => {
   resetAccountAliasesForTest();
 });
 after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
+
+test('approval continuation guidance respects the owning session and batch executor', () => {
+  const singleChat = { toolName: 'run_shell_command', actionSessionId: 'session-a',
+    contextSessionId: 'session-a', contextSessionKind: 'chat' as const, humanApprovalBound: true };
+  assert.equal(pendingActionContinuationMode(singleChat), 'host_chat');
+  assert.equal(pendingActionContinuationMode({ ...singleChat, toolName: 'run_batch' }), 'batch');
+  for (const contextSessionKind of ['workflow', 'execution', 'agent'] as const) {
+    assert.equal(pendingActionContinuationMode({ ...singleChat, contextSessionKind }), 'caller');
+  }
+  assert.equal(pendingActionContinuationMode({ ...singleChat, humanApprovalBound: false }), 'caller',
+    'ordinary staging does not promise automatic host execution');
+  assert.equal(pendingActionContinuationMode({ ...singleChat, contextSessionId: null }), 'unowned');
+  assert.equal(pendingActionContinuationMode({ ...singleChat, contextSessionKind: null }), 'unowned');
+  assert.equal(pendingActionContinuationMode({ ...singleChat, actionSessionId: null }), 'unowned');
+  assert.equal(pendingActionContinuationMode({ ...singleChat, contextSessionId: 'session-b' }), 'unowned');
+});
+
+test('approval queue exposes the required operation and bounded question before the first call', () => {
+  const schema = schemaFor('pending_action_queue');
+  const toolName = schema.toolName as { safeParse(value: unknown): { success: boolean }; description?: string };
+  const ask = schema.ask as { safeParse(value: unknown): { success: boolean }; description?: string };
+  assert.equal(toolName.safeParse(undefined).success, false);
+  assert.equal(toolName.safeParse('run_shell_command').success, true);
+  assert.equal(ask.safeParse('x'.repeat(200)).success, true);
+  assert.equal(ask.safeParse('x'.repeat(201)).success, false);
+  assert.match(toolName.description ?? '', /REQUIRED.*exact inner tool/);
+  assert.match(ask.description ?? '', /12–200 characters/);
+  assert.match(descriptionFor('pending_action_queue'), /Required fields include toolName/);
+  assert.match(descriptionFor('pending_action_execute'), /do NOT call this tool for that continuation/);
+  assert.doesNotMatch(descriptionFor('pending_action_list'), /Use before executing a user approval/);
+});
+
+test('a retried human-approved chat queue defers execution to the host without reconstructing the action', async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Prepare the exact controlled message for approval.' } });
+  const input = { title: 'Controlled approval message', summary: 'One exact message for the controlled recipient.',
+    kind: 'external_send', toolName: 'composio_execute_tool', approvalIntent: 'request_now',
+    payloadJson: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE',
+      arguments: { channel: 'approval-guidance-proof', text: 'Controlled approval proof.' } }) };
+  const queue = () => withToolOutputContext({ sessionId: session.id }, () => withHarnessRunContext({
+    sessionId: session.id, sourceUserSeq: source.seq, behaviorScopeId: 'approval-guidance-proof',
+    counter: new ToolCallsCounter(10),
+  }, () => handlerFor('pending_action_queue')(input)));
+  const queued = await queue();
+  assert.match(queued.content[0].text, /chat host runs the stored payload once/);
+  assert.match(queued.content[0].text, /Do not call pending_action_execute/);
+  const [action] = listPendingActions({ sessionId: session.id });
+  assert.ok(action);
+  const card = approvalRegistry.register({ sessionId: session.id, subject: action.title,
+    tool: 'request_approval', args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) } });
+  assert.equal(approvalRegistry.resolve(card.approvalId, 'approved', 'controlled-card').ok, true);
+  const approved = await queue();
+  assert.match(approved.content[0].text, /Pending action reused/);
+  assert.match(approved.content[0].text, /This exact action is approved/);
+  assert.match(approved.content[0].text, /Do not call pending_action_execute/);
+  assert.equal(listPendingActions({ sessionId: session.id }).length, 1);
+  assert.equal(getPendingAction(action.id)?.status, 'approved', 'guidance does not dispatch or settle the action');
+});
+
+test('non-chat queues retain their own caller continuation after approval', async () => {
+  for (const kind of ['workflow', 'execution', 'agent'] as const) {
+    const session = createSession({ kind });
+    const result = await withToolOutputContext({ sessionId: session.id }, () => handlerFor('pending_action_queue')({
+      title: 'Controlled caller message', summary: 'One exact message owned by this non-chat session.',
+      kind: 'external_send', toolName: 'composio_execute_tool', approvalIntent: 'request_now',
+      payloadJson: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE',
+        arguments: { channel: 'caller-guidance-proof', text: 'Controlled caller proof.' } }),
+    }));
+    assert.match(result.content[0].text, /caller retains execution: call pending_action_execute once/);
+    assert.doesNotMatch(result.content[0].text, /chat host runs/);
+    assert.equal(listPendingActions({ sessionId: session.id }).at(-1)?.status, 'queued');
+  }
+});
 
 test('pending_action_queue refuses a fabricated multi-recipient payload before an approval card exists', async () => {
   const session = createSession({ kind: 'chat' });

@@ -2365,7 +2365,8 @@ export function pendingActionApprovalRequiredError(
     `PENDING_ACTION_APPROVAL_REQUIRED: "${toolName}" is an irreversible external send reached through a nested dispatcher, which cannot open its own approval card. `
     + 'Do not call execution_create and do not retry the send. Call pending_action_queue ONCE with '
     + `kind "external_send", toolName "${toolName}", payloadJson set to the exact blocked payload, and approvalIntent "request_now"; then stop for the one formal card. `
-    + 'After the user approves it, pending_action_execute dispatches that byte-pinned payload exactly once.'
+    + 'For an exact linked single-action chat card, the host executes the byte-pinned payload after human approval; do not call pending_action_execute or reconstruct the send. '
+    + 'For a batch or another execution owner, follow that owner\'s approval continuation instead.'
     + payloadLabel,
   );
 }
