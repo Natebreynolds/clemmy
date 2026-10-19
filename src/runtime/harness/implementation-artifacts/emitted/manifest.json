@@ -2055,7 +2055,7 @@
           "bytes": 6038
         },
         "src/tools/work-call.ts": {
-          "bytes": 113702
+          "bytes": 114932
         },
         "src/runtime/harness/turn-answered-refusals.ts": {
           "bytes": 4633
@@ -2889,7 +2889,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740676
+          "bytes": 741343
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -6018,7 +6018,7 @@
           "bytes": 6038
         },
         "src/tools/work-call.ts": {
-          "bytes": 113702
+          "bytes": 114932
         },
         "src/runtime/harness/turn-answered-refusals.ts": {
           "bytes": 4633
@@ -6852,7 +6852,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740676
+          "bytes": 741343
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
