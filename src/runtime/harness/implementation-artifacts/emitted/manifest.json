@@ -705,7 +705,7 @@
           "bytes": 86552
         },
         "src/agents/proactivity-policy.ts": {
-          "bytes": 14535
+          "bytes": 14902
         },
         "src/runtime/semantic-boundary/admitted-capability-ref.ts": {
           "bytes": 432
@@ -2240,6 +2240,9 @@
         "src/runtime/harness/completion-review-steering.ts": {
           "bytes": 6462
         },
+        "src/runtime/harness/review-after-delivery.ts": {
+          "bytes": 10012
+        },
         "src/runtime/harness/host-stop-narration-lifecycle.ts": {
           "bytes": 2304
         },
@@ -2874,13 +2877,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830215
+          "bytes": 830470
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 731505
+          "bytes": 739789
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3705,7 +3708,7 @@
           "bytes": 20476
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 97200
+          "bytes": 98794
         },
         "src/runtime/outcome.ts": {
           "bytes": 35914
@@ -3918,13 +3921,13 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 101274
+          "bytes": 102456
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 96722
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 395752
+          "bytes": 395976
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 44327
@@ -4659,7 +4662,7 @@
           "bytes": 86552
         },
         "src/agents/proactivity-policy.ts": {
-          "bytes": 14535
+          "bytes": 14902
         },
         "src/runtime/semantic-boundary/admitted-capability-ref.ts": {
           "bytes": 432
@@ -6194,6 +6197,9 @@
         "src/runtime/harness/completion-review-steering.ts": {
           "bytes": 6462
         },
+        "src/runtime/harness/review-after-delivery.ts": {
+          "bytes": 10012
+        },
         "src/runtime/harness/host-stop-narration-lifecycle.ts": {
           "bytes": 2304
         },
@@ -6828,13 +6834,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 830215
+          "bytes": 830470
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 731505
+          "bytes": 739789
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7659,7 +7665,7 @@
           "bytes": 20476
         },
         "src/runtime/harness/delivery-committer.ts": {
-          "bytes": 97200
+          "bytes": 98794
         },
         "src/runtime/outcome.ts": {
           "bytes": 35914
@@ -7872,13 +7878,13 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 101274
+          "bytes": 102456
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 96722
         },
         "src/runtime/harness/eventlog.ts": {
-          "bytes": 395752
+          "bytes": 395976
         },
         "src/runtime/harness/host-capability-catalog-factory.ts": {
           "bytes": 44327
