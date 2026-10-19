@@ -22,6 +22,7 @@ import {
   type CarrierCompletion,
   type ProvenCompletionEntry,
 } from './carrier-completion-registry.js';
+import { carrierJsonObject } from './carrier-json.js';
 
 export type { CarrierCompletion, ProvenCompletionEntry };
 
@@ -54,10 +55,7 @@ function unwrapDoubledArgsEnvelope(value: Record<string, unknown>): Record<strin
 }
 
 function decodeInner(raw: unknown): Record<string, unknown> | null {
-  if (typeof raw === 'string') {
-    try { return asRecord(JSON.parse(raw)); } catch { return null; }
-  }
-  return asRecord(raw);
+  return typeof raw === 'string' ? carrierJsonObject(raw) : asRecord(raw);
 }
 
 /** A well-formed Composio operation slug: TOOLKIT_OPERATION, uppercase, single

@@ -539,6 +539,31 @@ test('a long chat keeps its checked account: each check covers only the messages
     'only the messages after the last check are rechecked');
 });
 
+test('a negative account review stands until the owner answers, then the answer is revalidated exactly', async () => {
+  // Windows tester trace 2026-10-19: two nominations quoting send intent were
+  // not_entailed, the send was retried unchanged, and discovery repeated.
+  const calls = installJudge((call) => ({
+    verdict: /Fixture Work|Scorpion/i.test(call.acceptedText) ? 'entailed' : 'not_entailed',
+  }));
+  const askText = 'TEST FIXTURE: send Dana the summit follow-up.';
+  const ask = source(askText);
+  const vague = { toolkit: 'outlook', identity: SCORPION, source_quote: 'send Dana the summit follow-up' };
+  const first = await routing.resolveSourceAccountRouting({ ...input(ask), nomination: vague, effect: 'write' });
+  assert.equal(first.kind, 'account_selection_required');
+  if (first.kind === 'account_selection_required') assert.equal(first.reason, 'not_entailed');
+  const repeated = await routing.resolveSourceAccountRouting({ ...input(ask), nomination: vague, effect: 'write' });
+  assert.deepEqual(repeated, first, 'the unchanged nomination gets the same refusal');
+  assert.equal(calls.length, 1, 'an unchanged nomination is not reviewed again');
+  const answerText = 'Use my Scorpion mailbox for it.';
+  const answer = source(answerText, ask.sessionId);
+  const bound = await routing.resolveSourceAccountRouting({ ...input(answer), effect: 'write',
+    nomination: { toolkit: 'outlook', identity: SCORPION, source_quote: 'my Scorpion mailbox' } });
+  assert.equal(bound.kind, 'resolved', JSON.stringify(bound));
+  assert.equal(calls.length, 2, 'the owner\'s answer is reviewed once, on its own words');
+  assert.equal(calls.at(-1)?.acceptedText, answerText);
+  if (bound.kind === 'resolved') assert.equal(bound.connection.connectionId, 'fixture-scorpion');
+});
+
 test('defaults do not inherit, and earlier account constraints survive no-tool continuations', async () => {
   const firstText = 'Draft a note using my outbound email skill.';
   const first = source(firstText);

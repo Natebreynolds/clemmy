@@ -941,9 +941,14 @@ function toolSearchResultRows(result: unknown): unknown[] {
   return rows;
 }
 
-function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> {
+/** Why discovery left an operation's account unbound. Recovery must keep it:
+ * a negative review asks the owner, an unfinished one retries the review. */
+export type ToolSearchAccountSelectionReason = 'review_unavailable' | 'not_entailed' | 'quote_not_in_source';
+const ACCOUNT_SELECTION_REASONS: ReadonlySet<unknown> = new Set(['review_unavailable', 'not_entailed', 'quote_not_in_source']);
+
+function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: ToolSearchAccountSelectionReason }> {
   const rows = toolSearchResultRows(result);
-  const blockers: Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> = [];
+  const blockers: Array<{ name: string; choices: string[]; labels?: Record<string, string>; reason?: ToolSearchAccountSelectionReason }> = [];
   for (const row of rows) {
     if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
     const record = row as {
@@ -967,7 +972,8 @@ function parseToolSearchAccountBlockers(result: unknown): Array<{ name: string; 
       : undefined;
     blockers.push({ name: record.name.trim(), choices,
       ...(labels && Object.keys(labels).length > 0 ? { labels } : {}),
-      ...(record.accountSelectionReason === 'review_unavailable' ? { reason: 'review_unavailable' as const } : {}) });
+      ...(ACCOUNT_SELECTION_REASONS.has(record.accountSelectionReason)
+        ? { reason: record.accountSelectionReason as ToolSearchAccountSelectionReason } : {}) });
   }
   return blockers;
 }
@@ -1008,8 +1014,8 @@ export function thisTurnSearchAccountSelectionBlockers(input: {
   sessionId: string;
   sourceUserSeq: number;
   inheritedSourceUserSeqs?: readonly number[];
-}): Array<{ name: string; choices: readonly string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }> {
-  const byName = new Map<string, { name: string; choices: string[]; labels?: Record<string, string>; reason?: 'review_unavailable' }>();
+}): Array<{ name: string; choices: readonly string[]; labels?: Record<string, string>; reason?: ToolSearchAccountSelectionReason }> {
+  const byName = new Map<string, { name: string; choices: string[]; labels?: Record<string, string>; reason?: ToolSearchAccountSelectionReason }>();
   const sources = new Set<number>([input.sourceUserSeq, ...(input.inheritedSourceUserSeqs ?? [])]);
   try {
     for (const event of listEvents(input.sessionId, { types: ['tool_returned'] })) {

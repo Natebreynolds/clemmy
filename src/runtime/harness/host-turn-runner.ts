@@ -152,6 +152,7 @@ import {
   readModelCarrier,
   resolveProvenOperation,
 } from './carrier-reader.js';
+import { carrierArgumentsProblem } from './carrier-json.js';
 import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
   KillRequested,
@@ -1450,17 +1451,9 @@ export function carrierInnerJsonProblem(args: unknown): string | null {
   const record = args && typeof args === 'object' && !Array.isArray(args)
     ? args as Record<string, unknown>
     : null;
-  const inner = record?.args_json;
-  if (typeof inner !== 'string') return null;
-  const trimmed = inner.trim();
-  if (!trimmed) return 'args_json is an empty string';
-  try {
-    JSON.parse(trimmed);
-    return null;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return `args_json is not valid JSON (${inner.length} chars; ${message})`;
-  }
+  // The same bounded reading the carrier reader uses: a slot it can read is
+  // not a shape problem, and one it cannot read is named precisely.
+  return carrierArgumentsProblem(record?.args_json);
 }
 
 export function hostCarrierInnerJsonRepair(name: string, problem: string): string {
@@ -1483,6 +1476,30 @@ export function carrierMissingNameRepair(name: string, args: unknown): string | 
   return `Tool 'work_call' was refused before dispatch: its own \`name\` is missing. Set name to "${local[1]}", the operation requirement_id ${requirement} selects, and keep args_json to that operation's own arguments. No local or external mutation was attempted.`;
 }
 
+/** The business operation a refused call named, read the way the carrier
+ * reader reads it; '' when none can be read. A carrier, gateway or built-in
+ * tool name is never returned as the operation. */
+export function refusedCallRequestedOperation(name: string, args: unknown, argumentsJson?: string): string {
+  try {
+    const carried = (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim();
+    // A reviewed-CLI identity stays lowercase; only a provider slug is uppercased.
+    if (carried) return isReviewedLiveReadIdentity(carried) ? carried : carried.toUpperCase();
+    // The model also names an operation in its carrier-prefixed form or
+    // as a slug-shaped requirement_id. Live 2026-09-08: those refusals lost
+    // the operation and therefore the account blocker that would have
+    // explained them, and answered "not proven, discover it" instead.
+    const parsed = args && typeof args === 'object' ? args as Record<string, unknown> : null;
+    for (const candidate of [name, parsed?.requirement_id, parsed?.name]) {
+      if (typeof candidate !== 'string') continue;
+      const slug = providerOperationFromNameForm(candidate);
+      if (slug) return slug;
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
 export function hostProvenOperationRepair(input: {
   requestedOperation: string;
   provenOperations: readonly string[];
@@ -1492,6 +1509,8 @@ export function hostProvenOperationRepair(input: {
   /** Human label per choice when the disclosure carried one. */
   accountChoiceLabels?: Readonly<Record<string, string>>;
   accountReviewUnavailable?: boolean;
+  /** Why discovery left the account unbound, as it reported it. */
+  accountSelectionReason?: 'review_unavailable' | 'not_entailed' | 'quote_not_in_source';
   /** The exact pre-dispatch miss, when known (e.g. `catalog_entry_or_manifest_missing:…`). */
   missReason?: string;
 }): string {
@@ -1527,6 +1546,18 @@ export function hostProvenOperationRepair(input: {
   const accountChoices = [...new Set((input.accountChoices ?? [])
     .map((choice) => choice.trim())
     .filter((choice) => choice.length > 0))].slice(0, 8);
+  // The account review read the owner's wording and found it does not name
+  // the account. Neither the same call nor the same search can change that;
+  // only the owner's answer can. Windows tester trace 2026-10-19: recovery
+  // lost this reason and told Clem to rediscover, buying more refused steps.
+  if (requested.length > 0 && accountChoices.length > 0
+    && (input.accountSelectionReason === 'not_entailed' || input.accountSelectionReason === 'quote_not_in_source')) {
+    const names = accountChoices.map((choice) => input.accountChoiceLabels?.[choice]?.trim() || choice);
+    return ` ${requested} is available, but the account review found that the owner's wording did not name the account to use, so it was not bound.`
+      + ` Do not send this call again and do not repeat tool_search with the same selection. ask_user_question once, offering these connected accounts by name: ${names.join(', ')}.`
+      + ' Repeat tool_search with account_selection quoting their answer verbatim only after the owner answers.'
+      + ' Do not substitute another provider, another operation, or a recipient address for that choice.';
+  }
   if (requested.length > 0 && accountChoices.length > 0 && input.accountReviewUnavailable) {
     return ` ${requested} is available, but the host source-account review did not complete.`
       + ' Retry tool_search once with the identical account_selection. If review is still unavailable, report that exact host blocker.'
@@ -7723,26 +7754,7 @@ const runHostTurnBody = async (
               .map((entry) => entry.identifier.trim().toUpperCase()),
             ...(currentAcceptedSourceCatalogManifestScope()?.operationIds ?? []),
           ].filter((operationId) => operationId && operationId !== name.toUpperCase()))];
-      const requestedOperation = (() => {
-        try {
-          const carried = (readModelCarrier(name, args ?? argumentsJson).operation ?? '').trim();
-          // A reviewed-CLI identity stays lowercase; only a provider slug is uppercased.
-          if (carried) return isReviewedLiveReadIdentity(carried) ? carried : carried.toUpperCase();
-          // The model also names an operation in its carrier-prefixed form or
-          // as a slug-shaped requirement_id. Live 2026-09-08: those refusals lost
-          // the operation and therefore the account blocker that would have
-          // explained them, and answered "not proven, discover it" instead.
-          const parsed = args && typeof args === 'object' ? args as Record<string, unknown> : null;
-          for (const candidate of [name, parsed?.requirement_id, parsed?.name]) {
-            if (typeof candidate !== 'string') continue;
-            const slug = providerOperationFromNameForm(candidate);
-            if (slug) return slug;
-          }
-          return '';
-        } catch {
-          return '';
-        }
-      })();
+      const requestedOperation = refusedCallRequestedOperation(name, args, argumentsJson);
       const accountBlockerForRequest = (() => {
         if (!requestedOperation) return undefined;
         try {
@@ -7763,6 +7775,7 @@ const runHostTurnBody = async (
           accountChoices: accountBlockerForRequest?.choices,
           accountChoiceLabels: (accountBlockerForRequest as { labels?: Record<string, string> } | undefined)?.labels,
           accountReviewUnavailable: accountBlockerForRequest?.reason === 'review_unavailable',
+          ...(accountBlockerForRequest?.reason ? { accountSelectionReason: accountBlockerForRequest.reason } : {}),
         });
       const literalOperation = literalOperationNotFrozenOperation(lastExactProductionMiss);
       if (literalOperation) {

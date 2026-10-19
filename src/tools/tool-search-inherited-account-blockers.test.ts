@@ -92,3 +92,18 @@ test('the answering source\'s own resolved return clears an inherited open block
     [],
   );
 });
+
+test('a negative account review keeps its reason through recovery', () => {
+  // Windows tester trace 2026-10-19: discovery answered not_entailed with an
+  // ask-the-owner step, but the blocker read back for recovery kept only
+  // review_unavailable, so the refused call was told to rediscover.
+  const sessionId = 'negative-account-review';
+  const sourceUserSeq = source(sessionId, 'Send the fixture follow-up.');
+  returned(sessionId, sourceUserSeq, [{ ...blocked, accountSelectionReason: 'not_entailed' }]);
+  assert.equal(provider.thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq })[0]?.reason, 'not_entailed');
+  returned(sessionId, sourceUserSeq, [{ ...blocked, accountSelectionReason: 'quote_not_in_source' }]);
+  assert.equal(provider.thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq })[0]?.reason, 'quote_not_in_source');
+  returned(sessionId, sourceUserSeq, [{ ...blocked, accountSelectionReason: 'invented_reason' }]);
+  assert.equal(provider.thisTurnSearchAccountSelectionBlockers({ sessionId, sourceUserSeq })[0]?.reason, undefined,
+    'only the reasons discovery can report are carried');
+});

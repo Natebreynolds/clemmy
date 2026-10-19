@@ -26,6 +26,7 @@ import {
   runtimeToolTail as localToolTail,
   stripMcpTransportPrefix as normalizedToolName,
 } from './runtime-tool-identity.js';
+import { carrierJsonObject } from './carrier-json.js';
 
 /**
  * Runtime effect classification used by the guardrail and SDK call ceiling.
@@ -299,19 +300,11 @@ function composioSlug(args: unknown): string | undefined {
 
 function decodedToolArgs(args: unknown): unknown {
   if (typeof args !== 'string') return args;
-  const trimmed = args.trim();
-  // A JSON object string, or that same string quoted once more as a JSON
-  // string (the model serialized its own serialization: `"{\"channel\": …}"`).
-  // Double-encoded, a retry unwraps to no operation and the very retry a
-  // refusal asked for is refused as off the recovery surface.
-  if (trimmed.startsWith('"')) {
-    try {
-      const inner = JSON.parse(trimmed) as unknown;
-      return typeof inner === 'string' ? decodedToolArgs(inner) : args;
-    } catch { return args; }
-  }
-  if (!trimmed.startsWith('{')) return args;
-  try { return JSON.parse(trimmed) as unknown; } catch { return args; }
+  // A JSON object string, or that same string quoted again as a JSON string
+  // (the model serialized its own serialization: `"{\"channel\": …}"`), read
+  // by the one bounded rule every carrier reader shares. Double-encoded, a
+  // retry used to unwrap to no operation here and to one elsewhere.
+  return carrierJsonObject(args) ?? args;
 }
 
 export interface RuntimeEffectiveToolIdentity {
@@ -828,9 +821,19 @@ export function isUnscopedShellRuntimeCall(toolName: string, args: unknown): boo
 /** A provider operation the model named either bare (UPPER_SNAKE) or in its
  *  carrier-prefixed form. Returns the bare slug, or null. Lives here — the
  *  one file allowed to know the carrier prefix — so kernels stay neutral. */
+/** A host carrier, the provider gateway or one of Clem's own tools: names
+ * that are never a provider operation, however they are spelled. */
+function isHostToolName(candidate: string): boolean {
+  const name = candidate.trim().toLowerCase();
+  return isPlainOrClementineLocalTool(name, 'work_call') || isPlainOrClementineLocalTool(name, 'call_tool')
+    || isTrustedComposioGateway(name) || TOOL_REGISTRY.some((declaration) => declaration.name === name);
+}
+
 export function providerOperationFromNameForm(candidate: string): string | null {
   const m = /^(?:composio:)?([A-Z0-9]+(?:_[A-Z0-9]+)+)$/i.exec(candidate.trim());
-  return m ? m[1]!.toUpperCase() : null;
+  // Windows tester trace 2026-10-19: an unreadable work_call fell back to its
+  // own name and recovery reported WORK_CALL as the missing operation.
+  return m && !isHostToolName(m[1]!) ? m[1]!.toUpperCase() : null;
 }
 
 export function classifyRuntimeToolEffect(toolName: string, args: unknown): RuntimeToolEffectDecision {

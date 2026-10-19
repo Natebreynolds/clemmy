@@ -20,6 +20,7 @@
  * before any provider I/O — the reader grants no authority of its own.
  */
 import type { ProvenCompletionEntry } from './carrier-completion-registry.js';
+import { carrierJsonOrOriginal } from './carrier-json.js';
 import {
   catalogOperationIdentityKey,
   isPlainOrClementineLocalTool,
@@ -60,16 +61,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-/** A string that is JSON of an object decodes; anything else is returned as-is. */
+/** A slot that is JSON of an object or list decodes, by the bounded rule every
+ * carrier reader shares (including a slot quoted again as a JSON string);
+ * anything else is returned as-is. */
 function decodeMaybeJson(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  const trimmed = value.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return value;
-  }
+  return carrierJsonOrOriginal(value);
 }
 
 function firstString(record: Record<string, unknown>, keys: readonly string[]): { key: string; value: string } | null {

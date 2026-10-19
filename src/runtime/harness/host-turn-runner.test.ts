@@ -232,6 +232,22 @@ test('a pre-dispatch repair names the door the call actually needs', async () =>
   assert.match(unavailableReview, /host source-account review did not complete/);
   assert.match(unavailableReview, /identical account_selection/);
   assert.doesNotMatch(unavailableReview, /ask_user_question/);
+  // Windows tester trace 2026-10-19: a negative review asks the owner once,
+  // by account name; it never sends the call again or rediscovers unchanged.
+  for (const reason of ['not_entailed', 'quote_not_in_source'] as const) {
+    const negative = hostProvenOperationRepair({
+      requestedOperation: 'OUTLOOK_SEND_EMAIL', provenOperations: [],
+      accountChoices: ['first@example.test', 'second@example.test'],
+      accountChoiceLabels: { 'first@example.test': 'Fixture Work', 'second@example.test': 'Fixture Home' },
+      accountSelectionReason: reason,
+    });
+    assert.match(negative, /did not name the account/, reason);
+    assert.match(negative, /ask_user_question/, reason);
+    assert.match(negative, /Fixture Work, Fixture Home/, reason);
+    assert.doesNotMatch(negative, /first@example\.test/, `${reason}: offered by name, never by id`);
+    assert.match(negative, /Do not send this call again/, reason);
+    assert.match(negative, /only after the owner answers/, reason);
+  }
 
 });
 
