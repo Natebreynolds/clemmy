@@ -458,4 +458,6 @@ test('the review reads a method a step names as the author\'s plan, not part of 
   // Live 2026-10-18: "call the scrape tool exactly once" and "save the JSON
   // verbatim" in a step held a run that wrote the right CSV as blocked.
   assert.match(objectiveSeen, /how many calls to make, how to format a temporary or intermediate file\) is how its author planned the work/);
+  // Live 2026-10-18 re-run: failed again for its /tmp branch files.
+  assert.match(objectiveSeen, /Temporary and intermediate files \(in a temporary folder, or written only for a later step to read\) are never part of the target, whatever a step says about their content or format/);
 });
