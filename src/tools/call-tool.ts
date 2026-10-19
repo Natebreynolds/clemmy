@@ -407,16 +407,21 @@ async function invokeCurrentCatalogProductionPort(input: {
   }
 }
 
+const FORMAL_APPROVAL_PREPARATION_GUIDANCE =
+  'For a prepared action needing a formal card, discover `pending_action_queue` if its schema is missing, then queue the exact payload with `approvalIntent:"request_now"` before execution or a generic sign-off question. Already sealed work stays on `work_call`; the target still validates consent.';
+
 const DESCRIPTION = [
   'Invoke a catalog built-in that is not one of your first-class tools: exact `name` (from the catalog / tool_search) plus `args_json`, the arguments as a JSON object ({} for none). A legacy JSON object string is also accepted.',
   'call_tool never prompts on its own — the target\'s own classification decides: a read runs immediately; a write/send/irreversible target gates exactly as if called directly. http_read is a dedicated bounded read-only HTTP GET tool. Legacy http_fetch, web_fetch, web_fetch_simple and fetch_url aliases require the allowed curl path.',
   'Arguments that miss the schema make NO change and return the schema — fix and retry without broad discovery; call tool_search once only for an unresolved capability.',
+  FORMAL_APPROVAL_PREPARATION_GUIDANCE,
 ].join(' ');
 
 const CONTROL_ONLY_DESCRIPTION = [
   'Invoke an available native control, recovery, or READ tool: exact `name` plus `args_json`, the arguments as a JSON object; a legacy JSON object string is also accepted. Prefer a tool\'s direct callable when its schema is already loaded.',
   'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
   'Invalid arguments dispatch nothing and return the exact schema. Correct the arguments using that schema; use tool_search only when the capability or schema is still missing.',
+  FORMAL_APPROVAL_PREPARATION_GUIDANCE,
 ].join(' ');
 
 function callToolInputSchema(controlOnlyBuiltins = false) {

@@ -57,7 +57,7 @@ export const BACKGROUND_EXECUTION_RUBRIC =
 
 /** One current call carrier and one consent owner, shared by every brain. */
 export const AUTO_CONSENT_RUBRIC =
-  "AUTO CONSENT — accepted plan-bound work uses `work_call`; host consent proceeds or links one formal card to the sealed call. Never wrap it in `pending_action_queue`: use that only for explicit stage-for-later requests without a current work boundary; approval executes stored authority only. Reads and exact reversible creates/updates need no card. Before external writes, verify exact account/resource identity; bundle materially unresolved account, target, credential or essential input into one question.";
+  "AUTO CONSENT — accepted plan-bound work uses `work_call`; host consent proceeds or links one formal card to the sealed call. Never wrap that sealed call in `pending_action_queue`. For a prepared action needing a formal card, discover `pending_action_queue` if its schema is missing, then queue the exact payload with `approvalIntent:\"request_now\"`; do not attempt execution or ask a generic approval question first. The host validates consent; approval executes stored authority only. Use `queue_only` solely for explicit stage-for-later requests. Reads and exact reversible creates/updates need no card. Before external writes, verify exact account/resource identity; bundle materially unresolved account, target, credential or essential input into one question.";
 
 /** Capture is asynchronous; reporting it never substitutes for storage evidence. */
 export const MEMORY_STATUS_RUBRIC =

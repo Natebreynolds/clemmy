@@ -28,3 +28,16 @@ test('the carrier refusal offers work_call for reads, not writes only', () => {
     'the writes-only framing must be gone',
   );
 });
+
+test('both initial carrier descriptions offer prepared formal approval before an execution refusal', () => {
+  const guidance = SRC.match(/const FORMAL_APPROVAL_PREPARATION_GUIDANCE =\s*'([^\n]+)'/u)?.[1];
+  assert.ok(guidance, 'the initial approval preparation guidance must exist');
+  assert.match(guidance, /prepared action needing a formal card/);
+  assert.match(guidance, /discover `pending_action_queue` if its schema is missing/);
+  assert.match(guidance, /exact payload[^.]*request_now[^.]*before execution or a generic sign-off question/);
+  assert.match(guidance, /Already sealed work stays on `work_call`; the target still validates consent/);
+  for (const name of ['DESCRIPTION', 'CONTROL_ONLY_DESCRIPTION']) {
+    const block = SRC.match(new RegExp(`const ${name} = \\[([\\s\\S]*?)\\]\\.join`))?.[1];
+    assert.ok(block?.includes('FORMAL_APPROVAL_PREPARATION_GUIDANCE'), `${name}: the initial callable must carry the guidance`);
+  }
+});

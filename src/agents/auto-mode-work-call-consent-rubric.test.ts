@@ -1,7 +1,7 @@
 /**
  * Auto-mode instruction pin: an accepted plan-bound call goes straight to the
- * canonical work_call consent boundary. A pending action is a user-requested
- * stage-for-later artifact, not a second approval carrier around current work.
+ * canonical work_call consent boundary. Prepared formal-card requests use the
+ * queue upfront, while a sealed call must not acquire a second approval owner.
  *
  * Run:
  *   node scripts/run-tests-isolated.mjs \
@@ -31,8 +31,28 @@ test('every flagship brain routes plan-bound work directly through one canonical
     );
     assert.match(
       rubric,
-      /pending_action_queue[^.]*(?:only|solely)[^.]*explicit[^.]*(?:stage|later)/i,
-      `${lane}: pending actions are explicit staging only`,
+      /Never wrap that sealed call in `pending_action_queue`/,
+      `${lane}: an existing sealed call keeps its consent owner`,
+    );
+    assert.match(
+      rubric,
+      /prepared action needing a formal card[^.]*discover `pending_action_queue` if its schema is missing[^.]*exact payload[^.]*request_now[^.]*do not attempt execution or ask a generic approval question first/i,
+      `${lane}: a prepared formal approval does not require a refused execution or generic ask first`,
+    );
+    assert.match(
+      rubric,
+      /`queue_only` solely for explicit stage-for-later requests/,
+      `${lane}: staging without a card retains its separate intent`,
+    );
+    assert.match(
+      rubric,
+      /The host validates consent; approval executes stored authority only\./,
+      `${lane}: prose grants no execution authority`,
+    );
+    assert.match(
+      rubric,
+      /Reads and exact reversible creates\/updates need no card/,
+      `${lane}: ordinary work acquires no extra approval requirement`,
     );
     assert.doesNotMatch(
       rubric,

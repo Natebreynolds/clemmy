@@ -128,7 +128,11 @@ test('approval queue exposes the required operation and bounded question before 
   assert.equal(ask.safeParse('x'.repeat(201)).success, false);
   assert.match(toolName.description ?? '', /REQUIRED.*exact inner tool/);
   assert.match(ask.description ?? '', /12–200 characters/);
-  assert.match(descriptionFor('pending_action_queue'), /Required fields include toolName/);
+  const queueDescription = descriptionFor('pending_action_queue');
+  assert.match(queueDescription, /Required fields include toolName/);
+  assert.match(queueDescription, /Do not attempt execution or wait for a refusal first; the host validates the requirement/);
+  assert.match(queueDescription, /request_now opens the one exact formal card this turn; queue_only stores it without a card/);
+  assert.match(queueDescription, /Do not queue an exact ordinary reversible write/);
   assert.match(descriptionFor('pending_action_execute'), /do NOT call this tool for that continuation/);
   assert.doesNotMatch(descriptionFor('pending_action_list'), /Use before executing a user approval/);
 });

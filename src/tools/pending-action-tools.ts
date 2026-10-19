@@ -264,7 +264,7 @@ export function registerPendingActionTools(server: McpServer): void {
   server.tool(
     'pending_action_queue',
     [
-      'Queue a fully prepared exact action only after the work boundary says one formal approval is required, such as an irreversible send, destructive change, high-impact deploy, or other approval-bound execution.',
+      'Queue a fully prepared exact action when formal approval is required, such as an irreversible send, destructive change, high-impact deploy, or other approval-bound execution. Do not attempt execution or wait for a refusal first; the host validates the requirement.',
       'This tool DOES NOT execute anything. Use it after you have gathered the facts, selected the exact tool, and built the exact payload.',
       'Do not queue an exact ordinary reversible write merely because it changes external state; execute that through the normal work boundary without a separate approval ceremony.',
       'State the graph edge with approvalIntent: request_now opens the one exact formal card this turn; queue_only stores it without a card. Use queue_only when the user explicitly asked to stage only, and do not queue at all while required scope is unresolved.',
