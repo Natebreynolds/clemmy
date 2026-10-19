@@ -35,6 +35,7 @@ const {
 const {
   _setWorkflowRunReaperAfterCanonicalUnlinkForTests,
   _setWorkflowRunReaperBeforeLockForTests,
+  _setWorkflowRunReaperPendingCheckForTests,
   reapStaleWorkflowRuns,
 } = await import('./workflow-scheduler.js');
 const {
@@ -254,6 +255,7 @@ function writeCompiledRun(label: string, record: Record<string, unknown> = {}): 
 beforeEach(() => {
   _setWorkflowRunReaperAfterCanonicalUnlinkForTests();
   _setWorkflowRunReaperBeforeLockForTests();
+  _setWorkflowRunReaperPendingCheckForTests();
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true });
   rmSync(WORKFLOWS_DIR, { recursive: true, force: true });
 });
@@ -459,6 +461,24 @@ test('reaper still removes an old terminal record whose report-back is fully ack
 
   assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 1, deleted: 1 });
   assert.equal(existsSync(file), false);
+});
+
+test('reaper checks pending dispatch evidence only for runs old enough to delete', () => {
+  // Live 2026-10-19: every hourly pass re-scanned all origin-group evidence for
+  // each of 409 recent terminal runs, none deletable, holding the service
+  // thread 15-105 s. A run too young to reap is decided by its age alone.
+  const recent = new Date(Date.now() - 60 * 60 * 1_000).toISOString();
+  const young = ['recent-a', 'recent-b', 'recent-c'].map((runId) => writeRun(runId, { finishedAt: recent }));
+  const old = writeRun('old-enough', {});
+  const checked: string[] = [];
+  const locked: string[] = [];
+  _setWorkflowRunReaperPendingCheckForTests((runId) => checked.push(runId));
+  _setWorkflowRunReaperBeforeLockForTests((file) => locked.push(path.basename(file, '.json')));
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 4, deleted: 1 });
+  assert.deepEqual(checked, ['old-enough']);
+  assert.deepEqual(locked, ['old-enough'], 'a run kept on a plain read never takes the record lock');
+  assert.equal(existsSync(old), false);
+  for (const file of young) assert.equal(existsSync(file), true);
 });
 
 test('reaper removes terminal run sidecars and an empty catalogless compiled owner but preserves trigger receipts', () => {

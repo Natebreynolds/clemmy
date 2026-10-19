@@ -1882,6 +1882,7 @@ interface ReapableWorkflowRunRecord extends WorkflowRunReportBackRecord {
 
 let beforeRunRecordReapLockForTests: ((filePath: string) => void) | undefined;
 let afterCanonicalRunUnlinkForTests: ((filePath: string) => void) | undefined;
+let pendingDispatchCheckForTests: ((runId: string) => void) | undefined;
 
 /** Deterministic race seam: runs after directory enumeration and immediately
  * before the authoritative per-record lock/read. */
@@ -1889,6 +1890,13 @@ export function _setWorkflowRunReaperBeforeLockForTests(
   hook?: (filePath: string) => void,
 ): void {
   beforeRunRecordReapLockForTests = hook;
+}
+
+/** Observes each run the reaper puts through its pending-dispatch checks. */
+export function _setWorkflowRunReaperPendingCheckForTests(
+  hook?: (runId: string) => void,
+): void {
+  pendingDispatchCheckForTests = hook;
 }
 
 /** Deterministic crash seam after the canonical pathname removal is durable but
@@ -2018,6 +2026,16 @@ function pruneEmptyCataloglessCompiledOwner(
   return removeDirectoryIfEmpty(ownerDir);
 }
 
+/** Terminal and older than the retention cutoff: the cheap facts every reap
+ * needs before any evidence scan. finishedAt is preferred; a legacy terminal
+ * record falls back to its file mtime. */
+function mayBeReapable(raw: ReapableWorkflowRunRecord | null | undefined, full: string, cutoffMs: number): raw is ReapableWorkflowRunRecord {
+  if (!raw || !isTerminalWorkflowRunRecord(raw)) return false;
+  const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : Number.NaN;
+  const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
+  return ageRef < cutoffMs;
+}
+
 export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return { scanned: 0, deleted: 0 };
   let files: string[];
@@ -2039,14 +2057,25 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   for (const file of files) {
     const full = path.join(WORKFLOW_RUNS_DIR, file);
     try {
+      // A record that is still running or too young to reap is kept on a plain
+      // read: keeping is always safe (age only grows, so it is reconsidered
+      // next pass), and taking the durable record lock for each one cost 409
+      // fsync pairs per hourly pass on the service thread. Every deletion is
+      // still decided below, from a fresh read under the lock.
+      if (!mayBeReapable(readWorkflowRunRecordUnlocked<ReapableWorkflowRunRecord>(full), full, cutoffMs)) continue;
       beforeRunRecordReapLockForTests?.(full);
       const reaped = withWorkflowRunRecordLock(full, () => {
         // Every deletion decision is made from a fresh snapshot after acquiring
         // the same lock used by terminal publication, cancellation, and report
         // acknowledgement. An optimistic scan can never delete their successor.
         const raw = readWorkflowRunRecordUnlocked<ReapableWorkflowRunRecord>(full);
-        if (!raw || !isTerminalWorkflowRunRecord(raw)) return false;
+        // A run too young to reap is decided by its age alone; nothing below
+        // can make it deletable. Live 2026-10-19: checked after the pending
+        // dispatch scans (each re-reads every origin group), 409 recent runs
+        // held the service thread 15-105 s every hour.
+        if (!mayBeReapable(raw, full, cutoffMs)) return false;
         const runId = file.replace(/\.json$/, '');
+        pendingDispatchCheckForTests?.(runId);
         // A chat turn may attach fresh exact-origin authority to an old
         // terminal duplicate. Preparation installs its retention pin while
         // this same record lock is held, so deletion must consult that pin
@@ -2066,11 +2095,6 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
         // Never delete it until an exact marker proves ExecutionStore observed
         // the same immutable terminal digest.
         if (!compiledProjectRootHasSettlementMarker(full, raw as unknown as Record<string, unknown>)) return false;
-
-        // Prefer finishedAt; fall back to file mtime for legacy terminal records.
-        const finishedMs = raw.finishedAt ? Date.parse(raw.finishedAt) : Number.NaN;
-        const ageRef = Number.isFinite(finishedMs) ? finishedMs : statSync(full).mtimeMs;
-        if (ageRef >= cutoffMs) return false;
 
         const workflowSlug = canonicalWorkflowSlugForReap(raw, runId);
         if (!workflowSlug) return false;
