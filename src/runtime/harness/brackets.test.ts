@@ -3103,6 +3103,71 @@ test('shell-send compensation: a generic nonzero provider exit remains possible 
   }
 });
 
+test('duplicate-target gate: the owner approving the exact queued shell command on its card is the consent the wall honors', async () => {
+  // Live 2026-10-19 (Windows install): Clem marked one CRM task complete, then
+  // the owner approved the card for creating the follow-up task, twice, and
+  // the wall refused it both times. The sign-in address in the command made
+  // the two different writes share a target, and the queued-action approval
+  // (stored as request_approval) never counted as the promised resend consent.
+  const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;
+  const prevExecGate = process.env.CLEMMY_EXECUTION_GATE;
+  const prevGrounding = process.env.CLEMMY_GROUNDING_GATE;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  process.env.CLEMMY_CONFIRM_FIRST = 'off';
+  process.env.CLEMMY_EXECUTION_GATE = 'off';
+  process.env.CLEMMY_GROUNDING_GATE = 'on';
+  resetEventLog();
+  const grounding = await import('./grounding-gate.js');
+  const approvals = await import('./approval-registry.js');
+  grounding._resetGroundingStateForTests();
+  grounding._resetDuplicateStateForTests();
+  grounding._setGroundingJudgeForTests(async () => ({ grounded: true, reason: 'ok' }));
+  const sess = createSession({ kind: 'chat' });
+  const anchor = anchorAcceptedTask(sess.id, 'TEST FIXTURE: complete the open task and create the follow-up task.');
+  const update = 'sf data update record --target-org fixture.owner@example.invalid --sobject Task --record-id 00TFIXTURE000001 --values "Status=Completed" --json';
+  const create = 'sf data create record --target-org fixture.owner@example.invalid --sobject Task --values "Subject=\'TEST FIXTURE follow-up\' ActivityDate=2026-10-26" --json';
+  try {
+    const counter = new ToolCallsCounter(100);
+    const ran: string[] = [];
+    const wrapped = wrapToolForHarness({
+      name: 'run_shell_command',
+      execute: async (input: { command: string }) => { ran.push(input.command); return 'exit_code: 0  stdout: {"status":0,"result":{"success":true}}'; },
+    });
+    const run = (command: string) => withHarnessRunContext({ sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, counter },
+      () => wrapped.execute!({ command, cwd: null, timeout_ms: 120_000 }));
+    assert.match(String(await run(update)), /exit_code: 0/);
+    assert.match(String(await run(create)), /DUPLICATE_EXTERNAL_WRITE/, 'without consent the wall still stands');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // The card exactly as a queued action raises it: request_approval carrying
+    // the action's immutable snapshot.
+    const { queuePendingAction } = await import('./pending-actions.js');
+    const { pendingActionApprovalView } = await import('./pending-action-view.js');
+    const queued = queuePendingAction({
+      sessionId: sess.id, sourceUserSeq: anchor.sourceUserSeq, kind: 'shell_command', toolName: 'run_shell_command',
+      title: 'TEST FIXTURE create follow-up', summary: 'Create the follow-up task.',
+      payload: { command: create, cwd: null, timeout_ms: 120_000 }, preview: create,
+    });
+    const card = approvals.register({
+      sessionId: sess.id,
+      subject: queued.title,
+      tool: 'request_approval',
+      args: { subject: queued.title, reason: queued.summary, pendingActionId: queued.id, pendingAction: pendingActionApprovalView(queued) },
+    });
+    approvals.resolve(card.approvalId, 'approved', 'fixture-owner-tap');
+    assert.match(String(await run(create)), /exit_code: 0/, 'the approved exact command runs');
+    assert.deepEqual(ran, [update, create]);
+    assert.match(String(await run(create)), /DUPLICATE_EXTERNAL_WRITE/, 'one approval authorizes one resend');
+    assert.equal(ran.length, 2);
+  } finally {
+    grounding._setGroundingJudgeForTests(null);
+    process.env.HARNESS_TOOL_BRACKETS = prevBrackets;
+    process.env.CLEMMY_CONFIRM_FIRST = prevConfirm;
+    process.env.CLEMMY_EXECUTION_GATE = prevExecGate;
+    if (prevGrounding === undefined) delete process.env.CLEMMY_GROUNDING_GATE; else process.env.CLEMMY_GROUNDING_GATE = prevGrounding;
+  }
+});
+
 test('duplicate-target gate: provider failure prose remains ambiguous and blocks a blind retry', async () => {
   const prevBrackets = process.env.HARNESS_TOOL_BRACKETS;
   const prevConfirm = process.env.CLEMMY_CONFIRM_FIRST;

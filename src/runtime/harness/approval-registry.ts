@@ -48,6 +48,7 @@ import {
   externalWriteSemanticFingerprint,
 } from './external-write-admission.js';
 import { exactApprovalAuthorityMatches } from './approval-authority.js';
+import { classifyShellNetworkMutation } from './destination-gate.js';
 import {
   decodedToolArgs,
   extractComposioSlug,
@@ -394,8 +395,34 @@ function approvedResendActionKey(
   if (tail.startsWith('cx_')) {
     return canonicalExternalWriteActionKey(approvedTool, tail.slice('cx_'.length));
   }
+  // The wall keys a shell write by the command's own mutation shape, not by
+  // the tool name; the approved command is keyed the same way or it can
+  // never match.
+  if (tail === 'run_shell_command') {
+    const command = typeof approvedArgs.command === 'string' ? approvedArgs.command : '';
+    const mutation = command ? classifyShellNetworkMutation(command) : null;
+    return mutation?.isNetworkMutation && mutation.shapeKey
+      ? canonicalExternalWriteActionKey(approvedTool, mutation.shapeKey)
+      : null;
+  }
 
   return canonicalExternalWriteActionKey(approvedTool, approvedTool);
+}
+
+/** A card raised from a queued action is stored as `request_approval` with the
+ * immutable snapshot of what it will run. Resend consent is about that action,
+ * so read the approved tool and payload from the snapshot. */
+function approvedResendInvocation(
+  tool: string | null,
+  args: Record<string, unknown>,
+): { tool: string | null; args: Record<string, unknown> } {
+  const snapshot = args.pendingAction;
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return { tool, args };
+  const { toolName, payload } = snapshot as { toolName?: unknown; payload?: unknown };
+  const decoded = typeof payload === 'string' ? safeParse(payload) : payload;
+  if (typeof toolName !== 'string' || !toolName.trim()
+    || !decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return { tool, args };
+  return { tool: toolName.trim(), args: decoded as Record<string, unknown> };
 }
 
 /**
@@ -505,16 +532,17 @@ function resendApprovalMatches(
     && (!candidate.resolved_at || candidate.resolved_at <= priorSendAtIso)
   ) return false;
   if (!candidate.args_json) return false;
-  const args = safeParse(candidate.args_json);
-  if (!args) return false;
+  const stored = safeParse(candidate.args_json);
+  if (!stored) return false;
+  const { tool, args } = approvedResendInvocation(candidate.tool, stored);
 
-  const approvedActionKey = approvedResendActionKey(candidate.tool, args);
+  const approvedActionKey = approvedResendActionKey(tool, args);
   if (!approvedActionKey || approvedActionKey !== requestedActionKey) return false;
 
   if (needle.startsWith('payload:semantic-v1:')) {
     return `payload:${externalWriteSemanticFingerprint(approvedActionKey, args)}` === needle;
   }
-  return approvedResendIdentityKeys(candidate.tool, args).has(needle);
+  return approvedResendIdentityKeys(tool, args).has(needle);
 }
 
 function pendingActionIdFromArgs(args: Record<string, unknown> | null): string | null {
