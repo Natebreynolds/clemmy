@@ -659,7 +659,9 @@ test('the pinned reviewed process receives current host CLI declarations without
  * Jev's HTTP transport answer deterministically. No judge function is replaced. */
 async function reviewedCliAnswer(label: string, mode: 'records' | 'empty_records' | 'nonzero' | 'missing_stdout' | 'truncated',
   review: 'done' | 'repair' | 'unavailable' = 'done') {
-  const { runConversation } = await import('./loop.js');
+  const { runConversation, _setReviewBeforeDeliveryForTests } = await import('./loop.js');
+  // This case tests the review-and-repair loop that runs before delivery.
+  _setReviewBeforeDeliveryForTests(true);
   const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
   const jev = await import('../jev/client.js');
   const completion = await import('./host-completion-work.js');

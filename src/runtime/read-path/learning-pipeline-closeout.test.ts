@@ -33,6 +33,8 @@ const candidates = await import('./capability-candidates.js');
 const { productionScope } = await import('./read-lane-chat.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const { withHarnessRunContext, ToolCallsCounter } = await import('../harness/brackets.js');
+// These cases test the review that runs before delivery.
+(await import('../harness/loop.js'))._setReviewBeforeDeliveryForTests(true);
 const { closeMemoryDb } = await import('../../memory/db.js');
 const { closeProcedureStoreForTests } = await import('../../memory/procedure-store.js');
 const { closeOperationalTelemetryDb } = await import('../operational-telemetry.js');

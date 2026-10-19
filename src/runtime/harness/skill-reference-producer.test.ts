@@ -146,7 +146,9 @@ test('unknown, missing, and reused-call evidence never invents current-source fr
 });
 
 test('production host_v1 call_tool retains the full skill behind its canonical source settlement', async () => {
-  const { runConversation } = await import('./loop.js');
+  const { runConversation, _setReviewBeforeDeliveryForTests } = await import('./loop.js');
+  // This case tests the review-and-repair loop that runs before delivery.
+  _setReviewBeforeDeliveryForTests(true);
   const host = await import('./host-turn-runner.js');
   const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
   const { sourceSettledReadEvidence } = await import('./host-completion-work.js');

@@ -345,7 +345,7 @@ test(`an exact file overwrite commits once without rediscovery or a redundant ap
   assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
   if (malformedFirst) {
     assert.match(JSON.stringify(result.history), /argument payload is not valid JSON/);
-    assert.match(JSON.stringify(result.history), /Correct the arguments and retry the same operation/);
+    assert.match(JSON.stringify(result.history), /Change only what this refusal names on this same call, and retry it once/);
     assert.doesNotMatch(JSON.stringify(result.history), /binding is absent or changed|not proven for this step|What IS proven/);
   }
   assert.ok(localDefinitions.nominateDisclosedLocalPlanningDefinition({ ...identity, capabilityRef,

@@ -159,6 +159,15 @@ test('timely original Jev abstention reaches one actual reviewer request without
 
 for (const boundary of ['fits', 'optional_overflow', 'both_overflow', 'cloned_composition', 'changed_owner', 'cancelled'] as const) {
   test(`actual selected-route admission ${boundary} preserves all required bytes and optional ownership`, async t => {
+    // The review reserve is the route's output budget (88112a36d). At its
+    // default this fixture's boundary windows fall under the 32,000-token floor
+    // the window store keeps; the model's full output keeps them above it.
+    const priorBudget = process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS;
+    process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = '65536';
+    t.after(() => {
+      if (priorBudget === undefined) delete process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS;
+      else process.env.CLEMMY_JUDGE_MAX_OUTPUT_TOKENS = priorBudget;
+    });
     const owner = { sessionId: read.sessionId!, sourceUserSeq: 50, attemptId: `attempt:opinion-${boundary}` };
     const requests: import('@openai/agents-core').ModelRequest[] = [];
     const context: Context = { ...read, fullSourceEvidence: true, reviewInputOwner: owner,

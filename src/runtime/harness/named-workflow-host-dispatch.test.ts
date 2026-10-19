@@ -285,7 +285,7 @@ test('tryHostDispatchNamedWorkflow: fuzzy and management phrasing never authoriz
   );
 });
 
-test('structured workflow_run: an exact disabled workflow does not queue', async () => {
+test('structured workflow_run: an exact workflow left off runs once and stays off', async () => {
   seedSlackAndFacebook();
   const session = createSession({ kind: 'chat', channel: 'desktop' });
   const source = appendEvent({
@@ -300,13 +300,16 @@ test('structured workflow_run: an exact disabled workflow does not queue', async
     },
   });
   const result = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => runWorkflow({ name: 'Team Activity Slack Updates' }));
-  assert.match(result.content[0]!.text, /disabled/);
+  // "Run it once and leave it off" (5e57cb804): a named run of a workflow
+  // left off is a one-shot run; its schedule stays off.
+  assert.match(result.content[0]!.text, /one-time run/);
+  assert.match(result.content[0]!.text, /stays off for its schedule/);
   assert.equal(
     existsSync(WORKFLOW_RUNS_DIR)
       ? readdirSync(WORKFLOW_RUNS_DIR).filter((name) => name.endsWith('.json')).length
       : 0,
-    0,
-    'disabled unique-run identity is not a queue',
+    1,
+    'the named run queues once',
   );
 });
 

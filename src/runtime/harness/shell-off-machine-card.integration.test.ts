@@ -45,7 +45,9 @@ const WORK = path.join(HOME, 'work');
 mkdirSync(WORK, { recursive: true });
 
 const eventlog = await import('./eventlog.js');
-const { runConversation } = await import('./loop.js');
+const { runConversation, _setReviewBeforeDeliveryForTests } = await import('./loop.js');
+// These cases test the review-and-repair loop that runs before delivery.
+_setReviewBeforeDeliveryForTests(true);
 const host = await import('./host-turn-runner.js');
 const { sourceSettledReadEvidence } = await import('./host-completion-work.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
