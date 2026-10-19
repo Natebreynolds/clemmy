@@ -191,7 +191,7 @@ export interface ProvenStrategyCandidate {
 // the caller treats the decision as unavailable, and a wrong pick is
 // recoverable in-turn because tool_search stays on the proven-skip surface.
 // The caller may shorten it to what the pick is worth at the turn start.
-const PROVEN_STRATEGY_TIMEOUT_MS = 2_000;
+const PROVEN_STRATEGY_TIMEOUT_MS = 2_500;
 
 export interface ProvenStrategyJevPick<T extends ProvenStrategyCandidate> {
   strategy: T | null;

@@ -967,3 +967,31 @@ test("an owner's rule Jev judges to apply beside a remembered run reaches the br
   assert.equal(runOnly.ownerRule, undefined);
   assert.doesNotMatch(runOnly.text ?? '', /owner's standing rule/);
 });
+
+test("when Jev does not answer, the owner's tool rule for the request still reaches the brain, unjudged", async () => {
+  // Live 2026-10-18: a page-read fan-out started 29 s after a restart; the
+  // turn-start decision timed out, the reads went another way, and the
+  // review sent them back to the owner's tool.
+  const { rememberToolChoice, listToolProcedures, updateToolProcedureOutcome } = await import('../../memory/tool-choice-store.js');
+  const { rememberFact } = await import('../../memory/facts.js');
+  rememberToolChoice({ intent: 'scrape a web page URL to markdown content', choice: { kind: 'composio', identifier: 'PAGEGRAB_SCRAPE' } });
+  const procedure = listToolProcedures().find((row) => row.choice?.identifier === 'PAGEGRAB_SCRAPE')!;
+  updateToolProcedureOutcome(procedure.procedureId, 'success', 'scrape a web page URL to markdown content');
+  rememberFact({ kind: 'constraint', content: 'Standing rule: when I ask for information from a web page, read it with PageGrab, unless the page needs clicking or a login; then use the browser.' });
+  const query = 'Get me the cheapest item on each of pages 1 to 4 of https://example.test/catalogue';
+
+  const timedOut = await prepareProvenOperationForRequest(
+    { query },
+    { decideTurnStart: decideWith([], () => ({ failedOpen: true })) },
+  );
+  assert.equal(timedOut.strategyId, undefined, 'nothing is routed or bound on an unjudged rule');
+  assert.deepEqual(timedOut.tools, []);
+  assert.match(timedOut.text ?? '', /^\[OWNER RULE\]\nThe owner's standing rule may apply to this request: "Standing rule: when I ask for information from a web page, read it with PageGrab/);
+  assert.match(timedOut.text ?? '', /use PAGEGRAB_SCRAPE[^.]* for that part, including inside anything you build for this request\./);
+
+  const answered = await prepareProvenOperationForRequest(
+    { query },
+    { decideTurnStart: decideWith([], () => ({})) },
+  );
+  assert.doesNotMatch(answered.text ?? '', /\[OWNER RULE\]/, 'a rule Jev judged not to apply is not repeated as a hint');
+});

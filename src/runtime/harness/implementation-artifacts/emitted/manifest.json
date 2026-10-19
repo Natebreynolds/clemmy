@@ -2568,7 +2568,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 50371
+          "bytes": 52264
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045
@@ -6513,7 +6513,7 @@
           "bytes": 2190
         },
         "src/runtime/jev/proven-operation.ts": {
-          "bytes": 50371
+          "bytes": 52264
         },
         "src/runtime/harness/action-task-state.ts": {
           "bytes": 2045

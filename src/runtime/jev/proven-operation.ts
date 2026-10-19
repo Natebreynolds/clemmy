@@ -39,8 +39,11 @@ import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../../tools/native-product-surfa
 const PROVEN_PROVISION_BUDGET_MS = 10_000;
 /** Admission budget for the optional turn-start Jev decision. Preparation
  *  before it and event-loop stalls can take longer; an answer admitted after
- *  this deadline is never used. */
-export const PROVEN_PICK_BUDGET_MS = 1_500;
+ *  this deadline is never used. Measured 2026-10-11..18: answers that arrived
+ *  ran p50 311 ms, p95 1.1 s, max 1.49 s, and 111 of 558 decisions (20%)
+ *  missed the old 1.5 s budget, 31 of them by under 0.6 s. A miss drops the
+ *  owner's tool rule and the remembered run for that turn. */
+export const PROVEN_PICK_BUDGET_MS = 2_500;
 /** One request's candidates: every operation a named family holds, as a rule. */
 const OPERATION_ROUTE_CANDIDATES = 10;
 /** Remembered kinds of work offered to Jev for one request. */
@@ -626,6 +629,19 @@ export function ownerRuleOperations(query: string): Array<{ id: string; purpose:
   return out.slice(0, OPERATION_ROUTE_CANDIDATES);
 }
 
+/** The owner's rules a request may fall under, for the brain to judge when
+ *  Jev did not: each rule once, in the owner's words, with its operations. */
+export function renderUnjudgedOwnerRules(rows: ReturnType<typeof ownerRuleOperations>): string {
+  const byRule = new Map<string, string[]>();
+  for (const row of rows) byRule.set(row.rule.text, [...(byRule.get(row.rule.text) ?? []), row.id]);
+  return [
+    '[OWNER RULE]',
+    ...[...byRule].slice(0, 2).map(([text, operations]) => (
+      `The owner's standing rule may apply to this request: "${text}" If it does, with any exception in it not met, use ${operations.slice(0, 3).join(' or ')} for that part, including inside anything you build for this request. Find it with tool_search when it is not already listed.`
+    )),
+  ].join('\n');
+}
+
 /** The operations this request most plausibly needs, from what the host can
  *  hand over before the first frame: registry tools the orchestrator can load,
  *  and provider operations already proven in a successful run. An operation is
@@ -822,6 +838,8 @@ async function prepareProvenOperationInScope(
   // Jev picked. It is provisioned with the run's operations; it never joins
   // the run's own proven tools, which that run alone proved.
   let ruleBesideRun: string | null = null;
+  // The owner's rules for this request when Jev never judged them.
+  let unjudgedRules: ReturnType<typeof ownerRuleOperations> = [];
   if (!strategy) {
     // The candidates exist only for Jev's question. When Jev cannot be asked
     // (turned off, or no key), none are built and nothing waits. With no
@@ -835,8 +853,11 @@ async function prepareProvenOperationInScope(
     const verified = decideTurnStart ? listVerifiedRunStrategies() : [];
     const familiar = decideTurnStart ? familiarRunStrategiesFromStrategies(input.query, strategyScope, verified) : [];
     // The owner's own rules go first: a tool they named for this kind of work
-    // is weighed before anything the request merely shares words with.
-    const ruled = decideTurnStart ? ownerRuleOperations(input.query) : [];
+    // is weighed before anything the request merely shares words with. They
+    // are gathered even when Jev cannot be asked: unjudged, they still reach
+    // the brain as rules that may apply.
+    const ruled = ownerRuleOperations(input.query);
+    if (!decideTurnStart) unjudgedRules = ruled;
     for (const row of ruled) if (!ownerRuleFor.has(row.id)) ownerRuleFor.set(row.id, row.rule);
     const operations = decideTurnStart ? [
       ...ruled.map(({ id, purpose, rule }) => ({ id, purpose, rule: rule.text })),
@@ -855,6 +876,7 @@ async function prepareProvenOperationInScope(
         { timeoutMs: PROVEN_PICK_BUDGET_MS, ...(input.sessionId ? { sessionId: input.sessionId } : {}) },
       ), PROVEN_PICK_BUDGET_MS);
       decisionWaitMs = Date.now() - startedAt;
+      if (decision.failedOpen) unjudgedRules = ruled;
       const judged = decision.strategy
         ? familiar.find((row) => row.id === decision.strategy!.id) ?? null
         : null;
@@ -887,7 +909,18 @@ async function prepareProvenOperationInScope(
       }
     }
   }
-  if (!strategy) return { ...empty, ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}) };
+  if (!strategy) {
+    // Jev did not answer (out of time, failed, or cannot be asked), so no one
+    // judged whether the owner's tool rule covers this request. Live
+    // 2026-10-18: a page-read fan-out started 29 s after a restart, the
+    // decision timed out, the reads went another way, and the review sent
+    // them back to the owner's tool. The brain is shown the rule to judge.
+    return {
+      ...empty,
+      ...(unjudgedRules.length > 0 ? { text: renderUnjudgedOwnerRules(unjudgedRules) } : {}),
+      ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}),
+    };
+  }
   const schemas: Record<string, unknown> = {};
   for (const name of strategy.toolsUsed) {
     const schema = schemaForTool(name);
