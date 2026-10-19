@@ -924,7 +924,7 @@ function completionSourceKey(event: EventRow): string | null {
  * Drawn from the same projection as live delivery, so a reopened reply shows
  * the same status line, pill and chip, never a sentence written for Clem.
  */
-export function publicTerminalFacts(data: Record<string, unknown>, eventSessionId: string, event?: EventRow): Record<string, unknown> {
+export function publicTerminalFacts(data: Record<string, unknown>, eventSessionId: string, event?: EventRow, acceptedSource?: EventRow): Record<string, unknown> {
   const projected = terminalData(data, eventSessionId);
   const approvalDecisionAck = event && event.sessionId === eventSessionId && isDeepStrictEqual(event.data, data)
     ? publicApprovalDecisionAck(event) : null;
@@ -932,10 +932,19 @@ export function publicTerminalFacts(data: Record<string, unknown>, eventSessionI
     ? projected.presentation as Record<string, unknown> : {};
   const outcome = projected.turnOutcome && typeof projected.turnOutcome === 'object'
     ? projected.turnOutcome as Record<string, unknown> : null;
+  const typed = validTypedCompletionPresentation(data, eventSessionId);
+  const memoryReason = data.blockedReason === 'memory_consolidation_pending' || data.blockedReason === 'memory_work_unverified'
+    ? data.blockedReason : undefined;
+  const exactMemorySource = memoryReason && typed && event && event.type === 'conversation_completed'
+    && event.sessionId === eventSessionId && isDeepStrictEqual(event.data, data)
+    && acceptedSource?.type === 'user_input_received' && acceptedSource.role === 'user' && acceptedSource.data.synthetic !== true
+    && acceptedSource.sessionId === eventSessionId && acceptedSource.seq === typed.identity.sourceUserSeq
+    && event.seq > acceptedSource.seq;
   return {
     presentation: { status: presentation.status, kind: presentation.kind },
     ...(outcome ? { turnOutcome: selected(outcome, ['status', 'resumable', 'needs']) } : {}),
     ...selected(projected, ['review', 'reviewNote', 'retained', 'notice']),
+    ...(exactMemorySource ? { sourceUserSeq: acceptedSource!.seq, blockedReason: memoryReason } : {}),
     ...(approvalDecisionAck ? { approvalDecisionAck, notice: { code: 'card_decision' },
       sourceUserSeq: approvalDecisionAck.sourceUserSeq, terminalSeq: event!.seq,
       presentation: projected.presentation, turnOutcome: projected.turnOutcome } : {}),

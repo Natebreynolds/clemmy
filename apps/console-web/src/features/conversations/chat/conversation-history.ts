@@ -10,7 +10,7 @@ let seedSeq = 0;
  * assistant history remains terminal text. */
 export function historyToMessages(turns: Turn[]): ChatMessage[] {
   const suppressed = new Set<string>();
-  let messages = turns.map((turn) => ({ ...historyMessage(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWork(turn) }));
+  let messages = turns.map((turn) => ({ ...historyMessage(turn), ...acceptedSource(turn), ...writtenAt(turn), ...answeredBy(turn), ...workedIn(turn), ...savedWork(turn) }));
   for (let index = 0; index < turns.length; index += 1) {
     const turn = turns[index]!;
     const terminal = turn.terminal as Record<string, unknown> | undefined;
@@ -30,6 +30,29 @@ export function historyToMessages(turns: Turn[]): ChatMessage[] {
     if (resolution.matched && id) suppressed.add(id);
   }
   return messages.filter(message => !suppressed.has(message.id));
+}
+
+/** Only the server's exact source pairing survives. Text, order, timestamps
+ * and the conversation's latest execution head never supply a missing ID. */
+function acceptedSource(turn: Turn): Pick<ChatMessage, 'acceptedSource'> {
+  const source = turn.acceptedSource;
+  if (turn.checkIn || turn.fromClem || turn.steerNote || !source || typeof source !== 'object' || Array.isArray(source)
+    || typeof source.sessionId !== 'string' || !source.sessionId.trim() || source.sessionId.length > 256
+    || !Number.isSafeInteger(source.sourceUserSeq) || source.sourceUserSeq <= 0
+    || !Number.isSafeInteger(source.turn) || source.turn < 0) return {};
+  return { acceptedSource: { sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq, turn: source.turn } };
+}
+
+/** Only the normalized server history prop may supply this list. Never build
+ * it from live chat messages: a foreign live claim cannot authorize itself. */
+export function historyHandlingSources(turns: readonly Turn[]): ReadonlySet<string> {
+  const sources = new Set<string>();
+  for (const turn of turns) {
+    if (turn.role !== 'assistant') continue;
+    const source = acceptedSource(turn).acceptedSource;
+    if (source) sources.add(JSON.stringify([source.sessionId, source.sourceUserSeq, source.turn]));
+  }
+  return sources;
 }
 
 /** The workflows and files the reply saved, as the receipt-only rows the live card is

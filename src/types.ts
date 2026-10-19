@@ -177,6 +177,8 @@ export interface UnifiedSessionSummary {
 
 /** A single normalized turn for rendering a conversation's history. */
 export interface UnifiedSessionTurn {
+  /** Exact retained human request; never inferred from display pairing. */
+  acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
   steerNote?: true;
   /** Durable display identity survives even when handling evidence is bounded. */
   steerNoteSessionId?: string;

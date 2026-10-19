@@ -24,4 +24,5 @@ test('legacy, foreign, live and progress messages cannot borrow a task explanati
   for (const sourceUserSeq of [0, -1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.equal(taskHandlingSource({ ...message, acceptedSource: { ...acceptedSource, sourceUserSeq } }), null);
   }
+  for (const turn of [-1, NaN, Infinity, 1.5]) assert.equal(taskHandlingSource({ ...message, acceptedSource: { ...acceptedSource, turn } }), null);
 });

@@ -354,10 +354,12 @@ export function ChatBubble({
   speaker,
   project,
   ownedTaskIds,
-  sessionId, executionBusy, onExecutePlan, onPreparePlan, onRevisePlan,
+  sessionId, retainedHistorySources, executionBusy, onExecutePlan, onPreparePlan, onRevisePlan,
 }: {
   message: ChatMessage;
   sessionId?: string;
+  /** Exact source triples from normalized server history on a merged chat. */
+  retainedHistorySources?: ReadonlySet<string>;
   /** The tasks this conversation delegated. Each has its own card under the
    *  thread (ConversationTasks), so the live strip over one is not drawn. */
   ownedTaskIds?: ReadonlySet<string>;
@@ -585,7 +587,7 @@ export function ChatBubble({
 
   const thinking = message.status === 'thinking';
   const live = thinking || Boolean(message.workflowLive);
-  const handlingSource = !live ? taskHandlingSource(message, sessionId) : null;
+  const handlingSource = !live ? taskHandlingSource(message, sessionId, retainedHistorySources) : null;
   const currentMemoryWork = hasExactMemoryWork(message.terminal, handlingSource);
   const pendingAction = message.approval?.pendingAction;
   // A decision needs somewhere to go. Without both handlers this thread is a

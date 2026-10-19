@@ -37,6 +37,11 @@ export interface Session {
 }
 
 export interface Turn {
+  /** Exact real accepted source paired by the server transcript projector.
+   * Missing on legacy/orphan/synthetic turns; never inferred by the client. */
+  acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
+  checkIn?: boolean;
+  fromClem?: boolean;
   steerReceipt?: import('@clem/chat-engine').SteerReceipt;
   steerNote?: true;
   steerNoteSessionId?: string;
@@ -82,6 +87,8 @@ export interface Turn {
 /** The typed terminal facts a reopened assistant turn carries, in the same
  *  shapes as the live terminal event; the chat engine revalidates every field. */
 export interface TurnTerminal {
+  sourceUserSeq?: unknown;
+  blockedReason?: unknown;
   presentation?: { status?: unknown; kind?: unknown };
   turnOutcome?: { status?: unknown; resumable?: unknown; needs?: unknown };
   review?: unknown;

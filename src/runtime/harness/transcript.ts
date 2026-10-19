@@ -146,7 +146,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; terminal?: Record<string, unknown> };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -171,6 +171,12 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       userText: event.data.synthetic === true ? '' : ownerBubbleText(event.data, event.sessionId),
     });
   }
+  const acceptedSourceFor = (source: SourceRecord): UnifiedSessionTurn['acceptedSource'] => (
+    source.event.type === 'user_input_received' && source.event.role === 'user' && source.event.data.synthetic !== true
+      && Number.isSafeInteger(source.event.seq) && source.event.seq > 0
+      && Number.isSafeInteger(source.event.turn) && source.event.turn >= 0
+      ? { sessionId: source.event.sessionId, sourceUserSeq: source.event.seq, turn: source.event.turn } : undefined
+  );
 
   // Additions are user rows within their existing source, never new turns.
   // Text-only catalog previews keep their original bounded event surface.
@@ -280,11 +286,14 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     const presentation = validTypedCompletionPresentation(event.data, event.sessionId);
     if (!presentation) continue;
     const key = sourceKey(event.sessionId, presentation.identity.sourceUserSeq);
-    if (!sources.has(key)) continue;
+    const source = sources.get(key);
+    if (!source) continue;
+    const acceptedSource = event.seq > source.event.seq ? acceptedSourceFor(source) : undefined;
     const prior = assistantBySource.get(key);
     if (!prior || event.seq < prior.seq) {
       assistantBySource.set(key, {
         seq: event.seq,
+        ...(acceptedSource ? { acceptedSource } : {}),
         // Every typed terminal reopens through the same public projection as
         // live delivery. Raw checkpoints stay in the durable event for reuse.
         text: presentation.status === 'needs_input'
@@ -294,7 +303,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
-        terminal: publicTerminalFacts(event.data, event.sessionId, event),
+        terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
   }
@@ -337,8 +346,13 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       }
     }
     if (source) {
+      // Legacy pairing by turn/unique preceding source stays display-only.
+      // Only its own explicit retained source may open task evidence.
+      const acceptedSource = exactSeq === source.event.seq && event.seq > source.event.seq
+        ? acceptedSourceFor(source) : undefined;
       assistantBySource.set(source.key, {
         seq: event.seq,
+        ...(acceptedSource ? { acceptedSource } : {}),
         text,
         createdAt: event.createdAt,
         planProposalId: planProposalIdFrom(event.data),
@@ -408,8 +422,10 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
   for (const source of sources.values()) {
     const assistant = assistantBySource.get(source.key);
     const publishedPlan = publishedPlans.get(source.key);
+    const acceptedSource = acceptedSourceFor(source);
     const userTurns: UnifiedSessionTurn[] = source.userText
       ? [{ role: 'user', text: source.userText, createdAt: source.event.createdAt,
+        ...(acceptedSource ? { acceptedSource } : {}),
         ...(publicTaskMode(source.event.data.taskMode) ? { taskMode: publicTaskMode(source.event.data.taskMode) } : {}) }]
       : [];
     userTurns.push(...(steerBySource.get(source.key) ?? []));
@@ -430,6 +446,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             role: 'assistant',
             text: assistant.text,
             createdAt: assistant.createdAt,
+            ...(assistant.acceptedSource ? { acceptedSource: assistant.acceptedSource } : {}),
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),

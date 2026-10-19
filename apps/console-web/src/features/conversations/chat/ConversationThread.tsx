@@ -3,7 +3,7 @@ import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/Clou
 import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
-import { Fragment, useEffect, useRef } from 'react';
+import { Fragment, useEffect, useMemo, useRef } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { FolderKanban, Pin, Loader2, Files, Globe } from 'lucide-react';
@@ -35,7 +35,7 @@ import { rawId } from '../lib/ids';
 import { originMeta } from '../lib/origin';
 import type { Session, Turn } from '../types';
 import { ReadOnlyNotice } from './ReadOnlyNotice';
-import { historyToMessages } from './conversation-history';
+import { historyHandlingSources, historyToMessages } from './conversation-history';
 import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '../lib/chatColumn';
 
 function Header({ session }: { session: Session }) {
@@ -93,6 +93,7 @@ function Header({ session }: { session: Session }) {
 /** Live, continuable conversation — reuses the canonical harness chat loop. */
 function ContinuableThread({ session, history }: { session: Session; history: Turn[] }) {
   const qc = useQueryClient();
+  const retainedHistorySources = useMemo(() => historyHandlingSources(history), [history]);
   const focus = usePoll(['focus'], listFocusSnapshot, 4000);
   const chat = useChat({
     initialSessionId: session.executionSessionId ?? rawId(session.id),
@@ -207,6 +208,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               project={projectMarks[index]?.project ?? undefined}
               ownedTaskIds={delegated.ownedIds}
               sessionId={chat.sessionId.current ?? undefined}
+              retainedHistorySources={retainedHistorySources}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
@@ -240,6 +242,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 /** Read-only transcript (workflow / agent runs, or legacy desktop chats). */
 function ReadOnlyThread({ session, history }: { session: Session; history: Turn[] }) {
   const messages = historyToMessages(history);
+  const retainedHistorySources = historyHandlingSources(history);
   const marks = agentThreadMarks(messages, session.agentName ?? null);
   const projectMarks = projectThreadMarks(messages, session.projectName ?? null);
   return (
@@ -253,7 +256,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
             messages.map((m, index) => (
               <Fragment key={m.id}>
                 <ConversationChangeLine agent={marks[index]?.switchedTo} project={projectMarks[index]?.movedTo} />
-                <ChatBubble message={m} speaker={marks[index]?.speaker ?? undefined} project={projectMarks[index]?.project ?? undefined} sessionId={rawId(session.id)} />
+                <ChatBubble message={m} speaker={marks[index]?.speaker ?? undefined} project={projectMarks[index]?.project ?? undefined} sessionId={rawId(session.id)} retainedHistorySources={retainedHistorySources} />
               </Fragment>
             ))
           )}
