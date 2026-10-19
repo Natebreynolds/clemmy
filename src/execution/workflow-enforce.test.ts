@@ -1035,3 +1035,29 @@ test('a step naming a provider operation is a testable read, so it must be verif
     'a local-only step has nothing to validate against real data');
   assert.equal(workflowNeedsCreationTest({ steps: [{ prompt: 'Write a limerick.' }] } as never), false);
 });
+
+test('auto-repair runs a call step of one of Clem\'s own tools as a prompt step allowed that tool', () => {
+  const def = wf({ steps: [
+    { id: 'list', prompt: '', call: { tool: 'run_shell_command', args: { command: 'ls {{input.folder}}' } } },
+    { id: 'sum', prompt: 'Summarize {{steps.list.output}}', dependsOn: ['list'] },
+  ] as never });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  const step = repaired.steps[0]!;
+  assert.equal(step.call, undefined, 'the call that can never run is gone');
+  assert.deepEqual(step.allowedTools, ['run_shell_command']);
+  assert.match(step.prompt, /Call run_shell_command with exactly these arguments: \{"command":"ls \{\{input\.folder\}\}"\}/);
+  assert.ok(repaired.inputs?.folder, 'a binding in the arguments is declared like any prompt reference');
+  assert.ok(repairs.some((line) => /Step "list" runs run_shell_command as a prompt step/.test(line)));
+  assert.equal(def.steps[0]!.call?.tool, 'run_shell_command', 'the authored definition is not mutated');
+  const prep = prepareWorkflowForWrite(def);
+  assert.ok(!prep.errors.some((error) => /no exact-call contract/.test(error)), prep.errors.join('\n'));
+});
+
+test('auto-repair restores the codified prompt of an own-tool call step instead of inventing one', () => {
+  const def = wf({ steps: [{ id: 'read', prompt: '', call: { tool: 'run_shell_command', args: { command: 'date' } },
+    codifiedFrom: { prompt: 'Tell me today\'s date from the shell.', allowedTools: ['run_shell_command'] } }] as never });
+  const step = autoRepairWorkflowDefinition(def).def.steps[0]!;
+  assert.equal(step.prompt, 'Tell me today\'s date from the shell.');
+  assert.deepEqual(step.allowedTools, ['run_shell_command']);
+  assert.equal(step.codifiedFrom, undefined);
+});

@@ -8,6 +8,7 @@ import {
   type WorkflowStepShape,
 } from './workflow-validator.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
+import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
 import { operationIdentity } from '../tools/operation-name-identity.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
@@ -592,6 +593,10 @@ export function checkDependencyBinding(def: WorkflowDefinition): string[] {
  *   2. `forEach: X` where X is a real step but not a dependency → same.
  *   3. `{{input.X}}` referenced but never declared (and not a common key)
  *      → declare it under the workflow inputs so the engine binds it.
+ *   4. A call step naming one of Clementine's own tools, which has no
+ *      exact-call contract and so can never run as a call → run it as a
+ *      prompt step allowed that one tool, the exact fix the validator names
+ *      (the step's codified prompt when it was codified from one).
  *
  * Each repair is intent-preserving, never introduces a cycle (a dep that
  * would cycle is left for the validator to surface honestly), and is
@@ -617,6 +622,23 @@ export function autoRepairWorkflowDefinition(
     dependsOn: Array.isArray(s.dependsOn) ? [...s.dependsOn] : s.dependsOn,
   }));
   const ids = new Set(steps.map((s) => s.id).filter(Boolean));
+
+  // 4 first, so a binding written in the call's arguments is wired below like
+  // any other prompt reference.
+  for (const step of steps) {
+    const tool = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+    if (!tool || step.invocationPlan || !registryToolHasNoExactCallContract(tool)) continue;
+    const args = step.call?.args && Object.keys(step.call.args).length > 0 ? step.call.args : undefined;
+    const codified = step.codifiedFrom?.prompt?.trim() ? step.codifiedFrom : undefined;
+    step.prompt = codified?.prompt ?? [
+      step.prompt?.trim(),
+      `Call ${tool}${args ? ` with exactly these arguments: ${JSON.stringify(args)}` : ''}, and report what it returns.`,
+    ].filter(Boolean).join('\n\n');
+    step.allowedTools = [...new Set([...(step.allowedTools ?? []), ...(codified?.allowedTools ?? []), tool])];
+    delete step.call;
+    delete step.codifiedFrom;
+    repairs.push(`Step "${step.id}" runs ${tool} as a prompt step allowed ${tool}, since a call step cannot run Clem's own tools.`);
+  }
 
   // Effect belongs to the authored step or exact runtime operation. Omitted
   // declarations stay omitted; prose cannot turn a draft into a send or stamp
