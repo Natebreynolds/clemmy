@@ -25,7 +25,7 @@ import {
   approveExecutePendingAction,
   canOfferStandingSendTrust,
   getPendingActionStatus,
-  queuedPendingActionProgress,
+  startQueuedPendingActionPolling,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecutionPhase,
@@ -424,6 +424,12 @@ export function ChatBubble({
   const editableField = editableApprovalField(message.approval?.preview);
   const [trustNote, setTrustNote] = useState<string | null>(null);
   const pendingActionId = message.approval?.pendingAction?.id;
+  const pendingApprovalId = message.approval?.approvalId ?? message.approval?.pendingAction?.approvalId ?? null;
+  const pendingPayloadHash = message.approval?.pendingAction?.payloadHash;
+  const pendingRevision = message.approval?.pendingAction?.updatedAt;
+  const queuedCardKey = JSON.stringify([pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision]);
+  const currentQueuedCard = useRef(queuedCardKey);
+  currentQueuedCard.current = queuedCardKey;
   const showDurablePresentation = (presentation: PendingActionExecutionPresentation) => {
     if (presentation.mode !== 'durable') return false;
     const note = presentation.note?.trim();
@@ -447,18 +453,16 @@ export function ChatBubble({
   const followingQueued = exec.phase === 'queued' || (exec.phase === 'running' && exec.note === QUEUED_RUNNING_NOTE);
   useEffect(() => {
     if (!pendingActionId || !followingQueued) return;
-    let stopped = false;
-    const timer = setInterval(() => {
-      void getPendingActionStatus(pendingActionId).then((snapshot) => {
-        if (stopped) return;
-        const progress = queuedPendingActionProgress(snapshot);
-        if (!progress || progress.mode !== 'durable') return;
-        if (progress.phase === 'running') setExec({ phase: 'running', note: QUEUED_RUNNING_NOTE });
-        else showDurablePresentation(progress);
-      }).catch(() => { /* the next tick reads again */ });
-    }, 2_500);
-    return () => { stopped = true; clearInterval(timer); };
-  }, [pendingActionId, followingQueued]);
+    return startQueuedPendingActionPolling({
+      id: pendingActionId, approvalId: pendingApprovalId, payloadHash: pendingPayloadHash ?? '', updatedAt: pendingRevision ?? '',
+    }, () => getPendingActionStatus(pendingActionId), (progress) => {
+      // Props can change before the previous effect's cleanup runs. Never
+      // attach that card's late response to a replacement/revised card.
+      if (currentQueuedCard.current !== queuedCardKey || progress.mode !== 'durable') return;
+      if (progress.phase === 'running') setExec({ phase: 'running', note: QUEUED_RUNNING_NOTE });
+      else showDurablePresentation(progress);
+    });
+  }, [pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision, queuedCardKey, followingQueued]);
   const runExecute = async () => {
     if (!pendingActionId || resolved || decisionBusy || editing || message.approval?.resolution) return;
     await decisionGate.current.run(async () => {

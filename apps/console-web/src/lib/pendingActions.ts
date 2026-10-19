@@ -68,7 +68,11 @@ type PendingActionStatusSnapshot = {
   ok: boolean;
   status: string;
   resultSummary: string | null;
+  pendingAction?: Pick<PendingActionApprovalView,
+    'id' | 'approvalId' | 'payloadHash' | 'updatedAt' | 'status' | 'resultSummary'>;
 };
+
+type QueuedPendingActionBinding = Pick<PendingActionApprovalView, 'id' | 'approvalId' | 'payloadHash' | 'updatedAt'>;
 
 export interface PendingActionReconciliationOptions {
   /** One durable read per entry. Kept injectable so tests are instant and the
@@ -176,14 +180,88 @@ export async function resolvePendingActionExecutionPresentation(
   return waitForDurableTerminalStatus(refresh, options);
 }
 
-/** A queued card's durable truth once its resume has picked it up: running
- * while it executes, then its terminal. Null while it still waits. */
+function queuedSnapshotMatchesCard(snapshot: PendingActionStatusSnapshot, card: QueuedPendingActionBinding): boolean {
+  const action = snapshot.pendingAction;
+  return snapshot.ok === true && !!action && typeof action === 'object' && !Array.isArray(action)
+    && !!card.id && !!card.approvalId && !!card.payloadHash
+    && action.id === card.id && action.approvalId === card.approvalId && action.payloadHash === card.payloadHash
+    && action.status === snapshot.status && action.resultSummary === snapshot.resultSummary
+    && (snapshot.resultSummary === null || typeof snapshot.resultSummary === 'string')
+    && typeof action.updatedAt === 'string' && typeof card.updatedAt === 'string'
+    && Number.isFinite(Date.parse(card.updatedAt))
+    && Date.parse(action.updatedAt) >= Date.parse(card.updatedAt);
+}
+
+/** Only this exact card's retained record may move its presentation forward.
+ * updatedAt is the durable revision: progress can advance it, never rewind it. */
 export function queuedPendingActionProgress(
   snapshot: PendingActionStatusSnapshot,
+  card: QueuedPendingActionBinding,
 ): PendingActionExecutionPresentation | null {
+  if (!queuedSnapshotMatchesCard(snapshot, card)) return null;
   const phase = durablePhase(snapshot.status);
   if (!phase) return null;
   return phase === 'running' ? { mode: 'durable', phase } : durablePresentation(phase, snapshot.resultSummary);
+}
+
+/** Observe only; this helper has no approval or dispatch path. Each read must
+ * settle before scheduling the next, and terminal truth is fenced before the
+ * React callback so cleanup timing cannot let an older read replace it. */
+export function startQueuedPendingActionPolling(
+  card: QueuedPendingActionBinding,
+  refresh: () => Promise<PendingActionStatusSnapshot>,
+  onProgress: (presentation: PendingActionExecutionPresentation) => void,
+  options: { schedule?: (read: () => void, delayMs: number) => () => void } = {},
+): () => void {
+  const schedule = options.schedule ?? ((read, delayMs) => {
+    const timer = setTimeout(read, delayMs);
+    return () => clearTimeout(timer);
+  });
+  let stopped = false;
+  let cancelNext: (() => void) | undefined;
+  let revision = Date.parse(card.updatedAt);
+  let running = false;
+  let reading = false;
+  let failures = 0;
+  const stop = () => { stopped = true; cancelNext?.(); };
+  const next = (delay: number) => { cancelNext = schedule(() => { cancelNext = undefined; void read(); }, delay); };
+  const read = async () => {
+    if (stopped || reading) return;
+    reading = true;
+    try {
+      const snapshot = await refresh();
+      if (stopped) return;
+      const phase = durablePhase(snapshot.status);
+      const nextRevision = Date.parse(snapshot.pendingAction?.updatedAt ?? '');
+      if (!queuedSnapshotMatchesCard(snapshot, card) || nextRevision < revision
+        || (running && phase !== 'running' && phase !== 'executed' && phase !== 'failed')
+        || (!phase && !['queued', 'approval_requested', 'approved'].includes(snapshot.status))) {
+        throw new Error('Unconfirmed action revision');
+      }
+      revision = nextRevision;
+      failures = 0;
+      const progress = queuedPendingActionProgress(snapshot, card);
+      if (progress?.mode === 'durable') {
+        running = progress.phase === 'running';
+        if (!running) stop();
+        onProgress(progress);
+      }
+    } catch {
+      if (stopped) return;
+      // An unavailable/mismatched read is not evidence of a failed dispatch.
+      // Back off, then leave an explicit unconfirmed result without replay.
+      failures += 1;
+      if (failures >= 3) { stop(); onProgress(uncertainPresentation()); }
+    } finally {
+      reading = false;
+    }
+    if (!stopped) next(Math.min(2_500 * (2 ** failures), 10_000));
+  };
+  if (!card.id || !card.approvalId || !card.payloadHash || !Number.isFinite(revision)) {
+    stop();
+    onProgress(uncertainPresentation());
+  } else next(2_500);
+  return stop;
 }
 
 /**

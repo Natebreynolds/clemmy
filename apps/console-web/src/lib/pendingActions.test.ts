@@ -3,10 +3,188 @@ import assert from 'node:assert/strict';
 import {
   canOfferStandingSendTrust,
   queuedPendingActionProgress,
+  startQueuedPendingActionPolling,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecuteResult,
 } from './pendingActions';
+
+const queuedBinding = {
+  id: 'pa-one', approvalId: 'apr-one', payloadHash: 'sha256:one', updatedAt: '2026-10-19T20:00:00.000Z',
+};
+
+function statusSnapshot(status: string, updatedAt = '2026-10-19T20:00:01.000Z') {
+  const resultSummary = status === 'executed' ? 'Updated 1 record.' : null;
+  return { ok: true, status, resultSummary, pendingAction: { ...queuedBinding, status, updatedAt, resultSummary } };
+}
+
+function pollClock() {
+  const scheduled: { run: () => void; delay: number; cancelled: boolean }[] = [];
+  return {
+    scheduled,
+    schedule(run: () => void, delay: number) {
+      const tick = { run, delay, cancelled: false };
+      scheduled.push(tick);
+      return () => { tick.cancelled = true; };
+    },
+    next() {
+      const tick = scheduled.shift();
+      assert.ok(tick, 'a next read must be scheduled');
+      if (!tick.cancelled) tick.run();
+      return tick;
+    },
+  };
+}
+
+async function finishRead() { await Promise.resolve(); await Promise.resolve(); }
+
+test('queued status cannot attach a different action result to this card', () => {
+  const snapshot = statusSnapshot('executed');
+  snapshot.pendingAction.id = 'pa-foreign';
+  assert.equal(queuedPendingActionProgress(snapshot, queuedBinding), null);
+});
+
+test('queued polling serializes slow reads and fences a terminal before another read can start', async () => {
+  const clock = pollClock();
+  const progress: unknown[] = [];
+  let reads = 0;
+  let finish!: (snapshot: ReturnType<typeof statusSnapshot>) => void;
+  const stop = startQueuedPendingActionPolling(queuedBinding, () => {
+    reads += 1;
+    return new Promise<ReturnType<typeof statusSnapshot>>((resolve) => { finish = resolve; });
+  }, (value) => progress.push(value), { schedule: clock.schedule });
+  const firstTick = clock.next();
+  firstTick.run();
+  assert.equal(reads, 1);
+  assert.equal(clock.scheduled.length, 0, 'no timer can overlap the unresolved read');
+  finish(statusSnapshot('executed'));
+  await finishRead();
+  assert.deepEqual(progress, [{ mode: 'durable', phase: 'executed', note: 'Updated 1 record.' }]);
+  assert.equal(clock.scheduled.length, 0, 'terminal truth is latched before React cleans up');
+  firstTick.run();
+  assert.equal(reads, 1, 'even a retained callback cannot read after the terminal');
+  stop();
+});
+
+test('queued progress requires the exact action, approval, payload, revision and consistent durable fields', () => {
+  const variants = [
+    { pendingAction: undefined },
+    { ok: false },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, id: 'pa-foreign' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, approvalId: 'apr-other' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, payloadHash: 'sha256:changed' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, updatedAt: '2026-10-19T19:59:59.999Z' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, updatedAt: 'not-a-revision' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, status: 'executing' } },
+    { pendingAction: { ...statusSnapshot('executed').pendingAction, resultSummary: 'Foreign receipt.' } },
+  ];
+  for (const variant of variants) {
+    assert.equal(queuedPendingActionProgress({ ...statusSnapshot('executed'), ...variant }, queuedBinding), null);
+  }
+  for (const status of ['executed', 'failed', 'rejected', 'expired', 'cancelled'] as const) {
+    assert.equal(queuedPendingActionProgress(statusSnapshot(status), queuedBinding)?.phase, status);
+  }
+});
+
+test('queued polling refuses older revisions and impossible pre-dispatch states after seeing an execution claim', async () => {
+  const clock = pollClock();
+  const progress: { phase: string }[] = [];
+  const reads = [
+    statusSnapshot('executing', '2026-10-19T20:00:02.000Z'),
+    statusSnapshot('executed', '2026-10-19T20:00:01.000Z'),
+    statusSnapshot('rejected', '2026-10-19T20:00:03.000Z'),
+    statusSnapshot('executed', '2026-10-19T20:00:04.000Z'),
+  ];
+  startQueuedPendingActionPolling(queuedBinding, async () => reads.shift()!, (value) => progress.push(value), { schedule: clock.schedule });
+  for (let i = 0; i < 3; i += 1) { clock.next(); await finishRead(); }
+  assert.deepEqual(progress, [{ mode: 'durable', phase: 'running' }]);
+  clock.next(); await finishRead();
+  assert.equal(progress.at(-1)?.phase, 'executed');
+  assert.equal(clock.scheduled.length, 0);
+});
+
+test('queued polling backs off failed reads, recovers from durable truth, and never changes an unavailable read into failure', async () => {
+  const clock = pollClock();
+  const progress: { phase: string }[] = [];
+  let reads = 0;
+  startQueuedPendingActionPolling(queuedBinding, async () => {
+    reads += 1;
+    if (reads === 1) throw new Error('read unavailable');
+    return statusSnapshot(reads === 2 ? 'executing' : 'failed');
+  }, (value) => progress.push(value), { schedule: clock.schedule });
+  assert.equal(clock.next().delay, 2_500); await finishRead();
+  assert.deepEqual(progress, []);
+  assert.equal(clock.next().delay, 5_000); await finishRead();
+  assert.equal(progress.at(-1)?.phase, 'running');
+  assert.equal(clock.next().delay, 2_500); await finishRead();
+  assert.equal(progress.at(-1)?.phase, 'failed');
+  assert.equal(reads, 3);
+  assert.equal(clock.scheduled.length, 0);
+});
+
+test('unavailable or foreign queued reads end as bounded unconfirmed truth without any second dispatch', async () => {
+  for (const foreign of [false, true]) {
+    const clock = pollClock();
+    const progress: { phase: string; note?: string }[] = [];
+    let reads = 0;
+    startQueuedPendingActionPolling(queuedBinding, async () => {
+      reads += 1;
+      if (!foreign) throw new Error('read unavailable');
+      const snapshot = statusSnapshot('executed');
+      snapshot.pendingAction.payloadHash = 'sha256:foreign';
+      return snapshot;
+    }, (value) => progress.push(value), { schedule: clock.schedule });
+    for (const delay of [2_500, 5_000, 10_000]) { assert.equal(clock.next().delay, delay); await finishRead(); }
+    assert.equal(reads, 3);
+    assert.equal(progress.length, 1);
+    assert.equal(progress[0].phase, 'uncertain');
+    assert.match(progress[0].note ?? '', /do not retry/i);
+    assert.equal(clock.scheduled.length, 0);
+  }
+});
+
+test('unmount cancels queued timers and ignores an outstanding response after a card is replaced', async () => {
+  const oldClock = pollClock();
+  const progress: unknown[] = [];
+  let finish!: (snapshot: ReturnType<typeof statusSnapshot>) => void;
+  const stop = startQueuedPendingActionPolling(queuedBinding,
+    () => new Promise<ReturnType<typeof statusSnapshot>>((resolve) => { finish = resolve; }),
+    (value) => progress.push(value), { schedule: oldClock.schedule });
+  oldClock.next();
+  stop();
+  const newClock = pollClock();
+  const replacement = { ...queuedBinding, approvalId: 'apr-revised', payloadHash: 'sha256:revised' };
+  const stopReplacement = startQueuedPendingActionPolling(replacement,
+    async () => ({ ...statusSnapshot('failed'), pendingAction: { ...statusSnapshot('failed').pendingAction, ...replacement } }),
+    (value) => progress.push(value), { schedule: newClock.schedule });
+  newClock.next(); await finishRead();
+  finish(statusSnapshot('executed')); await finishRead();
+  assert.deepEqual(progress, [{ mode: 'durable', phase: 'failed' }]);
+  assert.equal(oldClock.scheduled.length, 0);
+  stopReplacement();
+
+  let reads = 0;
+  const clock = pollClock();
+  const cancel = startQueuedPendingActionPolling(queuedBinding, async () => { reads += 1; return statusSnapshot('executed'); },
+    () => assert.fail('an unmounted timer cannot update the card'), { schedule: clock.schedule });
+  cancel();
+  assert.equal(clock.next().cancelled, true);
+  assert.equal(reads, 0);
+});
+
+test('missing card identity or revision remains unconfirmed without starting an unbound read', () => {
+  for (const binding of [
+    { ...queuedBinding, approvalId: null }, { ...queuedBinding, id: '' },
+    { ...queuedBinding, payloadHash: '' }, { ...queuedBinding, updatedAt: '' },
+  ]) {
+    const clock = pollClock();
+    const progress: { phase: string }[] = [];
+    startQueuedPendingActionPolling(binding, async () => assert.fail('no unbound read'),
+      (value) => progress.push(value), { schedule: clock.schedule });
+    assert.equal(progress[0]?.phase, 'uncertain');
+    assert.equal(clock.scheduled.length, 0);
+  }
+});
 
 test('standing send trust is offered only for recipient-scoped external sends', () => {
   assert.equal(canOfferStandingSendTrust({ kind: 'external_send' }), true);
@@ -192,8 +370,8 @@ test('a card queued behind a live run shows that and never sends the decision ag
   assert.deepEqual(presentation, { mode: 'durable', phase: 'queued', note: 'Approved. It runs once the current work in this chat ends.' });
   assert.equal(refreshes, 0);
 
-  assert.equal(queuedPendingActionProgress({ ok: true, status: 'approved', resultSummary: null }), null);
-  assert.deepEqual(queuedPendingActionProgress({ ok: true, status: 'executing', resultSummary: null }), { mode: 'durable', phase: 'running' });
-  assert.deepEqual(queuedPendingActionProgress({ ok: true, status: 'executed', resultSummary: 'Updated 1 record.' }),
+  assert.equal(queuedPendingActionProgress(statusSnapshot('approved'), queuedBinding), null);
+  assert.deepEqual(queuedPendingActionProgress(statusSnapshot('executing'), queuedBinding), { mode: 'durable', phase: 'running' });
+  assert.deepEqual(queuedPendingActionProgress(statusSnapshot('executed'), queuedBinding),
     { mode: 'durable', phase: 'executed', note: 'Updated 1 record.' });
 });
