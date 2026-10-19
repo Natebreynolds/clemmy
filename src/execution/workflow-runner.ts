@@ -16787,6 +16787,7 @@ async function processOneRunFile(
       const declaredRunGoal = workflowRunGoal(workflow.data);
       const legacyRunGoal = declaredRunGoal ? null : deriveLegacyWorkflowRunGoal(workflow.data, inputs);
       let targetVerdict: WorkflowTargetVerdict | null = null;
+      let targetJudgeError: string | undefined;
       if (!isCompiledProjectRun && !declaredRunGoal && blockedSteps.length === 0) {
         try {
           targetVerdict = await judgeWorkflowTarget({
@@ -16800,7 +16801,10 @@ async function processOneRunFile(
             executionEvidence: () => readWorkflowTargetEvidence(run.id),
             reviewPolicy: targetReviewPolicy,
           });
-        } catch { /* fail-open: a target-judge error never affects a completed run */ }
+        } catch (error) {
+          // Fail-open: a target-judge error never affects a completed run.
+          targetJudgeError = error instanceof Error ? error.message : String(error);
+        }
         // Verdict door (T3-B4): one canonical audit row per judge decision —
         // recorded only when the judge actually evaluated (skips are not verdicts).
         if (targetVerdict?.judged) {
@@ -16808,6 +16812,17 @@ async function processOneRunFile(
             kind: 'verdict_recorded',
             meta: { door: 'workflow_target', pass: targetVerdict.reached, reason: targetVerdict.gap.slice(0, 400),
               ...(targetVerdict.reviewer ? { reviewer: targetVerdict.reviewer } : {}) },
+          });
+        } else {
+          // A skip is not a verdict, but why the review did not rule is the
+          // only way to tell an unreviewed run from a reviewed one. Live
+          // 2026-10-18: a run passed with an advisory, made no review call,
+          // and left no record of why.
+          appendWorkflowEvent(workflow.name, run.id, {
+            kind: 'verdict_skipped',
+            meta: { door: 'workflow_target',
+              reason: (targetJudgeError ? `the target review threw: ${targetJudgeError}` : targetVerdict?.gap ?? 'the target review returned nothing').slice(0, 400),
+              ...(targetVerdict?.unavailable ? { unavailable: true } : {}) },
           });
         }
         // A judge OUTAGE on a legacy (no declared goal) run means NOTHING

@@ -2333,6 +2333,51 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
   assert.ok(graph?.edges?.some((edge) => edge.source === 'pull' && edge.target === 'summarize' && edge.type === 'dependency'));
 });
 
+test('a run whose target review does not rule records why, never a verdict', async () => {
+  // Live 2026-10-18: a four-branch run passed with an advisory, made no review
+  // call, and left no record of why its review did not run.
+  const { writeWorkflow } = await import('../memory/workflow-store.js');
+  const { recordStepResult } = await import('../tools/step-result-tool.js');
+  const slug = 'target-review-skip-runner';
+  const workflowName = 'Target Review Skip Runner';
+  const runId = `target-review-skip-${Date.now()}`;
+  writeWorkflow(slug, {
+    name: workflowName,
+    description: 'Returns one fixture value.',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'pull', prompt: 'Return the first fixture value.', sideEffect: 'read' }],
+  });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: workflowName, status: 'queued', inputs: {}, createdAt: new Date().toISOString(),
+  }), 'utf-8');
+  _setWorkflowHarnessLoopImplsForTests({
+    configureRuntime: (async () => ({ ok: true })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (options: { sessionId: string }) => {
+      recordStepResult(options.sessionId, { ok: true });
+      return {
+        sessionId: options.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+        lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
+      };
+    }) as never,
+  });
+  try {
+    await processWorkflowRuns({} as never);
+  } finally {
+    _setWorkflowHarnessLoopImplsForTests();
+  }
+  const events = readWorkflowEvents(slug, runId);
+  assert.ok(events.some((event) => event.kind === 'run_completed'), events.map((event) => event.kind).join(', '));
+  const recorded = events.filter((event) => event.kind === 'verdict_recorded');
+  const skipped = events.filter((event) => event.kind === 'verdict_skipped');
+  assert.equal(recorded.length + skipped.length, 1, 'every review-eligible run says whether its review ruled');
+  assert.equal(skipped.length, 1, 'with no reviewer configured the review cannot rule');
+  assert.equal(skipped[0]!.meta?.door, 'workflow_target');
+  assert.match(String(skipped[0]!.meta?.reason ?? ''), /\S/, 'the record says why');
+});
+
 test('fresh workflow run records ready batch metadata for parallel scheduler lanes', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
   const { recordStepResult } = await import('../tools/step-result-tool.js');
