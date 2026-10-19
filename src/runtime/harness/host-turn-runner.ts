@@ -11575,7 +11575,7 @@ const runHostTurnBody = async (
       }
       if (transportInterrupted && !signal?.aborted && !bufferedRequestInFlight) {
         // A name lookup that failed is this computer being offline, not the
-        // model: say what the owner can act on. Live 2026-10-18: Slack,
+        // model: say what the owner can act on. Live 2026-10-18: a chat app,
         // Discord, the phone relay and the brain all failed with ENOTFOUND.
         const waiting = blockedOutcome(
           networkLookupFailed(error)

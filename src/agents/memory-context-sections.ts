@@ -16,6 +16,8 @@ export const MEMORY_CONTEXT_SECTION_TITLES: readonly string[] = [
   'Completed Actions This Conversation',
   'User Preferences',
   'Standing Policies',
+  // The meeting-research turn's evidence-only context (harness-context.ts).
+  'Standing instructions',
   'Persistent Facts',
   'Recently Learned (last 24h)',
   'Data Landscape',

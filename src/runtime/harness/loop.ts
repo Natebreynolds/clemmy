@@ -1781,6 +1781,14 @@ export function noProgressCheckInSteerFor(blockedDetail: string | undefined): st
   return NO_PROGRESS_CHECK_IN_STEER;
 }
 
+/** Test seam: review a chat answer before delivery, the path plans, memory
+ * corrections and outside changes still take, so a test can exercise that
+ * review-and-repair loop on an ordinary answer. Production never sets it. */
+let reviewBeforeDeliveryForTests = false;
+export function _setReviewBeforeDeliveryForTests(value: boolean): void {
+  reviewBeforeDeliveryForTests = value;
+}
+
 /**
  * A STOP CLEM ALREADY TURNED INTO A QUESTION IS HER QUESTION.
  *
@@ -13199,7 +13207,8 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       opts.hostJudgeCompletion = options.judgeCompletion === true;
       // This caller publishes through the committer, which runs a chat
       // answer's review right after delivery (review-after-delivery.ts).
-      opts.hostReviewAfterDelivery = options.judgeCompletion === true && session.sessionRow.kind === 'chat';
+      opts.hostReviewAfterDelivery = !reviewBeforeDeliveryForTests
+        && options.judgeCompletion === true && session.sessionRow.kind === 'chat';
       opts.hostQueuedApprovalBeforeCompletion = hostQueuedApprovalBeforeCompletion(options.sessionId, turn, sourceUserSeq);
       opts.hostActivationStartedAt = options.hostActivationStartedAt;
       opts.hostPreviousResponseId = session.previousResponseId();

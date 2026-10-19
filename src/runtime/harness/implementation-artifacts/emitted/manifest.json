@@ -1548,7 +1548,7 @@
           "bytes": 54630
         },
         "src/agents/memory-context-sections.ts": {
-          "bytes": 1087
+          "bytes": 1191
         },
         "src/runtime/harness/advertised-tool-wire.ts": {
           "bytes": 2390
@@ -2883,13 +2883,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 835025
+          "bytes": 835453
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 744609
+          "bytes": 744614
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -5511,7 +5511,7 @@
           "bytes": 54630
         },
         "src/agents/memory-context-sections.ts": {
-          "bytes": 1087
+          "bytes": 1191
         },
         "src/runtime/harness/advertised-tool-wire.ts": {
           "bytes": 2390
@@ -6846,13 +6846,13 @@
           "bytes": 6085
         },
         "src/runtime/harness/loop.ts": {
-          "bytes": 835025
+          "bytes": 835453
         },
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 744609
+          "bytes": 744614
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
