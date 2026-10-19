@@ -24,6 +24,7 @@ import {
   publicPlanArtifactRef,
   publicTaskMode,
   publicSteerReceiptsForSource,
+  publicReviewSettledData,
 } from './public-presentation.js';
 
 /** The longest message of her own her thread shows: a workflow report (its
@@ -99,6 +100,8 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       'clem_message',
       // A card she asked, so a reopened approval reads as her question.
       'approval_requested',
+      // The ruling on an answer delivered before its review.
+      'completion_review_settled',
     ],
     limit,
   });
@@ -306,6 +309,19 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
+  }
+  // An answer delivered before its review reopens with the ruling that review
+  // reached (review-after-delivery.ts), never as still being checked.
+  for (const event of events) {
+    if (event.type !== 'completion_review_settled') continue;
+    const settled = publicReviewSettledData(event);
+    if (!settled) continue;
+    const key = sourceKey(event.sessionId, settled.sourceUserSeq as number);
+    const assistant = assistantBySource.get(key);
+    if (assistant?.terminal?.review !== 'checking') continue;
+    const { reviewNote: _note, ...terminal } = assistant.terminal;
+    assistantBySource.set(key, { ...assistant, terminal: { ...terminal, review: settled.review,
+      ...(typeof settled.reviewNote === 'string' ? { reviewNote: settled.reviewNote } : {}) } });
   }
 
   const orphanAssistants: Unit[] = [];

@@ -11,7 +11,7 @@
  */
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { AlertCircle, Check, CheckCircle2, Copy, FileText, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
+import { AlertCircle, Check, CheckCircle2, Copy, FileText, Loader2, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
 import {
   outsideWorkCards, projectPagePlace, projectPageTitle, turnByline, turnModelOffer, turnReview, turnReviewNote, workflowCardLevels, workflowCards,
   type ModelRuleOffer, type OutsideWorkCard, type TurnReview, type WorkflowCardData,
@@ -334,8 +334,9 @@ export function OutsideWorkCards({ activity, children }: { activity?: ActivityIt
   );
 }
 
-const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boolean }> = {
+const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boolean; pending?: true }> = {
   checked: { label: 'Checked', ok: true },
+  checking: { label: 'Checking…', title: 'Clem is checking this answer now. If the check finds a problem, she’ll follow up here.', ok: false, pending: true },
   unchecked: { label: 'Not checked', title: 'The review didn’t rule on this answer, so it wasn’t checked. Ask Clem to re-check it.', ok: false },
   rejected: { label: 'Didn’t pass review', title: 'The last review did not accept this answer.', ok: false },
   needs_recheck: { label: 'Needs a fresh check', title: 'Part of this answer rests on earlier results that need a fresh check. Ask Clem to re-check before relying on it.', ok: false },
@@ -346,9 +347,9 @@ const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boole
 function ReviewChip({ review, note }: { review: TurnReview; note?: string }) {
   const [open, setOpen] = useState(false);
   const chip = REVIEW_CHIP[review];
-  const Icon = chip.ok ? CheckCircle2 : AlertCircle;
-  const look = chip.ok ? 'font-semibold text-success' : 'font-medium text-warning';
-  const content = <><Icon className="h-3.5 w-3.5" aria-hidden /> {chip.label}</>;
+  const Icon = chip.pending ? Loader2 : chip.ok ? CheckCircle2 : AlertCircle;
+  const look = chip.pending ? 'font-medium text-muted' : chip.ok ? 'font-semibold text-success' : 'font-medium text-warning';
+  const content = <><Icon className={cn('h-3.5 w-3.5', chip.pending && 'animate-spin motion-reduce:animate-none')} aria-hidden /> {chip.label}</>;
   if (!note) return <span className={cn('inline-flex items-center gap-1', look)} title={chip.title}>{content}</span>;
   return (
     <>

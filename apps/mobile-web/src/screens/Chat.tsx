@@ -1752,8 +1752,9 @@ function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessi
   );
 }
 
-const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean }> = {
+const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean; pending?: true }> = {
   checked: { label: '✓ Checked', ok: true },
+  checking: { label: 'Checking…', ok: false, pending: true },
   unchecked: { label: 'Not checked', ok: false },
   rejected: { label: 'Didn’t pass review', ok: false },
   needs_recheck: { label: 'Needs a fresh check', ok: false },
@@ -1808,7 +1809,7 @@ function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?:
       {offer && sessionId ? <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} /> : null}
       {review || touched || byline ? (
         <button type="button" class="reply-receipt" onClick={() => setReveal(!reveal)} aria-expanded={reveal}>
-          {review ? <span class={REVIEW_CHIP[review].ok ? 'receipt-ok' : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
+          {review ? <span class={REVIEW_CHIP[review].pending ? 'receipt-pending' : REVIEW_CHIP[review].ok ? 'receipt-ok' : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
           {touched ? <span>{touched}</span> : null}
           {reveal && reviewNote ? <span class="receipt-model receipt-review-note">Review: {reviewNote}</span> : null}
           {reveal && byline ? <span class="receipt-model">{byline}</span> : null}

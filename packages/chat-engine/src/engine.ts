@@ -25,6 +25,7 @@ import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
+import { applyReviewSettlement, readReviewSettlement, reviewPendingSourceFor } from './review-settlement.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
 import { acceptedConversationSource, appendConversationCheckIn } from './conversation-check-in.js';
@@ -725,6 +726,12 @@ export class ChatEngine {
     }
     this.messages = applySteerReceiptEvent(this.messages, event, this.sessionId);
     if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') { this.emit(); return; }
+    if (event.type === 'completion_review_settled') {
+      const settled = readReviewSettlement(event, this.sessionId);
+      if (settled) this.messages = applyReviewSettlement(this.messages, settled);
+      this.emit();
+      return;
+    }
     if (readBackgroundOutcomeReport(event, this.sessionId)) {
       if (event.type === 'conversation_completed') {
         const id = `background-report-${event.seq}`;
@@ -980,6 +987,7 @@ export class ChatEngine {
         this.updateActive((m) => ({
           ...withoutAnswerDraft(m),
           ...presentation,
+          ...reviewPendingSourceFor(presentation.terminal, sourceUserSeqOf(event)),
           ...(readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ? { planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) } : {}),
           ...(planProposalId ? {
             planProposalId,
@@ -1210,6 +1218,11 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
   for (const event of events) {
     messages = applySteerReceiptEvent(messages, event, sessionId);
     if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') continue;
+    if (event.type === 'completion_review_settled') {
+      const settled = readReviewSettlement(event, sessionId);
+      if (settled) messages = applyReviewSettlement(messages, settled);
+      continue;
+    }
     const d = (event.data ?? {}) as Record<string, unknown>;
     if (readBackgroundOutcomeReport(event, sessionId)) {
       if (event.type === 'conversation_completed') {
@@ -1374,6 +1387,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           // chip as it did live; without its typed facts a notice reopened
           // as an empty reply.
           ...(presentation.terminal ? { terminal: presentation.terminal } : {}),
+          ...reviewPendingSourceFor(presentation.terminal, sourceUserSeq),
           taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
           planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),
           ...(planProposalId ? {

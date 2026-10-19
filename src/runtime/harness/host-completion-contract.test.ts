@@ -1062,6 +1062,10 @@ test('large file and all Space components reach the actual completion request wi
 
 async function runHost(options: { captured: boolean; incoming: boolean; text?: string; work?: boolean; reply?: string; firstReply?: string; secondReply?: string; abortAtJudge?: boolean; policyData?: Record<string, unknown>; readResult?: unknown; afterCapture?: () => void;
   resilient?: boolean; plan?: boolean; checkIn?: boolean; abortBeforeResponse?: boolean;
+  /** The caller publishes through the committer, which runs the review after delivery. */
+  reviewAfterDelivery?: boolean;
+  /** Leave the judge stub installed for a review that runs after the turn. */
+  keepJudge?: boolean;
   onModelCall?: () => void;
   beforeResponse?: (identity: ReturnType<typeof accepted>) => void;
   queuedApprovalHook?: import('./loop.js').HostQueuedApprovalBeforeCompletion;
@@ -1133,13 +1137,123 @@ async function runHost(options: { captured: boolean; incoming: boolean; text?: s
     const runner = Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not execute'); } });
     const outcome = await brackets.withHarnessRunContext({ ...identity,
       ...(runAttempt ? { runAttemptId: runAttempt.attemptId } : {}), counter: new brackets.ToolCallsCounter(20) }, () => host.hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: options.text ?? request }] as never, { maxTurns: 4, hostTurnEngine: 'host_v1', hostJudgeCompletion: options.incoming, hostQueuedApprovalBeforeCompletion: options.queuedApprovalHook,
-        ...(options.checkIn ? { hostConversationalCheckIn: true } : {}), context: identity, signal: signal.signal } as never));
-    return { identity, outcome, calls, judged, modelInputs, originalResponses };
+        ...(options.checkIn ? { hostConversationalCheckIn: true } : {}),
+        ...(options.reviewAfterDelivery ? { hostReviewAfterDelivery: true } : {}), context: identity, signal: signal.signal } as never));
+    return { identity, outcome, calls, callCount: () => calls, judged, modelInputs, originalResponses };
   } finally {
-    host._setHostObjectiveJudgeForTests(null);
+    if (!options.keepJudge) host._setHostObjectiveJudgeForTests(null);
     catalogs.installHostCapabilityCatalogFactory(prior);
   }
 }
+
+async function eventuallyEvent(sessionId: string, find: (row: ReturnType<typeof events.listEvents>[number]) => boolean,
+  types: Parameters<typeof events.listEvents>[1] extends infer O ? O extends { types?: infer T } ? T : never : never, timeoutMs = 5_000) {
+  const started = Date.now();
+  for (;;) {
+    const row = events.listEvents(sessionId, { types }).find(find);
+    if (row) return row;
+    if (Date.now() - started > timeoutMs) throw new Error(`no ${String(types)} row arrived`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test('an ordinary chat answer publishes before its review, which then rules on the exact published text', async () => {
+  const reply = 'The controlled report value is present.';
+  const run = await runHost({ captured: true, incoming: true, reviewAfterDelivery: true, keepJudge: true,
+    text: 'Update the controlled report summary from the retained fixture read.', reply, readResult: 'CONTROLLED_REPORT_VALUE',
+    firstVerdict: { done: true, reason: 'The controlled report value is supported.' } });
+  try {
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 0, 'the turn ends without waiting for its review');
+    assert.equal(run.outcome.finalOutput, reply);
+    assert.equal(run.outcome.terminal, undefined);
+    assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 1);
+    const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(run.identity), identity: run.identity,
+      status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } });
+    assert.equal(committed.presentation.status, 'done');
+    assert.equal(committed.presentation.text, reply, 'her words publish exactly');
+    assert.equal(committed.event.data.review, 'checking');
+    const settled = await eventuallyEvent(run.identity.sessionId, () => true, ['completion_review_settled']);
+    assert.equal(settled.data.review, 'checked');
+    assert.equal(settled.data.sourceUserSeq, run.identity.sourceUserSeq);
+    assert.equal(settled.data.terminalEventId, committed.event.id);
+    assert.equal(run.judged.length, 1);
+    assert.equal(run.judged[0]!.reply, reply, 'the review reads the published bytes');
+    const verdict = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] }).at(-1)!;
+    assert.equal(verdict.data.afterDelivery, true);
+    assert.equal(verdict.data.continuation, false);
+    assert.equal(verdict.data.fulfills, true);
+    assert.equal(verdict.data.replyDigest, createHash('sha256').update(reply).digest('hex'));
+    assert.equal(settled.data.verdictEventId, verdict.id);
+    assert.equal(run.callCount(), 1, 'a passing review buys no further model call');
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+  }
+});
+
+test('a review that says no after delivery lets Clem correct herself in the thread, once, in her own words', async () => {
+  const reply = 'The controlled report value is present.';
+  const correction = 'One correction to my last answer: the controlled value carries an unknown qualification, which I left out.';
+  const finding = 'The reply leaves out the controlled qualification shown in the retained read.';
+  const run = await runHost({ captured: true, incoming: true, reviewAfterDelivery: true, keepJudge: true,
+    text: 'Update the controlled report summary from the retained fixture read.', firstReply: reply, secondReply: correction,
+    readResult: 'CONTROLLED_REPORT_VALUE', firstVerdict: { done: false, reason: finding } });
+  try {
+    assert.equal(run.calls, 1);
+    assert.equal(run.judged.length, 0);
+    const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(run.identity), identity: run.identity,
+      status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } });
+    assert.equal(committed.presentation.status, 'done', 'a review still to come never holds the answer');
+    assert.equal(committed.event.data.review, 'checking');
+    const settled = await eventuallyEvent(run.identity.sessionId, () => true, ['completion_review_settled']);
+    assert.equal(settled.data.review, 'rejected');
+    assert.equal(settled.data.reviewNote, finding);
+    const verdict = events.listEvents(run.identity.sessionId, { types: ['goal_alignment_judged'] }).at(-1)!;
+    assert.equal(verdict.data.fulfills, false);
+    assert.equal(verdict.data.continuation, false, 'a delivered answer is never re-run');
+    const followUp = await eventuallyEvent(run.identity.sessionId, (row) => (
+      (row.data.presentation as { text?: unknown } | undefined)?.text === correction
+    ), ['conversation_completed']);
+    assert.ok(followUp.seq > committed.event.seq);
+    assert.equal(run.callCount(), 2, 'one tool-free request for the correction');
+    const correctionInput = JSON.stringify(run.modelInputs[1]);
+    assert.match(correctionInput, /ANSWER CHECK — AFTER DELIVERY/);
+    assert.ok(correctionInput.includes(finding));
+    const terminals = events.listEvents(run.identity.sessionId, { types: ['conversation_completed'] });
+    assert.equal(terminals.filter((row) => row.id === committed.event.id).length, 1);
+    assert.equal(committed.event.data.review, 'checking', 'the published answer row is never rewritten');
+  } finally {
+    host._setHostObjectiveJudgeForTests(null);
+  }
+});
+
+test('a caller that cannot run the review after delivery keeps the review before it', async () => {
+  const reply = 'The controlled report value is present.';
+  const run = await runHost({ captured: true, incoming: true,
+    text: 'Update the controlled report summary from the retained fixture read.', reply, readResult: 'CONTROLLED_REPORT_VALUE',
+    firstVerdict: { done: true, reason: 'The controlled report value is supported.' } });
+  assert.equal(run.judged.length, 1);
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+});
+
+test('a reply that only promises the work is reviewed before delivery and sent back to do it', async () => {
+  const run = await runHost({ captured: true, incoming: true, reviewAfterDelivery: true });
+  assert.equal(run.judged.length, 1, 'the promise is reviewed in the turn');
+  assert.equal(run.judged[0]?.reply, promise);
+  assert.equal(run.calls, 2, 'the turn goes back to work instead of publishing the promise');
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+});
+
+test('an owner format contract is reviewed before its answer leaves, even for a caller that can review after', async () => {
+  // Prose where the owner asked for one JSON object: the format review must
+  // rule before anything is published.
+  const raw = 'The retained controlled value is CONTROLLED_REPORT_VALUE.';
+  const run = await runHost({ captured: true, incoming: true, reviewAfterDelivery: true,
+    text: 'Report the retained controlled value. Return exactly one JSON object.', reply: raw, readResult: 'CONTROLLED_REPORT_VALUE',
+    firstVerdict: { done: true, reason: 'The retained value is reported.' } });
+  assert.ok(run.judged.length >= 1);
+  assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+});
 
 test('host completion journals bounded author comparison diagnostics without revising legacy verdict or candidate joins', async () => {
   const reply = 'The controlled report value is present.';

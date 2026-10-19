@@ -4421,6 +4421,7 @@ textarea.cz-input { resize: vertical; }
 }
 .receipt-ok { color: var(--accent-2); font-weight: 650; }
 .receipt-warn { color: var(--accent-warn); font-weight: 600; }
+.receipt-pending { color: var(--fg-2); font-weight: 600; }
 .receipt-model { flex-basis: 100%; color: var(--fg-2); }
 .receipt-review-note { overflow-wrap: anywhere; }
 

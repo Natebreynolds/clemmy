@@ -6,6 +6,7 @@ import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
 import { CompletionReviewSupersededError, reviewWithOwnerSteering } from './completion-review-steering.js';
+import { registerReviewAfterDelivery, replyEndsOnQuestion, reviewAfterDeliveryCorrectionDirective } from './review-after-delivery.js';
 import {
   STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON,
   STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
@@ -154,6 +155,7 @@ import {
 import { currentAcceptedSourceCatalogManifestScope } from './accepted-source-catalog-scope.js';
 import {
   KillRequested,
+  ToolCallsCounter,
   ToolCallsLimitExceeded,
   harnessToolBracketsEnabled,
   harnessRunContextStorage,
@@ -3503,6 +3505,11 @@ const runHostTurnBody = async (
   );
   const hostJudgeCompletion = hostProduction
     && (carriedProgress?.activation.judgeCompletion ?? (opts as { hostJudgeCompletion?: unknown }).hostJudgeCompletion === true);
+  // The caller publishes this turn through the committer, which runs a review
+  // held for after delivery (review-after-delivery.ts). Only a fresh chat
+  // turn's caller says so; every other caller is reviewed before delivery.
+  const hostReviewAfterDelivery = hostJudgeCompletion && !carriedProgress
+    && (opts as { hostReviewAfterDelivery?: unknown }).hostReviewAfterDelivery === true;
   const configuredHostApprovalId = (opts as { hostApprovalId?: unknown }).hostApprovalId;
   const configuredHostApprovalIds = (opts as { hostApprovalIds?: unknown }).hostApprovalIds;
   const hostApprovalIds = new Set<string>();
@@ -4308,6 +4315,9 @@ const runHostTurnBody = async (
   // the reply Clem writes in answer to it.
   let reviewDisclosureArmed = false;
   let reviewFindingDisclosed = false;
+  /** Set only while the review held for after delivery runs: its own deadline,
+   *  and the ruling it reached, read back once the review returns. */
+  let deliveredReviewRun: { signal: AbortSignal; verdict?: ObjectiveJudgeVerdict; verdictEventId?: string } | undefined;
   type CompletedReplyAuthor = { author: NonNullable<ReturnType<typeof getCompletedResponseAuthor>>;
     response: unknown; modelSettings: ModelRequest['modelSettings'];
     binding: CompletedModelResponseBinding; owner: ResponseFenceOwner };
@@ -4787,6 +4797,9 @@ const runHostTurnBody = async (
     ordinaryReviewOwner?: TerminalSteeringOwner,
   ): Promise<'continue' | 'done' | 'awaiting_user_input'> => {
     ownerResponseFormatHeld = undefined;
+    // A review held for after delivery runs on its own deadline: the turn's
+    // signal ended with the turn.
+    const reviewSignal = deliveredReviewRun?.signal ?? signal;
     // This host-owned, tool-free activation explains why the work stopped.
     // Its caller retains the blocked outcome. Judging the explanation against
     // the unfinished task rejects the very answer it exists to deliver and
@@ -4797,13 +4810,13 @@ const runHostTurnBody = async (
     const reviewEnabled = policy.status === 'captured'
       ? policy.policy.enabled
       : policy.status === 'absent' && hostJudgeCompletion;
-    if (!reviewEnabled || signal?.aborted) {
+    if (!reviewEnabled || reviewSignal?.aborted) {
       // Optional semantic review cannot waive an explicit owner output
       // contract. This only rejects an actual ordinary final candidate; it
       // never fabricates a review, buys a repair, or overrides a control.
       const owner = currentFenceOwner();
       const decision = toOrchestratorDecision(replyText);
-      if (!signal?.aborted && policy.status === 'captured' && !policy.policy.enabled
+      if (!reviewSignal?.aborted && policy.status === 'captured' && !policy.policy.enabled
         && !planCandidate && !turnIsPlanMode()
         && (!decision || (!decision.controlReceipt && decision.nextAction === 'completed' && decision.reply === replyText))
         && (() => { try { return approvalRegistry.listPending({ sessionId: identity.sessionId }).length === 0; }
@@ -5019,11 +5032,11 @@ const runHostTurnBody = async (
     const memoryWaitStartedAt = Date.now();
     while (explicitMemoryInstructionFor(objective) !== null
       && memoryConsolidation?.some(result => result.status === 'pending')
-      && !signal?.aborted && Date.now() - memoryWaitStartedAt < 15_000) {
+      && !reviewSignal?.aborted && Date.now() - memoryWaitStartedAt < 15_000) {
       await new Promise<void>(resolve => setTimeout(resolve, 500));
       memoryConsolidation = verifiedMemoryConsolidationEvidence(identity);
     }
-    if (signal?.aborted) return 'done';
+    if (reviewSignal?.aborted) return 'done';
     if (Date.now() - memoryWaitStartedAt >= 500) {
       try {
         appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
@@ -5036,6 +5049,101 @@ const runHostTurnBody = async (
     // acknowledgement as incomplete would send the model back to duplicate it.
     // completedOutcome reopens this evidence and retains an honest typed stop.
     if (explicitMemoryRequired && memoryConsolidation?.some(result => result.status === 'pending')) return 'done';
+    // DELIVER NOW, CHECK AFTER (owner 2026-10-18; review-after-delivery.ts).
+    // The first finished answer of an ordinary chat turn is published as soon
+    // as it is ready, and this same review rules on it right after, from the
+    // same evidence. Only when nothing about the answer needs the ruling before
+    // it leaves: no plan, owner format contract, memory requirement, open card,
+    // inherited, workflow or plan-execution evidence, a plain finished reply
+    // to the accepted objective that neither promises work still to do (the
+    // review sends that back to work) nor ends by asking the owner something,
+    // and a delivery the committer would publish without a verdict.
+    if (!deliveredReviewRun && hostReviewAfterDelivery && policy.status === 'captured'
+      && !planCandidate && !turnIsPlanMode() && !completionReviewFeedback && !reviewDisclosureArmed
+      && objectiveJudgeContinuations === 0 && !formatRepairReviewRequired && !ownerFormatCapture
+      && !ownerFormatRequiredAtRequest && !responseFormatRequirement && !responseFormatFinding
+      && !responseNormalization && !explicitMemoryRequired && !memoryRequirementRequired && !openApprovalCard
+      && !inheritedReads && !inheritedReadReviewRequired && !resumedHostState && !resumedRecoveryState
+      && (decision?.nextAction ?? 'completed') === 'completed' && !replyEndsOnQuestion(judgedReply)
+      && !gateInput.promiseShaped
+      && acceptedObjectiveForSource(identity) === objective
+      && !workflowParentActivation(identity.sessionId, identity.sourceUserSeq)
+      && (() => { try { return !acceptedPlanPreparationReadEvidence(identity); } catch { return false; } })()
+      && await reviewCanFollowDelivery(identity, judgedReply)) {
+      const ambientAttribution = modelUsageAttributionStorage.getStore();
+      const attemptId = ambientAttribution?.sessionId === identity.sessionId
+        && ambientAttribution.sourceUserSeq === identity.sourceUserSeq ? ambientAttribution.attemptId : undefined;
+      const scope = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        ...(attemptId ? { attemptId } : {}) };
+      // Outside the turn: no tool allowance, and its own cancel signal.
+      const heldContext = (cancel: AbortSignal) => ({ sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq, counter: new ToolCallsCounter(1, 1), callerCancelSignal: cancel });
+      const registered = registerReviewAfterDelivery({
+        sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, objective,
+        review: async (publishedText) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), REVIEW_AFTER_DELIVERY_BUDGET_MS);
+          const run: NonNullable<typeof deliveredReviewRun> = { signal: controller.signal };
+          deliveredReviewRun = run;
+          try {
+            await withModelUsageAttribution({ ...scope, role: 'reviewer' }, () => withHarnessRunContext(
+              heldContext(controller.signal), () => judgeHostCompletion(publishedText, [], undefined)));
+          } finally {
+            clearTimeout(timer);
+            if (deliveredReviewRun === run) deliveredReviewRun = undefined;
+          }
+          const ruled = run.verdict;
+          const ref = run.verdictEventId ? { verdictEventId: run.verdictEventId } : {};
+          if (!ruled || ruled.failedOpen) return { review: 'unchecked', ...ref };
+          if (ruled.done && !ruled.awaitingUser) return { review: 'checked', ...ref };
+          return { review: 'rejected', finding: ruled.reason, ...ref };
+        },
+        // One tool-free request on the turn's own model, as the stop narration
+        // makes: the finding is data, and what Clem says is hers.
+        correct: async (publishedText, finding) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), HOST_STOP_NARRATION_BUDGET_MS);
+          try {
+            let input = structuredClone(history);
+            let instructions = await resolveInstructions();
+            if (inputFilter) {
+              const filtered = await inputFilter({
+                modelData: { input: structuredClone(history), ...(instructions !== undefined ? { instructions } : {}) },
+                agent,
+                context: contextValue,
+                advertisedTools: [],
+                holdReading: () => { /* the correction publishes no prompt reading */ },
+              });
+              if (!filtered || !Array.isArray(filtered.input)) return undefined;
+              input = structuredClone(filtered.input);
+              if (typeof filtered.instructions !== 'undefined') instructions = filtered.instructions;
+            }
+            input.push({ role: 'system', content: reviewAfterDeliveryCorrectionDirective(publishedText, finding) } as AgentInputItem);
+            const step = await withModelUsageAttribution({
+              ...scope, role: 'brain', channel: 'narrator:review_correction', ownRequest: true,
+            }, () => withHarnessRunContext(heldContext(controller.signal), () => codexOneStep({
+              input,
+              tools: [],
+              ...(modelId !== undefined ? { modelId } : {}),
+              ...(resolveModel ? { resolveModel } : {}),
+              ...(instructions !== undefined ? { systemInstructions: instructions } : {}),
+              modelSettings: stepModelSettings(),
+              signal: controller.signal,
+              stream: false,
+            })));
+            return step.toolCalls.length === 0 ? step.text.trim() || undefined : undefined;
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+      });
+      if (registered) {
+        journalHostGuide('completion_review_after_delivery', {
+          objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
+          replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex') });
+        return 'done';
+      }
+    }
     let verdict: ObjectiveJudgeVerdict;
     const judgeStartedAt = Date.now();
     let preparation: ReturnType<typeof acceptedPlanPreparationReadEvidence>;
@@ -5043,7 +5151,8 @@ const runHostTurnBody = async (
     let agentInstructions: string | undefined;
     let reviewInputOwner: ReviewInputOwner | undefined;
     // The viewer sees that the finished draft is being checked, not a pause.
-    markAnswerDraftChecking(identity.sessionId, identity.sourceUserSeq);
+    // An answer already delivered has no draft left to mark.
+    if (!deliveredReviewRun) markAnswerDraftChecking(identity.sessionId, identity.sourceUserSeq);
     try {
       preparation = acceptedPlanPreparationReadEvidence(identity);
       if (inheritedReadReviewRequired && !inheritedReads) throw new Error('Required exact inherited read evidence is unavailable');
@@ -5156,7 +5265,7 @@ const runHostTurnBody = async (
           // the prefix the provider cached for the first review of this turn.
           completionReviewFeedback ? hostCompletionReviewFindingContext(completionReviewFeedback) : undefined,
         ].filter(Boolean).join('\n'),
-      }), signal);
+      }), reviewSignal);
       if (reviewed.status === 'superseded') throw new CompletionReviewSupersededError();
       verdict = reviewed.value;
       if (inheritedReads && (!inheritedReads.stillCurrent()
@@ -5170,7 +5279,7 @@ const runHostTurnBody = async (
       // An admitted amendment retires this candidate, never into failed-open
       // completion or another review-repair round. Caller Stop still wins.
       if (ordinaryReviewOwner) {
-        signal?.throwIfAborted();
+        reviewSignal?.throwIfAborted();
         harnessRunContextStorage.getStore()?.callerCancelSignal?.throwIfAborted();
       }
       if (error instanceof CompletionReviewSupersededError) throw error;
@@ -5213,9 +5322,11 @@ const runHostTurnBody = async (
     // A BLOCKED verdict says another attempt cannot change the outcome; the
     // reviewer's finding goes to the owner instead of a re-run.
     const blockedByReview = verdict.blocked === true && !verdict.failedOpen;
-    const ordinaryContinuation = verdict.reviewDisposition !== 'answered_unqualified' && !honestStop && !blockedByReview
+    // An answer already delivered is corrected in the thread, never re-run.
+    const ordinaryContinuation = !deliveredReviewRun
+      && verdict.reviewDisposition !== 'answered_unqualified' && !honestStop && !blockedByReview
       && !(memoryRequirementRequired && verdict.failedOpen) && ((!verdict.done && !awaitingInput)
-      || (awaitingInput && planCandidate?.readiness === 'ready')) && !signal?.aborted
+      || (awaitingInput && planCandidate?.readiness === 'ready')) && !reviewSignal?.aborted
       && (Boolean(planCandidate) || objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS);
     const formatPacket = responseFormatRepairPacket({ ...verdict,
       plan: Boolean(planCandidate) || turnIsPlanMode(), objective, reply: judgedReply, reason: verdict.reason,
@@ -5248,7 +5359,7 @@ const runHostTurnBody = async (
         && !verdict.evidenceCoverage.returnedForCorrection && verdict.evidenceCoverage.followUp !== 'unanswered'));
     let formatSlotEventId: string | undefined;
     if (!ordinaryContinuation && objectiveJudgeContinuations === MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS
-      && !honestStop && !blockedByReview && !awaitingInput && !signal?.aborted && !openApprovalCard
+      && !honestStop && !blockedByReview && !awaitingInput && !reviewSignal?.aborted && !openApprovalCard
       && formatPacket && actualAuthor && qualifiedFormatFinding
       && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq)) {
       const slot = claimReplyFormatRepairSlot({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
@@ -5278,6 +5389,7 @@ const runHostTurnBody = async (
         data: {
           lane: 'host_v1',
           kind: 'completion',
+          ...(deliveredReviewRun ? { afterDelivery: true } : {}),
           fulfills: verdict.done && !verdict.awaitingUser && verdict.reviewDisposition !== 'answered_unqualified',
           ...(responseFormatRequirement ? { responseFormatContract: { ...responseFormatRequirement,
             candidateValid: responseFormatFinding === null } } : {}),
@@ -5391,12 +5503,16 @@ const runHostTurnBody = async (
         },
       });
     } catch { /* telemetry never blocks the reply */ }
+    if (deliveredReviewRun) {
+      deliveredReviewRun.verdict = verdict;
+      if (judgedVerdictRow) deliveredReviewRun.verdictEventId = judgedVerdictRow.id;
+    }
     // A review that cannot pass is Clem's to tell, once per request: the next
     // reply is her own account of the finding and a question to the owner,
     // never the harness holding her answer under a blocked status.
     const disclose = !continuation && !awaitingInput && !verdict.done && !verdict.failedOpen && !planCandidate
-      && !responseFormatRequirement && !formatRepairReviewRequired && !signal?.aborted && !openApprovalCard
-      && !reviewDisclosureArmed && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
+      && !responseFormatRequirement && !formatRepairReviewRequired && !reviewSignal?.aborted && !openApprovalCard
+      && !deliveredReviewRun && !reviewDisclosureArmed && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
     if (disclose) {
       reviewDisclosureArmed = true;
       judgedBusinessCallsAtLastVerdict = businessCalls.length;
@@ -5416,7 +5532,7 @@ const runHostTurnBody = async (
     // Only for an answer that changed nothing outside, and only when every
     // quote is found verbatim; otherwise the unverified delivery stands. This
     // presentation repair never proves that all requested work remains done.
-    if (!continuation && !awaitingInput && !verdict.done && verdict.repairScope === 'claims'
+    if (!continuation && !awaitingInput && !verdict.done && verdict.repairScope === 'claims' && !deliveredReviewRun
       && !blockedByReview && !verdict.failedOpen && !planCandidate && settled.count === 0
       && !responseFormatRequirement && judgedVerdictRow) {
       const removal = removeReviewedClaims(judgedReply, verdict.reason);
@@ -13249,6 +13365,23 @@ export type HostRunOutcome = RunOutcome & { blockedDetail?: string };
 
 /** One tool-less model step: bounded so a slow provider never holds a stop. */
 const HOST_STOP_NARRATION_BUDGET_MS = 45_000;
+/** The outer deadline of a review held for after delivery. */
+const REVIEW_AFTER_DELIVERY_BUDGET_MS = 10 * 60_000;
+
+/** The committer would publish this reply without a verdict: no unfinished
+ *  local work or settlement gap that a review has to rule on first. */
+async function reviewCanFollowDelivery(
+  identity: { sessionId: string; sourceUserSeq: number },
+  reply: string,
+): Promise<boolean> {
+  try {
+    const committer = await import('./delivery-committer.js');
+    const assessment = committer.assessAcceptedSourceDelivery({
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, proposedReply: reply,
+    });
+    return !assessment.deliveryGap && !assessment.localWorkIncomplete;
+  } catch { return false; }
+}
 
 /** Stops whose fixed sentence is about the model itself (it stalled, was
  * filtered, gave nothing, ran out of its bound) or about bytes that must not

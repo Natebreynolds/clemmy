@@ -126,6 +126,8 @@ export const ACTIVITY_FOLD_EVENTS: ReadonlySet<string> = new Set([
   'run_completed', 'run_paused', 'run_resumed',
   'coding_run_activity', 'coding_run_settled',
   'delegated_task_state',
+  // Lands on the answer's review chip (review-settlement.ts).
+  'completion_review_settled',
 ]);
 
 /** The detail line under a lifecycle row: the step's own title where it has

@@ -112,6 +112,21 @@ test('reopen follows only a typed approval resume backed by its exact existing c
   }
 });
 
+test('an idle desktop chat lands a later review ruling on the answer that was still being checked', () => {
+  const source = { sessionId: 'idle-review', sourceUserSeq: 5, turn: 1 };
+  const answer: ChatMessage = { id: 'a-6', role: 'assistant', text: 'The notes cover two items.', status: 'complete',
+    terminal: { status: 'done', kind: 'answer', review: 'checking' }, acceptedSource: source };
+  const other: ChatMessage = { ...answer, id: 'a-9', acceptedSource: { ...source, sourceUserSeq: 8 } };
+  const ruling: HarnessEvent = { seq: 12, turn: 0, role: 'system', type: 'completion_review_settled', sessionId: 'idle-review',
+    data: { version: 1, sourceUserSeq: 5, review: 'rejected', reviewNote: 'The notes have three items.' } };
+  const messages = reconcileIdleChatEvent([answer, other], ruling, 'idle-review');
+  assert.equal(messages[0]?.terminal?.review, 'rejected');
+  assert.equal(messages[0]?.terminal?.reviewNote, 'The notes have three items.');
+  assert.equal(messages[1]?.terminal?.review, 'checking', 'another answer keeps waiting for its own ruling');
+  assert.equal(reconcileIdleChatEvent(messages, ruling, 'idle-review'), messages, 'a settled chip is not settled twice');
+  assert.equal(reconcileIdleChatEvent([answer], { ...ruling, sessionId: 'other-chat' }, 'idle-review')[0]?.terminal?.review, 'checking');
+});
+
 test('idle card resolution and confirmation reconcile the existing card across devices', () => {
   const card: ChatMessage = { id: 'card', role: 'assistant', text: '', status: 'awaiting-approval', approval: { approvalId: 'apr-idle', subject: 'Fixture' } };
   let messages = reconcileIdleChatEvent([card], { seq: 12, turn: 1, role: 'Clem', type: 'awaiting_user_input', sessionId: 'idle-chat',

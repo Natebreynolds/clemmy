@@ -13128,6 +13128,9 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
       // (2026-09-01: it only ever ran in the legacy core, which host_v1 never
       // enters — every live reply shipped unjudged).
       opts.hostJudgeCompletion = options.judgeCompletion === true;
+      // This caller publishes through the committer, which runs a chat
+      // answer's review right after delivery (review-after-delivery.ts).
+      opts.hostReviewAfterDelivery = options.judgeCompletion === true && session.sessionRow.kind === 'chat';
       opts.hostQueuedApprovalBeforeCompletion = hostQueuedApprovalBeforeCompletion(options.sessionId, turn, sourceUserSeq);
       opts.hostActivationStartedAt = options.hostActivationStartedAt;
       opts.hostPreviousResponseId = session.previousResponseId();

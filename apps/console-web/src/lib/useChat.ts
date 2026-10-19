@@ -1,7 +1,7 @@
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
-import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd } from '@clem/chat-engine';
+import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
 import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -413,6 +413,11 @@ export function reconcileIdleChatEvent(messages: readonly ChatMessage[], event: 
   const steered = applySteerReceiptEvent(messages as ChatMessage[], event, sessionId);
   if (event.type === 'user_steer_note' || event.type === 'user_steer_receipt') return steered;
   messages = steered;
+  // The ruling on an answer delivered before its review lands on its chip.
+  if (event.type === 'completion_review_settled') {
+    const settled = readReviewSettlement(event, sessionId);
+    return settled ? applyReviewSettlement(messages as ChatMessage[], settled) : messages as ChatMessage[];
+  }
   const d = event.data ?? {};
   if (event.type === 'approval_resolved') return applyApprovalResolution(messages, d);
   const decisionAck = reconcileApprovalDecisionAck(messages, event, sessionId);

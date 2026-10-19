@@ -824,24 +824,40 @@ export function durableCompletionTextForModel(data: Record<string, unknown>): st
   }
 }
 
-const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
+const PUBLIC_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck', 'checking']);
+/** The rulings a review held for after delivery can settle on. */
+const PUBLIC_SETTLED_REVIEW_STATES: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected']);
 const PUBLIC_REVIEW_NOTE_MAX_CHARS = 400;
 
 /** The committer's review state for the exact published text. Only the
  * committer writes it (it is not caller metadata); an unknown value stays
  * private rather than being guessed into a chip. */
 function publicTerminalReview(data: Record<string, unknown>): {
-  review?: 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+  review?: 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking';
   reviewNote?: string;
 } {
   const review = typeof data.review === 'string' && PUBLIC_REVIEW_STATES.has(data.review)
-    ? data.review as 'checked' | 'unchecked' | 'rejected' | 'needs_recheck'
+    ? data.review as 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking'
     : undefined;
   if (!review) return {};
   const note = typeof data.reviewNote === 'string'
     ? data.reviewNote.replace(/\s+/g, ' ').trim().slice(0, PUBLIC_REVIEW_NOTE_MAX_CHARS)
     : '';
   return { review, ...(note ? { reviewNote: note } : {}) };
+}
+
+/** The later ruling on an answer published while `checking`: which source's
+ * chip it settles, the ruling, and the reviewer's bounded finding. Written
+ * only by review-after-delivery.ts; any other shape stays private. */
+export function publicReviewSettledData(event: EventRow): Record<string, unknown> | null {
+  const data = event.data ?? {};
+  if (event.role !== 'system' || data.version !== 1
+    || !Number.isSafeInteger(data.sourceUserSeq) || Number(data.sourceUserSeq) < 1
+    || typeof data.review !== 'string' || !PUBLIC_SETTLED_REVIEW_STATES.has(data.review)) return null;
+  const note = data.review === 'rejected' && typeof data.reviewNote === 'string'
+    ? data.reviewNote.replace(/\s+/g, ' ').trim().slice(0, PUBLIC_REVIEW_NOTE_MAX_CHARS)
+    : '';
+  return { version: 1, sourceUserSeq: data.sourceUserSeq, review: data.review, ...(note ? { reviewNote: note } : {}) };
 }
 
 /** What the checkpoint kept, as counts. A needs-input terminal shows the
@@ -1449,6 +1465,8 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         ...(approvalDecisionAck ? { approvalDecisionAck, notice: { code: 'card_decision' } } : {}),
         ...(backgroundOutcomeReport ? { backgroundOutcomeReport } : {}) };
     }
+    case 'completion_review_settled':
+      return publicReviewSettledData(event);
     case 'conversation_preamble':
       // The dedicated eventlog CAS writer binds this event to its exact real
       // user source. Retain a small event-level floor here as well so a

@@ -693,6 +693,10 @@ export const EVENT_TYPES = [
   // settings change cannot relabel an already-running task.
   'completion_policy_captured',
   'completion_review_skipped',
+  // An ordinary chat answer published before its completion review, and that
+  // review's later ruling on the exact published text (review-after-delivery.ts).
+  'completion_review_deferred',
+  'completion_review_settled',
   'run_strategy_learned',
   'proven_operation_selected',
   // The scope one accepted source froze for its mutations. Read back by the

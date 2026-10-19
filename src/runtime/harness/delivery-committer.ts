@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { readCommittedArtifactContent } from './host-local-write-commit.js';
 import { completionReviewEnabled } from './respond-bridge.js';
 import { conversationalReviewSkipMatches } from './completion-review-skip.js';
+import { launchReviewAfterDelivery, reviewAfterDeliveryRecorded, reviewFindingForOwner } from './review-after-delivery.js';
 import { sourceAttemptedCompletionWork } from './host-completion-work.js';
 import { cancelledSuccessorReadReviewRequired } from './cancelled-successor-retained-read.js';
 import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, publishedPlanReplyText, readCapturedCompletionPolicy, settledSourceArtifacts } from './host-turn-runner.js';
@@ -75,8 +76,10 @@ import {
   type TerminalNotice,
 } from './terminal-notice.js';
 
-/** The committer's review state for the exact published text. */
-export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck';
+/** The committer's review state for the exact published text. `checking` is
+ * an answer published before its review, which rules on it right after
+ * (review-after-delivery.ts). */
+export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking';
 
 /** What the completion review did for this source, as the terminal records
  * it beside the verdict reference. `rejected` is a reviewer that answered and
@@ -952,20 +955,6 @@ export function acceptedSourceHasZeroExternalEffectSurface(
 }
 
 
-/** The reviewer's findings for the owner: every numbered item when it fits,
- *  cut only between items or sentences, never mid-word or mid-sentence. */
-function reviewFindingForOwner(reason: string, max = 900): string {
-  const text = reason.replace(/\s+/g, ' ').trim();
-  if (text.length <= max) return text;
-  const head = text.slice(0, max);
-  // Before the next numbered item, or just after a sentence's full stop.
-  const beforeItem = head.lastIndexOf('; (');
-  const afterSentence = head.lastIndexOf('. ') + 1;
-  const cut = Math.max(beforeItem, afterSentence);
-  const kept = cut > max / 3 ? head.slice(0, cut) : head.slice(0, head.lastIndexOf(' '));
-  return `${kept.trimEnd()} …`;
-}
-
 function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
   const workIdentity = completionEvidenceSource(outcome.identity);
   switch (outcome.status) {
@@ -1349,6 +1338,14 @@ export function commitTurnOutcome(
     sessionId: proposed.identity.sessionId,
     sourceUserSeq: reviewIdentity.sourceUserSeq,
   });
+  // DELIVER NOW, CHECK AFTER. The host deferred this source's review until its
+  // answer is published (review-after-delivery.ts). Only that durable host
+  // marker says so, never caller metadata. The answer publishes with its chip
+  // `checking`, and the review rules on these exact bytes once they are durable.
+  const reviewAfterDelivery = !publishedVerdict && !publishedPlan && outcome.status === 'done'
+    && capturedRead.status === 'captured' && reviewWasEnabled && acceptedObjective !== null
+    && reviewAfterDeliveryRecorded({ sessionId: proposed.identity.sessionId,
+      sourceUserSeq: reviewIdentity.sourceUserSeq, objective: acceptedObjective });
   const objectiveMatches = publishedVerdict?.objectiveDigest
     ? (acceptedObjective !== null
       && publishedVerdict.objectiveDigest
@@ -1543,7 +1540,8 @@ export function commitTurnOutcome(
   // missing review or a prior artifact-free verdict could self-exempt.
   const verificationRequired = reviewWasEnabled
     && (Boolean(publishedVerdict) || inheritedReadReviewRequired || artifactsRequired || !settledNow.evidenceAvailable);
-  const verificationFailed = verificationRequired && !verdictTrustworthy;
+  // A review still to come is not a review that failed: the chip says so.
+  const verificationFailed = verificationRequired && !verdictTrustworthy && !reviewAfterDelivery;
   // THE REVIEW IS CHROME, NEVER A SENTENCE UNDER CLEM'S WORDS.
   //
   // A completed answer publishes exactly as authored; what its review found
@@ -1561,6 +1559,7 @@ export function commitTurnOutcome(
     && publishedVerdict?.responseFormatUnmet === true && objectiveMatches && replyMatches;
   const reviewState: TerminalReviewState | undefined = (() => {
     if (!reviewApplies || !reviewWasEnabled || reviewDisposition === 'not_required') return undefined;
+    if (reviewAfterDelivery) return 'checking';
     if (verdictTrustworthy) return 'checked';
     if (!verificationRequired) return undefined;
     if (!publishedVerdict) return 'unchecked';
@@ -1766,7 +1765,8 @@ export function commitTurnOutcome(
   } } : {
     // Disabled is a legitimate policy, NOT a failed verification. An absent
     // verdict must be readable as which of the two it was.
-    completionReview: { version: 1 as const, disposition: reviewDisposition, policyEvidence },
+    completionReview: { version: 1 as const, disposition: reviewDisposition, policyEvidence,
+      ...(reviewAfterDelivery ? { afterDelivery: true } : {}) },
   };
   // Clean-attempt measurement, from the canonical ledgers. Metadata only — it
   // must never become a gate.
@@ -1893,6 +1893,10 @@ export function commitTurnOutcome(
       presentation: persisted,
     });
   } catch { /* next turn safely falls back to ordinary discovery */ }
+  // The review held for after delivery starts once the answer is durable, and
+  // only for the row this call wrote with the chip `checking`.
+  const reviewChecking = terminal.inserted && terminal.event.data.review === 'checking';
+  let learnAfterReview: (() => void) | undefined;
   // Capability learning is a separate, identity-only projection of already
   // durable success. It carries no invocation/approval authority and cannot
   // affect this terminal. A crash in this narrow gap is repaired lazily from
@@ -1918,35 +1922,54 @@ export function commitTurnOutcome(
       sourceUserSeq: persisted.identity.sourceUserSeq,
     };
     try { workIdentity = completionEvidenceSource(workIdentity); } catch { /* the published source stands */ }
-    try {
-      const strategy = learnHostRunStrategyForAcceptedTask(workIdentity);
-      // What the work resolved is kept on the same authority that admitted
-      // how it was done: a verified, reviewed finish, observed once.
-      if (strategy.status === 'learned' || strategy.status === 'updated') {
-        // After the terminal and off its path: it cannot delay or change it.
-        void learnResolvedReferencesForAcceptedTask({ ...workIdentity, occurredAt: terminal.event.createdAt })
-          .then((kept) => {
-            // What was considered and not kept is recorded too: a resolution
-            // that silently fails to be learned looks the same as one that
-            // was never there.
-            if (kept.references.length === 0 && kept.passedOver.length === 0) return;
-            appendEvent({
-              sessionId: workIdentity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
-              data: {
-                kind: 'resolved_references_learned', sourceUserSeq: workIdentity.sourceUserSeq,
-                learned: kept.learned, superseded: kept.superseded, held: kept.held,
-                // Which names and arguments, never the values: those live in memory with their provenance.
-                references: kept.references.map((row) => ({ named: row.named, operation: row.operation,
-                  argument: row.argument, effect: row.effect, foundIn: row.foundIn.tool,
-                  grade: row.grade, basis: row.basis, outcome: row.outcome })),
-                passedOver: kept.passedOver.slice(0, 24),
-              },
-            });
-          }).catch(() => { /* memory stays additive */ });
-      }
-    } catch { /* strategy recall stays additive */ }
-    // The reviewed answer and where its results live, for a later chat to reuse with its age.
-    recordAnswerWorkEpisode({ ...workIdentity, text: persisted.text });
+    // How the work was done, and the answer kept for reuse, are learned from
+    // the finish: for an answer still being checked, once its review rules,
+    // and never from one its review turned down.
+    const learnFromAnswer = (): void => {
+      try {
+        const strategy = learnHostRunStrategyForAcceptedTask(workIdentity);
+        // What the work resolved is kept on the same authority that admitted
+        // how it was done: a verified, reviewed finish, observed once.
+        if (strategy.status === 'learned' || strategy.status === 'updated') {
+          // After the terminal and off its path: it cannot delay or change it.
+          void learnResolvedReferencesForAcceptedTask({ ...workIdentity, occurredAt: terminal.event.createdAt })
+            .then((kept) => {
+              // What was considered and not kept is recorded too: a resolution
+              // that silently fails to be learned looks the same as one that
+              // was never there.
+              if (kept.references.length === 0 && kept.passedOver.length === 0) return;
+              appendEvent({
+                sessionId: workIdentity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+                data: {
+                  kind: 'resolved_references_learned', sourceUserSeq: workIdentity.sourceUserSeq,
+                  learned: kept.learned, superseded: kept.superseded, held: kept.held,
+                  // Which names and arguments, never the values: those live in memory with their provenance.
+                  references: kept.references.map((row) => ({ named: row.named, operation: row.operation,
+                    argument: row.argument, effect: row.effect, foundIn: row.foundIn.tool,
+                    grade: row.grade, basis: row.basis, outcome: row.outcome })),
+                  passedOver: kept.passedOver.slice(0, 24),
+                },
+              });
+            }).catch(() => { /* memory stays additive */ });
+        }
+      } catch { /* strategy recall stays additive */ }
+      // The reviewed answer and where its results live, for a later chat to reuse with its age.
+      recordAnswerWorkEpisode({ ...workIdentity, text: persisted.text });
+    };
+    if (reviewChecking) learnAfterReview = learnFromAnswer;
+    else learnFromAnswer();
+  }
+  if (reviewChecking) {
+    void launchReviewAfterDelivery({
+      sessionId: persisted.identity.sessionId,
+      workSourceUserSeq: reviewIdentity.sourceUserSeq,
+      sourceUserSeq: persisted.identity.sourceUserSeq,
+      terminalEventId: terminal.event.id,
+      publishedText: persisted.text,
+      ...(learnAfterReview ? { afterRuling: (review: 'checked' | 'rejected' | 'unchecked') => {
+        if (review !== 'rejected') learnAfterReview?.();
+      } } : {}),
+    });
   }
   // What the turn's model earned (review verdict, tool success) goes onto its
   // route metrics for the route policy, whatever the terminal's status.

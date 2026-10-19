@@ -100,7 +100,7 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   return facts;
 }
 
-const REVIEWS: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck']);
+const REVIEWS: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck', 'checking']);
 const OUTSIDE_CHANGES: ReadonlySet<string> = new Set(['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none']);
 const NOTICE_CODES: ReadonlySet<string> = new Set<TerminalNoticeCode>([
   'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
