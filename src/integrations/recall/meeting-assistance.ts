@@ -158,7 +158,8 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
   let port: MeetingAssistanceScanPort | null = null;
   let listener: ((id: string) => void) | null = null;
   const notify = (id: string) => { try { listener?.(id); } catch { /* optional research never owns capture */ } };
-  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  type PendingCheck = { at: number; handle: ReturnType<typeof setTimeout> };
+  const timers = new Map<string, PendingCheck>();
   const running = new Map<string, Promise<MeetingAssistanceSnapshot>>();
   const controllers = new Map<string, AbortController>();
   const dirty = new Set<string>();
@@ -241,7 +242,7 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
     });
     if (!input.enabled) {
       controllers.get(id)?.abort();
-      const timer = timers.get(id); if (timer) cancelSchedule(timer); timers.delete(id); dirty.delete(id);
+      const timer = timers.get(id); if (timer) cancelSchedule(timer.handle); timers.delete(id); dirty.delete(id);
     }
     notify(id);
     return get(id);
@@ -278,14 +279,32 @@ export function createMeetingAssistanceCoordinator(options: MeetingAssistanceCoo
   };
   const request = (id: string): void => {
     // GET never reaches this path. A retained finalized transcript or explicit recovery is the trigger.
-    const snapshot = get(id);
+    const record = recordFor(id);
+    const state = read(id, record);
+    const snapshot = project(state, record);
     if (!snapshot.enabled || snapshot.status === 'completed' || snapshot.status === 'offer') return;
+    // Partial-only and already-consumed finals do not own another wakeup.
+    // Invalid evidence still reaches scan(), which retains its precise reason.
+    try { if (!windowFor(state, record).length) return; } catch { /* scan reports invalid evidence */ }
     dirty.add(id);
-    const existing = timers.get(id); if (existing) cancelSchedule(existing);
-    timers.set(id, schedule(() => {
+    if (running.has(id)) return;
+    const at = Math.max(now() + DEBOUNCE_MS, snapshot.nextCheckAt ?? 0);
+    const existing = timers.get(id);
+    // Coalesce into the first deadline instead of waiting for speech to stop.
+    if (existing && existing.at <= at) return;
+    if (existing) cancelSchedule(existing.handle);
+    const pending: PendingCheck = { at, handle: schedule(() => {
+      // A canceled callback must not consume a later enable/request generation.
+      if (timers.get(id) !== pending) return;
       timers.delete(id);
-      void check(id).catch(() => { /* Strict failures are surfaced on the next explicit read; never reset state. */ });
-    }, Math.max(DEBOUNCE_MS, (snapshot.nextCheckAt ?? 0) - now())));
+      try {
+        // An explicit scan can overtake this timer and move the durable floor.
+        // Retain genuine new finals until that floor instead of dropping them.
+        if ((get(id).nextCheckAt ?? 0) > now()) { request(id); return; }
+        void check(id).catch(() => { /* Strict failures surface on the next explicit read; never reset state. */ });
+      } catch { /* Unreadable state remains unavailable; never reset it. */ }
+    }, Math.max(0, at - now())) };
+    timers.set(id, pending);
   };
   const scan = async (id: string): Promise<MeetingAssistanceSnapshot> => {
     let captured: { nonce: string; sourceDigest: string; segments: MeetingAssistanceSegment[]; recentOffers: MeetingAssistanceScanInput['recentOffers'] } | undefined;

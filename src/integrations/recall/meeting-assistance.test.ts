@@ -79,7 +79,7 @@ test('final windows debounce, coalesce one flight, retain cursor across reopen, 
   f.advance(1_000);
   f.append('Second finalized fixture sentence.');
   f.coordinator.requestMeetingAssistanceCheck(f.record.id);
-  f.advance(1_499); f.runDueTimers(); assert.equal(calls, 0);
+  f.advance(499); f.runDueTimers(); assert.equal(calls, 0);
   f.advance(1); f.runDueTimers(); assert.equal(calls, 1);
   assert.equal(f.coordinator.getMeetingAssistance(f.record.id).checking, true);
   const same = f.coordinator.checkMeetingAssistance(f.record.id);
@@ -98,6 +98,109 @@ test('final windows debounce, coalesce one flight, retain cursor across reopen, 
   await reopened.checkMeetingAssistance(f.record.id); assert.equal(calls, 2);
   f.advance(20_000);
   await reopened.checkMeetingAssistance(f.record.id); assert.equal(calls, 2, 'same retained cursor is not scanned again');
+});
+
+test('continuous finalized speech keeps the first scan deadline and coalesces arrivals during a slow scan', async () => {
+  const f = fixture();
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  const pending = deferred<ScanResult>();
+  const windows: ScanInput[] = [];
+  f.coordinator.registerMeetingAssistanceScanPort(async input => { windows.push(input); return pending.promise; });
+  for (let index = 0; index < 8; index++) {
+    f.append(`Continuous final ${index}.`);
+    f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+    f.advance(500); f.runDueTimers();
+    if (index === 2) assert.equal(windows.length, 1, 'speech cannot move the first 1500ms deadline');
+  }
+  assert.equal(windows.length, 1);
+  assert.deepEqual(windows[0].segments.map(segment => segment.text), ['Continuous final 0.', 'Continuous final 1.', 'Continuous final 2.']);
+  assert.equal(f.timers.size, 1, 'only the running scan deadline remains; arrivals coalesce without parallel wakeups');
+  const joined = f.coordinator.checkMeetingAssistance(f.record.id);
+  pending.resolve({ candidate: null }); await joined;
+  assert.equal(f.timers.size, 1, 'one follow-up retains the unscanned finals');
+  f.coordinator.registerMeetingAssistanceScanPort(async input => { windows.push(input); return { candidate: null }; });
+  f.advance(17_499); f.runDueTimers(); assert.equal(windows.length, 1);
+  f.advance(1); f.runDueTimers(); assert.equal(windows.length, 2, 'next scan keeps the durable 20s spacing');
+  await f.coordinator.checkMeetingAssistance(f.record.id);
+  assert.ok(windows[1].segments.some(segment => segment.text === 'Continuous final 7.'));
+  assert.equal(f.timers.size, 0, 'a null result does not schedule unchanged evidence');
+});
+
+test('a pending timer overtaken by an explicit scan retains later finals through cooldown', async () => {
+  const f = fixture();
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  const windows: ScanInput[] = [];
+  f.coordinator.registerMeetingAssistanceScanPort(async input => { windows.push(input); return { candidate: null }; });
+  f.append('The first final.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.advance(500); await f.coordinator.checkMeetingAssistance(f.record.id);
+  f.advance(500); f.append('A later final that must not be lost.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.advance(1_500); f.runDueTimers(); await Promise.resolve();
+  assert.equal(windows.length, 1);
+  assert.equal(f.timers.size, 1, 'the early timer rearms actual new evidence for the model cooldown');
+  f.advance(17_999); f.runDueTimers(); assert.equal(windows.length, 1);
+  f.advance(1); f.runDueTimers(); assert.equal(windows.length, 2);
+  await f.coordinator.checkMeetingAssistance(f.record.id);
+  assert.ok(windows[1].segments.some(segment => segment.text === 'A later final that must not be lost.'));
+});
+
+test('a timer overtaken by a still-running explicit scan hands new finals to one follow-up', async () => {
+  const f = fixture(); const pending = deferred<ScanResult>(); const windows: ScanInput[] = [];
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  f.coordinator.registerMeetingAssistanceScanPort(async input => { windows.push(input); return pending.promise; });
+  f.append('First final.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.advance(500); const running = f.coordinator.checkMeetingAssistance(f.record.id);
+  f.advance(500); f.append('Final while the explicit scan is pending.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.advance(500); f.runDueTimers();
+  assert.equal(windows.length, 1); assert.equal(f.timers.size, 1, 'only the running model deadline remains');
+  pending.resolve({ candidate: null }); await running;
+  assert.equal(f.timers.size, 1, 'one follow-up owns the new final');
+  f.coordinator.registerMeetingAssistanceScanPort(async input => { windows.push(input); return { candidate: null }; });
+  f.advance(18_999); f.runDueTimers(); assert.equal(windows.length, 1);
+  f.advance(1); f.runDueTimers(); assert.equal(windows.length, 2);
+  await f.coordinator.checkMeetingAssistance(f.record.id);
+  assert.ok(windows[1].segments.some(segment => segment.text === 'Final while the explicit scan is pending.'));
+  assert.equal(f.timers.size, 0);
+});
+
+test('partial-only and already-consumed updates do not retain a scheduled check', async () => {
+  const f = fixture(); let calls = 0;
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  f.coordinator.registerMeetingAssistanceScanPort(async () => { calls++; return { candidate: null }; });
+  for (let index = 0; index < 8; index++) {
+    f.append(`Partial ${index}`, false); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+    f.advance(500); f.runDueTimers();
+  }
+  assert.equal(calls, 0); assert.equal(f.timers.size, 0);
+  f.append('A finalized sentence.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.advance(1_500); f.runDueTimers(); assert.equal(calls, 1);
+  await f.coordinator.checkMeetingAssistance(f.record.id);
+  f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  f.append('A later partial', false); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  assert.equal(f.timers.size, 0);
+  f.advance(60_000); f.runDueTimers(); assert.equal(calls, 1);
+});
+
+test('a canceled callback cannot consume a newly enabled check and ended captures never dispatch', async () => {
+  const f = fixture(); let calls = 0;
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  f.coordinator.registerMeetingAssistanceScanPort(async () => { calls++; return { candidate: null }; });
+  f.append('A final sentence.'); f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  const staleCallback = [...f.timers.values()][0].callback;
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: false }); assert.equal(f.timers.size, 0);
+  f.coordinator.setMeetingAssistance(f.record.id, { enabled: true });
+  f.coordinator.requestMeetingAssistanceCheck(f.record.id);
+  staleCallback(); assert.equal(calls, 0); assert.equal(f.timers.size, 1);
+  f.advance(1_500); f.runDueTimers(); assert.equal(calls, 1);
+  await f.coordinator.checkMeetingAssistance(f.record.id);
+  for (const change of ['completed', 'cancelled', 'capture'] as const) {
+    const g = fixture(); let dispatched = 0;
+    g.coordinator.setMeetingAssistance(g.record.id, { enabled: true });
+    g.coordinator.registerMeetingAssistanceScanPort(async () => { dispatched++; return { candidate: null }; });
+    g.append('A final sentence.'); g.coordinator.requestMeetingAssistanceCheck(g.record.id);
+    if (change === 'capture') g.record.sdkUploadId = 'replacement-upload'; else g.record.status = change;
+    g.advance(1_500); g.runDueTimers(); await Promise.resolve();
+    assert.equal(dispatched, 0, change);
+  }
 });
 
 test('published offer has exact source quote and stable private lookup packet; public reads omit private accounting and raw input', async () => {
