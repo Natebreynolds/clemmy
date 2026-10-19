@@ -26,7 +26,7 @@ test.after(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function fixture(options: { nested?: boolean; outcome?: 'done' | 'blocked' } = {}) {
+function fixture(options: { nested?: boolean; outcome?: 'done' | 'blocked'; hostChild?: boolean } = {}) {
   const session = events.createSession({ kind: 'chat' });
   const attempt = events.beginRunAttempt(session.id);
   const source = events.recordRunAttemptUserInput(attempt, { role: 'user', turn: 1, data: { text: 'Create a controlled read workflow.' } });
@@ -41,8 +41,16 @@ function fixture(options: { nested?: boolean; outcome?: 'done' | 'blocked' } = {
     (session_id, source_user_seq, accepted_task_id, logical_tool_call_id, tool_name, argument_digest, raw_argument_digest, state, opened_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)`)
     .run(session.id, source.seq, acceptedTaskId, callId, material.toolName, material.argumentDigest, material.argumentDigest, new Date().toISOString());
+  // The host lane: the runner's lease issues a child lease bound to this one
+  // call; the call runs under the child and its top-level return is recorded
+  // under the runner's lease.
+  const runnerLease = options.hostChild
+    ? leases.activateDispatchLease({ sessionId: session.id, scopeId: `${session.id}:host-runner`, runAttemptId: attempt.attemptId })
+    : undefined;
   const lease = leases.activateDispatchLease({ sessionId: session.id, scopeId: `${session.id}:call`, runAttemptId: attempt.attemptId,
-    sourceUserSeq: source.seq, acceptedTaskId, logicalToolCallId: callId, recovery: { material, effect: 'local_write', businessCall: false } });
+    sourceUserSeq: source.seq, acceptedTaskId, logicalToolCallId: callId, recovery: { material, effect: 'local_write', businessCall: false },
+    ...(runnerLease ? { parentLease: runnerLease } : {}) });
+  const returnLease = runnerLease ?? lease;
   const nonce = randomUUID();
   const runId = `run-${randomUUID()}`;
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
@@ -65,11 +73,29 @@ function fixture(options: { nested?: boolean; outcome?: 'done' | 'blocked' } = {
     data: { sourceUserSeq: source.seq, callId, tool, accounting: 'top_level' } });
   const park = (text = output, invocationNonce = nonce, parkedCallId = callId, parkedTool = tool) => events.writeToolOutput({ sessionId: session.id, callId: parkedCallId, tool: parkedTool, output: text, invocationNonce });
   const metadata = (result: unknown = output, invocationNonce: string | undefined = nonce, authoritativeReturn = true) => inline.inlineCreationTestReturnedMetadata({
-    sessionId: session.id, sourceUserSeq: source.seq, callId, toolName: tool, result, invocationNonce, authoritativeReturn, dispatchLease: lease });
+    sessionId: session.id, sourceUserSeq: source.seq, callId, toolName: tool, result, invocationNonce, authoritativeReturn, dispatchLease: returnLease });
   const returned = (data = metadata()) => events.appendEvent({ sessionId: session.id, role: 'tool', type: 'tool_returned', turn: 1, parentEventId: called.id,
     data: { sourceUserSeq: source.seq, callId, canonicalCallId: callId, tool, accounting: 'top_level', ok: true, ...data } });
-  return { session, attempt, source, callId, tool, lease, nonce, runId, file, owned, run, save, receipt, output, park, metadata, returned };
+  return { session, attempt, source, callId, tool, lease, runnerLease, nonce, runId, file, owned, run, save, receipt, output, park, metadata, returned };
 }
+
+test('on the host lane the runner lease that issued this exact call seals its return, so Clem\'s inline result is not posted again', () => {
+  const f = fixture({ hostChild: true });
+  assert.equal(f.run.inlineCreationTestDelivery!.lease.leaseId, f.lease.leaseId, 'the test registers under the call\'s child lease');
+  f.park();
+  const foreign = leases.activateDispatchLease({ sessionId: f.session.id, scopeId: `${f.session.id}:other-runner`, runAttemptId: f.attempt.attemptId });
+  assert.deepEqual(inline.inlineCreationTestReturnedMetadata({ sessionId: f.session.id, sourceUserSeq: f.source.seq, callId: f.callId,
+    toolName: f.tool, result: f.output, invocationNonce: f.nonce, authoritativeReturn: true, dispatchLease: foreign }), {},
+  'a runner lease that did not issue this call cannot seal it');
+  assert.deepEqual(inline.inlineCreationTestReturnedMetadata({ sessionId: f.session.id, sourceUserSeq: f.source.seq, callId: `${f.callId}-other`,
+    toolName: f.tool, result: f.output, invocationNonce: f.nonce, authoritativeReturn: true, dispatchLease: f.runnerLease! }), {},
+  'the issuing lease seals only the call its child was bound to');
+  const sealed = f.metadata();
+  assert.ok(sealed.inlineCreationTestDelivery, 'the issuing runner lease seals the exact return');
+  f.returned(sealed);
+  assert.equal(inline.inlineCreationTestOriginDisposition(f.run, f.session.id), 'acknowledged');
+  leases.revokeDispatchLease(foreign);
+});
 
 test('retention alone keeps only the matching inline origin pending; exact paired return repairs ACK after restart/expiry', () => {
   const f = fixture();

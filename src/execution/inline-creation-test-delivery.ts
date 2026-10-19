@@ -95,6 +95,22 @@ function sameOwner(a: DispatchLeaseRef, b: DispatchLeaseRef): boolean {
   return a.sessionId === b.sessionId && a.scopeId === b.scopeId && a.leaseId === b.leaseId
     && typeof a.runAttemptId === 'string' && !!a.runAttemptId && a.runAttemptId === b.runAttemptId;
 }
+/** Who may seal the return of the call that registered this intent: the same
+ * lease, or on the host lane the runner lease that issued this exact call's
+ * child lease. The test registers under the child, inside the call; the call's
+ * top-level return is recorded under the parent. Requiring the same lease there
+ * meant no host-lane return was ever sealed, so every result Clem had already
+ * read was posted again as a chat report once the wait expired (live
+ * 2026-10-09 to 10-19: 47 repeats, 12 of them ending the chat blocked). */
+function ownsReturn(intent: DispatchLeaseRef, owner: { scopeId: string; leaseId: string; runAttemptId?: string; sessionId?: string },
+  callId: string | undefined): boolean {
+  if (owner.sessionId !== undefined && owner.sessionId !== intent.sessionId) return false;
+  if (typeof intent.runAttemptId !== 'string' || !intent.runAttemptId || intent.runAttemptId !== owner.runAttemptId) return false;
+  if (intent.scopeId === owner.scopeId && intent.leaseId === owner.leaseId) return true;
+  return typeof intent.parentScopeId === 'string' && intent.parentScopeId === owner.scopeId
+    && typeof intent.parentLeaseId === 'string' && intent.parentLeaseId === owner.leaseId
+    && typeof intent.logicalToolCallId === 'string' && !!intent.logicalToolCallId && intent.logicalToolCallId === callId;
+}
 export function createInlineCreationTestDeliveryIntent(runId: string, originSessionId?: string): InlineCreationTestDeliveryIntent | undefined {
   const lease = ambientOwner(), context = getToolOutputContext(), harness = harnessRunContextStorage.getStore(), now = Date.now();
   const sourceUserSeq = context?.sourceUserSeq;
@@ -201,7 +217,7 @@ export function inlineCreationTestReturnedMetadata(input: { sessionId: string; s
       } catch { /* plain text or formal compact digest */ }
       const eligible = receipts(parked.output).filter(receipt => {
         const run = readRun(receipt.runId), intent = run && intentOf(run), report = run && reportOf(run);
-        return intent && report && sameOwner(intent.lease, input.dispatchLease)
+        return intent && report && ownsReturn(intent.lease, input.dispatchLease, input.callId)
           && intent.originSessionId === input.sessionId && intent.sourceUserSeq === input.sourceUserSeq
           && (intent.callId === undefined || intent.callId === input.callId)
           && intent.token === receipt.token && reportDigest(report) === receipt.reportDigest
@@ -224,7 +240,8 @@ function acknowledged(run: Record<string, unknown>, i: InlineCreationTestDeliver
     const e = getEvent(row.id), d = e?.data, p = d?.inlineCreationTestDelivery;
     if (!e || !d || typeof d.callId !== 'string' || !d.callId || (i.callId !== undefined && d.callId !== i.callId)
       || d.accounting !== 'top_level' || d.ok === false || !e.parentEventId || !object(p) || p.version !== 1
-      || p.ownerScopeId !== i.lease.scopeId || p.ownerLeaseId !== i.lease.leaseId || p.ownerAttemptId !== i.lease.runAttemptId
+      || typeof p.ownerScopeId !== 'string' || typeof p.ownerLeaseId !== 'string' || typeof p.ownerAttemptId !== 'string'
+      || !ownsReturn(i.lease, { scopeId: p.ownerScopeId, leaseId: p.ownerLeaseId, runAttemptId: p.ownerAttemptId }, d.callId)
       || typeof p.invocationNonce !== 'string' || !p.invocationNonce || typeof p.outputSha256 !== 'string' || !SHA.test(p.outputSha256)
       || !Array.isArray(p.receipts) || Date.parse(e.createdAt) < Date.parse(i.createdAt) || Date.parse(e.createdAt) >= Date.parse(i.expiresAt)
       || (i.releasedAt && Date.parse(e.createdAt) >= Date.parse(i.releasedAt))) return false;
