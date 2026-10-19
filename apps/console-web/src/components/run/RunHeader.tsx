@@ -36,7 +36,7 @@ export function RunHeader({
 }) {
   return (
     <header className="border-b border-border bg-surface px-5 py-3">
-      <div className="mx-auto flex w-full max-w-3xl items-start gap-3">
+      <div className="mx-auto flex w-full max-w-[max(60rem,90%)] items-start gap-3">
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-h3 text-fg">{title}</h2>
           <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
