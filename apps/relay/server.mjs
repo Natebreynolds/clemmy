@@ -1056,6 +1056,17 @@ if (isMain) {
   if (!Number.isSafeInteger(shutdownGraceMs) || shutdownGraceMs < 0 || shutdownGraceMs > 300_000) {
     throw new Error('relay: invalid RELAY_DRAIN_TIMEOUT_MS');
   }
+  // The listener announces itself before startRelay resolves, so the stop
+  // handlers exist first: a SIGTERM in that window drains once the relay is
+  // up instead of killing the process mid-start.
+  let relayHandle = null;
+  let stopRequested = false;
+  const stop = () => {
+    stopRequested = true;
+    if (relayHandle) void relayHandle.close({ graceMs: shutdownGraceMs });
+  };
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
   startRelay({
     port: Number(env.RELAY_PORT ?? env.PORT ?? 9400),
     healthPort: env.RELAY_HEALTH_PORT === undefined ? undefined : Number(env.RELAY_HEALTH_PORT),
@@ -1064,9 +1075,8 @@ if (isMain) {
     tlsCertPem: readMaterial('RELAY_TLS_CERT_PEM', 'RELAY_TLS_CERT_FILE', 'TLS cert'),
     onFatalError: () => { process.exitCode = 1; },
   }).then((relay) => {
-    const stop = () => { void relay.close({ graceMs: shutdownGraceMs }); };
-    process.once('SIGTERM', stop);
-    process.once('SIGINT', stop);
+    relayHandle = relay;
+    if (stopRequested) { void relay.close({ graceMs: shutdownGraceMs }); return; }
     console.info(JSON.stringify({
       event: 'relay_ready',
       sourceSha256: createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex'),

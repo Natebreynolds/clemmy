@@ -5570,8 +5570,11 @@ const runHostTurnBody = async (
     // A review that cannot pass is Clem's to tell, once per request: the next
     // reply is her own account of the finding and a question to the owner,
     // never the harness holding her answer under a blocked status.
+    // An unverified memory correction ends on its own stop, which Clem
+    // narrates as her question; an account written here would be discarded.
     const disclose = !continuation && !awaitingInput && !verdict.done && !verdict.failedOpen && !planCandidate
       && !responseFormatRequirement && !formatRepairReviewRequired && !reviewSignal?.aborted && !openApprovalCard
+      && currentMemoryReviewCheck?.status !== 'unverified'
       && !deliveredReviewRun && !reviewDisclosureArmed && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);
     if (disclose) {
       reviewDisclosureArmed = true;
