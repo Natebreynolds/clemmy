@@ -1365,9 +1365,17 @@ async function approvedCheckpointFixture(stopTarget?: 'control' | 'business') {
   const { HarnessSession } = await import('./session.js');
   const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
   const { captureFreshSourceSessionContext, readSourceSessionContext } = await import('./source-session-context.js');
-  if (!saved) captureFreshSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
-  else assert.ok(readSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: saved.sourceUserSeq }));
-  const agent = await fixture.useProductionAgent();
+  const { withSourceSessionContext } = await import('./source-session-context-scope.js');
+  const composition = saved
+    ? readSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: saved.sourceUserSeq })
+    : captureFreshSourceSessionContext({ sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq });
+  assert.ok(composition);
+  // The production bridge builds the fresh agent inside its accepted source
+  // context and the resume reads that same context back, so the source-bound
+  // tool wire (and with it the host surface digest) is identical across the
+  // pause. Building the agent outside the context here gave the first run a
+  // different question tool than the resume and poisoned the root.
+  const agent = await withSourceSessionContext(composition, () => fixture.useProductionAgent());
   if (saved) {
     const original = fixture.model.getResponse.bind(fixture.model);
     fixture.model.getResponse = async (request: any) => ({ ...await original(request),
