@@ -8,6 +8,7 @@ import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
 import { CLARIFICATION_APPROVAL_GUIDANCE, FORMAL_APPROVAL_PREPARATION_GUIDANCE, SEALED_APPROVAL_GUIDANCE } from '../shared/approval-preparation-guidance.js';
+import { conditionalApprovalPreparationRepair } from './question-tools.js';
 import { getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
@@ -1717,10 +1718,17 @@ export function buildAskUserQuestionTool() {
             },
           });
         } catch { /* audit note is best-effort; never block the proceed path */ }
+        let preparationRepair: ReturnType<typeof conditionalApprovalPreparationRepair> = null;
+        if (classifier === 'typed') {
+          try {
+            preparationRepair = conditionalApprovalPreparationRepair(getLocalToolSchemas().get('pending_action_queue'));
+          } catch { /* unavailable schema retains the original non-halting guidance */ }
+        }
         return formatAutoResolvedAskUserQuestionOutput(
           'This generic question created no approval card and granted no execution consent. Standing approval never replaces an exact formal card. '
           + FORMAL_APPROVAL_PREPARATION_GUIDANCE + ' ' + SEALED_APPROVAL_GUIDANCE
           + ' For work requiring no card, continue through its ordinary execution boundary; this question supplies no authority.'
+          + (preparationRepair ? `\n${JSON.stringify(preparationRepair)}` : '')
         );
       }
       if (sessionId) {
