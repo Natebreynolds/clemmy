@@ -436,7 +436,6 @@ interface HarnessSnapshotIndex {
   workflowRows: Map<string, HarnessSessionRow[]>;
   conversations: Map<string, ReturnType<typeof readAcceptedSourceConversationProjection>>;
   observer?: ProjectionReadObserver;
-  previewGeneration?: { db: Database.Database; value: string };
 }
 // These presentation indexes live only as long as this request's row array.
 // Detail, mutation and control paths do not pass a snapshot and read fresh.
@@ -521,15 +520,10 @@ interface HarnessSummaryCollection {
 }
 
 function collectHarnessSummaries(observer?: ProjectionReadObserver): HarnessSummaryCollection {
-  const previewDb = openEventLog();
-  const previewGeneration = readPreviewGeneration(previewDb);
   const allRows = listAllHarnessRowsForDisplay(observer);
   // The observer follows this request's existing snapshot, never a global
   // cache or any continuation/control reader.
-  const index = snapshotIndex(allRows, observer);
-  if (previewGeneration !== null && previewGeneration === readPreviewGeneration(previewDb)) {
-    index.previewGeneration = { db: previewDb, value: previewGeneration };
-  }
+  snapshotIndex(allRows, observer);
   const rows = userFacingHarnessRows(allRows);
   const out: UnifiedRunSummary[] = [];
   const rawIds = new Set(rows.map((row) => row.id));
@@ -656,42 +650,68 @@ function reconstructHarnessDetailTurns(row: HarnessSessionRow, perSessionLimit =
 }
 
 interface HarnessPreviewScalars { preview: string; turnCount: number }
-interface HarnessPreviewCache { generation: string; values: Map<string, HarnessPreviewScalars> }
-const harnessPreviewCaches = new WeakMap<Database.Database, HarnessPreviewCache>();
+const harnessPreviewCaches = new WeakMap<Database.Database, Map<string, HarnessPreviewScalars>>();
+const HARNESS_PREVIEW_CACHE_LIMIT = 512;
+const previewCacheStats = { hits: 0, misses: 0 };
 
-/** Only a successful public text projection is reused. Main schema changes
- * and DML, including external UPDATE/DELETE with unchanged MAX(seq), invalidate it.
- * No TTL, transcript/authority objects, or preexisting transaction is cached. */
-function readPreviewGeneration(db: Database.Database): string | null {
+/** The rows one public text projection is built from: a workflow run's member
+ * rows, a conversation's verified lineage, or the row alone. Null when the
+ * snapshot does not hold every member, so nothing is cached on a partial set. */
+function previewMembers(row: HarnessSessionRow, allRows: HarnessSessionRow[]): HarnessSessionRow[] | null {
+  const workflowRunId = workflowRunIdFor(row);
+  if (workflowRunId) {
+    const members = listHarnessRowsForWorkflowRun(workflowRunId, row, allRows);
+    return members.some((member) => member.id === row.id) ? members : [row, ...members];
+  }
+  const conversation = snapshotConversation(allRows, row.id);
+  if (!conversation) return [row];
+  const index = snapshotIndex(allRows);
+  const members: HarnessSessionRow[] = [];
+  for (const id of conversation.sessionIds) {
+    const member = index.rows.get(id);
+    if (!member) return null;
+    members.push(member);
+  }
+  return members;
+}
+
+/** What a preview depends on, per member: the row's updated_at and the
+ * session's event count and last seq. An append, a retention delete or a
+ * row update changes a mark; writes to other sessions do not. The schema
+ * version covers migrations. A store-wide data_version here invalidated every
+ * preview on every write anywhere, so each 10-s sidebar poll rebuilt 200
+ * transcripts while Clem was working (1.6 s on the daemon loop per poll). */
+function previewChangeMarks(db: Database.Database, members: readonly HarnessSessionRow[]): string | null {
   try {
     if (!db.open || db.inTransaction) return null;
-    const version = db.pragma('data_version', { simple: true });
     const schema = db.pragma('schema_version', { simple: true });
-    const changes = (db.prepare('SELECT total_changes() AS changes').get() as { changes?: unknown } | undefined)?.changes;
-    if (!Number.isSafeInteger(version) || Number(version) < 1
-      || !Number.isSafeInteger(schema) || Number(schema) < 0
-      || !Number.isSafeInteger(changes) || Number(changes) < 0 || !db.open || db.inTransaction) return null;
-    return `${version}:${schema}:${changes}`;
+    if (!Number.isSafeInteger(schema)) return null;
+    const read = db.prepare('SELECT COUNT(*) AS n, MAX(seq) AS seq FROM events WHERE session_id = ?');
+    const marks = members.map((member) => {
+      const row = read.get(member.id) as { n?: unknown; seq?: unknown } | undefined;
+      return [member.id, member.updatedAt, row?.n ?? null, row?.seq ?? null];
+    });
+    return JSON.stringify([schema, marks]);
   } catch { return null; }
 }
 
 function previewReuse(row: HarnessSessionRow, allRows?: HarnessSessionRow[]): {
-  db: Database.Database; generation: string; cache: HarnessPreviewCache; key: string;
+  cache: Map<string, HarnessPreviewScalars>; key: string;
 } | null {
-  if (!allRows || row.kind !== 'chat' || workflowRunIdFor(row)) return null;
-  const pin = snapshotIndex(allRows).previewGeneration;
-  const conversation = snapshotConversation(allRows, row.id);
-  if (!pin || !conversation || pin.db !== openEventLog() || readPreviewGeneration(pin.db) !== pin.value) return null;
-  // The ordered lineage was verified again in this request, including every
-  // member's principal and persisted selector proof. It is never a cache value.
-  const key = JSON.stringify([row.id, 'public-text', 1000, conversation.sessionIds]);
+  if (!allRows) return null;
+  const members = previewMembers(row, allRows);
+  if (!members) return null;
+  const db = openEventLog();
+  const marks = previewChangeMarks(db, members);
+  if (marks === null) return null;
+  const key = JSON.stringify([row.id, 'public-text', 1000, marks]);
   if (key.length > 16_384) return null;
-  let cache = harnessPreviewCaches.get(pin.db);
-  if (!cache || cache.generation !== pin.value) {
-    cache = { generation: pin.value, values: new Map() };
-    harnessPreviewCaches.set(pin.db, cache);
+  let cache = harnessPreviewCaches.get(db);
+  if (!cache) {
+    cache = new Map();
+    harnessPreviewCaches.set(db, cache);
   }
-  return { db: pin.db, generation: pin.value, cache, key };
+  return { cache, key };
 }
 
 function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: HarnessSessionRow[]): void {
@@ -702,23 +722,30 @@ function fillHarnessPreviewAndCount(summary: UnifiedSessionSummary, allRows?: Ha
     return;
   }
   const reuse = previewReuse(row, allRows);
-  const cached = reuse?.cache.values.get(reuse.key);
-  if (reuse && cached && readPreviewGeneration(reuse.db) === reuse.generation) {
-    reuse.cache.values.delete(reuse.key);
-    reuse.cache.values.set(reuse.key, cached);
+  const cached = reuse?.cache.get(reuse.key);
+  if (reuse && cached) {
+    previewCacheStats.hits++;
+    reuse.cache.delete(reuse.key);
+    reuse.cache.set(reuse.key, cached);
     summary.turnCount = cached.turnCount;
     summary.preview = cached.preview;
     return;
   }
+  previewCacheStats.misses++;
   // Keep the original projector outside cache/counter error handling.
   const turns = reconstructHarnessDetailTurns(row, 1000, allRows, true);
   summary.turnCount = turns.length;
   summary.preview = clip(turns[turns.length - 1]?.text ?? '', 140);
-  if (reuse && readPreviewGeneration(reuse.db) === reuse.generation) {
-    reuse.cache.values.delete(reuse.key);
-    reuse.cache.values.set(reuse.key, { preview: summary.preview, turnCount: summary.turnCount });
-    if (reuse.cache.values.size > 256) reuse.cache.values.delete(reuse.cache.values.keys().next().value!);
+  if (reuse) {
+    reuse.cache.delete(reuse.key);
+    reuse.cache.set(reuse.key, { preview: summary.preview, turnCount: summary.turnCount });
+    if (reuse.cache.size > HARNESS_PREVIEW_CACHE_LIMIT) reuse.cache.delete(reuse.cache.keys().next().value!);
   }
+}
+
+/** Test seam: hit/miss counts of the per-conversation preview cache. */
+export function _previewCacheStatsForTests(): { hits: number; misses: number } {
+  return { ...previewCacheStats };
 }
 
 function canonicalHarnessRowForRawId(rawId: string): HarnessSessionRow | null {

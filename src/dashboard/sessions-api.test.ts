@@ -27,6 +27,7 @@ const {
   getUnifiedSessionDetail,
   patchUnifiedSession,
   deleteUnifiedSession,
+  _previewCacheStatsForTests,
 } = await import('./sessions-api.js');
 const { SessionStore } = await import('../memory/session-store.js');
 const {
@@ -835,6 +836,39 @@ test('the list reads session rows without conversation state; every other key su
   assert.equal(summary?.pinned, true);
   assert.equal(summary?.preview, 'light reply');
   assert.equal(summary?.turnCount, 2);
+});
+
+// Live 2026-10-20: the sidebar's 10-s poll rebuilt every one of 200 previews
+// whenever anything in the store had changed (memory jobs, daemon ticks, other
+// chats), 1.6 s on the daemon loop per poll while Clem was working. A preview
+// is keyed on its own conversation's rows and events, so unrelated writes
+// keep it and its own next message replaces it.
+test('a session preview survives writes to other sessions and follows its own conversation', () => {
+  const quiet = createSession({ kind: 'chat', channel: 'desktop', title: 'Quiet chat', metadata: { source: 'desktop' } });
+  appendEvent({ sessionId: quiet.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'first ask' } });
+  appendEvent({ sessionId: quiet.id, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'first answer' } });
+  const stepA = createSession({ kind: 'workflow', channel: 'workflow', title: 'Cached Flow::a', metadata: { source: 'workflow', workflowName: 'Cached Flow', workflowRunId: 'run-cached', stepId: 'a' } });
+  appendEvent({ sessionId: stepA.id, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'cached step a done' } });
+  const find = (title: string) => buildUnifiedSessionList({ q: title }).find((row) => row.title === title);
+
+  assert.equal(find('Quiet chat')?.preview, 'first answer');
+  assert.equal(find('Cached Flow')?.preview, 'cached step a done');
+  const before = _previewCacheStatsForTests();
+
+  const busy = createSession({ kind: 'chat', channel: 'desktop', title: 'Busy chat', metadata: { source: 'desktop' } });
+  appendEvent({ sessionId: busy.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'unrelated' } });
+  appendEvent({ sessionId: busy.id, turn: 1, role: 'assistant', type: 'conversation_completed', data: { reply: 'unrelated answer' } });
+  assert.equal(find('Quiet chat')?.preview, 'first answer');
+  assert.equal(find('Cached Flow')?.preview, 'cached step a done');
+  const after = _previewCacheStatsForTests();
+  assert.equal(after.hits - before.hits, 2, 'both previews were reused after an unrelated session wrote');
+  assert.equal(after.misses - before.misses, 0, 'neither was projected again');
+
+  appendEvent({ sessionId: quiet.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'second ask' } });
+  appendEvent({ sessionId: quiet.id, turn: 2, role: 'assistant', type: 'conversation_completed', data: { reply: 'second answer' } });
+  const quietAgain = find('Quiet chat');
+  assert.equal(quietAgain?.preview, 'second answer', 'its own next message replaces the preview');
+  assert.equal(quietAgain?.turnCount, 4);
 });
 
 test('pinning a workflow run after a list build keeps each step\'s conversation state', () => {
