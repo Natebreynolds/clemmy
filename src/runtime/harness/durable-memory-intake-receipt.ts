@@ -14,6 +14,7 @@ import {
   automaticMemoryOriginsForCapture,
   selectAutoMemoryCandidates,
   isEligibleAutoCaptureSourceProvenance,
+  EXPLICIT_CORRECTION_REASON,
 } from '../../memory/auto-capture.js';
 import { openMemoryDb } from '../../memory/db.js';
 import {
@@ -472,6 +473,29 @@ export function verifiedIntakeHasOwnerStatedMemory(input: { sessionId: string; s
     const loaded = readVerifiedIntake(input);
     return loaded.status === 'ok'
       && loaded.intake.rows.some(row => statedToKeep(row.intake_reason));
+  } catch { return false; }
+}
+
+/** Storage evidence alone for a request the owner stated to keep: every
+ *  captured row has settled, each stated-to-keep row is promoted, verified,
+ *  linked to this exact source and in scope, and none is a correction. This
+ *  says the fact is saved; it never says an older fact was replaced. */
+export function hostVerifiedStatedRetention(input: { sessionId: string; sourceUserSeq: number }): boolean {
+  try {
+    return openMemoryDb().transaction(() => {
+      const loaded = readVerifiedIntake(input);
+      if (loaded.status !== 'ok' || loaded.intake.rows.length === 0) return false;
+      const rows = loaded.intake.rows;
+      if (!rows.some(row => statedToKeep(row.intake_reason))) return false;
+      if (rows.some(row => row.intake_reason === EXPLICIT_CORRECTION_REASON)) return false;
+      return rows.every(row => {
+        if (row.status === 'pending') return false;
+        if (!statedToKeep(row.intake_reason)) return true;
+        const result = canonicalResult(loaded.intake, row);
+        return row.status === 'promoted' && result.verified && result.links.length > 0 && result.scopeMatches
+          && result.destination.status === 'resolved';
+      });
+    })();
   } catch { return false; }
 }
 

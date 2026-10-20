@@ -868,6 +868,11 @@ export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryI
 /** The one gate every caller shares for "is this message an explicit memory
  * instruction": the parse, minus a same-turn opt-out. Detection only — the
  * caller decides what to do with the message, and never reads its subject. */
+/** The intake reason of a claim the owner stated as replacing something already
+ *  saved. Completion of such a claim is a review's to bind (the old fact must be
+ *  retired), never the host's storage evidence alone. */
+export const EXPLICIT_CORRECTION_REASON = 'explicit durable correction';
+
 export function explicitMemoryInstructionFor(message: string): ExplicitMemoryInstructionParse | null {
   const text = clean(message, Infinity);
   if (!text) return null;
@@ -1071,7 +1076,7 @@ function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 
     addCandidate(candidates, {
       kind: explicitRememberKind(content),
       content,
-      reason: 'explicit durable correction',
+      reason: EXPLICIT_CORRECTION_REASON,
     });
     return candidates.slice(0, maxCandidates);
   }

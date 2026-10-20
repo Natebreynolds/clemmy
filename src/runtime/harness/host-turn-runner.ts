@@ -7,7 +7,7 @@ export { HostInterruptState, HostRecoveryState, MAX_HOST_OBJECTIVE_JUDGE_CONTINU
 export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT } from './dispatch-streak.js';
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
-import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion } from './memory-completion-obligation.js';
+import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
 import { liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
@@ -4327,8 +4327,11 @@ const runHostTurnBody = async (
           reason: typeof check.reason === 'string' ? check.reason : 'The last memory requirement review was not qualified.' };
       }
       const source = readMemoryRequirementSource(exactHostIdentity(), judgedObjective());
-      return source ? memoryCorrectionCompletion(source)
-        : { status: 'unverified', reason: 'The original owner request and memory context could not be verified.' };
+      if (!source) return { status: 'unverified', reason: 'The original owner request and memory context could not be verified.' };
+      const completion = memoryCorrectionCompletion(source);
+      // A fact the automatic layer already stored and verified for this exact
+      // request is complete without a reviewer's assessment of it.
+      return completion.status === 'unverified' ? (hostVerifiedMemoryRetention(source) ?? completion) : completion;
     } catch { return { status: 'unverified', reason: 'The source-bound memory requirement could not be reopened.' }; }
   };
 
@@ -4854,7 +4857,13 @@ const runHostTurnBody = async (
         }
       } catch { /* The final gate reopens the retained requirement; a rejected replacement cannot waive it. */ }
       const memoryCheck = memoryAssessmentAccepted ? memoryRequirementCompletion(false)
-        : { status: 'unverified' as const, reason: 'The memory requirement review was unavailable, invalid, or conflicted with the retained correction.' };
+        : (() => {
+          // No accepted assessment: the host's own verified storage of a
+          // stated-to-keep fact still completes the requirement; a correction
+          // or an unsaved fact stays unverified.
+          try { const source = readMemoryRequirementSource(identity, objective); const stored = source && hostVerifiedMemoryRetention(source); if (stored) return stored; } catch { /* unreadable evidence cannot verify */ }
+          return { status: 'unverified' as const, reason: 'The memory requirement review was unavailable, invalid, or conflicted with the retained correction.' };
+        })();
       currentMemoryReviewCheck = memoryCheck;
       if (memoryCheck.status === 'unverified' && !(verdict.awaitingUser && !verdict.failedOpen)) {
         verdict = { ...verdict, done: false, repairScope: undefined,

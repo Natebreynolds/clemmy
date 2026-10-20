@@ -10854,6 +10854,48 @@ test('durable memory completion obligation reuses verified automatic evidence wi
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
 });
 
+// Live 2026-10-20 (r44v4): "Remember that …" was promoted and verified by the
+// automatic layer, the completion checker's plan quota was used up, and the
+// turn ended blocked "memory_correction_unverified" over a fact already saved.
+// The host's own verified storage of a stated-to-keep fact completes the
+// requirement; a reviewer that gave no answer cannot hold it.
+test('durable memory completion obligation accepts verified automatic storage when the reviewer is unavailable', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryConsolidationEvidence, hostVerifiedStatedRetention } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'controlled reviewer unavailable' };
+  });
+  const fixture = acceptJudgedSource('memory-automatic-reviewer-down',
+    'Remember that this project report heading is Juniper for future chats.');
+  await retainAutomaticMemoryForHost(fixture, true);
+  const before = verifiedMemoryConsolidationEvidence(fixture.context);
+  assert.ok(before?.length && before.every(result => result.verified));
+  assert.equal(hostVerifiedStatedRetention(fixture.context), true);
+  const model = scriptedRecordingModel([[textMsg('The project heading is remembered.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.terminal, undefined, 'a saved, verified fact never ends blocked behind an unavailable reviewer');
+  assert.equal(model.calls(), 1, 'no repair turn is spent re-saving a stored fact');
+  assert.equal(reviews, 1);
+  const judged = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  assert.equal((judged?.data.judgedMemoryRequirement as { status?: string } | undefined)?.status, 'verified');
+  assert.deepEqual(verifiedMemoryConsolidationEvidence(fixture.context), before);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+});
+
+test('host-verified retention is storage evidence only: pending intake does not qualify', async () => {
+  const { hostVerifiedStatedRetention } = await import('./durable-memory-intake-receipt.js');
+  const fixture = acceptJudgedSource('memory-automatic-still-pending',
+    'Remember that this project report heading is Rowan for future chats.');
+  await retainAutomaticMemoryForHost(fixture, false);
+  assert.equal(hostVerifiedStatedRetention(fixture.context), false);
+});
+
 test('durable memory completion obligation holds pending intake without a duplicate-save repair', async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');

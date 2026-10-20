@@ -17,6 +17,7 @@ import { acceptedTaskMode } from './accepted-task-mode.js';
 import { rehydrateConsumedClarificationContext } from './task-continuity-runtime.js';
 import { adoptedSteerNotesForSource } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, isEligibleAutoCaptureSourceProvenance } from '../../memory/auto-capture.js';
+import { hostVerifiedStatedRetention } from './durable-memory-intake-receipt.js';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const textDigest = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -277,6 +278,20 @@ export const MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS = [
 export type MemoryCorrectionCompletion =
   | { status: 'not_required' | 'verified'; assessmentDigest?: string }
   | { status: 'unverified'; reason: string };
+/** Completion the host reads from its own storage when no requirement review
+ * left an assessment: every claim the owner stated to keep is promoted,
+ * verified and linked to this exact source, and none of them is a correction
+ * (whose postcondition, the old fact retired, only a review can bind). A
+ * reviewer that gave no answer is not a reason to hold a fact that is already
+ * saved. Live 2026-10-20: "Remember that …" was promoted and verified, the
+ * checker's plan quota was used up, and the turn ended blocked
+ * "memory_correction_unverified". */
+export function hostVerifiedMemoryRetention(source: MemoryRequirementSource): MemoryCorrectionCompletion | null {
+  try {
+    if (readRetainedMemoryRequirement(source)) return null;
+    return hostVerifiedStatedRetention(source) ? { status: 'verified' } : null;
+  } catch { return null; }
+}
 /** Reopen retained evidence and canonical state. This proves only the bound
  * correction postconditions, never all semantic requirements of the turn. */
 export function memoryCorrectionCompletion(source: MemoryRequirementSource): MemoryCorrectionCompletion {
