@@ -1,6 +1,11 @@
 import { completionEvidenceSource } from './recovery-activation.js';
 import { redactSensitiveText } from '../security.js';
 import { workflowParentActivation } from './workflow-parent-activation.js';
+import * as approvalRegistry from './approval-registry.js';
+import { pendingActionPayloadHash } from './pending-actions.js';
+import { pendingActionIdFromArgs } from './pending-action-view.js';
+import { queuedApprovalTransitionsForRequest } from './pending-action-transition.js';
+import { normalizePendingActionResultBinding } from '../../shared/pending-action-result-binding.js';
 /**
  * The single durable foreground-delivery boundary.
  *
@@ -27,6 +32,7 @@ import {
   AcceptedTaskTerminalPublicationError,
   appendTerminalEventOnce,
   listEvents,
+  listEventsAtSequences,
   getSession,
   openEventLog,
   type EventRow,
@@ -84,9 +90,75 @@ export type TerminalReviewState = 'checked' | 'unchecked' | 'rejected' | 'needs_
 /** What the completion review did for this source, as the terminal records
  * it beside the verdict reference. `rejected` is a reviewer that answered and
  * said no; `enabled_unavailable` is one that never answered, could not read
- * its evidence, or whose verdict cannot be bound to the published text. */
+ * its evidence, or whose verdict cannot be bound to the published text.
+ * `deferred_for_approval` is an exact host-owned card pause before review,
+ * never a review result or an exemption from review after the action. */
 export type CompletionReviewDisposition =
-  | 'disabled_by_owner' | 'reviewed' | 'rejected' | 'enabled_unavailable' | 'not_required';
+  | 'disabled_by_owner' | 'reviewed' | 'rejected' | 'enabled_unavailable' | 'not_required'
+  | 'deferred_for_approval';
+
+/** Read-only provenance for the queue-before-review host exit. A generic
+ * question, claimed approval id or an old card does not explain a missing
+ * verdict. None of this evidence can approve or execute the queued action. */
+function exactQueuedApprovalReviewPause(outcome: TurnOutcome, reviewIdentity: TurnIdentity): boolean {
+  if (outcome.status !== 'needs_input' || outcome.needs.kind !== 'approval'
+    || outcome.presentation.kind !== 'approval'
+    || outcome.identity.sessionId !== reviewIdentity.sessionId
+    || outcome.identity.sourceUserSeq !== reviewIdentity.sourceUserSeq
+    || outcome.identity.turn !== reviewIdentity.turn) return false;
+  try {
+    const { sessionId, sourceUserSeq, turn } = outcome.identity;
+    const approvalId = outcome.presentation.approvalId;
+    const source = listEventsAtSequences(sessionId, [sourceUserSeq])[0];
+    if (!source || source.sessionId !== sessionId || source.turn !== turn
+      || source.type !== 'user_input_received' || source.role !== 'user'
+      || source.data.synthetic === true) return false;
+    const transition = queuedApprovalTransitionsForRequest(sessionId, sourceUserSeq).find((entry) =>
+      entry.approvalIntent === 'request_now'
+      && entry.record.approvalId === approvalId);
+    if (!transition) return false;
+    const record = transition.record;
+    const card = approvalRegistry.get(approvalId);
+    if (!card || !approvalRegistry.isActionable(card)
+      || !Number.isFinite(Date.parse(card.expiresAt))
+      || card.sessionId !== sessionId || card.tool !== 'request_approval'
+      || record.sourceUserSeq !== sourceUserSeq || record.status !== 'approval_requested'
+      || card.resumeKey !== `pending-action-approval-v1:${sessionId}:${record.id}:${record.payloadHash}`
+      || pendingActionIdFromArgs(card.args) !== record.id) return false;
+    const pinned = card.args?.pendingAction as Record<string, unknown> | undefined;
+    if (!pinned || pinned.id !== record.id || pinned.toolName !== record.toolName
+      || pinned.payloadHash !== record.payloadHash
+      || JSON.stringify(pinned.executionAuthority ?? null) !== JSON.stringify(record.executionAuthority ?? null)
+      || pendingActionPayloadHash(record.toolName, pinned.payload, record.executionAuthority ?? null) !== record.payloadHash
+      || pendingActionPayloadHash(record.toolName, record.payload, record.executionAuthority ?? null) !== record.payloadHash) return false;
+    const events = listEvents(sessionId, { sinceSeq: sourceUserSeq,
+      types: ['autonomy_note', 'approval_requested', 'approval_parked', 'goal_alignment_judged',
+        'model_transport_observed', 'completion_review_settled', 'completion_review_deferred'] });
+    // Negative provenance only: a reviewer attempt without a usable verdict
+    // stays unavailable. A routing Jev answer is not a completion review.
+    if (events.some((event) => event.data.sourceUserSeq === sourceUserSeq && (
+      (event.type === 'goal_alignment_judged' && event.data.lane === 'host_v1' && event.data.kind === 'completion')
+      || (event.type === 'model_transport_observed'
+        && (event.data.purpose === 'reviewer' || event.data.callPurpose === 'jev-completion'))
+      || event.type === 'completion_review_settled' || event.type === 'completion_review_deferred'
+    ))) return false;
+    const queued = events.find((event) => event.seq === transition.eventSeq
+      && event.role === 'Clem' && event.turn === turn
+      && event.data.sourceUserSeq === sourceUserSeq
+      && event.data.approvalIntent === 'request_now');
+    if (!queued) return false;
+    const requested = events.find((event) => event.seq > queued.seq
+      && event.type === 'approval_requested' && event.role === 'Clem' && event.turn === turn
+      && event.data.source === 'pending_action_graph_transition'
+      && event.data.sourceUserSeq === sourceUserSeq
+      && event.data.tool === 'request_approval' && event.data.approvalId === card.approvalId);
+    return Boolean(requested && events.some((event) => event.seq > requested.seq
+      && event.type === 'approval_parked' && event.role === 'system' && event.turn === turn
+      && event.data.source === 'pending_action_graph_transition'
+      && event.data.sourceUserSeq === sourceUserSeq && event.data.pendingActionId === record.id
+      && event.data.tool === 'request_approval' && event.data.approvalId === card.approvalId));
+  } catch { return false; }
+}
 
 export interface DeliveryCommitResult {
   event: EventRow;
@@ -678,6 +750,13 @@ function safeDeliveryMetadata(
     if (notice) selected.hostNotice = notice;
     else delete selected.hostNotice;
   }
+  // A bounded pointer only, not approval or result authority. The public
+  // reader independently reopens the exact source/card/action/terminal.
+  try {
+    const binding = normalizePendingActionResultBinding(metadata.pendingActionResultBinding);
+    if (binding?.sessionId === presentation.identity.sessionId
+      && binding.sourceUserSeq === presentation.identity.sourceUserSeq) selected.pendingActionResultBinding = binding;
+  } catch { /* malformed metadata supplies no result binding */ }
   if (warmTransport) {
     for (const key of WARM_DELIVERY_METADATA_KEYS) {
       if (metadata[key] !== undefined) selected[key] = metadata[key];
@@ -1319,7 +1398,13 @@ export function commitTurnOutcome(
     // A policy we could not read cannot certify anything about this run.
     if (capturedRead.status === 'unreadable') return 'enabled_unavailable';
     if (!reviewWasEnabled) return reviewOffDisposition;
-    if (!publishedVerdict) return 'enabled_unavailable';
+    if (!publishedVerdict) return capturedRead.status === 'captured'
+      && outcome.status === 'needs_input' && outcome.needs.kind === 'approval'
+      && outcome.presentation.kind === 'approval'
+      && effectiveOutcome.presentation.kind === 'approval'
+      && outcome.presentation.approvalId === effectiveOutcome.presentation.approvalId
+      && exactQueuedApprovalReviewPause(effectiveOutcome, reviewIdentity)
+      ? 'deferred_for_approval' : 'enabled_unavailable';
     // A review that ran but did not stand — negative, failed open, or with
     // unreadable evidence — is NOT 'reviewed'. Calling it reviewed is what let a
     // failed-open publish look like a successful evaluation.
@@ -1413,7 +1498,8 @@ export function commitTurnOutcome(
   // narrow conversational skip only from matching host evidence and recheck
   // current-source work at publication, including after restart/re-entry.
   if (!publishedVerdict && !publishedPlan && capturedRead.status === 'captured'
-    && reviewWasEnabled && acceptedObjective !== null && settledNow.count === 0
+    && reviewWasEnabled && reviewDisposition !== 'deferred_for_approval'
+    && acceptedObjective !== null && settledNow.count === 0
     && settledNow.evidenceAvailable && !sourceAttemptedCompletionWork(reviewIdentity) && !inheritedReadReviewRequired) {
     try {
       const skipped = listEvents(proposed.identity.sessionId, { types: ['completion_review_skipped'] })

@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
@@ -16,8 +16,12 @@ const {
   appendTerminalEventOnce,
   createSession,
   listEvents,
+  openEventLog,
 } = await import('./eventlog.js');
 const { commitTurnOutcome, completionDataForTurnOutcome } = await import('./delivery-committer.js');
+const { captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
+const { PENDING_ACTIONS_DIR, getPendingAction, queuePendingAction } = await import('./pending-actions.js');
+const { materializeQueuedApprovals, queuedApprovalTransitionsForRequest } = await import('./pending-action-transition.js');
 const turnGraph = await import('../graph/turn-graph-shadow.js');
 const expectedWork = await import('./expected-work-contract.js');
 const acceptedAuthority = await import('./accepted-task-authority.js');
@@ -72,6 +76,27 @@ function acceptedAnswer(
     identity,
   };
 }
+
+test('delivery keeps only a closed pending-action result pointer bound to this exact terminal source', () => {
+  const proposed = answer('controlled-result-binding', 'The controlled action finished.');
+  const binding = { version: 1, sessionId: proposed.identity.sessionId, sourceUserSeq: proposed.identity.sourceUserSeq,
+    pendingActionId: 'pa-controlled', approvalId: 'apr-ab12', payloadHash: 'a'.repeat(16),
+    recordUpdatedAt: '2026-10-19T00:00:00.000Z', recordStatus: 'executed', resultSummaryDigest: 'b'.repeat(64) };
+  const data = completionDataForTurnOutcome(proposed, { metadata: { pendingActionResultBinding: binding } });
+  assert.deepEqual(data.pendingActionResultBinding, binding);
+  assert.equal(data.review, undefined, 'the pointer is not a review result');
+  for (const invalid of [
+    { ...binding, sourceUserSeq: binding.sourceUserSeq + 1 },
+    { ...binding, sessionId: 'different-controlled-session' },
+    { ...binding, recordStatus: 'approved' },
+    { ...binding, resultSummaryDigest: 'unknown' },
+    { ...binding, extra: 'not allowlisted' },
+    { ...binding, sourceUserSeq: 0 },
+  ]) {
+    const rejected = completionDataForTurnOutcome(proposed, { metadata: { pendingActionResultBinding: invalid } });
+    assert.equal(rejected.pendingActionResultBinding, undefined);
+  }
+});
 
 function acceptedFailedDiscoveryRead(sessionId: string) {
   createSession({ id: sessionId, kind: 'chat' });
@@ -981,6 +1006,124 @@ test('a rejection recorded against other reply bytes keeps its disposition while
   assert.equal(ref.deliveredTextIsJudgedText, false);
   assert.equal(ref.verified, false);
 });
+
+function exactApprovalPauseFixture(suffix: string) {
+  const sessionId = `deferred-review-card-${suffix}`;
+  createSession({ id: sessionId, kind: 'chat' });
+  const accepted = acceptedAnswer(sessionId, 'The controlled action is ready for approval.');
+  captureEffectiveCompletionPolicyOnce({ ...accepted.identity, enabled: true, ownerEnabled: true });
+  const record = queuePendingAction({
+    title: 'Perform the controlled action', summary: 'An inert action fixture.',
+    kind: 'external_write', toolName: 'controlled_fixture_write', payload: { value: 'one' },
+    sessionId, sourceUserSeq: accepted.identity.sourceUserSeq,
+  });
+  const queued = appendEvent({ sessionId, turn: accepted.identity.turn, role: 'Clem', type: 'autonomy_note', data: {
+    kind: 'pending_action_queued', pendingActionId: record.id, actionKind: record.kind,
+    payloadHash: record.payloadHash, approvalRequired: true,
+    sourceUserSeq: accepted.identity.sourceUserSeq, approvalIntent: 'request_now',
+  } });
+  const card = materializeQueuedApprovals(sessionId, accepted.identity.turn, accepted.identity.sourceUserSeq,
+    queuedApprovalTransitionsForRequest(sessionId, accepted.identity.sourceUserSeq))[0]?.approval;
+  assert.ok(card, 'the real queue materializer supplies the fixture card and host receipts');
+  const outcome: TurnOutcome = { version: 2, id: accepted.id, identity: accepted.identity,
+    status: 'needs_input', resumable: true, needs: { kind: 'approval' },
+    presentation: { kind: 'approval', text: accepted.presentation.text, approvalId: card.approvalId } };
+  return { sessionId, record, card, queued, outcome };
+}
+
+test('an exact host-materialized approval pause records deferred review without claiming a verdict or disabling policy', () => {
+  const fixture = exactApprovalPauseFixture('exact');
+  // A routing Jev call cannot substitute for completion review, nor turn an
+  // intentional pre-review approval pause into reviewer unavailability.
+  appendEvent({ sessionId: fixture.sessionId, turn: 0, role: 'system', type: 'model_transport_observed', data: {
+    sourceUserSeq: fixture.outcome.identity.sourceUserSeq, purpose: 'router', callPurpose: 'jev-turn-start',
+    phase: 'model_result_completed', outcome: 'returned',
+  } });
+  const committed = commitTurnOutcome(fixture.outcome);
+  assert.equal(committed.presentation.status, 'needs_input');
+  assert.deepEqual(committed.event.data.completionReview,
+    { version: 1, disposition: 'deferred_for_approval', policyEvidence: 'captured' });
+  assert.equal(committed.event.data.pendingApprovalId, fixture.card.approvalId);
+  assert.equal(committed.event.data.review, undefined);
+  assert.equal(committed.event.data.completionVerdictRef, undefined);
+  assert.equal(committed.event.data.reason, 'awaiting_approval');
+  assert.equal(listEvents(fixture.sessionId, { types: ['completion_policy_captured'] })[0].data.enabled, true);
+  assert.equal(getPendingAction(fixture.record.id)?.status, 'approval_requested');
+  assert.equal(listEvents(fixture.sessionId, { types: ['tool_called'] }).length, 0, 'metadata publishes no execution');
+});
+
+for (const variant of [
+  'missing-card', 'missing-action', 'expired-card', 'invalid-expiry', 'resolved-card', 'foreign-card', 'foreign-source',
+  'changed-card-payload', 'changed-action-payload', 'missing-park', 'queue-only', 'untrusted-queue',
+  'generic-question', 'review-attempted', 'jev-completion-attempted', 'unreadable-policy',
+] as const) {
+  test(`review deferral rejects ${variant}; missing proof never becomes reviewed or not required`, () => {
+    const fixture = exactApprovalPauseFixture(variant);
+    const { sessionId, card, record, queued } = fixture;
+    let outcome: TurnOutcome = fixture.outcome;
+    const db = openEventLog();
+    if (variant === 'missing-card') db.prepare('DELETE FROM pending_approvals WHERE approval_id = ?').run(card.approvalId);
+    if (variant === 'missing-action') rmSync(path.join(PENDING_ACTIONS_DIR, `${record.id}.json`));
+    if (variant === 'expired-card') db.prepare('UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?')
+      .run('2000-01-01T00:00:00.000Z', card.approvalId);
+    if (variant === 'invalid-expiry') db.prepare('UPDATE pending_approvals SET expires_at = ? WHERE approval_id = ?')
+      .run('unreadable', card.approvalId);
+    if (variant === 'resolved-card') db.prepare("UPDATE pending_approvals SET status = 'cancelled' WHERE approval_id = ?").run(card.approvalId);
+    if (variant === 'foreign-card') {
+      const foreign = createSession({ id: `${sessionId}-foreign`, kind: 'chat' });
+      db.prepare('UPDATE pending_approvals SET session_id = ? WHERE approval_id = ?').run(foreign.id, card.approvalId);
+    }
+    if (variant === 'foreign-source' || variant === 'changed-action-payload') {
+      const filename = path.join(PENDING_ACTIONS_DIR, `${record.id}.json`);
+      const saved = JSON.parse(readFileSync(filename, 'utf8'));
+      if (variant === 'foreign-source') saved.sourceUserSeq += 1;
+      else saved.payload = { value: 'two' };
+      writeFileSync(filename, JSON.stringify(saved));
+    }
+    if (variant === 'changed-card-payload') db.prepare('UPDATE pending_approvals SET args_json = ? WHERE approval_id = ?')
+      .run(JSON.stringify({ ...card.args, pendingAction: { ...(card.args?.pendingAction as object), payload: { value: 'two' } } }), card.approvalId);
+    if (variant === 'missing-park') db.prepare("DELETE FROM events WHERE session_id = ? AND type = 'approval_parked'").run(sessionId);
+    if (variant === 'queue-only') db.prepare('UPDATE events SET data_json = ? WHERE id = ?')
+      .run(JSON.stringify({ ...queued.data, approvalIntent: 'queue_only', autoMaterialize: false }), queued.id);
+    if (variant === 'untrusted-queue') db.prepare("UPDATE events SET role = 'user' WHERE id = ?").run(queued.id);
+    if (variant === 'generic-question') outcome = { ...outcome, status: 'needs_input', resumable: true,
+      needs: { kind: 'input' }, presentation: { kind: 'question', text: 'The card is ready. Shall I continue?' } };
+    if (variant === 'review-attempted' || variant === 'jev-completion-attempted') appendEvent({
+      sessionId, turn: 0, role: 'system', type: 'model_transport_observed', data: {
+        sourceUserSeq: outcome.identity.sourceUserSeq,
+        ...(variant === 'review-attempted' ? { purpose: 'reviewer' } : { purpose: 'router', callPurpose: 'jev-completion' }),
+        phase: 'adapter_attempt_created',
+      },
+    });
+    if (variant === 'unreadable-policy') {
+      const policy = listEvents(sessionId, { types: ['completion_policy_captured'] })[0];
+      db.prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify({ ...policy.data, enabled: 'unknown' }), policy.id);
+    }
+    const committed = commitTurnOutcome(outcome);
+    assert.equal((committed.event.data.completionReview as { disposition: string }).disposition, 'enabled_unavailable');
+    assert.equal(committed.event.data.review, undefined);
+    assert.equal(committed.event.data.completionVerdictRef, undefined);
+  });
+}
+
+for (const [label, verdict, expected] of [
+  ['failed-open', { fulfills: true, failedOpen: true, reviewFailure: 'unavailable' }, 'enabled_unavailable'],
+  ['negative', { fulfills: false }, 'rejected'],
+  ['unreadable-evidence', { fulfills: true, settledEvidenceAvailable: false }, 'enabled_unavailable'],
+] as const) {
+  test(`an exact approval card cannot relabel an actual ${label} completion verdict as deferred`, () => {
+    const fixture = exactApprovalPauseFixture(`verdict-${label}`);
+    appendEvent({ sessionId: fixture.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged', data: {
+      lane: 'host_v1', kind: 'completion', sourceUserSeq: fixture.outcome.identity.sourceUserSeq,
+      objectiveDigest: createHash('sha256').update('Accepted request.').digest('hex'),
+      replyDigest: createHash('sha256').update(fixture.outcome.presentation.text).digest('hex'), ...verdict,
+    } });
+    const committed = commitTurnOutcome(fixture.outcome);
+    assert.equal((committed.event.data.completionVerdictRef as { disposition: string }).disposition, expected);
+    assert.equal(committed.event.data.completionReview, undefined);
+    assert.equal(committed.event.data.review, undefined);
+  });
+}
 
 test('publication distinguishes an intentional history-only review skip from an unavailable review', async () => {
   const { captureEffectiveCompletionPolicyOnce } = await import('./host-turn-runner.js');
