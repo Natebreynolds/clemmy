@@ -47,7 +47,12 @@ export interface ApprovedActionCompletionReceipt {
   sourceUserSeq: number;
   acceptedTaskId: string;
   logicalToolCallId: string;
+  admittedArgumentDigest: string;
+  executedArgumentDigest: string;
+  refinementEventId: string | null;
   physicalDispatchId: string;
+  physicalDispatchIds: string[];
+  physicalCrossingsDigest: string;
   settlementEventId: string;
   settlementDigest: string;
   resultHandleId: string;
@@ -140,16 +145,38 @@ export function proveApprovedActionCompletionInTransaction(
     .all(input.sessionId, input.sourceUserSeq) as Row[];
   requireProof(logical.length === 1 && logical[0]!.logical_tool_call_id === intent.logicalToolCallId
     && logical[0]!.accepted_task_id === intent.acceptedTaskId && logical[0]!.tool_name === intent.toolName
-    && (logical[0]!.argument_digest === intent.argumentDigest || logical[0]!.raw_argument_digest === intent.argumentDigest)
+    && logical[0]!.raw_argument_digest === intent.argumentDigest
     && logical[0]!.state === 'settled' && logical[0]!.outcome_kind === 'succeeded'
     && String(intentEvent!.created_at) <= String(logical[0]!.opened_at), 'exact call did not settle successfully');
+  const executedDigest = String(logical[0]!.argument_digest);
+  let refinement: Row | undefined;
+  if (executedDigest === intent.argumentDigest) {
+    requireProof(logical[0]!.effective_argument_digest === null && logical[0]!.refinement_event_id === null
+      && logical[0]!.refined_at === null, 'unchanged call has an incoherent refinement');
+  } else {
+    requireProof(logical[0]!.effective_argument_digest === executedDigest && /^[a-f0-9]{64}$/.test(executedDigest)
+      && typeof logical[0]!.refinement_event_id === 'string' && typeof logical[0]!.refined_at === 'string',
+      'changed arguments have no canonical one-shot refinement');
+    const refinements = db.prepare(`SELECT * FROM events WHERE session_id=? AND type='logical_call_contract_refined'
+      AND json_valid(data_json) AND json_extract(data_json,'$.sourceUserSeq')=?
+      AND json_extract(data_json,'$.logicalToolCallId')=? LIMIT 2`)
+      .all(input.sessionId,input.sourceUserSeq,intent.logicalToolCallId) as Row[];
+    refinement = refinements[0];
+    const expected = {sourceUserSeq:input.sourceUserSeq,acceptedTaskId:intent.acceptedTaskId,
+      logicalToolCallId:intent.logicalToolCallId,tool:intent.toolName,
+      rawArgumentDigest:intent.argumentDigest,effectiveArgumentDigest:executedDigest};
+    requireProof(refinements.length === 1 && refinement?.id === logical[0]!.refinement_event_id
+      && refinement.role === 'system' && refinement.turn === intent.turn
+      && refinement.created_at === logical[0]!.refined_at && Number(refinement.seq) > Number(intentEvent!.seq)
+      && closedCanonicalJson(JSON.parse(String(refinement.data_json))) === closedCanonicalJson(expected),
+      'canonical refinement mirror is missing or foreign');
+  }
   const settlement = db.prepare('SELECT s.*,l.accepted_task_id FROM logical_call_settlements s JOIN logical_tool_calls l USING(session_id,source_user_seq,logical_tool_call_id) WHERE s.session_id=? AND s.source_user_seq=? AND s.logical_tool_call_id=?')
     .get(input.sessionId, input.sourceUserSeq, intent.logicalToolCallId) as Row | undefined;
   requireProof(settlement?.outcome_kind === 'succeeded' && settlement.accepted_task_id === intent.acceptedTaskId
     && settlement.settlement_event_id === logical[0]!.settlement_event_id && settlement.requires_reconciliation === 0
-    && settlement.continues_requirement === 0 && settlement.result_handle_id
-    && Number(settlement.physical_crossing_count) + Number(settlement.host_crossing_count ?? 0) === 1,
-    'successful single-dispatch settlement is missing');
+    && settlement.continues_requirement === 0 && settlement.result_handle_id,
+    'successful exact-call settlement is missing');
   // Same canonical settlement projection as logical-call-settlement-store.
   // Recompute it here rather than importing that admission/dispatch graph into
   // the synchronous eventlog validator or trusting a stored digest by itself.
@@ -173,12 +200,23 @@ export function proveApprovedActionCompletionInTransaction(
   });
   requireProof(semantic === settlement!.semantic_digest && settlement!.protocol_version === 1
     && settlement!.crossing_authority_version === 2, 'settlement semantic digest changed');
-  const crossings = db.prepare('SELECT * FROM physical_dispatches WHERE session_id=? AND source_user_seq=?')
+  const crossings = db.prepare('SELECT * FROM physical_dispatches WHERE session_id=? AND source_user_seq=? ORDER BY ordinal LIMIT 3')
     .all(input.sessionId, input.sourceUserSeq) as Row[];
-  const crossing = crossings[0];
-  requireProof(crossings.length === 1 && crossing?.logical_tool_call_id === intent.logicalToolCallId
-    && crossing.accepted_task_id === intent.acceptedTaskId && crossing.state === 'returned'
-    && crossing.argument_digest === intent.argumentDigest && crossing.settle_event_id, 'crossing is missing, multiple or uncertain');
+  const crossing = crossings.at(-1);
+  const expectedRelations = crossings.length === 1 ? ['primary'] : ['probe','child'];
+  requireProof((crossings.length === 1 || crossings.length === 2)
+    && Number(settlement!.physical_crossing_count) + Number(settlement!.host_crossing_count ?? 0) === crossings.length
+    && crossings.every((entry,index)=>entry.logical_tool_call_id === intent.logicalToolCallId
+      && entry.accepted_task_id === intent.acceptedTaskId && entry.state === 'returned'
+      && entry.argument_digest === executedDigest && entry.tool_name === intent.toolName
+      && entry.ordinal === index+1 && entry.relation === expectedRelations[index] && entry.retry_of === null
+      && entry.settle_event_id && entry.lease_scope_id === crossing?.lease_scope_id && entry.lease_id === crossing?.lease_id),
+    'exact primary or preparation/business crossing chain is missing, extra or uncertain');
+  for (const entry of crossings) {
+    const start = db.prepare('SELECT seq,session_id,type FROM events WHERE id=?').get(entry.start_event_id) as Row | undefined;
+    requireProof(start?.session_id === input.sessionId && start.type === 'provider_dispatch_started'
+      && Number(start.seq) > Number(refinement?.seq ?? intentEvent!.seq), 'intent/refinement did not precede physical execution');
+  }
   const frozen = db.prepare(`SELECT * FROM logical_call_settlement_crossings WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=? ORDER BY ordinal`)
     .all(input.sessionId,input.sourceUserSeq,intent.logicalToolCallId) as Row[];
   const projection = (r: Row, frozenRow = false): SettlementCrossingAuthorityEntry => ({
@@ -188,7 +226,7 @@ export function proveApprovedActionCompletionInTransaction(
     terminalState: (frozenRow ? r.terminal_state : r.state) as SettlementCrossingAuthorityEntry['terminalState'],
     ...(r.execution_site === 'host' ? { executionSite: 'host' as const } : {}),
   });
-  requireProof(frozen.length === 1 && settlementCrossingAuthorityDigest(frozen.map(r=>projection(r,true)),2) === settlement!.physical_crossings_digest
+  requireProof(frozen.length === crossings.length && settlementCrossingAuthorityDigest(frozen.map(r=>projection(r,true)),2) === settlement!.physical_crossings_digest
     && settlementCrossingAuthorityDigest(crossings.map(r=>projection(r)),2) === settlement!.physical_crossings_digest,
     'frozen/live crossing digest changed');
   const mirrorRow = db.prepare('SELECT * FROM events WHERE id=?').get(settlement!.settlement_event_id) as Row | undefined;
@@ -204,7 +242,7 @@ export function proveApprovedActionCompletionInTransaction(
     && (mirror.requirementId ?? null) === (settlement!.requirement_id ?? null)
     && mirror.physicalDispatchCount === settlement!.physical_crossing_count
     && mirror.physicalCrossingsDigest === settlement!.physical_crossings_digest
-    && JSON.stringify(mirror.physicalDispatchIds) === JSON.stringify([crossing!.physical_dispatch_id])
+    && JSON.stringify(mirror.physicalDispatchIds) === JSON.stringify(crossings.map(entry=>entry.physical_dispatch_id))
     && mirror.resultHandleId === settlement!.result_handle_id && (mirror.progressKeyDigest ?? null) === (settlement!.progress_key_digest ?? null)
     && (mirror.progressClaimed ?? false) === (settlement!.progress_claimed === 1), 'settlement mirror changed');
   const lease = db.prepare('SELECT * FROM run_dispatch_leases WHERE session_id=? AND scope_id=? AND lease_id=?')
@@ -216,7 +254,7 @@ export function proveApprovedActionCompletionInTransaction(
     .get(settlement!.result_handle_id, input.sessionId, input.sourceUserSeq, intent.logicalToolCallId) as Row | undefined;
   requireProof(raw?.accepted_task_id === intent.acceptedTaskId && raw.success === 1 && raw.rejection_reason === null
     && raw.tool_name === intent.toolName
-    && raw.physical_dispatch_id === crossing!.physical_dispatch_id && raw.argument_digest === intent.argumentDigest,
+    && raw.physical_dispatch_id === crossing!.physical_dispatch_id && raw.argument_digest === executedDigest,
     'retained result is missing or foreign');
   const payload = readDurableResultPayload({ rawLocation: raw!.raw_location as string | null,
     rawPayloadJson: raw!.raw_payload_json as string | null, rawPayloadSha256: raw!.raw_payload_sha256 as string | null,
@@ -224,6 +262,10 @@ export function proveApprovedActionCompletionInTransaction(
   requireProof(payload.status === 'ok', 'retained result bytes are not intact');
   return { intent, intentId, receipt: { version: 1, scope: 'exact_approved_call', intentId, sessionId: input.sessionId,
     sourceUserSeq: input.sourceUserSeq, acceptedTaskId: intent.acceptedTaskId, logicalToolCallId: intent.logicalToolCallId,
+    admittedArgumentDigest:intent.argumentDigest,executedArgumentDigest:executedDigest,
+    refinementEventId:refinement ? String(refinement.id) : null,
+    physicalDispatchIds:crossings.map(entry=>String(entry.physical_dispatch_id)),
+    physicalCrossingsDigest:String(settlement!.physical_crossings_digest),
     physicalDispatchId: String(crossing!.physical_dispatch_id), settlementEventId: String(settlement!.settlement_event_id),
     settlementDigest: String(settlement!.semantic_digest), resultHandleId: String(raw!.handle_id),
     rawPayloadSha256: String(raw!.raw_payload_sha256), rawByteCount: Number(raw!.raw_byte_count) } };

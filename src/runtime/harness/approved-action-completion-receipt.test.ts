@@ -6,6 +6,7 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 const home=mkdtempSync(path.join(os.tmpdir(),'clem-approved-action-completion-'));
 process.env.CLEMENTINE_HOME=home;
+process.env.COMPOSIO_BACKEND='sdk';
 mkdirSync(path.join(home,'state'),{recursive:true});
 const events=await import('./eventlog.js');
 const actions=await import('./pending-actions.js');
@@ -24,6 +25,8 @@ const {requireActionExpectedWorkActivation}=await import('./action-expected-work
 const {ToolCallsCounter,withHarnessRunContext}=await import('./brackets.js');
 const {commitTurnOutcome}=await import('./delivery-committer.js');
 const {turnOutcomeId}=await import('./turn-outcome.js');
+const {authorizeResolvedLogicalCallContract,currentLogicalCall,withPhysicalDispatch,withPhysicalPreparationDispatch}=await import('./attempt-identity.js');
+const {settleToolAttempt}=await import('./attempt-settlement.js');
 
 after(()=>{resume._resetChatApprovalResumeForTest();events.closeEventLog();rmSync(home,{recursive:true,force:true});});
 beforeEach(()=>resume._resetChatApprovalResumeForTest());
@@ -251,4 +254,119 @@ test('the canonical expired-session reaper removes exact-call proof with no orph
   for(const table of ['approved_action_completion_intents_v1','approved_action_completion_receipts_v1','accepted_task_authority'])
     assert.equal(db.prepare(`SELECT count(*) n FROM ${table} WHERE session_id=?`).get(current.session.id)?.n,0);
   assert.deepEqual(db.pragma('foreign_key_check'),[]);
+});
+
+/** The provider body is a no-network fixture. Claim/account checks, trusted
+ * resolver refinement, physical preparation/dispatch and settlement are real. */
+async function providerReadyB(options:{refine?:boolean;preparation?:boolean;extra?:boolean;write?:boolean}={}) {
+  const session=events.createSession({kind:'chat'});
+  const account='ca-controlled-approval';const tool=options.write?'SLACK_SEND_MESSAGE':'SLACK_FETCH_CONVERSATION_HISTORY';
+  const inner={channel:'C-CONTROLLED',...(options.write?{text:'Named no-provider fixture.'}:{limit:2}),
+    ...(options.refine?{connected_account_id:account}:{})};
+  const payload={tool_slug:tool,arguments:JSON.stringify(inner),connected_account_id:account};
+  const action=actions.queuePendingAction({title:options.write?'Send the exact controlled message':'Read the exact controlled channel',summary:'No-network SDK normalization fixture.',
+    kind:options.write?'external_send':'other',toolName:'composio_execute_tool',payload,sessionId:session.id});
+  const card=registry.register({sessionId:session.id,subject:action.title,tool:'request_approval',
+    args:{pendingActionId:action.id,pendingAction:pendingActionApprovalView(action)}});
+  registry.resolve(card.approvalId,'approved','desktop-chat-card');
+  actions.markPendingActionApprovalResolved(action.id,'approved',card.approvalId);
+  const attempt=events.beginRunAttempt(session.id,{runId:`approval-resume:${card.approvalId}`});
+  const source=events.recordRunAttemptUserInput(attempt,{turn:0,role:'user',data:{text:`Approve ${card.approvalId}.`,
+    synthetic:true,source:'approval_resume',approvalId:card.approvalId,decision:'approve'}},{armRunInFlight:true});
+  const identity={sessionId:session.id,sourceUserSeq:source.seq,turn:source.turn};
+  await recordAcceptedSourceGraph({identity,surface:'approval_resume',acceptedText:String(source.data.text)});
+  requireAcceptedTaskAuthority(identity);requireActionExpectedWorkActivation(identity);
+  let businessCalls=0;let preparations=0;let adapterFailure:string|undefined;
+  executor._setApprovedCallDispatchForTests(async(name,args,_session,_batch,capability)=>{
+    try {
+    assert.equal(name,'composio_execute_tool');assert.deepEqual(args,payload);
+    assert.equal(capability.pendingActionId,action.id);
+    assert.equal((args as typeof payload).connected_account_id,account,'SDK account remains pinned in the approved route');
+    const effective={...inner} as Record<string,unknown>;
+    if(options.refine)delete effective.connected_account_id;
+    authorizeResolvedLogicalCallContract({...identity,tool,effectiveArgs:effective});
+    const physical={...identity,tool,args:effective};
+    if(options.preparation)await withPhysicalPreparationDispatch(physical,async()=>{preparations++;return {schema:'controlled-current'};});
+    const result=await withPhysicalDispatch(physical,async()=>{businessCalls++;return {successful:true,data:{id:'controlled-result'}};});
+    if(options.extra)await withPhysicalDispatch(physical,async()=>{businessCalls++;return {successful:true,data:{id:'extra-result'}};});
+    settleToolAttempt({...identity,lane:'composio',toolName:tool,callId:currentLogicalCall()!.logicalToolCallId,
+      args:effective,businessCall:true,mutating:options.write===true,result,signals:{envelopeSuccessful:true}});
+    return result;
+    } catch(error) {adapterFailure=error instanceof Error?error.stack:String(error);throw error;}
+  });
+  const execution=await withHarnessRunContext({...identity,runAttemptId:attempt.attemptId,behaviorScopeId:attempt.runId!,counter:new ToolCallsCounter(1)},
+    ()=>executor.executeApprovedPendingActionCall(action.id,{sessionId:session.id,sourceUserSeq:source.seq}));
+  if(!options.write)assert.equal(execution.status,'executed',`${adapterFailure??''}\n${JSON.stringify(execution)}`);
+  return {session,action,source,identity,businessCalls:()=>businessCalls,preparations:()=>preparations,
+    execution,adapterFailure,
+    outcome:{version:2 as const,id:turnOutcomeId(identity),identity,status:'done' as const,resumable:false as const,
+      presentation:{kind:'answer' as const,text:'The exact approved call returned its saved result.'}}};
+}
+
+test('canonical read-only SDK provider-ready refinement closes only its exact approved B and retains the pinned account',async()=>{
+  const current=await providerReadyB({refine:true});
+  const result=commitTurnOutcome(current.outcome);
+  assert.equal(result.presentation.status,'done');
+  assert.equal(events.readValidatedTerminalEvent(result.event.id,current.session.id,current.source.seq).id,result.event.id);
+  const proven=proof.proveApprovedActionCompletionInTransaction(events.openEventLog(),current.identity);
+  assert.notEqual(proven.receipt.admittedArgumentDigest,proven.receipt.executedArgumentDigest);
+  assert.ok(proven.receipt.refinementEventId);
+  assert.equal(proven.receipt.physicalDispatchIds.length,1);
+  assert.equal(current.businessCalls(),1);
+});
+
+test('nested approved write keeps its existing exact-work refusal with no crossing or completion receipt',async()=>{
+  const current=await providerReadyB({refine:true,write:true});const db=events.openEventLog();
+  assert.equal(current.execution.status,'failed');
+  assert.match(current.adapterFailure??'',/work_binding_required/);
+  assert.equal(current.businessCalls(),0);
+  assert.equal(db.prepare('SELECT count(*) n FROM physical_dispatches WHERE session_id=?').get(current.session.id)?.n,0);
+  assert.equal(db.prepare('SELECT count(*) n FROM approved_action_completion_receipts_v1 WHERE session_id=?').get(current.session.id)?.n,0);
+});
+
+test('a missing or foreign refinement mirror cannot close an executed approval B',async()=>{
+  const current=await providerReadyB({refine:true});const db=events.openEventLog();
+  const refined=db.prepare("SELECT id,data_json FROM events WHERE session_id=? AND type='logical_call_contract_refined'")
+    .get(current.session.id) as {id:string;data_json:string};
+  db.prepare("UPDATE events SET data_json=json_set(data_json,'$.sourceUserSeq',?) WHERE id=?").run(current.source.seq+1000,refined.id);
+  assert.equal(receipt.prepareApprovedActionHostCompletion(current.identity).status,'conflict');
+  assert.equal(loadAcceptedTaskAuthority(current.session.id,current.source.seq).status,'ok');
+  assert.equal(current.businessCalls(),1);
+  db.prepare('UPDATE events SET data_json=? WHERE id=?').run(refined.data_json,refined.id);
+  assert.equal(commitTurnOutcome(current.outcome).presentation.status,'done');
+  assert.equal(current.businessCalls(),1,'repairing retained proof never repeats execution');
+});
+
+test('the real physical preparation API plus one business crossing closes B with the full retained chain',async()=>{
+  const current=await providerReadyB({preparation:true});const db=events.openEventLog();
+  const result=commitTurnOutcome(current.outcome);assert.equal(result.presentation.status,'done');
+  const proven=proof.proveApprovedActionCompletionInTransaction(db,current.identity);
+  assert.equal(proven.receipt.physicalDispatchIds.length,2);
+  assert.equal(proven.receipt.physicalDispatchId,proven.receipt.physicalDispatchIds[1]);
+  assert.deepEqual(db.prepare('SELECT ordinal,relation,state FROM physical_dispatches WHERE session_id=? ORDER BY ordinal')
+    .all(current.session.id),[{ordinal:1,relation:'probe',state:'returned'},{ordinal:2,relation:'child',state:'returned'}]);
+  assert.equal(current.preparations(),1);assert.equal(current.businessCalls(),1);
+  assert.equal(events.readValidatedTerminalEvent(result.event.id,current.session.id,current.source.seq).id,result.event.id);
+});
+
+test('an extra business child cannot be hidden behind the preparation receipt shape',async()=>{
+  const current=await providerReadyB({preparation:true,extra:true});
+  assert.equal(current.preparations(),1);assert.equal(current.businessCalls(),2);
+  assert.equal(receipt.prepareApprovedActionHostCompletion(current.identity).status,'conflict');
+  assert.equal(events.openEventLog().prepare('SELECT count(*) n FROM approved_action_completion_receipts_v1 WHERE session_id=?')
+    .get(current.session.id)?.n,0);
+});
+
+test('an uncertain retained preparation cannot redeem an otherwise successful business result',async()=>{
+  const current=await providerReadyB({preparation:true});const db=events.openEventLog();
+  const triggers=db.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='physical_dispatches'").all() as Array<{name:string;sql:string}>;
+  for(const trigger of triggers)db.exec(`DROP TRIGGER ${trigger.name}`);
+  try{
+    db.prepare("UPDATE physical_dispatches SET state='unknown' WHERE session_id=? AND ordinal=1").run(current.session.id);
+    assert.equal(receipt.prepareApprovedActionHostCompletion(current.identity).status,'conflict');
+    assert.equal(current.businessCalls(),1);
+  }finally{
+    db.prepare("UPDATE physical_dispatches SET state='returned' WHERE session_id=? AND ordinal=1").run(current.session.id);
+    for(const trigger of triggers)db.exec(trigger.sql);
+  }
 });

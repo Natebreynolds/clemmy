@@ -89,6 +89,7 @@ export function prepareApprovedActionHostCompletion(input: { sessionId: string; 
         || retained.value.rawPayloadSha256 !== proof.receipt.rawPayloadSha256) throw new Error('canonical settlement/result redemption failed');
       const action = getPendingAction(proof.intent.pendingActionId);
       if (!action || action.status !== 'executed' || action.approvedBy !== 'human' || action.sessionId !== input.sessionId
+        || action.sourceUserSeq !== proof.intent.originalSourceUserSeq
         || action.approvalId !== proof.intent.approvalId || action.payloadHash !== proof.intent.payloadHash
         || action.executionClaimTokenHash !== proof.intent.claimHash
         || approvedActionProofDigest(action.executionAuthority ?? null) !== proof.intent.executionAuthorityDigest
