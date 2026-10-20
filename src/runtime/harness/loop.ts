@@ -6798,6 +6798,9 @@ const heldPublicationAdapter = {
     commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'blocked', resumable: true,
       presentation: { kind: 'blocked', text } }, { legacyReason: 'blocked', metadata: { blockedReason: 'held_turn_recovery_failed' } });
   },
+  settleUndispatched: (sessionId: string, sourceUserSeq: number) => {
+    settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq });
+  },
 };
 /** Daemon lifecycle observation only; never enters a conversation executor. */
 export function drainPendingHeldStopPublications(): number {

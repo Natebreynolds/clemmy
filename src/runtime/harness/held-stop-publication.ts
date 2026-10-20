@@ -210,10 +210,20 @@ export function heldStopPublicationHoldsExecutionSource(sessionId: string, sourc
 export interface HeldStopPublicationAdapter {
   isExecuting(sessionId: string, sourceUserSeq: number): boolean;
   commit(identity: TurnIdentity, text: string): void;
+  /** Settle this source's calls that were admitted but never dispatched (no
+   *  lease, no physical crossing) as cancelled before dispatch, the same way a
+   *  Stop does. Only their runner could settle them, and it is gone. */
+  settleUndispatched?(sessionId: string, sourceUserSeq: number): void;
 }
 function ownerChanged(debt: Debt): boolean {
   const o = debt.origin; const latest = getRunAttemptBySourceUserSeq(o.sessionId, o.sourceUserSeq);
   return !latest || latest.attemptId !== o.attemptId || latest.status === 'completed' || latest.status === 'cancelled';
+}
+function leaseCurrent(debt: Debt, now: number): boolean {
+  const o = debt.origin;
+  const lease = openEventLog().prepare('SELECT lease_owner, lease_expires_at FROM run_attempts WHERE session_id=? AND attempt_id=?')
+    .get(o.sessionId, o.attemptId) as { lease_owner: string | null; lease_expires_at: string | null };
+  return Boolean(lease.lease_owner && lease.lease_expires_at && Date.parse(lease.lease_expires_at) > now);
 }
 function knownIneligible(debt: Debt, now: number): boolean {
   const o = debt.origin; const db = openEventLog();
@@ -221,9 +231,7 @@ function knownIneligible(debt: Debt, now: number): boolean {
     (SELECT COUNT(*) FROM logical_tool_calls WHERE session_id=? AND source_user_seq=? AND state!='settled') AS logical,
     (SELECT COUNT(*) FROM physical_dispatches WHERE session_id=? AND source_user_seq=? AND state='started') AS physical`)
     .get(o.sessionId, o.executionSourceUserSeq, o.sessionId, o.executionSourceUserSeq) as { logical: number; physical: number };
-  const lease = db.prepare('SELECT lease_owner, lease_expires_at FROM run_attempts WHERE session_id=? AND attempt_id=?')
-    .get(o.sessionId, o.attemptId) as { lease_owner: string | null; lease_expires_at: string | null };
-  return busy.logical > 0 || busy.physical > 0 || Boolean(lease.lease_owner && lease.lease_expires_at && Date.parse(lease.lease_expires_at) > now);
+  return busy.logical > 0 || busy.physical > 0 || leaseCurrent(debt, now);
 }
 function ackWinner(debt: Debt): boolean {
   const o = debt.origin; const winner = resolveExactTerminalForAcceptedSource(boundSource(o));
@@ -239,6 +247,16 @@ export function drainHeldStopPublication(sessionId: string, sourceUserSeq: numbe
     const raw = metadata(sessionId).debts[String(sourceUserSeq)]; if (raw === undefined) return 'absent'; debt = parseDebt(raw);
     if (debt.origin.sessionId !== sessionId || debt.origin.sourceUserSeq !== sourceUserSeq) return 'held';
     const ack = withEventPublicationTransaction(() => ackWinner(debt)); if (ack) return 'acknowledged';
+    // A call admitted but never dispatched can only settle through its runner.
+    // With the checkpoint owner failed, nothing executing this source and no
+    // current lease, that runner is gone (live 2026-10-06: one such write_file
+    // kept a stop unpublished, its marker armed and its chat's approvals
+    // waiting for 13 days). Settle it exactly as a Stop does; a call that
+    // crossed or holds a lease still waits.
+    if (!ownerChanged(debt) && !hasCheckpoint(debt.origin) && !adapter.isExecuting(sessionId, sourceUserSeq)
+      && !adapter.isExecuting(sessionId, debt.origin.executionSourceUserSeq) && !leaseCurrent(debt, now)) {
+      adapter.settleUndispatched?.(sessionId, debt.origin.executionSourceUserSeq);
+    }
     if (ownerChanged(debt) || hasCheckpoint(debt.origin) || adapter.isExecuting(sessionId, sourceUserSeq)
       || adapter.isExecuting(sessionId, debt.origin.executionSourceUserSeq) || knownIneligible(debt, now)
       || debt.attemptsUsed >= LIMIT || debt.nextAttemptAt > now) return 'held';
