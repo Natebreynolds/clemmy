@@ -79,6 +79,13 @@ import {
   editableApprovalField,
   ApprovalDecisionGate,
   workflowConversationSlugFromSessionId,
+  approvalResultRelationKey,
+  sameApprovalResultRelation,
+  mergeApprovalResultBinding,
+  mergeApprovalResultRecord,
+  pendingActionRecordPresentation,
+  pendingActionPresentationCopy,
+  type PendingActionResultLookup,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -94,6 +101,7 @@ import {
   uploadChatAttachment,
   switchChatAgent,
   approveApprovalWithFields,
+  getApprovalResult,
   type MobileAgent,
 } from '../lib/api';
 import { listChatDelegatedTasks, listProjects, setChatProject } from '../lib/project-api';
@@ -123,6 +131,7 @@ import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
 import { assertDraftCurrent, currentDraftStep, fileContextKey, fileContextProblem, fileSendWasNotAdmitted, mobileConversationDraftOwner, mobileDrafts, newMobileDraftScope, prepareSelectedFile, reconcileDraftChoice, settleDraftChoice, settledFileRequest, submitFileDraft, type MobileDraft, type SelectedFileContext, type DraftSendResult } from '../lib/file-context';
 import { loadMobileChatHistory } from '../lib/chat-history';
+import { MobileApprovalResultReader, type MobileApprovalResultState } from '../lib/chat-approval-result';
 
 interface Props {
   initialComposeMode?: ComposeMode;
@@ -1047,9 +1056,68 @@ function approvalFieldLabel(name: string): string {
   return words ? words[0]!.toUpperCase() + words.slice(1) : name;
 }
 
+function useMobileApprovalResult(approval: ChatMessage['approval']) {
+  const known = approval?.resultRecord;
+  // A workflow/Space root or the current execution head is not this card's
+  // owner. Only the shared history projection supplies its raw session.
+  const lookup: PendingActionResultLookup | null = approval?.ownerSessionId && approval.approvalId ? {
+    sessionId: approval.ownerSessionId,
+    approvalId: approval.approvalId,
+    ...(approval.pendingActionId ?? known?.id ? { pendingActionId: approval.pendingActionId ?? known!.id } : {}),
+    ...(approval.payloadHash ?? known?.payloadHash ? { payloadHash: approval.payloadHash ?? known!.payloadHash } : {}),
+    ...(approval.recordUpdatedAt ?? known?.updatedAt ? { recordUpdatedAt: approval.recordUpdatedAt ?? known!.updatedAt } : {}),
+  } : null;
+  const scope = lookup ? approvalResultRelationKey(lookup)
+    : JSON.stringify([approval?.approvalId, known?.id, known?.payloadHash]);
+  const previousReader = useRef<MobileApprovalResultReader | null>(null);
+  const reader = useMemo(() => {
+    if (!approval) return null;
+    const previous = previousReader.current?.snapshot();
+    const compatible = sameApprovalResultRelation(previous?.binding ?? null, lookup);
+    const record = compatible && previous?.record ? (known ? mergeApprovalResultRecord(previous.record, known) ?? previous.record : previous.record) : known;
+    return new MobileApprovalResultReader(compatible ? mergeApprovalResultBinding(previous!.binding, lookup, record) : lookup, record, getApprovalResult);
+  }, [scope, Boolean(approval)]);
+  previousReader.current = reader;
+  const [observed, setObserved] = useState<{ reader: MobileApprovalResultReader; state: MobileApprovalResultState } | null>(null);
+  useEffect(() => {
+    if (!reader) return;
+    const unsubscribe = reader.subscribe(state => setObserved({ reader, state }));
+    return () => { unsubscribe(); reader.dispose(); };
+  }, [reader]);
+  useEffect(() => { reader?.reconcile(known, lookup); }, [reader, known, approval?.recordUpdatedAt]);
+  // A response from an unmounted or revised card cannot supply the next
+  // card's state, including the render before effect cleanup runs.
+  const state = reader ? observed?.reader === reader ? observed.state : reader.snapshot() : null;
+  const presentation = state?.record ? pendingActionRecordPresentation(state.record) : null;
+  return {
+    state,
+    presentation,
+    refresh: () => { void reader?.refresh(); },
+  };
+}
+
+function ApprovalResult({ result, closed }: { result: ReturnType<typeof useMobileApprovalResult>; closed: boolean }) {
+  const { state, presentation } = result;
+  if (!state || (!presentation && !(closed && state.binding))) return null;
+  const copy = presentation ? pendingActionPresentationCopy(presentation) : {};
+  return (
+    <div class="approval-result" aria-label="Action result" aria-busy={state.loading}>
+      {copy.note ? <div class="approval-result-copy bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(copy.note, { appPlaceLinks: 'phone' }) }} /> : null}
+      {copy.details ? <details class="approval-result-details">
+        <summary>Execution details</summary>
+        <pre>{copy.details}</pre>
+      </details> : null}
+      {state.binding ? <button type="button" class="approval-result-refresh" disabled={state.loading} onClick={result.refresh}>
+        {state.loading ? 'Refreshing result…' : presentation ? 'Refresh result' : 'Load result'}
+      </button> : null}
+      {state.error ? <p class="approval-result-error" role="status">{state.error}</p> : null}
+    </div>
+  );
+}
+
 function MessageRow({
   message, speaker, sessionId, busy, onExecutePlan, onRevisePlan, planActing, planOutcome, onPlanAction, onRetry, onDiscard,
-  approvalActing, approvalDecided, onApprovalAction, onApproveWithEdits,
+  approvalActing, approvalDecided: recordedApprovalDecision, onApprovalAction, onApproveWithEdits,
   onDelegatedStateChange, onDelegatedChanged, onAnswer, onContinue, onConnectionContinue, onChangeModel, onOpenSettings,
 }: {
   message: ChatMessage;
@@ -1085,6 +1153,8 @@ function MessageRow({
 }) {
   const [editing, setEditing] = useState(false);
   const [editedValue, setEditedValue] = useState('');
+  const approvalResult = useMobileApprovalResult(message.approval);
+  const approvalDecided = recordedApprovalDecision || approvalResult.presentation?.mode === 'durable';
   if (message.role === 'user') {
     return (
       <div class={`turn turn-user${message.pending ? ` pending pending-${message.pending}` : ''}`}>
@@ -1139,6 +1209,7 @@ function MessageRow({
       <div class="turn turn-approval" role="status">
         <div class="approval-head">{message.approval.subject}</div>
         <div class="approval-reason">Approval closed</div>
+        <ApprovalResult result={approvalResult} closed />
       </div>
     );
     // The decision stays on its card; it does not claim execution finished.
@@ -1147,6 +1218,7 @@ function MessageRow({
       <div class="turn turn-approval" role="status">
         <div class="approval-head">{message.approval.subject}</div>
         <div class="approval-reason">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
+        <ApprovalResult result={approvalResult} closed />
       </div>
     );
     const approvalId = message.approval.approvalId;
@@ -1166,7 +1238,7 @@ function MessageRow({
             {message.approval.preview?.why ? <div class="approval-reason">{message.approval.preview.why}</div> : null}
           </>
         ) : (
-          <div class="approval-head">{message.approval.preview?.items ? `Review ${message.approval.preview.items.length} actions` : `Waiting on you — ${message.approval.subject}`}</div>
+          <div class="approval-head">{message.approval.preview?.items ? `${approvalDecided ? 'Reviewed' : 'Review'} ${message.approval.preview.items.length} actions` : approvalDecided ? message.approval.subject : `Waiting on you — ${message.approval.subject}`}</div>
         )}
         {message.approval.reason && !ask ? <div class="approval-reason">{message.approval.reason}</div> : null}
         {message.approval.preview?.check?.status === 'conflicts' && message.approval.preview.check.conflicts?.length ? (
@@ -1299,12 +1371,13 @@ function MessageRow({
         ) : !approvalId ? (
           <div class="approval-reason">Open “Needs you” from the menu to act on this.</div>
         ) : message.approval.resolution === 'changed' ? (
-          <div class="approval-reason">You asked for a change — the revised version is below. Nothing was sent from this one.</div>
+          <div class="approval-reason">You asked for a change — the revised version is below.</div>
         ) : message.approval.resolution === 'expired' ? (
-          <div class="approval-reason">Expired without an answer — it did not run.</div>
+          <div class="approval-reason">Expired without an answer.</div>
         ) : message.approval.resolution === 'approved' || message.approval.resolution === 'declined' ? (
           <div class="approval-reason" role="status">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
         ) : null}
+        <ApprovalResult result={approvalResult} closed={approvalDecided} />
       </div>
     );
   }

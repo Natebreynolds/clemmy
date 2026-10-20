@@ -1485,6 +1485,19 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-ask { font-size: var(--t-body); line-height: 1.45; color: var(--fg); }
 .approval-exact-label { margin-top: var(--sp-3); font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-3); }
 .approval-reason { color: var(--fg-2); font-size: var(--t-sm); margin-top: 4px; }
+.turn-approval .approval-result { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); min-width: 0; }
+.turn-approval .approval-result-copy { color: var(--fg); font-size: var(--t-body); line-height: 1.5; overflow-wrap: anywhere; }
+.turn-approval .approval-result-copy > :first-child { margin-top: 0; }
+.turn-approval .approval-result-copy > :last-child { margin-bottom: 0; }
+.turn-approval .approval-result-details { margin-top: var(--sp-2); font-size: var(--t-sm); color: var(--fg-2); }
+.turn-approval .approval-result-details > summary { width: fit-content; min-height: 44px; display: flex; align-items: center; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.turn-approval .approval-result-details pre { margin: 0 0 var(--sp-2); color: var(--fg-2); font-size: var(--t-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+.turn-approval .approval-result-refresh { min-height: 44px; padding: 8px 0; border: 0; background: transparent; color: var(--accent); font: inherit; font-size: var(--t-sm); cursor: pointer; text-align: start; }
+.turn-approval .approval-result-refresh:disabled { color: var(--fg-2); cursor: default; }
+.turn-approval .approval-result-refresh:not(:disabled):hover { text-decoration: underline; text-underline-offset: 3px; }
+.turn-approval .approval-result-refresh:active { opacity: .75; }
+.turn-approval .approval-result-refresh:focus-visible, .turn-approval .approval-result-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.turn-approval .approval-result-error { margin: 0; color: var(--fg-2); font-size: var(--t-sm); line-height: 1.45; }
 /* What approving would send: each argument the tool receives. */
 .approval-preview { margin: 8px 0 0; font-size: var(--t-sm); }
 .approval-preview > div + div { margin-top: 6px; }

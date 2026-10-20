@@ -54,3 +54,5 @@ export * from './follow-up.js';
 
 export * from './proactive-reply.js';
 export * from './proactive-status.js';
+
+export * from './pending-action-result.js';

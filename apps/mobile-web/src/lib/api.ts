@@ -1,4 +1,4 @@
-import type { HeartbeatPresentation } from '@clem/chat-engine';
+import type { HeartbeatPresentation, PendingActionResultLookup } from '@clem/chat-engine';
 import { readChatStopReceipt, readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike, type WorkflowStopQualification } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
@@ -435,6 +435,19 @@ export interface ApprovalsListResponse {
 
 export async function listApprovals(): Promise<ApprovalsListResponse> {
   return api<ApprovalsListResponse>('/m/api/approvals');
+}
+
+/** Read one card's durable result in its raw owning session. The shared chat
+ * projection admits the response and pins a discovered legacy relation. */
+export async function getApprovalResult(card: PendingActionResultLookup, signal?: AbortSignal): Promise<unknown> {
+  const query = new URLSearchParams({ sessionId: card.sessionId });
+  if (card.pendingActionId) query.set('pendingActionId', card.pendingActionId);
+  if (card.payloadHash) query.set('payloadHash', card.payloadHash);
+  if (card.recordUpdatedAt) query.set('recordUpdatedAt', card.recordUpdatedAt);
+  return api(`/m/api/approvals/${encodeURIComponent(card.approvalId)}/result?${query}`, {
+    signal,
+    cache: 'no-store',
+  });
 }
 
 export async function approveApproval(id: string, modifiedArgs?: string): Promise<unknown> {

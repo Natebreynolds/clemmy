@@ -484,6 +484,12 @@ export interface ChatMessage {
     /** The card links a queued exact payload (a command, a send): its fields
      *  can be edited by hand on the card and the edited record runs. */
     queued?: boolean;
+    /** Exact raw owner and retained action relation, for display-only GETs. */
+    ownerSessionId?: string;
+    pendingActionId?: string;
+    payloadHash?: string;
+    recordUpdatedAt?: string;
+    resultRecord?: import('./pending-action-result.js').PendingActionResultRecord;
     /** Host reducer facts, passed through unchanged for display, not authority. */
     consentCall?: {
       effect: string;

@@ -75,6 +75,8 @@ export interface Turn {
     subject: string;
     reason?: string;
     approvalId: string;
+    ownerSessionId?: string;
+    pendingActionId?: string;
     pendingAction?: unknown;
     preview?: unknown;
     /** The card this one revises after a change in words (owner's words, fields as they were). */

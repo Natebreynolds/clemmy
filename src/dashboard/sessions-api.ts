@@ -1,3 +1,4 @@
+import { readApprovalCardResultSnapshot } from '../runtime/harness/approval-card-result-reader.js';
 /**
  * Unified Conversations API — the desktop console as a single client over
  * the two session engines.
@@ -733,7 +734,12 @@ function detailForHarnessRow(row: HarnessSessionRow): SessionDetail {
   fillWorkflowRunStatus(summary, createWorkflowRunStatusReader());
   const turns = reconstructHarnessDetailTurns(row);
   const executionSessionId = summary.executionSessionId ?? row.id;
-  appendPendingApprovalTurns(executionSessionId, turns);
+  // Selector-proven conversation ancestry only. A card keeps its own session
+  // even when the next accepted message moved the conversation's head.
+  const approvalConversation = readAcceptedSourceConversationProjection(row.id);
+  const approvalSessions = approvalConversation?.headSessionId === executionSessionId
+    ? approvalConversation.sessionIds : [executionSessionId];
+  for (const ownerSessionId of approvalSessions) appendPendingApprovalTurns(ownerSessionId, turns);
   // Only a continuable chat can own an inline plan decision. Workflow,
   // execution, and agent transcripts are intentionally read-only; attaching
   // an Approve card there would paint a gate whose handlers are no-ops.
@@ -805,8 +811,8 @@ function appendPendingPlanProposalTurns(sessionId: string, turns: UnifiedSession
  * (live 2026-07-23). Attach one synthetic assistant turn per approval that is
  * still pending. A formal card whose lifetime ran out unanswered stays too,
  * marked expired: otherwise the chat ended on Clem's question with no sign of
- * what became of it. Answered or closed approvals render nothing; the turns
- * after them tell that story.
+ * what became of it. Recent bound results remain discoverable without reopening
+ * a decision; their substantive reply stays in the conversation.
  */
 function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn[]): void {
   try {
@@ -824,6 +830,9 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
     const cardEvents = listHarnessEvents(sessionId, { types: ['approval_requested'] });
     if (cardEvents.length === 0) return;
     const seen = new Set<string>();
+    // Reopening history must not read every old action/terminal. Recent linked
+    // results get a cheap typed record view; richer text is one exact-card GET.
+    const recentResultCards = new Set(cardEvents.slice(-12).map(event => event.id));
     for (const ev of cardEvents) {
       const d = ev.data as Record<string, unknown>;
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : '';
@@ -831,9 +840,15 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
       seen.add(approvalId);
       const rowNow = approvalRegistry.get(approvalId);
       if (!rowNow) continue;
+      if (rowNow.sessionId !== sessionId || ev.sessionId !== sessionId) continue;
       const expiredUnanswered = rowNow.status === 'expired' && rowNow.resolution === 'expired';
       const decided = rowNow.status === 'resolved' ? receipts.get(approvalId) : undefined;
-      if (rowNow.status !== 'pending' && !expiredUnanswered && !decided) continue;
+      const exactResult = rowNow.status !== 'pending' && recentResultCards.has(ev.id)
+        ? readApprovalCardResultSnapshot({ approvalId, sessionId }) : null;
+      const result = exactResult?.ok && ['executing', 'executed', 'failed'].includes(exactResult.value.pendingAction.status)
+        ? exactResult.value.pendingAction : null;
+      if (rowNow.status !== 'pending' && !expiredUnanswered && !decided && !result) continue;
+      if (turns.some(turn => turn.approval?.approvalId === approvalId)) continue;
       if (!approvalRegistry.isFormalApprovalSurface(rowNow)) {
         if (rowNow.status !== 'pending') continue;
         turns.push({
@@ -843,30 +858,40 @@ function appendPendingApprovalTurns(sessionId: string, turns: UnifiedSessionTurn
         });
         continue;
       }
-      // The reply that paused on this card already reads as its question;
-      // the still-pending card takes that turn's place rather than asking
-      // twice.
+      const actionView = pendingActionApprovalViewFromArgs(rowNow.args ?? null);
+      const sameResult = result && actionView && actionView.id === result.id && actionView.approvalId === result.approvalId
+        && actionView.payloadHash === result.payloadHash && actionView.updatedAt === result.updatedAt
+        && actionView.status === result.status && actionView.resultSummary === result.resultSummary;
+      // A racing result never attaches to the prior card snapshot. Keep the
+      // existing paused turn too: an executing action may not have a B reply.
+      if (result && !sameResult) continue;
+      // Only replace the paused question once its card view can be attached.
       const paused = turns.findIndex((turn) => turn.role === 'assistant' && turn.pausedOnApprovalId === approvalId && !turn.approval);
       if (paused >= 0) turns.splice(paused, 1);
+      const closedResolution = rowNow.status === 'cancelled' ? 'cancelled' as const
+        : rowNow.resolution === 'approved' ? 'approved' as const
+          : rowNow.resolution === 'rejected' ? 'declined' as const
+            : rowNow.status === 'expired' ? 'expired' as const : undefined;
       turns.push({
         role: 'assistant',
         text: '',
         createdAt: ev.createdAt,
         approval: {
+          ownerSessionId: sessionId,
           subject: typeof d.subject === 'string' && d.subject ? d.subject : String(d.tool ?? 'this action'),
           reason: typeof d.reason === 'string' ? d.reason : undefined,
           approvalId,
           // Hydrated fresh from the registry row (card events are slim, ids
           // only) — also picks up the CURRENT pending-action state rather
           // than a snapshot from park time.
-          pendingAction: pendingActionApprovalViewFromArgs(rowNow.args ?? null),
+          pendingAction: sameResult ? { ...actionView, ...result } : actionView,
           // What approving would do, as the live card showed it.
           ...(approvalPreviewProjection(d.preview) ?? {}),
           // The change in words this card carries (owner's words, fields as
           // they were), so the reopened chat draws it as the live one did.
           ...(approvalRevisionProjection(d.revises) ?? {}),
           ...(expiredUnanswered ? { resolution: 'expired' as const } : {}),
-          ...(decided ? { resolution: decided } : {}),
+          ...(decided ? { resolution: decided } : result && closedResolution ? { resolution: closedResolution } : {}),
         },
       });
     }

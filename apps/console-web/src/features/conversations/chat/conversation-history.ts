@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation } from '@clem/chat-engine';
+import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation, approvalResultFields } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -119,12 +119,13 @@ function historyMessage(turn: Turn): ChatMessage {
         subject: turn.approval.subject,
         reason: turn.approval.reason,
         approvalId: turn.approval.approvalId,
+        ...approvalResultFields(turn.approval as unknown as Record<string, unknown>, turn.approval.ownerSessionId),
         pendingAction: pendingActionFromEvent(turn.approval.pendingAction),
         ...(approvalPreviewFrom(turn.approval.preview) ? { preview: approvalPreviewFrom(turn.approval.preview) } : {}),
         // A reopened chat draws the change on the card as the live one did.
         ...(approvalRevisionFrom(turn.approval.revises) ? { revises: approvalRevisionFrom(turn.approval.revises) } : {}),
-        ...(['approved', 'declined', 'changed', 'expired'].includes(String(turn.approval.resolution))
-          ? { resolution: turn.approval.resolution as 'approved' | 'declined' | 'changed' | 'expired' } : {}),
+        ...(['approved', 'declined', 'changed', 'expired', 'cancelled'].includes(String(turn.approval.resolution))
+          ? { resolution: turn.approval.resolution as 'approved' | 'declined' | 'changed' | 'expired' | 'cancelled' } : {}),
       },
     };
   }

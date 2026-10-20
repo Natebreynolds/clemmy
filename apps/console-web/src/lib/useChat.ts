@@ -1,3 +1,5 @@
+import { approvalResultFields, normalizePendingActionPublicResult } from '@clem/chat-engine';
+import type { PendingActionResultRecord } from '@clem/chat-engine';
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
@@ -158,6 +160,10 @@ export interface ChatMessage {
     reason?: string;
     approvalId?: string | null;
     pendingActionId?: string;
+    ownerSessionId?: string;
+    payloadHash?: string;
+    recordUpdatedAt?: string;
+    resultRecord?: PendingActionResultRecord;
     pendingAction?: PendingActionApprovalView;
     /** What approving would do: operation + argument values (display only). */
     preview?: ApprovalPreview;
@@ -356,6 +362,7 @@ export function appendLiveApprovalCard(
         subject: String(d.subject ?? d.tool ?? 'this action'),
         reason: typeof d.reason === 'string' ? d.reason : undefined,
         approvalId,
+        ...approvalResultFields(d, event.sessionId),
         ...(pendingActionId ? { pendingActionId } : {}),
         ...(pendingAction ? { pendingAction } : {}),
         ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
@@ -1513,6 +1520,14 @@ export function pendingActionFromEvent(value: unknown): PendingActionApprovalVie
     resultSummary: typeof record.resultSummary === 'string' ? record.resultSummary : null,
     createdAt: typeof record.createdAt === 'string' ? record.createdAt : '',
     updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : '',
+    ...(() => {
+      const result = normalizePendingActionPublicResult(record.publicResult, {
+        id: record.id!, approvalId: typeof record.approvalId === 'string' ? record.approvalId : null,
+        payloadHash: typeof record.payloadHash === 'string' ? record.payloadHash : '',
+        updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : '', status: typeof record.status === 'string' ? record.status : 'queued',
+      });
+      return result ? { publicResult: result } : {};
+    })(),
   };
 }
 
@@ -1541,10 +1556,15 @@ export function pendingActionIdFromApprovalEvent(
   return undefined;
 }
 
-/** Apply one durable hydration result to every live/replayed card for the same
- * action. A crash-repaired stream can contain more than one card referencing
- * that id; one read must not leave the later card generic merely because the
- * first card owned the in-flight request. */
+/** Full editable payloads are needed only while the question is still waiting.
+ * Closed historical results use an explicit exact-card read instead. */
+export function pendingActionNeedsPayloadHydration(message: ChatMessage): boolean {
+  const approval = message.approval;
+  return !!approval?.approvalId && !!approval.pendingActionId && !approval.pendingAction && !approval.resolution
+    && (!approval.resultRecord || ['queued', 'approval_requested'].includes(approval.resultRecord.status));
+}
+
+/** An action id alone cannot hydrate a revised or different approval card. */
 export function mergePendingActionHydration(
   messages: readonly ChatMessage[],
   pendingActionId: string,
@@ -1553,8 +1573,12 @@ export function mergePendingActionHydration(
   let changed = false;
   const next = messages.map((message) => {
     if (
-      message.approval?.pendingActionId !== pendingActionId
-      || message.approval.pendingAction
+      pendingAction.id !== pendingActionId || !pendingActionNeedsPayloadHydration(message)
+      || message.approval?.pendingActionId !== pendingActionId
+      || message.approval.approvalId !== pendingAction.approvalId
+      || (message.approval.payloadHash !== undefined && message.approval.payloadHash !== pendingAction.payloadHash)
+      || (message.approval.recordUpdatedAt !== undefined && (!Number.isFinite(Date.parse(message.approval.recordUpdatedAt))
+        || Date.parse(pendingAction.updatedAt) < Date.parse(message.approval.recordUpdatedAt)))
     ) return message;
     changed = true;
     return {
@@ -1769,10 +1793,7 @@ export function useChat(options?: UseChatOptions) {
   useEffect(() => {
     const missingIds = new Set(
       messages
-        .filter((message) => (
-          message.approval?.pendingActionId
-          && !message.approval.pendingAction
-        ))
+        .filter(pendingActionNeedsPayloadHydration)
         .map((message) => message.approval!.pendingActionId!),
     );
     for (const pendingActionId of missingIds) {
@@ -2765,7 +2786,7 @@ export function inboxOutcomeCursorForSession(
  *  when one exists — never a Map keyed by turn, because proactive relays are
  *  commonly all stamped turn 0. Exported for tests. */
 export function inboxAdditionsFromEvents(
-  events: Array<{ seq: number; turn: number; type: string; data: Record<string, unknown> }>,
+  events: Array<{ seq: number; turn: number; type: string; sessionId?: string; data: Record<string, unknown> }>,
   deliveries: InboxOutcomeDeliveryState,
 ): ChatMessage[] {
   const additions: ChatMessage[] = [];
@@ -2899,6 +2920,7 @@ export function inboxAdditionsFromEvents(
           subject: String(d.subject ?? d.tool ?? 'this action'),
           reason: typeof d.reason === 'string' ? d.reason : undefined,
           approvalId,
+          ...approvalResultFields(d, ev.sessionId),
           ...(pendingActionId ? { pendingActionId } : {}),
           ...(pendingAction ? { pendingAction } : {}),
           ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),

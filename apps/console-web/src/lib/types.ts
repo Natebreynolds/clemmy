@@ -36,17 +36,8 @@ export interface ChatPostResult {
   replayed?: boolean;
 }
 
-export interface PendingActionPublicResult {
-  version: 1;
-  pendingActionId: string;
-  approvalId: string | null;
-  payloadHash: string;
-  recordUpdatedAt: string;
-  status: 'executed' | 'failed' | 'executing' | 'rejected' | 'expired' | 'cancelled';
-  source: 'record' | 'terminal';
-  text: string;
-  terminal?: { eventId: string; sourceUserSeq: number };
-}
+import type { PendingActionPublicResult } from '@clem/chat-engine';
+export type { PendingActionPublicResult } from '@clem/chat-engine';
 
 export interface PendingActionApprovalView {
   id: string;

@@ -1,3 +1,4 @@
+import { ApprovalResult } from './ApprovalResult';
 import { ConnectionSetup, type ConnectionResume } from './ConnectionSetup';
 import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
@@ -5,7 +6,7 @@ import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ArrowUpRight, Check, Send, X } from 'lucide-react';
-import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate, isIdentifierLike } from '@clem/chat-engine';
+import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate, isIdentifierLike, normalizePendingActionResultRecord, retainPendingActionPresentation } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
@@ -40,7 +41,7 @@ import type { ChatMessage } from '@/lib/useChat';
 const QUEUED_RUNNING_NOTE = 'Running the approved action now.';
 type DurableActionPresentation = Extract<PendingActionExecutionPresentation, { mode: 'durable' }>;
 type ActionExecutionView = { phase: 'idle' | PendingActionExecutionPhase; note?: string; details?: string;
-  presentation?: DurableActionPresentation; observedExecution?: boolean };
+  presentation?: DurableActionPresentation; observedExecution?: boolean; relationKey?: string };
 function actionExecutionView(presentation: DurableActionPresentation, observedExecution = false): ActionExecutionView {
   const copy = pendingActionPresentationCopy(presentation);
   const defaultNote: Partial<Record<PendingActionExecutionPhase, string>> = {
@@ -432,7 +433,7 @@ export function ChatBubble({
   // Execute-button truth (U3): a pending-action card's Execute fires the exact
   // stored call server-side and shows the DURABLE outcome — never a client-side
   // "Submitted" that outruns whether the send actually happened.
-  const [exec, setExec] = useState<ActionExecutionView>({ phase: 'idle' });
+  const [storedExec, setStoredExec] = useState<ActionExecutionView>({ phase: 'idle' });
   // Grant-at-card (C, v2.3.0): opting in stores a NARROW standing send-trust
   // grant (exactly this card's recipients on this toolkit) so the next
   // identical send skips the card. trustNote reports the server's truth —
@@ -446,10 +447,20 @@ export function ChatBubble({
   const editableField = editableApprovalField(message.approval?.preview);
   const [trustNote, setTrustNote] = useState<string | null>(null);
   const pendingAction = message.approval?.pendingAction;
-  const pendingActionId = pendingAction?.id;
+  const pendingActionId = pendingAction?.id ?? message.approval?.pendingActionId ?? message.approval?.resultRecord?.id;
   const pendingApprovalId = message.approval?.approvalId ?? message.approval?.pendingAction?.approvalId ?? null;
-  const pendingPayloadHash = message.approval?.pendingAction?.payloadHash;
-  const pendingRevision = message.approval?.pendingAction?.updatedAt;
+  const pendingPayloadHash = pendingAction?.payloadHash ?? message.approval?.payloadHash ?? message.approval?.resultRecord?.payloadHash;
+  const pendingRevision = pendingAction?.updatedAt ?? message.approval?.recordUpdatedAt ?? message.approval?.resultRecord?.updatedAt;
+  const actionRelationKey = JSON.stringify([pendingActionId, pendingApprovalId, pendingPayloadHash]);
+  const currentActionRelation = useRef(actionRelationKey); currentActionRelation.current = actionRelationKey;
+  const exec: ActionExecutionView = storedExec.relationKey === actionRelationKey ? storedExec : { phase: 'idle' };
+  const setExec = (value: ActionExecutionView | ((current: ActionExecutionView) => ActionExecutionView)) => {
+    setStoredExec(current => {
+      if (currentActionRelation.current !== actionRelationKey) return current;
+      const own = current.relationKey === actionRelationKey ? current : { phase: 'idle' as const };
+      return { ...(typeof value === 'function' ? value(own) : value), relationKey: actionRelationKey };
+    });
+  };
   const queuedCardKey = JSON.stringify([pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision]);
   const currentQueuedCard = useRef(queuedCardKey);
   currentQueuedCard.current = queuedCardKey;
@@ -468,9 +479,10 @@ export function ChatBubble({
     const presentation = pendingActionRecordPresentation(pendingAction);
     if (presentation?.mode !== 'durable') return;
     setExec((current) => {
-      if (current.phase === 'idle') return actionExecutionView(presentation);
-      const enriched = pendingActionTerminalResultUpgrade(current.presentation, presentation);
-      return enriched?.mode === 'durable' ? actionExecutionView(enriched) : current;
+      const known = current.phase === 'idle' ? undefined : current.presentation
+        ?? { mode: 'durable' as const, phase: current.phase, ...(current.note ? { note: current.note } : {}) };
+      const retained = retainPendingActionPresentation(known, presentation);
+      return retained?.mode === 'durable' ? actionExecutionView(retained, current.observedExecution) : current;
     });
   }, [pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision, propResultKey]);
   const terminalResultKey = useMemo(() => JSON.stringify(exec.presentation), [exec.presentation]);
@@ -493,7 +505,7 @@ export function ChatBubble({
   }, [hydrationCardKey, terminalResultKey, exec.observedExecution]);
   // A queued card follows its durable record until the resume picks it up,
   // so the label moves from "Up next" to the real outcome by itself.
-  const followingQueued = exec.phase === 'queued' || (exec.phase === 'running' && exec.note === QUEUED_RUNNING_NOTE);
+  const followingQueued = exec.observedExecution === true && (exec.phase === 'queued' || (exec.phase === 'running' && exec.note === QUEUED_RUNNING_NOTE));
   useEffect(() => {
     if (!pendingActionId || !followingQueued) return;
     return startQueuedPendingActionPolling({
@@ -502,7 +514,7 @@ export function ChatBubble({
       // Props can change before the previous effect's cleanup runs. Never
       // attach that card's late response to a replacement/revised card.
       if (currentQueuedCard.current !== queuedCardKey || progress.mode !== 'durable') return;
-      if (progress.phase === 'running') setExec({ phase: 'running', note: QUEUED_RUNNING_NOTE });
+      if (progress.phase === 'running') setExec({ phase: 'running', note: QUEUED_RUNNING_NOTE, observedExecution: true });
       else showDurablePresentation(progress);
     });
   }, [pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision, queuedCardKey, followingQueued]);
@@ -598,24 +610,13 @@ export function ChatBubble({
   // card, not the conversation; only one that failed to land is shown. A
   // decided card keeps its own receipt, without claiming its work finished.
   if (hiddenCardDecision(message)) return null;
-  if (!isUser && message.approval?.resolution === 'cancelled'
-    && (exec.phase === 'idle' || exec.phase === 'cancelled')) return (
-    <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 py-1 text-caption text-muted" role="status">
-      <span className="break-words">{message.approval.subject}</span>
-      <span>Approval closed</span>
-    </div>
-  );
-  if (message.status === 'awaiting-approval'
-    && !message.approval?.pendingAction && !message.approval?.pendingActionId
-    && exec.phase === 'idle' && !exec.note && !decisionError && !trustNote
-    && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined')) return (
-    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-4 py-3" role="status">
-      <span className="text-body text-muted">{message.approval.subject}</span>
-      <StatusPill tone="neutral" icon={message.approval.resolution === 'approved' ? Check : X}>
-        {message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}
-      </StatusPill>
-    </div>
-  );
+  const retainedActionResult = normalizePendingActionResultRecord(message.approval?.resultRecord);
+  const resultClosesQuestion = retainedActionResult?.approvalId === message.approval?.approvalId
+    && !['queued', 'approval_requested'].includes(retainedActionResult?.status ?? 'queued');
+  if (!isUser && message.status === 'awaiting-approval' && message.approval && (message.approval.resolution || resultClosesQuestion)) {
+    return <ApprovalResult approval={message.approval} observed={exec.phase !== 'idle'
+      ? exec.presentation ?? { mode: 'durable', phase: exec.phase, ...(exec.note ? { note: exec.note } : {}) } : undefined} />;
+  }
 
   if (isUser) {
     return (

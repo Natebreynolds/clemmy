@@ -485,7 +485,7 @@ test('one pending-action read hydrates every slim card sharing the durable actio
 
   const hydrated = mergePendingActionHydration(messages, pendingAction.id, pendingAction);
   assert.equal(hydrated[0].approval?.pendingAction, pendingAction);
-  assert.equal(hydrated[1].approval?.pendingAction, pendingAction);
+  assert.equal(hydrated[1].approval?.pendingAction, undefined, 'a same-action-id card for a different approval cannot borrow its payload');
   assert.equal(
     mergePendingActionHydration(hydrated, pendingAction.id, pendingAction),
     hydrated,

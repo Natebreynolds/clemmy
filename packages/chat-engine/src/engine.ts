@@ -1,3 +1,4 @@
+import { approvalResultFields } from './pending-action-result.js';
 import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
 import { followUpSendsAfter, steerRefusalWaitsForTurnEnd } from './follow-up.js';
 import { readQuestionOptions } from './question-options.js';
@@ -932,6 +933,7 @@ export class ChatEngine {
             subject: String(d.subject ?? d.tool ?? 'this action'),
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
+            ...approvalResultFields(d, event.sessionId ?? this.sessionId ?? undefined),
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
             ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
@@ -1524,6 +1526,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
             subject: String(d.subject ?? d.tool ?? 'this action'),
             reason: typeof d.reason === 'string' ? d.reason : undefined,
             approvalId,
+            ...approvalResultFields(d, event.sessionId ?? sessionId ?? undefined),
             ...(d.consentCall ? { consentCall: d.consentCall as NonNullable<ChatMessage['approval']>['consentCall'] } : {}),
             ...(approvalPreviewFrom(d.preview) ? { preview: approvalPreviewFrom(d.preview) } : {}),
             ...(approvalRevisionFrom(d.revises) ? { revises: approvalRevisionFrom(d.revises) } : {}),
