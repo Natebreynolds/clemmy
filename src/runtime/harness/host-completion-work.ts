@@ -13,6 +13,7 @@ import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
 import type { JudgeEvidenceSource } from './judge-evidence-tools.js';
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
+import { durableLogicalCallContract } from './logical-call-contract.js';
 import { normalizeCallableArguments } from './callable-contract.js';
 import { retainedProjectionSourceScope } from './retained-projection-scope.js';
 import { loadRetainedReaderProjection } from './retained-reader-projection-receipt.js';
@@ -242,11 +243,93 @@ export function sourceProducedOutput(input: {
   sourceUserSeq: number;
 }): boolean {
   try {
-    return settledCalls(input).some((row) => (row.mutating === 1 || registryDeclaresWrite(row.toolName))
-      && !isRestorableExecution(row));
+    const rows = settledCalls(input);
+    if (rows.some((row) => row.toolName === 'run_shell_command' && row.mutating === 0)
+      && shellSourceHasOutputOrIncompleteCall(input)) return true;
+    const budget = { calls: 0, bytes: 0 };
+    return rows.some((row) => {
+      if (row.outcomeDetail === HOST_EXECUTION_SAVED_LOCAL_FILES || !row.toolName) return true;
+      if (isRestorableExecution(row)) return false;
+      if (row.mutating !== 0) return true;
+      if (!registryDeclaresWrite(row.toolName)) return false;
+      return !verifiedNonProducingShell(input, row, budget);
+    });
   } catch {
     return true;
   }
+}
+
+// This is review selection, never permission to run a command. Keep the
+// exception small: large/spilled results and legacy or incomplete proof retain
+// the existing reviewer rather than adding another unbounded payload read.
+const NO_OUTPUT_SHELL_MAX_BYTES = 65_536;
+const NO_OUTPUT_SHELL_SOURCE_MAX_BYTES = 262_144;
+const NO_OUTPUT_SHELL_MAX_CALLS = 16;
+type SettledOutputCall = MutatingSettlementRow & {
+  mutating: number; logicalToolCallId: string; outcomeDetail: string | null;
+};
+
+function shellSourceHasOutputOrIncompleteCall(input: { sessionId: string; sourceUserSeq: number }): boolean {
+  const db = openEventLog();
+  // One source check, not another JSON/inventory scan per qualifying call.
+  // Missing call ids on older file-revision markers stay conservative.
+  return Boolean(db.prepare(`SELECT 1 FROM events WHERE session_id = ? AND type = 'guardrail_tripped'
+    AND json_extract(data_json, '$.sourceUserSeq') = ?
+    AND json_extract(data_json, '$.kind') = 'own_file_revision_after_command' LIMIT 1`)
+    .get(input.sessionId, input.sourceUserSeq)
+    || db.prepare(`SELECT 1 FROM logical_tool_calls l WHERE session_id = ? AND source_user_seq = ?
+      AND tool_name = 'run_shell_command' AND (state != 'settled' OR NOT EXISTS (
+        SELECT 1 FROM logical_call_settlements s WHERE s.session_id = l.session_id
+          AND s.source_user_seq = l.source_user_seq AND s.logical_tool_call_id = l.logical_tool_call_id)) LIMIT 1`)
+      .get(input.sessionId, input.sourceUserSeq));
+}
+
+function verifiedNonProducingShell(
+  input: { sessionId: string; sourceUserSeq: number },
+  row: SettledOutputCall,
+  budget: { calls: number; bytes: number },
+): boolean {
+  if (row.toolName !== 'run_shell_command'
+    || TOOL_REGISTRY.find((entry) => entry.name === row.toolName)?.effectDecidedPerCall !== true
+    || row.executionKind !== 'local_execution'
+    || !['succeeded', 'empty_result'].includes(row.outcomeKind ?? '')
+    || ++budget.calls > NO_OUTPUT_SHELL_MAX_CALLS) return false;
+  const db = openEventLog();
+  // octet_length inspects SQLite's retained size before either reader opens
+  // payload/request bytes. Only bounded inline results qualify in this slice.
+  const size = db.prepare(`SELECT h.raw_byte_count AS resultBytes,
+      octet_length(e.data_json) AS requestBytes
+    FROM logical_call_settlements s JOIN durable_result_handles h ON h.handle_id = s.result_handle_id
+    JOIN physical_dispatches p ON p.session_id = s.session_id AND p.source_user_seq = s.source_user_seq
+      AND p.logical_tool_call_id = s.logical_tool_call_id AND p.physical_dispatch_id = h.physical_dispatch_id
+    JOIN events e ON e.id = p.start_event_id AND e.session_id = p.session_id
+    WHERE s.session_id = ? AND s.source_user_seq = ? AND s.logical_tool_call_id = ?
+      AND s.crossing_authority_version = 2 AND s.physical_crossing_count = 0 AND s.host_crossing_count = 1
+      AND h.raw_byte_count BETWEEN 1 AND ? AND h.raw_payload_json != ''
+      AND octet_length(h.raw_payload_json) = h.raw_byte_count
+      AND octet_length(e.data_json) BETWEEN 1 AND ?`)
+    .get(input.sessionId, input.sourceUserSeq, row.logicalToolCallId,
+      NO_OUTPUT_SHELL_MAX_BYTES, NO_OUTPUT_SHELL_MAX_BYTES) as { resultBytes: number; requestBytes: number } | undefined;
+  if (!size || (budget.bytes += size.resultBytes + size.requestBytes) > NO_OUTPUT_SHELL_SOURCE_MAX_BYTES) return false;
+  const identity = { ...input, acceptedTaskId: evidenceAcceptedTaskId(input.sessionId, input.sourceUserSeq),
+    logicalToolCallId: row.logicalToolCallId };
+  const canonical = redeemDurableLogicalCallSettlementForHost(identity);
+  if (canonical.status !== 'ok') return false;
+  const settled = canonical.settlement;
+  const crossing = settled.crossings[0];
+  if (settled.toolName !== row.toolName || settled.recovery.mutating !== false
+    || settled.executionKind !== 'local_execution' || settled.crossingAuthorityVersion !== 2
+    || settled.outcome.kind !== row.outcomeKind || settled.outcome.detail === HOST_EXECUTION_SAVED_LOCAL_FILES
+    || settled.physicalCrossingCount !== 0 || settled.hostCrossingCount !== 1 || settled.crossings.length !== 1
+    || crossing?.terminalState !== 'returned' || crossing.executionSite !== 'host') return false;
+  const result = redeemSuccessfulSettlementResultForHost(identity);
+  if (result.status !== 'ok' || result.value.toolName !== row.toolName || result.value.executionSite !== 'host'
+    || result.value.resultHandleId !== settled.resultHandleId
+    || result.value.physicalDispatchId !== crossing.physicalDispatchId) return false;
+  const request = loadPhysicalRequestEvidence({ ...input, logicalToolCallId: row.logicalToolCallId,
+    physicalDispatchId: result.value.physicalDispatchId });
+  const contract = request && durableLogicalCallContract(identity.acceptedTaskId, row.toolName, request.args);
+  return Boolean(contract && contract.toolName === settled.toolName && contract.argumentDigest === settled.argumentDigest);
 }
 
 function registryDeclaresWrite(toolName: string | null): boolean {
@@ -254,9 +337,10 @@ function registryDeclaresWrite(toolName: string | null): boolean {
   return row?.sideEffect === 'write';
 }
 
-function settledCalls(input: { sessionId: string; sourceUserSeq: number }): Array<MutatingSettlementRow & { mutating: number }> {
+function settledCalls(input: { sessionId: string; sourceUserSeq: number }): SettledOutputCall[] {
   return openEventLog().prepare(`
     SELECT s.mutating AS mutating, s.execution_kind AS executionKind, s.outcome_kind AS outcomeKind,
+           s.logical_tool_call_id AS logicalToolCallId, s.outcome_detail AS outcomeDetail,
            s.requirement_id AS requirementId, l.tool_name AS toolName
       FROM logical_call_settlements s
       LEFT JOIN logical_tool_calls l
@@ -264,7 +348,7 @@ function settledCalls(input: { sessionId: string; sourceUserSeq: number }): Arra
        AND l.source_user_seq = s.source_user_seq
        AND l.logical_tool_call_id = s.logical_tool_call_id
      WHERE s.session_id = ? AND s.source_user_seq = ?
-  `).all(input.sessionId, input.sourceUserSeq) as Array<MutatingSettlementRow & { mutating: number }>;
+  `).all(input.sessionId, input.sourceUserSeq) as SettledOutputCall[];
 }
 
 export interface MutatingSettlementRow {
