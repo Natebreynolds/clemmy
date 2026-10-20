@@ -17,9 +17,10 @@ export interface PendingActionPublicResult {
   payloadHash: string;
   recordUpdatedAt: string;
   status: ResultStatus;
-  source: 'record' | 'terminal';
+  source: 'record' | 'terminal' | 'authored_projection';
   text: string;
   terminal?: { eventId: string; sourceUserSeq: number };
+  projection?: { id: string; revision: 1; evidenceDigest: string; textDigest: string; publishedAt: string };
 }
 const STATUS_TEXT: Record<ResultStatus, string> = {
   executed: 'The approved action completed. Open execution details to see the recorded result.',

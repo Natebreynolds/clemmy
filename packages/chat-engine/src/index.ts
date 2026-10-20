@@ -56,3 +56,5 @@ export * from './proactive-reply.js';
 export * from './proactive-status.js';
 
 export * from './pending-action-result.js';
+
+export * from './approval-result-update.js';

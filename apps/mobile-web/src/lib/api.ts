@@ -19,6 +19,7 @@ import { connectionDoor, reportConnectionLost, setConnectionDoor } from './nativ
 import { LAST_GOOD_HEADER, clearLastGood, noteLastGood } from './last-good.js';
 import { readBrainSelectionResponse, type BrainSelectionResponse, type ModelScorecardLike } from '@clem/chat-engine';
 import type { WorkflowRunReceipt } from './workflow-run-receipt';
+import { publishApprovalResultUpdate } from './approval-result-updates.js';
 
 /**
  * The current session's fingerprint, which every proof is signed over.
@@ -1289,6 +1290,9 @@ export function createChatStreamTransport(): {
       });
       source.addEventListener('event', (ev) => {
         try { opts.onEvent(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore */ }
+      });
+      source.addEventListener('approval.result_updated', (ev) => {
+        try { publishApprovalResultUpdate(JSON.parse((ev as MessageEvent).data)); } catch { /* display signal only */ }
       });
       source.addEventListener('error', () => {
         // Close immediately: letting EventSource retry its (now spent-ticket)

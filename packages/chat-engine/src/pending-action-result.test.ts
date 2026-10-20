@@ -145,3 +145,47 @@ test('filling an old immutable relation retains pinned identity and the newest o
   assert.equal(approvalResultRelationKey({ ...first.binding, recordUpdatedAt: at }), approvalResultRelationKey(first.binding));
   assert.equal(sameApprovalResultRelation(first.binding, { ...first.binding, payloadHash: 'other' }), false);
 });
+
+function authoredResult(): PendingActionResultRecord {
+  const base = withResult('terminal');
+  return { ...base, publicResult: { ...base.publicResult!, source: 'authored_projection', text: 'I completed the approved action; the recorded result is available below.',
+    projection: { id: 'projection-fixture', revision: 1, evidenceDigest: 'a'.repeat(64), textDigest: 'b'.repeat(64), publishedAt: later } } };
+}
+
+test('authored wording enriches only the same settled execution and canonical terminal', async () => {
+  const { retainPendingActionPresentation } = await import('./pending-action-result.js');
+  const recordOnly = withResult('record'); const terminal = withResult('terminal'); const authored = authoredResult();
+  assert.deepEqual(normalizePendingActionResultRecord(authored), authored);
+  assert.equal(mergeApprovalResultRecord(recordOnly, authored), authored);
+  assert.equal(mergeApprovalResultRecord(terminal, authored), authored);
+  assert.equal(mergeApprovalResultRecord(authored, terminal), authored);
+  assert.equal(mergeApprovalResultRecord(authored, recordOnly), authored);
+  const before = pendingActionRecordPresentation(terminal)!; const after = pendingActionRecordPresentation(authored)!;
+  assert.deepEqual(retainPendingActionPresentation(before, after), after);
+  assert.equal(retainPendingActionPresentation(after, before), after);
+  assert.equal(pendingActionPresentationCopy(after).details, authored.resultSummary);
+  assert.equal(pendingActionPresentationCopy(after).note, authored.publicResult!.text);
+  for (const change of [
+    { ...authored, updatedAt: later, publicResult: { ...authored.publicResult!, recordUpdatedAt: later } },
+    { ...authored, resultSummary: 'Changed execution result' },
+    { ...authored, publicResult: { ...authored.publicResult!, terminal: { eventId: 'foreign-terminal', sourceUserSeq: 12 } } },
+    { ...authored, publicResult: { ...authored.publicResult!, terminal: { eventId: 'event-terminal', sourceUserSeq: 13 } } },
+  ]) assert.equal(mergeApprovalResultRecord(terminal, change), null);
+  for (const change of [
+    { ...authored, publicResult: { ...authored.publicResult!, text: 'Changed authored answer' } },
+    { ...authored, publicResult: { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, textDigest: 'c'.repeat(64) } } },
+    { ...authored, publicResult: { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, id: 'replacement-projection' } } },
+  ]) assert.equal(mergeApprovalResultRecord(authored, change), null);
+});
+
+test('failed actions and incomplete authored receipts cannot claim authored success', () => {
+  const authored = authoredResult();
+  for (const change of [
+    { ...authored.publicResult!, status: 'failed' },
+    { ...authored.publicResult!, terminal: undefined },
+    { ...authored.publicResult!, projection: undefined },
+    { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, revision: 2 } },
+    { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, evidenceDigest: 'not-a-digest' } },
+    { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, textDigest: '' } },
+  ]) assert.equal(normalizePendingActionPublicResult(change, change.status === 'failed' ? { ...authored, status: 'failed' } : authored), null);
+});

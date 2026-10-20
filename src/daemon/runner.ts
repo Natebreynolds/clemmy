@@ -2648,6 +2648,19 @@ export async function startDaemon(
   }
   // Re-queue tasks interrupted by a previous restart/crash so the work
   // resumes instead of stranding (bounded by resumeCount to avoid loops).
+  // Optional card wording owns its own durable model job. Startup never
+  // reconstructs a human turn or retries a previously started request.
+  try {
+    const projection = await import('../runtime/harness/approved-action-result-projection.js');
+    projection.startApprovedActionResultProjectionDrain();
+    const stopProjection = () => projection.stopApprovedActionResultProjectionDrain();
+    // Run before the outer process shutdown handler closes shared resources.
+    process.prependOnceListener('SIGTERM', stopProjection);
+    process.prependOnceListener('SIGINT', stopProjection);
+    process.once('beforeExit', stopProjection);
+  } catch {
+    logger.warn('Optional approval result wording is unavailable; recorded execution results remain available');
+  }
   try {
     const autoResumed = resumeInterruptedBackgroundTasks({ cap: 2 });
     if (autoResumed > 0) {

@@ -4186,7 +4186,16 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     // step sessions whose origin observer is this chat — without them the
     // phone shows a silent bubble for the whole delegated run.
     const bridgesToThisSession = createBridgePredicate(session.id);
+    // The existing selector proves at most eight same-principal ancestors.
+    // Snapshot once for this stream; preserve each card's raw owner in the signal.
+    const resultDisplayOwners = new Set([session.id, ...sameConversationAncestorSessionIds({ sessionId: session.id, principalId: streamDeviceId })]);
     const unsubscribe = actionBus.subscribe((event) => {
+      if (event.kind === 'approval.result_updated') {
+        // A display invalidation has no harness sequence and creates no bubble.
+        // Only proven ancestry can cross a branch, and never changes the owner.
+        if (resultDisplayOwners.has(event.sessionId)) writeEvent('approval.result_updated', event);
+        return;
+      }
       if (event.kind !== 'harness.public_event') return;
       if (event.sessionId !== session.id) {
         if (!isCanonicalBridgedActivity(event.event)) return;

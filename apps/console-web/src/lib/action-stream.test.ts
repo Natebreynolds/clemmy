@@ -403,3 +403,29 @@ test('a Space session\'s progress refreshes the Space screens at once; other ses
   assert.equal(spaceSlugForSession('space-deal-board'), 'deal-board');
   assert.equal(spaceSlugForSession('sess-desktop-abc'), null);
 });
+
+test('authored result signals use the existing socket, bypass history replays and do not invalidate global work', async () => {
+  const { ApprovalResultUpdateGate, approvalResultUpdateLookup } = await import('@clem/chat-engine');
+  const binding = { sessionId: 'exact-card-owner', approvalId: 'apr-result', pendingActionId: 'pa-result', payloadHash: 'fixture-hash', recordUpdatedAt: '2026-10-20T01:00:00.000Z' };
+  const update = { ...binding, kind: 'approval.result_updated' as const, projectionId: 'projection-result' };
+  installBrowser();
+  const requested: unknown[] = []; const invalidated: string[][] = [];
+  const gate = new ApprovalResultUpdateGate();
+  const stop = subscribeActionStream({ onInvalidate: keys => invalidated.push([...keys]), onApprovalResultUpdated(event) {
+    const admitted = gate.admit(event, binding);
+    if (admitted) requested.push(approvalResultUpdateLookup(admitted, binding));
+  } });
+  try {
+    const stream = FakeEventSource.opened.at(-1)!; stream.accept(); mock.timers.tick(1_000); invalidated.length = 0;
+    stream.deliver('replay', [update]);
+    assert.equal(requested.length, 0, 'mounting or reconnecting history cannot fan out result reads');
+    stream.deliver('approval.result_updated', { ...update, sessionId: 'latest-execution-head' });
+    assert.equal(requested.length, 0, 'a successor is not the card owner');
+    stream.deliver('approval.result_updated', update);
+    stream.deliver('approval.result_updated', update);
+    assert.deepEqual(requested, [binding], 'one exact live projection requests one exact read');
+    assert.equal(FakeEventSource.opened.length, 1, 'the result card shares the shell transport');
+    mock.timers.tick(1_000);
+    assert.deepEqual(invalidated, [], 'display wording does not restart work, refresh all history or create global work');
+  } finally { uninstallBrowser(stop); }
+});

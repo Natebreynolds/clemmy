@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
+  ApprovalResultUpdateGate, approvalResultUpdateLookup, approvalResultUpdateMatchesRecord, type ApprovalResultUpdatedEvent,
   approvalResultRelationKey, sameApprovalResultRelation, mergeApprovalResultBinding, mergeApprovalResultRecord, normalizeApprovalResultResponse,
   normalizePendingActionResultRecord, pendingActionPresentationCopy, pendingActionRecordPresentation, retainPendingActionPresentation, renderMarkdown,
   type PendingActionResultLookup, type PendingActionResultRecord, type PendingActionExecutionPresentation,
 } from '@clem/chat-engine';
 import { api } from '@/lib/api';
+import { subscribeActionStream } from '@/lib/action-stream';
 import type { ChatMessage } from '@/lib/useChat';
 
 interface ReadState { key: string; record?: PendingActionResultRecord; binding: PendingActionResultLookup | null; reading: boolean; error?: string }
@@ -31,6 +33,10 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
   const currentKey = useRef(key); currentKey.current = key;
   const request = useRef<AbortController | null>(null);
   const requestSequence = useRef(0);
+  const updateGate = useRef({ key, gate: new ApprovalResultUpdateGate() });
+  if (updateGate.current.key !== key) updateGate.current = { key, gate: new ApprovalResultUpdateGate() };
+  const pendingUpdate = useRef<ApprovalResultUpdatedEvent | null>(null);
+  const refreshRef = useRef<(event?: ApprovalResultUpdatedEvent) => Promise<void>>(async () => {});
   const [state, setState] = useState<ReadState>({ key, record: initial, binding: lookup, reading: false });
   const compatible = state.key === key || sameApprovalResultRelation(state.binding, lookup);
   const visible: ReadState = compatible ? state : { key, record: initial, binding: lookup, reading: false };
@@ -40,24 +46,28 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
       const record = same && current.record ? (initial ? mergeApprovalResultRecord(current.record, initial) ?? current.record : current.record) : initial;
       const binding = same ? mergeApprovalResultBinding(current.binding, lookup, record) : lookup;
       const revised = current.key !== key || binding?.recordUpdatedAt !== current.binding?.recordUpdatedAt;
-      if (revised) { requestSequence.current++; request.current?.abort(); request.current = null; }
+      if (revised) { requestSequence.current++; request.current?.abort(); request.current = null; pendingUpdate.current = null; }
       return { key, record, binding, reading: revised ? false : current.reading,
         ...(same && current.error ? { error: current.error } : {}) };
     });
   }, [key, initialKey, lookup?.recordUpdatedAt]);
-  useEffect(() => () => { requestSequence.current++; request.current?.abort(); request.current = null; }, []);
-  const refresh = async () => {
+  useEffect(() => () => { requestSequence.current++; request.current?.abort(); request.current = null; pendingUpdate.current = null; }, []);
+  const refresh = async (update?: ApprovalResultUpdatedEvent) => {
     if (!visible.binding || request.current) return;
+    if (update && visible.record && approvalResultUpdateMatchesRecord(update, visible.record)) return;
+    const expected = update ? approvalResultUpdateLookup(update, visible.binding, visible.record) : visible.binding;
+    if (!expected) return;
     const controller = new AbortController(); request.current = controller;
     const sequence = ++requestSequence.current;
     const ownsRead = () => currentKey.current === key && requestSequence.current === sequence;
-    const expected = visible.binding;
     setState(current => ownsRead() ? { ...current, reading: true, error: undefined } : current);
     const timeout = setTimeout(() => {
       controller.abort();
       if (ownsRead() && request.current === controller) {
         request.current = null;
         setState(current => ownsRead() ? { ...current, reading: false, error: 'Couldn’t refresh this result. Try again.' } : current);
+        const pending = pendingUpdate.current; pendingUpdate.current = null;
+        if (pending) void refreshRef.current(pending);
       }
     }, 15_000);
     try {
@@ -73,7 +83,7 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
         if (!ownsRead()) return current;
         const admitted = normalizeApprovalResultResponse(raw, current.binding ?? expected);
         const record = admitted && mergeApprovalResultRecord(current.record, admitted.record);
-        if (!admitted || !record) return { ...current, reading: false, error: 'Couldn’t refresh this result. Try again.' };
+        if (!admitted || !record || update && !approvalResultUpdateMatchesRecord(update, admitted.record)) return { ...current, reading: false, error: 'Couldn’t refresh this result. Try again.' };
         return { key: current.key, record, binding: admitted.binding, reading: false };
       });
     } catch {
@@ -81,9 +91,27 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
         error: 'Couldn’t refresh this result. Try again.' } : current);
     } finally {
       clearTimeout(timeout);
-      if (request.current === controller) request.current = null;
+      if (request.current === controller) {
+        request.current = null;
+        const pending = pendingUpdate.current; pendingUpdate.current = null;
+        if (pending && ownsRead()) void refreshRef.current(pending);
+      }
     }
   };
+  refreshRef.current = refresh;
+  const liveState = useRef(visible); liveState.current = visible;
+  useEffect(() => {
+    if (!lookup) return;
+    return subscribeActionStream({ onApprovalResultUpdated(event) {
+      if (currentKey.current !== key) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const current = liveState.current;
+      const admitted = updateGate.current.gate.admit(event, current.binding, current.record);
+      if (!admitted) return;
+      if (request.current) { pendingUpdate.current = admitted; return; }
+      void refreshRef.current(admitted);
+    } });
+  }, [key]);
   const presentation = retainPendingActionPresentation(observed, visible.record ? pendingActionRecordPresentation(visible.record) : null);
   const copy = presentation ? pendingActionPresentationCopy(presentation) : {};
   const labels = { approved: 'Approved', declined: 'Declined', changed: 'Change requested', expired: 'Expired', cancelled: 'Approval closed' };

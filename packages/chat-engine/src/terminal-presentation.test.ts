@@ -209,6 +209,27 @@ test('a typed terminal keeps Clem’s own words, streamed or delivered', () => {
 // The host holds a draft that may not be in the format the owner asked for and
 // publishes Clem's own words with the format notice beside them. Blanking every
 // notice terminal hid her answer, leaving only the status line.
+test('successful approval host text is a notice, never a fabricated Clem reply', () => {
+  const rendered = terminalCompletionPresentation({
+    reply: 'The approved action completed.',
+    presentation: { status: 'done', kind: 'answer', text: 'The approved action completed.' },
+    turnOutcome: { status: 'done' },
+    hostNotice: { code: 'approved_action_completed' },
+    notice: { code: 'approved_action_completed' },
+  }, '');
+  assert.equal(rendered.text, '');
+  assert.equal(rendered.terminal?.notice?.code, 'approved_action_completed');
+  assert.equal(rendered.status, 'complete');
+  const contrary = terminalCompletionPresentation({
+    reply: 'The completion could not be confirmed.',
+    presentation: { status: 'failed', kind: 'error', text: 'The completion could not be confirmed.' },
+    turnOutcome: { status: 'failed' }, notice: { code: 'approved_action_completed' },
+  }, '');
+  assert.equal(contrary.text, 'The completion could not be confirmed.');
+  assert.equal(contrary.terminal?.notice, undefined);
+  assert.equal(contrary.status, 'failed');
+});
+
 test('a format notice sits beside Clem’s own draft: her words stay and the notice line is drawn', () => {
   const draft = '```json\n{"value":"fixture"}\n```\nIts completeness is unknown.';
   for (const code of ['response_format_unmet', 'response_format_unqualified'] as const) {

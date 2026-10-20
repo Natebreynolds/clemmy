@@ -11,6 +11,7 @@ import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { buildSync } from 'esbuild';
 import { ACTIVE_WORK_OBSERVER_LIMITS as observerLimits, observationIdentityDigest, policyMapDigest, type ObservationIdentity, type ObserverToMain } from './active-work-observer-protocol.js';
+import { HARNESS_SCHEMA_VERSION } from '../runtime/harness/schema-version.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-active-work-worker-'));
 Object.assign(process.env, { CLEMENTINE_HOME: home, CLEMMY_TEST_ISOLATED_HOME: '1',
@@ -30,7 +31,7 @@ const workerEntry = new URL('./active-work-observer.worker.ts', import.meta.url)
 const codingBase = path.join(home, 'state', 'coding-runs');
 const machineFile = path.join(home, 'state', 'machine-id');
 const digest = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex');
-const observer = () => createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: 97 });
+const observer = () => createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION });
 beforeEach(() => {
   events.resetEventLog();
   events.openEventLog(); // Initialize this disposable fixture, never in the read-only worker.
@@ -133,15 +134,15 @@ test('worker coding inventory shares canonical read-only owners and does not ini
 
 test('missing DB, wrong schema and deadline stay200-compatible unverified/nonzero without initialization', async () => {
   const missing = path.join(home, 'missing');
-  const a = await createActiveWorkObserver({ baseDir: missing, workflowDir: path.join(missing, 'runs'), schema: 97 }).read();
+  const a = await createActiveWorkObserver({ baseDir: missing, workflowDir: path.join(missing, 'runs'), schema: HARNESS_SCHEMA_VERSION }).read();
   assert.equal(a.quiescence.state, 'unverified'); assert.ok(a.total >= 1); assert.equal(existsSync(missing), false);
   const old = path.join(home, 'old-schema'); mkdirSync(path.join(old, 'state'), { recursive: true });
   const file = path.join(old, 'state', 'harness.db'); const db = new Database(file);
   db.exec('CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(1)'); db.close();
   const before = digest(file);
-  const b = await createActiveWorkObserver({ baseDir: old, workflowDir: path.join(old, 'runs'), schema: 97 }).read();
+  const b = await createActiveWorkObserver({ baseDir: old, workflowDir: path.join(old, 'runs'), schema: HARNESS_SCHEMA_VERSION }).read();
   assert.equal(b.quiescence.state, 'unverified'); assert.ok(b.total >= 1); assert.equal(digest(file), before);
-  const c = await createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: 97, timeoutMs: 1 }).read();
+  const c = await createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION, timeoutMs: 1 }).read();
   assert.equal(c.quiescence.state, 'unverified'); assert.ok(c.total >= 1);
 });
 
@@ -167,7 +168,7 @@ for (const boundary of ['filesystem', 'database', 'foreign_nonce', 'missing_poli
     leases.revokeDispatchLease(call); leases.revokeDispatchLease(parent);
   }
   const identity: ObservationIdentity = { nonce: 'controlled-nonce', epoch: 'controlled-epoch', build: 'controlled-build',
-    baseDir: realpathSync(home), workflowDir: realpathSync(WORKFLOW_RUNS_DIR), schema: 97, requestedAt: Date.now(), deadline: Date.now() + 10_000, artifacts: [] };
+    baseDir: realpathSync(home), workflowDir: realpathSync(WORKFLOW_RUNS_DIR), schema: HARNESS_SCHEMA_VERSION, requestedAt: Date.now(), deadline: Date.now() + 10_000, artifacts: [] };
   const worker = new Worker(`const {workerData}=require('node:worker_threads');
     import(workerData.tsxApi).then(({register})=>{register();return import(workerData.entry)});`, {
     eval: true, workerData: { ...identity, tsxApi: import.meta.resolve('tsx/esm/api'), entry: workerEntry.href },
@@ -201,7 +202,7 @@ test('actual bundled service resolves the built distributed worker, with no appl
     writeFileSync(path.join(packed, 'package.json'), '{"type":"module"}');
     symlinkSync(path.join(repo, 'node_modules'), path.join(packed, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
     writeFileSync(path.join(dist, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: 'controlled-package-fixture', gitDirty: false,
-      sourceFingerprint: 'a'.repeat(64), expectedSchemaVersion: 97 }));
+      sourceFingerprint: 'a'.repeat(64), expectedSchemaVersion: HARNESS_SCHEMA_VERSION }));
     const builtWorker = path.join(dist, 'dashboard/active-work-observer.worker.js');
     const graph = buildSync({ entryPoints: [fileURLToPath(workerEntry)], outfile: builtWorker, bundle: true,
       platform: 'node', format: 'esm', packages: 'external', metafile: true, logLevel: 'silent' });
@@ -215,7 +216,7 @@ test('actual bundled service resolves the built distributed worker, with no appl
       banner: { js: 'var import_meta_url=require("node:url").pathToFileURL(__filename).href;' }, define: { 'import.meta.url': 'import_meta_url' } });
     const loaded = createRequire(import.meta.url)(service) as typeof import('./active-work-observer.js');
     assert.equal(fileURLToPath(loaded.resolveActiveWorkWorkerEntry(pathToFileURL(service).href)), builtWorker);
-    const result = await loaded.createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: 97 }).read();
+    const result = await loaded.createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION }).read();
     assert.equal(result.quiescence.state, 'quiescent', 'the actual emitted-location service starts the built JS worker');
   } finally { rmSync(packed, { recursive: true, force: true }); }
 });
@@ -224,10 +225,10 @@ test('a directly selected home symlink is refused while a missing optional workf
   const linked = path.join(home, 'home-link');
   symlinkSync(home, linked, process.platform === 'win32' ? 'junction' : 'dir');
   try {
-    const rejected = await createActiveWorkObserver({ baseDir: linked, workflowDir: WORKFLOW_RUNS_DIR, schema: 97 }).read();
+    const rejected = await createActiveWorkObserver({ baseDir: linked, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION }).read();
     assert.equal(rejected.quiescence.state, 'unverified'); assert.ok(rejected.total >= 1);
     const absent = path.join(home, 'not-yet-created', 'runs');
-    const accepted = await createActiveWorkObserver({ baseDir: home, workflowDir: absent, schema: 97 }).read();
+    const accepted = await createActiveWorkObserver({ baseDir: home, workflowDir: absent, schema: HARNESS_SCHEMA_VERSION }).read();
     assert.equal(accepted.quiescence.state, 'quiescent'); assert.equal(existsSync(absent), false);
   } finally { rmSync(linked, { force: true }); }
 });

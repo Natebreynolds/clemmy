@@ -6289,3 +6289,89 @@ test('the phone chat stream carries the live answer draft without ever moving La
     assert.equal(frames[0]!.data.delta + frames[1]!.data.delta, answer);
   } finally { await h.close(); }
 });
+
+test('phone chat relays only its exact owner display update, with no harness cursor or new transcript event', async () => {
+  const h = await startHarness();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const sessionId = 'mobile-projection-display-owner';
+    createHarnessSession({ id: sessionId, kind: 'chat' });
+    const before = listEvents(sessionId, { limit: 20 });
+    const fixture = await pairedDeviceAfterRotation(h);
+    const streamPath = `/m/api/chat/sessions/${sessionId}/stream`;
+    const mintProof = await deviceProof(fixture.pair, 'POST', '/m/auth/stream-ticket', fixture.currentFingerprint);
+    const minted = await fetch(`${h.url}/m/auth/stream-ticket`, { method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: fixture.currentCookie, 'x-clem-device-proof': mintProof }, body: JSON.stringify({ path: streamPath }) });
+    const { ticket } = await minted.json() as { ticket: string };
+    const response = await fetch(`${h.url}${streamPath}?ticket=${encodeURIComponent(ticket)}`, { headers: { cookie: fixture.currentCookie, accept: 'text/event-stream' } });
+    assert.equal(response.status, 200);
+    reader = response.body!.getReader();
+    const decoder = new TextDecoder(); let raw = '';
+    const first = await reader.read(); if (!first.done) raw += decoder.decode(first.value, { stream: true });
+    const update = { kind: 'approval.result_updated' as const, sessionId, approvalId: 'apr-mobile-projection', pendingActionId: 'pa-mobile-projection',
+      payloadHash: 'controlled-payload-hash', recordUpdatedAt: '2026-10-20T01:00:00.000Z', projectionId: 'projection-mobile-stream' };
+    actionBus.emit({ ...update, sessionId: 'foreign-execution-head' });
+    actionBus.emit(update);
+    const deadline = setTimeout(() => { void reader?.cancel(); }, 2_000);
+    try {
+      while (!raw.includes('event: approval.result_updated')) {
+        const chunk = await reader.read(); if (chunk.done) break;
+        raw += decoder.decode(chunk.value, { stream: true });
+      }
+    } finally { clearTimeout(deadline); }
+    const frames = raw.split('\n\n').filter(block => block.includes('event: approval.result_updated'));
+    assert.equal(frames.length, 1);
+    assert.doesNotMatch(frames[0]!, /^id: |foreign-execution-head|"type":/m);
+    assert.deepEqual(JSON.parse(frames[0]!.split('\n').find(line => line.startsWith('data: '))!.slice(6)), update);
+    assert.deepEqual(listEvents(sessionId, { limit: 20 }), before, 'the display signal appends no second terminal, human source or bubble');
+  } finally { await reader?.cancel(); await h.close(); }
+});
+
+test('phone display updates retain a selector-proven ancestor owner and exclude foreign principal or unproven same-name sessions', async () => {
+  const { selectSessionForAcceptedSource, sameConversationAncestorSessionIds } = await import('../runtime/harness/accepted-source-session-branch.js');
+  const h = await startHarness();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const fixture = await pairedDeviceAfterRotation(h);
+    const tokenHash = createHash('sha256').update(fixture.currentToken).digest('hex');
+    const principalId = listSessions({ stateDir: h.stateDir }).find(row => row.tokenHash === tokenHash)!.deviceId;
+    const parentId = 'mobile-projection-proven-parent'; const conversationId = 'mobile-projection-proven-conversation';
+    createHarnessSession({ id: parentId, kind: 'chat', channel: 'mobile', userId: principalId,
+      metadata: { source: 'mobile', channelId: conversationId } });
+    openEventLog().prepare("UPDATE sessions SET status='failed' WHERE id=?").run(parentId);
+    const selected = selectSessionForAcceptedSource({ kind: 'ordinary', entrySessionId: parentId, durableSourceId: 'mobile-projection-proven-child',
+      continuity: { provider: 'mobile', scopeId: null, conversationId, audienceId: principalId } });
+    assert.equal(selected.disposition, 'branched');
+    assert.deepEqual(sameConversationAncestorSessionIds({ sessionId: selected.sessionId, principalId }), [parentId]);
+    assert.deepEqual(sameConversationAncestorSessionIds({ sessionId: selected.sessionId, principalId: 'foreign-principal' }), []);
+    createHarnessSession({ id: 'mobile-projection-unproven-parent', kind: 'chat', channel: 'mobile', userId: principalId,
+      metadata: { source: 'mobile', channelId: conversationId, parentSessionId: parentId } });
+    createHarnessSession({ id: 'mobile-projection-foreign-principal', kind: 'chat', channel: 'mobile', userId: 'foreign-principal',
+      metadata: { source: 'mobile', channelId: conversationId } });
+    const before = listEvents(selected.sessionId, { limit: 30 });
+    const streamPath = `/m/api/chat/sessions/${selected.sessionId}/stream`;
+    const proof = await deviceProof(fixture.pair, 'POST', '/m/auth/stream-ticket', fixture.currentFingerprint);
+    const minted = await fetch(`${h.url}/m/auth/stream-ticket`, { method: 'POST', headers: {
+      'content-type': 'application/json', cookie: fixture.currentCookie, 'x-clem-device-proof': proof }, body: JSON.stringify({ path: streamPath }) });
+    const { ticket } = await minted.json() as { ticket: string };
+    const response = await fetch(`${h.url}${streamPath}?ticket=${encodeURIComponent(ticket)}`, { headers: { cookie: fixture.currentCookie, accept: 'text/event-stream' } });
+    assert.equal(response.status, 200);
+    reader = response.body!.getReader(); const decoder = new TextDecoder(); let raw = '';
+    const first = await reader.read(); if (!first.done) raw += decoder.decode(first.value, { stream: true });
+    const update = { kind: 'approval.result_updated' as const, sessionId: parentId, approvalId: 'apr-proven-parent', pendingActionId: 'pa-proven-parent',
+      payloadHash: 'controlled-proven-hash', recordUpdatedAt: '2026-10-20T01:00:00.000Z', projectionId: 'projection-proven-parent' };
+    actionBus.emit({ ...update, sessionId: 'mobile-projection-unproven-parent' });
+    actionBus.emit({ ...update, sessionId: 'mobile-projection-foreign-principal' });
+    actionBus.emit(update);
+    const deadline = setTimeout(() => { void reader?.cancel(); }, 2_000);
+    try { while (!raw.includes('event: approval.result_updated')) {
+      const chunk = await reader.read(); if (chunk.done) break; raw += decoder.decode(chunk.value, { stream: true });
+    } } finally { clearTimeout(deadline); }
+    const frames = raw.split('\n\n').filter(block => block.includes('event: approval.result_updated'));
+    assert.equal(frames.length, 1);
+    const delivered = JSON.parse(frames[0]!.split('\n').find(line => line.startsWith('data: '))!.slice(6));
+    assert.deepEqual(delivered, update, 'the card keeps its original ancestor session, never the child/latest head');
+    assert.doesNotMatch(frames[0]!, /^id: /m);
+    assert.deepEqual(listEvents(selected.sessionId, { limit: 30 }), before);
+  } finally { await reader?.cancel(); await h.close(); }
+});

@@ -34,6 +34,7 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { getAuthToken } from './bootstrap';
+import { normalizeApprovalResultUpdatedEvent, type ApprovalResultUpdatedEvent } from '@clem/chat-engine';
 
 // ─── The wire contract ───────────────────────────────────────────────────────
 
@@ -44,6 +45,7 @@ export const CONSOLE_ACTION_EVENT_KINDS = [
   'run.event',
   'approval.created',
   'approval.resolved',
+  'approval.result_updated',
   'notification.created',
   'execution.transitioned',
   'harness.event',
@@ -74,6 +76,7 @@ const SUBSCRIBED_ACTION_EVENT_KINDS: readonly ConsoleActionEventKind[] =
  * rots out of sync with the bus, and a green typecheck would never say so.
  */
 export type ConsoleActionEvent =
+  | ApprovalResultUpdatedEvent
   | { kind: 'run.event'; runId: string; runStatus: string; event: { id: string } }
   | { kind: 'approval.created'; approval: { id: string } }
   | { kind: 'approval.resolved'; approval: { id: string }; resolution: 'approved' | 'rejected' }
@@ -126,6 +129,7 @@ export function parseActionEvent(raw: unknown): ConsoleActionEvent | null {
         resolution: frame.resolution === 'rejected' ? 'rejected' : 'approved',
       };
     }
+    case 'approval.result_updated': return normalizeApprovalResultUpdatedEvent(frame);
     case 'notification.created': {
       const notification = nested(frame, 'notification');
       if (!str(notification.id)) return null;
@@ -238,6 +242,9 @@ export function queryKeysForActionEvent(event: ConsoleActionEvent): readonly str
     case 'approval.created':
     case 'approval.resolved':
       return DECISION_KEYS;
+    case 'approval.result_updated':
+      // Exact visible-card subscribers own this read; no global query fan-out.
+      return [];
     case 'notification.created':
       return ['command-center', 'notifications'];
     case 'execution.transitioned':
@@ -465,6 +472,8 @@ export interface ActionStreamHandlers {
   /** react-query keys that just went stale, already coalesced. */
   onInvalidate?: (keys: readonly string[]) => void;
   onStatus?: (status: ActionStreamStatus) => void;
+  /** Live display-only signal. Replays never trigger card reads. */
+  onApprovalResultUpdated?: (event: ApprovalResultUpdatedEvent) => void;
 }
 
 function withToken(path: string): string {
@@ -534,6 +543,12 @@ function ingest(frame: ActionStreamFrame): void {
   // Traffic — of any shape, including a frame that invalidates nothing — is the
   // only proof this socket is still attached to a daemon.
   lastHeardAt = Date.now();
+  if (frame.kind === 'event') {
+    const event = normalizeApprovalResultUpdatedEvent(frame.event);
+    if (event) for (const listener of listeners) {
+      try { listener.onApprovalResultUpdated?.(event); } catch { /* each exact visible card is independent */ }
+    }
+  }
   const result = applyActionFrame(state, frame);
   state = result.state;
   queueInvalidations(result.invalidate);

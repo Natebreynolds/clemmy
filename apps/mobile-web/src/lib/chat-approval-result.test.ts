@@ -215,3 +215,66 @@ test('same-revision in-flight enrichment survives a late fallback response or re
     reader.dispose();
   }
 });
+
+function authoredFixture(): PendingActionResultRecord {
+  return { ...record, status: 'executed', resultSummary: 'Exact raw retained result.', publicResult: {
+    version: 1, pendingActionId: record.id, approvalId: owner.approvalId, payloadHash: record.payloadHash,
+    recordUpdatedAt: record.updatedAt, status: 'executed', source: 'authored_projection', text: 'I completed the approved action.',
+    terminal: { eventId: 'canonical-approved-terminal', sourceUserSeq: 31 },
+    projection: { id: 'projection-mobile-fixture', revision: 1, evidenceDigest: 'a'.repeat(64), textDigest: 'b'.repeat(64), publishedAt: record.updatedAt },
+  } };
+}
+const update = { ...binding, kind: 'approval.result_updated' as const, projectionId: 'projection-mobile-fixture' };
+const flushReads = async () => { for (let turn = 0; turn < 8; turn++) await Promise.resolve(); };
+
+test('one direct-owner live signal enriches an already terminal card; foreign owners and repeats never read', async () => {
+  const { subscribeApprovalResultUpdates, publishApprovalResultUpdate } = await import('./approval-result-updates.js');
+  const authored = authoredFixture();
+  const terminal: PendingActionResultRecord = { ...authored, publicResult: { ...authored.publicResult!, source: 'terminal', projection: undefined, text: 'The approved action completed.' } };
+  const reads: PendingActionResultLookup[] = [];
+  const reader = new MobileApprovalResultReader(binding, terminal, async expected => { reads.push(expected); return response(authored); });
+  const unsubscribe = subscribeApprovalResultUpdates(event => reader.observeResultUpdate(event));
+  try {
+    assert.equal(reads.length, 0, 'no history-mount fetch');
+    publishApprovalResultUpdate({ ...update, sessionId: 'foreign-successor' });
+    publishApprovalResultUpdate({ ...update, payloadHash: 'foreign-payload' });
+    await flushReads(); assert.equal(reads.length, 0);
+    publishApprovalResultUpdate(update); publishApprovalResultUpdate(update);
+    await flushReads();
+    assert.deepEqual(reads, [binding]);
+    assert.deepEqual(reader.snapshot().record, authored);
+    publishApprovalResultUpdate(update); await flushReads();
+    assert.equal(reads.length, 1, 'the authored tier is settled display evidence, never a poll trigger');
+  } finally { unsubscribe(); reader.dispose(); }
+});
+
+test('a live projection arriving during an older read gets one follow-up, without a polling loop', async () => {
+  const authored = authoredFixture(); const fallback = { ...authored, publicResult: undefined };
+  const pending = deferred<unknown>(); let reads = 0;
+  const reader = new MobileApprovalResultReader(binding, fallback, async () => ++reads === 1 ? pending.promise : response(authored));
+  const explicit = reader.refresh();
+  reader.observeResultUpdate(update); reader.observeResultUpdate(update);
+  assert.equal(reads, 1);
+  pending.resolve(response(fallback)); await explicit; await flushReads();
+  assert.equal(reads, 2);
+  assert.equal(reader.snapshot().record?.publicResult?.source, 'authored_projection');
+  reader.observeResultUpdate(update); await flushReads(); assert.equal(reads, 2);
+  reader.dispose();
+});
+
+test('failed or mismatched event readback retains the known terminal and never retries automatically', async () => {
+  for (const fail of [false, true]) {
+    const authored = authoredFixture();
+    const terminal: PendingActionResultRecord = { ...authored, publicResult: { ...authored.publicResult!, source: 'terminal', projection: undefined, text: 'The action completed.' } };
+    let reads = 0;
+    const reader = new MobileApprovalResultReader(binding, terminal, async () => {
+      reads++;
+      if (fail) throw new Error('Controlled unavailable read');
+      return response({ ...authored, publicResult: { ...authored.publicResult!, projection: { ...authored.publicResult!.projection!, id: 'another-projection' } } });
+    });
+    reader.observeResultUpdate(update); await flushReads(); reader.observeResultUpdate(update); await flushReads();
+    assert.equal(reads, 1); assert.equal(reader.snapshot().record, terminal);
+    assert.match(reader.snapshot().error ?? '', /refresh this result/);
+    reader.dispose();
+  }
+});

@@ -14,6 +14,8 @@ import { readAcceptedTaskWorkflowParticipants, readClosedCreationTestWorkflowPar
 import { compactResultProvesExactToolOutput } from '../src/runtime/harness/exact-output-receipt.js';
 import { readAcceptedTaskWorkflowParentTerminalIdentity } from './lib/accepted-task-workflow-parent-terminal.js';
 import { selectAcceptedTaskNoticingUsage, type NoticingAccountingParticipant } from './lib/accepted-task-noticing-usage.js';
+import { readAcceptedTaskApprovalProjectionParticipants } from './lib/accepted-task-approval-projection-participants.js';
+import { selectAcceptedTaskApprovalProjectionUsage, type ApprovalProjectionAccountingParticipant } from './lib/accepted-task-approval-projection-usage.js';
 
 /**
  * Read-only accounting for one dedicated harness session.
@@ -216,6 +218,12 @@ export interface AcceptedTaskMeasurement extends SessionMeasurement {
   proactiveUsageIssues: string[];
   proactiveExactUsageRecords: number;
   proactiveUsageScope: { timing: 'precursor_operations_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
+  /** Optional card wording happens after its exact approved call's terminal.
+   * Its usage belongs to this task; its clocks never extend the action span. */
+  postTerminalProjectionUsageParticipants: ApprovalProjectionAccountingParticipant[];
+  postTerminalProjectionUsageIssues: string[];
+  postTerminalProjectionExactUsageRecords: number;
+  postTerminalProjectionUsageScope: { timing: 'post_terminal_display_jobs_only'; servingIdentity: 'not_measured'; executionWindowUnaffected: true };
   /** Claims remain diagnostic; hosted steps require full retained authority. */
   workflowUsageParticipants: WorkflowAccountingParticipant[];
   workflowApprovalContinuations: Array<ApprovalContinuationMeasurement & { sessionId: string }>;
@@ -1783,13 +1791,15 @@ function acceptedUsageCompleteness(input: {
   events: readonly SessionEvent[];
   sources: ReadonlyMap<number, TimingSource>;
   usage: readonly UsageEvent[];
+  nonExecutionUsage?: ReadonlySet<UsageEvent>;
   attributionIssues: readonly string[];
   isAncestor?: (ancestor: number, descendant: number) => boolean;
 }): AcceptedUsageCompleteness {
   const isAncestor = input.isAncestor ?? ((ancestor, descendant) => ancestor === descendant);
   const sourceByAttempt = new Map<string, number>();
   for (const [source, scope] of input.sources) for (const attempt of scope.attempts.ids) sourceByAttempt.set(attempt, source);
-  const mainIssues = new Set(mainModelUsageCoverageIssues(input.sessionId, input.events, input.sources, input.usage, isAncestor));
+  const executionUsage = input.usage.filter(row => !input.nonExecutionUsage?.has(row));
+  const mainIssues = new Set(mainModelUsageCoverageIssues(input.sessionId, input.events, input.sources, executionUsage, isAncestor));
   const calls = new Map<string, { source: number; attempt: string; callId: string; events: SessionEvent[] }>();
   for (const event of input.events) {
     const data = event.data;
@@ -1814,7 +1824,7 @@ function acceptedUsageCompleteness(input: {
     const starts = call.events.filter(event => event.data.phase === 'call_started');
     const responses = call.events.filter(event => event.data.phase === 'response_observed');
     const finishes = call.events.filter(event => event.data.phase === 'call_finished');
-    const ownedUsage = input.usage.filter(row => row.trace?.acceptedSource === usageSourceKey(input.sessionId, call.source)
+    const ownedUsage = executionUsage.filter(row => row.trace?.acceptedSource === usageSourceKey(input.sessionId, call.source)
       && row.trace.logicalTurnId === `turn:${call.source}` && row.trace.attemptId === call.attempt
       && row.trace.modelCallId === call.callId);
     for (const row of ownedUsage) mainUsage.add(row);
@@ -1842,7 +1852,7 @@ function acceptedUsageCompleteness(input: {
   }
   // A usage row is evidence for that response, not proof that no other host or
   // auxiliary request ran. Unknown legacy roles cannot establish absence.
-  if (calls.size === 0 && input.usage.some(row => row.role === 'brain' || row.role === 'writer')) {
+  if (calls.size === 0 && executionUsage.some(row => row.role === 'brain' || row.role === 'writer')) {
     mainIssues.add('main_fresh_producer_inventory_unproved');
   }
   const recordedTokenRows = { certified: 0, unknown: 0, invalid: 0, failed: 0 };
@@ -2555,11 +2565,20 @@ export function measureAcceptedTask(
   const proactiveSelection = selectAcceptedTaskNoticingUsage({ ...proactive,
     acceptedSources: new Set(accountingSources.map(source => usageSourceKey(source.sessionId, source.sourceUserSeq))),
     usage: usageRead.events });
+  const projection = readAcceptedTaskApprovalProjectionParticipants(home, accountingSources);
+  const projectionSelection = selectAcceptedTaskApprovalProjectionUsage({ ...projection,
+    acceptedSources: new Set(accountingSources.map(source => usageSourceKey(source.sessionId, source.sourceUserSeq))),
+    usage: usageRead.events });
+  const projectionIssues = [...new Set([...projection.issues, ...projectionSelection.issues])];
+  for (const issue of projectionIssues) issues.add(issue);
   const proactiveIssues = [...new Set([...proactive.issues, ...proactiveSelection.issues])];
   for (const issue of proactiveIssues) issues.add(issue);
   for (const issue of workflowInventory.issues) if (issue !== 'workflow_candidate_authority_and_usage_unproved') issues.add(issue);
   const proactiveExact = new Set(proactiveSelection.exactIndices);
   const proactiveUnproven = new Set(proactiveSelection.unprovenIndices);
+  const projectionExact = new Set(projectionSelection.exactIndices);
+  const projectionUnproven = new Set(projectionSelection.unprovenIndices);
+  const projectionUsage = new Set<UsageEvent>();
   const exactUsage: UsageEvent[] = [];
   const unprovenUsage: UsageEvent[] = [];
   const usageAttemptIds = new Set<string>();
@@ -2568,6 +2587,10 @@ export function measureAcceptedTask(
   let unscopedWindowUsageRecords = 0;
   const claimedWorkflowRunSources = new Set([...workflowProof.claimedRunIds, ...creationProof.claimedRunIds].map(id => `workflow:${id}`));
   for (const [index, event] of usageRead.events.entries()) {
+    // Optional result wording is a distinct post-terminal owner. Include its
+    // exact usage once without lending its call/clock to B's closed attempt.
+    if (projectionExact.has(index)) { exactUsage.push(event); projectionUsage.add(event); continue; }
+    if (projectionUnproven.has(index)) { unprovenUsage.push(event); continue; }
     // One read and one row selection. An exact precursor is included in task
     // recorded usage, but cannot supply an accepted source/attempt or time.
     if (proactiveExact.has(index)) { exactUsage.push(event); continue; }
@@ -2613,7 +2636,7 @@ export function measureAcceptedTask(
   if (sessionRead.malformedEventPayloads > 0) issues.add('malformed_session_events');
   for (const issue of mainModelUsageCoverageIssues(sessionId, sessionRead.events, new Map(
     [...members].map(([seq, source]) => [seq, { source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq) }]),
-  ), exactUsage, isAncestor)) issues.add(issue);
+  ), exactUsage.filter(row => !projectionUsage.has(row)), isAncestor)) issues.add(issue);
   const hostedSessions = new Map<string, { events: SessionEvent[]; sources: Map<number, TimingSource> }>();
   for (const scope of workflow.scopes.values()) {
     let hosted = hostedSessions.get(scope.sessionId);
@@ -2762,6 +2785,9 @@ export function measureAcceptedTask(
     proactiveUsageParticipants: proactive.jobs, proactiveUsageIssues: proactiveIssues,
     proactiveExactUsageRecords: proactiveExact.size,
     proactiveUsageScope: { timing: 'precursor_operations_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
+    postTerminalProjectionUsageParticipants: projection.jobs, postTerminalProjectionUsageIssues: projectionIssues,
+    postTerminalProjectionExactUsageRecords: projectionExact.size,
+    postTerminalProjectionUsageScope: { timing: 'post_terminal_display_jobs_only', servingIdentity: 'not_measured', executionWindowUnaffected: true },
     workflowUsageInventory: workflowInventory,
     workflowUsageParticipants: workflowParticipants.filter(participant => workflow.scopes.has(usageSourceKey(participant.sessionId, participant.sourceUserSeq))),
     workflowApprovalContinuations: workflow.approvals, workflowUsageIssues: [...workflowIssues],
@@ -2776,7 +2802,7 @@ export function measureAcceptedTask(
     usageCompleteness: acceptedUsageCompleteness({ sessionId, events: sessionRead.events,
       sources: new Map([...members].map(([seq, source]) => [seq, {
         source, attempts: attemptsBySource.get(seq)!, terminal: terminals.get(seq),
-      }])), usage: exactUsage, attributionIssues: [...issues], isAncestor }),
+      }])), usage: exactUsage, nonExecutionUsage: projectionUsage, attributionIssues: [...issues], isAncestor }),
     modelRouteEvents: routes.length,
     attemptCount: sourceByAttempt.size, unfinishedAttempts,
     terminalSeq: terminal?.seq ?? null,
@@ -3121,6 +3147,8 @@ export function formatAcceptedTaskComparison(comparison: AcceptedTaskComparison)
     row('Unfinished helper attempts', b.unfinishedWorkerAttempts ?? 0, c.unfinishedWorkerAttempts ?? 0),
     row('Receipt-linked proactive jobs', b.proactiveUsageParticipants?.length ?? null, c.proactiveUsageParticipants?.length ?? null),
     row('Original-response-linked proactive usage rows', b.proactiveExactUsageRecords ?? null, c.proactiveExactUsageRecords ?? null),
+    row('Exact post-terminal card wording jobs', b.postTerminalProjectionUsageParticipants?.length ?? null, c.postTerminalProjectionUsageParticipants?.length ?? null),
+    row('Original-response-linked card wording usage rows', b.postTerminalProjectionExactUsageRecords ?? null, c.postTerminalProjectionExactUsageRecords ?? null),
     row('Workflow dispatch claims (authority checked separately)', b.workflowUsageInventory?.candidates.length ?? null, c.workflowUsageInventory?.candidates.length ?? null),
     row('Proved hosted workflow sources', b.workflowUsageParticipants?.length ?? null, c.workflowUsageParticipants?.length ?? null),
     row('Exact hosted workflow usage rows', b.workflowExactUsageRecords ?? null, c.workflowExactUsageRecords ?? null),

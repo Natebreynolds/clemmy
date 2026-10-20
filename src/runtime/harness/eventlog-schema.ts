@@ -3,6 +3,7 @@ export { acceptedTurnSourceEventDigest, acceptedTurnCallAuthorityDigest, accepte
 export type { AcceptedTurnSourceEventDigestInput, AcceptedTurnCallAuthorityDigestInput } from './accepted-turn-authority-digests.js';
 import { installApprovedActionCompletionSchema } from './approved-action-completion-schema.js';
 import { installApprovedActionProviderBindingSchema } from './approved-action-provider-binding-schema.js';
+import { installApprovedActionResultProjectionSchema } from './approved-action-result-projection-schema.js';
 import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.js';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11477,6 +11478,10 @@ const MIGRATIONS: EventLogMigration[] = [
   { version: 97, sql: '', backfill: (db) => {
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     installApprovedActionProviderBindingSchema(db);
+  } },
+  { version: 98, sql: '', backfill: (db) => {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
+    installApprovedActionResultProjectionSchema(db);
   } },
 ];
 

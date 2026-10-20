@@ -613,7 +613,8 @@ export function ChatBubble({
   const retainedActionResult = normalizePendingActionResultRecord(message.approval?.resultRecord);
   const resultClosesQuestion = retainedActionResult?.approvalId === message.approval?.approvalId
     && !['queued', 'approval_requested'].includes(retainedActionResult?.status ?? 'queued');
-  if (!isUser && message.status === 'awaiting-approval' && message.approval && (message.approval.resolution || resultClosesQuestion)) {
+  const observedActionSettled = exec.observedExecution === true && ['executed', 'failed', 'rejected', 'expired', 'cancelled'].includes(exec.phase);
+  if (!isUser && message.status === 'awaiting-approval' && message.approval && (message.approval.resolution || resultClosesQuestion || observedActionSettled)) {
     return <ApprovalResult approval={message.approval} observed={exec.phase !== 'idle'
       ? exec.presentation ?? { mode: 'durable', phase: exec.phase, ...(exec.note ? { note: exec.note } : {}) } : undefined} />;
   }

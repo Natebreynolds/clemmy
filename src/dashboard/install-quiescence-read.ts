@@ -31,7 +31,7 @@ export interface InstallQuiescenceReader {
 
 export interface InstallWorkOwner {
   key: string;
-  kind: 'execution' | 'workflow' | 'background' | 'coding' | 'approval' | 'checkpoint' | 'effect';
+  kind: 'execution' | 'workflow' | 'background' | 'coding' | 'approval' | 'checkpoint' | 'effect' | 'projection';
   state: 'running' | 'queued' | 'waiting' | 'unfinished' | 'uncertain';
   sessionIds: string[];
   approvalIds: string[];
@@ -189,6 +189,18 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
     const db = reader.database();
     const rows = <T>(sql: string, category: string, ...params: unknown[]): T[] =>
       bounded(db.prepare(sql).all(...params, limit + 1) as T[], category);
+    // Optional display work owns no business effect, but a live/uncertain
+    // paid request must remain visible to cutover. Queued wording can wait.
+    const projections = rows<{ projection_id: string; session_id: string; status: string; claim_id: string | null;
+      started_at: string | null; finished_at: string | null }>(`SELECT projection_id,session_id,status,claim_id,started_at,finished_at
+      FROM approved_action_result_projection_jobs_v1 WHERE status='started'
+        OR (status='unknown' AND transport_closed_at IS NULL) LIMIT ?`, 'projection');
+    for (const job of projections) {
+      if (!text(job.projection_id) || !text(job.session_id) || !text(job.claim_id) || !text(job.started_at)
+        || !Number.isFinite(Date.parse(job.started_at))) issues.add('projection_owner_unverified');
+      if (job.status === 'unknown') issues.add('projection_transport_unverified');
+      add(`projection:${job.projection_id}`, 'projection', job.status === 'started' ? 'running' : 'uncertain', job.session_id);
+    }
     type Session = { id: string; metadata_json: string };
     const exactTerminal = (sessionId: string, sourceSeq: unknown, notBefore?: string): 'absent' | 'terminal' | 'retained' | 'unverified' => {
       if (!Number.isSafeInteger(sourceSeq) || Number(sourceSeq) <= 0) return 'unverified';

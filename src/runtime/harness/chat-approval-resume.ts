@@ -49,6 +49,7 @@ import {
   openEventLog,
   recordRunAttemptUserInput,
   withEventPublicationTransaction,
+  afterEventPublicationCommit,
   type EventRow,
   type RunAttemptRef,
 } from './eventlog.js';
@@ -56,6 +57,7 @@ import { HarnessSession } from './session.js';
 import { getPendingAction, pendingActionPayloadHash, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
 import { pendingActionResultApprovalMatches, pendingActionResultBinding } from './pending-action-public-result.js';
 import { prepareApprovedActionHostCompletion } from './approved-action-completion-receipt.js';
+import { enqueueApprovedActionResultProjectionInTransaction, kickApprovedActionResultProjectionDrain } from './approved-action-result-projection.js';
 import { approvedActionDecisionWasStoppedInTransaction } from './approved-action-completion-proof.js';
 import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
@@ -564,7 +566,7 @@ async function settleConversationalSource(
       const action = ending?.kind === 'current' ? ending.action : actionId ? getPendingAction(actionId) : null;
       const resultBinding = action?.approvalId === row.approvalId
         ? pendingActionResultBinding(action, source) : null;
-      commitTurnOutcome(outcome, {
+      const completed = commitTurnOutcome(outcome, {
         legacyReason: 'conversational_send_consent_resolved',
         metadata: {
           approvalId: row.approvalId,
@@ -573,6 +575,17 @@ async function settleConversationalSource(
           ...(input.hostNotice ? { hostNotice: input.hostNotice } : {}),
         },
       });
+      if (input.status === 'done' && action?.status === 'executed') {
+        // Optional wording debt commits beside its already-complete B. No
+        // model is awaited, and neither A nor the action is reopened.
+        try {
+          const queued = enqueueApprovedActionResultProjectionInTransaction(openEventLog(), {
+            action, source, terminal: completed.event,
+            retainedWorkNeedsVerification: approvedActionRetainedWorkNeedsVerification(row, action, source),
+          });
+          if (queued === 'queued') afterEventPublicationCommit(kickApprovedActionResultProjectionDrain);
+        } catch { /* Optional wording cannot roll back a successful action terminal. */ }
+      }
       return true;
     });
     if (!committed) return false;
@@ -750,6 +763,7 @@ async function executeApprovedLinkedActionAndSettle(
       status: 'done',
       text: approvedActionRanText(pendingAction, result,
         approvedActionRetainedWorkNeedsVerification(row, pendingAction, source)),
+      hostNotice: { code: 'approved_action_completed' },
     });
   }
   if (pendingAction.status === 'executing' || pendingAction.status === 'failed') {
@@ -775,6 +789,7 @@ async function executeApprovedLinkedActionAndSettle(
     if (current.action.status === 'executed') return await settleConversationalSource(row, source, {
       status: 'done', text: approvedActionRanText(current.action, current.action.resultSummary ?? '',
         approvedActionRetainedWorkNeedsVerification(row, current.action, source)), endingGuard: freshGuard,
+      hostNotice: { code: 'approved_action_completed' },
     });
     if (current.action.status !== 'failed' && current.action.status !== 'executing') return await settleConversationalSource(row, source, {
       status: 'needs_input', text: `The stored action is ${current.action.status}. Its result is not confirmed; nothing will run again on its own.`,
@@ -963,8 +978,6 @@ async function drainQueuedApprovalResumes(sessionId: string): Promise<void> {
   }
 }
 
-const APPROVED_RESULT_LINES = 20;
-
 /** Reporting only: the exact original request still has requirements the
  * admission oracle has not discharged. Approval source B completing one
  * action neither proves source A complete nor authorizes another effect.
@@ -999,18 +1012,12 @@ export function approvedActionRetainedWorkNeedsVerification(
   }
 }
 
-/** The owner's decision ends with what the approved action did, in Clem's
- * words. Name a next step only from exact retained requirement evidence. */
-export function approvedActionRanText(action: Pick<PendingActionRecord, 'kind' | 'toolName'>, result: string, retainedWorkNeedsVerification = false): string {
-  const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
-  const lines = result.split('\n');
-  const shown = lines.slice(0, APPROVED_RESULT_LINES).join('\n').trim();
-  const more = lines.length > APPROVED_RESULT_LINES ? `\n… (${lines.length - APPROVED_RESULT_LINES} more lines; ask and I'll show the rest)` : '';
-  const body = shell
-    ? `Done — I ran it. Here's what it printed:\n\n\`\`\`\n${shellOutputOnly(shown)}${more}\n\`\`\``
-    : `Done — that went through.${shown && !shown.startsWith('{') && shown.length <= 300 ? `\n\n${shown}` : ''}`;
+/** The app's immediate execution status. Authored wording is a separate,
+ * optional card projection; fixed host prose never impersonates Clem. */
+export function approvedActionRanText(_action: Pick<PendingActionRecord, 'kind' | 'toolName'>, _result: string, retainedWorkNeedsVerification = false): string {
+  const body = 'The approved action completed. Open execution details to see the recorded result.';
   return retainedWorkNeedsVerification
-    ? `${body}\n\nYour earlier request still has retained work to verify. Say "continue" to check the saved results and finish what remains.`
+    ? `${body}\n\nYour earlier request still has retained work to verify. Ask Clem to check what completed and what remains before continuing.`
     : body;
 }
 

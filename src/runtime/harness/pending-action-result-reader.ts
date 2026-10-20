@@ -3,6 +3,7 @@ import * as approvalRegistry from './approval-registry.js';
 import { getUserInputEventAtSequence, openEventLog, readValidatedTerminalEvent } from './eventlog.js';
 import { loadAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { pendingActionPublicResult, pendingActionResultApprovalMatches, type PendingActionResultRecord, type PendingActionResultEvidence } from './pending-action-public-result.js';
+import { readApprovedActionResultProjection } from './approved-action-result-projection.js';
 
 function readExactEvidence(action: PendingActionResultRecord): PendingActionResultEvidence | null {
   if (!action.approvalId || !action.sessionId) return null;
@@ -28,5 +29,13 @@ function readExactEvidence(action: PendingActionResultRecord): PendingActionResu
   return { approval, source, terminal: readValidatedTerminalEvent(authority.authority.terminalEventId, action.sessionId, sourceSeq) };
 }
 export function readPendingActionPublicResult(action: PendingActionResultRecord) {
-  return pendingActionPublicResult(action, readExactEvidence);
+  let evidence: PendingActionResultEvidence | null = null;
+  const result = pendingActionPublicResult(action, value => { evidence = readExactEvidence(value); return evidence; });
+  if (!result || result.source !== 'terminal' || action.status !== 'executed' || !evidence) return result;
+  // This exact GET only reads an already committed display projection. It
+  // never enqueues, invokes a model, changes execution state or repairs history.
+  const projection = readApprovedActionResultProjection(action, (evidence as PendingActionResultEvidence).terminal);
+  if (!projection) return result;
+  const { text, ...receipt } = projection;
+  return { ...result, source: 'authored_projection' as const, text, projection: receipt };
 }

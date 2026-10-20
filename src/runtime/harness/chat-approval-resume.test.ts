@@ -668,7 +668,8 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   const { pendingActionResultBinding } = await import('./pending-action-public-result.js');
   assert.deepEqual(terminal!.data.pendingActionResultBinding, pendingActionResultBinding(getPendingAction(action.id)!, resumeSource!),
     'the trusted host binds clean presentation to the exact action, card, revision, raw result and B source');
-  assert.match(String(terminal!.data.reply), /^Done — I ran it\. Here's what it printed:/, 'in Clem\'s words, not the executor\'s');
+  assert.match(String(terminal!.data.reply), /^The approved action completed\./, 'fixed host status is app voice, never fabricated Clem words');
+  assert.deepEqual(terminal!.data.hostNotice, { code: 'approved_action_completed' });
   assert.doesNotMatch(String(terminal!.data.reply), /run_shell_command|exit_code|pa-/, 'no tool names or ids reach the owner');
   assert.doesNotMatch(String(terminal!.data.reply), /continue|more to do|request.*complete/i,
     'a legacy action without exact original work evidence reports only its own result');
@@ -734,7 +735,7 @@ test('approved action B names verification only from the original A retained req
     ['open', 'blocked_on_dependency']);
   const result = await approveStoredActionForOriginal(session.id, original.source.seq);
   assert.match(String(result.terminal.data.reply), /earlier request still has retained work to verify/);
-  assert.match(String(result.terminal.data.reply), /Say "continue" to check the saved results and finish what remains/);
+  assert.match(String(result.terminal.data.reply), /Ask Clem to check what completed and what remains before continuing/);
   assert.doesNotMatch(String(result.terminal.data.reply), /more to do after it|I'll pick it up from here|entire request.*complete/i);
   assert.equal(listEvents(session.id, { types: ['conversation_completed'] })
     .filter((event) => event.data.sourceUserSeq === original.source.seq).length, 0,
@@ -1025,19 +1026,19 @@ test('a resume on the desktop attempt that owns the typed decision keeps that at
   assert.equal(source?.runId, attempt.runId, 'and the hand-off names its run family, not a foreign one');
 });
 
-test('the ending after an approved shell action shows only what the command printed', async () => {
+test('the immediate approved-action ending is neutral app status and keeps raw output in details', async () => {
   const { approvedActionRanText } = await import('./chat-approval-resume.js');
   const text = approvedActionRanText(
     { kind: 'shell_command', toolName: 'run_shell_command' },
     'Executed the approved run_shell_command call. exit_code: 0 stdout: host localhost stderr: Pseudo-terminal will not be allocated because stdin is not a terminal.',
   );
-  assert.match(text, /^Done — I ran it\. Here's what it printed:\n\n```\nhost localhost\n```/);
+  assert.equal(text, 'The approved action completed. Open execution details to see the recorded result.');
   assert.doesNotMatch(text, /stderr|exit_code|run_shell_command/);
   assert.doesNotMatch(text, /continue|more to do/i, 'action-only is the default');
   const quiet = approvedActionRanText({ kind: 'shell_command', toolName: 'run_shell_command' }, 'exit_code: 0 stdout:   stderr: ');
-  assert.match(quiet, /\(nothing printed\)/);
+  assert.equal(quiet, text);
   const sent = approvedActionRanText({ kind: 'external_send', toolName: 'composio_execute_tool' }, '{"id":"msg-1"}');
-  assert.match(sent, /^Done — that went through\./);
+  assert.equal(sent, text);
   assert.doesNotMatch(sent, /msg-1/);
 });
 

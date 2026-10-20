@@ -313,6 +313,7 @@ export interface NoticingAnswerResult {
 
 export const CLEM_VOICE_PURPOSE = 'clem_voice' as const;
 export const CLEM_REPLY_PURPOSE = 'clem_reply' as const;
+export const APPROVED_ACTION_RESULT_PROJECTION_PURPOSE = 'approval_result_projection' as const;
 
 /** One thing a heartbeat brought the owner, to be said by Clem in her own
  * words. The item is data about the owner's own work, never an instruction. */
@@ -330,6 +331,30 @@ export interface ClemVoiceResult {
   choices?: string[];
   evidenceDigest: string;
   modelIdentity: string;
+}
+
+/** Optional card wording after an exact approved call has already settled.
+ * This display job cannot finish a request, run a tool or grant authority. */
+export interface ApprovedActionResultProjectionCall {
+  purpose: typeof APPROVED_ACTION_RESULT_PROJECTION_PURPOSE;
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  checkActive?: () => void;
+  /** Host SDK promise lifetime only, not remote settlement or usage proof. */
+  onRequestSettled?: () => void;
+  asked: string;
+  action: { title: string; kind: 'command_on_this_computer' | 'connected_app_change' };
+  result: {
+    preview: string;
+    rawByteCount: number;
+    truncated: boolean;
+    retainedWorkNeedsVerification: boolean;
+    independentReadback: false;
+  };
+  evidenceDigest: string;
+}
+export interface ApprovedActionResultProjectionResult extends ClemVoiceResult {
+  authorship?: import('./approved-action-result-authorship.js').ApprovedActionResultProjectionAuthorship;
 }
 
 /** One action the owner approved that did not go through, to be told to the
@@ -419,6 +444,8 @@ export interface TurnSemanticModelPort {
   /** On the brain role: Clem's reply when an approved action did not go
    * through: what happened, what she would change, and whether to go ahead. */
   voiceApprovedActionEnding?(call: ApprovedActionEndingCall): Promise<ClemVoiceResult>;
+  /** Separately owned, tool-free wording for one already completed action. */
+  voiceApprovedActionResultProjection?(call: ApprovedActionResultProjectionCall): Promise<ApprovedActionResultProjectionResult>;
   /** On the brain role: Clem's report, in the chat that started it, of how a
    * workflow run ended. */
   voiceWorkflowRunEnding?(call: WorkflowRunEndingCall): Promise<ClemVoiceResult>;

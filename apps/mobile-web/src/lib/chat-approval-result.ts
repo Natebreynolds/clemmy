@@ -1,4 +1,6 @@
 import {
+  ApprovalResultUpdateGate, approvalResultUpdateLookup, approvalResultUpdateMatchesRecord,
+  type ApprovalResultUpdatedEvent,
   mergeApprovalResultRecord,
   mergeApprovalResultBinding,
   sameApprovalResultRelation,
@@ -19,13 +21,15 @@ const REFRESH_PROBLEM = 'Couldn’t refresh this result. Try again.';
 const REFRESH_TIMEOUT = 'This result is taking too long to load. Try again.';
 const READ_DEADLINE_MS = 15_000;
 
-/** One visible card owns this reader. Reading is explicit: mounting history
- * never starts requests, and a discovered old relation stays pinned. */
+/** One visible card owns this reader. History mounts never request data; an
+ * explicit refresh or a new exact live display signal may enrich its record. */
 export class MobileApprovalResultReader {
   private state: MobileApprovalResultState;
   private listeners = new Set<(state: MobileApprovalResultState) => void>();
   private request: AbortController | null = null;
   private active = true;
+  private readonly updateGate = new ApprovalResultUpdateGate();
+  private pendingUpdate: ApprovalResultUpdatedEvent | null = null;
 
   constructor(binding: PendingActionResultLookup | null, record: PendingActionResultRecord | undefined, private readonly read: ReadResult) {
     this.state = { binding, ...(record ? { record } : {}), loading: false, error: null };
@@ -46,15 +50,26 @@ export class MobileApprovalResultReader {
     const merged = record ? mergeApprovalResultRecord(this.state.record, record) : this.state.record;
     const nextBinding = mergeApprovalResultBinding(this.state.binding, binding ?? this.state.binding, merged ?? this.state.record);
     const revised = nextBinding?.recordUpdatedAt !== this.state.binding?.recordUpdatedAt;
-    if (revised) { this.request?.abort(); this.request = null; }
+    if (revised) { this.request?.abort(); this.request = null; this.pendingUpdate = null; }
     if (merged === this.state.record && !revised) return;
     this.publish({ ...this.state, ...(merged ? { record: merged } : {}), binding: nextBinding,
       ...(revised ? { loading: false, error: null } : {}) });
   }
 
-  async refresh(): Promise<void> {
+  /** Only a live signal for this exact mounted card may trigger one automatic read. */
+  observeResultUpdate(value: unknown): void {
+    if (!this.active) return;
+    const event = this.updateGate.admit(value, this.state.binding, this.state.record);
+    if (!event) return;
+    if (this.request) { this.pendingUpdate = event; return; }
+    void this.refresh(event);
+  }
+
+  async refresh(update?: ApprovalResultUpdatedEvent): Promise<void> {
     if (!this.active || this.state.loading || !this.state.binding) return;
-    const expected = this.state.binding;
+    if (update && this.state.record && approvalResultUpdateMatchesRecord(update, this.state.record)) return;
+    const expected = update ? approvalResultUpdateLookup(update, this.state.binding, this.state.record) : this.state.binding;
+    if (!expected) return;
     const request = new AbortController();
     this.request = request;
     this.publish({ ...this.state, loading: true, error: null });
@@ -73,7 +88,7 @@ export class MobileApprovalResultReader {
       if (!this.active || this.request !== request || request.signal.aborted) return;
       const admitted = normalizeApprovalResultResponse(value, expected);
       const record = admitted && mergeApprovalResultRecord(this.state.record, admitted.record);
-      if (!admitted || !record) {
+      if (!admitted || !record || update && !approvalResultUpdateMatchesRecord(update, admitted.record)) {
         this.publish({ ...this.state, loading: false, error: REFRESH_PROBLEM });
         return;
       }
@@ -85,12 +100,17 @@ export class MobileApprovalResultReader {
     } finally {
       clearTimeout(timer);
       if (abortRead) request.signal.removeEventListener('abort', abortRead);
-      if (this.request === request) this.request = null;
+      if (this.request === request) {
+        this.request = null;
+        const pending = this.pendingUpdate; this.pendingUpdate = null;
+        if (pending && this.active) void this.refresh(pending);
+      }
     }
   }
 
   dispose(): void {
     this.active = false;
+    this.pendingUpdate = null;
     this.request?.abort();
     this.request = null;
     this.listeners.clear();

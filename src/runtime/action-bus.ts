@@ -30,6 +30,12 @@ export type ActionEvent =
       resolution: 'approved' | 'rejected';
     }
   | {
+      /** Published display evidence only; never changes execution or turn state. */
+      kind: 'approval.result_updated';
+      sessionId: string; approvalId: string; pendingActionId: string;
+      payloadHash: string; recordUpdatedAt: string; projectionId: string;
+    }
+  | {
       kind: 'notification.created';
       notification: NotificationRecord;
     }

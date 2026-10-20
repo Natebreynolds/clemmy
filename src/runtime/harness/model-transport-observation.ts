@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendEvent } from './eventlog.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
 import { completedModelResponseBinding } from './model-response-binding.js';
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { modelCallPurpose, type ModelCallPurpose } from '../model-call-purpose.js';
 import { modelUsageAttributionStorage, captureModelUsageProvenance, capturedModelUsageAttribution,
   standaloneModelAccountingJobFromContext, standaloneModelAccountingJobBinding,
@@ -42,6 +43,7 @@ interface AttemptState {
   dispatchIds: string[];
   terminal: boolean;
   journalFailed: boolean;
+  pendingJournalCount?: number;
   expectation: ReviewWireExpectation;
   usage?: CapturedModelUsageProvenance;
   framePromptComponents?: Record<string, number>;
@@ -81,6 +83,11 @@ export function finishActiveClaudeReviewWireTransform(transform: ReviewWireTrans
   if (transform) try { finishReviewWireTransform(transform, body, projection, identity); } catch { /* diagnostic only */ }
 }
 const states = new WeakMap<ModelTransportAttempt, AttemptState>();
+const completedOriginalReceipts = new WeakMap<object, {
+  scope: ModelTransportAttempt; hostResultReceiptId: string; responseOutputDigest: string;
+}>();
+const boundedOriginalOutput = (response: object): string => closedCanonicalJson((response as { output?: unknown }).output,
+  { maxNodes: 2_048, maxDepth: 12, maxStringBytes: 16_384, maxTotalBytes: 32_768, omitUndefinedObjectMembers: true });
 const activeAttempt = new AsyncLocalStorage<ModelTransportAttempt>();
 const overrideRecorder = new AsyncLocalStorage<ModelTransportRecorder>();
 const identity = (value: unknown): value is string => typeof value === 'string'
@@ -160,7 +167,9 @@ function emit(scope: ModelTransportAttempt, fields: Record<string, unknown>): vo
     at: Date.now(), clock: 'host_epoch_ms', journalFailed: state.journalFailed });
     const returned = state.record(data);
     if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
-      void Promise.resolve(returned).catch(() => { state.journalFailed = true; });
+      state.pendingJournalCount = (state.pendingJournalCount ?? 0) + 1;
+      void Promise.resolve(returned).catch(() => { state.journalFailed = true; })
+        .finally(() => { state.pendingJournalCount = Math.max(0, (state.pendingJournalCount ?? 1) - 1); });
     }
   } catch { state.journalFailed = true; /* diagnostics never change dispatch */ }
 }
@@ -311,7 +320,8 @@ export function recordStandaloneModelAccountingJobObservation(job: StandaloneMod
   const binding = standaloneModelAccountingJobBinding(job);
   if (!binding) return;
   try {
-    recordOperationalEvent({ source: 'model', type: 'model_accounting_observed', actor: binding.operation === 'meeting_opportunity' ? 'meeting' : 'noticing', payload: {
+    recordOperationalEvent({ source: 'model', type: 'model_accounting_observed', actor: binding.operation === 'approval_result_projection'
+      ? 'approval' : binding.operation === 'meeting_opportunity' ? 'meeting' : 'noticing', payload: {
       version: 1, ownerKind: 'accounting_job', ...binding, phase: input.phase,
       ...(input.outcome ? { outcome: input.outcome, usage: 'unknown' } : {}),
       ...(input.receiptDigest && /^[a-f0-9]{64}$/.test(input.receiptDigest) ? { receiptDigest: input.receiptDigest } : {}),
@@ -396,11 +406,50 @@ export function observeCompletedTransportModelResponse(scope: ModelTransportAtte
     associateOriginalReviewWireResponse(state.expectation, response, owner, state.dispatchIds, state.wireInclusions);
   } catch { state.journalFailed = true; }
   state.terminal = true;
+  const hostResultReceiptId = randomUUID();
+  let responseOutputDigest: string | undefined;
+  try {
+    if (scope.accountingJob?.operation === 'approval_result_projection') {
+      const serialized = boundedOriginalOutput(response as object);
+      if (typeof serialized === 'string' && Buffer.byteLength(serialized) <= 32_768) {
+        responseOutputDigest = createHash('sha256').update(serialized).digest('hex');
+      }
+    }
+  } catch { /* oversized/unreadable output has no display-authorship proof */ }
   emit(scope, { phase: 'model_result_completed', resultScope: 'original_sdk_response',
-    hostResultReceiptId: randomUUID(),
+    hostResultReceiptId,
+    ...(responseOutputDigest ? { responseOutputDigest } : {}),
     dispatchIds: [...state.dispatchIds], providerResponseIdDigest: binding.providerResponseIdDigest,
     ...(state.wireInclusions.length ? { reviewWireInclusionReceipts: state.wireInclusions.map(record => record.receiptId) } : {}),
     rawHttpBodyEof: 'not_observed', wireUsageCoverage: 'unproved' });
+  try {
+    if (response && typeof response === 'object' && responseOutputDigest && !state.journalFailed && !state.ambiguousLocalOriginal) {
+      completedOriginalReceipts.set(response, { scope, hostResultReceiptId, responseOutputDigest });
+    }
+  } catch { /* missing display provenance never changes the model result */ }
+}
+
+/** A returned original in its own standalone job. Serialized IDs, clones,
+ * failed/cancelled adapters and later mutated responses cannot lend this proof. */
+export function completedStandaloneModelResponseReceipt(response: unknown): {
+  modelCallId: string; physicalAttempt: number; providerResponseIdDigest: string;
+  hostResultReceiptId: string; responseOutputDigest: string;
+  usageJobId: string; operation: StandaloneModelAccountingJobBinding['operation']; operationId: string; revisionDigest: string;
+} | undefined {
+  try {
+    if (!response || typeof response !== 'object') return undefined;
+    const original = completedOriginalReceipts.get(response); const scope = original?.scope;
+    const state = scope && states.get(scope); const binding = completedModelResponseBinding(response);
+    if (!original || !scope?.accountingJob || !binding || !state || state.journalFailed || state.pendingJournalCount || !state.terminal
+      || state.localOutcome !== 'returned' || state.ambiguousLocalOriginal || state.localOriginal?.response !== response
+      || !state.dispatchIds.length || binding.modelCallId !== scope.modelCallId || binding.physicalAttempt !== scope.physicalAttempt
+      || binding.providerResponseIdDigest !== state.localOriginal.providerResponseIdDigest) return undefined;
+    const output = boundedOriginalOutput(response);
+    if (typeof output !== 'string' || Buffer.byteLength(output) > 32_768
+      || createHash('sha256').update(output).digest('hex') !== original.responseOutputDigest) return undefined;
+    return Object.freeze({ ...binding, ...scope.accountingJob, hostResultReceiptId: original.hostResultReceiptId,
+      responseOutputDigest: original.responseOutputDigest });
+  } catch { return undefined; }
 }
 
 /** Jev owns its parsed result. This local retirement does not declare remote

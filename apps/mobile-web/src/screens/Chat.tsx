@@ -4,6 +4,7 @@ import type { ConnectionContinuation } from '../lib/connection-setup';
 import { ApprovalReview } from '../components/ApprovalReview';
 import { SteerReceiptStatus } from '../components/SteerReceiptStatus';
 import { CliSessions } from '../components/CliSessions';
+import { subscribeApprovalResultUpdates } from '../lib/approval-result-updates.js';
 /**
  * The chat screen, rebuilt on the shared chat engine (@clem/chat-engine —
  * the same transport/presentation core the desktop console is converging on).
@@ -1085,6 +1086,10 @@ function useMobileApprovalResult(approval: ChatMessage['approval']) {
     return () => { unsubscribe(); reader.dispose(); };
   }, [reader]);
   useEffect(() => { reader?.reconcile(known, lookup); }, [reader, known, approval?.recordUpdatedAt]);
+  useEffect(() => reader ? subscribeApprovalResultUpdates(event => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    reader.observeResultUpdate(event);
+  }) : undefined, [reader]);
   // A response from an unmounted or revised card cannot supply the next
   // card's state, including the render before effect cleanup runs.
   const state = reader ? observed?.reader === reader ? observed.state : reader.snapshot() : null;

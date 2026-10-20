@@ -207,9 +207,9 @@ test('approve-execute on a card the resume owns reports the resume\'s one execut
     assert.equal(presentation.status, 'done');
     assert.deepEqual(body.record.publicResult.terminal, { eventId: settled.id, sourceUserSeq: source.seq });
     assert.equal(body.record.publicResult.text, presentation.text, 'the card presents the whole exact B answer');
-    // The ending speaks as Clem (the card-voice patch): what ran and what it
-    // printed, never the host's "Executed the approved … call".
-    assert.match(presentation.text, /Done — I ran it/);
+    // A model has not spoken yet. Canonical completion supplies neutral app
+    // status; optional authored wording belongs to the separate card projection.
+    assert.match(presentation.text, /^The approved action completed\./);
     const read = await (await fetch(`${h.url}/api/console/pending-actions/${record.id}`)).json() as {
       resultSummary: string; pendingAction: { publicResult: { source: string; text: string;
         terminal?: { eventId: string; sourceUserSeq: number } } };

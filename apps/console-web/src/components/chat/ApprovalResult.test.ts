@@ -71,3 +71,17 @@ test('legacy slim closed history does not pretend an action finished or borrow a
   assert.match(html, /Approval closed/);
   assert.doesNotMatch(html, /Refresh result|Action completed|nothing ran|>Approve</i);
 });
+
+test('authored result wording enriches the same closed card and preserves execution details without live buttons', () => {
+  const settled = { ...record, status: 'executed', publicResult: {
+    version: 1 as const, pendingActionId: record.id, approvalId: record.approvalId, payloadHash: record.payloadHash,
+    recordUpdatedAt: record.updatedAt, status: 'executed' as const, source: 'authored_projection' as const,
+    text: 'I completed the approved action. You can see the recorded result below.',
+    terminal: { eventId: 'canonical-result-terminal', sourceUserSeq: 48 },
+    projection: { id: 'projection-render-fixture', revision: 1 as const, evidenceDigest: 'a'.repeat(64), textDigest: 'b'.repeat(64), publishedAt: record.updatedAt },
+  } };
+  const html = render({ approval: { ...approval, resultRecord: settled, resolution: 'approved' } });
+  assert.match(html, /I completed the approved action/);
+  assert.match(html, /Raw &lt;fixture&gt; evidence/);
+  assert.doesNotMatch(html, />Approve<|>Decline<|Execute queued action|Edit by hand/);
+});

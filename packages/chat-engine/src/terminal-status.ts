@@ -118,6 +118,8 @@ export function terminalNoticeLine(terminal: TerminalFacts | undefined): Termina
     ...(action ? { action } : {}),
   });
   switch (notice.code) {
+    case 'approved_action_completed':
+      return terminal.status === 'done' ? line('Approved action completed', 'neutral') : null;
     case 'stopped':
     case 'card_decision':
       return null;
@@ -173,7 +175,7 @@ export function terminalNoticeVoiceFact(terminal: Pick<TerminalFacts, 'notice' |
   const notice = terminal?.notice;
   // Recovery publication only reports a stopped owner's missing checkpoint.
   // It must never start a voice narrator/model after that owner has stopped.
-  if (!notice || notice.code === 'stopped' || notice.code === 'card_decision'
+  if (!notice || notice.code === 'stopped' || notice.code === 'card_decision' || notice.code === 'approved_action_completed'
     || notice.code === 'continuation_unavailable') return null;
   const named = [
     notice.model ? `model: ${notice.model}` : '',

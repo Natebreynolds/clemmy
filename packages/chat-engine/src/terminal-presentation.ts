@@ -96,14 +96,14 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   const retained = retainedFrom(data.retained);
   if (retained) facts.retained = retained;
   const notice = noticeFrom(data.notice);
-  if (notice) facts.notice = notice;
+  if (notice && (notice.code !== 'approved_action_completed' || status === 'done')) facts.notice = notice;
   return facts;
 }
 
 const REVIEWS: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck', 'checking']);
 const OUTSIDE_CHANGES: ReadonlySet<string> = new Set(['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none']);
 const NOTICE_CODES: ReadonlySet<string> = new Set<TerminalNoticeCode>([
-  'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
+  'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision', 'approved_action_completed',
   'saved_model_unavailable', 'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired',
   'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable', 'continuation_unavailable',
 ]);

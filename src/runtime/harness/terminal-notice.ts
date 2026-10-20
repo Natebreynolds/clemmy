@@ -12,6 +12,7 @@ export const TERMINAL_NOTICE_CODES = [
   'response_format_unqualified',
   'provider_quota',
   'card_decision',
+  'approved_action_completed',
   'saved_model_unavailable',
   'model_unavailable_on_sign_in',
   'no_model_connected',

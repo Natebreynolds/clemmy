@@ -114,6 +114,15 @@ test('a stop the owner asked for is the pill only, and a card decision is the ca
   assert.equal(cardDecisionNoticeOnly({ text: '', status: 'stopped', terminal: { status: 'cancelled', notice: { code: 'stopped' } } }), false);
 });
 
+test('approved execution completion is an app notice without a second voice request', () => {
+  const terminal: TerminalFacts = { status: 'done', notice: { code: 'approved_action_completed' } };
+  assert.deepEqual(terminalNoticeLine(terminal), { label: 'Approved action completed', tone: 'neutral' });
+  assert.equal(terminalNoticeVoiceFact(terminal), null);
+  for (const status of ['failed', 'blocked', 'cancelled', 'uncertain', 'needs_input'] as const) {
+    assert.equal(terminalNoticeLine({ ...terminal, status }), null);
+  }
+});
+
 test('no status line, chip or notice the app writes ever speaks as Clem', () => {
   const firstPerson = /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b/;
   const seen: string[] = [];

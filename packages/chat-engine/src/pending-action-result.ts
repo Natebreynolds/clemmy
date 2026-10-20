@@ -3,8 +3,9 @@ export interface PendingActionPublicResult {
   version: 1; pendingActionId: string; approvalId: string | null; payloadHash: string;
   recordUpdatedAt: string;
   status: 'executed' | 'failed' | 'executing' | 'rejected' | 'expired' | 'cancelled';
-  source: 'record' | 'terminal'; text: string;
+  source: 'record' | 'terminal' | 'authored_projection'; text: string;
   terminal?: { eventId: string; sourceUserSeq: number };
+  projection?: { id: string; revision: 1; evidenceDigest: string; textDigest: string; publishedAt: string };
 }
 export interface PendingActionResultRecord {
   id: string; approvalId: string | null; payloadHash: string; updatedAt: string;
@@ -20,6 +21,9 @@ function object(value: unknown): Record<string, unknown> | null {
 function identifier(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\s\u0000-\u001f\u007f]/.test(value);
 }
+function digest(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
 function revision(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 64 && Number.isFinite(Date.parse(value));
 }
@@ -32,12 +36,17 @@ export function normalizePendingActionPublicResult(value: unknown, record: {
     || r.pendingActionId !== record.id || r.approvalId !== record.approvalId || r.payloadHash !== record.payloadHash
     || r.recordUpdatedAt !== record.updatedAt || r.status !== record.status
     || typeof r.text !== 'string' || !r.text.trim() || r.text.length > 12_000
-    || (r.source !== 'record' && r.source !== 'terminal')) return null;
+    || !['record', 'terminal', 'authored_projection'].includes(String(r.source))) return null;
   const t = object(r.terminal);
-  if (r.source === 'terminal' && (!t || !identifier(t.eventId) || !Number.isSafeInteger(t.sourceUserSeq) || Number(t.sourceUserSeq) < 1)) return null;
+  if (r.source !== 'record' && (!t || !identifier(t.eventId) || !Number.isSafeInteger(t.sourceUserSeq) || Number(t.sourceUserSeq) < 1)) return null;
+  const p = object(r.projection);
+  if (r.source === 'authored_projection' && (r.status !== 'executed' || !p || !identifier(p.id) || p.revision !== 1
+    || !digest(p.evidenceDigest) || !digest(p.textDigest) || !revision(p.publishedAt))) return null;
   return { version: 1, pendingActionId: record.id, approvalId: record.approvalId ?? null, payloadHash: record.payloadHash,
-    recordUpdatedAt: record.updatedAt!, status: r.status as PendingActionPublicResult['status'], source: r.source, text: r.text,
-    ...(r.source === 'terminal' ? { terminal: { eventId: t!.eventId as string, sourceUserSeq: Number(t!.sourceUserSeq) } } : {}) };
+    recordUpdatedAt: record.updatedAt!, status: r.status as PendingActionPublicResult['status'], source: r.source as PendingActionPublicResult['source'], text: r.text,
+    ...(r.source !== 'record' ? { terminal: { eventId: t!.eventId as string, sourceUserSeq: Number(t!.sourceUserSeq) } } : {}),
+    ...(r.source === 'authored_projection' ? { projection: { id: p!.id as string, revision: 1 as const, evidenceDigest: p!.evidenceDigest as string,
+      textDigest: p!.textDigest as string, publishedAt: p!.publishedAt as string } } : {}) };
 }
 export function normalizePendingActionResultRecord(value: unknown): PendingActionResultRecord | null {
   const r = object(value);
@@ -88,20 +97,24 @@ export function mergeApprovalResultRecord(current: PendingActionResultRecord | u
   if (current.id !== incoming.id || current.approvalId !== incoming.approvalId || current.payloadHash !== incoming.payloadHash
     || Date.parse(incoming.updatedAt) < Date.parse(current.updatedAt)) return null;
   const settled = ['executed','failed','rejected','expired','cancelled'].includes(current.status);
-  if (settled && (current.status !== incoming.status || current.resultSummary !== incoming.resultSummary)) return null;
+  if (settled && (current.updatedAt !== incoming.updatedAt || current.status !== incoming.status || current.resultSummary !== incoming.resultSummary)) return null;
   if (current.status === 'executing' && !['executing','executed','failed'].includes(incoming.status)) return null;
   if (current.publicResult && !incoming.publicResult && current.updatedAt === incoming.updatedAt
     && current.status === incoming.status && current.resultSummary === incoming.resultSummary) return current;
-  if (current.publicResult?.source === 'terminal' && incoming.publicResult?.source === 'terminal'
-    && (current.updatedAt !== incoming.updatedAt || current.publicResult.text !== incoming.publicResult.text
-      || current.publicResult.terminal?.eventId !== incoming.publicResult.terminal?.eventId
-      || current.publicResult.terminal?.sourceUserSeq !== incoming.publicResult.terminal?.sourceUserSeq)) return null;
-  if (current.publicResult?.source === 'terminal' && incoming.publicResult?.source !== 'terminal') {
+  const before = current.publicResult; const after = incoming.publicResult;
+  if (before && after && before.source !== 'record' && after.source !== 'record') {
+    if (current.updatedAt !== incoming.updatedAt || before.terminal?.eventId !== after.terminal?.eventId
+      || before.terminal?.sourceUserSeq !== after.terminal?.sourceUserSeq) return null;
+    if (before.source === after.source && (before.text !== after.text
+      || JSON.stringify(before.projection) !== JSON.stringify(after.projection))) return null;
+  }
+  if (before?.source === 'authored_projection' && after?.source !== 'authored_projection'
+    || before?.source === 'terminal' && (!after || after.source === 'record')) {
     return current.updatedAt === incoming.updatedAt && current.status === incoming.status && current.resultSummary === incoming.resultSummary ? current : null;
   }
-  if (settled && current.publicResult && incoming.publicResult?.source === 'terminal' && current.publicResult.source === 'record') {
-    const before = pendingActionRecordPresentation(current); const after = pendingActionRecordPresentation(incoming);
-    if (!before || !after || !pendingActionTerminalResultUpgrade(before, after)) return null;
+  if (settled && before && after && presentationRank(after) > presentationRank(before)) {
+    const oldPresentation = pendingActionRecordPresentation(current); const nextPresentation = pendingActionRecordPresentation(incoming);
+    if (!oldPresentation || !nextPresentation || !pendingActionTerminalResultUpgrade(oldPresentation, nextPresentation)) return null;
   }
   return incoming;
 }
@@ -163,6 +176,10 @@ export function withPublicResult(presentation: PendingActionExecutionPresentatio
 
 /** A later answer may enrich this settled record, never replace its execution
  * truth or another revision's evidence. Both projections passed withPublicResult. */
+function presentationRank(result: PendingActionPublicResult): number {
+  return result.source === 'authored_projection' ? 2 : result.source === 'terminal' ? 1 : 0;
+}
+
 export function pendingActionTerminalResultUpgrade(
   current: PendingActionExecutionPresentation | undefined,
   incoming: PendingActionExecutionPresentation,
@@ -173,7 +190,10 @@ export function pendingActionTerminalResultUpgrade(
     || current.recordResultSummary !== incoming.recordResultSummary) return null;
   const before = current.publicResult;
   const after = incoming.publicResult;
-  if (!before || before.source !== 'record' || !after || after.source !== 'terminal'
+  if (!before || !after || presentationRank(after) <= presentationRank(before)
+    || (after.source === 'authored_projection' && (current.phase !== 'executed' || !after.projection))
+    || (before.source !== 'record' && (before.terminal?.eventId !== after.terminal?.eventId
+      || before.terminal?.sourceUserSeq !== after.terminal?.sourceUserSeq))
     || before.pendingActionId !== after.pendingActionId || before.approvalId !== after.approvalId
     || before.payloadHash !== after.payloadHash || before.recordUpdatedAt !== after.recordUpdatedAt
     || before.status !== after.status || after.status !== current.phase) return null;
@@ -189,7 +209,7 @@ export function retainPendingActionPresentation(known: PendingActionExecutionPre
   const terminal = ['executed','failed','rejected','expired','cancelled'].includes(known.phase);
   if (terminal) {
     if (incoming.phase !== known.phase) return known;
-    if (known.publicResult?.source === 'terminal') return known;
+    if (known.publicResult?.source === 'authored_projection') return known;
     return pendingActionTerminalResultUpgrade(known, incoming) ?? (known.publicResult ? known : incoming);
   }
   if (known.phase === 'uncertain' && !['executed','failed','rejected','expired','cancelled'].includes(incoming.phase)) return known;
