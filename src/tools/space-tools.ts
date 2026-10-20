@@ -1437,7 +1437,24 @@ export function registerSpaceTools(server: McpServer): void {
             : pendingCount > 0
               ? 'Refresh incomplete for'
               : 'Refresh failed for';
-      return textResult(`${heading} "${slug}":\n${lines.join('\n')}`);
+      const report = `${heading} "${slug}":\n${lines.join('\n')}`;
+      // A refresh that landed is a write to the Space's dataset file, so its
+      // result carries the same host file commit receipt a dataset save does.
+      // Without it the settled refresh owed a file receipt it never produced,
+      // the reviewer could not verify it, and the turn ended "needs a look"
+      // although the review passed (live 10-20: `completion_review_artifact_drift`
+      // on "Refresh my R45 nine space"; the same ending on turn 12 of the
+      // 30-turn ringer).
+      if (anyOk) {
+        try {
+          return textResult(withHostLocalWriteCommitFromFile({
+            createdId: slug,
+            committedPath: resolveInSpace(slug, 'data.json'),
+            result: report,
+          }));
+        } catch { /* an unmintable receipt leaves the report as it was */ }
+      }
+      return textResult(report);
     },
   );
 

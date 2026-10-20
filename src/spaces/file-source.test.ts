@@ -102,3 +102,43 @@ test('space_save accepts a file source end to end and the Space holds the file r
   const data = JSON.parse(readFileSync(spaces.resolveInSpace('framework-test-file-saved-shelf', 'data.json'), 'utf8')) as Record<string, unknown>;
   assert.deepEqual(data.books, [{ title: 'Thirst', price: '£17.27', star_rating: 'Five' }, { title: 'Soumission', price: '£50.10', star_rating: 'One' }]);
 });
+
+test('a refresh that landed returns the host file commit receipt for the Space dataset, so the review can verify it', async () => {
+  // Live 10-20: "Refresh my R45 nine space" ended "needs a look" with
+  // completion_review_artifact_drift although the review passed — the settled
+  // refresh owed a file receipt it never produced.
+  const { registerSpaceTools } = await import('../tools/space-tools.js');
+  const { parseHostLocalWriteCommitFacts } = await import('../runtime/harness/host-local-write-commit.js');
+  const { createHash } = await import('node:crypto');
+  type Handler = (input: Record<string, unknown>) => Promise<unknown>;
+  const handlers: Record<string, Handler> = {};
+  registerSpaceTools({ tool(name: string, _d: string, _p: unknown, h: Handler) { handlers[name] = h; } } as never);
+  const slug = 'framework-test-file-refresh-receipt';
+  const csv = path.join(FIXTURES, 'refresh-receipt.csv');
+  writeFileSync(csv, 'title,price\nThirst,£17.27\n');
+  const saved = await handlers.space_save!({
+    slug,
+    title: 'FRAMEWORK-TEST refresh receipt',
+    view_html: '<!doctype html><html><body><div class="clem-app" id="app"></div><script>async function render(){const d=await clem.data();document.getElementById("app").textContent=(d.books||[]).length+" books";}clem.onData(render);render();</script></body></html>',
+    data_sources: [{ id: 'books', file_path: csv }],
+  });
+  const savedText = (saved as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+  assert.doesNotMatch(savedText, /NOT saved|declares nothing to read|Error/, savedText.slice(0, 400));
+  writeFileSync(csv, 'title,price\nThirst,£17.27\nSoumission,£50.10\n');
+  const out = (await handlers.space_refresh!({ slug, source_id: 'books' }) as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+  const facts = parseHostLocalWriteCommitFacts(out);
+  assert.ok(facts, out.slice(0, 300));
+  assert.equal(facts!.createdId, slug);
+  assert.match(facts!.handle, /framework-test-file-refresh-receipt\/data\.json$/);
+  const current = createHash('sha256').update(readFileSync(spaces.resolveInSpace(slug, 'data.json'))).digest('hex');
+  assert.equal(facts!.contentDigest, current, 'the receipt names the dataset as it is now');
+  assert.match(out, /Refreshed "framework-test-file-refresh-receipt"/);
+  assert.match(out, /books: ok \(2 rows\)/);
+
+  // Nothing landed: no receipt, the plain report as before.
+  const { unlinkSync } = await import('node:fs');
+  unlinkSync(csv);
+  const failed = (await handlers.space_refresh!({ slug, source_id: 'books' }) as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+  assert.equal(parseHostLocalWriteCommitFacts(failed), null);
+  assert.match(failed, /Refresh failed for/);
+});
