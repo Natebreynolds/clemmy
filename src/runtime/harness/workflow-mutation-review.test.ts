@@ -253,3 +253,20 @@ test('different long proposed values with the same displayed prefix retain disti
   assert.equal(Object.keys(found!.matches).length, 2);
   assert.deepEqual(Object.values(found!.matches).sort(), [['first'], ['second']]);
 });
+
+test('observations past the default canonical string limit are still reviewed, never thrown away as an outage', async () => {
+  // Live 10-19 → 10-20 (Platform 49): the Slack channel text passed 64 KB,
+  // the proposal digest threw, and every scheduled sheet write was refused.
+  const summary = 'Slack channel digest line. '.repeat(4_000);
+  assert.ok(Buffer.byteLength(summary) > 64_000);
+  const result = await reviewWorkflowMutation({ ...input, observations: { complete: true, summary } }, {
+    evaluate: async () => { throw new Error('large proposal must be reviewed'); },
+    judge: async (_system, prompt, parse) => {
+      const packet = JSON.parse(prompt);
+      assert.equal(packet.observations, summary);
+      return { value: parse({ verdict: 'compatible', reason: 'Checked the complete proposal.',
+        proposalDigest: packet.proposalDigest }), failure: null };
+    },
+  });
+  assert.equal(result.verdict, 'compatible', result.reason);
+});

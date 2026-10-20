@@ -4,7 +4,7 @@ import os from 'node:os';
 import { BASE_DIR } from '../../config.js';
 import pino from 'pino';
 
-import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { resolveWorkflowRunDefinitionSnapshot } from '../../execution/workflow-run-definition.js';
 import { readWorkflowRunRecord, workflowRunPhase } from '../../execution/workflow-run-record.js';
 import { validateArgsAgainstSchema } from '../../tools/composio-batch-validator.js';
@@ -147,8 +147,12 @@ export type RecordAuthoredWorkflowWriteAuthorityResult =
   | { status: 'none' }
   | { status: 'refused'; reason: string };
 
+// Live 10-19 → 10-20 (Platform 49): a scheduled sheet write was refused on
+// every run as "constraints unavailable" because the proposal's Slack
+// observations passed the default 64 KB string limit and the digest threw.
+// A digest is an identity, not a size gate; it takes the sealed-call limits.
 function digest(value: unknown): string {
-  return createHash('sha256').update(closedCanonicalJson(value), 'utf8').digest('hex');
+  return createHash('sha256').update(closedCanonicalJson(value, SEALED_CALL_CANONICAL_LIMITS), 'utf8').digest('hex');
 }
 
 function sourceEvent(sessionId: string, sourceUserSeq: number): SourceEventRow | null {
@@ -201,7 +205,7 @@ function catalogIdentityBytesEqual(
   left: CanonicalCatalogIdentityV1,
   right: CanonicalCatalogIdentityV1,
 ): boolean {
-  return closedCanonicalJson(left) === closedCanonicalJson(right);
+  return closedCanonicalJson(left, SEALED_CALL_CANONICAL_LIMITS) === closedCanonicalJson(right, SEALED_CALL_CANONICAL_LIMITS);
 }
 
 function sourceMetadata(row: SourceEventRow): Record<string, unknown> | null {
@@ -498,7 +502,7 @@ export function recordAuthoredWorkflowWriteAuthority(input: {
       authorityDigest: digest(body),
     };
     const eventId = eventIdFor(source);
-    const dataJson = closedCanonicalJson(receipt);
+    const dataJson = closedCanonicalJson(receipt, SEALED_CALL_CANONICAL_LIMITS);
     const db = openEventLog();
     const committed = db.transaction((): boolean => {
       const rows = db.prepare(`

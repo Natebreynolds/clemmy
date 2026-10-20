@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge } from './objective-judge.js';
 import { mutationReviewTimeoutMs, recordJudgeMetric } from './judge-family.js';
@@ -168,10 +168,14 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   evaluate?: typeof evaluateSystemOne;
   judge?: typeof runHedgedJudge;
 } = {}): Promise<WorkflowMutationReview> {
+  // The proposal digest is an identity, never a size gate. Live 10-19 → 10-20
+  // (Platform 49): the Slack observations passed the default 64 KB string
+  // limit, this canonicalization threw, and every scheduled sheet write was
+  // refused as "constraints unavailable" for a day.
   const proposal = JSON.parse(closedCanonicalJson({ instructions: input.instructions, tool: input.tool,
     ...(input.account ? { account: input.account } : {}),
-    schema: input.schema, args: input.args, observations: input.observations.summary }));
-  const proposalDigest = createHash('sha256').update(closedCanonicalJson(proposal)).digest('hex');
+    schema: input.schema, args: input.args, observations: input.observations.summary }, SEALED_CALL_CANONICAL_LIMITS));
+  const proposalDigest = createHash('sha256').update(closedCanonicalJson(proposal, SEALED_CALL_CANONICAL_LIMITS)).digest('hex');
   const uncertain = (reason: string): WorkflowMutationReview => ({ verdict: 'uncertain', reason, proposalDigest });
   // The parts that do not change between the reviews of one step (its saved
   // instructions, the tool, its schema) lead the prompt; what changes with
