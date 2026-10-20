@@ -8,7 +8,7 @@ import { Agent, tool } from '@openai/agents';
 import type { Handoff } from '@openai/agents';
 import { z } from 'zod';
 import { CLARIFICATION_APPROVAL_GUIDANCE, FORMAL_APPROVAL_PREPARATION_GUIDANCE, SEALED_APPROVAL_GUIDANCE } from '../shared/approval-preparation-guidance.js';
-import { conditionalApprovalPreparationRepair } from './question-tools.js';
+import { conditionalApprovalPreparationRepair, parseQuestionToolWireEdition, type QuestionToolWireEdition } from './question-tools.js';
 import { getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
@@ -40,7 +40,7 @@ import { harnessInstructions } from './harness-context.js';
 import { meetingResearchSource } from '../integrations/recall/meeting-research-boundary.js';
 import { getCoreToolsAsync } from '../tools/registry.js';
 import { bindAgentRebuildContext } from './agent-rebuild-context.js';
-import { bindAgentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
+import { bindAgentSourceSessionContext, questionToolWireEditionForSource } from '../runtime/harness/source-session-context-scope.js';
 import { enabledExternalServerNames } from '../runtime/mcp-servers.js';
 import { batchShapeDirective } from '../tools/batch-shape-directive.js';
 import { detectMultiItemIntentFromConversation } from '../runtime/harness/context-packet.js';
@@ -61,6 +61,7 @@ import {
   appendEvent,
   getSession,
   listEvents,
+  openEventLog,
   resolveToolOutputEvidenceExcerptsForAuthority,
   resolveToolOutputExcerptsForAuthority,
   type EventRow,
@@ -179,7 +180,7 @@ import {
 } from '../runtime/harness/work-manifest.js';
 import { evaluateQuantifiedWorkManifestGateWithArbitration } from '../runtime/harness/quantified-work-manifest.js';
 import { currentToolAbortDeadlineAt, currentToolAbortSignal } from '../runtime/tool-abort-context.js';
-import type { DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
+import { assertDispatchLeaseCurrent, currentDispatchLease, type DispatchLeaseRef } from '../runtime/harness/dispatch-lease.js';
 import {
   bindWorkerPacketExpectedWork,
 } from '../runtime/harness/expected-work-admission.js';
@@ -188,7 +189,11 @@ import {
   harnessOutputGuardrails,
 } from '../runtime/harness/guardrails.js';
 import { assertNotKilled, DEFAULT_MAX_TURNS, harnessRunContextStorage, KillRequested, withDeferredLoading, wrapToolForHarness, workerThrashGuardEnabled, type WrappableTool } from '../runtime/harness/brackets.js';
-import { currentLogicalCall } from '../runtime/harness/attempt-identity.js';
+import { acceptedTaskIdFor, currentLogicalCall } from '../runtime/harness/attempt-identity.js';
+import { acceptedTurnCallAuthorityFor } from '../runtime/harness/accepted-turn-call-authority.js';
+import { durableLogicalCallContract, durableLogicalCallRecoveryMaterial } from '../runtime/harness/logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from '../runtime/harness/logical-call-settlement-store.js';
+import { redeemSuccessfulSettlementResultForHost } from '../runtime/harness/result-handle.js';
 import { CancelledPreDispatchResult, HostLocalExecutionFailureResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { WorkerBatchGenerationCancelledError } from './worker-batch-execution.js';
 import { describeInvalidToolInput, isSdkToolInputValidationError } from '../tools/shared.js';
@@ -1031,6 +1036,73 @@ function unresolvedRecipientCandidateFromBatch(
   } : null;
 }
 
+/** A durable historical result cannot borrow a different publication owner. */
+function currentWrappedQuestionOwner(context: unknown): boolean {
+  const sessionId = extractSessionId(context); const sourceUserSeq = extractSourceUserSeq(context);
+  const active = harnessRunContextStorage.getStore(); const lease = active?.dispatchLease;
+  const nestedLease = currentDispatchLease();
+  if (!sessionId || !sourceUserSeq || active?.sessionId !== sessionId || active.sourceUserSeq !== sourceUserSeq
+    || !lease || lease.sessionId !== sessionId
+    || (nestedLease && (nestedLease.scopeId !== lease.scopeId || nestedLease.leaseId !== lease.leaseId))
+    || (lease.sourceUserSeq !== undefined && lease.sourceUserSeq !== sourceUserSeq)
+    || !active.runAttemptId || lease.runAttemptId !== active.runAttemptId) return false;
+  const attempt = openEventLog().prepare(`SELECT 1 FROM run_dispatch_leases AS lease
+    JOIN run_attempts AS attempt ON attempt.attempt_id = lease.run_attempt_id
+    WHERE lease.session_id = ? AND lease.scope_id = ? AND lease.lease_id = ? AND lease.run_attempt_id = ?
+      AND attempt.session_id = lease.session_id AND attempt.source_user_seq = ?
+      AND attempt.status = 'active' AND attempt.finished_at IS NULL`)
+    .get(sessionId, lease.scopeId, lease.leaseId, active.runAttemptId, sourceUserSeq);
+  if (!attempt) return false;
+  // Durable historical results do not revive a stopped or replaced owner.
+  assertDispatchLeaseCurrent(lease);
+  assertNotKilled(sessionId, { attemptId: active.runAttemptId });
+  active.callerCancelSignal?.throwIfAborted();
+  return true;
+}
+
+function hostOwnedWrappedQuestionCandidate(context: unknown, result: OrchestratorToolResult): AskUserQuestionCandidate | null {
+  // Eligibility only: unrelated (possibly large) provider output is never
+  // parsed or redeemed merely because it resembles a question receipt.
+  if (result.tool.name !== 'call_tool') return null;
+  const outer = toolCallInputOf(result) as { name?: unknown } | null;
+  if (!outer || outer.name !== 'ask_user_question') return null;
+  const sessionId = extractSessionId(context); const sourceUserSeq = extractSourceUserSeq(context);
+  const logicalToolCallId = resultBatchCallId(result);
+  if (!sessionId || !sourceUserSeq || !logicalToolCallId || !currentWrappedQuestionOwner(context)) return null;
+  const acceptedTaskId = acceptedTaskIdFor(sessionId, sourceUserSeq);
+  const authority = acceptedTurnCallAuthorityFor(sessionId, sourceUserSeq);
+  if (authority.status !== 'ok' || authority.authority.state !== 'open'
+    || authority.authority.identity.acceptedTaskId !== acceptedTaskId
+    || authority.authority.identity.sourceTurn !== extractTurn(context)) return null;
+  const raw = durableLogicalCallRecoveryMaterial(acceptedTaskId, 'call_tool', outer);
+  if (!raw || raw.toolName !== 'ask_user_question'
+    || Object.keys(raw.args).some(key => !['question', 'options', 'purpose'].includes(key))) return null;
+  const identity = { sessionId, sourceUserSeq, acceptedTaskId, logicalToolCallId };
+  const read = redeemDurableLogicalCallSettlementForHost(identity);
+  if (read.status !== 'ok') return null;
+  const settled = read.settlement;
+  if (settled.toolName !== 'ask_user_question' || settled.executionKind !== 'local_execution'
+    || settled.outcome.kind !== 'succeeded' || settled.recovery.mutating !== false
+    || settled.physicalCrossingCount !== 0 || settled.hostCrossingCount !== 1 || settled.crossings.length !== 1
+    || settled.crossings[0].toolName !== 'ask_user_question' || settled.crossings[0].executionSite !== 'host'
+    || settled.crossings[0].terminalState !== 'returned' || !settled.resultHandleId) return null;
+  const retained = redeemSuccessfulSettlementResultForHost(identity);
+  if (retained.status !== 'ok' || retained.value.resultHandleId !== settled.resultHandleId
+    || retained.value.executionSite !== 'host' || retained.value.toolName !== 'ask_user_question') return null;
+  const carrierBytes = typeof retained.value.rawPayload === 'string' ? retained.value.rawPayload : retained.value.rawPayloadJson;
+  if (typeof result.output !== 'string' || result.output !== carrierBytes) return null;
+  const candidate = askUserQuestionCandidate(result.output);
+  if (!candidate || Object.keys(candidate).sort().join('|') !== 'kind|options|posted|purpose|question|status') return null;
+  const effective = durableLogicalCallContract(acceptedTaskId, 'ask_user_question', {
+    question: candidate.question, options: candidate.options, purpose: candidate.purpose,
+  });
+  const submitted = durableLogicalCallContract(acceptedTaskId, 'ask_user_question', {
+    question: raw.args.question, options: raw.args.options ?? null, purpose: raw.args.purpose ?? null,
+  });
+  return effective?.argumentDigest === settled.argumentDigest && submitted?.argumentDigest === settled.argumentDigest
+    ? candidate : null;
+}
+
 /** End a provider turn only after a real user-choice pause. Approval-shaped
  * YOLO asks explicitly return a non-halting result and must run the model again. */
 export function userChoiceToolUseBehavior(
@@ -1103,11 +1175,13 @@ export function userChoiceToolUseBehavior(
   // publish one while both tool receipts falsely claim success.
   const candidates: AskUserQuestionCandidate[] = [];
   const seenCandidates = new Set<string>();
+  let wrappedQuestion = false;
   for (const result of toolResults) {
     if (result.type !== 'function_output') continue;
-    if (bareTerminalToolName(result.tool.name ?? '') !== 'ask_user_question') continue;
-    const candidate = askUserQuestionCandidate(result.output);
+    const direct = bareTerminalToolName(result.tool.name ?? '') === 'ask_user_question';
+    const candidate = direct ? askUserQuestionCandidate(result.output) : hostOwnedWrappedQuestionCandidate(context, result);
     if (!candidate) continue;
+    if (!direct) wrappedQuestion = true;
     const key = exactAskUserQuestionCandidateKey(candidate);
     if (seenCandidates.has(key)) continue;
     seenCandidates.add(key);
@@ -1200,7 +1274,7 @@ export function userChoiceToolUseBehavior(
       ? { question: connectionProjection.question, options: [...connectionProjection.options] }
       : rendered;
     const existing = listEvents(sessionId, { types: ['awaiting_user_input'] })
-      .find((event) => event.turn === turn);
+      .find((event) => event.turn === turn && (!sourceUserSeq || event.data.sourceUserSeq === sourceUserSeq));
     if (existing) {
       const existingQuestion = String(
         (existing.data as { question?: unknown }).question ?? publicAsk.question,
@@ -1218,6 +1292,8 @@ export function userChoiceToolUseBehavior(
           proposedText: publicAsk.question,
         })
       : { text: publicAsk.question, constrained: false };
+    // No await separates this fresh owner check from the public post.
+    if (wrappedQuestion && !currentWrappedQuestionOwner(context)) return { isFinalOutput: false as const, isInterrupted: undefined };
     appendEvent({
       sessionId,
       turn,
@@ -1655,7 +1731,13 @@ const askUserQuestionParams = z.object({
     .describe('Use "clarification" for a missing fact or choice only the user has; null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
 });
 
-export function buildAskUserQuestionTool() {
+const clarificationQuestionParams = askUserQuestionParams.extend({
+  purpose: z.enum(['clarification']).nullable().describe('Use "clarification" for a missing fact or choice only the user has; null if neither.'),
+});
+
+export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'legacy_v1') {
+  if (!parseQuestionToolWireEdition(edition)) throw new Error('Unknown question tool wire edition.');
+  const legacy = edition === 'legacy_v1';
   return tool({
     name: 'ask_user_question',
     description:
@@ -1665,9 +1747,9 @@ export function buildAskUserQuestionTool() {
       + 'out yourself, what would not change the outcome, or what this session already settled. Do the unblocked part '
       + 'first; ask ONE targeted question with 2-5 concrete options, recommendation first, no "other" option; batch '
       + 'independent questions. `purpose`: "clarification" = a fact only they have, or a choice between different '
-      + 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. '
+      + (legacy ? 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. ' : 'ways forward. ')
       + CLARIFICATION_APPROVAL_GUIDANCE,
-    parameters: askUserQuestionParams,
+    parameters: legacy ? askUserQuestionParams : clarificationQuestionParams,
     execute: async (args, runContext) => {
       const sessionId = extractSessionId(runContext);
       if (sessionId) {
@@ -4246,12 +4328,13 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
   const resumesChatTurn = options.acceptedRoute === 'act' && resumeMayKeepDesk
     && Boolean(options.sessionId && options.sourceUserSeq
       && recordedTurnDesk(options.sessionId, options.sourceUserSeq as number));
+  const questionTool = buildAskUserQuestionTool(questionToolWireEditionForSource(options.sessionId ?? '', options.sourceUserSeq));
   const structuralTools = factorySkip
     ? []
     : planMode
-      ? [buildPublishPlanTool(hostFreshPlanning), buildAskUserQuestionTool(), runWorkerTool!]
+      ? [buildPublishPlanTool(hostFreshPlanning), questionTool, runWorkerTool!]
     : reviewedReadOnlyExecution
-      ? [...reviewedComputeResults, buildAskUserQuestionTool(), runWorkerTool!]
+      ? [...reviewedComputeResults, questionTool, runWorkerTool!]
     : carrierWork
     // run_worker stays DIRECT on action turns: it is the fan-out coordination
     // primitive (control role), not a business operation — dropping it made
@@ -4278,14 +4361,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           // toolsOnAdvertisedWire also exposes it when acquisition doors are
           // absent. Enablement and exact plan admission are unchanged.
           deferLoading: options.acceptedRoute !== 'act' || resumesChatTurn,
-        }), buildAskUserQuestionTool(), runWorkerTool!]
-      : [buildRequestApprovalTool(), buildAskUserQuestionTool(), runWorkerTool!]
+        }), questionTool, runWorkerTool!]
+      : [buildRequestApprovalTool(), questionTool, runWorkerTool!]
     : localMemoryScope
-    ? [plannerTool!, buildAskUserQuestionTool()]
+    ? [plannerTool!, questionTool]
     : [
         plannerTool!,
         buildRequestApprovalTool(),
-        buildAskUserQuestionTool(),
+        questionTool,
         runWorkerTool!,
       ];
   // Structural capabilities are constructed here because their exact tool

@@ -567,6 +567,39 @@ export type NativeToolArgumentPreparation =
   | { status: 'prepared'; args: Record<string, unknown>; inputSchema: unknown }
   | { status: 'invalid'; schema: unknown; detail: string; violations: string[]; guidance?: string };
 
+/** The selected host-local instance owns both its parser and its dispatch.
+ * A separate registry entry with the same name is not an equivalent schema. */
+function prepareTurnOwnedToolArguments(target: string, args: unknown, configured: unknown): NativeToolArgumentPreparation {
+  let inputSchema: unknown = null;
+  try {
+    const selected = configured as { name?: unknown; invoke?: unknown; parameters?: unknown; description?: unknown } | null;
+    if (!selected || selected.name !== target || typeof selected.invoke !== 'function') throw new Error('invalid instance');
+    inputSchema = structuredClone(selected.parameters);
+    if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)
+      || (inputSchema as { type?: unknown }).type !== 'object'
+      || !(inputSchema as { properties?: unknown }).properties
+      || typeof (inputSchema as { properties?: unknown }).properties !== 'object'
+      || Array.isArray((inputSchema as { properties?: unknown }).properties)) throw new Error('invalid schema');
+    const schema = z.fromJSONSchema(inputSchema as Parameters<typeof z.fromJSONSchema>[0]);
+    const parsed = schema.safeParse(materializeStrictNullableFields(args, inputSchema));
+    if (!parsed.success) {
+      const paths = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
+        ? issue.keys.map((key) => [...issue.path, key].join('.'))
+        : [issue.path.join('.') || '(root)']);
+      return { status: 'invalid', schema: inputSchema,
+        ...(typeof selected.description === 'string' ? { guidance: selected.description } : {}),
+        detail: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '),
+        violations: [...new Set(paths)] };
+    }
+    if (!parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)) throw new Error('invalid arguments');
+    return { status: 'prepared', args: parsed.data as Record<string, unknown>, inputSchema };
+  } catch {
+    return { status: 'invalid', schema: null,
+      detail: `The selected turn-owned input schema for ${target} is unavailable; no tool was dispatched.`,
+      violations: ['(schema)'] };
+  }
+}
+
 /** One preparation owner for native argument bytes, before logical refinement.
  * Deferred local tools keep their lossless canonical Zod schema. Native core
  * tools use the exact assembled parameters that their SDK parser advertises.
@@ -1295,6 +1328,17 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         }
       }
 
+      // Capture the resolved local instance once, before any further await.
+      // A catalog port or external MCP branch owns its own schema/dispatch;
+      // it must never validate against an unused local lookalike.
+      const hasLocalOverride = options.localToolOverrides?.has(target) === true;
+      const localToolOverride = hasLocalOverride ? options.localToolOverrides!.get(target) : undefined;
+      if (hasLocalOverride && (isMcpNamespacedTool(target) || catalogProductionDispatch)) {
+        return refuse({ error: 'arg_validation',
+          detail: 'The selected local instance conflicts with this operation\'s exact dispatch branch; no tool was dispatched.',
+          violations: ['(schema)'] });
+      }
+
       // 3. Canonicalize representation drift, then Zod-validate BEFORE
       // dispatch — zero side effects on failure. This is deliberately before
       // the irreversible-send check so every surface reasons over the same
@@ -1361,7 +1405,9 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           detail: carrierValidationError.detail,
         });
       }
-      const prepared = await prepareNativeToolArguments(target, resolvedArgs);
+      const prepared = hasLocalOverride
+        ? prepareTurnOwnedToolArguments(target, resolvedArgs, localToolOverride)
+        : await prepareNativeToolArguments(target, resolvedArgs);
       if (prepared.status === 'invalid') {
         const next = missingRequiredNextAction(
           target,
@@ -1506,7 +1552,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           // callback as proof of a plan made that valid read demand a token
           // which, by construction, could never exist.
           Boolean(options.aroundResolvedDispatch && currentExpectedWorkBinding()),
-          options.localToolOverrides?.get(target) as never,
+          localToolOverride as never,
         );
       const dispatchWithCarrierPreparation = async (): Promise<unknown> => {
         if (!remappedCatalogPreparation) return dispatch();

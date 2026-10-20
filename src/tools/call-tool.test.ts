@@ -2420,7 +2420,8 @@ test('wrapped first-class discovery uses the turn-configured instance and retain
   const sessionId = 'sess-configured-discovery-instance';
   const accepted = acceptedSourceForCallToolFixture(sessionId);
   const calls: unknown[] = [];
-  const configuredSearch = { name: 'tool_search', invoke: async (_ctx: unknown, raw: string) => {
+  const { buildScopedLocalToolSearch } = await import('./local-runtime-tools.js');
+  const configuredSearch = { ...buildScopedLocalToolSearch(new Set(['tool_search'])), invoke: async (_ctx: unknown, raw: string) => {
     calls.push(JSON.parse(raw)); return JSON.stringify({ brokerCoverage: 'connected-source-fixture', results: [{ name: 'connected__read' }] });
   }};
   const args = { name: 'tool_search', args_json: JSON.stringify({ query: 'connected__read', limit: 1, role_key: null, cursor: null, account_selection: null }) };
@@ -2436,6 +2437,65 @@ test('wrapped first-class discovery uses the turn-configured instance and retain
     assert.ok(denied.includes('not_reachable'), denied);
     assert.equal(calls.length, 1, 'the selected instance never bypasses this turn exclusion');
   });
+});
+
+test('turn-owned schema owns nullable/default handling, strict validation and the instance retained across awaits', async () => {
+  const { tool } = await import('@openai/agents'); const { z } = await import('zod');
+  const sessionId = 'sess-turn-owned-schema'; const accepted = acceptedSourceForCallToolFixture(sessionId);
+  const received: unknown[] = []; let replacementCalls = 0;
+  const selected = tool({ name: 'ask_user_question', description: 'Controlled turn-owned input contract.',
+    parameters: z.strictObject({ purpose: z.literal('clarification').nullable(), limit: z.number().int().default(3) }),
+    execute: async args => { received.push(args); return { owner: 'selected', ...args }; } });
+  const replacement = tool({ name: 'ask_user_question', description: 'Unused replacement.',
+    parameters: z.strictObject({ unrelated: z.string() }), execute: async () => { replacementCalls++; return 'wrong'; } });
+  const overrides = new Map([['ask_user_question', selected]]);
+  const callTool = buildCallTool({ firstClassNames: new Set(['ask_user_question']), localToolOverrides: overrides,
+    admitBuiltinAcquisition: async () => { await Promise.resolve(); overrides.set('ask_user_question', replacement as typeof selected); return { ok: true }; } }) as unknown as ToolLike;
+  const run = (args: unknown) => withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+    callTool.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'ask_user_question', args_json: args }), {}));
+  const result = JSON.parse(String(await run({})));
+  assert.deepEqual(result, { owner: 'selected', purpose: null, limit: 3 });
+  assert.deepEqual(received, [{ purpose: null, limit: 3 }]); assert.equal(replacementCalls, 0);
+  for (const args of [{ purpose: 'approval' }, { purpose: 'clarification', unknown: true }]) {
+    overrides.set('ask_user_question', selected);
+    const refused = JSON.parse(String(await run(args)));
+    assert.equal(refused.error, 'arg_validation');
+    assert.equal(refused.guidance, selected.description);
+    assert.deepEqual(refused.schema, selected.parameters);
+  }
+  assert.equal(received.length, 1); assert.equal(replacementCalls, 0);
+  // An explicitly open host schema stays open without stripping model data;
+  // only the strict schema above refuses extra keys.
+  const open = tool({ name: 'ask_user_question', description: 'Controlled open input contract.', strict: false,
+    parameters: z.toJSONSchema(z.looseObject({ marker: z.string() })), execute: async args => args });
+  const openCarrier = buildCallTool({ firstClassNames: new Set(['ask_user_question']),
+    localToolOverrides: new Map([['ask_user_question', open]]) }) as unknown as ToolLike;
+  const openArgs = { marker: 'retained', extra: { nested: ['unchanged'] } };
+  const openResult = await withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+    openCarrier.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'ask_user_question', args_json: openArgs }), {}));
+  assert.deepEqual(JSON.parse(String(openResult)), openArgs);
+});
+
+test('malformed turn-owned instance/schema never falls back to a global implementation', async () => {
+  const sessionId = 'sess-turn-owned-invalid'; const accepted = acceptedSourceForCallToolFixture(sessionId);
+  let globalCalls = 0; let overrideCalls = 0;
+  _setInnerDispatchToolsForTests(new Map([['tool_search', { name: 'tool_search', invoke: async () => { globalCalls++; return '{}'; } }]]));
+  try {
+    const invoke = async () => { overrideCalls++; return '{}'; };
+    for (const selected of [undefined, { name: 'wrong', invoke, parameters: { type: 'object', properties: {} } },
+      { name: 'tool_search', invoke }, { name: 'tool_search', parameters: { type: 'object', properties: {} } },
+      { name: 'tool_search', invoke, parameters: { type: 'object' } },
+      { name: 'tool_search', invoke, parameters: { type: 'object', properties: { nested: { if: { type: 'string' }, then: {} } } } }]) {
+      const callTool = buildCallTool({ firstClassNames: new Set(['tool_search']),
+        localToolOverrides: new Map([['tool_search', selected]]) as never }) as unknown as ToolLike;
+      const result = await withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+        callTool.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'tool_search', args_json: { query: 'controlled', limit: 1 } }), {}));
+      const refusal = JSON.parse(String(result));
+      assert.equal(refusal.error, 'arg_validation'); assert.deepEqual(refusal.violations, ['(schema)']);
+      assert.match(refusal.detail, /selected turn-owned input schema/);
+    }
+    assert.equal(overrideCalls, 0); assert.equal(globalCalls, 0);
+  } finally { _setInnerDispatchToolsForTests(null); }
 });
 
 test('a carried local tool that returns an image delivers image content, never base64 text', async () => {

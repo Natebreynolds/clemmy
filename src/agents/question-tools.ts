@@ -1,6 +1,13 @@
 import { z } from 'zod';
 import { stableJsonDigest } from '../shared/stable-json-digest.js';
 
+/** Disclosure contract only; never approval or execution authority. */
+export const QUESTION_TOOL_WIRE_EDITIONS = ['legacy_v1', 'clarification_v2'] as const;
+export type QuestionToolWireEdition = typeof QUESTION_TOOL_WIRE_EDITIONS[number];
+export function parseQuestionToolWireEdition(value: unknown): QuestionToolWireEdition | null {
+  return value === 'legacy_v1' || value === 'clarification_v2' ? value : null;
+}
+
 export interface ConditionalApprovalPreparationRepair {
   kind: 'conditional_formal_approval_preparation';
   applies_when: 'formal_card_required_and_work_not_already_sealed';

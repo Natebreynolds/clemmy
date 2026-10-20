@@ -7,11 +7,13 @@ import { agentScopeKey, type MemoryScope } from '../../memory/memory-scope.js';
 import { readRecoveryActivation } from './recovery-activation.js';
 import { ensureSourceSessionContextStore } from './retained-session-proof-schema.js';
 import type { WorkflowConversationBinding } from '../../shared/workflow-conversation.js';
-import { currentSourceSessionContext, withSourceSessionContext,
+import { parseQuestionToolWireEdition, type QuestionToolWireEdition } from '../../agents/question-tools.js';
+import { currentSourceSessionContext, withSourceSessionContext, retainValidatedSourceQuestionToolEdition, sourceQuestionToolWireEdition,
   type SourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
 interface SourceSessionIdentity {
   version: 1;
+  questionToolWireEdition?: QuestionToolWireEdition;
   sessionId: string;
   sourceUserSeq: number;
   sessionKind: SessionKind;
@@ -56,6 +58,11 @@ function assertSource(input: Pick<SourceSessionContextRef, 'sessionId' | 'source
 
 function reopen(identity: SourceSessionIdentity, digest: string): SourceSessionContext {
   assertSource(identity);
+  // Verify stored bytes/digest before applying this compatibility default.
+  // Missing old fields remain missing in storage; unknown present editions fail.
+  const edition = Object.hasOwn(identity, 'questionToolWireEdition')
+    ? parseQuestionToolWireEdition(identity.questionToolWireEdition) : 'legacy_v1';
+  if (!edition) throw new Error('The retained question tool wire edition is unavailable.');
   if (!getSession(identity.sessionId) || identity.version !== 1 || !identity.memoryScope
     || ![identity.memoryScope.projectId, identity.memoryScope.agentKey].every(v => v === null || typeof v === 'string')) {
     throw new Error('The retained task composition is unavailable.');
@@ -86,9 +93,10 @@ function reopen(identity: SourceSessionIdentity, digest: string): SourceSessionC
     if (!parent || hash(parent.memoryScope) !== hash(identity.memoryScope)) {
       throw new Error('The worker lost its original parent memory scope.');
     }
+    if (sourceQuestionToolWireEdition(parent) !== edition) throw new Error('The worker lost its original question tool wire edition.');
   }
-  return { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, digest, mount,
-    memoryScope: { ...identity.memoryScope } };
+  return retainValidatedSourceQuestionToolEdition({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, digest, mount,
+    memoryScope: { ...identity.memoryScope } }, edition);
 }
 
 /** Does not infer a missing historical identity from today's chat settings. */
@@ -138,7 +146,9 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
     // agent incarnation. Only a validated parent can supply inherited scope.
     const memoryScope: MemoryScope = parent?.memoryScope ?? {
       projectId: mount.project?.project.id ?? null, agentKey: mount.agent ? agentScopeKey(mount.agent.agent) : null };
-    const identity: SourceSessionIdentity = { version: 1, ...input, sessionKind: row.kind,
+    const edition = parent ? sourceQuestionToolWireEdition(parent) : 'clarification_v2';
+    const identity: SourceSessionIdentity = { version: 1, questionToolWireEdition: edition,
+      sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, sessionKind: row.kind,
       mountKind: mount.kind, workspaceSlug: mount.workspaceSlug, workflow: mount.workflow,
       ...(mount.workflowConversation ? { workflowConversation: mount.workflowConversation } : {}),
       delegatedTaskId: typeof row.metadata?.delegatedTaskId === 'string' ? row.metadata.delegatedTaskId : null,
@@ -148,7 +158,8 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
     const digest = hash(identity);
     table().prepare('INSERT INTO source_session_contexts_v1 (session_id, source_user_seq, identity_json, identity_digest) VALUES (?, ?, ?, ?)')
       .run(input.sessionId, input.sourceUserSeq, JSON.stringify(identity), digest);
-    return { ...input, digest, mount, memoryScope };
+    return retainValidatedSourceQuestionToolEdition({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      digest, mount, memoryScope }, edition);
   }).immediate();
 }
 
