@@ -10,6 +10,7 @@ import { gunzipSync } from 'node:zlib';
 import Database from 'better-sqlite3';
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { applyHarnessMigrations, applyHarnessMigrationsThroughVersionForTests } from './eventlog-schema.js';
+import { HARNESS_SCHEMA_VERSION } from './schema-version.js';
 import { assertApprovedActionCompletionReceipt } from './approved-action-completion-proof.js';
 
 const NOW = '2026-10-19T00:00:00.000Z';
@@ -115,7 +116,8 @@ test('real 95→97 and 96→97 migrations retain historical bytes and the exact 
       applyHarnessMigrations(f.db);
       assert.deepEqual(tables.map(t=>f.db.prepare(`SELECT * FROM ${t}`).all()),before);
       assert.deepEqual(f.db.prepare("SELECT type,name,sql FROM sqlite_master WHERE tbl_name='durable_memory_intake_receipts' ORDER BY type,name").all(),memory);
-      assert.equal(f.db.prepare('SELECT max(version) v FROM schema_version').get()?.v,97);
+      // Migrations run to the current head (98 since the next lane); the fixture pins 96→head, not a literal.
+      assert.equal(f.db.prepare('SELECT max(version) v FROM schema_version').get()?.v,HARNESS_SCHEMA_VERSION);
       assert.deepEqual(f.db.prepare('SELECT * FROM approved_action_provider_bindings_v1').all(),[]);
       assert.deepEqual(f.db.pragma('foreign_key_check'),[]);
       applyHarnessMigrations(f.db);
@@ -153,7 +155,7 @@ test('a genuine committed schema96 canonical receipt migrates unchanged and reop
     assert.equal((intentBefore[0] as {intent_id:string}).intent_id,manifest.intentId);
     assert.equal((receiptBefore[0] as {receipt_id:string}).receipt_id,manifest.receiptId);
     applyHarnessMigrations(db);
-    assert.equal(db.prepare('SELECT max(version) v FROM schema_version').get()?.v,97);
+    assert.equal(db.prepare('SELECT max(version) v FROM schema_version').get()?.v,HARNESS_SCHEMA_VERSION);
     assert.deepEqual(snapshot(),before,'all populated schema96 rows, including original intent/receipt JSON, remain byte-identical');
     assert.deepEqual(db.prepare('SELECT * FROM approved_action_provider_bindings_v1').all(),[]);
     assertApprovedActionCompletionReceipt(db,authority());assert.deepEqual(db.pragma('foreign_key_check'),[]);
