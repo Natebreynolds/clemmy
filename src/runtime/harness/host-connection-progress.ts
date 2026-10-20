@@ -2,8 +2,8 @@
  * callable grants, or new execution owner live here. The canonical batch
  * journal remains the sole owner of conversation and settled-result bytes. */
 import type { AcceptedModelBatchRef } from './accepted-model-batch-checkpoint.js';
-import type { HostRecoveryState } from './host-turn-runner.js';
-import { assertSourceBudgetPolicyRef, type SourceBudgetPolicyRef } from './source-budget-policy.js';
+import type { HostRecoveryState } from './host-checkpoint-state.js';
+import { assertSourceBudgetPolicyRef, type SourceBudgetPolicyRef } from './source-budget-policy-ref.js';
 
 export interface HostConnectionProgress {
   version: 1;

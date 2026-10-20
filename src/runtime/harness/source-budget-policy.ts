@@ -1,3 +1,6 @@
+import { assertSourceBudgetPolicyRef, type SourceBudgetPolicyRef } from './source-budget-policy-ref.js';
+export { assertSourceBudgetPolicyRef } from './source-budget-policy-ref.js';
+export type { SourceBudgetPolicyRef } from './source-budget-policy-ref.js';
 /** The accepted request's outer policy, not an execution grant or a fresh
  * allowance. Reconnect controls must never substitute their current settings. */
 import { createHash } from 'node:crypto';
@@ -14,17 +17,9 @@ export interface SourceBudgetPolicy {
   maxUncachedTokens: number;
   tokenEnforcementEnabled: boolean;
 }
-export interface SourceBudgetPolicyRef { eventId: string; digest: string }
 export interface RetainedSourceBudgetPolicy extends SourceBudgetPolicyRef { policy: SourceBudgetPolicy }
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const natural = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-
-export function assertSourceBudgetPolicyRef(value: SourceBudgetPolicyRef): void {
-  if (!value || typeof value.eventId !== 'string' || !value.eventId
-    || typeof value.digest !== 'string' || !/^[a-f0-9]{64}$/.test(value.digest)) {
-    throw new Error('The retained task budget reference is invalid.');
-  }
-}
 
 export function readSourceBudgetPolicy(source: { sessionId: string; sourceUserSeq: number },
   expected?: SourceBudgetPolicyRef): RetainedSourceBudgetPolicy | null {

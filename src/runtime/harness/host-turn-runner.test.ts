@@ -43,6 +43,11 @@ const {
   literalOperationNotFrozenReason,
   _setHostJitReadProvisionerForTests,
 } = await import('./host-turn-runner.js');
+const canonicalCheckpointState = await import('./host-checkpoint-state.js');
+test('runner checkpoint exports retain the exact canonical leaf class identity', () => {
+  assert.equal(HostInterruptState, canonicalCheckpointState.HostInterruptState);
+  assert.equal(HostRecoveryState, canonicalCheckpointState.HostRecoveryState);
+});
 const { NO_PROGRESS_RETRY_BUDGET } = await import('./no-progress-governor.js');
 const catalogScope = await import('./accepted-source-catalog-scope.js');
 const hostRunRunner: typeof productionHostRunRunner = (
