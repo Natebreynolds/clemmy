@@ -902,7 +902,8 @@ function updatePendingAction(
         || (card.args?.pendingActionId ?? card.args?.pending_action_id) !== record.id || snapshot?.id !== record.id
         || snapshot.toolName !== record.toolName || snapshot.payloadHash !== record.payloadHash
         || pendingActionPayloadHash(record.toolName,record.payload,record.executionAuthority ?? null) !== expected.payloadHash
-        || pendingActionPayloadHash(record.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== expected.payloadHash) return record;
+        || JSON.stringify(snapshot.executionAuthority ?? null) !== JSON.stringify(record.executionAuthority ?? null)
+        || pendingActionPayloadHash(record.toolName,snapshot.payload,record.executionAuthority ?? null) !== expected.payloadHash) return record;
     }
     const evidence = opts.approvalEvidence;
     const verifiedHumanUpgrade = record.status === 'approved'

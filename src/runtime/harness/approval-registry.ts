@@ -1649,7 +1649,8 @@ export function reconcileLinkedPendingActionResolution(row: PendingApprovalRow):
         || (retired.approvalId !== row.approvalId && retired.approvalId !== null) || retired.payloadHash !== snapshot.payloadHash
         || snapshot.id !== retired.id || snapshot.toolName !== retired.toolName
         || pendingActionPayloadHash(retired.toolName,retired.payload,retired.executionAuthority ?? null) !== snapshot.payloadHash
-        || pendingActionPayloadHash(retired.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== snapshot.payloadHash) return false;
+        || JSON.stringify(snapshot.executionAuthority ?? null) !== JSON.stringify(retired.executionAuthority ?? null)
+        || pendingActionPayloadHash(retired.toolName,snapshot.payload,retired.executionAuthority ?? null) !== snapshot.payloadHash) return false;
       const cancelled = retired.status === 'cancelled';
       if (!cancelled && !hasRetainedActionOwner(retired,row.approvalId)) return false;
       publishOwnerMovedOnRetirement(row,{actionId:pendingActionId,payloadHash:snapshot.payloadHash,
@@ -1946,7 +1947,8 @@ export function retireFormalApprovalsForNewMessage(sessionIds: readonly string[]
         const snapshot = member.args?.pendingAction as Record<string, unknown> | undefined;
         if (!action || action.sessionId !== member.sessionId || (action.approvalId !== null && action.approvalId !== member.approvalId)
           || snapshot?.id !== action.id || snapshot.toolName !== action.toolName || snapshot.payloadHash !== action.payloadHash
-          || pendingActionPayloadHash(action.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== action.payloadHash) {
+          || JSON.stringify(snapshot.executionAuthority ?? null) !== JSON.stringify(action.executionAuthority ?? null)
+          || pendingActionPayloadHash(action.toolName,snapshot.payload,action.executionAuthority ?? null) !== action.payloadHash) {
           throw new Error('The previous action could not be safely identified.');
         }
         if (!['queued','approval_requested'].includes(action.status) || action.approvedBy !== null
