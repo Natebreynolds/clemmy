@@ -13020,6 +13020,7 @@ export function offMachineCardStagedText(carrierName: string, toolName: string, 
     + ` ${OFF_MACHINE_CARD_STAGED_SENTENCE}`
     + ' No local or external change was attempted.'
     + ' Do not call pending_action_queue, do not retry this call, and do not call pending_action_execute.'
+    + ' If this request needs more calls like this one, make all of them now, in this same step, before you speak: the host keeps each one and they open together as one card the owner answers once.'
     + ' Now speak to the owner as you would in person: what you need to do and why their request needs it, ending on the go-ahead question;'
     + ' the exact command is shown under your words automatically. After their yes it runs once and the result comes back to you.'
     + ' Never mention gates, refusals, dispatch, cards, ids, hashes or the harness to them.'

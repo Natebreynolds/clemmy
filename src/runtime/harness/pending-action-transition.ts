@@ -11,6 +11,8 @@ import {
 } from './pending-actions.js';
 import { isDirectionSeekingQuestion } from './objective-judge.js';
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
+import { approvalCallPreview } from './approval-call-preview.js';
+import { approvalPreviewProjection } from './public-presentation.js';
 
 export interface QueuedApprovalTransition {
   eventSeq: number;
@@ -226,6 +228,7 @@ function materializeQueuedApproval(
   turn: number,
   sourceUserSeq: number,
   transition: QueuedApprovalTransition,
+  options: { groupedMember?: boolean } = {},
 ): MaterializedQueuedApproval | null {
   try {
     const record = getPendingAction(transition.record.id);
@@ -298,7 +301,9 @@ function materializeQueuedApproval(
       sinceSeq: sourceUserSeq - 1,
       limit: 1,
     }).find((event) => event.seq === sourceUserSeq);
-    const presentation = acceptedSource
+    // A member of a host-staged batch is a formal card; the group owns the
+    // one conversational decision, so a bare "yes" lands on the set.
+    const presentation = acceptedSource && !options.groupedMember
       ? autonomousSendConsentPresentation(
           'request_approval',
           args,
@@ -445,13 +450,104 @@ export function materializeQueuedApprovals(
   sourceUserSeq: number,
   transitions: QueuedApprovalTransition[],
 ): MaterializedQueuedApproval[] {
-  return transitions.flatMap((transition) => {
-    const materialized = materializeQueuedApproval(
+  const siblings = hostStagedSiblingIds(transitions);
+  const materialized = transitions.flatMap((transition) => {
+    const result = materializeQueuedApproval(
       sessionId,
       turn,
       sourceUserSeq,
       transition,
+      { groupedMember: siblings.has(transition.record.id) },
     );
-    return materialized ? [materialized] : [];
+    return result ? [result] : [];
   });
+  groupHostStagedSiblings(sessionId, turn, sourceUserSeq, materialized, siblings);
+  return materialized;
+}
+
+/**
+ * ONE CARD FOR A BATCH. When the host staged several commands of the same
+ * tool for one request (each refused at the off-machine door), the owner
+ * answers once: the members are registered as formal cards and one review
+ * group owns the single decision over the set, with every exact command
+ * listed. Live 10-20 (Windows tester, and reproduced on the Mac): deleting
+ * three drafts took three cards and three taps, each ending "one is done,
+ * can I delete the next one too?". Members keep their own execution
+ * authority; approving the group resolves each of them, and each runs once.
+ */
+function hostStagedSiblingIds(transitions: readonly QueuedApprovalTransition[]): Set<string> {
+  const byTool = new Map<string, QueuedApprovalTransition[]>();
+  for (const transition of transitions) {
+    const record = transition.record;
+    if (record.createdBy !== 'host_off_machine_door' || transition.approvalIntent !== 'request_now') continue;
+    const list = byTool.get(record.toolName) ?? [];
+    list.push(transition);
+    byTool.set(record.toolName, list);
+  }
+  return new Set([...byTool.values()].filter((list) => list.length >= 2)
+    .flatMap((list) => list.map((transition) => transition.record.id)));
+}
+
+function groupHostStagedSiblings(
+  sessionId: string,
+  turn: number,
+  sourceUserSeq: number,
+  materialized: readonly MaterializedQueuedApproval[],
+  siblings: ReadonlySet<string>,
+): void {
+  const byTool = new Map<string, MaterializedQueuedApproval[]>();
+  for (const item of materialized) {
+    if (!item.created || !siblings.has(item.transition.record.id)) continue;
+    const list = byTool.get(item.transition.record.toolName) ?? [];
+    list.push(item);
+    byTool.set(item.transition.record.toolName, list);
+  }
+  for (const members of byTool.values()) {
+    if (members.length < 2) continue;
+    try {
+      const rows = members.map((item) => approvalRegistry.get(item.approval.approvalId));
+      if (rows.some((row) => !row || row.status !== 'pending' || row.presentation)) continue;
+      const items = members.map((item) => {
+        const record = item.transition.record;
+        const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+          ? record.payload as Record<string, unknown> : null;
+        return payload ? approvalCallPreview({ toolName: record.toolName, args: payload, rawArgs: JSON.stringify(payload) }, true, true) : null;
+      });
+      if (items.some((item) => !item)) continue;
+      const typedItems = items as NonNullable<(typeof items)[number]>[];
+      // Old clients render the legacy field; new clients render typed items.
+      const legacyReview = typedItems.map((item, index) => `${index + 1}. ${item.operation}\n${item.fields
+        .map((field) => `${field.name}: ${field.label ? `${field.label} · ` : ''}${field.value}`).join('\n')}`).join('\n\n');
+      const groupPreview = {
+        operation: `Review ${typedItems.length} prepared actions`,
+        fields: [{ name: 'Prepared actions', value: legacyReview }],
+        items: typedItems,
+      };
+      if (!approvalPreviewProjection(groupPreview)) continue;
+      const group = approvalRegistry.registerApprovalGroup(rows as approvalRegistry.PendingApprovalRow[], groupPreview);
+      const announced = listEvents(sessionId, { types: ['approval_requested'] })
+        .some((event) => event.data.approvalId === group.approvalId);
+      if (announced) continue;
+      appendEvent({
+        sessionId,
+        turn,
+        role: 'Clem',
+        type: 'approval_requested',
+        data: {
+          tool: approvalRegistry.APPROVAL_GROUP_TOOL,
+          subject: group.subject,
+          args: group.args,
+          rawArgs: JSON.stringify(group.args),
+          preview: groupPreview,
+          approvalId: group.approvalId,
+          sourceUserSeq,
+          source: 'pending_action_graph_transition',
+          memberApprovalIds: members.map((item) => item.approval.approvalId),
+        },
+      });
+    } catch {
+      // The members stand as their own cards; a group that cannot be formed
+      // never withholds a decision the owner can still make one by one.
+    }
+  }
 }

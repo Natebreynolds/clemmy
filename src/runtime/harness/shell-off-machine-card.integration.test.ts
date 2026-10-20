@@ -426,3 +426,63 @@ test('an approved command that was refused before it started ends in Clem\'s wor
   assert.match(approved.outcomeText, /That never ran: the folder I picked does not exist/, approved.outcomeText);
   assert.doesNotMatch(approved.outcomeText, /I ran it/);
 });
+
+test('several commands of one kind staged for one request open as one review card, and approving it runs each once', async () => {
+  // Live 10-20 (Windows tester; reproduced on the Mac): three deletes took
+  // three cards and three taps. The members stay exact; the group owns the
+  // owner's single decision.
+  received.length = 0;
+  const REQUEST = 'Post x=1 and x=2 to the hook endpoint.';
+  const COMMAND_2 = `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`;
+  const run = await hostTurn('post-two', REQUEST, [
+    [call('call-discover-shell', 'tool_search', {
+      query: 'run_shell_command', role_key: null, account_selection: null, limit: 1, cursor: null,
+    })],
+    (frame) => {
+      const result = JSON.parse(frame.toolResults.at(-1)!);
+      const discovery = result.type === 'text' ? JSON.parse(result.text) : result;
+      const row = discovery.results.find((candidate: { name: string }) => candidate.name === 'run_shell_command');
+      assert.ok(row);
+      const one = { command: COMMAND, cwd: WORK, timeout_ms: 20_000 };
+      const two = { command: COMMAND_2, cwd: WORK, timeout_ms: 20_000 };
+      return [one, two].map((args, index) => call(`call-post-${index + 1}`, row.carrier, {
+        requirement_id: row.capabilityRef, source_call_ids: null, source_record_ids: null,
+        universe_item_id: null, universe_selector: null, seal_amendment: null,
+        name: row.invocation.name, args_json: JSON.stringify(args),
+      }));
+    },
+    [text('I need to post x=1 and x=2 to your hook endpoint. OK to go ahead with both?')],
+  ]);
+  const debug = JSON.stringify({ status: run.result.status, frames: run.frames, events: run.trace.map((e) => e.type).slice(-40) }).slice(0, 6_000);
+  assert.equal(run.result.status, 'awaiting_approval', debug);
+  const refusals = (run.frames[2]?.toolResults ?? []).filter((result) => /already staged for the owner's card/.test(result));
+  assert.equal(refusals.length, 2, debug);
+  for (const refusal of refusals) assert.match(refusal, /they open together as one card/, 'the steer names the batch');
+  const pending = approvalRegistry.listPending({ sessionId: run.session.id, status: 'pending' });
+  assert.equal(pending.length, 1, `one decision, not one per command: ${JSON.stringify(pending.map((row) => row.subject))}`);
+  const group = pending[0]!;
+  assert.equal(approvalRegistry.isApprovalGroup(group), true, JSON.stringify(group));
+  const members = approvalRegistry.approvalGroupMembers(group) ?? [];
+  assert.equal(members.length, 2);
+  const preview = (group.args as { preview?: { items?: Array<{ fields: Array<{ name: string; value: string }> }> } }).preview;
+  assert.equal(preview?.items?.length, 2, 'the card lists both exact commands');
+  const listed = preview!.items!.flatMap((item) => item.fields.map((field) => field.value));
+  assert.ok(listed.some((value) => value.includes('x=1')) && listed.some((value) => value.includes('x=2')), JSON.stringify(listed));
+  const announced = run.trace.filter((event) => event.type === 'approval_requested' && event.data.approvalId === group.approvalId);
+  assert.equal(announced.length, 1, 'the group is announced once');
+  for (const member of members) assert.equal(member.presentation, null, 'members are formal cards; the group owns the conversational decision');
+
+  const resolved = approvalRegistry.resolve(group.approvalId, 'approved', 'desktop-chat-card');
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  for (const member of members) {
+    const row = approvalRegistry.get(member.approvalId)!;
+    assert.equal(row.resolution, 'approved', JSON.stringify(row));
+    const settled = await handleResolvedApprovalForChatResume(row, async () => { assert.fail('no model turn is spent on an approval'); });
+    assert.equal(settled, true, member.approvalId);
+  }
+  assert.deepEqual(received.sort(), ['POST /hook x=1', 'POST /hook x=2']);
+  for (const member of members) {
+    const view = pendingActionApprovalViewFromArgs(member.args);
+    assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', member.approvalId);
+  }
+});
