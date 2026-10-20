@@ -337,6 +337,10 @@ export interface ClemVoiceResult {
  * Every field is data about the owner's own work, never an instruction. */
 export interface ApprovedActionEndingCall {
   purpose: typeof CLEM_VOICE_PURPOSE;
+  /** Host-only lifetime controls; never model input or execution authority. */
+  signal?: AbortSignal;
+  deadlineAt?: number;
+  checkActive?: () => void;
   /** What the owner asked for, in their words. */
   asked: string;
   action: { title: string; kind: 'command_on_this_computer' | 'connected_app_change'; detail: string };

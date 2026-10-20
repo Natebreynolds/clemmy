@@ -4,7 +4,7 @@
  * that is later APPROVED re-drives the session exactly once; rejections,
  * non-parked approvals, and in-flight sessions never dispatch.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -21,6 +21,7 @@ const {
   finishRunAttempt,
   getActiveRunAttempt,
   getRunAttemptSourceUserEvent,
+  getRunAttemptBySourceUserSeq,
   listEvents,
   openEventLog,
   beginRunAttempt,
@@ -33,7 +34,10 @@ const {
   getPendingAction,
   markPendingActionApprovalResolved,
   queuePendingAction,
+  PENDING_ACTIONS_DIR,
 } = await import('./pending-actions.js');
+const { installTurnSemanticModelPort } = await import('../semantic-boundary/turn-semantic-port-registry.js');
+const { modelUsageAttributionStorage } = await import('../usage-log.js');
 const { _setApprovedCallDispatchForTests } = await import('../../execution/pending-action-executor.js');
 const { pendingActionApprovalView } = await import('./pending-action-view.js');
 const { HarnessSession } = await import('./session.js');
@@ -369,7 +373,7 @@ function recordingDispatch() {
   });
   return dispatched;
 }
-test.afterEach(() => { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); });
+test.afterEach(() => { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); installTurnSemanticModelPort(null); });
 
 let workflowFixtureNumber = 0;
 function workflowHold(activate = true) {
@@ -1080,4 +1084,178 @@ test('the facts Clem is given about an approved action that did not land come fr
   assert.match(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_TOOL_REFUSAL}; provider outcome is uncertain and no retry is safe: Tool call refused by harness: shell_policy_denial: reads a credential` }).verdict, /^guard_refused$/);
   assert.equal(approvedActionEndingFacts({ status: 'failed', resultSummary: `${PENDING_ACTION_DISPATCH_UNCERTAIN}: socket hang up. Do not retry automatically.` }).verdict, 'uncertain');
   assert.equal(approvedActionEndingFacts({ status: 'executing', resultSummary: null }).verdict, 'uncertain');
+});
+
+
+function endingBarrier<T>() {
+  let resolve!: (value: T) => void; let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+function endingFixture(sideOwner = false) {
+  const held = sideOwner ? workflowHold() : null;
+  const session = held?.session ?? createSession({ kind: 'chat' });
+  const { action, row } = storedApproval(session.id, held?.source.seq ?? null);
+  let effects = 0;
+  _setApprovedCallDispatchForTests(async () => { effects++; throw new Error('Controlled result was lost after the one dispatch.'); });
+  const resolved = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const run = () => handleResolvedApprovalForChatResume(resolved, async () => { throw new Error('No model continuation'); });
+  const source = () => listEvents(session.id, { types: ['user_input_received'] })
+    .find(event => event.data.approvalId === row.approvalId && event.data.decision === 'approve')!;
+  const terminal = () => listEvents(session.id, { types: ['conversation_completed'] })
+    .find(event => event.data.sourceUserSeq === source()?.seq);
+  return { session, action, row, run, source, terminal, effects: () => effects, held };
+}
+function endingPort(voice: NonNullable<import('../semantic-boundary/turn-semantic-model-port.js').TurnSemanticModelPort['voiceApprovedActionEnding']>) {
+  installTurnSemanticModelPort({ interpret: async () => { throw new Error('No interpretation'); }, voiceApprovedActionEnding: voice });
+}
+const endingWords = 'I cannot confirm what landed. Shall I check the saved result before anything is repeated?';
+
+for (const sideOwner of [false, true]) test(`approval result narrator binds its current exact result${sideOwner ? ' beside a different foreground owner' : ''}`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const f = endingFixture(sideOwner); const markers = parentMarkers(f.session.id);
+  let calls = 0; let signal!: AbortSignal;
+  endingPort(async call => {
+    calls++; signal = call.signal!; assert.equal(signal.aborted, false);
+    const usage = modelUsageAttributionStorage.getStore();
+    assert.equal(usage?.sessionId, f.session.id); assert.equal(usage?.sourceUserSeq, f.source().seq);
+    assert.equal(usage?.attemptId, getRunAttemptBySourceUserSeq(f.session.id, f.source().seq)?.attemptId,
+      'an ingress without inherited usage still records its exact prepared B attempt');
+    assert.ok(call.deadlineAt! > Date.now()); assert.ok(call.deadlineAt! <= Date.now() + 20_000);
+    call.checkActive!(); assert.equal(call.happened.verdict, 'uncertain');
+    return { message: endingWords, modelIdentity: 'controlled-semantic-model', evidenceDigest: call.evidenceDigest };
+  });
+  assert.equal(await f.run(), true); assert.equal(calls, 1); assert.equal(f.effects(), 1);
+  assert.equal(f.terminal()!.data.reply, endingWords);
+  assert.equal(f.terminal()!.data.turnOutcome?.status, 'failed');
+  assert.match(getPendingAction(f.action.id)!.resultSummary!, /uncertain/i);
+  const { pendingActionResultBinding } = await import('./pending-action-public-result.js');
+  assert.deepEqual(f.terminal()!.data.pendingActionResultBinding, pendingActionResultBinding(getPendingAction(f.action.id)!, f.source()));
+  if (sideOwner) assert.deepEqual(parentMarkers(f.session.id), markers);
+  t.mock.timers.tick(40_000); assert.equal(signal.aborted, false, 'completed narration leaves no deadline or watcher running');
+  assert.equal(calls, 1); assert.equal(f.effects(), 1);
+});
+
+for (const mode of ['compatible_parent', 'foreign_source', 'foreign_parent', 'unproved_job'] as const) test(`approval result narrator accounting refuses borrowed ownership (${mode})`, async () => {
+  const f = endingFixture();
+  // Use the same real accepted-source producer as the approval-resume path,
+  // so the inherited accounting coordinates can refer to its actual B.
+  const attempt = beginRunAttempt(f.session.id, { runId: `approval-resume:${f.row.approvalId}` });
+  const decision = recordRunAttemptUserInput(attempt, { turn: 0, role: 'user',
+    data: { text: `Approve ${f.row.approvalId}.`, synthetic: true, source: 'approval_resume', approvalId: f.row.approvalId, decision: 'approve' } },
+  { armRunInFlight: true });
+  const foreign = createSession({ kind: 'chat' });
+  const other = beginRunAttempt(foreign.id, { runId: `controlled-foreign-accounting:${mode}:${foreign.id}` });
+  const otherSource = recordRunAttemptUserInput(other, { turn: 1, role: 'user', data: { text: 'Controlled unrelated request.' } });
+  const parent = mode === 'foreign_parent'
+    ? { sessionId: foreign.id, sourceUserSeq: otherSource.seq, attemptId: other.attemptId }
+    : { sessionId: f.session.id, sourceUserSeq: decision.seq, attemptId: attempt.attemptId };
+  const usage = { sessionId: mode === 'foreign_source' ? foreign.id : f.session.id,
+    sourceUserSeq: mode === 'foreign_source' ? otherSource.seq : decision.seq,
+    attemptId: mode === 'foreign_source' ? other.attemptId : attempt.attemptId,
+    ...(mode === 'unproved_job' ? { usageJobId: 'controlled-unrelated-job' } : { usageParentTurn: parent }) };
+  let calls = 0;
+  endingPort(async call => {
+    calls++; assert.equal(modelUsageAttributionStorage.getStore()?.attemptId, attempt.attemptId);
+    assert.deepEqual(modelUsageAttributionStorage.getStore()?.usageParentTurn, parent);
+    return { message: endingWords, evidenceDigest: call.evidenceDigest, modelIdentity: 'controlled' };
+  });
+  assert.equal(await modelUsageAttributionStorage.run(usage, f.run), true);
+  assert.equal(calls, mode === 'compatible_parent' ? 1 : 0);
+  assert.equal(f.effects(), 1, 'accounting refusal never repeats or changes the approved effect');
+  if (mode !== 'compatible_parent') assert.doesNotMatch(String(f.terminal()!.data.reply), /Shall I/);
+});
+
+test('approval result narrator stops a pending ignoring adapter and never publishes late rejected or fulfilled words', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const f = endingFixture(); const started = endingBarrier<AbortSignal>(); const response = endingBarrier<never>();
+  let calls = 0;
+  endingPort(call => { calls++; started.resolve(call.signal!); return response.promise; });
+  const pending = f.run(); const signal = await started.promise;
+  requestKill(f.session.id, 'Controlled narrator Stop.', { sourceUserSeq: f.source().seq });
+  t.mock.timers.tick(250);
+  assert.equal(await pending, true); assert.equal(signal.aborted, true);
+  assert.equal(f.terminal()!.data.turnOutcome?.status, 'cancelled');
+  assert.equal(f.terminal()!.data.hostNotice?.code, 'stopped');
+  assert.doesNotMatch(String(f.terminal()!.data.reply), /Shall I|confirm what landed/);
+  const retained = getPendingAction(f.action.id)!;
+  assert.equal(retained.status, 'failed'); assert.match(retained.resultSummary!, /uncertain/i);
+  response.reject(new Error('Controlled late rejection after Stop.')); await Promise.resolve();
+  assert.equal(calls, 1); assert.equal(f.effects(), 1);
+  assert.equal(await f.run(), false, 'stopped terminal cannot start a new narrator or effect');
+});
+
+test('approval result narrator deadline aborts transport and a late answer cannot replace the retained app status', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const f = endingFixture(); const started = endingBarrier<AbortSignal>();
+  const response = endingBarrier<import('../semantic-boundary/turn-semantic-model-port.js').ClemVoiceResult>();
+  let digest = ''; let calls = 0;
+  endingPort(call => { calls++; digest = call.evidenceDigest; started.resolve(call.signal!); return response.promise; });
+  const pending = f.run(); const signal = await started.promise;
+  t.mock.timers.tick(20_001);
+  assert.equal(await pending, true); assert.equal(signal.aborted, true);
+  assert.equal(f.terminal()!.data.turnOutcome?.status, 'failed');
+  assert.doesNotMatch(String(f.terminal()!.data.reply), /Shall I/);
+  const terminal = f.terminal()!;
+  response.resolve({ message: endingWords, modelIdentity: 'controlled-late-model', evidenceDigest: digest });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.terminal()!.id, terminal.id); assert.equal(f.terminal()!.data.reply, terminal.data.reply);
+  assert.equal(calls, 1); assert.equal(f.effects(), 1);
+});
+
+test('approval result narrator never starts after exact Stop', async () => {
+  const f = endingFixture(); let calls = 0;
+  endingPort(async call => { calls++; return { message: endingWords, evidenceDigest: call.evidenceDigest, modelIdentity: 'controlled' }; });
+  _setApprovedCallDispatchForTests(async () => {
+    requestKill(f.session.id, 'Controlled Stop at result.', { sourceUserSeq: f.source().seq });
+    throw new Error('Controlled one dispatch stopped.');
+  });
+  assert.equal(await f.run(), true); assert.equal(calls, 0);
+  assert.equal(f.terminal()!.data.turnOutcome?.status, 'cancelled');
+});
+
+for (const mode of ['finished_owner', 'changed_summary', 'changed_payload', 'wrong_digest'] as const) test(`approval result narrator rejects ${mode} evidence`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const f = endingFixture(); let calls = 0;
+  endingPort(async call => {
+    calls++;
+    if (mode === 'finished_owner') finishRunAttempt(getActiveRunAttempt(f.session.id)!, 'superseded');
+    if (mode === 'changed_summary' || mode === 'changed_payload') {
+      const file = path.join(PENDING_ACTIONS_DIR, `${f.action.id}.json`);
+      const record = JSON.parse(readFileSync(file, 'utf8'));
+      if (mode === 'changed_summary') { record.resultSummary = 'Controlled later provider failure.'; record.updatedAt = new Date(Date.now() + 1).toISOString(); }
+      else record.payload.command = 'echo different';
+      writeFileSync(file, JSON.stringify(record));
+    }
+    return { message: endingWords, modelIdentity: 'controlled', evidenceDigest: mode === 'wrong_digest' ? '0'.repeat(64) : call.evidenceDigest };
+  });
+  const settled = await f.run(); assert.equal(calls, 1); assert.equal(f.effects(), 1);
+  if (mode === 'finished_owner' || mode === 'changed_payload') {
+    assert.equal(settled, false); assert.equal(f.terminal(), undefined, 'no borrowed owner or unbound payload publication');
+  } else {
+    assert.equal(settled, true); assert.doesNotMatch(String(f.terminal()!.data.reply), /Shall I/);
+    const { pendingActionResultBinding } = await import('./pending-action-public-result.js');
+    assert.deepEqual(f.terminal()!.data.pendingActionResultBinding, pendingActionResultBinding(getPendingAction(f.action.id)!, f.source()));
+  }
+});
+
+test('approval result narrator Stop at the final managed publication check wins without changing uncertain effect truth', async () => {
+  const f = endingFixture(); const db = openEventLog(); const prepare = db.prepare;
+  let armed = false; let stopped = false;
+  endingPort(async call => {
+    armed = true; return { message: endingWords, modelIdentity: 'controlled', evidenceDigest: call.evidenceDigest };
+  });
+  db.prepare = function (sql: string) {
+    if (armed && !stopped && db.inTransaction && sql.startsWith('SELECT source_user_seq, run_id, started_at, status, finished_at')) {
+      stopped = true; requestKill(f.session.id, 'Controlled final-publication Stop.', { sourceUserSeq: f.source().seq });
+    }
+    return prepare.call(this, sql);
+  } as typeof db.prepare;
+  try {
+    assert.equal(await f.run(), true); assert.equal(stopped, true);
+    assert.equal(f.terminal()!.data.turnOutcome?.status, 'cancelled');
+    assert.equal(f.terminal()!.data.hostNotice?.code, 'stopped');
+    assert.doesNotMatch(String(f.terminal()!.data.reply), /Shall I/);
+    assert.equal(getPendingAction(f.action.id)!.status, 'failed'); assert.equal(f.effects(), 1);
+  } finally { db.prepare = prepare; }
 });

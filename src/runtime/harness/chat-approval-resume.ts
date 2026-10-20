@@ -48,12 +48,13 @@ import {
   listEvents,
   openEventLog,
   recordRunAttemptUserInput,
+  withEventPublicationTransaction,
   type EventRow,
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
-import { getPendingAction, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
-import { pendingActionResultBinding } from './pending-action-public-result.js';
+import { getPendingAction, pendingActionPayloadHash, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
+import { pendingActionResultApprovalMatches, pendingActionResultBinding } from './pending-action-public-result.js';
 import { prepareApprovedActionHostCompletion } from './approved-action-completion-receipt.js';
 import { approvedActionDecisionWasStoppedInTransaction } from './approved-action-completion-proof.js';
 import { BoundaryError } from '../boundary-error.js';
@@ -64,7 +65,7 @@ import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL,
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
 import { peekTurnSemanticModelPort } from '../semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_VOICE_PURPOSE } from '../semantic-boundary/turn-semantic-model-port.js';
-import { withOwnModelRequestAttribution } from '../usage-log.js';
+import { modelUsageAttributionStorage, withOwnModelRequestAttribution } from '../usage-log.js';
 import { commitTurnOutcome } from './delivery-committer.js';
 import { turnOutcomeId, type TurnIdentity } from './turn-outcome.js';
 import { resolveExactTerminalForAcceptedSource } from './accepted-source-terminal.js';
@@ -73,10 +74,11 @@ import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { reprojectUndeliveredConversationalApproval } from './claude-agent-approval.js';
 import { requireAcceptedTaskAuthority } from './accepted-task-authority.js';
 import { requireActionExpectedWorkActivation } from './action-expected-work-boundary.js';
-import { ToolCallsCounter, withHarnessRunContext } from './brackets.js';
+import { harnessRunContextStorage, ToolCallsCounter, withHarnessRunContext } from './brackets.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { expectedWorkPlanLines } from './expected-work-admission.js';
 import { OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT, type TerminalNotice } from './terminal-notice.js';
+import { runOwnedHostStopNarration } from './host-stop-narration-lifecycle.js';
 
 const logger = pino({ name: 'clementine.chat-approval-resume' });
 
@@ -500,7 +502,7 @@ function approvalSourceIsSafeToDispatch(row: approvalRegistry.PendingApprovalRow
 async function settleConversationalSource(
   row: approvalRegistry.PendingApprovalRow,
   source: EventRow,
-  input: { text: string; status: 'done' | 'failed' | 'needs_input' | 'cancelled'; hostNotice?: TerminalNotice },
+  input: { text: string; status: 'done' | 'failed' | 'needs_input' | 'cancelled'; hostNotice?: TerminalNotice; endingGuard?: ApprovedActionEndingGuard },
 ): Promise<boolean> {
   const identity: TurnIdentity = {
     sessionId: source.sessionId,
@@ -514,54 +516,70 @@ async function settleConversationalSource(
       acceptedText: typeof source.data.text === 'string' ? source.data.text : '',
     });
     if (input.status === 'done') prepareApprovedActionHostCompletion({ sessionId: source.sessionId, sourceUserSeq: source.seq });
-    // Receipt publication can notify an owner Stop. Recheck after the last
-    // asynchronous graph boundary and receipt signal; the final transactional
-    // validator independently refuses any later Stop before a done CAS.
-    if (input.status === 'done' && approvedActionDecisionWasStoppedInTransaction(openEventLog(), {
-      sessionId: source.sessionId, sourceUserSeq: source.seq,
-    })) input = {
-      status: 'cancelled', text: `${OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT} This action will not run again on its own.`,
-      hostNotice: { code: 'stopped' },
-    };
-    const common = { version: 2 as const, id: turnOutcomeId(identity), identity };
-    const outcome = input.status === 'done'
-      ? {
-          ...common,
-          status: 'done' as const,
-          resumable: false as const,
-          presentation: { kind: 'answer' as const, text: input.text },
-        }
-      : input.status === 'needs_input'
+    // The async graph boundary is over. Hold the exact SQLite owner/Stop
+    // check and terminal CAS in one managed publication transaction; no model
+    // or executor work runs in this frame.
+    const committed = withEventPublicationTransaction(() => {
+      const ending = input.endingGuard ? readApprovedActionEndingOwner(input.endingGuard.owner) : null;
+      if (ending?.kind === 'unavailable') return false;
+      const stopped = ending?.kind === 'stopped' || approvedActionDecisionWasStoppedInTransaction(openEventLog(), {
+        sessionId: source.sessionId, sourceUserSeq: source.seq,
+      });
+      if (!stopped && ending?.kind === 'current' && ending.actionDigest !== input.endingGuard!.actionDigest) return false;
+      if (stopped) input = {
+        ...input, status: 'cancelled',
+        text: `${OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT} This action will not run again on its own.`,
+        hostNotice: { code: 'stopped' },
+      };
+      const common = { version: 2 as const, id: turnOutcomeId(identity), identity: {
+        ...identity, ...(input.endingGuard ? { attemptId: input.endingGuard.owner.attemptId,
+          runId: input.endingGuard.owner.runId } : {}),
+      } };
+      const outcome = input.status === 'done'
         ? {
             ...common,
-            status: 'needs_input' as const,
-            resumable: true as const,
-            needs: { kind: 'input' as const },
-            presentation: { kind: 'question' as const, text: input.text },
-          }
-        : input.status === 'cancelled'
-          ? { ...common, status: 'cancelled' as const, resumable: false as const,
-              presentation: { kind: 'stopped' as const, text: input.text } }
-        : {
-            ...common,
-            status: 'failed' as const,
+            status: 'done' as const,
             resumable: false as const,
-            presentation: { kind: 'error' as const, text: input.text },
-          };
-    const actionId = pendingActionIdFromArgs(row.args);
-    const action = actionId ? getPendingAction(actionId) : null;
-    const resultBinding = action?.approvalId === row.approvalId
-      ? pendingActionResultBinding(action, source) : null;
-    commitTurnOutcome(outcome, {
-      legacyReason: 'conversational_send_consent_resolved',
-      metadata: {
-        approvalId: row.approvalId,
-        pendingActionId: pendingActionIdFromArgs(row.args),
-        ...(resultBinding ? { pendingActionResultBinding: resultBinding } : {}),
-        ...(input.hostNotice ? { hostNotice: input.hostNotice } : {}),
-      },
+            presentation: { kind: 'answer' as const, text: input.text },
+          }
+        : input.status === 'needs_input'
+          ? {
+              ...common,
+              status: 'needs_input' as const,
+              resumable: true as const,
+              needs: { kind: 'input' as const },
+              presentation: { kind: 'question' as const, text: input.text },
+            }
+          : input.status === 'cancelled'
+            ? { ...common, status: 'cancelled' as const, resumable: false as const,
+                presentation: { kind: 'stopped' as const, text: input.text } }
+          : {
+              ...common,
+              status: 'failed' as const,
+              resumable: false as const,
+              presentation: { kind: 'error' as const, text: input.text },
+            };
+      const actionId = pendingActionIdFromArgs(row.args);
+      // A narrated message and its metadata use the same re-read record.
+      const action = ending?.kind === 'current' ? ending.action : actionId ? getPendingAction(actionId) : null;
+      const resultBinding = action?.approvalId === row.approvalId
+        ? pendingActionResultBinding(action, source) : null;
+      commitTurnOutcome(outcome, {
+        legacyReason: 'conversational_send_consent_resolved',
+        metadata: {
+          approvalId: row.approvalId,
+          pendingActionId: actionId,
+          ...(resultBinding ? { pendingActionResultBinding: resultBinding } : {}),
+          ...(input.hostNotice ? { hostNotice: input.hostNotice } : {}),
+        },
+      });
+      return true;
     });
-    const attempt = getActiveRunAttempt(row.sessionId);
+    if (!committed) return false;
+    const attempt = input.endingGuard ? {
+      sessionId: row.sessionId, attemptId: input.endingGuard.owner.attemptId,
+      runId: input.endingGuard.owner.runId, startedAt: input.endingGuard.owner.startedAt,
+    } : getActiveRunAttempt(row.sessionId);
     if (attempt && getRunAttemptSourceUserEvent(attempt)?.seq === source.seq) {
       try { finishRunAttempt(attempt, input.status === 'cancelled' ? 'cancelled'
         : input.status === 'failed' ? 'failed' : 'completed'); } catch { /* terminal wins */ }
@@ -742,10 +760,30 @@ async function executeApprovedLinkedActionAndSettle(
     // Clem says it herself, from the record: what happened, what she would
     // change, and whether to go ahead (owner 2026-10-09). The plain ending
     // stands when no brain answers in time.
-    const said = await approvedActionEndingInClemsWords(row, pendingAction, source.seq);
+    const guard = approvedActionEndingGuard(row, pendingAction, source, prepared);
+    if (!guard) return false;
+    const said = await approvedActionEndingInClemsWords(row, pendingAction, source, guard);
+    const current = readApprovedActionEndingOwner(guard.owner);
+    if (current.kind === 'unavailable') return false;
+    if (current.kind === 'stopped') return await settleConversationalSource(row, source, {
+      status: 'cancelled', text: OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT,
+      hostNotice: { code: 'stopped' }, endingGuard: guard,
+    });
+    // A changed record gets its current app status, never old generated words
+    // or another narrator/business retry. The terminal rechecks this snapshot.
+    const freshGuard = { owner: guard.owner, actionDigest: current.actionDigest };
+    if (current.action.status === 'executed') return await settleConversationalSource(row, source, {
+      status: 'done', text: approvedActionRanText(current.action, current.action.resultSummary ?? '',
+        approvedActionRetainedWorkNeedsVerification(row, current.action, source)), endingGuard: freshGuard,
+    });
+    if (current.action.status !== 'failed' && current.action.status !== 'executing') return await settleConversationalSource(row, source, {
+      status: 'needs_input', text: `The stored action is ${current.action.status}. Its result is not confirmed; nothing will run again on its own.`,
+      endingGuard: freshGuard,
+    });
     return await settleConversationalSource(row, source, {
       status: 'failed',
-      text: said ?? approvedActionFailedText(pendingAction),
+      text: current.actionDigest === guard.actionDigest && said ? said : approvedActionFailedText(current.action),
+      endingGuard: freshGuard,
     });
   }
   return await settleConversationalSource(row, source, {
@@ -1005,16 +1043,110 @@ export function approvedActionEndingFacts(action: Pick<PendingActionRecord, 'sta
   return { verdict: 'refused', reply: boundedEndingField(summary) };
 }
 
-/** Clem's own reply when an approved action did not go through: what
- * happened, what she would change, and whether to go ahead. Null when no
- * brain is reachable in time; the caller then keeps the plain ending. */
+interface ApprovedActionEndingOwner {
+  sessionId: string;
+  sourceUserSeq: number;
+  sourceDigest: string;
+  approvalId: string;
+  approvalDigest: string;
+  pendingActionId: string;
+  attemptId: string;
+  runId: string;
+  startedAt: string;
+}
+interface ApprovedActionEndingGuard { owner: ApprovedActionEndingOwner; actionDigest: string }
+type ApprovedActionEndingOwnerRead = { kind: 'unavailable' | 'stopped' }
+  | { kind: 'current'; action: PendingActionRecord; actionDigest: string };
+const endingDigest = (value: unknown): string => createHash('sha256').update(closedCanonicalJson(value)).digest('hex');
+const endingApprovalDigest = (row: approvalRegistry.PendingApprovalRow): string => endingDigest({
+  approvalId: row.approvalId, sessionId: row.sessionId, args: row.args,
+  status: row.status, resolution: row.resolution, presentation: row.presentation ?? null,
+});
+const endingSourceDigest = (source: EventRow): string => endingDigest({
+  id: source.id, sessionId: source.sessionId, seq: source.seq, turn: source.turn,
+  role: source.role, type: source.type, data: source.data,
+});
+
+/** An exact decision can settle beside another foreground owner. Neither the
+ * session's newest source nor its coarse foreground marker owns this read. */
+function readApprovedActionEndingOwner(owner: ApprovedActionEndingOwner): ApprovedActionEndingOwnerRead {
+  try {
+    const source = getUserInputEventAtSequence(owner.sessionId, owner.sourceUserSeq);
+    const row = approvalRegistry.get(owner.approvalId);
+    if (!source || source.role !== 'user' || source.type !== 'user_input_received'
+      || source.data.approvalId !== owner.approvalId || source.data.decision !== 'approve'
+      || endingSourceDigest(source) !== owner.sourceDigest
+      || !row || endingApprovalDigest(row) !== owner.approvalDigest
+      || resolveExactTerminalForAcceptedSource(source).kind !== 'absent') return { kind: 'unavailable' };
+    const attempt = openEventLog().prepare(`SELECT source_user_seq, run_id, started_at, status, finished_at
+      FROM run_attempts WHERE session_id=? AND attempt_id=?`).get(owner.sessionId, owner.attemptId) as {
+        source_user_seq: number | null; run_id: string | null; started_at: string; status: string; finished_at: string | null;
+      } | undefined;
+    if (!attempt || attempt.source_user_seq !== owner.sourceUserSeq || attempt.run_id !== owner.runId
+      || attempt.started_at !== owner.startedAt) return { kind: 'unavailable' };
+    if (approvedActionDecisionWasStoppedInTransaction(openEventLog(), owner)) return { kind: 'stopped' };
+    if (attempt.status !== 'active' || attempt.finished_at !== null) return { kind: 'unavailable' };
+    const action = getPendingAction(owner.pendingActionId);
+    if (!action || !pendingActionResultApprovalMatches(action, row)
+      || pendingActionPayloadHash(action.toolName, action.payload, action.executionAuthority ?? null) !== action.payloadHash) return { kind: 'unavailable' };
+    return { kind: 'current', action, actionDigest: endingDigest(action) };
+  } catch { return { kind: 'unavailable' }; }
+}
+
+function approvedActionEndingGuard(
+  row: approvalRegistry.PendingApprovalRow,
+  action: PendingActionRecord,
+  source: EventRow,
+  prepared: ChatApprovalResumeSource,
+): ApprovedActionEndingGuard | null {
+  try {
+    if (source.sessionId !== row.sessionId || source.seq !== prepared.sourceUserSeq
+      || pendingActionIdFromArgs(row.args) !== action.id || !pendingActionResultApprovalMatches(action, row)) return null;
+    const attempt = openEventLog().prepare(`SELECT started_at FROM run_attempts
+      WHERE session_id=? AND attempt_id=? AND source_user_seq=? AND run_id=?`)
+      .get(row.sessionId, prepared.runAttemptId, source.seq, prepared.runId) as { started_at: string } | undefined;
+    if (!attempt) return null;
+    const owner: ApprovedActionEndingOwner = { sessionId: row.sessionId, sourceUserSeq: source.seq,
+      sourceDigest: endingSourceDigest(source), approvalId: row.approvalId, approvalDigest: endingApprovalDigest(row),
+      pendingActionId: action.id, attemptId: prepared.runAttemptId, runId: prepared.runId, startedAt: attempt.started_at };
+    const current = readApprovedActionEndingOwner(owner);
+    return current.kind === 'unavailable' ? null : { owner, actionDigest: endingDigest(action) };
+  } catch { return null; }
+}
+
+/** The existing tool-free wording request owns only its exact result snapshot.
+ * Cancellation never changes the action record or grants replay permission. */
 async function approvedActionEndingInClemsWords(
   row: approvalRegistry.PendingApprovalRow,
   action: PendingActionRecord,
-  decisionSeq: number,
+  source: EventRow,
+  guard: ApprovedActionEndingGuard,
 ): Promise<string | null> {
   const port = peekTurnSemanticModelPort();
   if (!port?.voiceApprovedActionEnding) return null;
+  const ambient = harnessRunContextStorage.getStore();
+  const usage = modelUsageAttributionStorage.getStore();
+  // Own attribution preserves inherited ownership. Refuse a foreign inherited
+  // frame instead of silently labelling this request as someone else's work.
+  if ((ambient && (ambient.sessionId !== row.sessionId || ambient.sourceUserSeq !== source.seq
+    || ambient.runAttemptId !== guard.owner.attemptId))
+    || (usage && (usage.sessionId !== row.sessionId || usage.sourceUserSeq !== source.seq
+      || (usage.attemptId !== undefined && usage.attemptId !== guard.owner.attemptId)
+      || (usage.usageParentTurn !== undefined && (!usage.usageParentTurn || usage.usageParentTurn.sessionId !== row.sessionId
+        || usage.usageParentTurn.sourceUserSeq !== source.seq
+        || (usage.usageParentTurn.attemptId !== undefined && usage.usageParentTurn.attemptId !== guard.owner.attemptId)))
+      // This direct result request has no autonomous/memory job binding.
+      // Matching outer coordinates do not prove that an inherited job owns it.
+      || usage.usageJobId !== undefined || usage.standaloneAccountingJob !== undefined
+      || usage.memoryAccountingOrigin !== undefined || usage.waitForOwnModel === true
+      || usage.channel?.trim().toLowerCase().startsWith('memory:')))) return null;
+  const usageOwner = { ...usage, sessionId: row.sessionId, sourceUserSeq: source.seq, attemptId: guard.owner.attemptId };
+  const deadlineAt = Date.now() + APPROVED_ACTION_ENDING_DEADLINE_MS;
+  const assertOwned = () => {
+    const current = readApprovedActionEndingOwner(guard.owner);
+    if (current.kind !== 'current' || current.actionDigest !== guard.actionDigest)
+      throw new Error('Approval result narration no longer owns this exact result.');
+  };
   try {
     const shell = action.toolName === 'run_shell_command' || action.kind === 'shell_command';
     const payload = action.payload && typeof action.payload === 'object' ? action.payload as Record<string, unknown> : {};
@@ -1024,26 +1156,28 @@ async function approvedActionEndingInClemsWords(
       const accepted = getUserInputEventAtSequence(row.sessionId, action.sourceUserSeq);
       if (accepted && accepted.data.synthetic !== true) asked = publicUserInputText(accepted.data);
     }
-    const happened = approvedActionEndingFacts(action);
-    const work = withOwnModelRequestAttribution({ sessionId: row.sessionId, sourceUserSeq: decisionSeq }, () => port.voiceApprovedActionEnding!({
-      purpose: CLEM_VOICE_PURPOSE,
+    const evidenceDigest = endingDigest(guard);
+    const result = await runOwnedHostStopNarration({
+      signal: ambient?.callerCancelSignal, deadlineMs: Math.max(0, deadlineAt - Date.now()), assertOwned,
+      isStopped: () => approvedActionDecisionWasStoppedInTransaction(openEventLog(), guard.owner),
+      work: scope => modelUsageAttributionStorage.run(usageOwner, () => withOwnModelRequestAttribution({
+        sessionId: row.sessionId, sourceUserSeq: source.seq,
+      }, () => port.voiceApprovedActionEnding!({
+      purpose: CLEM_VOICE_PURPOSE, signal: scope.signal, deadlineAt, checkActive: scope.assertCurrent,
       asked: boundedEndingField(asked),
       action: {
         title: boundedEndingField(action.title ?? '', 200),
         kind: shell ? 'command_on_this_computer' : 'connected_app_change',
         detail: boundedEndingField(command || action.title || '', 400),
       },
-      happened,
-      evidenceDigest: createHash('sha256').update(`${action.id}\0${action.resultSummary ?? ''}`).digest('hex'),
-    }));
-    let timer: NodeJS.Timeout | undefined;
-    const deadline = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), APPROVED_ACTION_ENDING_DEADLINE_MS); });
-    const result = await Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+      happened: approvedActionEndingFacts(action), evidenceDigest,
+    }))),
+    });
+    assertOwned();
     const message = result?.message?.trim();
-    return message ? message : null;
-  } catch (err) {
-    logger.warn({ pendingActionId: action.id, err: err instanceof Error ? err.message : String(err) },
-      'approved action ending: Clem could not be reached; the plain ending stands');
+    return result?.evidenceDigest === evidenceDigest && message && message.length <= 600 ? message : null;
+  } catch {
+    logger.warn({ pendingActionId: action.id }, 'approved action ending: no current narrated result; retained app status stands');
     return null;
   }
 }
