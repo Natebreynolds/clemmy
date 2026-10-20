@@ -665,14 +665,20 @@ test('a complete ordinary read lets a 1.9 s affirmative Jev check settle without
   assert.equal(state.reviewerCalls(), 0, 'the settled hedge must be cleared');
 });
 
-test('an incomplete Jev finding starts the configured reviewer immediately, with no extra delay', async t => {
+test('an incomplete Jev finding on a complete read is the verdict; the configured reviewer never starts', async t => {
+  // The owner's rule: a read is checked by Jev alone. Jev's NOT-DONE drives the
+  // bounded revision as its own verdict; the reviewer is for no reply only.
   const state = setup(t, async () => ({ verdict: { done: false, reason: 'The requested part remains absent.' }, failure: null }));
   _setSystemOneFetchForTests(async () => jevResponse('incomplete'));
   const verdict = await judgeObjectiveComplete(objective, 'I will read the missing status.', read);
-  assert.equal(state.reviewerCalls(), 1);
+  assert.equal(state.reviewerCalls(), 0, 'a complete read never pays for the configured reviewer behind a Jev finding');
   assert.equal(verdict.done, false);
+  assert.equal(verdict.fast, true);
+  assert.equal(verdict.judgeModelId, 'jev-1.13.0');
   assert.equal(verdict.jevAttempt?.accepted, false);
-  assert.notEqual(verdict.fast, true);
+  assert.equal(verdict.jevAttempt?.reviewerStarted, false);
+  t.mock.timers.tick(JEV_READ_HEDGE_DELAY_MS + 1); await flush();
+  assert.equal(state.reviewerCalls(), 0, 'no hedge timer is armed for a complete read');
 });
 
 for (const kind of ['missing_key', 'malformed_response', 'http_error'] as const) {
@@ -862,10 +868,19 @@ for (const lane of ['configured_reviewer', 'late_fallback'] as const) {
     const verdict = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(objective, reply, {
       ...read, reviewInputOwner: owner, ...(lane === 'late_fallback' ? { reviewStakes: 'write' } : {}),
     }));
-    assert.equal(verdict.done, true); assert.equal(verdict.fast, undefined);
     assert.equal(verdict.jevAttempt?.originalReading, undefined);
-    assert.equal(state.reviewerCalls(), 1); assert.equal(calls, 1);
-    assert.equal(Boolean(verdict.failedOpen), lane === 'late_fallback');
+    assert.equal(calls, 1);
     assert.equal(verdict.jevAttempt?.accepted, false);
+    if (lane === 'configured_reviewer') {
+      // A complete read: Jev's NOT-DONE is the verdict and carries no
+      // original-reading diagnostic; the configured reviewer never runs.
+      assert.equal(verdict.done, false); assert.equal(verdict.fast, true);
+      assert.equal(state.reviewerCalls(), 0);
+      assert.notEqual(verdict.failedOpen, true);
+    } else {
+      assert.equal(verdict.done, true); assert.equal(verdict.fast, undefined);
+      assert.equal(state.reviewerCalls(), 1);
+      assert.equal(verdict.failedOpen, true);
+    }
   });
 }

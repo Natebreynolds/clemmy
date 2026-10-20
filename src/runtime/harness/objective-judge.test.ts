@@ -1584,7 +1584,7 @@ test('round17 execution restrictions: default requests retain scope evidence, ho
   assert.doesNotMatch(system, /Mark not-done ONLY when/);
 });
 
-test('round17 execution restrictions: actual Jev payload keeps the same constraint and one existing fallback review', async () => {
+test('round17 execution restrictions: actual Jev payload keeps the same constraint; a complete read settles on Jev without a fallback review', async () => {
   const { HOST_COMPLETION_EVIDENCE_GUIDANCE, buildCompletionJudgeInstructions, runRoutedJudgeAttempt } = await import('./objective-judge.js');
   const fixture = {
     objective: 'Read only controlled local reference A and report its status. Do not read sibling reference B.',
@@ -1616,8 +1616,10 @@ test('round17 execution restrictions: actual Jev payload keeps the same constrai
       { toolName: 'read_file', logicalToolCallId: 'read-B', resultHandleId: 'rh_B', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
     ],
   });
-  assert.equal(payloads.length, 1); assert.equal(reviewerCalls, 1); assert.equal(captured.requests.length, 1);
-  assert.equal(verdict.done, false); assert.equal(verdict.blocked, true); assert.notEqual(verdict.failedOpen, true);
+  // The owner's rule: a complete read is checked by Jev alone. Jev's NOT-DONE
+  // on the restriction is the verdict; no reviewer request is paid for.
+  assert.equal(payloads.length, 1); assert.equal(reviewerCalls, 0); assert.equal(captured.requests.length, 0);
+  assert.equal(verdict.done, false); assert.equal(verdict.fast, true); assert.notEqual(verdict.failedOpen, true);
   assert.equal(verdict.jevAttempt?.accepted, false);
   assert.equal(payloads[0]!.state.request, fixture.objective); assert.equal(payloads[0]!.state.response, fixture.candidate);
   assert.ok(JSON.stringify(payloads[0]!.state).includes(fixture.evidence));

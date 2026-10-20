@@ -2661,15 +2661,21 @@ export async function judgeObjectiveComplete(
   if (!reviewsPlan && !reviewsWrite && !reviewsMemory && !reviewsInherited
     && (coverage.complete || directionQuestion || historicalEligible)) {
     const jevPromise = askJev(true);
-    const hedgeDelayMs = skillContext?.reviewStakes === 'read' && coverage.complete && !directionQuestion
-      ? JEV_READ_HEDGE_DELAY_MS : JEV_HEDGE_DELAY_MS;
-    const hedge = setTimeout(startJudge, hedgeDelayMs);
-    hedge.unref?.();
-    const cancelHedge = () => clearTimeout(hedge);
+    // The owner's rule: a read is checked by Jev alone. A complete read with
+    // no direction question arms no reviewer behind Jev: Jev's DONE ships, its
+    // NOT-DONE drives the ordinary bounded revision as its own verdict, and the
+    // configured reviewer runs only when Jev gives no reply at all (timeout,
+    // outage, abstention). Live 2026-10-20: a 14 s page read spent 10.6 s in a
+    // reviewer the old 2.5 s hedge had started, on a plan whose quota was used
+    // up. Other stakes keep the 1 s hedge.
+    const readOnlyScreen = skillContext?.reviewStakes === 'read' && coverage.complete && !directionQuestion;
+    const hedge = readOnlyScreen ? null : setTimeout(startJudge, JEV_HEDGE_DELAY_MS);
+    hedge?.unref?.();
+    const cancelHedge = () => { if (hedge) clearTimeout(hedge); };
     callerSignal?.addEventListener('abort', cancelHedge, { once: true });
     let fast: Awaited<typeof jevPromise>;
     try { fast = await jevPromise; } finally {
-      clearTimeout(hedge);
+      if (hedge) clearTimeout(hedge);
       callerSignal?.removeEventListener('abort', cancelHedge);
     }
     callerSignal?.throwIfAborted();
@@ -2715,6 +2721,21 @@ export async function judgeObjectiveComplete(
         ...(fast.awaitingUser ? { awaitingUser: true } : {}),
         ...(fast.blocked ? { blocked: true } : {}),
         ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+      };
+    }
+    // Jev read the complete read and found it unmet: that finding is the
+    // read's verdict and drives the bounded revision. Only no reply hands the
+    // read to the configured reviewer below.
+    if (readOnlyScreen && fast && !fast.done && !fast.awaitingUser) {
+      return {
+        done: false,
+        reason: fast.reason?.trim() ? fast.reason : 'The fast check found the read incomplete.',
+        judgeModelId: fast.judgeModelId,
+        fast: true,
+        ...UNAVAILABLE_JUDGE_COMPARISON,
+        ...(fast.blocked ? { blocked: true } : {}),
+        ...(fast.repairScope ? { repairScope: fast.repairScope } : {}),
+        ...(jevAttempt ? { jevAttempt } : {}),
       };
     }
   }
