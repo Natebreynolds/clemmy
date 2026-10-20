@@ -369,11 +369,23 @@ async function drainOne(): Promise<void> {
     // A nominal successful original response also proves its host request
     // returned. A caller-described result or timeout race never proves this.
     if(authorship) closeTransport();
-    if (!text || text.length > MAX_TEXT || result?.evidenceDigest !== row.evidence_digest
-      || typeof result.modelIdentity !== 'string' || !result.modelIdentity.trim() || result.modelIdentity.length > 256
-      || result.choices?.length || !authorship || authorship.textDigest!==projectionTextDigest(text)
-      || authorship.usageJobId!==accounting.usageJobId || authorship.operationId!==row.projection_id
-      || authorship.revisionDigest!==row.evidence_digest) { finish(row,claimId,transportClosed ? 'failed' : 'unknown'); return; }
+    const rejected = [
+      !text && 'no_message', text && text.length > MAX_TEXT && 'message_too_long',
+      result?.evidenceDigest !== row.evidence_digest && 'evidence_digest_mismatch',
+      (typeof result?.modelIdentity !== 'string' || !result.modelIdentity.trim() || result.modelIdentity.length > 256) && 'model_identity_invalid',
+      result?.choices?.length && 'choices_present', !authorship && 'authorship_unbound',
+      authorship && text && authorship.textDigest!==projectionTextDigest(text) && 'text_digest_mismatch',
+      authorship && authorship.usageJobId!==accounting.usageJobId && 'usage_job_mismatch',
+      authorship && authorship.operationId!==row.projection_id && 'operation_id_mismatch',
+      authorship && authorship.revisionDigest!==row.evidence_digest && 'revision_digest_mismatch',
+    ].filter((reason): reason is string => typeof reason === 'string');
+    if (rejected.length > 0) {
+      // The card keeps its fixed line; the log says why Clem's words were not used.
+      logger.warn({ projectionId: row.projection_id, rejected, modelIdentity: result?.modelIdentity ?? null,
+        messageLength: text?.length ?? 0 }, 'approval result wording was rejected');
+      finish(row,claimId,transportClosed ? 'failed' : 'unknown'); return;
+    }
+    if (!text || !result || !authorship) { finish(row,claimId,transportClosed ? 'failed' : 'unknown'); return; }
     const published = db.transaction(() => {
       assertOwned();
       if (!currentEvidence(row)) return false;
