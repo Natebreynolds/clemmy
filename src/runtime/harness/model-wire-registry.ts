@@ -352,6 +352,33 @@ const REGISTRY: RegistryRow[] = [
   // Opus 4.7/4.8 + Fable 5: budget_tokens thinking is REMOVED (HTTP 400) — must
   // use output_config.effort. cacheMin 4096 (Opus/Haiku) or 2048 (Fable/Sonnet4.6).
   {
+    // Opus 5 / 5.5 (claude-api skill, 2026-10): 1M context, 128K output, effort
+    // low..max (5.5 defaults to medium), thinking always on and `disabled`
+    // rejected at every effort. Must sit above the broad /claude-opus/ row,
+    // which would cap it at 200K/64K. The effort map's floor is 'low', never a
+    // disabled thinking block, so the shape below is already what 5.5 accepts.
+    idMatch: /claude-opus-5/i,
+    cap: {
+      family: 'claude-opus-5', apiShape: 'anthropic_messages',
+      contextWindow: 1_000_000, maxOutput: 128_000, supportsEffort: true,
+      effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
+      supportsPromptCache: true, cacheMinTokens: 4096, retryClass: 'anthropic',
+    },
+  },
+  {
+    // Haiku 5.5 (claude-api skill, 2026-10): adaptive thinking on by default,
+    // effort low..max (default medium), 1M context, 128K output. Unlike Haiku
+    // 4.5 it ACCEPTS output_config.effort, so it must not fall into the 4.5
+    // row below, which would strip every effort decision.
+    idMatch: /claude-haiku-5/i,
+    cap: {
+      family: 'claude-haiku-5', apiShape: 'anthropic_messages',
+      contextWindow: 1_000_000, maxOutput: 128_000, supportsEffort: true,
+      effortMap: ANTHROPIC_EFFORT_MAP, thinkingMode: 'effort',
+      supportsPromptCache: true, cacheMinTokens: 4096, retryClass: 'anthropic',
+    },
+  },
+  {
     idMatch: /claude-opus-4-(7|8)|claude-opus-4\.(7|8)/i,
     cap: {
       family: 'claude-opus-4.7/4.8', apiShape: 'anthropic_messages',

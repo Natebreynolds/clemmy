@@ -33,6 +33,22 @@ test('registry: live Claude brain (opus 4.8) resolves to anthropic effort + 4096
   assert.equal(cap.retryClass, 'anthropic');
 });
 
+test('registry: Opus 5.5 and Haiku 5.5 resolve to their own effort-capable rows, not the 4.x fallbacks', () => {
+  const opus = resolveModelCapability('claude-opus-5-5');
+  assert.equal(opus.family, 'claude-opus-5');
+  assert.equal(opus.contextWindow, 1_000_000);
+  assert.equal(opus.maxOutput, 128_000);
+  assert.equal(opus.supportsEffort, true);
+  assert.equal(opus.effortMap.none, 'low', 'thinking cannot be disabled on Opus 5.5; the floor is effort low');
+  const haiku = resolveModelCapability('claude-haiku-5-5');
+  assert.equal(haiku.family, 'claude-haiku-5');
+  assert.equal(haiku.supportsEffort, true, 'Haiku 5.5 accepts output_config.effort, unlike Haiku 4.5');
+  assert.equal(haiku.contextWindow, 1_000_000);
+  // The older rows keep their verified shapes.
+  assert.equal(resolveModelCapability('claude-haiku-4-5').supportsEffort, false);
+  assert.equal(resolveModelCapability('claude-opus-4-6').family, 'claude-opus-4.5/4.6');
+});
+
 test('registry: Fable 5 and Sonnet 4.6 have the 2048 cache minimum', () => {
   assert.equal(resolveModelCapability('claude-fable-5').cacheMinTokens, 2048);
   assert.equal(resolveModelCapability('claude-sonnet-4-6').cacheMinTokens, 2048);

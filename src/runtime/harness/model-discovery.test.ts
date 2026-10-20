@@ -100,7 +100,7 @@ test('Claude subscription model discovery owns no executable SDK surface', () =>
 test('picker choices include DISCOVERED models after presets, deduped against presets', async () => {
   _setDiscoveredModelsForTest({
     anthropic: [
-      { id: 'claude-fable-5', label: 'dupe of a preset — must not double' },
+      { id: 'claude-fable-5-1', label: 'dupe of a preset — must not double' },
       { id: 'claude-omega-7', label: 'Claude Omega 7' },
     ],
     openai: [{ id: 'gpt-6', label: 'GPT 6' }],
@@ -111,8 +111,8 @@ test('picker choices include DISCOVERED models after presets, deduped against pr
     };
     const { codex, claude } = __testChoices();
     // Presets first (curated labels win on dupes), discovered appended.
-    assert.equal(claude.filter((m) => m.id === 'claude-fable-5').length, 1, 'preset dupe not doubled');
-    assert.equal(claude.find((m) => m.id === 'claude-fable-5')!.label.includes('most capable'), true, 'preset label wins');
+    assert.equal(claude.filter((m) => m.id === 'claude-fable-5-1').length, 1, 'preset dupe not doubled');
+    assert.equal(claude.find((m) => m.id === 'claude-fable-5-1')!.label.includes('most capable'), true, 'preset label wins');
     assert.ok(claude.some((m) => m.id === 'claude-omega-7'), 'a NEW Anthropic model appears in the picker');
     assert.ok(codex.some((m) => m.id === 'gpt-6'), 'a NEW OpenAI model appears in the picker');
     assert.equal(codex[0].id, 'gpt-5.4-nano', 'presets stay first / ordering stable');

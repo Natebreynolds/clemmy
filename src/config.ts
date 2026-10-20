@@ -355,9 +355,16 @@ export const CLAUDE_MODEL_PRESETS = [
   // Fable 5: most capable widely released model ($10/$50 per MTok).
   // Sonnet 5 (launched 2026-06): best speed/intelligence, $3/$15 ($2/$10 intro
   // through 2026-08-31) — a 4.6+ generation Sonnet (effort + adaptive thinking).
-  { id: 'claude-fable-5', label: 'Claude Fable 5 (most capable)' },
-  { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 (flagship)' },
-  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 (fast + smart)' },
+  // 2026-10 (claude-api skill): the served family is Fable 5.1 / Opus 5.5 /
+  // Sonnet 5.5 / Haiku 5.5; discovery through the subscription (Agent SDK
+  // supportedModels) still wins over this list in model-role-options.
+  { id: 'claude-fable-5-1', label: 'Claude Fable 5.1 (most capable)' },
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 (flagship)' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (fast + smart)' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 (lightest)' },
+  { id: 'claude-fable-5', label: 'Claude Fable 5' },
+  { id: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
+  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5' },
   { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (legacy)' },
   { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
 ];
