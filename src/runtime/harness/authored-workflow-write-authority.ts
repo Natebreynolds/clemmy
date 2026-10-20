@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import { BASE_DIR } from '../../config.js';
+import pino from 'pino';
 
 import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
 import { resolveWorkflowRunDefinitionSnapshot } from '../../execution/workflow-run-definition.js';
@@ -77,6 +78,7 @@ let mutationReviewerOverride: typeof reviewWorkflowMutation | null = null;
 export function _setWorkflowMutationReviewerForTests(review: typeof reviewWorkflowMutation | null): void {
   mutationReviewerOverride = review;
 }
+const logger = pino({ name: 'clementine.workflow-write-authority' });
 
 /**
  * What a saved step does, as its run is granted: the author's declaration, or,
@@ -873,6 +875,8 @@ async function reviewAuthoredWriteConstraints(input: {
   ownerApprovedExactly?: boolean;
   /** An ordinary recoverable write is reviewed at a measured depth first. */
   stakes?: 'ordinary' | 'high';
+  /** Set on the one retry after the check itself threw. */
+  retried?: boolean;
 }): Promise<HostInteractiveConsentResult | null> {
   try {
     const argsDigest = digest(input.args);
@@ -987,10 +991,30 @@ async function reviewAuthoredWriteConstraints(input: {
     return result.verdict === 'conflict'
       ? { status: 'repair', retryable: true, reason: `workflow_write_constraint_conflict: ${result.reason}${corrected}` }
       : { status: 'hold', retryable: true, reason: `workflow_write_constraints_unverified: ${result.reason}${corrected}` };
-  } catch {
-    return { status: 'hold', retryable: true, reason: 'workflow_write_constraints_unavailable' };
+  } catch (error) {
+    // Live 10-19/10-20: every sheet write of a scheduled channel review was
+    // held with this reason for two days, and nothing said why — the error
+    // was swallowed here, so the owner's workflow failed four runs in a row
+    // on a fault no one could see. Say what threw, and ask once more: a busy
+    // process lock or a record mid-rename is a moment, not a verdict on the
+    // owner's write. A second failure holds, with the reason attached.
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn({
+      err: message,
+      stack: error instanceof Error ? (error.stack ?? '').split('\n').slice(0, 8).join(' | ') : undefined,
+      sessionId: input.attestation.sessionId,
+      sourceUserSeq: input.attestation.sourceUserSeq,
+      toolName: input.attestation.toolName,
+      retried: input.retried === true,
+    }, 'workflow write constraint check threw');
+    if (input.retried !== true) {
+      await new Promise((resolve) => setTimeout(resolve, CONSTRAINT_CHECK_RETRY_DELAY_MS));
+      return reviewAuthoredWriteConstraints({ ...input, retried: true });
+    }
+    return { status: 'hold', retryable: true, reason: `workflow_write_constraints_unavailable: ${message.slice(0, 240)}` };
   }
 }
+const CONSTRAINT_CHECK_RETRY_DELAY_MS = 400;
 
 function acceptedOccurrenceBinds(input: {
   attestation: HostCallAttestation;

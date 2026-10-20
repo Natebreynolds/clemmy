@@ -1162,3 +1162,50 @@ test('a creation test grants no write or send authority, and a finished one gran
   const finished = createStepFixture({ kind: 'workflow', sideEffect: 'read', rehearsal: 'finished' });
   assert.deepEqual(finished.recorded, { status: 'refused', reason: 'workflow_definition_authority_missing_or_changed' });
 });
+
+test('a constraint check that throws is asked once more; a second throw holds with the reason attached, never a bare "unavailable"', async () => {
+  // Live 10-19/10-20: every sheet write of a scheduled review was held as
+  // workflow_write_constraints_unavailable for two days, and nothing said why.
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  let reviews = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    reviews += 1;
+    if (reviews === 1) throw new Error('plan-scopes-state is busy');
+    return { verdict: 'compatible', reason: 'The write matches the saved instructions.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('native-once', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Approved goal saved.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    const outcome = await runProductionHost(fixture, agent);
+    assert.equal(reviews, 2, 'the check is asked once more after it threw');
+    assert.equal(bodies.goal_upsert, 1, 'the write proceeds on the second answer');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /workflow_write_constraints_unavailable/);
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+
+  const second = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const twice = fixtureTools(['goal_upsert']);
+  let attempts = 0;
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
+    attempts += 1;
+    throw new Error('plan-scopes-state is busy');
+  });
+  try {
+    const model = stubModel([
+      [toolCall('native-twice', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Could not save.')],
+    ]);
+    const agent = { model, tools: twice.tools };
+    bindSurface(second, agent, twice.tools);
+    const outcome = await runProductionHost(second, agent);
+    assert.equal(attempts, 2);
+    assert.equal(twice.bodies.goal_upsert, 0, 'nothing ran');
+    assert.match(JSON.stringify(outcome.history), /workflow_write_constraints_unavailable: plan-scopes-state is busy/, 'the reason names what threw');
+  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+});
