@@ -137,6 +137,14 @@ export interface PendingActionExecutionCapability {
   sourceUserSeq: number;
 }
 
+/** Optional cancellation CAS for a card the owner moved past. It is checked
+ * under the existing transition lock, never against a caller's stale read. */
+export interface PendingActionWaitingApprovalGuard {
+  sessionId: string;
+  approvalId: string;
+  payloadHash: string;
+}
+
 export interface QueuePendingActionInput {
   title: string;
   summary: string;
@@ -874,11 +882,28 @@ function updatePendingAction(
     approvedBy?: PendingActionApprovedBy;
     approvalEvidence?: PendingActionApprovalEvidence;
     executionClaimToken?: string;
+    expectedWaitingApproval?: PendingActionWaitingApprovalGuard;
   } = {},
 ): PendingActionRecord | null {
   const mutate = (): PendingActionRecord | null => {
     const record = getPendingAction(id);
     if (!record) return null;
+    if (opts.expectedWaitingApproval) {
+      const expected = opts.expectedWaitingApproval;
+      const card = approvalRegistryForVerify.get(expected.approvalId);
+      const snapshot = card?.args?.pendingAction as Record<string, unknown> | undefined;
+      if (status !== 'cancelled' || !['queued','approval_requested'].includes(record.status)
+        || record.approvedBy !== null || record.executionClaimTokenHash || record.executionClaimedAt || record.executionClaimedBy
+        || record.sessionId !== expected.sessionId || record.payloadHash !== expected.payloadHash
+        || (record.approvalId !== null && record.approvalId !== expected.approvalId)
+        || !card || card.sessionId !== expected.sessionId || card.status !== 'cancelled'
+        || card.resolution !== 'cancelled_by_system' || card.resolver !== 'owner_moved_on'
+        || !approvalRegistryForVerify.isFormalApprovalSurface(card)
+        || (card.args?.pendingActionId ?? card.args?.pending_action_id) !== record.id || snapshot?.id !== record.id
+        || snapshot.toolName !== record.toolName || snapshot.payloadHash !== record.payloadHash
+        || pendingActionPayloadHash(record.toolName,record.payload,record.executionAuthority ?? null) !== expected.payloadHash
+        || pendingActionPayloadHash(record.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== expected.payloadHash) return record;
+    }
     const evidence = opts.approvalEvidence;
     const verifiedHumanUpgrade = record.status === 'approved'
       && status === 'approved'
@@ -1418,12 +1443,14 @@ export function recordPendingActionResult(
   resultSummary: string,
   actor = 'clementine',
   executionClaimToken?: string,
+  expectedWaitingApproval?: PendingActionWaitingApprovalGuard,
 ): PendingActionRecord | null {
   return updatePendingAction(id, status, {
     resultSummary: cleanLine(resultSummary, status, 4000),
     note: resultSummary,
     actor,
     executionClaimToken,
+    ...(expectedWaitingApproval ? { expectedWaitingApproval } : {}),
   });
 }
 

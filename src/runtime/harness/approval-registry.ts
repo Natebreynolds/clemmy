@@ -40,6 +40,8 @@ import {
   amendPendingActionPayload,
   pendingActionPayloadHash,
   pendingActionWithEditedPayload,
+  recordPendingActionResult,
+  type PendingActionRecord,
 } from './pending-actions.js';
 import { pendingActionApprovalView } from './pending-action-view.js';
 import { appendAuditRecord } from '../audit-ledger.js';
@@ -1582,11 +1584,79 @@ function conversationConsentForRow(
     : undefined;
 }
 
+/** A completed retirement is diagnostic, never approval or execution authority.
+ * Bind its exact card/action/payload so later action-file cleanup needs no repair. */
+function hasCompletedOwnerMovedOnRetirement(row: PendingApprovalRow, actionId: string, payloadHash: string): boolean {
+  return Boolean(openEventLog().prepare(`SELECT 1 FROM events WHERE session_id = ? AND type = 'approval_resolved'
+    AND json_extract(data_json,'$.approvalId') = ? AND json_extract(data_json,'$.decision') = 'cancelled'
+    AND json_extract(data_json,'$.resolution') = 'cancelled_by_system' AND json_extract(data_json,'$.reason') = 'owner_moved_on'
+    AND json_extract(data_json,'$.retirement.version') = 1 AND json_extract(data_json,'$.retirement.pendingActionId') = ?
+    AND json_extract(data_json,'$.retirement.payloadHash') = ?
+    AND ((json_extract(data_json,'$.retirement.outcome') = 'action_cancelled' AND json_extract(data_json,'$.retirement.actionStatus') = 'cancelled')
+      OR (json_extract(data_json,'$.retirement.outcome') = 'already_owned' AND json_extract(data_json,'$.retirement.actionStatus') IN ('approved','executing','executed','failed'))) LIMIT 1`).get(row.sessionId,row.approvalId,actionId,payloadHash));
+}
+
+/** Retained owner/claim evidence is used only to leave an owned action alone,
+ * never to infer a successful effect or mint execution/approval authority. */
+function hasRetainedActionOwner(record: PendingActionRecord, approvalId: string): boolean {
+  const evidence = record.approvalEvidence;
+  const approvalOwner = record.status === 'approved'
+    && ((record.approvedBy === 'human' && evidence?.kind === 'card' && evidence.approvalId === approvalId)
+      || (record.approvedBy === 'policy' && evidence?.kind === 'policy' && typeof evidence.scope === 'string' && evidence.scope.trim().length > 0)
+      || ((record.approvedBy === 'human' || record.approvedBy === 'policy') && evidence?.kind === 'workflow'
+        && typeof evidence.workflowRunId === 'string' && evidence.workflowRunId.trim().length > 0));
+  const claimOwner = ['executing','executed','failed'].includes(record.status)
+    && typeof record.executionClaimTokenHash === 'string' && /^[a-f0-9]{64}$/.test(record.executionClaimTokenHash)
+    && typeof record.executionClaimedBy === 'string' && record.executionClaimedBy.trim().length > 0
+    && typeof record.executionClaimedAt === 'string' && Number.isFinite(Date.parse(record.executionClaimedAt))
+    && Array.isArray(record.history) && record.history.some(item => item.status === 'executing' && item.at === record.executionClaimedAt && item.actor === record.executionClaimedBy);
+  return approvalOwner || claimOwner;
+}
+
+function publishOwnerMovedOnRetirement(row: PendingApprovalRow, linked?: {
+  actionId:string;payloadHash:string;outcome:'action_cancelled'|'already_owned';actionStatus:PendingActionRecord['status'];
+}): void {
+  withEventPublicationTransaction(() => {
+    const current = get(row.approvalId);
+    if (!current || current.sessionId !== row.sessionId || current.status !== 'cancelled'
+      || current.resolution !== 'cancelled_by_system' || current.resolver !== 'owner_moved_on') {
+      throw new Error('The previous approval retirement changed before publication.');
+    }
+    if (linked && (pendingActionIdFromArgs(current.args) !== linked.actionId
+      || (current.args?.pendingAction as Record<string,unknown> | undefined)?.payloadHash !== linked.payloadHash)) {
+      throw new Error('The previous approval action changed before retirement publication.');
+    }
+    if (linked && hasCompletedOwnerMovedOnRetirement(current,linked.actionId,linked.payloadHash)) return;
+    appendEvent({sessionId:row.sessionId,turn:0,role:'system',type:'approval_resolved',data:{approvalId:row.approvalId,
+      tool:row.tool,decision:'cancelled',resolution:'cancelled_by_system',reason:'owner_moved_on',resolver:'owner_moved_on',
+      sticky:false,edited:false,...(linked?{retirement:{version:1,pendingActionId:linked.actionId,payloadHash:linked.payloadHash,outcome:linked.outcome,actionStatus:linked.actionStatus}}:{})}});
+  });
+}
+
 /** Reconcile the durable file-backed action from the canonical SQLite
  * decision. Safe to call at ingress, immediately after resolve, and on boot. */
 export function reconcileLinkedPendingActionResolution(row: PendingApprovalRow): boolean {
   const pendingActionId = pendingActionIdFromArgs(row.args);
   if (!pendingActionId || !row.resolution || row.status === 'pending') return false;
+  if (row.status === 'cancelled' && row.resolution === 'cancelled_by_system' && row.resolver === 'owner_moved_on') {
+    const snapshot = row.args?.pendingAction as Record<string, unknown> | undefined;
+    if (typeof snapshot?.payloadHash !== 'string') return false;
+    if (hasCompletedOwnerMovedOnRetirement(row,pendingActionId,snapshot.payloadHash)) return true;
+    try {
+      const retired = recordPendingActionResult(pendingActionId,'cancelled','Not run: you moved on to a new message.',
+        'approval-registry',undefined,{sessionId:row.sessionId,approvalId:row.approvalId,payloadHash:snapshot.payloadHash});
+      if (!retired || retired.sessionId !== row.sessionId
+        || (retired.approvalId !== row.approvalId && retired.approvalId !== null) || retired.payloadHash !== snapshot.payloadHash
+        || snapshot.id !== retired.id || snapshot.toolName !== retired.toolName
+        || pendingActionPayloadHash(retired.toolName,retired.payload,retired.executionAuthority ?? null) !== snapshot.payloadHash
+        || pendingActionPayloadHash(retired.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== snapshot.payloadHash) return false;
+      const cancelled = retired.status === 'cancelled';
+      if (!cancelled && !hasRetainedActionOwner(retired,row.approvalId)) return false;
+      publishOwnerMovedOnRetirement(row,{actionId:pendingActionId,payloadHash:snapshot.payloadHash,
+        outcome:cancelled?'action_cancelled':'already_owned',actionStatus:retired.status});
+      return true;
+    } catch { return false; }
+  }
   const pendingAction = getPendingAction(pendingActionId);
   if (!pendingAction || pendingAction.sessionId !== row.sessionId || pendingAction.approvalId !== row.approvalId) {
     return false;
@@ -1840,6 +1910,96 @@ export function withApprovalControlCommit<T>(
     }
     return value;
   });
+}
+
+/** A human message moved on from these caller-validated conversation sessions.
+ * Resolve the registry first; after that commit the file reconciler may cancel
+ * an exact still-waiting action and publish its standard event/checkpoint.
+ * An approved/acquired action is never a member of this retirement operation. */
+export function retireFormalApprovalsForNewMessage(sessionIds: readonly string[], requestId?: string): { retiredApprovalIds: string[] } {
+  const sessions = [...new Set(sessionIds.filter(id => typeof id === 'string' && id.trim() === id && id.length > 0))];
+  let requestAlreadyAccepted = false;
+  const retired = withApprovalControlCommit(resolveDecision => {
+    // A concurrent retry may have awaited the reply reader while the first
+    // request accepted. Check under this same writer transaction before any CAS.
+    if (requestId && openEventLog().prepare('SELECT 1 FROM harness_chat_requests WHERE request_id = ?').get(requestId)) {
+      requestAlreadyAccepted = true;
+      return [];
+    }
+    // Do not deserialize every historical approval on every message. No cap:
+    // every currently waiting row in the proven conversation is considered.
+    const candidates = sessions.flatMap(sessionId => openEventLog().prepare(
+      "SELECT * FROM pending_approvals WHERE session_id = ? AND status = 'pending' ORDER BY requested_at DESC"
+    ).all(sessionId) as ApprovalSqlRow[]).map(rowToPublic).filter(isFormalApprovalSurface);
+    const waiting: PendingApprovalRow[] = [];
+    const ownedGroupMembers = new Set<string>();
+    for (const row of candidates) {
+      const members = isApprovalGroup(row) ? approvalGroupMembers(row) : [row];
+      if (!members) throw new Error('The waiting approval group could not be read.');
+      let owned = false;
+      for (const member of members) {
+        if (member.status !== 'pending') continue;
+        if (!sessions.includes(member.sessionId)) throw new Error('The waiting approval belongs to another conversation.');
+        const id = pendingActionIdFromArgs(member.args);
+        if (!id) continue;
+        const action = getPendingAction(id);
+        const snapshot = member.args?.pendingAction as Record<string, unknown> | undefined;
+        if (!action || action.sessionId !== member.sessionId || (action.approvalId !== null && action.approvalId !== member.approvalId)
+          || snapshot?.id !== action.id || snapshot.toolName !== action.toolName || snapshot.payloadHash !== action.payloadHash
+          || pendingActionPayloadHash(action.toolName,snapshot.payload,snapshot.executionAuthority ?? null) !== action.payloadHash) {
+          throw new Error('The previous action could not be safely identified.');
+        }
+        if (!['queued','approval_requested'].includes(action.status) || action.approvedBy !== null
+          || action.executionClaimTokenHash || action.executionClaimedAt || action.executionClaimedBy) {
+          if (!hasRetainedActionOwner(action,member.approvalId)) throw new Error('The previous action owner could not be safely verified.');
+          owned = true;
+        }
+      }
+      // An already acquired/settled action is not an unapproved waiting action.
+      // Do not cancel it, and do not prevent the owner from continuing chat.
+      if (owned && isApprovalGroup(row)) for (const member of members) ownedGroupMembers.add(member.approvalId);
+      if (!owned) waiting.push(row);
+    }
+    const retiring = waiting.filter(row => !ownedGroupMembers.has(row.approvalId));
+    const ids: string[] = [];
+    for (const row of retiring) {
+      const current = get(row.approvalId);
+      if (current?.status !== 'pending') continue;
+      const result = resolveDecision(row.approvalId,'cancelled_by_system','owner_moved_on');
+      if (!result.ok) throw new Error('The previous approval changed before it could be retired.');
+    }
+    for (const row of retiring) {
+      const current = get(row.approvalId);
+      if (current?.status !== 'cancelled' || current.resolution !== 'cancelled_by_system' || current.resolver !== 'owner_moved_on') continue;
+      ids.push(row.approvalId);
+      if (!pendingActionIdFromArgs(current.args)) afterEventPublicationCommit(() => publishOwnerMovedOnRetirement(current));
+    }
+    return ids;
+  });
+  if (requestAlreadyAccepted) return {retiredApprovalIds:retired};
+  // An exact completion event is the reconciliation checkpoint. Retry only
+  // interrupted cancellations, not historical rows whose action file was reaped.
+  for (const sessionId of sessions) {
+    const unfinished = openEventLog().prepare(`SELECT p.* FROM pending_approvals p
+      WHERE p.session_id = ? AND p.status = 'cancelled' AND p.resolution = 'cancelled_by_system' AND p.resolver = 'owner_moved_on'
+      AND COALESCE(json_extract(p.args_json,'$.pendingActionId'),json_extract(p.args_json,'$.pending_action_id')) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.session_id = p.session_id AND e.type = 'approval_resolved'
+        AND json_extract(e.data_json,'$.approvalId') = p.approval_id AND json_extract(e.data_json,'$.decision') = 'cancelled'
+        AND json_extract(e.data_json,'$.resolution') = 'cancelled_by_system' AND json_extract(e.data_json,'$.reason') = 'owner_moved_on'
+        AND json_extract(e.data_json,'$.retirement.version') = 1
+        AND json_extract(e.data_json,'$.retirement.pendingActionId') = COALESCE(json_extract(p.args_json,'$.pendingActionId'),json_extract(p.args_json,'$.pending_action_id'))
+        AND json_extract(e.data_json,'$.retirement.payloadHash') = json_extract(p.args_json,'$.pendingAction.payloadHash')
+        AND ((json_extract(e.data_json,'$.retirement.outcome') = 'action_cancelled' AND json_extract(e.data_json,'$.retirement.actionStatus') = 'cancelled')
+          OR (json_extract(e.data_json,'$.retirement.outcome') = 'already_owned' AND json_extract(e.data_json,'$.retirement.actionStatus') IN ('approved','executing','executed','failed'))))
+      ORDER BY p.requested_at DESC`).all(sessionId) as ApprovalSqlRow[];
+    for (const sql of unfinished) {
+      const row = rowToPublic(sql);
+      if (pendingActionIdFromArgs(row.args) && !reconcileLinkedPendingActionResolution(row)) {
+        throw new Error('The previous action cancellation is still being saved.');
+      }
+    }
+  }
+  return {retiredApprovalIds:retired};
 }
 
 /**

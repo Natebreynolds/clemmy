@@ -17751,6 +17751,7 @@ export function registerConsoleRoutes(
     // declines or approves what the card will do. A change rejects the exact
     // call and carries the owner's words into one fresh call and a new card.
     let intent = parsedIntent;
+    let answeredWaitingCard = intent !== null;
     let approvalChangeRequest: string | undefined;
     let approvalConfirm: { approvalId: string; leaning: 'approves' | 'declines' | 'unread'; question: string } | undefined;
     let approvalInquiry: { approvalIds: string[]; decision: 'approve' | 'reject' } | undefined;
@@ -17762,6 +17763,8 @@ export function registerConsoleRoutes(
       const routed = await routeReplyToPendingApproval({ sessionId: cardSessionId, text: input, parsed: parsedIntent })
         .catch(() => null);
       if (routed) {
+        answeredWaitingCard ||= Boolean(routed.intent || routed.changeRequest || routed.inquiry
+          || (routed.confirm && routed.confirm.leaning !== 'unread'));
         intent = routed.intent;
         approvalChangeRequest = routed.changeRequest;
         approvalInquiry = routed.inquiry;
@@ -17781,6 +17784,20 @@ export function registerConsoleRoutes(
           intent = null;
           approvalChangeRequest = undefined;
         }
+      }
+    }
+    if (!priorReceipt && !connectionContext && !meetingLookup && !answeredWaitingCard
+      && command !== 'cancel' && proposedEarlyRoute?.kind !== 'background_input' && proposedEarlyRoute?.kind !== 'background_continue') {
+      // This is an authenticated human chat message, not a replay, meeting
+      // lookup or background-task answer. An unread semantic classification
+      // grants nothing: under the owner's moving-on policy the old card retires.
+      try {
+        approvalRegistry.retireFormalApprovalsForNewMessage([sessionId,
+          ...sameConversationAncestorSessionIds({sessionId,principalId:'desktop'})],requestIdentity.requestId);
+        approvalConfirm = undefined;
+      } catch {
+        res.status(503).json({code:'APPROVAL_RETIREMENT_PENDING',error:'The previous approval is still being settled. Try your message again shortly.'});
+        return;
       }
     }
     if ((intent || approvalConfirm || approvalInquiry) && cardSessionId !== sessionId) {
