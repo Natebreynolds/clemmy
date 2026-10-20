@@ -902,7 +902,9 @@ for (const failure of ['uncertain', 'outage'] as const) {
       const agent = { model, tools: [carrier.tool] };
       bindSurface(fixture, agent, [carrier.tool]);
       const outcome = await runProductionHost(fixture, agent);
-      assert.equal(reviewed, 1);
+      // A checker that threw is asked once more (live 10-19: a scheduled
+      // sheet write refused on a swallowed exception); an answer is not.
+      assert.equal(reviewed, failure === 'outage' ? 2 : 1);
       assert.equal(portBodies[SEND.manifest.operationId], before);
       assert.deepEqual(nonRefusedSettlements(fixture), []);
       assert.deepEqual(pendingApprovals(fixture), []);

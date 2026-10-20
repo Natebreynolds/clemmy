@@ -97,7 +97,7 @@ const classify = (f: ReturnType<typeof fixture>) => readWorkflowCompletionStakes
  * supported: Jev's confident DONE. */
 const jevDone = async () => ({ status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-fixture',
   answers: Object.fromEntries(Object.entries({ delivered: .95, unaddressed: .03, unsupported: .03, computed: .03, asksUser: .03,
-    cannotFinish: .03 }).map(([id, noul]) => [id, { type: 'noul', noul }])),
+    cannotFinish: .03, deadEnd: .03 }).map(([id, noul]) => [id, { type: 'noul', noul }])),
   usage: { input_tokens: 100, output_tokens: 20 } }) });
 
 test('a run that only read takes the fast review; an external mutation takes the full one', () => {

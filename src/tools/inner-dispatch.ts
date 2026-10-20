@@ -228,6 +228,10 @@ async function realToolsByName(): Promise<Map<string, InvokableTool>> {
   for (const t of getLocalDeferredDispatchTools() as unknown as InvokableTool[]) {
     if (t && typeof t.name === 'string') m.set(t.name, t);
   }
+  // A map installed while the registries were loading (the test seam below,
+  // reached from a fire-and-forget signature priming) wins over this one;
+  // the real map is rebuilt on the next read after a reset.
+  if (toolsByName) return toolsByName;
   toolsByName = m;
   return m;
 }

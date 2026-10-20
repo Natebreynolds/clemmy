@@ -735,7 +735,7 @@ async function reviewedCliAnswer(label: string, mode: 'records' | 'empty_records
       const repairFirst = review === 'repair' && completionPayloads.length === 1;
       const scores = { delivered: failedRead || repairFirst ? 0.05 : 0.95,
         unaddressed: repairFirst ? 0.95 : 0.05, unsupported: failedRead || repairFirst ? 0.95 : 0.03,
-        computed: 0.03, asksUser: 0.03, cannotFinish: failedRead ? 0.95 : 0.03 };
+        computed: 0.03, asksUser: 0.03, cannotFinish: failedRead ? 0.95 : 0.03, deadEnd: 0.03 };
       return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
         answers: Object.fromEntries(Object.entries(scores).map(([id, noul]) => [id, { type: 'noul', noul }])),
         usage: { input_tokens: 20, output_tokens: 5 } }) };

@@ -34,7 +34,7 @@ function jevCompletionReading(kind: 'done' | 'incomplete' | 'awaiting' | 'missin
         : { delivered: 0.2, unaddressed: 0.5, unsupported, asksUser: 0.92 };
   return {
     model: 'jev-1.13.0',
-    answers: Object.fromEntries(Object.entries({ computed: 0.03, asksUser: 0.03, cannotFinish: 0.03, ...nouls })
+    answers: Object.fromEntries(Object.entries({ computed: 0.03, asksUser: 0.03, cannotFinish: 0.03, deadEnd: 0.03, ...nouls })
       .map(([id, noul]) => [id, { type: 'noul', noul }])),
     usage: { input_tokens: 36, output_tokens: 5 },
   };
@@ -1734,7 +1734,7 @@ test('a Jev-only completed abstention retains its exact original reading without
   const context = { sessionId: owner.sessionId, reviewInputOwner: { ...owner }, skills: [],
     toolCallSummary: 'The supplied controlled briefing says ready.', producedNoOutput: true,
     fullSourceEvidence: true, completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE };
-  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08 };
+  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08, deadEnd: 0.03 };
   const digest = (value: string) => createHash('sha256').update(value).digest('hex');
   let calls = 0; let reviewerCalls = 0; let posted = '';
   _setTypesafeKeyForTests('ts_controlled_abstention');
@@ -1776,7 +1776,7 @@ test('Jev-only transport failure, malformed response and changed source, context
   const { modelUsageAttributionStorage } = await import('../usage-log.js');
   const { rememberTurnMemoryForJudges } = await import('../../memory/judge-memory.js');
   const { HOST_COMPLETION_EVIDENCE_GUIDANCE } = await import('./objective-judge.js');
-  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08 };
+  const scores = { delivered: 0.93, unaddressed: 0.19, unsupported: 0.15, computed: 0.07, asksUser: 0.03, cannotFinish: 0.08, deadEnd: 0.03 };
   let reviewerCalls = 0;
   _setCompletionJudgeForTests(async () => { reviewerCalls++; return unavailableSettingsJudge(); });
   _setTypesafeKeyForTests('ts_controlled_abstention_changes');

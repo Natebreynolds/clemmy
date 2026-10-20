@@ -209,7 +209,7 @@ for (const kind of ['semantic', 'payload', 'missing-crossing', 'corrupt-crossing
 
 function jevReading(done: boolean) {
   return { model: 'jev-1.13.0', answers: Object.fromEntries(Object.entries({ computed: 0.03,
-    asksUser: 0.03, cannotFinish: 0.03, delivered: done ? 0.93 : 0.1, unaddressed: done ? 0.05 : 0.9, unsupported: 0.05 })
+    asksUser: 0.03, cannotFinish: 0.03, deadEnd: 0.03, delivered: done ? 0.93 : 0.1, unaddressed: done ? 0.05 : 0.9, unsupported: 0.05 })
     .map(([id, noul]) => [id, { type: 'noul', noul }])), usage: { input_tokens: 36, output_tokens: 5 } };
 }
 
