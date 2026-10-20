@@ -180,7 +180,8 @@ test('a command that leaves the machine is refused into one card, and the approv
       const row = discovery.results.find((candidate: { name: string }) => candidate.name === 'run_shell_command');
       assert.ok(row, 'the production search must disclose the shell row');
       assert.equal(row.effectDecidedPerCall, true);
-      assert.match(row.effectRoutingNote, /classified external_write.*pending_action_queue.*request_now.*before execution/);
+      assert.match(row.effectRoutingNote, /classified external_write.*one card.*stages the exact command for that card itself/);
+      assert.doesNotMatch(row.effectRoutingNote, /pending_action_queue/, 'discovery no longer sends the model to the queue tool');
       assert.equal(row.carrier, 'work_call');
       assert.equal(row.capabilityRef, 'cap:local:run_shell_command:ordinary');
       assert.ok(discovery.schemas[row.name]?.properties.command, 'discovery includes the actual shell argument contract');
@@ -195,17 +196,8 @@ test('a command that leaves the machine is refused into one card, and the approv
         name: row.invocation.name, args_json: JSON.stringify(exactArgs),
       })];
     },
-    // Told the one door, it queues the exact same arguments once.
-    [call('call-queue', 'call_tool', {
-      name: 'pending_action_queue',
-      args_json: JSON.stringify({
-        title: 'Post to the hook endpoint', summary: 'Sends x=1 to the hook endpoint on this machine\'s local port.',
-        kind: 'shell_command', toolName: 'run_shell_command', payloadJson: JSON.stringify(SHELL_ARGS),
-        approvalIntent: 'request_now',
-      }),
-    })],
-    // 3. And stops for the card.
-    [text('The command is waiting for your approval.')],
+    // The host staged the card itself; the model only speaks to the owner.
+    [text('I need to post x=1 to your hook endpoint to finish this. OK to go ahead?')],
   ]);
   const debug = JSON.stringify({ status: run.result.status, frames: run.frames, events: run.trace.map((e) => e.type).slice(-40) }).slice(0, 6_000);
 
@@ -216,24 +208,20 @@ test('a command that leaves the machine is refused into one card, and the approv
     .all(run.session.id) as Array<{ tool_name: string; state: string }>;
   assert.ok(!dispatches.some((row) => row.tool_name === 'run_shell_command'), debug);
 
-  // The refusal named the door, with the same arguments, and not discovery.
+  // The refusal says the host staged the card itself: no door to walk, no
+  // discovery, no queue call, no argument repair — only speaking is left.
   const refusal = run.frames[2]?.toolResults.join('\n') ?? '';
   assert.match(refusal, /outside this machine/, debug);
-  assert.match(refusal, /pending_action_queue/, debug);
-  assert.match(refusal, /request_now/, debug);
-  assert.match(refusal, /queue_for_approval/, 'the typed next edge is the queue, not an argument repair');
+  assert.match(refusal, /already staged for the owner's card/, debug);
+  assert.match(refusal, /speak_for_card/, 'the typed next edge is to speak, not to queue');
+  assert.doesNotMatch(refusal, /queue_for_approval/, debug);
   assert.doesNotMatch(refusal, /repair_arguments/, debug);
-  assert.ok(refusal.includes(COMMAND), debug);
   assert.doesNotMatch(refusal, /Discover that exact operation with tool_search/, debug);
 
-  // The queue took it as approval-bound work (it was not sent away as ordinary).
-  const queued = run.frames[3]?.toolResults.join('\n') ?? '';
-  assert.match(queued, /Pending action (queued|reused)/, debug);
-  assert.doesNotMatch(queued, /PENDING_ACTION_APPROVAL_NOT_REQUIRED/, debug);
-
-  // The turn opened the one card without another model round.
+  // The turn opened the one card with zero model-issued queue calls and no
+  // extra model round: discover, call, speak.
   assert.equal(run.result.status, 'awaiting_approval', debug);
-  assert.equal(run.frames.length, 4, debug);
+  assert.equal(run.frames.length, 3, debug);
   const approvals = run.trace.filter((event) => event.type === 'approval_requested');
   assert.equal(approvals.length, 1, debug);
   const approvalId = String(approvals[0]!.data.approvalId);
@@ -242,6 +230,8 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.equal(view!.toolName, 'run_shell_command');
   assert.equal(view!.preview, COMMAND, 'the card shows the exact command');
   assert.equal(view!.status, 'approval_requested');
+  assert.deepEqual(pendingActions.getPendingAction(view!.id)?.payload, SHELL_ARGS, 'the staged payload is byte-for-byte the refused call');
+  assert.equal(pendingActions.getPendingAction(view!.id)?.createdBy, 'host_off_machine_door', 'the host staged it, not a model queue call');
   assert.equal(run.trace.filter((event) => event.type === 'heartbeat' && event.data.kind === 'pending_action_transition_materialized').length, 1, debug);
 
   // The owner approves the card. The harness runs the stored action once and

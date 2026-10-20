@@ -161,6 +161,7 @@ const NEXT_EDGE_CHANGES = new Set<NextEdgeChange>([
   'ask_user',
   'choose_other_capability',
   'queue_for_approval',
+  'speak_for_card',
 ]);
 
 function parseHostNextEdge(value: unknown): HostNextEdgeV1 | undefined {

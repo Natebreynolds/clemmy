@@ -65,8 +65,7 @@ export function pendingActionContinuationMode(input: {
   return input.humanApprovalBound && input.contextSessionKind === 'chat' ? 'host_chat' : 'caller';
 }
 
-function continuationModeFor(record: PendingActionRecord, approvalRequired: boolean): PendingActionContinuationMode {
-  const sessionId = ownedSessionId();
+function continuationModeFor(record: PendingActionRecord, approvalRequired: boolean, sessionId: string | null = ownedSessionId()): PendingActionContinuationMode {
   let sessionKind: SessionKind | null = null;
   try { sessionKind = sessionId ? getSession(sessionId)?.kind ?? null : null; } catch {
     // An unreadable owner cannot justify either a host promise or caller replay.
@@ -229,8 +228,9 @@ function queuedActionNextStep(
   record: PendingActionRecord,
   approvalRequired: boolean,
   approvalIntent?: PendingActionApprovalIntent,
+  sessionId: string | null = ownedSessionId(),
 ): string {
-  const continuationMode = continuationModeFor(record, approvalRequired);
+  const continuationMode = continuationModeFor(record, approvalRequired, sessionId);
   const afterApproval = continuationMode === 'host_chat'
     ? 'After the owner approves the one exact card, the chat host runs the stored payload once and returns its durable result. Do not call pending_action_execute, repeat the underlying call, or reconstruct its arguments.'
     : continuationMode === 'batch'
@@ -275,6 +275,250 @@ export function exactCommandPreview(toolName: string, payload: unknown): string 
   return typeof command === 'string' && command.trim() ? command : undefined;
 }
 
+/** Exactly what pending_action_queue takes, for a host that stages a card itself. */
+export interface QueueExactPendingActionInput {
+  title: string;
+  summary: string;
+  ask?: string;
+  why?: string;
+  kind: PendingActionKind;
+  toolName: string;
+  payloadJson: string;
+  approvalIntent?: PendingActionApprovalIntent;
+  targetSummary?: string;
+  preview?: string;
+  risk?: string;
+  rollback?: string;
+  createdBy?: string;
+}
+
+/** Who owns the queued action: the session and accepted source it belongs to.
+ * The tool reads these from the harness context; a host passes its own. */
+export interface QueueExactPendingActionOwner {
+  sessionId: string | null;
+  /** Whether a tool-output context was active (a context without an owner refuses). */
+  contextPresent: boolean;
+  attribution: { sourceUserSeq?: number; runScopeId?: string; callId?: string };
+}
+
+export interface QueueExactPendingActionResult {
+  /** What the caller is told, in the queue tool's own words. */
+  text: string;
+  record: PendingActionRecord | null;
+  reused: boolean;
+  /** True when nothing was queued (refused, failed, or not approval-bound). */
+  refused: boolean;
+}
+
+/**
+ * Queue one fully prepared exact action, opening its one card at this turn's
+ * boundary when approval is required and asked for. This is the whole of
+ * pending_action_queue; the host calls it directly when it refuses a call
+ * that leaves this machine, so the model never has to discover and call the
+ * queue tool to reach the owner's card (live 10-19: two Windows testers each
+ * spent three extra brain steps on that detour).
+ */
+export async function queueExactPendingAction(
+  input: QueueExactPendingActionInput,
+  owner: QueueExactPendingActionOwner,
+): Promise<QueueExactPendingActionResult> {
+  const refused = (text: string): QueueExactPendingActionResult => ({ text, record: null, reused: false, refused: true });
+  let parsedPayload: unknown;
+  try {
+    parsedPayload = parsePendingActionPayloadJson(input.payloadJson);
+  } catch (err) {
+    return refused(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let admitted: AdmittedPendingActionCall;
+  const approvalIntent = input.approvalIntent as PendingActionApprovalIntent | undefined;
+  try {
+    admitted = admitPendingActionCall(input.toolName, parsedPayload, {
+      approvalIntent: approvalIntent ?? 'legacy',
+    });
+  } catch (err) {
+    return refused(`pending_action_queue refused: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const { toolName, executionAuthority } = admitted;
+  let payload = admitted.payload;
+  // A card promises exactly what will run, so the payload must fit the
+  // tool it names before the card exists. Live 2026-10-07: a queued
+  // shell command without its nullable `cwd` was approved, then refused
+  // before dispatch — the owner's yes ran nothing.
+  try {
+    const { innerDispatchToolParameters } = await import('./inner-dispatch.js');
+    const schema = await innerDispatchToolParameters(toolName);
+    if (schema && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const shaped = completePayloadForToolSchema(schema, payload as Record<string, unknown>);
+      if (shaped.issues.length > 0) return refused(payloadShapeRefusal(toolName, shaped.issues));
+      payload = shaped.payload;
+    }
+  } catch { /* an unreadable schema leaves validation to dispatch, as before */ }
+  const sessionId = owner.sessionId;
+  if (owner.contextPresent && !sessionId) {
+    return refused('pending_action_queue refused: the active harness context has no authoritative session owner.');
+  }
+  const shape = classifyExternalWrite(toolName, payload);
+  const kind = input.kind as PendingActionKind;
+  const needsFormalApproval = pendingActionRequiresHumanApproval({
+    kind,
+    toolName,
+    payload,
+  }, { sessionId });
+  if (approvalIntent === 'request_now' && !needsFormalApproval) {
+    return refused(
+      'pending_action_queue refused: PENDING_ACTION_APPROVAL_NOT_REQUIRED. This exact action is not approval-bound. Execute it through the ordinary work boundary without asking for or creating a separate approval; use queue_only only when the user explicitly requested staging without execution.',
+    );
+  }
+  if (needsFormalApproval && !sessionId) {
+    return refused('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
+  }
+  // An approval-bound action queued now is the one the owner is about to
+  // be asked about, so its one card opens at this turn's boundary unless
+  // the caller asked only to stage it. The no-intent prose bridge remains
+  // for edges recorded before the intent existed.
+  const requestedIntent: PendingActionApprovalIntent | undefined = approvalIntent
+    ?? (needsFormalApproval ? 'request_now' : undefined);
+  if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
+    const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
+    if (recipientResult.action === 'block') {
+      const error = new RecipientSetIntegrityError({ toolName, result: recipientResult });
+      try {
+        appendEvent({
+          sessionId,
+          turn: 0,
+          role: 'system',
+          type: 'guardrail_tripped',
+          data: {
+            kind: 'recipient_set_integrity_blocked',
+            phase: 'pending_action_queue',
+            toolName,
+            recipients: recipientResult.recipients,
+            unsupportedRecipients: recipientResult.unsupportedRecipients ?? [],
+            reason: recipientResult.reason,
+          },
+        });
+      } catch { /* refusal remains deterministic even if telemetry is unavailable */ }
+      return refused(`pending_action_queue refused by harness: ${error.message}`);
+    }
+  }
+  const attribution = owner.attribution;
+  const payloadHash = pendingActionPayloadHash(toolName, payload, executionAuthority);
+  const targetSummary = input.targetSummary
+    ?? (executionAuthority
+      ? `${executionAuthority.toolkit} CLI default — ${executionAuthority.label}`
+      : undefined);
+  let record = requestOwnedQueueRetry({
+    sessionId,
+    sourceUserSeq: attribution.sourceUserSeq,
+    payloadHash,
+    kind,
+    approvalRequired: needsFormalApproval,
+  });
+  const reused = Boolean(record);
+  if (!record) {
+    record = queuePendingAction({
+      title: input.title,
+      summary: input.summary,
+      kind,
+      toolName,
+      payload,
+      executionAuthority,
+      targetSummary,
+      preview: exactCommandPreview(toolName, payload) ?? input.preview,
+      risk: input.risk,
+      rollback: input.rollback,
+      ask: input.ask,
+      why: input.why,
+      sessionId,
+      // The accepted source this action was prepared for. An approval
+      // that arrives with no turn of its own (a card button) settles the
+      // approved call under this source.
+      sourceUserSeq: attribution.sourceUserSeq,
+      createdBy: input.createdBy ?? 'clementine',
+    });
+    const edgePersisted = maybeLog(sessionId, 'queued', {
+      pendingActionId: record.id,
+      toolName: record.toolName,
+      actionKind: record.kind,
+      approvalRequired: needsFormalApproval,
+      ...(requestedIntent ? {
+        approvalIntent: requestedIntent,
+        autoMaterialize: requestedIntent === 'request_now',
+      } : {}),
+      payloadHash: record.payloadHash,
+      targetSummary: record.targetSummary,
+      ...attribution,
+    });
+    if (needsFormalApproval && !edgePersisted) {
+      cancelPendingActionIfQueuedUnlinked(
+        record.id,
+        record.id,
+        'Approval-bound queue was cancelled because its durable request edge could not be recorded.',
+      );
+      return refused(
+        'pending_action_queue failed safely: the approval-bound payload was not accepted because its durable request edge could not be recorded. Nothing is authorized or executable; retry the queue once.',
+      );
+    }
+  } else if (requestedIntent && attribution.sourceUserSeq) {
+    const currentIntent = requestOwnedApprovalIntentState({
+      sessionId,
+      sourceUserSeq: attribution.sourceUserSeq,
+      pendingActionId: record.id,
+      payloadHash: record.payloadHash,
+    });
+    const shouldPromote = requestedIntent === 'request_now'
+      && currentIntent !== 'request_now';
+    const shouldRecordQueueOnly = requestedIntent === 'queue_only'
+      && currentIntent !== 'request_now'
+      && currentIntent !== 'queue_only';
+    if (
+      (shouldPromote || shouldRecordQueueOnly)
+      && !maybeLog(sessionId, 'queued', {
+        pendingActionId: record.id,
+        toolName: record.toolName,
+        actionKind: record.kind,
+        approvalRequired: needsFormalApproval,
+        approvalIntent: requestedIntent,
+        autoMaterialize: requestedIntent === 'request_now',
+        payloadHash: record.payloadHash,
+        targetSummary: record.targetSummary,
+        ...attribution,
+      })
+    ) {
+      return refused(
+        'pending_action_queue failed safely: the existing payload remains inert because its updated approval graph edge could not be recorded. Retry once.',
+      );
+    }
+  }
+  const persistedIntent = requestOwnedApprovalIntentState({
+    sessionId,
+    sourceUserSeq: attribution.sourceUserSeq,
+    pendingActionId: record.id,
+    payloadHash: record.payloadHash,
+  });
+  const effectiveApprovalIntent = persistedIntent === 'request_now'
+    || persistedIntent === 'queue_only'
+    ? persistedIntent
+    : requestedIntent;
+  const nextStep = queuedActionNextStep(
+    record,
+    needsFormalApproval,
+    effectiveApprovalIntent,
+    sessionId,
+  );
+  return {
+    text: [
+      `Pending action ${reused ? 'reused' : 'queued'}: ${record.id}`,
+      nextStep,
+      '',
+      formatPendingAction(record, { verbose: true }),
+    ].join('\n'),
+    record,
+    reused,
+    refused: false,
+  };
+}
+
 export function registerPendingActionTools(server: McpServer): void {
   server.tool(
     'pending_action_queue',
@@ -301,196 +545,11 @@ export function registerPendingActionTools(server: McpServer): void {
       rollback: z.string().max(1000).optional().describe('Undo/rollback note if available.'),
       createdBy: z.string().max(120).optional(),
     },
-    async (input) => {
-      let parsedPayload: unknown;
-      try {
-        parsedPayload = parsePendingActionPayloadJson(input.payloadJson);
-      } catch (err) {
-        return textResult(`pending_action_queue failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      let admitted: AdmittedPendingActionCall;
-      const approvalIntent = input.approvalIntent as PendingActionApprovalIntent | undefined;
-      try {
-        admitted = admitPendingActionCall(input.toolName, parsedPayload, {
-          approvalIntent: approvalIntent ?? 'legacy',
-        });
-      } catch (err) {
-        return textResult(`pending_action_queue refused: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      const { toolName, executionAuthority } = admitted;
-      let payload = admitted.payload;
-      // A card promises exactly what will run, so the payload must fit the
-      // tool it names before the card exists. Live 2026-10-07: a queued
-      // shell command without its nullable `cwd` was approved, then refused
-      // before dispatch — the owner's yes ran nothing.
-      try {
-        const { innerDispatchToolParameters } = await import('./inner-dispatch.js');
-        const schema = await innerDispatchToolParameters(toolName);
-        if (schema && payload && typeof payload === 'object' && !Array.isArray(payload)) {
-          const shaped = completePayloadForToolSchema(schema, payload as Record<string, unknown>);
-          if (shaped.issues.length > 0) return textResult(payloadShapeRefusal(toolName, shaped.issues));
-          payload = shaped.payload;
-        }
-      } catch { /* an unreadable schema leaves validation to dispatch, as before */ }
-      const sessionId = ownedSessionId();
-      if (getToolOutputContext() && !sessionId) {
-        return textResult('pending_action_queue refused: the active harness context has no authoritative session owner.');
-      }
-      const shape = classifyExternalWrite(toolName, payload);
-      const kind = input.kind as PendingActionKind;
-      const needsFormalApproval = pendingActionRequiresHumanApproval({
-        kind,
-        toolName,
-        payload,
-      }, { sessionId });
-      if (approvalIntent === 'request_now' && !needsFormalApproval) {
-        return textResult(
-          'pending_action_queue refused: PENDING_ACTION_APPROVAL_NOT_REQUIRED. This exact action is not approval-bound. Execute it through the ordinary work boundary without asking for or creating a separate approval; use queue_only only when the user explicitly requested staging without execution.',
-        );
-      }
-      if (needsFormalApproval && !sessionId) {
-        return textResult('pending_action_queue refused: an approval-bound action requires an authoritative harness session.');
-      }
-      // An approval-bound action queued now is the one the owner is about to
-      // be asked about, so its one card opens at this turn's boundary unless
-      // the caller asked only to stage it. The no-intent prose bridge remains
-      // for edges recorded before the intent existed.
-      const requestedIntent: PendingActionApprovalIntent | undefined = approvalIntent
-        ?? (needsFormalApproval ? 'request_now' : undefined);
-      if (sessionId && shape.mutating && shape.irreversible && isRecipientIntegrityGateEnabled()) {
-        const recipientResult = evaluateRecipientSetIntegrity(sessionId, payload);
-        if (recipientResult.action === 'block') {
-          const error = new RecipientSetIntegrityError({ toolName, result: recipientResult });
-          try {
-            appendEvent({
-              sessionId,
-              turn: 0,
-              role: 'system',
-              type: 'guardrail_tripped',
-              data: {
-                kind: 'recipient_set_integrity_blocked',
-                phase: 'pending_action_queue',
-                toolName,
-                recipients: recipientResult.recipients,
-                unsupportedRecipients: recipientResult.unsupportedRecipients ?? [],
-                reason: recipientResult.reason,
-              },
-            });
-          } catch { /* refusal remains deterministic even if telemetry is unavailable */ }
-          return textResult(`pending_action_queue refused by harness: ${error.message}`);
-        }
-      }
-      const attribution = currentRequestAttribution();
-      const payloadHash = pendingActionPayloadHash(toolName, payload, executionAuthority);
-      const targetSummary = input.targetSummary
-        ?? (executionAuthority
-          ? `${executionAuthority.toolkit} CLI default — ${executionAuthority.label}`
-          : undefined);
-      let record = requestOwnedQueueRetry({
-        sessionId,
-        sourceUserSeq: attribution.sourceUserSeq,
-        payloadHash,
-        kind,
-        approvalRequired: needsFormalApproval,
-      });
-      const reused = Boolean(record);
-      if (!record) {
-        record = queuePendingAction({
-          title: input.title,
-          summary: input.summary,
-          kind,
-          toolName,
-          payload,
-          executionAuthority,
-          targetSummary,
-          preview: exactCommandPreview(toolName, payload) ?? input.preview,
-          risk: input.risk,
-          rollback: input.rollback,
-          ask: input.ask,
-          why: input.why,
-          sessionId,
-          // The accepted source this action was prepared for. An approval
-          // that arrives with no turn of its own (a card button) settles the
-          // approved call under this source.
-          sourceUserSeq: attribution.sourceUserSeq,
-          createdBy: input.createdBy ?? 'clementine',
-        });
-        const edgePersisted = maybeLog(sessionId, 'queued', {
-          pendingActionId: record.id,
-          toolName: record.toolName,
-          actionKind: record.kind,
-          approvalRequired: needsFormalApproval,
-          ...(requestedIntent ? {
-            approvalIntent: requestedIntent,
-            autoMaterialize: requestedIntent === 'request_now',
-          } : {}),
-          payloadHash: record.payloadHash,
-          targetSummary: record.targetSummary,
-          ...attribution,
-        });
-        if (needsFormalApproval && !edgePersisted) {
-          cancelPendingActionIfQueuedUnlinked(
-            record.id,
-            record.id,
-            'Approval-bound queue was cancelled because its durable request edge could not be recorded.',
-          );
-          return textResult(
-            'pending_action_queue failed safely: the approval-bound payload was not accepted because its durable request edge could not be recorded. Nothing is authorized or executable; retry the queue once.',
-          );
-        }
-      } else if (requestedIntent && attribution.sourceUserSeq) {
-        const currentIntent = requestOwnedApprovalIntentState({
-          sessionId,
-          sourceUserSeq: attribution.sourceUserSeq,
-          pendingActionId: record.id,
-          payloadHash: record.payloadHash,
-        });
-        const shouldPromote = requestedIntent === 'request_now'
-          && currentIntent !== 'request_now';
-        const shouldRecordQueueOnly = requestedIntent === 'queue_only'
-          && currentIntent !== 'request_now'
-          && currentIntent !== 'queue_only';
-        if (
-          (shouldPromote || shouldRecordQueueOnly)
-          && !maybeLog(sessionId, 'queued', {
-            pendingActionId: record.id,
-            toolName: record.toolName,
-            actionKind: record.kind,
-            approvalRequired: needsFormalApproval,
-            approvalIntent: requestedIntent,
-            autoMaterialize: requestedIntent === 'request_now',
-            payloadHash: record.payloadHash,
-            targetSummary: record.targetSummary,
-            ...attribution,
-          })
-        ) {
-          return textResult(
-            'pending_action_queue failed safely: the existing payload remains inert because its updated approval graph edge could not be recorded. Retry once.',
-          );
-        }
-      }
-      const persistedIntent = requestOwnedApprovalIntentState({
-        sessionId,
-        sourceUserSeq: attribution.sourceUserSeq,
-        pendingActionId: record.id,
-        payloadHash: record.payloadHash,
-      });
-      const effectiveApprovalIntent = persistedIntent === 'request_now'
-        || persistedIntent === 'queue_only'
-        ? persistedIntent
-        : requestedIntent;
-      const nextStep = queuedActionNextStep(
-        record,
-        needsFormalApproval,
-        effectiveApprovalIntent,
-      );
-      return textResult([
-        `Pending action ${reused ? 'reused' : 'queued'}: ${record.id}`,
-        nextStep,
-        '',
-        formatPendingAction(record, { verbose: true }),
-      ].join('\n'));
-    },
+    async (input) => textResult((await queueExactPendingAction(input as QueueExactPendingActionInput, {
+      sessionId: ownedSessionId(),
+      contextPresent: Boolean(getToolOutputContext()),
+      attribution: currentRequestAttribution(),
+    })).text),
   );
 
   server.tool(

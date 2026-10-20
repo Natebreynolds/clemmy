@@ -464,7 +464,7 @@ function unlabeledServerTool(name: string): boolean {
 
 export const PER_CALL_EFFECT_DISPATCH_NOTE = 'A call that only reads or computes runs now: invoke it as the inner name and args_json of work_call, with the tool\'s own name as requirement_id. A call that changes files, or that leaves this machine, is a different effect and is not carried by this example.';
 
-const PER_CALL_EFFECT_CARD_ROUTING_NOTE = 'The row\'s effect and capabilityRef describe a local envelope, not the chosen command\'s effect or permission. A command classified external_write, including remote execution or network mutation, needs one exact pending_action_queue action through call_tool with approvalIntent:"request_now" before execution; do not probe work_call to request approval. Unknown, admin and destructive calls retain their existing boundaries. This note grants no permission.';
+const PER_CALL_EFFECT_CARD_ROUTING_NOTE = 'The row\'s effect and capabilityRef describe a local envelope, not the chosen command\'s effect or permission. A command classified external_write, including remote execution or network mutation, runs only after the owner approves it on one card: call it once through the shown invocation and the app stages the exact command for that card itself and tells you to speak to the owner; do not queue it yourself and do not probe work_call to request approval. Unknown, admin and destructive calls retain their existing boundaries. This note grants no permission.';
 
 export function renderCarrierInvocationExample(
   carrier: string,

@@ -169,7 +169,7 @@ test('the shell is disclosed as ordinary local work, with the carrier and the ca
     assert.equal(row.effectDecidedPerCall, true, 'a local planning ref must not hide argument-dependent effects');
     assert.match(row.effectRoutingNote, /eligible ordinary local_write commands keep the shown work_call invocation/);
     assert.match(row.effectRoutingNote, /classified external_write.*remote execution or network mutation/);
-    assert.match(row.effectRoutingNote, /pending_action_queue.*call_tool.*request_now.*before execution/);
+    assert.match(row.effectRoutingNote, /one card.*stages the exact command for that card itself.*do not queue it yourself/);
     assert.match(row.effectRoutingNote, /Unknown, admin and destructive calls retain their existing boundaries/);
     assert.match(row.effectRoutingNote, /grants no permission/);
     assert.doesNotMatch(body.hint, /call_tool\(name, args_json\): [^.]*run_shell_command/, 'the shell is never said to go through call_tool');
@@ -203,7 +203,7 @@ test('ref-less shell discovery keeps its read/compute scope while naming the ext
   assert.equal(row.example.args.requirement_id, 'run_shell_command');
   assert.equal(row.effectDecidedPerCall, true);
   assert.match(row.effectRoutingNote, /limited to reads and computation; it does not authorize local writes/);
-  assert.match(row.effectRoutingNote, /classified external_write.*pending_action_queue.*request_now/);
+  assert.match(row.effectRoutingNote, /classified external_write.*one card.*stages the exact command for that card itself/);
 });
 
 test('ordinary local operations and foreign shell lookalikes never acquire local per-call routing metadata', async () => {

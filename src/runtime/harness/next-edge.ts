@@ -54,7 +54,10 @@ export type NextEdgeChange =
   | 'choose_other_capability'
   /** The call is right but needs the owner's decision: queue it once with the
    * same arguments so the turn opens the card, then stop. */
-  | 'queue_for_approval';
+  | 'queue_for_approval'
+  /** The host already staged the owner's card from this exact call; speak to
+   * the owner in your own words and make no further call for it. */
+  | 'speak_for_card';
 
 export interface NextEdgeFieldV1 {
   /** JSON-pointer-ish path into the tool's own arguments. */
@@ -87,6 +90,7 @@ const DEFAULT_SAY: Record<NextEdgeChange, string> = {
   ask_user: 'Ask the user this one exact question; it cannot be discovered.',
   choose_other_capability: 'This exact capability cannot serve this step — select a different one.',
   queue_for_approval: 'Queue this exact call once with pending_action_queue (same tool, same arguments, approvalIntent request_now, and ask: your own words to the owner — what you need to do and why, ending with the go-ahead question), then end the turn speaking to the owner, never about gates or the harness. Do not retry the call itself.',
+  speak_for_card: 'The owner\'s card is already staged from this exact call. Say what you need to do and why their request needs it, in your own words, ending on the go-ahead question; make no further call for it.',
 };
 
 /** Build an edge. `say` is derived unless the caller knows something better;

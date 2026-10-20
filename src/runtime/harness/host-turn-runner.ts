@@ -7092,6 +7092,68 @@ const runHostTurnBody = async (
       ? ` Repair: invoke it through the configured carrier ${carrier} with name ${JSON.stringify(name)} and args_json carrying these same arguments (one carrier call per item).`
       : '';
   };
+  /**
+   * A call that leaves this machine was refused before dispatch. Instead of
+   * sending the model to discover and call the queue tool, the host stages
+   * the exact refused payload itself through the same admission the queue
+   * tool uses, asks the owner's checker to write the card's question in
+   * Clem's words from the exact call, and tells the model to speak. The card
+   * opens at this turn's boundary as any request_now action does. Returns
+   * null when nothing could be staged, so the refusal stays the old door.
+   */
+  const stageOffMachineCard = async (
+    carrierName: string,
+    args: Record<string, unknown> | null,
+    callId: string,
+  ): Promise<string | null> => {
+    const effective = unwrapRuntimeEffectiveToolIdentity(carrierName, args);
+    const toolName = effective.toolName?.trim() ?? '';
+    const toolArgs = effective.args;
+    if (!toolName || !toolArgs || typeof toolArgs !== 'object' || Array.isArray(toolArgs)) return null;
+    let payloadJson: string;
+    try {
+      payloadJson = JSON.stringify(toolArgs);
+    } catch {
+      return null;
+    }
+    const identity = exactHostIdentity();
+    if (!identity.sessionId || !identity.sourceUserSeq) return null;
+    try {
+      const { queueExactPendingAction, exactCommandPreview } = await import('../../tools/pending-action-tools.js');
+      const command = exactCommandPreview(toolName, toolArgs);
+      const preview = approvalCallPreview(
+        { toolName, args: toolArgs as Record<string, unknown>, rawArgs: payloadJson },
+        true,
+        false,
+        identity,
+      );
+      const voice = await approvalPrecheck({
+        sessionId: identity.sessionId,
+        sourceUserSeq: identity.sourceUserSeq,
+        preview,
+        consent: { effect: 'external_write', consequence: 'reaches outside this computer' },
+      }).catch(() => undefined);
+      const staged = await queueExactPendingAction({
+        title: (command ?? toolName).slice(0, 160),
+        summary: `The exact ${toolName} call prepared for this request; it leaves this computer, so it runs once after the owner's go-ahead.`,
+        ...(voice?.ask ? { ask: voice.ask } : {}),
+        ...(voice?.why ? { why: voice.why } : {}),
+        kind: 'external_write',
+        toolName,
+        payloadJson,
+        approvalIntent: 'request_now',
+        createdBy: 'host_off_machine_door',
+      }, {
+        sessionId: identity.sessionId,
+        contextPresent: true,
+        attribution: { sourceUserSeq: identity.sourceUserSeq, callId },
+      });
+      if (staged.refused || !staged.record) return null;
+      return offMachineCardStagedText(carrierName, toolName, staged.record.id);
+    } catch {
+      return null;
+    }
+  };
   const readOnlyCanaryRefusal = (
     name: string,
     args: Record<string, unknown> | null,
@@ -7423,7 +7485,7 @@ const runHostTurnBody = async (
       ?? (parsedArguments ? classifyRuntimeToolEffect(call.name, parsedArguments).effect : 'unknown');
     // A carried call answers to the same host refusals as the carrier call it
     // rides; only the sealed identity below stays the authored name.
-    const canaryRefusal = offSurfaceCarry
+    let canaryRefusal = offSurfaceCarry
       ? readOnlyCanaryRefusal(
           offSurfaceCarry.carrierName,
           offSurfaceCarry.carrierArgs,
@@ -7438,6 +7500,16 @@ const runHostTurnBody = async (
           tool,
           call.callId,
         );
+    // A call that leaves this machine: the host stages the owner's card from
+    // the exact refused payload itself, so the model's next step is to speak.
+    if (canaryRefusal && hostProduction && isOffMachineCallNeedsCardRepair(canaryRefusal)) {
+      const staged = await stageOffMachineCard(
+        offSurfaceCarry ? offSurfaceCarry.carrierName : call.name,
+        offSurfaceCarry ? offSurfaceCarry.carrierArgs : parsedArguments,
+        call.callId,
+      );
+      if (staged) canaryRefusal = staged;
+    }
     // Read synchronously: sibling reads share a bounded pool, and the exact
     // miss belongs to the refusal composed on the line above.
     const literalFaultOperation = canaryRefusal
@@ -8336,6 +8408,10 @@ const runHostTurnBody = async (
           // Nothing is wrong with this call; a sibling held the batch back.
           ? nextEdge({ tool: innerTool, change: 'reissue_unstarted',
             say: 'Send this call again unchanged with a fresh call ID, in the same step as the corrected call.' })
+          : input.diagnostic && isOffMachineCardStaged(input.diagnostic)
+          // The host staged the owner's card itself; the one move left is
+          // to speak to the owner, not to queue or retry anything.
+          ? nextEdge({ tool: innerTool, change: 'speak_for_card' })
           : input.diagnostic && isOffMachineCallNeedsCardRepair(input.diagnostic)
           // The call was right; only the owner's decision is missing. The
           // edge is the queue, never a repair of the arguments.
@@ -12209,6 +12285,10 @@ const runHostTurnBody = async (
           call.name, parsedArguments, argumentsJson, tool, call.callId,
         );
       }
+      if (canaryRefusal && hostProduction && isOffMachineCallNeedsCardRepair(canaryRefusal)) {
+        const staged = await stageOffMachineCard(call.name, parsedArguments, call.callId);
+        if (staged) canaryRefusal = staged;
+      }
       if (!canaryRefusal && hostProduction && parsedArguments && tool) {
         const approvalToolCallItem = {
           type: 'function_call' as const,
@@ -12900,7 +12980,34 @@ const OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE = 'changes something outside this mac
 /** Whether a host-authored diagnostic is the off-machine repair, so its
  * disposition carries the queue edge instead of an argument repair. */
 export function isOffMachineCallNeedsCardRepair(diagnostic: string): boolean {
-  return diagnostic.includes(OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE);
+  return diagnostic.includes(OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE) && !isOffMachineCardStaged(diagnostic);
+}
+
+/** The one sentence a staged-card result carries; the edge is keyed on it. */
+const OFF_MACHINE_CARD_STAGED_SENTENCE = 'The exact command is already staged for the owner\'s card, which opens when you finish speaking.';
+
+/** Whether a host-authored diagnostic says the host staged the card itself,
+ * so the only move left is to speak to the owner. */
+export function isOffMachineCardStaged(diagnostic: string): boolean {
+  return diagnostic.includes(OFF_MACHINE_CARD_STAGED_SENTENCE);
+}
+
+/**
+ * What the model is told once the host has staged the refused command for
+ * the owner's card itself: nothing to discover, queue or retry — speak.
+ * Live 10-19 (two Windows testers): told to queue, the model searched for the
+ * queue tool, queued with a schema error, queued again, then ran its own
+ * approval; the one card the owner needed cost five brain steps.
+ */
+export function offMachineCardStagedText(carrierName: string, toolName: string, pendingActionId: string): string {
+  return `Tool '${carrierName}' did not run: this ${toolName} call ${OFF_MACHINE_CALL_NEEDS_CARD_SENTENCE}`
+    + ` ${OFF_MACHINE_CARD_STAGED_SENTENCE}`
+    + ' No local or external change was attempted.'
+    + ' Do not call pending_action_queue, do not retry this call, and do not call pending_action_execute.'
+    + ' Now speak to the owner as you would in person: what you need to do and why their request needs it, ending on the go-ahead question;'
+    + ' the exact command is shown under your words automatically. After their yes it runs once and the result comes back to you.'
+    + ' Never mention gates, refusals, dispatch, cards, ids, hashes or the harness to them.'
+    + ` (Staged action id for your tool calls only: ${pendingActionId}.)`;
 }
 
 /**
