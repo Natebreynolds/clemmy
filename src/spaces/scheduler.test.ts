@@ -83,8 +83,16 @@ test('a second tick inside an evaluated minute reads no Space manifests; the nex
     assert.deepEqual(sameMinute, { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 });
     await sched.processSpaceSchedules(new Date(minute.getTime() + 60_000));
     assert.equal(listings, 2, 'the next minute evaluates again');
+    // A Space saved inside the evaluated minute still gets that minute: an
+    // hourly schedule saved during its own minute must not wait an hour.
+    store.spaceStore.save({ id: 'sched-saved-mid-minute', title: 'Saved mid-minute', dataSources: [] });
+    await sched.processSpaceSchedules(new Date(minute.getTime() + 75_000));
+    assert.equal(listings, 3, 'a changed Space manifest re-evaluates within the minute');
+    await sched.processSpaceSchedules(new Date(minute.getTime() + 90_000));
+    assert.equal(listings, 3, 'unchanged manifests skip again');
   } finally {
     store.spaceStore.listWhere = original;
+    store.spaceStore.archive('sched-saved-mid-minute');
   }
 });
 

@@ -14,7 +14,7 @@
  *
  * Mirrors processWorkflowSchedules (dedupe-by-minute, 24h catch-up, prune).
  */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -22,7 +22,7 @@ import { cronMatches, scheduleCatchupWindow } from '../execution/workflow-schedu
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification } from '../runtime/notifications.js';
 import { withFileLock } from '../runtime/atomic-json.js';
-import { spaceStore, type SpaceDataSource, type SpaceRecord } from './store.js';
+import { SPACES_DIR, spaceStore, type SpaceDataSource, type SpaceRecord } from './store.js';
 import { refreshSpaceData, type RefreshResult } from './runner.js';
 import { readData } from './data-store.js';
 import { reengageSpace } from './reengage.js';
@@ -217,23 +217,39 @@ export function processSpaceSchedules(now: Date = new Date()): Promise<SpaceFire
   return withScheduleStateOwner(() => processSpaceSchedulesOwned(now));
 }
 
+/** The Space manifests as last fully evaluated: one stat per Space, no reads.
+ *  A manifest written since (a saved or archived Space, a changed schedule)
+ *  changes the signature, so a Space saved inside an already-evaluated minute
+ *  still gets that minute. Process-local: a restart evaluates in full. */
+let lastFullyEvaluatedSignature: string | undefined;
+function spaceManifestSignature(): string {
+  try {
+    return readdirSync(SPACES_DIR).sort().map((name) => {
+      try { return `${name}:${statSync(path.join(SPACES_DIR, name, 'space.json')).mtimeMs}`; } catch { return name; }
+    }).join('|');
+  } catch { return ''; }
+}
+
 async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   const state = loadState();
   const minutes = scheduleCatchupWindow(state.lastEvaluatedAtMs, now.getTime());
   const lastRun = state.lastRunByMinute;
   const reengageKeys = state.lastReengageByKey;
   const streaks = state.sourceStreakByKey;
-  // Within a minute this pass already evaluated, no schedule can newly match:
-  // skip the per-Space manifest reads unless a failing source's streak or an
-  // undelivered notice still needs this pass. Live 2026-10-20 (89 Spaces, a
-  // tick every 15 s): this step was the largest steady-state event-loop hold,
-  // 160 holds / 185 s in 2.3 h, on ticks where nothing could fire.
+  // Within a minute this pass already evaluated, with no Space manifest
+  // written since, no schedule can newly match: skip the per-Space manifest
+  // reads unless a failing source's streak or an undelivered notice still
+  // needs this pass. Live 2026-10-20 (89 Spaces, a tick every 15 s): this
+  // step was the largest steady-state event-loop hold, 160 holds / 185 s in
+  // 2.3 h, on ticks where nothing could fire.
   const minuteAlreadyEvaluated = state.lastEvaluatedAtMs !== undefined
     && Math.floor(state.lastEvaluatedAtMs / 60_000) === Math.floor(now.getTime() / 60_000);
-  if (minuteAlreadyEvaluated && Object.keys(streaks).length === 0
-    && Object.keys(state.pendingSourceNotices).length === 0) {
+  const signature = spaceManifestSignature();
+  if (minuteAlreadyEvaluated && signature === lastFullyEvaluatedSignature
+    && Object.keys(streaks).length === 0 && Object.keys(state.pendingSourceNotices).length === 0) {
     return { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 };
   }
+  lastFullyEvaluatedSignature = signature;
   const scheduledKeys = new Set<string>();
   const connections = connectionSnapshot();
   let evaluated = 0;
