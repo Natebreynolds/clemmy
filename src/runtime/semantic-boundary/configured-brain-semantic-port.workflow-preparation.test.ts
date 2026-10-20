@@ -66,3 +66,57 @@ test('a Stop observed at the first failure starts no fallback and an already exp
     assert.equal(calls, 1);
   } finally { Runner.prototype.run = original; }
 });
+
+
+test('default approved-result semantic runner keeps exact synthetic decision attribution and aborts its real request', async () => {
+  const { configuredBrainSemanticPort } = await import('./configured-brain-semantic-port.js');
+  const { createSession, appendEvent } = await import('../harness/eventlog.js');
+  const { withOwnModelRequestAttribution, modelUsageAttributionStorage } = await import('../usage-log.js');
+  const session = createSession({ kind: 'chat' });
+  const decision = appendEvent({ sessionId: session.id, turn: 0, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled approval.', synthetic: true, source: 'approval_resume', approvalId: 'controlled-card', decision: 'approve' } });
+  const controller = new AbortController(); let signal!: AbortSignal; let calls = 0; let late!: (value: unknown) => void;
+  Runner.prototype.run = (async (agent: { tools: unknown[] }, _input: unknown, options: { signal?: AbortSignal; maxTurns?: number }) => {
+    calls++; signal = options.signal!;
+    assert.equal(agent.tools.length, 0); assert.equal(options.maxTurns, 1);
+    assert.equal(modelUsageAttributionStorage.getStore()?.sessionId, session.id);
+    assert.equal(modelUsageAttributionStorage.getStore()?.sourceUserSeq, decision.seq);
+    assert.equal(modelUsageAttributionStorage.getStore()?.channel, 'semantic:clem_voice');
+    return new Promise(resolve => { late = resolve; });
+  }) as unknown as typeof original;
+  try {
+    let checks = 0;
+    const running = withOwnModelRequestAttribution({ sessionId: session.id, sourceUserSeq: decision.seq }, () =>
+      configuredBrainSemanticPort(completeViaConfiguredBrain).voiceApprovedActionEnding!({ purpose: 'clem_voice',
+        signal: controller.signal, deadlineAt: Date.now() + 5_000, checkActive: () => { checks++; },
+        asked: 'Controlled request.', action: { title: 'Controlled action', kind: 'connected_app_change', detail: '' },
+        happened: { verdict: 'uncertain', reply: '' }, evidenceDigest: 'b'.repeat(64) }));
+    void running.catch(() => {}); await tick(); assert.equal(calls, 1);
+    const reason = new Error('Controlled approved-result Stop.'); controller.abort(reason);
+    await assert.rejects(running, error => error === reason); assert.equal(signal.aborted, true); assert.ok(checks > 0);
+    late({ finalOutput: { message: 'Discarded late result.', choices: null } }); await tick();
+    assert.equal(calls, 1, 'cancelled semantic result cannot start another model or effect');
+  } finally { Runner.prototype.run = original; }
+});
+
+test('default approved-result semantic runner honors an absolute deadline and optional legacy controls remain valid', async () => {
+  const { configuredBrainSemanticPort } = await import('./configured-brain-semantic-port.js');
+  let calls = 0; let signal!: AbortSignal;
+  const call = { purpose: 'clem_voice' as const, asked: 'Controlled request.',
+    action: { title: 'Controlled action', kind: 'command_on_this_computer' as const, detail: '' },
+    happened: { verdict: 'never_started' as const, reply: '' }, evidenceDigest: 'c'.repeat(64) };
+  Runner.prototype.run = (async (_agent: unknown, _input: unknown, options: { signal?: AbortSignal }) => {
+    calls++; signal = options.signal!; return new Promise(() => {});
+  }) as unknown as typeof original;
+  try {
+    await assert.rejects(configuredBrainSemanticPort(completeViaConfiguredBrain).voiceApprovedActionEnding!({
+      ...call, deadlineAt: Date.now() + 30 }), /deadline/);
+    assert.equal(signal.aborted, true); assert.equal(calls, 1);
+    const port = configuredBrainSemanticPort(async input => {
+      assert.equal(input.signal, undefined); assert.equal(input.deadlineAt, undefined); assert.equal(input.checkActive, undefined);
+      return { raw: { message: 'Nothing ran. Shall I correct the detail?', choices: null }, modelIdentity: 'controlled',
+        inputTokens: 0, outputTokens: 0, latencyMs: 0 };
+    });
+    assert.match((await port.voiceApprovedActionEnding!(call)).message!, /Nothing ran/);
+  } finally { Runner.prototype.run = original; }
+});

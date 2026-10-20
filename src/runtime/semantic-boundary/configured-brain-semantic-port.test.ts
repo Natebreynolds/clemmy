@@ -159,3 +159,26 @@ test('semantic usage preserves cached inputs across SDK detail rows without coun
     { usage: { inputTokens: 50, outputTokens: 5, inputTokensDetails: [{ cached_tokens: 20 }] } },
   ] }), { inputTokens: 100, outputTokens: 10, cachedInputTokens: 40 });
 });
+
+
+test('approved action wording forwards host lifetime controls without putting them in model input', async () => {
+  const controller = new AbortController(); const checkActive = () => {};
+  const deadlineAt = Date.now() + 1_000; let called = 0;
+  const port = configuredBrainSemanticPort(async input => {
+    called++;
+    assert.equal(input.signal, controller.signal); assert.equal(input.deadlineAt, deadlineAt);
+    assert.equal(input.checkActive, checkActive);
+    assert.deepEqual(Object.keys(JSON.parse(input.user)).sort(), ['action', 'asked', 'happened']);
+    assert.match(input.system, /may have landed/);
+    assert.match(input.system, /never propose a retry, resend or replacement write/);
+    assert.match(input.system, /Only never_started proves that nothing ran or changed/);
+    return { raw: { message: 'I cannot confirm the result. Shall I check it first?', choices: null },
+      modelIdentity: 'controlled', inputTokens: 0, outputTokens: 0, latencyMs: 0 };
+  });
+  const result = await port.voiceApprovedActionEnding!({ purpose: 'clem_voice', signal: controller.signal,
+    deadlineAt, checkActive, asked: 'Controlled owner request.',
+    action: { title: 'Controlled action', kind: 'connected_app_change', detail: 'Controlled detail.' },
+    happened: { verdict: 'uncertain', reply: '' }, evidenceDigest: 'a'.repeat(64) });
+  assert.equal(called, 1); assert.equal(result.evidenceDigest, 'a'.repeat(64));
+  assert.match(result.message!, /cannot confirm/);
+});
