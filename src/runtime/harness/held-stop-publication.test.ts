@@ -358,3 +358,56 @@ test('held publication rotating drain advances past nine malformed sessions to a
   assert.equal(publication.drainHeldStopPublications(port, 1000), 1, 'a full malformed page cannot reset the cursor ahead of valid responsibility');
   assert.equal(calls.value, 1); assert.equal(terminals(f).length, 1); assert.equal(debt(f), undefined);
 });
+
+function admitOnly(f: ReturnType<typeof fixture>) {
+  const armed = authority.armHostReadOnlyCallAuthority({ sessionId: f.sessionId, sourceUserSeq: f.sourceUserSeq,
+    surfaceVersion: 'configured_harness_tools_v1', catalogRevisionDigest: hash('catalog'), bindingRevisionDigest: hash('binding'),
+    maxLogicalCalls: 8, maxParallelCalls: 4 });
+  assert.equal(armed.status, 'armed');
+  const loaded = authority.acceptedTurnCallAuthorityFor(f.sessionId, f.sourceUserSeq);
+  assert.equal(loaded.status, 'ok'); if (loaded.status !== 'ok') throw new Error(loaded.reason);
+  const logicalToolCallId = `fixture-admitted-${serial}`; const tool = 'session_history'; const args = { limit: 5 };
+  const contract = contracts.durableLogicalCallContract(f.acceptedTaskId, tool, args)!;
+  const admitted = authority.withHostReadOnlyCallAttestation({ sessionId: f.sessionId, sourceUserSeq: f.sourceUserSeq,
+    acceptedTaskId: f.acceptedTaskId, sourceEventId: loaded.authority.sourceEventId, sourceEventDigest: loaded.authority.sourceEventDigest,
+    logicalToolCallId, toolName: contract.toolName, argumentDigest: contract.argumentDigest,
+    engineVersion: loaded.authority.engineVersion, surfaceVersion: loaded.authority.surfaceVersion,
+    authorityDigest: loaded.authority.authorityDigest, authorityRevision: loaded.authority.revision,
+    surfaceDigest: loaded.authority.surfaceDigest, catalogRevisionDigest: loaded.authority.catalogRevisionDigest!,
+    bindingRevisionDigest: loaded.authority.bindingRevisionDigest! },
+    () => dispatch.admitLogicalCall({ identity: { ...f, logicalToolCallId }, tool, args }));
+  assert.equal(admitted.status, 'inserted');
+  return logicalToolCallId;
+}
+
+test('held publication settles a call its gone runner admitted but never sent, then publishes the stop once', async () => {
+  // Live 2026-10-06 → 10-19: one admitted, never-dispatched write_file kept a
+  // held stop unpublished for 13 days; the chat's marker stayed armed and every
+  // boot skipped it as publication_only_owner_pending.
+  const { settleUndispatchedOpenCallsOnStop } = await import('./attempt-settlement.js');
+  const f = fixture(); const logicalToolCallId = admitOnly(f); publication.sealHeldStopPublication(f.ticket, 1000);
+  const calls = { value: 0 };
+  const settling = { ...adapter(calls), settleUndispatched: (sessionId: string, seq: number) => { settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq: seq }); } };
+  // While something still executes this source, the admitted call is left alone.
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, { ...settling, isExecuting: () => true }, 1000), 'held');
+  assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId }).status, 'open');
+  assert.equal(calls.value, 0); assert.equal(debt(f).attemptsUsed, 0);
+  // Without a way to settle it, the open call keeps the stop waiting (the defect).
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, adapter(calls), 1000), 'held');
+  assert.equal(calls.value, 0);
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, settling, 1000), 'published');
+  assert.notEqual(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId }).status, 'open');
+  assert.equal(calls.value, 1); assert.equal(terminals(f).length, 1); assert.equal(debt(f), undefined);
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, settling, 2000), 'absent');
+  assert.equal(calls.value, 1);
+});
+
+test('held publication never settles a call that crossed to its tool', async () => {
+  const { settleUndispatchedOpenCallsOnStop } = await import('./attempt-settlement.js');
+  const f = fixture(); const read = openRead(f); publication.sealHeldStopPublication(f.ticket, 1000);
+  const calls = { value: 0 };
+  const settling = { ...adapter(calls), settleUndispatched: (sessionId: string, seq: number) => { settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq: seq }); } };
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, settling, 1000), 'held');
+  assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId: read.logicalToolCallId }).status, 'open');
+  assert.equal(calls.value, 0); assert.equal(debt(f).attemptsUsed, 0);
+});
