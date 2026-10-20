@@ -107,7 +107,7 @@ import {
 } from '../memory/focus.js';
 import { readMemoryIndexStatus, reindexVault } from '../memory/indexer.js';
 import { readEntityRelationshipHealth, reconcileMemoryRelationshipsAsync } from '../memory/relations.js';
-import { withDaemonRuntimePhase } from '../daemon/phase.js';
+import { withDaemonRuntimePhase, withDaemonRuntimePhaseSync } from '../daemon/phase.js';
 import { listEntityIdentityConflicts } from '../memory/entity-identity.js';
 import { consolidateFact, readReflectionReplayHealth } from '../memory/reflection.js';
 import { readReflectionCandidateHealth } from '../memory/reflection-candidates.js';
@@ -14950,13 +14950,13 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const memory = readMemoryIndexStatus();
-      const runs = listRuns(50);
+      const runs = withDaemonRuntimePhaseSync('daemon.http.command_center.runs', {}, () => listRuns(50));
       const approvals = assistant.getRuntime().listPendingApprovals();
       const harnessApprovals = approvalRegistry.listPending({ status: 'pending' })
         .filter(approvalRegistry.isFormalApprovalSurface);
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
-      const inboxQuestions = listInboxQuestions();
+      const inboxQuestions = withDaemonRuntimePhaseSync('daemon.http.command_center.inbox_questions', {}, () => listInboxQuestions());
       const openCheckIns = listActionableCheckIns();
       // For WORKING NOW we only want executions the daemon is RUNNING
       // right now. Blocked/paused are stalled — they show in Activity.
@@ -14971,7 +14971,7 @@ export function registerConsoleRoutes(
           const t = Date.parse((execution as { updatedAt?: string }).updatedAt ?? '');
           return !Number.isFinite(t) || t >= executionActiveCutoff;
         });
-      const backgroundTasks = listBackgroundTasks().slice(0, 60);
+      const backgroundTasks = withDaemonRuntimePhaseSync('daemon.http.command_center.background_tasks', {}, () => listBackgroundTasks().slice(0, 60));
       const pendingApprovalIds = new Set<string>([
         ...approvals.map((approval) => approval.id),
         ...harnessApprovals.map((approval) => approval.approvalId),
@@ -15003,8 +15003,8 @@ export function registerConsoleRoutes(
       const credentialHealth = await (await getSecretStore()).health({ passive: true });
       const runtimeAuth = getAuthStatus();
       const policy = getProactivityPolicySnapshot();
-      const pendingWorkflowRuns = listPendingRuns();
-      const recentHarnessSessions = listHarnessSessions({ limit: 60, withoutConversationState: true }).filter(isConsoleVisibleHarnessSession);
+      const pendingWorkflowRuns = withDaemonRuntimePhaseSync('daemon.http.command_center.pending_runs', {}, () => listPendingRuns());
+      const recentHarnessSessions = withDaemonRuntimePhaseSync('daemon.http.command_center.sessions', {}, () => listHarnessSessions({ limit: 60, withoutConversationState: true }).filter(isConsoleVisibleHarnessSession));
       // Chat sessions stay status='active' BETWEEN turns (see
       // project_session_status_semantics memory: that's what session
       // 'active' actually means — open + addressable, not necessarily
@@ -15013,7 +15013,7 @@ export function registerConsoleRoutes(
       // under a held lease is live however quiet the provider is, a lost lease
       // is stale, and an ordinary foreground turn stays in the conversation
       // until it has run long enough to be work the user may have left behind.
-      const activitySnapshot = projectActivitySnapshot({ kinds: ['chat'] });
+      const activitySnapshot = withDaemonRuntimePhaseSync('daemon.http.command_center.activity', {}, () => projectActivitySnapshot({ kinds: ['chat'] }));
       const activityObservedMs = Date.parse(activitySnapshot.observedAt);
       const chatActivityBySession = new Map<string, ActivityEntry>();
       for (const entry of activitySnapshot.entries) {
@@ -15290,7 +15290,7 @@ export function registerConsoleRoutes(
       // lifecycle noise: silent records + "still running" heartbeats. (This is
       // the first slice of the unified inbox; the full panel + read/unread +
       // not-delivered backstop builds on this same feed.)
-      const rawNotifs = listNotifications(300);
+      const rawNotifs = withDaemonRuntimePhaseSync('daemon.http.command_center.notifications', {}, () => listNotifications(300));
       const inboxNotifs = rawNotifs.filter(
         (notification) => !notification.silent && notification.metadata?.heartbeat !== true,
       );

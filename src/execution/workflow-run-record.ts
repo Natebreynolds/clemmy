@@ -361,6 +361,7 @@ export function writeWorkflowRunRecordDurablyUnlocked(
     closeSync(fd);
     fd = undefined;
     renameSync(temp, filePath);
+    parsedRecords.delete(filePath);
     if (process.platform !== 'win32') {
       const dirFd = openSync(path.dirname(filePath), 'r');
       try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
@@ -404,8 +405,17 @@ export function readWorkflowRunRecord<T extends object>(filePath: string): T | n
  * lock while enumerating a potentially large workflow corpus.
  */
 export function readWorkflowRunRecordSnapshot<T extends object>(filePath: string): T | null {
-  try { return readWorkflowRunRecordUnlocked<T>(filePath); }
-  catch { return null; }
+  try {
+    const identity = recordFileIdentity(filePath);
+    if (identity === 'missing') return null;
+    if (identity !== 'busy') {
+      const remembered = rememberedParsedRecord(filePath, identity);
+      if (remembered) return remembered as T;
+    }
+    const parsed = readWorkflowRunRecordUnlocked<T>(filePath);
+    if (parsed && identity !== 'busy') rememberParsedRecord(filePath, identity, parsed as Record<string, unknown>);
+    return parsed;
+  } catch { return null; }
 }
 
 export interface WorkflowRunRecordTryRead<T extends object> {
@@ -542,7 +552,11 @@ export function scanWorkflowRunRecord<T extends object>(
 export function scanWorkflowRunRecordSnapshot<T extends object>(
   filePath: string,
 ): WorkflowRunRecordScanResult<T> {
-  if (!existsSync(filePath)) return { status: 'missing' };
+  const identity = recordFileIdentity(filePath);
+  if (identity === 'missing') return { status: 'missing' };
+  if (identity === 'busy') return { status: 'busy' };
+  const remembered = rememberedParsedRecord(filePath, identity);
+  if (remembered) return { status: 'ok', record: remembered as T };
   let raw: Buffer;
   try {
     raw = readFileSync(filePath);
@@ -567,7 +581,62 @@ export function scanWorkflowRunRecordSnapshot<T extends object>(
       evidence: corruptionEvidence(filePath, raw, 'invalid_canonical_identity'),
     };
   }
+  rememberParsedRecord(filePath, identity, parsed as Record<string, unknown>);
   return { status: 'ok', record: parsed as T };
+}
+
+/**
+ * Parsed records by file identity. Every maintenance scan and dashboard poll
+ * reads the whole runs directory (live 10-20: 443 records, 6 MB, parsed in
+ * full by three reapers every 15 s and by the Home poll every 6 s, holding
+ * the daemon loop up to 1.4 s a tick). A record is replaced only by an atomic
+ * rename, so a file whose inode, mtime and size are unchanged is the record
+ * already parsed; one stat replaces the read and parse. Only the lock-free
+ * snapshot readers use this; a reader under the record lock stays exact.
+ * The parsed object is shared between readers, as the drain's settled cache
+ * already shares it; readers treat a record as immutable.
+ */
+type RecordFileIdentity = { ino: number; mtimeMs: number; size: number };
+const PARSED_RECORD_LIMIT = 8192;
+const parsedRecords = new Map<string, RecordFileIdentity & { parsed: Record<string, unknown> }>();
+const parsedRecordStats = { parsed: 0, reused: 0 };
+
+function recordFileIdentity(filePath: string): RecordFileIdentity | 'missing' | 'busy' {
+  try {
+    const stat = statSync(filePath);
+    return { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      parsedRecords.delete(filePath);
+      return 'missing';
+    }
+    return 'busy';
+  }
+}
+
+function rememberedParsedRecord(filePath: string, identity: RecordFileIdentity): Record<string, unknown> | null {
+  const entry = parsedRecords.get(filePath);
+  if (!entry || entry.ino !== identity.ino || entry.mtimeMs !== identity.mtimeMs || entry.size !== identity.size) return null;
+  parsedRecordStats.reused += 1;
+  return entry.parsed;
+}
+
+function rememberParsedRecord(filePath: string, identity: RecordFileIdentity, parsed: Record<string, unknown>): void {
+  parsedRecordStats.parsed += 1;
+  parsedRecords.delete(filePath);
+  parsedRecords.set(filePath, { ...identity, parsed });
+  if (parsedRecords.size > PARSED_RECORD_LIMIT) parsedRecords.delete(parsedRecords.keys().next().value!);
+}
+
+/** A writer in this process drops its own entry; a write from elsewhere is a
+ * new inode and misses on its own. */
+export function forgetParsedWorkflowRunRecord(filePath: string): void {
+  parsedRecords.delete(filePath);
+}
+
+/** Test seam: how many snapshot reads parsed a file versus reused its parse. */
+export function _workflowRunRecordParseStatsForTests(): { parsed: number; reused: number } {
+  return { ...parsedRecordStats };
 }
 
 function quarantineMarkerPath(

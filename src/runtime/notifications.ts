@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -613,7 +613,38 @@ function hasUniqueDeliveryJobIds(
     && new Set(ids as string[]).size === ids.length;
 }
 
+/**
+ * The store parsed by file identity. Live 10-20: 1,000 records, 1.9 MB,
+ * parsed and validated three times per Home poll (the list, the workflow
+ * question reconcile, the stale-approval sweep) at 40-75 ms each, all on the
+ * daemon loop. Every write is an atomic rename, so an unchanged inode, mtime
+ * and size is the array already parsed. Writers under the lock mutate that
+ * array in place and save; the save is a new identity, so the next load
+ * parses again. A corrupted load is never remembered.
+ */
+let parsedStore: { ino: number; mtimeMs: number; size: number; items: NotificationRecord[] } | null = null;
+
+function notificationsFileIdentity(): { ino: number; mtimeMs: number; size: number } | null {
+  try {
+    const stat = statSync(NOTIFICATIONS_FILE);
+    return { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+/** Test seam: forget the parsed store so the next load reads the file. */
+export function _forgetParsedNotificationsForTests(): void {
+  parsedStore = null;
+}
+
 function loadNotificationsUnlocked(): NotificationRecord[] {
+  const identity = notificationsFileIdentity();
+  if (identity && parsedStore && parsedStore.ino === identity.ino
+    && parsedStore.mtimeMs === identity.mtimeMs && parsedStore.size === identity.size) {
+    return parsedStore.items;
+  }
+  parsedStore = null;
   const result = loadJsonResilient<NotificationRecord[]>(NOTIFICATIONS_FILE, [], {
     beforeQuarantine: ensureNotificationsRecoveryMarker,
     validate: (value): value is NotificationRecord[] => Array.isArray(value)
@@ -623,6 +654,8 @@ function loadNotificationsUnlocked(): NotificationRecord[] {
   if (result.corrupted) {
     pendingCorruptionSignals.add(NOTIFICATIONS_FILE);
     ensureNotificationsRecoveryMarker();
+  } else if (identity) {
+    parsedStore = { ...identity, items: result.value };
   }
   return result.value;
 }

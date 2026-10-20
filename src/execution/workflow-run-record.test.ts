@@ -372,3 +372,34 @@ test('quarantine binds path plus raw bytes, preserves the source, and yields onl
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a snapshot read of an unchanged record reuses its parse; an atomic rewrite or an in-place edit is read again', async () => {
+  const { _workflowRunRecordParseStatsForTests, writeWorkflowRunRecordDurablyUnlocked } = await import('./workflow-run-record.js');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'run-record-parse-'));
+  try {
+    const file = path.join(dir, 'run-parse.json');
+    writeFileSync(file, JSON.stringify({ id: 'run-parse', workflow: 'wf', status: 'blocked' }));
+    const before = _workflowRunRecordParseStatsForTests();
+    const first = scanWorkflowRunRecordSnapshot<{ status: string }>(file);
+    const second = scanWorkflowRunRecordSnapshot<{ status: string }>(file);
+    const third = readWorkflowRunRecordSnapshot<{ status: string }>(file);
+    assert.equal(first.status, 'ok'); assert.equal(second.status, 'ok');
+    assert.equal(third?.status, 'blocked');
+    let stats = _workflowRunRecordParseStatsForTests();
+    assert.equal(stats.parsed - before.parsed, 1, 'one parse for three reads of the same file');
+    assert.equal(stats.reused - before.reused, 2);
+
+    writeWorkflowRunRecordDurablyUnlocked(file, { id: 'run-parse', workflow: 'wf', status: 'completed' });
+    const afterRewrite = scanWorkflowRunRecordSnapshot<{ status: string }>(file);
+    assert.equal(afterRewrite.status === 'ok' && afterRewrite.record.status, 'completed', 'an atomic rewrite is a new file');
+
+    writeFileSync(file, JSON.stringify({ id: 'run-parse', workflow: 'wf', status: 'cancelled!' }));
+    const afterEdit = readWorkflowRunRecordSnapshot<{ status: string }>(file);
+    assert.equal(afterEdit?.status, 'cancelled!', 'an in-place edit changes the identity too');
+    stats = _workflowRunRecordParseStatsForTests();
+    assert.equal(stats.parsed - before.parsed, 3);
+
+    rmSync(file);
+    assert.equal(scanWorkflowRunRecordSnapshot(file).status, 'missing');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
