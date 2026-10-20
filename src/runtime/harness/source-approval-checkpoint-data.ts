@@ -54,4 +54,3 @@ export function hostApprovalCheckpointSource(serialized: string, sessionId: stri
   }
   return source;
 }
-

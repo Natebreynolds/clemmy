@@ -56,4 +56,3 @@ export function hostInteractiveConsentApprovalResumeKey(
   const subject = parseHostInteractiveConsentSubjectV1(value);
   return subject ? `host-consent:v1:${createHash('sha256').update(closedCanonicalJson(subject), 'utf8').digest('hex')}` : null;
 }
-
