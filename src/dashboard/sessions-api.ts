@@ -689,10 +689,15 @@ function previewChangeMarks(db: Database.Database, members: readonly HarnessSess
     if (!db.open || db.inTransaction) return null;
     const schema = db.pragma('schema_version', { simple: true });
     if (!Number.isSafeInteger(schema) || Number(schema) < 0) return null;
-    const read = db.prepare('SELECT MIN(seq) AS first, MAX(seq) AS seq FROM events WHERE session_id = ?');
+    // One aggregate per statement: SQLite reads a lone MIN or MAX from the
+    // index edge, but MIN and MAX together walk the whole session range
+    // (live 10-20 on r46v1: 4.7 s of a 90 s profile under a 17,000-event chat).
+    const first = db.prepare('SELECT MIN(seq) AS seq FROM events WHERE session_id = ?');
+    const last = db.prepare('SELECT MAX(seq) AS seq FROM events WHERE session_id = ?');
     const marks = members.map((member) => {
-      const row = read.get(member.id) as { first?: unknown; seq?: unknown } | undefined;
-      return [member.id, member.updatedAt, row?.first ?? null, row?.seq ?? null];
+      const lo = first.get(member.id) as { seq?: unknown } | undefined;
+      const hi = last.get(member.id) as { seq?: unknown } | undefined;
+      return [member.id, member.updatedAt, lo?.seq ?? null, hi?.seq ?? null];
     });
     return JSON.stringify([schema, marks]);
   } catch { return null; }
