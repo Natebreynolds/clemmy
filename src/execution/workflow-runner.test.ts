@@ -109,6 +109,7 @@ const {
   latestWorkflowNotifyUserPresentation,
   mergeWorkflowPresentationContribution,
   scrubWorkflowTerminalPresentation,
+  _workflowRunScanStatsForTests,
 } = await import('./workflow-runner.js');
 // The workflow watcher would otherwise place a REAL judge call from any
 // multi-step test run (live OAuth tokens make the judge reachable on dev
@@ -8431,4 +8432,57 @@ test('a run flagged for attention without a blocked step says why; a blocked or 
   assert.equal(runner.workflowAttentionNote({ needsAttention: true, blockedSteps: [{ stepId: 'a' }], attentionReason: 'x' }), '');
   assert.equal(runner.workflowAttentionNote({ needsAttention: false, blockedSteps: [], attentionReason: 'x' }), '');
   assert.equal(runner.workflowAttentionNote({ needsAttention: true, blockedSteps: [], attentionReason: undefined }), '');
+});
+
+// Live 2026-10-20: every drain parsed all 411 run files (12 MB) although
+// almost all were finished; with a running step kicking drains every few
+// seconds that was 0.3-0.6 s of the daemon loop per drain. A finished record
+// is reused while its file is untouched; a rewrite (new inode by rename, or
+// new mtime/size in place) is parsed again.
+test('a drain reuses finished run records until their file changes', async () => {
+  const write = (runId: string, extra: Record<string, unknown> = {}) => {
+    const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+    writeFileSync(file, JSON.stringify({
+      id: runId, workflow: 'Settled scan fixture', status: 'completed', inputs: {},
+      createdAt: '2026-10-20T00:00:00.000Z', startedAt: '2026-10-20T00:00:01.000Z', finishedAt: '2026-10-20T00:00:02.000Z',
+      notifiedAt: '2026-10-20T00:00:03.000Z', ...extra,
+    }, null, 2), 'utf-8');
+    return file;
+  };
+  const fileA = write('settled-scan-a');
+  write('settled-scan-b');
+  const assistant = { respond: async () => { throw new Error('a finished run never executes'); } } as never;
+  const stats = () => _workflowRunScanStatsForTests();
+
+  await processWorkflowRuns(assistant);
+  const afterFirst = stats();
+  await processWorkflowRuns(assistant);
+  const afterSecond = stats();
+  assert.ok(afterSecond.reused - afterFirst.reused >= 2, 'both finished records were reused unchanged');
+  // Other tests leave unfinished records behind; those are parsed on every
+  // pass, and a drain may still settle some of them. Drain until two untouched
+  // passes parse the same count: that is the steady baseline the fixtures add
+  // nothing to.
+  let previous = afterSecond;
+  let baseline = -1;
+  for (let pass = 0; pass < 8; pass++) {
+    await processWorkflowRuns(assistant);
+    const current = stats();
+    const delta = current.parsed - previous.parsed;
+    if (delta === baseline) break;
+    baseline = delta;
+    previous = current;
+  }
+  const untouched = stats();
+  assert.equal(untouched.parsed - previous.parsed, baseline, 'untouched passes reach a steady parse count');
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  write('settled-scan-a', { notifiedAt: '2026-10-20T00:00:09.000Z' });
+  await processWorkflowRuns(assistant);
+  const touched = stats();
+  assert.equal(touched.parsed - untouched.parsed, baseline + 1, 'the rewritten record is parsed again');
+  assert.equal(touched.reused - untouched.reused >= 1, true, 'the untouched one is still reused');
+
+  rmSync(fileA, { force: true });
+  rmSync(path.join(WORKFLOW_RUNS_DIR, 'settled-scan-b.json'), { force: true });
 });

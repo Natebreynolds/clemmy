@@ -7,7 +7,7 @@ import { workflowVerificationDependencyState } from '../tools/workflow-verificat
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
 import { validateWorkflowRunGoal, workflowGoalExecutionEvidence, workflowGoalValidationReceipt } from './workflow-goal-review.js';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
@@ -13316,6 +13316,50 @@ export function reapResolvedParkedRuns(): void {
   }
 }
 
+// A drain scans every run file. Finished runs are the bulk of the directory
+// and never change until something acts on them, yet each scan parsed all of
+// them again (live 2026-10-20: 411 files, 12 MB, 0.3-0.6 s on the daemon loop
+// per drain, and a running step kicks a drain every few seconds). A terminal
+// record is remembered with the bytes' identity (inode, mtime, size) and
+// reused while the file is untouched; any write publishes by rename, which
+// changes that identity. Queued, running and finalizing records are read
+// fresh every time; the predicates below run on a reused record exactly as
+// on a parsed one.
+const settledRunScans = new Map<string, { ino: number; mtimeMs: number; size: number; record: QueuedRunRecord }>();
+const SETTLED_RUN_SCAN_LIMIT = 4096;
+const runScanStats = { parsed: 0, reused: 0 };
+
+function scanSettledForReuse(run: QueuedRunRecord): boolean {
+  if (run.status === 'dry_run' || run.status === 'creation_test') return Boolean(run.finishedAt);
+  return Boolean(run.status) && run.status !== 'queued' && run.status !== 'running' && run.status !== 'finalizing';
+}
+
+function readRunRecordForScanReusingSettled(filePath: string): QueuedRunRecord | null {
+  let identity: { ino: number; mtimeMs: number; size: number } | null = null;
+  try {
+    const stat = statSync(filePath);
+    identity = { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch { /* missing or unreadable: the strict reader decides */ }
+  const cached = identity ? settledRunScans.get(filePath) : undefined;
+  if (cached && identity && cached.ino === identity.ino && cached.mtimeMs === identity.mtimeMs && cached.size === identity.size) {
+    runScanStats.reused += 1;
+    return cached.record;
+  }
+  settledRunScans.delete(filePath);
+  const record = readRunRecordForScan(filePath);
+  runScanStats.parsed += 1;
+  if (record && identity && scanSettledForReuse(record)) {
+    settledRunScans.set(filePath, { ...identity, record });
+    if (settledRunScans.size > SETTLED_RUN_SCAN_LIMIT) settledRunScans.delete(settledRunScans.keys().next().value!);
+  }
+  return record;
+}
+
+/** Test seam: how many run files a drain parsed versus reused unchanged. */
+export function _workflowRunScanStatsForTests(): { parsed: number; reused: number } {
+  return { ...runScanStats };
+}
+
 // Per-runId guard so the same run file is never processed by two
 // concurrent slots (or two overlapping drain passes). Module-scoped so
 // it persists across passes.
@@ -13915,10 +13959,14 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
   );
   const eligible: WorkflowDrainCandidate[] = [];
   const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+  if (settledRunScans.size > 0) {
+    const present = new Set(files.map((file) => path.join(WORKFLOW_RUNS_DIR, file)));
+    for (const key of settledRunScans.keys()) if (!present.has(key)) settledRunScans.delete(key);
+  }
   withDaemonRuntimePhaseSync('daemon.timer.workflow_runs.execution.scan', { files: files.length }, () => {
   for (const file of files) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
-    let run = readRunRecordForScan(filePath);
+    let run = readRunRecordForScanReusingSettled(filePath);
     if (!run) continue;
     // One-time upgrade bridge: legacy versions wrote a missed schedule
     // directly as queued. Freeze only a pristine original scheduler record,
