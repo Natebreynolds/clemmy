@@ -14,7 +14,7 @@ import { associateOriginalReviewWireResponse, beginReviewWireTransform, captureR
   type ReviewWireExpectation, type ReviewWireInclusionObservation, type ReviewWireOwner,
   type ReviewWireTransform } from './review-input-observation.js';
 
-export type ObservedModelTransport = 'raw_claude_messages' | 'typesafe_systemone';
+export type ObservedModelTransport = 'raw_claude_messages' | 'typesafe_systemone' | 'openai_compatible_chat';
 export type ModelTransportRecorder = (data: Readonly<Record<string, unknown>>) => unknown;
 
 interface ObservationOwner {

@@ -51,7 +51,7 @@ import {
 } from './model-wire-registry.js';
 import { recordModelUsage } from '../usage-log.js';
 import { captureModelTransportUsageOwner, captureActiveModelTransportUsage, capturedModelTransportUsageCallId,
-  type CapturedModelTransportUsage } from './model-transport-observation.js';
+  observeModelTransportFetch, type CapturedModelTransportUsage } from './model-transport-observation.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
@@ -1313,6 +1313,15 @@ export function noteByoCreditOutcome(providerId: string, res: Response, method?:
   }
 }
 
+/** The model named in one chat-completions request body; nothing else is read. */
+function requestedModelFromBody(body: unknown): string | undefined {
+  if (typeof body !== 'string' || body.length > 4_000_000) return undefined;
+  try {
+    const model = (JSON.parse(body) as { model?: unknown }).model;
+    return typeof model === 'string' ? model : undefined;
+  } catch { return undefined; }
+}
+
 function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // OAuth-backed providers (xAI): resolve a FRESH bearer per request. The
   // client's static apiKey may be an already-expired access token; refreshing
@@ -1343,18 +1352,26 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // sees the original response.
   const limitKey = byo.providerId || '';
   const baseFetch: typeof fetch = bearerRefreshingFetch ?? fetch;
-  const capturingFetch: typeof fetch | undefined = limitKey
+  const capturingFetch: typeof fetch = limitKey
     ? (async (url, init) => {
         const res = await baseFetch(url as never, init as never);
         recordByoRateLimit(limitKey, res.headers);
         noteByoCreditOutcome(limitKey, res, init?.method);
         return res;
       }) as typeof fetch
-    : bearerRefreshingFetch;
+    : baseFetch;
+  // Every wire call is a dispatch of the model call that owns it, the same way
+  // the Claude and Jev transports report theirs. Without this a BYO brain's
+  // completed response had no dispatch and so no completion receipt: the
+  // approval-result wording it wrote was rejected as unbound (live 2026-10-20,
+  // "no_completed_receipt"), and the card kept the fixed host line.
+  const observedFetch: typeof fetch = (async (url, init) =>
+    observeModelTransportFetch('openai_compatible_chat', requestedModelFromBody(init?.body),
+      () => capturingFetch(url as never, init as never))) as typeof fetch;
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,
-    ...(capturingFetch ? { fetch: capturingFetch } : {}),
+    fetch: observedFetch,
     ...(modelParityEnabled() ? { maxRetries: 0 } : {}),
   });
   const completions = client.chat.completions;
