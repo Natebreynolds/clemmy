@@ -1,3 +1,4 @@
+import { installApprovedActionCompletionSchema } from './approved-action-completion-schema.js';
 import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.js';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11577,6 +11578,10 @@ const MIGRATIONS: EventLogMigration[] = [
       ON outcome_reports_pending_v1(attempts, created_at);
     CREATE INDEX IF NOT EXISTS outcome_reports_pending_session_v1 ON outcome_reports_pending_v1(session_id);`,
   },
+  { version: 96, sql: '', backfill: (db) => {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
+    installApprovedActionCompletionSchema(db);
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
@@ -11672,6 +11677,9 @@ export const STRICT_TAIL_TABLES: readonly string[] = Object.freeze([
   'host_model_result_receipts',
   // v69
   'logical_model_result_projection_receipts',
+  // v96
+  'approved_action_completion_receipts_v1',
+  'approved_action_completion_intents_v1',
 ]);
 
 export function applyHarnessMigrations(db: Database.Database): void {

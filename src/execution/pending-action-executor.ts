@@ -1,3 +1,4 @@
+import { prepareApprovedActionCompletionIntent } from '../runtime/harness/approved-action-completion-receipt.js';
 /**
  * Approved-pending-action executor (P0c). A pending-approval card minted for a
  * judge-couldn't-verify irreversible call (or any single-call pending action)
@@ -121,6 +122,8 @@ async function dispatchApprovedCall(
   if (root.status !== 'ok' || root.authority.authorityKind !== 'turn_graph') {
     throw new PendingActionPreDispatchError('The approved action does not own an accepted graph call root.');
   }
+  try { prepareApprovedActionCompletionIntent({ sessionId, capability, effect }); }
+  catch (error) { throw new PendingActionPreDispatchError('The exact approved-call completion intent could not be frozen.', error); }
   const logicalToolCallId = pendingActionResumeLogicalCallId(capability);
   const ownLease = !parent?.dispatchLease;
   const lease = parent?.dispatchLease ?? activateDispatchLease({

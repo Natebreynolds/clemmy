@@ -55,12 +55,19 @@ test('v93 preserves historical V1 bytes, authority references, triggers and FKs 
     const beforeEvents = db.prepare('SELECT * FROM events').all();
     const beforeObjects = objects(db);
     assert.ok(beforeObjects.length >= 5);
+    schema.applyHarnessMigrationsThroughVersionForTests(db,93);
+    assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,93);
+    assert.deepEqual(db.prepare('SELECT * FROM durable_memory_intake_receipts').all(),beforeRows);
+    assert.deepEqual(db.prepare('SELECT * FROM accepted_task_authority').all(),beforeAuthority);
+    assert.deepEqual(db.prepare('SELECT * FROM events').all(),beforeEvents);
+    assert.deepEqual(objects(db),beforeObjects);
+    // Then cross the new exact-call receipt union with this NONEMPTY retained
+    // memory receipt. No old receipt, authority pointer or event is rewritten.
     schema.applyHarnessMigrations(db);
     assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,HARNESS_SCHEMA_VERSION);
     assert.deepEqual(db.prepare('SELECT * FROM durable_memory_intake_receipts').all(),beforeRows);
     assert.deepEqual(db.prepare('SELECT * FROM accepted_task_authority').all(),beforeAuthority);
     assert.deepEqual(db.prepare('SELECT * FROM events').all(),beforeEvents);
-    assert.deepEqual(objects(db),beforeObjects);
     assert.deepEqual(db.pragma('foreign_key_check'),[]);
     assert.throws(() => db.prepare("UPDATE durable_memory_intake_receipts SET issued_at='altered' WHERE receipt_id=?").run(fixture.receiptId),/immutable/);
     assert.throws(() => db.prepare('DELETE FROM durable_memory_intake_receipts WHERE receipt_id=?').run(fixture.receiptId),/immutable/);
@@ -107,8 +114,8 @@ test('v93 preserves its V1 receipt alongside unrelated missing-source run histor
     const before = ['run_attempts','durable_memory_intake_receipts','accepted_task_authority','events']
       .map(table => db.prepare(`SELECT * FROM ${table}`).all());
     const beforeObjects = objects(db);
-    schema.applyHarnessMigrations(db);
-    assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,HARNESS_SCHEMA_VERSION);
+    schema.applyHarnessMigrationsThroughVersionForTests(db,93);
+    assert.equal((db.prepare('SELECT MAX(version) v FROM schema_version').get() as {v:number}).v,93);
     assert.deepEqual(['run_attempts','durable_memory_intake_receipts','accepted_task_authority','events']
       .map(table => db.prepare(`SELECT * FROM ${table}`).all()),before);
     assert.deepEqual(objects(db),beforeObjects);

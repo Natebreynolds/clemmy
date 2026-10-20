@@ -4,6 +4,7 @@ import { workflowParentActivation } from './workflow-parent-activation.js';
 import * as approvalRegistry from './approval-registry.js';
 import { pendingActionPayloadHash } from './pending-actions.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
+import { approvedActionDecisionWasStoppedInTransaction } from './approved-action-completion-proof.js';
 import { queuedApprovalTransitionsForRequest } from './pending-action-transition.js';
 import { normalizePendingActionResultBinding } from '../../shared/pending-action-result-binding.js';
 /**
@@ -1104,6 +1105,15 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
   }
 }
 
+/** A frozen exact-call decision is its own source. Its durable Stop cannot
+ * become an unverified-completion hold after its transient latch was cleared. */
+function exactApprovedDecisionWasStopped(identity: TurnIdentity): boolean {
+  const db = openEventLog();
+  return Boolean(db.prepare(`SELECT 1 FROM approved_action_completion_intents_v1
+    WHERE session_id=? AND source_user_seq=?`).get(identity.sessionId, identity.sourceUserSeq))
+    && approvedActionDecisionWasStoppedInTransaction(db, identity);
+}
+
 
 /** Did this accepted source publish an inspectable plan revision? */
 function acceptedSourcePublishedPlanRevision(identity: {
@@ -1138,6 +1148,18 @@ export function commitTurnOutcome(
   assertExactAcceptedSource(requested.identity);
   let effectiveOutcome = outcome;
   let effectiveOptions = options;
+  const cancelStoppedApprovedDecision = (): boolean => {
+    if (outcome.status !== 'done' || !exactApprovedDecisionWasStopped(outcome.identity)) return false;
+    effectiveOutcome = withRetainedWorkTerminal({
+      version: outcome.version, id: outcome.id, identity: outcome.identity,
+      status: 'cancelled', resumable: false,
+      presentation: { kind: 'stopped', text: OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT },
+      ...(outcome.evidenceRefs ? { evidenceRefs: outcome.evidenceRefs } : {}),
+    });
+    effectiveOptions = { ...options, legacyReason: 'cancelled',
+      metadata: { ...options.metadata, hostNotice: { code: 'stopped' } } };
+    return true;
+  };
   /** The exact terminal to fall back to when an unavailable-reviewer `done`
    * cannot close its accepted-task authority. Set only by that branch, so its
    * failure lands on the unverified hold it replaced — note and verdict
@@ -1234,6 +1256,7 @@ export function commitTurnOutcome(
       }
     }
   }
+  cancelStoppedApprovedDecision();
   // TERMINAL COPY DERIVES FROM THE WRITE LEDGER'S EFFECT-TRUTH, never from
   // tool-shape heuristics. The host runner's uncertain-blocked constant claims
   // possible external execution; the ledger for this exact accepted source is
@@ -1884,6 +1907,18 @@ export function commitTurnOutcome(
     // this module re-deriving the condition and drifting from it. A turn that
     // cannot legally complete is genuinely incomplete: fall back to the hold.
     if (!(error instanceof AcceptedTaskTerminalPublicationError)) throw error;
+    if (cancelStoppedApprovedDecision()) {
+      // The transactional proof caught a Stop after the last projection.
+      // Retry only this source's terminal, never its settled action.
+      const stopped = presentationEventForOutcome(effectiveOutcome);
+      data = {
+        ...completionDataForTurnOutcome(effectiveOutcome, effectiveOptions),
+        ...refusalMetadata,
+        completionReview: { version: 1 as const, disposition: 'not_required' as const, policyEvidence },
+      };
+      terminal = appendTerminalEventOnce({ sessionId: stopped.identity.sessionId,
+        turn: stopped.identity.turn, role: 'system', data }, stopped.outcomeId);
+    } else {
     // The unavailable-reviewer branch owns its own failure. Its `done` is an
     // upgrade over the terminal it replaced, so when the authority cannot close
     // — a turn that manifested no verification is still `armed` — it must land
@@ -1944,6 +1979,7 @@ export function commitTurnOutcome(
       role: 'system',
       data,
     }, heldPresentation.outcomeId);
+    }
     }
   }
   // THE FENCE IS WRITTEN WHERE THE FOREGROUND ACTUALLY STOPS. Detach cannot

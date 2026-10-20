@@ -38,13 +38,13 @@ test('v94 upgrade adds the indexed bounded retry ledger without rewriting histor
     const priorVersions = db.prepare('SELECT * FROM schema_version ORDER BY version').all();
     const objects = db.prepare("SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name").all();
 
-    schema.applyHarnessMigrations(db);
+    schema.applyHarnessMigrationsThroughVersionForTests(db,95);
 
-    assert.equal(HARNESS_SCHEMA_VERSION, 95);
+    assert.ok(HARNESS_SCHEMA_VERSION >= 95);
     assert.deepEqual(tables.map(table => db.prepare(`SELECT * FROM ${table}`).all()), rows);
     assert.deepEqual(db.prepare('SELECT * FROM schema_version WHERE version <= 94 ORDER BY version').all(), priorVersions);
     assert.deepEqual(db.prepare('SELECT version FROM schema_version ORDER BY version').all(),
-      Array.from({ length: HARNESS_SCHEMA_VERSION }, (_, index) => ({ version: index + 1 })));
+      Array.from({ length: 95 }, (_, index) => ({ version: index + 1 })));
     assert.deepEqual(db.prepare(`SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL
       AND name NOT IN ('outcome_reports_pending_v1','outcome_reports_pending_order_v1','outcome_reports_pending_session_v1')
       ORDER BY type,name`).all(), objects);
@@ -60,7 +60,7 @@ test('v94 upgrade adds the indexed bounded retry ledger without rewriting histor
     assert.throws(() => insert.run('missing-source', 'historical-background', NOW), /FOREIGN KEY constraint/);
     assert.throws(() => db.prepare('UPDATE outcome_reports_pending_v1 SET attempts=-1').run(), /CHECK constraint/);
     assert.throws(() => insert.run('missing-session', null, NOW), /NOT NULL constraint/);
-    schema.applyHarnessMigrations(db);
+    schema.applyHarnessMigrationsThroughVersionForTests(db,95);
     assert.equal((db.prepare('SELECT COUNT(*) n FROM outcome_reports_pending_v1').get() as { n: number }).n, 1);
     assert.deepEqual(tables.map(table => db.prepare(`SELECT * FROM ${table}`).all()), rows);
   } finally { db.close(); }

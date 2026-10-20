@@ -9,7 +9,7 @@ process.env.CLEMENTINE_HOME = fixtureHome;
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('./eventlog.js');
 const schema = await import('./eventlog-schema.js');
-const { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture } = await import('./historical-migration-fixture.testsupport.js');
+const { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture, restorePre96ApprovedActionFixture } = await import('./historical-migration-fixture.testsupport.js');
 const { HARNESS_SCHEMA_VERSION } = await import('./schema-version.js');
 
 test.after(() => { log.closeEventLog(); rmSync(fixtureHome, { recursive: true, force: true }); });
@@ -18,6 +18,7 @@ test('v78 preserves exact pending-batch recovery while replacing its full event 
   const db = log.openEventLog();
   // Shed the later receipt CHECK widening too: all migrations after v77 will
   // replay, and v93 must see its genuine V1 predecessor.
+  restorePre96ApprovedActionFixture(db);
   restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture(db);
   db.exec('DROP INDEX idx_events_type_seq; DELETE FROM schema_version WHERE version >= 78;');
   assert.equal((db.prepare('SELECT MAX(version) AS v FROM schema_version').get() as { v: number }).v, 77);

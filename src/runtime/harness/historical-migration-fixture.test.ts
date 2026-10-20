@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { applyHarnessMigrations } from './eventlog-schema.js';
-import { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture as restore } from './historical-migration-fixture.testsupport.js';
+import { restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture as restore, restorePre96ApprovedActionFixture } from './historical-migration-fixture.testsupport.js';
 
 const receiptSql = (db: Database.Database): string => (db.prepare(
   "SELECT sql FROM sqlite_master WHERE name='durable_memory_intake_receipts'",
@@ -16,6 +16,8 @@ test('historical fixture restores empty canonical V1 checks and preserves all ot
     applyHarnessMigrations(db);
     const original = receiptSql(db);
     const otherObjects = () => db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name!='durable_memory_intake_receipts' ORDER BY type,name").all();
+    const originalObjects = otherObjects();
+    restorePre96ApprovedActionFixture(db);
     const before = otherObjects();
     const versions = db.prepare('SELECT * FROM schema_version ORDER BY version').all();
     restore(db);
@@ -25,10 +27,11 @@ test('historical fixture restores empty canonical V1 checks and preserves all ot
     assert.deepEqual(db.pragma('foreign_key_check'), []);
     assert.equal(db.pragma('foreign_keys', { simple: true }), 1);
     restore(db); // Already historical and empty is a no-op.
+    restorePre96ApprovedActionFixture(db);
     db.exec('DELETE FROM schema_version WHERE version >= 93');
     applyHarnessMigrations(db);
     assert.equal(receiptSql(db), original);
-    assert.deepEqual(otherObjects(), before);
+    assert.deepEqual(otherObjects(), originalObjects);
   } finally { db.close(); }
 });
 

@@ -21,27 +21,30 @@ import { test } from 'node:test';
 
 const { STRICT_TAIL_TABLES } = await import('./eventlog-schema.js');
 
-const source = readFileSync(
-  fileURLToPath(new URL('./eventlog-schema.ts', import.meta.url)),
-  'utf8',
-);
+const sources = ['./eventlog-schema.ts', './approved-action-completion-schema.ts'].map((name) => ({
+  name,
+  text: readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8'),
+}));
 
 /** Every table a migration refuses when it already exists. */
-function guardedTables(): string[] {
+function guardedTablesIn(source: string): string[] {
   const names = new Set<string>();
   // Literal form: throw new Error('schema vNN refuses preexisting unsanctioned table X')
-  for (const m of source.matchAll(/refuses preexisting unsanctioned table ([a-z_]+)'/g)) {
+  for (const m of source.matchAll(/refuses preexisting unsanctioned table ([a-z_][a-z0-9_]*)['"`]/g)) {
     names.add(m[1]!);
   }
   // Templated form: `schema v65 refuses preexisting unsanctioned table ${table}`
-  // — the names come from the array literal the loop iterates.
-  if (/refuses preexisting unsanctioned table \$\{table\}/.test(source)) {
-    const loop = source.match(/for \(const table of \[([^\]]+)\]/);
-    if (loop) {
-      for (const m of loop[1]!.matchAll(/'([a-z_]+)'/g)) names.add(m[1]!);
-    }
+  // — read the guarded loop in its own module, never the first loop from
+  // another schema source or an unrelated array earlier in the same file.
+  for (const loop of source.matchAll(/for\s*\(\s*const table of \[([^\]]+)\]\s*\)\s*\{([\s\S]*?)\n\s*\}/g)) {
+    if (!/refuses preexisting unsanctioned table \$\{table\}/.test(loop[2]!)) continue;
+    for (const m of loop[1]!.matchAll(/'([a-z_][a-z0-9_]*)'/g)) names.add(m[1]!);
   }
   return [...names].sort();
+}
+
+function guardedTables(): string[] {
+  return [...new Set(sources.flatMap((source) => guardedTablesIn(source.text)))].sort();
 }
 
 test('the fixture knows about every table a migration will refuse', () => {
@@ -68,7 +71,16 @@ test('the list contains no table that nothing actually guards', () => {
     + 'nothing recreates');
 });
 
-test('the named strict-tail regressions through schema v70 are covered', () => {
+test('the separate v96 schema guard retains both digit-suffixed table names', () => {
+  const source = sources.find((entry) => entry.name === './approved-action-completion-schema.ts');
+  assert.ok(source);
+  assert.deepEqual(guardedTablesIn(source.text), [
+    'approved_action_completion_intents_v1',
+    'approved_action_completion_receipts_v1',
+  ]);
+});
+
+test('the named strict-tail regressions through schema v96 are covered', () => {
   // Named explicitly so the exact regression that cost 46 tests is pinned by
   // name, not only by the generic rule above. Schema 69 is included because
   // projection receipts also refuse a preexisting lookalike and must be shed
@@ -79,6 +91,8 @@ test('the named strict-tail regressions through schema v70 are covered', () => {
     'model_request_provenance',
     'host_model_result_receipts',
     'logical_model_result_projection_receipts',
+    'approved_action_completion_intents_v1',
+    'approved_action_completion_receipts_v1',
   ]) {
     assert.ok(STRICT_TAIL_TABLES.includes(table), `${table} must be shed before a rehearsal replays it`);
   }

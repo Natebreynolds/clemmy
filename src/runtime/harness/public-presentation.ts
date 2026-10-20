@@ -157,6 +157,8 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'stuck_detected',
   'learning_candidate_evaluated',
   'durable_memory_intake_receipt',
+  'approved_action_completion_intent',
+  'approved_action_completion_receipt',
 ]);
 
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);

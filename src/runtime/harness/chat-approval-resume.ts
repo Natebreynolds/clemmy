@@ -53,6 +53,9 @@ import {
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
 import { getPendingAction, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
+import { pendingActionResultBinding } from './pending-action-public-result.js';
+import { prepareApprovedActionHostCompletion } from './approved-action-completion-receipt.js';
+import { approvedActionDecisionWasStoppedInTransaction } from './approved-action-completion-proof.js';
 import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicAsyncWorkDispatchedData, publicUserInputText } from './public-presentation.js';
@@ -510,6 +513,16 @@ async function settleConversationalSource(
       surface: 'approval_resume',
       acceptedText: typeof source.data.text === 'string' ? source.data.text : '',
     });
+    if (input.status === 'done') prepareApprovedActionHostCompletion({ sessionId: source.sessionId, sourceUserSeq: source.seq });
+    // Receipt publication can notify an owner Stop. Recheck after the last
+    // asynchronous graph boundary and receipt signal; the final transactional
+    // validator independently refuses any later Stop before a done CAS.
+    if (input.status === 'done' && approvedActionDecisionWasStoppedInTransaction(openEventLog(), {
+      sessionId: source.sessionId, sourceUserSeq: source.seq,
+    })) input = {
+      status: 'cancelled', text: `${OWNER_STOP_RESULTS_KEPT_TERMINAL_TEXT} This action will not run again on its own.`,
+      hostNotice: { code: 'stopped' },
+    };
     const common = { version: 2 as const, id: turnOutcomeId(identity), identity };
     const outcome = input.status === 'done'
       ? {
@@ -535,11 +548,16 @@ async function settleConversationalSource(
             resumable: false as const,
             presentation: { kind: 'error' as const, text: input.text },
           };
+    const actionId = pendingActionIdFromArgs(row.args);
+    const action = actionId ? getPendingAction(actionId) : null;
+    const resultBinding = action?.approvalId === row.approvalId
+      ? pendingActionResultBinding(action, source) : null;
     commitTurnOutcome(outcome, {
       legacyReason: 'conversational_send_consent_resolved',
       metadata: {
         approvalId: row.approvalId,
         pendingActionId: pendingActionIdFromArgs(row.args),
+        ...(resultBinding ? { pendingActionResultBinding: resultBinding } : {}),
         ...(input.hostNotice ? { hostNotice: input.hostNotice } : {}),
       },
     });

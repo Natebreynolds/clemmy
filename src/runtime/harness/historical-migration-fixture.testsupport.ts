@@ -42,6 +42,7 @@ export function restoreEmptyV1MemoryReceiptForHistoricalMigrationFixture(db: Dat
     WHERE ${bindingColumns.map(column => `${quote(column)} IS NOT NULL`).join(' OR ')} LIMIT 1`).get()) {
     throw new Error('historical receipt fixture refuses bound host completion authority');
   }
+  restorePre96ApprovedActionFixture(db);
   if (!historicalReceiptSql) {
     const historical = new Database(':memory:');
     try {
@@ -97,6 +98,27 @@ export function removeV65StructuresFromHistoricalMigrationFixture(db: Database.D
   for (const table of STRICT_TAIL_TABLES) {
     db.exec(`DROP TABLE IF EXISTS ${table};`);
   }
+}
+
+/** Rehearsal only: restore genuine pre-v96 receipt structures before replay.
+ * Never drop a populated proof or rewrite a live/historical user database. */
+export function restorePre96ApprovedActionFixture(db: Database.Database): void {
+  if (process.env.CLEMMY_TEST_ISOLATED_HOME !== '1') throw new Error('pre-v96 fixture requires isolated test contract');
+  const tables=['approved_action_completion_receipts_v1','approved_action_completion_intents_v1'];
+  if(!tables.some(table=>db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)))return;
+  for(const table of tables) {
+    if(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)
+      && Number((db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n)!==0) throw new Error('pre-v96 fixture refuses populated approved-action proof');
+  }
+  const old=new Database(':memory:');
+  try {
+    applyHarnessMigrationsThroughVersionForTests(old,95);
+    for(const name of ['trg_accepted_task_host_completion_monotonic','trg_accepted_task_host_terminal_exact']) {
+      const trigger=old.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name) as {sql:string};
+      db.exec(`DROP TRIGGER IF EXISTS ${name}`);db.exec(trigger.sql);
+    }
+    for(const table of tables)db.exec(`DROP TABLE IF EXISTS ${table}`);
+  } finally {old.close();}
 }
 
 /**

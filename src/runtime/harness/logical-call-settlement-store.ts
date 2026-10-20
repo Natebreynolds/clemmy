@@ -1,3 +1,4 @@
+import { settlementSemanticDigest as semanticDigest } from './settlement-semantic-digest.js';
 /**
  * Atomic persistence kernel for one logical tool-call settlement.
  *
@@ -276,50 +277,6 @@ function progressKeyDigest(acceptedTaskId: string, identity: string | undefined)
   return sha256(`${acceptedTaskId}\0${identity}`);
 }
 
-function semanticDigest(input: {
-  toolName: string;
-  argumentDigest: string;
-  executionKind: LogicalCallExecutionKind;
-  outcome: CommitLogicalCallSettlementInput['outcome'];
-  recovery: CommitLogicalCallSettlementInput['recovery'];
-  progressDigest?: string;
-  resultHandleId?: string;
-}): string {
-  return sha256(JSON.stringify({
-    protocolVersion: LOGICAL_CALL_SETTLEMENT_PROTOCOL_VERSION,
-    toolName: input.toolName,
-    argumentDigest: input.argumentDigest,
-    executionKind: input.executionKind,
-    resultHandleId: input.resultHandleId ?? null,
-    outcome: {
-      kind: input.outcome.kind,
-      evidence: input.outcome.evidence,
-      providerStatus: normalizedProviderStatus(input.outcome.providerStatus) ?? null,
-      detail: normalizedDetail(input.outcome.detail) ?? null,
-      directive: {
-        action: input.outcome.directive.action,
-        retrySameCandidate: input.outcome.directive.retrySameCandidate,
-        eliminatesCandidate: input.outcome.directive.eliminatesCandidate,
-        opensDiscoveryEpoch: input.outcome.directive.opensDiscoveryEpoch,
-        requiresReconciliation: input.outcome.directive.requiresReconciliation,
-      },
-    },
-    recovery: {
-      businessCall: input.recovery.businessCall,
-      mutating: input.recovery.mutating,
-      requirementId: input.recovery.requirementId ?? null,
-      continuesRequirement: input.recovery.continuesRequirement === true,
-      progressKeyDigest: input.progressDigest ?? null,
-      governorEvidence: input.recovery.governorEvidence
-        ? {
-            kind: input.recovery.governorEvidence.kind,
-            detail: input.recovery.governorEvidence.detail?.replace(/\s+/g, ' ').trim().slice(0, 256) || null,
-            onlyIfProgressClaimed: input.recovery.governorEvidence.onlyIfProgressClaimed === true,
-          }
-        : null,
-    },
-  }));
-}
 
 function poison(
   db: ReturnType<typeof openEventLog>,

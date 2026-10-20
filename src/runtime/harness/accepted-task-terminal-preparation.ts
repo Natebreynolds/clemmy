@@ -1,3 +1,4 @@
+import { prepareApprovedActionHostCompletion } from './approved-action-completion-receipt.js';
 import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 /**
  * Production orchestration for the staged expected-work protocol.
@@ -705,6 +706,10 @@ export function prepareAcceptedTaskTerminal(input: {
    * reply that IS the content (published). */
   proposedReply?: string;
 }): AcceptedTaskTerminalPreparation {
+  const exactApprovedCall = prepareApprovedActionHostCompletion(input);
+  if (exactApprovedCall.status === 'redeemed') return { status: 'ready', manifestId: exactApprovedCall.receiptId,
+    verdict: { status: 'done', missing: [], facts: ['the exact approved call returned one retained successful result; original-objective and artifact acceptance are separate'] } };
+  if (exactApprovedCall.status !== 'ineligible') return { status: exactApprovedCall.status, reason: exactApprovedCall.reason };
   const contract = loadExpectedWorkContract(input.sessionId, input.sourceUserSeq);
   if (contract.status === 'missing') {
     // A task accepted before expected-work activation may already own a

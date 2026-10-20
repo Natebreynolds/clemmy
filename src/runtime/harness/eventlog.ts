@@ -1,3 +1,4 @@
+import { assertApprovedActionCompletionReceipt, APPROVED_ACTION_RECEIPT_EVENT } from './approved-action-completion-proof.js';
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
@@ -86,6 +87,8 @@ export const HARNESS_DB_PATH = path.join(HARNESS_STATE_DIR, 'harness.db');
  * code change so the replay code is forced to handle them.
  */
 export const EVENT_TYPES = [
+  'approved_action_completion_intent',
+  'approved_action_completion_receipt',
   'session_started',
   'turn_started',
   'turn_ended',
@@ -2510,6 +2513,28 @@ interface TerminalPublicationMemoryReceiptRow {
   receipt_event_id: string;
 }
 
+/** The exact event discriminates receipt protocols; no prefix or prose grants
+ * authority. The existing memory validator remains unchanged. */
+function assertExactHostCompletionReceipt(
+  db: Database.Database, authority: TerminalPublicationAuthorityRow,
+  options: { requireCurrentProtocol?: boolean; allowStopped?: boolean; stopBefore?: string } = {},
+): void {
+  const event = authority.host_completion_event_id ? db.prepare('SELECT type FROM events WHERE id=? AND session_id=?')
+    .get(authority.host_completion_event_id,authority.session_id) as {type:string}|undefined : undefined;
+  if (event?.type !== APPROVED_ACTION_RECEIPT_EVENT) {
+    assertExactDurableMemoryHostReceipt(db,authority,options);
+    return;
+  }
+  assertExactTerminalPublicationGraphStructure(db,authority);
+  if (authority.work_contract_id!==null || !authority.host_completion_receipt_id
+    || authority.manifest_id!==authority.host_completion_receipt_id
+    || authority.backstop_event_id!==authority.host_completion_event_id) {
+    throw new AcceptedTaskTerminalPublicationError('conflict','approved-call authority is not exactly receipt-bound');
+  }
+  try { assertApprovedActionCompletionReceipt(db,authority,options); }
+  catch(error) {throw new AcceptedTaskTerminalPublicationError('conflict',error instanceof Error ? error.message : 'approved-call proof unavailable');}
+}
+
 /** Validate the immutable normalized host receipt inside the terminal writer
  * transaction. The memory ledger was independently re-redeemed immediately
  * before publication; this check ensures the transaction closes only the exact
@@ -3017,7 +3042,7 @@ function closeAcceptedTaskTerminalPublicationInTransaction(input: {
   }
   if (presentation.status !== 'done') {
     if (authority.host_completion_receipt_id) {
-      assertExactDurableMemoryHostReceipt(input.db, authority);
+      assertExactHostCompletionReceipt(input.db, authority, { allowStopped: true });
     } else if (authority.work_contract_id) {
       assertExactTerminalPublicationStructure(input.db, authority);
     } else {
@@ -3106,7 +3131,7 @@ function closeAcceptedTaskTerminalPublicationInTransaction(input: {
     return presentation;
   }
   if (authority.host_completion_receipt_id) {
-    assertExactDurableMemoryHostReceipt(input.db, authority, { requireCurrentProtocol: true });
+    assertExactHostCompletionReceipt(input.db, authority, { requireCurrentProtocol: true });
     if (authority.state !== 'manifested_verifying') {
       throw new AcceptedTaskTerminalPublicationError(
         authority.state === 'armed' ? 'not_ready' : 'conflict',
@@ -3272,7 +3297,7 @@ function validatePersistedTerminalPublicationWinner(
       );
     }
     if (authority.host_completion_receipt_id) {
-      assertExactDurableMemoryHostReceipt(db, authority);
+      assertExactHostCompletionReceipt(db, authority, { allowStopped: presentation.status !== 'done', stopBefore: event.createdAt });
     } else if (authority.work_contract_id) {
       assertExactTerminalPublicationStructure(db, authority);
     } else {
@@ -3323,7 +3348,7 @@ function validatePersistedTerminalPublicationWinner(
   }
   if (!authority.work_contract_id && !authority.host_completion_receipt_id) return event;
   if (authority.host_completion_receipt_id) {
-    assertExactDurableMemoryHostReceipt(db, authority);
+    assertExactHostCompletionReceipt(db, authority, { allowStopped: presentation.status !== 'done', stopBefore: event.createdAt });
     if (
       authority.state !== 'terminal'
       || authority.terminal_event_id !== event.id
@@ -3386,8 +3411,13 @@ export function readAcceptedTaskTerminalPublication(
       if (authority.work_contract_id || strayContract) {
         return { status: 'conflict', reason: 'host-completed authority also owns provider work' };
       }
+      const terminalRow = terminalEventForTaskAuthority(db, sessionId, sourceUserSeq);
       try {
-        assertExactDurableMemoryHostReceipt(db, authority);
+        const retainedPresentation = terminalRow ? presentationEventFromCompletionData(JSON.parse(terminalRow.data_json)) : null;
+        assertExactHostCompletionReceipt(db, authority, {
+          allowStopped: retainedPresentation?.status !== 'done',
+          ...(terminalRow ? { stopBefore: terminalRow.created_at } : {}),
+        });
       } catch (error) {
         return {
           status: 'conflict',
@@ -3399,7 +3429,6 @@ export function readAcceptedTaskTerminalPublication(
       if (authority.state === 'conflict') {
         return { status: 'conflict', reason: 'accepted-task authority is conflicted' };
       }
-      const terminalRow = terminalEventForTaskAuthority(db, sessionId, sourceUserSeq);
       if (authority.state === 'terminal') {
         if (!authority.terminal_event_id || !terminalRow || terminalRow.id !== authority.terminal_event_id) {
           return { status: 'conflict', reason: 'host terminal authority does not name its exact event' };

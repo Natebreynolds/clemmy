@@ -424,6 +424,7 @@ test('production approval ingress runs one stored action beside its retained wor
   const held = workflowHold();
   const { action, row } = storedApproval(held.session.id, held.source.seq);
   const markers = parentMarkers(held.session.id);
+  const originalAuthority = openEventLog().prepare('SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?').get(held.session.id,held.source.seq);
   const calls = recordingDispatch();
   let modelCalls = 0;
   await startChatApprovalResume(async () => { modelCalls += 1; });
@@ -435,6 +436,8 @@ test('production approval ingress runs one stored action beside its retained wor
   assert.deepEqual(calls, [{ tool: action.toolName, payload: action.payload, sessionId: held.session.id }]);
   assert.equal(modelCalls, 0);
   assert.deepEqual(parentMarkers(held.session.id), markers);
+  assert.deepEqual(openEventLog().prepare('SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?').get(held.session.id,held.source.seq),originalAuthority,'B closure cannot alter A authority');
+  assert.equal((openEventLog().prepare('SELECT state FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?').get(held.session.id,decision.seq) as {state:string}).state,'terminal');
   const parent = openEventLog().prepare('SELECT status, finished_at FROM run_attempts WHERE attempt_id = ?').get(held.run.attemptId);
   assert.deepEqual(parent, { status: 'active', finished_at: null });
   _resetChatApprovalResumeForTest();
@@ -658,6 +661,9 @@ test('a parked pending-action card runs its exact stored action on approval, wit
   const terminal = listEvents(sess.id, { types: ['conversation_completed'] })
     .find((event) => event.data.sourceUserSeq === resumeSource!.seq);
   assert.ok(terminal, 'that source settled with what landed');
+  const { pendingActionResultBinding } = await import('./pending-action-public-result.js');
+  assert.deepEqual(terminal!.data.pendingActionResultBinding, pendingActionResultBinding(getPendingAction(action.id)!, resumeSource!),
+    'the trusted host binds clean presentation to the exact action, card, revision, raw result and B source');
   assert.match(String(terminal!.data.reply), /^Done — I ran it\. Here's what it printed:/, 'in Clem\'s words, not the executor\'s');
   assert.doesNotMatch(String(terminal!.data.reply), /run_shell_command|exit_code|pa-/, 'no tool names or ids reach the owner');
   assert.doesNotMatch(String(terminal!.data.reply), /continue|more to do|request.*complete/i,
@@ -714,6 +720,12 @@ async function approveStoredActionForOriginal(sessionId: string, sourceUserSeq: 
 test('approved action B names verification only from the original A retained requirements', async () => {
   const session = createSession({ kind: 'chat' });
   const original = retainedOriginalWork(session.id);
+  const db = openEventLog();
+  const retained = {
+    authority: db.prepare('SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?').get(session.id, original.source.seq),
+    contract: db.prepare('SELECT * FROM accepted_task_work_contracts WHERE session_id=? AND source_user_seq=?').get(session.id, original.source.seq),
+    markers: parentMarkers(session.id),
+  };
   assert.deepEqual(workAdmission.expectedWorkPlanLines(original.identity).map((line) => line.state),
     ['open', 'blocked_on_dependency']);
   const result = await approveStoredActionForOriginal(session.id, original.source.seq);
@@ -725,6 +737,17 @@ test('approved action B names verification only from the original A retained req
   'executing B does not claim or settle A complete');
   assert.deepEqual(workAdmission.expectedWorkPlanLines(original.identity).map((line) => line.settledInstances), [0, 0],
     'B success cannot discharge A requirements');
+  assert.deepEqual(db.prepare('SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?').get(session.id, original.source.seq),
+    retained.authority, 'B canonical closure leaves the original A authority byte-for-byte unchanged');
+  assert.deepEqual(db.prepare('SELECT * FROM accepted_task_work_contracts WHERE session_id=? AND source_user_seq=?').get(session.id, original.source.seq),
+    retained.contract, 'the real two-operation A contract is retained unchanged');
+  assert.deepEqual(parentMarkers(session.id), retained.markers);
+  assert.equal(db.prepare('SELECT terminal_event_id FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?')
+    .get(session.id, original.source.seq)?.terminal_event_id, null);
+  const closedB = db.prepare('SELECT state,terminal_event_id FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?')
+    .get(session.id, result.decision.seq) as {state:string;terminal_event_id:string};
+  assert.deepEqual(closedB, {state:'terminal',terminal_event_id:result.terminal.id});
+  assert.equal((await import('./eventlog.js')).readValidatedTerminalEvent(closedB.terminal_event_id,session.id,result.decision.seq).id,result.terminal.id);
 });
 
 test('unknown or corrupt original work never invents a Continue invitation despite sibling work', async () => {
