@@ -1422,7 +1422,10 @@ function gateDraftExcerpt(step: WorkflowStepInput, ctx: StepExecutionContext, ma
  */
 function workflowRunOriginSource(runId: string): { sessionId: string; sourceUserSeq: number } | null {
   try {
-    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    // The fields read here are set at creation and never change, so the
+    // lock-free snapshot is exact; the locked read stages an owner file,
+    // fsyncs twice and renames for every record it opens.
+    const record = readRunRecordForScan(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
     if (!record) return null;
     const creation = record.creationTestSource;
     if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {
@@ -1469,8 +1472,12 @@ function workflowCreationOriginSource(workflowName: string): { sessionId: string
   try {
     if (!existsSync(WORKFLOW_RUNS_DIR)) return null;
     const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json')).sort().reverse();
+    // Live 10-20: every scheduled step start walked up to 400 records under
+    // the full record lock (mkdir, staged owner, two fsyncs, rename each),
+    // 13 s on the daemon loop at :00 and :30. The creation source never
+    // changes after the record is written; the lock-free snapshot is exact.
     for (const file of files.slice(0, 400)) {
-      const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, file));
+      const record = readRunRecordForScan(path.join(WORKFLOW_RUNS_DIR, file));
       if (!record || record.workflow !== workflowName) continue;
       const creation = record.creationTestSource;
       if (creation && typeof creation.sessionId === 'string' && Number.isSafeInteger(creation.sourceUserSeq) && creation.sourceUserSeq > 0) {

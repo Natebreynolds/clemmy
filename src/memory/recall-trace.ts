@@ -14,6 +14,9 @@ import type { ConsolidatedFact } from './facts.js';
  */
 const TRACE_FILE = path.join(BASE_DIR, 'state', 'memory-recall-trace.jsonl');
 const MAX_LINES = 3000;
+/** Appends allowed past MAX_LINES before the file is trimmed back to it. */
+const TRIM_SLACK = 300;
+let traceLineCount: number | null = null;
 
 export const RECALL_SELECTION_TRACE_CAP = 128;
 export interface RecallSelectionRef { type: string; id?: string; digest?: string }
@@ -192,9 +195,19 @@ export function appendFactRecallTrace(input: {
 
     mkdirSync(path.dirname(TRACE_FILE), { recursive: true });
     appendFileSync(TRACE_FILE, `${JSON.stringify(entry)}\n`);
-    const lines = readFileSync(TRACE_FILE, 'utf-8').split('\n').filter(Boolean);
-    if (lines.length > MAX_LINES) {
+    // The trim used to re-read and rewrite the whole file after every append
+    // (live 10-20: 37 MB, 2.5 s on the daemon loop per recall). Count lines
+    // once, then trim only when the slack is used up.
+    if (traceLineCount === null) {
+      try { traceLineCount = readFileSync(TRACE_FILE, 'utf-8').split('\n').filter(Boolean).length; }
+      catch { traceLineCount = 1; }
+    } else {
+      traceLineCount += 1;
+    }
+    if (traceLineCount > MAX_LINES + TRIM_SLACK) {
+      const lines = readFileSync(TRACE_FILE, 'utf-8').split('\n').filter(Boolean);
       writeFileSync(TRACE_FILE, `${lines.slice(-MAX_LINES).join('\n')}\n`);
+      traceLineCount = Math.min(lines.length, MAX_LINES);
     }
   } catch {
     // Best-effort observability only.

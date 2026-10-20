@@ -1098,6 +1098,18 @@ export function readWorkflowOriginGroupCloseIntent(
 
 /** Bounded restart driver input for the crash seam where the filesystem fence
  * won but the SQLite close event did not. */
+/** Group directories that held a close intent at the last full walk. Live
+ * 10-20: 5,791 group directories and 40 intents; the walk stat'ed every
+ * directory on every 15-s reconcile tick, 5.5 s on the daemon loop at :00.
+ * A writer in this process forgets the walk; a walk older than the rescan
+ * interval is repeated so an intent written elsewhere is still found. */
+let closeIntentWalk: { atMs: number; entries: string[] } | null = null;
+const CLOSE_INTENT_RESCAN_MS = 60_000;
+
+function forgetCloseIntentWalk(): void {
+  closeIntentWalk = null;
+}
+
 export function listWorkflowOriginGroupCloseIntents(
   limit = 200,
 ): WorkflowOriginGroupCloseAuthority[] {
@@ -1106,7 +1118,16 @@ export function listWorkflowOriginGroupCloseIntents(
   }
   if (!existsSync(WORKFLOW_ORIGIN_GROUPS_DIR)) return [];
   const intents: WorkflowOriginGroupCloseAuthority[] = [];
-  for (const entry of readdirSync(WORKFLOW_ORIGIN_GROUPS_DIR).sort()) {
+  const nowMs = Date.now();
+  let entries: string[];
+  if (closeIntentWalk && nowMs - closeIntentWalk.atMs < CLOSE_INTENT_RESCAN_MS) {
+    entries = closeIntentWalk.entries;
+  } else {
+    entries = readdirSync(WORKFLOW_ORIGIN_GROUPS_DIR).sort()
+      .filter((entry) => existsSync(path.join(WORKFLOW_ORIGIN_GROUPS_DIR, entry, 'closing.json')));
+    closeIntentWalk = { atMs: nowMs, entries };
+  }
+  for (const entry of entries) {
     if (intents.length >= limit) break;
     const file = path.join(WORKFLOW_ORIGIN_GROUPS_DIR, entry, 'closing.json');
     if (!existsSync(file)) continue;
@@ -1171,6 +1192,7 @@ export function recordWorkflowOriginGroupCloseIntent(
     validateCloseAgainstAdmissionEvidence(authority);
     if (existingIntent) return existingIntent;
     const file = closingGroupFile(authority.sourceGroupId);
+    forgetCloseIntentWalk();
     if (createJsonDurably(file, authority)) return authority;
     const winner = decodeWorkflowOriginGroupCloseAuthority(
       readJson(file, `Workflow origin group ${authority.sourceGroupId} close intent`),
@@ -1620,6 +1642,7 @@ function removeCompactedWorkflowOriginGroupFiles(sourceGroupId: string): void {
       rmdirSync(dir);
     }
   }
+  forgetCloseIntentWalk();
   for (const file of [
     closingGroupFile(sourceGroupId),
     closedGroupFile(sourceGroupId),
