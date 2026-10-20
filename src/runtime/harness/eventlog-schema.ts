@@ -11483,6 +11483,16 @@ const MIGRATIONS: EventLogMigration[] = [
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     installApprovedActionResultProjectionSchema(db);
   } },
+  // The session list (Home poll every 6 s, the sidebar, every catalog
+  // projection) orders every row by updated_at and takes the newest few.
+  // Live 10-20: 5,582 sessions, 15 MB of rows, a full scan plus a temp sort
+  // per call, 0.7 s of every 30 s on the daemon loop. The existing partial
+  // index serves only a literal kind = 'chat'; this one serves the order
+  // itself, filtered or not.
+  { version: 99, sql: '', backfill: (db) => {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
+    db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_updated_id ON sessions(updated_at DESC, id DESC)');
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

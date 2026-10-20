@@ -676,20 +676,23 @@ function previewMembers(row: HarnessSessionRow, allRows: HarnessSessionRow[]): H
 }
 
 /** What a preview depends on, per member: the row's updated_at and the
- * session's event count and last seq. An append, a retention delete or a
- * row update changes a mark; writes to other sessions do not. The schema
- * version covers migrations. A store-wide data_version here invalidated every
- * preview on every write anywhere, so each 10-s sidebar poll rebuilt 200
- * transcripts while Clem was working (1.6 s on the daemon loop per poll). */
+ * session's first and last event seq. An append, a retention delete (which
+ * takes the oldest events) or a row update changes a mark; writes to other
+ * sessions do not. The schema version covers migrations. A store-wide
+ * data_version here invalidated every preview on every write anywhere, so
+ * each 10-s sidebar poll rebuilt 200 transcripts while Clem was working
+ * (1.6 s on the daemon loop per poll). The mark once counted every event of
+ * every member: a 17,000-event chat walked its whole index on each poll,
+ * 0.65 s of every 30 s live 10-20; MIN and MAX each read one index edge. */
 function previewChangeMarks(db: Database.Database, members: readonly HarnessSessionRow[]): string | null {
   try {
     if (!db.open || db.inTransaction) return null;
     const schema = db.pragma('schema_version', { simple: true });
     if (!Number.isSafeInteger(schema) || Number(schema) < 0) return null;
-    const read = db.prepare('SELECT COUNT(*) AS n, MAX(seq) AS seq FROM events WHERE session_id = ?');
+    const read = db.prepare('SELECT MIN(seq) AS first, MAX(seq) AS seq FROM events WHERE session_id = ?');
     const marks = members.map((member) => {
-      const row = read.get(member.id) as { n?: unknown; seq?: unknown } | undefined;
-      return [member.id, member.updatedAt, row?.n ?? null, row?.seq ?? null];
+      const row = read.get(member.id) as { first?: unknown; seq?: unknown } | undefined;
+      return [member.id, member.updatedAt, row?.first ?? null, row?.seq ?? null];
     });
     return JSON.stringify([schema, marks]);
   } catch { return null; }
