@@ -48,9 +48,10 @@ const flush = async () => {
   await new Promise<void>(resolve => setImmediate(resolve));
 };
 
-function jevResponse(kind: 'done' | 'incomplete' | 'awaiting' | 'abstained' = 'done') {
+function jevResponse(kind: 'done' | 'incomplete' | 'awaiting' | 'abstained' | 'dead_end' = 'done') {
   const values = { delivered: 0.95, unaddressed: 0.03, unsupported: 0.03,
-    computed: 0.03, asksUser: 0.03, cannotFinish: 0.03,
+    computed: 0.03, asksUser: 0.03, cannotFinish: 0.03, deadEnd: 0.03,
+    ...(kind === 'dead_end' ? { delivered: 0.9, deadEnd: 0.95 } : {}),
     ...(kind === 'incomplete' ? { delivered: 0.1, unaddressed: 0.95 } : {}),
     ...(kind === 'awaiting' ? { delivered: 0.2, asksUser: 0.95 } : {}),
     ...(kind === 'abstained' ? { delivered: 0.4, unaddressed: 0.7, unsupported: 0.93, computed: 0.8 } : {}),
@@ -884,3 +885,15 @@ for (const lane of ['configured_reviewer', 'late_fallback'] as const) {
     }
   });
 }
+
+test('a reply that ends on something undone with no next way and no reason is incomplete, never done or blocked', async t => {
+  // Owner's rule (10-20): find another tool and say how, or say plainly why
+  // not; never end on "the retry was refused" and stop.
+  const state = setup(t, async () => ({ verdict: { done: true, reason: 'unused' }, failure: null }));
+  _setSystemOneFetchForTests(async () => jevResponse('dead_end'));
+  const verdict = await judgeObjectiveComplete(objective, 'The status read was refused before it ran. It remains unfinished.', read);
+  assert.equal(verdict.done, false);
+  assert.equal(verdict.judgeModelId, 'jev-1.13.0');
+  assert.match(verdict.reason, /name another tool or route for it, what the owner can do, or why it is impossible/);
+  assert.equal(state.reviewerCalls(), 0, 'a complete read is Jev\'s alone');
+});

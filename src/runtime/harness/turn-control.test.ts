@@ -1378,3 +1378,31 @@ test('the 2026-08-05 live regression: a scrape-and-sheet request aligns; the cal
   });
   assert.equal(calendar.phase, 'execute', 'a plain lookup must never earn a beat');
 });
+
+test('an owner\'s short answer to what Clem just asked carries her question, so "Yes" is read as the agreed work', async () => {
+  const { classifyMessageIntent } = await import('../../assistant/message-intent.js');
+  const sessionId = freshSession('chat');
+  const ask = 'Kevin, I stopped too soon. I would test the repairs, retry only close-out for the three existing drafts, then verify each result. Shall I proceed?';
+  const first = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Run the outreach workflow.' } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: ask, awaitingUser: true, sourceUserSeq: first.seq } });
+  const yes = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Yes' } });
+  const objective = effectiveTurnObjective(sessionId, 'Yes', yes.seq);
+  assert.match(objective, /^Yes\n\nThis answers what Clem last asked or offered\. Her words:\n/);
+  assert.ok(objective.includes('retry only close-out'), objective);
+  assert.equal(classifyMessageIntent(objective).intent, 'action', 'the agreed work reads as action, never as a bare acknowledgement');
+  assert.equal(classifyMessageIntent('Yes').intent === 'action', false, 'precondition: the bare word is not action');
+  // A later terminal of this very turn never counts as "what was asked".
+  appendEvent({ sessionId, turn: 2, role: 'system', type: 'conversation_completed', data: { reply: 'Done. Anything else?', awaitingUser: false, sourceUserSeq: yes.seq } });
+  assert.equal(effectiveTurnObjective(sessionId, 'Yes', yes.seq), objective, 'stable across publication');
+  // A reply that ended on a question, without the waiting marker, still counts; a plain statement does not.
+  const sessionB = freshSession('chat');
+  const b1 = appendEvent({ sessionId: sessionB, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Draft it.' } });
+  appendEvent({ sessionId: sessionB, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Here is the draft.\n\nWant me to send it?', sourceUserSeq: b1.seq } });
+  const b2 = appendEvent({ sessionId: sessionB, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'go ahead' } });
+  assert.match(effectiveTurnObjective(sessionB, 'go ahead', b2.seq), /Want me to send it\?$/);
+  const sessionC = freshSession('chat');
+  const c1 = appendEvent({ sessionId: sessionC, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'What time is it?' } });
+  appendEvent({ sessionId: sessionC, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'It is noon.', sourceUserSeq: c1.seq } });
+  const c2 = appendEvent({ sessionId: sessionC, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Thanks' } });
+  assert.equal(effectiveTurnObjective(sessionC, 'Thanks', c2.seq), 'Thanks');
+});

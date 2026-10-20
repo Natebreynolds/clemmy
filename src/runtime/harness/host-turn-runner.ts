@@ -130,6 +130,7 @@ import {
 } from '../../agents/capability-envelope.js';
 import type { HostQueuedApprovalBeforeCompletion, InterruptionInfo, RunOutcome, RunRunnerFn } from './loop.js';
 import { approvalCallPreview } from './approval-call-preview.js';
+import { failedAttemptNextDoorNote } from './failed-attempt-note.js';
 import { approvalPreviewLabels, type ApprovalLabelMemo } from './approval-preview-labels.js';
 import { approvalPrecheck } from './approval-precheck.js';
 import { removeReviewedClaims, reviewQuotes } from './reviewed-claim-removal.js';
@@ -950,6 +951,7 @@ import { projectClarificationPromptContext } from './clarification-prompt-contex
 import {
   sourceStrategyBindingsEqual,
   turnPreflightDecisionsEqual,
+  answeredAssistantQuestion,
 } from './turn-control.js';
 import {
   admitSourceStrategyPhysicalDispatch,
@@ -7552,6 +7554,7 @@ const runHostTurnBody = async (
     let providerRejectedBeforeEffect = false;
     let providerRepliedUnverified = false;
     let providerUnacknowledged = false;
+    let attemptFailedKind: import('./attempt-outcome.js').AttemptOutcomeKind | null = null;
     let committedVerificationHolds: CommittedMutationVerificationHold[] = [];
     if (canaryRefusal) {
       output = canaryRefusal;
@@ -7911,6 +7914,7 @@ const runHostTurnBody = async (
             && !providerAnsweredWithRefusal(invoked.settlement.outcome);
           providerUnacknowledged = providerLeftInTheDark(invoked.settlement.outcome)
             && uncertainEffectStopsTurn(effect);
+          attemptFailedKind = invoked.settlement.outcome.kind === 'succeeded' ? null : invoked.settlement.outcome.kind;
           if (providerUnacknowledged) noteUnacknowledgedWrite(exactSource, call.callId, edgeToolName(call.name, parsedArguments));
           if (
             preserveWorkCallCarrier
@@ -8098,7 +8102,13 @@ const runHostTurnBody = async (
         + 'Say exactly what the read establishes and what remains unknown. An omitted record in a partial listing is not proof of absence, and a pre-existing record does not prove this call created it. '
         + 'If you cannot verify the outcome, explain the concrete missing evidence and next way to check it; do not ask the owner to resend the original call.'
       : undefined;
-    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, boundedConstraintNote].filter(Boolean).join('\n') || undefined;
+    // Any other failed attempt carries its next door, whatever the tool: the
+    // owner's rule is another way or a plain reason, never an incomplete end.
+    const failedAttemptNote = !structuredToolOutputs(output) && attemptFailedKind
+      && !refusedWriteNote && !repliedUnverifiedNote && !darkWriteNote
+      ? failedAttemptNextDoorNote(attemptFailedKind, edgeToolName(call.name, parsedArguments))
+      : undefined;
+    const steer = [hostSteer, refusedWriteNote, repliedUnverifiedNote, darkWriteNote, boundedConstraintNote, failedAttemptNote].filter(Boolean).join('\n') || undefined;
     return {
       historyItem: functionResultItem(call.callId, call.name, modelOutput, steer),
       ...(tool ? { tool } : {}),
@@ -13400,7 +13410,11 @@ export function acceptedObjectiveForSource(input: {
         + `those inputs told you, the steps you intend to fan out, what each step produces, and in what order. Explain relevant remembered context that shaped the plan, distinguishing confirmed facts, established preferences and unverified assumptions. Do `
         + `not carry out the research in this turn. If you genuinely cannot plan without a fact you do not have, `
         + `ask the user that exact question. The user decides when to execute. User's planning objective: ${text}`
-      : acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq) ?? text);
+      // An answer to what Clem herself just asked or offered carries that
+      // question, so the judge measures "Yes" against what was agreed to.
+      : acceptedPlanExecutionText(input.sessionId, input.sourceUserSeq)
+        ?? answeredAssistantQuestion(input.sessionId, input.sourceUserSeq, text)
+        ?? text);
     // The EFFECTIVE objective, not just the opening request. Steering the owner
     // sent mid-run is part of the job; a judge that never sees it rules against
     // an objective the owner already moved on from.

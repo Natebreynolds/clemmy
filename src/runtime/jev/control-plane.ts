@@ -1109,6 +1109,7 @@ const COMPLETION_REASONS = {
   incomplete: 'Jev found part of the request left without a result.',
   awaiting: 'Jev found a genuine question for the user.',
   blocked: 'Jev found the work cannot finish with available tools.',
+  deadEnd: 'Jev found the reply ends on something undone with neither a concrete next way to do it nor a plain reason it cannot be done: name another tool or route for it, what the owner can do, or why it is impossible.',
 } as const;
 
 /** Jev's documented budget is 32K tokens for state plus the longest question;
@@ -1247,6 +1248,14 @@ export async function tryJevCompletionVerdict(
     cannotFinish: {
       type: 'noul',
       instructions: 'Does response report that the work cannot be done with the tools or access available?',
+    },
+    deadEnd: {
+      type: 'noul',
+      instructions: 'Does response end on something that did not get done (a refused, failed or skipped step, a blocked retry, an unverified change) WITHOUT either (a) a concrete next way to do it — another tool, another route, a specific thing the user can do — or (b) a plain reason it cannot be done at all? A bare report that something was refused or remains unfinished, with no way forward named, is a dead end.',
+      criteria: {
+        true: 'Something asked for did not get done and the response names neither a concrete next way nor a plain reason it cannot be done.',
+        false: 'Everything asked for got done, or each undone part comes with a concrete next way or a plain reason it cannot be done.',
+      },
     },
   };
   if (historical) {
@@ -1405,6 +1414,7 @@ export async function tryJevCompletionVerdict(
   const computed = read('computed');
   const asksUser = read('asksUser');
   const cannotFinish = read('cannotFinish');
+  const deadEnd = read('deadEnd');
   const sure = (value: number | null): boolean => value !== null && value >= COMPLETION_SURE;
   const sureNot = (value: number | null): boolean => value !== null && value <= 1 - COMPLETION_SURE;
   let historicalClosure: HistoricalReadClosure | undefined;
@@ -1422,6 +1432,12 @@ export async function tryJevCompletionVerdict(
   let verdict: Omit<JevCompletionVerdict, 'judgeModelId'> | null = null;
   if (taskViewComplete && !evidence.clipped && sure(asksUser)) {
     verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting', confidence: asksUser! };
+  } else if (taskViewComplete && !evidence.clipped && sure(deadEnd)) {
+    // Owner's rule (10-20): an undone part needs a next way or a plain reason.
+    // A reply that ends on "it was refused" with neither is not done and not
+    // a blocked ending the owner can act on; it goes back for the door or
+    // the reason, whatever "delivered" read.
+    verdict = { done: false, reason: COMPLETION_REASONS.deadEnd, choice: 'incomplete', confidence: deadEnd!, requirementCoverage: 'missing' };
   } else if (
     sure(delivered) && sureNot(unaddressed)
     && unsupported !== null && unsupported <= COMPLETION_UNSUPPORTED_MAX

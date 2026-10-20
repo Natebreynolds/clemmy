@@ -37,7 +37,7 @@ test('original same-invocation abstention remains advisory with exact request an
   const hash = (s: string) => createHash('sha256').update(s).digest('hex');
   const expected = { owner, reviewInvocationId: 'review:assessment', contextDigest: 'a'.repeat(64),
     objectiveDigest: hash(objective), candidateDigest: hash(reply) };
-  const scores = { delivered: 0.4, unaddressed: 0.7, unsupported: 0.93, computed: 0.8, asksUser: 0.03, cannotFinish: 0.04 };
+  const scores = { delivered: 0.4, unaddressed: 0.7, unsupported: 0.93, computed: 0.8, asksUser: 0.03, cannotFinish: 0.04, deadEnd: 0.04 };
   let posted = ''; let calls = 0; let assessment: unknown;
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async (_url, init) => { calls++; posted = init.body; return { status: 200, ok: true,
@@ -49,7 +49,10 @@ test('original same-invocation abstention remains advisory with exact request an
       assessmentScope: expected, onAssessment: value => { assessment = value; } });
     assert.equal(verdict, null, 'forwarding does not change an abstention into a verdict');
     const metadata = jevCompletionAssessmentForReview(assessment, expected)!;
-    assert.ok(metadata); assert.equal(metadata.outcome, 'abstained'); assert.deepEqual(metadata.scores, scores);
+    // The frozen witness binds the six delivery scores; the dead-end reading
+    // steers the verdict and is not part of that exogenous binding.
+    const { deadEnd: _deadEnd, ...sixScores } = scores;
+    assert.ok(metadata); assert.equal(metadata.outcome, 'abstained'); assert.deepEqual(metadata.scores, sixScores);
     assert.equal(metadata.producer.requestBodySha256, hash(posted));
     assert.equal(metadata.stateSha256, hash(JSON.stringify(JSON.parse(posted).state)));
     assert.equal(metadata.questionnaireSha256, hash(JSON.stringify(JSON.parse(posted).questions)));
@@ -301,8 +304,8 @@ test('tryJevGroundingVerdict returns a typed verdict only when confidence is hig
 // independent yes/no readings over compact state. It settles a review only
 // when the delivery readings are sure and the reply leans supported by
 // evidence Jev saw in full, with no figure Jev finds computed.
-function completionAnswers(nouls: Partial<Record<'delivered' | 'unaddressed' | 'unsupported' | 'computed' | 'asksUser' | 'cannotFinish', number>>) {
-  const values = { delivered: 0.5, unaddressed: 0.5, unsupported: 0.5, computed: 0.05, asksUser: 0.05, cannotFinish: 0.05, ...nouls };
+function completionAnswers(nouls: Partial<Record<'delivered' | 'unaddressed' | 'unsupported' | 'computed' | 'asksUser' | 'cannotFinish' | 'deadEnd', number>>) {
+  const values = { delivered: 0.5, unaddressed: 0.5, unsupported: 0.5, computed: 0.05, asksUser: 0.05, cannotFinish: 0.05, deadEnd: 0.05, ...nouls };
   return JSON.stringify({
     model: 'jev-1.13.0',
     answers: Object.fromEntries(Object.entries(values).map(([id, noul]) => [id, { type: 'noul', noul }])),

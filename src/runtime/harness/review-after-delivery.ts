@@ -166,7 +166,10 @@ export function launchReviewAfterDelivery(input: {
     if (!correction || correction === NO_CORRECTION_REPLY) return;
     try {
       const { publishProactiveOutcome } = await import('../outcome.js');
-      publishProactiveOutcome(input.sessionId, { status: 'done', detail: correction }, {
+      // A correction that ends by asking the owner ("Shall I proceed?") is a
+      // turn waiting on them, so their "yes" is read as the answer to it
+      // (live 10-20: published as done, three yeses in a row did nothing).
+      publishProactiveOutcome(input.sessionId, { status: replyEndsOnQuestion(correction) ? 'needs_input' : 'done', detail: correction }, {
         originSessionId: input.sessionId,
         sourceLabel: 'answer check',
         sourceId: `answer-check:${input.sourceUserSeq}`,

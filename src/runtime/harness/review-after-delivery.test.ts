@@ -134,3 +134,22 @@ test('a reply that ends by asking the owner something keeps its review before de
     assert.equal(replyEndsOnQuestion(text), false, text);
   }
 });
+
+test('a correction that ends by asking the owner is published waiting on them, not as a finished answer', async () => {
+  _resetReviewAfterDeliveryForTests();
+  const outcome = acceptedAnswer('after-delivery-asks', 'The notes cover two controlled items.');
+  registerReviewAfterDelivery({ sessionId: outcome.identity.sessionId, sourceUserSeq: outcome.identity.sourceUserSeq,
+    objective: OBJECTIVE, review: async () => ({ review: 'rejected', finding: 'The third item was never summarized.' }),
+    correct: async () => 'I stopped short: the third item is missing. I would read it and add it now. Shall I proceed?' });
+  commitTurnOutcome(outcome);
+  await settled(outcome.identity.sessionId);
+  for (let waited = 0; waited < 200; waited += 1) {
+    if (listEvents(outcome.identity.sessionId, { types: ['conversation_completed'] }).length >= 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const terminals = listEvents(outcome.identity.sessionId, { types: ['conversation_completed'] });
+  assert.equal(terminals.length, 2, 'the correction is its own published turn');
+  const correction = terminals.at(-1)!;
+  assert.equal(correction.data.awaitingUser, true, 'a correction ending on a question waits on the owner');
+  assert.match(String(correction.data.reply), /Shall I proceed\?$/);
+});

@@ -1619,6 +1619,52 @@ export function effectiveTurnObjective(
     // row still recovers its objective.
     const legacy = legacyAlignedObjectiveForAcknowledgement(sessionId, fallback, exactSourceUserSeq);
     if (legacy) return legacy;
+    // The owner answering what Clem herself just asked or offered. Live
+    // 10-20 (Windows tester): "Shall I proceed?" — "Yes" — and the turn ran
+    // on the word "Yes" alone: no action intent, effort none, review skipped,
+    // and three "yes" turns in a row did nothing. The answer and the question
+    // it answers are one request; the question rides with it so the brain,
+    // the judges and the intent read all see what was agreed to.
+    const asked = answeredAssistantQuestion(sessionId, exactSourceUserSeq, fallback);
+    if (asked) return asked;
   } catch { /* fallback remains authoritative */ }
   return fallback;
+}
+
+/** A short owner message is an answer when the last thing published before it
+ * was Clem waiting on the owner, or a reply that ended on a question. */
+const ANSWER_MAX_CHARS = 240;
+const ASKED_MAX_CHARS = 1_200;
+
+export function answeredAssistantQuestion(
+  sessionId: string,
+  sourceUserSeq: number | undefined,
+  message: string,
+): string | null {
+  const answer = message.trim();
+  if (!answer || answer.length > ANSWER_MAX_CHARS) return null;
+  if (!Number.isSafeInteger(sourceUserSeq) || Number(sourceUserSeq) <= 0) return null;
+  // The newest window, then the newest terminal that precedes this source:
+  // at publication this turn's own terminal already exists and must not count.
+  const prior = [...listEvents(sessionId, { types: ['conversation_completed'], desc: true, limit: 8 })]
+    .reverse()
+    .find((event) => event.seq < Number(sourceUserSeq));
+  if (!prior) return null;
+  const reply = typeof prior.data.reply === 'string' ? prior.data.reply.trim() : '';
+  if (!reply) return null;
+  const lastLine = (reply.split(/\n+/).map((line) => line.trim()).filter(Boolean).at(-1) ?? '')
+    .replace(/[\s*_`"'”’)\]]+$/u, '');
+  const askedOwner = prior.data.awaitingUser === true || lastLine.endsWith('?') || lastLine.endsWith('？');
+  if (!askedOwner) return null;
+  // A typed clarification (an awaiting row paired to that terminal) has its
+  // own answer protocol: the continuity packet reads yes, no and a choice and
+  // decides what the answer inherits. Only a question with no such row — an
+  // after-delivery correction, a reply that simply ended by asking — needs
+  // the question carried here.
+  const priorSourceSeq = typeof prior.data.sourceUserSeq === 'number' ? prior.data.sourceUserSeq : prior.seq;
+  const typedClarification = listEvents(sessionId, { types: ['awaiting_user_input'], sinceSeq: priorSourceSeq })
+    .some((event) => event.seq < Number(sourceUserSeq));
+  if (typedClarification) return null;
+  const asked = reply.length > ASKED_MAX_CHARS ? `…${reply.slice(-ASKED_MAX_CHARS)}` : reply;
+  return `${answer}\n\nThis answers what Clem last asked or offered. Her words:\n${asked}`;
 }
