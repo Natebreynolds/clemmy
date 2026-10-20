@@ -764,11 +764,21 @@ async function executeApprovedLinkedActionAndSettle(
     // the owner is an ordinary turn that sees the request, the card and this
     // result, and carries on.
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
+    const stillOpen = approvedActionRetainedWorkNeedsVerification(row, pendingAction, source);
+    // Clem says what landed herself, from the recorded result, and names
+    // what the request still has left (owner 10-20, Windows tester: the app
+    // line "The approved action completed. Open execution details…" read as
+    // nothing happened; the wording job that should have replaced it was
+    // rejected as unbound). The app line stands only when no brain answers.
+    const guard = approvedActionEndingGuard(row, pendingAction, source, prepared);
+    const said = guard ? await approvedActionEndingInClemsWords(row, pendingAction, source, guard, { stillOpen }) : null;
+    const current = guard ? readApprovedActionEndingOwner(guard.owner) : null;
+    const narrated = said && current?.kind === 'current' && current.actionDigest === guard!.actionDigest ? said : null;
     return await settleConversationalSource(row, source, {
       status: 'done',
-      text: approvedActionRanText(pendingAction, result,
-        approvedActionRetainedWorkNeedsVerification(row, pendingAction, source)),
+      text: narrated ?? approvedActionRanText(pendingAction, result, stillOpen),
       hostNotice: { code: 'approved_action_completed' },
+      ...(guard && narrated ? { endingGuard: guard } : {}),
     });
   }
   if (pendingAction.status === 'executing' || pendingAction.status === 'failed') {
@@ -1037,11 +1047,12 @@ function boundedEndingField(value: string, max = APPROVED_ACTION_ENDING_FIELD_CH
 /** What the record says happened to an approved action that did not land,
  * read from the executor's own markers, never from provider prose. */
 export function approvedActionEndingFacts(action: Pick<PendingActionRecord, 'status' | 'resultSummary'>): {
-  verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain';
+  verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain' | 'executed';
   reply: string;
 } {
   const summary = typeof action.resultSummary === 'string' ? action.resultSummary : '';
   const after = (marker: string) => summary.slice(summary.indexOf(marker) + marker.length).replace(/^[\s:;.-]+/, '');
+  if (action.status === 'executed') return { verdict: 'executed', reply: boundedEndingField(summary) };
   if (action.status === 'failed' && summary.startsWith(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) {
     return { verdict: 'never_started', reply: boundedEndingField(after(PENDING_ACTION_PRE_DISPATCH_REFUSAL)) };
   }
@@ -1133,6 +1144,7 @@ async function approvedActionEndingInClemsWords(
   action: PendingActionRecord,
   source: EventRow,
   guard: ApprovedActionEndingGuard,
+  options: { stillOpen?: boolean } = {},
 ): Promise<string | null> {
   const port = peekTurnSemanticModelPort();
   if (!port?.voiceApprovedActionEnding) return null;
@@ -1182,7 +1194,7 @@ async function approvedActionEndingInClemsWords(
         kind: shell ? 'command_on_this_computer' : 'connected_app_change',
         detail: boundedEndingField(command || action.title || '', 400),
       },
-      happened: approvedActionEndingFacts(action), evidenceDigest,
+      happened: { ...approvedActionEndingFacts(action), ...(options.stillOpen ? { stillOpen: true } : {}) }, evidenceDigest,
     }))),
     });
     assertOwned();

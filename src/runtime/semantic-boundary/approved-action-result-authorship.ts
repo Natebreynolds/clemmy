@@ -56,21 +56,31 @@ export function captureApprovedActionResultProjectionResponse(rawResponses: read
 
 export function bindApprovedActionResultProjectionAuthorship(response: ApprovedActionResultProjectionResponse | undefined,
   raw: unknown, message: string | null, evidenceDigest: string): ApprovedActionResultProjectionAuthorship | undefined {
+  // Diagnostics only: which check kept Clem's words off the card. Live 10-20
+  // (DeepSeek brain, Windows tester on a different brain): the job rejected
+  // the wording as "authorship_unbound" and nothing said which of these it was.
+  const why = (reason: string): undefined => {
+    logger.warn({ reason, messageLength: typeof message === 'string' ? message.length : null }, 'approval result authorship could not be bound');
+    return undefined;
+  };
   try {
     const captured = response && responses.get(response);
-    if (!captured || typeof message !== 'string' || !message.trim() || message.length > 600
-      || !/^[a-f0-9]{64}$/.test(evidenceDigest) || captured.receipt.revisionDigest !== evidenceDigest
-      || captured.raw !== boundedJson(raw)
-      || !raw || typeof raw !== 'object' || Array.isArray(raw)
-      || typeof (raw as { message?: unknown }).message !== 'string'
-      || (raw as { message: string }).message.trim() !== message) return undefined;
+    if (!captured) return why('response_not_captured');
+    if (typeof message !== 'string' || !message.trim()) return why('no_message');
+    if (message.length > 600) return why('message_too_long');
+    if (!/^[a-f0-9]{64}$/.test(evidenceDigest)) return why('evidence_digest_shape');
+    if (captured.receipt.revisionDigest !== evidenceDigest) return why('revision_digest_mismatch');
+    if (captured.raw !== boundedJson(raw)) return why('raw_mismatch');
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+      || typeof (raw as { message?: unknown }).message !== 'string') return why('raw_message_shape');
+    if ((raw as { message: string }).message.trim() !== message) return why('message_mismatch');
     const data = normalizeApprovedActionResultProjectionAuthorshipData({ ...captured.receipt,
       textDigest: createHash('sha256').update(message).digest('hex') });
-    if (!data) return undefined;
+    if (!data) return why('authorship_data_shape');
     const token = Object.freeze({ kind: 'approved_action_result_authorship' as const });
     authorships.set(token, { message, evidenceDigest, data: Object.freeze(data) });
     return token;
-  } catch { return undefined; }
+  } catch (error) { return why(error instanceof Error ? error.message : String(error)); }
 }
 
 export function approvedActionResultProjectionAuthorship(result: {

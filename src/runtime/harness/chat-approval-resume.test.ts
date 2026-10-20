@@ -1260,3 +1260,38 @@ test('approval result narrator Stop at the final managed publication check wins 
     assert.equal(getPendingAction(f.action.id)!.status, 'failed'); assert.equal(f.effects(), 1);
   } finally { db.prepare = prepare; }
 });
+
+test('an executed approved action ends in Clem\'s words from its recorded result, naming what is still open', async () => {
+  // Live 10-20 (Windows tester): "The approved action completed. Open
+  // execution details…" read as nothing happened; the wording job that should
+  // have replaced it was rejected as unbound. The ending is narrated the same
+  // way a failed action already is, from the record, before the source settles.
+  const sess = createSession({ kind: 'chat' });
+  const action = queuePendingAction({
+    title: 'Create the follow-up task', summary: 'One exact Salesforce task.', kind: 'shell_command',
+    toolName: 'run_shell_command', payload: { command: 'sf data create record --sobject Task', cwd: '/tmp' }, sessionId: sess.id,
+  });
+  const row = approvalRegistry.register({ sessionId: sess.id, subject: 'Create the follow-up task', tool: 'request_approval',
+    args: { pendingActionId: action.id, pendingAction: pendingActionApprovalView(action) } });
+  appendEvent({ sessionId: sess.id, turn: 0, role: 'system', type: 'approval_parked',
+    data: { approvalId: row.approvalId, tool: 'request_approval', pendingActionId: action.id } });
+  const resolvedRow = approvalRegistry.resolve(row.approvalId, 'approved', 'desktop-chat-card').row!;
+  const dispatched = recordingDispatch();
+  const words = 'Done, the follow-up task for Michelle is in Salesforce for October 27. The other six accounts still need theirs; shall I carry on?';
+  let heard: { verdict: string; reply: string; stillOpen?: boolean } | null = null;
+  endingPort(async call => {
+    heard = call.happened;
+    return { message: words, modelIdentity: 'controlled-semantic-model', evidenceDigest: call.evidenceDigest };
+  });
+  assert.equal(await handleResolvedApprovalForChatResume(resolvedRow, async () => {}), true);
+  assert.equal(dispatched.length, 1); assert.equal(getPendingAction(action.id)?.status, 'executed');
+  assert.ok(heard); assert.equal(heard!.verdict, 'executed');
+  assert.ok(heard!.reply.length > 0, 'the recorded result reaches the narrator');
+  const resumeSource = listEvents(sess.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === row.approvalId);
+  const terminal = listEvents(sess.id, { types: ['conversation_completed'] }).find((event) => event.data.sourceUserSeq === resumeSource!.seq);
+  assert.ok(terminal);
+  assert.equal(terminal!.data.reply, words, 'Clem\'s own ending replaces the app line');
+  assert.deepEqual(terminal!.data.hostNotice, { code: 'approved_action_completed' });
+  assert.equal(terminal!.data.turnOutcome?.status, 'done');
+});

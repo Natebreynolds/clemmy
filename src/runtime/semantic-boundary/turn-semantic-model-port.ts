@@ -372,9 +372,11 @@ export interface ApprovedActionEndingCall {
   happened: {
     /** never_started: nothing ran. refused: the app or command answered no.
      *  guard_refused: Clem's own guard stopped it. uncertain: it may have
-     *  partly happened. */
-    verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain';
+     *  partly happened. executed: it ran once; reply is its recorded result. */
+    verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain' | 'executed';
     reply: string;
+    /** The owner's original request still has work left after this action. */
+    stillOpen?: boolean;
   };
   evidenceDigest: string;
 }
