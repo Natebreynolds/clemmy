@@ -725,15 +725,22 @@ test('all_in: claude judge binding validates as claude while the wire classifier
   });
 });
 
-test('a successful provider catalog replaces stale presets and saved model guesses', async () => {
+test('a successful provider catalog leads the Claude picker; verified presets follow it, and it replaces Codex guesses', async () => {
   const { __testChoices } = await import('./model-role-options.js');
+  const { CLAUDE_MODEL_PRESETS } = await import('../../config.js');
   _setDiscoveredModelsForTest({
     anthropic: [{ id: 'claude-opus-55', label: 'Provider supplied Claude label' }],
     openai: [{ id: 'gpt-66-sol', label: 'Provider supplied Codex label' }],
   });
   try {
     withEnv({ OPENAI_API_KEY: 'test-only', ANTHROPIC_API_KEY: 'test-only' }, () => {
-      assert.deepEqual(__testChoices().claude, [{ id: 'claude-opus-55', label: 'Provider supplied Claude label' }]);
+      // Live 2026-10-20: the subscription handshake omitted claude-haiku-5-5 and
+      // claude-sonnet-5-5 while one-call probes on the same token were served
+      // both, so the handshake cannot be the whole picker.
+      assert.deepEqual(__testChoices().claude, [
+        { id: 'claude-opus-55', label: 'Provider supplied Claude label' },
+        ...CLAUDE_MODEL_PRESETS,
+      ]);
       assert.deepEqual(__testChoices().codex, [{ id: 'gpt-66-sol', label: 'Provider supplied Codex label' }]);
     });
   } finally {

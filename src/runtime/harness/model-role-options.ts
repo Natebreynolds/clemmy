@@ -185,7 +185,15 @@ function codexBrainModelChoices(): Array<{ id: string; label: string }> {
 function claudeBrainModelChoices(): Array<{ id: string; label: string }> {
   const live = discoveredModels().anthropic;
   if (modelDiscoveryStatus().providers.anthropic.phase === 'ready' && live.length > 0) {
-    return live.map((model) => ({ id: model.id, label: model.label }));
+    // The subscription handshake (Agent SDK supportedModels) is the Claude Code
+    // picker's list, not the set the subscription serves: live 2026-10-20 it
+    // listed Fable 5.1 / Opus 5.5 / Sonnet 5 / Haiku 4.5 while one-call probes
+    // on the same OAuth token were served claude-haiku-5-5 and
+    // claude-sonnet-5-5. Discovered ids lead (their labels win); the verified
+    // presets follow so a served model the handshake omits stays pickable.
+    const models = live.map((model) => ({ id: model.id, label: model.label }));
+    for (const preset of CLAUDE_MODEL_PRESETS) pushUnique(models, preset.id, preset.label);
+    return models;
   }
   const models = [...CLAUDE_MODEL_PRESETS];
   for (const id of [getClaudeBrainModel(), getDebateCheckerModel()]) {
