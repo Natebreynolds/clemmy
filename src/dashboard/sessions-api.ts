@@ -13,7 +13,9 @@
  */
 import { SessionStore } from '../memory/session-store.js';
 import type Database from 'better-sqlite3';
-import { measureProjectionRead, type ProjectionReadObserver } from './projection-read-metrics.js';
+import { performance } from 'node:perf_hooks';
+import pino from 'pino';
+import { measureProjectionRead, type ProjectionReadObserver, type ProjectionReadPhase } from './projection-read-metrics.js';
 import { createWorkflowRunStatusReader, type UnifiedRunCoverage } from './workflow-run-status.js';
 export type { UnifiedRunCoverage } from './workflow-run-status.js';
 import {
@@ -878,9 +880,46 @@ export function listSessionsForAgent(agentId: string, limit = 20): UnifiedRunSum
   return buildUnifiedSessionList({ agent: agentId, limit });
 }
 
+const logger = pino({ name: 'clementine.sessions-api' });
+
+/** A list build this slow holds the daemon long enough to be felt (the
+ * sidebar polls every 10 s; live 2026-10-19 holds ran 1-3 s with no
+ * breakdown). It names its phases, at most once a minute. */
+let slowSessionList = { thresholdMs: 750, minIntervalMs: 60_000, lastAt: 0,
+  sink: (record: Record<string, unknown>) => { logger.warn(record, 'session list build was slow'); } };
+
 export function buildUnifiedSessionList(query: SessionListQuery = {}, diagnostics: { observer?: ProjectionReadObserver } = {}): UnifiedRunSummary[] {
-  return measureProjectionRead(diagnostics.observer, 'catalog_build', () => buildUnifiedSessionListObserved(query, diagnostics.observer),
-    (rows) => rows.length);
+  if (diagnostics.observer) {
+    return measureProjectionRead(diagnostics.observer, 'catalog_build', () => buildUnifiedSessionListObserved(query, diagnostics.observer),
+      (rows) => rows.length);
+  }
+  const phases = new Map<ProjectionReadPhase, { ms: number; calls: number }>();
+  const observe: ProjectionReadObserver = (phase, observation) => {
+    const total = phases.get(phase) ?? { ms: 0, calls: 0 };
+    total.ms += observation.durationMs;
+    total.calls++;
+    phases.set(phase, total);
+  };
+  const started = performance.now();
+  const rows = buildUnifiedSessionListObserved(query, observe);
+  const ms = performance.now() - started;
+  const now = Date.now();
+  if (ms >= slowSessionList.thresholdMs && now - slowSessionList.lastAt >= slowSessionList.minIntervalMs) {
+    slowSessionList.lastAt = now;
+    try {
+      slowSessionList.sink({ ms: Math.round(ms), limit: query.limit ?? null, rows: rows.length,
+        phases: Object.fromEntries([...phases].map(([phase, total]) => [phase, { ms: Math.round(total.ms), calls: total.calls }])) });
+    } catch { /* diagnostics never change the list */ }
+  }
+  return rows;
+}
+
+/** Test seam: force the slow-build report and capture it. */
+export function _setSlowSessionListReportForTests(input: { thresholdMs: number; sink: (record: Record<string, unknown>) => void } | null): void {
+  slowSessionList = input
+    ? { thresholdMs: input.thresholdMs, minIntervalMs: 0, lastAt: 0, sink: input.sink }
+    : { thresholdMs: 750, minIntervalMs: 60_000, lastAt: 0,
+        sink: (record) => { logger.warn(record, 'session list build was slow'); } };
 }
 
 function buildUnifiedSessionListObserved(query: SessionListQuery, observer?: ProjectionReadObserver): UnifiedRunSummary[] {

@@ -985,3 +985,21 @@ test('the display list re-reads only changed rows: an own write, a pin, a delete
   assert.deepEqual(eventlogModule.listSessionRowsForDisplay()!.find((row) => row.id === c.id)!.metadata.tags, ['moved'],
     'another connection\'s metadata write without an update-time bump is seen by its size');
 });
+
+test('a slow session list build names its phases once and returns the same list', async () => {
+  const eventlogModule = await import('../runtime/harness/eventlog.js');
+  const api = await import('./sessions-api.js');
+  eventlogModule.createSession({ id: 'slow-list-a', kind: 'chat', channel: 'desktop', title: 'Slow list fixture' });
+  const quiet = api.buildUnifiedSessionList({ limit: 50 });
+  const reports: Record<string, unknown>[] = [];
+  api._setSlowSessionListReportForTests({ thresholdMs: 0, sink: (record) => { reports.push(record); } });
+  try {
+    const measured = api.buildUnifiedSessionList({ limit: 50 });
+    assert.deepEqual(measured.map((row) => [row.id, row.preview, row.turnCount]), quiet.map((row) => [row.id, row.preview, row.turnCount]),
+      'recording phases never changes the list');
+    assert.equal(reports.length, 1);
+    const phases = reports[0]!.phases as Record<string, { ms: number; calls: number }>;
+    for (const phase of ['catalog_collect', 'catalog_preview']) assert.ok(phases[phase]?.calls >= 1, `${phase} is named`);
+    assert.equal(JSON.stringify(reports[0]).includes('Slow list fixture'), false, 'no chat content is logged');
+  } finally { api._setSlowSessionListReportForTests(null); }
+});
