@@ -1,3 +1,8 @@
+import { approvedComposioPreparationProjection } from './approved-composio-preparation-projection.js';
+import { currentDispatchLease } from './dispatch-lease.js';
+import { ExternalWritePreDispatchError } from './external-write-admission.js';
+import { currentApprovedComposioPreparation } from './approved-connected-call-context.js';
+import { assertCurrentApprovedComposioOwnerInTransaction } from './approved-action-provider-binding-proof.js';
 import { reviewedFileCorrectionForCall, retainReviewedFileCorrection, staleReviewedReadCalls } from './reviewed-file-correction.js';
 import { isAnsweredRefusalStatus } from './attempt-outcome.js';
 /**
@@ -504,6 +509,43 @@ export function assertExpectedWorkLogicalAdmission(input: {
        LIMIT 1
     `).get(input.sessionId, input.sourceUserSeq, ...candidateLogicalIds);
     if (bound) return;
+  }
+  // A verified exact approval may prepare its one inner SDK call. This is
+  // logical admission only: no opaque resolved provider permit exists yet.
+  const approvedSdk = currentApprovedComposioPreparation();
+  if (approvedSdk && approvedSdk.sessionId === input.sessionId && approvedSdk.sourceUserSeq === input.sourceUserSeq) {
+    const context = harnessRunContextStorage.getStore();
+    const capability = context?.pendingActionExecution;
+    const action = capability ? getPendingAction(capability.pendingActionId) : null;
+    const contract = durableLogicalCallContract(authority.accepted_task_id,input.tool,input.args);
+    const projected=action ? approvedComposioPreparationProjection(action.payload) : null;
+    const projectedContract=projected ? durableLogicalCallContract(authority.accepted_task_id,projected.toolSlug,projected.args) : null;
+    const exactPreparation = {
+      preparationSeal:projected?.connectedAccountId===approvedSdk.connectedAccountId && projectedContract?.toolName===approvedSdk.toolName
+        && projectedContract?.argumentDigest===approvedSdk.preparationArgumentDigest,
+      logicalOwner:approvedSdk.logicalToolCallId === input.logicalToolCallId,
+      attemptOwner:context?.runAttemptId === approvedSdk.attemptId,
+      executingClaim:action?.status === 'executing',
+      toolIdentity:contract?.toolName === approvedSdk.toolName,
+      rawContract:contract?.argumentDigest === approvedSdk.rawArgumentDigest
+        || contract?.argumentDigest === approvedSdk.preparationArgumentDigest,
+      claimCapability:Boolean(capability && action && verifyPendingActionResumeExecutionCapability({capability,sessionId:input.sessionId,toolName:action.toolName,payload:action.payload})),
+    };
+    const failedPreparation = Object.entries(exactPreparation).filter(([,valid])=>!valid).map(([name])=>name);
+    if (failedPreparation.length > 0)
+      throw new ExternalWritePreDispatchError(`Exact approved SDK logical preparation does not match its current raw call/claim owner (${failedPreparation.join(',')}).`);
+    try {
+      if (contract?.argumentDigest === approvedSdk.rawArgumentDigest) {
+        assertCurrentApprovedComposioOwnerInTransaction(db,approvedSdk,false);
+      } else {
+        const lease=currentDispatchLease();
+        if (!lease || lease.parentScopeId !== approvedSdk.lease.scopeId || lease.parentLeaseId !== approvedSdk.lease.leaseId)
+          throw new Error('SDK preparation projection has no exact bound child generation.');
+        assertCurrentApprovedComposioOwnerInTransaction(db,{...approvedSdk,lease},true);
+      }
+    }
+    catch (cause) { throw new ExternalWritePreDispatchError(`Exact approved SDK logical preparation refused: ${cause instanceof Error ? cause.message : 'owner evidence unavailable'}`,{cause}); }
+    return;
   }
   // Control-role tools (ask/status/discovery/execution bookkeeping) are exempt
   // REGARDLESS of contract state — the wall exists for BUSINESS dispatch, and

@@ -1,0 +1,23 @@
+{
+  "exactSource": "2d73a173ece57ee559266d70b3c9da5b1eaaf08c",
+  "sourceClean": true,
+  "schema": 96,
+  "sessionId": "sess-mvg06960-779e1374",
+  "sourceUserSeq": 1,
+  "terminalEventId": "78e3bbd0-72ce-4fba-8701-c519027f97e7",
+  "receiptId": "approved-action-receipt:v1:b8e62ce68ffc630ed9aec1325dc7d740eb1269f2afe5aaa7a5c3ebf7698b75b7",
+  "intentId": "approved-action-intent:v1:4c87a6f38d0d1fe50a797751f9b30bc155fc348556c94a72bbc8223a3db73d47",
+  "dbSha256": "4e8ec6f25aa4e6059c2779cb57bf7fdbbfaee418112d59e9ceeb29a66abdbb60",
+  "canonicalBeforeMigration": true,
+  "providerCalls": 0,
+  "modelCalls": 0,
+  "purpose": "Genuine schema96 controlled shell approval completion; migration preservation/canonical reopen fixture, never an installed or provider acceptance claim.",
+  "compressedSha256": "454c4feb6cf10112a05bbfa41f612f3a854bda5d25afb784632c809e713d0791",
+  "producerSha256": "6ca03475b708e12a69d8cd8d16cd74435a8669a69f2ac1a8c1a5c6b78d38381d",
+  "generatorLogSha256": "00a714f5fbbe3f437304a5ecc0d557bc7dd3c8b397909f93e77a5052a78530ef",
+  "intentRowsSha256": "8c49e425375e22adfafbd7e3119469a01ac0fb1dfe03574b6c4e0f854a191e43",
+  "receiptRowsSha256": "45aeaa5a26d64c5392bbc0d0e84cbfe496e43557275914890928c8aaa90851b7",
+  "data": "Only generated offline named fixture data. No real account, credentials, user content, model call or external network request.",
+  "reproduction": "Check out exactSource in a disposable detached worktree, copy producer-source.txt to output/genuine96/producer.test.ts, set CLEM_SCHEMA96_FIXTURE_OUT to an empty controlled directory, then invoke node scripts/run-tests-isolated.mjs --test-concurrency=1 output/genuine96/producer.test.ts. Generated IDs/timestamps differ; canonical semantics must pass. Original producer hash records the exact executed source; the portable copy changes only the explicit output location.",
+  "portableProducerSha256": "3e47bb4addb9b6685a4c72e515eb507f2f1b945ebe713e2ce2ccd3ee87de59cc"
+}

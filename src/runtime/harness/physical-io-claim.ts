@@ -1,3 +1,7 @@
+import { closedCanonicalJson } from '../../shared/closed-canonical-json.js';
+import { withEventPublicationTransaction } from './eventlog.js';
+import { inspectApprovedComposioDispatchPermit, consumeApprovedComposioDispatchPermit, type ApprovedComposioDispatchPermit } from './approved-connected-call-context.js';
+import { assertCurrentApprovedComposioOwnerInTransaction, approvedActionProviderBindingId, approvedActionProviderIoOwner, type ApprovedActionProviderBinding } from './approved-action-provider-binding-proof.js';
 /**
  * Sole owner of provider-I/O ownership on a physical crossing.
  *
@@ -408,4 +412,52 @@ export function claimWorkflowPaginatedPreparationPhysicalIo(
   input: Parameters<typeof claimWorkflowPaginatedIo>[0],
 ): PhysicalIoClaimResult {
   return claimWorkflowPaginatedIo(input, 'probe');
+}
+
+export function claimApprovedComposioPhysicalIo(permit: ApprovedComposioDispatchPermit): void {
+  withEventPublicationTransaction(()=>{
+    const state = inspectApprovedComposioDispatchPermit(permit);
+    if (!state) throw new Error('Approved SDK physical permit is not registered.');
+    assertCurrentApprovedComposioOwnerInTransaction(openEventLog(),state,true);
+    const db = openEventLog();
+    const row = db.prepare(`SELECT b.binding_id,b.binding_json,b.binding_event_id,p.*,l.state AS logical_state,
+      l.raw_argument_digest AS logical_raw_digest,l.argument_digest AS logical_effective_digest,
+      l.refinement_event_id AS logical_refinement,e.type AS binding_event_type,e.data_json AS binding_event_data
+      FROM approved_action_provider_bindings_v1 b
+      JOIN physical_dispatches p ON p.session_id=b.session_id AND p.source_user_seq=b.source_user_seq AND p.physical_dispatch_id=b.physical_dispatch_id
+      JOIN logical_tool_calls l ON l.session_id=p.session_id AND l.source_user_seq=p.source_user_seq AND l.logical_tool_call_id=p.logical_tool_call_id
+      JOIN events e ON e.id=b.binding_event_id AND e.session_id=b.session_id
+      WHERE b.intent_id=? AND b.physical_dispatch_id=?`).get(state.intentId,state.physicalDispatchId) as Record<string,unknown>|undefined;
+    if (!row || row.state !== 'started' || row.io_claimed_at !== null || row.logical_tool_call_id !== state.logicalToolCallId
+      || row.accepted_task_id !== state.acceptedTaskId || row.argument_digest !== state.effectiveArgumentDigest
+      || row.logical_state !== 'open' || row.logical_raw_digest !== state.rawArgumentDigest
+      || row.logical_effective_digest !== state.effectiveArgumentDigest || (row.logical_refinement ?? null) !== state.refinementEventId
+      || row.provider_argument_digest !== state.providerArgumentDigest || row.lease_scope_id !== state.lease.scopeId
+      || row.lease_id !== state.lease.leaseId || row.ordinal !== 1 || row.relation !== 'primary' || row.retry_of !== null
+      || (db.prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id=? AND source_user_seq=?').get(state.sessionId,state.sourceUserSeq) as {n:number}).n !== 1)
+      throw new Error('Approved SDK I/O reservation is absent, changed or already claimed.');
+    const binding = JSON.parse(String(row.binding_json)) as ApprovedActionProviderBinding;
+    const mirror=JSON.parse(String(row.binding_event_data)) as Record<string,unknown>;
+    if (row.binding_event_type!=='approved_action_provider_bound' || mirror.sourceUserSeq!==state.sourceUserSeq
+      || mirror.bindingId!==row.binding_id || closedCanonicalJson(mirror.binding)!==closedCanonicalJson(binding))
+      throw new Error('Approved SDK binding event mirror changed before I/O.');
+    if (row.binding_id !== approvedActionProviderBindingId(binding) || binding.intentId !== state.intentId
+      || binding.providerArgumentDigest !== state.providerArgumentDigest || binding.physicalDispatchId !== state.physicalDispatchId
+      || binding.sessionId !== state.sessionId || binding.sourceUserSeq !== state.sourceUserSeq
+      || binding.acceptedTaskId !== state.acceptedTaskId || binding.logicalToolCallId !== state.logicalToolCallId
+      || binding.attemptId !== state.attemptId || binding.toolName !== state.toolName
+      || binding.rawArgumentDigest !== state.rawArgumentDigest || binding.effectiveArgumentDigest !== state.effectiveArgumentDigest
+      || binding.refinementEventId !== state.refinementEventId || binding.providerOperationId !== state.providerOperationId
+      || binding.providerOperationVersion !== state.providerOperationVersion || binding.providerInputSchemaDigest !== state.providerInputSchemaDigest
+      || binding.schemaFingerprint !== state.schemaFingerprint || binding.connectedAccountId !== state.connectedAccountId
+      || binding.accountIdentityDigest !== state.accountIdentityDigest || binding.providerOwnerIdentityDigest !== state.providerOwnerIdentityDigest
+      || binding.invokePortId !== state.invokePortId || binding.effect !== state.effect
+      || binding.leaseScopeId !== state.lease.scopeId || binding.leaseId !== state.lease.leaseId)
+      throw new Error('Approved SDK immutable binding no longer reopens.');
+    const changed = db.prepare(`UPDATE physical_dispatches SET io_claimed_at=?,io_owner=?,io_fence=1,io_revision=1
+      WHERE session_id=? AND source_user_seq=? AND physical_dispatch_id=? AND state='started' AND io_claimed_at IS NULL`)
+      .run(new Date().toISOString(),approvedActionProviderIoOwner(String(row.binding_id)),state.sessionId,state.sourceUserSeq,state.physicalDispatchId);
+    if (changed.changes!==1) throw new Error('Approved SDK I/O claim CAS lost.');
+    consumeApprovedComposioDispatchPermit(permit);
+  });
 }

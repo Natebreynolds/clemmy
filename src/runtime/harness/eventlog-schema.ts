@@ -1,4 +1,5 @@
 import { installApprovedActionCompletionSchema } from './approved-action-completion-schema.js';
+import { installApprovedActionProviderBindingSchema } from './approved-action-provider-binding-schema.js';
 import { DISCOVERY_REQUEST_CALLS_SCHEMA_V1 } from './discovery-request-identity.js';
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
@@ -11582,6 +11583,10 @@ const MIGRATIONS: EventLogMigration[] = [
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     installApprovedActionCompletionSchema(db);
   } },
+  { version: 97, sql: '', backfill: (db) => {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
+    installApprovedActionProviderBindingSchema(db);
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
@@ -11677,6 +11682,8 @@ export const STRICT_TAIL_TABLES: readonly string[] = Object.freeze([
   'host_model_result_receipts',
   // v69
   'logical_model_result_projection_receipts',
+  // v97 depends on the v96 intent and must be removed first.
+  'approved_action_provider_bindings_v1',
   // v96
   'approved_action_completion_receipts_v1',
   'approved_action_completion_intents_v1',

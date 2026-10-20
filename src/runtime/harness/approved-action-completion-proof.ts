@@ -1,3 +1,4 @@
+import { proveApprovedActionProviderBindingInTransaction } from './approved-action-provider-binding-proof.js';
 import { settlementSemanticDigest } from './settlement-semantic-digest.js';
 import type { CommitLogicalCallSettlementInput, LogicalCallExecutionKind } from './logical-call-settlement-store.js';
 /** Exact-call completion, never proof of the original business objective.
@@ -16,6 +17,7 @@ export const approvedActionProofDigest = (value: unknown): string => createHash(
 export interface ApprovedActionCompletionIntent {
   version: 1;
   scope: 'exact_approved_call';
+  providerDispatchProtocol?: 'approved_composio_sdk_v1';
   sessionId: string;
   sourceUserSeq: number;
   sourceEventId: string;
@@ -58,6 +60,8 @@ export interface ApprovedActionCompletionReceipt {
   resultHandleId: string;
   rawPayloadSha256: string;
   rawByteCount: number;
+  providerBindingId?: string;
+  providerBindingDigest?: string;
 }
 type Row = Record<string, unknown>;
 export const approvedActionIntentId = (intent: ApprovedActionCompletionIntent): string => `approved-action-intent:v1:${approvedActionProofDigest(intent)}`;
@@ -99,6 +103,7 @@ export function proveApprovedActionCompletionInTransaction(
   const intentId = approvedActionIntentId(intent);
   requireProof(row!.intent_id === intentId && intent.sessionId === input.sessionId && intent.sourceUserSeq === input.sourceUserSeq
     && intent.version === 1 && intent.scope === 'exact_approved_call'
+    && (intent.providerDispatchProtocol === undefined || intent.providerDispatchProtocol === 'approved_composio_sdk_v1')
     && intent.acceptedTaskId === `task:${input.sessionId}#${input.sourceUserSeq}`
     && intent.logicalToolCallId === `approved-action:${intent.pendingActionId}:${intent.sourceUserSeq}:${intent.claimHash}`
     && /^[a-f0-9]{64}$/.test(intent.claimHash), 'intent identity is not exact');
@@ -260,7 +265,10 @@ export function proveApprovedActionCompletionInTransaction(
     rawPayloadJson: raw!.raw_payload_json as string | null, rawPayloadSha256: raw!.raw_payload_sha256 as string | null,
     rawByteCount: Number(raw!.raw_byte_count), rejectionReason: raw!.rejection_reason as string | null });
   requireProof(payload.status === 'ok', 'retained result bytes are not intact');
+  const providerBinding = intent.providerDispatchProtocol === 'approved_composio_sdk_v1'
+    ? proveApprovedActionProviderBindingInTransaction(db, intent, intentId) : null;
   return { intent, intentId, receipt: { version: 1, scope: 'exact_approved_call', intentId, sessionId: input.sessionId,
+    ...(providerBinding ? { providerBindingId: providerBinding.providerBindingId, providerBindingDigest: providerBinding.providerBindingDigest } : {}),
     sourceUserSeq: input.sourceUserSeq, acceptedTaskId: intent.acceptedTaskId, logicalToolCallId: intent.logicalToolCallId,
     admittedArgumentDigest:intent.argumentDigest,executedArgumentDigest:executedDigest,
     refinementEventId:refinement ? String(refinement.id) : null,

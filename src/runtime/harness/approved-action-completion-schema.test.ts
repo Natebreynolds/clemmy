@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import {applyHarnessMigrations,applyHarnessMigrationsThroughVersionForTests} from './eventlog-schema.js';
+import {applyHarnessMigrationsThroughVersionForTests} from './eventlog-schema.js';
 
 test('v95 to v96 preserves historical rows and memory schema while adding empty exact-call proof',()=>{
   const db=new Database(':memory:');
@@ -12,7 +12,7 @@ test('v95 to v96 preserves historical rows and memory schema while adding empty 
     const rows=['sessions','events','run_attempts','accepted_task_authority','durable_memory_intake_receipts'].map(t=>db.prepare(`SELECT * FROM ${t}`).all());
     const memory=db.prepare("SELECT sql FROM sqlite_master WHERE name='durable_memory_intake_receipts'").get();
     const oldTriggers=db.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('trg_accepted_task_host_completion_monotonic','trg_accepted_task_host_terminal_exact')").all() as Array<{name:string;sql:string}>;
-    applyHarnessMigrations(db);
+    applyHarnessMigrationsThroughVersionForTests(db,96);
     assert.deepEqual(['sessions','events','run_attempts','accepted_task_authority','durable_memory_intake_receipts'].map(t=>db.prepare(`SELECT * FROM ${t}`).all()),rows);
     assert.deepEqual(db.prepare("SELECT sql FROM sqlite_master WHERE name='durable_memory_intake_receipts'").get(),memory);
     for(const trigger of oldTriggers) {
@@ -32,7 +32,7 @@ test('v96 refuses preexisting unsanctioned proof without stamping version or alt
     applyHarnessMigrationsThroughVersionForTests(db,95);
     db.exec('CREATE TABLE approved_action_completion_receipts_v1(untrusted TEXT)');
     const before=db.serialize();
-    assert.throws(()=>applyHarnessMigrations(db),/refuses preexisting unsanctioned/);
+    assert.throws(()=>applyHarnessMigrationsThroughVersionForTests(db,96),/refuses preexisting unsanctioned/);
     assert.deepEqual(db.serialize(),before);
     assert.equal((db.prepare('SELECT max(version) v FROM schema_version').get() as {v:number}).v,95);
   } finally {db.close();}

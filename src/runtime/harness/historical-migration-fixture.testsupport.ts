@@ -104,11 +104,14 @@ export function removeV65StructuresFromHistoricalMigrationFixture(db: Database.D
  * Never drop a populated proof or rewrite a live/historical user database. */
 export function restorePre96ApprovedActionFixture(db: Database.Database): void {
   if (process.env.CLEMMY_TEST_ISOLATED_HOME !== '1') throw new Error('pre-v96 fixture requires isolated test contract');
-  const tables=['approved_action_completion_receipts_v1','approved_action_completion_intents_v1'];
+  const tables=['approved_action_provider_bindings_v1','approved_action_completion_receipts_v1','approved_action_completion_intents_v1'];
   if(!tables.some(table=>db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)))return;
   for(const table of tables) {
     if(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)
       && Number((db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n)!==0) throw new Error('pre-v96 fixture refuses populated approved-action proof');
+  }
+  for(const name of ['approved_action_provider_intent_protocol_v97','approved_action_provider_receipt_exact_v97']) {
+    db.exec(`DROP TRIGGER IF EXISTS ${name}`);
   }
   const old=new Database(':memory:');
   try {

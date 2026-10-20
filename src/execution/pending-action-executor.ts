@@ -1,3 +1,5 @@
+import { prepareApprovedComposioCall } from '../runtime/harness/approved-connected-call.js';
+import { withApprovedComposioPreparation } from '../runtime/harness/approved-connected-call-context.js';
 import { prepareApprovedActionCompletionIntent } from '../runtime/harness/approved-action-completion-receipt.js';
 /**
  * Approved-pending-action executor (P0c). A pending-approval card minted for a
@@ -140,7 +142,11 @@ async function dispatchApprovedCall(
       dispatchLease: lease,
       counter: parent?.counter ?? new ToolCallsCounter(1),
       pendingActionExecution: capability,
-    }, () => invokeHostToolCall({
+    }, () => {
+      let preparation: ReturnType<typeof prepareApprovedComposioCall>;
+      try { preparation = prepareApprovedComposioCall({ sessionId, sourceUserSeq:capability.sourceUserSeq, lease }); }
+      catch (cause) { throw new PendingActionPreDispatchError(`Exact approved SDK preparation refused: ${cause instanceof Error ? cause.message : 'owner evidence unavailable'}`,cause); }
+      const invoke = () => invokeHostToolCall({
       identity: { sessionId, sourceUserSeq: capability.sourceUserSeq, modelCallId: logicalToolCallId,
         toolName: record.toolName, args: record.payload, ...(parent?.turn ? { turn: parent.turn } : {}) },
       parentLease: lease,
@@ -157,7 +163,9 @@ async function dispatchApprovedCall(
       pendingActionExecution: capability,
       invoke: () => dispatch(record.toolName, record.payload, sessionId,
         { batchId: record.id, payloadHash: record.payloadHash }, capability),
-    }));
+    });
+      return preparation ? withApprovedComposioPreparation(preparation, invoke) : invoke();
+    });
     return { value: invoked.value, outcome: invoked.settlement.outcome };
   } finally {
     if (ownLease) await revokeDispatchLeaseBeforeRecovery(lease);

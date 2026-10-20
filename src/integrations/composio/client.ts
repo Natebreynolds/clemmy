@@ -1,3 +1,5 @@
+import { inspectApprovedComposioDispatchPermit, type ApprovedComposioDispatchPermit } from '../../runtime/harness/approved-connected-call-context.js';
+import { normalizeProcedureAccountIdentity } from '../../runtime/read-path/procedure-scope.js';
 import {
   existsSync,
   mkdirSync,
@@ -3269,6 +3271,8 @@ export interface PreparedComposioPresignOneShot {
 
 interface PreparedComposioOneShotState {
   lane: 'sdk';
+  approvedPermit?: ApprovedComposioDispatchPermit;
+  credentialIdentity?: string;
   toolSlug: string;
   args: Record<string, unknown>;
   /** The exact input schema the caller validated, when it has one; its
@@ -3359,6 +3363,38 @@ export function inspectPreparedComposioOneShotDispatch(
     connectedAccountId: state.connectedAccountId ?? null,
     providerOperationVersion: state.providerOperationVersion ?? null,
   });
+}
+
+/** Digest-only identities from the actual private SDK token. Neither the
+ * owning provider user id nor account text is added to protocol events. */
+export function inspectPreparedComposioApprovedIdentity(prepared: PreparedComposioOneShotDispatch): {
+  providerOwnerIdentityDigest:string; accountIdentityDigest:string;
+} | null {
+  const state = preparedComposioOneShots.get(prepared as object);
+  const snapshot = peekCurrentConnectedToolkits();
+  const row = snapshot?.find(value=>value.connectionId===state?.connectedAccountId);
+  if (!state || !row || !/^(ACTIVE|ENABLED|INITIATED)$/i.test(row.status)
+    || filterSuppressedConnectedToolkits([row],readComposioConnectionSuppressionState()).length !== 1
+    || (row.ownerUserId ?? cachedConnectionOwner(row.connectionId))?.trim() !== state.userId) return null;
+  let identity:string;
+  try { identity=normalizeProcedureAccountIdentity(row.accountEmail ?? cachedIdentityEmail(row.connectionId)); } catch { return null; }
+  if (!identity) return null;
+  return { providerOwnerIdentityDigest:preparedProviderArgumentDigest({owner:state.userId}),
+    accountIdentityDigest:preparedProviderArgumentDigest({identity}) };
+}
+export function bindPreparedComposioApprovedPermit(prepared: PreparedComposioOneShotDispatch, permit: ApprovedComposioDispatchPermit): void {
+  const state=preparedComposioOneShots.get(prepared as object);
+  const bound=inspectApprovedComposioDispatchPermit(permit);
+  const actual=inspectPreparedComposioOneShotDispatch(prepared);
+  const identity=inspectPreparedComposioApprovedIdentity(prepared);
+  if (!state || state.approvedPermit || !bound || !actual || !identity || actual.toolSlug!==bound.providerOperationId
+    || actual.connectedAccountId!==bound.connectedAccountId || actual.providerOperationVersion!==bound.providerOperationVersion
+    || actual.providerArgumentDigest!==bound.providerArgumentDigest
+    || identity.accountIdentityDigest!==bound.accountIdentityDigest || identity.providerOwnerIdentityDigest!==bound.providerOwnerIdentityDigest
+    || state.credentialIdentity!==preparedProviderArgumentDigest({key:readComposioEnv('COMPOSIO_API_KEY'),backend:getComposioExecutionBackend()})
+    || composioFileInputs(state.inputSchema ?? composioOperationInputSchema(state.toolSlug),state.args).length !== 0)
+    throw new ComposioPreDispatchError('preparation-required','Exact approved SDK token/account/arguments cannot be bound.');
+  state.approvedPermit=permit;
 }
 
 /** Copy-safe identity; filename and content digests remain behind the token. */
@@ -3474,6 +3510,7 @@ export function prepareComposioOneShotDispatch(input: {
   }
   const state: PreparedComposioOneShotState = {
     lane: 'sdk',
+    credentialIdentity:preparedProviderArgumentDigest({key:readComposioEnv('COMPOSIO_API_KEY'),backend:getComposioExecutionBackend()}),
     toolSlug,
     args,
     ...(input.schema !== undefined ? { inputSchema: input.schema } : {}),
@@ -3709,12 +3746,49 @@ export async function executePreparedComposioTool(
   }
   // One-shot ownership: consume before entering the terminal body so neither a
   // returned failure nor a throw can reuse the same preparation.
-  preparedComposioOneShots.delete(prepared);
+  if (!state.approvedPermit) preparedComposioOneShots.delete(prepared);
   const execute = state.rawClient?.tools?.execute;
   if (!execute || !state.providerOperationVersion) {
     throw new ComposioPreDispatchError('preparation-required', 'Prepared Composio SDK transport was lost.');
   }
+  // The exact approved bridge supports no upload/modifier subcalls. Keep the
+  // ordinary SDK file path unchanged; an approved write fails before any upload.
+  if (state.approvedPermit && composioFileInputs(state.inputSchema ?? composioOperationInputSchema(state.toolSlug),state.args).length !== 0) {
+    preparedComposioOneShots.delete(prepared);
+    throw new ComposioPreDispatchError('preparation-required','Approved SDK file preparation needs a separately owned protocol.');
+  }
   const requestArgs = await composioArgumentsWithUploadedFiles(state);
+  if (state.approvedPermit) {
+    const permit=state.approvedPermit;
+    const bound=inspectApprovedComposioDispatchPermit(permit);
+    // All module loading/async work finishes before current observations and
+    // the final synchronous claim. No await separates that claim from execute.
+    const schemaCache=await import('../../tools/composio-schema-cache.js');
+    const {digestSchema}=await import('../../tools/tool-contract-store.js');
+    const {claimApprovedComposioIo}=await import('../../runtime/harness/approved-connected-call.js');
+    const {classifyRuntimeToolEffect}=await import('../../runtime/harness/tool-effect.js');
+    const {checkHostToolInvocationProviderCrossing}=await import('../../runtime/harness/tool-invocation-observation-context.js');
+    if (bound) checkHostToolInvocationProviderCrossing({sessionId:bound.sessionId,sourceUserSeq:bound.sourceUserSeq,
+      acceptedTaskId:bound.acceptedTaskId,logicalToolCallId:bound.logicalToolCallId,toolName:state.toolSlug,args:requestArgs,lease:bound.lease});
+    const actual=inspectPreparedComposioOneShotDispatch(prepared);
+    const identity=inspectPreparedComposioApprovedIdentity(prepared);
+    const schema=schemaCache.getCachedToolSchema(state.toolSlug);
+    if (!bound || !actual || !identity || composioExecutionUsesCliOnlyLane(getComposioCredentialStatus())
+      || state.credentialIdentity!==preparedProviderArgumentDigest({key:readComposioEnv('COMPOSIO_API_KEY'),backend:getComposioExecutionBackend()})
+      || identity.accountIdentityDigest!==bound.accountIdentityDigest || identity.providerOwnerIdentityDigest!==bound.providerOwnerIdentityDigest
+      || actual.providerArgumentDigest!==bound.providerArgumentDigest || preparedProviderArgumentDigest(requestArgs)!==bound.providerArgumentDigest
+      || actual.connectedAccountId!==bound.connectedAccountId || actual.providerOperationVersion!==bound.providerOperationVersion
+      || schemaCache.liveComposioSchemaFingerprint(state.toolSlug)!==bound.schemaFingerprint
+      || schemaCache.liveComposioOperationVersion(state.toolSlug)!==bound.providerOperationVersion
+      || !schema || digestSchema(schema)!==bound.providerInputSchemaDigest
+      || classifyRuntimeToolEffect('composio_execute_tool',{tool_slug:state.toolSlug,arguments:requestArgs,connected_account_id:state.connectedAccountId}).effect!==bound.effect) {
+      preparedComposioOneShots.delete(prepared);
+      throw new ComposioPreDispatchError('preparation-required','Approved SDK current account/backend/schema/version changed before I/O.');
+    }
+    preparedComposioRequestOptions();
+    claimApprovedComposioIo(permit);
+    preparedComposioOneShots.delete(prepared);
+  }
   const body: Record<string, unknown> = {
     arguments: requestArgs,
     user_id: state.userId,

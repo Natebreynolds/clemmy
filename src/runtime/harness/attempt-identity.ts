@@ -1,3 +1,4 @@
+import { currentApprovedComposioPreparation, inspectApprovedComposioDispatchPermit, type ApprovedComposioDispatchPermit } from './approved-connected-call-context.js';
 /**
  * Three identities, not two.
  *
@@ -83,6 +84,7 @@ export interface PhysicalDispatchInput {
    * adapter must perform a durable local reservation after source admission but
    * before the physical provider-start row is inserted. */
   sourceAdmissionProof?: PhysicalDispatchSourceAdmissionProof;
+  approvedComposioPermit?: ApprovedComposioDispatchPermit;
 }
 
 /** Public only as an opaque hand-off type. Object shape is not authority; the
@@ -403,6 +405,29 @@ export function withLogicalToolCall<T>(
   // this way six times a day (platform-49, 2026-08-11: a local orchestrator
   // tool whose inner provider action wore its caller's identity).
   const ownContract = durableLogicalCallContract(acceptedTaskId, input.tool, input.args);
+  // The actual SDK parser has already applied its closed carrier normalizer
+  // before this inner reentry. Only this registered exact approval may prepare
+  // that projection under the PRIVATE inherited call frame. No new logical
+  // row or physical permission is minted, and the original raw frame remains
+  // intact until the real provider-final resolver records its one refinement.
+  const approvedPreparation = currentApprovedComposioPreparation();
+  const preparationLease = currentDispatchLease();
+  if (approvedPreparation && inherited && ownContract
+    && inherited.acceptedTaskId === acceptedTaskId && inherited.acceptedTaskId === approvedPreparation.acceptedTaskId
+    && inherited.logicalToolCallId === approvedPreparation.logicalToolCallId
+    && inherited.toolName === approvedPreparation.toolName && inherited.argumentDigest === approvedPreparation.rawArgumentDigest
+    && (requested === undefined || requested === inherited.logicalToolCallId)
+    && ownContract.toolName === approvedPreparation.toolName
+    && ownContract.argumentDigest === approvedPreparation.preparationArgumentDigest
+    && preparationLease?.sessionId === input.sessionId && preparationLease.runAttemptId === approvedPreparation.attemptId
+    && preparationLease.sourceUserSeq === input.sourceUserSeq && preparationLease.acceptedTaskId === inherited.acceptedTaskId
+    && preparationLease.logicalToolCallId === inherited.logicalToolCallId
+    && preparationLease.parentScopeId === approvedPreparation.lease.scopeId
+    && preparationLease.parentLeaseId === approvedPreparation.lease.leaseId) {
+    assertExpectedWorkLogicalAdmission({sessionId:input.sessionId,sourceUserSeq:input.sourceUserSeq,
+      logicalToolCallId:inherited.logicalToolCallId,tool:input.tool,args:input.args,trustedEffectCarrier:input.trustedEffectCarrier});
+    return work({acceptedTaskId:inherited.acceptedTaskId,logicalToolCallId:inherited.logicalToolCallId});
+  }
   const sameWorkAsInherited = inherited !== undefined
     && ownContract !== null
     && inherited.toolName === ownContract.toolName
@@ -549,7 +574,7 @@ async function withPhysicalDispatchMode<T>(
   const proposed: PhysicalDispatchIdentity = {
     acceptedTaskId,
     logicalToolCallId: owned?.logicalToolCallId ?? `call:${randomUUID()}`,
-    physicalDispatchId: `dispatch:${randomUUID()}`,
+    physicalDispatchId: inspectApprovedComposioDispatchPermit(input.approvedComposioPermit)?.physicalDispatchId ?? `dispatch:${randomUUID()}`,
     ordinal: owned?.crossings ?? 1,
     ...(input.retryOf ? { retryOf: input.retryOf } : {}),
   };
@@ -569,6 +594,7 @@ async function withPhysicalDispatchMode<T>(
     turn: input.turn,
     ...(!preparation && input.relation ? { relation: input.relation } : {}),
     trustedEffectCarrier: input.trustedEffectCarrier,
+    approvedComposioPermit: input.approvedComposioPermit,
   });
   if (admission.status !== 'inserted') {
     throw new PhysicalDispatchPreDispatchError(

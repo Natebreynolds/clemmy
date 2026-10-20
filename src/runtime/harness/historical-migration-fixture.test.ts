@@ -66,3 +66,26 @@ test('historical fixture requires isolation and refuses an unknown empty receipt
     db.close();
   }
 });
+
+test('pre-v96 rehearsal also sheds the empty v97 dependency and protocol guards', () => {
+  const db=new Database(':memory:');
+  try {
+    db.pragma('foreign_keys=ON');applyHarnessMigrations(db);
+    restorePre96ApprovedActionFixture(db);
+    assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE name='approved_action_provider_bindings_v1'").get(),undefined);
+    assert.deepEqual(db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'approved_action_provider_%'").all(),[]);
+    db.exec('DELETE FROM schema_version WHERE version>=96');applyHarnessMigrations(db);
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name='approved_action_provider_bindings_v1'").get());
+    assert.deepEqual(db.pragma('foreign_key_check'),[]);
+  } finally {db.close();}
+});
+
+test('pre-v96 rehearsal refuses even an otherwise empty fixture with a populated v97 binding', () => {
+  const db=new Database(':memory:');
+  try {
+    db.exec("CREATE TABLE approved_action_provider_bindings_v1(binding_id TEXT); INSERT INTO approved_action_provider_bindings_v1 VALUES('retained');");
+    const before=db.serialize();
+    assert.throws(()=>restorePre96ApprovedActionFixture(db),/populated approved-action proof/);
+    assert.deepEqual(db.serialize(),before);
+  } finally {db.close();}
+});

@@ -36,8 +36,13 @@ export function prepareApprovedActionCompletionIntent(input: {
     || authority.status !== 'ok' || authority.authority.state !== 'armed' || authority.authority.workContractId
     || !attempt || attempt.status !== 'active' || !contract
     || isKillRequested(input.sessionId, { attemptId: attempt.attemptId, sourceUserSeq: source.seq })) throw new Error('exact pre-dispatch decision authority changed');
+  const payload = action.payload as Record<string, unknown> | null;
+  const sdkProtocol = (input.effect === 'external_write' || input.effect === 'admin')
+    && action.toolName === 'composio_execute_tool' && action.executionAuthority === null
+    && typeof payload?.connected_account_id === 'string' && payload.connected_account_id.trim().length > 0;
   const intent: ApprovedActionCompletionIntent = {
-    version: 1, scope: 'exact_approved_call', sessionId: input.sessionId, sourceUserSeq: source.seq,
+    version: 1, scope: 'exact_approved_call',
+    ...(sdkProtocol ? { providerDispatchProtocol: 'approved_composio_sdk_v1' as const } : {}), sessionId: input.sessionId, sourceUserSeq: source.seq,
     sourceEventId: source.id, turn: source.turn, acceptedTaskId: authority.authority.acceptedTaskId,
     graphEventId: authority.authority.graphEventId, graphId: authority.authority.graphId, graphHash: authority.authority.graphHash,
     originalSourceUserSeq: action.sourceUserSeq, approvalId: action.approvalId, pendingActionId: action.id,

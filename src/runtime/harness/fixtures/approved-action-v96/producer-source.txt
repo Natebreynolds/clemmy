@@ -1,0 +1,47 @@
+/** Generate a genuine canonical schema96 receipt using exact committed old source.
+ * Only canonical disposable runner may invoke. No provider/model/livehome. */
+import assert from 'node:assert/strict';
+import {test} from 'node:test';
+import {writeFileSync,mkdirSync} from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME,'1');
+assert.equal(process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS,'1');
+const home=process.env.CLEMENTINE_HOME!;
+assert.ok(home && !home.includes('/Users/nathan.reynolds/.clementine-next'));
+process.env.COMPOSIO_BACKEND='sdk';
+const out=process.env.CLEM_SCHEMA96_FIXTURE_OUT;
+assert.ok(out && path.isAbsolute(out), 'Explicit controlled output directory required.');
+const ev=await import('../../src/runtime/harness/eventlog.js');
+const actions=await import('../../src/runtime/harness/pending-actions.js');
+const registry=await import('../../src/runtime/harness/approval-registry.js');
+const resume=await import('../../src/runtime/harness/chat-approval-resume.js');
+const {pendingActionApprovalView}=await import('../../src/runtime/harness/pending-action-view.js');
+const {loadAcceptedTaskAuthority}=await import('../../src/runtime/harness/accepted-task-authority.js');
+const proof=await import('../../src/runtime/harness/approved-action-completion-proof.js');
+const {readPendingActionPublicResult}=await import('../../src/runtime/harness/pending-action-result-reader.js');
+const sha=(v:string|Buffer)=>createHash('sha256').update(v).digest('hex');
+test('exact schema96 source generates a canonical actual local approved-call receipt for migration reopen',async()=>{
+ const db=ev.openEventLog();assert.equal(db.prepare('SELECT max(version) v FROM schema_version').get()?.v,96);
+ const session=ev.createSession({kind:'chat',title:'Controlled historical96 migration fixture'});
+ const action=actions.queuePendingAction({title:'Controlled migration proof',summary:'Only local configuration output; no network or provider.',kind:'shell_command',toolName:'run_shell_command',payload:{command:"ssh -G -F /dev/null localhost | grep -m1 '^hostname '",cwd:home,timeout_ms:20000},sessionId:session.id});
+ const card=registry.register({sessionId:session.id,subject:action.title,tool:'request_approval',args:{pendingActionId:action.id,pendingAction:pendingActionApprovalView(action)}});
+ const row=registry.resolve(card.approvalId,'approved','desktop-chat-card').row!;
+ await resume.handleResolvedApprovalForChatResume(row,async()=>assert.fail('No model callback'));
+ const done=actions.getPendingAction(action.id)!;assert.equal(done.status,'executed',done.resultSummary??'');assert.match(done.resultSummary??'',/hostname localhost/);
+ const source=ev.listEvents(session.id,{types:['user_input_received']}).find(e=>e.data.approvalId===card.approvalId)!;assert.ok(source);
+ const loaded=loadAcceptedTaskAuthority(session.id,source.seq);assert.equal(loaded.status,'ok');if(loaded.status!=='ok')return;
+ assert.equal(loaded.authority.state,'terminal');assert.ok(loaded.authority.terminalEventId);
+ const terminal=ev.readValidatedTerminalEvent(loaded.authority.terminalEventId!,session.id,source.seq);
+ assert.equal((terminal.data.turnOutcome as {status:string}).status,'done');
+ const proven=proof.proveApprovedActionCompletionInTransaction(db,{sessionId:session.id,sourceUserSeq:source.seq});
+ assert.equal(readPendingActionPublicResult(done)?.source,'terminal');
+ const intents=db.prepare('SELECT * FROM approved_action_completion_intents_v1 ORDER BY intent_id').all();
+ const receipts=db.prepare('SELECT * FROM approved_action_completion_receipts_v1 ORDER BY receipt_id').all();
+ assert.equal(intents.length,1);assert.equal(receipts.length,1);
+ const memorySchema=db.prepare("SELECT type,name,sql FROM sqlite_master WHERE tbl_name='durable_memory_intake_receipts' ORDER BY type,name").all();
+ const bytes=db.serialize();writeFileSync(path.join(out,'actual-schema96.db'),bytes,{flag:'wx'});
+ const receipt={version:1,kind:'genuine-schema96-canonical-approved-call-fixture',source:'2d73a173e',schema:96,sourceUnmodified:true,installedAcceptance:false,sessionId:session.id,sourceUserSeq:source.seq,terminalEventId:terminal.id,receiptId:loaded.authority.hostCompletionReceiptId,intentId:proven.intentId,dbFile:'actual-schema96.db',dbSha256:sha(bytes),intentRows:intents,receiptRows:receipts,memorySchema,physicalRows:db.prepare('SELECT state,io_claimed_at FROM physical_dispatches WHERE session_id=? AND source_user_seq=?').all(session.id,source.seq),canonicalBeforeMigration:true,providerCalls:0,modelCalls:0,liveHomeSentinel:'NOT PERFORMED: active installed daemon owns live home; canonical disposable runner isolation used'};
+ writeFileSync(path.join(out,'fixture.json'),JSON.stringify(receipt,null,2)+'\n',{flag:'wx'});
+ ev.closeEventLog();
+});

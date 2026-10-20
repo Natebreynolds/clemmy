@@ -21,7 +21,7 @@ import { test } from 'node:test';
 
 const { STRICT_TAIL_TABLES } = await import('./eventlog-schema.js');
 
-const sources = ['./eventlog-schema.ts', './approved-action-completion-schema.ts'].map((name) => ({
+const sources = ['./eventlog-schema.ts', './approved-action-completion-schema.ts', './approved-action-provider-binding-schema.ts'].map((name) => ({
   name,
   text: readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8'),
 }));
@@ -80,7 +80,13 @@ test('the separate v96 schema guard retains both digit-suffixed table names', ()
   ]);
 });
 
-test('the named strict-tail regressions through schema v96 are covered', () => {
+test('the separate v97 guard retains its provider binding table', () => {
+  const source = sources.find((entry) => entry.name === './approved-action-provider-binding-schema.ts');
+  assert.ok(source);
+  assert.deepEqual(guardedTablesIn(source.text), ['approved_action_provider_bindings_v1']);
+});
+
+test('the named strict-tail regressions through schema v97 are covered', () => {
   // Named explicitly so the exact regression that cost 46 tests is pinned by
   // name, not only by the generic rule above. Schema 69 is included because
   // projection receipts also refuse a preexisting lookalike and must be shed
@@ -93,6 +99,7 @@ test('the named strict-tail regressions through schema v96 are covered', () => {
     'logical_model_result_projection_receipts',
     'approved_action_completion_intents_v1',
     'approved_action_completion_receipts_v1',
+    'approved_action_provider_bindings_v1',
   ]) {
     assert.ok(STRICT_TAIL_TABLES.includes(table), `${table} must be shed before a rehearsal replays it`);
   }

@@ -68,7 +68,7 @@ test('the projection boundary still looks like a fail-closed allowlist', () => {
   assert.ok(PROJECTED.has('conversation_completed'), 'Sanity: terminals should be projected.');
   assert.ok(!PROJECTED.has('memory_correction'),
     'memory_correction is now projected — move it from AWAITING_PROJECTION into LIFECYCLE_ROWS.');
-  for (const type of ['approved_action_completion_intent', 'approved_action_completion_receipt']) {
+  for (const type of ['approved_action_completion_intent', 'approved_action_completion_receipt', 'approved_action_provider_bound']) {
     assert.ok(PRIVATE.has(type), `${type} must stay private proof evidence`);
     assert.ok(!PROJECTED.has(type), `${type} cannot enter the chat event stream`);
   }

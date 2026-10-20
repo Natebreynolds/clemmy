@@ -315,12 +315,14 @@ test('canonical read-only SDK provider-ready refinement closes only its exact ap
   assert.equal(current.businessCalls(),1);
 });
 
-test('nested approved write keeps its existing exact-work refusal with no crossing or completion receipt',async()=>{
+test('an override-only approved write without an original owner cannot acquire the SDK bridge or a completion receipt',async()=>{
   const current=await providerReadyB({refine:true,write:true});const db=events.openEventLog();
   assert.equal(current.execution.status,'failed');
-  assert.match(current.adapterFailure??'',/work_binding_required/);
+  assert.match(current.execution.resultSummary,/Exact approved SDK preparation refused: approved SDK binding: original accepted source is not a real earlier owner/);
+  assert.equal(current.adapterFailure,undefined,'the override must not be reached without the original accepted owner');
   assert.equal(current.businessCalls(),0);
   assert.equal(db.prepare('SELECT count(*) n FROM physical_dispatches WHERE session_id=?').get(current.session.id)?.n,0);
+  assert.equal(db.prepare('SELECT count(*) n FROM approved_action_provider_bindings_v1 WHERE session_id=?').get(current.session.id)?.n,0);
   assert.equal(db.prepare('SELECT count(*) n FROM approved_action_completion_receipts_v1 WHERE session_id=?').get(current.session.id)?.n,0);
 });
 

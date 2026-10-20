@@ -89,6 +89,7 @@ export const HARNESS_DB_PATH = path.join(HARNESS_STATE_DIR, 'harness.db');
 export const EVENT_TYPES = [
   'approved_action_completion_intent',
   'approved_action_completion_receipt',
+  'approved_action_provider_bound',
   'session_started',
   'turn_started',
   'turn_ended',

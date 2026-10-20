@@ -1,3 +1,5 @@
+import { assertApprovedComposioPermitCurrent, persistApprovedComposioBindingInTransaction } from './approved-connected-call.js';
+import { type ApprovedComposioDispatchPermit } from './approved-connected-call-context.js';
 /**
  * Durable authority for every real provider crossing.
  *
@@ -11,6 +13,7 @@ import {
   insertInternalEventInTransaction,
   openEventLog,
   publishCommittedInternalEvent,
+  withEventPublicationTransaction,
   type EventRow,
 } from './eventlog.js';
 import {
@@ -1044,6 +1047,7 @@ interface CompatibilityPhysicalDispatchInput {
   relation?: DispatchRelation;
   trustedEffectCarrier?: TrustedRuntimeEffectCarrier;
   executionSite?: 'host';
+  approvedComposioPermit?: ApprovedComposioDispatchPermit;
   /** Exact host-owned generation authorizing this physical admission. When
    * omitted, the ambient generation is used. */
   dispatchLease?: DispatchLeaseRef;
@@ -1184,6 +1188,12 @@ function beginPhysicalDispatchCore(
   if (preparation && (typed || staged)) {
     return { status: 'conflict', reason: 'preparation crossing requires compatibility host authority' };
   }
+  const approvedSdk = input.approvedComposioPermit ? assertApprovedComposioPermitCurrent(input.approvedComposioPermit) : null;
+  if (approvedSdk && (typed || staged || preparation || input.executionSite || input.identity.retryOf
+    || input.identity.sessionId !== approvedSdk.sessionId || input.identity.sourceUserSeq !== approvedSdk.sourceUserSeq
+    || input.identity.acceptedTaskId !== approvedSdk.acceptedTaskId || input.identity.logicalToolCallId !== approvedSdk.logicalToolCallId
+    || input.identity.physicalDispatchId !== approvedSdk.physicalDispatchId))
+    return {status:'conflict',reason:'approved SDK permit does not own this exact primary provider crossing'};
   const expectedState = expectedForAdmission(input.identity.sessionId, input.identity.sourceUserSeq);
   if (expectedState.status !== 'ok') return expectedState;
   const authority = expectedState.authority;
@@ -1251,6 +1261,8 @@ function beginPhysicalDispatchCore(
         })
       : undefined)
     ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
+  if (approvedSdk && admissionEffect !== approvedSdk.effect)
+    return {status:'conflict',reason:'approved SDK current effect differs from the human-approved effect'};
   const dispatchLease = input.dispatchLease ?? currentDispatchLease();
   if (
     dispatchLease
@@ -1354,6 +1366,14 @@ function beginPhysicalDispatchCore(
       const tool = logicalAdmission.identity.toolName;
       const digest = logicalAdmission.identity.argumentDigest;
 
+      if (input.approvedComposioPermit) {
+        const fresh = assertApprovedComposioPermitCurrent(input.approvedComposioPermit);
+        if (fresh.toolName !== tool || fresh.effectiveArgumentDigest !== digest || fresh.effect !== admissionEffect
+          || db.prepare('SELECT 1 FROM physical_dispatches WHERE session_id=? AND source_user_seq=? LIMIT 1')
+            .get(input.identity.sessionId,input.identity.sourceUserSeq))
+          return {status:'conflict',reason:'approved SDK call already crossed or refined contract changed'};
+      }
+
       // v32 action-topology backstop. The action-only carrier is activated on
       // the exact accepted graph before the model runs. Once active, a paid
       // crossing is authorized only by the immutable requirement binding for
@@ -1393,7 +1413,7 @@ function beginPhysicalDispatchCore(
         const dispatchEffect = trustedAdmissionDecision?.effect
           ?? classifyRuntimeToolEffect(input.tool, input.args).effect;
         const gentleRead = dispatchEffect === 'read' || dispatchEffect === 'compute';
-        if (!binding && !gentleRead && !approvedMandateAdmitsCall(
+        if (!binding && !gentleRead && !approvedSdk && !approvedMandateAdmitsCall(
           db,
           input.identity.sessionId,
           input.identity.sourceUserSeq,
@@ -1769,11 +1789,12 @@ function beginPhysicalDispatchCore(
         mirror.id,
         input.executionSite ?? null,
         typed?.authorityDigest ?? null,
-        typed?.providerArgumentDigest ?? staged?.state.providerArgumentDigest ?? null,
+        typed?.providerArgumentDigest ?? staged?.state.providerArgumentDigest ?? approvedSdk?.providerArgumentDigest ?? null,
         staged?.state.authorityDigest ?? null,
         dispatchLease?.scopeId ?? null,
         dispatchLease?.leaseId ?? null,
       );
+      if (input.approvedComposioPermit) persistApprovedComposioBindingInTransaction(input.approvedComposioPermit);
       if (typed) {
         db.prepare(`
           INSERT INTO physical_dispatch_authority
@@ -1813,7 +1834,9 @@ function beginPhysicalDispatchCore(
       }
       return { status: 'inserted', identity: admittedIdentity };
     });
-    const result = transaction.immediate();
+    const result = input.approvedComposioPermit
+      ? withEventPublicationTransaction(() => transaction.immediate())
+      : transaction.immediate();
     if (result.status === 'inserted' && mirror) publishCommittedInternalEvent(mirror);
     return result;
   } catch (error) {

@@ -1,3 +1,4 @@
+import { currentApprovedComposioPreparation, type ApprovedComposioDispatchPermit } from '../runtime/harness/approved-connected-call-context.js';
 import { readHarnessCapabilityHealth, recordHarnessCapabilityHealth } from '../runtime/harness/capability-health.js';
 import { contractFieldLimits } from './schema-contract-lines.js';
 import { hasActiveStructuralProcedureForIdentifier } from '../memory/procedure-receipts.js';
@@ -22,6 +23,9 @@ import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
 import {
   executeComposioTool,
   executePreparedComposioTool,
+  inspectPreparedComposioOneShotDispatch,
+  inspectPreparedComposioApprovedIdentity,
+  bindPreparedComposioApprovedPermit,
   prepareComposioOneShotDispatch,
   composioCliErrorProvesNoDispatch,
   composioExecutionUsesCliOnlyLane,
@@ -132,7 +136,7 @@ import {
   fingerprintSchema,
   saveToolContractExample,
 } from './tool-contract-store.js';
-import { appendEvent, listEvents } from '../runtime/harness/eventlog.js';
+import { appendEvent, listEvents, openEventLog } from '../runtime/harness/eventlog.js';
 import {
   locateBeforeEditRefusal,
   locateResourceArgs,
@@ -2540,6 +2544,34 @@ export async function executePreparedComposioGatewayTool(
   return executePreparedComposioTool(state.clientPrepared);
 }
 
+/** Only the real private gateway token can bind its real SDK child. A plain
+ * resolver object, callback or matching text is never terminal authority. */
+async function approvedComposioPermitForGateway(toolSlug:string, resolved:ComposioGatewayResolved): Promise<ApprovedComposioDispatchPermit|undefined> {
+  const preparation=currentApprovedComposioPreparation();
+  if (!preparation) return undefined;
+  const state=resolved.preparedDispatch ? preparedComposioGatewayOneShots.get(resolved.preparedDispatch as object) : null;
+  const actual=state ? inspectPreparedComposioOneShotDispatch(state.clientPrepared) : null;
+  const identity=state ? inspectPreparedComposioApprovedIdentity(state.clientPrepared) : null;
+  if (!state || state.consumed || !actual || !identity || !resolved.schemaFingerprint || !resolved.providerInputSchemaDigest
+    || !resolved.providerOperationVersion || actual.toolSlug!==toolSlug || actual.connectedAccountId!==preparation.connectedAccountId
+    || resolved.connectionId!==preparation.connectedAccountId || actual.providerOperationVersion!==resolved.providerOperationVersion)
+    throw new ComposioPreDispatchError('preparation-required','Approved SDK exact account/definition/token is not prepared.');
+  const logical=openEventLog().prepare('SELECT argument_digest,refinement_event_id FROM logical_tool_calls WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?')
+    .get(preparation.sessionId,preparation.sourceUserSeq,preparation.logicalToolCallId) as {argument_digest:string;refinement_event_id:string|null}|undefined;
+  if (!logical) throw new ComposioPreDispatchError('preparation-required','Approved SDK exact logical call is not retained.');
+  const {prepareApprovedComposioDispatch}=await import('../runtime/harness/approved-connected-call.js');
+  let permit:ApprovedComposioDispatchPermit|undefined;
+  try { permit=prepareApprovedComposioDispatch({providerOperationId:toolSlug,providerOperationVersion:resolved.providerOperationVersion,
+    providerArgumentDigest:actual.providerArgumentDigest,providerInputSchemaDigest:resolved.providerInputSchemaDigest,
+    schemaFingerprint:resolved.schemaFingerprint,connectedAccountId:preparation.connectedAccountId,
+    ...identity,effectiveArgumentDigest:logical.argument_digest,refinementEventId:logical.refinement_event_id,
+    invokePortId:'composio_sdk_v3_execute'}); }
+  catch (cause) { throw new ComposioPreDispatchError('preparation-required',`Exact approved SDK resolved preparation refused: ${cause instanceof Error ? cause.message : 'owner evidence unavailable'}`,cause); }
+  if (!permit) throw new ComposioPreDispatchError('preparation-required','Approved SDK scope was lost during preparation.');
+  bindPreparedComposioApprovedPermit(state.clientPrepared,permit);
+  return permit;
+}
+
 function reprepareComposioGatewayOneShot(input: {
   prior: PreparedComposioGatewayOneShotDispatch;
   toolSlug: string;
@@ -2876,6 +2908,10 @@ export async function resolveComposioDispatch(
   // `account_alias` meta-arg (never reaches the provider): WITH a pinned
   // connection it is the "remember this one by name" gesture; alone it means
   // "use the account I named" and resolves through the alias store.
+  const approvedSdkPreparation = currentApprovedComposioPreparation();
+  if (approvedSdkPreparation && Object.prototype.hasOwnProperty.call(args,'account_alias')) {
+    return {ok:false,reason:'invalid-args',message:'Approved SDK account aliases need a separately owned setup step; no provider dispatch was started.',toolkit};
+  }
   const aliasArg = typeof (args as Record<string, unknown>).account_alias === 'string'
     ? String((args as Record<string, unknown>).account_alias).trim()
     : undefined;
@@ -3583,7 +3619,7 @@ export async function resolveComposioDispatch(
     || !preparedSchemaIdentity.schemaFingerprint
     || !preparedSchemaIdentity.providerInputSchemaDigest
     || (!cliOnlyLane && !preparedOperationVersion);
-  if (opts.preparedExecution && !preparationInstrument && preparedDefinitionCold()) {
+  if (opts.preparedExecution && !preparationInstrument && preparedDefinitionCold() && !currentApprovedComposioPreparation()) {
     // Only the STRONG exact-slug provider observation discharges the demand:
     // it stamps providerObservedAt and the operation version, so every leg
     // re-derives. ensureToolSchema cannot — its cached return never moves the
@@ -3850,6 +3886,8 @@ export async function dispatchComposioTool(
         effectiveArgs: resolved.args,
       });
     }
+    const approvedComposioPermit = currentApprovedComposioPreparation()
+      ? await approvedComposioPermitForGateway(toolSlug,resolved) : undefined;
     let providerOutcomeSettled = false;
     try {
       const providerBody = (): Promise<unknown> => {
@@ -3871,6 +3909,7 @@ export async function dispatchComposioTool(
               tool: toolSlug,
               args: resolved.args,
               trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, resolved.args),
+              approvedComposioPermit,
               sourceCapability: {
                 capabilityId: `capability:composio:${toolSlug}`,
                 ...(resolved.accountIdentityProof?.identity
@@ -4262,6 +4301,8 @@ async function runComposioExecuteInner(
       effectiveArgs: args,
     });
   }
+  const approvedComposioPermit = currentApprovedComposioPreparation()
+      ? await approvedComposioPermitForGateway(toolSlug,resolved) : undefined;
   const effectiveConnectionId = resolved.connectionId;
   let accountRouteNote = resolved.notes.join('\n');
   const gate = { routeConnectedAccountId: resolved.senderVerified ? resolved.connectionId : undefined };
@@ -4309,7 +4350,7 @@ async function runComposioExecuteInner(
   let lastError: unknown;
   // Reads are safe to retry after ambiguous transport failures. Mutations are
   // not: a timeout/5xx can arrive after the provider committed the change.
-  const maxDispatchAttempts = composioSlugIsReadOnly(toolSlug) ? 3 : 1;
+  const maxDispatchAttempts = currentApprovedComposioPreparation() ? 1 : composioSlugIsReadOnly(toolSlug) ? 3 : 1;
 
   // Retry loop with exponential backoff for transient errors
   let priorDispatchId: string | undefined;
@@ -4344,6 +4385,7 @@ async function runComposioExecuteInner(
           tool: toolSlug,
           args,
           trustedEffectCarrier: trustedComposioPhysicalEffectCarrier(toolSlug, args),
+          approvedComposioPermit,
           sourceCapability: {
             capabilityId: `capability:composio:${toolSlug}`,
             ...(resolved.accountIdentityProof?.identity

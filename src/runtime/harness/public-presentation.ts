@@ -159,6 +159,7 @@ const PRIVATE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'durable_memory_intake_receipt',
   'approved_action_completion_intent',
   'approved_action_completion_receipt',
+  'approved_action_provider_bound',
 ]);
 
 const DECISION_KEYS = new Set(['summary', 'reply', 'done', 'nextaction', 'reason']);
