@@ -1,5 +1,6 @@
 /** Optional, independently owned card wording. Never reopens a turn or executes a tool. */
 import { randomUUID } from 'node:crypto';
+import pino from 'pino';
 import { constants, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
@@ -29,6 +30,7 @@ import {
 } from './approved-action-result-projection-data.js';
 
 export * from './approved-action-result-projection-data.js';
+const logger = pino({ name: 'clementine.approved-action-result-projection' });
 const MAX_BYTES = 65_536;
 const DEADLINE_MS = 20_000;
 type SqlRow = Record<string, unknown>;
@@ -126,23 +128,30 @@ function boundedProofInputs(db: Database.Database, sessionId: string, sourceUser
 
 function readEvidence(db: Database.Database, input: { sessionId: string; sourceUserSeq: number; pendingActionId: string;
   terminalEventId: string; retainedWorkNeedsVerification: boolean }): Evidence | null {
+  // Optional wording that never queues is invisible otherwise (live 2026-10-20:
+  // no job was ever queued); the reason is diagnostics, not a user message.
+  const why = (reason: string): null => {
+    logger.warn({ reason, sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, pendingActionId: input.pendingActionId },
+      'approval result wording is ineligible');
+    return null;
+  };
   try {
     const action = readBoundedAction(input.pendingActionId);
-    if (!action || action.sessionId !== input.sessionId || Number(action.sourceUserSeq) >= input.sourceUserSeq) return null;
+    if (!action || action.sessionId !== input.sessionId || Number(action.sourceUserSeq) >= input.sourceUserSeq) return why('action_mismatch');
     boundedProofInputs(db, input.sessionId, input.sourceUserSeq, action.sourceUserSeq!, action.approvalId!, input.terminalEventId);
     const source = getUserInputEventAtSequence(input.sessionId, input.sourceUserSeq);
     const original = getUserInputEventAtSequence(input.sessionId, action.sourceUserSeq!);
-    if (!source || !original || original.role !== 'user' || original.data.synthetic === true) return null;
+    if (!source || !original || original.role !== 'user' || original.data.synthetic === true) return why('source_or_original_unavailable');
     const authority = db.prepare('SELECT * FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?')
       .get(input.sessionId, input.sourceUserSeq) as SqlRow | undefined;
-    if (!authority || authority.state !== 'terminal' || authority.terminal_event_id !== input.terminalEventId) return null;
+    if (!authority || authority.state !== 'terminal' || authority.terminal_event_id !== input.terminalEventId) return why('authority_not_terminal');
     const terminal = readValidatedTerminalEvent(input.terminalEventId, input.sessionId, input.sourceUserSeq);
     const presentation = presentationEventFromCompletionData(terminal.data);
     if (presentation?.status !== 'done' || presentation.identity.sessionId !== source.sessionId
-      || presentation.identity.sourceUserSeq !== source.seq || presentation.identity.turn !== source.turn) return null;
+      || presentation.identity.sourceUserSeq !== source.seq || presentation.identity.turn !== source.turn) return why('presentation_not_done');
     const expected = pendingActionResultBinding(action, source);
     const stored = normalizePendingActionResultBinding(terminal.data.pendingActionResultBinding);
-    if (!expected || !stored || !same(expected, stored)) return null;
+    if (!expected || !stored || !same(expected, stored)) return why('result_binding_mismatch');
     // The terminal's retained winner is checked at its own publication time.
     // A later Stop can cancel this optional job, never rewrite action success.
     const proof = proveApprovedActionCompletionInTransaction(db, { sessionId: input.sessionId,
@@ -156,12 +165,12 @@ function readEvidence(db: Database.Database, input: { sessionId: string; sourceU
       || proof.intent.originalSourceUserSeq !== action.sourceUserSeq || proof.intent.payloadHash !== action.payloadHash
       || proof.intent.claimHash !== action.executionClaimTokenHash
       || approvedActionProofDigest(action.executionAuthority ?? null) !== proof.intent.executionAuthorityDigest
-      || pendingActionPayloadHash(action.toolName, action.payload, action.executionAuthority ?? null) !== action.payloadHash) return null;
+      || pendingActionPayloadHash(action.toolName, action.payload, action.executionAuthority ?? null) !== action.payloadHash) return why('completion_proof_mismatch');
     const raw = db.prepare('SELECT * FROM durable_result_handles WHERE handle_id=?').get(proof.receipt.resultHandleId) as SqlRow;
     const payload = readDurableResultPayload({ rawLocation: raw.raw_location as string | null,
       rawPayloadJson: raw.raw_payload_json as string | null, rawPayloadSha256: raw.raw_payload_sha256 as string | null,
       rawByteCount: Number(raw.raw_byte_count), rejectionReason: raw.rejection_reason as string | null });
-    if (payload.status !== 'ok' || payload.storage !== 'inline') return null;
+    if (payload.status !== 'ok' || payload.storage !== 'inline') return why('raw_payload_not_inline');
     const originalDigest = approvedActionProofDigest({ id: original.id, seq: original.seq, sessionId: original.sessionId,
       turn: original.turn, role: original.role, type: original.type, data: original.data });
     const binding = normalizeApprovedActionResultProjectionBinding({ version: 1, sessionId: input.sessionId,
@@ -176,10 +185,10 @@ function readEvidence(db: Database.Database, input: { sessionId: string; sourceU
       settlementDigest: proof.receipt.settlementDigest, resultHandleId: proof.receipt.resultHandleId,
       rawPayloadSha256: proof.receipt.rawPayloadSha256, rawByteCount: proof.receipt.rawByteCount,
       retainedWorkNeedsVerification: input.retainedWorkNeedsVerification });
-    if (!binding) return null;
+    if (!binding) return why('binding_invalid');
     const asked = original.data.displayText ?? original.data.text ?? original.data.message;
     return { binding, asked: typeof asked === 'string' ? asked.slice(0, 1_200) : '', action, rawJson: payload.rawJson };
-  } catch { return null; }
+  } catch (error) { return why(error instanceof Error ? error.message : String(error)); }
 }
 
 export function enqueueApprovedActionResultProjectionInTransaction(db: Database.Database, input: {

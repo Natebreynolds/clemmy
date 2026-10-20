@@ -584,7 +584,12 @@ async function settleConversationalSource(
             retainedWorkNeedsVerification: approvedActionRetainedWorkNeedsVerification(row, action, source),
           });
           if (queued === 'queued') afterEventPublicationCommit(kickApprovedActionResultProjectionDrain);
-        } catch { /* Optional wording cannot roll back a successful action terminal. */ }
+          else logger.warn({ approvalId: row.approvalId, pendingActionId: action.id, queued }, 'approval result wording was not queued');
+        } catch (err) {
+          // Optional wording cannot roll back a successful action terminal.
+          logger.warn({ approvalId: row.approvalId, pendingActionId: action.id, err: err instanceof Error ? err.message : String(err) },
+            'approval result wording could not be queued');
+        }
       }
       return true;
     });
