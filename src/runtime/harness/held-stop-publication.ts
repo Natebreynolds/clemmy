@@ -221,9 +221,10 @@ function ownerChanged(debt: Debt): boolean {
 }
 function leaseCurrent(debt: Debt, now: number): boolean {
   const o = debt.origin;
-  const lease = openEventLog().prepare('SELECT lease_owner, lease_expires_at FROM run_attempts WHERE session_id=? AND attempt_id=?')
-    .get(o.sessionId, o.attemptId) as { lease_owner: string | null; lease_expires_at: string | null };
-  return Boolean(lease.lease_owner && lease.lease_expires_at && Date.parse(lease.lease_expires_at) > now);
+  const leases = openEventLog().prepare(`SELECT lease_owner, lease_expires_at FROM run_attempts
+    WHERE session_id=? AND (attempt_id=? OR (source_user_seq=? AND finished_at IS NULL))`)
+    .all(o.sessionId, o.attemptId, o.executionSourceUserSeq) as Array<{ lease_owner: string | null; lease_expires_at: string | null }>;
+  return leases.some(lease => Boolean(lease.lease_owner && lease.lease_expires_at && Date.parse(lease.lease_expires_at) > now));
 }
 function knownIneligible(debt: Debt, now: number): boolean {
   const o = debt.origin; const db = openEventLog();
@@ -255,7 +256,17 @@ export function drainHeldStopPublication(sessionId: string, sourceUserSeq: numbe
     // crossed or holds a lease still waits.
     if (!ownerChanged(debt) && !hasCheckpoint(debt.origin) && !adapter.isExecuting(sessionId, sourceUserSeq)
       && !adapter.isExecuting(sessionId, debt.origin.executionSourceUserSeq) && !leaseCurrent(debt, now)) {
-      adapter.settleUndispatched?.(sessionId, debt.origin.executionSourceUserSeq);
+      withEventPublicationTransaction(() => {
+        const current = parseDebt(metadata(sessionId).debts[String(sourceUserSeq)]);
+        if (JSON.stringify(current) !== JSON.stringify(debt)) throw new Error('Publication responsibility changed before settlement.');
+        boundSource(current.origin);
+        // The advisory dead-runner read cannot authorize a mutation. Lock and
+        // re-read both delivery and execution ownership before settling calls;
+        // canonical settlement mirrors publish only after this frame commits.
+        if (ownerChanged(current) || hasCheckpoint(current.origin) || adapter.isExecuting(sessionId, sourceUserSeq)
+          || adapter.isExecuting(sessionId, current.origin.executionSourceUserSeq) || leaseCurrent(current, now)) return;
+        adapter.settleUndispatched?.(sessionId, current.origin.executionSourceUserSeq);
+      });
     }
     if (ownerChanged(debt) || hasCheckpoint(debt.origin) || adapter.isExecuting(sessionId, sourceUserSeq)
       || adapter.isExecuting(sessionId, debt.origin.executionSourceUserSeq) || knownIneligible(debt, now)

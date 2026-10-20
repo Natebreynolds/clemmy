@@ -411,3 +411,80 @@ test('held publication never settles a call that crossed to its tool', async () 
   assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId: read.logicalToolCallId }).status, 'open');
   assert.equal(calls.value, 0); assert.equal(debt(f).attemptsUsed, 0);
 });
+
+test('held publication rechecks a lease acquired after its preliminary eligibility before cancelling any call', async () => {
+  const { settleUndispatchedOpenCallsOnStop } = await import('./attempt-settlement.js');
+  const f = fixture(); const logicalToolCallId = admitOnly(f); publication.sealHeldStopPublication(f.ticket, 1000);
+  const db = log.openEventLog(); const calls = { value: 0 }; let observations = 0; let settlements = 0;
+  const port = { ...adapter(calls), isExecuting() {
+    if (++observations === 3) {
+      // The first two observations were advisory. Simulate the durable owner
+      // becoming current before the locked cancellation revalidation.
+      db.prepare('UPDATE run_attempts SET lease_owner=?,lease_expires_at=? WHERE attempt_id=?')
+        .run('fixture-reacquired', new Date(100_000).toISOString(), f.attempt.attemptId);
+    }
+    return false;
+  }, settleUndispatched(sessionId: string, sourceUserSeq: number) {
+    settlements++; settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq });
+  } };
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, port, 1000), 'held');
+  assert.ok(observations >= 3); assert.equal(settlements, 0);
+  assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId }).status, 'open');
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_attempt_settled'] }).length, 0);
+  assert.equal(calls.value, 0); assert.equal(terminals(f).length, 0); assert.equal(debt(f).attemptsUsed, 0);
+});
+
+test('held publication preserves a live exact execution-source lease behind a different delivery source', async () => {
+  const { settleUndispatchedOpenCallsOnStop } = await import('./attempt-settlement.js');
+  const approvals = await import('./approval-registry.js');
+  const f = fixture(); const logicalToolCallId = admitOnly(f);
+  const card = approvals.register({ sessionId: f.sessionId, subject: 'Controlled approval continuation', tool: 'session_history', args: { limit: 5 } });
+  assert.equal(approvals.resolve(card.approvalId, 'approved', 'fixture-owner').ok, true);
+  const control = log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Approved.', approvalId: card.approvalId, decision: 'approve' } });
+  log.appendEvent({ sessionId: f.sessionId, turn: 2, role: 'system', type: 'run_resumed', data: {
+    reviewContinuationVersion: 1, deliverySourceUserSeq: control.seq, executionSourceUserSeq: f.sourceUserSeq,
+    approvalId: card.approvalId, decision: 'approve',
+  } });
+  const deliveryAttempt = log.beginRunAttempt(f.sessionId, { runId: `fixture-delivery-${serial}` });
+  log.bindRunAttemptSourceUserEvent(deliveryAttempt, control.seq);
+  const session = HarnessSession.load(f.sessionId)!; session.saveRecoveryState(f.blob);
+  const ticket = publication.observeHeldStopPublicationOwner({ sessionId: f.sessionId, sourceUserSeq: control.seq,
+    runAttemptId: deliveryAttempt.attemptId });
+  assert.ok(ticket); session.clearRecoveryState(); publication.sealHeldStopPublication(ticket, 1000);
+  const executing = log.beginRunAttempt(f.sessionId, { runId: `fixture-execution-${serial}` });
+  log.bindRunAttemptSourceUserEvent(executing, f.sourceUserSeq);
+  log.openEventLog().prepare('UPDATE run_attempts SET lease_owner=?,lease_expires_at=? WHERE attempt_id=?')
+    .run('fixture-execution-owner', new Date(100_000).toISOString(), executing.attemptId);
+  const calls = { value: 0 }; let settlements = 0;
+  const port = { ...adapter(calls), settleUndispatched(sessionId: string, sourceUserSeq: number) {
+    settlements++; settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq });
+  } };
+  assert.equal(publication.drainHeldStopPublication(f.sessionId, control.seq, port, 1000), 'held');
+  assert.equal(settlements, 0); assert.equal(calls.value, 0);
+  assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId }).status, 'open');
+  const retained = log.getSession(f.sessionId)!.metadata[KEY] as Record<string, { attemptsUsed: number }>;
+  assert.equal(retained[String(control.seq)].attemptsUsed, 0);
+  assert.equal(log.getRunAttemptBySourceUserSeq(f.sessionId, f.sourceUserSeq)!.leaseOwner, 'fixture-execution-owner');
+});
+
+test('held publication rolls back a failed cleanup without publishing cancellation mirrors', async () => {
+  const { settleUndispatchedOpenCallsOnStop } = await import('./attempt-settlement.js');
+  const { actionBus } = await import('../action-bus.js');
+  const f = fixture(); const logicalToolCallId = admitOnly(f); publication.sealHeldStopPublication(f.ticket, 1000);
+  const calls = { value: 0 }; let emitted = 0;
+  const detach = actionBus.subscribe(event => {
+    if (event.kind === 'harness.event' && event.sessionId === f.sessionId && event.event.type === 'tool_attempt_settled') emitted++;
+  });
+  try {
+    const port = { ...adapter(calls), settleUndispatched(sessionId: string, sourceUserSeq: number) {
+      assert.equal(log.openEventLog().inTransaction, true);
+      assert.equal(settleUndispatchedOpenCallsOnStop({ sessionId, sourceUserSeq }).settled, 1);
+      throw new Error('Controlled cleanup transaction failure.');
+    } };
+    assert.equal(publication.drainHeldStopPublication(f.sessionId, f.sourceUserSeq, port, 1000), 'held');
+    assert.equal(dispatch.logicalCallAuthorityState({ ...f, logicalToolCallId }).status, 'open');
+    assert.equal(log.listEvents(f.sessionId, { types: ['tool_attempt_settled'] }).length, 0);
+    assert.equal(emitted, 0); assert.equal(calls.value, 0); assert.equal(debt(f).attemptsUsed, 0);
+  } finally { detach(); }
+});
