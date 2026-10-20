@@ -3845,8 +3845,10 @@ export async function startDaemon(
       await loopStep('daemon.loop.space_schedules', () => processSpaceSchedules());
       // Paused-build auto-retry: a workspace parked by a TRANSIENT build-time
       // failure re-pulls its sources (2 attempts, spaced) and reactivates on
-      // success instead of stranding until the user notices the banner.
-      await loopStep('daemon.loop.space_retry_paused', () => retryPausedSpaces());
+      // success instead of stranding until the user notices the banner. Its
+      // attempts are minutes apart, so one Space listing a minute is enough;
+      // every 15 s tick read every Space manifest for nothing (live 2026-10-20).
+      if (tickCount % 4 === 0) await loopStep('daemon.loop.space_retry_paused', () => retryPausedSpaces());
       // First-ten-minutes activation: once-ever SUGGEST when the user has zero
       // workspaces but a usable connection ("I can build you a Deal Board").
       // Deterministic + marker-guarded + probe-throttled; never auto-builds.

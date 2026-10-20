@@ -223,6 +223,17 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   const lastRun = state.lastRunByMinute;
   const reengageKeys = state.lastReengageByKey;
   const streaks = state.sourceStreakByKey;
+  // Within a minute this pass already evaluated, no schedule can newly match:
+  // skip the per-Space manifest reads unless a failing source's streak or an
+  // undelivered notice still needs this pass. Live 2026-10-20 (89 Spaces, a
+  // tick every 15 s): this step was the largest steady-state event-loop hold,
+  // 160 holds / 185 s in 2.3 h, on ticks where nothing could fire.
+  const minuteAlreadyEvaluated = state.lastEvaluatedAtMs !== undefined
+    && Math.floor(state.lastEvaluatedAtMs / 60_000) === Math.floor(now.getTime() / 60_000);
+  if (minuteAlreadyEvaluated && Object.keys(streaks).length === 0
+    && Object.keys(state.pendingSourceNotices).length === 0) {
+    return { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 };
+  }
   const scheduledKeys = new Set<string>();
   const connections = connectionSnapshot();
   let evaluated = 0;

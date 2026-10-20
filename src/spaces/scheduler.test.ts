@@ -65,6 +65,29 @@ test('a due approved local source is contained and still dedupes within the minu
   }
 });
 
+test('a second tick inside an evaluated minute reads no Space manifests; the next minute does', async () => {
+  // Live 2026-10-20: with 89 Spaces and a 15 s tick, listing every Space on
+  // ticks where no schedule could fire was the largest steady-state daemon hold.
+  const original = store.spaceStore.listWhere;
+  let listings = 0;
+  store.spaceStore.listWhere = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
+    listings += 1;
+    return original.apply(this, args);
+  } as typeof original;
+  try {
+    const minute = new Date('2026-06-09T09:15:00.000Z');
+    await sched.processSpaceSchedules(minute);
+    assert.equal(listings, 1, 'the first tick of a minute evaluates the Spaces');
+    const sameMinute = await sched.processSpaceSchedules(new Date(minute.getTime() + 15_000));
+    assert.equal(listings, 1, 'a later tick in the same minute lists nothing');
+    assert.deepEqual(sameMinute, { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 });
+    await sched.processSpaceSchedules(new Date(minute.getTime() + 60_000));
+    assert.equal(listings, 2, 'the next minute evaluates again');
+  } finally {
+    store.spaceStore.listWhere = original;
+  }
+});
+
 test('a 24-hour hourly backlog contains one latest occurrence without starting a process', async () => {
   const slug = 'sched-hourly-collapse';
   const stateFile = path.join(process.env.CLEMENTINE_HOME!, 'state', 'space-schedule-state.json');
