@@ -62,6 +62,7 @@ import { approvedActionDecisionWasStoppedInTransaction } from './approved-action
 import { BoundaryError } from '../boundary-error.js';
 import { pendingActionIdFromArgs } from './pending-action-view.js';
 import { publicAsyncWorkDispatchedData, publicUserInputText } from './public-presentation.js';
+import { approvalCardAsk } from './approval-card-voice.js';
 import { freshExternalWriteEvidenceStatus } from './tool-evidence.js';
 import { PENDING_ACTION_DISPATCH_UNCERTAIN, PENDING_ACTION_PRE_DISPATCH_REFUSAL, PENDING_ACTION_TOOL_REFUSAL, executeApprovedPendingActionCall } from '../../execution/pending-action-executor.js';
 import { recordAcceptedSourceGraph } from './record-accepted-source-graph.js';
@@ -1268,7 +1269,16 @@ export function chatApprovalResumeDirective(
   tool: string,
   pendingActionId?: string,
   pendingActionToolName?: string,
+  context: { ask?: string; request?: string } = {},
 ): string {
+  // The approval is the owner's yes to a question Clem asked for THEIR
+  // request; it is never a task of its own. Live 10-20 (Mac fixture): the
+  // resumed turn ran the approved delete, then reported "instead of approving
+  // apr-… three unrelated drafts were deleted; the approvals were not
+  // performed", judging itself against the approval message.
+  const framing = !context.ask && !context.request ? '' : `${context.ask ? `The owner just said yes to: "${context.ask}". ` : ''}`
+    + `${context.request ? `That answers their request: "${context.request}". ` : ''}`
+    + 'Report what landed against their request, in your own words; never describe the approval itself as a task, and never say an approval was not performed. ';
   if (pendingActionId) {
     if (pendingActionToolName === 'run_batch') {
       return (
@@ -1285,11 +1295,25 @@ export function chatApprovalResumeDirective(
     );
   }
   return (
-    `[approval-resume] The user just APPROVED the pending action "${subject}" (${tool}). `
+    `[approval-resume] The user just APPROVED the pending action "${subject}" (${tool}). ${framing}`
     + 'Resume the parked task now: re-run the approved tool call with the exact same arguments — '
     + 'the approval gate will let that exact payload through without asking again. '
+    + 'If more actions of this same kind remain for the request, issue all of them in one step so the owner answers once for the set. '
     + 'Then finish any remaining work from the original request and report what landed.'
   );
+}
+
+/** The owner's own request that an approval card answered: the accepted
+ * source the card was raised for, in the owner's words, bounded. */
+function approvalRequestText(row: approvalRegistry.PendingApprovalRow): string | undefined {
+  try {
+    const seq = row.presentation?.sourceUserSeq;
+    if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 1) return undefined;
+    const source = getUserInputEventAtSequence(row.sessionId, seq);
+    if (!source || source.role !== 'user' || source.data.synthetic === true) return undefined;
+    const text = publicUserInputText(source.data).replace(/\s+/g, ' ').trim();
+    return text ? (text.length > 600 ? `${text.slice(0, 599)}…` : text) : undefined;
+  } catch { return undefined; }
 }
 
 /** Decide + dispatch for one resolved approval. Exported for tests.
@@ -1395,6 +1419,8 @@ export async function handleResolvedApprovalForChatResume(
           row.tool ?? 'the approved tool',
           pendingActionId,
           pendingAction?.toolName,
+          { ...(approvalCardAsk(row.sessionId, row.approvalId) ? { ask: approvalCardAsk(row.sessionId, row.approvalId)! } : {}),
+            ...(approvalRequestText(row) ? { request: approvalRequestText(row)! } : {}) },
         ),
         source,
       );

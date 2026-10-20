@@ -1625,6 +1625,8 @@ export function effectiveTurnObjective(
     // and three "yes" turns in a row did nothing. The answer and the question
     // it answers are one request; the question rides with it so the brain,
     // the judges and the intent read all see what was agreed to.
+    const approvedFor = approvedCardRequest(sessionId, exactSourceUserSeq, rows);
+    if (approvedFor) return approvedFor;
     const asked = answeredAssistantQuestion(sessionId, exactSourceUserSeq, fallback);
     if (asked) return asked;
   } catch { /* fallback remains authoritative */ }
@@ -1635,6 +1637,39 @@ export function effectiveTurnObjective(
  * was Clem waiting on the owner, or a reply that ended on a question. */
 const ANSWER_MAX_CHARS = 240;
 const ASKED_MAX_CHARS = 1_200;
+
+/** An approval tapped or typed for a card is the owner's yes to a question
+ * Clem asked for THEIR request. The judged objective is that request plus
+ * the question answered, never the approval message (live 10-20, Mac
+ * fixture: the resumed turn reported "the approvals were not performed"
+ * after doing exactly the approved work). */
+export function approvedCardRequest(
+  sessionId: string,
+  sourceUserSeq: number,
+  rows?: ReturnType<typeof listEvents>,
+): string | null {
+  try {
+    const all = rows ?? listEvents(sessionId, { types: ['user_input_received'] });
+    const source = all.find((row) => row.type === 'user_input_received' && row.seq === sourceUserSeq);
+    const data = source?.data as { source?: unknown; approvalId?: unknown } | undefined;
+    if (!data || (data.source !== 'desktop_approval' && data.source !== 'mobile_approval') || typeof data.approvalId !== 'string') return null;
+    const approvalId = data.approvalId;
+    const announced = listEvents(sessionId, { types: ['approval_requested'] })
+      .filter((row) => row.data.approvalId === approvalId).at(-1);
+    const preview = announced?.data.preview as { ask?: unknown } | undefined;
+    const ask = typeof preview?.ask === 'string' && preview.ask.trim() ? preview.ask.trim() : '';
+    const parentSeq = typeof announced?.data.sourceUserSeq === 'number' ? announced.data.sourceUserSeq : null;
+    if (!parentSeq || !Number.isSafeInteger(parentSeq) || parentSeq >= sourceUserSeq) return null;
+    const parent = all.find((row) => row.type === 'user_input_received' && row.seq === parentSeq);
+    const parentText = typeof parent?.data.displayText === 'string' && parent.data.displayText.trim()
+      ? parent.data.displayText.trim()
+      : typeof parent?.data.text === 'string' ? parent.data.text.trim() : '';
+    if (!parentText || parent?.data.synthetic === true) return null;
+    return ask
+      ? `${parentText}\n\nThe owner approved what Clem asked for this request. Her words:\n${ask}`
+      : `${parentText}\n\nThe owner approved what Clem asked for this request.`;
+  } catch { return null; }
+}
 
 export function answeredAssistantQuestion(
   sessionId: string,

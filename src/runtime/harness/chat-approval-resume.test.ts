@@ -1295,3 +1295,14 @@ test('an executed approved action ends in Clem\'s words from its recorded result
   assert.deepEqual(terminal!.data.hostNotice, { code: 'approved_action_completed' });
   assert.equal(terminal!.data.turnOutcome?.status, 'done');
 });
+
+test('the resume directive names the question the owner said yes to and the request it answers', () => {
+  const directive = chatApprovalResumeDirective('Delete Outlook message', 'work_call', undefined, undefined,
+    { ask: 'Can I delete the last R45 fixture draft too?', request: 'Delete all three R45 fixture drafts by ID now.' });
+  assert.match(directive, /said yes to: "Can I delete the last R45 fixture draft too\?"/);
+  assert.match(directive, /answers their request: "Delete all three R45 fixture drafts by ID now\."/);
+  assert.match(directive, /never say an approval was not performed/);
+  assert.match(directive, /issue all of them in one step so the owner answers once/);
+  assert.match(chatApprovalResumeDirective('x', 'work_call'), /^\[approval-resume\] The user just APPROVED the pending action "x" \(work_call\)\. Resume the parked task now/,
+    'without context the directive is unchanged in shape');
+});

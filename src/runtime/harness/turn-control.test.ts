@@ -1406,3 +1406,21 @@ test('an owner\'s short answer to what Clem just asked carries her question, so 
   const c2 = appendEvent({ sessionId: sessionC, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Thanks' } });
   assert.equal(effectiveTurnObjective(sessionC, 'Thanks', c2.seq), 'Thanks');
 });
+
+test('an approval tapped for a card is judged against the request the card was raised for, with Clem\'s question', async () => {
+  const { approvedCardRequest } = await import('./turn-control.js');
+  const sessionId = freshSession('chat');
+  const request = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Delete all three R45 fixture drafts by ID now.' } });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'approval_requested', data: {
+    tool: 'work_call', subject: 'Delete Outlook message', approvalId: 'apr-fixture', sourceUserSeq: request.seq,
+    preview: { operation: 'Delete Outlook message', fields: [], ask: 'Can I delete the last R45 fixture draft too?' },
+  } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'conversation_completed', data: { reply: 'Can I delete the last R45 fixture draft too?', sourceUserSeq: request.seq } });
+  const approve = appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Approve apr-fixture.', source: 'desktop_approval', approvalId: 'apr-fixture', decision: 'approve' } });
+  const objective = effectiveTurnObjective(sessionId, 'Approve apr-fixture.', approve.seq);
+  assert.match(objective, /^Delete all three R45 fixture drafts by ID now\./, objective);
+  assert.match(objective, /The owner approved what Clem asked for this request\. Her words:\nCan I delete the last R45 fixture draft too\?$/, objective);
+  assert.equal(approvedCardRequest(sessionId, request.seq), null, 'the original request is not an approval');
+  const plain = appendEvent({ sessionId, turn: 3, role: 'user', type: 'user_input_received', data: { text: 'Approve apr-fixture.' } });
+  assert.equal(approvedCardRequest(sessionId, plain.seq), null, 'the words alone are not an approval source');
+});
