@@ -1750,7 +1750,7 @@ export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'leg
       + (legacy ? 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. ' : 'ways forward. ')
       + CLARIFICATION_APPROVAL_GUIDANCE,
     parameters: legacy ? askUserQuestionParams : clarificationQuestionParams,
-    execute: async (args, runContext) => {
+    execute: async (args: z.infer<typeof askUserQuestionParams>, runContext) => {
       const sessionId = extractSessionId(runContext);
       if (sessionId) {
         const lastUser = [...listEvents(sessionId, { types: ['user_input_received'] })].at(-1);
