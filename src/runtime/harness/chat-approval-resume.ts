@@ -1055,7 +1055,7 @@ interface ApprovedActionEndingOwner {
   startedAt: string;
 }
 interface ApprovedActionEndingGuard { owner: ApprovedActionEndingOwner; actionDigest: string }
-type ApprovedActionEndingOwnerRead = { kind: 'unavailable' | 'stopped' }
+type ApprovedActionEndingOwnerRead = { kind: 'unavailable' } | { kind: 'stopped' }
   | { kind: 'current'; action: PendingActionRecord; actionDigest: string };
 const endingDigest = (value: unknown): string => createHash('sha256').update(closedCanonicalJson(value)).digest('hex');
 const endingApprovalDigest = (row: approvalRegistry.PendingApprovalRow): string => endingDigest({
