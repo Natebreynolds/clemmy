@@ -45,14 +45,44 @@ test('an approved gate covers the step\'s declared local write, one reservation 
   assert.equal(second?.requirementDigest, scope.requirementDigest);
 });
 
-test('no approval, a declined gate, an undeclared tool, a send step or a chat session give no coverage', () => {
+test('a gated step without its approval, a declined gate, an undeclared tool, a send step or a chat session give no coverage', () => {
   const base = { sessionId: 'workflow:run-1:save_drafts', toolName: 'write_file', logicalToolCallId: 'call-a' };
   assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => [], step: () => writeStep }), null);
   assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => [{ ...approvedRows[0], resolution: 'rejected' }], step: () => writeStep }), null);
   assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => approvedRows, step: () => ({ ...writeStep, allowedTools: ['read_file'] }) }), null, 'undeclared tool');
-  assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => approvedRows, step: () => ({ ...writeStep, requiresApproval: false }) }), null, 'no gate on the step');
+  assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => approvedRows, step: () => ({ ...writeStep, requiresApproval: false, sideEffect: 'read' }) }), null, 'no gate and no declared write');
+  assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => approvedRows, step: () => ({ id: 'save_drafts', allowedTools: ['write_file'] }) }), null, 'no gate and no sideEffect at all');
   assert.equal(gateApprovedStepWriteCoverage({ ...base, approvals: () => approvedRows, step: () => ({ ...writeStep, sideEffect: 'send', allowedTools: ['write_file'] }) }), null, 'the send floor is untouched');
   assert.equal(gateApprovedStepWriteCoverage({ ...base, sessionId: 'sess-desktop-1', approvals: () => approvedRows, step: () => writeStep }), null);
+});
+
+// Live 2026-10-20: a chat-authored "fetch page, write CSV" step (no human gate,
+// sideEffect write, run_shell_command allowed) had its shell write refused
+// twice as coverage_missing and the run blocked; the same command ran in chat.
+test('an ungated step that declares its write is covered by its own declaration, one reservation per call', () => {
+  const declared = { id: 'fetch_and_write', allowedTools: ['run_shell_command'], sideEffect: 'write' };
+  const first = gateApprovedStepWriteCoverage({
+    sessionId: 'workflow:run-2:fetch_and_write', toolName: 'run_shell_command', logicalToolCallId: 'call-x',
+    approvals: () => [], step: () => declared,
+  });
+  assert.ok(first, 'declared write without a gate is covered');
+  assert.equal(first.contractId, 'workflow-step:run-2:fetch_and_write');
+  assert.equal(first.requirementId, 'fetch_and_write:run_shell_command');
+  assert.equal(first.reservationKey, 'run-2:fetch_and_write:run_shell_command:call-x');
+  const second = gateApprovedStepWriteCoverage({
+    sessionId: 'workflow:run-2:fetch_and_write', toolName: 'cap:local:run_shell_command', logicalToolCallId: 'call-y',
+    approvals: () => [], step: () => declared,
+  });
+  assert.equal(second?.requirementDigest, first.requirementDigest);
+  assert.equal(second?.reservationKey, 'run-2:fetch_and_write:run_shell_command:call-y');
+  assert.equal(gateApprovedStepWriteCoverage({
+    sessionId: 'workflow:run-2:fetch_and_write', toolName: 'write_file', logicalToolCallId: 'call-z',
+    approvals: () => [], step: () => declared,
+  }), null, 'a tool the step did not declare stays uncovered');
+  assert.equal(gateApprovedStepWriteCoverage({
+    sessionId: 'workflow:run-2:fetch_and_write', toolName: 'run_shell_command', logicalToolCallId: 'call-s',
+    approvals: () => [], step: () => ({ ...declared, sideEffect: 'send' }),
+  }), null, 'the send floor is untouched');
 });
 
 test('production reads the step from the run record\'s admitted snapshot', () => {
