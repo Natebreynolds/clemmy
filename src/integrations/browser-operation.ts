@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { parseBrowserOperationArguments, type BrowserOperationName } from '../tools/browser-operation-contract.js';
 import { browserBackendOffered, LOCAL_BROWSER_NOT_OFFERED } from '../tools/browser-backend.js';
 import { findBrowserHarnessPython } from './browser-python.js';
+import { browserUnavailableDoors } from '../tools/page-read-doors.js';
 
 export interface BrowserProcessResult { code: number | null; stdout: string; stderr: string; termination?: 'timeout' | 'cancelled'; dispatched?: boolean; }
 export type BrowserOperationRunner = (code: string, sessionName: string, signal?: AbortSignal) => Promise<BrowserProcessResult>;
@@ -217,9 +218,12 @@ export async function executeBrowserOperation(operation: BrowserOperationName, a
     status: ok ? 'completed' : processResult.termination ?? 'failed',
   };
   const receiptDigest = createHash('sha256').update(JSON.stringify({ receipt, result })).digest('hex');
+  const error = returned?.error || processResult.stderr || 'Browser returned no valid exact-target outcome';
   const value = { ok, ...(ok && result ? { result } : {}), receipt, receiptDigest,
     ...(ok ? { artifactId: `browser:${receiptDigest}`, handle: { session_name: sessionName, browser_id: receipt.browser_id, target_id: receipt.target_id } }
-      : { error: returned?.error || processResult.stderr || 'Browser returned no valid exact-target outcome' }) };
+      // A browser that would not answer is a detour, never the end of the
+      // request: say what the refusal means and name the other doors.
+      : { error, next: browserUnavailableDoors(String(error), { localChrome: browserBackendOffered('local') }) }) };
   if (!ok && provenNoMutation && (mutating || processResult.dispatched === false)) NO_MUTATION_RESULTS.add(value);
   return value;
 }
