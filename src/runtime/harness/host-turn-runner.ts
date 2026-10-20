@@ -8104,7 +8104,13 @@ const runHostTurnBody = async (
       : undefined;
     // Any other failed attempt carries its next door, whatever the tool: the
     // owner's rule is another way or a plain reason, never an incomplete end.
-    const failedAttemptNote = !structuredToolOutputs(output) && attemptFailedKind
+    // The host's own directive, when it wrote one, already IS the next door;
+    // the generic note is for a failure the host said nothing about.
+    // A JSON-shaped result is a contract the host's own recovery parses (a
+    // plan refusal's code, question and choices); a sentence appended to it
+    // would break that parse, so the note rides only prose results.
+    const jsonShapedResult = typeof text === 'string' && /^\s*[[{]/.test(text);
+    const failedAttemptNote = !structuredToolOutputs(output) && attemptFailedKind && !hostSteer && !jsonShapedResult
       && !refusedWriteNote && !repliedUnverifiedNote && !darkWriteNote
       ? failedAttemptNextDoorNote(attemptFailedKind, edgeToolName(call.name, parsedArguments))
       : undefined;

@@ -87,7 +87,7 @@ function answers(input: { choice?: string; historical?: number; unsupported?: nu
     const selected = input.choice ?? Object.keys(body.questions.historicalGroup.criteria).find(key => key.startsWith('historical_source_'));
     assert.ok(selected);
     const values: Record<string, unknown> = Object.fromEntries(Object.entries({ delivered: .95, unaddressed: .03,
-      unsupported: input.unsupported ?? .03, computed: input.computed ?? .03, asksUser: .03, cannotFinish: .03,
+      unsupported: input.unsupported ?? .03, computed: input.computed ?? .03, asksUser: .03, cannotFinish: .03, deadEnd: .03,
       historicalOnly: input.historical ?? .95 }).map(([id, noul]) => [id, { type: 'noul', noul }]));
     values.historicalGroup = { type: 'choice', choice: selected, confidence: .95, probabilities: { [selected]: .95 } };
     if (input.omit) delete values[input.omit];

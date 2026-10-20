@@ -37,7 +37,7 @@ function reading(kind: 'done' | 'incomplete' | 'missing') {
   const scores = kind === 'done' ? { delivered: .93, unaddressed: .05 }
     : kind === 'missing' ? { delivered: .93, unaddressed: .9 } : { delivered: .1, unaddressed: .9 };
   return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
-    answers: Object.fromEntries(Object.entries({ computed: .03, asksUser: .03, cannotFinish: .03, unsupported: .05, ...scores })
+    answers: Object.fromEntries(Object.entries({ computed: .03, asksUser: .03, cannotFinish: .03, deadEnd: .03, unsupported: .05, ...scores })
       .map(([id, noul]) => [id, { type: 'noul', noul }])), usage: { input_tokens: 36, output_tokens: 5 } }) };
 }
 function deferred<T>() {
