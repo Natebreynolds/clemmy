@@ -53,7 +53,7 @@ export const APPROVAL_ANSWER_WORDS = {
   reject: 'No, don’t do that.',
 } as const;
 
-export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired';
+export type ApprovalResolution = 'approved' | 'declined' | 'changed' | 'expired' | 'cancelled';
 
 /** Clem asked the card's own question back after a written reply she could
  * not read as a decision (a leaning yes or no, or Jev unavailable). Drawn ON
@@ -106,6 +106,9 @@ export function hiddenCardDecision(message: { cardDecision?: CardDecision; pendi
 
 /** The card state an approval_resolved event records, or undefined. */
 export function approvalResolutionFrom(data: Record<string, unknown>): ApprovalResolution | undefined {
+  // A durable retired card is no longer an answerable question. Do not infer
+  // cancellation from a new message or from the assistant's wording.
+  if (data.decision === 'cancelled' && data.resolution === 'cancelled_by_system') return 'cancelled';
   if (data.changeRequested === true) return 'changed';
   if (data.decision === 'approve' || data.decision === 'approve_with_edits') return 'approved';
   if (data.decision === 'reject') return 'declined';

@@ -1135,6 +1135,12 @@ function MessageRow({
   if (hiddenCardDecision(message)) return null;
 
   if (message.approval) {
+    if (message.approval.resolution === 'cancelled') return (
+      <div class="turn turn-approval" role="status">
+        <div class="approval-head">{message.approval.subject}</div>
+        <div class="approval-reason">Approval closed</div>
+      </div>
+    );
     // The decision stays on its card; it does not claim execution finished.
     if (!message.approval.queued
       && (message.approval.resolution === 'approved' || message.approval.resolution === 'declined')) return (

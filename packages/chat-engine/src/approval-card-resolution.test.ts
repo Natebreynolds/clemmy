@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChatEngine, foldTranscript, inFlightTurnSince } from './engine.js';
 import { applyApprovalDecisionAck, readApprovalDecisionAck } from './approval-card-resolution.js';
-import { hiddenCardDecision, type HarnessEvent, type ReplayPayload } from './types.js';
+import { approvalResolutionFrom, hiddenCardDecision, type HarnessEvent, type ReplayPayload } from './types.js';
 import type { StreamConnection, StreamTransport } from './stream.js';
 
 const SESSION = 'approval-card-resolution-fixture';
@@ -67,6 +67,41 @@ test('a foreign session resolution cannot decide a same-id local card', () => {
   assert.equal(rows.find(row => row.approval)?.approval?.resolution, undefined);
 });
 
+test('a durable retirement resolves its exact card in history without treating the new message as approval', () => {
+  const retired = event(3, 'approval_resolved', { approvalId: 'apr-fixture', decision: 'cancelled',
+    resolution: 'cancelled_by_system', reason: 'owner_moved_on' });
+  const rows = foldTranscript([card(), card(2, 'apr-other'), retired,
+    { ...event(4, 'user_input_received', { text: 'A different task.' }), role: 'user', turn: 2 }], SESSION);
+  assert.equal(rows.find(row => row.approval?.approvalId === 'apr-fixture')?.approval?.resolution, 'cancelled');
+  assert.equal(rows.find(row => row.approval?.approvalId === 'apr-other')?.approval?.resolution, undefined);
+  assert.ok(rows.some(row => row.role === 'user' && row.text === 'A different task.'));
+  for (const incomplete of [{ decision: 'cancelled' }, { resolution: 'cancelled_by_system' },
+    { decision: 'unread', reason: 'owner_moved_on' }]) assert.equal(approvalResolutionFrom(incomplete), undefined);
+});
+
+test('a live retirement updates the old card without ending the newer human turn', async () => {
+  const transport = new ReceiptTransport();
+  const engine = new ChatEngine({ sessionId: SESSION, transport, api: {
+    loadSession: async () => ({ events: [card()], latestSeq: 2 }),
+    send: async () => ({ sessionId: SESSION, accepted: true }),
+  } });
+  try {
+    await engine.open();
+    await engine.send('A different task.');
+    await tick();
+    transport.live!.onEvent({ ...event(10, 'user_input_received', { text: 'A different task.' }), role: 'user', turn: 2 });
+    const before = engine.snapshot();
+    transport.live!.onEvent(event(11, 'approval_resolved', { approvalId: 'apr-fixture', decision: 'cancelled',
+      resolution: 'cancelled_by_system', reason: 'owner_moved_on' }));
+    const after = engine.snapshot();
+    assert.equal(after.messages.find(row => row.approval)?.approval?.resolution, 'cancelled');
+    assert.equal(after.busy, true);
+    assert.equal(after.activeSourceUserSeq, before.activeSourceUserSeq);
+    assert.equal(after.cancelKey, before.cancelKey);
+    assert.deepEqual(after.messages.filter(row => !row.approval), before.messages.filter(row => !row.approval));
+  } finally { engine.dispose(); }
+});
+
 test('only a closed exact typed host receipt can be folded into a card', () => {
   const valid = receipt();
   assert.deepEqual(readApprovalDecisionAck(valid, SESSION), marker());
@@ -109,7 +144,7 @@ test('approve and reject update only the exact card, with no receipt bubble acro
 });
 
 test('a late receipt preserves changed and expired cards, while absent cards retain a concise decision', () => {
-  for (const resolution of ['changed', 'expired', 'declined'] as const) {
+  for (const resolution of ['changed', 'expired', 'declined', 'cancelled'] as const) {
     const rows = [{ id: 'card', role: 'assistant', approval: { approvalId: 'apr-fixture', resolution } }];
     const applied = applyApprovalDecisionAck(rows, marker() as NonNullable<ReturnType<typeof readApprovalDecisionAck>>);
     assert.equal(applied.matched, false);

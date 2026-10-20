@@ -275,7 +275,8 @@ function ApprovalOutcomePill({ resolution }: { resolution: ApprovalResolution })
   const label = resolution === 'approved' ? 'Approved'
     : resolution === 'declined' ? 'Declined'
       : resolution === 'changed' ? 'Changed · the revised version is below'
-        : 'Expired · it did not run';
+        : resolution === 'cancelled' ? 'Approval closed'
+          : 'Expired · it did not run';
   return (
     <p className="mt-2.5 flex flex-wrap items-center gap-2 text-caption" role="status">
       <span className={cn('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-semibold', tone)}>
@@ -597,6 +598,13 @@ export function ChatBubble({
   // card, not the conversation; only one that failed to land is shown. A
   // decided card keeps its own receipt, without claiming its work finished.
   if (hiddenCardDecision(message)) return null;
+  if (!isUser && message.approval?.resolution === 'cancelled'
+    && (exec.phase === 'idle' || exec.phase === 'cancelled')) return (
+    <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 py-1 text-caption text-muted" role="status">
+      <span className="break-words">{message.approval.subject}</span>
+      <span>Approval closed</span>
+    </div>
+  );
   if (message.status === 'awaiting-approval'
     && !message.approval?.pendingAction && !message.approval?.pendingActionId
     && exec.phase === 'idle' && !exec.note && !decisionError && !trustNote
