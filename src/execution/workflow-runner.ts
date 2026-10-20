@@ -12306,7 +12306,12 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
   if (workflowDrainInFlight) return;
   workflowDrainInFlight = true;
   try {
-    const corruptRunRecords = reconcileCorruptWorkflowRunRecords();
+    // Each stage is its own phase so the hold log names which one held the
+    // loop (live 2026-10-20: this tick was the second-largest steady-state
+    // hold at 213 ms p50, 2.4 s max, with no finer attribution).
+    const corruptRunRecords = withDaemonRuntimePhaseSync(
+      'daemon.timer.workflow_runs.execution.corrupt_scan', {}, () => reconcileCorruptWorkflowRunRecords(),
+    );
     if (corruptRunRecords.failed > 0) {
       logger.warn(
         { corruptRunRecords },
@@ -12322,7 +12327,9 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     // record doubles as a durable presentation outbox, so repair its cards,
     // shared activity state, and exact-origin question before considering any
     // executable work. This is idempotent and never re-admits the run.
-    const inputProjection = reconcileAwaitingInputWorkflowRunProjections();
+    const inputProjection = withDaemonRuntimePhaseSync(
+      'daemon.timer.workflow_runs.execution.awaiting_input_projection', {}, () => reconcileAwaitingInputWorkflowRunProjections(),
+    );
     if (inputProjection.failed.length > 0) {
       logger.warn(
         { failures: inputProjection.failed },
@@ -12335,7 +12342,9 @@ export async function processWorkflowRuns(assistant: ClementineAssistant): Promi
     // replay their original message. Every recovery re-enters the ordinary
     // queue contract, so malformed/conflicting bytes remain non-executable.
     try {
-      const projectBindings = reconcileAwaitingCompiledWorkflowRunBindings();
+      const projectBindings = withDaemonRuntimePhaseSync(
+        'daemon.timer.workflow_runs.execution.compiled_bindings', {}, () => reconcileAwaitingCompiledWorkflowRunBindings(),
+      );
       if (projectBindings.activated > 0) {
         logger.info(
           { projectBindings },
@@ -13901,9 +13910,13 @@ function notifyCancelledRunOnce(filePath: string, run: QueuedRunRecord): void {
 }
 
 async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> {
-  const workflows = listWorkflows();
+  const workflows = withDaemonRuntimePhaseSync(
+    'daemon.timer.workflow_runs.execution.list_workflows', {}, () => listWorkflows(),
+  );
   const eligible: WorkflowDrainCandidate[] = [];
-  for (const file of readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'))) {
+  const files = readdirSync(WORKFLOW_RUNS_DIR).filter((entry) => entry.endsWith('.json'));
+  withDaemonRuntimePhaseSync('daemon.timer.workflow_runs.execution.scan', { files: files.length }, () => {
+  for (const file of files) {
     const filePath = path.join(WORKFLOW_RUNS_DIR, file);
     let run = readRunRecordForScan(filePath);
     if (!run) continue;
@@ -13958,6 +13971,7 @@ async function drainWorkflowRuns(assistant: ClementineAssistant): Promise<void> 
     if (inFlightRunIds.has(run.id)) continue; // already draining in another slot
     eligible.push({ file, filePath, run });
   }
+  });
   if (eligible.length === 0) return;
   const admitted = selectWorkflowDrainCandidates(eligible);
   if (admitted.length === 0) return;
