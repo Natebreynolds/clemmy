@@ -1,3 +1,4 @@
+import { handleApprovalCardResultRead } from './approval-card-result-route.js';
 import { registerMeetingAssistanceRoutes } from './meeting-assistance-routes.js';
 import { registerMeetingAssistantPolicyRoutes } from './meeting-assistant-policy-routes.js';
 import { registerMeetingResearchRoutes } from './meeting-research-routes.js';
@@ -9284,6 +9285,12 @@ export function registerConsoleRoutes(
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+
+  // Exact-card GET only. This handler cannot approve, dispatch or narrate.
+  app.get('/api/console/approvals/:id/result', (req, res, next) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    next();
+  }, handleApprovalCardResultRead);
 
   /**
    * The installed updater's total/summary describe current durable work

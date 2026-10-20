@@ -1,3 +1,4 @@
+import { handleApprovalCardResultRead } from '../dashboard/approval-card-result-route.js';
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
 import {
   nativeVoiceControlBoundary,
@@ -3036,6 +3037,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   registerCliSessionRoutes(router, requireMobileSession, '/api');
   registerCloudBrowserRoutes(router, requireMobileSession, '/api');
   registerConnectionSetupRoutes(router, requireMobileSession, '/api', { requireContext: true });
+
+  // Phone and desktop use the same display-only read behind their own auth.
+  router.get('/api/approvals/:id/result', requireMobileSession, handleApprovalCardResultRead);
 
   router.get('/api/approvals', requireMobileSession, (_req, res) => {
     try {

@@ -224,6 +224,8 @@ export interface UnifiedSessionTurn {
     subject: string;
     reason?: string;
     approvalId: string;
+    /** Exact original card owner; never the conversation's newest branch. */
+    ownerSessionId?: string;
     /** What approving would do (operation and argument values), display only. */
     preview?: { operation: string; fields: Array<{ name: string; value: string; label?: string }> };
     pendingAction?: unknown;
@@ -232,7 +234,7 @@ export interface UnifiedSessionTurn {
     revises?: { approvalId: string; changeRequest?: string; fields?: Array<{ name: string; value: string; label?: string }> };
     /** Present when nobody answered before the card's lifetime ran out: the
      *  card renders settled, without controls. */
-    resolution?: 'approved' | 'declined' | 'changed' | 'expired';
+    resolution?: 'approved' | 'declined' | 'changed' | 'expired' | 'cancelled';
   };
 }
 
