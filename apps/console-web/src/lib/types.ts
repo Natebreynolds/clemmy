@@ -36,6 +36,18 @@ export interface ChatPostResult {
   replayed?: boolean;
 }
 
+export interface PendingActionPublicResult {
+  version: 1;
+  pendingActionId: string;
+  approvalId: string | null;
+  payloadHash: string;
+  recordUpdatedAt: string;
+  status: 'executed' | 'failed' | 'executing' | 'rejected' | 'expired' | 'cancelled';
+  source: 'record' | 'terminal';
+  text: string;
+  terminal?: { eventId: string; sourceUserSeq: number };
+}
+
 export interface PendingActionApprovalView {
   id: string;
   title: string;
@@ -55,6 +67,7 @@ export interface PendingActionApprovalView {
   idempotencyKey: string;
   approvalId: string | null;
   resultSummary: string | null;
+  publicResult?: PendingActionPublicResult;
   createdAt: string;
   updatedAt: string;
   /** Files on this computer the action sends, named by name, size and folder. */

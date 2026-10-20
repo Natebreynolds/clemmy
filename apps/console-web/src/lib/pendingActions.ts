@@ -5,7 +5,7 @@
  * actually happened.
  */
 import { apiGet, apiPost } from './api';
-import type { PendingActionApprovalView } from './types';
+import type { PendingActionApprovalView, PendingActionPublicResult } from './types';
 
 export interface PendingActionExecuteResult {
   ok: boolean;
@@ -18,7 +18,8 @@ export interface PendingActionExecuteResult {
    *  narrow send-trust grant (these recipients, this toolkit) was stored. */
   trustGranted?: boolean;
   trustGrantId?: string | null;
-  record: { id: string; status: string; resultSummary: string | null; payloadHash: string } | null;
+  record: { id: string; status: string; resultSummary: string | null; payloadHash: string;
+    approvalId?: string | null; updatedAt?: string; publicResult?: PendingActionPublicResult } | null;
 }
 
 /** Resolve the human card (if an approvalId is known) and fire the exact stored
@@ -61,7 +62,9 @@ export type PendingActionExecutionPhase =
   | 'uncertain';
 
 export type PendingActionExecutionPresentation =
-  | { mode: 'durable'; phase: PendingActionExecutionPhase; note?: string }
+  | { mode: 'durable'; phase: PendingActionExecutionPhase; note?: string; publicResult?: PendingActionPublicResult;
+      /** Exact raw record evidence retained only for read-only result hydration. */
+      recordResultSummary?: string | null }
   | { mode: 'conversational'; phase: 'idle' };
 
 type PendingActionStatusSnapshot = {
@@ -69,7 +72,7 @@ type PendingActionStatusSnapshot = {
   status: string;
   resultSummary: string | null;
   pendingAction?: Pick<PendingActionApprovalView,
-    'id' | 'approvalId' | 'payloadHash' | 'updatedAt' | 'status' | 'resultSummary'>;
+    'id' | 'approvalId' | 'payloadHash' | 'updatedAt' | 'status' | 'resultSummary' | 'publicResult'>;
 };
 
 type QueuedPendingActionBinding = Pick<PendingActionApprovalView, 'id' | 'approvalId' | 'payloadHash' | 'updatedAt'>;
@@ -79,6 +82,68 @@ export interface PendingActionReconciliationOptions {
    *  production wait remains deliberately bounded. */
   pollDelaysMs?: readonly number[];
   wait?: (delayMs: number) => Promise<void>;
+  card?: QueuedPendingActionBinding;
+}
+
+type ResultRecord = NonNullable<PendingActionExecuteResult['record']>;
+function recordMatchesCard(action: ResultRecord | null | undefined, card: QueuedPendingActionBinding): boolean {
+  return !!action && !!card.id && !!card.approvalId && !!card.payloadHash
+    && action.id === card.id && action.approvalId === card.approvalId && action.payloadHash === card.payloadHash
+    && typeof action.updatedAt === 'string' && Number.isFinite(Date.parse(card.updatedAt))
+    && Date.parse(action.updatedAt) >= Date.parse(card.updatedAt);
+}
+function withPublicResult(presentation: PendingActionExecutionPresentation, action?: ResultRecord | null): PendingActionExecutionPresentation {
+  const result = action?.publicResult;
+  if (presentation.mode !== 'durable' || !action || !result || result.version !== 1
+    || durablePhase(action.status) !== presentation.phase
+    || result.pendingActionId !== action.id || result.approvalId !== action.approvalId
+    || result.payloadHash !== action.payloadHash || result.recordUpdatedAt !== action.updatedAt || result.status !== action.status
+    || typeof result.text !== 'string' || !result.text.trim() || result.text.length > 12_000
+    || (result.source !== 'record' && result.source !== 'terminal')
+    || (result.source === 'terminal' && (typeof result.terminal?.eventId !== 'string' || !result.terminal.eventId.trim()
+      || result.terminal.eventId.length > 256 || !Number.isSafeInteger(result.terminal.sourceUserSeq) || result.terminal.sourceUserSeq < 1))) return presentation;
+  return { ...presentation, publicResult: result, recordResultSummary: action.resultSummary };
+}
+
+/** A later answer may enrich this settled record, never replace its execution
+ * truth or another revision's evidence. Both projections passed withPublicResult. */
+export function pendingActionTerminalResultUpgrade(
+  current: PendingActionExecutionPresentation | undefined,
+  incoming: PendingActionExecutionPresentation,
+): PendingActionExecutionPresentation | null {
+  if (current?.mode !== 'durable' || incoming.mode !== 'durable'
+    || (current.phase !== 'executed' && current.phase !== 'failed') || current.phase !== incoming.phase
+    || !Object.hasOwn(current, 'recordResultSummary') || !Object.hasOwn(incoming, 'recordResultSummary')
+    || current.recordResultSummary !== incoming.recordResultSummary) return null;
+  const before = current.publicResult;
+  const after = incoming.publicResult;
+  if (!before || before.source !== 'record' || !after || after.source !== 'terminal'
+    || before.pendingActionId !== after.pendingActionId || before.approvalId !== after.approvalId
+    || before.payloadHash !== after.payloadHash || before.recordUpdatedAt !== after.recordUpdatedAt
+    || before.status !== after.status || after.status !== current.phase) return null;
+  return incoming;
+}
+
+/** Raw evidence is always disclosure text. A missing legacy projection cannot
+ * make a technical summary, provider prose or a later result the main answer. */
+export function pendingActionPresentationCopy(presentation: PendingActionExecutionPresentation): { note?: string; details?: string } {
+  if (presentation.mode !== 'durable') return {};
+  const raw = presentation.note?.trim();
+  const fallback: Partial<Record<PendingActionExecutionPhase, string>> = {
+    executed: 'The approved action completed. Open execution details to see the recorded result.',
+    failed: 'The action failed or may have completed only in part. Check what changed before trying again.',
+    rejected: 'This action was rejected.', expired: 'This approval expired.', cancelled: 'This action was cancelled.',
+  };
+  if (fallback[presentation.phase]) {
+    const note = presentation.publicResult?.text ?? fallback[presentation.phase];
+    return { note, ...(raw && raw !== note ? { details: raw } : {}) };
+  }
+  return { ...(raw ? { note: raw } : {}) };
+}
+
+export function pendingActionRecordPresentation(action: PendingActionApprovalView): PendingActionExecutionPresentation | null {
+  const phase = durablePhase(action.status);
+  return phase && phase !== 'running' ? withPublicResult(durablePresentation(phase, action.resultSummary), action) : null;
 }
 
 const DEFAULT_POLL_DELAYS_MS = [0, 200, 600, 1_400, 2_800] as const;
@@ -135,7 +200,8 @@ async function waitForDurableTerminalStatus(
     }
     const phase = durablePhase(snapshot.status);
     if (phase && phase !== 'running') {
-      return durablePresentation(phase, snapshot.resultSummary);
+      if (options.card && !queuedSnapshotMatchesCard(snapshot, options.card)) continue;
+      return withPublicResult(durablePresentation(phase, snapshot.resultSummary), snapshot.pendingAction);
     }
     // `executing` and pre-claim states both remain unresolved after a lost
     // response. Never infer "safe to retry" from either one.
@@ -158,9 +224,11 @@ export async function resolvePendingActionExecutionPresentation(
   refresh: () => Promise<PendingActionStatusSnapshot>,
   options: PendingActionReconciliationOptions = {},
 ): Promise<PendingActionExecutionPresentation> {
+  if (options.card && (!recordMatchesCard(result.record, options.card)
+    || ((result.status === 'executed' || result.status === 'failed') && result.record?.status !== result.status))) return uncertainPresentation();
   if (result.status === 'executed' || result.status === 'failed') {
-    const note = (result.resultSummary || result.record?.resultSummary || '').trim();
-    return durablePresentation(result.status, note);
+    const note = (result.record?.resultSummary || result.resultSummary || '').trim();
+    return withPublicResult(durablePresentation(result.status, note), result.record);
   }
   // The approval is recorded and its exact resume is waiting for the chat's
   // live run. Never fall through to a conversational "approve" turn here.
@@ -172,10 +240,10 @@ export async function resolvePendingActionExecutionPresentation(
     const terminalDecision = initialPhase === 'rejected'
       || initialPhase === 'expired'
       || initialPhase === 'cancelled';
-    return durablePresentation(
+    return withPublicResult(durablePresentation(
       initialPhase,
       result.record?.resultSummary || (terminalDecision ? null : result.resultSummary),
-    );
+    ), result.record);
   }
   return waitForDurableTerminalStatus(refresh, options);
 }
@@ -201,7 +269,8 @@ export function queuedPendingActionProgress(
   if (!queuedSnapshotMatchesCard(snapshot, card)) return null;
   const phase = durablePhase(snapshot.status);
   if (!phase) return null;
-  return phase === 'running' ? { mode: 'durable', phase } : durablePresentation(phase, snapshot.resultSummary);
+  return phase === 'running' ? { mode: 'durable', phase }
+    : withPublicResult(durablePresentation(phase, snapshot.resultSummary), snapshot.pendingAction);
 }
 
 /** Observe only; this helper has no approval or dispatch path. Each read must
@@ -261,6 +330,66 @@ export function startQueuedPendingActionPolling(
     stop();
     onProgress(uncertainPresentation());
   } else next(2_500);
+  return stop;
+}
+
+/** Record settlement can precede publication of its canonical answer. This
+ * short, serialized GET-only pass fills that presentation gap; failed reads or
+ * exhaustion leave the known settled outcome untouched. It cannot dispatch. */
+export function startPendingActionTerminalResultHydration(
+  settled: PendingActionExecutionPresentation,
+  refresh: () => Promise<PendingActionStatusSnapshot>,
+  onResult: (presentation: PendingActionExecutionPresentation) => void,
+  options: { observedExecution?: boolean; schedule?: (read: () => void, delayMs: number) => () => void } = {},
+): () => void {
+  const result = settled.mode === 'durable' ? settled.publicResult : undefined;
+  // Loading a history page must not launch a poll for every old settled card.
+  // This flag only selects fresh presentation work; it proves no execution.
+  if (options.observedExecution !== true || settled.mode !== 'durable' || (settled.phase !== 'executed' && settled.phase !== 'failed')
+    || !result || result.source !== 'record' || result.status !== settled.phase
+    || !result.pendingActionId || !result.approvalId || !result.payloadHash
+    || !Number.isFinite(Date.parse(result.recordUpdatedAt))
+    || !Object.hasOwn(settled, 'recordResultSummary')) return () => {};
+  const card = { id: result.pendingActionId, approvalId: result.approvalId,
+    payloadHash: result.payloadHash, updatedAt: result.recordUpdatedAt };
+  const schedule = options.schedule ?? ((read, delayMs) => {
+    const timer = setTimeout(read, delayMs);
+    return () => clearTimeout(timer);
+  });
+  const delays = [250, 750, 1_500, 3_000, 6_000] as const;
+  let stopped = false;
+  let reading = false;
+  let reads = 0;
+  let cancelNext: (() => void) | undefined;
+  const stop = () => { stopped = true; cancelNext?.(); };
+  const next = () => {
+    if (stopped || reads >= delays.length) return;
+    let fired = false;
+    cancelNext = schedule(() => {
+      if (fired) return;
+      fired = true;
+      cancelNext = undefined;
+      void read();
+    }, delays[reads]);
+  };
+  const read = async () => {
+    if (stopped || reading || reads >= delays.length) return;
+    reading = true;
+    reads += 1;
+    try {
+      const snapshot = await refresh();
+      if (stopped) return;
+      const incoming = queuedPendingActionProgress(snapshot, card);
+      const enriched = incoming && pendingActionTerminalResultUpgrade(settled, incoming);
+      if (enriched) { stop(); onResult(enriched); }
+    } catch {
+      // A missing answer is not a new execution verdict or permission to retry.
+    } finally {
+      reading = false;
+    }
+    next();
+  };
+  next();
   return stop;
 }
 

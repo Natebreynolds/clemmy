@@ -25,6 +25,10 @@ import {
   approveExecutePendingAction,
   canOfferStandingSendTrust,
   getPendingActionStatus,
+  pendingActionPresentationCopy,
+  pendingActionRecordPresentation,
+  pendingActionTerminalResultUpgrade,
+  startPendingActionTerminalResultHydration,
   startQueuedPendingActionPolling,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
@@ -34,6 +38,23 @@ import {
 import type { ChatMessage } from '@/lib/useChat';
 
 const QUEUED_RUNNING_NOTE = 'Running the approved action now.';
+type DurableActionPresentation = Extract<PendingActionExecutionPresentation, { mode: 'durable' }>;
+type ActionExecutionView = { phase: 'idle' | PendingActionExecutionPhase; note?: string; details?: string;
+  presentation?: DurableActionPresentation; observedExecution?: boolean };
+function actionExecutionView(presentation: DurableActionPresentation, observedExecution = false): ActionExecutionView {
+  const copy = pendingActionPresentationCopy(presentation);
+  const defaultNote: Partial<Record<PendingActionExecutionPhase, string>> = {
+    queued: 'Approved. It runs once the current work in this chat ends.',
+    running: 'This exact queued action already has an execution claim. No second dispatch was attempted.',
+    failed: 'The action failed or its final provider outcome needs review. Check the durable action before retrying.',
+    rejected: 'You rejected this action. It was not dispatched.',
+    expired: 'This approval expired. The action was not dispatched.',
+    cancelled: 'This action was cancelled. It was not dispatched.',
+    uncertain: 'The execution outcome is not confirmed. Check the durable action before continuing; do not retry it.',
+  };
+  return { phase: presentation.phase, note: copy.note?.trim() || defaultNote[presentation.phase],
+    ...(copy.details ? { details: copy.details } : {}), presentation, observedExecution };
+}
 import { snoozeNeedsYou } from '@/lib/inbox';
 import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
 
@@ -410,7 +431,7 @@ export function ChatBubble({
   // Execute-button truth (U3): a pending-action card's Execute fires the exact
   // stored call server-side and shows the DURABLE outcome — never a client-side
   // "Submitted" that outruns whether the send actually happened.
-  const [exec, setExec] = useState<{ phase: 'idle' | PendingActionExecutionPhase; note?: string }>({ phase: 'idle' });
+  const [exec, setExec] = useState<ActionExecutionView>({ phase: 'idle' });
   // Grant-at-card (C, v2.3.0): opting in stores a NARROW standing send-trust
   // grant (exactly this card's recipients on this toolkit) so the next
   // identical send skips the card. trustNote reports the server's truth —
@@ -423,7 +444,8 @@ export function ChatBubble({
   const [editedValue, setEditedValue] = useState('');
   const editableField = editableApprovalField(message.approval?.preview);
   const [trustNote, setTrustNote] = useState<string | null>(null);
-  const pendingActionId = message.approval?.pendingAction?.id;
+  const pendingAction = message.approval?.pendingAction;
+  const pendingActionId = pendingAction?.id;
   const pendingApprovalId = message.approval?.approvalId ?? message.approval?.pendingAction?.approvalId ?? null;
   const pendingPayloadHash = message.approval?.pendingAction?.payloadHash;
   const pendingRevision = message.approval?.pendingAction?.updatedAt;
@@ -432,22 +454,42 @@ export function ChatBubble({
   currentQueuedCard.current = queuedCardKey;
   const showDurablePresentation = (presentation: PendingActionExecutionPresentation) => {
     if (presentation.mode !== 'durable') return false;
-    const note = presentation.note?.trim();
-    const defaultNote: Partial<Record<PendingActionExecutionPhase, string>> = {
-      queued: 'Approved. It runs once the current work in this chat ends.',
-      running: 'This exact queued action already has an execution claim. No second dispatch was attempted.',
-      failed: 'The action failed or its final provider outcome needs review. Check the durable action before retrying.',
-      rejected: 'You rejected this action. It was not dispatched.',
-      expired: 'This approval expired. The action was not dispatched.',
-      cancelled: 'This action was cancelled. It was not dispatched.',
-      uncertain: 'The execution outcome is not confirmed. Check the durable action before continuing; do not retry it.',
-    };
-    setExec({
-      phase: presentation.phase,
-      note: (note || defaultNote[presentation.phase])?.slice(0, 240),
-    });
+    setExec(actionExecutionView(presentation, true));
     return true;
   };
+  const propResultKey = useMemo(() => JSON.stringify([pendingAction?.status, pendingAction?.resultSummary, pendingAction?.publicResult]),
+    [pendingAction?.status, pendingAction?.resultSummary, pendingAction?.publicResult]);
+  const hydrationCardKey = useMemo(() => JSON.stringify([queuedCardKey, propResultKey]), [queuedCardKey, propResultKey]);
+  const currentHydrationCard = useRef(hydrationCardKey);
+  currentHydrationCard.current = hydrationCardKey;
+  useEffect(() => {
+    if (!pendingAction || pendingAction.approvalId !== pendingApprovalId) return;
+    const presentation = pendingActionRecordPresentation(pendingAction);
+    if (presentation?.mode !== 'durable') return;
+    setExec((current) => {
+      if (current.phase === 'idle') return actionExecutionView(presentation);
+      const enriched = pendingActionTerminalResultUpgrade(current.presentation, presentation);
+      return enriched?.mode === 'durable' ? actionExecutionView(enriched) : current;
+    });
+  }, [pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision, propResultKey]);
+  const terminalResultKey = useMemo(() => JSON.stringify(exec.presentation), [exec.presentation]);
+  useEffect(() => {
+    const settled = exec.presentation;
+    const result = settled?.publicResult;
+    if (!settled || !result || result.pendingActionId !== pendingActionId || result.approvalId !== pendingApprovalId
+      || result.payloadHash !== pendingPayloadHash || Date.parse(pendingRevision ?? '') > Date.parse(result.recordUpdatedAt)) return;
+    const propTerminal = pendingAction && pendingActionRecordPresentation(pendingAction);
+    if (propTerminal?.mode === 'durable' && (pendingRevision !== result.recordUpdatedAt
+      || propTerminal.phase !== settled.phase || pendingAction?.resultSummary !== settled.recordResultSummary)) return;
+    return startPendingActionTerminalResultHydration(settled,
+      () => getPendingActionStatus(result.pendingActionId), (presentation) => {
+        if (currentHydrationCard.current !== hydrationCardKey) return;
+        setExec((current) => {
+          const enriched = pendingActionTerminalResultUpgrade(current.presentation, presentation);
+          return enriched?.mode === 'durable' ? actionExecutionView(enriched) : current;
+        });
+      }, { observedExecution: exec.observedExecution });
+  }, [hydrationCardKey, terminalResultKey, exec.observedExecution]);
   // A queued card follows its durable record until the resume picks it up,
   // so the label moves from "Up next" to the real outcome by itself.
   const followingQueued = exec.phase === 'queued' || (exec.phase === 'running' && exec.note === QUEUED_RUNNING_NOTE);
@@ -464,7 +506,7 @@ export function ChatBubble({
     });
   }, [pendingActionId, pendingApprovalId, pendingPayloadHash, pendingRevision, queuedCardKey, followingQueued]);
   const runExecute = async () => {
-    if (!pendingActionId || resolved || decisionBusy || editing || message.approval?.resolution) return;
+    if (!pendingActionId || resolved || decisionBusy || editing || message.approval?.resolution || exec.phase !== 'idle') return;
     await decisionGate.current.run(async () => {
       setDecisionBusy('approve');
       setResolvedDecision('approve');
@@ -479,6 +521,7 @@ export function ChatBubble({
         const presentation = await resolvePendingActionExecutionPresentation(
           result,
           () => getPendingActionStatus(pendingActionId),
+          { card: { id: pendingActionId, approvalId: pendingApprovalId, payloadHash: pendingPayloadHash ?? '', updatedAt: pendingRevision ?? '' } },
         );
         if (!showDurablePresentation(presentation)) {
           // A genuinely queued/non-executable legacy card still belongs to the
@@ -492,6 +535,7 @@ export function ChatBubble({
         // the record; bounded failure becomes explicit do-not-retry uncertainty.
         const presentation = await reconcilePendingActionExecutionFailure(
           () => getPendingActionStatus(pendingActionId),
+          { card: { id: pendingActionId, approvalId: pendingApprovalId, payloadHash: pendingPayloadHash ?? '', updatedAt: pendingRevision ?? '' } },
         );
         showDurablePresentation(presentation);
       } finally {
@@ -614,7 +658,6 @@ export function ChatBubble({
   const live = thinking || Boolean(message.workflowLive);
   const handlingSource = !live ? taskHandlingSource(message, sessionId, retainedHistorySources) : null;
   const currentMemoryWork = hasExactMemoryWork(message.terminal, handlingSource);
-  const pendingAction = message.approval?.pendingAction;
   // A decision needs somewhere to go. Without both handlers this thread is a
   // replay, and the card is a record rather than a control.
   const canDecide = Boolean(onApprove && onReject);
@@ -840,7 +883,7 @@ export function ChatBubble({
             {pendingAction && (message.approval?.resolution === 'approved' || message.approval?.resolution === 'declined') && (
               <ApprovalOutcomePill resolution={message.approval.resolution} />
             )}
-            {canOfferStandingSendTrust(pendingAction) && !resolved && !message.approval?.resolution && (
+            {canOfferStandingSendTrust(pendingAction) && !resolved && !message.approval?.resolution && exec.phase === 'idle' && (
               <label className="mt-2 flex cursor-pointer items-center gap-1.5 text-caption text-muted">
                 <input
                   type="checkbox"
@@ -878,13 +921,13 @@ export function ChatBubble({
             <div className="mt-2.5 flex items-center gap-2">
               <Button
                 size="sm"
-                disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null || exec.phase === 'running'}
+                disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null || exec.phase !== 'idle'}
                 onClick={pendingAction ? runExecute : () => { void resolvePlainDecision('approve'); }}
               >
                 {pendingAction ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
                 {pendingAction ? (voicedPendingAction ? 'Yes, go ahead' : 'Execute queued action') : message.approval?.preview?.items ? `Approve all ${message.approval.preview.items.length}` : 'Approve'}
               </Button>
-              <Button size="sm" variant="secondary" disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> {voicedPendingAction ? 'No, skip it' : 'Decline'}</Button>
+              <Button size="sm" variant="secondary" disabled={resolved || Boolean(message.approval?.resolution) || decisionBusy !== null || exec.phase !== 'idle'} onClick={() => { void resolvePlainDecision('reject'); }}><X className="h-4 w-4" aria-hidden /> {voicedPendingAction ? 'No, skip it' : 'Decline'}</Button>
               {!resolved && !message.approval?.resolution && exec.phase === 'idle' && (
                 <Button size="sm" variant="ghost" disabled={decisionBusy !== null} onClick={() => { void setAsideForLater(); }}>Not now</Button>
               )}
@@ -917,11 +960,15 @@ export function ChatBubble({
             )}
             {decisionError && <p role="alert" className="mt-1.5 text-caption text-danger">{decisionError}</p>}
             {pendingAction && exec.note && exec.phase !== 'idle' && (
-              <p
-                className={cn('mt-1.5 whitespace-pre-wrap text-caption', exec.phase === 'failed' ? 'text-danger' : 'text-muted')}
-              >
-                {exec.note}
-              </p>
+              <div className="mt-1.5 min-w-0 text-caption text-muted">
+                <ReplyProse text={exec.note} failed={exec.phase === 'failed'} />
+              </div>
+            )}
+            {pendingAction && exec.details && exec.phase !== 'idle' && (
+              <details className="mt-2 min-w-0 text-caption text-muted">
+                <summary className="cursor-pointer">Execution details</summary>
+                <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-2 p-2 font-mono text-caption text-fg">{exec.details}</pre>
+              </details>
             )}
             {trustNote && <p className="mt-1 text-caption text-muted">{trustNote}</p>}
           </div>

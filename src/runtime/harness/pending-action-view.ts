@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
 import { outgoingFilesInCommand } from '../shell-outgoing-files.js';
 import { LocalFileSendRefusal, describeLocalFileToSend, resolveLocalFileToSend } from '../local-file-sending.js';
+import { pendingActionPublicResult, type PendingActionPublicResult } from './pending-action-public-result.js';
 
 export interface PendingActionApprovalView {
   id: string;
@@ -24,6 +25,8 @@ export interface PendingActionApprovalView {
   idempotencyKey: string;
   approvalId: string | null;
   resultSummary: string | null;
+  /** Display-only exact-record/terminal projection; raw evidence stays above. */
+  publicResult?: PendingActionPublicResult;
   createdAt: string;
   updatedAt: string;
   /** The local files a command would send off this computer, each named
@@ -67,6 +70,7 @@ export function pendingActionApprovalView(record: PendingActionRecord): PendingA
     idempotencyKey: record.idempotencyKey,
     approvalId: record.approvalId,
     resultSummary: record.resultSummary,
+    ...(() => { const publicResult = pendingActionPublicResult(record); return publicResult ? { publicResult } : {}; })(),
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
     ...(() => {

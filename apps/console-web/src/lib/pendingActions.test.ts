@@ -2,12 +2,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canOfferStandingSendTrust,
+  pendingActionPresentationCopy,
+  pendingActionRecordPresentation,
+  pendingActionTerminalResultUpgrade,
+  startPendingActionTerminalResultHydration,
   queuedPendingActionProgress,
   startQueuedPendingActionPolling,
   reconcilePendingActionExecutionFailure,
   resolvePendingActionExecutionPresentation,
   type PendingActionExecuteResult,
+  type PendingActionExecutionPresentation,
 } from './pendingActions';
+import type { PendingActionApprovalView, PendingActionPublicResult } from './types';
 
 const queuedBinding = {
   id: 'pa-one', approvalId: 'apr-one', payloadHash: 'sha256:one', updatedAt: '2026-10-19T20:00:00.000Z',
@@ -37,6 +43,209 @@ function pollClock() {
 }
 
 async function finishRead() { await Promise.resolve(); await Promise.resolve(); }
+
+function publicResult(snapshot = statusSnapshot('executed')): PendingActionPublicResult {
+  return {
+    version: 1, pendingActionId: snapshot.pendingAction.id, approvalId: snapshot.pendingAction.approvalId,
+    payloadHash: snapshot.pendingAction.payloadHash, recordUpdatedAt: snapshot.pendingAction.updatedAt,
+    status: 'executed', source: 'terminal', text: 'Done — I ran it.\n\nfixture output', terminal: { eventId: 'terminal-B', sourceUserSeq: 2 },
+  };
+}
+
+function projectedSnapshot(snapshot = statusSnapshot('executed'), source: 'record' | 'terminal' = 'record') {
+  return { ...snapshot, pendingAction: { ...snapshot.pendingAction, publicResult: {
+    ...publicResult(snapshot), status: snapshot.status as PendingActionPublicResult['status'], source,
+    ...(source === 'record' ? { terminal: undefined, text: 'The approved action completed.' } : {}),
+  } } };
+}
+
+test('settled queued record is enriched by its later canonical answer without reopening execution or overlapping reads', async () => {
+  const queueClock = pollClock();
+  const progress: PendingActionExecutionPresentation[] = [];
+  const queuedReads = [statusSnapshot('executing'), projectedSnapshot()];
+  startQueuedPendingActionPolling(queuedBinding, async () => queuedReads.shift()!,
+    (value) => progress.push(value), { schedule: queueClock.schedule });
+  queueClock.next(); await finishRead();
+  queueClock.next(); await finishRead();
+  const settled = progress.at(-1)!;
+  assert.equal(settled.phase, 'executed');
+  assert.equal(queueClock.scheduled.length, 0, 'execution observation remains terminal-fenced');
+  const clock = pollClock();
+  const enriched: PendingActionExecutionPresentation[] = [];
+  let reads = 0;
+  let finish!: (snapshot: ReturnType<typeof projectedSnapshot>) => void;
+  startPendingActionTerminalResultHydration(settled, () => {
+    reads += 1;
+    if (reads === 1) return new Promise<ReturnType<typeof projectedSnapshot>>((resolve) => { finish = resolve; });
+    return Promise.resolve(projectedSnapshot(statusSnapshot('executed'), 'terminal'));
+  }, (value) => enriched.push(value), { observedExecution: true, schedule: clock.schedule });
+  const first = clock.next();
+  first.run();
+  assert.equal(reads, 1);
+  assert.equal(clock.scheduled.length, 0);
+  finish(projectedSnapshot()); await finishRead();
+  assert.equal(enriched.length, 0, 'record-only copy leaves the settled outcome unchanged');
+  clock.next(); await finishRead();
+  assert.equal(enriched[0]?.phase, 'executed');
+  assert.equal(pendingActionPresentationCopy(enriched[0]).note, publicResult().text);
+  assert.equal(pendingActionPresentationCopy(enriched[0]).details, 'Updated 1 record.');
+  assert.equal(reads, 2);
+  assert.equal(clock.scheduled.length, 0);
+  first.run();
+  assert.equal(reads, 2, 'retained callbacks cannot restart a finished hydration');
+});
+
+test('historical record-only terminal cards do not start a GET hydration burst on mount', () => {
+  const settled = queuedPendingActionProgress(projectedSnapshot(), queuedBinding)!;
+  const clock = pollClock();
+  startPendingActionTerminalResultHydration(settled, async () => assert.fail('history must not poll'),
+    () => assert.fail('no history hydration'), { schedule: clock.schedule });
+  assert.equal(clock.scheduled.length, 0);
+});
+
+test('same-bubble canonical props upgrade a settled fallback at the same revision and never downgrade it', () => {
+  const settled = queuedPendingActionProgress(projectedSnapshot(), queuedBinding)!;
+  const rich = pendingActionRecordPresentation(projectedSnapshot(statusSnapshot('executed'), 'terminal').pendingAction as PendingActionApprovalView)!;
+  assert.equal(settled.phase, 'executed');
+  assert.equal(pendingActionTerminalResultUpgrade(settled, rich), rich, 'non-idle phase does not block richer same-record props');
+  assert.equal(pendingActionTerminalResultUpgrade(rich, settled), null);
+  assert.equal(pendingActionTerminalResultUpgrade(rich, rich), null, 'canonical projection is monotonic');
+  for (const change of [
+    { id: 'pa-foreign' }, { approvalId: 'apr-other' }, { payloadHash: 'foreign' },
+    { updatedAt: '2026-10-19T20:00:02.000Z' }, { status: 'failed' },
+    { resultSummary: 'Updated 1 record. ' },
+  ]) {
+    const action = { ...statusSnapshot('executed').pendingAction, ...change };
+    const result: PendingActionPublicResult = { ...publicResult(), pendingActionId: action.id,
+      approvalId: action.approvalId, payloadHash: action.payloadHash, recordUpdatedAt: action.updatedAt,
+      status: action.status as PendingActionPublicResult['status'] };
+    const incoming = pendingActionRecordPresentation({ ...action, publicResult: result } as PendingActionApprovalView)!;
+    assert.equal(pendingActionTerminalResultUpgrade(settled, incoming), null, JSON.stringify(change));
+  }
+});
+
+test('late result hydration is bounded and preserves settled failure on unavailable, foreign, stale or inconsistent reads', async () => {
+  const settledSnapshot = projectedSnapshot(statusSnapshot('failed'));
+  const settled = queuedPendingActionProgress(settledSnapshot, queuedBinding)!;
+  for (const kind of ['unavailable', 'foreign', 'stale', 'changed-raw', 'running', 'missing-proof']) {
+    const clock = pollClock();
+    let reads = 0;
+    startPendingActionTerminalResultHydration(settled, async () => {
+      reads += 1;
+      if (kind === 'unavailable') throw new Error('read unavailable');
+      const snapshot = projectedSnapshot(statusSnapshot('failed'), 'terminal');
+      if (kind === 'foreign') snapshot.pendingAction.approvalId = 'apr-other';
+      if (kind === 'stale') snapshot.pendingAction.updatedAt = queuedBinding.updatedAt;
+      if (kind === 'changed-raw') { snapshot.pendingAction.resultSummary = 'changed'; snapshot.resultSummary = 'changed'; }
+      if (kind === 'running') { snapshot.status = 'executing'; snapshot.pendingAction.status = 'executing'; }
+      if (kind === 'missing-proof') snapshot.pendingAction.publicResult.terminal = undefined;
+      return snapshot;
+    }, () => assert.fail('unproven enrichment cannot replace the settled failure'), { observedExecution: true, schedule: clock.schedule });
+    for (const delay of [250, 750, 1_500, 3_000, 6_000]) { assert.equal(clock.next().delay, delay); await finishRead(); }
+    assert.equal(reads, 5);
+    assert.equal(clock.scheduled.length, 0);
+    assert.equal(settled.phase, 'failed');
+  }
+});
+
+test('a canonical failure answer enriches details without turning a partial or uncertain effect into success', async () => {
+  const snapshot = projectedSnapshot(statusSnapshot('failed'));
+  snapshot.pendingAction.resultSummary = 'Connection ended after dispatch; effect uncertain.';
+  snapshot.resultSummary = snapshot.pendingAction.resultSummary;
+  const settled = queuedPendingActionProgress(snapshot, queuedBinding)!;
+  const canonical = projectedSnapshot({ ...snapshot, pendingAction: { ...snapshot.pendingAction } }, 'terminal');
+  canonical.pendingAction.publicResult.text = 'The connection ended after the action began. Check the destination before trying again.';
+  const progress: PendingActionExecutionPresentation[] = [];
+  const clock = pollClock();
+  startPendingActionTerminalResultHydration(settled, async () => canonical,
+    (value) => progress.push(value), { observedExecution: true, schedule: clock.schedule });
+  clock.next(); await finishRead();
+  assert.equal(progress[0]?.phase, 'failed');
+  assert.deepEqual(pendingActionPresentationCopy(progress[0]), {
+    note: canonical.pendingAction.publicResult.text, details: snapshot.resultSummary,
+  });
+  assert.equal(clock.scheduled.length, 0);
+});
+
+test('late result hydration cleanup fences outstanding responses and already-rich or unbound records schedule no read', async () => {
+  const settled = queuedPendingActionProgress(projectedSnapshot(), queuedBinding)!;
+  const clock = pollClock();
+  let finish!: (snapshot: ReturnType<typeof projectedSnapshot>) => void;
+  const stop = startPendingActionTerminalResultHydration(settled,
+    () => new Promise<ReturnType<typeof projectedSnapshot>>((resolve) => { finish = resolve; }),
+    () => assert.fail('a replaced or unmounted card cannot take a late answer'), { observedExecution: true, schedule: clock.schedule });
+  clock.next(); stop();
+  finish(projectedSnapshot(statusSnapshot('executed'), 'terminal')); await finishRead();
+  assert.equal(clock.scheduled.length, 0);
+  const cancelledClock = pollClock();
+  const cancel = startPendingActionTerminalResultHydration(settled,
+    async () => assert.fail('cleanup cancels an unread timer'), () => assert.fail('no unmounted update'),
+    { observedExecution: true, schedule: cancelledClock.schedule });
+  cancel();
+  assert.equal(cancelledClock.next().cancelled, true);
+  for (const presentation of [
+    queuedPendingActionProgress(projectedSnapshot(statusSnapshot('executed'), 'terminal'), queuedBinding)!,
+    queuedPendingActionProgress(statusSnapshot('executed'), queuedBinding)!,
+    { mode: 'durable', phase: 'uncertain' } as const,
+  ]) {
+    const idleClock = pollClock();
+    startPendingActionTerminalResultHydration(presentation, async () => assert.fail('no unbound or redundant read'),
+      () => assert.fail('no extra presentation'), { observedExecution: true, schedule: idleClock.schedule });
+    assert.equal(idleClock.scheduled.length, 0);
+  }
+});
+
+test('exact public result is primary card copy while raw executor evidence remains in disclosure', async () => {
+  const snapshot = statusSnapshot('executed');
+  const action = { ...snapshot.pendingAction, resultSummary: 'Executed the approved call. exit_code: 0 stdout: fixture stderr: warning', publicResult: publicResult(snapshot) };
+  const presentation = await resolvePendingActionExecutionPresentation({
+    ok: true, status: 'executed', resultSummary: 'Executed the approved call. exit_code: 0 stdout: fixture stderr: warning', record: action,
+  }, async () => assert.fail('no extra result read'), { card: queuedBinding });
+  assert.equal(presentation.phase, 'executed');
+  assert.deepEqual(pendingActionPresentationCopy(presentation), {
+    note: action.publicResult.text, details: 'Executed the approved call. exit_code: 0 stdout: fixture stderr: warning',
+  });
+  const hydrated = pendingActionRecordPresentation(action as PendingActionApprovalView)!;
+  assert.equal(pendingActionPresentationCopy(hydrated).note, action.publicResult.text);
+});
+
+test('foreign or stale public-result coordinates never become primary card text', () => {
+  const snapshot = statusSnapshot('executed');
+  for (const change of [
+    { pendingActionId: 'pa-foreign' }, { approvalId: 'apr-else' }, { payloadHash: 'different' },
+    { recordUpdatedAt: queuedBinding.updatedAt }, { status: 'failed' as const },
+    { source: 'terminal' as const, terminal: undefined },
+  ]) {
+    const progress = queuedPendingActionProgress({ ...snapshot,
+      pendingAction: { ...snapshot.pendingAction, publicResult: { ...publicResult(snapshot), ...change } },
+    }, queuedBinding)!;
+    const copy = pendingActionPresentationCopy(progress);
+    assert.match(copy.note ?? '', /approved action completed/i);
+    assert.doesNotMatch(copy.note ?? '', /fixture output/);
+    assert.equal(copy.details, snapshot.resultSummary);
+  }
+});
+
+test('an exact card cannot consume a foreign execute response or an unrelated reconciliation result', async () => {
+  const foreign = { ...statusSnapshot('executed').pendingAction, id: 'pa-foreign' };
+  const presentation = await resolvePendingActionExecutionPresentation({ ok: true, status: 'executed', resultSummary: 'Done', record: foreign },
+    async () => assert.fail('a foreign result is not an execution retry'), { card: queuedBinding });
+  assert.equal(presentation.phase, 'uncertain');
+  const reconciled = await reconcilePendingActionExecutionFailure(async () => ({ ...statusSnapshot('executed'), pendingAction: foreign }),
+    { card: queuedBinding, pollDelaysMs: [0], wait: async () => {} });
+  assert.equal(reconciled.phase, 'uncertain');
+});
+
+test('missing/legacy public copy is truthful, and a rich result never loses a trailing warning to the old 240-character cap', () => {
+  const failed = pendingActionPresentationCopy({ mode: 'durable', phase: 'failed', note: 'socket failed after dispatch' });
+  assert.match(failed.note ?? '', /check what changed/i);
+  assert.equal(failed.details, 'socket failed after dispatch');
+  assert.doesNotMatch(failed.note ?? '', /nothing ran|nothing changed/i);
+  const snapshot = statusSnapshot('executed');
+  const rich = { ...publicResult(snapshot), text: `${'Recorded output. '.repeat(30)}The earlier request still has work to verify.` };
+  const progress = queuedPendingActionProgress({ ...snapshot, pendingAction: { ...snapshot.pendingAction, publicResult: rich } }, queuedBinding)!;
+  assert.equal(pendingActionPresentationCopy(progress).note, rich.text);
+});
 
 test('queued status cannot attach a different action result to this card', () => {
   const snapshot = statusSnapshot('executed');

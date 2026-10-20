@@ -14171,18 +14171,23 @@ export function registerConsoleRoutes(
   // come from the DURABLE record: approve-execute resolves the human card and
   // fires the exact stored call server-side, returning the real outcome; the
   // GET refreshes a card from the record's truth.
-  app.get('/api/console/pending-actions/:id', (req, res) => {
+  app.get('/api/console/pending-actions/:id', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const record = getPendingAction(req.params.id);
     if (!record) { res.status(404).json({ ok: false, reason: 'pending action not found' }); return; }
     // Read-only hydration for slim workflow/background approval events. The
     // execution endpoint still re-verifies the exact card/action/session
     // backlinks; returning this view grants no authority.
+    const view = pendingActionApprovalView(record);
+    const publicResult = record.status === 'executed' || record.status === 'failed'
+      ? await import('../runtime/harness/pending-action-result-reader.js')
+        .then(reader => reader.readPendingActionPublicResult(record)).catch(() => null)
+      : null;
     res.json({
       ok: true,
       status: record.status,
       resultSummary: record.resultSummary,
-      pendingAction: pendingActionApprovalView(record),
+      pendingAction: { ...view, ...(publicResult ? { publicResult } : {}) },
     });
   });
 
@@ -14329,13 +14334,18 @@ export function registerConsoleRoutes(
           })
         : await executeApprovedPendingActionCall(id, { sessionId: record.sessionId ?? undefined });
       const out = exec.record ?? getPendingAction(id);
+      const outcomeView = out ? pendingActionApprovalView(out) : null;
+      const publicResult = out && (out.status === 'executed' || out.status === 'failed') ? await import('../runtime/harness/pending-action-result-reader.js')
+        .then(reader => reader.readPendingActionPublicResult(out)).catch(() => null) : null;
       res.json({
         ok: exec.ok,
         status: exec.status,
         resultSummary: exec.resultSummary,
         ...(alwaysAllow ? { trustGranted: Boolean(trustGrant), trustGrantId: trustGrant?.id ?? null } : {}),
         record: out
-          ? { id: out.id, status: out.status, resultSummary: out.resultSummary, payloadHash: out.payloadHash }
+          ? { id: out.id, status: out.status, resultSummary: out.resultSummary, payloadHash: out.payloadHash,
+              approvalId: out.approvalId, updatedAt: out.updatedAt,
+              ...(publicResult || outcomeView?.publicResult ? { publicResult: publicResult ?? outcomeView!.publicResult } : {}) }
           : null,
       });
     } catch (err) {
