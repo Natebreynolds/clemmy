@@ -13,6 +13,7 @@ import {
   aliasLabelFor, isAccountRoleLabel, listAccountAliases, resolveAccountAlias, rememberAccountAlias,
   READ_DEFAULT_ACCOUNT_LABEL, SEND_DEFAULT_ACCOUNT_LABEL,
 } from '../memory/account-alias-store.js';
+import { searchFactsByText } from '../memory/facts.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { structuralDestinationPosture } from '../runtime/harness/external-capability-risk.js';
 import pino from 'pino';
@@ -116,6 +117,32 @@ function acceptedSource(sessionId: string, seq: number) {
   // different accepted source are excluded by the shared adoption contract.
   const text = objectiveWithAdoptedSteering(original, adoptedSteerNotesForSource({ sessionId, sourceUserSeq: seq }));
   return { sessionId, seq, text, digest: digest(text) };
+}
+
+/**
+ * A standing instruction the owner wrote in some earlier conversation and Clem
+ * kept verbatim ("only use my Scorpion account for Outlook") is the owner's
+ * own words as much as a message in this chat is. A nomination that quotes it
+ * gets that instruction as its origin, so a new conversation does not ask the
+ * account question the owner already answered for good (live 10-19, Windows:
+ * the rule was stated, and the next chat asked again). Only owner-authored
+ * standing spans count: pinned facts, feedback and constraints; never a
+ * paraphrase Clem derived from a tool result.
+ */
+function standingMemoryOrigin(quote: string, sessionId: string, seq: number, sourceDigest: string) {
+  const needle = quote.trim();
+  if (!needle) return null;
+  try {
+    const fact = searchFactsByText(needle, 8).find((candidate) => (
+      candidate.active
+      && (candidate.pinned === true || candidate.kind === 'feedback' || candidate.kind === 'constraint')
+      && candidate.content.includes(needle)
+    ));
+    if (!fact) return null;
+    return { sessionId, seq, text: fact.content, digest: sourceDigest, remembered: true as const };
+  } catch {
+    return null;
+  }
 }
 
 /** Continuity must see corrections even when an intervening turn never ran a
@@ -586,7 +613,8 @@ export async function resolveSourceAccountRouting(input: {
       const prior = acceptedSource(event.sessionId, event.seq);
       if (prior?.text.includes(sourceQuote!)) return prior;
     }
-    return null;
+    // Not in this conversation: the owner's remembered standing instruction.
+    return standingMemoryOrigin(sourceQuote!, input.sessionId, source.seq, source.digest);
   })();
   if (!origin || (sourceQuote !== null && !origin.text.includes(sourceQuote))) return blocked(sourceQuote !== null ? 'quote_not_in_source' : undefined);
   if (established?.checkedForSourceUserSeq === input.sourceUserSeq
@@ -630,8 +658,11 @@ export async function resolveSourceAccountRouting(input: {
   // exact connected identity — or the conversation's established route — is
   // the route. The result discloses the account so the user can correct it.
   if (input.effect === 'read' && !defaultMode && origin) {
-    if (sourceAnsweredAQuestion(input.sessionId, input.sourceUserSeq)) {
-      // The user just answered "which account?" — remember it for reads.
+    const remembered = 'remembered' in origin && origin.remembered === true;
+    if (remembered || sourceAnsweredAQuestion(input.sessionId, input.sourceUserSeq)) {
+      // The user just answered "which account?", or their remembered standing
+      // instruction named it — remember it for reads, so the next
+      // conversation routes with no nomination at all.
       try {
         rememberAccountAlias({ toolkit, label: READ_DEFAULT_ACCOUNT_LABEL, email: emailOf(connection) || undefined, connectionId: connection.connectionId });
       } catch { /* memory is a convenience, never a gate */ }
@@ -642,7 +673,7 @@ export async function resolveSourceAccountRouting(input: {
       sourceQuote: sourceQuote ?? '', sourceDigest: origin.digest,
       checkedForSourceUserSeq: input.sourceUserSeq,
       checkedForSourceDigest: source.digest,
-      judgeModelIdentity: 'host:read_route',
+      judgeModelIdentity: remembered ? 'host:read_standing_instruction' : 'host:read_route',
     } };
   }
   const proposalDigest = digest(JSON.stringify(subject));
@@ -669,7 +700,7 @@ export async function resolveSourceAccountRouting(input: {
       ?? [connection.accountLabel, connection.alias, connection.accountName, connection.wordId]
         .map((value) => String(value ?? '').trim()).find(Boolean)
       ?? null,
-    establishedSource: origin.seq !== input.sourceUserSeq
+    establishedSource: origin.seq !== input.sourceUserSeq || ('remembered' in origin && origin.remembered === true)
       ? { acceptedText: origin.text, sourceQuote: sourceQuote!, previouslyChecked: established !== null } : null,
     interveningAcceptedSources,
     proposalDigest,

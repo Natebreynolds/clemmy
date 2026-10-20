@@ -1118,3 +1118,38 @@ test('a nomination that echoes the remembered SEND default is resolved by the ho
   assert.equal(calls.length, 2);
   resetAccountAliasesForTest();
 });
+
+test('a standing instruction Clem remembered from another conversation routes a read in a new chat and becomes the read default', async () => {
+  // Last in this file on purpose: it leaves a remembered read default behind.
+  const facts = await import('../memory/facts.js');
+  const rule = 'Only ever use my Scorpion mailbox for anything in Outlook.';
+  facts.rememberFact({ kind: 'feedback', content: rule, trustLevel: 1 });
+  const identity = source('List my Outlook mail folders.');
+  const calls = installJudge();
+  const quoted = { ...nomination, source_quote: 'use my Scorpion mailbox for anything in Outlook' };
+  const selected = await routing.resolveSourceAccountRouting({
+    ...input(identity), operation: 'OUTLOOK_LIST_MAIL_FOLDERS', effect: 'read', nomination: quoted,
+  });
+  assert.equal(selected.kind, 'resolved', JSON.stringify(selected));
+  if (selected.kind !== 'resolved') return;
+  assert.equal(selected.connection.connectionId, 'fixture-scorpion');
+  assert.equal(selected.evidence.judgeModelIdentity, 'host:read_standing_instruction');
+  assert.equal(calls.length, 0, 'a read never waits on the judge');
+
+  // The next conversation needs no nomination at all: the rule is the read default.
+  const later = source('Show my Outlook folders again.');
+  const again = await routing.resolveSourceAccountRouting({
+    ...input(later), operation: 'OUTLOOK_LIST_MAIL_FOLDERS', effect: 'read', nomination: null,
+  });
+  assert.equal(again.kind, 'resolved', JSON.stringify(again));
+  if (again.kind === 'resolved') assert.equal(again.evidence.judgeModelIdentity, 'host:read_default');
+
+  // A quote found in no conversation and no remembered instruction still blocks.
+  const stranger = source('List my Outlook mail folders.');
+  const blocked = await routing.resolveSourceAccountRouting({
+    ...input(stranger), operation: 'OUTLOOK_LIST_MAIL_FOLDERS', effect: 'read',
+    nomination: { toolkit: 'outlook', identity: PERSONAL, source_quote: 'use my Personal mailbox for anything in Outlook' },
+  });
+  assert.equal(blocked.kind, 'account_selection_required');
+  if (blocked.kind === 'account_selection_required') assert.equal(blocked.reason, 'quote_not_in_source');
+});
