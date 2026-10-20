@@ -162,8 +162,36 @@ test('production reader proves canonical B from real host execution and refuses 
     assert.equal(readPendingActionPublicResult(first.settled)?.source, 'record', 'two B candidates cannot select a convenient terminal');
     db.prepare('DELETE FROM events WHERE id = ? AND session_id = ?').run(duplicate.id, session.id);
     assert.equal(readPendingActionPublicResult(first.settled)?.source, 'terminal');
-    db.prepare('DELETE FROM accepted_task_authority WHERE session_id = ? AND source_user_seq = ?').run(session.id, first.source.seq);
-    assert.equal(readPendingActionPublicResult(first.settled)?.source, 'record', 'missing authority is not display authority');
+    // A separate legacy/unarmed source has no canonical authority to borrow.
+    // Do not delete a real host's immutable completion evidence to manufacture
+    // this negative case: even well-shaped terminal text alone proves nothing.
+    const legacySession = events.createSession({ kind: 'chat', channel: 'desktop' });
+    const legacyAction = actions.queuePendingAction({ title: 'Controlled legacy result', summary: 'No-dispatch missing-authority fixture.',
+      kind: 'shell_command', toolName: 'run_shell_command', payload: { command: 'echo never-dispatched', cwd: '/tmp' }, sessionId: legacySession.id });
+    const legacyCard = registry.register({ sessionId: legacySession.id, subject: legacyAction.title, tool: 'request_approval',
+      args: { pendingActionId: legacyAction.id, pendingAction: pendingActionApprovalView(legacyAction) } });
+    registry.resolve(legacyCard.approvalId, 'approved', 'desktop-chat-card');
+    const claim = actions.claimPendingActionExecution(legacyAction.id, 'legacy-fixture', {
+      expectedSessionId: legacySession.id, requireResolvedHumanCard: true,
+    });
+    assert.equal(claim.claimed, true);
+    assert.ok(claim.claimToken);
+    const legacySettled = actions.recordPendingActionResult(legacyAction.id, 'failed', 'Unproved legacy failure summary.',
+      'legacy-fixture', claim.claimToken)!;
+    assert.equal(legacySettled.status, 'failed');
+    const legacySource = events.appendEvent({ sessionId: legacySession.id, turn: 1, role: 'user', type: 'user_input_received',
+      data: { synthetic: true, source: 'approval_resume', approvalId: legacyCard.approvalId, decision: 'approve' } });
+    const identity = { sessionId: legacySession.id, sourceUserSeq: legacySource.seq, turn: legacySource.turn };
+    const legacyOutcome: TurnOutcome = { version: 2, id: turnOutcomeId(identity), identity, status: 'failed', resumable: false,
+      presentation: { kind: 'error', text: 'This shaped legacy answer has no canonical authority.' } };
+    db.prepare(`INSERT INTO events (id,session_id,turn,role,type,data_json,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(`legacy-unarmed-${legacyAction.id}`, legacySession.id, legacySource.turn, 'system', 'conversation_completed', JSON.stringify({
+        sourceUserSeq: legacySource.seq, terminalKey: turnOutcomeId(identity), turnOutcome: legacyOutcome,
+        presentation: presentationEventForOutcome(legacyOutcome), pendingActionResultBinding: pendingActionResultBinding(legacySettled, legacySource),
+      }), new Date().toISOString());
+    assert.equal(loadAcceptedTaskAuthority(legacySession.id, legacySource.seq).status, 'legacy');
+    assert.equal(readPendingActionPublicResult(legacySettled)?.source, 'record', 'missing authority is not display authority');
+    assert.equal(readPendingActionPublicResult(first.settled)?.source, 'terminal', 'the real host evidence stays intact');
     assert.equal(dispatches, 2, 'all projection reads leave the exact dispatch count unchanged');
   } finally {
     executor._setApprovedCallDispatchForTests(null);

@@ -170,19 +170,63 @@ test('approve-execute on a card the resume owns reports the resume\'s one execut
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }),
     });
     assert.equal(res.status, 200);
-    const body = await res.json() as { ok: boolean; status: string; resultSummary: string };
+    const body = await res.json() as { ok: boolean; status: string; resultSummary: string;
+      record: { approvalId: string; updatedAt: string; publicResult: { source: string; text: string; pendingActionId: string;
+        terminal?: { eventId: string; sourceUserSeq: number } } } };
     assert.equal(body.ok, true, JSON.stringify(body));
     assert.equal(body.status, 'executed');
     assert.match(body.resultSummary, /Executed the approved run_shell_command call/);
+    assert.equal(body.record.approvalId, card.approvalId);
+    assert.equal(body.record.publicResult.pendingActionId, record.id);
+    assert.equal(body.record.publicResult.source, 'terminal', 'a successful real-host action publishes its exact canonical result');
+    assert.doesNotMatch(body.record.publicResult.text, /Executed the approved|exit_code/);
     assert.equal(dispatched.length, 1, 'the stored payload ran exactly once');
     assert.deepEqual(dispatched[0].payload, record.payload);
     assert.equal(getPendingAction(record.id)?.status, 'executed');
-    // The resume settled its own accepted source with what landed.
-    const settled = listEvents(sessionId, { types: ['conversation_completed'] }).at(-1);
-    assert.ok(settled, 'the approval source settled');
+    // The card's own synthetic B owns this terminal. A convenient latest
+    // completion or merely formatted host text is never display authority.
+    const sources = listEvents(sessionId, { types: ['user_input_received'] })
+      .filter(event => event.data.approvalId === card.approvalId && event.data.decision === 'approve');
+    assert.equal(sources.length, 1, 'the real host created exactly one approval-response source');
+    const source = sources[0]!;
+    assert.equal(source.data.source, 'approval_resume');
+    assert.equal(source.data.synthetic, true);
+    const { loadAcceptedTaskAuthority } = await import('../runtime/harness/accepted-task-authority.js');
+    const { readValidatedTerminalEvent } = await import('../runtime/harness/eventlog.js');
+    const { presentationEventFromCompletionData } = await import('../runtime/harness/turn-outcome.js');
+    const authority = loadAcceptedTaskAuthority(sessionId, source.seq);
+    assert.equal(authority.status, 'ok');
+    if (authority.status !== 'ok') assert.fail('the exact approval-response source must retain canonical authority');
+    assert.ok(authority.authority.terminalEventId, 'successful canonical authority retains its own terminal pointer');
+    const settled = readValidatedTerminalEvent(authority.authority.terminalEventId, sessionId, source.seq);
+    const presentation = presentationEventFromCompletionData(settled.data);
+    assert.ok(presentation, 'the exact canonical B terminal has a validated public presentation');
+    assert.equal(presentation.identity.sessionId, sessionId);
+    assert.equal(presentation.identity.sourceUserSeq, source.seq);
+    assert.equal(presentation.identity.turn, source.turn);
+    assert.equal(presentation.status, 'done');
+    assert.deepEqual(body.record.publicResult.terminal, { eventId: settled.id, sourceUserSeq: source.seq });
+    assert.equal(body.record.publicResult.text, presentation.text, 'the card presents the whole exact B answer');
     // The ending speaks as Clem (the card-voice patch): what ran and what it
     // printed, never the host's "Executed the approved … call".
-    assert.match(JSON.stringify(settled!.data), /Done — I ran it/);
+    assert.match(presentation.text, /Done — I ran it/);
+    const read = await (await fetch(`${h.url}/api/console/pending-actions/${record.id}`)).json() as {
+      resultSummary: string; pendingAction: { publicResult: { source: string; text: string;
+        terminal?: { eventId: string; sourceUserSeq: number } } };
+    };
+    assert.match(read.resultSummary, /Executed the approved/, 'GET retains raw executor evidence');
+    assert.equal(read.pendingAction.publicResult.source, 'terminal');
+    assert.equal(read.pendingAction.publicResult.text, body.record.publicResult.text);
+    assert.deepEqual(read.pendingAction.publicResult.terminal, body.record.publicResult.terminal);
+    // A forged ordinary source tagged with the same card is ambiguity, never
+    // permission to choose whichever B or terminal happens to be newest.
+    const { appendEvent } = await import('../runtime/harness/eventlog.js');
+    appendEvent({ sessionId, turn: 99, role: 'user', type: 'user_input_received', data: { text: 'unrelated', approvalId: card.approvalId, decision: 'approve' } });
+    const ambiguous = await (await fetch(`${h.url}/api/console/pending-actions/${record.id}`)).json() as {
+      pendingAction: { publicResult: { source: string } };
+    };
+    assert.equal(ambiguous.pendingAction.publicResult.source, 'record');
+    assert.equal(dispatched.length, 1, 'projection reads do not dispatch or ask a model');
   } finally {
     _setApprovedCallDispatchForTests(null);
     _resetChatApprovalResumeForTest();
@@ -739,11 +783,11 @@ function runMarker(sessionId: string): unknown {
   return (openEventLog().prepare(`SELECT json_extract(metadata_json, '$.__run_in_flight') AS at, json_extract(metadata_json, '$.__run_in_flight_owner') AS owner FROM sessions WHERE id = ?`).get(sessionId));
 }
 
-test('an approved card runs when only a marker no live run owns holds the chat, and leaves that marker alone', async () => {
-  // Windows tester traces 2026-10-19: approved Salesforce updates sat
-  // "approved" forever. The chat carried a run marker no live run owned, so
-  // the resume waited for it; the button then fell back to chat text and
-  // Clem looped on refused pending_action_execute calls.
+test('unproven, mismatched and legacy marker owners keep the exact action queued without replay', async () => {
+  // These markers do not establish that the exact retained owner ended:
+  // a missing attempt, a different source, and untyped "Done" prose are not
+  // release authority. Canonical retired-owner positives live in the resume
+  // suite. The card must wait without starting a second model/tool attempt.
   for (const holder of ['earlier_process', 'finished_attempt', 'ended_request'] as const) {
     _resetChatApprovalResumeForTest();
     startChatApprovalResume(async () => { throw new Error('a linked card never resumes the model'); });
@@ -774,9 +818,9 @@ test('an approved card runs when only a marker no live run owns holds the chat, 
       const res = await fetch(`${h.url}/api/console/pending-actions/${record.id}/approve-execute`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ approvalId: card.approvalId }) });
       const body = await res.json() as { status: string };
-      assert.equal(body.status, 'executed', `${holder}: ${JSON.stringify(body)}`);
-      assert.equal(dispatched.length, 1, `${holder}: the stored payload ran exactly once`);
-      assert.equal(getPendingAction(record.id)?.status, 'executed');
+      assert.equal(body.status, 'queued', `${holder}: ${JSON.stringify(body)}`);
+      assert.equal(dispatched.length, 0, `${holder}: an unproven owner cannot authorize dispatch`);
+      assert.equal(getPendingAction(record.id)?.status, 'approved');
       assert.equal(JSON.stringify(runMarker(sessionId)), before, `${holder}: the marker it did not own is left as it was`);
     } finally { _setApprovedCallDispatchForTests(null); _resetChatApprovalResumeForTest(); await h.close(); }
   }
