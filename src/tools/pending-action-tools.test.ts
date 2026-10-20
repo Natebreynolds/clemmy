@@ -11,7 +11,7 @@ const {
   pendingActionContinuationMode,
   registerPendingActionTools,
 } = await import('./pending-action-tools.js');
-const { appendEvent, createSession, listEvents, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
+const { appendEvent, createSession, listEvents, openEventLog, resetEventLog, writeToolOutput } = await import('../runtime/harness/eventlog.js');
 const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 const { ToolCallsCounter, withHarnessRunContext } = await import('../runtime/harness/brackets.js');
 const {
@@ -23,9 +23,14 @@ const {
   recordPendingActionResult,
 } = await import('../runtime/harness/pending-actions.js');
 const {
+  materializeQueuedApprovals,
   queuedApprovalTransitionShouldMaterialize,
   queuedApprovalTransitionsForRequest,
 } = await import('../runtime/harness/pending-action-transition.js');
+const { armHostCallAuthority, acceptedTurnCallAuthorityFor } = await import('../runtime/harness/accepted-turn-call-authority.js');
+const { captureEffectiveCompletionPolicyOnce } = await import('../runtime/harness/host-turn-runner.js');
+const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
 const {
   grantComposioCliDefaultAccountAuthority,
   revokeComposioCliDefaultAccountAuthority,
@@ -862,6 +867,85 @@ test('pending_action_queue binds its audit edge to the exact accepted request an
   assert.equal(event.data.pendingActionId, record.id);
   assert.equal(event.data.payloadHash, record.payloadHash);
 });
+
+for (const contextKind of ['ambient-run', 'output-only'] as const) {
+test(`the real queue producer at a nonzero host turn binds its card and deferred review through ${contextKind}`, async () => {
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 7, role: 'user', type: 'user_input_received',
+    data: { text: 'Prepare the exact controlled message and ask me before sending it.' } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn };
+  assert.equal(armHostCallAuthority({ ...identity, catalogRevisionDigest: 'a'.repeat(64),
+    bindingRevisionDigest: 'b'.repeat(64), maxLogicalCalls: 10, maxParallelCalls: 1 }).status, 'armed');
+  captureEffectiveCompletionPolicyOnce({ ...identity, enabled: true, ownerEnabled: true });
+  const invoke = () => handlerFor('pending_action_queue')({
+        title: 'Controlled exact approval', summary: 'One inert approval fixture.', kind: 'external_send',
+        toolName: 'composio_execute_tool', approvalIntent: 'request_now',
+        payloadJson: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE',
+          arguments: { channel: 'controlled-approval-turn', text: 'Controlled approval fixture.' } }),
+      });
+  const queued = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq, callId: 'exact-queue-turn' },
+    () => contextKind === 'ambient-run'
+      ? withHarnessRunContext({ ...identity, turn: 99, counter: new ToolCallsCounter(10) }, invoke)
+      : invoke());
+  assert.match(queued.content[0].text, /Pending action queued:/);
+  const edge = listEvents(session.id, { types: ['autonomy_note'] })
+    .find(event => event.data.kind === 'pending_action_queued')!;
+  assert.equal(edge.turn, source.turn, 'the nested runtime turn cannot replace the accepted source turn');
+  assert.equal(edge.data.sourceUserSeq, source.seq);
+  const [transition] = queuedApprovalTransitionsForRequest(session.id, source.seq);
+  assert.ok(transition);
+  const [materialized] = materializeQueuedApprovals(session.id, source.turn, source.seq, [transition]);
+  assert.ok(materialized);
+  const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+    status: 'needs_input', resumable: true, needs: { kind: 'approval' },
+    presentation: { kind: 'approval', text: 'The exact controlled message is ready for your approval.',
+      approvalId: materialized.approval.approvalId } });
+  assert.equal(committed.presentation.status, 'needs_input');
+  assert.deepEqual(committed.event.data.completionReview,
+    { version: 1, disposition: 'deferred_for_approval', policyEvidence: 'captured' });
+  for (const event of listEvents(session.id, { types: ['approval_requested', 'approval_parked'] })) {
+    assert.equal(event.turn, source.turn);
+    assert.equal(event.data.sourceUserSeq, source.seq);
+    assert.equal(event.data.approvalId, materialized.approval.approvalId);
+  }
+  assert.equal(getPendingAction(transition.record.id)?.status, 'approval_requested');
+  assert.equal(listEvents(session.id, { types: ['completion_policy_captured'] })[0].data.enabled, true);
+  assert.equal(listEvents(session.id, { types: ['goal_alignment_judged', 'provider_dispatch_started'] }).length, 0,
+    'recording a deferred review neither judges nor executes the action');
+  assert.equal(committed.event.data.completionVerdictRef, undefined);
+  const authority = acceptedTurnCallAuthorityFor(session.id, source.seq);
+  assert.equal(authority.status, 'ok');
+  if (authority.status === 'ok') assert.equal(authority.authority.authorityKind, 'host_v1');
+  assert.equal(openEventLog().prepare('SELECT COUNT(*) AS n FROM accepted_task_authority WHERE session_id=? AND source_user_seq=?')
+    .get(session.id, source.seq)?.n, 0, 'a card pause does not fabricate graph-task authority');
+});
+}
+
+for (const variant of ['foreign-source', 'missing-source', 'non-user-source', 'foreign-run', 'conflicting-output-source'] as const) {
+  test(`an attributed queue cannot borrow a turn from ${variant}`, async () => {
+    const session = createSession({ kind: 'chat' });
+    const foreign = createSession({ kind: 'chat' });
+    const source = appendEvent({ sessionId: variant === 'foreign-source' ? foreign.id : session.id,
+      turn: 11, role: variant === 'non-user-source' ? 'system' : 'user', type: 'user_input_received',
+      data: { text: 'Controlled exact-source ownership fixture.' } });
+    const sourceUserSeq = variant === 'missing-source' ? source.seq + 100_000 : source.seq;
+    const result = await withToolOutputContext({ sessionId: session.id,
+      ...(variant === 'conflicting-output-source' ? { sourceUserSeq: source.seq + 100_000 } : {}) },
+      () => withHarnessRunContext({ sessionId: variant === 'foreign-run' ? foreign.id : session.id,
+        sourceUserSeq, turn: 91, counter: new ToolCallsCounter(10) },
+      () => handlerFor('pending_action_queue')({
+        title: 'Controlled refused queue', summary: 'No source turn may be borrowed.', kind: 'external_send',
+        toolName: 'composio_execute_tool', approvalIntent: 'request_now',
+        payloadJson: JSON.stringify({ tool_slug: 'SLACK_SEND_MESSAGE',
+          arguments: { channel: 'controlled-approval-turn', text: 'Controlled no-execution fixture.' } }),
+      })));
+    assert.match(result.content[0].text, /failed safely/);
+    assert.equal(listEvents(session.id, { types: ['autonomy_note'] })
+      .filter(event => event.data.kind === 'pending_action_queued').length, 0);
+    assert.equal(listPendingActions({ sessionId: session.id })[0]?.status, 'cancelled');
+    assert.equal(queuedApprovalTransitionsForRequest(session.id, sourceUserSeq).length, 0);
+  });
+}
 
 test('pending_action_queue reuses an exact same-request retry but not a later user request', async () => {
   const session = createSession({ kind: 'chat' });

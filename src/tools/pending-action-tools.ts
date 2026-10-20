@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { appendEvent, getSession, listEvents, type SessionKind } from '../runtime/harness/eventlog.js';
+import { appendEvent, getSession, getUserInputEventAtSequence, listEvents, type SessionKind } from '../runtime/harness/eventlog.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import { pendingActionAsk } from '../runtime/harness/pending-action-view.js';
 import { harnessRunContextStorage } from '../runtime/harness/brackets.js';
@@ -110,7 +110,7 @@ function currentRequestAttribution(): {
 } {
   const outputContext = getToolOutputContext();
   const runContext = harnessRunContextStorage.getStore();
-  const sourceUserSeq = runContext?.sourceUserSeq;
+  const sourceUserSeq = runContext ? runContext.sourceUserSeq : outputContext?.sourceUserSeq;
   return {
     ...(Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
       ? { sourceUserSeq: sourceUserSeq as number }
@@ -132,9 +132,24 @@ function activeContextOwns(record: { sessionId: string | null }): boolean {
 function maybeLog(sessionId: string | null, type: 'queued' | 'result', data: Record<string, unknown>): boolean {
   if (!sessionId) return false;
   try {
+    let turn = 0;
+    if (type === 'queued' && data.sourceUserSeq !== undefined) {
+      const run = harnessRunContextStorage.getStore();
+      const output = getToolOutputContext();
+      const owner = run ?? output;
+      if (!Number.isSafeInteger(data.sourceUserSeq) || Number(data.sourceUserSeq) <= 0
+        || !owner || owner.sessionId !== sessionId || owner.sourceUserSeq !== data.sourceUserSeq
+        || (output?.sourceUserSeq !== undefined
+          && (output.sessionId !== sessionId || output.sourceUserSeq !== data.sourceUserSeq))) return false;
+      const source = getUserInputEventAtSequence(sessionId, Number(data.sourceUserSeq));
+      if (!source || source.role !== 'user' || !Number.isSafeInteger(source.turn) || source.turn < 0) return false;
+      // This edge belongs to the accepted source, not a mutable session turn
+      // or a nested SDK invocation's default turn zero.
+      turn = source.turn;
+    }
     appendEvent({
       sessionId,
-      turn: 0,
+      turn,
       role: 'Clem',
       type: 'autonomy_note',
       data: { kind: `pending_action_${type}`, ...data },
