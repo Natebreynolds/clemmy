@@ -1100,3 +1100,21 @@ test('public observation entry does not read requests or move assertion/return/t
   await assert.rejects(model.getStreamedResponse(req())[Symbol.asyncIterator]().throw!(thrown), error => error === thrown);
   assert.equal(calls, 0);
 });
+
+test('getResponse: a 429 on a brain with another brain behind it is surfaced at once, not retried here', async () => {
+  // Live 10-20: two-minute waits per turn while a healthy backup sat idle.
+  const { CHAIN_ALTERNATIVES } = await import('./resilient-model.js');
+  let calls = 0;
+  const limited = { statusCode: 429 };
+  const inner = makeModel({ getResponse: async () => { calls += 1; throw limited; } });
+  const request = req() as unknown as Record<symbol, unknown>;
+  request[CHAIN_ALTERNATIVES] = 1;
+  await assert.rejects(() => withResilience(inner, policy({ maxRetries: 3 })).getResponse(request as never), (err) => err === limited);
+  assert.equal(calls, 1, 'the chain switches instead of paying this brain\'s retry ladder');
+
+  calls = 0;
+  const last = req() as unknown as Record<symbol, unknown>;
+  last[CHAIN_ALTERNATIVES] = 0;
+  await assert.rejects(() => withResilience(inner, policy({ maxRetries: 2 })).getResponse(last as never), (err) => err === limited);
+  assert.equal(calls, 3, 'the last brain in the chain still retries as before');
+});

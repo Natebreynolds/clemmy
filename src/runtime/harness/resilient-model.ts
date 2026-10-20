@@ -365,6 +365,20 @@ interface NoAnswerCall {
   startedAt: number;
   signal?: AbortSignal;
   noAnswerRetries: number;
+  /** How many other brains the outer chain can still turn to for this request. */
+  alternatives?: number;
+}
+
+/** The outer fallback chain marks each request it hands a brain with how many
+ * other brains remain after it. A rate limit or overload on a brain with an
+ * alternative is surfaced at once instead of paying that brain's retry ladder
+ * first (owner's rule: switch, then tell; live 10-20: two-minute waits per
+ * turn on a 429 while a healthy backup sat idle). */
+export const CHAIN_ALTERNATIVES = Symbol.for('clementine.model.chainAlternatives');
+
+function chainAlternativesOf(request: ModelRequest): number | undefined {
+  const value = (request as unknown as Record<symbol, unknown>)[CHAIN_ALTERNATIVES];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 interface ErrorClass {
@@ -692,6 +706,11 @@ export class ResilientModel implements Model {
     // A durable plan/model allowance cannot heal during exponential backoff.
     // Surface it immediately to the outer cross-provider chain.
     if (!cls.retryable || cls.sameProviderRetryable === false) return false;
+    if ((cls.kind === 'model.rate_limited' || cls.kind === 'model.overloaded') && (call.alternatives ?? 0) > 0) {
+      logger.warn({ label: this.policy.label, path, attempt: attempt + 1, kind: cls.kind, status: cls.status, alternatives: call.alternatives },
+        'brain is rate limited or overloaded and another brain is available — switching now instead of retrying here');
+      return false;
+    }
     const noAnswer = NO_ANSWER_KINDS.has(cls.kind);
     if (attempt >= this.maxRetries) {
       // Other retries share the attempt count, so a no-answer failure that
@@ -727,7 +746,7 @@ export class ResilientModel implements Model {
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
-    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
+    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0, alternatives: chainAlternativesOf(request) };
     const entry = publicModelObservation.getStore();
     const observation = entry?.target === this ? entry : undefined;
     const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal,
@@ -809,7 +828,7 @@ export class ResilientModel implements Model {
     observation: { transportOwner: CapturedModelTransportOwner; observer: ResilienceTelemetryObserver | undefined }): AsyncIterable<StreamEvent> {
     let req = translateSettings(request, this.policy.capability);
     const authRefreshed = { value: false };
-    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0 };
+    const call: NoAnswerCall = { startedAt: this.now(), signal: request.signal, noAnswerRetries: 0, alternatives: chainAlternativesOf(request) };
     const telemetry = new ResilienceCallTelemetry(this.policy.label, 'getStreamedResponse', this.maxRetries, call.startedAt, () => this.now(), request.signal, observation.transportOwner, undefined, observation);
     let outcome: ResilienceOutcome = 'interrupted';
     let failureKind: ResilienceFailureKind | undefined;

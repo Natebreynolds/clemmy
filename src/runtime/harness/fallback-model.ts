@@ -30,7 +30,7 @@ import path from 'node:path';
 import { BoundaryError } from '../boundary-error.js';
 import { appendEvent } from './eventlog.js';
 import { sessionAgentFields, sessionProjectFields } from './session-composition.js';
-import { classifyModelError } from './resilient-model.js';
+import { classifyModelError, CHAIN_ALTERNATIVES } from './resilient-model.js';
 import { isAuthRecoverableError } from '../../execution/transient-error.js';
 import { providerCapacityErrorText, isProviderExtraUsageUnavailable } from '../../shared/provider-capacity.js';
 import { redactSensitiveText } from '../security.js';
@@ -1005,6 +1005,7 @@ export class FallbackModel implements Model {
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
+      (req as unknown as Record<symbol, unknown>)[CHAIN_ALTERNATIVES] = chain.length - i - 1;
       try {
         // `getResponse()` resolves only after the complete response, so racing it
         // against a FIRST-BYTE budget mistakes healthy long reasoning for silence
@@ -1080,6 +1081,7 @@ export class FallbackModel implements Model {
         continue;
       }
       const { request: req, cleanup } = this.linkAbort(request);
+      (req as unknown as Record<symbol, unknown>)[CHAIN_ALTERNATIVES] = chain.length - i - 1;
       const attemptStartedAt = Date.now();
       let sawModelActivity = false;
       let committedActionable = false;
