@@ -113,6 +113,16 @@ export function restorePre96ApprovedActionFixture(db: Database.Database): void {
   for(const name of ['approved_action_provider_intent_protocol_v97','approved_action_provider_receipt_exact_v97']) {
     db.exec(`DROP TRIGGER IF EXISTS ${name}`);
   }
+  // The v98 wording-job trigger joins the receipts table. With the table gone
+  // and the trigger kept, SQLite refuses every later ALTER TABLE ... RENAME in
+  // the store ("error in trigger ...: no such table"), which broke every
+  // rehearsal that replays migration 83 (103 CI cases on 2026-10-20). A
+  // pre-v96 store has no v98 schema either; migration 98 recreates it.
+  for(const table of ['approved_action_result_projection_jobs_v1','approved_action_result_projections_v1']) {
+    if(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(table)
+      && Number((db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n)!==0) throw new Error('pre-v96 fixture refuses populated approval wording');
+    db.exec(`DROP TABLE IF EXISTS ${table}`);
+  }
   const old=new Database(':memory:');
   try {
     applyHarnessMigrationsThroughVersionForTests(old,95);

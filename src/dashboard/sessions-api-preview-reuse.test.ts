@@ -1,11 +1,17 @@
-/** Reconstructed round 19 controls. Real private SQLite; no app, provider or live-home access. */
+/** Preview reuse controls. Real private SQLite; no app, provider or live-home access.
+ *
+ * A session's list preview is reused until its own conversation changes: a
+ * member row's updated_at, its event count or last seq, or the schema. The
+ * event log is append-only in production (retention deletes whole rows), so
+ * those marks are the whole truth; a store-wide generation here made every
+ * unrelated write rebuild all 200 previews on each 10-s sidebar poll. */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-preview-reuse-reconstructed-'));
+const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-preview-reuse-'));
 for (const name of ['HOME', 'CLEMENTINE_HOME', 'CLEMMY_HOME']) process.env[name] = fixtureHome;
 mkdirSync(path.join(fixtureHome, 'state'), { recursive: true });
 const log = await import('../runtime/harness/eventlog.js');
@@ -35,8 +41,15 @@ function exchange(id: string, request: string, reply: string): number {
   return log.appendEvent({ sessionId: id, turn: 1, role: 'Clem', type: 'conversation_completed',
     data: { sourceUserSeq: source.seq, reply } }).seq;
 }
-function changeReply(db: Db, seq: number, text: string) {
-  db.prepare("UPDATE events SET data_json = json_set(data_json, '$.reply', ?) WHERE seq = ?").run(text, seq);
+/** A later message from another connection: the production shape of an
+ * external change to a conversation (the daemon and a tool both append). */
+function externalExchange(other: InstanceType<typeof Database>, id: string, request: string, reply: string): void {
+  const next = (other.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events').get() as { seq: number }).seq;
+  const insert = other.prepare(`INSERT INTO events (seq, id, session_id, turn, role, type, data_json, created_at)
+    VALUES (?, ?, ?, 1, ?, ?, ?, ?)`);
+  const at = new Date().toISOString();
+  insert.run(next, `ext-${next}`, id, 'user', 'user_input_received', JSON.stringify({ text: request }), at);
+  insert.run(next + 1, `ext-${next + 1}`, id, 'Clem', 'conversation_completed', JSON.stringify({ sourceUserSeq: next, reply }), at);
 }
 function instrument(db: Db) {
   const prepare = db.prepare.bind(db);
@@ -45,16 +58,8 @@ function instrument(db: Db) {
   const reads: Array<{ id: string; args: unknown[] }> = [];
   const searchReads: string[] = [];
   let publicRead: (() => void) | undefined;
-  let totalRead: (() => void) | undefined;
-  let counters: 'ok' | 'throw' | 'string' | 'negative' = 'ok';
-  let versions: 'ok' | 'throw' | 'string' | 'negative' = 'ok';
   let schemas: 'ok' | 'throw' | 'string' | 'negative' = 'ok';
   db.pragma = ((sql: string, options?: unknown) => {
-    if (sql === 'data_version' && !db.inTransaction) {
-      if (versions === 'throw') throw new Error('fixture data_version unavailable');
-      if (versions === 'string') return '1';
-      if (versions === 'negative') return -1;
-    }
     if (sql === 'schema_version' && !db.inTransaction) {
       if (schemas === 'throw') throw new Error('fixture schema_version unavailable');
       if (schemas === 'string') return '1';
@@ -84,23 +89,11 @@ function instrument(db: Db) {
           return all(...args);
         }) as typeof statement.all;
       }
-      if (/SELECT\s+total_changes\(\)/i.test(sql)) {
-        const get = statement.get.bind(statement);
-        statement.get = ((...args: unknown[]) => {
-          if (counters === 'throw') throw new Error('fixture counter unavailable');
-          const result = get(...args);
-          totalRead?.();
-          if (counters === 'string') return { changes: '1' };
-          if (counters === 'negative') return { changes: -1 };
-          return result;
-        }) as typeof statement.get;
-      }
     }
     return statement;
   }) as typeof db.prepare;
   return { reads, searchReads, reset: () => { reads.length = 0; searchReads.length = 0; }, count: (id: string) => reads.filter(r => r.id === id).length,
-    onPublicRead: (fn?: () => void) => { publicRead = fn; }, onTotalRead: (fn?: () => void) => { totalRead = fn; },
-    counters: (value: typeof counters) => { counters = value; }, versions: (value: typeof versions) => { versions = value; },
+    onPublicRead: (fn?: () => void) => { publicRead = fn; },
     schemas: (value: typeof schemas) => { schemas = value; },
     restore: () => { db.prepare = prepare; db.pragma = pragma; } };
 }
@@ -139,28 +132,30 @@ test('unchanged accepted chat previews reuse only scalar output; public nine-typ
   } finally { m.restore(); }
 });
 
-test('same-connection and external UPDATE/DELETE invalidate even with unchanged MAX(seq); unrelated writes invalidate conservatively', () => {
+test('a message appended on this or another connection replaces the preview; a retention delete does too; writes elsewhere keep it', () => {
   const f = accepted('mutation'); const db = log.openEventLog(); const other = new Database(log.HARNESS_DB_PATH);
   const m = instrument(db);
   try {
     log.appendEvent({ sessionId: f.id, turn: 0, role: 'system', type: 'turn_model_routed', data: { note: 'nonpublic tail' } });
-    const max = () => db.prepare('SELECT MAX(seq) AS n FROM events').get();
-    const originalMax = max(); f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    changeReply(db, f.replySeq!, 'same connection changed'); m.reset();
-    assert.equal(f.list()[0]!.preview, 'same connection changed'); assert.equal(m.count(f.id), 1); assert.deepEqual(max(), originalMax);
+    f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
+    exchange(f.id, 'second request', 'same connection changed'); m.reset();
+    assert.equal(f.list()[0]!.preview, 'same connection changed'); assert.equal(m.count(f.id), 1);
     m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    changeReply(other, f.replySeq!, 'external changed'); m.reset();
-    assert.equal(f.list()[0]!.preview, 'external changed'); assert.equal(m.count(f.id), 1); assert.deepEqual(max(), originalMax);
-    f.list(); other.prepare('DELETE FROM events WHERE seq = ?').run(f.replySeq!); m.reset();
-    assert.equal(f.list()[0]!.preview, 'mutation request'); assert.equal(f.list()[0]!.turnCount, 1);
-    assert.equal(m.count(f.id), 1); assert.deepEqual(max(), originalMax);
-    f.list(); db.exec('CREATE TABLE preview_unrelated (value INTEGER)'); db.prepare('INSERT INTO preview_unrelated VALUES (?)').run(1);
-    m.reset(); f.list(); assert.equal(m.count(f.id), 1, 'unknown same-connection writes clear rather than guess relevance');
-    f.list(); other.prepare('UPDATE preview_unrelated SET value = ?').run(2); m.reset(); f.list();
-    assert.equal(m.count(f.id), 1, 'unknown external commits clear rather than guess relevance');
-    const source = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received'").get(f.id) as { seq: number };
+    externalExchange(other, f.id, 'third request', 'external changed'); m.reset();
+    assert.equal(f.list()[0]!.preview, 'external changed'); assert.equal(m.count(f.id), 1);
+    m.reset(); f.list(); assert.equal(m.count(f.id), 0);
+    // Retention removes whole rows; a removed last reply changes the count.
+    const last = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'conversation_completed' ORDER BY seq DESC LIMIT 1").get(f.id) as { seq: number };
+    other.prepare('DELETE FROM events WHERE seq = ?').run(last.seq); m.reset();
+    assert.equal(f.list()[0]!.preview, 'third request'); assert.equal(m.count(f.id), 1);
+    // Writes to other sessions and other tables are not this conversation.
+    const neighbour = accepted('neighbour'); f.list(); m.reset(); neighbour.list(); exchange(neighbour.id, 'noise', 'noise answer');
+    db.exec('CREATE TABLE IF NOT EXISTS preview_unrelated (value INTEGER)'); db.prepare('INSERT INTO preview_unrelated VALUES (?)').run(1);
+    other.prepare('UPDATE preview_unrelated SET value = ?').run(2);
+    f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0, 'a write elsewhere in the store keeps this conversation\'s preview');
+    const source = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'user_input_received' ORDER BY seq LIMIT 1").get(f.id) as { seq: number };
     db.prepare('DELETE FROM events WHERE seq = ?').run(source.seq); m.reset();
-    assert.equal(f.list()[0]!.turnCount, 0); assert.equal(m.count(f.id), 1); assert.deepEqual(max(), originalMax);
+    assert.equal(m.count(f.id), 0); f.list(); assert.equal(m.count(f.id), 1, 'a deleted first message is a changed conversation');
   } finally { m.restore(); other.close(); }
 });
 
@@ -188,103 +183,72 @@ test('metadata, principal, and accepted Stop lineage changes are freshly elected
   } finally { m.restore(); }
 });
 
-test('preexisting transactions never reuse or retain uncommitted values; rollback and later commit are observed', () => {
+test('inside a preexisting transaction nothing is reused or stored; the committed value is reused after it', () => {
   const f = accepted('transaction'); const db = log.openEventLog(); const m = instrument(db);
   try {
     f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
     db.exec('BEGIN');
     try {
       m.reset(); assert.equal(f.list()[0]!.preview, 'transaction answer'); assert.equal(m.count(f.id), 1);
-      changeReply(db, f.replySeq!, 'uncommitted answer'); m.reset();
+      exchange(f.id, 'uncommitted request', 'uncommitted answer'); m.reset();
       assert.equal(f.list()[0]!.preview, 'uncommitted answer'); assert.equal(m.count(f.id), 1);
       m.reset(); f.list(); assert.equal(m.count(f.id), 1, 'transaction values cannot become warm cache hits');
     } finally { db.exec('ROLLBACK'); }
-    m.reset(); assert.equal(f.list()[0]!.preview, 'transaction answer'); assert.equal(m.count(f.id), 1);
-    m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    db.transaction(() => changeReply(db, f.replySeq!, 'committed answer'))(); m.reset();
+    m.reset(); assert.equal(f.list()[0]!.preview, 'transaction answer');
+    assert.equal(m.count(f.id), 0, 'the rolled-back conversation is the one that was cached');
+    db.transaction(() => exchange(f.id, 'committed request', 'committed answer'))(); m.reset();
     assert.equal(f.list()[0]!.preview, 'committed answer'); assert.equal(m.count(f.id), 1);
+    m.reset(); f.list(); assert.equal(m.count(f.id), 0);
   } finally { if (db.inTransaction) db.exec('ROLLBACK'); m.restore(); }
 });
 
-test('unavailable or malformed counters fall back; original reader and malformed JSON exceptions still propagate', () => {
+test('an unavailable or malformed schema version never authorizes reuse; original reader exceptions still propagate', () => {
   const f = accepted('errors'); const db = log.openEventLog(); const m = instrument(db);
   try {
     f.list();
-    for (const mode of ['throw', 'string', 'negative'] as const) {
-      m.counters(mode); m.reset(); assert.equal(f.list()[0]!.preview, 'errors answer'); f.list();
-      assert.equal(m.count(f.id), 2, `counter mode ${mode} must never authorize reuse`);
-    }
-    m.counters('ok');
-    for (const mode of ['throw', 'string', 'negative'] as const) {
-      m.versions(mode); m.reset(); assert.equal(f.list()[0]!.preview, 'errors answer'); f.list();
-      assert.equal(m.count(f.id), 2, `data_version mode ${mode} must never authorize reuse`);
-    }
-    m.versions('ok');
     for (const mode of ['throw', 'string', 'negative'] as const) {
       m.schemas(mode); m.reset(); assert.equal(f.list()[0]!.preview, 'errors answer'); f.list();
       assert.equal(m.count(f.id), 2, `schema_version mode ${mode} must never authorize reuse`);
     }
     m.schemas('ok'); f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    changeReply(db, f.replySeq!, 'reader failing');
+    exchange(f.id, 'failing request', 'reader failing');
     m.onPublicRead(() => { throw new Error('fixture original projector error'); });
     assert.throws(() => f.list(), /fixture original projector error/, 'cache plumbing cannot catch original projection failures');
     m.onPublicRead(); assert.equal(f.list()[0]!.preview, 'reader failing');
-    // A legacy public message can contain malformed JSON. Terminal-specific
-    // expression indexes correctly reject corruption of a completion instead.
-    const legacy = log.appendEvent({ sessionId: f.id, turn: 0, role: 'Clem', type: 'clem_message', data: { text: 'legacy fixture' } });
-    const saved = db.prepare('SELECT data_json FROM events WHERE seq = ?').get(legacy.seq) as { data_json: string };
-    f.list();
-    db.prepare('UPDATE events SET data_json = ? WHERE seq = ?').run('{malformed', legacy.seq);
-    assert.throws(() => f.list(), SyntaxError, 'a changed malformed public payload cannot be hidden by a warm scalar');
-    db.prepare('UPDATE events SET data_json = ? WHERE seq = ?').run(saved.data_json, legacy.seq);
-    assert.equal(f.list()[0]!.turnCount, 3);
+    assert.equal(f.list()[0]!.turnCount, 4);
   } finally { m.restore(); }
 });
 
-test('external commits during MISS hydration and between warmed HIT checks cannot store or return an old scalar', () => {
-  const miss = accepted('miss-race'); const db = log.openEventLog(); const other = new Database(log.HARNESS_DB_PATH);
+test('a message landing from another connection during hydration or between polls is never hidden by the stored scalar', () => {
+  const f = accepted('race'); const db = log.openEventLog(); const other = new Database(log.HARNESS_DB_PATH);
   const m = instrument(db);
   try {
     let fired = false;
-    m.onPublicRead(() => { if (!fired) { fired = true; changeReply(other, miss.replySeq!, 'after miss commit'); } });
-    assert.equal(miss.list()[0]!.preview, 'miss-race answer', 'original read may finish at its pre-commit snapshot');
+    m.onPublicRead(() => { if (!fired) { fired = true; externalExchange(other, f.id, 'during request', 'after miss commit'); } });
+    const hydrated = f.list()[0]!.preview;
+    assert.ok(hydrated === 'race answer' || hydrated === 'after miss commit', 'the original read finishes at its own snapshot');
     m.onPublicRead(); assert.equal(fired, true); m.reset();
-    assert.equal(miss.list()[0]!.preview, 'after miss commit'); assert.equal(m.count(miss.id), 1, 'raced MISS must not populate the later generation');
-    m.reset(); miss.list(); assert.equal(m.count(miss.id), 0);
-    let reads = 0; fired = false;
-    m.onTotalRead(() => { if (++reads === 3) { fired = true; changeReply(other, miss.replySeq!, 'after hit commit'); } });
-    m.reset(); assert.equal(miss.list()[0]!.preview, 'after hit commit'); assert.equal(fired, true);
-    assert.equal(m.count(miss.id), 1, 'a commit between warmed-hit generation checks falls back to the original projector');
-    m.onTotalRead(); m.reset(); assert.equal(miss.list()[0]!.preview, 'after hit commit'); assert.equal(m.count(miss.id), 1);
-    m.reset(); miss.list(); assert.equal(m.count(miss.id), 0);
-  } finally { m.restore(); other.close(); }
-});
-
-test('a commit after accepted-row snapshot acquisition forbids reuse for that request', () => {
-  const f = accepted('snapshot-race'); const db = log.openEventLog(); const other = new Database(log.HARNESS_DB_PATH);
-  const m = instrument(db);
-  try {
-    f.list(); let fired = false; m.reset();
-    const changed = f.list({}, { observer: (phase: string) => {
-      if (phase === 'catalog_collect' && !fired) { fired = true; changeReply(other, f.replySeq!, 'after snapshot commit'); }
-    } });
-    assert.equal(fired, true); assert.equal(changed[0]!.preview, 'after snapshot commit'); assert.equal(m.count(f.id), 1);
-    m.reset(); f.list(); assert.equal(m.count(f.id), 1, 'the raced snapshot cannot authorize storage for a later request');
+    assert.equal(f.list()[0]!.preview, 'after miss commit'); assert.equal(m.count(f.id), 1, 'a raced MISS is keyed on the marks it read, so the newer conversation is projected again');
+    m.reset(); f.list(); assert.equal(m.count(f.id), 0);
+    externalExchange(other, f.id, 'between request', 'after hit commit'); m.reset();
+    assert.equal(f.list()[0]!.preview, 'after hit commit'); assert.equal(m.count(f.id), 1);
     m.reset(); f.list(); assert.equal(m.count(f.id), 0);
   } finally { m.restore(); other.close(); }
 });
 
-test('verified empty chats can reuse zero; legacy and workflow paths still read fresh; close/reopen uses a new DB identity', () => {
+test('empty, legacy and workflow previews reuse like accepted chats; close/reopen uses a new DB identity', () => {
   const f = accepted('empty', { empty: true }); const db = log.openEventLog(); const m = instrument(db);
   try {
     assert.equal(f.list()[0]!.turnCount, 0); assert.equal(f.list()[0]!.preview, ''); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
     const legacy = log.createSession({ id: `legacy-${f.id}`, kind: 'chat', channel: 'desktop', metadata: { tags: [`legacy-${f.id}`] } });
     exchange(legacy.id, 'legacy request', 'legacy answer');
-    const legacyList = () => buildUnifiedSessionList({ tag: legacy.id }); legacyList(); m.reset(); legacyList(); assert.equal(m.count(legacy.id), 1);
+    const legacyList = () => buildUnifiedSessionList({ tag: legacy.id }); legacyList(); m.reset(); legacyList(); assert.equal(m.count(legacy.id), 0);
+    exchange(legacy.id, 'legacy again', 'legacy changed'); m.reset(); assert.equal(legacyList()[0]!.preview, 'legacy changed'); assert.equal(m.count(legacy.id), 1);
     const workflow = log.createSession({ id: `workflow-${f.id}`, kind: 'workflow', channel: 'workflow', userId: 'owner',
       metadata: { tags: [`workflow-${f.id}`], workflowRunId: `run-${f.id}`, workflowName: 'Fixture flow', stepId: 'only' } });
     exchange(workflow.id, 'workflow request', 'workflow answer');
-    const workflowList = () => buildUnifiedSessionList({ tag: workflow.id }); workflowList(); m.reset(); workflowList(); assert.equal(m.count(workflow.id), 1);
+    const workflowList = () => buildUnifiedSessionList({ tag: workflow.id }); workflowList(); m.reset(); workflowList(); assert.equal(m.count(workflow.id), 0);
+    exchange(workflow.id, 'workflow again', 'workflow changed'); m.reset(); assert.equal(workflowList()[0]!.preview, 'workflow changed'); assert.equal(m.count(workflow.id), 1);
     f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
   } finally { m.restore(); }
   log.closeEventLog(); const replacement = log.openEventLog(); assert.notEqual(replacement, db);
@@ -293,28 +257,27 @@ test('verified empty chats can reuse zero; legacy and workflow paths still read 
   finally { reopened.restore(); }
 });
 
-test('the actual oldest 1000 public-event window stays unchanged when later or outside-window events exist', () => {
+test('the oldest 1000 public-event window stays the preview when later events land outside it', () => {
   const f = accepted('bounded-window', { empty: true });
   for (let n = 0; n < 502; n++) exchange(f.id, `window request ${n}`, `window answer ${n}`);
   const db = log.openEventLog(); const m = instrument(db);
   try {
     const first = f.list()[0]!; assert.equal(first.turnCount, 1000); assert.equal(first.preview, 'window answer 499');
     m.reset(); assert.equal(f.list()[0]!.preview, first.preview); assert.equal(m.count(f.id), 0);
-    const outside = db.prepare("SELECT seq FROM events WHERE session_id = ? AND type = 'conversation_completed' ORDER BY seq DESC LIMIT 1")
-      .get(f.id) as { seq: number };
-    changeReply(db, outside.seq, 'outside the retained oldest window'); m.reset();
-    assert.equal(f.list()[0]!.preview, first.preview); assert.equal(f.list()[0]!.turnCount, 1000); assert.equal(m.count(f.id), 1);
+    exchange(f.id, 'outside request', 'outside the retained oldest window'); m.reset();
+    assert.equal(f.list()[0]!.preview, first.preview); assert.equal(f.list()[0]!.turnCount, 1000);
+    assert.equal(m.count(f.id), 1, 'a changed conversation is projected again even when its window is unchanged');
     assert.equal(getUnifiedSessionDetail(`harness:${f.id}`)!.turns.length, 1000);
   } finally { m.restore(); }
 });
 
-test('the scalar cache evicts its least recently used entry at 256 rather than retaining an unbounded catalog', () => {
-  const fixtures = Array.from({ length: 257 }, (_, n) => accepted(`capacity-${n}`, { empty: true }));
+test('the scalar cache evicts its least recently used entry at 512 rather than retaining an unbounded catalog', () => {
+  const fixtures = Array.from({ length: 513 }, (_, n) => accepted(`capacity-${n}`, { empty: true }));
   const db = log.openEventLog(); const m = instrument(db);
   try {
     for (const f of fixtures) f.list();
     const newest = fixtures.at(-1)!; m.reset(); newest.list(); assert.equal(m.count(newest.id), 0);
-    const oldest = fixtures[0]!; m.reset(); oldest.list(); assert.equal(m.count(oldest.id), 1, 'the 257th insert evicted the oldest scalar');
+    const oldest = fixtures[0]!; m.reset(); oldest.list(); assert.equal(m.count(oldest.id), 1, 'the 513th insert evicted the oldest scalar');
     m.reset(); newest.list(); assert.equal(m.count(newest.id), 0, 'reading a hit refreshes its LRU position');
     const nextOldest = fixtures[1]!; m.reset(); nextOldest.list(); assert.equal(m.count(nextOldest.id), 1);
   } finally { m.restore(); }
@@ -336,21 +299,17 @@ test('an oversized lineage key retains the ordinary projector instead of caching
   } finally { m.restore(); }
 });
 
-test('same-connection DDL invalidates even when data_version and total_changes stay unchanged', () => {
+test('same-connection DDL invalidates even when the conversation itself is unchanged', () => {
   const f = accepted('schema-only'); const db = log.openEventLog(); const m = instrument(db);
-  const dataCounters = () => ({ version: db.pragma('data_version', { simple: true }),
-    changes: (db.prepare('SELECT total_changes() AS changes').get() as { changes: number }).changes });
   try {
     f.list(); m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    const before = dataCounters(); const schemaBefore = db.pragma('schema_version', { simple: true });
+    const schemaBefore = db.pragma('schema_version', { simple: true });
     db.exec('CREATE TABLE preview_schema_only (value INTEGER)');
-    assert.deepEqual(dataCounters(), before, 'pure DDL is not covered by either data counter');
     assert.notEqual(db.pragma('schema_version', { simple: true }), schemaBefore);
     m.reset(); assert.equal(f.list()[0]!.preview, 'schema-only answer');
     assert.equal(m.count(f.id), 1, 'main-schema DDL must force the original public reader');
     m.reset(); f.list(); assert.equal(m.count(f.id), 0);
-    const beforeDrop = dataCounters(); db.exec('DROP TABLE preview_schema_only');
-    assert.deepEqual(dataCounters(), beforeDrop);
+    db.exec('DROP TABLE preview_schema_only');
     m.reset(); assert.equal(f.list()[0]!.turnCount, 2); assert.equal(m.count(f.id), 1);
   } finally { m.restore(); }
 });

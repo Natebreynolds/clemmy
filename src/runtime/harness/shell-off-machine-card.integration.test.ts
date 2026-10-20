@@ -250,8 +250,14 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.equal(approved.settled, true, approved.outcomeText);
   assert.deepEqual(received, ['POST /hook x=1'], `${approved.outcomeText}\n${pendingActions.getPendingAction(view!.id)?.resultSummary ?? ''}`);
   assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', approved.outcomeText);
-  assert.match(approved.outcomeText, /Done — I ran it\. Here's what it printed/, approved.outcomeText);
-  assert.match(approved.outcomeText, /```\\nok\\n```/, 'the command\'s own output, not the executor\'s bookkeeping');
+  // The turn ends on the app's structured notice bound to the exact action;
+  // fixed host prose never speaks for Clem, and her own wording of the result
+  // is a separate, optional card projection authored after the action settles.
+  const outcome = JSON.parse(approved.outcomeText) as { hostNotice?: { code?: string }; pendingActionResultBinding?: { pendingActionId?: string; recordStatus?: string } };
+  assert.equal(outcome.hostNotice?.code, 'approved_action_completed', approved.outcomeText);
+  assert.equal(outcome.pendingActionResultBinding?.pendingActionId, view!.id, approved.outcomeText);
+  assert.equal(outcome.pendingActionResultBinding?.recordStatus, 'executed', approved.outcomeText);
+  assert.match(pendingActions.getPendingAction(view!.id)?.resultSummary ?? '', /stdout:\s*ok\b/, 'the command\'s own output is on the action record');
 });
 
 function queueScript(command: string, title: string): Output[][] {

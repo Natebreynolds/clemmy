@@ -685,7 +685,7 @@ function previewChangeMarks(db: Database.Database, members: readonly HarnessSess
   try {
     if (!db.open || db.inTransaction) return null;
     const schema = db.pragma('schema_version', { simple: true });
-    if (!Number.isSafeInteger(schema)) return null;
+    if (!Number.isSafeInteger(schema) || Number(schema) < 0) return null;
     const read = db.prepare('SELECT COUNT(*) AS n, MAX(seq) AS seq FROM events WHERE session_id = ?');
     const marks = members.map((member) => {
       const row = read.get(member.id) as { n?: unknown; seq?: unknown } | undefined;
