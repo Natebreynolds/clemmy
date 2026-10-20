@@ -16,6 +16,7 @@ import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { z } from 'zod';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-shell-off-machine-'));
 Object.assign(process.env, {
@@ -51,6 +52,7 @@ _setReviewBeforeDeliveryForTests(true);
 const host = await import('./host-turn-runner.js');
 const { sourceSettledReadEvidence } = await import('./host-completion-work.js');
 const { buildOrchestratorAgent } = await import('../../agents/orchestrator.js');
+const { RUN_SHELL_COMMAND_PARAMS } = await import('../../tools/computer-tools.js');
 const semanticPorts = await import('../semantic-boundary/turn-semantic-port-registry.js');
 const approvalRegistry = await import('./approval-registry.js');
 const pendingActions = await import('./pending-actions.js');
@@ -82,6 +84,7 @@ after(() => {
 
 type Frame = { tools: string[]; toolResults: string[] };
 type Output = Record<string, unknown>;
+type ScriptStep = Output[] | ((frame: Frame) => Output[]);
 
 const text = (content: string): Output => ({
   type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: content }],
@@ -91,7 +94,7 @@ const call = (callId: string, name: string, args: Record<string, unknown>): Outp
 });
 
 /** A brain that follows a script and keeps every tool result it was shown. */
-function scriptedBrain(script: Output[][]) {
+function scriptedBrain(script: ScriptStep[]) {
   const frames: Frame[] = [];
   return {
     frames,
@@ -104,7 +107,8 @@ function scriptedBrain(script: Output[][]) {
           .filter((item) => item.type === 'function_call_result' || item.type === 'function_call_output')
           .map((item) => typeof item.output === 'string' ? item.output : JSON.stringify(item.output)),
       });
-      const output = script[Math.min(frames.length - 1, script.length - 1)]!;
+      const step = script[Math.min(frames.length - 1, script.length - 1)]!;
+      const output = typeof step === 'function' ? step(frames.at(-1)!) : step;
       return {
         responseId: `off-machine-${frames.length}`,
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] },
@@ -123,7 +127,7 @@ function scriptedBrain(script: Output[][]) {
   };
 }
 
-async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; runAttemptId: string; request: string; script: Output[][]; judgeCompletion?: boolean }) {
+async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; runAttemptId: string; request: string; script: ScriptStep[]; judgeCompletion?: boolean }) {
   const brain = scriptedBrain(input.script);
   if (input.judgeCompletion) host.captureEffectiveCompletionPolicyOnce({ ...input, enabled: true });
   const result = await runConversation({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, input: input.request,
@@ -137,7 +141,7 @@ async function runHostTurn(input: { sessionId: string; sourceUserSeq: number; ru
   return { result, frames: brain.frames, trace: eventlog.listEvents(input.sessionId) };
 }
 
-async function hostTurn(label: string, request: string, script: Output[][], judgeCompletion = false) {
+async function hostTurn(label: string, request: string, script: ScriptStep[], judgeCompletion = false) {
   const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: label });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `off-machine-${label}:${session.id}` });
   const accepted = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
@@ -165,13 +169,33 @@ async function approveCard(sessionId: string, approvalId: string) {
 test('a command that leaves the machine is refused into one card, and the approved card runs it once', async () => {
   const REQUEST = 'Post x=1 to the hook endpoint.';
   const run = await hostTurn('post', REQUEST, [
-    // 1. The model sends the command through the work carrier, as it would any shell command.
-    [call('call-post', 'work_call', {
-      requirement_id: 'cap:local:run_shell_command:ordinary', source_call_ids: null, source_record_ids: null,
-      universe_item_id: null, universe_selector: null, seal_amendment: null,
-      name: 'run_shell_command', args_json: JSON.stringify(SHELL_ARGS),
+    [call('call-discover-shell', 'tool_search', {
+      query: 'run_shell_command', role_key: null, account_selection: null, limit: 1, cursor: null,
     })],
-    // 2. Told the one door, it queues the exact same arguments once.
+    // Use the actual disclosed row and registered argument schema, then prove
+    // that its ordinary ref still cannot authorize these external-write args.
+    (frame) => {
+      const result = JSON.parse(frame.toolResults.at(-1)!);
+      const discovery = result.type === 'text' ? JSON.parse(result.text) : result;
+      const row = discovery.results.find((candidate: { name: string }) => candidate.name === 'run_shell_command');
+      assert.ok(row, 'the production search must disclose the shell row');
+      assert.equal(row.effectDecidedPerCall, true);
+      assert.match(row.effectRoutingNote, /classified external_write.*pending_action_queue.*request_now.*before execution/);
+      assert.equal(row.carrier, 'work_call');
+      assert.equal(row.capabilityRef, 'cap:local:run_shell_command:ordinary');
+      assert.ok(discovery.schemas[row.name]?.properties.command, 'discovery includes the actual shell argument contract');
+      // The shell is a core SDK tool, not a deferred local-tools entry. These
+      // are the same exported parameters its actual registration wraps.
+      const registeredSchema = z.object(RUN_SHELL_COMMAND_PARAMS);
+      const exactArgs = registeredSchema.parse(SHELL_ARGS);
+      assert.deepEqual(exactArgs, SHELL_ARGS);
+      return [call('call-post', row.carrier, {
+        requirement_id: row.capabilityRef, source_call_ids: null, source_record_ids: null,
+        universe_item_id: null, universe_selector: null, seal_amendment: null,
+        name: row.invocation.name, args_json: JSON.stringify(exactArgs),
+      })];
+    },
+    // Told the one door, it queues the exact same arguments once.
     [call('call-queue', 'call_tool', {
       name: 'pending_action_queue',
       args_json: JSON.stringify({
@@ -193,7 +217,7 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.ok(!dispatches.some((row) => row.tool_name === 'run_shell_command'), debug);
 
   // The refusal named the door, with the same arguments, and not discovery.
-  const refusal = run.frames[1]?.toolResults.join('\n') ?? '';
+  const refusal = run.frames[2]?.toolResults.join('\n') ?? '';
   assert.match(refusal, /outside this machine/, debug);
   assert.match(refusal, /pending_action_queue/, debug);
   assert.match(refusal, /request_now/, debug);
@@ -203,13 +227,13 @@ test('a command that leaves the machine is refused into one card, and the approv
   assert.doesNotMatch(refusal, /Discover that exact operation with tool_search/, debug);
 
   // The queue took it as approval-bound work (it was not sent away as ordinary).
-  const queued = run.frames[2]?.toolResults.join('\n') ?? '';
+  const queued = run.frames[3]?.toolResults.join('\n') ?? '';
   assert.match(queued, /Pending action (queued|reused)/, debug);
   assert.doesNotMatch(queued, /PENDING_ACTION_APPROVAL_NOT_REQUIRED/, debug);
 
   // The turn opened the one card without another model round.
   assert.equal(run.result.status, 'awaiting_approval', debug);
-  assert.equal(run.frames.length, 3, debug);
+  assert.equal(run.frames.length, 4, debug);
   const approvals = run.trace.filter((event) => event.type === 'approval_requested');
   assert.equal(approvals.length, 1, debug);
   const approvalId = String(approvals[0]!.data.approvalId);

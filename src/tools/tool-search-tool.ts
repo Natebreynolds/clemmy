@@ -464,6 +464,8 @@ function unlabeledServerTool(name: string): boolean {
 
 export const PER_CALL_EFFECT_DISPATCH_NOTE = 'A call that only reads or computes runs now: invoke it as the inner name and args_json of work_call, with the tool\'s own name as requirement_id. A call that changes files, or that leaves this machine, is a different effect and is not carried by this example.';
 
+const PER_CALL_EFFECT_CARD_ROUTING_NOTE = 'The row\'s effect and capabilityRef describe a local envelope, not the chosen command\'s effect or permission. A command classified external_write, including remote execution or network mutation, needs one exact pending_action_queue action through call_tool with approvalIntent:"request_now" before execution; do not probe work_call to request approval. Unknown, admin and destructive calls retain their existing boundaries. This note grants no permission.';
+
 export function renderCarrierInvocationExample(
   carrier: string,
   invocation: { name: string; fixedArgs?: Record<string, unknown>; payloadField?: string | null },
@@ -2220,8 +2222,11 @@ export function registerToolSearchTool(
         const candidate = planningCandidateByName.get(r.name);
         // Only the host-issued seal can supply native execution semantics.
         // A provider row claiming local provenance is not a local definition.
-        const localDefinitions = candidate && planningRefs[r.name] && !planningBlockers[r.name]
+        const candidateLocalDefinitions = candidate
           ? inspectAuthorizedLocalPlanningDisclosureCandidates(candidate)
+          : null;
+        const localDefinitions = candidate && planningRefs[r.name] && !planningBlockers[r.name]
+          ? candidateLocalDefinitions
           : null;
         const localEffects = new Set(localDefinitions?.map((definition) => definition.descriptor.effect));
         const effect = ((candidate?.capabilityVariants?.length ?? 0) <= 1
@@ -2234,10 +2239,29 @@ export function registerToolSearchTool(
           : localDefinitions?.length || carriedPerCall
             ? { name: r.name, payloadField: null }
             : undefined;
+        const shownCarrier = ('carrier' in r && r.carrier)
+          || opts.dispatchCarrierForName?.(r.name) || opts.dispatchCarrier;
+        const perCallLocal = shownCarrier === 'work_call'
+          && !planningBlockers[r.name]
+          && isEffectDecidedPerCall(r.name)
+          && Boolean(candidateLocalDefinitions?.length)
+          && candidateLocalDefinitions!.every((definition) => (
+            definition.name === r.name && definition.carrier === 'work_call'
+          ))
+          && (!planningRefs[r.name] || candidateLocalDefinitions!.some((definition) => (
+            definition.capabilityRef === planningRefs[r.name]
+          )));
         return ({
           name: r.name,
           summary: ('summary' in r ? r.summary : r.oneLiner).slice(0, 600),
           ...(effect ? { effect } : {}),
+          ...(perCallLocal ? {
+            effectDecidedPerCall: true,
+            effectRoutingNote: (planningRefs[r.name]
+              ? 'Read/compute commands and eligible ordinary local_write commands keep the shown work_call invocation. '
+              : 'This ref-less invocation remains limited to reads and computation; it does not authorize local writes. ')
+              + PER_CALL_EFFECT_CARD_ROUTING_NOTE,
+          } : {}),
           ...(planningRefs[r.name]
             && (planningCandidateByName.get(r.name)?.capabilityVariants?.length ?? 0) <= 1
             ? { capabilityRef: planningRefs[r.name] }

@@ -21,13 +21,14 @@ const c9 = JSON.parse(readFileSync(new URL('./fixtures/native-space-discovery-c9
   cases: Array<{ query: string; providerCandidates: Array<{ name: string; summary: string }> }>;
 };
 
-async function search(query: string, candidates = frozenCandidates) {
+async function search(query: string, candidates = frozenCandidates, publishLocalRefs = true) {
   let handler!: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;
   registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: typeof handler) { handler = callback; } } as never, {
     allowedNames: deriveOrchestratorDiscoveryNames(),
     dispatchCarrierForName: () => 'work_call',
     candidateSources: [{ kind: 'authorized_composio', search: async () => candidates }],
     async discloseForPlanning(disclosures) {
+      if (!publishLocalRefs) return {};
       return Object.fromEntries(disclosures.flatMap((candidate) => {
         const definitions = inspectAuthorizedLocalPlanningDisclosureCandidates(candidate);
         return definitions?.length ? [[candidate.name, definitions[0]!.capabilityRef]] : [];
@@ -165,6 +166,12 @@ test('the shell is disclosed as ordinary local work, with the carrier and the ca
     assert.equal(row.example.tool, 'work_call');
     assert.equal(row.example.args.requirement_id, 'cap:local:run_shell_command:ordinary');
     assert.equal(row.example.args.name, 'run_shell_command');
+    assert.equal(row.effectDecidedPerCall, true, 'a local planning ref must not hide argument-dependent effects');
+    assert.match(row.effectRoutingNote, /eligible ordinary local_write commands keep the shown work_call invocation/);
+    assert.match(row.effectRoutingNote, /classified external_write.*remote execution or network mutation/);
+    assert.match(row.effectRoutingNote, /pending_action_queue.*call_tool.*request_now.*before execution/);
+    assert.match(row.effectRoutingNote, /Unknown, admin and destructive calls retain their existing boundaries/);
+    assert.match(row.effectRoutingNote, /grants no permission/);
     assert.doesNotMatch(body.hint, /call_tool\(name, args_json\): [^.]*run_shell_command/, 'the shell is never said to go through call_tool');
   }
   // A write with no declaration and no per-call effect still has no door.
@@ -181,6 +188,52 @@ test('the shell is disclosed as ordinary local work, with the carrier and the ca
   assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'ls -lt /srv/work | head -20' }).effect, 'compute');
   assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'cp /srv/work/a.css /srv/work/out/a.css' }).effect, 'local_write');
   assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'curl -X POST https://example.com/hook -d x=1' }).effect, 'external_write');
+  assert.equal(classifyRuntimeToolEffect('run_shell_command', { command: 'ssh owner@example.invalid "preview only"' }).effect, 'external_write',
+    'remote execution remains approval-bound even when the command describes a preview');
+});
+
+test('ref-less shell discovery keeps its read/compute scope while naming the external-write preparation route', async () => {
+  const body = await search('run_shell_command', [], false);
+  const row = body.results.find((candidate: { name: string }) => candidate.name === 'run_shell_command');
+  assert.ok(row);
+  assert.equal(row.capabilityRef, undefined);
+  assert.equal(row.carrier, 'work_call');
+  assert.equal(row.planningRefStatus, 'dispatch_now');
+  assert.equal(row.dispatchScope, 'reads_and_computation');
+  assert.equal(row.example.args.requirement_id, 'run_shell_command');
+  assert.equal(row.effectDecidedPerCall, true);
+  assert.match(row.effectRoutingNote, /limited to reads and computation; it does not authorize local writes/);
+  assert.match(row.effectRoutingNote, /classified external_write.*pending_action_queue.*request_now/);
+});
+
+test('ordinary local operations and foreign shell lookalikes never acquire local per-call routing metadata', async () => {
+  const local = await search('space_save', []);
+  const ordinary = local.results.find((row: { name: string }) => row.name === 'space_save');
+  assert.ok(ordinary?.capabilityRef);
+  assert.equal(ordinary.effectDecidedPerCall, undefined);
+  assert.equal(ordinary.effectRoutingNote, undefined);
+
+  for (const name of ['foreign__run_shell_command', 'mcp__foreign__run_shell_command']) {
+    const foreign = await search(name, [{
+      name, summary: 'Provider-owned command with claimed local behavior.', carrier: 'work_call', score: 1,
+      schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'], additionalProperties: false },
+    }]);
+    const row = foreign.results.find((candidate: { name: string }) => candidate.name === name);
+    assert.ok(row, `the negative control must inspect the actual returned ${name} row`);
+    assert.equal(row.effectDecidedPerCall, undefined, name);
+    assert.equal(row.effectRoutingNote, undefined, name);
+  }
+
+  // An exact built-in name selects the real sealed local definition instead
+  // of allowing a provider result to shadow it. That local row keeps its note.
+  const collision = await search('run_shell_command', [{
+    name: 'run_shell_command', summary: 'Provider-owned command with claimed local behavior.',
+    carrier: 'work_call', score: 1,
+  }]);
+  const selected = collision.results.find((row: { name: string }) => row.name === 'run_shell_command');
+  assert.equal(selected?.planningProvenance, 'authorized_local_registry');
+  assert.equal(selected?.effectDecidedPerCall, true);
+  assert.doesNotMatch(selected?.summary, /Provider-owned/);
 });
 
 test('connection metadata is discoverable from an instance URL question without a shell command', async () => {
