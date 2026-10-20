@@ -36,6 +36,7 @@ const {
   STEERING_REOPEN_UNAVAILABLE_BLOCKED_REASON, STEERING_REOPEN_UNAVAILABLE_TERMINAL_TEXT,
 } = await import('./terminal-notice.js');
 const { CHAT_STEER_REFUSAL, STEER_NOTE_ADMISSION_MESSAGE } = await import('./steer-notes.js');
+const publicationTexts = await import('./held-stop-publication.js');
 const presentationModule = await import('./public-presentation.js');
 const { reconstructHarnessTranscript } = await import('./transcript.js');
 const { pullRecentTurnsForSession } = await import('./session-transcript.js');
@@ -330,6 +331,35 @@ test('a turn that could not reopen its mid-turn message handoff is an app-voice 
   }
   for (const refusal of Object.values(CHAT_STEER_REFUSAL)) {
     assert.ok(!refusal.error.includes(refusal.code), `${refusal.code} appears in its own line`);
+  }
+});
+
+test('an exact lost-continuation stop carries an app notice through public delivery and history', () => {
+  const { HELD_STOP_PUBLICATION_TEXT, HELD_STOP_PUBLICATION_PENDING_TEXT } = publicationTexts;
+  const sessionId = 'voice-held-continuation-unavailable';
+  createSession({ id: sessionId, kind: 'chat' });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: OBJECTIVE } });
+  loop._testOnly_reduceStandardConversationTerminal({
+    result: { sessionId, status: 'blocked', steps: 0, lastTurn: source.turn, error: HELD_STOP_PUBLICATION_TEXT,
+      blockedReason: 'held_turn_recovery_failed' } as never,
+    sourceUserSeq: source.seq,
+  });
+  const terminal = listEvents(sessionId, { types: ['conversation_completed'] })[0]!;
+  assert.equal(terminal.data.sourceUserSeq, source.seq);
+  assert.equal(terminal.data.blockedReason, 'held_turn_recovery_failed');
+  assert.equal((terminal.data.turnOutcome as { status: string; resumable: boolean }).status, 'blocked');
+  assert.equal((terminal.data.turnOutcome as { resumable: boolean }).resumable, true);
+  assert.equal((terminal.data.presentation as { text: string }).text, HELD_STOP_PUBLICATION_TEXT);
+  const data = record('held:continuation_unavailable', terminal);
+  assert.deepEqual(data.notice, { code: 'continuation_unavailable' });
+  assert.equal(data.reply, HELD_STOP_PUBLICATION_TEXT);
+  const reopened = reconstructHarnessTranscript(sessionId).filter(turn => turn.role === 'assistant');
+  assert.deepEqual(reopened.map(turn => turn.text), [HELD_STOP_PUBLICATION_TEXT]);
+  assert.deepEqual(reopened[0]!.terminal?.notice, { code: 'continuation_unavailable' });
+  assert.equal(pullRecentTurnsForSession(openEventLog(), sessionId, 10).at(-1)?.text, HELD_STOP_PUBLICATION_TEXT);
+  for (const text of [HELD_STOP_PUBLICATION_TEXT, HELD_STOP_PUBLICATION_PENDING_TEXT]) {
+    assert.doesNotMatch(text, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b|say .continue|nothing (?:ran|changed)/i);
+    assert.match(text, /Ask (?:Clem|her) to check what completed and what remains/);
   }
 });
 

@@ -10,8 +10,8 @@ import { resolveExactTerminalForAcceptedSource } from './accepted-source-termina
 import { completionEvidenceSource } from './recovery-activation.js';
 import type { TurnIdentity } from './turn-outcome.js';
 
-export const HELD_STOP_PUBLICATION_TEXT = 'I could not continue this request and its saved continuation point is unavailable, so it is still unfinished. Ask me to check what completed and what remains before continuing this exact request.';
-export const HELD_STOP_PUBLICATION_PENDING_TEXT = 'This request is unfinished and I cannot yet verify its stop reply. Ask me to check this exact request’s delivery and any completed work before continuing.';
+export const HELD_STOP_PUBLICATION_TEXT = 'Clem can’t resume this request from where it stopped. Ask her to check what completed and what remains before continuing.';
+export const HELD_STOP_PUBLICATION_PENDING_TEXT = 'This request is unfinished, and its final update has not been confirmed. Ask Clem to check what completed and what remains before continuing.';
 const LIMIT = 8;
 const MAX_ENTRIES = 64;
 const MAX_BYTES = 262_144;

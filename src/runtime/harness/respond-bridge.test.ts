@@ -6031,6 +6031,9 @@ test('held publication early bridge replay fences exact source before preparatio
   const attemptsBefore = openEventLog().prepare('SELECT * FROM run_attempts WHERE session_id=?').all(session.id);
   const pending = await respondViaHarness('webhook', { sessionId: session.id, message: String(source.data.text), sourceUserSeq: source.seq }, { turnEngine: 'host_v1' });
   assert.equal(pending.stoppedReason, 'in-progress'); assert.equal(pending.text, HELD_STOP_PUBLICATION_PENDING_TEXT);
+  assert.doesNotMatch(pending.text, /\b(?:I|I’m|I'm|I’ll|I'll|I’ve|I've|me|my)\b|say .continue|nothing (?:ran|changed)/i);
+  assert.match(pending.text, /Ask Clem to check what completed and what remains/);
+  assert.equal(listEvents(session.id, { types: ['conversation_completed'] }).length, 0, 'pending publication is not an invented terminal');
   assert.deepEqual(calls, { configure: 0, build: 0, candidates: 0, execute: 0 });
   assert.deepEqual(openEventLog().prepare('SELECT * FROM run_attempts WHERE session_id=?').all(session.id), attemptsBefore);
   await assert.rejects(respondViaHarness('webhook', { sessionId: session.id, message: 'Different text using the same source.', sourceUserSeq: source.seq }, { turnEngine: 'host_v1' }), /does not match/);

@@ -41,6 +41,11 @@ export function terminalStatusPill(
   const edge = options.wordless && terminal.resumable !== false ? CONTINUE_EDGE : '';
   switch (terminal.status) {
     case 'blocked':
+      if (terminal.notice?.code === 'continuation_unavailable') {
+        // The retained result count is evidence; a missing checkpoint is not
+        // proof that all work was kept or that "continue" can resume it.
+        return { label: parts('Request unfinished', kept), tone: 'warning' };
+      }
       return { label: parts(kept ? `Stopped here — ${kept}` : 'Stopped here — your work is kept', edge), tone: 'warning' };
     case 'failed':
       return { label: parts('Didn’t finish', kept, edge), tone: 'danger' };
@@ -142,6 +147,8 @@ export function terminalNoticeLine(terminal: TerminalFacts | undefined): Termina
       // The record is the conversation's, so sending again meets the same
       // block: no "Try again"; the line names the edge that does clear it.
       return line('This conversation’s steering record couldn’t be read — the message didn’t start. Start a new conversation to continue', 'warning');
+    case 'continuation_unavailable':
+      return line('Clem can’t resume this request from where it stopped. Ask her to check what completed and what remains before continuing', 'warning');
   }
 }
 
@@ -164,7 +171,10 @@ export function cardDecisionNoticeOnly(message: Pick<ChatMessage, 'terminal' | '
  */
 export function terminalNoticeVoiceFact(terminal: Pick<TerminalFacts, 'notice' | 'retained'> | undefined): string | null {
   const notice = terminal?.notice;
-  if (!notice || notice.code === 'stopped' || notice.code === 'card_decision') return null;
+  // Recovery publication only reports a stopped owner's missing checkpoint.
+  // It must never start a voice narrator/model after that owner has stopped.
+  if (!notice || notice.code === 'stopped' || notice.code === 'card_decision'
+    || notice.code === 'continuation_unavailable') return null;
   const named = [
     notice.model ? `model: ${notice.model}` : '',
     notice.agentName ? `agent: ${notice.agentName}` : '',

@@ -32,3 +32,14 @@ test('phone: a draft held for its format is read, and a notice turn gives the vo
   assert.match(fact!, /Try again/);
   assert.deepEqual(voiceTurnNoticeFacts([clem('n2', '', 'stopped', { terminal: { notice: { code: 'stopped' } } })], 0), []);
 });
+
+test('phone: a lost continuation is neither spoken nor sent to a live voice narrator', () => {
+  const held = clem('held', 'Clem can’t resume this request from where it stopped.', 'failed',
+    { terminal: { status: 'blocked', resumable: true, notice: { code: 'continuation_unavailable' } } });
+  assert.equal(voiceReadableText(held), '');
+  assert.deepEqual(voiceUtterances([held], new Map(), new Set()), []);
+  assert.deepEqual(voiceTurnNoticeFacts([held], 0), []);
+  const [queued] = voiceUtterances([clem('held', 'Working on the draft.', 'complete')], new Map(), new Set());
+  assert.ok(queued);
+  assert.equal(voiceUtteranceCurrent(queued!, [held]), false);
+});

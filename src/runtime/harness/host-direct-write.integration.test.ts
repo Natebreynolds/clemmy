@@ -1716,6 +1716,7 @@ test('a held turn whose recovery cannot publish its stop is answered once the op
     assert.equal(terminals().length, 0, 'the stop waits while its call cannot settle');
     const pendingDebt = (eventlog.getSession(fixture.session.id)!.metadata[eventlog.HELD_STOP_PUBLICATION_METADATA_KEY] as Record<string, { attemptsUsed: number }>)[String(fixture.source.seq)];
     assert.equal(pendingDebt?.attemptsUsed, 0, 'known open-call waiting consumes no publication credit');
+    const modelsBeforePublication = fixture.counts().modelCalls;
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');
     // The real daemon's existing reaper owns structural settlement. The new
     // publication-only watcher must never do this sweep or execute the body.
@@ -1726,6 +1727,7 @@ test('a held turn whose recovery cannot publish its stop is answered once the op
       drainPendingHeldStopPublications();
       await new Promise(resolve => setTimeout(resolve, 50));
     }
+    assert.equal(fixture.counts().modelCalls, modelsBeforePublication, 'stop publication never starts a narrator or another model turn');
   } finally {
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_result_checkpoint');
     db.exec('DROP TRIGGER IF EXISTS reject_unowned_settlement');
@@ -1734,6 +1736,10 @@ test('a held turn whose recovery cannot publish its stop is answered once the op
   const presentation = terminals()[0]!.data.presentation as { status?: string; text?: string } | undefined;
   assert.equal(presentation?.status, 'blocked');
   assert.equal(presentation?.text, HELD_TURN_UNOWNED_STOP_TEXT);
+  assert.deepEqual(terminals()[0]!.data.hostNotice, { code: 'continuation_unavailable' });
+  assert.equal(terminals()[0]!.data.blockedReason, 'held_turn_recovery_failed');
+  assert.equal(terminals()[0]!.data.sourceUserSeq, fixture.source.seq);
+  assert.equal((terminals()[0]!.data.turnOutcome as { resumable?: boolean }).resumable, true);
   assert.equal(eventlog.getActiveRunAttempt(fixture.session.id), null, 'the stop closes the run attempt');
   assert.equal(fixture.counts().providerCalls, 1, 'the landed call never repeats');
 });

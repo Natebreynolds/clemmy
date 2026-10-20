@@ -18,7 +18,7 @@ const ALL_STATUSES: TerminalFacts['status'][] = ['done', 'needs_input', 'blocked
 const ALL_NOTICES: TerminalNoticeCode[] = [
   'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
   'saved_model_unavailable', 'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired',
-  'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable',
+  'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable', 'continuation_unavailable',
 ];
 const ALL_OUTSIDE: RetainedOutsideChange[] = ['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none'];
 
@@ -52,6 +52,21 @@ test('a stop with no words names its next edge on the pill; one the owner asked 
   assert.equal(terminalStatusPill({ status: 'cancelled', retained: { results: 1, outsideChange: 'none' } }, { wordless: true })?.label,
     'Cancelled · 1 result kept');
   assert.equal(terminalStatusPill({ status: 'blocked' }, { wordless: false })?.label, 'Stopped here — your work is kept');
+});
+
+test('a lost continuation offers a work check without promising a saved checkpoint or voice narration', () => {
+  const terminal: TerminalFacts = { status: 'blocked', resumable: true, notice: { code: 'continuation_unavailable' } };
+  assert.deepEqual(terminalStatusPill(terminal, { wordless: true }), { label: 'Request unfinished', tone: 'warning' });
+  const notice = terminalNoticeLine(terminal)!;
+  assert.match(notice.label, /Ask her to check what completed and what remains before continuing/);
+  assert.equal(notice.action, undefined);
+  assert.doesNotMatch(notice.label, /say .continue|try again|work is kept|nothing (?:ran|changed)/i);
+  assert.equal(terminalNoticeVoiceFact(terminal), null, 'publishing this stopped owner never asks a voice model to narrate');
+  assert.deepEqual(terminalStatusPill({ ...terminal, retained: { results: 2, outsideChange: 'uncertain' } }, { wordless: true }),
+    { label: 'Request unfinished · 2 results kept', tone: 'warning' });
+  assert.match(terminalNoticeLine({ ...terminal, retained: { results: 2, outsideChange: 'uncertain' } })!.label, /2 results kept$/);
+  assert.equal(retainedOutsideChange({ ...terminal, retained: { results: 2, outsideChange: 'uncertain' } })?.label,
+    'Change in another app not confirmed — check before repeating');
 });
 
 test('an outside change with a settled state gets its own chip', () => {

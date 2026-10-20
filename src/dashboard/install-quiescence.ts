@@ -336,6 +336,16 @@ export function readInstallQuiescence(options: { nowMs?: number; maxEntries?: nu
       const identity = `${effect.session_id}:${effect.source_user_seq}`;
       if (audited.has(identity)) continue;
       audited.add(identity);
+      const source = db.prepare('SELECT role, type FROM events WHERE session_id = ? AND seq = ?')
+        .get(effect.session_id, effect.source_user_seq) as { role: string; type: string } | undefined;
+      if (source?.role === 'system' && source.type === 'workflow_node_invocation_activated') {
+        // The chat audit requires a human-input source. A readable workflow
+        // activation needs its own exact audit; it is not a storage failure.
+        // This observation verifies no workflow outcome and releases no hold.
+        issues.add('workflow_effect_owner_unverified');
+        add(workKey(effect.session_id, effect.source_user_seq, `effect:${identity}`), 'effect', 'uncertain', effect.session_id);
+        continue;
+      }
       const audit = auditAcceptedSourceSettlementTruth({ sessionId: effect.session_id, sourceUserSeq: effect.source_user_seq });
       // The terminal audit deliberately permits some reversible/answered
       // effects. It does not change a still-open physical/call owner into a

@@ -133,6 +133,7 @@ test('a notice terminal is never spoken: no app line and no fallback sentence re
     ['cancelled', 'stopped', 'stopped', 'Stopped. Nothing further runs for this turn.'],
     ['blocked', 'blocked', 'provider_quota', 'No Codex quota is available for this saved agent, so this turn did not start.'],
     ['failed', 'error', 'run_failed', 'This request stopped on an error before it finished.'],
+    ['blocked', 'blocked', 'continuation_unavailable', 'Clem can’t resume this request from where it stopped.'],
     ['blocked', 'blocked', 'response_format_unmet', '```json\n{"value":"fixture"}\n```'],
   ] as const) {
     const voiced = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 14, status, kind, text,

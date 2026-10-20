@@ -20,6 +20,7 @@ export const TERMINAL_NOTICE_CODES = [
   'model_stalled',
   'run_failed',
   'steering_unavailable',
+  'continuation_unavailable',
 ] as const;
 
 export type TerminalNoticeCode = typeof TERMINAL_NOTICE_CODES[number];

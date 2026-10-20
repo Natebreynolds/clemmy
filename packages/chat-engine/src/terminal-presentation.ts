@@ -105,7 +105,7 @@ const OUTSIDE_CHANGES: ReadonlySet<string> = new Set(['went_through', 'did_not',
 const NOTICE_CODES: ReadonlySet<string> = new Set<TerminalNoticeCode>([
   'stopped', 'response_format_unmet', 'response_format_unqualified', 'provider_quota', 'card_decision',
   'saved_model_unavailable', 'model_unavailable_on_sign_in', 'no_model_connected', 'codex_sign_in_expired',
-  'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable',
+  'provider_out_of_credit', 'model_stalled', 'run_failed', 'steering_unavailable', 'continuation_unavailable',
 ]);
 
 /** The most of a reviewer's finding the receipt carries. */

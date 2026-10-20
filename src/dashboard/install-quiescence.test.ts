@@ -249,6 +249,31 @@ test('a physically pending effect cannot disappear when the source audit has no 
   } finally { db.prepare = prepare as typeof db.prepare; }
 });
 
+test('readable workflow activation evidence remains held without being misreported as chat-storage failure', () => {
+  const session = events.createSession({ kind: 'workflow' });
+  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'system',
+    type: 'workflow_node_invocation_activated', data: { fixture: 'controlled unreadied workflow effect' } });
+  const db = events.openEventLog();
+  const prepare = db.prepare.bind(db);
+  // Retained incomplete ledger inventory, not a new dispatch or a manufactured
+  // workflow authority. The only required outcome is to preserve its hold.
+  db.prepare = ((sql: string) => sql.includes("FROM physical_dispatches WHERE state IN ('started', 'unknown')")
+    ? { all: () => [{ session_id: session.id, source_user_seq: source.seq }] }
+    : prepare(sql)) as typeof db.prepare;
+  try {
+    const snapshot = readInstallQuiescence();
+    assert.equal(snapshot.quiescence.state, 'unverified');
+    assert.equal(snapshot.total, 1);
+    assert.equal(snapshot.currentWork.items[0]?.kind, 'effect');
+    assert.equal(snapshot.currentWork.items[0]?.state, 'uncertain');
+    assert.deepEqual(snapshot.currentWork.items[0]?.sessionIds, [session.id]);
+    assert.ok(snapshot.quiescence.issues.includes('workflow_effect_owner_unverified'));
+    assert.ok(!snapshot.quiescence.issues.includes('effect_evidence_unreadable'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM physical_dispatches').get()?.n, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM logical_call_settlements').get()?.n, 0);
+  } finally { db.prepare = prepare as typeof db.prepare; }
+});
+
 test('a retired attempt cannot hide a returned/failed physical crossing whose logical call is still open', () => {
   for (const state of ['returned', 'threw', 'timed_out', 'cancelled']) {
     const accepted = attempt();

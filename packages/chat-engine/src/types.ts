@@ -388,7 +388,8 @@ export type TerminalNoticeCode =
   | 'provider_out_of_credit'
   | 'model_stalled'
   | 'run_failed'
-  | 'steering_unavailable';
+  | 'steering_unavailable'
+  | 'continuation_unavailable';
 
 export interface TerminalNotice {
   code: TerminalNoticeCode;

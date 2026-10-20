@@ -162,6 +162,25 @@ test('a notice in place of a reply yields no assistant text, whatever the event 
   assert.equal(decided.status, 'complete');
 });
 
+test('a lost continuation is app chrome, while an old unmarked reply keeps its exact words', () => {
+  const appText = 'Clem can’t resume this request from where it stopped.';
+  const held = withFacts('blocked', { notice: { code: 'continuation_unavailable' } }, appText);
+  for (const streamed of ['', 'Clem was still writing a draft.']) {
+    const rendered = terminalCompletionPresentation(held, streamed, 'thinking');
+    assert.equal(rendered.text, '');
+    assert.equal(rendered.status, 'failed');
+    assert.equal(rendered.terminal?.status, 'blocked');
+    assert.equal(rendered.terminal?.resumable, true);
+    assert.deepEqual(rendered.terminal?.notice, { code: 'continuation_unavailable' });
+    assert.match(terminalNoticeLine(rendered.terminal)?.label ?? '', /Ask her to check what completed and what remains/);
+    assert.equal(terminalNoticeLine(rendered.terminal)?.action, undefined);
+  }
+  const oldText = 'I could not continue this request and its saved continuation point is unavailable.';
+  const old = terminalCompletionPresentation(withFacts('blocked', { blockedReason: 'held_turn_recovery_failed' }, oldText), '');
+  assert.equal(old.text, oldText, 'history is not reclassified from a reason or matching prose');
+  assert.equal(old.terminal?.notice, undefined);
+});
+
 // The old fallbacks put a sentence in Clem's mouth ("I reached this run's
 // current limit…") whenever a typed terminal arrived with no words. Typed
 // terminals now carry a status the surfaces draw as a pill instead.
