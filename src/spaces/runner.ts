@@ -40,6 +40,8 @@ import {
   prepareAndAcquireSpaceReviewedCliReadAuthority,
 } from './space-read-authority.js';
 import { compileReviewedCliArgv } from '../runtime/harness/reviewed-cli-shell-match.js';
+import { REVIEWED_CLI_READ_ACCOUNT } from '../runtime/harness/reviewed-cli-read-config.js';
+import { withLoginKeychainContext } from '../runtime/login-keychain.js';
 import { readHostCliEnvelope } from '../runtime/harness/json-repair.js';
 import { parseSpaceSourceTransforms, transformSpaceSourceData } from './source-transforms.js';
 import { readWorkspaceFileSource } from './file-source.js';
@@ -280,9 +282,15 @@ async function runSpaceComposio(
   if (outcome.status === 'completed' || outcome.status === 'replayed') {
     return { ok: true, data: outcome.result };
   }
+  // A reviewed command-line read that failed while the owner's login keychain
+  // could not be read says so in the stored source error, so the Space's
+  // "didn't refresh" names the Mac, not the tool's sign-in (live 10-20).
+  const reason = parsed.plan.binding.accountId === REVIEWED_CLI_READ_ACCOUNT
+    ? (await withLoginKeychainContext(outcome.reason)).message
+    : outcome.reason;
   return {
     ok: false,
-    error: `${carrierLabel} was ${outcome.status} by the shared durable call kernel: ${outcome.reason}`,
+    error: `${carrierLabel} was ${outcome.status} by the shared durable call kernel: ${reason}`,
     ...(outcome.zeroBody ? { provenNoDispatch: true as const } : {}),
     // A refusal before any provider body is a preparation failure; anything
     // after the crossing started is the provider's answer.

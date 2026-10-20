@@ -18347,18 +18347,21 @@ async function processOneRunFile(
         : error instanceof Error ? error.message : String(error);
       let cancelled = error instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id);
       const requestedCancellation = cancelled;
-      // A local command step that failed while the owner's login keychain was
-      // locked: tools that keep their sign-ins there fail in their own words
-      // ("org not found"), which reads as a broken integration (live 10-02).
-      // Say what was locked first, and mark the run for one follow-up when
-      // the keychain is unlocked again.
+      // A step that failed while the owner's login keychain was locked: tools
+      // that keep their sign-ins there fail in their own words ("org not
+      // found"), which reads as a broken integration (live 10-02). The same
+      // failure arrives as a plain batch error when the command ran through
+      // the shared call kernel (live 10-20: a scheduled report failed three
+      // mornings with the tool's own words and no follow-up), so every
+      // non-cancelled failure asks once. Say what was locked first, and mark
+      // the run for one follow-up when the keychain is unlocked again.
       let keychainLockedAt: string | null = null;
-      if (!cancelled && structuredFailure) {
+      if (!cancelled) {
         try {
           if ((await probeLoginKeychain()).state === 'locked') keychainLockedAt = new Date().toISOString();
         } catch { /* the probe never decides a failure */ }
       }
-      if (keychainLockedAt) {
+      if (keychainLockedAt && !message.includes(LOGIN_KEYCHAIN_LOCKED_GUIDANCE)) {
         message = `${LOGIN_KEYCHAIN_LOCKED_GUIDANCE} I'll follow up on this run once it is unlocked.\n\n${message}`;
       }
       // Preview the post-failure count without mutating the advisory ledger.

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-const { probeLoginKeychain, __loginKeychainTest__ } = await import('./login-keychain.js');
+const { probeLoginKeychain, withLoginKeychainContext, LOGIN_KEYCHAIN_LOCKED_GUIDANCE, __loginKeychainTest__ } = await import('./login-keychain.js');
 
 afterEach(() => {
   __loginKeychainTest__.setRunner(null);
@@ -52,4 +52,31 @@ test('a probe that throws reads as unknown, never as locked', async () => {
   __loginKeychainTest__.setPlatform(() => 'darwin');
   __loginKeychainTest__.setRunner(async () => { throw new Error('spawn failed'); });
   assert.equal((await probeLoginKeychain({ fresh: true })).state, 'unknown');
+});
+
+test('a local tool failure gets the one sentence after it only while the keychain cannot be read', async () => {
+  __loginKeychainTest__.setPlatform(() => 'darwin');
+  let code = 51;
+  __loginKeychainTest__.setRunner(async () => ({ code }));
+  const toolWords = 'reviewed CLI process nonzero_exit: NoDefaultEnvError: No default environment found. Use -o or --target-org to specify an environment.';
+  const explained = await withLoginKeychainContext(toolWords);
+  assert.equal(explained.keychainLocked, true);
+  assert.ok(explained.message.startsWith(toolWords), 'the tool\'s own words are kept first');
+  assert.ok(explained.message.endsWith(LOGIN_KEYCHAIN_LOCKED_GUIDANCE));
+  assert.match(explained.message, /security unlock-keychain ~\/Library\/Keychains\/login\.keychain-db/);
+  const again = await withLoginKeychainContext(explained.message);
+  assert.equal(again.message, explained.message, 'never said twice');
+  assert.equal(await withLoginKeychainContext('').then((r) => r.message), LOGIN_KEYCHAIN_LOCKED_GUIDANCE);
+
+  code = 0;
+  __loginKeychainTest__.reset();
+  const fine = await withLoginKeychainContext(toolWords);
+  assert.equal(fine.keychainLocked, false);
+  assert.equal(fine.message, toolWords);
+
+  __loginKeychainTest__.setPlatform(() => 'linux');
+  __loginKeychainTest__.reset();
+  const elsewhere = await withLoginKeychainContext(toolWords);
+  assert.equal(elsewhere.keychainLocked, false);
+  assert.equal(elsewhere.message, toolWords);
 });

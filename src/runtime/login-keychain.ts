@@ -78,6 +78,34 @@ export async function probeLoginKeychain(options: { fresh?: boolean } = {}): Pro
   return cached;
 }
 
+/**
+ * A local command-line tool's failure, with the one sentence after it when
+ * the failure happened while the login keychain could not be read. The tool
+ * speaks in its own words ("no authorization information found", "no default
+ * environment"), which read as a sign-in problem and send the owner to sign
+ * in again for nothing (live 10-20: a Space section and a scheduled report
+ * both failed that way for days). The message comes back unchanged when the
+ * keychain reads fine, off macOS, when the probe cannot answer, or when the
+ * message already says so.
+ */
+export async function withLoginKeychainContext(
+  message: string,
+): Promise<{ message: string; keychainLocked: boolean }> {
+  let locked = false;
+  try {
+    locked = (await probeLoginKeychain()).state === 'locked';
+  } catch {
+    locked = false;
+  }
+  if (!locked) return { message, keychainLocked: false };
+  if (message.includes(LOGIN_KEYCHAIN_LOCKED_GUIDANCE)) return { message, keychainLocked: true };
+  const trimmed = message.trim();
+  const joined = trimmed
+    ? `${trimmed}${/[.!?]$/.test(trimmed) ? '' : '.'} ${LOGIN_KEYCHAIN_LOCKED_GUIDANCE}`
+    : LOGIN_KEYCHAIN_LOCKED_GUIDANCE;
+  return { message: joined, keychainLocked: true };
+}
+
 export const __loginKeychainTest__ = {
   setRunner(next: Runner | null): void { runner = next ?? defaultRunner; cached = null; cachedAtMs = 0; },
   setPlatform(next: (() => NodeJS.Platform) | null): void { platform = next ?? (() => process.platform); cached = null; cachedAtMs = 0; },
