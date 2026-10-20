@@ -52,7 +52,7 @@ function fence(file: string): void {
   if (fences.has(file) && fences.get(file) !== current) throw new Error('observation_drift');
   fences.set(file, current);
 }
-function readText(file: string, maximum = limits.fileBytes): string | undefined {
+function readText(file: string, maximum: number = limits.fileBytes): string | undefined {
   fence(file);
   if (!fences.get(file)) return undefined;
   const stat = lstatSync(file);
