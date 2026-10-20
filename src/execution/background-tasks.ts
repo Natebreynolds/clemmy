@@ -982,6 +982,7 @@ function writeTask(task: BackgroundTaskRecord): void {
     closeSync(fd);
     fd = undefined;
     renameSync(tmpPath, filePath);
+    parsedTaskFiles.delete(filePath);
     if (process.platform !== 'win32') {
       const dirFd = openSync(BACKGROUND_TASK_DIR, 'r');
       try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
@@ -1038,10 +1039,26 @@ function syncBackgroundProspectiveIntention(task: BackgroundTaskRecord): void {
   }
 }
 
+/** Task files parsed by identity (inode, mtime, size): every list read and
+ * re-parsed all of them (live 10-20: 162 files, 1.9 MB, three lists per Home
+ * poll). A task is replaced only by the atomic rename below, so an unchanged
+ * identity is the record already parsed. Callers treat a record as read-only;
+ * a writer re-reads under its own lock before it saves. */
+const parsedTaskFiles = new Map<string, { ino: number; mtimeMs: number; size: number; task: BackgroundTaskRecord }>();
+const PARSED_TASK_FILE_LIMIT = 4096;
+
 function loadTaskFile(filePath: string): BackgroundTaskRecord | null {
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as BackgroundTaskRecord;
+    const stat = statSync(filePath);
+    const cached = parsedTaskFiles.get(filePath);
+    if (cached && cached.ino === stat.ino && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.task;
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as BackgroundTaskRecord;
+    parsedTaskFiles.delete(filePath);
+    parsedTaskFiles.set(filePath, { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, task });
+    if (parsedTaskFiles.size > PARSED_TASK_FILE_LIMIT) parsedTaskFiles.delete(parsedTaskFiles.keys().next().value!);
+    return task;
   } catch {
+    parsedTaskFiles.delete(filePath);
     return null;
   }
 }
