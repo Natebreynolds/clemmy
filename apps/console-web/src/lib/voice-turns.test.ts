@@ -156,7 +156,7 @@ test('a spoken turn that ends on a notice hands the voice its typed fact; a chos
 
 test('a lost continuation is neither spoken nor sent to a live voice narrator', () => {
   const held = clem('held', 'Clem can’t resume this request from where it stopped.', 'failed',
-    { terminal: { status: 'blocked', resumable: true, notice: { code: 'continuation_unavailable' } } });
+    { terminal: { status: 'blocked', notice: { code: 'continuation_unavailable' } } });
   assert.equal(voiceReadableText(held), '');
   assert.deepEqual(voiceUtterances([held], new Map(), new Set()), []);
   assert.deepEqual(voiceTurnNoticeFacts([owner('u1', 'go'), held], 1), []);
