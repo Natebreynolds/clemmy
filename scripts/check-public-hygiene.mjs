@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readlinkSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -294,7 +295,36 @@ export function classifyText(text, identityOptions = {}) {
   return categories;
 }
 
-export function scanExistingTrackedFiles(repoRoot = process.cwd()) {
+/**
+ * Reviewed fixtures whose bytes trip a text or path rule by construction. Each
+ * entry pins the exact file by SHA-256 and names only the categories it may
+ * carry; any other category still fails, and a changed file loses the
+ * exemption until it is reviewed again. Nothing here widens a rule.
+ */
+export const PUBLIC_FIXTURE_EXEMPTIONS = [
+  {
+    path: 'src/runtime/harness/fixtures/approved-action-v96/manifest.json',
+    sha256: 'b379645116089508cc5e922614b4b1c4ea7a10bac53c6e5202eea1ba62e07658',
+    categories: ['live-session-identifier', 'provider-resource-id'],
+    reason: 'Schema-96 approved-action receipt fixture minted by an isolated test runner (providerCalls 0, modelCalls 0): its session id is synthetic and the "resource id" is a hex digest.',
+  },
+  {
+    path: 'src/runtime/harness/fixtures/approved-action-v96/receipt.db.gz',
+    sha256: '454c4feb6cf10112a05bbfa41f612f3a854bda5d25afb784632c809e713d0791',
+    categories: ['run-or-generated-artifact'],
+    reason: 'The same fixture\'s pinned SQLite archive; its SHA-256 is also recorded in the manifest (compressedSha256).',
+  },
+];
+
+function exemptedCategories(filePath, content, exemptions) {
+  const entry = exemptions.find((row) => row.path === filePath);
+  if (!entry) return new Set();
+  const sha256 = createHash('sha256').update(content).digest('hex');
+  return sha256 === entry.sha256 ? new Set(entry.categories) : new Set();
+}
+
+export function scanExistingTrackedFiles(repoRoot = process.cwd(), options = {}) {
+  const exemptions = options.exemptions ?? PUBLIC_FIXTURE_EXEMPTIONS;
   const output = execFileSync('git', ['ls-files', '--cached', '-z'], {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -322,7 +352,8 @@ export function scanExistingTrackedFiles(repoRoot = process.cwd()) {
       const identityText = publicMaintainerMetadataRemoved(filePath, text);
       for (const category of classifyText(text, { ...identityHints, identityText })) categories.add(category);
     }
-    for (const category of [...categories].sort()) findings.push({ category, filePath });
+    const exempt = exemptedCategories(filePath, content, exemptions);
+    for (const category of [...categories].sort()) if (!exempt.has(category)) findings.push({ category, filePath });
   }
 
   return findings;

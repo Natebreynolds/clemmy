@@ -8,7 +8,7 @@ import {createHash} from 'node:crypto';
 assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME,'1');
 assert.equal(process.env.CLEMMY_TEST_DISABLE_LIVE_MODELS,'1');
 const home=process.env.CLEMENTINE_HOME!;
-assert.ok(home && !home.includes('/Users/nathan.reynolds/.clementine-next'));
+assert.ok(home && !home.endsWith('/.clementine-next') && !home.includes('/.clementine-next/'));
 process.env.COMPOSIO_BACKEND='sdk';
 const out=process.env.CLEM_SCHEMA96_FIXTURE_OUT;
 assert.ok(out && path.isAbsolute(out), 'Explicit controlled output directory required.');

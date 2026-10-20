@@ -125,6 +125,39 @@ test('allows only explicit public maintainer metadata and flags contributor iden
   }
 });
 
+test('a reviewed fixture exemption is pinned to exact bytes and named categories', async () => {
+  const { createHash } = await import('node:crypto');
+  const repo = mkdtempSync(path.join(os.tmpdir(), 'public-hygiene-exempt-'));
+  try {
+    execFileSync('git', ['init', '--quiet'], { cwd: repo });
+    mkdirSync(path.join(repo, 'fixtures'), { recursive: true });
+    // Assembled at runtime so this test file carries no literal the gate flags.
+    const manifest = `{"sessionId":"${['sess', 'mabc1234', '9f9f'].join('-')}","purpose":"synthetic fixture"}\n`;
+    writeFileSync(path.join(repo, 'fixtures', 'manifest.json'), manifest);
+    writeFileSync(path.join(repo, 'fixtures', 'receipt.db.gz'), Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0]));
+    execFileSync('git', ['add', 'fixtures'], { cwd: repo });
+    const sha = (text) => createHash('sha256').update(text).digest('hex');
+    const exemptions = [
+      { path: 'fixtures/manifest.json', sha256: sha(manifest), categories: ['live-session-identifier'], reason: 'test' },
+      { path: 'fixtures/receipt.db.gz', sha256: sha(Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0])), categories: ['run-or-generated-artifact'], reason: 'test' },
+    ];
+    assert.deepEqual(scanExistingTrackedFiles(repo, { exemptions }), [], 'exact bytes with named categories pass');
+    assert.deepEqual(scanExistingTrackedFiles(repo, { exemptions: [] }).map((f) => f.category).sort(),
+      ['live-session-identifier', 'run-or-generated-artifact'], 'without the exemption both files are reported');
+    // A changed file loses its exemption until reviewed again.
+    writeFileSync(path.join(repo, 'fixtures', 'manifest.json'), manifest.replace('9f9f', '1a1a'));
+    execFileSync('git', ['add', 'fixtures'], { cwd: repo });
+    assert.deepEqual(scanExistingTrackedFiles(repo, { exemptions }), [{ category: 'live-session-identifier', filePath: 'fixtures/manifest.json' }]);
+    // An exemption never covers a category it did not name.
+    writeFileSync(path.join(repo, 'fixtures', 'manifest.json'), manifest);
+    execFileSync('git', ['add', 'fixtures'], { cwd: repo });
+    const narrower = [{ ...exemptions[0], categories: [] }, exemptions[1]];
+    assert.deepEqual(scanExistingTrackedFiles(repo, { exemptions: narrower }), [{ category: 'live-session-identifier', filePath: 'fixtures/manifest.json' }]);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('scans existing Git-tracked files only and never reports matching values', () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'public-hygiene-test-'));
   try {
