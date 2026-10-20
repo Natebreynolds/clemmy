@@ -1,3 +1,6 @@
+import { parseCurrentManifestRecoverySemantics, type CurrentManifestRecoverySemanticsV1 } from './current-manifest-recovery-data.js';
+export { parseCurrentManifestRecoverySemantics } from './current-manifest-recovery-data.js';
+export type { CurrentManifestRecoverySemanticsV1 } from './current-manifest-recovery-data.js';
 import {
   type CapabilityManifestOperationSemanticsV1,
   type ManifestEffect,
@@ -15,13 +18,6 @@ import type { OperationVerificationContractV1 } from './mutation-verification-co
  * exact-artifact reconciliation contract can make a rejected call repairable
  * even when the provider definition did not declare a general undo operation.
  */
-export interface CurrentManifestRecoverySemanticsV1 {
-  version: 1;
-  operationId: string;
-  manifestDigest: string;
-  basis: 'reversible_operation' | 'exact_artifact_reconciliation';
-}
-
 export interface CurrentManifestOperationSemanticsV1 {
   operationId: string;
   manifestDigest: string;
@@ -143,29 +139,6 @@ export function currentManifestRecoverySemantics(
 
 /** Parse only the closed event form. Event rows are host-authored, but this
  * keeps malformed/legacy rows from accidentally becoming recovery authority. */
-export function parseCurrentManifestRecoverySemantics(
-  value: unknown,
-): CurrentManifestRecoverySemanticsV1 | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const row = value as Record<string, unknown>;
-  if (
-    row.version !== 1
-    || (row.basis !== 'reversible_operation' && row.basis !== 'exact_artifact_reconciliation')
-    || typeof row.operationId !== 'string'
-    || !row.operationId.trim()
-    || typeof row.manifestDigest !== 'string'
-    || !/^[a-f0-9]{64}$/.test(row.manifestDigest)
-    || Object.keys(row).some((key) => !['version', 'operationId', 'manifestDigest', 'basis'].includes(key))
-    || Object.keys(row).length !== 4
-  ) return null;
-  return {
-    version: 1,
-    operationId: row.operationId,
-    manifestDigest: row.manifestDigest,
-    basis: row.basis,
-  };
-}
-
 export function currentManifestOperationSemantics(
   operationId: string | null | undefined,
 ): (CurrentManifestOperationSemanticsV1 & {

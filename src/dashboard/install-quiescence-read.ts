@@ -13,6 +13,12 @@ export interface InstallQuiescenceReader {
   BASE_DIR: string;
   WORKFLOW_RUNS_DIR: string;
   database: () => Database.Database;
+  /** The worker applies the same read-only open with bounded row decoding. */
+  openCodingDatabase?: (file: string) => Database.Database;
+  /** Reuse bounded machine-id bytes captured in the same observer generation. */
+  readCodingMachineId?: () => string;
+  /** Allows one already-fenced, bounded directory snapshot in the observer. */
+  listDirectoryFiles?: (directory: string) => string[];
   getUserInputEventAtSequence: typeof import('../runtime/harness/eventlog.js').getUserInputEventAtSequence;
   getBackgroundTask: typeof import('../execution/background-tasks.js').getBackgroundTask;
   readWorkflowRunInventoryFile: typeof import('../execution/workflow-run-inventory.js').readWorkflowRunInventoryFile;
@@ -90,7 +96,8 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
     return rows.slice(0, limit);
   };
   const files = (directory: string, category: string): string[] => {
-    try { return bounded(readdirSync(directory).filter(file => file.endsWith('.json')).sort(), category); }
+    try { return bounded((reader.listDirectoryFiles ? reader.listDirectoryFiles(directory) : readdirSync(directory))
+      .filter(file => file.endsWith('.json')).sort(), category); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') issues.add(`${category}_inventory_unreadable`);
       return [];
@@ -137,7 +144,8 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
   let coding: Database.Database | undefined;
   try {
     statSync(codingBase);
-    const machineId = readFileSync(path.join(reader.BASE_DIR, 'state', 'machine-id'), 'utf8').trim();
+    const machineId = (reader.readCodingMachineId ? reader.readCodingMachineId()
+      : readFileSync(path.join(reader.BASE_DIR, 'state', 'machine-id'), 'utf8')).trim();
     if (!/^[A-Za-z0-9._-]+$/.test(machineId) || machineId === '.' || machineId === '..') {
       issues.add('coding_machine_identity_unverified');
     } else {
@@ -147,7 +155,8 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') present = false; else throw error;
       }
       if (present) {
-        coding = new Database(file, { readonly: true, fileMustExist: true });
+        coding = reader.openCodingDatabase ? reader.openCodingDatabase(file)
+          : new Database(file, { readonly: true, fileMustExist: true });
         coding.pragma('query_only = ON');
         const runs = bounded(coding.prepare(`SELECT run_id, session_id, state, lease_owner, lease_expires_at_ms
           FROM coding_runs WHERE state IS NULL OR state != 'settled' LIMIT ?`).all(limit + 1) as Array<{

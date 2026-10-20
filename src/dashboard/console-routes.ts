@@ -487,8 +487,10 @@ import { getHarnessBudgetSnapshot } from '../runtime/harness/budget-settings.js'
 import { HarnessSession } from '../runtime/harness/session.js';
 
 import { stopExactHarnessAttempt } from '../runtime/harness/stop-exact-attempt.js';
-import { isIgnorableActiveWorkSession } from '../runtime/harness/session-reconcile.js';
-import { readInstallQuiescence, unverifiedInstallQuiescence } from './install-quiescence.js';
+import { createActiveWorkObserver } from './active-work-observer.js';
+import { unverifiedInstallQuiescence } from './install-quiescence-read.js';
+import { HARNESS_SCHEMA_VERSION } from '../runtime/harness/schema-version.js';
+const activeWorkObserver = createActiveWorkObserver({ baseDir: BASE_DIR, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION });
 import { parseApprovalIntent, parseHarnessCommand } from '../channels/discord-harness.js';
 import { approvalConfirmationAlreadyAsked, approvalInquiryQuestion, resolveQueuedCardAsChanged, routeReplyToPendingApproval, sessionHoldingWaitingCard } from '../runtime/harness/approval-reply-routing.js';
 import { approvalArgsWithFieldEdits } from '../runtime/harness/approval-call-preview.js';
@@ -2037,27 +2039,6 @@ function harnessSessionSourceLabel(session: HarnessSessionRow): string {
   if (isDiscordHarnessSession(session)) return 'Discord';
   if (session.kind === 'workflow' || session.channel === 'workflow' || session.metadata.source === 'workflow') return 'Workflow';
   return session.channel || session.kind;
-}
-
-const ACTIVE_WORK_SESSION_PAGE_SIZE = 500;
-
-function listVisibleActiveWorkHarnessSessions(pendingSessionIds: Set<string>): HarnessSessionRow[] {
-  const out: HarnessSessionRow[] = [];
-  for (let offset = 0; ; offset += ACTIVE_WORK_SESSION_PAGE_SIZE) {
-    const page = listHarnessSessions({
-      kind: ['workflow', 'execution', 'agent'],
-      status: ['active', 'paused'],
-      limit: ACTIVE_WORK_SESSION_PAGE_SIZE,
-      offset,
-    });
-    for (const session of page) {
-      if (!isIgnorableActiveWorkSession(session, { pendingSessionIds })) {
-        out.push(session);
-      }
-    }
-    if (page.length < ACTIVE_WORK_SESSION_PAGE_SIZE) break;
-  }
-  return out;
 }
 
 function actionEventTime(event: ActionEvent): string {
@@ -9310,75 +9291,14 @@ export function registerConsoleRoutes(
    * evidence. The retained session/activity fields remain for display only:
    * an active/paused session row alone never establishes current execution.
    */
-  app.get('/api/console/active-work', (req, res) => {
+  app.get('/api/console/active-work', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    let install: ReturnType<typeof readInstallQuiescence>;
-    try { install = readInstallQuiescence(); }
-    catch { install = unverifiedInstallQuiescence('install_inventory_unreadable'); }
-    try {
-      const pendingApprovals = approvalRegistry.listPending({ status: 'pending' })
-        .filter(approvalRegistry.isFormalApprovalSurface);
-      const sessionsWithPendingApprovals = new Set(pendingApprovals.map((approval) => approval.sessionId));
-      const activeNonChatSessions = listVisibleActiveWorkHarnessSessions(sessionsWithPendingApprovals);
-      const activeBackgroundTasks = listBackgroundTasks().filter(
-        (task) => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval',
-      );
-      const activeWorkItems = [
-        ...activeNonChatSessions.map((session) => ({
-          type: 'session',
-          id: session.id,
-          kind: session.kind,
-          status: session.status,
-          title: session.title || session.objective || session.id,
-          updatedAt: session.updatedAt,
-        })),
-        ...pendingApprovals.map((approval) => ({
-          type: 'approval',
-          id: approval.approvalId,
-          kind: 'harness-approval',
-          status: approval.status,
-          title: approval.subject || approval.tool || approval.approvalId,
-          sessionId: approval.sessionId,
-          tool: approval.tool,
-          updatedAt: approval.requestedAt,
-        })),
-        ...activeBackgroundTasks.map((task) => ({
-          type: 'background-task',
-          id: task.id,
-          kind: task.source,
-          status: task.status,
-          title: task.title,
-          updatedAt: task.updatedAt,
-          pendingApprovalId: task.pendingApprovalId,
-        })),
-      ];
-      // Build a human-readable summary for the auto-updater dialog so
-      // the user sees what's at stake before choosing "Install anyway."
-      const summaryParts: string[] = [];
-      if (activeNonChatSessions.length > 0) {
-        summaryParts.push(`${activeNonChatSessions.length} tracked run${activeNonChatSessions.length === 1 ? '' : 's'} active or paused`);
-      }
-      if (pendingApprovals.length > 0) {
-        summaryParts.push(`${pendingApprovals.length} pending approval${pendingApprovals.length === 1 ? '' : 's'}`);
-      }
-      if (activeBackgroundTasks.length > 0) {
-        summaryParts.push(`${activeBackgroundTasks.length} background task${activeBackgroundTasks.length === 1 ? '' : 's'}`);
-      }
-      res.json({
-        // The native updater already consumes total/summary. Keep retained
-        // activity fields for their display consumers, but never call those
-        // historical sessions current execution ownership.
-        ...install,
-        activeSessions: activeNonChatSessions.length,
-        pendingApprovals: pendingApprovals.length,
-        activeBackgroundTasks: activeBackgroundTasks.length,
-        items: activeWorkItems,
-        trackedActivitySummary: summaryParts.join(', ') || 'no tracked activity',
-      });
-    } catch {
-      // Shipped native clients fail open on HTTP/probe failure. An unreadable
-      // activity store must therefore be an explicit conservative 200 warning.
-      res.json({ ...unverifiedInstallQuiescence('tracked_activity_unreadable', install),
+    res.set('Cache-Control', 'no-store');
+    try { res.json(await activeWorkObserver.read()); }
+    catch {
+      // Native clients must receive an explicit conservative 200 warning even
+      // when the observer cannot start. Never fall back to a daemon-thread scan.
+      res.json({ ...unverifiedInstallQuiescence('active_work_observation_unverified'),
         activeSessions: 0, pendingApprovals: 0, activeBackgroundTasks: 0, items: [], activityAvailable: false });
     }
   });

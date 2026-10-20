@@ -1,3 +1,4 @@
+import { slimWorkflowRunRecord } from './workflow-run-inventory-data.js';
 /**
  * One lightweight inventory of workflow run records for status and history
  * reads.
@@ -43,9 +44,6 @@ export type WorkflowRunInventoryFileResult =
   | { kind: 'empty' }
   | { kind: 'failed' };
 
-const HEAVY_FIELDS = new Set(['stepOutputs', 'workflowDefinitionSnapshot', 'output', 'reportBack', 'mutationContractSnapshot']);
-const SNAPSHOT_IDENTITY_FIELDS = ['version', 'scope', 'compilerId', 'definitionHash', 'workflowSlug', 'codeRevision'];
-
 interface CachedEntry {
   entry: WorkflowRunInventoryEntry;
   generation: string;
@@ -58,28 +56,6 @@ function generation(stat: BigIntStats): string {
   // Atomic publication may replace a record with same-sized bytes and preserve
   // its mtime. The file identity and change time still belong to the new value.
   return `${stat.dev}\0${stat.ino}\0${stat.ctimeNs}\0${stat.mtimeNs}\0${stat.size}`;
-}
-
-function slim(raw: Record<string, unknown>): Record<string, unknown> {
-  // Spread defines own data keys, including a decoded `__proto__` key. An
-  // assignment loop could turn that key into inherited workflow/status fields.
-  const out = { ...raw };
-  for (const key of HEAVY_FIELDS) delete out[key];
-  const outputs = raw.stepOutputs;
-  out.stepOutputKeys = outputs && typeof outputs === 'object' && !Array.isArray(outputs) ? Object.keys(outputs) : [];
-  const snapshot = raw.workflowDefinitionSnapshot;
-  if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
-    const identity: Record<string, unknown> = {};
-    for (const key of SNAPSHOT_IDENTITY_FIELDS) {
-      if (key in snapshot) identity[key] = (snapshot as Record<string, unknown>)[key];
-    }
-    out.workflowDefinitionSnapshot = identity;
-  }
-  const report = raw.reportBack;
-  if (report && typeof report === 'object' && !Array.isArray(report)) {
-    out.reportBack = { outcome: (report as Record<string, unknown>).outcome };
-  }
-  return out;
 }
 
 function createdKey(entry: WorkflowRunInventoryEntry): string {
@@ -116,7 +92,7 @@ function refreshFile(file: string): WorkflowRunInventoryFileResult {
       file,
       mtimeMs: Number(before.mtimeNs) / 1_000_000,
       size: Number(before.size),
-      record: Object.freeze(slim(raw as Record<string, unknown>)),
+      record: Object.freeze(slimWorkflowRunRecord(raw as Record<string, unknown>)),
     });
     cache.set(file, { generation: revision, entry });
     return { kind: 'record', entry };

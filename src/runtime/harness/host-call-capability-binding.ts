@@ -15,7 +15,7 @@ import {
   acceptedTurnCallAuthorityDigest,
   acceptedTurnCallSurfaceDigest,
   acceptedTurnSourceEventDigest,
-} from './eventlog-schema.js';
+} from './accepted-turn-authority-digests.js';
 
 export interface HostCallCapabilityBinding {
   protocolVersion: 1;

@@ -1,3 +1,6 @@
+import { isTerminalWorkflowRunStatus, TERMINAL_STATUSES, type WorkflowRunTerminalStatus } from './workflow-run-terminal-status.js';
+export { isTerminalWorkflowRunStatus } from './workflow-run-terminal-status.js';
+export type { WorkflowRunTerminalStatus } from './workflow-run-terminal-status.js';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -33,16 +36,6 @@ export interface WorkflowRunCancellationRequest {
   source: string;
 }
 
-export type WorkflowRunTerminalStatus =
-  | 'completed'
-  | 'completed_with_errors'
-  | 'blocked'
-  | 'error'
-  | 'failed'
-  | 'cancelled'
-  | 'dry_run'
-  | 'creation_test';
-
 type WorkflowRunProjection = Record<string, unknown> & {
   id?: unknown;
   workflow?: unknown;
@@ -61,23 +54,6 @@ export type CancelWorkflowRunResult =
   | { status: 'refused'; reason: 'ownership_unproved' | 'shared_child_requires_exact_run_stop'; run: WorkflowRunProjection };
 
 const CANCELLATION_DIR = path.join(WORKFLOW_RUNS_DIR, '.cancellations');
-const TERMINAL_STATUSES = new Set<WorkflowRunTerminalStatus>([
-  'completed',
-  'completed_with_errors',
-  'blocked',
-  'error',
-  'failed',
-  'cancelled',
-  'dry_run',
-  'creation_test',
-]);
-
-/** A run in one of the terminal states — nothing to cancel/cleanup. Exported
- *  for the workflow-lifecycle cleanup (delete/disable) and tests. */
-export function isTerminalWorkflowRunStatus(status: unknown): boolean {
-  return typeof status === 'string' && TERMINAL_STATUSES.has(status as WorkflowRunTerminalStatus);
-}
-
 let beforeCancellationLockForTests: (() => void) | undefined;
 
 /** Deterministic seam: runs after the optimistic route read and before the
