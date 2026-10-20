@@ -9,7 +9,7 @@ exercises the installed product against the same disposable migrated home. The
 only model endpoint is a loopback fixture server. Every path remains below the
 operating system's temporary directory.
 
-## Current candidate: harness schema v95
+## Current candidate: harness schema v98
 
 Target reviewed: 2026-10-15. The migration authority is
 `src/runtime/harness/eventlog-schema.ts`; retained-proof migration details live
@@ -35,6 +35,9 @@ execute saved scripts, or replay completed effects.
 | 93 | Rebuild `durable_memory_intake_receipts` so its checks admit protocol 2 receipts (`memory-intake:v2:` ids) beside protocol 1, recreating its indexes and triggers from their original SQL. | Every v1 receipt is copied column for column and stays readable history; only a v2 receipt can establish new memory completion. The migration refuses an unexpected predecessor declaration, a preexisting replacement table or inbound foreign keys, and fails if the rebuilt table has a foreign-key violation. |
 | 94 | Add `session_conversation_state` (session id, state JSON, fidelity, memory episode id, update and compaction times) and move each session's `__conversation` out of `sessions.metadata_json` into it. | Each state is moved byte for byte (fidelity `full`) and removed from the metadata in the same transaction; the session row, its update time and every other metadata key are unchanged. A session with no stored conversation gets no row. |
 | 95 | Add `outcome_reports_pending_v1` (source event id, session id, created time, attempt count) with order and session indexes: the retry outbox that publishes a background result once it is committed beside its passive result. | Additive only: the migration creates the table and its indexes; no existing row is copied, rewritten or removed. |
+| 96 | Add `approved_action_completion_intents_v1` and `approved_action_completion_receipts_v1` (an approved action's exact completion intent and its receipt, each with immutable update/delete triggers). | Additive only: both tables start empty; no historical approval, pending action or event is rewritten or reinterpreted as a completion. |
+| 97 | Add `approved_action_provider_bindings_v1` with immutable triggers and the exact-binding triggers (`approved_action_provider_intent_protocol_v97`, `approved_action_provider_binding_exact_v97`, `approved_action_provider_receipt_exact_v97`) that bind one approved SDK write to one retained provider crossing. | Additive only: the table starts empty and the triggers constrain new rows; existing intents, receipts and settlements are untouched. |
+| 98 | Add `approved_action_result_projection_jobs_v1` (queue and parent indexes) and `approved_action_result_projections_v1` with the insert, transition, result and delete triggers that let an optional card-wording job exist only for an exact completed action. | Additive only: both tables start empty; no job is synthesized for a historical action, and the triggers never touch events, authority or receipts. |
 
 A second open must preserve the resulting schema and rows. The rehearsal must
 reach the exported current schema version and compare both migrated boots.
@@ -73,7 +76,7 @@ v3.14 graph; any installed dependency drift refuses exact-tag execution.
 
 | Store | v3.14.0 | Current target | Upgrade behavior | Rehearsed |
 |---|---:|---:|---|---|
-| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 95) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
+| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 98) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
 | `state/memory.db` | migration 32 | exported `MEMORY_SCHEMA_VERSION` | numbered migrations 33 through current; opening an old DB must first make an immutable pre-migration backup | Yes, including backup existence and second-open idempotence |
 | `state/workspaces.db` | `PRAGMA user_version=3` | 5 | v4 adds workflow binding/run projection/partition tables; v5 adds the canonical-entity projection head; Space remains a read model | Yes, with a v3 Space and dataset observation |
 | `state/workflow-triggers.db` | schema contract 4 | 4 | additive shape validation; no release-boundary version change | Yes, with exact cron and event triggers compiled by v3.14 |
