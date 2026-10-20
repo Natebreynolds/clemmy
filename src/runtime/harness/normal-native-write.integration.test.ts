@@ -365,8 +365,14 @@ test(`an exact file overwrite commits once without rediscovery or a redundant ap
 });
 }
 
-for (const label of ['sibling', 'invented'] as const) {
-test(`a native write carrying ${label === 'sibling' ? "another configured operation's" : 'an invented'} requirement id ${label === 'sibling' ? 'runs under its own definition' : 'keeps the refusal'}`, async () => {
+// Live 2026-10-20: a page read's third shell call and a workflow run each
+// carried a label the model made up ("read.page") and were refused "not yet
+// published; call tool_search" — two model steps per hoop. The named operation
+// and its arguments are the call; a free label publishes its own definition
+// the way an exact name does. A cap:local ref that names no configured
+// operation still keeps the refusal.
+for (const label of ['sibling', 'invented', 'free'] as const) {
+test(`a native write carrying ${label === 'sibling' ? "another configured operation's" : label === 'free' ? 'a made-up' : 'an invented cap:local'} requirement id ${label === 'invented' ? 'keeps the refusal' : 'runs under its own definition'}`, async () => {
   eventlog.resetEventLog();
   capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
   capabilityManifestStores.installCapabilityManifestStore(capabilityManifestStores.createCapabilityManifestStore());
@@ -381,7 +387,8 @@ test(`a native write carrying ${label === 'sibling' ? "another configured operat
   assert.ok(primed.ok);
   if (!primed.ok) throw new Error(primed.reason);
   const args = { path: file, content: 'Revised draft', mode: 'overwrite', append: null };
-  const authoredRequirement = label === 'sibling' ? 'cap:local:space_save:reversible' : 'cap:local:not_a_tool:reversible';
+  const authoredRequirement = label === 'sibling' ? 'cap:local:space_save:reversible'
+    : label === 'free' ? 'read.page' : 'cap:local:not_a_tool:reversible';
   const workCall = brackets.wrapToolForHarness(workCallTools.buildWorkCall({ requireHostPlan: true,
     reachableBuiltinNames: new Set(['write_file']), firstClassNames: new Set(), catalogIdentifiers: ['write_file'],
     settlementLane: 'byo', hostPlanningReady: () => true }) as never);
@@ -408,7 +415,7 @@ test(`a native write carrying ${label === 'sibling' ? "another configured operat
     { maxTurns: 3, hostTurnEngine: 'host_v1', context: identity } as never));
   const dispatches = (eventlog.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ?')
     .get(session.id) as { n: number }).n;
-  if (label === 'sibling') {
+  if (label === 'sibling' || label === 'free') {
     assert.doesNotMatch(JSON.stringify(result.history), /work_contract_required|not yet published|tool_search/);
     assert.equal(readFileSync(file, 'utf8'), 'Revised draft\n');
     assert.equal(dispatches, 1);

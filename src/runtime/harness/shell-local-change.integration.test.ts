@@ -247,6 +247,24 @@ test('a command that changes local files runs as ordinary accepted work, with no
   assert.equal(run.plans, 0);
 });
 
+// Live 2026-10-20: the model labelled its third shell call "read.page" and was
+// refused "not yet published; call tool_search" — the named command and its
+// arguments are the call, so the host publishes its own definition and runs it.
+test('a command that changes local files under a made-up requirement label runs in one round', async () => {
+  const run = await runShellTurn({
+    id: 'shell-free-label-copy',
+    prompt: 'Copy assets/brand.css into out-free/brand.css in the work folder.',
+    command: 'mkdir -p out-free && cp assets/brand.css out-free/brand.css',
+    requirementId: 'read.page',
+  });
+  assert.doesNotMatch(run.history, /work_contract_required|not yet published|tool_search/, run.history);
+  assert.equal(readFileSync(path.join(WORK, 'out-free', 'brand.css'), 'utf8'), 'body{color:#123}\n');
+  assert.deepEqual(run.dispatches, [{ tool_name: SHELL, state: 'returned' }]);
+  assert.deepEqual(run.bindings.map((row) => [row.tool_name, row.capability_id, row.effect]),
+    [[SHELL, ORDINARY, 'local_write']]);
+  assert.equal(run.approvals, 0);
+});
+
 test('a command that only reads still runs under its own envelope, by its label', async () => {
   const run = await runShellTurn({
     id: 'shell-local-read',

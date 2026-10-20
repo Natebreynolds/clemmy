@@ -11605,11 +11605,17 @@ const runHostTurnBody = async (
           continue;
         }
         const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
-        // A requirement id that is just the carried operation's own name is a
+        // A requirement id that is just the carried operation's own name, a
+        // free label the model made up ("read.page"), or no id at all is a
         // label slip, not a different request: run the named operation under
         // its own exact current definition, exactly as a direct call would.
-        if (args && typeof args.requirement_id === 'string' && typeof args.name === 'string'
-          && args.requirement_id.trim() === args.name.trim() && !actionExpectedWorkRequired(exactHostIdentity())) {
+        // Live 2026-10-20: a page read's third shell call and a workflow run
+        // each carried an invented label and were refused "not yet published
+        // for this request; call tool_search", two model steps per hoop.
+        const requirementLabel = args && typeof args.requirement_id === 'string' ? args.requirement_id.trim() : '';
+        if (args && typeof args.name === 'string'
+          && (!requirementLabel || requirementLabel === args.name.trim() || !requirementLabel.startsWith('cap:local:'))
+          && !actionExpectedWorkRequired(exactHostIdentity())) {
           const selfNamed = unwrapRuntimeEffectiveToolIdentity(call.name, args);
           if (selfNamed.toolName && selfNamed.args && typeof selfNamed.args === 'object' && !Array.isArray(selfNamed.args)) {
             const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
