@@ -1107,7 +1107,7 @@ function withRetainedWorkTerminal(outcome: TurnOutcome): TurnOutcome {
 
 /** A frozen exact-call decision is its own source. Its durable Stop cannot
  * become an unverified-completion hold after its transient latch was cleared. */
-function exactApprovedDecisionWasStopped(identity: TurnIdentity): boolean {
+function exactApprovedDecisionWasStopped(identity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>): boolean {
   const db = openEventLog();
   return Boolean(db.prepare(`SELECT 1 FROM approved_action_completion_intents_v1
     WHERE session_id=? AND source_user_seq=?`).get(identity.sessionId, identity.sourceUserSeq))

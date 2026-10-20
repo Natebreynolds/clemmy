@@ -3297,7 +3297,7 @@ function validatePersistedTerminalPublicationWinner(
       );
     }
     if (authority.host_completion_receipt_id) {
-      assertExactHostCompletionReceipt(db, authority, { allowStopped: presentation.status !== 'done', stopBefore: event.createdAt });
+      assertExactHostCompletionReceipt(db, authority, { allowStopped: true, stopBefore: event.createdAt });
     } else if (authority.work_contract_id) {
       assertExactTerminalPublicationStructure(db, authority);
     } else {
