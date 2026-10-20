@@ -21,6 +21,9 @@ const { buildOrchestratorAgent } = await import('./orchestrator.js');
 const { primePrimaryModelPlanningCatalog } = await import('../runtime/semantic-boundary/admit-and-compile-accepted-source.js');
 const { boundAgentCapabilityEnvelope, boundAgentCapabilityRevision, toolSchemaFingerprint } = await import('./capability-envelope.js');
 const { isRegistryDeclaredRead } = await import('../tools/tool-registry.js');
+// A catalog entry may carry its call signature (`space_refresh(slug, source_id?)`);
+// the index is still one name per entry.
+const catalogEntryNames = (line: string): string[] => line.slice(2).split(/, (?![^(]*\))/).map((entry) => entry.replace(/\(.*$/, ''));
 const { buildScopedLocalToolSearch } = await import('../tools/local-runtime-tools.js');
 
 after(() => { log.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
@@ -48,9 +51,9 @@ async function fixture(mode: 'normal' | 'plan', options: {
     ? String(await agent.instructions(new RunContext({}), agent)) : String(agent.instructions);
   const match = instructions.match(/\[native-read-catalog\][^\n]*\n(?:- [^\n]+(?:\n|$))+/);
   const block = match?.[0].trimEnd() ?? '';
-  const names = block.split('\n').slice(1).flatMap(line => line.slice(2).split(', '));
+  const names = block.split('\n').slice(1).flatMap(catalogEntryNames);
   const authoringBlock = instructions.match(/\[native-authoring-catalog\][^\n]*\n(?:- [^\n]+(?:\n|$))+/)?.[0].trimEnd() ?? '';
-  const authoringNames = authoringBlock.split('\n').slice(1).flatMap(line => line.slice(2).split(', '));
+  const authoringNames = authoringBlock.split('\n').slice(1).flatMap(catalogEntryNames);
   const entireCatalog = [block, authoringBlock].filter(Boolean).join('\n');
   assert.deepEqual({ envelope: JSON.stringify(boundAgentCapabilityEnvelope(agent)),
     revision: JSON.stringify(boundAgentCapabilityRevision(agent)),

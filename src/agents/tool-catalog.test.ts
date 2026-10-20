@@ -542,3 +542,22 @@ test('holdNewPromotions keeps what the previous build promoted and holds only ad
   assert.deepEqual(decided.held, ['view_image']);
   assert.deepEqual([...holdNewPromotions(new Set(['view_image']), null).promoted], ['view_image'], 'no recorded list holds nothing');
 });
+
+test('a catalog line carries the call signature of one of her own tools once its schema is known', async () => {
+  const { renderToolSignature, _setToolSignaturesForTest } = await import('./tool-catalog.js');
+  assert.equal(renderToolSignature('space_refresh', {
+    type: 'object', properties: { slug: {}, source_id: {} }, required: ['slug'],
+  }), 'space_refresh(slug, source_id?)');
+  assert.equal(renderToolSignature('space_get', {
+    type: 'object', properties: { a: {}, b: {}, c: {}, d: {}, e: {}, f: {}, g: {} }, required: ['g'],
+  }), 'space_get(g, a?, b?, c?, d?, e?, …)', 'bounded to six parameters, required first');
+  assert.equal(renderToolSignature('workspace_roots', { type: 'object', properties: {} }), 'workspace_roots');
+  _setToolSignaturesForTest({ space_refresh: 'space_refresh(slug, source_id?)' });
+  try {
+    const text = buildCompactToolCatalog();
+    assert.match(text, /space_refresh\(slug, source_id\?\)/, 'the primed signature rides the catalog line');
+    assert.match(text, /(^|, )space_diff(,|$)/m, 'an unprimed name stays bare');
+  } finally {
+    _setToolSignaturesForTest(null);
+  }
+});

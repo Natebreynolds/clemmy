@@ -84,7 +84,7 @@ import {
   ORCHESTRATOR_BEHAVIOR_NATIVE,
 } from './clem-rubric.js';
 import { resolveToolJitDecision, selectToolsForTurn, recallPinnedBuiltinTools } from './tool-jit.js';
-import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions, holdNewPromotions } from './tool-catalog.js';
+import { resolveToolSearchDecision, resolveHotSetParts, buildCompactToolCatalog, DISCOVERY_SIBLING_DOORS, applyProvenSkipToHotSet, steadySessionPromotions, holdNewPromotions, primeToolSignatures } from './tool-catalog.js';
 import { holdsWarmPrefix, recordedTurnDesk, renderDeskNamesLine, resolveTurnDesk, warmPromptPrefixFor, type TurnDeskDecision, type WarmPromptPrefix } from './turn-desk.js';
 import { bindSessionWireOrder } from '../runtime/harness/advertised-tool-wire.js';
 import { NATIVE_PRODUCT_AUTHORING_TOOLS } from '../tools/native-product-surface.js';
@@ -4199,6 +4199,9 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
             && toolNameOffered(name)
           )))
         : new Set([...discoverableNames].filter(toolNameOffered));
+      // Her own tools carry their call signatures on the line, so a listed name
+      // is callable on the first try; the cache fills asynchronously once.
+      void primeToolSignatures(catalogNames);
       const catalogText = buildCompactToolCatalog({ allowedNames: catalogNames });
       const nativeAuthoringNames = hostFreshPlanning
         ? new Set([...localPlanningCapabilityNames].filter(name => workCallBuiltinNames.has(name)
@@ -4206,13 +4209,14 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
           && !visibleFirstClassNames.has(name)
           && toolNameOffered(name)))
         : new Set<string>();
+      void primeToolSignatures(nativeAuthoringNames);
       const nativeAuthoringCatalog = nativeAuthoringNames.size > 0
         ? '[native-authoring-catalog] Available native authoring tools. If an exact tool fits, use its known work_call contract or look up that exact name with tool_search for its schema and callable example. An exact native lookup stays local; describing it as a broad app search can return unrelated connectors.\n'
           + buildCompactToolCatalog({ allowedNames: nativeAuthoringNames })
         : '';
       catalogBlock = hostFreshPlanning
         ? [catalogNames.size > 0 ? [
-              '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: {<the target arguments>}}); prefer this JSON object form over an encoded string. If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
+              '[native-read-catalog] These available native lookup tools are reachable this turn through call_tool. Use a known schema directly as call_tool({name: "<exact native name>", args_json: {<the target arguments>}}); prefer this JSON object form over an encoded string. A listed name that shows its arguments in parentheses (`?` marks optional) needs no lookup: call it. If its schema is missing, call tool_search with that exact name; native schema lookup does not search connectors. This inventory adds no execution authority; existing source, schema, effect and mode checks still apply.',
               catalogText,
             ].join('\n') : '', nativeAuthoringCatalog].filter(Boolean).join('\n') || null
         : [
@@ -4222,10 +4226,10 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         // impossible to misread as a capability restriction.
         carrierWork
           ? frozenContract
-            ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null. A name listed below is callable now: pass it to `call_tool` with its args_json (hot controls and local reads) or to `work_call` (business writes); `tool_search` is for a schema you do not know, and searching by the exact name returns it in one lookup.'
+            ? '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. The host already froze the work contract; every `work_call` uses proposal:null. A name listed below is callable now: pass it to `call_tool` with its args_json (hot controls and local reads) or to `work_call` (business writes). A name that shows its arguments in parentheses (`?` marks optional) needs no lookup; `tool_search` is for a schema you do not know, and searching by the exact name returns it in one lookup.'
             : hostFreshPlanning
               ? '[tool-catalog] Full tool access. In Normal mode, call the exposed native space_save, workflow_create, and workflow_update tools directly using their schemas; the host prepares their current definitions and validates the exact call. No discovery or model-authored requirement ID is needed for those direct native calls. Explicit Plan and reviewed Execute keep their reviewed-step path. The planning card contains only exact live refs. For other operations, if a required ref is absent, use `tool_search`; its results disclose exact capabilityRef values without business I/O. Run safe reads as you reason. Each identified proposal-free `work_call` goes directly to the existing tool-edge allow/deny/ask decision. Independent exact reversible writes can proceed one call at a time; chat does not compile a hidden plan for them. Include source_call_ids only when the write arguments consume or copy a settled result\'s bytes. Use explicit `plan_task` for dependency or set topology, unresolved dependencies, an explicit tracked plan, ambiguity, admin, destructive, or unknown-effect work. Reads never need approval.'
-              : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null. A name listed below is callable now: pass it to `call_tool` with its args_json (hot controls and local reads) or to `work_call` (business writes); `tool_search` is for a schema you do not know, and searching by the exact name returns it in one lookup.'
+              : '[tool-catalog] Full tool access. Hot controls and graph-neutral local reads use `call_tool`; plan-selected local reads and business WRITES/MCP/Composio use `work_call`. Reads never need approval. One `tool_search` is the discovery door — do not open sibling search tools. If the packet already resolved a capability, invoke it. First `work_call` fuses the proposal with the first inner call; later calls use proposal:null. A name listed below is callable now: pass it to `call_tool` with its args_json (hot controls and local reads) or to `work_call` (business writes). A name that shows its arguments in parentheses (`?` marks optional) needs no lookup; `tool_search` is for a schema you do not know, and searching by the exact name returns it in one lookup.'
           : '[tool-catalog] Full tool access this turn. First-class tools have schemas; everything else is reachable through `tool_search` then `call_tool`. That is the only discovery door — do not open sibling search tools. If you already know the exact name, `call_tool` it. External MCP names are `<server>__<tool>`. The inner tool controls approval.',
         catalogText,
       ].join('\n');

@@ -303,13 +303,73 @@ export function buildToolCatalog(opts: { allowedNames?: ReadonlySet<string> } = 
 export function buildCompactToolCatalog(
   opts: { allowedNames?: ReadonlySet<string>; namesPerLine?: number } = {},
 ): string {
-  const names = catalogEntries(opts).map((entry) => entry.name);
+  const names = catalogEntries(opts).map((entry) => toolSignatures.get(entry.name) ?? entry.name);
   const width = Math.max(4, Math.min(20, Math.trunc(opts.namesPerLine ?? 10)));
   const lines: string[] = [];
   for (let index = 0; index < names.length; index += width) {
     lines.push(`- ${names.slice(index, index + width).join(', ')}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * The call signature a catalog line carries for one of Clem's own tools:
+ * `space_refresh(slug, source_id?)`. Live 10-20, "Refresh my R45 nine space
+ * and tell me what changed": space_refresh, space_diff and workflow_run were
+ * names in the catalog, so the brain spent three tool_search rounds (each a
+ * full prompt re-send) learning two or three argument names. A bare name
+ * tells the model a tool exists; the signature lets it call the tool on the
+ * first try, which is what "her own tools on every turn" means. Bounded: the
+ * first six parameters, required ones bare, optional ones with `?`.
+ */
+const SIGNATURE_PARAMS_MAX = 6;
+export function renderToolSignature(name: string, schema: Record<string, unknown> | null | undefined): string {
+  const properties = schema && typeof schema.properties === 'object' && schema.properties && !Array.isArray(schema.properties)
+    ? Object.keys(schema.properties as Record<string, unknown>)
+    : [];
+  if (properties.length === 0) return name;
+  const required = new Set(Array.isArray(schema!.required) ? (schema!.required as unknown[]).filter((v): v is string => typeof v === 'string') : []);
+  const ordered = [...properties.filter((p) => required.has(p)), ...properties.filter((p) => !required.has(p))];
+  const shown = ordered.slice(0, SIGNATURE_PARAMS_MAX).map((p) => (required.has(p) ? p : `${p}?`));
+  if (ordered.length > SIGNATURE_PARAMS_MAX) shown.push('…');
+  return `${name}(${shown.join(', ')})`;
+}
+
+/** name → signature, filled from the registered schemas; absent names render bare. */
+const toolSignatures = new Map<string, string>();
+const signaturesAsked = new Set<string>();
+
+/**
+ * Fill the signature cache for these names, asynchronously and once per name.
+ * The catalog is built synchronously inside prompt composition, so the first
+ * turn after boot may still render bare names; every later turn carries the
+ * signatures. Never throws, never blocks.
+ */
+export function primeToolSignatures(names: Iterable<string>): Promise<void> {
+  const missing = [...names].filter((name) => !toolSignatures.has(name) && !signaturesAsked.has(name));
+  if (missing.length === 0) return Promise.resolve();
+  for (const name of missing) signaturesAsked.add(name);
+  return (async () => {
+    try {
+      const { innerDispatchToolParameters } = await import('../tools/inner-dispatch.js');
+      for (const name of missing) {
+        try {
+          const schema = await innerDispatchToolParameters(name);
+          if (schema) toolSignatures.set(name, renderToolSignature(name, schema));
+        } catch { /* a tool without a readable schema stays a bare name */ }
+      }
+    } catch { /* no dispatch surface: bare names, as before */ }
+  })();
+}
+
+export function toolSignatureFor(name: string): string | undefined {
+  return toolSignatures.get(name);
+}
+
+export function _setToolSignaturesForTest(entries: Record<string, string> | null): void {
+  toolSignatures.clear();
+  signaturesAsked.clear();
+  if (entries) for (const [name, signature] of Object.entries(entries)) toolSignatures.set(name, signature);
 }
 
 /**
