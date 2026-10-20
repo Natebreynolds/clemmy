@@ -101,12 +101,11 @@ export type CompletionReviewDisposition =
 /** Read-only provenance for the queue-before-review host exit. A generic
  * question, claimed approval id or an old card does not explain a missing
  * verdict. None of this evidence can approve or execute the queued action. */
-function exactQueuedApprovalReviewPause(outcome: TurnOutcome, reviewIdentity: TurnIdentity): boolean {
+function exactQueuedApprovalReviewPause(outcome: TurnOutcome, reviewIdentity: Pick<TurnIdentity, 'sessionId' | 'sourceUserSeq'>): boolean {
   if (outcome.status !== 'needs_input' || outcome.needs.kind !== 'approval'
     || outcome.presentation.kind !== 'approval'
     || outcome.identity.sessionId !== reviewIdentity.sessionId
-    || outcome.identity.sourceUserSeq !== reviewIdentity.sourceUserSeq
-    || outcome.identity.turn !== reviewIdentity.turn) return false;
+    || outcome.identity.sourceUserSeq !== reviewIdentity.sourceUserSeq) return false;
   try {
     const { sessionId, sourceUserSeq, turn } = outcome.identity;
     const approvalId = outcome.presentation.approvalId;
