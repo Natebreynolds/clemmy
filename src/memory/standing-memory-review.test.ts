@@ -36,6 +36,25 @@ test('invented standing text and malformed classifications remain retryable erro
 });
 
 
+test('an owner-authorized remember cannot be rejected on durability; the reviewer only places it', async () => {
+  const { createAutomaticMemoryOrigin } = await import('./memory-destination.js');
+  const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');
+  const source = 'Remember that the R45 test fixture shelf code is TANGERINE-7.';
+  const origin = createAutomaticMemoryOrigin({ source: { authority: 'accepted_user_input', sessionId: 'review-explicit',
+    eventId: 'event-2', eventSeq: 2, eventType: 'user_input_received', ownerText: source,
+    context: { sessionId: 'review-explicit', sourceUserSeq: 2, digest: 'b'.repeat(64), memoryScope: { projectId: null, agentKey: null } } },
+    claim: { start: 14, end: source.length }, claimMode: 'complete', candidate: { kind: 'user', text: source.slice(14) } });
+  // Live 2026-10-20 (Haiku 5.5): "a test fixture code … a test contract rather than standing owner policy".
+  const taskVerdict = { durability: 'task', claim: origin.claim, destination: 'kind_default', destinationSpans: [], reason: 'test contract, not policy' };
+  const authorized = parseAutomaticStandingMemoryReview(taskVerdict, origin, { ownerAuthorized: true });
+  assert.equal(authorized.scope, 'standing');
+  assert.equal(authorized.text, source.slice(14));
+  assert.equal(authorized.destinationDecision?.destination, 'kind_default');
+  assert.match(authorized.reason, /owner authorized remembering/);
+  // Without the owner's authorization the reviewer's task verdict stands.
+  assert.equal(parseAutomaticStandingMemoryReview(taskVerdict, origin).scope, 'task');
+});
+
 test('automatic review requires checked destination and complete raw claim, preserving old durability parser', async () => {
   const { createAutomaticMemoryOrigin } = await import('./memory-destination.js');
   const { parseAutomaticStandingMemoryReview } = await import('./standing-memory-review.js');

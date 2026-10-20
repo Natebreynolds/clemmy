@@ -25,8 +25,24 @@ const instructions = [
 
 /** The destination decoder reuses the persisted envelope's span/immutability
  * contract. A durability-only reply cannot accidentally mean kind_default. */
-export function parseAutomaticStandingMemoryReview(value: unknown, origin: AutomaticMemoryOrigin): StandingMemoryReview {
-  const parsed = typeof value === 'string' ? JSON.parse(extractJsonCandidate(value) ?? 'null') : value;
+export function parseAutomaticStandingMemoryReview(value: unknown, origin: AutomaticMemoryOrigin,
+  options: { ownerAuthorized?: boolean } = {}): StandingMemoryReview {
+  let parsed = typeof value === 'string' ? JSON.parse(extractJsonCandidate(value) ?? 'null') : value;
+  // An explicit "remember" is the owner's durability decision; the review
+  // only places it. Live 2026-10-20: Haiku 5.5 answered `task` to "Remember
+  // that the R45 test fixture shelf code is TANGERINE-7" ("a test fixture
+  // code … a test contract rather than standing owner policy"), the candidate
+  // was rejected, nothing was saved, and the turn paid a bounced review and a
+  // manual read-back. The owner's word stands; the reviewer's placement and
+  // its reason are kept.
+  if (options.ownerAuthorized && parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    && (parsed as Record<string, unknown>).durability === 'task') {
+    const row = parsed as Record<string, unknown>;
+    parsed = { ...row, durability: 'standing', claim: origin.claim,
+      destination: typeof row.destination === 'string' && row.destination !== 'unresolved' ? row.destination : 'kind_default',
+      destinationSpans: Array.isArray(row.destinationSpans) ? row.destinationSpans : [],
+      reason: `owner authorized remembering; reviewer placement only (it said task: ${String(row.reason ?? '').slice(0, 120)})` };
+  }
   const envelope = withAutomaticMemoryDecision(createAutomaticMemoryEnvelope(origin), parsed as AutomaticMemoryDecision);
   const decision = envelope.decision!;
   return { scope: decision.durability, reason: decision.reason, destinationDecision: decision,
@@ -189,7 +205,8 @@ async function reviewStandingMemoryNow(
     maxTurns: 1,
     signal: AbortSignal.timeout(60_000),
   });
-  const review = origin ? parseAutomaticStandingMemoryReview(result.finalOutput, origin)
+  const review = origin
+    ? parseAutomaticStandingMemoryReview(result.finalOutput, origin, { ownerAuthorized: mode === 'explicit' || mode === 'destination' })
     : parseStandingMemoryReview(result.finalOutput, source);
   if (!origin && mode === 'explicit' && (review.scope !== 'standing' || !review.text?.includes(candidate))) {
     throw new Error('Explicit memory scope review lost the authorized candidate');
