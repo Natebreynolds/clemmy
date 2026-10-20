@@ -16,6 +16,34 @@ import { openEventLog } from './eventlog.js';
  */
 export const HOST_NO_DISPATCH_STREAK_LIMIT = 8;
 
+/** How many times one step may be refused before dispatch for the same
+ * operation and the same reason within one turn, however many reads land in
+ * between, before the host ends the turn with the reason said plainly.
+ * Live 10-20 (Platform 49): a scheduled step alternated Slack reads with
+ * sheet writes refused on one constraint-check fault; the no-dispatch streak
+ * reset on every read, the step cap was off, and a five-minute workflow ran
+ * for an hour (52 checker calls). */
+export const HOST_IDENTICAL_REFUSAL_LIMIT = 3;
+
+/** The identity of a pre-dispatch refusal: which operations the step
+ * proposed and which reason the host gave, with ids, digests and counts
+ * removed so the same fault reads the same each time. */
+export function identicalRefusalKey(operations: readonly (string | null)[], refusalDetail: string | undefined): string | null {
+  const detail = (refusalDetail ?? '').trim();
+  if (!detail) return null;
+  const named = [...new Set(operations.filter((name): name is string => typeof name === 'string' && name.trim().length > 0))].sort();
+  if (named.length === 0) return null;
+  const check = /Failed check: ([a-z_]+)/i.exec(detail)?.[1];
+  const code = /^([a-z_]+(?::[a-z_]+)*)\s*[:\-]/i.exec(detail)?.[1];
+  const reason = (check ?? code ?? detail.slice(0, 120))
+    .toLowerCase()
+    .replace(/[0-9a-f]{16,}/g, '#')
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return `${named.join(',')}|${reason}`;
+}
+
 export type StepDispatch = 'none_dispatched' | 'dispatched' | 'no_calls';
 
 function callIdOf(item: AgentInputItem, type: 'function_call' | 'function_call_result'): string | null {

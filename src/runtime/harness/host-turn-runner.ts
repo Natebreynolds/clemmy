@@ -5,7 +5,7 @@ import {
 } from './host-checkpoint-state.js';
 export { HostInterruptState, HostRecoveryState, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } from './host-checkpoint-state.js';
 export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
-import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT } from './dispatch-streak.js';
+import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT, identicalRefusalKey } from './dispatch-streak.js';
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
 import { liftNestedCarrierFields } from './carrier-field-lift.js';
@@ -4095,6 +4095,7 @@ const runHostTurnBody = async (
   // Steps in a row whose every call was refused before it ran (see
   // dispatch-streak.ts); observed in every phase, plan active or not.
   let consecutiveStepsWithoutDispatch = 0;
+  const identicalRefusalCounts = new Map<string, number>();
   let dispatchStreakCursor = history.length;
   const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
     if (!hostProduction) return;
@@ -10542,6 +10543,39 @@ const runHostTurnBody = async (
             }];
           }).slice(0, 8),
         });
+        // The same operation refused for the same reason, again and again,
+        // with reads landing in between: the streak above never trips, so
+        // this does (owner's rule: a refusal gets one plain answer, never
+        // silent repeats).
+        const refusedOperations = streakDelta.flatMap((entry) => {
+          const row = entry as unknown as Record<string, unknown>;
+          if (row.type !== 'function_call') return [];
+          try {
+            const argumentsJson = row.arguments;
+            return typeof row.name === 'string'
+              ? [unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName ?? row.name]
+              : [];
+          } catch { return typeof row.name === 'string' ? [row.name] : []; }
+        });
+        const refusalKey = refusalDetail && !isOffMachineCardStaged(refusalDetail)
+          ? identicalRefusalKey(refusedOperations, refusalDetail) : null;
+        const repeatedRefusals = refusalKey ? (identicalRefusalCounts.get(refusalKey) ?? 0) + 1 : 0;
+        if (refusalKey) identicalRefusalCounts.set(refusalKey, repeatedRefusals);
+        if (repeatedRefusals >= HOST_IDENTICAL_REFUSAL_LIMIT) {
+          journalHostGuide('repeated_refusal_cap', { key: refusalKey, repeated: repeatedRefusals, streak: consecutiveStepsWithoutDispatch });
+          return blockedOutcome(
+            hostNoProgressBlockedText(
+              noProgressState,
+              'refused_before_dispatch',
+              admissibleRecoveryToolNames,
+              refusalDetail ?? lastConcreteToolError(),
+              turnIsPlanMode(),
+            ),
+            'control_no_progress_exhausted',
+            true,
+            `refused_before_dispatch:repeated:${repeatedRefusals}`,
+          );
+        }
         if (consecutiveStepsWithoutDispatch >= HOST_NO_DISPATCH_STREAK_LIMIT) {
           return blockedOutcome(
             hostNoProgressBlockedText(
