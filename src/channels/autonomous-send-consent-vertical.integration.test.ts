@@ -487,7 +487,7 @@ test('Autonomous ordinary Yes executes one frozen Outlook send through the real 
     outcomeKind: 'succeeded',
   }], 'the provider result settles its one logical parent under B');
 
-  assert.match(delivery.initial.at(-1) ?? '', /Executed .*OUTLOOK_SEND_EMAIL/i);
+  assert.match(delivery.initial.at(-1) ?? '', /Executed .*OUTLOOK_SEND_EMAIL|approved action completed/i);
 
   // Redelivering the same provider inbox answer cannot produce a second send.
   await tryHandleHarnessApprovalReply({

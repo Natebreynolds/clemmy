@@ -842,10 +842,15 @@ test('desktop ordinary work branches a held session before acceptance and retrie
     const firstRaw = await firstResponse.text();
     assert.equal(firstResponse.status, 202, firstRaw);
     const first = JSON.parse(firstRaw) as { sessionId: string; runId: string; replayed: boolean };
-    assert.notEqual(first.sessionId, parent.id);
+    // Owner's rule (2026-10-20): a waiting card goes away when the owner sends
+    // a message instead of tapping, so the chat is no longer held and the new
+    // request is accepted on it rather than on a branched child.
+    assert.equal(first.sessionId, parent.id);
     assert.equal(first.replayed, false);
-    assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 0);
-    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending');
+    assert.equal(listEvents(parent.id, { types: ['user_input_received'] }).length, 1);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'cancelled');
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'cancelled_by_system');
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolver, 'owner_moved_on');
     await brainEntered;
 
     const replayResponse = await send();
@@ -1509,8 +1514,10 @@ test('desktop /new and /cancel acknowledgements are typed source-bound outcomes'
     assert.equal(getBackgroundTask(parkedTask.id)?.status, 'awaiting_input', '/cancel cannot resume the old task');
     assert.equal(getBackgroundTask(parkedTask.id)?.inputResolution, undefined);
     const firstResolution = approvalRegistry.get(pending.approvalId);
-    assert.equal(firstResolution?.resolution, 'cancelled_by_user');
-    assert.equal(firstResolution?.resolver, 'chat-dock-user:typed-cancel-command-request');
+    // The typed /new already moved the owner on, which retired the waiting
+    // card (owner's rule, 2026-10-20); /cancel then finds nothing to cancel.
+    assert.equal(firstResolution?.resolution, 'cancelled_by_system');
+    assert.equal(firstResolution?.resolver, 'owner_moved_on');
     const firstResolvedAt = firstResolution?.resolvedAt;
 
     const stoppedReplay = await post('/cancel', 'typed-cancel-command-request');
@@ -1591,11 +1598,12 @@ test('desktop qualified approval steers the live owner without authorizing its p
         clientRequestId: 'qualified-approval-change' }),
     });
     const amendmentBody = await amendment.json() as { steered?: boolean };
-    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'pending',
+    // A qualified approval is a message, not a tap: the waiting card retires
+    // (owner's rule, 2026-10-20) and the original call is never released.
+    assert.equal(approvalRegistry.get(approval.approvalId)?.status, 'cancelled',
       'a qualified approval must not release the original call');
-    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, null);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'cancelled_by_system');
     assert.deepEqual(approvalRegistry.get(approval.approvalId)?.args, frozenArgs);
-    assert.equal(resolutions, 0);
     assert.equal(amendment.status, 200);
     assert.equal(amendmentBody.steered, true);
     assert.match(steerBlockForToolBoundary(session.id), /approve with changes/,
@@ -1607,10 +1615,11 @@ test('desktop qualified approval steers the live owner without authorizing its p
       body: JSON.stringify({ input: 'approve', sessionId: session.id,
         clientRequestId: 'qualified-approval-exact-decision' }),
     });
-    assert.equal(exact.status, 202);
-    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'approved',
-      'an exact later approval still resolves the sole existing card');
-    assert.equal(resolutions, 1);
+    // The card already went away with the owner's earlier message; a later
+    // bare "approve" has nothing to resolve and starts no model turn.
+    assert.equal(exact.status, 200);
+    assert.equal(approvalRegistry.get(approval.approvalId)?.resolution, 'cancelled_by_system',
+      'a retired card is not revived by a later bare approval');
     assert.equal(getActiveRunAttempt(session.id)?.attemptId, owner.attemptId);
     assert.equal(brainCalls, 0);
   } finally {

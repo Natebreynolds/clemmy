@@ -93,7 +93,9 @@ test('a desktop approval of a real off-machine shell command runs it once and en
     assert.equal(terminal.length, 1);
     const told = JSON.stringify(terminal[0].data);
     assert.equal((terminal[0].data.turnOutcome as { status: string }).status, 'done', told);
-    assert.match(told, /Done — I ran it/, told);
+    // The turn ends on the app's structured notice bound to the exact action;
+    // Clem's own wording of the result is the optional card projection.
+    assert.match(told, /approved_action_completed/, told);
     assert.doesNotMatch(told, /can't tell whether/, told);
     assert.equal(modelCalls, 0);
   } finally {

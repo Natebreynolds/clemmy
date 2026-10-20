@@ -261,10 +261,10 @@ export function inFlightCompactionThresholds(
       'CLEMMY_INFLIGHT_RESULT_TRIGGER_TOKENS',
       seededCacheSupport ? Math.max(scaledTrigger, CHECKPOINTED_MIN_RESULT_TRIGGER_TOKENS) : scaledTrigger,
     ),
-    retainedResultBudgetTokens: positive(
-      'CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS',
-      Math.round(DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS * cacheScale),
-    ),
+    // The retained tail stays small whatever the window: each checkpoint must
+    // remove far more than it re-sends, and a 1M-window wire scaling the tail
+    // to 80k re-sent four times the default on every checkpoint.
+    retainedResultBudgetTokens: positive('CLEMMY_INFLIGHT_RESULT_BUDGET_TOKENS', DEFAULT_IN_FLIGHT_RESULT_BUDGET_TOKENS),
     minRetainPairs: positive('CLEMMY_INFLIGHT_MIN_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MIN_RETAIN_PAIRS),
     maxRetainPairs: positive('CLEMMY_INFLIGHT_MAX_RETAIN_PAIRS', DEFAULT_IN_FLIGHT_MAX_RETAIN_PAIRS),
     checkpointed,

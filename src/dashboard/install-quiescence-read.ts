@@ -96,7 +96,10 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
     return rows.slice(0, limit);
   };
   const files = (directory: string, category: string): string[] => {
-    try { return bounded((reader.listDirectoryFiles ? reader.listDirectoryFiles(directory) : readdirSync(directory))
+    // `in`, not a property read: a reader that refuses every unknown access
+    // after one failure (the unavailable-database control) must not be made to
+    // report the directories unreadable too.
+    try { return bounded((('listDirectoryFiles' in reader && reader.listDirectoryFiles) ? reader.listDirectoryFiles(directory) : readdirSync(directory))
       .filter(file => file.endsWith('.json')).sort(), category); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') issues.add(`${category}_inventory_unreadable`);

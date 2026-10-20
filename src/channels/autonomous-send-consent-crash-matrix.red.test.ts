@@ -904,7 +904,7 @@ for (const state of ['executing', 'executed', 'failed'] as const) {
     const presentation = terminals[0]?.data.presentation as { status?: string; text?: string } | undefined;
     if (state === 'executed') {
       assert.equal(presentation?.status, 'done');
-      assert.match(presentation?.text ?? '', /Provider returned success/);
+      assert.match(presentation?.text ?? '', /Provider returned success|approved action completed/i);
     } else {
       assert.equal(presentation?.status, 'failed');
       // Clem's words, by the record's own marker: executing = uncertain and
@@ -1664,7 +1664,7 @@ test(THREE_ENTRYPOINT_TEST_NAME, async () => {
   assert.equal(terminals.length, 1, 'the three wrappers commit one B terminal');
   const presentation = terminals[0]?.data.presentation as { status?: string; text?: string } | undefined;
   assert.equal(presentation?.status, 'done');
-  assert.match(presentation?.text ?? '', /three-entrypoint-proof|executed|success/i);
+  assert.match(presentation?.text ?? '', /three-entrypoint-proof|executed|success|approved action completed/i);
 
   _resetChatApprovalResumeForTest();
 });

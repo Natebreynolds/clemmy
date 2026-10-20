@@ -730,9 +730,9 @@ export function auditAcceptedSourceSettlementTruthRead(input: {
       // sent, no external state moved, nothing exists to reconcile — and this
       // gate exists solely to reconcile external state. Treating a refusal as
       // an unrecovered failure makes Clementine's own guardrails the reason she
-      // cannot report (live 2026-08-12: a pre-dispatch policy denial on
-      // GOOGLESHEETS_CREATE, immediately followed by the same sheet being
-      // created successfully through another carrier, still blocked the turn).
+      // cannot report (live: a pre-dispatch policy denial on a sheet-creation
+      // operation, immediately followed by the same sheet being created
+      // successfully through another carrier, still blocked the turn).
       // Work the refusal actually prevented remains visible to the
       // expected-work gates, which judge coverage rather than blame.
       if (row.execution_kind === 'refused_pre_dispatch') return false;
@@ -796,10 +796,10 @@ export function auditAcceptedSourceSettlementTruthRead(input: {
       // A REPAIRED WRITE IS A RECOVERED WRITE. Recovery identity is the exact
       // argument digest, so fixing the arguments the provider rejected produces
       // a different identity and never registers as recovery — which is exactly
-      // what repair does. The same live Slack review lost its whole report to
-      // this: GOOGLESHEETS_INSERT_DIMENSION was refused with HTTP 400, the model
-      // corrected the arguments, and the very next insert into the same
-      // spreadsheet succeeded. Recovery here means a LATER success of the same
+      // what repair does. A live review lost its whole report to this: a
+      // column-insert operation was refused with HTTP 400, the model corrected
+      // the arguments, and the very next insert into the same spreadsheet
+      // succeeded. Recovery here means a LATER success of the same
       // write shape against the same target, and only for an effect the host
       // classified reversible — a rejected irreversible send is never repaired
       // by a different send.
