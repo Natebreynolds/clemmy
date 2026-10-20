@@ -10888,6 +10888,40 @@ test('durable memory completion obligation accepts verified automatic storage wh
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
 });
 
+// Live 2026-10-20 (r45v1): the first review retained `retain` ("verified
+// consolidation already retains the exact requested information"), bounced the
+// reply's hedge, and the continuation's review failed open on quota; the gate
+// ignored the retained assessment and the turn ended blocked.
+test('durable memory completion obligation honours an earlier retained assessment when the later review fails open', async (t) => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryIntakeContext } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    if (reviews === 1) {
+      return { done: false, reason: 'The reply hedges about pending consolidation, which contradicts the verified fact.',
+        memoryRequirement: { version: 1, kind: 'retain', corrections: [], reason: 'The owner asks to retain a new shelf code; verified consolidation already retains it.' } };
+    }
+    return { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'controlled reviewer unavailable' };
+  });
+  const fixture = acceptJudgedSource('memory-automatic-retained-then-unavailable',
+    'Remember that this project report heading is Hawthorn for future chats.');
+  await retainAutomaticMemoryForHost(fixture, true);
+  assert.match(verifiedMemoryIntakeContext(fixture.context) ?? '', /durably SAVED/, 'verified storage is told to the brain as saved, not queued');
+  const model = scriptedRecordingModel([
+    [textMsg('The heading is captured; consolidation has not finished yet.')],
+    [textMsg('The project heading Hawthorn is remembered.')],
+  ]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(result.terminal, undefined, 'a retained retain assessment completes the requirement when the next review is unavailable');
+  assert.equal(reviews, 2);
+  assert.equal(model.calls(), 2);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+});
+
 test('host-verified retention is storage evidence only: pending intake does not qualify', async () => {
   const { hostVerifiedStatedRetention } = await import('./durable-memory-intake-receipt.js');
   const fixture = acceptJudgedSource('memory-automatic-still-pending',

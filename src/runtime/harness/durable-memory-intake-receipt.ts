@@ -506,6 +506,13 @@ export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUs
   // statement volunteered for background review was not, so an ordinary
   // question carries no memory notice.
   if (!loaded.intake.rows.some(row => statedToKeep(row.intake_reason))) return null;
+  // Once storage is verified, the notice says so: a "queued, not proof" notice
+  // over an already-saved fact made Clem hedge ("consolidation hasn't finished
+  // yet"), which the reviewer then bounced as contradicting the verified fact
+  // (live 2026-10-20) — a wasted round on a one-sentence save.
+  if (hostVerifiedStatedRetention(input)) {
+    return '[Verified memory intake] The automatic layer has durably SAVED these exact accepted claims: verified, active and linked to this request. Say plainly that it is remembered. Do not save it again through memory_remember, do not read it back to check, and do not describe it as queued or pending.';
+  }
   return '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.';
 }
 

@@ -4858,10 +4858,22 @@ const runHostTurnBody = async (
       } catch { /* The final gate reopens the retained requirement; a rejected replacement cannot waive it. */ }
       const memoryCheck = memoryAssessmentAccepted ? memoryRequirementCompletion(false)
         : (() => {
-          // No accepted assessment: the host's own verified storage of a
-          // stated-to-keep fact still completes the requirement; a correction
-          // or an unsaved fact stays unverified.
-          try { const source = readMemoryRequirementSource(identity, objective); const stored = source && hostVerifiedMemoryRetention(source); if (stored) return stored; } catch { /* unreadable evidence cannot verify */ }
+          // No accepted assessment from THIS review. An earlier review of the
+          // same request may already have retained one (live 2026-10-20: the
+          // first review retained `retain`, the continuation's review failed
+          // open on quota, and the turn ended blocked); and the host's own
+          // verified storage of a stated-to-keep fact completes the
+          // requirement on its own. A correction or an unsaved fact stays
+          // unverified.
+          try {
+            const source = readMemoryRequirementSource(identity, objective);
+            if (source) {
+              const retainedCompletion = memoryCorrectionCompletion(source);
+              if (retainedCompletion.status !== 'unverified') return retainedCompletion;
+              const stored = hostVerifiedMemoryRetention(source);
+              if (stored) return stored;
+            }
+          } catch { /* unreadable evidence cannot verify */ }
           return { status: 'unverified' as const, reason: 'The memory requirement review was unavailable, invalid, or conflicted with the retained correction.' };
         })();
       currentMemoryReviewCheck = memoryCheck;
