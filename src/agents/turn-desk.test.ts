@@ -152,11 +152,14 @@ test('a small or cold prefix climbs as before, and a hold never goes below the s
   assert.equal(noClimb.held, undefined);
 });
 
-test('a held climb stays owed: the next turn takes it unless it is held again', () => {
+test('a held climb is taken by the next turn even while the prefix is still large and warm', () => {
   const owed = decideTurnDesk(SURFACE, facts({ heldRung: 'readers' }), 15);
   assert.equal(owed.rung, 'readers');
   assert.deepEqual(owed.climbedBy, ['held_climb']);
-  const heldAgain = decideTurnDesk(SURFACE, facts({ heldRung: 'readers', warmPrefix: { rung: 'lean', promptTokens: 64_000 } }), 16);
-  assert.equal(heldAgain.rung, 'lean');
-  assert.deepEqual(heldAgain.held?.climbedBy, ['held_climb']);
+  // Live 2026-10-20: a long chat's prefix is always warm, so a climb held
+  // "until it is small or cold" was owed on 17 sources and never taken.
+  const stillWarm = decideTurnDesk(SURFACE, facts({ heldRung: 'readers', warmPrefix: { rung: 'lean', promptTokens: 64_000 } }), 16);
+  assert.equal(stillWarm.rung, 'readers', 'one hold per climb; the next turn pays the re-send');
+  assert.deepEqual(stillWarm.climbedBy, ['held_climb']);
+  assert.equal(stillWarm.held, undefined);
 });

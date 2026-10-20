@@ -162,7 +162,13 @@ export function decideTurnDesk(
   if (facts.sessionFloor) climb(facts.sessionFloor, 'session_floor');
   if (facts.heldRung) climb(facts.heldRung, 'held_climb');
   const warm = facts.warmPrefix;
+  // A climb is held for one turn, never longer. In a long session the prefix
+  // is always large and recent, so a climb held "until the prefix is small or
+  // cold" was never taken (live 2026-10-20, a 30-turn chat: the full rung
+  // stayed owed on 17 sources and each deferred tool cost a search step on
+  // first use, 11 searches). One uncached re-send is cheaper than that.
   if (warm && warm.promptTokens >= DESK_HOLD_MIN_PROMPT_TOKENS
+    && !facts.heldRung
     && rungIndex(warm.rung) < rungIndex(rung)
     && rungIndex(warm.rung) >= rungIndex(facts.sessionFloor ?? 'lean')) {
     return {
