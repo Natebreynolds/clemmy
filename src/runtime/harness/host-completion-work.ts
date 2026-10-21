@@ -1137,17 +1137,9 @@ export function sourceSettledReadEvidence(input: {
       if (echoed && substituted !== null) {
         shown = { ...shown, text: substituted };
         blocks.push(`${label}: this result carries exactly the current saved content of artifact ${echoed.createdId} (receipt digest ${echoed.contentDigest.slice(0, 16)}) that THIS request wrote; that span reads as a reference below and the content is shown once in the artifact block. Everything else in the result is shown as it was.`);
-      } else if (echoed) {
-        hasRetainedJsonDigest = true;
-        results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
-          physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
-          rawByteCount: value.rawByteCount, shownByteCount: 0, contentComplete: false,
-          contentDisposition: 'written_by_this_request',
-          ...(!row.mutating && row.settlementIndex < lastWriteIndex ? { precedesWrite: true } : {}) });
-        const what = row.mutating ? 'this write\'s returned result carries' : readsRetained ? 'this result carries' : 'this read returned';
-        blocks.push(`${label}: authenticated receipt; handle=${value.resultHandleId}; retained JSON sha256=${value.rawPayloadSha256}; retained JSON bytes=${value.rawByteCount}; content not repeated: ${what} exactly the current saved content of artifact ${echoed.createdId} (handle ${echoed.handle}, receipt digest ${echoed.contentDigest.slice(0, 16)}) that THIS request wrote, shown once in full in the artifact block${!row.mutating && row.settlementIndex < lastWriteIndex ? '; it settled before a later write of this request' : ''}. Judge the content there.`);
-        continue;
       }
+      // A span the bounded view does not show cannot be substituted; the
+      // result is then shown as it always was, never collapsed to a reference.
       const lookupPreview = input.lookupBacked === true && !row.mutating;
       const budgetInput = { toolName: row.toolName, args: requestArgs, routedModelId };
       const view = evidenceKind === 'retained_projection' && !lookupPreview

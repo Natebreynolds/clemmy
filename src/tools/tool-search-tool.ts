@@ -2529,7 +2529,9 @@ export function registerToolSearchTool(
           return base + `${namedButAbsent.map((toolkit) => toolkit.name).join(', ')} is among the connectable apps but has no result here: it is NOT CONNECTED or its operations did not match; search tool_search for one of its operations by name to get the card that connects it.`;
         }
         if (named.length === 0) {
-          return base + `No app named in this search is among the ${catalog.length} connectable apps (UNSUPPORTED here). If the owner named such a product, say so plainly and offer the ways in: its own API with a key the owner supplies, a browser session the owner signs into, or another source they already have.`;
+          // A miss against the cached names is NOT FOUND, never proof that
+          // the product is unsupported (review note 2026-10-21).
+          return base + `No app named in this search was found among the ${catalog.length} cached connectable apps. If the owner named a product, treat it as not found here: say so plainly, do not claim it is unsupported, and offer the ways in: a search by the product's exact name, its own API with a key the owner supplies, a browser session the owner signs into, or another source they already have.`;
         }
         return undefined;
       };

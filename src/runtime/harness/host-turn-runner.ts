@@ -4137,6 +4137,25 @@ const runHostTurnBody = async (
   // dispatch-streak.ts); observed in every phase, plan active or not.
   let consecutiveStepsWithoutDispatch = 0;
   const identicalRefusalCounts = new Map<string, number>();
+  /** The operations of the calls in a step that the host refused before
+   * dispatch (their results carry the refused marker), by effective tool. */
+  const refusedCallOperations = (delta: readonly AgentInputItem[]): string[] => {
+    const refusedIds = new Set(delta.flatMap((item) => {
+      const row = item as unknown as Record<string, unknown>;
+      return row.type === 'function_call_result' && typeof row.callId === 'string'
+        && hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch' ? [row.callId] : [];
+    }));
+    return delta.flatMap((entry) => {
+      const row = entry as unknown as Record<string, unknown>;
+      if (row.type !== 'function_call' || typeof row.callId !== 'string' || !refusedIds.has(row.callId)) return [];
+      try {
+        const argumentsJson = row.arguments;
+        return typeof row.name === 'string'
+          ? [unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName ?? row.name]
+          : [];
+      } catch { return typeof row.name === 'string' ? [row.name] : []; }
+    });
+  };
   let dispatchStreakCursor = history.length;
   const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
     if (!hostProduction) return;
@@ -10574,16 +10593,10 @@ const runHostTurnBody = async (
       const refusedInDelta = streakDelta.some((item) => hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch');
       if (stepDispatch === 'dispatched' && refusedInDelta) {
         const refusalDetail = lastHostRefusalDetail(history);
-        const refusedOperations = streakDelta.flatMap((entry) => {
-          const row = entry as unknown as Record<string, unknown>;
-          if (row.type !== 'function_call') return [];
-          try {
-            const argumentsJson = row.arguments;
-            return typeof row.name === 'string'
-              ? [unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName ?? row.name]
-              : [];
-          } catch { return typeof row.name === 'string' ? [row.name] : []; }
-        });
+        // Only the calls that were refused name the key: a successful read
+        // beside the same refused write changes from step to step and must
+        // not make each repeat look new (review note 2026-10-21).
+        const refusedOperations = refusedCallOperations(streakDelta);
         const refusalKey = refusalDetail && !isOffMachineCardStaged(refusalDetail)
           ? identicalRefusalKey(refusedOperations, refusalDetail) : null;
         const repeatedRefusals = refusalKey ? (identicalRefusalCounts.get(refusalKey) ?? 0) + 1 : 0;
@@ -10632,16 +10645,7 @@ const runHostTurnBody = async (
         // with reads landing in between: the streak above never trips, so
         // this does (owner's rule: a refusal gets one plain answer, never
         // silent repeats).
-        const refusedOperations = streakDelta.flatMap((entry) => {
-          const row = entry as unknown as Record<string, unknown>;
-          if (row.type !== 'function_call') return [];
-          try {
-            const argumentsJson = row.arguments;
-            return typeof row.name === 'string'
-              ? [unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName ?? row.name]
-              : [];
-          } catch { return typeof row.name === 'string' ? [row.name] : []; }
-        });
+        const refusedOperations = refusedCallOperations(streakDelta);
         const refusalKey = refusalDetail && !isOffMachineCardStaged(refusalDetail)
           ? identicalRefusalKey(refusedOperations, refusalDetail) : null;
         const repeatedRefusals = refusalKey ? (identicalRefusalCounts.get(refusalKey) ?? 0) + 1 : 0;
