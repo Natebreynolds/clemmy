@@ -22,6 +22,7 @@
  * facts the registry already declares plus durable settlement outcomes.
  */
 import { appendEvent, listEvents, openEventLog } from './eventlog.js';
+import { readPersistedSemanticInterpretation } from '../semantic-boundary/interpret-accepted-source.js';
 
 export type MutationScopeBasis =
   /** Nothing in this family was frozen yet; establish its accepted scope. */
@@ -34,7 +35,13 @@ export type MutationScopeBasis =
    *  work is the same job, not a new one. */
   | 'created_by_this_source'
   /** The owner sent a further instruction after the scope was frozen. */
-  | 'owner_amendment';
+  | 'owner_amendment'
+  /** The accepted request itself, as the semantic judge read it, asks for a
+   *  change of this posture: a wrong first tool mode cannot narrow the job
+   *  the owner gave (live 2026-10-21: "change that first bullet" opened with
+   *  a refused create, then the right replace was refused as a different
+   *  instruction, and the model went around it through the shell). */
+  | 'owner_request';
 
 export type MutationScopeVerdict =
   | { allowed: true; basis: MutationScopeBasis }
@@ -101,6 +108,32 @@ function sourceCreatedDeliverable(
   }
 }
 
+/**
+ * The accepted request, as the independent semantic judge read it at
+ * admission, asks for work of this posture: an entailed verdict whose judged
+ * destination posture is the proposed one. The judge's reading of the owner's
+ * words is the authority here, never the proposed call itself, so a create
+ * that failed cannot launder an edit the owner did not ask for (142281), and a
+ * wrong first mode cannot narrow an edit the owner did ask for.
+ */
+type InterpretationReader = typeof readPersistedSemanticInterpretation;
+let interpretationReader: InterpretationReader = readPersistedSemanticInterpretation;
+/** Test seam: the request's persisted interpretation without a model turn. */
+export function _setRequestInterpretationReaderForTests(reader: InterpretationReader | null): void {
+  interpretationReader = reader ?? readPersistedSemanticInterpretation;
+}
+
+function requestEntailsPosture(sessionId: string, sourceUserSeq: number, posture: string): boolean {
+  try {
+    const persisted = interpretationReader(sessionId, sourceUserSeq);
+    if (!persisted || persisted.validationOutcome !== 'admitted') return false;
+    const judged = persisted.judgeResult;
+    return Boolean(judged && judged.verdict === 'entailed' && judged.destinationPosture === posture);
+  } catch {
+    return false;
+  }
+}
+
 /** An owner instruction adopted AFTER the scope was frozen re-opens the job. */
 function amendmentAfter(sessionId: string, sourceUserSeq: number, seq: number): boolean {
   try {
@@ -158,6 +191,10 @@ export function admitMutationIntoAcceptedScope(input: {
 
   if (sourceCreatedDeliverable(input.sessionId, input.sourceUserSeq, input.deliverableKind)) {
     return record('created_by_this_source');
+  }
+
+  if (requestEntailsPosture(input.sessionId, input.sourceUserSeq, input.destinationPosture)) {
+    return record('owner_request');
   }
 
   if (amendmentAfter(input.sessionId, input.sourceUserSeq, frozen.seq)) {

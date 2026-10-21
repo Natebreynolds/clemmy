@@ -29,7 +29,7 @@ mkdirSync(path.join(HOME, 'state'), { recursive: true });
 writeFileSync(path.join(HOME, 'state', 'machine-id'), 'mutation-scope\n', 'utf8');
 
 const eventlog = await import('./eventlog.js');
-const { admitMutationIntoAcceptedScope } = await import('./accepted-mutation-scope.js');
+const { admitMutationIntoAcceptedScope, _setRequestInterpretationReaderForTests } = await import('./accepted-mutation-scope.js');
 after(() => { eventlog.closeEventLog(); rmSync(HOME, { recursive: true, force: true }); });
 
 function job(title: string) {
@@ -159,4 +159,42 @@ test('a second family edit cannot launder a failed workflow create into overwrit
   propose(j, 'workflow_create', 'create_new');
   assert.equal(admitMutationIntoAcceptedScope({ ...j, turn: 1, logicalToolCallId: 'arrange-home', operationId: 'home_update', deliverableKind: 'home', destinationPosture: 'named_existing' }).allowed, true);
   assert.equal(propose(j, 'workflow_update', 'named_existing').allowed, false);
+});
+
+test('THE OWNER ASKED FOR THE EDIT: a wrong first mode cannot narrow the job the request gave', () => {
+  // Live 2026-10-21: "change that first bullet, keep everything else exactly
+  // as it is" opened with a refused create; the right replace was then refused
+  // as "a different instruction", and the model went around it in the shell.
+  const j = job('owner-asked-for-edit');
+  const interpretation = (verdict: 'entailed' | 'conflict' | 'uncertain', posture: 'create_new' | 'named_existing' | null) => ({
+    validationOutcome: 'admitted', judgeResult: { verdict, effect: 'local_write', destinationPosture: posture, proposalDigest: 'd' },
+  }) as never;
+  _setRequestInterpretationReaderForTests(() => interpretation('entailed', 'named_existing'));
+  try {
+    propose(j, 'write_file_create', 'create_new');
+    const edit = propose(j, 'write_file_replace', 'named_existing');
+    assert.equal(edit.allowed, true, 'the judge read the owner\'s words as an edit of an existing file');
+    assert.equal(edit.allowed === true && edit.basis, 'owner_request');
+  } finally {
+    _setRequestInterpretationReaderForTests(null);
+  }
+
+  // The 142281 protection stands: the judge read that request as a create.
+  const k = job('owner-asked-to-create');
+  _setRequestInterpretationReaderForTests(() => interpretation('entailed', 'create_new'));
+  try {
+    propose(k, 'workflow_create', 'create_new');
+    assert.equal(propose(k, 'workflow_update', 'named_existing').allowed, false, 'an unrequested patch stays outside the job');
+  } finally {
+    _setRequestInterpretationReaderForTests(null);
+  }
+  // And a judge that was not sure grants nothing.
+  const u = job('judge-uncertain');
+  _setRequestInterpretationReaderForTests(() => interpretation('uncertain', 'named_existing'));
+  try {
+    propose(u, 'workflow_create', 'create_new');
+    assert.equal(propose(u, 'workflow_update', 'named_existing').allowed, false);
+  } finally {
+    _setRequestInterpretationReaderForTests(null);
+  }
 });
