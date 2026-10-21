@@ -400,6 +400,9 @@ export interface WorkflowRunEndingCall {
   outcome: 'done' | 'blocked' | 'failed';
   /** The run's report as the runner wrote it: the facts to tell. */
   report: string;
+  /** The owner started several runs together for this request; this is one
+   * of them. The others report on their own. */
+  partOfSet?: { count: number };
   evidenceDigest: string;
 }
 
