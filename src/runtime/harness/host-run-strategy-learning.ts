@@ -9,6 +9,7 @@
  * may teach a strategy. It never grants dispatch, approval, or a new loop.
  */
 import { appendEvent, listEvents, openEventLog } from './eventlog.js';
+import { sourceRefusedAttempts } from './source-refused-attempts.js';
 import { acceptedObjectiveForSource, completionVerdictForAcceptedSource, settledSourceArtifacts } from './host-turn-runner.js';
 import {
   evaluateLearningCandidate,
@@ -179,6 +180,31 @@ function deliverableForSource(input: { sessionId: string; sourceUserSeq: number 
   }
 }
 
+/** Tool-call doors (carriers) say nothing about which tool was refused. */
+const CARRIER_NAMES: ReadonlySet<string> = new Set(['work_call', 'call_tool']);
+
+/** The business tools this source was refused on and never settled with:
+ * the work got done through a different door than the one the model first
+ * reached for, which is a workaround, not a route to remember. */
+export function refusedToolsNotAmongUsed(
+  input: { sessionId: string; sourceUserSeq: number },
+  toolsUsed: readonly string[],
+): string[] {
+  try {
+    const used = new Set(toolsUsed);
+    const refused = new Set<string>();
+    for (const attempt of sourceRefusedAttempts(input).attempts) {
+      const tool = attempt.tool.trim();
+      if (!tool || CARRIER_NAMES.has(tool) || used.has(tool)) continue;
+      if (selectLearnedStrategyTools([tool]).length === 0) continue;
+      refused.add(tool);
+    }
+    return [...refused].sort();
+  } catch {
+    return [];
+  }
+}
+
 export function learnHostRunStrategyForAcceptedTask(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -196,6 +222,14 @@ export function learnHostRunStrategyForAcceptedTask(input: {
   if (!objective?.trim()) return { status: 'not_proven', reason: 'no accepted objective' };
   const toolsUsed = toolsUsedForSource(input);
   if (toolsUsed.length === 0) return { status: 'not_proven', reason: 'no settled business tools' };
+  // A route found by going around a refusal is not a proven route. Live
+  // 2026-10-21: an edit whose right tool was refused was finished through the
+  // shell; that run became the proven strategy for the request, and the next
+  // identical request was steered to the shell before the refusal was fixed.
+  const refusedElsewhere = refusedToolsNotAmongUsed(input, toolsUsed);
+  if (refusedElsewhere.length > 0) {
+    return { status: 'not_proven', reason: `route_found_around_a_refusal:${refusedElsewhere.join(',')}` };
+  }
   const verdict = completionVerdictForAcceptedSource(input);
   const ownerSelected = verdict?.ownerSelectedJudge === true;
   const independent = verdict?.fast === true && verdict?.failedOpen !== true;

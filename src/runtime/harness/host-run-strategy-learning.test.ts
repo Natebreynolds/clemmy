@@ -12,7 +12,7 @@ process.env.CLEMENTINE_HOME = HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
 const { createSession, appendEvent } = await import('./eventlog.js');
-const { learnHostRunStrategyForAcceptedTask, selectLearnedStrategyTools } = await import('./host-run-strategy-learning.js');
+const { learnHostRunStrategyForAcceptedTask, selectLearnedStrategyTools, refusedToolsNotAmongUsed } = await import('./host-run-strategy-learning.js');
 const { evaluateLearningCandidate } = await import('../../memory/learning-receipt.js');
 const { renderRunStrategiesForContext } = await import('../../memory/run-strategy-store.js');
 
@@ -191,4 +191,23 @@ test('the part each operation played is read from the order and effect of its se
   ], 'the same read before and after the change played two parts; a refused change is not a change');
   assert.deepEqual(provenStepsForSource({ sessionId: session.id, sourceUserSeq: source.seq }, ['deskscope__find_channel']), [],
     'with no change among the learned tools there are no parts to tell apart');
+});
+
+test('a route found by going around a refusal is not a proven route', () => {
+  // Live 2026-10-21: write_file was refused and the edit was finished through
+  // the shell; that run must not teach "shell" for the request.
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'around-a-refusal' });
+  const user = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Change the first bullet of the digest file' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'refused_pre_dispatch', sourceUserSeq: user.seq, tool: 'write_file', callId: 'call-1', refusalDetail: 'outside_accepted_scope: …',
+  } });
+  assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: user.seq }, ['run_shell_command']), ['write_file']);
+  // The same tool refused and then settled is an ordinary repair, not a workaround.
+  assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: user.seq }, ['write_file']), []);
+  // A refusal of the carrier itself names no tool.
+  const other = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'x' } });
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'refused_pre_dispatch', sourceUserSeq: other.seq, tool: 'work_call', callId: 'call-2',
+  } });
+  assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: other.seq }, ['run_shell_command']), []);
 });
