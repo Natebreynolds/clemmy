@@ -231,7 +231,7 @@ import {
   acceptedPlanPreparationReadEvidence, sourceAttemptedCompletionWork, sourceHasNoCompletionWork, sourceEvidenceLookup, sourceWritesAtStake,
   sourceAttemptedWrites, sourceProducedOutput, historicalReadCompletionEvidence, historicalReadClosureIsAuthentic,
   sourceIncompleteAttemptsEvidence, sourceSettledReadEvidence, sourceSucceededResultCount,
-  earlierTurnsEvidence,
+  earlierTurnsEvidence, type WrittenContentReference,
 } from './host-completion-work.js';
 import {
   beginAnswerDraft, markAnswerDraftChecking, presentAnswerDraft, retractAnswerDraft,
@@ -390,6 +390,10 @@ export interface SourceArtifactEvidence {
   evidenceAvailable: boolean;
   /** Human-readable evidence block handed to the completion judge. */
   summary: string;
+  /** The verified current text of each non-superseded artifact, exactly as
+   * the summary shows it, so a read-back of the same bytes is referenced to
+   * it instead of repeated in the review. */
+  contents: ReadonlyArray<WrittenContentReference>;
   artifacts: ReadonlyArray<{
     createdId: string;
     handle: string;
@@ -525,6 +529,33 @@ export function commandRevisionGenerations(
     found.set(facts.handle, { callId: typeof event.data.callId === 'string' ? event.data.callId : '', facts });
   }
   return [...found.values()];
+}
+
+/**
+ * The completion review's private evidence, joined as before, with each
+ * section's size journaled so the cost of a review can be read from the log
+ * instead of guessed: live 2026-10-21 one file build sent the reviewer 90 KB
+ * of evidence, then 133 KB on the re-review, and nothing said which part.
+ * The journal is diagnostic only; a failure to write it changes nothing.
+ */
+export function journaledReviewEvidence(
+  identity: { sessionId: string; sourceUserSeq: number },
+  sections: ReadonlyArray<string | undefined>,
+): string {
+  const present = sections.filter((section): section is string => Boolean(section));
+  try {
+    appendEvent({
+      sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+      data: {
+        kind: 'completion_review_evidence_sizes', sourceUserSeq: identity.sourceUserSeq,
+        totalBytes: present.reduce((sum, section) => sum + Buffer.byteLength(section, 'utf8'), 0),
+        sections: present.map((section) => ({
+          head: section.replace(/\s+/g, ' ').slice(0, 60), bytes: Buffer.byteLength(section, 'utf8'),
+        })),
+      },
+    });
+  } catch { /* diagnostic only */ }
+  return present.join('\n');
 }
 
 export function settledSourceArtifacts(input: {
@@ -722,7 +753,7 @@ export function settledSourceArtifacts(input: {
     }
   } catch {
     // The spine was unreadable. Say so; never present it as "wrote nothing".
-    return { count: 0, evidenceAvailable: false, summary: '', artifacts: [] };
+    return { count: 0, evidenceAvailable: false, summary: '', contents: [], artifacts: [] };
   }
 
   // SAME-SOURCE REVISION COLLAPSE. One request that writes an artifact twice
@@ -742,6 +773,7 @@ export function settledSourceArtifacts(input: {
   }));
 
   const blocks: string[] = [];
+  const contents: WrittenContentReference[] = [];
   // Later same-request receipts per handle, so a Space bundle whose component
   // this request edited again afterwards verifies as its final generation.
   const laterReceiptsAfter = (index: number): Map<string, string> => {
@@ -814,9 +846,11 @@ export function settledSourceArtifacts(input: {
     lines.push(`  current saved content matches its receipt across ${content.parts.length} `
       + `part(s), ${content.totalBytes} bytes total.`);
     for (const part of content.parts) {
+      const text = part.bytes.toString('utf8');
       lines.push(`  <<<PART ${part.role} ${part.handle} — ALL ${part.bytes.byteLength} bytes>>>`);
-      lines.push(part.bytes.toString('utf8'));
+      lines.push(text);
       lines.push(`  <<<END ${part.handle}>>>`);
+      contents.push({ createdId: entry.createdId, handle: part.handle, contentDigest: entry.contentDigest, text });
     }
     blocks.push(lines.join('\n'));
   }
@@ -826,6 +860,7 @@ export function settledSourceArtifacts(input: {
     count: artifacts.filter((entry) => !entry.superseded).length,
     evidenceAvailable: true,
     summary: blocks.join('\n'),
+    contents,
     artifacts: artifacts.map(({ facts: _facts, ...rest }) => rest),
   };
 }
@@ -4529,7 +4564,7 @@ const runHostTurnBody = async (
       return 'done';
     }
     const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate),
-      lookupBacked: !planCandidate });
+      lookupBacked: !planCandidate, writtenContents: settled.contents });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
     // Reuse a rejection only for the SAME reply and unchanged business work.
     // A read answer can correct missing records using already-retained evidence
@@ -4785,7 +4820,7 @@ const runHostTurnBody = async (
         // RECEIPT-BOUND artifact content for this exact request, with explicit
         // ordering, so the verdict rules on what is actually saved. A read that
         // ran BEFORE the write is not evidence of the write.
-        toolCallSummary: [
+        toolCallSummary: journaledReviewEvidence(identity, [
           responseNormalization ? `Host exact outer-fence transformation of this current candidate (syntax only, not semantic acceptance): ${JSON.stringify(responseNormalization)}. Judge the normalized candidate above against the whole objective and evidence.` : undefined,
           responseFormatRequirement ? WHOLE_JSON_OBJECT_REVIEW_GUIDANCE : undefined,
           queuedApprovalRegistrationEvidence,
@@ -4819,7 +4854,7 @@ const runHostTurnBody = async (
           // Last: present only on a re-review, so everything before it stays
           // the prefix the provider cached for the first review of this turn.
           completionReviewFeedback ? hostCompletionReviewFindingContext(completionReviewFeedback) : undefined,
-        ].filter(Boolean).join('\n'),
+        ]),
       }), reviewSignal);
       if (reviewed.status === 'superseded') throw new CompletionReviewSupersededError();
       verdict = reviewed.value;

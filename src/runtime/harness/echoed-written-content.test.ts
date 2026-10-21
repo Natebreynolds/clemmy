@@ -1,0 +1,34 @@
+/**
+ * Run: node scripts/run-tests-isolated.mjs src/runtime/harness/echoed-written-content.test.ts
+ *
+ * A read that returned exactly what this request wrote is referenced to the
+ * artifact instead of repeated in the review; anything else is shown as before.
+ */
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+const { echoedWrittenContent, ECHOED_WRITE_MIN_CHARS } = await import('./host-completion-work.js');
+
+const text = `# Deck\n\n${'Slide line with "quotes" and a tab\t.\n'.repeat(12)}`;
+const written = [{ createdId: 'write_file#c1', handle: 'h1', contentDigest: 'a'.repeat(64), text }];
+
+test('a string result holding the whole written text is the write echoed back', () => {
+  assert.ok(text.length >= ECHOED_WRITE_MIN_CHARS);
+  assert.equal(echoedWrittenContent(`Path: /x/deck.md\n\n${text}\n\n[retained]`, written)?.createdId, 'write_file#c1');
+});
+
+test('a JSON-shaped result holding the text, escaped, is the write echoed back', () => {
+  assert.equal(echoedWrittenContent({ path: '/x/deck.md', content: text, chars: text.length }, written)?.createdId, 'write_file#c1');
+});
+
+test('a partial match, a short write, or no writes leave the read shown as before', () => {
+  assert.equal(echoedWrittenContent(text.slice(0, 300), written), undefined);
+  assert.equal(echoedWrittenContent('short', [{ ...written[0]!, text: 'short' }]), undefined);
+  assert.equal(echoedWrittenContent(text, []), undefined);
+  assert.equal(echoedWrittenContent(text, undefined), undefined);
+});
+
+test('the largest written part wins when a result holds several', () => {
+  const small = { createdId: 'w#small', handle: 'hs', contentDigest: 'b'.repeat(64), text: text.slice(0, 250) };
+  assert.equal(echoedWrittenContent(text, [small, written[0]!])?.createdId, 'write_file#c1');
+});

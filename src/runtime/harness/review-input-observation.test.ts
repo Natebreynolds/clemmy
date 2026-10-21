@@ -446,7 +446,7 @@ test('a second review round continues the first round\'s exact conversation with
   assert.match(message.content, /^=== REVISED RESPONSE: REVIEW AGAIN ===/);
   assert.match(message.content, /as a complete review, against the whole objective and all of the evidence/);
   assert.match(message.content, /The revised candidate\./);
-  assert.match(message.content, /Added to the evidence since your first review:\n\[HISTORICAL COMPLETION FINDING\] the second claim was unsupported/);
+  assert.match(message.content, /Added to the evidence since your last review:\n\[HISTORICAL COMPLETION FINDING\] the second claim was unsupported/);
   assert.doesNotMatch(message.content, /Objective: controlled objective/, 'the unchanged objective is not sent again');
   assert.doesNotMatch(message.content, /The first candidate/, 'the superseded response is only in the earlier turn');
   assert.equal(requests[1]!.systemInstructions, requests[0]!.systemInstructions);

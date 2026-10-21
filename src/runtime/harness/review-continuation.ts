@@ -71,6 +71,45 @@ function partsBefore(parts: readonly PromptPart[], endByte: number): Map<string,
   return named;
 }
 
+/**
+ * The host writes the evidence as blocks, each opening on its own line with a
+ * host heading (an artifact, a receipt, a retained read, an earlier turn).
+ * A part that changed in its middle, as the artifact block does when the
+ * same file is written again, is sent as the blocks that are new or changed
+ * and the first lines of the blocks that are gone, never as the whole part
+ * again: live 2026-10-21 a re-review after one rewrite re-sent 133 KB and
+ * reused 7 KB of it.
+ */
+const BLOCK_START = /\n(?=(?:- artifact |- settled |Receipt timing: |Receipt chronology scope|Artifacts written by THIS request|This request produced no receipt-bound artifact|Retained READ results|EARLIER TURNS|Turn at \d|Incremental trajectory evidence|Retained result guidance|Write receipt: |Authoring receipt: |Reported failed-call|[A-Za-z0-9_.:-]+ \[logicalCall=))/;
+
+export function evidenceBlocks(text: string): string[] {
+  return text.split(BLOCK_START).map((block) => block.trim()).filter(Boolean);
+}
+
+export function blockChanges(label: string, first: string, text: string): string {
+  const before = evidenceBlocks(first);
+  const after = evidenceBlocks(text);
+  const beforeSet = new Set(before);
+  const afterSet = new Set(after);
+  const changed = after.filter((block) => !beforeSet.has(block));
+  const gone = before.filter((block) => !afterSet.has(block));
+  // No block structure on either side, or nothing recognisable moved: the
+  // whole part is the honest update.
+  if ((before.length <= 1 && after.length <= 1) || (changed.length === 0 && gone.length === 0)) {
+    return `${label.charAt(0).toUpperCase()}${label.slice(1)} now reads (this replaces the earlier version):\n${text}`;
+  }
+  const lines = [`Changes to ${label} since your last review. Blocks not listed here are unchanged and still stand as you saw them.`];
+  if (gone.length > 0) {
+    lines.push(`No longer current (${gone.length} block${gone.length === 1 ? '' : 's'}, superseded or replaced; do not rely on them):`);
+    for (const block of gone) lines.push(`- ${block.split('\n')[0]!.slice(0, 200)}`);
+  }
+  if (changed.length > 0) {
+    lines.push(`New or changed (${changed.length} block${changed.length === 1 ? '' : 's'}):`);
+    lines.push(changed.join('\n'));
+  }
+  return lines.join('\n');
+}
+
 /** The byte where the candidate response's own heading line starts. */
 function responseHeadingByte(composition: ReviewInputComposition): number | null {
   const candidate = composition.components.find((component) => component.name === 'candidate_response');
@@ -104,7 +143,10 @@ export function rememberReviewRound(key: string, input: {
     conversations.delete(key);
     return;
   }
-  const firstParts = input.continued && earlier ? earlier.firstParts : partsBefore(promptParts(input.prompt), heading);
+  // What the reviewer has now seen: a continued round's conversation already
+  // carries this round's changes, so the next round is measured against them.
+  const firstParts = partsBefore(promptParts(input.prompt), heading);
+  void earlier;
   conversations.delete(key);
   conversations.set(key, { instructionsDigest: digest(input.instructions), history: [...input.history], firstParts, at: now });
 }
@@ -132,7 +174,9 @@ export function continuedReviewRound(key: string, input: {
     const label = LABELS[name] ?? 'the review context';
     if (first !== undefined && text.startsWith(first)) {
       const added = text.slice(first.length).trim();
-      if (added) updates.push(`Added to ${label} since your first review:\n${added}`);
+      if (added) updates.push(`Added to ${label} since your last review:\n${added}`);
+    } else if (first !== undefined) {
+      updates.push(blockChanges(label, first, text));
     } else {
       updates.push(`${label.charAt(0).toUpperCase()}${label.slice(1)} now reads (this replaces the earlier version):\n${text}`);
     }
