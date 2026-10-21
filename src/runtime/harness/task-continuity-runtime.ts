@@ -730,6 +730,16 @@ function normalized(value: unknown): string {
   return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
 }
 
+/** The public text showed the card's question when it is that question, or
+ * ends on it: a question halt keeps the model's own words ahead of the
+ * question, and the question is always last. Both inputs are normalized. */
+function deliveredQuestionShown(delivered: string, question: string): boolean {
+  if (!delivered || !question) return false;
+  const shown = delivered.toLowerCase();
+  const asked = question.toLowerCase();
+  return shown === asked || shown.endsWith(asked);
+}
+
 function normalizedKey(value: string): string {
   return normalized(value).toLowerCase().replace(/[.!]+$/g, '');
 }
@@ -1014,7 +1024,7 @@ export function persistCommittedClarificationContinuity(input: {
   if (
     !question
     || !deliveredQuestion
-    || question.toLowerCase() !== deliveredQuestion.toLowerCase()
+    || !deliveredQuestionShown(deliveredQuestion, question)
   ) return null;
   // The awaiting row was emitted by the accepted host tool call and the exact
   // paired terminal proves which question was publicly committed. Persist its
@@ -2193,7 +2203,7 @@ export function inspectDurableMaterialSourceContinuation(input: {
         && presentation.status === 'needs_input'
         && presentation.kind === 'question'
         && presentation.needs?.kind === 'input'
-        && normalized(withoutRetainedWorkCheckpoint(presentation.text)) === normalized(context.question);
+        && deliveredQuestionShown(normalized(withoutRetainedWorkCheckpoint(presentation.text)), normalized(context.question));
     } catch {
       return false;
     }

@@ -1081,10 +1081,25 @@ const PARKS_OBSERVED_CONNECTION_SOURCES = new Set([
 
 function terminalQuestionText(result: RunConversationResult, sourceUserSeq: number): string {
   const event = terminalQuestionEventForAcceptedSource({ sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn });
-  return (event ? publicReplyText(event.data.question, '') : '')
-    || publicReplyText(result.lastDecision?.reply, '')
-    || publicReplyText(result.lastDecision?.summary, '')
-    || 'I need your input before I can continue.';
+  return questionTerminalReply({
+    question: event ? publicReplyText(event.data.question, '') : '',
+    reply: publicReplyText(result.lastDecision?.reply, ''),
+    summary: publicReplyText(result.lastDecision?.summary, ''),
+  });
+}
+
+/**
+ * The words a question terminal shows. The card's question is the event's;
+ * the reply is the whole of what the model said in that step when it answered
+ * first and asked last (the halt keeps that text ahead of the question), so a
+ * reply that ends on the card's question is preferred over the question
+ * alone. Any other shape keeps the event's question as the only safe text.
+ */
+export function questionTerminalReply(input: { question: string; reply: string; summary: string }): string {
+  const question = input.question.trim();
+  const reply = input.reply.trim();
+  if (question && reply && reply !== question && reply.endsWith(question)) return reply;
+  return question || reply || input.summary.trim() || 'I need your input before I can continue.';
 }
 
 /** Display projection only: the registry and paused executor still own every

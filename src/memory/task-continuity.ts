@@ -762,6 +762,13 @@ function normalizedVisibleText(value: unknown): string {
   return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
 }
 
+/** The public text showed the card's question when it is that question or
+ * ends on it: a question halt keeps the model's own words ahead of the
+ * question, and the question is always last. Both inputs are normalized. */
+function questionShownLast(shown: string, asked: string): boolean {
+  return Boolean(shown && asked) && (shown === asked || shown.endsWith(asked));
+}
+
 function exactPublicDeliveryBinding(input: {
   db: Database.Database;
   sessionId: string;
@@ -839,7 +846,7 @@ function exactPublicDeliveryBinding(input: {
   return sourceUserSeq === input.sourceUserSeq
     && terminalSourceUserSeq === input.sourceUserSeq
     && awaitingQuestion === normalizedVisibleText(input.question)
-    && terminalQuestion === normalizedVisibleText(input.question)
+    && questionShownLast(terminalQuestion, normalizedVisibleText(input.question))
     && awaitingOptions.length === input.options.length
     && awaitingOptions.every((option, index) => option === normalizedVisibleText(input.options[index]));
 }
@@ -1287,7 +1294,12 @@ function deliveredClarificationForReply(
     if (typed) {
       if (typed.identity.sessionId !== packet.sessionId || typed.status !== 'needs_input'
         || typed.kind !== 'question' || typed.needs?.kind !== 'input') return null;
-      question = withoutRetainedWorkCheckpoint(typed.text);
+      // The card's question is what a reask shows again; the words the model
+      // said ahead of it in the same step are not re-asked.
+      const shown = withoutRetainedWorkCheckpoint(typed.text);
+      const asked = typeof awaitingData.question === 'string' ? awaitingData.question.trim() : '';
+      question = asked && shown.trim() !== asked
+        && questionShownLast(normalizedVisibleText(shown), normalizedVisibleText(asked)) ? asked : shown;
     } else if (terminalData.presentation !== undefined || terminalData.turnOutcome !== undefined) return null;
   } catch { return null; }
   const options = awaitingData.options ?? [];
