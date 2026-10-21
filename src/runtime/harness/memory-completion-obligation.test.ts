@@ -19,6 +19,7 @@ const host = await import('./host-turn-runner.js');
 const brackets = await import('./brackets.js');
 const context = await import('./source-session-context.js');
 const memory = await import('./memory-completion-obligation.js');
+const receipts = await import('../../memory/memory-remember-receipt.js');
 const facts = await import('../../memory/facts.js');
 const factState = await import('../../memory/fact-correction.js');
 const scope = await import('../../memory/memory-scope.js');
@@ -213,6 +214,32 @@ for (const failedOpen of [false, true]) test(`actual host rejects ${failedOpen ?
   assert.ok(result.calls > 0 && result.reviews > 0, 'the actual completion boundary was reached');
   if (failedOpen) assert.equal(result.calls, 1, 'unavailable reviewer adds no repair turns');
   assert.equal(memory.readRetainedMemoryRequirement(identity.retained), null);
+});
+
+test('an explicit supersede the host settled verifies the memory request when the typed packet is missing', async () => {
+  // Live 2026-10-21 (a tester): "commit this to memory so every time I ask …"
+  // → memory_remember superseded the older rule, three reviews returned no
+  // packet, and the turn ended blocked "I could not confirm that your
+  // correction replaced what I had saved before". The tool's own receipt
+  // names the fact it left active; the host reads storage, not prose.
+  const identity = source('Commit this to memory: whenever I ask for my untouched accounts, match the saved report exactly.');
+  const older = facts.rememberFact({ kind: 'user', content: `Older untouched-account rule ${serial}: filter by hand.`, scope: null });
+  const stored = facts.rememberFact({ kind: 'user', content: `Untouched-account rule ${serial}: match the saved report exactly.`, scope: null,
+    sessionId: identity.sessionId });
+  settle(identity, 'memory_remember', `explicit-supersede-${serial}`,
+    `${receipts.MEMORY_REMEMBER_RECEIPT_PREFIX} ${JSON.stringify({ action: 'supersede', factId: stored.id })}\nSuperseded the prior fact with (user): match the saved report exactly.`);
+  assert.deepEqual(memory.explicitRememberStored({ ...identity, acceptedTaskId: identity.retained.acceptedTaskId }), { action: 'supersede', factId: stored.id });
+  const result = await runHost(identity, { done: true, reason: 'Saved.', failedOpen: true, reviewFailure: 'unavailable' as const });
+  assert.equal(result.outcome.terminal, undefined, JSON.stringify(result.outcome.terminal));
+  assert.equal(result.calls, 1, 'no repair turns for a save the host can read');
+  assert.equal(factState.readFactObservation(older.id)?.active, true, 'the host verifies; it never retires facts itself');
+  // A plain add with no older fact retired is still not a correction.
+  const plain = source('Commit this to memory: my untouched accounts come from the saved report.');
+  const added = facts.rememberFact({ kind: 'user', content: `Plain rule ${serial}: from the saved report.`, scope: null, sessionId: plain.sessionId });
+  settle(plain, 'memory_remember', `explicit-add-${serial}`,
+    `${receipts.MEMORY_REMEMBER_RECEIPT_PREFIX} ${JSON.stringify({ action: 'add', factId: added.id })}\nRemembered (user): from the saved report.`);
+  assert.deepEqual(memory.explicitRememberStored({ ...plain, acceptedTaskId: plain.retained.acceptedTaskId }), { action: 'add', factId: added.id });
+  assert.equal(memory.hostVerifiedMemoryRetention(plain.retained)?.status, undefined, 'an add alone is read through the intake path as before');
 });
 
 test('ordinary memory save with disabled review and background memory read keep existing policy', async () => {

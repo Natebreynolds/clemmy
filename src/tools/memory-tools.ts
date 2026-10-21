@@ -1,4 +1,5 @@
 import { memoryScopeOf, recordVisible, sameScope, scopeOfSession } from '../memory/memory-scope.js';
+import { formatMemoryRememberReceipt } from '../memory/memory-remember-receipt.js';
 
 function factMayBeSeen(id: number): boolean {
   return recordVisible('fact', id);
@@ -898,7 +899,10 @@ export function registerMemoryTools(server: McpServer): void {
             + unresolvedFacts.map(fact => `[fact:${fact.id}] ${fact.kind}: ${fact.content}`).join('\n')
             + '\nCompare these records with the owner’s actual instruction. For a requested correction, open the original with memory_read and use memory_remember.correct with that retained read and exact edits, preserving its stored scope and unchanged content. A separately saved duplicate may prevent an exact replacement; report that unresolved conflict instead of deleting the original or claiming completion. Do not claim the correction is fully applied while its contradictory prior facts remain active.'
           : '';
-        return textResult(`${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}${conflict}`);
+        // The host's receipt heads the result: what happened and the fact
+        // left active, so a review can read storage instead of prose.
+        const receipt = formatMemoryRememberReceipt({ action: outcome.action, ...(outcome.factId ? { factId: outcome.factId } : {}) });
+        return textResult(`${receipt}\n${verb} (${kind}): ${content}${graph.summary}${reconciliation}${warning}${conflict}`);
       } catch (err) {
         return textResult(`memory_remember failed: ${err instanceof Error ? err.message : String(err)}`);
       }

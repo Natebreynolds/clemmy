@@ -18,6 +18,7 @@ import { rehydrateConsumedClarificationContext } from './task-continuity-runtime
 import { adoptedSteerNotesForSource } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, isEligibleAutoCaptureSourceProvenance } from '../../memory/auto-capture.js';
 import { hostVerifiedStatedRetention } from './durable-memory-intake-receipt.js';
+import { parseMemoryRememberReceipt } from '../../memory/memory-remember-receipt.js';
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const textDigest = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex');
@@ -288,8 +289,41 @@ export type MemoryCorrectionCompletion =
  * "memory_correction_unverified". */
 export function hostVerifiedMemoryRetention(source: MemoryRequirementSource): MemoryCorrectionCompletion | null {
   try {
-    if (readRetainedMemoryRequirement(source)) return null;
+    const retained = readRetainedMemoryRequirement(source);
+    // An exact correction keeps its bound postcondition: only its proof closes it.
+    if (retained?.assessment.kind === 'correct') return null;
+    // The brain stored the memory itself in this request and its receipt says
+    // an older fact was retired (or the fact was already held): host storage,
+    // not prose. Live 2026-10-21 (a tester): "commit this to memory …" → the
+    // automatic capture sat unresolved, memory_remember superseded the old
+    // rule, three reviews gave no packet, and the turn ended "I could not
+    // confirm that your correction replaced what I had saved before".
+    const explicit = explicitRememberStored(source);
+    if (explicit && explicit.action !== 'add') return { status: 'verified' };
+    if (retained) return null;
     return hostVerifiedStatedRetention(source) ? { status: 'verified' } : null;
+  } catch { return null; }
+}
+/** The memory_remember this exact request settled on the host, by its own
+ * receipt, with the fact it names still active and written by this
+ * conversation. Null when no such call settled or its fact is gone. */
+export function explicitRememberStored(source: Pick<MemoryRequirementSource, 'sessionId' | 'sourceUserSeq' | 'acceptedTaskId'>):
+  { action: 'add' | 'supersede' | 'reinforce'; factId: number } | null {
+  try {
+    const calls = openEventLog().prepare(`SELECT logical_tool_call_id AS callId FROM logical_tool_calls
+      WHERE session_id = ? AND source_user_seq = ? AND tool_name = 'memory_remember' ORDER BY rowid`)
+      .all(source.sessionId, source.sourceUserSeq) as Array<{ callId: string }>;
+    for (const call of calls) {
+      const result = redeemSuccessfulSettlementResultForHost({ sessionId: source.sessionId, sourceUserSeq: source.sourceUserSeq,
+        acceptedTaskId: source.acceptedTaskId, logicalToolCallId: call.callId });
+      if (result.status !== 'ok' || result.value.toolName !== 'memory_remember' || result.value.executionSite !== 'host') continue;
+      const receipt = parseMemoryRememberReceipt(result.value.rawPayload) ?? parseMemoryRememberReceipt(result.value.rawPayloadJson);
+      if (!receipt?.factId || receipt.action === 'ignore') continue;
+      const row = openMemoryDb().prepare('SELECT active, source_session_id FROM consolidated_facts WHERE id = ?')
+        .get(receipt.factId) as { active: number; source_session_id: string | null } | undefined;
+      if (row?.active === 1 && row.source_session_id === source.sessionId) return { action: receipt.action, factId: receipt.factId };
+    }
+    return null;
   } catch { return null; }
 }
 /** Reopen retained evidence and canonical state. This proves only the bound
@@ -299,6 +333,11 @@ export function memoryCorrectionCompletion(source: MemoryRequirementSource): Mem
     const retained = readRetainedMemoryRequirement(source);
     if (!retained) return { status: 'unverified', reason: 'The memory requirement has not been checked.' };
     if (retained.assessment.kind === 'none' || retained.assessment.kind === 'retain') return { status: 'not_required', assessmentDigest: retained.assessmentDigest };
+    if (retained.assessment.kind === 'unresolved' || retained.assessment.kind === 'replaced') {
+      // The brain's own settled supersede retired the older fact: host storage.
+      const explicit = explicitRememberStored(source);
+      if (explicit?.action === 'supersede') return { status: 'verified', assessmentDigest: retained.assessmentDigest };
+    }
     if (retained.assessment.kind === 'unresolved') return { status: 'unverified', reason: 'The requested memory change is not yet bound to its original fact and exact changes.' };
     if (retained.assessment.kind === 'replaced') {
       const intake = intakeReplacementsForSource(source);
