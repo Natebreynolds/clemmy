@@ -97,8 +97,7 @@ import {
   checkClarificationAnswerCompleteness,
   validatedClarificationAnswerCompleteness,
   type ClarificationRevisionInput,
-  type ProposedClarificationRevision,
-} from '../semantic-boundary/clarification-revision.js';
+  type ProposedClarificationRevision, hostOfferedOptionCompleteness } from '../semantic-boundary/clarification-revision.js';
 
 const ANSWER_MAX_CHARS = 280;
 const ANSWER_MAX_WORDS = 24;
@@ -425,7 +424,11 @@ export async function classifyUnsettledOpenQuestionReply(input: {
     const sameSlot = slot && target?.goalId === slot.goalId && target?.baseRevision === slot.revision
       && answer?.questionId === slot.questionId && answer?.slotKey === slot.slotKey;
     const checkedInput = sameSlot ? clarificationRevisionInputFor(current.packet, input.sourceUserSeq) : null;
-    const check = checkedInput
+    // One of the host's own offered options, picked verbatim, is complete by
+    // construction; only another wording is read by the model.
+    const offered = checkedInput ? hostOfferedOptionCompleteness(checkedInput) : null;
+    const check = offered ? { status: offered.status, receipt: offered.receipt }
+      : checkedInput
       ? await (clarificationCompletenessForTests ?? checkClarificationAnswerCompleteness)(checkedInput)
         .catch(() => ({ status: 'unavailable' as const, reason: 'review_failed' }))
       : { status: 'unavailable' as const, reason: 'exact_answer_edge_unavailable' };

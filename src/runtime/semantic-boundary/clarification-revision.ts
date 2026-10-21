@@ -331,6 +331,27 @@ export function validatedClarificationAnswerCompleteness(
   };
 }
 
+/** A reply that is exactly one of the options the host itself offered is a
+ * complete answer by construction: the host wrote those strings, and the
+ * person picked one (a tap on the card sends the option verbatim). No model
+ * is asked whether its own option answers its own question. Live
+ * 2026-10-21 (a tester): the completeness call failed, and tapping the
+ * recommended option twice got "I couldn't verify how it changes the pending
+ * question" both times. Null when the reply is not one of the options. */
+export function hostOfferedOptionCompleteness(input: ClarificationRevisionInput): CheckedClarificationAnswerCompleteness | null {
+  if (!validInput(input)) return null;
+  const reply = input.acceptedReply.trim();
+  if (!reply || !input.deliveredOptions.some(option => option.trim() === reply)) return null;
+  const inputDigest = completenessInputDigest(input);
+  return validatedClarificationAnswerCompleteness(input, {
+    version: 1,
+    purpose: 'clarification_answer_completeness_v1',
+    inputDigest,
+    sourceDigest: inputDigest,
+    review: { modelIdentity: 'host:offered_option_v1', decisionId: null, noul: 1 },
+  } satisfies ClarificationAnswerCompletenessReceipt);
+}
+
 /** One Jev call. Only the caller's NEW checked-revision leaf may use this
  * additional adequacy gate; it does not change legacy v2/v3 answer handling. */
 export async function checkClarificationAnswerCompleteness(

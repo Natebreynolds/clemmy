@@ -1949,6 +1949,34 @@ test('a fully answered first clarification uses one exact completeness receipt a
   } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
 });
 
+test('an option picked verbatim settles the question without asking a model whether its own option answers it', async () => {
+  // Live 2026-10-21 (a tester): the completeness call failed and tapping the
+  // recommended option twice got "I couldn't verify how it changes the
+  // pending question" both times; "yes exclude them" got it a third time.
+  const sessionId = 'continuity-offered-option';
+  const origin = accepted(sessionId, 'Draft outreach for ten of my untouched accounts.');
+  const options = ['Exclude customers and open opportunities from outreach (recommended)', 'Use all report-matched accounts'];
+  commitClarification({ sessionId, sourceSeq: origin.seq, question: 'Should I exclude customers and open opportunities?', options });
+  const open = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(open.status, 'available');
+  if (open.status !== 'available') return;
+  const text = options[0]!;
+  const reply = accepted(sessionId, text);
+  const slot = open.packet.pause.slot!;
+  seedSemanticReading(sessionId, reply.seq, 'admitted', { version: 1, relation: 'answer_open_slot',
+    targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null,
+    slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: text }],
+    rationale: 'The person picked the recommended option.' });
+  let checks = 0;
+  runtime._setClarificationAnswerCompletenessForTests(async () => { checks++; return { status: 'unavailable' as const, reason: 'review_failed' }; });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'settled', JSON.stringify(route));
+    assert.equal(checks, 0, 'the host offered the option; no model is asked whether it answers');
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled', 'replay reads the receipt');
+  } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
+});
+
 test('an interrupted exact-source clarification reading holds honestly without automatically repeating provider entry', async () => {
   const sessionId = 'continuity-reading-claimed-crash';
   const origin = accepted(sessionId, 'Create a local summary only after all details are confirmed.');
