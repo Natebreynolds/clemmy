@@ -378,6 +378,13 @@ export interface ApprovedActionEndingCall {
     /** The owner's original request still has work left after this action. */
     stillOpen?: boolean;
   };
+  /** The other actions the owner approved together with this one on the same
+   * card, each with its own recorded outcome. One reply covers the set. */
+  siblings?: Array<{
+    title: string;
+    detail: string;
+    happened: { verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain' | 'executed'; reply: string };
+  }>;
   evidenceDigest: string;
 }
 

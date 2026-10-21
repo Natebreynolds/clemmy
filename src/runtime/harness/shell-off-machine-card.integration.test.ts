@@ -474,15 +474,44 @@ test('several commands of one kind staged for one request open as one review car
 
   const resolved = approvalRegistry.resolve(group.approvalId, 'approved', 'desktop-chat-card');
   assert.equal(resolved.ok, true, JSON.stringify(resolved));
-  for (const member of members) {
-    const row = approvalRegistry.get(member.approvalId)!;
-    assert.equal(row.resolution, 'approved', JSON.stringify(row));
-    const settled = await handleResolvedApprovalForChatResume(row, async () => { assert.fail('no model turn is spent on an approval'); });
-    assert.equal(settled, true, member.approvalId);
+  const endingsBefore = eventlog.listEvents(run.session.id, { types: ['conversation_completed'] }).length;
+  const narrated: Array<Record<string, unknown>> = [];
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('not used by an approval'); },
+    async voiceApprovedActionEnding(call) {
+      narrated.push(call as unknown as Record<string, unknown>);
+      return { message: 'Both ran: x=1 and x=2 each reached the hook endpoint once.', evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture' };
+    },
+  } as never);
+  try {
+    for (const member of members) {
+      const row = approvalRegistry.get(member.approvalId)!;
+      assert.equal(row.resolution, 'approved', JSON.stringify(row));
+      const settled = await handleResolvedApprovalForChatResume(row, async () => { assert.fail('no model turn is spent on an approval'); });
+      assert.equal(settled, true, member.approvalId);
+    }
+  } finally {
+    semanticPorts.installTurnSemanticModelPort(null);
   }
   assert.deepEqual(received.sort(), ['POST /hook x=1', 'POST /hook x=2']);
   for (const member of members) {
     const view = pendingActionApprovalViewFromArgs(member.args);
     assert.equal(pendingActions.getPendingAction(view!.id)?.status, 'executed', member.approvalId);
   }
+  // Live 2026-10-21: two checks approved on one card ended twice, the second
+  // ending calling the first "still outstanding". The set ends once, when its
+  // last member settles, with every member's own outcome in front of Clem.
+  // Each member keeps its own exact receipt (source, attempt, terminal); only
+  // the set's last member speaks, and no ending calls a sibling outstanding.
+  const endings = eventlog.listEvents(run.session.id, { types: ['conversation_completed'] }).slice(endingsBefore);
+  assert.equal(endings.length, members.length, JSON.stringify(endings.map((event) => event.data)));
+  const texts = endings.map((event) => JSON.stringify(event.data));
+  assert.match(texts.at(-1)!, /Both ran: x=1 and x=2/, 'the set ends in Clem\'s words');
+  assert.match(texts[0]!, /One reply covers the whole approved set/, 'the quiet member leaves one line');
+  for (const text of texts) assert.doesNotMatch(text, /outstanding|still has retained work/);
+  assert.equal(narrated.length, 1, 'Clem speaks once for the set');
+  const siblings = narrated[0]!.siblings as Array<{ detail: string; happened: { verdict: string } }>;
+  assert.equal(siblings?.length, 1, JSON.stringify(narrated[0]));
+  assert.equal(siblings[0]!.happened.verdict, 'executed');
+  assert.ok(siblings[0]!.detail.includes('x=1') || siblings[0]!.detail.includes('x=2'), siblings[0]!.detail);
 });

@@ -54,7 +54,7 @@ import {
   type RunAttemptRef,
 } from './eventlog.js';
 import { HarnessSession } from './session.js';
-import { getPendingAction, pendingActionPayloadHash, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
+import { getPendingAction, listPendingActions, pendingActionPayloadHash, recordPendingActionResult, type PendingActionRecord } from './pending-actions.js';
 import { pendingActionResultApprovalMatches, pendingActionResultBinding } from './pending-action-public-result.js';
 import { prepareApprovedActionHostCompletion } from './approved-action-completion-receipt.js';
 import { enqueueApprovedActionResultProjectionInTransaction, kickApprovedActionResultProjectionDrain } from './approved-action-result-projection.js';
@@ -766,13 +766,36 @@ async function executeApprovedLinkedActionAndSettle(
     // result, and carries on.
     const result = pendingAction.resultSummary ?? `Executed the exact approved ${pendingAction.toolName} call.`;
     const stillOpen = approvedActionRetainedWorkNeedsVerification(row, pendingAction, source);
+    // The owner approved this action together with others on one card: the
+    // set ends once, in Clem's words, when its last member has settled. An
+    // earlier member settles with the plain receipt and no narration (live
+    // 2026-10-21: two checks approved on one card ended twice, the second
+    // ending calling the first "still outstanding").
+    let group = approvedActionGroupSiblings(row, pendingAction);
+    if (group && !group.narrator) {
+      return await settleConversationalSource(row, source, {
+        status: 'done',
+        text: approvedActionGroupMemberDoneText(pendingAction),
+        hostNotice: { code: 'approved_action_completed' },
+      });
+    }
+    if (group && group.unsettled > 0) {
+      // The set's speaker gives its siblings a bounded moment to finish; a
+      // sibling still running after that is reported as not finished, never
+      // as done.
+      const until = Date.now() + APPROVED_ACTION_SIBLING_WAIT_MS;
+      while (group && group.unsettled > 0 && Date.now() < until) {
+        await waitForConversationalTransition(APPROVED_ACTION_SIBLING_POLL_MS);
+        group = approvedActionGroupSiblings(row, pendingAction) ?? group;
+      }
+    }
     // Clem says what landed herself, from the recorded result, and names
     // what the request still has left (owner 10-20, Windows tester: the app
     // line "The approved action completed. Open execution details…" read as
     // nothing happened; the wording job that should have replaced it was
     // rejected as unbound). The app line stands only when no brain answers.
     const guard = approvedActionEndingGuard(row, pendingAction, source, prepared);
-    const said = guard ? await approvedActionEndingInClemsWords(row, pendingAction, source, guard, { stillOpen }) : null;
+    const said = guard ? await approvedActionEndingInClemsWords(row, pendingAction, source, guard, { stillOpen, ...(group ? { siblings: group.siblings } : {}) }) : null;
     const current = guard ? readApprovedActionEndingOwner(guard.owner) : null;
     const narrated = said && current?.kind === 'current' && current.actionDigest === guard!.actionDigest ? said : null;
     return await settleConversationalSource(row, source, {
@@ -1047,6 +1070,64 @@ function boundedEndingField(value: string, max = APPROVED_ACTION_ENDING_FIELD_CH
 
 /** What the record says happened to an approved action that did not land,
  * read from the executor's own markers, never from provider prose. */
+export interface ApprovedActionEndingSibling {
+  title: string;
+  detail: string;
+  happened: { verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain' | 'executed'; reply: string };
+}
+
+/** The other members of the approval group this action was approved on, as
+ * ending facts, how many of them have not settled yet, and whether this
+ * member is the one that speaks for the set (the last one listed on the card:
+ * fixed at card time, so concurrent members never both stay quiet). Undefined
+ * when the action was approved on its own card. */
+export function approvedActionGroupSiblings(
+  row: approvalRegistry.PendingApprovalRow,
+  action: PendingActionRecord,
+): { siblings: ApprovedActionEndingSibling[]; unsettled: number; narrator: boolean } | undefined {
+  try {
+    const group = approvalRegistry.approvalGroupContaining(row.sessionId, row.approvalId);
+    if (!group) return undefined;
+    const members = approvalRegistry.approvalGroupMembers(group) ?? [];
+    const memberIds = new Set(members.map((member) => member.approvalId));
+    memberIds.delete(row.approvalId);
+    if (memberIds.size === 0) return undefined;
+    const narrator = members.at(-1)?.approvalId === row.approvalId;
+    const records = listPendingActions({ sessionId: row.sessionId, status: 'all', limit: 100 })
+      .filter((record) => record.id !== action.id && typeof record.approvalId === 'string' && memberIds.has(record.approvalId));
+    const byApproval = new Map(records.map((record) => [record.approvalId, record] as const));
+    const siblings: ApprovedActionEndingSibling[] = [];
+    let unsettled = 0;
+    for (const member of members) {
+      if (member.approvalId === row.approvalId) continue;
+      const record = byApproval.get(member.approvalId);
+      const settled = record && (record.status === 'executed' || record.status === 'failed');
+      if (!settled) unsettled += 1;
+      const shell = record && (record.toolName === 'run_shell_command' || record.kind === 'shell_command');
+      const payload = record?.payload && typeof record.payload === 'object' ? record.payload as Record<string, unknown> : {};
+      const command = shell && typeof payload.command === 'string' ? payload.command : '';
+      siblings.push({
+        title: boundedEndingField(record?.title ?? member.subject ?? '', 200),
+        detail: boundedEndingField(command || record?.title || member.subject || '', 400),
+        happened: settled ? approvedActionEndingFacts(record) : { verdict: 'uncertain',
+          reply: 'This one had not finished when this reply was written; its own result is not known yet.' },
+      });
+    }
+    return { siblings, unsettled, narrator };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The one line the quiet members of an approved set leave; the set's reply
+ * comes with its last member. */
+export function approvedActionGroupMemberDoneText(action: Pick<PendingActionRecord, 'title'>): string {
+  return `Done: ${boundedEndingField(action.title ?? 'the approved action', 200)}. One reply covers the whole approved set when its last action finishes.`;
+}
+
+const APPROVED_ACTION_SIBLING_WAIT_MS = 15_000;
+const APPROVED_ACTION_SIBLING_POLL_MS = 500;
+
 export function approvedActionEndingFacts(action: Pick<PendingActionRecord, 'status' | 'resultSummary'>): {
   verdict: 'never_started' | 'refused' | 'guard_refused' | 'uncertain' | 'executed';
   reply: string;
@@ -1145,7 +1226,7 @@ async function approvedActionEndingInClemsWords(
   action: PendingActionRecord,
   source: EventRow,
   guard: ApprovedActionEndingGuard,
-  options: { stillOpen?: boolean } = {},
+  options: { stillOpen?: boolean; siblings?: ApprovedActionEndingSibling[] } = {},
 ): Promise<string | null> {
   const port = peekTurnSemanticModelPort();
   if (!port?.voiceApprovedActionEnding) return null;
@@ -1195,7 +1276,8 @@ async function approvedActionEndingInClemsWords(
         kind: shell ? 'command_on_this_computer' : 'connected_app_change',
         detail: boundedEndingField(command || action.title || '', 400),
       },
-      happened: { ...approvedActionEndingFacts(action), ...(options.stillOpen ? { stillOpen: true } : {}) }, evidenceDigest,
+      happened: { ...approvedActionEndingFacts(action), ...(options.stillOpen ? { stillOpen: true } : {}) },
+      ...(options.siblings && options.siblings.length > 0 ? { siblings: options.siblings } : {}), evidenceDigest,
     }))),
     });
     assertOwned();

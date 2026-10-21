@@ -922,6 +922,21 @@ export function get(approvalId: string): PendingApprovalRow | undefined {
 
 /** Host-owned review group. Members retain their own immutable execution
  * authority; the group only owns the single human decision over that set. */
+/** The approval group a member belongs to, whatever its status, or undefined. */
+export function approvalGroupContaining(sessionId: string, approvalId: string): PendingApprovalRow | undefined {
+  try {
+    const rows = openEventLog().prepare(`
+      SELECT * FROM pending_approvals
+       WHERE session_id = ? AND tool = ? AND args_json LIKE ?
+       ORDER BY rowid DESC LIMIT 10
+    `).all(sessionId, APPROVAL_GROUP_TOOL, `%${JSON.stringify(approvalId)}%`) as ApprovalSqlRow[];
+    return rows.map(rowToPublic).find((group) => isApprovalGroup(group)
+      && (approvalGroupMembers(group) ?? []).some((member) => member.approvalId === approvalId));
+  } catch {
+    return undefined;
+  }
+}
+
 export function approvalGroupMembers(row: PendingApprovalRow): PendingApprovalRow[] | null {
   return approvalGroupMembersRead(row, get);
 }
