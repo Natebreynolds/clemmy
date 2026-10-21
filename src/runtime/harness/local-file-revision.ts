@@ -76,7 +76,11 @@ type Revision = {
   contentDigest: string;
   bytes: number;
   previous: { handle: string; contentDigest: string; bytes: number; mode: number } | null;
-  operation?: { key: string; requestDigest: string; previousRevisionDigest: string | null };
+  operation?: { key: string; requestDigest: string; previousRevisionDigest: string | null;
+    /** The base this operation was admitted against, frozen with it. Absent
+     * on records written before the base was recorded; recovery then reads
+     * the base from the request as before. */
+    expectedContentDigest?: string | null };
   /** Set when the host recorded bytes a command changed, not a file tool. */
   observedAfter?: { tool: string; callId: string };
 };
@@ -124,19 +128,25 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
   if (realpathSync(dir) !== dir) throw new Error('Local file revision directory changed.');
   const current = path.join(dir, 'current.json');
   return withFileLockSyncStrict(current, () => {
-    const requestDigest = digest(JSON.stringify({ target, content: input.content,
-      mode: input.mode, expectedContentDigest: input.expectedContentDigest ?? null,
+    const requestDigestFor = (expectedContentDigest: string | null) => digest(JSON.stringify({ target, content: input.content,
+      mode: input.mode, expectedContentDigest,
       ...(input.mode === 'replace' ? { find: input.find ?? null } : {}) }));
+    const requestDigest = requestDigestFor(input.expectedContentDigest ?? null);
     const operationFile = input.operationKey
       ? path.join(dir, `operation-${digest(input.operationKey)}.json`) : null;
     if (operationFile && existsSync(operationFile)) {
       const encoded = readDirectFile(operationFile).bytes;
       const saved = JSON.parse(encoded.toString('utf8')) as Revision;
+      // The base is part of the operation's identity and was frozen with it:
+      // recovery compares against the frozen base, never one recomputed from
+      // what the conversation has seen since (its own write, for one).
+      const frozenRequestDigest = saved.operation && saved.operation.expectedContentDigest !== undefined
+        ? requestDigestFor(saved.operation.expectedContentDigest) : requestDigest;
       if (saved.version !== 1 || saved.kind !== 'local_file_revision_v1'
         || saved.target !== target || saved.createdId !== createdId
         || !/^[a-f0-9-]{36}$/.test(saved.revisionId)
         || !saved.operation || saved.operation.key !== input.operationKey
-        || saved.operation.requestDigest !== requestDigest
+        || saved.operation.requestDigest !== frozenRequestDigest
         || !readDirectFile(path.join(dir, `${saved.revisionId}.prepared.json`)).bytes.equals(encoded)) {
         throw new LocalFileRevisionConflict('The recorded file operation does not match this request. No file content was changed.');
       }
@@ -160,7 +170,7 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
     const prior = existsSync(target) ? readDirectFile(target) : null;
     if (input.expectedContentDigest !== undefined
       && (!prior || digest(prior.bytes) !== input.expectedContentDigest)) {
-      throw new LocalFileRevisionConflict('The local file changed since this request wrote it. Re-read it and reconcile the intervening edit before replacing it. No file content was changed.');
+      throw new LocalFileRevisionConflict('The local file changed since this conversation last read or wrote it. Re-read it and reconcile the outside edit before writing. No file content was changed.');
     }
     if (input.mode === 'create' && prior) throw new LocalFileCreateConflict(`Refused to overwrite existing file: ${target}. Use mode="append" or mode="overwrite" for a requested revision.`);
     const content = input.content.endsWith('\n') ? input.content : `${input.content}\n`;
@@ -175,7 +185,8 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
     const revision: Revision = { version: 1, kind: 'local_file_revision_v1', createdId, revisionId, target,
       contentDigest: digest(bytes), bytes: bytes.length,
       ...(input.operationKey ? { operation: { key: input.operationKey, requestDigest,
-        previousRevisionDigest: existsSync(current) ? digest(readDirectFile(current).bytes) : null } } : {}),
+        previousRevisionDigest: existsSync(current) ? digest(readDirectFile(current).bytes) : null,
+        expectedContentDigest: input.expectedContentDigest ?? null } } : {}),
       previous: prior && previousPath ? { handle: path.relative(root, previousPath).split(path.sep).join('/'),
         contentDigest: digest(prior.bytes), bytes: prior.bytes.length, mode: prior.mode } : null };
     const encoded = Buffer.from(JSON.stringify(revision));

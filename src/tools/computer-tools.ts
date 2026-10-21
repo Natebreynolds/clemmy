@@ -13,6 +13,7 @@ import { performance } from 'node:perf_hooks';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
+import { observedLocalFileBase, recordLocalFileObservation } from '../runtime/harness/local-file-observation.js';
 import { canonicalLocalFileTarget, commitLocalFileRevision, isLocalFileRevisionHandle, recordedLocalFileAtRevision, recordLocalFileRevisionAfterCommand, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
 import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { reviewedFileCorrectionPrecondition } from '../runtime/harness/reviewed-file-correction.js';
@@ -1750,10 +1751,19 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
   if (writeTargetsProtectedOwnStore(filePath) || writeTargetsProtectedOwnStore(canonicalTarget)) {
     return `Refused to write ${filePath}: Clementine's own data stores (state databases, audit ledger, secrets) are protected from direct file writes. Use the purpose-built tools (memory_*, workflow_*, settings) instead.`;
   }
+  const observerSession = getToolOutputContext()?.sessionId;
   let revision: ReturnType<typeof commitLocalFileRevision>;
   try {
     const bound = currentExpectedWorkBinding();
-    const expectedContentDigest = bound ? reviewedFileCorrectionPrecondition(bound, { target: canonicalTarget, content: input.content, mode }) : undefined;
+    let expectedContentDigest = bound ? reviewedFileCorrectionPrecondition(bound, { target: canonicalTarget, content: input.content, mode }) : undefined;
+    // The write binds to what this conversation last saw of the file (its
+    // own read or write), so an edit made outside since then is met as a
+    // typed conflict, never replaced in silence. A file never observed has
+    // no base and no read is demanded. Recovery never recomputes a base: the
+    // operation record froze it.
+    if (expectedContentDigest === undefined && !options?.recoveryOnly && mode !== 'create' && observerSession) {
+      expectedContentDigest = observedLocalFileBase({ sessionId: observerSession, target: canonicalTarget })?.contentDigest;
+    }
     if (options?.recoveryOnly && !options.operationKey) throw new Error('File recovery requires an operation identity.');
     const revise = options?.recoveryOnly
       ? (value: Parameters<typeof commitLocalFileRevision>[0]) => recoverLocalFileRevision({ ...value, operationKey: options.operationKey! })
@@ -1776,6 +1786,13 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
     throw error;
   }
   if (!options?.recoveryOnly) teeFileDeliverable(filePath);
+  if (!options?.recoveryOnly && observerSession) {
+    try {
+      const context = getToolOutputContext();
+      recordLocalFileObservation({ sessionId: observerSession, sourceUserSeq: context?.sourceUserSeq, callId: context?.callId,
+        tool: 'write_file', target: canonicalTarget, bytes: readFileSync(canonicalTarget) });
+    } catch { /* the receipt below still proves the write; only the base for a later write is missing */ }
+  }
   const notice = workspaceAuthoringNotice(filePath);
   const text = revision.unchanged
     ? `No changes needed for ${filePath} (${input.content.length} chars already present).`
@@ -1929,7 +1946,13 @@ async function executeLocalFileReadWithDependencies(
       return output;
     }
     readKind = isHtmlSource ? 'html' : 'text';
-    const text = timing.sync('file_read', () => readFileSync(filePath, 'utf-8'));
+    const raw = timing.sync('file_read', () => readFileSync(filePath));
+    const text = raw.toString('utf-8');
+    const observer = getToolOutputContext();
+    if (observer?.sessionId) {
+      recordLocalFileObservation({ sessionId: observer.sessionId, sourceUserSeq: observer.sourceUserSeq, callId: observer.callId,
+        tool: 'read_file', target: canonicalLocalFileTarget(filePath), bytes: raw });
+    }
     const output = formatToolOutput(
       'read_file',
       runContext,
