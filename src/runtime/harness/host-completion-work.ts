@@ -805,19 +805,43 @@ export function echoedWrittenContent(
  * carries the whole reviewed plan as its argument; that plan is already the
  * review's objective, so its scope is stated by size and digest, never
  * repeated (live 2026-10-21: 8.5 KB of plan prose twice in one review). */
-export function requestScopeText(toolName: string, args: unknown): string {
+export function requestScopeText(
+  toolName: string,
+  args: unknown,
+  written?: ReadonlyArray<WrittenContentReference>,
+): string {
   if (toolName === 'publish_plan' && args && typeof args === 'object' && !Array.isArray(args)) {
-    const record = args as Record<string, unknown>;
-    const fullText = typeof record.full_text === 'string' ? record.full_text : '';
-    const rest = Object.fromEntries(Object.entries(record).filter(([key]) => key !== 'full_text'));
-    return JSON.stringify({
-      ...rest,
-      full_text: fullText
-        ? `[the reviewed plan: ${fullText.length} chars, sha256 ${createHash('sha256').update(fullText, 'utf8').digest('hex').slice(0, 16)}; it is this review's objective and is not repeated here]`
-        : fullText,
-    });
+    // A plan publication's arguments are the plan (prose, graph, patches).
+    // The saved plan is the review's objective; refused drafts are history.
+    const summary = Object.fromEntries(Object.entries(args as Record<string, unknown>).map(([key, value]) => {
+      const text = typeof value === 'string' ? value : JSON.stringify(value) ?? '';
+      return [key, `[${text.length} chars, sha256 ${createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16)}]`];
+    }));
+    return `${JSON.stringify(summary)} (the published plan is this review's objective and is not repeated here)`;
   }
-  return JSON.stringify(args);
+  // An argument that carries the whole of a file this request wrote (the
+  // content a write was given, a step note the answerer pasted it into) is
+  // referenced to the artifact block, which shows those bytes once.
+  // Live 2026-10-21: a 13 KB deck appeared in two request scopes of one review.
+  const candidates = (written ?? []).filter((entry) => entry.text.length >= ECHOED_WRITE_MIN_CHARS)
+    .sort((a, b) => b.text.length - a.text.length);
+  const reference = (entry: WrittenContentReference): string =>
+    `[identical to the current saved content of artifact ${entry.createdId} (receipt digest ${entry.contentDigest.slice(0, 16)}), shown once in the artifact block]`;
+  const walk = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      for (const entry of candidates) {
+        if (value === entry.text) return reference(entry);
+        if (value.includes(entry.text)) return value.replace(entry.text, reference(entry));
+      }
+      return value;
+    }
+    if (Array.isArray(value)) return value.map(walk);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, inner]) => [key, walk(inner)]));
+    }
+    return value;
+  };
+  return JSON.stringify(candidates.length > 0 ? walk(args) : args);
 }
 
 export function sourceSettledReadEvidence(input: {
@@ -999,11 +1023,11 @@ export function sourceSettledReadEvidence(input: {
       if (request.ok && request.authority.logicalCallId === row.callId) {
         requestArgs = request.authority.canonicalArgs;
         blocks.push(`${label}: VERIFIED REQUEST SCOPE:\n`
-          + requestScopeText(row.toolName, request.authority.canonicalArgs));
+          + requestScopeText(row.toolName, request.authority.canonicalArgs, input.writtenContents));
       } else if (admittedRequest) {
         requestArgs = admittedRequest.args;
         blocks.push(`${label}: VERIFIED ADMITTED REQUEST SCOPE (sealed exact physical call):\n`
-          + requestScopeText(row.toolName, admittedRequest.args));
+          + requestScopeText(row.toolName, admittedRequest.args, input.writtenContents));
       } else {
         // Legacy read transports retain a source/call-bound invocation event
         // but no sealed provider authority. Show its requested scope honestly;
@@ -1030,7 +1054,7 @@ export function sourceSettledReadEvidence(input: {
         }).find(contract => !contract.error && contract.toolName === row.toolName);
         requestArgs = recorded?.args;
         blocks.push(`${label}: RECORDED INVOCATION SCOPE (source/call-bound requested arguments, not a sealed wire call):\n`
-          + (recorded ? requestScopeText(row.toolName, recorded.args) : 'unavailable'));
+          + (recorded ? requestScopeText(row.toolName, recorded.args, input.writtenContents) : 'unavailable'));
       }
       const projection = readsRetained ? loadRetainedReaderProjection({
         sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,

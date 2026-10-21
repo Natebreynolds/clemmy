@@ -35,8 +35,17 @@ test('the largest written part wins when a result holds several', () => {
 
 test('a plan publication states its plan by size and digest, other scopes are shown whole', async () => {
   const { requestScopeText } = await import('./host-completion-work.js');
-  const plan = requestScopeText('publish_plan', { full_text: 'x'.repeat(5000), readiness: 'ready' });
-  assert.match(plan, /the reviewed plan: 5000 chars, sha256 [0-9a-f]{16}/);
+  const plan = requestScopeText('publish_plan', { full_text: 'x'.repeat(5000), readiness: 'ready', structured_plan: { steps: [1, 2] } });
+  assert.match(plan, /"full_text":"\[5000 chars, sha256 [0-9a-f]{16}\]"/);
+  assert.match(plan, /"structured_plan":"\[\d+ chars, sha256 [0-9a-f]{16}\]"/);
   assert.ok(plan.length < 400);
   assert.equal(requestScopeText('read_file', { path: '/a', max_chars: 10 }), '{"path":"/a","max_chars":10}');
+  // An argument carrying the whole written file is referenced to the artifact.
+  const scoped = requestScopeText('write_file', { path: '/x/deck.md', content: text, mode: 'create' }, written);
+  assert.doesNotMatch(scoped, /Slide line with/);
+  assert.match(scoped, /identical to the current saved content of artifact write_file#c1/);
+  assert.match(scoped, /"mode":"create"/);
+  const note = requestScopeText('plan_step_result', { step_id: 's1', result: `Draft:\n${text}\nDone.` }, written);
+  assert.match(note, /Draft:\\n\[identical to the current saved content of artifact write_file#c1/);
+  assert.equal(requestScopeText('write_file', { content: text }, []), JSON.stringify({ content: text }));
 });
