@@ -370,6 +370,32 @@ test('evidence coverage: a proven authoring commit is the outcome of an authorin
   assert.equal(failed.complete, false);
 });
 
+test('evidence coverage: a job handed off is the outcome of the turn that handed it off', () => {
+  // Live 2026-10-21: a dispatch turn carried a discovery row and the
+  // dispatch receipt; both read as non-outcome, coverage was missing, and
+  // every hand-off review abstained.
+  const rows = [
+      { toolName: 'tool_search', outcome: 'succeeded', status: 'verified', contentComplete: false, evidenceKind: 'source_result', contentDisposition: 'discovery_navigation' },
+      { toolName: 'dispatch_background_task', outcome: 'succeeded', status: 'verified', contentComplete: true, evidenceKind: 'source_result' },
+  ] as const;
+  const objective = 'Have Design Studio build a landing page in the background and report back.';
+  // Without the host record of a job, an execution primitive's receipt is control, as before.
+  assert.equal(assessCompletionEvidenceCoverage({ objective, results: [...rows] }).missingCoverage, true);
+  const handoff = assessCompletionEvidenceCoverage({ objective, results: [...rows], handedOff: true });
+  assert.equal(handoff.missingCoverage, false);
+  assert.equal(handoff.complete, true);
+  assert.deepEqual(handoff.outcomeEvidence.map((row) => row.toolName), ['dispatch_background_task']);
+  // A refused dispatch is still a failed business attempt, not evidence.
+  const refused = assessCompletionEvidenceCoverage({
+    objective: 'Have Design Studio build a landing page in the background.',
+    handedOff: true,
+    results: [
+      { toolName: 'dispatch_background_task', outcome: 'failed', status: 'not_succeeded', evidenceKind: 'source_result' },
+    ],
+  });
+  assert.equal(refused.complete, false);
+});
+
 test('evidence coverage: a read whose target is absent is a complete read, and Jev may settle it', async () => {
   // The absence is the read's content. The row settles like any other read,
   // so coverage stays complete and the read turn stays on the Jev path. The

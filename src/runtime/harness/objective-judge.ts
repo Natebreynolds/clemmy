@@ -24,7 +24,7 @@ import {
   assessReviewCoverage, parseNeedsAllOf, reviewCoverageFinding, reviewCoverageFollowUp, reviewCoverageLedger,
   type EvidenceCoverageRow, type ReviewCoverageStatus, type ReviewedEvidenceRow,
 } from './review-evidence-coverage.js';
-import { actionTopologyRoleFor } from '../../tools/tool-registry.js';
+import { actionTopologyRoleFor, isRegisteredDelegationPrimitive } from '../../tools/tool-registry.js';
 import { projectionMayCompleteSource, retainedProjectionReadsSource } from './retained-projection-scope.js';
 import { historicalReadPacketIsCurrent, historicalReadClosureIsCurrent,
   type HistoricalReadPacket, type HistoricalReadClosure } from './historical-completion-evidence.js';
@@ -962,6 +962,8 @@ function isIncompleteOutcomeReceipt(row: CompletionEvidenceRow, all: readonly Co
 export function assessCompletionEvidenceCoverage(input: {
   objective: string;
   results?: CompletionEvidenceRow[] | null;
+  /** The host record says this turn handed work to a background job. */
+  handedOff?: boolean;
 }): {
   outcomeEvidence: CompletionEvidenceRow[];
   failedAttempts: CompletionEvidenceRow[];
@@ -971,6 +973,16 @@ export function assessCompletionEvidenceCoverage(input: {
 } {
   const results = input.results ?? [];
   const outcomeEvidence = results.filter(isInspectableOutcomeEvidence);
+  // A job handed off is the outcome of the turn that handed it off: when
+  // the host record says a job exists, the complete receipt of the execution
+  // primitive that started it is what the reply reports. Live 2026-10-21:
+  // with only a discovery row and the dispatch receipt, coverage read as
+  // missing and every hand-off review abstained.
+  if (input.handedOff && outcomeEvidence.length === 0) {
+    outcomeEvidence.push(...results.filter((row) => isRegisteredDelegationPrimitive(row.toolName)
+      && isSucceededReceipt(row) && row.contentComplete !== false
+      && row.status !== 'not_succeeded' && row.status !== 'unavailable'));
+  }
   const failedAttempts = results.filter(isFailedOutcomeAttempt);
   const incompleteReceipts = results.filter((row) => isIncompleteOutcomeReceipt(row, results));
   const missingCoverage = outcomeEvidence.length === 0;
@@ -2377,6 +2389,7 @@ export async function judgeObjectiveComplete(
   const coverage = assessCompletionEvidenceCoverage({
     objective,
     results: skillContext?.verifiedReadResults,
+    handedOff: (skillContext?.delegatedJobs?.length ?? 0) > 0,
   });
   const directionQuestion = isDirectionSeekingQuestion(assistantResponse);
   const historicalEligible = (skillContext?.verifiedReadResults?.length ?? 0) === 0
