@@ -844,6 +844,18 @@ export function requestScopeText(
   return JSON.stringify(candidates.length > 0 ? walk(args) : args);
 }
 
+/** The presentation text with the written content replaced by a reference,
+ * and nothing else touched: a warning or a missing-requirement line beside
+ * the saved content stays in front of the reviewer. Null when the span is
+ * not in this text (a windowed view), so the caller keeps its own rule. */
+export function substituteWrittenContent(text: string, entry: WrittenContentReference): string | null {
+  const reference = `[identical to the current saved content of artifact ${entry.createdId} (receipt digest ${entry.contentDigest.slice(0, 16)}), shown once in the artifact block]`;
+  if (text.includes(entry.text)) return text.replace(entry.text, reference);
+  const escaped = JSON.stringify(entry.text).slice(1, -1);
+  if (escaped !== entry.text && text.includes(escaped)) return text.replace(escaped, reference);
+  return null;
+}
+
 export function sourceSettledReadEvidence(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1067,7 +1079,7 @@ export function sourceSettledReadEvidence(input: {
       const projectedSource = projection
         ? { ...projection, ...retainedProjectionSourceScope(row.toolName, requestArgs) } : {};
       if (readsRetained && !projection) blocks.push(`${label}: authenticated control/diagnostic result only. No producer-owned retained-read receipt was verified; the requested call_id is not evidence that its source was read and this result cannot satisfy source coverage.`);
-      const shown = completionReadPresentation(value.rawPayloadJson);
+      let shown = completionReadPresentation(value.rawPayloadJson);
       const priorWindow = incremental && row.settlementIndex <= input.afterSettlementIndex!;
       // Repeating a query can observe a meaningful state transition. Keep each
       // distinct result; the final state alone cannot prove an intermediate
@@ -1118,7 +1130,14 @@ export function sourceSettledReadEvidence(input: {
       // bytes once, verified against the receipt.
       const echoed = evidenceKind !== 'retained_projection'
         ? echoedWrittenContent(value.rawPayload, input.writtenContents) : undefined;
-      if (echoed) {
+      // Only the identical span is replaced; a warning, a refusal or a
+      // missing-requirement line that sits beside the saved content in the
+      // same result stays visible (review note 2026-10-21).
+      const substituted = echoed ? substituteWrittenContent(shown.text, echoed) : null;
+      if (echoed && substituted !== null) {
+        shown = { ...shown, text: substituted };
+        blocks.push(`${label}: this result carries exactly the current saved content of artifact ${echoed.createdId} (receipt digest ${echoed.contentDigest.slice(0, 16)}) that THIS request wrote; that span reads as a reference below and the content is shown once in the artifact block. Everything else in the result is shown as it was.`);
+      } else if (echoed) {
         hasRetainedJsonDigest = true;
         results.push({ ...base, ...projectedSource, status: 'verified', resultHandleId: value.resultHandleId,
           physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,

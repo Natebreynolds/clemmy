@@ -49,3 +49,18 @@ test('a plan publication states its plan by size and digest, other scopes are sh
   assert.match(note, /Draft:\\n\[identical to the current saved content of artifact write_file#c1/);
   assert.equal(requestScopeText('write_file', { content: text }, []), JSON.stringify({ content: text }));
 });
+
+test('a result that carries the written content beside a warning keeps the warning and references the content', async () => {
+  const { substituteWrittenContent } = await import('./host-completion-work.js');
+  const entry = written[0]!;
+  const plain = `Wrote the deck.\n${text}\nWARNING: missing requirement: the success criteria name a slide 6 that is absent.`;
+  const out = substituteWrittenContent(plain, entry)!;
+  assert.doesNotMatch(out, /Slide line with/);
+  assert.match(out, /identical to the current saved content of artifact write_file#c1/);
+  assert.match(out, /missing requirement: the success criteria name a slide 6/);
+  const json = JSON.stringify({ receipt: 'ok', content: text, warning: 'missing requirement: X' });
+  const outJson = substituteWrittenContent(json, entry)!;
+  assert.doesNotMatch(outJson, /Slide line with/);
+  assert.match(outJson, /missing requirement: X/);
+  assert.equal(substituteWrittenContent('a windowed view without the span', entry), null);
+});

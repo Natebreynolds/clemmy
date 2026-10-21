@@ -2503,6 +2503,36 @@ export function registerToolSearchTool(
         const primarySchemaName = selectedExactly?.name
           ?? schemaNames.find((name) => schemas[name] !== undefined);
         let compactSecondaryProse = false;
+      // Three different facts, never collapsed into one (review note
+      // 2026-10-21): a product may be NOT FOUND YET (more pages, or a source
+      // did not answer), NOT CONNECTED (in the catalog, no connection), or
+      // UNSUPPORTED (no app of that name among the connectable apps).
+      const appHintFor = (): string | undefined => {
+        if (!rows.some((row) => appIdentityOf(row.name))) return undefined;
+        const base = 'Each provider result names its app. Never substitute an app with a similar name for a product the owner named. ';
+        if (renderedUnavailable.length > 0 || nextCursor) {
+          return base + 'This search is not complete (a source did not answer, or more pages remain): a product with no result here is NOT FOUND YET, not absent; retry or continue before saying anything about it.';
+        }
+        let catalog: readonly { slug: string; name: string }[] = [];
+        try { catalog = listCachedToolkits(); } catch { catalog = []; }
+        if (catalog.length === 0) return base + 'The app catalog could not be read, so absence from these results proves nothing.';
+        const words = new Set(query.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length >= 4));
+        const compact = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const named = catalog.filter((toolkit) => {
+          const slug = toolkit.slug.trim().toLowerCase();
+          const name = toolkit.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+          return Boolean(slug) && (words.has(slug) || words.has(name) || (name.length >= 6 && compact.includes(name)));
+        });
+        const shownToolkits = new Set(rows.flatMap((row) => { try { return [registeredToolkitOfSlug(row.name).trim().toLowerCase()]; } catch { return []; } }));
+        const namedButAbsent = named.filter((toolkit) => !shownToolkits.has(toolkit.slug.trim().toLowerCase()));
+        if (namedButAbsent.length > 0) {
+          return base + `${namedButAbsent.map((toolkit) => toolkit.name).join(', ')} is among the connectable apps but has no result here: it is NOT CONNECTED or its operations did not match; search tool_search for one of its operations by name to get the card that connects it.`;
+        }
+        if (named.length === 0) {
+          return base + `No app named in this search is among the ${catalog.length} connectable apps (UNSUPPORTED here). If the owner named such a product, say so plainly and offer the ways in: its own API with a key the owner supplies, a browser session the owner signs into, or another source they already have.`;
+        }
+        return undefined;
+      };
         const render = (): string => JSON.stringify({
           query,
           ...(role_key ? { role_key } : {}),
@@ -2534,11 +2564,7 @@ export function registerToolSearchTool(
             : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint: hintForRows(rows, schemaReadRequired.size > 0),
-          ...(rows.some((row) => appIdentityOf(row.name)) ? {
-            app_hint: 'Each provider result names its app. If the owner named a product and no result here belongs to that product, '
-              + 'it is not connectable here: say so plainly, never substitute an app with a similar name, and offer the ways in '
-              + '(the product\'s own API with a key the owner supplies, a browser session the owner signs into, or another source they already have).',
-          } : {}),
+          ...(appHintFor() ? { app_hint: appHintFor() } : {}),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,

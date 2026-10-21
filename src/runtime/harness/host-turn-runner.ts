@@ -10567,6 +10567,43 @@ const runHostTurnBody = async (
         refusedByMarker: (item) => hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch',
       });
       if (stepDispatch === 'dispatched') consecutiveStepsWithoutDispatch = 0;
+      // The same operation refused for the same reason again, with a
+      // successful sibling (a read) in the same step: the no-dispatch streak
+      // never trips and, counted only on no-dispatch steps, neither did the
+      // cap (review note 2026-10-21). Refusals are counted on every step.
+      const refusedInDelta = streakDelta.some((item) => hostToolDispositionOutput(item)?.disposition === 'refused_pre_dispatch');
+      if (stepDispatch === 'dispatched' && refusedInDelta) {
+        const refusalDetail = lastHostRefusalDetail(history);
+        const refusedOperations = streakDelta.flatMap((entry) => {
+          const row = entry as unknown as Record<string, unknown>;
+          if (row.type !== 'function_call') return [];
+          try {
+            const argumentsJson = row.arguments;
+            return typeof row.name === 'string'
+              ? [unwrapRuntimeEffectiveToolIdentity(row.name, typeof argumentsJson === 'string' ? JSON.parse(argumentsJson) : argumentsJson).toolName ?? row.name]
+              : [];
+          } catch { return typeof row.name === 'string' ? [row.name] : []; }
+        });
+        const refusalKey = refusalDetail && !isOffMachineCardStaged(refusalDetail)
+          ? identicalRefusalKey(refusedOperations, refusalDetail) : null;
+        const repeatedRefusals = refusalKey ? (identicalRefusalCounts.get(refusalKey) ?? 0) + 1 : 0;
+        if (refusalKey) identicalRefusalCounts.set(refusalKey, repeatedRefusals);
+        if (repeatedRefusals >= HOST_IDENTICAL_REFUSAL_LIMIT) {
+          journalHostGuide('repeated_refusal_cap', { key: refusalKey, repeated: repeatedRefusals, streak: consecutiveStepsWithoutDispatch, mixedStep: true });
+          return blockedOutcome(
+            hostNoProgressBlockedText(
+              noProgressState,
+              'refused_before_dispatch',
+              admissibleRecoveryToolNames,
+              refusalDetail ?? lastConcreteToolError(),
+              turnIsPlanMode(),
+            ),
+            'control_no_progress_exhausted',
+            true,
+            `refused_before_dispatch:repeated:${repeatedRefusals}`,
+          );
+        }
+      }
       if (stepDispatch === 'none_dispatched') {
         consecutiveStepsWithoutDispatch += 1;
         const refusalDetail = lastHostRefusalDetail(history);
