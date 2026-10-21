@@ -15,7 +15,9 @@ export type ConversationTaskExpansion = Partial<Record<ConversationTaskGroupKind
 const GROUPS: ReadonlyArray<{ kind: ConversationTaskGroupKind; title: string; defaultOpen: boolean }> = [
   { kind: 'decision', title: 'Needs your input', defaultOpen: true },
   { kind: 'attention', title: 'Needs attention', defaultOpen: true },
-  { kind: 'background', title: 'Background work', defaultOpen: false },
+  // Open while it runs: folded, an agent at work was invisible in the thread
+  // (owner 2026-10-21: "today it's just the top header").
+  { kind: 'background', title: 'Background work', defaultOpen: true },
   { kind: 'finished', title: 'Finished work', defaultOpen: false },
   { kind: 'stopped', title: 'Stopped work', defaultOpen: false },
 ];

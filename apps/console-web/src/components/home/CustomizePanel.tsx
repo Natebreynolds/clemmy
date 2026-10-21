@@ -54,7 +54,7 @@ const PANE_LABELS: Record<HomePaneId, string> = {
   quick_actions: 'Quick actions',
   needs_you: 'Needs you',
   today: 'Today',
-  running: 'Running',
+  running: 'Working now',
   while_away: 'What came back',
   made: 'Made',
   projects: 'More Spaces',

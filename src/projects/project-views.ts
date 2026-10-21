@@ -268,6 +268,19 @@ export function delegatedTasksForAgent(agentId: string, limit = 30): DelegatedTa
   return delegatedTasks((task) => task.delegation?.agentId === agentId, limit);
 }
 
+/**
+ * Every background task still moving, whoever owns it: the work a Home card
+ * shows while it runs. A task Clem runs herself has no delegation and reads
+ * as hers; a plan's internal workers are never listed. Newest first.
+ */
+export function openBackgroundTaskViews(limit = 12): DelegatedTaskView[] {
+  return listBackgroundTasks({ includeArchived: false })
+    .filter((task) => !task.internal && !TERMINAL.has(task.status))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, limit)
+    .map(delegatedTaskView);
+}
+
 export interface AssignmentView {
   agentId: string;
   agentName: string;

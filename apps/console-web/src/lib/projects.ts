@@ -39,6 +39,7 @@ export const projectKeys = {
   localProjects: ['project-records', 'local-projects'] as const,
   pageDocument: (projectId: string, pageId: string, reload: number) => ['project-records', 'page-document', projectId, pageId, reload] as const,
   sessionTasks: (sessionId: string) => ['delegated-tasks', 'session', sessionId] as const,
+  openTasks: ['delegated-tasks', 'open'] as const,
   agentAssignments: (agentId: string) => ['agents', 'assignments', agentId] as const,
 };
 
@@ -394,6 +395,11 @@ export const getDelegatedTask = (taskId: string) =>
 export const listConversationTasks = (sessionId: string) =>
   apiGet<{ tasks?: DelegatedTask[] }>(`/api/console/sessions/${id(sessionId)}/delegated-tasks`)
     .then((r) => r.tasks ?? []);
+
+/** Every task still moving, whoever owns it: what Home shows while an agent
+ *  (or Clem) works in the background. Newest first. */
+export const listOpenTasks = (limit = 12) =>
+  apiGet<{ tasks?: DelegatedTask[] }>(`${TASKS}?limit=${limit}`).then((r) => r.tasks ?? []);
 
 /**
  * Correct a task. Work still open takes the correction itself; work that

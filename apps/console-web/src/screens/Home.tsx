@@ -63,6 +63,8 @@ import { buildHomeContentLayout } from '@/components/home/home-content-layout';
 import { listWatches } from '@/lib/watches';
 import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
+import { DelegatedTaskCard } from '@/components/projects/DelegatedTaskCard';
+import { listOpenTasks } from '@/lib/projects';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 import '@/components/home/home-presence.css';
 
@@ -97,6 +99,10 @@ function LiveHome() {
   // Shared with the shell's badge; Home reads it for the live band only (the
   // board owns the detail).
   const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
+  // The jobs still moving, as task records: Home draws the same card for each
+  // that the chat draws, so an agent at work is a card here and not only a
+  // line in the header.
+  const openTasks = usePoll(['delegated-tasks', 'open'], () => listOpenTasks(), 12_000);
   const spaces = usePoll(['spaces'], listSpaces, 60_000);
   const userContext = usePoll(['user-context'], getContext, 300_000);
   const builds = useHomeBuilds({
@@ -227,10 +233,12 @@ function LiveHome() {
     updates: away.updates,
     attention: away.attention,
     settled: immediateSettled,
-    workRows: workingView.total,
+    workRows: Math.max(workingView.total, openTasks.data?.length ?? 0),
   }));
   const showNeeds = !daemonUnreachable && shown('needs_you') && (!silent.has('needs_you') || clemWaiting > 0);
   const showRecent = !daemonUnreachable && shown('while_away') && (!silent.has('while_away') || clemUpdates > 0);
+  const openTaskRows = openTasks.data ?? [];
+  const showRunning = !daemonUnreachable && shown('running') && openTaskRows.length > 0;
   // Today appears once a calendar is connected (or while its read is loading);
   // Tune lists it either way.
   const showToday = !daemonUnreachable && shown('today') && (today.isLoading || today.isError || Boolean(today.data?.connected));
@@ -246,7 +254,7 @@ function LiveHome() {
 
   // Nothing placed, building, waiting or chosen — and we actually KNOW that.
   const homeIsBare = immediateSettled && !daemonUnreachable && !layout.isLoading && Boolean(layout.data)
-    && tiles.length === 0 && liveBuilds.length === 0 && !showNeeds && !showRecent && !showToday && lowerPanes.length === 0
+    && tiles.length === 0 && liveBuilds.length === 0 && !showNeeds && !showRecent && !showToday && !showRunning && lowerPanes.length === 0
     && !(shown('quick_actions') && prefs.quickActions.length > 0);
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
@@ -304,6 +312,17 @@ function LiveHome() {
   );
   const todayPane = (
     <TodayPane headingId="home-today" today={today.data} loading={today.isLoading} error={today.isError && !today.data} onRetry={() => { void today.refetch(); }} maxRows={prefs.style === 'briefing' ? 6 : 5} />
+  );
+  const runningPane = (
+    <section aria-labelledby="home-running" className="flex min-w-0 flex-col gap-2.5">
+      <SectionHeader id="home-running" label="Working now" count={openTaskRows.length} countTone="muted" />
+      <div className="flex flex-col gap-2">
+        {openTaskRows.map((task) => (
+          <DelegatedTaskCard key={task.taskId} task={task} beside={openTaskRows} compact
+            onChanged={() => { void openTasks.refetch(); }} />
+        ))}
+      </div>
+    </section>
   );
   const recentPane = (variant: 'list' | 'timeline') => (
     <WhileAwayPane headingId="home-while-away" items={recent} loading={ccLoading} error={ccError} onRetry={retryCommandCenter} variant={variant}
@@ -368,6 +387,7 @@ function LiveHome() {
   const paneContent = new Map<HomePaneId, ReactNode>([
     ['needs_you', showNeeds ? needsPane(prefs.style === 'briefing' ? 'strip' : 'list', prefs.style === 'briefing' ? 3 : 2) : null],
     ['today', showToday ? todayPane : null],
+    ['running', showRunning ? runningPane : null],
     ['while_away', showRecent ? recentPane(prefs.style === 'briefing' ? 'timeline' : 'list') : null],
     ['quick_actions', quickActions],
     ...lowerPanes.map(id => [id, renderLower(id)] as [HomePaneId, ReactNode]),

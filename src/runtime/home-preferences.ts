@@ -65,7 +65,7 @@ export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   style: 'dashboard',
   liveStatus: 'animated',
   spaceViews: {},
-  panes: { order: ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions'], hidden: ['workstate'] },
+  panes: { order: ['needs_you', 'running', 'today', 'while_away', 'made', 'projects', 'quick_actions'], hidden: ['workstate'] },
   nav: {
     // Chat is the main feature; it is pinned, not folded. Spaces (/workspaces)
     // keep the product name the phone already uses.

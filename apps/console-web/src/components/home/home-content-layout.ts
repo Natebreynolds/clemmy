@@ -2,7 +2,7 @@ import type { HomePaneId, HomeStyle } from '../../lib/home-prefs';
 
 export type HomeContentBlock = { kind: 'spaces' } | { kind: 'panes'; panes: HomePaneId[] };
 
-const immediate = new Set<HomePaneId>(['today', 'needs_you', 'while_away']);
+const immediate = new Set<HomePaneId>(['today', 'needs_you', 'running', 'while_away']);
 
 /** Compose already-filtered panes without changing the owner's relative order.
  * Spaces has one fixed position per style; only adjacent immediate panes share

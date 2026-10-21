@@ -27,7 +27,7 @@ test('current decisions and unfinished work lead; routine work and finished reco
   assert.deepEqual(groups.map(group => [group.kind, group.tasks.map(row => row.taskId)]), [
     ['decision', ['question']], ['attention', ['failed']], ['background', ['working']], ['finished', ['complete']], ['stopped', ['stopped']],
   ]);
-  assert.deepEqual(groups.map(group => conversationTaskGroupOpen(group, {})), [true, true, false, false, false]);
+  assert.deepEqual(groups.map(group => conversationTaskGroupOpen(group, {})), [true, true, true, false, false]);
   assert.equal(groups[0].tasks[0], rows[4], 'the actual task and its controls pass through unchanged');
 });
 

@@ -23,7 +23,7 @@ import {
   saveAssignment, saveResource, updateProject, type ProjectOrigin, type ProjectResourceKind,
 } from './project-record.js';
 import {
-  agentWork, delegatedTaskById, delegatedTasksForSession, projectLabelsForSessions, projectOverview, projectSummaries,
+  agentWork, delegatedTaskById, delegatedTasksForSession, openBackgroundTaskViews, projectLabelsForSessions, projectOverview, projectSummaries,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
 import { admitLocalProject, chooseLocalProject, foundLocalProjects, localProjects } from './local-projects.js';
@@ -497,6 +497,14 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       return;
     }
     res.json({ fact: moved.fact });
+  });
+
+  // The work still moving, whoever owns it: what a Home card shows while an
+  // agent (or Clem) works in the background.
+  add('get', mount.tasks, (req, res) => {
+    const limitRaw = Number.parseInt(String(req.query.limit ?? '12'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 50) : 12;
+    res.json({ tasks: openBackgroundTaskViews(limit), generatedAt: new Date().toISOString() });
   });
 
   add('get', `${mount.tasks}/:taskId`, (req, res) => {

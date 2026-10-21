@@ -78,6 +78,7 @@ export interface HomePreferences {
  */
 export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
   'needs_you',
+  'running',
   'today',
   'while_away',
   'made',
@@ -86,12 +87,14 @@ export const DEFAULT_HOME_PANE_ORDER: HomePaneId[] = [
 ];
 
 /**
- * Panes Home no longer draws. `running` moved to the board (/tasks), which
- * owns Clem's work in detail; Home keeps a one-line summary that links there.
- * A saved record that still names one keeps every other choice exactly — the
- * id is skipped on read, never rewritten on the server's copy.
+ * Panes Home no longer draws. A saved record that still names one keeps every
+ * other choice exactly — the id is skipped on read, never rewritten on the
+ * server's copy. `running` was retired to the board on 09-26 and is back
+ * (owner 2026-10-21: an agent at work was "just the top header", and the
+ * board "doesn't do it justice"): Home draws the same task card the chat
+ * draws, one card per job.
  */
-export const RETIRED_HOME_PANES: ReadonlySet<HomePaneId> = new Set(['running']);
+export const RETIRED_HOME_PANES: ReadonlySet<HomePaneId> = new Set<HomePaneId>();
 
 export const DEFAULT_HOME_PREFERENCES: HomePreferences = {
   landing: 'home',

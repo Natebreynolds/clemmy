@@ -103,7 +103,7 @@ test('the shipped default puts work first and the two "talk to Clem" blocks last
   // sheet displays, rather than by the renderer overruling that order.
   assert.deepEqual(
     homeBlocks(visiblePanes(DEFAULT_HOME_PREFERENCES)),
-    ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'running', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
 });
 
@@ -149,7 +149,7 @@ test('the daemon\'s chips-first default is re-expressed as the chips-last defaul
   assert.deepEqual(migrated.panes.order, DEFAULT_HOME_PANE_ORDER);
   assert.deepEqual(
     homeBlocks(visiblePanes(migrated)),
-    ['needs_you', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
+    ['needs_you', 'running', 'today', 'while_away', 'made', 'projects', 'quick_actions', 'composer'],
   );
   const withMade = migrateHomePreferences(prefs(['quick_actions', 'needs_you', 'running', 'while_away', 'made', 'projects']));
   assert.deepEqual(withMade.panes.order, DEFAULT_HOME_PANE_ORDER);
@@ -167,15 +167,16 @@ test('an order the user actually saved is never re-expressed', () => {
   assert.deepEqual(migrateHomePreferences(reordered).panes.order, reordered.panes.order);
 });
 
-test('a saved order that still names the retired Running pane keeps every other choice', () => {
-  // Running moved to the board. The record on the daemon is not rewritten:
-  // the id is skipped on read and the owner's order and hidden set stand.
+test('a saved order that names the Running pane keeps it where the owner put it, now that Home draws it again', () => {
+  // Running went to the board on 09-26 and is back (owner 2026-10-21). A
+  // record saved in between is not rewritten: the owner's order and hidden
+  // set stand, and the pane simply shows in its saved place.
   const saved: HomePreferences = {
     ...DEFAULT_HOME_PREFERENCES,
     panes: { order: ['projects', 'running', 'quick_actions', 'needs_you', 'while_away', 'made', 'workstate'], hidden: ['made'] },
   };
   // Today is new: a saved order that predates it gets it at the end.
-  assert.deepEqual(visiblePanes(saved), ['projects', 'quick_actions', 'needs_you', 'while_away', 'workstate', 'today']);
+  assert.deepEqual(visiblePanes(saved), ['projects', 'running', 'quick_actions', 'needs_you', 'while_away', 'workstate', 'today']);
   assert.equal(saved.panes.order.includes('running'), true, 'the stored order itself is untouched');
 });
 

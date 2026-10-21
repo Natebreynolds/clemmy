@@ -251,3 +251,18 @@ test('duplicate, JSON5 and malformed metadata retain legacy per-project fallback
     }
   });
 });
+
+test('the open-work list carries every task still moving, whoever owns it, and nothing that ended', () => {
+  const p = project('Open Work');
+  const agentTask = task(p, 'Build the landing page', { status: 'running' });
+  const clemTask = tasks.createBackgroundTask({ title: 'Tidy the inbox', prompt: 'tidy', source: 'desktop' });
+  const ended = task(p, 'Yesterday\'s page', { status: 'done', completedAt: '2034-01-01T00:00:00.000Z' });
+  const open = views.openBackgroundTaskViews();
+  const ids = open.map((row) => row.taskId);
+  assert.ok(ids.includes(agentTask.id), 'the agent\'s running task is listed');
+  assert.ok(ids.includes(clemTask.id), 'a task Clem runs herself is listed too');
+  assert.ok(!ids.includes(ended.id), 'ended work is not open');
+  assert.equal(open.find((row) => row.taskId === agentTask.id)?.owner.agentName, 'Build the landing page');
+  assert.equal(open.find((row) => row.taskId === clemTask.id)?.owner.agentName, null, 'no agent: the owner reads as Clem');
+  assert.equal(open.find((row) => row.taskId === agentTask.id)?.phase, 'working');
+});

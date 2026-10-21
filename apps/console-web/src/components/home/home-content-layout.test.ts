@@ -65,7 +65,7 @@ test('all pane identities and their order survive mixed layouts, including retai
       for (const block of blocks) {
         if (block.kind !== 'panes' || block.panes.length === 1) continue;
         assert.ok(block.panes.length <= (style === 'dashboard' ? 3 : 2));
-        assert.ok(block.panes.every(pane => ['today', 'needs_you', 'while_away'].includes(pane)));
+        assert.ok(block.panes.every(pane => ['today', 'needs_you', 'running', 'while_away'].includes(pane)));
       }
     }
   }
