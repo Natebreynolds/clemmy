@@ -2096,7 +2096,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const run_shell_command = tool({
     name: 'run_shell_command',
     description: [
-      'Run a shell command in an allowed workspace directory. Ordinary commands, including local changes, run without asking. A destructive command, or one that changes something outside this machine, may first show the owner the exact command for a decision, depending on their Auto/Ask setting; a few dangerous commands are always refused. Has output and time limits.',
+      'Run a shell command in an allowed workspace directory. With cwd omitted it runs in ~/.clementine-next; the owner\'s Clem files live under files/ there (a Clem path such as clem-fixtures/note.md is ~/.clementine-next/files/clem-fixtures/note.md). Ordinary commands, including local changes, run without asking. A destructive command, or one that changes something outside this machine, may first show the owner the exact command for a decision, depending on their Auto/Ask setting; a few dangerous commands are always refused. Has output and time limits.',
       '',
       shellCwdGuidance(),
     ].join('\n'),
