@@ -58,7 +58,7 @@ const semanticPorts = await import('../semantic-boundary/turn-semantic-port-regi
 const approvalRegistry = await import('./approval-registry.js');
 const pendingActions = await import('./pending-actions.js');
 const { pendingActionApprovalViewFromArgs } = await import('./pending-action-view.js');
-const { handleResolvedApprovalForChatResume } = await import('./chat-approval-resume.js');
+const { handleResolvedApprovalForChatResume, _setApprovedActionSiblingWaitForTests, _resetChatApprovalResumeForTest } = await import('./chat-approval-resume.js');
 
 // No semantic port: the boundary admits each accepted source on its own
 // shadow graph, which is what the resume's hidden control edge needs too.
@@ -530,4 +530,183 @@ test('several commands of one kind staged for one request open as one review car
   assert.equal(siblings?.length, 1, JSON.stringify(narrated[0]));
   assert.equal(siblings[0]!.happened.verdict, 'executed');
   assert.ok(siblings[0]!.detail.includes('x=1') || siblings[0]!.detail.includes('x=2'), siblings[0]!.detail);
+});
+
+/**
+ * Two commands of one kind staged for one request, approved on one card:
+ * the members in card order, with a narrator installed that records every
+ * ending it is asked to voice. Nothing has been resumed yet.
+ */
+async function stagedPair(label: string, args: [Record<string, unknown>, Record<string, unknown>]) {
+  _setApprovalPrecheckRunForTests(async () => JSON.stringify({ ask: 'Can I run both?', why: 'They reach outside this computer.', conflicts: [] }));
+  let run: Awaited<ReturnType<typeof hostTurn>>;
+  try {
+    run = await hostTurn(label, 'Post x=1 and x=2 to the hook endpoint.', [
+      [call('call-discover-shell', 'tool_search', { query: 'run_shell_command', role_key: null, account_selection: null, limit: 1, cursor: null })],
+      (frame) => {
+        const result = JSON.parse(frame.toolResults.at(-1)!);
+        const discovery = result.type === 'text' ? JSON.parse(result.text) : result;
+        const row = discovery.results.find((candidate: { name: string }) => candidate.name === 'run_shell_command');
+        return args.map((one, index) => call(`call-post-${index + 1}`, row.carrier, {
+          requirement_id: row.capabilityRef, source_call_ids: null, source_record_ids: null,
+          universe_item_id: null, universe_selector: null, seal_amendment: null,
+          name: row.invocation.name, args_json: JSON.stringify(one),
+        }));
+      },
+      [text('Both are on one card. OK to go ahead?')],
+    ]);
+  } finally {
+    _setApprovalPrecheckRunForTests(null);
+  }
+  assert.equal(run.result.status, 'awaiting_approval', JSON.stringify({ status: run.result.status, frames: run.frames }).slice(0, 3_000));
+  const group = approvalRegistry.listPending({ sessionId: run.session.id, status: 'pending' }).find((row) => approvalRegistry.isApprovalGroup(row))!;
+  assert.ok(group, 'one group card');
+  const members = approvalRegistry.approvalGroupMembers(group) ?? [];
+  assert.equal(members.length, 2);
+  const resolved = approvalRegistry.resolve(group.approvalId, 'approved', 'desktop-chat-card');
+  assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  const narrated: Array<Record<string, unknown>> = [];
+  semanticPorts.installTurnSemanticModelPort({
+    async interpret() { throw new Error('not used by an approval'); },
+    async voiceApprovedActionEnding(call) {
+      narrated.push(call as unknown as Record<string, unknown>);
+      const siblings = (call.siblings ?? []).map((sibling) => `${sibling.detail}: ${sibling.happened.verdict}`).join('; ');
+      return { message: `Ending for ${call.action.detail} (${call.happened.verdict})${siblings ? ` with ${siblings}` : ''}.`,
+        evidenceDigest: call.evidenceDigest, modelIdentity: 'fixture' };
+    },
+  } as never);
+  // Endings after the card opened: the preparation turn's own terminal (the
+  // card) is not one of the set's endings.
+  const endingsBefore = eventlog.listEvents(run.session.id, { types: ['conversation_completed'] }).length;
+  const endings = () => eventlog.listEvents(run.session.id, { types: ['conversation_completed'] })
+    .slice(endingsBefore).map((event) => JSON.stringify(event.data));
+  const resume = (index: 0 | 1) => handleResolvedApprovalForChatResume(approvalRegistry.get(members[index]!.approvalId)!,
+    async () => { assert.fail('no model turn is spent on an approval'); });
+  const record = (index: 0 | 1) => pendingActions.getPendingAction(pendingActionApprovalViewFromArgs(members[index]!.args)!.id)!;
+  return { run, group, members, narrated, endings, resume, record, release: () => semanticPorts.installTurnSemanticModelPort(null) };
+}
+
+test('group completion: members settling at the same time end the set once, from their receipts', async () => {
+  received.length = 0;
+  const pair = await stagedPair('pair-simultaneous', [
+    { command: COMMAND, cwd: WORK, timeout_ms: 20_000 },
+    { command: `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`, cwd: WORK, timeout_ms: 20_000 },
+  ]);
+  _setApprovedActionSiblingWaitForTests({ waitMs: 5_000, pollMs: 25 });
+  try {
+    // Both resumes arrive together. The registry's durable ownership lets one
+    // run while the other queues behind its live run and is drained after it;
+    // the set still ends once. Drive the drain here so it cannot leak later.
+    const first = await Promise.all([pair.resume(0), pair.resume(1)]);
+    assert.ok(first.some(Boolean), JSON.stringify(first));
+    const until = Date.now() + 8_000;
+    while (Date.now() < until && !(pair.record(0).status === 'executed' && pair.record(1).status === 'executed' && pair.endings().length === 2)) {
+      for (const index of [0, 1] as const) if (pair.record(index).status !== 'executed') await pair.resume(index);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } finally {
+    _setApprovedActionSiblingWaitForTests(null);
+    pair.release();
+  }
+  assert.deepEqual(received.sort(), ['POST /hook x=1', 'POST /hook x=2'], 'each member ran exactly once');
+  assert.equal(pair.narrated.length, 1, 'one narration for the set');
+  assert.equal((pair.narrated[0]!.siblings as unknown[]).length, 1);
+  const texts = pair.endings();
+  assert.equal(texts.length, 2, 'each member keeps its own receipt');
+  assert.ok(texts.some((t) => /One reply covers the whole approved set/.test(t)), texts.join('\n'));
+  assert.ok(texts.some((t) => /Ending for .*x=2.*executed.* with .*x=1.*: executed/.test(t)), texts.join('\n'));
+
+  // Restart: the in-process memory is gone, the durable rows remain. Resuming
+  // both again dispatches nothing and ends nothing a second time.
+  _resetChatApprovalResumeForTest();
+  // A settled member reports nothing new to do (false): its source already
+  // carries its terminal, so the durable rows, not process memory, finalize.
+  const again = await Promise.all([pair.resume(0), pair.resume(1)]);
+  assert.deepEqual(again, [false, false], JSON.stringify(again));
+  assert.equal(received.length, 2, 'no duplicate dispatch after restart');
+  assert.equal(pair.endings().length, 2, 'no duplicate ending after restart');
+  assert.equal(pair.narrated.length, 1, 'no duplicate narration after restart');
+});
+
+test('group completion: a failed final member still ends the set once, naming the sibling that ran', async () => {
+  received.length = 0;
+  const pair = await stagedPair('pair-failed-final', [
+    { command: COMMAND, cwd: WORK, timeout_ms: 20_000 },
+    { command: `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`, cwd: path.join(HOME, 'no-such-folder'), timeout_ms: 20_000 },
+  ]);
+  _setApprovedActionSiblingWaitForTests({ waitMs: 5_000, pollMs: 25 });
+  try {
+    assert.equal(await pair.resume(0), true);
+    assert.equal(await pair.resume(1), true);
+  } finally {
+    _setApprovedActionSiblingWaitForTests(null);
+    pair.release();
+  }
+  assert.deepEqual(received, ['POST /hook x=1'], 'the member that could not start never reached the endpoint');
+  assert.equal(pair.record(0).status, 'executed');
+  assert.equal(pair.record(1).status, 'failed', pair.record(1).resultSummary ?? '');
+  assert.equal(pair.narrated.length, 1, 'one narration for the set');
+  const call = pair.narrated[0]!;
+  assert.equal((call.happened as { verdict: string }).verdict, 'never_started');
+  assert.deepEqual((call.siblings as Array<{ happened: { verdict: string } }>).map((s) => s.happened.verdict), ['executed']);
+  const texts = pair.endings();
+  assert.equal(texts.length, 2);
+  assert.ok(texts.some((t) => /never_started.* with .*x=1.*: executed/.test(t)), texts.join('\n'));
+  for (const t of texts) assert.doesNotMatch(t, /outstanding/);
+});
+
+test('group completion: a member that settles after the set has ended speaks for itself', async () => {
+  received.length = 0;
+  const pair = await stagedPair('pair-delayed', [
+    { command: COMMAND, cwd: WORK, timeout_ms: 20_000 },
+    { command: `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`, cwd: WORK, timeout_ms: 20_000 },
+  ]);
+  _setApprovedActionSiblingWaitForTests({ waitMs: 0, pollMs: 10 });
+  try {
+    // The speaker runs first and cannot wait: it reports the sibling as not
+    // finished. The sibling then lands and is told on its own.
+    assert.equal(await pair.resume(1), true);
+    assert.equal(pair.narrated.length, 1);
+    assert.deepEqual((pair.narrated[0]!.siblings as Array<{ happened: { verdict: string } }>).map((s) => s.happened.verdict), ['uncertain']);
+    assert.equal(await pair.resume(0), true);
+  } finally {
+    _setApprovedActionSiblingWaitForTests(null);
+    pair.release();
+  }
+  assert.deepEqual(received.sort(), ['POST /hook x=1', 'POST /hook x=2']);
+  assert.equal(pair.narrated.length, 2, 'the late member is voiced, not left as a quiet line');
+  assert.equal(pair.narrated[1]!.siblings, undefined, 'the late member speaks only for itself');
+  const texts = pair.endings();
+  assert.equal(texts.length, 2);
+  assert.ok(texts.every((t) => !/One reply covers the whole approved set/.test(t)), texts.join('\n'));
+});
+
+test('group completion: an owner Stop during the wait ends the speaker as stopped with its completed result kept', async () => {
+  received.length = 0;
+  const pair = await stagedPair('pair-stop', [
+    { command: COMMAND, cwd: WORK, timeout_ms: 20_000 },
+    { command: `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`, cwd: WORK, timeout_ms: 20_000 },
+  ]);
+  _setApprovedActionSiblingWaitForTests({ waitMs: 10_000, pollMs: 25 });
+  const startedAt = Date.now();
+  try {
+    const speaker = pair.resume(1);
+    // The owner stops this source while the speaker waits for its sibling.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const source = eventlog.listEvents(pair.run.session.id, { types: ['user_input_received'] })
+      .find((event) => event.data.approvalId === pair.members[1]!.approvalId && event.data.decision === 'approve')!;
+    assert.ok(source, 'the speaker has its own synthetic source');
+    eventlog.requestKill(pair.run.session.id, 'Controlled owner Stop.', { sourceUserSeq: source.seq });
+    assert.equal(await speaker, true);
+  } finally {
+    _setApprovedActionSiblingWaitForTests(null);
+    pair.release();
+  }
+  assert.ok(Date.now() - startedAt < 5_000, 'the Stop ended the wait at once');
+  assert.deepEqual(received, ['POST /hook x=2'], 'the completed write stays done; the stop did not undo or repeat it');
+  assert.equal(pair.record(1).status, 'executed', 'the receipt of the completed write is retained');
+  const texts = pair.endings();
+  assert.equal(texts.length, 1);
+  assert.match(texts[0]!, /Stopped\. Completed results are kept/, texts[0]);
+  assert.equal(pair.narrated.length, 0, 'no narration starts after an exact Stop');
 });
