@@ -35,6 +35,9 @@ interface SteerMessage {
   steer?: 'pending' | 'delivered' | 'failed' | 'queued' | 'held'; steerReceipt?: SteerReceipt;
   idempotencyKey?: string; requestSessionId?: string | null; steerNoteSeq?: number;
   pending?: 'sending' | 'failed'; pendingError?: string;
+  /** An addition the run ended without reading: sent on as its own message,
+   *  or held for the owner's tap. */
+  steerFollowUp?: 'sent' | 'held';
 }
 interface ReceiptEvent { type: string; sessionId?: string; seq: number; role?: string; data?: Record<string, unknown> }
 /** Admission is a display acknowledgement, independent of whether bounded
@@ -84,7 +87,28 @@ export function applySteerReceiptEvent<T extends SteerMessage>(messages: T[], ev
   }
   return next;
 }
-export function steerReceiptLabel(message: { steer?: string; steerReceipt?: SteerReceipt }): string {
+/** The request id an unread addition goes on with: fixed to the note, so the
+ *  daemon runs it once whichever window sends it. */
+export function steerFollowUpRequestId(receipt: Pick<SteerReceipt, 'sessionId' | 'noteSeq'>): string {
+  return `steer-followup:${receipt.sessionId.replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 120)}:${receipt.noteSeq}`;
+}
+
+/**
+ * The owner's additions a run ended without reading, that this view sent
+ * itself and has not followed up. Live 2026-10-21: "we cant even write notes?"
+ * reached the daemon 24 s before the run ended, no step read it, and it sat
+ * under "your message is kept" with nothing to send it on. A row only seen in
+ * history (no request id of this view's) is never sent on its own: opening an
+ * old chat does not fire an old message.
+ */
+export function unhandledSteerFollowUps<T extends SteerMessage>(messages: readonly T[]): T[] {
+  return messages.filter((message) => message.role === 'user' && message.steerReceipt?.state === 'unhandled'
+    && !message.steerFollowUp && Boolean(message.idempotencyKey) && message.text.trim().length > 0);
+}
+
+export function steerReceiptLabel(message: { steer?: string; steerReceipt?: SteerReceipt; steerFollowUp?: 'sent' | 'held' }): string {
+  if (message.steerFollowUp === 'sent') return 'Clem had finished, so this went as its own message';
+  if (message.steerFollowUp === 'held') return 'Clem finished before reading this';
   if (message.steerReceipt?.state === 'adopted') return 'Added to this run’s context';
   if (message.steerReceipt?.state === 'unhandled') return 'Run ended — use of this addition wasn’t confirmed; your message is kept';
   if (message.steerReceipt?.state === 'accepted' || message.steer === 'delivered') return 'Received for this run';

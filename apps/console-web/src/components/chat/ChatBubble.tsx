@@ -630,7 +630,7 @@ export function ChatBubble({
           {message.steer && (
             <p className="mt-1 text-caption text-muted">
               {steerReceiptLabel(message)}
-              {message.steer === 'held' && onSendHeld && (
+              {(message.steer === 'held' || message.steerFollowUp === 'held') && onSendHeld && (
                 <>
                   {' · '}
                   <button type="button" className="font-medium text-fg underline-offset-2 hover:underline"

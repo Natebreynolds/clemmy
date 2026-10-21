@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applySteerReceiptEvent, readSteerReceipt, steerReceiptLabel } from './steer-receipt.js';
+import { applySteerReceiptEvent, readSteerReceipt, steerFollowUpRequestId, steerReceiptLabel, unhandledSteerFollowUps } from './steer-receipt.js';
 import type { ChatMessage } from './types.js';
 
 const receipt = (state = 'accepted', changedAtSeq = 11) => ({ version: 1, sessionId: 'sess-receipt',
@@ -41,6 +41,31 @@ test('steer receipt: terminal receipts distinguish an unhandled saved addition f
   const final = applySteerReceiptEvent(adopted, { type: 'conversation_completed', sessionId: 'sess-receipt', seq: 14,
     data: { sourceUserSeq: 10, steerReceipts: [receipt('adopted', 12)] } }, 'sess-receipt');
   assert.equal(final[0]!.steerReceipt?.state, 'adopted');
+});
+
+test('steer receipt: an addition the run ended without reading goes on from the window that sent it, once', () => {
+  // Live 2026-10-21: "we cant even write notes?" sat under "your message is
+  // kept" with nothing to send it on.
+  const sent = { id: 'echo-1', role: 'user' as const, text: 'Synthetic addition', steer: 'pending' as const,
+    idempotencyKey: 'request-note', requestSessionId: 'sess-receipt' };
+  let rows = applySteerReceiptEvent<ChatMessage>([sent as ChatMessage], note(), 'sess-receipt');
+  rows = applySteerReceiptEvent(rows, { type: 'conversation_completed', sessionId: 'sess-receipt', seq: 14,
+    data: { sourceUserSeq: 10, steerReceipts: [receipt('unhandled', 14)] } }, 'sess-receipt');
+  assert.deepEqual(unhandledSteerFollowUps(rows).map((row) => row.id), ['echo-1']);
+  const id = steerFollowUpRequestId(rows[0]!.steerReceipt!);
+  assert.equal(id, 'steer-followup:sess-receipt:11');
+  assert.ok(/^[A-Za-z0-9._:-]{8,160}$/.test(id), 'a request id the daemon accepts');
+  const followed = rows.map((row) => ({ ...row, steerFollowUp: 'sent' as const }));
+  assert.deepEqual(unhandledSteerFollowUps(followed), [], 'followed up once');
+  assert.match(steerReceiptLabel(followed[0]!), /its own message/);
+  assert.match(steerReceiptLabel({ ...followed[0]!, steerFollowUp: 'held' }), /finished before reading/);
+  // A later receipt replay keeps the follow-up state.
+  const replayed = applySteerReceiptEvent(followed, { type: 'conversation_completed', sessionId: 'sess-receipt', seq: 15,
+    data: { sourceUserSeq: 10, steerReceipts: [receipt('unhandled', 15)] } }, 'sess-receipt');
+  assert.equal(replayed[0]!.steerFollowUp, 'sent');
+  // A row only seen in history (no request id of this window's) is not sent on its own.
+  const history = applySteerReceiptEvent<ChatMessage>([], note('unhandled', 14), 'sess-receipt');
+  assert.deepEqual(unhandledSteerFollowUps(history), []);
 });
 
 test('steer receipt: foreign identity, wrong source, malformed bounds and text-only matches are inert', () => {

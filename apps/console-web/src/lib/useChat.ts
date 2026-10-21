@@ -4,7 +4,7 @@ import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
-import { applySteerReceiptEvent, hasSteerAdmission, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import { applySteerReceiptEvent, hasSteerAdmission, steerFollowUpRequestId, unhandledSteerFollowUps, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
@@ -151,6 +151,8 @@ export interface ChatMessage {
    *  'queued' waits for the turn to end and then goes out as its own message;
    *  'held' waits for the owner's tap. */
   steer?: 'pending' | 'delivered' | 'failed' | 'queued' | 'held';
+  /** An addition the run ended without reading: sent on, or held for a tap. */
+  steerFollowUp?: 'sent' | 'held';
   steerReceipt?: SteerReceipt;
   steerNoteSeq?: number;
   idempotencyKey?: string;
@@ -1717,7 +1719,9 @@ export async function readReattachTurn(sessionId: string, input: {
 }
 
 /** What one send carries; a follow-up keeps it until the turn ends. */
-type ChatSendInput = { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void };
+type ChatSendInput = { text: string; displayText?: string; attachmentIds?: string[]; attachmentNames?: string[]; taskMode?: TaskMode; agentId?: string; agentName?: string | null; projectId?: string; projectName?: string | null; connectionResume?: { connectionRequestId: string; clientRequestId: string }; voice?: boolean; onAccepted?: () => void;
+  /** Sends an unread addition on as its own turn: this request id, and its existing bubble instead of a new one. */
+  followsSteerNote?: string };
 
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
@@ -2367,9 +2371,12 @@ export function useChat(options?: UseChatOptions) {
       ...prev,
       // The owner's bubble reads their own words (a card answer reads "Yes,
       // go ahead."); `text` still travels to the host exactly.
-      { id: userId, role: 'user', text: input.displayText?.trim() || text, attachmentNames: input.attachmentNames, taskMode,
+      // An unread addition sent on keeps its own bubble; no second copy.
+      ...(input.followsSteerNote ? [] : [
+      { id: userId, role: 'user' as const, text: input.displayText?.trim() || text, attachmentNames: input.attachmentNames, taskMode,
         ...(input.agentName !== undefined ? { agentName: input.agentName } : {}),
         ...(input.projectName !== undefined ? { projectName: input.projectName } : {}) },
+      ]),
       { id: assistantId, role: 'assistant', text: '', status: 'thinking', startedAt: Date.now(), taskMode, progress: taskMode?.kind === 'plan' ? 'Investigating with read-only tools…' : 'Starting up…' },
     ]);
     setBusy(true);
@@ -2387,7 +2394,8 @@ export function useChat(options?: UseChatOptions) {
         ...(projectId ? { projectId } : {}),
         ...(input.connectionResume ? { connectionRequestId: input.connectionResume.connectionRequestId } : {}),
         ...(input.voice ? { voice: true } : {}),
-      }, input.connectionResume ? () => input.connectionResume!.clientRequestId : undefined);
+      }, input.connectionResume ? () => input.connectionResume!.clientRequestId
+        : input.followsSteerNote ? () => input.followsSteerNote! : undefined);
       retainPending(pending);
       const body = await postPendingChatWithRetry(pending, {
         signal: postAbort.signal,
@@ -2519,12 +2527,47 @@ export function useChat(options?: UseChatOptions) {
     const [next, ...rest] = followUpsRef.current;
     followUpsRef.current = rest;
     const echo = messages.find((message) => message.id === next!.id);
+    if (next!.input.followsSteerNote) {
+      patch(next!.id, { steerFollowUp: 'sent' } as Partial<ChatMessage>);
+      void send(next!.input).catch(() => {
+        heldFollowUpsRef.current.set(next!.id, next!.input);
+        patch(next!.id, { steerFollowUp: 'held' } as Partial<ChatMessage>);
+      });
+      return;
+    }
     setMessages((prev) => prev.filter((message) => message.id !== next!.id));
     void send(next!.input).catch(() => {
       heldFollowUpsRef.current.set(next!.id, next!.input);
       if (echo) setMessages((prev) => [...prev, { ...echo, steer: 'held' }]);
     });
-  }, [busy, messages, send]);
+  }, [busy, messages, send, patch]);
+
+  // A message the server took as an addition to a run that then ended before
+  // any step read it is still the owner's message, not a dead end. It goes on
+  // as its own turn under the queued rule (a turn that ended on a question, a
+  // card, a plan or a Stop holds it for a tap), with a request id fixed to the
+  // note so the daemon runs it once whichever window sends it.
+  useEffect(() => {
+    if (busy) return;
+    const unhandled = unhandledSteerFollowUps(messages);
+    if (unhandled.length === 0) return;
+    const ended = [...messages].reverse().find((message) => message.role === 'assistant')?.status;
+    if (!stoppedRef.current && (ended === undefined || ended === 'thinking')) return;
+    const inputFor = (message: ChatMessage): ChatSendInput => ({ text: message.text,
+      followsSteerNote: steerFollowUpRequestId(message.steerReceipt!) });
+    const goes = !stoppedRef.current && followUpSendsAfter(ended) ? unhandled[0]! : null;
+    const held = unhandled.filter((message) => message.id !== goes?.id);
+    for (const message of held) heldFollowUpsRef.current.set(message.id, inputFor(message));
+    const heldIds = new Set(held.map((message) => message.id));
+    setMessages((prev) => prev.map((message) => message.id === goes?.id ? { ...message, steerFollowUp: 'sent' as const }
+      : heldIds.has(message.id) ? { ...message, steerFollowUp: 'held' as const } : message));
+    if (goes) {
+      void send(inputFor(goes)).catch(() => {
+        heldFollowUpsRef.current.set(goes.id, inputFor(goes));
+        patch(goes.id, { steerFollowUp: 'held' } as Partial<ChatMessage>);
+      });
+    }
+  }, [busy, messages, send, patch]);
 
   /** The owner's tap on a waiting message: it goes now, or right after the
    *  turn that is running. */
@@ -2535,6 +2578,14 @@ export function useChat(options?: UseChatOptions) {
     if (busyRef.current) {
       followUpsRef.current = [...followUpsRef.current, { id, input }];
       patch(id, { steer: 'queued' } as Partial<ChatMessage>);
+      return;
+    }
+    if (input.followsSteerNote) {
+      patch(id, { steerFollowUp: 'sent' } as Partial<ChatMessage>);
+      void send(input).catch(() => {
+        heldFollowUpsRef.current.set(id, input);
+        patch(id, { steerFollowUp: 'held' } as Partial<ChatMessage>);
+      });
       return;
     }
     const echo = messages.find((message) => message.id === id);
