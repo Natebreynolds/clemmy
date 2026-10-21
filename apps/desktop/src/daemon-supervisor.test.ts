@@ -159,7 +159,7 @@ test('a boot still making progress gets more time; a stale, foreign or stuck boo
   assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 90_000), true);
   assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 9999, 90_000), false, "a previous daemon's beacon never extends this boot");
   assert.equal(shouldExtendReadinessForLivenessBeacon({ ...booting, ageMs: 25_000 }, 4242, 90_000), false, 'a stale beacon means the boot is not progressing');
-  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 5 * 60_000), false, 'the whole wait stays bounded');
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 15 * 60_000), false, 'the whole wait stays bounded');
   assert.equal(shouldExtendReadinessForLivenessBeacon({ ...booting, beacon: { ...booting.beacon, phase: { name: 'daemon.boot.start', activeMs: 11 * 60_000 } } }, 4242, 90_000), false,
     'one phase past the stuck ceiling is a freeze');
   assert.equal(shouldExtendReadinessForLivenessBeacon(null, 4242, 90_000), false);
@@ -229,4 +229,15 @@ test('a Node started with the daemon\'s trust env trusts every system root', asy
     + 'process.stdout.write(String(t.getCACertificates("system").every((c)=>d.has(c))))';
   const env = { ...process.env, NODE_OPTIONS: '', ...daemonSystemTrustEnv({}) };
   assert.equal(execFileSync(process.execPath, ['-e', probe], { env, encoding: 'utf8' }), 'true');
+});
+
+test('a boot still making progress past five minutes is not killed by the clock; the stuck-phase ceiling and the bound still end it', () => {
+  // Live 2026-10-21: under full swap the daemon was advancing boot phases at
+  // 331 s when the five-minute cap killed it, and each restart redid the boot.
+  const booting = { beacon: { pid: 4242, phase: { name: 'daemon.boot.start', activeMs: 5_000 } } as never, ageMs: 1_000 };
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 6 * 60_000), true, 'six minutes of progress is still progress');
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 14 * 60_000), true);
+  assert.equal(shouldExtendReadinessForLivenessBeacon(booting, 4242, 15 * 60_000), false, 'the bound still ends it');
+  const stuck = { beacon: { pid: 4242, phase: { name: 'daemon.boot.start', activeMs: 11 * 60_000 } } as never, ageMs: 1_000 };
+  assert.equal(shouldExtendReadinessForLivenessBeacon(stuck, 4242, 6 * 60_000), false, 'a single phase past the ceiling is a hang, not a slow boot');
 });

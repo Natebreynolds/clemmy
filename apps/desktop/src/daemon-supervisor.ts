@@ -60,7 +60,12 @@ const READINESS_TIMEOUT_MS = 90_000;
 // under memory pressure a boot can outlast the base timeout, and killing it
 // only restarts the same slow boot.
 const READINESS_EXTENSION_MS = 60_000;
-const READINESS_MAX_MS = 5 * 60_000;
+// The bound on a boot that keeps making progress. Live 2026-10-21: with swap
+// full the daemon was still advancing boot phases at 331 s, the five-minute
+// cap killed it, and each restart redid the same slow boot while the machine
+// stayed loaded; the stuck-phase ceiling, not the clock, is what tells a
+// hung boot from a slow one.
+const READINESS_MAX_MS = 15 * 60_000;
 const READINESS_POLL_MS = 250;
 const SHUTDOWN_GRACE_MS = 5_000;
 const RESTART_BASE_MS = 1_000;
