@@ -848,10 +848,19 @@ export function ChatBubble({
                   const was = message.approval?.revises?.fields?.find((f) => f.name === field.name);
                   const changed = Boolean(was && was.value !== field.value);
                   const shown = field.label ?? field.display ?? field.value;
+                  // The words the action carries (a note, an email body) are
+                  // what the owner is approving: shown open as a page, never
+                  // folded (owner 2026-10-21: "I had to expand that"). A long
+                  // block with no prose in it (a script, raw data) still folds.
+                  const isMessage = !changed && field.name === editableField?.name && /\s/.test(String(shown).trim());
                   return (
                     <div key={field.name}>
                       <dt className="text-muted">{approvalFieldLabel(field.name)}</dt>
-                      {!changed && String(shown).length > 280 ? (
+                      {isMessage ? (
+                        <dd className="mt-1 max-h-[26rem] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-subtle px-3 py-2.5 text-small leading-relaxed text-fg">
+                          {shown}
+                        </dd>
+                      ) : !changed && String(shown).length > 280 ? (
                         <dd>
                           <details className="rounded-md border border-border bg-subtle">
                             <summary className="cursor-pointer px-2.5 py-1.5 font-semibold text-muted">Show the full {approvalFieldLabel(field.name).toLowerCase()}</summary>
