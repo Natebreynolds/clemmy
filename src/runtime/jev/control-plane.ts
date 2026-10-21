@@ -1181,6 +1181,9 @@ export async function tryJevCompletionVerdict(
      *  Jev is the only reader left (the reviewer could not run), it is
      *  always asked. */
     screening?: boolean;
+    /** A longer wait than the default screen, for a review that holds no reply
+     *  back (it runs after delivery). */
+    timeoutMs?: number;
     sessionId?: string;
     /** Complete host review rules plus applicable standing/skill context.
      * This is separate from selected historical evidence and is never clipped.
@@ -1397,7 +1400,7 @@ export async function tryJevCompletionVerdict(
   const result = await evaluateSystemOne({
     state,
     questions,
-    timeoutMs: COMPLETION_TIMEOUT_MS,
+    timeoutMs: opts?.timeoutMs ?? COMPLETION_TIMEOUT_MS,
     sessionId: opts?.sessionId,
     channel: 'jev-completion',
     decisionContext: sizeGateContext,

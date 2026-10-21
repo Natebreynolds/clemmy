@@ -4818,6 +4818,7 @@ const runHostTurnBody = async (
         // review rules (never clipped), not only in the evidence: a reply
         // that hands work off is judged as the hand-off.
         ...(delegatedJobs.length > 0 ? { delegatedJobs } : {}),
+        ...(deliveredReviewRun ? { reviewAfterDelivery: true } : {}),
         ...(planCandidate ? { reviewsPlan: true } : {}),
         // The full review guards what reached outside or cannot be restored;
         // a local file write that kept its earlier bytes takes the read depth.

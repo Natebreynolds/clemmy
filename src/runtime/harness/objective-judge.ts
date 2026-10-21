@@ -808,6 +808,11 @@ export interface SkillExecutionContext {
   /** The turn wrote or created nothing (a browser page visit is not output).
    *  Such an answer is checked by Jev alone. */
   producedNoOutput?: boolean;
+  /** The answer is already with the owner; this review settles its chip. Jev
+   *  may take longer here, since no reply waits (live 2026-10-21: the fast
+   *  screen timed out at 2.5 s twice while a just-dispatched agent's own Jev
+   *  calls were in flight, and the hand-off stayed unchecked). */
+  reviewAfterDelivery?: boolean;
 }
 
 /** Select the same options in their original read order, including both
@@ -2119,6 +2124,9 @@ export const WRITE_REVIEW_TIMEOUT_MS = 180_000;
  * before failing open — 93 s of "still working" for a list. Nothing ran and
  * nothing was written; the person was only waiting on the reviewer. */
 export const READ_REVIEW_TIMEOUT_MS = 30_000;
+/** Jev's wait for a review that runs after the answer was delivered: no reply
+ *  waits on it, so it may outlast a moment of Jev contention. */
+const DELIVERED_REVIEW_JEV_TIMEOUT_MS = 6_000;
 
 /**
  * Review depth follows what the review protects. Work that wrote to an app or
@@ -2474,7 +2482,7 @@ export async function judgeObjectiveComplete(
         return result;
       };
       const snapshot = Object.create(null) as Record<string, unknown>;
-      snapshot.context = fields(skillContext, ['reviewInputOwner', 'sessionId', 'skills', 'agentInstructions', 'delegatedJobs',
+      snapshot.context = fields(skillContext, ['reviewInputOwner', 'sessionId', 'skills', 'agentInstructions', 'delegatedJobs', 'reviewAfterDelivery',
         'completionEvidenceGuidance', 'toolCallSummary', 'verifiedReads', 'verifiedReadResults', 'historicalEvidence',
         'memoryRequirementContext', 'inheritedReadCoverage', 'reviewsPlan', 'reviewStakes', 'fullSourceEvidence']);
       // This copy is only a change detector. Original ownership still comes
@@ -2515,6 +2523,7 @@ export async function judgeObjectiveComplete(
       if (screening) screeningMemoryReader = judgeMemoryFor;
       return await tryJevCompletionVerdict(objective, assistantResponse, {
         ...(screening ? { screening: true } : {}),
+        ...(skillContext?.reviewAfterDelivery ? { timeoutMs: DELIVERED_REVIEW_JEV_TIMEOUT_MS } : {}),
         ...context,
         ...(expected ? { assessmentScope: { ...expected, signal: callerSignal },
           onAssessment: (value: import('../jev/control-plane.js').JevCompletionAssessment) => {
