@@ -32,3 +32,11 @@ test('the largest written part wins when a result holds several', () => {
   const small = { createdId: 'w#small', handle: 'hs', contentDigest: 'b'.repeat(64), text: text.slice(0, 250) };
   assert.equal(echoedWrittenContent(text, [small, written[0]!])?.createdId, 'write_file#c1');
 });
+
+test('a plan publication states its plan by size and digest, other scopes are shown whole', async () => {
+  const { requestScopeText } = await import('./host-completion-work.js');
+  const plan = requestScopeText('publish_plan', { full_text: 'x'.repeat(5000), readiness: 'ready' });
+  assert.match(plan, /the reviewed plan: 5000 chars, sha256 [0-9a-f]{16}/);
+  assert.ok(plan.length < 400);
+  assert.equal(requestScopeText('read_file', { path: '/a', max_chars: 10 }), '{"path":"/a","max_chars":10}');
+});

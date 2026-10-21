@@ -801,6 +801,25 @@ export function echoedWrittenContent(
   return undefined;
 }
 
+/** The request scope a result is judged against, as text. A plan publication
+ * carries the whole reviewed plan as its argument; that plan is already the
+ * review's objective, so its scope is stated by size and digest, never
+ * repeated (live 2026-10-21: 8.5 KB of plan prose twice in one review). */
+export function requestScopeText(toolName: string, args: unknown): string {
+  if (toolName === 'publish_plan' && args && typeof args === 'object' && !Array.isArray(args)) {
+    const record = args as Record<string, unknown>;
+    const fullText = typeof record.full_text === 'string' ? record.full_text : '';
+    const rest = Object.fromEntries(Object.entries(record).filter(([key]) => key !== 'full_text'));
+    return JSON.stringify({
+      ...rest,
+      full_text: fullText
+        ? `[the reviewed plan: ${fullText.length} chars, sha256 ${createHash('sha256').update(fullText, 'utf8').digest('hex').slice(0, 16)}; it is this review's objective and is not repeated here]`
+        : fullText,
+    });
+  }
+  return JSON.stringify(args);
+}
+
 export function sourceSettledReadEvidence(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -980,11 +999,11 @@ export function sourceSettledReadEvidence(input: {
       if (request.ok && request.authority.logicalCallId === row.callId) {
         requestArgs = request.authority.canonicalArgs;
         blocks.push(`${label}: VERIFIED REQUEST SCOPE:\n`
-          + JSON.stringify(request.authority.canonicalArgs));
+          + requestScopeText(row.toolName, request.authority.canonicalArgs));
       } else if (admittedRequest) {
         requestArgs = admittedRequest.args;
         blocks.push(`${label}: VERIFIED ADMITTED REQUEST SCOPE (sealed exact physical call):\n`
-          + JSON.stringify(admittedRequest.args));
+          + requestScopeText(row.toolName, admittedRequest.args));
       } else {
         // Legacy read transports retain a source/call-bound invocation event
         // but no sealed provider authority. Show its requested scope honestly;
@@ -1011,7 +1030,7 @@ export function sourceSettledReadEvidence(input: {
         }).find(contract => !contract.error && contract.toolName === row.toolName);
         requestArgs = recorded?.args;
         blocks.push(`${label}: RECORDED INVOCATION SCOPE (source/call-bound requested arguments, not a sealed wire call):\n`
-          + (recorded ? JSON.stringify(recorded.args) : 'unavailable'));
+          + (recorded ? requestScopeText(row.toolName, recorded.args) : 'unavailable'));
       }
       const projection = readsRetained ? loadRetainedReaderProjection({
         sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
@@ -1068,7 +1087,12 @@ export function sourceSettledReadEvidence(input: {
       // Callers without lookup still receive the answerer's whole retained page.
       // The answerer reading back the file it just wrote: the artifact block
       // already shows those exact bytes once, verified against the receipt.
-      const echoed = !row.mutating && !readsRetained && evidenceKind === 'source_result'
+      // Any result that carries the whole of a file this request wrote: the
+      // write's own returned receipt, a read-back, or a step note the answerer
+      // pasted it into (live 2026-10-21: two write receipts and two step
+      // notes each repeated an 11 KB deck). The artifact block shows those
+      // bytes once, verified against the receipt.
+      const echoed = evidenceKind !== 'retained_projection'
         ? echoedWrittenContent(value.rawPayload, input.writtenContents) : undefined;
       if (echoed) {
         hasRetainedJsonDigest = true;
@@ -1076,8 +1100,9 @@ export function sourceSettledReadEvidence(input: {
           physicalDispatchId: value.physicalDispatchId, contentDigest: value.rawPayloadSha256,
           rawByteCount: value.rawByteCount, shownByteCount: 0, contentComplete: false,
           contentDisposition: 'written_by_this_request',
-          ...(row.settlementIndex < lastWriteIndex ? { precedesWrite: true } : {}) });
-        blocks.push(`${label}: authenticated receipt; handle=${value.resultHandleId}; retained JSON sha256=${value.rawPayloadSha256}; retained JSON bytes=${value.rawByteCount}; content not repeated: this read returned exactly the current saved content of artifact ${echoed.createdId} (handle ${echoed.handle}, receipt digest ${echoed.contentDigest.slice(0, 16)}) that THIS request wrote, shown once in full in the artifact block. It is a read-back of that write, after it${row.settlementIndex < lastWriteIndex ? ' but before a later write of this request' : ''}; judge the content there.`);
+          ...(!row.mutating && row.settlementIndex < lastWriteIndex ? { precedesWrite: true } : {}) });
+        const what = row.mutating ? 'this write\'s returned result carries' : readsRetained ? 'this result carries' : 'this read returned';
+        blocks.push(`${label}: authenticated receipt; handle=${value.resultHandleId}; retained JSON sha256=${value.rawPayloadSha256}; retained JSON bytes=${value.rawByteCount}; content not repeated: ${what} exactly the current saved content of artifact ${echoed.createdId} (handle ${echoed.handle}, receipt digest ${echoed.contentDigest.slice(0, 16)}) that THIS request wrote, shown once in full in the artifact block${!row.mutating && row.settlementIndex < lastWriteIndex ? '; it settled before a later write of this request' : ''}. Judge the content there.`);
         continue;
       }
       const lookupPreview = input.lookupBacked === true && !row.mutating;
