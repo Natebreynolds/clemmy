@@ -2032,7 +2032,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const read_file = tool({
     name: 'read_file',
     description: [
-      'Read a file from an allowed workspace path.',
+      'Read a file from an allowed workspace path. A relative path (for example clem-fixtures/note.md) is inside Clem\'s files folder, where the owner\'s Clem files live; use it as given instead of searching for the file.',
       'The complete content is retained for recall_tool_result and tool_output_query. max_chars controls only the visible preview, never how much of the file is retained; null uses the normal result preview.',
       'UTF-8 text is returned as-is; PDF, Office and EPub documents, images (OCR) and audio (transcript) are extracted to Markdown.',
     ].join('\n'),
@@ -2077,7 +2077,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
   const write_file = tool({
     name: 'write_file',
     description: [
-      'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path.',
+      'Create, append to, or overwrite a UTF-8 file inside an allowed local workspace path. A relative path (for example clem-fixtures/note.md) lands inside Clem\'s files folder, where the owner\'s Clem files live.',
       'mode=create or null creates a new file and refuses to replace an existing one.',
       'Missing parent directories are created automatically inside the allowed workspace; a separate directory-creation step is unnecessary.',
       'mode=append appends content to the existing file, adding a newline boundary when needed.',
