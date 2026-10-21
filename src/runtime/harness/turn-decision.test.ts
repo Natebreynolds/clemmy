@@ -340,6 +340,18 @@ test('short generic ack ("Continuing.") is a punt', () => {
 
 // ── Marker contract ──────────────────────────────────────────────────────────
 
+test('ASK: a question on the marker line that the body repeats at the end is shown once, after her words', () => {
+  // Live 2026-10-21: a meeting summary opened and closed on the same question.
+  const body = 'ASK: What would you like me to act on?\n\n**Meeting summary**\n- A hiring exercise, not a client call.\n\nWhat would you like me to act on?';
+  const { kind, decision } = classifyTurnText(body, { toolCalls: 1 });
+  assert.equal(kind, 'ask');
+  assert.equal(decision?.nextAction, 'awaiting_user_input');
+  assert.equal(decision?.reply, '**Meeting summary**\n- A hiring exercise, not a client call.\n\nWhat would you like me to act on?');
+  // A question that is not repeated keeps the marker line as the question.
+  const single = classifyTurnText('ASK: Which calendar?\n\nI found two connected.', { toolCalls: 0 });
+  assert.equal(single.decision?.reply, 'Which calendar?\n\nI found two connected.');
+});
+
 test('ASK: marker → ask, body is the question shown to the user', () => {
   const { kind, decision } = classifyTurnText('ASK: Which calendar should I use — work or personal?', { toolCalls: 0 });
   assert.equal(kind, 'ask');

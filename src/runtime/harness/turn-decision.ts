@@ -192,6 +192,24 @@ function decisionFromObject(value: Record<string, unknown>): OrchestratorDecisio
 // output (the 2026-07-08 landing-page D_decision_unparsed failure class). Empty /
 // recovery-sentinel output returns null → the existing stall-retry path (unchanged).
 const ASK_DECISION_MARKER = /^\s*ASK:\s*([\s\S]+)$/i;
+
+/** "ASK: <question>", then her words, then the same question again: the
+ *  marker contract puts the question on the first line, and a reply that
+ *  answers first and asks last repeats it at the end. The leading copy is the
+ *  marker's, not hers; the words-then-question body is what the owner reads.
+ *  Live 2026-10-21: a meeting summary opened and closed on "What would you
+ *  like me to act on?" and the question card carried both. */
+function withoutLeadingAskCopy(body: string): string {
+  const firstBreak = body.search(/\r?\n/);
+  if (firstBreak < 0) return body;
+  const first = body.slice(0, firstBreak).trim();
+  const rest = body.slice(firstBreak).trim();
+  if (!first || !rest) return body;
+  const plain = (text: string) => text.replace(/[\s*_`"'\u201c\u201d\u2018\u2019]+/g, ' ').trim().toLowerCase();
+  const lastLine = rest.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) ?? '';
+  return plain(lastLine) === plain(first) ? rest : body;
+}
+
 /** The same marker after context the model wrote first, at a sentence end or
  *  a line break ("…site health.ASK: Can you link…"). Live 2026-10-16 that
  *  marker reached the owner verbatim inside the reply. */
@@ -513,7 +531,7 @@ function parseDecisionText(text: string): OrchestratorDecisionShape | null {
     };
   }
   if (ask && ask[1].trim()) {
-    const question = ask[1].trim();
+    const question = withoutLeadingAskCopy(ask[1].trim());
     return {
       summary: deriveDecisionSummary(question),
       reply: scrubInternalNarration(question) || question,
