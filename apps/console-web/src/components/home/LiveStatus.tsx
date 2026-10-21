@@ -49,7 +49,11 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
   const next = !unavailable && nextCheckAt && Date.parse(nextCheckAt) > Date.now() ? clockLabel(nextCheckAt) : '';
 
   if (compact) {
-    const second = current ? step : (next ? `Next check ${next}` : '');
+    // Who is on it, then the step: "Design Studio · Running 1 call" (owner
+    // 2026-10-21: the pill read "Thinking" for an agent's whole job).
+    const second = current
+      ? [current.entry.owner?.trim(), step].filter(Boolean).join(' · ')
+      : (next ? `Next check ${next}` : '');
     return (
       <button
         type="button"

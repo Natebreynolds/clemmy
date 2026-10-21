@@ -239,6 +239,12 @@ function LiveHome() {
   const showRecent = !daemonUnreachable && shown('while_away') && (!silent.has('while_away') || clemUpdates > 0);
   const openTaskRows = openTasks.data ?? [];
   const showRunning = !daemonUnreachable && shown('running') && openTaskRows.length > 0;
+  // The header pill lands on the cards it summarises.
+  const focusRunning = new URLSearchParams(location.search).get('focus') === 'running';
+  useEffect(() => {
+    if (!focusRunning || !showRunning) return;
+    document.getElementById('home-running')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [focusRunning, showRunning]);
   // Today appears once a calendar is connected (or while its read is loading);
   // Tune lists it either way.
   const showToday = !daemonUnreachable && shown('today') && (today.isLoading || today.isError || Boolean(today.data?.connected));

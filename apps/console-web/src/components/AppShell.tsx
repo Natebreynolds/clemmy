@@ -130,7 +130,9 @@ export function AppShell() {
           onToggleSidebar={toggleSidebar}
           runningCount={workingView.running}
           needsYouCount={needsYouCount}
-          onOpenTasks={() => navigate('/tasks')}
+          // The pill opens the work itself: Home's Working now cards, not
+          // the board (owner 2026-10-21: "I should be able to click this").
+          onOpenTasks={() => navigate('/?focus=running')}
           liveEntries={workingView.entries}
           liveMode={liveMode}
           nextCheckAt={today.data?.nextCheckAt ?? null}
