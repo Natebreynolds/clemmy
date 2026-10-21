@@ -24,6 +24,7 @@ const { registerConsoleRoutes } = await import('./console-routes.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const {
   projectActivitySnapshot,
+  projectBackgroundTaskActivity,
   projectForegroundWorkingNowEntry,
   projectForegroundWorkingNowSnapshot,
   projectWorkingNowSnapshot,
@@ -253,6 +254,29 @@ test('chat, background, and workflow work all appear in ONE projection', () => {
 
   const queued = entryFor(entries, 'workflow:act-queued');
   assert.equal(queued.lifecycle, 'queued', 'queued is queued — never running');
+});
+
+test('a task handed to an agent names the agent and, while its run has calls open, the step it is on', () => {
+  // Live 2026-10-21: Design Studio's two-minute build showed a bare title in
+  // the header pill with no owner and no step.
+  const task = createBackgroundTask({
+    title: 'Build a landing page',
+    prompt: 'build it',
+    source: 'desktop',
+    delegation: { agentId: 'design-studio', agentName: 'Design Studio', agentCreatedAt: null,
+      projectId: null, projectName: null, assignedBy: 'clem' },
+  });
+  const running = markBackgroundTaskRunning(task.id)!;
+  const quiet = projectBackgroundTaskActivity(running, '2026-10-21T16:38:00.000Z');
+  assert.equal(quiet.owner, 'Design Studio');
+  assert.equal(quiet.activity, undefined, 'no open call, no invented step');
+  const busy = projectBackgroundTaskActivity(running, '2026-10-21T16:38:00.000Z', { openCalls: { open: 1, settledForSource: 2 } });
+  assert.equal(busy.owner, 'Design Studio');
+  assert.equal(busy.activity?.phase, 'calling');
+  assert.equal(busy.activity?.text, 'Running 3 calls in parallel · 2 settled');
+  const plain = projectBackgroundTaskActivity(
+    createBackgroundTask({ title: 'Tidy the inbox', prompt: 'tidy', source: 'desktop' }), '2026-10-21T16:38:00.000Z');
+  assert.equal(plain.owner, undefined, 'no agent: no owner is invented');
 });
 
 test('revisions advance with durable evidence and never rewind', () => {

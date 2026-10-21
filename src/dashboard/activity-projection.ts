@@ -649,6 +649,10 @@ const BACKGROUND_TERMINALS: Record<string, SurfaceTerminal> = {
 export function projectBackgroundTaskActivity(
   task: BackgroundTaskRecord,
   observedAt: string,
+  live: {
+    /** Tool calls open in the task's own run right now, from the ledger. */
+    openCalls?: { open: number; settledForSource: number };
+  } = {},
 ): ActivityEntry {
   const lifecycle = BACKGROUND_LIFECYCLES[task.status] ?? 'accepted';
   const terminal = BACKGROUND_TERMINALS[task.status];
@@ -669,14 +673,25 @@ export function projectBackgroundTaskActivity(
     observedAt,
     revision: revisionFromEvidence(lastEvidenceAt),
     ...(terminal ? { typedTerminal: terminal } : {}),
+    // The step a running task is on, the same way a chat turn says it: only
+    // while its run has calls open (live 2026-10-21: an agent's task showed
+    // a bare title in the header pill for its whole two minutes).
+    ...(lifecycle === 'reasoning' && live.openCalls && live.openCalls.open > 0
+      ? { activityLabel: { phase: 'calling' as const, completed: live.openCalls.settledForSource,
+          total: live.openCalls.open + live.openCalls.settledForSource } }
+      : {}),
   });
   const nextAction = task.pendingQuestion && lifecycle === 'awaiting_input'
     ? 'Answer the question to continue.'
     : nextActionFor(lifecycle, terminal);
+  // Who is doing the work: the saved agent the task was handed to, so a
+  // surface can say "Design Studio" instead of "Task".
+  const owner = task.delegation?.agentName?.trim();
   return asEntry(snapshot, 'background', {
     taskId: task.id,
     sessionId: task.runSessionId,
     origin: task.source,
+    ...(owner ? { owner } : {}),
     ...(nextAction ? { nextAction } : {}),
   });
 }
@@ -863,12 +878,17 @@ function projectActivitySnapshotInternal(
   } catch { /* the runs directory is optional */ }
 
   if (wants('background')) try {
-    for (const task of listBackgroundTasks()) {
-      // Worker windows and the exact reducer task are SUB-UNITS of a plan, not
-      // work in their own right. Projecting either would put a child beside the
-      // plan that owns it and count the same work twice.
-      if (task.internal || reducerTaskIds.has(task.id)) continue;
-      entries.push(projectBackgroundTaskActivity(task, observedAt));
+    // Worker windows and the exact reducer task are SUB-UNITS of a plan, not
+    // work in their own right. Projecting either would put a child beside the
+    // plan that owns it and count the same work twice.
+    const tasks = listBackgroundTasks().filter((task) => !task.internal && !reducerTaskIds.has(task.id));
+    let openCalls = new Map<string, { open: number; settledForSource: number }>();
+    try {
+      openCalls = countInFlightToolCallsForSessions(
+        tasks.filter((task) => task.status === 'running').map((task) => task.runSessionId));
+    } catch { /* the live-call count is an enrichment; a row still projects */ }
+    for (const task of tasks) {
+      entries.push(projectBackgroundTaskActivity(task, observedAt, { openCalls: openCalls.get(task.runSessionId) }));
     }
   } catch { /* the task store is optional */ }
 
