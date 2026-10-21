@@ -259,6 +259,10 @@ export interface ToolDecl {
   /** Authenticated result acknowledges coordination; it promises no host file.
    * This does not change effect authority or discharge child effects. */
   resultContract?: 'acknowledgement';
+  /** The call delivers to the owner (a notification). For a send step, one
+   *  successful call of such a tool is the send landing; it owes no write
+   *  receipt. */
+  ownerDelivery?: true;
   /** Re-reads only already-retained output; crosses nothing. See ToolRuntimeEffectOverride docs. */
   readsRetainedOutput?: boolean;
   /** Characters of one result shown inline, above the ordinary per-result
@@ -551,7 +555,7 @@ export const TOOL_REGISTRY: ToolDecl[] = [
   // (morning-briefing, 2026-09-01, five runs). host_only asks no consent and
   // stays out of business accounting; the taxonomy class stays `read` so the
   // approval floor and the sideEffect/classifyTool mirror are unchanged.
-  { name: 'notify_user', sideEffect: 'read', runtimeEffect: 'host_only', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Send a notification to the user via the notification queue.' },
+  { name: 'notify_user', sideEffect: 'read', runtimeEffect: 'host_only', ownerDelivery: true, tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'agentic', blockedFor: ['worker'], loopClass: 'mutating', actionTopologyRole: 'control', description: 'Send a notification to the user via the notification queue.' },
   { name: 'pending_action_execute', sideEffect: 'write', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'cli'], sdkLayer: 'authoring', blockedFor: ['worker'], needsApproval: false, loopClass: 'mutating', actionTopologyRole: 'control', delegationPrimitive: true, description: 'Execute the exact stored payload of an approved single-call pending action.' },
   { name: 'pending_action_get', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'Read one queued action with its exact payload, status, approval id, preview, and result h…' },
   { name: 'pending_action_list', sideEffect: 'read', tier: 'core', lanes: ['orchestrator', 'sdk-brain', 'sdk-worker', 'cli'], sdkLayer: 'read-only', actionTopologyRole: 'control', description: 'List durable pending actions.' },

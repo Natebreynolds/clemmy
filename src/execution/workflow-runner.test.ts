@@ -8486,3 +8486,37 @@ test('a drain reuses finished run records until their file changes', async () =>
   rmSync(fileA, { force: true });
   rmSync(path.join(WORKFLOW_RUNS_DIR, 'settled-scan-b.json'), { force: true });
 });
+
+test('a send step whose send is a notification to the owner is done when that notification went out', () => {
+  // Live 2026-10-21: the morning briefing was delivered every day through
+  // notify_user and the run was marked blocked every day ("sent nothing", or
+  // "refused every call" after one unrelated refusal), eight mornings in a row.
+  resetEventLog();
+  const sessionId = 'workflow:morning-briefing-fixture:brief';
+  HarnessSession.create({ id: sessionId, kind: 'workflow', channel: 'workflow', title: 'Briefing fixture', metadata: { source: 'workflow' } });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send the briefing.' } });
+  appendEvent({ sessionId, turn: 1, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'refused_pre_dispatch', sourceUserSeq: source.seq, tool: 'working_memory', callId: 'call-wm', refusalDetail: 'Current schema for working_memory: Missing required field(s)',
+  } });
+  appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'tool_called', data: { sourceUserSeq: source.seq, tool: 'notify_user', callId: 'call-notify', arguments: JSON.stringify({ title: 'Morning briefing', body: 'Nothing overdue.' }), accounting: 'top_level' } });
+  appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'notify_user', callId: 'call-notify', ok: true, result: 'Notification queued: 1' } });
+  const output = { notified: true, briefing_title: 'Morning briefing' };
+  const guarded = settlementGuardedStepOutput({
+    step: { id: 'brief', prompt: 'Give Nate a concise morning briefing.', sideEffect: 'send' },
+    sessionId, sourceUserSeq: source.seq,
+    toolUses: ['notify_user', 'workflow_step_result'],
+    output,
+  } as never);
+  assert.deepEqual(guarded, output, `the notification is the send: ${JSON.stringify(guarded)}`);
+
+  // Without the notification the same step is still not done.
+  const quiet = 'workflow:morning-briefing-fixture:quiet';
+  HarnessSession.create({ id: quiet, kind: 'workflow', channel: 'workflow', title: 'Briefing fixture (no send)', metadata: { source: 'workflow' } });
+  const quietSource = appendEvent({ sessionId: quiet, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send the briefing.' } });
+  const blocked = settlementGuardedStepOutput({
+    step: { id: 'brief', prompt: 'Give Nate a concise morning briefing.', sideEffect: 'send' },
+    sessionId: quiet, sourceUserSeq: quietSource.seq, toolUses: ['workflow_step_result'], output,
+  } as never) as { blocked?: boolean; reason?: string };
+  assert.equal(blocked.blocked, true);
+  assert.match(blocked.reason ?? '', /sent nothing|without calling any tool/);
+});

@@ -1,3 +1,4 @@
+import { TOOL_REGISTRY } from '../tools/tool-registry.js';
 import { workerStandingInstructions } from './workflow-worker-standing-instructions.js';
 import type { InlineCreationTestDeliveryIntent } from './inline-creation-test-delivery.js';
 import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
@@ -137,7 +138,7 @@ import {
 } from './workflow-run-workspace.js';
 import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
 import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
-import { sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
+import { listEvents, sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import {
   actionTopologyRoleForRuntimeCall,
@@ -10012,6 +10013,20 @@ function durableTerminalBlockedDetail(sessionId: string): string | undefined {
   }
 }
 
+/** Whether a tool that delivers to the owner returned successfully for this
+ * source: the send of a send step whose deliverable is a notification. */
+function ownerDeliveryLandedForSource(sessionId: string, sourceUserSeq: number): boolean {
+  try {
+    const deliveryTools = new Set(TOOL_REGISTRY.filter((entry) => entry.ownerDelivery === true).map((entry) => entry.name));
+    if (deliveryTools.size === 0) return false;
+    return listEvents(sessionId, { types: ['tool_returned'], sinceSeq: sourceUserSeq }).some((event) =>
+      event.data.sourceUserSeq === sourceUserSeq && event.data.ok === true
+      && typeof event.data.tool === 'string' && deliveryTools.has(event.data.tool));
+  } catch {
+    return false;
+  }
+}
+
 export function settlementGuardedStepOutput(input: {
   step: WorkflowStepInput;
   sessionId: string;
@@ -10082,10 +10097,16 @@ export function settlementGuardedStepOutput(input: {
   // finished without sending was reported completed (live 2026-10-16, after
   // the "nothing to change" exemption was closed for sends). Without one
   // confirmed or possibly-landed write, a send step is not done.
+  // A send whose deliverable is a notification to the owner lands without a
+  // write receipt: a successful owner-delivery call is the send. Live
+  // 2026-10-21: the morning briefing was delivered every day and the run was
+  // marked blocked every day ("sent nothing" / "refused every call").
+  const ownerDeliveryLanded = sideEffect === 'send' && ownerDeliveryLandedForSource(input.sessionId, input.sourceUserSeq);
   if (
     sideEffect === 'send'
     && input.continuesLandedWork !== true
     && audit.facts.confirmedWrites + (audit.facts.uncertainWrites ?? 0) === 0
+    && !ownerDeliveryLanded
   ) {
     const refusals = readPreDispatchRefusals(input.sessionId, input.sourceUserSeq);
     return {
@@ -10096,6 +10117,9 @@ export function settlementGuardedStepOutput(input: {
     };
   }
   if (audit.status === 'clean') return input.output;
+  // A send step whose deliverable was a notification to the owner has its
+  // business evidence: the delivery. It owes no read and no write receipt.
+  if (audit.status === 'no_business_evidence' && ownerDeliveryLanded) return input.output;
   // A declared write/send step that LOOKED and found nothing to change is
   // complete: it settled at least one successful read, attempted no mutation
   // at all, and its output satisfies its declared contract. Zero rows is a
