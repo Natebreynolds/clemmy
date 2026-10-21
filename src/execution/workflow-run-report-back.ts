@@ -546,7 +546,7 @@ function workflowOriginTerminalStatus(
     : null;
 }
 
-function workflowRunRecordFile(runId: string): string | null {
+export function workflowRunRecordFile(runId: string): string | null {
   const safe = runId.replace(/[^a-zA-Z0-9_.:-]/g, '');
   return safe && safe === runId ? path.join(WORKFLOW_RUNS_DIR, `${safe}.json`) : null;
 }
