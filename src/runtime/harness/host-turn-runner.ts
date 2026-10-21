@@ -8,7 +8,7 @@ export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT, identicalRefusalKey } from './dispatch-streak.js';
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
-import { liftNestedCarrierFields } from './carrier-field-lift.js';
+import { carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -11800,8 +11800,11 @@ const runHostTurnBody = async (
             const prepared = requirement ? await materializeLocalRuntimeToolArguments(selfNamed.toolName, selfNamed.args) : null;
             if (requirement && prepared) {
               directLocalCallRequirements.set(call.callId, requirement);
+              // The prepared outer contract carries only the carrier's own
+              // fields; a target field the model put beside the carrier has
+              // been folded into the prepared target arguments above.
               localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
-                JSON.stringify({ ...args, requirement_id: requirement, args_json: JSON.stringify(prepared.args) }));
+                JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirement, args_json: JSON.stringify(prepared.args) }));
             }
           }
           continue;
@@ -11823,7 +11826,7 @@ const runHostTurnBody = async (
         const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
         if (!prepared) continue;
         localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
-          JSON.stringify({ ...args, requirement_id: requirementId, args_json: JSON.stringify(prepared.args) }));
+          JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirementId, args_json: JSON.stringify(prepared.args) }));
       }
     }
     const repeatsCommittedCallId = canonicalCalls.some((call) => history.some((item) => {

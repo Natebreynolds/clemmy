@@ -14641,3 +14641,96 @@ test('a returned unacknowledged write freezes the next external sibling after it
     { logical_tool_call_id: 'dark-batch-sibling', execution_kind: 'refused_pre_dispatch', outcome_kind: 'invalid_arguments', physical_crossing_count: 0, requires_reconciliation: 0 },
   ]);
 });
+
+test('a steer that arrives while the model proposes a write is absorbed, and the next frame\'s write lands', async (t) => {
+  // Live 2026-10-21 (installed app, ringer S2): a steer note during a two-file
+  // job dropped the proposed frame correctly, then the very next write was
+  // admitted, never dispatched, and the turn died at
+  // exact_checkpoint_admission_exhausted with nothing written.
+  const steering = await import('./steer-notes.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  const priorCatalog = capabilityCatalogs.peekHostCapabilityCatalogFactory();
+  const priorFetch = globalThis.fetch;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  capabilityCatalogs.installHostCapabilityCatalogFactory(capabilityCatalogs.createHostCapabilityCatalogFactory());
+  globalThis.fetch = async () => { throw new Error('this local carrier fixture cannot use a network transport'); };
+  t.after(() => {
+    globalThis.fetch = priorFetch;
+    capabilityCatalogs.installHostCapabilityCatalogFactory(priorCatalog);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const file = path.join(TMP_HOME, `harness-steer-write-${++acceptedSerial}.md`);
+  const fiveSlides = '# Outline\n1\n2\n3\n4\n5\n';
+  const fourSlides = '# Outline\n1\n2\n3\n4\n';
+  // In-flight steering is owned by chat sessions (sess-…), as on the desktop.
+  const steerSession = eventlog.createSession({ id: `sess-steer-write-${acceptedSerial}`, kind: 'chat' });
+  const steerSource = eventlog.appendEvent({ sessionId: steerSession.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: `Create one new local markdown outline at ${file} with five numbered slides. Do not use external tools.` } });
+  const fixture = { session: steerSession, source: steerSource,
+    parent: { sessionId: steerSession.id, sourceUserSeq: steerSource.seq, counter: new brackets.ToolCallsCounter(8),
+      behaviorScopeId: `${steerSession.id}::turn:1` } as Record<string, unknown>,
+    context: { sessionId: steerSession.id, sourceUserSeq: steerSource.seq } };
+  const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `steer-write-${fixture.source.seq}` });
+  eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: fixture.source.data },
+    { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+  Object.assign(fixture.parent, { runAttemptId: attempt.attemptId });
+  t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
+  const primed = await semanticCompile.primePrimaryModelPlanningCatalog({ ...fixture.context, turn: 1 });
+  assert.equal(primed.ok, true);
+  if (!primed.ok) throw new Error('controlled local planning context unavailable');
+  let requirementId = '';
+  let modelCalls = 0;
+  const model = {
+    async getResponse(request: { input: Array<{ type?: string; callId?: string; output?: { text?: string }; content?: unknown }> }) {
+      modelCalls += 1;
+      const results = request.input.filter(item => item.type === 'function_call_result');
+      let output: unknown[];
+      if (modelCalls === 1) {
+        output = [toolCall('discover-steer-write', 'tool_search', { query: 'write_file', role_key: null, limit: 1 })];
+      } else if (modelCalls === 2) {
+        const found = results.find(item => item.callId === 'discover-steer-write');
+        const discovery = JSON.parse(found?.output?.text ?? '{}') as { results?: Array<{
+          name: string; capabilityVariants?: Array<{ variantId: string; capabilityRef: string }>;
+        }> };
+        requirementId = discovery.results?.find(row => row.name === 'write_file')?.capabilityVariants
+          ?.find(variant => variant.variantId === 'create')?.capabilityRef ?? '';
+        assert.ok(requirementId, 'actual local discovery must disclose the exact create-only capability');
+        output = [toolCall('stale-five-slide-write', 'work_call', { name: 'write_file', requirement_id: requirementId,
+          args_json: { path: file, content: fiveSlides, mode: 'create' } })];
+        // The owner changes the plan while this frame is being proposed.
+        steering.appendSteerNote(fixture.session.id, 'Change of plan: make it 4 slides, not 5.');
+      } else if (modelCalls === 3) {
+        assert.match(JSON.stringify(request.input), /make it 4 slides/, 'the steer reaches the next frame');
+        assert.equal(existsSync(file), false, 'the stale five-slide frame never dispatched');
+        // The live brain also put the write's optional nullable fields on the
+        // carrier itself; the host drops them when it completes the carrier.
+        output = [toolCall('four-slide-write', 'work_call', { name: 'write_file', requirement_id: requirementId,
+          args_json: { path: file, content: fourSlides }, mode: 'create', append: null, find: null })];
+      } else {
+        assert.equal(readFileSync(file, 'utf8'), fourSlides, 'the steered write landed with the new content');
+        output = [textMsg('Saved the four-slide outline.')];
+      }
+      return { responseId: `steer-write-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output };
+    },
+    getStreamedResponse: testModelStream,
+  };
+  const agent = await buildOrchestratorAgent({ ...fixture.context, userInput: String(fixture.source.data.text),
+    hostFreshPlanning: primed.planning, model: model as never, allowToolJit: true,
+    allowedToolNames: ['call_tool', 'tool_search', 'work_call', 'write_file'] });
+  const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>, undefined,
+    { hostJudgeCompletion: false, maxTurns: 6 });
+  const guides = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).map(row => row.data.kind);
+  const identities = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id AS id, tool_name AS tool, state FROM logical_tool_calls
+    WHERE session_id = ? AND source_user_seq = ?`).all(fixture.session.id, fixture.source.seq);
+  const settlements = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id AS id, outcome_kind AS outcome FROM logical_call_settlements
+    WHERE session_id = ? AND source_user_seq = ?`).all(fixture.session.id, fixture.source.seq);
+  const diagnostic = JSON.stringify({ terminal: outcome.terminal, finalOutput: outcome.finalOutput, modelCalls, fileExists: existsSync(file),
+    identities, settlements, guides: guides.filter(kind => kind !== 'model_memory_context') });
+  assert.ok(guides.includes('owner_steering_before_dispatch'), `the stale frame was dropped for the steer: ${diagnostic}`);
+  assert.equal(outcome.finalOutput, 'Saved the four-slide outline.', diagnostic);
+  assert.equal(outcome.terminal, undefined, `a steered write must not end blocked: ${JSON.stringify(outcome.terminal)} ${outcome.finalOutput}`);
+  assert.equal(outcome.finalOutput, 'Saved the four-slide outline.');
+  assert.equal(readFileSync(file, 'utf8'), fourSlides);
+  assert.equal(modelCalls, 4);
+});

@@ -636,7 +636,15 @@ export async function prepareNativeToolArguments(target: string, args: unknown):
       : [issue.path.join('.') || '(root)']);
     return { status: 'invalid', schema: inputSchema,
       ...(local.descriptions.get(target) ? { guidance: local.descriptions.get(target) } : {}),
-      detail: parsed.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '),
+      // A refused enum names its allowed values: "mode: Invalid input" sent
+      // the model to a tool search and a retry on every write (live
+      // 2026-10-21, `mode: "write"` against create|append|overwrite|replace).
+      detail: parsed.error.issues.map((issue) => {
+        const allowed = (issue as { values?: unknown }).values ?? (issue as { options?: unknown }).options;
+        const expected = Array.isArray(allowed) && allowed.length > 0 && allowed.length <= 12
+          ? ` (expected one of: ${allowed.map((value) => JSON.stringify(value)).join(', ')})` : '';
+        return `${issue.path.join('.') || '(root)'}: ${issue.message}${expected}`;
+      }).join('; '),
       violations: [...new Set(paths)] };
   }
   const completed = localSchema

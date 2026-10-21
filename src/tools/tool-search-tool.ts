@@ -30,6 +30,7 @@ import { mcpToolAwaitsEffectLabel, mcpToolEffectApprovalOpen } from '../runtime/
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
 import { catalogEntries, rankCatalogEntriesLexically, toolSchemaSearchText, type RankedCatalogEntry } from '../agents/tool-catalog.js';
 import { composioSlugLooksWellFormed, registeredToolkitOfSlug } from '../integrations/composio/toolkit-slug.js';
+import { listCachedToolkits } from '../integrations/composio/client.js';
 import { currentlyServedOperationIdsForToolkit } from '../runtime/harness/current-manifest-operation-semantics.js';
 import { operationNamedInQuery, sameOperationName } from './operation-name-identity.js';
 import { successorSlugsFromProse } from '../integrations/composio/lifecycle-prose.js';
@@ -2218,6 +2219,29 @@ export function registerToolSearchTool(
           ? entry.effect : undefined;
       };
 
+      const toolkitIdentities = (() => {
+        let cached: Map<string, string> | null = null;
+        return (slug: string): string | undefined => {
+          if (!cached) {
+            cached = new Map();
+            try {
+              for (const toolkit of listCachedToolkits()) {
+                const key = toolkit.slug.trim().toLowerCase();
+                if (!key) continue;
+                const description = (toolkit.description ?? '').replace(/\s+/g, ' ').trim();
+                cached.set(key, description ? `${toolkit.name}: ${description.slice(0, 120)}` : toolkit.name);
+              }
+            } catch { /* no catalog cache: rows carry no app identity */ }
+          }
+          return cached.get(slug);
+        };
+      })();
+      const appIdentityOf = (name: string): string | undefined => {
+        try {
+          const toolkit = registeredToolkitOfSlug(name).trim().toLowerCase();
+          return toolkit ? toolkitIdentities(toolkit) : undefined;
+        } catch { return undefined; }
+      };
       const publicResult = (r: RankedWindowRow) => {
         const candidate = planningCandidateByName.get(r.name);
         // Only the host-issued seal can supply native execution semantics.
@@ -2254,6 +2278,12 @@ export function registerToolSearchTool(
         return ({
           name: r.name,
           summary: ('summary' in r ? r.summary : r.oneLiner).slice(0, 600),
+          // The app a provider operation belongs to, by its own name and
+          // description, so a lexical near-miss is visible as one: live
+          // 2026-10-21 "daily call volume" for a call-tracking product
+          // returned a video-meetings app's operation and it was taken as
+          // the product.
+          ...(appIdentityOf(r.name) ? { app: appIdentityOf(r.name) } : {}),
           ...(effect ? { effect } : {}),
           ...(perCallLocal ? {
             effectDecidedPerCall: true,
@@ -2504,6 +2534,11 @@ export function registerToolSearchTool(
             : {}),
           brokerCoverage: toolSearchBrokerCoverage(opts.candidateSources),
           hint: hintForRows(rows, schemaReadRequired.size > 0),
+          ...(rows.some((row) => appIdentityOf(row.name)) ? {
+            app_hint: 'Each provider result names its app. If the owner named a product and no result here belongs to that product, '
+              + 'it is not connectable here: say so plainly, never substitute an app with a similar name, and offer the ways in '
+              + '(the product\'s own API with a key the owner supplies, a browser session the owner signs into, or another source they already have).',
+          } : {}),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
           ...(nextCursor ? {
             next_cursor: nextCursor,

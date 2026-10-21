@@ -71,9 +71,30 @@ test('a field the carrier does not have, sent empty, is dropped; one with a valu
   for (const empty of [[], '']) {
     assert.equal('extra' in JSON.parse(liftNestedCarrierFields(JSON.stringify({ ...live, record_ids: undefined, extra: empty }))!.argumentsJson), false);
   }
-  assert.equal(liftNestedCarrierFields(JSON.stringify({ ...live, record_ids: ['r1'] })), null, 'a stray field with a value is not guessed at');
+  // A stray field WITH a value is the target's own field sent beside the
+  // carrier: it moves into args_json, where the target's schema judges it.
+  const moved = liftNestedCarrierFields(JSON.stringify({ ...live, record_ids: ['r1'] }))!;
+  const movedOuter = JSON.parse(moved.argumentsJson);
+  assert.equal('record_ids' in movedOuter, false);
+  assert.deepEqual(JSON.parse(movedOuter.args_json), { command: 'ls', cwd: null, timeout_ms: null, record_ids: ['r1'] });
+  assert.match(moved.changes.join(' '), /moved record_ids into args_json/);
   const clean = { ...live } as Record<string, unknown>;
   delete clean.record_ids;
   assert.equal(liftNestedCarrierFields(JSON.stringify(clean)), null, 'a well-formed carrier is untouched');
   assert.equal(liftNestedCarrierFields(JSON.stringify({ ...clean, proposal: null })), null, 'proposal is the carrier\'s own field');
+});
+
+test('a target field sent beside the carrier moves into args_json, and the inner value wins when both are sent', () => {
+  // Live 2026-10-21 shape: write_file's mode on the carrier, its optional fields null.
+  const live = { requirement_id: 'cap:local:write_file:create', name: 'write_file',
+    args_json: { path: '/tmp/deck.md', content: '# Outline' }, mode: 'create', append: null, find: null };
+  const lifted = liftNestedCarrierFields(JSON.stringify(live))!;
+  const outer = JSON.parse(lifted.argumentsJson);
+  assert.deepEqual(Object.keys(outer).sort(), ['args_json', 'name', 'requirement_id']);
+  assert.deepEqual(JSON.parse(outer.args_json), { path: '/tmp/deck.md', content: '# Outline', mode: 'create' });
+  assert.equal(lifted.target, 'write_file');
+  assert.match(lifted.changes.join(' '), /dropped append, find/);
+  assert.match(lifted.changes.join(' '), /moved mode into args_json/);
+  const both = liftNestedCarrierFields(JSON.stringify({ ...live, args_json: { ...live.args_json, mode: 'append' } }))!;
+  assert.equal(JSON.parse(JSON.parse(both.argumentsJson).args_json).mode, 'append', 'the inner value is the target\'s own');
 });

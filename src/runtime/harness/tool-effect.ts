@@ -27,6 +27,7 @@ import {
   stripMcpTransportPrefix as normalizedToolName,
 } from './runtime-tool-identity.js';
 import { carrierJsonObject } from './carrier-json.js';
+import { foldTargetFieldsIntoArgs } from './carrier-field-lift.js';
 
 /**
  * Runtime effect classification used by the guardrail and SDK call ceiling.
@@ -472,7 +473,14 @@ export function unwrapRuntimeEffectiveToolIdentity(
     const record = args as Record<string, unknown>;
     const target = typeof record.name === 'string' ? record.name.trim() : '';
     if (!target) return { toolName: tail, args };
-    const targetArgs = decodedToolArgs(record.args_json ?? record.args ?? {});
+    const decodedTarget = decodedToolArgs(record.args_json ?? record.args ?? {});
+    // A target field sent beside the carrier (live 2026-10-21: a write's
+    // `mode` next to name and args_json) is the target's argument. The
+    // logical identity minted here must name the same contract the lift
+    // dispatches, or the inner settlement is missing and the turn dies.
+    const targetArgs = decodedTarget && typeof decodedTarget === 'object' && !Array.isArray(decodedTarget)
+      ? foldTargetFieldsIntoArgs(record, decodedTarget as Record<string, unknown>).args
+      : decodedTarget;
     const alias = resolveCallToolAlias(target, targetArgs);
     if (alias?.ok) {
       return unwrapRuntimeEffectiveToolIdentity(

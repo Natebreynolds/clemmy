@@ -39,6 +39,32 @@ const CARRIER_OWN_FIELDS = new Set<string>([...CARRIER_FIELDS, 'name', 'args_jso
 const emptyValue = (value: unknown): boolean => value === null || value === undefined || value === ''
   || (Array.isArray(value) && value.length === 0);
 
+/**
+ * The target's arguments with any valued field sent beside the carrier folded
+ * in (a field the target already carries keeps the inner value). Admission
+ * and dispatch must name the same contract: the unwrap that mints the logical
+ * identity and the lift that completes the carrier both apply this rule, so
+ * a write's `mode` beside the carrier reaches the write under one digest.
+ */
+export function foldTargetFieldsIntoArgs(
+  carrier: Record<string, unknown>,
+  targetArgs: Record<string, unknown>,
+): { args: Record<string, unknown>; moved: string[] } {
+  const moved = Object.keys(carrier).filter((field) => !CARRIER_OWN_FIELDS.has(field)
+    && !emptyValue(carrier[field]) && !(field in targetArgs));
+  if (moved.length === 0) return { args: targetArgs, moved };
+  const args = { ...targetArgs };
+  for (const field of moved) args[field] = carrier[field];
+  return { args, moved };
+}
+
+/** The carrier record with only the carrier's own fields: what a prepared
+ * outer contract is digested from, after the target's fields have been folded
+ * into args_json by {@link foldTargetFieldsIntoArgs}. */
+export function carrierOwnFieldsOnly(carrier: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(carrier).filter(([field]) => CARRIER_OWN_FIELDS.has(field)));
+}
+
 export interface LiftedCarrierFields {
   argumentsJson: string;
   target: string;
@@ -72,10 +98,25 @@ export function liftNestedCarrierFields(argumentsJson: string): LiftedCarrierFie
     try { inner = record(JSON.parse(outer.args_json)); } catch { return strayOnly(); }
   }
   if (!inner) return strayOnly();
+  // A target's own field sent beside the carrier's (live 2026-10-21: a
+  // write's `mode: "create"` next to name and args_json, with its optional
+  // fields sent null) belongs inside args_json. Left outside, the target ran
+  // without it, its settlement was missing, and the turn died at the exact
+  // checkpoint. A field the target already carries inside keeps the inner
+  // value; the carrier's own fields are never moved.
+  const strayValued = Object.keys(outer).filter((field) => !CARRIER_OWN_FIELDS.has(field) && !(field in inner!));
+  if (strayValued.length > 0) {
+    for (const field of strayValued) { inner[field] = outer[field]; delete outer[field]; }
+    strayChange.push(`moved ${strayValued.join(', ')} into args_json: a field of the target, not the carrier`);
+  }
   const nested = CARRIER_FIELDS.filter((field) => field in inner!);
   // Only the carrier's own fields mark the shape; a target that merely has a
   // `name` parameter is left alone.
-  if (nested.length === 0 && !sentAsObject) return strayOnly();
+  if (nested.length === 0 && !sentAsObject) {
+    if (strayValued.length === 0) return strayOnly();
+    const target = typeof outer.name === 'string' ? outer.name.trim() : '';
+    return target ? { argumentsJson: JSON.stringify({ ...outer, args_json: JSON.stringify(inner) }), target, changes: strayChange } : null;
+  }
   const outerName = typeof outer.name === 'string' ? outer.name.trim() : '';
   const innerName = nested.length > 0 && typeof inner.name === 'string' ? inner.name.trim() : '';
   if (outerName && innerName && innerName !== outerName) return strayOnly();
