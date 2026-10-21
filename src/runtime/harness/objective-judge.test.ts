@@ -659,7 +659,7 @@ test('review depth follows what the review protects', async () => {
 
   const write = script({ done: true, reason: 'the sheet holds the requested rows' });
   const w = await reviewAtStakes('write', write.review);
-  assert.deepEqual(write.asked, [{ timeoutMs: WRITE_REVIEW_TIMEOUT_MS }], 'a write gets one full-depth review with time to finish');
+  assert.deepEqual(write.asked, [{ effort: 'medium', timeoutMs: WRITE_REVIEW_TIMEOUT_MS }], 'a write gets one full-depth review with time to finish');
   assert.equal(w.reviewDepth, 'full');
 
   for (const stakes of ['read', 'plan'] as const) {
@@ -776,7 +776,7 @@ test('a bounded reply correction goes to repair before a second review of the un
       asked.push(depth);
       return { verdict: { done: false, repairScope, reason: 'A write still requires full review.' }, failure: null };
     });
-    assert.deepEqual(asked, [{ timeoutMs: WRITE_REVIEW_TIMEOUT_MS }]);
+    assert.deepEqual(asked, [{ effort: 'medium', timeoutMs: WRITE_REVIEW_TIMEOUT_MS }]);
     assert.equal(result.verdict?.done, false);
     assert.equal(result.reviewDepth, 'full');
   }

@@ -2119,7 +2119,11 @@ export async function reviewAtStakes(
 ): Promise<CompletionJudgeRun> {
   evidence.signal?.throwIfAborted();
   if (stakes === 'write') {
-    const full = await review({ timeoutMs: WRITE_REVIEW_TIMEOUT_MS });
+    // Full evidence and the long deadline are what protect a write; the
+    // reviewer's reasoning length is not. Left to the provider's default, a
+    // two-draft review spent 54 s and 4.6k output tokens on a 400-character
+    // verdict (live 2026-10-21). Medium effort reads the same receipts.
+    const full = await review({ effort: 'medium', timeoutMs: WRITE_REVIEW_TIMEOUT_MS });
     evidence.signal?.throwIfAborted();
     return { ...full, reviewDepth: 'full' };
   }
