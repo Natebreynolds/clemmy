@@ -93,3 +93,33 @@ test('a failure that is not a scripted step\'s own exit is still read against th
   const notice = listNotifications(50).find((row) => row.metadata?.runId === runId);
   assert.equal(notice?.metadata?.failureCause, 'login_keychain_locked');
 });
+
+test('a step whose output failed its own contract is not told as a locked keychain, even while it is locked', async () => {
+  // Live 2026-10-21: a step returned an object instead of a path; the owner
+  // was told to unlock the keychain, true of the machine and nothing to do
+  // with the run, and the run was marked for a follow-up it did not need.
+  __loginKeychainTest__.setPlatform(() => 'darwin');
+  __loginKeychainTest__.setRunner(async () => ({ code: 51 }));
+  const slug = 'locked-contract';
+  const workflowName = 'Keychain locked-contract';
+  writeWorkflow(slug, {
+    name: workflowName, description: 'Writes a digest.', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'write_digest', prompt: 'Write the digest.', sideEffect: 'write', deterministic: { runner: 'write.mjs' },
+      output: { type: 'object', required_keys: ['path'] } }],
+  } as never);
+  const scripts = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(path.join(scripts, 'write.mjs'), 'process.stdout.write(JSON.stringify({ "clem-fixtures/digest.md": { exists: true } }));\n', 'utf-8');
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = `${slug}-${Date.now()}`;
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: workflowName, status: 'queued', inputs: {}, createdAt: new Date().toISOString() }), 'utf-8');
+  await processWorkflowRuns({} as never);
+  const run = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+  assert.equal(run.status, 'error');
+  assert.match(run.error, /failed its contract/, run.error);
+  assert.doesNotMatch(run.error, /keychain/i, 'the host diagnosed this failure itself');
+  assert.equal(run.failureContext, undefined);
+  const notice = listNotifications(50).find((row) => row.metadata?.runId === runId);
+  assert.equal(notice?.metadata?.failureCause, undefined, 'no follow-up on unlock for a contract failure');
+});

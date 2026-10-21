@@ -18362,8 +18362,16 @@ async function processOneRunFile(
       // mornings with the tool's own words and no follow-up), so every
       // non-cancelled failure asks once. Say what was locked first, and mark
       // the run for one follow-up when the keychain is unlocked again.
+      // A failure the host diagnosed itself (a step's output failed its own
+      // contract) is not a tool failing in its own words: the keychain is not
+      // asked about it, and the run is not marked for a follow-up when it
+      // unlocks. Live 2026-10-21: a step that returned an object instead of a
+      // path was told to the owner as "your login keychain is locked, run
+      // security unlock-keychain", true of the machine and nothing to do with
+      // the run.
+      const hostDiagnosed = error instanceof WorkflowContractViolationError;
       let keychainLockedAt: string | null = null;
-      if (!cancelled) {
+      if (!cancelled && !hostDiagnosed) {
         try {
           if ((await probeLoginKeychain()).state === 'locked') keychainLockedAt = new Date().toISOString();
         } catch { /* the probe never decides a failure */ }
