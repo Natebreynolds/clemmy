@@ -313,7 +313,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
       'Hand an AGREED, multi-step task to the reliable background runner (fire-and-forget).',
       'Call this ONLY AFTER you and the user have aligned on what to do (CONVERSE FIRST) and they want it run in the background rather than waited-on here.',
       'A whole job in a project that has a lead is handed to that lead this way once it is agreed: the owner chose that the project\'s jobs run under its lead, who plans the job, runs its own workers, and checks in here.',
-      'It runs in the daemon — board-visible, survives a restart — and reports its outcome back to THIS chat automatically when it finishes (or if it gets stuck or needs your input).',
+      'It runs in the daemon — shown as a card on Home and in this chat, survives a restart — and reports its outcome back to THIS chat automatically when it finishes (or if it gets stuck or needs your input).',
       'Pass the AGREED objective + the concrete steps you settled on (NOT the raw user message).',
       'After it returns: confirm to the user that it is running and that you will report back, then STOP — do NOT do the work yourself this turn, do NOT poll. The user is free to fire another task immediately.',
     ].join('\n'),
@@ -535,7 +535,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         `Dispatched "${task.title}"${owner} to the background (task ${task.id})`
         + (goal ? ' with a goal contract — it will keep working until the success criteria are met, not just run once' : '')
         + `. It's running in the daemon now and will report its result back HERE automatically when it finishes — or pause and ask you here if it needs a decision. `
-        + `Tell the user it's on it and that you'll report back; do NOT wait, poll, or do the work yourself this turn — you're free to take their next request right now. It's also watchable on the Tasks board.`,
+        + `Tell the user it's on it and that you'll report back; do NOT wait, poll, or do the work yourself this turn — you're free to take their next request right now. While it runs it shows as a card on Home and in this chat, where the user can steer or stop it.`,
       );
     },
   );

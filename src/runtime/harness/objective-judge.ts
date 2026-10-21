@@ -795,7 +795,7 @@ export interface SkillExecutionContext {
   /** Background jobs this request started, from the host record. The part
    *  of the request handed to one is judged as a hand-off: the job reports
    *  back under its own review, so its unproduced result is not a gap here. */
-  delegatedJobs?: ReadonlyArray<{ taskId: string; phase: string; title?: string; agentName?: string }>;
+  delegatedJobs?: ReadonlyArray<{ taskId: string; phase: string; title?: string; agentName?: string; instruction?: string; artifactDestination?: string }>;
   /** The candidate is a plan, reviewed before anything runs. */
   reviewsPlan?: boolean;
   /** What the review protects: work that wrote to an app or file, a plan

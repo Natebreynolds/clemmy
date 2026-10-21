@@ -754,7 +754,12 @@ function publishDelegatedTaskState(
         ...(delegation.projectId ? { projectId: delegation.projectId } : {}),
         ...(delegation.projectName ? { projectName: delegation.projectName } : {}),
         ...(typeof delegation.originSourceUserSeq === 'number' ? { sourceUserSeq: delegation.originSourceUserSeq } : {}),
-        ...(detail.instruction ? { instruction: clean(detail.instruction, 400) } : {}),
+        // The hand-off's own contract, so a reviewer of the turn that handed
+        // it off can see what the reply restates (the receipt says only that
+        // a task exists; live 2026-10-21 the reply's plan read as unsupported).
+        ...(detail.instruction ? { instruction: clean(detail.instruction, 400) }
+          : phase === 'dispatched' && task.prompt ? { instruction: clean(task.prompt, 400) } : {}),
+        ...(delegation.artifactDestination ? { artifactDestination: clean(delegation.artifactDestination, 200) } : {}),
         ...(detail.evidencePolicy ? { evidencePolicy: detail.evidencePolicy } : {}),
         ...(detail.reason ? { reason: clean(detail.reason, 400) } : {}),
         ...(detail.note ? { note: clean(detail.note, 600) } : {}),

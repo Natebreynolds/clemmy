@@ -2068,18 +2068,25 @@ class OwnerSteeringFenceError extends Error {
 /** The background jobs an accepted request started, as the host recorded
  *  them: their work happens after the reply, under their own review. */
 export function delegatedJobsStartedBy(identity: { sessionId: string; sourceUserSeq: number }): Array<{
-  taskId: string; phase: string; title?: string; agentName?: string;
+  taskId: string; phase: string; title?: string; agentName?: string; instruction?: string; artifactDestination?: string;
 }> {
-  const jobs = new Map<string, { taskId: string; phase: string; title?: string; agentName?: string }>();
+  const jobs = new Map<string, { taskId: string; phase: string; title?: string; agentName?: string; instruction?: string; artifactDestination?: string }>();
   try {
     for (const event of listEvents(identity.sessionId, { types: ['delegated_task_state'], sinceSeq: identity.sourceUserSeq })) {
       const data = event.data as Record<string, unknown>;
       if (event.role !== 'system' || data.sourceUserSeq !== identity.sourceUserSeq || typeof data.taskId !== 'string') continue;
+      const prior = jobs.get(data.taskId);
       jobs.set(data.taskId, {
         taskId: data.taskId,
         phase: typeof data.phase === 'string' ? data.phase : 'unknown',
         ...(typeof data.title === 'string' ? { title: data.title.slice(0, 160) } : {}),
         ...(typeof data.agentName === 'string' ? { agentName: data.agentName } : {}),
+        // The hand-off's contract and destination, from the state that
+        // first recorded them; a later state keeps them.
+        ...(typeof data.instruction === 'string' ? { instruction: data.instruction.slice(0, 400) }
+          : prior?.instruction ? { instruction: prior.instruction } : {}),
+        ...(typeof data.artifactDestination === 'string' ? { artifactDestination: data.artifactDestination.slice(0, 200) }
+          : prior?.artifactDestination ? { artifactDestination: prior.artifactDestination } : {}),
       });
     }
   } catch { /* the review proceeds on the turn's own evidence */ }
