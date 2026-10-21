@@ -551,6 +551,11 @@ export function journaledReviewEvidence(
         totalBytes: present.reduce((sum, section) => sum + Buffer.byteLength(section, 'utf8'), 0),
         sections: present.map((section) => ({
           head: section.replace(/\s+/g, ' ').slice(0, 60), bytes: Buffer.byteLength(section, 'utf8'),
+          // The largest host blocks inside the section, so a 38 KB read
+          // section says which reads it holds.
+          blocks: evidenceBlocks(section)
+            .map((block) => ({ head: block.replace(/\s+/g, ' ').slice(0, 80), bytes: Buffer.byteLength(block, 'utf8') }))
+            .sort((a, b) => b.bytes - a.bytes).slice(0, 8),
         })),
       },
     });
@@ -973,6 +978,7 @@ import {
 } from './expected-work-admission.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { visibleModelMemory, recordAcceptedModelMemory, acceptedModelMemoryEvidence } from './model-memory-evidence.js';
+import { evidenceBlocks } from './review-continuation.js';
 import { expectedTaskFor } from './resolution-ledger.js';
 import {
   classifyHostModelFrame,
@@ -4563,7 +4569,12 @@ const runHostTurnBody = async (
       }
       return 'done';
     }
-    const readEvidence = sourceSettledReadEvidence({ ...identity, omitSuccessfulDiscovery: Boolean(planCandidate),
+    // Successful discovery dumps are scaffolding for a plan under review and
+    // for a reviewed plan being executed: the plan carries its selected
+    // contracts either way. Failed discovery and actual reads stay visible.
+    const executingReviewedPlan = Boolean(acceptedPlanExecution(identity.sessionId, identity.sourceUserSeq));
+    const readEvidence = sourceSettledReadEvidence({ ...identity,
+      omitSuccessfulDiscovery: Boolean(planCandidate) || executingReviewedPlan,
       lookupBacked: !planCandidate, writtenContents: settled.contents });
     const judgedReply = decision?.reply?.trim() ? decision.reply : replyText;
     // Reuse a rejection only for the SAME reply and unchanged business work.
