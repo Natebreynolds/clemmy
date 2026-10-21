@@ -8499,7 +8499,8 @@ test('a send step whose send is a notification to the owner is done when that no
     kind: 'refused_pre_dispatch', sourceUserSeq: source.seq, tool: 'working_memory', callId: 'call-wm', refusalDetail: 'Current schema for working_memory: Missing required field(s)',
   } });
   appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'tool_called', data: { sourceUserSeq: source.seq, tool: 'notify_user', callId: 'call-notify', arguments: JSON.stringify({ title: 'Morning briefing', body: 'Nothing overdue.' }), accounting: 'top_level' } });
-  appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'notify_user', callId: 'call-notify', ok: true, result: 'Notification queued: 1' } });
+  // The real top-level return row: result text, no `ok` field (live r48v2 step 625336).
+  appendEvent({ sessionId, turn: 1, role: 'tool', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'notify_user', callId: 'call-notify', accounting: 'top_level', result: 'Notification queued: 1' } });
   const output = { notified: true, briefing_title: 'Morning briefing' };
   const guarded = settlementGuardedStepOutput({
     step: { id: 'brief', prompt: 'Give Nate a concise morning briefing.', sideEffect: 'send' },
@@ -8513,6 +8514,8 @@ test('a send step whose send is a notification to the owner is done when that no
   const quiet = 'workflow:morning-briefing-fixture:quiet';
   HarnessSession.create({ id: quiet, kind: 'workflow', channel: 'workflow', title: 'Briefing fixture (no send)', metadata: { source: 'workflow' } });
   const quietSource = appendEvent({ sessionId: quiet, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Send the briefing.' } });
+  // A failed notification is not a send.
+  appendEvent({ sessionId: quiet, turn: 1, role: 'tool', type: 'tool_returned', data: { sourceUserSeq: quietSource.seq, tool: 'notify_user', callId: 'call-failed', ok: false, error: 'queue unavailable' } });
   const blocked = settlementGuardedStepOutput({
     step: { id: 'brief', prompt: 'Give Nate a concise morning briefing.', sideEffect: 'send' },
     sessionId: quiet, sourceUserSeq: quietSource.seq, toolUses: ['workflow_step_result'], output,

@@ -10019,9 +10019,13 @@ function ownerDeliveryLandedForSource(sessionId: string, sourceUserSeq: number):
   try {
     const deliveryTools = new Set(TOOL_REGISTRY.filter((entry) => entry.ownerDelivery === true).map((entry) => entry.name));
     if (deliveryTools.size === 0) return false;
+    // A top-level return row carries the result text and no `ok` field (the
+    // transport mirror has one); a failure carries `ok: false` or `error`.
     return listEvents(sessionId, { types: ['tool_returned'], sinceSeq: sourceUserSeq }).some((event) =>
-      event.data.sourceUserSeq === sourceUserSeq && event.data.ok === true
-      && typeof event.data.tool === 'string' && deliveryTools.has(event.data.tool));
+      event.data.sourceUserSeq === sourceUserSeq
+      && typeof event.data.tool === 'string' && deliveryTools.has(event.data.tool)
+      && event.data.ok !== false && event.data.error === undefined
+      && (typeof event.data.result === 'string' || typeof event.data.preview === 'string' || event.data.ok === true));
   } catch {
     return false;
   }
