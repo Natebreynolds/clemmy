@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 import { z } from 'zod';
+import { _setApprovalPrecheckRunForTests } from './approval-precheck.js';
 
 const HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-shell-off-machine-'));
 Object.assign(process.env, {
@@ -434,7 +435,17 @@ test('several commands of one kind staged for one request open as one review car
   received.length = 0;
   const REQUEST = 'Post x=1 and x=2 to the hook endpoint.';
   const COMMAND_2 = `curl -sS -X POST http://127.0.0.1:${PORT}/hook -d x=2`;
-  const run = await hostTurn('post-two', REQUEST, [
+  // The checker writes each card's question once, although the same call
+  // meets the door in the preparation pass and again in the execute pass
+  // (live 2026-10-21: four checker calls, 15 s, for two cards).
+  const prechecks: string[] = [];
+  _setApprovalPrecheckRunForTests(async (input) => {
+    prechecks.push(input.content);
+    return JSON.stringify({ ask: `Can I post ${/x=\d/.exec(input.content)?.[0] ?? 'this'} to your hook endpoint?`, why: 'It reaches outside this computer.', conflicts: [] });
+  });
+  let run: Awaited<ReturnType<typeof hostTurn>>;
+  try {
+    run = await hostTurn('post-two', REQUEST, [
     [call('call-discover-shell', 'tool_search', {
       query: 'run_shell_command', role_key: null, account_selection: null, limit: 1, cursor: null,
     })],
@@ -452,9 +463,14 @@ test('several commands of one kind staged for one request open as one review car
       }));
     },
     [text('I need to post x=1 and x=2 to your hook endpoint. OK to go ahead with both?')],
-  ]);
+    ]);
+  } finally {
+    _setApprovalPrecheckRunForTests(null);
+  }
   const debug = JSON.stringify({ status: run.result.status, frames: run.frames, events: run.trace.map((e) => e.type).slice(-40) }).slice(0, 6_000);
   assert.equal(run.result.status, 'awaiting_approval', debug);
+  assert.equal(prechecks.length, 2, `one question per staged action: ${JSON.stringify(prechecks)}`);
+  assert.ok(prechecks.some((content) => content.includes('x=1')) && prechecks.some((content) => content.includes('x=2')), JSON.stringify(prechecks));
   const refusals = (run.frames[2]?.toolResults ?? []).filter((result) => /already staged for the owner's card/.test(result));
   assert.equal(refusals.length, 2, debug);
   for (const refusal of refusals) assert.match(refusal, /they open together as one card/, 'the steer names the batch');

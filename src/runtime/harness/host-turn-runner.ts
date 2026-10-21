@@ -7169,6 +7169,10 @@ const runHostTurnBody = async (
    * opens at this turn's boundary as any request_now action does. Returns
    * null when nothing could be staged, so the refusal stays the old door.
    */
+  // The same call meets the door twice in one step (the preparation pass and
+  // the execute pass); the card is staged and its question written once
+  // (live 2026-10-21: two checks took four checker calls, 15 s, for two cards).
+  const stagedOffMachineCards = new Map<string, string | null>();
   const stageOffMachineCard = async (
     carrierName: string,
     args: Record<string, unknown> | null,
@@ -7186,6 +7190,21 @@ const runHostTurnBody = async (
     }
     const identity = exactHostIdentity();
     if (!identity.sessionId || !identity.sourceUserSeq) return null;
+    const memoKey = `${callId}\u0000${toolName}\u0000${payloadJson}`;
+    const memoized = stagedOffMachineCards.get(memoKey);
+    if (memoized !== undefined) return memoized;
+    const stagedText = await stageOffMachineCardOnce(carrierName, toolName, toolArgs as Record<string, unknown>, payloadJson, identity, callId);
+    stagedOffMachineCards.set(memoKey, stagedText);
+    return stagedText;
+  };
+  const stageOffMachineCardOnce = async (
+    carrierName: string,
+    toolName: string,
+    toolArgs: Record<string, unknown>,
+    payloadJson: string,
+    identity: { sessionId: string; sourceUserSeq: number },
+    callId: string,
+  ): Promise<string | null> => {
     try {
       const { queueExactPendingAction, exactCommandPreview } = await import('../../tools/pending-action-tools.js');
       const command = exactCommandPreview(toolName, toolArgs);
