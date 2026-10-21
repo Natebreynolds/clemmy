@@ -211,6 +211,22 @@ export function parseAwaitingUserInputFinalOutput(value: unknown): string | null
 }
 
 /**
+ * A question halt keeps the words the model wrote in the same step. The model
+ * answers first and then asks ("here is what works and what I'd change; now,
+ * which firm?"); the halt used to publish the question alone, so three turns
+ * of critique were written and never shown (live 2026-10-21, a deck review
+ * that read as an interrogation). The question stays last, so the card and
+ * the reply end on the same words; a step that only asked is unchanged.
+ */
+export function awaitingUserInputWithSpokenText(finalOutput: string, spoken: string | undefined): string {
+  const question = parseAwaitingUserInputFinalOutput(finalOutput);
+  const words = (spoken ?? '').trim();
+  if (!question || !words) return finalOutput;
+  if (words === question || words.endsWith(question)) return formatAwaitingUserInputFinalOutput(words);
+  return formatAwaitingUserInputFinalOutput(`${words}\n\n${question}`);
+}
+
+/**
  * A bounded async-read refinement can end without satisfying its accepted
  * research requirement. The work_call result is then a host-authored scope
  * gate, not model prose and not verified read evidence. Recognize only the

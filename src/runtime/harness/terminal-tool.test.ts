@@ -231,3 +231,18 @@ test('dispatch_coding_task halts on an admission receipt and renders the handoff
   assert.equal(terminalToolShouldHalt('dispatch_coding_task', refused), false, 'a refusal goes back to the model');
   assert.doesNotMatch(renderTerminalToolReply('dispatch_coding_task', {}, refused), /is working on/);
 });
+
+test('a question halt keeps the words the model wrote in the same step, question last', async () => {
+  const { awaitingUserInputWithSpokenText, formatAwaitingUserInputFinalOutput, parseAwaitingUserInputFinalOutput } = await import('./terminal-tool.js');
+  const halt = formatAwaitingUserInputFinalOutput('Which firm are you meeting?');
+  const spoken = '## What is working\n\nSlide 2 is the deck.';
+  const kept = awaitingUserInputWithSpokenText(halt, spoken);
+  assert.equal(parseAwaitingUserInputFinalOutput(kept), `${spoken}\n\nWhich firm are you meeting?`);
+  // A step that only asked, or that already ended on the question, is unchanged.
+  assert.equal(awaitingUserInputWithSpokenText(halt, ''), halt);
+  assert.equal(awaitingUserInputWithSpokenText(halt, undefined), halt);
+  assert.equal(parseAwaitingUserInputFinalOutput(awaitingUserInputWithSpokenText(halt, `${spoken}\n\nWhich firm are you meeting?`)),
+    `${spoken}\n\nWhich firm are you meeting?`);
+  // Any other final output is left alone.
+  assert.equal(awaitingUserInputWithSpokenText('plain reply', spoken), 'plain reply');
+});

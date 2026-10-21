@@ -1015,7 +1015,7 @@ import {
 import {
   AUTHORIZED_LIVE_READ_REGISTRY_PROVENANCE,
 } from './live-read-planning-authority.js';
-import { bareTerminalToolName } from './terminal-tool.js';
+import { awaitingUserInputWithSpokenText, bareTerminalToolName } from './terminal-tool.js';
 import {
   initializeNoProgressGovernor,
   isCanonicalNoProgressAskArguments,
@@ -9224,6 +9224,7 @@ const runHostTurnBody = async (
 
   const finalOutputFromToolBehavior = async (
     results: Awaited<ReturnType<typeof executeCall>>[],
+    spoken?: string,
   ): Promise<string | undefined> => {
     const callableResults = results
       .filter((result): result is typeof result & { tool: FunctionToolLike } => Boolean(result.tool))
@@ -9262,7 +9263,8 @@ const runHostTurnBody = async (
       if (decision.isInterrupted) {
         throw new Error('Host toolUseBehavior returned an interruption after tool execution.');
       }
-      return decision.isFinalOutput ? resultText(decision.finalOutput) : undefined;
+      return decision.isFinalOutput
+        ? awaitingUserInputWithSpokenText(resultText(decision.finalOutput), spoken) : undefined;
     }
     throw new Error('Invalid agent toolUseBehavior.');
   };
@@ -12251,7 +12253,7 @@ const runHostTurnBody = async (
         recordZeroCrossingRefusal(frame.frameDigest);
         if (frame.hostFault) return blockedOutcome(frame.hostFault.text, frame.hostFault.reason, false);
         if (terminalBehaviorEligibleMixedResults(frame.returned)) {
-          const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+          const finalOutput = await finalOutputFromToolBehavior(frame.returned, step.text);
           if (finalOutput !== undefined) return await completedOutcome(finalOutput);
         }
         continue;
@@ -12262,7 +12264,7 @@ const runHostTurnBody = async (
       if (publishedPlan !== undefined) return publishedPlan.needsInput
         ? { history, lastResponseId, finalOutput: await runOutputGuardrails(publishedPlan.text), terminal: { status: 'awaiting_user_input', reason: 'plan_needs_input' } }
         : await completedOutcome(publishedPlan.text);
-      const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+      const finalOutput = await finalOutputFromToolBehavior(frame.returned, step.text);
       if (finalOutput !== undefined) return await completedOutcome(finalOutput);
       continue;
     }
@@ -12856,7 +12858,7 @@ const runHostTurnBody = async (
       // rather than hand the model a refusal it cannot repair.
       if (frame.hostFault) return blockedOutcome(frame.hostFault.text, frame.hostFault.reason, false);
       if (terminalBehaviorEligibleMixedResults(frame.returned)) {
-        const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+        const finalOutput = await finalOutputFromToolBehavior(frame.returned, step.text);
         if (finalOutput !== undefined) return await completedOutcome(finalOutput);
       }
       continue;
@@ -12865,7 +12867,7 @@ const runHostTurnBody = async (
     if (publishedPlan !== undefined) return publishedPlan.needsInput
       ? { history, lastResponseId, finalOutput: await runOutputGuardrails(publishedPlan.text), terminal: { status: 'awaiting_user_input', reason: 'plan_needs_input' } }
       : await completedOutcome(publishedPlan.text);
-    const finalOutput = await finalOutputFromToolBehavior(frame.returned);
+    const finalOutput = await finalOutputFromToolBehavior(frame.returned, step.text);
     if (finalOutput !== undefined) return await completedOutcome(finalOutput);
   }
 
