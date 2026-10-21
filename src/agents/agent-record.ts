@@ -108,7 +108,11 @@ function fromDisk(record: TeamAgentRecord): AgentRecord {
     instructions: record.personality,
     skills: record.skills ?? [],
     workflows: record.workflows ?? [],
-    tools: record.tools ?? [],
+    // A file written by the team tools names its tools as `allowedTools`;
+    // the product's view read only `tools`, so an owner's list was ignored
+    // (live 2026-10-21: an agent with nine listed tools ran on the default
+    // surface). Either spelling is the list its turns keep first-class.
+    tools: record.tools?.length ? record.tools : record.allowedTools ?? [],
     model: record.model ?? null,
     memoryScope: record.memoryScope ?? null,
     createdFrom: isOrigin(record.createdFrom) ? record.createdFrom : null,

@@ -238,6 +238,32 @@ test('a chat opened in a saved agent mounts its context and the tools its pins n
   assert.equal(unknown.agent, null, 'a deleted agent leaves an ordinary chat, never a broken one');
 });
 
+test('the tools the owner listed on an agent are pinned on its turns, in a chat and in a task handed to it', async () => {
+  // Live 2026-10-21: an agent's listed tools reached no surface at all.
+  const { createAgentRecord } = await import('../../agents/agent-record.js');
+  const created = createAgentRecord({
+    name: 'Page Studio',
+    handles: 'Pages.',
+    instructions: 'Think in grids.',
+    tools: ['read_file', 'write_file', 'view_image'],
+  });
+  assert.equal(created.ok, true);
+  const chat = composeSession({
+    sessionId: 'sess-desktop-studio',
+    sessionKind: 'chat',
+    metadata: { source: 'desktop', agentId: 'page-studio', agentName: 'Page Studio' },
+  });
+  assert.deepEqual([...chat.pinnedTools], ['read_file', 'write_file', 'view_image']);
+  assert.deepEqual([...chat.hotTools], ['read_file', 'write_file', 'view_image']);
+  const delegated = composeSession({
+    sessionId: 'background:bg-studio-1',
+    sessionKind: 'execution',
+    metadata: { delegatedTaskId: 'bg-studio-1', agentId: 'page-studio', agentName: 'Page Studio' },
+  });
+  assert.equal(delegated.agent?.agent.id, 'page-studio');
+  assert.deepEqual([...delegated.pinnedTools], ['read_file', 'write_file', 'view_image']);
+});
+
 test('a reviewer is told the agent a reply was written as; a plain chat tells it nothing', async () => {
   const { createAgentRecord } = await import('../../agents/agent-record.js');
   const { createSession } = await import('./eventlog.js');

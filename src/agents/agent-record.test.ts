@@ -95,6 +95,21 @@ test('a hand-written file with runtime-only fields keeps them across a save', ()
   assert.match(onDisk, /Be careful and quick\./);
 });
 
+test('an agent whose file lists its tools as allowedTools keeps that list as its tools', () => {
+  // Live 2026-10-21: the owner's Design Studio named nine tools under
+  // `allowedTools` (the team tools' spelling) and the product read none.
+  mkdirSync(path.join(AGENTS_DIR, 'studio'), { recursive: true });
+  writeFileSync(agentFilePath('studio'), [
+    '---', 'name: Studio', 'description: Pages.', 'allowedTools:', '  - read_file', '  - write_file', '---', 'Be visual.',
+  ].join('\n'));
+  assert.deepEqual(getAgentRecord('studio')?.tools, ['read_file', 'write_file']);
+  mkdirSync(path.join(AGENTS_DIR, 'studio-both'), { recursive: true });
+  writeFileSync(agentFilePath('studio-both'), [
+    '---', 'name: Studio Both', 'description: Pages.', 'allowedTools:', '  - read_file', 'tools:', '  - list_files', '---', 'Be visual.',
+  ].join('\n'));
+  assert.deepEqual(getAgentRecord('studio-both')?.tools, ['list_files'], 'the product\'s own field wins when both are present');
+});
+
 test('the host identity is never listed as an agent', () => {
   mkdirSync(path.join(AGENTS_DIR, HOST_AGENT_ID), { recursive: true });
   writeFileSync(agentFilePath(HOST_AGENT_ID), '---\nname: Clementine\ndescription: host\n---\nYou are the host.');

@@ -246,6 +246,10 @@ export function composeSession(input: ComposeSessionInput): SessionMount {
   const project = takesIdentity ? projectFromMetadata(input.metadata, agent?.agent.id ?? null) : null;
   const agentTools = agent || project
     ? [
+        // The tools the owner listed on the agent stay first-class on its
+        // turns. A pin keeps a name that is already reachable; it widens
+        // nothing (live 2026-10-21: the list was read by nothing at all).
+        ...(agent ? agent.tools : []),
         ...(agent && agent.agent.workflows.length > 0 ? AGENT_WORKFLOW_TOOLS : []),
         ...((agent && (agent.pinnedSkills.length > 0 || agent.missingSkills.length > 0))
           || (project && (project.pinnedSkills.length > 0 || project.missingSkills.length > 0))
