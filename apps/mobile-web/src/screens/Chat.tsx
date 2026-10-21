@@ -1241,6 +1241,8 @@ function MessageRow({
           <>
             <div class="approval-ask">{ask}</div>
             {message.approval.preview?.why ? <div class="approval-reason">{message.approval.preview.why}</div> : null}
+            {/* What will happen, one plain sentence by name and place. */}
+            {message.approval.preview?.does ? <div class="approval-does">{message.approval.preview.does}</div> : null}
           </>
         ) : (
           <div class="approval-head">{message.approval.preview?.items ? `${approvalDecided ? 'Reviewed' : 'Review'} ${message.approval.preview.items.length} actions` : approvalDecided ? message.approval.subject : `Waiting on you — ${message.approval.subject}`}</div>

@@ -12910,7 +12910,8 @@ const runHostTurnBody = async (
         const previewCheck = await approvalPrecheck({
           sessionId: approvalIdentity.sessionId,
           sourceUserSeq: approvalIdentity.sourceUserSeq,
-          preview: previewLabels ? approvalCallPreview({ ...info, previewLabels }, true, false, approvalIdentity) : preview,
+          // The checker reads the whole content; the card's preview clips it.
+          preview: approvalCallPreview({ ...info, ...(previewLabels ? { previewLabels } : {}) }, true, true, approvalIdentity),
           ...(pending.consentCall ? {
             consent: {
               effect: pending.consentCall.effect,

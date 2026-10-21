@@ -810,7 +810,7 @@ export function ChatBubble({
               )}
               {(voicedApproval || voicedPendingAction) && (
                 <div className="mt-2.5 flex items-center justify-between">
-                  <p className="text-caption font-semibold uppercase tracking-wide text-faint">Exactly what happens</p>
+                  <p className="text-caption font-semibold uppercase tracking-wide text-faint">{message.approval.preview.does ? 'What I’ll do' : 'Exactly what happens'}</p>
                   {editableField && onApproveWithEdits && !resolved && !message.approval.resolution && !editing && (
                     <button type="button" className="text-caption font-semibold text-primary-ink hover:underline"
                       onClick={() => { setEditedValue(editableField.value); setEditing(true); }}>
@@ -833,6 +833,12 @@ export function ChatBubble({
                   </div>
                   <p className="text-caption text-muted">Exactly what you typed goes out, checked the same way first.</p>
                 </div>
+              )}
+              {/* What will happen, in one plain sentence by name and place,
+                  above the exact content (owner 2026-10-21: "a cleaner what
+                  Clem is going to do"). */}
+              {voicedApproval && message.approval.preview.does && (
+                <p className="mt-1 text-body text-fg">{message.approval.preview.does}</p>
               )}
               <dl className={cn('mt-2 space-y-1.5 text-caption', editing && 'opacity-60')}>
                 {/* Plain first, as in Needs you (owner 2026-10-18: no weird

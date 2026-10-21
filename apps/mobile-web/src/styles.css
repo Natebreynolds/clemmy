@@ -1485,6 +1485,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
 .approval-ask { font-size: var(--t-body); line-height: 1.45; color: var(--fg); }
 .approval-exact-label { margin-top: var(--sp-3); font-size: var(--t-xs); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-3); }
 .approval-reason { color: var(--fg-2); font-size: var(--t-sm); margin-top: 4px; }
+.approval-does { color: var(--fg); font-size: var(--t-body); line-height: 1.45; margin-top: var(--sp-2); }
 .turn-approval .approval-result { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); min-width: 0; }
 .turn-approval .approval-result-copy { color: var(--fg); font-size: var(--t-body); line-height: 1.5; overflow-wrap: anywhere; }
 .turn-approval .approval-result-copy > :first-child { margin-top: 0; }

@@ -104,6 +104,34 @@ test('the checker writes the card in Clem\'s words for every card, from the exac
   assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /to the owner as "you"/);
 });
 
+test('the card says what will happen by name, from the whole content and what Clem last said', async () => {
+  // Live 2026-10-21: a note card for Frank Tarantino's record read "Darrin's
+  // candidate record" (the id carried no name), and the checker flagged its
+  // own clipped preview of a 2,825-character body as "cut off mid-thought".
+  const where = conversation();
+  eventlog.appendEvent({ sessionId: where.sessionId, turn: 2, role: 'system', type: 'conversation_completed',
+    data: { presentation: { text: 'Pulled him up: Frank Tarantino — candidate id 74944335008, application 83113188008.' } } });
+  const later = eventlog.appendEvent({ sessionId: where.sessionId, turn: 4, role: 'user', type: 'user_input_received',
+    data: { text: 'fill in what we can and notes. Darrin said this is one we will put in second place for now' } });
+  const body = `Debrief. ${'Strong research and tone. '.repeat(110)}Pricing framing: keep it open.`;
+  assert.ok(body.length > 2_000);
+  const seen: Array<Record<string, unknown>> = [];
+  _setApprovalPrecheckRunForTests(async (input) => {
+    seen.push(input as unknown as Record<string, unknown>);
+    return { does: 'Add a public note to Frank Tarantino\'s Greenhouse record with the debrief below.',
+      ask: 'Can I add this note to Frank Tarantino\'s Greenhouse record?', why: 'Your hiring team will see it.', conflicts: [] };
+  });
+  const result = await approvalPrecheck({ sessionId: where.sessionId, sourceUserSeq: later.seq, preview: { operation: 'Create Greenhouse note',
+    fields: [{ name: 'candidate_id', value: '74944335008' }, { name: 'visibility', value: 'public' }, { name: 'body', value: body }] } });
+  assert.equal(result?.does, 'Add a public note to Frank Tarantino\'s Greenhouse record with the debrief below.');
+  assert.match(String(seen[0]!.clemSaid), /Frank Tarantino — candidate id 74944335008/);
+  assert.ok(String(seen[0]!.content).includes('Pricing framing: keep it open.'), 'the whole body is read, not a clipped preview');
+  assert.doesNotMatch(String(seen[0]!.content), /more characters\)/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /"does": one plain sentence, not a question/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /Never name a person or record that neither the content nor "clemSaid" ties to that id/);
+  assert.match(APPROVAL_PRECHECK_INSTRUCTIONS, /shortened for this check/);
+});
+
 test('the card\'s words are bounded and optional', async () => {
   const where = conversation();
   _setApprovalPrecheckRunForTests(async () => ({ ask: `Can I ${'really '.repeat(60)}do it?`, conflicts: [] }));

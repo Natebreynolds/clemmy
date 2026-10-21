@@ -43,6 +43,8 @@ export interface ApprovalPreview {
    *  needed. Display only; the fields above are still the exact content. */
   ask?: string;
   why?: string;
+  /** What will happen, one plain sentence by name and place. */
+  does?: string;
 }
 
 /** What the owner's answer to an approval card reads as in the conversation,
@@ -174,11 +176,13 @@ export function approvalPreviewFrom(value: unknown): ApprovalPreview | undefined
   );
   const ask = line(record.ask, 200);
   const why = line(record.why, 260);
+  const does = line(record.does, 240);
   return {
     operation: record.operation,
     fields,
     ...(items ? { items } : {}),
     ...(status ? { check: { status, ...(conflicts.length ? { conflicts } : {}) } } : {}),
+    ...(does ? { does } : {}),
     ...(ask ? { ask } : {}),
     ...(why ? { why } : {}),
   };
