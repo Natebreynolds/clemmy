@@ -98,6 +98,21 @@ function isNonEmptyHttpUrl(value: unknown): boolean {
  *
  * `fileExists` is injectable for tests (defaults to fs.existsSync).
  */
+/** Where a relative file path names a file: the same place a relative write
+ * lands (Clem's files folder on a packaged install). The runner installs the
+ * real resolver; the default is the process working directory. */
+let literalPathResolver: (relative: string) => string = (relative) => path.resolve(relative);
+export function setStepOutputLiteralPathResolver(resolver: ((relative: string) => string) | null): void {
+  literalPathResolver = resolver ?? ((relative) => path.resolve(relative));
+}
+
+/** A contract entry that names a file rather than a field: it has a path
+ * separator, a home prefix, or a file extension on its last segment. */
+function looksLikeFilePath(entry: string): boolean {
+  if (entry.includes('/') || entry.includes('\\') || entry.startsWith('~')) return true;
+  return /\.[A-Za-z0-9]{1,8}$/.test(entry) && !entry.includes(' ');
+}
+
 export function verifyStepOutput(
   contract: WorkflowStepOutputContract | undefined,
   value: unknown,
@@ -158,14 +173,22 @@ export function verifyStepOutput(
 
   if (contract.verify?.path_exists) {
     for (const p of contract.verify.path_exists) {
-      // A file target may be known at authoring time, or returned in a field
-      // (or at the root) by the step. All three check the real filesystem;
-      // none accepts the assistant's claim that it wrote a file.
-      const resolved = path.isAbsolute(p) ? p : p === '' || p === '.' ? value : resolvePath(value, p);
-      if (typeof resolved !== 'string' || resolved.trim().length === 0) {
+      // A file target may be known at authoring time (an absolute path, or a
+      // relative one such as clem-fixtures/digest.md: live 2026-10-21, two
+      // brains wrote the file's own path here and the step failed as "not a
+      // file path string" because the entry was read as a key name), or
+      // returned in a field (or at the root) by the step. All check the real
+      // filesystem; none accepts the assistant's claim that it wrote a file.
+      const fromField = p === '' || p === '.' ? value : path.isAbsolute(p) ? undefined : resolvePath(value, p);
+      const literal = path.isAbsolute(p) || (fromField === undefined && looksLikeFilePath(p)) ? p : null;
+      const candidate = literal ?? fromField;
+      if (typeof candidate !== 'string' || candidate.trim().length === 0) {
         problems.push(`verify.path_exists: output "${p}" is not a file path string`);
-      } else if (!fileExists(resolved.trim())) {
-        problems.push(`verify.path_exists: file at "${p}" (${resolved.trim()}) does not exist`);
+        continue;
+      }
+      const target = path.isAbsolute(candidate.trim()) ? candidate.trim() : literalPathResolver(candidate.trim());
+      if (!fileExists(target)) {
+        problems.push(`verify.path_exists: file at "${p}" (${target}) does not exist`);
       }
     }
   }
@@ -224,7 +247,7 @@ export function renderOutputContractSpec(contract: WorkflowStepOutputContract): 
     lines.push(`- "${pathKey}" must contain a real http(s) URL.`);
   }
   for (const pathKey of contract.verify?.path_exists ?? []) {
-    lines.push(`- "${pathKey}" must be a path to a file that actually exists.`);
+    lines.push(`- "${pathKey}" is a file path, or a field holding one; that file must actually exist.`);
   }
   lines.push('- If you are genuinely blocked, submit {"blocked": true, "reason": "<specifics>"} instead of a partial shape.');
   return lines.join('\n');

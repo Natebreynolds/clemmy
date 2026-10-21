@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { coerceOutputForContract, verifyStepOutput } from './step-output-verify.js';
+import { coerceOutputForContract, setStepOutputLiteralPathResolver, verifyStepOutput } from './step-output-verify.js';
 
 test('a structured result satisfies a string contract as rendered text', () => {
   const contract = { type: 'string' as const, non_empty: [''] };
@@ -178,4 +178,29 @@ test('a non-empty key the output does not have says which keys it did produce, a
   assert.equal(classifyContractProblems(result.problems), 'empty_output', 'routing is unchanged');
   const empty = verifyStepOutput({ type: 'object', non_empty: ['upstream'] }, { upstream: [] });
   assert.match(empty.problems.join('\n'), /non_empty: output "upstream" is empty \(no data produced\)/, 'a present but empty key is still empty');
+});
+
+test('verify.path_exists accepts the file\'s own relative path, resolved where relative writes land', () => {
+  // Live 2026-10-21: two brains wrote the file path itself into path_exists
+  // and the step failed as "not a file path string" because the entry was
+  // read as a key name.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-path-exists-'));
+  writeFileSync(path.join(dir, 'digest.md'), '- a\n');
+  setStepOutputLiteralPathResolver((relative) => path.join(dir, relative));
+  try {
+    const contract = { type: 'object' as const, required_keys: ['path'], verify: { path_exists: ['clem-fixtures/digest.md'] } };
+    assert.ok(verifyStepOutput(contract, { path: 'clem-fixtures/digest.md' }, (p) => p === path.join(dir, 'clem-fixtures/digest.md')).ok, 'a literal relative path that exists');
+    const missing = verifyStepOutput(contract, { path: 'x' }, () => false);
+    assert.equal(missing.ok, false);
+    assert.match(missing.problems.join(' '), /does not exist/);
+    // A field holding a relative path is resolved the same way.
+    assert.ok(verifyStepOutput({ verify: { path_exists: ['path'] } }, { path: 'clem-fixtures/digest.md' }, (p) => p === path.join(dir, 'clem-fixtures/digest.md')).ok);
+    // A field name that is not a path and is absent still reads as a missing field.
+    const absent = verifyStepOutput({ verify: { path_exists: ['file'] } }, { other: 1 }, () => true);
+    assert.equal(absent.ok, false);
+    assert.match(absent.problems.join(' '), /not a file path string/);
+  } finally {
+    setStepOutputLiteralPathResolver(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

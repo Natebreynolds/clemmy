@@ -262,7 +262,8 @@ import { closePlanScope, openPlanScope } from '../agents/plan-scope.js';
 import { setSessionWorkerModelOverride, clearSessionWorkerModelOverride } from '../runtime/harness/session-role-overrides.js';
 import { approvedSendSlugsForSessions } from '../runtime/harness/approval-registry.js';
 import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
-import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, isEmptyValue } from './step-output-verify.js';
+import { classifyContractProblems, coerceOutputForContract, isBlockedStepOutput, renderOutputContractSpec, verifyStepOutput, setStepOutputLiteralPathResolver, isEmptyValue } from './step-output-verify.js';
+import { resolveAllowedPath } from '../tools/computer-tools.js';
 import { evaluateOutputGrounding, isOutputGroundingGateEnabled } from '../runtime/harness/output-grounding-gate.js';
 import { buildWorkflowObjective, deriveLegacyWorkflowRunGoal, judgeWorkflowTarget, type WorkflowTargetVerdict } from './workflow-objective-judge.js';
 import { humanDecisionBlocks, readWorkflowTargetEvidence } from './workflow-target-evidence.js';
@@ -429,6 +430,9 @@ import { reconcileWorkflowGraphPatchTelemetry } from './workflow-graph-reshape.j
 import { renderSessionHistoryForModel } from '../runtime/harness/session-transcript.js';
 import type { AssistantRouteDiagnostics } from '../types.js';
 
+// A relative file path in a step contract names the file where a relative
+// write lands, not the daemon's working directory.
+setStepOutputLiteralPathResolver((relative) => resolveAllowedPath(relative));
 const logger = pino({ name: 'clementine-next.workflow-runner' });
 
 // Narrow test seams for the direct (non-SDK) workflow harness lane. Production
