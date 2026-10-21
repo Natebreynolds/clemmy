@@ -694,3 +694,22 @@ console.log('composio-batch-validator tests passed');
   });
   if (text.errors.length === 0) throw new Error('a quoted non-object string must still be an error');
 }
+
+// A required key the schema allows to be null (an optional the strict wire
+// conversion made mandatory) is not missing when omitted. Live 2026-10-21:
+// a scheduled briefing's working_memory read was refused eight mornings in a
+// row for a missing "content".
+{
+  const schema = {
+    type: 'object',
+    properties: { action: { type: 'string', enum: ['read', 'append'] }, content: { type: ['string', 'null'] } },
+    required: ['action', 'content'],
+    additionalProperties: false,
+  };
+  const ok = validateArgsAgainstSchema('working_memory', { action: 'read' }, schema);
+  if (ok) throw new Error(`omitting a nullable required key must not refuse: ${ok.reason}`);
+  const stillMissing = validateArgsAgainstSchema('working_memory', { content: null }, schema);
+  if (!stillMissing || !stillMissing.reason.includes('action')) throw new Error('a required key that cannot be null is still required');
+  const viaAnyOf = { type: 'object', properties: { note: { anyOf: [{ type: 'string' }, { type: 'null' }] } }, required: ['note'] };
+  if (validateArgsAgainstSchema('x', {}, viaAnyOf)) throw new Error('a null alternative permits omission');
+}

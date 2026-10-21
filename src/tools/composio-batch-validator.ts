@@ -273,6 +273,20 @@ export function validateComposioArgs(
  * `additionalProperties: false`. Types and formats remain Composio's job.
  * Fail-open on any malformed/unexpected schema shape.
  */
+/** Whether a property schema accepts null: a null type, a type list with
+ * null, nullable, or a null alternative. */
+function propertyPermitsNull(property: unknown): boolean {
+  if (!isRecordValue(property)) return false;
+  const type = property.type;
+  if (type === 'null' || (Array.isArray(type) && type.includes('null'))) return true;
+  if (property.nullable === true) return true;
+  for (const key of ['anyOf', 'oneOf'] as const) {
+    const alternatives = property[key];
+    if (Array.isArray(alternatives) && alternatives.some((entry) => propertyPermitsNull(entry))) return true;
+  }
+  return false;
+}
+
 function schemaProperties(schema: Record<string, unknown>): Record<string, unknown> | null {
   return isRecordValue(schema.properties) ? schema.properties : null;
 }
@@ -390,7 +404,19 @@ export function validateArgsAgainstSchema(
     const required = Array.isArray(schema.required)
       ? schema.required.filter((k): k is string => typeof k === 'string')
       : [];
-    const missing = required.filter((key) => !(key in args));
+    // A key the schema lists as required but allows to be null is an
+    // optional the strict wire conversion made mandatory (optional → required
+    // and nullable). Omitting it is the same as sending null; the host does
+    // not refuse the call for it. Live 2026-10-21: a scheduled briefing's
+    // working_memory read ({action:"read"}) was refused for a missing
+    // "content" eight mornings in a row, and the step re-sent everything.
+    const declared = schemaProperties(schema);
+    const missing = required.filter((key) => !(key in args) && !propertyPermitsNull(declared?.[key]));
+    // The same omitted nullable keys read as null in the nested shape check.
+    const effectiveArgs: Record<string, unknown> = { ...args };
+    for (const key of required) {
+      if (!(key in effectiveArgs) && propertyPermitsNull(declared?.[key])) effectiveArgs[key] = null;
+    }
     if (missing.length > 0) {
       return {
         field: missing.join(', '),
@@ -492,7 +518,7 @@ export function validateArgsAgainstSchema(
     // `"<FILL: object — …>"`. Types, enums and undeclared keys of open
     // objects remain the provider's job (fail-open contract above).
     const nested: ProofProviderSchemaFailure[] = [];
-    collectProviderSchemaFailures(args, schema, '', nested, {
+    collectProviderSchemaFailures(effectiveArgs, schema, '', nested, {
       maxEntries: 24,
       maxDepth: 6,
       policy: 'required_only',
