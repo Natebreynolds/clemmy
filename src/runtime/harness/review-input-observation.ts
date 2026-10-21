@@ -10,6 +10,8 @@ export type ReviewInputComponentName =
   | 'judge_rubric' | 'host_completion_guidance' | 'memory_review_guidance'
   | 'effective_objective' | 'candidate_response' | 'private_review_evidence'
   | 'coverage_ledger' | 'retained_skill_references' | 'standing_instructions'
+  /** The host record of background jobs the reviewed request handed work to. */
+  | 'delegated_jobs'
   | 'memory_requirement_context' | 'evidence_tool_guidance' | 'evidence_reference_inventory'
   | 'coverage_followup' | 'verdict_restatement_instructions' | 'verdict_restatement_input'
   /** A later review round's new message, sent after the earlier round's exact conversation. */

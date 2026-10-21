@@ -1439,6 +1439,26 @@ test('the reviewer sees the standing instructions of the agent a reply was writt
     'the agent section only adds to what a plain reply is judged on');
 });
 
+test('a reply that handed work to a background job is judged as the hand-off, by rule and not only by evidence', () => {
+  // Live 2026-10-21: "Design Studio is on it — I'll report back when it
+  // finishes" was rejected after delivery as a promise, and the correction
+  // offered to build the page in the chat instead.
+  const objective = 'Have Design Studio build a landing page in the background and report back here when it is done.';
+  const reply = 'Design Studio is on it — the task is running in the background. I will report back here when it finishes.';
+  const plain = buildObjectiveJudgePrompt(objective, reply, { skills: [], toolCallSummary: '' });
+  assert.doesNotMatch(plain, /HANDED TO A BACKGROUND JOB/);
+  const handoff = buildObjectiveJudgePrompt(objective, reply, {
+    skills: [],
+    toolCallSummary: '',
+    delegatedJobs: [{ taskId: 'bg-1', phase: 'started', title: 'Build a landing page', agentName: 'Design Studio' }],
+  });
+  assert.match(handoff, /WORK HANDED TO A BACKGROUND JOB THIS REQUEST STARTED/);
+  assert.match(handoff, /"agentName":"Design Studio"/);
+  assert.match(handoff, /not a gap, a promise or an unaddressed part of this reply/);
+  assert.equal(handoff.startsWith(plain.slice(0, plain.indexOf('A statement that a provider'))), true,
+    'the hand-off rule only adds to what a plain reply is judged on');
+});
+
 test('a skill\'s method advice reaches the reviewer as guidance judged by its effect, never as the owner\'s prohibition', () => {
   // Live 2026-10-18: a Space build tested its new button once against the
   // state file it had just created, reset it, and found an example runner by
