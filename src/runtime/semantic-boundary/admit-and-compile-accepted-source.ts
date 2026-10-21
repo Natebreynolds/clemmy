@@ -117,6 +117,7 @@ import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidates,
   observeCurrentLocalPlanningDefinition,
+  observeCurrentLocalPlanningDefinitions,
   revalidateLocalPlanningDefinition,
   type AuthorizedLocalPlanningDefinitionV1,
 } from '../harness/local-planning-capability.js';
@@ -2248,10 +2249,17 @@ export async function primePrimaryModelPlanningCatalog(input: {
     const known = new Set(indexedLocalDefinitions.map((definition) => definition.name));
     for (const name of priorNames) {
       if (known.has(name)) continue;
-      const observed = await observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
+      // Every envelope of the tool, not its first: one physical tool can own
+      // several argument-dependent variants (write_file: create, append,
+      // overwrite, replace). Live 2026-10-21: a card seeded with the create
+      // envelope alone made "change that first bullet" refuse the model's
+      // correct replace call as outside the contract, and it went to the shell.
+      const observed = await observeCurrentLocalPlanningDefinitions({ name, carrier: 'work_call' });
       if (!observed.ok) continue;
-      if (indexedLocalDefinitions.some((d) => d.capabilityRef === observed.definition.capabilityRef)) continue;
-      indexedLocalDefinitions.push(observed.definition);
+      for (const definition of observed.definitions) {
+        if (indexedLocalDefinitions.some((d) => d.capabilityRef === definition.capabilityRef)) continue;
+        indexedLocalDefinitions.push(definition);
+      }
     }
   } catch {
     // Additive only: session history that cannot be read leaves nomination as-is.
@@ -2295,10 +2303,13 @@ export async function primePrimaryModelPlanningCatalog(input: {
     }
     for (const name of siblingNames) {
       try {
-        const observed = await observeCurrentLocalPlanningDefinition({ name, carrier: 'work_call' });
-        if (!observed.ok || primedRefs.has(observed.definition.capabilityRef)) continue;
-        primedRefs.add(observed.definition.capabilityRef);
-        indexedLocalDefinitions.push(observed.definition);
+        const observed = await observeCurrentLocalPlanningDefinitions({ name, carrier: 'work_call' });
+        if (!observed.ok) continue;
+        for (const definition of observed.definitions) {
+          if (primedRefs.has(definition.capabilityRef)) continue;
+          primedRefs.add(definition.capabilityRef);
+          indexedLocalDefinitions.push(definition);
+        }
       } catch {
         // Additive only: a sibling that cannot be observed is simply not offered.
       }

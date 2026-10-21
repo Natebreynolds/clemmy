@@ -27,6 +27,7 @@ writeFileSync(path.join(HOME, 'state', 'machine-id'), 'machine-write-file-author
 
 const local = await import('./local-planning-capability.js');
 const registry = await import('../../tools/tool-registry.js');
+const semantic = await import('../semantic-boundary/admit-and-compile-accepted-source.js');
 const eventlog = await import('./eventlog.js');
 
 type WriteVariant = {
@@ -155,4 +156,27 @@ test('unrecognized or malformed write modes never inherit local planning authori
   assert.equal(exactMatch(observed.definitions,
     { path: 'report.txt', content: 'content', mode: undefined, append: null })?.capabilityRef,
   'cap:local:write_file:create', 'an omitted optional mode retains the safe create-only default');
+});
+
+test('a later turn seeded from an earlier write_file use is offered every envelope, not only the one it used', async () => {
+  // Live 2026-10-21: a card seeded with the create envelope alone made "change
+  // that first bullet" refuse the model's correct replace call as outside the
+  // contract, and the model went around the refusal through the shell.
+  const row = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'write-file-seeding' });
+  const attempt = eventlog.beginRunAttempt(row.id, { runId: 'run-seed' });
+  const first = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Write a three-bullet digest to clem-fixtures/digest.md.' } });
+  eventlog.appendEvent({ sessionId: row.id, turn: 1, role: 'system', type: 'capability_discovered', data: {
+    sourceUserSeq: first.seq,
+    capabilities: [{ kind: 'authorized_local_registry', identifier: 'write_file', effectClass: 'write',
+      capabilityRef: 'cap:local:write_file:create', providerKind: local.AUTHORIZED_LOCAL_REGISTRY_PROVENANCE, accountIdentity: 'local_registry:host' }],
+  } });
+  const second = eventlog.beginRunAttempt(row.id, { runId: 'run-seed-2' });
+  const edit = eventlog.recordRunAttemptUserInput(second, { turn: 2, role: 'user', data: { text: 'Now change that first bullet and keep everything else in the file exactly as it is.' } });
+  const primed = await semantic.primePrimaryModelPlanningCatalog({ sessionId: row.id, sourceUserSeq: edit.seq });
+  assert.equal(primed.ok, true, primed.ok ? '' : primed.reason);
+  if (!primed.ok) return;
+  const offered = primed.planning.capabilities.map((capability) => capability.id).filter((id) => id.startsWith('cap:local:write_file:'));
+  assert.deepEqual([...offered].sort(), [
+    'cap:local:write_file:append', 'cap:local:write_file:create', 'cap:local:write_file:overwrite', 'cap:local:write_file:replace',
+  ], JSON.stringify(primed.planning.capabilities.map((capability) => capability.id)));
 });
