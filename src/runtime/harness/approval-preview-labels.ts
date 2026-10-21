@@ -54,7 +54,9 @@ export function labelCandidatesFor(payloads: readonly unknown[], value: string):
       return;
     }
     const fields = Object.values(node as Record<string, unknown>);
-    if (fields.some((field) => field === value)) {
+    // An id the card shows as text is often a number in the record that
+    // carries it (live 2026-10-21: candidate_id 74944335008).
+    if (fields.some((field) => field === value || (typeof field === 'number' && String(field) === value))) {
       for (const field of fields) {
         add(field);
         if (field && typeof field === 'object' && !Array.isArray(field)) {

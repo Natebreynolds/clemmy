@@ -25,6 +25,10 @@ test('candidates are the strings of the records that carry the exact id, most re
   assert.ok(!candidates.includes('Someone Else'), 'another record is not a candidate');
   assert.ok(!candidates.some((text) => text.includes('://')), 'a URL is never a name');
   assert.deepEqual(labelCandidatesFor([directory], 'U0NOWHERE'), []);
+  // An id the card shows as text is a number in the record that carries it.
+  const applications = { applications: [{ id: 83113188008, candidate_id: 74944335008, location: 'Austin, Texas' }] };
+  assert.deepEqual(labelCandidatesFor([applications], '74944335008'), ['Austin, Texas']);
+  assert.deepEqual(labelCandidatesFor([applications], '7494433500'), [], 'a different number never matches');
 });
 
 test('the members of one approval batch ask an identical label question once', async () => {
