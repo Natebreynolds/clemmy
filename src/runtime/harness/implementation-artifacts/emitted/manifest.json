@@ -558,7 +558,7 @@
           "bytes": 117794
         },
         "src/runtime/harness/pending-actions.ts": {
-          "bytes": 60192
+          "bytes": 60461
         },
         "src/runtime/shell-outgoing-files.ts": {
           "bytes": 9082
@@ -576,7 +576,7 @@
           "bytes": 6678
         },
         "src/runtime/harness/pending-action-view.ts": {
-          "bytes": 7248
+          "bytes": 7331
         },
         "src/runtime/harness/approval-registry.ts": {
           "bytes": 94154
@@ -1380,7 +1380,7 @@
           "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
-          "bytes": 23857
+          "bytes": 23927
         },
         "src/memory/work-episodes.ts": {
           "bytes": 7913
@@ -2592,7 +2592,7 @@
           "bytes": 27691
         },
         "src/tools/pending-action-tools.ts": {
-          "bytes": 30914
+          "bytes": 30955
         },
         "src/runtime/harness/permanent-activation-error.ts": {
           "bytes": 662
@@ -3015,7 +3015,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740666
+          "bytes": 740720
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -4035,7 +4035,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 102612
+          "bytes": 102693
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 96722
@@ -4629,7 +4629,7 @@
           "bytes": 117794
         },
         "src/runtime/harness/pending-actions.ts": {
-          "bytes": 60192
+          "bytes": 60461
         },
         "src/runtime/shell-outgoing-files.ts": {
           "bytes": 9082
@@ -4647,7 +4647,7 @@
           "bytes": 6678
         },
         "src/runtime/harness/pending-action-view.ts": {
-          "bytes": 7248
+          "bytes": 7331
         },
         "src/runtime/harness/approval-registry.ts": {
           "bytes": 94154
@@ -5451,7 +5451,7 @@
           "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
-          "bytes": 23857
+          "bytes": 23927
         },
         "src/memory/work-episodes.ts": {
           "bytes": 7913
@@ -6663,7 +6663,7 @@
           "bytes": 27691
         },
         "src/tools/pending-action-tools.ts": {
-          "bytes": 30914
+          "bytes": 30955
         },
         "src/runtime/harness/permanent-activation-error.ts": {
           "bytes": 662
@@ -7086,7 +7086,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740666
+          "bytes": 740720
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -8106,7 +8106,7 @@
           "bytes": 6267
         },
         "src/runtime/harness/public-presentation.ts": {
-          "bytes": 102612
+          "bytes": 102693
         },
         "src/runtime/harness/terminal-publication-proof.ts": {
           "bytes": 96722
