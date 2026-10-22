@@ -819,6 +819,11 @@ const MAX_CONSTRAINT_REVIEW_REFUSALS = 2;
  * earns one review past the cap (`correctedReviewed` marks it spent). */
 const constraintRefusalRounds = new Map<string, { count: number; lastReason: string; correctedDigest?: string; correctedReviewed?: boolean }>();
 const boundedConstraintNotes = new Map<string, string>();
+/** The exact write (by argument digest) whose last review ended with no
+ * readable verdict, per step. Its compact first read had already failed to
+ * clear it; only the full-evidence review decides it. */
+const checkerFailedWrites = new Map<string, string>();
+const CHECKER_FAILED_WRITES_MAX = 256;
 
 function constraintReviewKey(reopened: ReopenedAuthoredStep, toolName: string): string {
   return `${reopened.receipt.workflowRunId}:${reopened.receipt.stepId}:${toolName}`;
@@ -851,6 +856,7 @@ export function takeBoundedConstraintNote(identity: { sessionId: string; sourceU
 export function _resetConstraintReviewRoundsForTests(): void {
   constraintRefusalRounds.clear();
   boundedConstraintNotes.clear();
+  checkerFailedWrites.clear();
 }
 
 /** The write named as its author would name it: the carrier the model called
@@ -923,7 +929,32 @@ async function reviewAuthoredWriteConstraints(input: {
     const boundAccount = input.attestation.accountId?.trim() ?? '';
     const boundEmail = boundAccount ? cachedIdentityEmail(boundAccount) : undefined;
     const account = boundAccount ? `${boundAccount}${boundEmail ? ` (mailbox ${boundEmail})` : ''}` : undefined;
-    let result = await review({
+    const fullEvidenceReview = () => {
+      const full = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, {
+        compactResults: false,
+        consumerStepId: input.reopened.receipt.stepId,
+      });
+      return review({
+        sessionId: input.attestation.sessionId,
+        instructions: input.reopened.step.prompt,
+        tool: toolLabel,
+        ...(account ? { account } : {}),
+        schema,
+        args: input.args,
+        observations: { summary: full.summary, complete: full.available, evidence: full.evidence },
+        stakes: 'high',
+      });
+    };
+    // The same write proposed again after its review ended unreadable. Live
+    // 2026-10-21 (a scheduled channel review): the compact first read said
+    // "uncertain", the full-evidence review answered in a shape that could not
+    // be read, and the identical write, with nothing new read, went through
+    // the compact read again before the full review cleared it: four reviews,
+    // about six minutes, for one sheet update. The compact read already failed
+    // to clear these exact arguments; the full-evidence review, with evidence
+    // read fresh, is the one that decides them.
+    const retryAfterCheckerFailure = stakes === 'ordinary' && checkerFailedWrites.get(roundsKey) === argsDigest;
+    let result = retryAfterCheckerFailure ? await fullEvidenceReview() : await review({
       sessionId: input.attestation.sessionId,
       instructions: input.reopened.step.prompt,
       tool: toolLabel,
@@ -938,26 +969,13 @@ async function reviewAuthoredWriteConstraints(input: {
       // channel review spent 58 reviewer calls, most of them in such pairs).
       ...(rounds && rounds.count > 0 ? { measuredFirst: false } : {}),
     });
-    if (result.verdict === 'uncertain' && !result.checkerFailure && stakes === 'ordinary') {
+    if (!retryAfterCheckerFailure && result.verdict === 'uncertain' && !result.checkerFailure && stakes === 'ordinary') {
       // The compact view names each retained result in a line; a reviewer
       // that cannot see a record cannot establish its absence. A recoverable
       // write reviewed at measured depth is asked once more with the whole
       // retained evidence before the doubt counts as a refusal. A high-stakes
       // write (a send) gets its one review at full stakes; its doubt holds.
-      const full = readWorkflowTargetEvidence(input.reopened.receipt.workflowRunId, {
-        compactResults: false,
-        consumerStepId: input.reopened.receipt.stepId,
-      });
-      result = await review({
-        sessionId: input.attestation.sessionId,
-        instructions: input.reopened.step.prompt,
-        tool: toolLabel,
-        ...(account ? { account } : {}),
-        schema,
-        args: input.args,
-        observations: { summary: full.summary, complete: full.available, evidence: full.evidence },
-        stakes: 'high',
-      });
+      result = await fullEvidenceReview();
     }
     // Model review is asynchronous. Do not project a verdict into an attempt
     // that ended or whose adopted authority changed while it was running.
@@ -969,6 +987,15 @@ async function reviewAuthoredWriteConstraints(input: {
     if (result.verdict === 'compatible') {
       constraintRefusalRounds.delete(roundsKey);
       return null;
+    }
+    if (result.checkerFailure) {
+      checkerFailedWrites.delete(roundsKey);
+      checkerFailedWrites.set(roundsKey, argsDigest);
+      if (checkerFailedWrites.size > CHECKER_FAILED_WRITES_MAX) {
+        checkerFailedWrites.delete(checkerFailedWrites.keys().next().value as string);
+      }
+    } else {
+      checkerFailedWrites.delete(roundsKey);
     }
     if (result.checkerFailure) {
       // No reviewer answered. That is the checker's outage, not a fact about

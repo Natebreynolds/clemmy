@@ -891,6 +891,41 @@ test('a constraint checker that cannot answer stops the step truthfully instead 
   } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
 
+test('the same write proposed again after an unreadable review goes straight to the full-evidence review', async () => {
+  // Live 2026-10-21 (a scheduled channel review, accepted source 633820): the
+  // compact first read said uncertain, the full-evidence review could not be
+  // read, and the identical sheet update, with nothing new read, was read
+  // compactly again before the full review cleared it: four reviews, ~6 min.
+  const authority = await import('./authored-workflow-write-authority.js');
+  authority._resetConstraintReviewRoundsForTests();
+  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
+  const { bodies, tools } = fixtureTools(['goal_upsert']);
+  const depths: string[] = [];
+  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
+    depths.push(input.stakes ?? 'high');
+    if (depths.length === 1) return { verdict: 'uncertain', reason: 'The compact view does not show the record is absent.', proposalDigest: 'fixture-review' };
+    if (depths.length === 2) return { verdict: 'uncertain', reason: 'The constraint checker answered in a shape that could not be read; this write was not judged.',
+      proposalDigest: 'fixture-review', checkerFailure: 'invalid' };
+    return { verdict: 'compatible', reason: 'The full evidence shows the record is absent.', proposalDigest: 'fixture-review' };
+  });
+  try {
+    const model = stubModel([
+      [toolCall('unread-first', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [toolCall('unread-again', 'goal_upsert', { title: 'Approved title', status: 'active' })],
+      [textMsg('Approved goal saved.')],
+    ]);
+    const agent = { model, tools };
+    bindSurface(fixture, agent, tools);
+    await runProductionHost(fixture, agent);
+    assert.deepEqual(depths, ['ordinary', 'high', 'high'], 'the retry is not read compactly again; the full review decides it');
+    assert.equal(bodies.goal_upsert, 1, 'the cleared write runs once');
+  } finally {
+    authorityAdapter._setWorkflowMutationReviewerForTests(null);
+    authority._resetConstraintReviewRoundsForTests();
+  }
+});
+
 test('a constraint checker whose objections keep changing gets two refusals, then an ordinary write proceeds with its note', async () => {
   // Live 2026-10-13: a scheduled sheet review's one digest row was refused six
   // times in ten minutes, each for a different reason, until the run was
