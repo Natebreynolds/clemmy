@@ -14,16 +14,22 @@ test('a workflow its own permissions refused, or whose goal fell short, is named
     repair: [{ kind: 'step_started', stepId: 'main' }],
   };
   const stepsAsked: string[][] = [];
+  const now = Date.parse('2026-10-22T00:00:00Z');
+  const at = (hoursAgo: number) => new Date(now - hoursAgo * 3_600_000).toISOString();
   const signals = workflowImprovementSignals([
-    { runId: 'r1', workflow: 'channel-review', status: 'completed' },
-    { runId: 'r2', workflow: 'channel-review', status: 'completed' },
-    { runId: 'clean', workflow: 'digest', status: 'completed' },
+    // The observed window is in file-name order; a stale run comes first here.
+    { runId: 'stale', workflow: 'channel-review', status: 'completed', createdAt: at(24 * 30) },
+    { runId: 'r2', workflow: 'channel-review', status: 'completed', createdAt: at(1) },
+    { runId: 'r1', workflow: 'channel-review', status: 'completed', createdAt: at(2) },
+    { runId: 'clean', workflow: 'digest', status: 'completed', createdAt: at(3) },
     // A single re-run step repairs another run; it is not the workflow's own run.
-    { runId: 'repair', workflow: 'digest', status: 'completed', targetStepId: 'main' },
+    { runId: 'repair', workflow: 'digest', status: 'completed', createdAt: at(1), targetStepId: 'main' },
   ], {
+    now,
     readEvents: (_workflow, runId) => events[runId] ?? [],
     refusals: (runId, stepIds) => {
       stepsAsked.push([...stepIds]);
+      if (runId === 'stale') throw new Error('a month-old run is not read');
       return runId === 'r1' || runId === 'r2' ? [{ stepId: 'main', tool: 'space_refresh', reason: 'coverage_missing' }] : [];
     },
   });

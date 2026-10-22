@@ -25,22 +25,34 @@ export interface WorkflowImprovementSignal {
   goalShortfalls: string[];
 }
 
-interface RunRef { runId: string; workflow: string; status: string; targetStepId?: string | null }
+interface RunRef { runId: string; workflow: string; status: string; createdAt?: string; targetStepId?: string | null }
 
 interface SignalDeps {
   readEvents?: (workflow: string, runId: string) => Array<{ kind?: string; stepId?: string; meta?: Record<string, unknown> }>;
   refusals?: typeof workflowRunAuthorityRefusals;
+  now?: number;
 }
 
 const RUNS_PER_WORKFLOW = 3;
 const MAX_WORKFLOWS = 6;
+/** Older runs say little about the workflow as it is saved now. */
+const RECENT_MS = 7 * 24 * 60 * 60_000;
 
 /** Workflows whose recent runs carry at least one such signal. */
 export function workflowImprovementSignals(runs: readonly RunRef[], deps: SignalDeps = {}): WorkflowImprovementSignal[] {
   const readEvents = deps.readEvents ?? (readWorkflowEvents as NonNullable<SignalDeps['readEvents']>);
   const refusals = deps.refusals ?? workflowRunAuthorityRefusals;
+  const cutoff = (deps.now ?? Date.now()) - RECENT_MS;
+  // The observed window is ordered by file name, not by time (scheduled runs
+  // are named trigger-…, others by timestamp), so order by when each run
+  // started and keep only recent ones.
+  const recentFirst = runs
+    .map((run) => ({ run, at: run.createdAt ? Date.parse(run.createdAt) : Number.NaN }))
+    .filter((entry) => Number.isFinite(entry.at) && entry.at >= cutoff)
+    .sort((a, b) => b.at - a.at)
+    .map((entry) => entry.run);
   const byWorkflow = new Map<string, RunRef[]>();
-  for (const run of runs) {
+  for (const run of recentFirst) {
     // A single re-run step is a repair of another run, not the workflow's own run.
     if (run.targetStepId) continue;
     const list = byWorkflow.get(run.workflow) ?? [];
