@@ -1508,7 +1508,7 @@ test('with a plan active, steps whose every call is refused before it runs stop 
   capabilityManifestStores.installCapabilityManifestStore(
     capabilityManifestStores.createCapabilityManifestStore(),
   );
-  const { HOST_NO_DISPATCH_STREAK_LIMIT } = await import('./dispatch-streak.js');
+  const { HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT } = await import('./dispatch-streak.js');
 
   const session = eventlog.createSession({ id: 'workflow-create-refusal-streak', kind: 'chat' });
   const source = eventlog.appendEvent({
@@ -1621,11 +1621,14 @@ test('with a plan active, steps whose every call is refused before it runs stop 
 
   const steps = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
     .filter((event) => event.data.kind === 'no_dispatch_step');
-  assert.equal(steps.length, HOST_NO_DISPATCH_STREAK_LIMIT, JSON.stringify(outcome.terminal));
+  // Every attempt is the same fault on the same operation, so the identical
+  // refusal bound (d6c7f5a16, 10-20) ends the turn before the streak bound.
+  assert.equal(steps.length, HOST_IDENTICAL_REFUSAL_LIMIT, JSON.stringify(outcome.terminal));
+  assert.ok(HOST_IDENTICAL_REFUSAL_LIMIT < HOST_NO_DISPATCH_STREAK_LIMIT);
   assert.ok(steps.every((event) => typeof event.data.refusalDetail === 'string' && event.data.refusalDetail.length > 0),
     'each refused step records why it was refused');
   assert.match(JSON.stringify(outcome.terminal), /control_no_progress_exhausted/);
-  assert.match(JSON.stringify(outcome), new RegExp(`refused_before_dispatch:${HOST_NO_DISPATCH_STREAK_LIMIT}`));
+  assert.match(JSON.stringify(outcome), new RegExp(`refused_before_dispatch:repeated:${HOST_IDENTICAL_REFUSAL_LIMIT}`));
   assert.notEqual(outcome.finalOutput, 'Created it.', 'the scripted success after the bound is never reached');
   assert.equal(workflowStore.readWorkflow('broken-canary-0'), null);
 });
