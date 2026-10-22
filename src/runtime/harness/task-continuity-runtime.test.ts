@@ -1788,20 +1788,21 @@ function seedSemanticReading(
               VALUES (?, ?, 'test', ?, ?, 'a', 'b', 'c')`).run(sessionId, sourceUserSeq, new Date().toISOString(), event.id);
 }
 
-/** The one shape that still holds honestly: the reply answered the question's
- * slot and the independent completeness check could not run. The quick
- * model is never asked; the exact reoffer stays. */
-function seedHeldReading(sessionId: string, sourceUserSeq: number, value: string) {
+/** A held reading as earlier builds recorded it (a slot answer whose
+ * completeness check could not run), still in people's histories: it keeps
+ * displaying its notice exactly. New readings of that shape reach the brain. */
+function seedHeldReading(sessionId: string, sourceUserSeq: number, _value: string) {
   const packet = continuity.peekTaskContinuityPacket({ sessionId });
   if (packet.status !== 'available' || !packet.packet.pause.slot) throw new Error('fixture needs an open slot');
-  const slot = packet.packet.pause.slot;
-  seedSemanticReading(sessionId, sourceUserSeq, 'admitted', {
-    version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
-    goal: null, work: null,
-    slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value }],
-    rationale: 'The reply answers the open slot.',
-  });
-  runtime._setClarificationAnswerCompletenessForTests(async () => ({ status: 'unavailable' as const, reason: 'review_failed' }));
+  const source = eventlog.listEvents(sessionId, { types: ['user_input_received'] }).find(row => row.seq === sourceUserSeq);
+  const sourceDigest = runtime._clarificationReplyEdgeDigestForTests(sessionId, sourceUserSeq);
+  if (!source || !sourceDigest) throw new Error('fixture needs the exact reply edge');
+  const common = { sourceUserSeq, parentPacketId: packet.packet.packetId, parentSlot: packet.packet.pause.slot ?? null };
+  eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'open_question_reply_reading_claimed', ...common, sourceDigest, answerCompletenessRequired: true } });
+  eventlog.appendEvent({ sessionId, turn: source.turn, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'open_question_reply_classified', ...common, route: 'reask',
+    reading: 'checked_residual_answer', answerCompletenessRequired: true, revisionUnavailable: true } });
 }
 
 function heldDraft(sessionId: string) {
@@ -2714,7 +2715,7 @@ test('a partial answer whose checked revision is unavailable goes to the brain w
   }
 });
 
-test('a completeness check that cannot run keeps the honest hold instead of guessing the answer complete', async () => {
+test('a completeness check that cannot run hands the exact reply to the brain instead of a canned hold', async () => {
   const sessionId = 'continuity-partial-completeness-unavailable';
   const origin = accepted(sessionId, 'Create one local summary after all required details are confirmed.');
   commitClarification({ sessionId, sourceSeq: origin.seq, question: COMPOUND_QUESTION });
@@ -2732,11 +2733,13 @@ test('a completeness check that cannot run keeps the honest hold instead of gues
   runtime._setClarificationAnswerCompletenessForTests(async () => ({ status: 'unavailable', reason: 'review_unavailable' }));
   try {
     const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
-    assert.equal(route?.route, 'reask');
-    assert.equal(route?.partialAnswer, undefined);
+    assert.equal(route?.route, 'respond', JSON.stringify(route));
+    assert.equal(route?.partialAnswer, true);
+    assert.equal(route?.replyReading, 'completeness_unavailable', 'the brain reads the reply itself, never the partial-answer hold');
     assert.equal(revisions, 0, 'no revision without a completeness verdict');
-    assert.match(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq })?.publicText ?? '', /reply is recorded/);
-    assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
+    assert.equal(runtime.unresolvedClarificationReofferForAcceptedSource({ sessionId, sourceUserSeq: reply.seq }), null,
+      'no "reply is recorded" notice is offered');
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'respond', 'replay reads the record');
   } finally {
     runtime._setClarificationRevisionProposerForTests(null);
     runtime._setClarificationAnswerCompletenessForTests(null);

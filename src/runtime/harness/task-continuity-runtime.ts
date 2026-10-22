@@ -296,6 +296,13 @@ function hasCheckedRevisionChain(packet: TaskContinuityPacket): boolean {
 }
 
 let clarificationCompletenessForTests: typeof checkClarificationAnswerCompleteness | null = null;
+/** The exact reply edge a reading claim is bound to, for fixtures that
+ * stage an interrupted reading. */
+export function _clarificationReplyEdgeDigestForTests(sessionId: string, sourceUserSeq: number): string | null {
+  const packet = peekTaskContinuityPacket({ sessionId });
+  const edge = packet.status === 'available' ? clarificationRevisionInputFor(packet.packet, sourceUserSeq) : null;
+  return edge ? createHash('sha256').update(JSON.stringify(edge)).digest('hex') : null;
+}
 export function _setClarificationAnswerCompletenessForTests(check: typeof checkClarificationAnswerCompleteness | null): void {
   clarificationCompletenessForTests = check;
 }
@@ -439,6 +446,14 @@ export async function classifyUnsettledOpenQuestionReply(input: {
     recordedReading = { reading: 'checked_residual_answer', answerCompletenessRequired: true,
       ...(verified ? { completeness: verified.receipt } : { revisionUnavailable: true }),
     };
+    // The check could not run, but the person's exact words are here: the
+    // brain reads them against the exact question (it answers, changes, or
+    // does not answer) rather than the host holding with a notice that it
+    // could not verify them. The check's absence is not a reason to stop.
+    if (!verified) {
+      route = 'respond';
+      recordedReading = { reading: 'completeness_unavailable', answerCompletenessRequired: true, partialAnswer: true };
+    }
   } else if (unreadable) {
     // The quick reading was lost (schema refusal, model failure). The reply
     // is still the person's words: before paying the revision proposer for a
@@ -535,7 +550,8 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   // A reply the quick semantic reading could not admit is still the person's
   // exact words; when the revision check is unavailable too, the brain reads
   // them (owner 2026-10-06: no canned hold). The verbatim re-ask on a
-  // no-progress revision stands; only an unrunnable completeness check holds.
+  // no-progress revision stands. An unrunnable completeness check reaches
+  // the brain too (above); only an interrupted reading holds.
   const brainReadsReply = completenessRequired || amending || continuing
     || ((recordedReading.reading === 'answers' || unreadable) && recordedReading.revisionUnavailable === true);
   if (route === 'reask' && !revision && !skipRevision && brainReadsReply) {
