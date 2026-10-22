@@ -10888,6 +10888,39 @@ test('durable memory completion obligation accepts verified automatic storage wh
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
 });
 
+test('a host-verified memory save publishes before its review when the caller can review after', async (t) => {
+  // Live 10-21: a one-line "remember" took 39-60 s, most of it the reply
+  // waiting for a review of a fact the host had already stored and verified.
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  let reviews = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    reviews += 1;
+    return { done: true, reason: 'The retained memory fact matches this controlled request.',
+      memoryRequirement: { version: 1, kind: 'retain', corrections: [], reason: 'The owner asks to retain a new project heading.' } };
+  });
+  const fixture = acceptJudgedSource('memory-verified-deliver-now',
+    'Remember that this project report heading is Rowan for future chats.');
+  await retainAutomaticMemoryForHost(fixture, true);
+  assert.ok(verifiedMemoryConsolidationEvidence(fixture.context)?.every(result => result.verified));
+  const model = scriptedRecordingModel([[textMsg('The project heading is remembered.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    throwingRunner() as never, agent as never,
+    [{ type: 'message', role: 'user', content: fixture.source.data.text }] as never,
+    { maxTurns: 6, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true,
+      hostReviewAfterDelivery: true } as never,
+  ));
+  const holds = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'completion_review_holds_reply').map(row => row.data.reason);
+  assert.equal(result.terminal, undefined);
+  assert.ok(!holds.includes('memory_requirement'), `a verified save is not held for its review: ${JSON.stringify(holds)}`);
+  assert.deepEqual(holds, [], 'nothing held this reply');
+  assert.equal(reviews, 0, 'the review runs after the reply, not inside the turn');
+});
+
 // Live 2026-10-20 (r45v1): the first review retained `retain` ("verified
 // consolidation already retains the exact requested information"), bounced the
 // reply's hedge, and the continuation's review failed open on quota; the gate

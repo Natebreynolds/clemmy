@@ -4698,7 +4698,23 @@ const runHostTurnBody = async (
       if (objectiveJudgeContinuations !== 0) return 'review_continuation';
       if (formatRepairReviewRequired || ownerFormatCapture || ownerFormatRequiredAtRequest
         || responseFormatRequirement || responseFormatFinding || responseNormalization) return 'owner_format';
-      if (explicitMemoryRequired || memoryRequirementRequired) return 'memory_requirement';
+      if (explicitMemoryRequired || memoryRequirementRequired) {
+        // A save the host has already proven from its own storage (the turn's
+        // memory_remember receipt names an active fact this conversation wrote,
+        // or every stated fact is promoted and linked to this request) is
+        // truthful to report now; the review still rules right after and can
+        // correct in the thread. A correction, or an automatic save still
+        // pending, keeps the review in front. Live 10-21: a one-line "remember"
+        // took 39–60 s, most of it the reply waiting for its review.
+        const hostProvenSave = (() => {
+          try {
+            if (memoryConsolidation?.some((result) => result.status === 'pending')) return false;
+            const source = readMemoryRequirementSource(exactHostIdentity(), judgedObjective());
+            return source ? hostVerifiedMemoryRetention(source)?.status === 'verified' : false;
+          } catch { return false; }
+        })();
+        if (!hostProvenSave) return 'memory_requirement';
+      }
       if (openApprovalCard) return 'open_card';
       if (inheritedReads || inheritedReadReviewRequired) return 'inherited_reads';
       if (resumedHostState || resumedRecoveryState) return 'resumed';
