@@ -406,7 +406,7 @@ export function Composer(props: ComposerProps) {
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" hidden onChange={onFiles} />
           <input ref={photosRef} type="file" accept="image/*" multiple hidden onChange={onFiles} />
           <input ref={filesRef} type="file" multiple hidden onChange={onFiles} />
-          <Sheet open={attachOpen} onClose={() => setAttachOpen(false)} ariaLabel="Attach" class="sheet-compact">
+          <Sheet open={attachOpen} onClose={() => setAttachOpen(false)} title="Attach" class="sheet-compact" aside={<button type="button" class="btn-quiet" onClick={() => setAttachOpen(false)}>Done</button>}>
             <nav class="switcher-list" aria-label="Attach">
               <button type="button" class="switcher-row" onClick={() => { haptic('light'); cameraRef.current?.click(); }}>
                 <span class="switcher-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z" /><circle cx="12" cy="13" r="3.5" /></svg></span>
