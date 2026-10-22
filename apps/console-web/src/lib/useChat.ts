@@ -26,6 +26,7 @@ import {
 } from './chat';
 import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
+import { chatPendingStorageKey } from './chat-pending-scope';
 import { getPendingActionStatus } from './pendingActions';
 import { humanToolLabel, salientArgDetail } from './toolLabels';
 import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone, type WriteLedgerRow } from '@clem/chat-engine';
@@ -1595,6 +1596,9 @@ export function mergePendingActionHydration(
 }
 
 export interface UseChatOptions {
+  /** Window-local auxiliary panels keep their retry receipt separate from the
+   * primary new-chat slot. This is storage identity, never a server session. */
+  pendingStorageScope?: string;
   /** Resume an existing harness session (its turns post back to this id). */
   initialSessionId?: string | null;
   /** Stable visible chat root; execution successors never replace this id. */
@@ -1748,7 +1752,7 @@ export function useChat(options?: UseChatOptions) {
   const streamRef = useRef<StreamHandle | null>(null);
   const activeAssistantId = useRef<string | null>(null);
   const lateWatchRef = useRef<{ cancel: () => void } | null>(null);
-  const pendingStorageKey = `clem.pending.console:${options?.conversationSessionId ?? options?.initialSessionId ?? 'new'}`;
+  const pendingStorageKey = chatPendingStorageKey(options?.pendingStorageScope, options?.conversationSessionId ?? options?.initialSessionId);
   const [pendingPost, setPendingPost] = useState<PendingChatPost | null>(() => {
     try { return loadPendingChatPost(localStorage, pendingStorageKey); } catch { return null; }
   });

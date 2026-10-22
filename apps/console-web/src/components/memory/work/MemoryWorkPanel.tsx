@@ -66,8 +66,7 @@ function readFolds(): Partial<Record<Fold, boolean>> {
   }
 }
 
-/** Closed until the owner opens it. A running job opens today's learning the
- *  first time, and a choice sticks for the rest of the visit. */
+/** Closed until the owner opens it. Polling never changes disclosure height. */
 function useWorkFolds(): [Partial<Record<Fold, boolean>>, (key: Fold, open: boolean) => void] {
   const [chosen, setChosen] = useState<Partial<Record<Fold, boolean>>>(readFolds);
   const setOpen = (key: Fold, open: boolean) => {
@@ -210,7 +209,7 @@ function WorkGlance({ view, now }: { view: ReturnType<typeof memoryWorkViewModel
           id="memory-work-today"
           title="Today’s learning"
           summary={`${read?.text ?? '—'} read · ${kept?.text ?? '—'} kept · ${view.todayCaption}`}
-          open={isOpen('learning', view.live)}
+          open={isOpen('learning', false)}
           onOpen={(open) => setOpen('learning', open)}
         >
           <LearningPipeline stages={view.pipeline} flows={view.flows} />

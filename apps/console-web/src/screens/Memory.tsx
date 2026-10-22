@@ -1,12 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
   Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
-  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Globe,
+  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Globe, MessageCircle, Activity, ChevronRight,
 } from 'lucide-react';
-import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
@@ -41,6 +40,9 @@ import { ReviewPane } from '@/components/memory/ReviewPane';
 import { LearnedPane } from '@/components/memory/LearnedPane';
 import { MemoryDetail } from '@/components/memory/MemoryDetail';
 import { MemoryWorkPanel } from '@/components/memory/work/MemoryWorkPanel';
+import { MemoryAssistant } from '@/components/memory/MemoryAssistant';
+import { memoryWorkViewModel, useMemoryWork } from '@/lib/memory-work';
+import './memory-workspace.css';
 import type { MemoryStore } from '@/lib/memory';
 import { memoryScopeLabel } from '@clem/chat-engine';
 import { ScopeChip } from '@/components/memory/ScopeChip';
@@ -51,28 +53,28 @@ import { isMac } from '@/lib/platform';
 import { ExactMemoryDetail } from '@/components/memory/ExactMemoryDetail';
 import { memoryFactId } from '@/lib/memory-fact-links';
 
-type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources';
-const TABS: readonly Tab[] = ['overview', 'facts', 'tools', 'episodes', 'entities', 'sources'];
+type Tab = 'overview' | 'facts' | 'tools' | 'episodes' | 'entities' | 'sources' | 'activity' | 'review';
+const TABS: readonly Tab[] = ['overview', 'facts', 'tools', 'episodes', 'entities', 'sources', 'activity', 'review'];
 const KIND_LABEL: Record<Fact['kind'], string> = { user: 'About you', project: 'Project', feedback: 'Preference', reference: 'Reference', constraint: 'Hard constraint' };
 
 const KIND_FACETS: Array<{ key: MemoryStore | 'all'; label: string }> = [
-  { key: 'all', label: 'All' }, { key: 'fact', label: 'Facts' }, { key: 'entity', label: 'People' }, { key: 'note', label: 'Notes' }, { key: 'procedure', label: 'How-tos' }, { key: 'episode', label: 'Moments' },
+  { key: 'all', label: 'All' }, { key: 'fact', label: 'Facts' }, { key: 'entity', label: 'People' }, { key: 'note', label: 'Notes' }, { key: 'procedure', label: 'Procedures' }, { key: 'episode', label: 'Timeline' }, { key: 'resource', label: 'Resources' }, { key: 'policy', label: 'Policies' },
 ];
 type Scope = 'all' | 'week' | 'meetings' | 'salesforce';
 const SCOPE_FACETS: Array<{ key: Scope; label: string }> = [
-  { key: 'week', label: 'This week' }, { key: 'meetings', label: 'From meetings' }, { key: 'salesforce', label: 'From Salesforce' },
+  { key: 'week', label: 'Effective this week' }, { key: 'meetings', label: 'From meetings' }, { key: 'salesforce', label: 'From Salesforce' },
 ];
 function inScope(hit: MemoryHit, scope: Scope): boolean {
   if (scope === 'all') return true;
   if (scope === 'week') { const t = hit.validFrom ? Date.parse(hit.validFrom) : NaN; return Number.isFinite(t) && t >= Date.now() - 7 * 24 * 60 * 60 * 1000; }
   const uris = hit.evidence.map((e) => e.sourceUri ?? '').join(' ');
-  if (scope === 'meetings') return /meeting|recall|transcript/i.test(uris) || hit.ref.type === 'episode';
+  if (scope === 'meetings') return /meeting|recall|transcript/i.test(uris);
   return /salesforce/i.test(uris);
 }
 /** A fact from the Learned pane opens in the same detail panel a search hit does. */
 function factToHit(f: Fact): MemoryHit {
   return {
-    ref: { type: 'fact', id: f.id }, text: f.content, score: 1, confidence: typeof f.confidence === 'number' ? f.confidence : 0.7,
+    ref: { type: 'fact', id: f.id }, text: f.content, score: 1, confidence: typeof f.confidence === 'number' ? f.confidence : null,
     evidence: (f.evidence ?? []).map((e) => ({ episodeId: e.episodeId, excerpt: e.excerpt, ...(e.sourceUri ? { sourceUri: e.sourceUri } : {}) })),
     whyRecalled: [], ...(f.validFrom || f.createdAt ? { validFrom: (f.validFrom ?? f.createdAt) as string } : {}), ...(f.validTo ? { validTo: f.validTo } : {}),
   };
@@ -89,24 +91,35 @@ export function Memory() {
 
 function MemoryOverview() {
   const qc = useQueryClient();
-  // A link from a project or an agent opens the facts kept for it.
-  const [params] = useSearchParams();
-  const linkedTab = TABS.find((key) => key === params.get('tab'));
+  const [params, setParams] = useSearchParams();
   const linkedScope = factScopeKey(factScopeFromKey(params.get('scope') ?? ''));
-  const [tab, setTab] = useState<Tab>(linkedTab ?? (linkedScope !== 'all' ? 'facts' : 'overview'));
+  const tab = TABS.find((key) => key === params.get('tab')) ?? (linkedScope !== 'all' ? 'facts' : 'overview');
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [kind, setKind] = useState<MemoryStore | 'all'>('all');
   const [scope, setScope] = useState<Scope>('all');
   const [selected, setSelected] = useState<MemoryHit | null>(null);
-  const [selectedPinned, setSelectedPinned] = useState(false);
-  const [counts, setCounts] = useState<{ review: number | null; duplicates: number | null }>({ review: null, duplicates: null });
+  const [selectedPinned, setSelectedPinned] = useState<boolean | null>(null);
+  const [selectedActive, setSelectedActive] = useState<boolean | null>(null);
+  const [correctSelection, setCorrectSelection] = useState(false);
+  const [selectionVersion, setSelectionVersion] = useState(0);
+  const [panel, setPanel] = useState<'ask' | 'detail' | null>(() => window.innerWidth >= 1440 ? 'ask' : null);
+  const [askContext, setAskContext] = useState<MemoryHit | null>(null);
+  const [asking, setAsking] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const focusHeading = useRef(false);
+  const panelTrigger = useRef<HTMLElement | null>(null);
+  const rememberPanelTrigger = () => { if (document.activeElement instanceof HTMLElement) panelTrigger.current = document.activeElement; };
+  const closePanel = () => {
+    setPanel(null);
+    requestAnimationFrame(() => (panelTrigger.current?.isConnected ? panelTrigger.current : searchInputRef.current)?.focus({ preventScroll: true }));
+  };
+  const showAsk = () => { rememberPanelTrigger(); setPanel('ask'); };
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
   const searching = debouncedQ.length >= 2;
-  // A filter that is set must never be invisible: hiding the chips while one
-  // is still applied would silently narrow the next search to a scope the
-  // owner cannot see and did not remember choosing.
-  const showFacets = searching || kind !== 'all' || scope !== 'all';
+  const showFacets = q.length > 0 || kind !== 'all' || scope !== 'all';
   const search = useQuery({
     queryKey: ['mem-search', debouncedQ, kind],
     queryFn: () => searchMemory(debouncedQ, { limit: 30, ...(kind === 'all' ? {} : { stores: [kind] }) }),
@@ -115,144 +128,126 @@ function MemoryOverview() {
   const health = usePoll(['mem-health'], getMemoryHealth, 30_000);
   const brain = usePoll(['brain-health'], getBrainHealth, 30_000);
   const memoryFiles = usePoll(['memory-files'], getMemoryFiles, 60_000);
-  // A failed health read must not become "0 told · 0 learned". The words below
-  // are the label the tabs use when a store count did not load.
-  const statsUnknown = brain.isError && !brain.data;
-  const sub = (text: string) => (statsUnknown ? 'count unavailable' : text);
-  const sourcesUnknown = memoryFiles.isError && !memoryFiles.data;
+  // Count reads are shared with ReviewPane. They never insert rows above the
+  // navigation or change the viewport belonging to the user's current store.
+  const review = usePoll(['mem-review'], () => listMemoryReviewCandidates(8), 30_000);
+  const duplicates = usePoll(['mem-dups'], () => listEntityDuplicateCandidates(8), 30_000);
+  const reviewCount = review.data ? review.data.total ?? review.data.candidates.length : null;
+  const duplicateCount = duplicates.data ? duplicates.data.total ?? duplicates.data.candidates.length : null;
+  const waiting = reviewCount != null && duplicateCount != null ? reviewCount + duplicateCount : null;
   const hits = (search.data?.hits ?? []).filter((h) => inScope(h, scope));
-  const searchInputRef = useRef<HTMLInputElement>(null);
+  const refreshMemory = useCallback(() => {
+    for (const key of ['mem-search', 'facts', 'mem-health', 'memory-health', 'brain-health', 'mem-review', 'mem-dups', 'memory-work', 'memory-review-candidates', 'reflection-candidates', 'memory-readiness', 'entity-memory', 'entities', 'entity-identity-conflicts', 'entity-duplicate-candidates', 'memory-episodes', 'tool-recall', 'context', 'source-map', 'memory-files', 'identity-proposals', 'mem-import-batches']) {
+      void qc.invalidateQueries({ queryKey: [key] });
+    }
+  }, [qc]);
+  const navigate = (next: Tab, addMemory = false) => {
+    setParams((previous) => { const value = new URLSearchParams(previous); value.set('tab', next); if (addMemory) { value.set('add', '1'); value.delete('scope'); } else value.delete('add'); return value; }, { replace: true });
+    setQ(''); setDebouncedQ(''); setKind('all'); setScope('all');
+    focusHeading.current = !addMemory;
+    // Also reset when selecting the current store after searching.
+    contentRef.current?.scrollTo({ top: 0 });
+  };
+  useLayoutEffect(() => {
+    contentRef.current?.scrollTo({ top: 0 });
+    if (focusHeading.current) { headingRef.current?.focus({ preventScroll: true }); focusHeading.current = false; }
+  }, [tab, searching, debouncedQ, kind, scope, linkedScope]);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); searchInputRef.current?.focus(); } };
+    const onKey = (event: KeyboardEvent) => {
+      // Keep the global command palette's shortcut; Memory search has its own.
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault(); searchInputRef.current?.focus();
+      }
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
-  // What Clementine is holding for YOU, on the tab that holds it. Review and
-  // duplicate badges come from the queue. Store totals come from the health
-  // read, and stay blank when that read failed.
-  const storeCount = (key: Tab): string | null => {
-    if (statsUnknown) return null;
-    if (key === 'facts') return typeof brain.data?.activeFacts === 'number' ? brain.data.activeFacts.toLocaleString() : null;
-    if (key === 'entities') return typeof brain.data?.entitiesTotal === 'number' ? brain.data.entitiesTotal.toLocaleString() : null;
-    if (key === 'episodes') return typeof brain.data?.memoryEpisodesTotal === 'number' ? brain.data.memoryEpisodesTotal.toLocaleString() : null;
-    if (key === 'sources') return !sourcesUnknown && typeof memoryFiles.data?.files?.length === 'number' ? memoryFiles.data.files.length.toLocaleString() : null;
+  const pick = (hit: MemoryHit, pinned: boolean | null = null, active: boolean | null = null, correct = false) => { rememberPanelTrigger(); setSelected(hit); setSelectedPinned(pinned); setSelectedActive(active); setCorrectSelection(correct); setSelectionVersion((value) => value + 1); setPanel('detail'); };
+  const pickFact = (fact: Fact, correct = false) => pick(factToHit(fact), typeof fact.pinned === 'boolean' ? fact.pinned : null, typeof fact.active === 'boolean' ? fact.active : null, correct);
+  const askAbout = (hit: MemoryHit) => { setAskContext(hit); showAsk(); };
+  const storeCount = (key: Tab): number | null => {
+    if (key === 'facts') return brain.data?.activeFacts ?? null;
+    if (key === 'entities') return brain.data?.entitiesTotal ?? null;
+    if (key === 'episodes') return brain.data?.memoryEpisodesTotal ?? null;
+    if (key === 'sources') return memoryFiles.data?.files?.length ?? null;
+    if (key === 'review') return waiting;
     return null;
   };
-  const tabs: { key: Tab; label: string; icon: typeof Search; badge?: number; badgeLabel?: string }[] = [
-    { key: 'overview', label: 'Overview', icon: Brain, badge: counts.review ?? undefined, badgeLabel: 'to review' },
-    { key: 'facts', label: 'Facts', icon: BookOpen },
-    { key: 'tools', label: 'Learned tools', icon: Wrench },
-    { key: 'episodes', label: 'Timeline', icon: History },
-    { key: 'entities', label: 'People & things', icon: Users, badge: counts.duplicates ?? undefined, badgeLabel: 'possible duplicates' },
-    { key: 'sources', label: 'Sources', icon: FileText },
+  const tabs: { key: Tab; label: string; icon: typeof Search; description: string }[] = [
+    { key: 'overview', label: 'Overview', icon: Brain, description: 'Recent learning and the context Clem carries forward.' },
+    { key: 'facts', label: 'Facts', icon: BookOpen, description: 'What you told Clem and what she learned, with sources and history.' },
+    { key: 'entities', label: 'People & things', icon: Users, description: 'People, organizations, and the connections between them.' },
+    { key: 'tools', label: 'Procedures & tools', icon: Wrench, description: 'How Clem learns to do things, and which tools worked.' },
+    { key: 'episodes', label: 'Timeline', icon: History, description: 'The conversations and observations behind durable memories.' },
+    { key: 'sources', label: 'Sources', icon: FileText, description: 'The files and context behind what Clem knows.' },
+    { key: 'activity', label: 'Learning activity', icon: Activity, description: 'Background jobs, the models doing the work, and what changed.' },
+    { key: 'review', label: 'Review & health', icon: ShieldCheck, description: 'Decisions, repairs, and the evidence behind memory health.' },
   ];
-  const showDetail = Boolean(selected) || searching;
-  const total = (health.data?.facts?.active ?? 0) + (health.data?.entities ?? 0);
+  const current = tabs.find((item) => item.key === tab)!;
   return (
-    <Page title="Memory" subtitle={total > 0 ? `${total.toLocaleString()} things she knows — and where each one came from` : 'Everything Clementine knows — and where it comes from'}>
-      <div className={cn('grid gap-5', showDetail && 'xl:grid-cols-[minmax(0,1fr)_400px]')}>
-        <div className="min-w-0">
-          <div className="mb-3 flex items-center gap-2 rounded-lg border border-border bg-surface px-3 shadow-md">
-            <Search className="h-4 w-4 text-faint" aria-hidden />
-            <input ref={searchInputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search everything she knows" aria-label="Search memory"
-              className="h-12 flex-1 bg-transparent text-body-lg text-fg outline-none placeholder:text-faint" />
-            {!q && <kbd className="rounded bg-subtle px-1.5 py-0.5 font-mono text-caption text-faint">{isMac() ? '⌘K' : 'Ctrl K'}</kbd>}
-            {q && <button type="button" onClick={() => { setQ(''); setSelected(null); }} aria-label="Clear search" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
-          </div>
-          {/* Filters belong to the search, not to the page. Two rows of chips sat
-              above the fold at all times narrowing nothing — the first thing
-              the eye met on the memory screen was a control panel for a query
-              nobody had typed. */}
-          {showFacets && (
-          <div className="mb-2 flex flex-wrap items-center gap-1.5">
-            {KIND_FACETS.map((f) => (
-              <button key={f.key} type="button" aria-pressed={kind === f.key} onClick={() => setKind(f.key)}
-                className={cn('rounded-full px-3 py-1 text-caption font-semibold transition-colors', kind === f.key ? 'bg-fg text-canvas' : 'bg-subtle text-muted hover:text-fg')}>{f.label}</button>
-            ))}
-            {searching && <span className="ml-auto font-mono text-caption text-faint">{search.isLoading ? 'looking…' : `${hits.length} ${hits.length === 1 ? 'match' : 'matches'}${search.data?.diagnostics?.elapsedMs ? ` · ${(search.data.diagnostics.elapsedMs / 1000).toFixed(1)}s` : ''}`}</span>}
-          </div>
-          )}
-          {showFacets && (
-          <div className="mb-5 flex flex-wrap items-center gap-1.5">
-            {SCOPE_FACETS.map((f) => (
-              <button key={f.key} type="button" aria-pressed={scope === f.key} onClick={() => setScope(scope === f.key ? 'all' : f.key)}
-                className={cn('rounded-full border px-3 py-1 text-caption font-semibold transition-colors', scope === f.key ? 'border-fg bg-fg text-canvas' : 'border-border text-muted hover:border-border-strong hover:text-fg')}>{f.label}</button>
-            ))}
-          </div>
-          )}
-
-          {searching ? (
-            search.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
-            : hits.length === 0 ? (
-              <div className="rounded-lg border border-border bg-surface p-5 text-center shadow-xs">
-                <p className="text-body font-semibold text-fg">Nothing about “{debouncedQ}”{scope !== 'all' || kind !== 'all' ? ' with those filters' : ''}.</p>
-                <p className="mt-1 text-small text-muted">Try a shorter word{scope !== 'all' || kind !== 'all' ? ', clear a filter' : ''}, or ask her in chat — she can look further than this box.</p>
-                <Link to={`/chat?prompt=${encodeURIComponent(`What do you know about ${debouncedQ}?`)}`} className="mt-3 inline-flex rounded-md border border-border px-3 py-1.5 text-small font-semibold text-fg hover:border-border-strong">Ask Clementine</Link>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <h2 className="text-body font-semibold text-fg">Matches</h2>
-                {hits.map((hit, i) => (
-                  <HitRow key={`${hit.ref.type}:${hit.ref.id}`} hit={hit} index={i} selected={selected?.ref.type === hit.ref.type && String(selected?.ref.id) === String(hit.ref.id)} onSelect={() => { setSelected(hit); setSelectedPinned(false); }} />
-                ))}
-              </div>
-            )
-          ) : (
-            <div className="space-y-4">
-              <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} unavailable={health.isError && !health.data} />
-              <ReviewPane
-                quietEmpty={tab !== 'overview'}
-                onOpen={setTab}
-                onCounts={(n) => {
-                  setCounts((prev) => {
-                    const next = { review: n.review ?? prev.review, duplicates: n.duplicates ?? prev.duplicates };
-                    return next.review === prev.review && next.duplicates === prev.duplicates ? prev : next;
-                  });
-                }}
-              />
-              {(statsUnknown || sourcesUnknown) && (
-                <p className="text-caption text-muted">{statsUnknown ? 'Store counts couldn’t be read.' : 'The sources count couldn’t be read.'}</p>
-              )}
-              <div className="sticky top-0 z-20 border-b border-border bg-canvas">
-                <div className="flex flex-wrap gap-1" role="group" aria-label="Memory stores">
-                  {tabs.map((t) => {
-                    const Icon = t.icon; const active = tab === t.key;
-                    const count = storeCount(t.key);
-                    const unknownLabel = statsUnknown ? sub(t.label) : t.key === 'sources' && sourcesUnknown ? 'count unavailable' : null;
-                    return (
-                      <button key={t.key} type="button" aria-current={active ? 'page' : undefined} onClick={() => setTab(t.key)}
-                        aria-label={unknownLabel ? `${t.label}, ${unknownLabel}` : undefined}
-                        className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
-                          active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
-                        <Icon className="h-4 w-4" aria-hidden /> {t.label}
-                        {count && <span className="text-caption tabular-nums text-faint">{count}</span>}
-                        {t.badge ? (
-                          <span
-                            className="inline-flex min-w-5 items-center justify-center rounded-full bg-warning-tint px-1.5 py-0.5 text-caption font-semibold text-warning"
-                            aria-label={`${t.badge} ${t.badgeLabel}`}
-                          >
-                            {t.badge > 99 ? '99+' : t.badge}
-                          </span>
-                        ) : null}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-              {tab === 'overview' && <OverviewTab onNavigate={setTab} onPickLearned={(f) => { setSelected(factToHit(f)); setSelectedPinned(Boolean(f.pinned)); }} />}
-              {tab === 'facts' && <FactsTab qc={qc} initialScope={linkedScope} />}
+    <section className="memory-workspace" aria-label="Memory workspace">
+      <header className="memory-toolbar">
+        <div className="memory-search">
+          <Search size={18} aria-hidden />
+          <input ref={searchInputRef} value={q} onChange={(event) => setQ(event.target.value)} placeholder="Find a fact, person, or procedure…" aria-label="Search all memory" />
+          {q ? <button type="button" aria-label="Clear memory search" onClick={() => { setQ(''); setDebouncedQ(''); searchInputRef.current?.focus(); }}><X size={17} aria-hidden /></button>
+            : <kbd>{isMac() ? '⌘⇧F' : 'Ctrl Shift F'}</kbd>}
+        </div>
+        <Button variant="secondary" onClick={() => panel === 'ask' ? closePanel() : showAsk()} aria-expanded={panel === 'ask'} aria-controls="memory-assistant-pane">
+          <MessageCircle className="h-4 w-4" aria-hidden /> {asking ? 'Clem is working…' : 'Ask Clem'}
+        </Button>
+      </header>
+      <div className="memory-layout" data-panel-open={Boolean(panel)}>
+        <nav className="memory-navigation" aria-label="Memory sections">
+          {tabs.map((item, index) => {
+            const count = storeCount(item.key); const Icon = item.icon;
+            return <button key={item.key} type="button" aria-current={!searching && item.key === tab ? 'page' : undefined}
+              className={cn('memory-nav-item', index === 6 && 'memory-nav-secondary')} onClick={() => navigate(item.key)}>
+              <Icon size={17} aria-hidden /><span>{item.label}</span>
+              {count != null && <span className={cn('memory-nav-count', item.key === 'review' && count > 0 && 'memory-nav-attention')}>{count.toLocaleString()}</span>}
+            </button>;
+          })}
+        </nav>
+        <div ref={contentRef} className="memory-content" tabIndex={0} aria-label={searching ? 'Memory search results' : `${current.label} content`}>
+          <div className="memory-content-inner">
+            <div className="memory-section-heading">
+              <div><h2 ref={headingRef} tabIndex={-1}>{searching ? 'Search results' : current.label}</h2>
+                <p>{searching ? `Across memory${kind === 'all' ? '' : ` · ${KIND_FACETS.find((facet) => facet.key === kind)?.label ?? kind}`}` : current.description}</p></div>
+              {!searching && tab === 'overview' && <Button variant="secondary" size="sm" onClick={() => navigate('facts', true)}><Plus className="h-4 w-4" aria-hidden /> Add a memory</Button>}
+            </div>
+            {showFacets && <div className="memory-search-filters" aria-label="Search filters">
+              <div>{KIND_FACETS.map((facet) => <button key={facet.key} type="button" aria-pressed={kind === facet.key} onClick={() => setKind(facet.key)}>{facet.label}</button>)}</div>
+              <div>{SCOPE_FACETS.map((facet) => <button key={facet.key} type="button" aria-pressed={scope === facet.key} onClick={() => setScope(scope === facet.key ? 'all' : facet.key)}>{facet.label}</button>)}
+                {(kind !== 'all' || scope !== 'all') && <button type="button" onClick={() => { setKind('all'); setScope('all'); }}>Clear filters</button>}</div>
+            </div>}
+            {searching ? (
+              search.isLoading ? <div className="space-y-3" aria-busy="true">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-20 w-full" />)}</div>
+                : search.isError && !search.data ? <CouldNotRead what="Memory search" onRetry={() => void search.refetch()} />
+                : <>
+                  {search.isError && <p role="status" className="mb-3 text-small text-warning">Showing the last results. The latest search couldn’t refresh.</p>}
+                  {hits.length === 0 ? <div className="memory-search-empty"><Search size={24} aria-hidden /><h3>No matches returned for “{debouncedQ}”{kind !== 'all' || scope !== 'all' ? ' with these filters' : ''}</h3><p>Try another phrase, clear a filter, or ask Clem to look into it.</p><Button variant="secondary" onClick={showAsk}>Ask about memory</Button></div>
+                    : <div className="space-y-2"><p className="text-small text-muted">{hits.length} {hits.length === 1 ? 'match' : 'matches'} shown</p>{hits.map((hit, index) => <HitRow key={`${hit.ref.type}:${hit.ref.id}`} hit={hit} index={index} selected={selected?.ref.type === hit.ref.type && String(selected.ref.id) === String(hit.ref.id)} onSelect={() => pick(hit)} />)}</div>}
+                </>
+            ) : <>
+              {tab === 'overview' && <OverviewTab onNavigate={navigate} onPickLearned={pickFact} />}
+              {tab === 'facts' && <FactsTab key={linkedScope} initialScope={linkedScope} initialAddOpen={params.get('add') === '1'} onPick={pickFact} onChanged={refreshMemory} />}
               {tab === 'tools' && <ToolRecallSection />}
               {tab === 'episodes' && <EpisodesTab />}
               {tab === 'entities' && <EntitiesTab />}
-              {tab === 'sources' && <SourcesTab qc={qc} onNavigate={setTab} />}
-            </div>
-          )}
+              {tab === 'sources' && <SourcesTab qc={qc} onNavigate={navigate} />}
+              {tab === 'activity' && <MemoryWorkPanel />}
+              {tab === 'review' && <MemoryReviewTab onNavigate={navigate} health={health.data} review={reviewCount} duplicates={duplicateCount} healthUnavailable={health.isError && !health.data} />}
+            </>}
+          </div>
         </div>
-        {showDetail && (
-          <MemoryDetail hit={selected} pinned={selectedPinned} onChanged={() => { void qc.invalidateQueries({ queryKey: ['mem-search'] }); void qc.invalidateQueries({ queryKey: ['facts'] }); void qc.invalidateQueries({ queryKey: ['mem-health'] }); }} className="xl:sticky xl:top-4 xl:max-h-[calc(100vh-9rem)]" />
-        )}
+        <div className="memory-sidepanel" data-open={Boolean(panel)} aria-label="Memory companion" hidden={!panel}>
+          <div id="memory-assistant-pane" className="memory-assistant-host" hidden={panel !== 'ask'}>
+            <MemoryAssistant open={panel === 'ask'} onClose={closePanel} context={askContext} onClearContext={() => setAskContext(null)} onMemoryChanged={refreshMemory} onBusyChange={setAsking} />
+          </div>
+          {panel === 'detail' && <MemoryDetail key={selectionVersion} hit={selected} pinned={selectedPinned} active={selectedActive} initialEditing={correctSelection} onClose={closePanel} onAsk={askAbout} onReplaced={pickFact} onChanged={refreshMemory} className="memory-inspector" />}
+        </div>
       </div>
-    </Page>
+    </section>
   );
 }
 
@@ -262,73 +257,42 @@ function MemoryOverview() {
 // repairs, and the map. Diagnostics stay behind one fold.
 function OverviewTab({ onNavigate, onPickLearned }: { onNavigate: (tab: Tab) => void; onPickLearned: (fact: Fact) => void }) {
   const ctx = usePoll(['context'], getContext, 20000);
+  const [mapOpen, setMapOpen] = useState(false);
+  const workingMem = (ctx.data?.files ?? []).find((file) => file.key === 'working_memory');
+  return <div className="memory-overview">
+    <MemoryLearningGlance onOpen={() => onNavigate('activity')} />
+    <LearnedPane onPick={onPickLearned} />
+    <details className="memory-overview-disclosure">
+      <summary><Clock size={18} aria-hidden /><span><strong>Current working context</strong><small>What Clem carries forward as you work together</small></span><ChevronRight size={17} aria-hidden /></summary>
+      <div>{ctx.isLoading ? <Skeleton className="h-24 w-full" /> : ctx.isError && !ctx.data ? <CouldNotRead what="Working memory" onRetry={() => void ctx.refetch()} /> : workingMem ? <ContextFileCard file={workingMem} onNavigate={onNavigate} /> : <p className="text-small text-muted">No working context is recorded yet.</p>}</div>
+    </details>
+    <details className="memory-overview-disclosure" onToggle={(event) => setMapOpen(event.currentTarget.open)}>
+      <summary><Network size={18} aria-hidden /><span><strong>Knowledge map</strong><small>Explore the connections between memories and their sources</small></span><ChevronRight size={17} aria-hidden /></summary>
+      {mapOpen && <div><p className="mb-3 text-small text-muted">Stored links first. Text matches and semantic similarity are labeled overlays.</p><MemoryGraphContainer height={420} /></div>}
+    </details>
+    <button type="button" className="memory-review-link" onClick={() => onNavigate('review')}><ShieldCheck size={18} aria-hidden /><span>Review decisions and memory health</span><ArrowRight size={17} aria-hidden /></button>
+  </div>;
+}
+
+function MemoryLearningGlance({ onOpen }: { onOpen: () => void }) {
+  const work = useMemoryWork();
+  const view = work.data ? memoryWorkViewModel(work.data, Date.now(), { stale: work.isError, readAt: work.dataUpdatedAt || undefined }) : null;
+  return <section className="memory-learning-glance" aria-label="Background learning">
+    <div className="memory-learning-heading"><span className="memory-status-dot" data-state={view?.state ?? 'unknown'} aria-hidden /><h3>{view?.headline ?? (work.isError ? 'Learning status unavailable' : work.isLoading ? 'Reading learning activity…' : 'Learning activity is not reported')}</h3></div>
+    <p>{view?.detail ?? 'See what the background jobs have learned and which model did the work.'}</p>
+    <div className="memory-learning-footer"><span>{view?.model.name ? `Memory model · ${view.model.name}` : 'Memory model not reported'}</span><button type="button" onClick={onOpen}>View learning activity <ArrowRight size={15} aria-hidden /></button></div>
+  </section>;
+}
+
+function MemoryReviewTab({ onNavigate, health, review, duplicates, healthUnavailable }: { onNavigate: (tab: Tab) => void; health?: import('@/lib/memory').MemoryHealth; review: number | null; duplicates: number | null; healthUnavailable: boolean }) {
   const memHealth = usePoll(['memory-health'], getMemoryHealth, 30000);
   const readiness = usePoll(['memory-readiness'], getMemoryReadiness, 30000);
-  const [mapOpen, setMapOpen] = useState(false);
-  const workingMem = (ctx.data?.files ?? []).find((f) => f.key === 'working_memory');
-  const assurance = readiness.data ? memoryAssuranceView(readiness.data) : null;
-  const firstIssue = readiness.data?.checks.find((c) => c.status === 'fail') ?? readiness.data?.checks.find((c) => c.status !== 'pass');
-  const contextUnknown = ctx.isError && !ctx.data;
-
-  return (
-    <div className="space-y-6">
-      <MemoryWorkPanel />
-      <div className="grid gap-5 lg:grid-cols-2">
-        <section>
-          <h3 className="mb-3 flex items-center gap-2 text-h3 text-fg"><Clock className="h-5 w-5 text-primary" aria-hidden /> Short-term</h3>
-          {ctx.isLoading ? <Skeleton className="h-32 w-full" />
-            : contextUnknown
-            ? <Card className="p-4 text-body text-muted">Working memory couldn’t be read just now — nothing has been lost.{' '}
-                <button type="button" onClick={() => { void ctx.refetch(); }} className="cursor-pointer font-medium text-primary hover:underline">Try again</button></Card>
-            : workingMem
-            ? <ContextFileCard file={workingMem} onNavigate={onNavigate} />
-            : <Card className="p-4 text-body text-muted">No working memory yet — it fills in as you chat.</Card>}
-        </section>
-        <LearnedPane onPick={onPickLearned} />
-      </div>
-
-      <MemoryReviewQueue
-        health={memHealth.data}
-        readiness={readiness.data}
-        onNavigate={onNavigate}
-        onUpdated={() => {
-          void memHealth.refetch();
-          void readiness.refetch();
-        }}
-      />
-
-      {/* One plain sentence when a safeguard needs a human; the full audit
-          panel (pass counts, schema versions) lives in the diagnostics fold. */}
-      {assurance && assurance.tone !== 'success' && (
-        <div className="flex items-center gap-2 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning">
-          <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
-          <span className="min-w-0 flex-1">{firstIssue ? firstIssue.summary : assurance.detail} — details under Memory diagnostics below.</span>
-        </div>
-      )}
-
-      <details
-        className="memory-fold rounded-lg border border-border bg-surface px-4"
-        onToggle={(event) => setMapOpen(event.currentTarget.open)}
-      >
-        <summary className="cursor-pointer list-none py-3 text-body font-medium text-fg">Knowledge map</summary>
-        {mapOpen && (
-          <div className="pb-4">
-            <p className="mb-2 text-small text-muted">Stored links first. Text matches and semantic similarity are labeled overlays.</p>
-            <MemoryGraphContainer height={480} />
-          </div>
-        )}
-      </details>
-
-      <details className="rounded-lg border border-border bg-surface p-4">
-        <summary className="cursor-pointer text-body font-medium text-fg">Memory diagnostics</summary>
-        <div className="mt-4 space-y-4">
-          <MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} />
-          <RecallHealthStrip health={memHealth.data} />
-          <GraphTruthCoverage health={memHealth.data} readiness={readiness.data} />
-        </div>
-      </details>
-    </div>
-  );
+  return <div className="space-y-5">
+    <HealthStrip health={health} review={review} duplicates={duplicates} unavailable={healthUnavailable} />
+    <ReviewPane onOpen={onNavigate} />
+    <MemoryReviewQueue health={memHealth.data} readiness={readiness.data} onNavigate={onNavigate} onUpdated={() => { void memHealth.refetch(); void readiness.refetch(); }} />
+    <details className="memory-overview-disclosure"><summary><ShieldCheck size={18} aria-hidden /><span><strong>Memory diagnostics</strong><small>Readiness, retrieval, and evidence coverage</small></span><ChevronRight size={17} aria-hidden /></summary><div className="space-y-4"><MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} /><RecallHealthStrip health={memHealth.data} /><GraphTruthCoverage health={memHealth.data} readiness={readiness.data} /></div></details>
+  </div>;
 }
 
 function MemoryReviewQueue({
@@ -704,7 +668,7 @@ function CouldNotRead({ what, onRetry }: { what: string; onRetry: () => void }) 
   );
 }
 
-function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQueryClient>; initialScope?: string }) {
+function FactsTab({ initialScope = 'all', initialAddOpen = false, onPick, onChanged }: { initialScope?: string; initialAddOpen?: boolean; onPick: (fact: Fact, correct?: boolean) => void; onChanged: () => void }) {
   const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
   const [showForgotten, setShowForgotten] = useState(false);
   // Where the facts shown apply: everything, everywhere only, one project or one agent.
@@ -738,15 +702,20 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
       // Already everywhere is what was asked for; anything else is said in words.
       if (apiErrorCode(error) !== 'ALREADY_KEPT_THERE') throw new Error(refusalText(error, 'It could not be moved just now. Try again.'));
     } finally {
-      void qc.invalidateQueries({ queryKey: ['facts'] });
+      onChanged();
     }
   };
   const [resolvingReview, setResolvingReview] = useState('');
   const [draft, setDraft] = useState('');
   const [draftKind, setDraftKind] = useState<Fact['kind']>('user');
-  const [addResult, setAddResult] = useState<string>('');
+  const [addResult, setAddResult] = useState('');
+  const [addError, setAddError] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [addOpen, setAddOpen] = useState(initialAddOpen);
   const add = async () => {
-    if (!draft.trim()) return;
+    if (!draft.trim() || adding) return;
+    const submitted = draft;
+    setAdding(true); setAddError(''); setAddResult('');
     try {
       const result = await addFact(draft.trim(), draftKind);
       const message = result.consolidation.action === 'supersede'
@@ -757,15 +726,16 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
             ? `Already represented by canonical memory${result.fact ? ` #${result.fact.id}` : ''}; no duplicate was created.`
             : `Added canonical memory${result.fact ? ` #${result.fact.id}` : ''} with durable evidence.`;
       setAddResult(message);
-      setDraft('');
+      setDraft((current) => current === submitted ? '' : current);
+    } catch (error) {
+      setAddError(error instanceof Error ? error.message : 'This memory could not be saved. Try again.');
     } finally {
-      void qc.invalidateQueries({ queryKey: ['facts'] });
+      setAdding(false); onChanged();
     }
   };
-  const onForget = async (id: Fact['id']) => { try { await forgetFact(id); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
-  const onPin = async (id: Fact['id'], pinned: boolean) => { try { await pinFact(id, pinned); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
-  const onRestore = async (id: Fact['id']) => { try { await restoreFact(id); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
-  const onEdit = async (id: Fact['id'], content: string) => { try { await updateFact(id, { content }); } finally { void qc.invalidateQueries({ queryKey: ['facts'] }); } };
+  const onForget = async (id: Fact['id']) => { try { await forgetFact(id); } finally { onChanged(); } };
+  const onPin = async (id: Fact['id'], pinned: boolean) => { try { await pinFact(id, pinned); } finally { onChanged(); } };
+  const onRestore = async (id: Fact['id']) => { try { await restoreFact(id); } finally { onChanged(); } };
   const resolveReview = async (candidate: MemoryReviewCandidate, action: 'apply' | 'dismiss') => {
     const fact = candidate.targetFacts[0];
     if (action === 'apply') {
@@ -779,7 +749,7 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
       if (action === 'apply') await applyMemoryReviewCandidate(candidate.id);
       else await dismissMemoryReviewCandidate(candidate.id);
       await Promise.all([reviews.refetch(), facts.refetch()]);
-      void qc.invalidateQueries({ queryKey: ['facts'] });
+      onChanged();
     } finally {
       setResolvingReview('');
     }
@@ -800,7 +770,7 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
         for (const candidate of transient) await applyMemoryReviewCandidate(candidate.id);
       }
       await Promise.all([reviews.refetch(), facts.refetch()]);
-      void qc.invalidateQueries({ queryKey: ['facts'] });
+      onChanged();
     } finally {
       setResolvingReview('');
     }
@@ -841,12 +811,17 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
           Showing {rows.length} of {facts.data.total} {showForgotten ? 'current and historical' : 'current'} facts{scopeKey === 'all' ? '' : scopeKey === 'everywhere' ? ' that apply everywhere' : ` kept for ${scopeLabel}`}{rows.length < facts.data.total ? ' · use memory search for the full archive' : ''}
         </span>}
       </div>
-      <div className="mb-4 flex flex-wrap gap-2">
-        <Input value={draft} onChange={(e) => { setDraft(e.target.value); setAddResult(''); }} placeholder="Tell Clementine something to remember…" aria-label="New fact" className="min-w-48 flex-1" onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} />
-        <Select value={draftKind} onChange={(e) => setDraftKind(e.target.value as Fact['kind'])} aria-label="Fact type" className="w-40">{FACT_KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}</Select>
-        <Button onClick={add} disabled={!draft.trim()}><Plus className="h-4 w-4" aria-hidden /> Remember</Button>
-        {addResult && <p className="basis-full text-caption text-muted"><CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" aria-hidden />{addResult}</p>}
-      </div>
+      <details className="memory-add-fact" open={addOpen} onToggle={(event) => setAddOpen(event.currentTarget.open)}>
+        <summary>Add a memory</summary>
+        <form onSubmit={(event) => { event.preventDefault(); void add(); }}>
+          <p className="basis-full text-small text-muted">Applies everywhere · Tell Clem something to remember across your conversations.</p>
+          <Input autoFocus={initialAddOpen} value={draft} onChange={(e) => { setDraft(e.target.value); setAddResult(''); setAddError(''); }} placeholder="What would you like Clem to remember?" aria-label="New fact" className="min-w-0 basis-full" />
+          <Select value={draftKind} onChange={(e) => setDraftKind(e.target.value as Fact['kind'])} aria-label="Fact type" className="w-40">{FACT_KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}</Select>
+          <Button type="submit" disabled={!draft.trim() || adding}><Plus className="h-4 w-4" aria-hidden /> {adding ? 'Saving…' : 'Remember'}</Button>
+          {addResult && <p role="status" className="basis-full text-small text-muted"><CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" aria-hidden />{addResult}</p>}
+          {addError && <p role="alert" className="basis-full text-small text-danger">{addError}</p>}
+        </form>
+      </details>
       {facts.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
         : facts.isError && !facts.data ? <CouldNotRead what="Your facts" onRetry={() => { void facts.refetch(); }} />
         : !scoped.supported ? (
@@ -860,7 +835,7 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
         : rows.length === 0 ? (scopeKey === 'all'
           ? <Card><EmptyState title="Still getting to know you" description="As we work together, the important things land here — and you can edit or forget anything." /></Card>
           : <Card><EmptyState title={scopeKey === 'everywhere' ? 'Nothing here applies everywhere yet' : `Nothing is kept for ${scopeLabel} yet`} description="What is learned there lands here, with where it came from." action={<Button variant="secondary" size="sm" onClick={() => setScopeKey('all')}>Show all facts</Button>} /></Card>)
-          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onMoveEverywhere={canMoveToEverywhere(f) ? () => onMoveEverywhere(f.id) : undefined} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onEdit={(content) => onEdit(f.id, content)} onImportance={(value) => { void updateFact(f.id, { importance: value }).finally(() => qc.invalidateQueries({ queryKey: ['facts'] })); }} />)}</div>}
+          : <div className="space-y-2">{rows.map((f) => <FactCard key={f.id} fact={f} onInspect={(correct) => onPick(f, correct)} onMoveEverywhere={canMoveToEverywhere(f) ? () => onMoveEverywhere(f.id) : undefined} onPin={() => onPin(f.id, !f.pinned)} onForget={() => onForget(f.id)} onRestore={() => onRestore(f.id)} onImportance={(value) => updateFact(f.id, { importance: value }).finally(onChanged)} />)}</div>}
       {(reviews.data?.candidates.length ?? 0) > 0 && <Card className="mt-4 border-warning/40 bg-warning/5 p-4">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <div className="text-body font-medium text-fg">Memory review</div>
@@ -970,86 +945,62 @@ function FactsTab({ qc, initialScope = 'all' }: { qc: ReturnType<typeof useQuery
   );
 }
 
-function FactCard({ fact, onPin, onForget, onRestore, onEdit, onImportance, onMoveEverywhere }: { fact: Fact; onPin: () => void; onForget: () => void; onRestore: () => void; onEdit: (content: string) => Promise<void>; onImportance?: (value: number) => void; /** Present only on a fact kept for a project or an agent. */ onMoveEverywhere?: () => Promise<void> }) {
-  const [expanded, setExpanded] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [moving, setMoving] = useState<'confirm' | 'busy' | null>(null);
-  const [moveError, setMoveError] = useState('');
-  const moveEverywhere = async () => {
-    if (!onMoveEverywhere) return;
-    setMoving('busy');
-    setMoveError('');
-    try { await onMoveEverywhere(); setMoving(null); }
-    catch (error) { setMoveError(error instanceof Error && error.message.trim() ? error.message : 'It could not be moved just now. Try again.'); setMoving('confirm'); }
-  };
-  const [draft, setDraft] = useState(fact.content);
-  const long = (fact.content?.length ?? 0) > 180;
+function FactCard({ fact, onPin, onForget, onRestore, onImportance, onMoveEverywhere, onInspect }: {
+  fact: Fact; onInspect: (correct?: boolean) => void; onPin: () => Promise<void>; onForget: () => Promise<void>; onRestore: () => Promise<void>;
+  onImportance?: (value: number) => Promise<unknown>; onMoveEverywhere?: () => Promise<void>;
+}) {
+  const [moving, setMoving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => { if (fact.active === false) setMoving(false); }, [fact.active]);
   const usableEvidence = (fact.evidence ?? []).filter((item) =>
     (item.status === 'available' || item.status === 'partial' || item.status === undefined) && item.excerpt.trim().length > 0);
-  const unavailableEvidence = (fact.evidence ?? []).filter((item) => !usableEvidence.includes(item));
-  let policyReason = '';
-  try {
-    const parsed = JSON.parse(fact.policy?.applies_to_json ?? '{}') as { reason?: unknown };
-    policyReason = typeof parsed.reason === 'string' ? parsed.reason : '';
-  } catch { /* malformed legacy metadata remains visibly unclassified */ }
-  return (
-    <Card className="flex items-start gap-3 p-3.5">
-      {fact.pinned && <Pin className="mt-1 h-4 w-4 shrink-0 text-primary" aria-hidden />}
-      <div className="min-w-0 flex-1">
-        <div className="mb-1 flex flex-wrap gap-1.5">
-          <StatusPill tone="neutral">{KIND_LABEL[fact.kind] ?? fact.kind}</StatusPill>
-          {/* Told-vs-learned origin (confidence wave 2026-07-31): the single
-              most trust-relevant attribute of a memory — whether the user
-              STATED it or Clem INFERRED it — was stored but never shown. */}
-          {fact.derivedFrom?.tool || fact.derivedFrom?.callId
-            ? <span title={fact.derivedFrom?.tool ? `Learned from ${fact.derivedFrom.tool}` : 'Learned from a tool result'}><StatusPill tone="neutral">she learned this</StatusPill></span>
-            : <StatusPill tone="success">you told her</StatusPill>}
-          {/* Where it applies. A service that predates scopes says nothing,
-              and nothing is shown rather than "Everywhere" assumed. */}
-          {fact.scope && <ScopeChip scope={fact.scope} />}
-          {fact.policy && <span title={policyReason || undefined}><StatusPill tone={fact.policy.enforcement === 'dispatch' ? 'warning' : 'neutral'}>{fact.policy.policy_type.replace(/_/g, ' ')} · {fact.policy.enforcement}</StatusPill></span>}
-          {fact.active === false && <StatusPill tone="warning">historical</StatusPill>}
-          {fact.active === false && fact.supersededByFactId != null && <StatusPill tone="neutral">continued as #{fact.supersededByFactId}</StatusPill>}
-        </div>
-        {editing ? <div className="space-y-2">
-          <Input value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="Edit fact" />
-          <div className="flex gap-2"><Button size="sm" onClick={async () => { await onEdit(draft.trim()); setEditing(false); }} disabled={!draft.trim() || draft.trim() === fact.content}>Save as correction</Button><Button size="sm" variant="ghost" onClick={() => { setDraft(fact.content); setEditing(false); }}>Cancel</Button></div>
-        </div> : <p className={cn('text-body text-fg', !expanded && long && 'line-clamp-3')}>{fact.content}</p>}
-        {long && <button type="button" onClick={() => setExpanded((v) => !v)} className="mt-1 text-caption font-semibold text-primary hover:underline cursor-pointer">{expanded ? 'Show less' : 'Show more'}</button>}
-        <div className="mt-1 flex flex-wrap items-center gap-x-2 text-caption text-faint">
-          <span>{typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% confidence · ` : ''}{usableEvidence.length} source{usableEvidence.length === 1 ? '' : 's'}{unavailableEvidence.length > 0 ? ` · ${unavailableEvidence.length} unavailable` : ''} · used {fact.utilityCount ?? 0}× · shown {fact.impressionCount ?? 0}×</span>
-          {fact.active !== false && typeof fact.importance === 'number' && onImportance && (
-            <span className="inline-flex items-center gap-1" title="Importance drives how strongly this memory competes for recall (0–10)">
-              · importance {fact.importance}
-              <button type="button" aria-label="Raise importance" disabled={fact.importance >= 10} onClick={() => onImportance(Math.min(10, (fact.importance ?? 5) + 1))} className="cursor-pointer rounded px-1 text-muted hover:bg-subtle hover:text-fg disabled:opacity-40">+</button>
-              <button type="button" aria-label="Lower importance" disabled={fact.importance <= 0} onClick={() => onImportance(Math.max(0, (fact.importance ?? 5) - 1))} className="cursor-pointer rounded px-1 text-muted hover:bg-subtle hover:text-fg disabled:opacity-40">−</button>
-            </span>
-          )}
-        </div>
-        {fact.pinned && <div className="mt-0.5 text-caption text-primary">Pinned — always in her context, never ages out.</div>}
-        {moving && onMoveEverywhere && (
-          <div className="mt-2 rounded-md border border-border bg-subtle px-3 py-2" role="group" aria-label="Confirm using this fact everywhere">
-            <p className="text-small text-fg">Use this everywhere? It is kept for {memoryScopeLabel(fact.scope)} now; after this it applies in every conversation.</p>
-            {moveError && <p role="alert" className="mt-1 text-caption text-danger">{moveError}</p>}
-            <div className="mt-2 flex gap-2">
-              <Button size="sm" disabled={moving === 'busy'} onClick={() => { void moveEverywhere(); }}>{moving === 'busy' ? 'Moving…' : 'Use everywhere'}</Button>
-              <Button size="sm" variant="ghost" disabled={moving === 'busy'} onClick={() => { setMoving(null); setMoveError(''); }}>Cancel</Button>
-            </div>
-          </div>
-        )}
-        {(fact.evidence?.length ?? 0) > 0 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View provenance</summary><div className="mt-1 space-y-1">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-2"><div>{item.excerpt || 'Supporting excerpt unavailable — the source expired before durable capture.'}</div><div className="mt-1 text-faint">{item.status ?? 'available'}{item.sourceUri ? ` · ${item.sourceUri}` : ''}</div></div>)}</div></details>}
-        {(fact.validityIntervals?.length ?? 0) > 1 && <details className="mt-1 text-caption text-muted"><summary className="cursor-pointer">View validity history ({fact.validityIntervals?.length} periods)</summary><div className="mt-1 space-y-1">{fact.validityIntervals?.map((interval) => <div key={interval.id} className="rounded bg-subtle p-2"><div>{new Date(interval.validFrom).toLocaleString()} → {interval.validTo ? new Date(interval.validTo).toLocaleString() : 'current'}</div><div className="mt-1 text-faint">{interval.openedReason}{interval.closedReason ? ` · ${interval.closedReason}` : ''}</div></div>)}</div></details>}
-      </div>
-      <div className="flex shrink-0 gap-1">
-        {fact.active === false ? <Button variant="ghost" size="icon" aria-label="Restore" title="Restore" onClick={onRestore}><Undo2 className="h-4 w-4" aria-hidden /></Button> : <>
-          {onMoveEverywhere && <Button variant="ghost" size="icon" aria-label="Use this everywhere" title="Use this everywhere" aria-expanded={moving !== null} onClick={() => setMoving((value) => (value ? null : 'confirm'))}><Globe className="h-4 w-4" aria-hidden /></Button>}
-          <Button variant="ghost" size="icon" aria-label="Correct" title="Correct with temporal history" onClick={() => setEditing(true)}><Pencil className="h-4 w-4" aria-hidden /></Button>
-          <Button variant="ghost" size="icon" aria-label={fact.pinned ? 'Unpin' : 'Pin'} title={fact.pinned ? 'Unpin' : 'Pin'} onClick={onPin}><Pin className={cn('h-4 w-4', fact.pinned && 'fill-primary text-primary')} aria-hidden /></Button>
-          <Button variant="ghost" size="icon" aria-label="Forget this" title="Forget this" onClick={onForget}><Trash2 className="h-4 w-4" aria-hidden /></Button>
+  const unavailableEvidence = (fact.evidence?.length ?? 0) - usableEvidence.length;
+  const perform = async (action: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(true); setError('');
+    try { await action(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'This change could not be saved. Try again.'); }
+    finally { setBusy(false); }
+  };
+  return <Card className="memory-fact-card">
+    <div className="memory-fact-meta">
+      {fact.pinned && <Pin className="h-3.5 w-3.5 text-primary" aria-label="Pinned" />}
+      <span>{KIND_LABEL[fact.kind] ?? fact.kind}</span>
+      {fact.scope && <ScopeChip scope={fact.scope} />}
+      {fact.active === false && <StatusPill tone="warning">Historical{fact.supersededByFactId != null ? ` · continued as #${fact.supersededByFactId}` : ''}</StatusPill>}
+    </div>
+    <button type="button" className="memory-fact-text" onClick={() => onInspect()}><span className="line-clamp-3">{fact.content}</span></button>
+    <div className="memory-fact-footer">
+      <button type="button" onClick={() => onInspect()}>Inspect & ask <ArrowRight size={14} aria-hidden /></button>
+      <span className="text-caption text-muted">{usableEvidence.length} source excerpt{usableEvidence.length === 1 ? '' : 's'}{unavailableEvidence > 0 ? ` · ${unavailableEvidence} unavailable` : ''}</span>
+    </div>
+    <details className="memory-fact-more">
+      <summary>History & actions</summary>
+      <p className="text-small">{fact.derivedFrom?.tool ? `Learned from ${fact.derivedFrom.tool}` : fact.derivedFrom?.callId ? 'Learned from a tool result' : 'Learning origin not recorded'} · {typeof fact.confidence === 'number' ? `${Math.round(fact.confidence * 100)}% recorded confidence` : 'Confidence not recorded'}</p>
+      <p className="mt-1 text-caption">Used {fact.utilityCount ?? 0} times · shown {fact.impressionCount ?? 0} times{typeof fact.importance === 'number' ? ` · importance ${fact.importance}/10` : ''}</p>
+      {fact.policy && <p className="mt-2 text-small">{fact.policy.policy_type.replace(/_/g, ' ')} · {fact.policy.enforcement === 'dispatch' ? 'enforced at dispatch' : 'included in the prompt'}</p>}
+      {fact.pinned && <p className="mt-2 text-small text-primary">Pinned memories stay in Clem’s context.</p>}
+      {fact.active !== false && moving && onMoveEverywhere && <div className="mt-3 space-y-2 rounded-md bg-subtle p-3" role="group" aria-label="Confirm using this fact everywhere">
+        <p className="text-small">Use this everywhere? It is kept for {memoryScopeLabel(fact.scope)} now; after this it applies in every conversation.</p>
+        <div className="flex flex-wrap gap-2"><Button size="sm" disabled={busy} onClick={() => void perform(async () => { await onMoveEverywhere(); setMoving(false); })}>Use everywhere</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => setMoving(false)}>Cancel</Button></div>
+      </div>}
+      <div className="memory-fact-actions">
+        {fact.active === false ? <Button size="sm" variant="secondary" disabled={busy} onClick={() => void perform(onRestore)}><Undo2 size={14} aria-hidden /> Restore</Button> : <>
+          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onInspect(true)}><Pencil size={14} aria-hidden /> Correct</Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void perform(onPin)}><Pin size={14} aria-hidden /> {fact.pinned ? 'Unpin' : 'Pin'}</Button>
+          {onMoveEverywhere && <Button size="sm" variant="ghost" disabled={busy} onClick={() => setMoving(!moving)}><Globe size={14} aria-hidden /> Use everywhere</Button>}
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void perform(onForget)}><Trash2 size={14} aria-hidden /> Forget</Button>
+          {typeof fact.importance === 'number' && onImportance && <span className="inline-flex items-center gap-1" title="Importance affects how strongly this memory competes for recall">
+            <Button size="sm" variant="ghost" disabled={busy || fact.importance >= 10} onClick={() => void perform(() => onImportance(Math.min(10, (fact.importance ?? 5) + 1)))}>Raise importance</Button>
+            <Button size="sm" variant="ghost" disabled={busy || fact.importance <= 0} onClick={() => void perform(() => onImportance(Math.max(0, (fact.importance ?? 5) - 1)))}>Lower</Button>
+          </span>}
         </>}
       </div>
-    </Card>
-  );
+      {error && <p role="alert" className="mt-2 text-small text-danger">{error}</p>}
+      {(fact.evidence?.length ?? 0) > 0 && <details className="mt-3"><summary className="cursor-pointer">Source excerpts ({fact.evidence?.length})</summary><div className="mt-2 space-y-2">{fact.evidence?.map((item) => <div key={`${item.episodeId}:${item.excerpt}`} className="rounded bg-subtle p-3"><p>{item.excerpt || 'Supporting excerpt unavailable — the source expired before durable capture.'}</p><p className="mt-1 text-caption">{item.status ?? 'status not recorded'}{item.sourceUri ? ` · ${item.sourceUri}` : ''}</p></div>)}</div></details>}
+      {(fact.validityIntervals?.length ?? 0) > 1 && <details className="mt-3"><summary className="cursor-pointer">Validity history ({fact.validityIntervals?.length} periods)</summary><div className="mt-2 space-y-2">{fact.validityIntervals?.map((interval) => <div key={interval.id} className="rounded bg-subtle p-3"><p>{new Date(interval.validFrom).toLocaleString()} → {interval.validTo ? new Date(interval.validTo).toLocaleString() : 'current'}</p><p className="mt-1 text-caption">{interval.openedReason}{interval.closedReason ? ` · ${interval.closedReason}` : ''}</p></div>)}</div></details>}
+    </details>
+  </Card>;
 }
 
 // ─────────── Timeline (durable source episodes) ───────────

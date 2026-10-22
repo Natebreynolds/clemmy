@@ -15,9 +15,13 @@ export function ToolRecallSection() {
   const recall = usePoll(['tool-recall'], getToolRecall, 30000);
   const rows = recall.data?.records ?? [];
   return (
-    <section className="mt-8">
+    <section>
       <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Wrench className="h-5 w-5 text-primary" aria-hidden /> Tool recall</h3>
       <p className="mb-3 text-small text-muted">Reusable tool procedures, with every phrasing kept as an alias instead of a duplicate memory. Outcomes belong to the procedure actually used; impressions are shown separately.</p>
+      {recall.isError && <p className="mb-3 text-small text-muted" role="status">
+        {recall.data ? 'Couldn’t refresh learned procedures. Showing the last loaded records.' : 'Learned procedures couldn’t be read just now.'}{' '}
+        <button type="button" onClick={() => { void recall.refetch(); }} className="font-semibold text-primary underline underline-offset-2">Try again</button>
+      </p>}
       {recall.data && rows.length > 0 && (
         <div className="mb-3 flex flex-wrap gap-2 text-caption text-muted">
           <span className="rounded-full border border-border bg-surface px-2.5 py-1">{recall.data.count} canonical procedures</span>
@@ -27,6 +31,7 @@ export function ToolRecallSection() {
         </div>
       )}
       {recall.isLoading ? <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}</div>
+        : recall.isError && !recall.data ? null
         : rows.length === 0 ? <Card><EmptyState title="No learned procedures yet" description="As Clementine proves out which tool handles a kind of task, it lands here so she doesn't rediscover it next time." /></Card>
           : <div className="space-y-2">{rows.map((r) => <ProcedureCard key={r.procedureId ?? r.intent} rec={r} />)}</div>}
     </section>

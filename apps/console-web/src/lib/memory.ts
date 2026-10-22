@@ -139,7 +139,7 @@ export interface MemoryHit {
   title?: string;
   text: string;
   score: number;
-  confidence: number;
+  confidence: number | null;
   evidence: Array<{ episodeId: string; excerpt: string; sourceUri?: string }>;
   whyRecalled: string[];
   validFrom?: string;

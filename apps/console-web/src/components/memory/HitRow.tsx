@@ -7,7 +7,7 @@ import type { MemoryHit } from '@/lib/memory';
 import { displayTitle, hitSourceLine, memoryKind, whyChips } from '@/lib/memory-why';
 import { MemoryKindIcon } from './MemoryKindIcon';
 
-export function HitRow({ hit, selected, onSelect, index }: { hit: MemoryHit; selected: boolean; onSelect: () => void; index: number }) {
+export function HitRow({ hit, selected, onSelect }: { hit: MemoryHit; selected: boolean; onSelect: () => void; index?: number }) {
   const kind = memoryKind(hit.ref.type);
   const chips = whyChips(hit);
   const { source, when } = hitSourceLine(hit);
@@ -16,8 +16,7 @@ export function HitRow({ hit, selected, onSelect, index }: { hit: MemoryHit; sel
       type="button"
       onClick={onSelect}
       aria-pressed={selected}
-      style={{ animationDelay: `${Math.min(index, 8) * 40}ms` }}
-      className={cn('grid w-full animate-fade-in grid-cols-[auto_1fr_auto] items-start gap-3 rounded-lg border bg-surface px-3.5 py-3 text-left shadow-xs transition-shadow hover:shadow-md', selected ? 'border-primary' : 'border-transparent')}
+      className={cn('grid w-full grid-cols-[auto_minmax(0,1fr)] items-start gap-3 rounded-lg border bg-surface px-3.5 py-3 text-left transition-colors hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary', selected ? 'border-primary' : 'border-border')}
     >
       <MemoryKindIcon kind={kind} />
       <span className="min-w-0">
@@ -27,10 +26,9 @@ export function HitRow({ hit, selected, onSelect, index }: { hit: MemoryHit; sel
             {chips.map((c) => <span key={c.label} className={cn('rounded-full px-2 py-0.5 text-caption', c.strong ? 'bg-success-tint text-success' : 'bg-subtle text-muted')}>{c.label}</span>)}
           </span>
         )}
-      </span>
-      <span className="text-right font-mono text-caption leading-relaxed text-faint">
-        {source && <span className="block text-muted">{source}</span>}
-        {when && <span className="block">{when}</span>}
+        {(source || when) && <span className="mt-2 flex flex-wrap gap-x-3 text-caption text-muted">
+          {source && <span>{source}</span>}{when && <span>{when}</span>}
+        </span>}
       </span>
     </button>
   );

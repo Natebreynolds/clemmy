@@ -35,13 +35,13 @@ test('every list branches on failure before it branches on emptiness', () => {
   }
 });
 
-test('the overview never interpolates a zero count it did not read', () => {
-  // `${h.directFacts ?? 0} told` rendered "0 told · 0 learned" on a failed
-  // health call — a claim, not a placeholder.
-  assert.ok(source.includes('statsUnknown'),
-    'Memory overview lost its statsUnknown guard; stat sub-lines will report 0 on failure again.');
-  assert.ok(source.includes("'count unavailable'"),
-    'Memory overview no longer has an unknown-count label.');
+test('navigation totals stay unknown until their backing store is read', () => {
+  // Counts now live in the persistent section rail. A missing response must
+  // remain null and must not turn into a displayed zero on the overview.
+  assert.match(source, /if \(key === 'facts'\) return brain\.data\?\.activeFacts \?\? null/);
+  assert.match(source, /if \(key === 'entities'\) return brain\.data\?\.entitiesTotal \?\? null/);
+  assert.match(source, /if \(key === 'episodes'\) return brain\.data\?\.memoryEpisodesTotal \?\? null/);
+  assert.ok(source.includes('count != null &&'), 'Unknown navigation counts must be omitted, not displayed as zero.');
 });
 
 test('an unreadable store says nothing was lost', () => {
@@ -59,13 +59,13 @@ test('the health strip reports unknown as unknown, not as zero', () => {
     fileURLToPath(new URL('../components/memory/HealthStrip.tsx', import.meta.url)), 'utf8');
   assert.ok(strip.includes('unavailable'),
     'HealthStrip lost its unavailable branch; a failed health call reports 0 again.');
-  assert.ok(source.includes('unavailable={health.isError && !health.data}'),
+  assert.ok(source.includes('healthUnavailable={health.isError && !health.data}') && source.includes('unavailable={healthUnavailable}'),
     'Memory.tsx no longer tells HealthStrip when health could not be read.');
 });
 
 test('a set filter is never hidden', () => {
   // The chips render only while searching — but a filter left set would then
   // narrow the next search invisibly.
-  assert.ok(source.includes('const showFacets = searching || '),
+  assert.ok(source.includes("const showFacets = q.length > 0 || kind !== 'all' || scope !== 'all'"),
     'The facet visibility rule changed; a set filter could become invisible.');
 });
