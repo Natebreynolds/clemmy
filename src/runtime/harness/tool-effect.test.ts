@@ -1051,3 +1051,19 @@ test('a Composio carrier whose arguments the model quoted once more still names 
   assert.equal(carried.toolName, 'goal_upsert');
   assert.deepEqual(carried.args, { title: 'Approved title', status: 'active' });
 });
+
+test('a carrier that sends its target arguments as `args` names the target with exactly those arguments', () => {
+  // 6ca8ff0d2 folded every non-carrier field into the target's arguments, and
+  // `args` (the alias the unwrap reads them from) came back as a field of its
+  // own, so an approved work_call no longer named the call that was inspected.
+  const identity = unwrapRuntimeEffectiveToolIdentity('mcp__clementine-local__work_call', {
+    name: 'project_tools_connect', args: { resource_id: 'res_fixture', server_name: 'fixture' },
+  });
+  assert.equal(identity.toolName, 'project_tools_connect');
+  assert.deepEqual(identity.args, { resource_id: 'res_fixture', server_name: 'fixture' });
+  // A target field sent beside the carrier is still the target's.
+  const beside = unwrapRuntimeEffectiveToolIdentity('work_call', {
+    name: 'project_tools_connect', args: { resource_id: 'res_fixture' }, server_name: 'fixture',
+  });
+  assert.deepEqual(beside.args, { resource_id: 'res_fixture', server_name: 'fixture' });
+});

@@ -478,8 +478,13 @@ export function unwrapRuntimeEffectiveToolIdentity(
     // `mode` next to name and args_json) is the target's argument. The
     // logical identity minted here must name the same contract the lift
     // dispatches, or the inner settlement is missing and the turn dies.
+    // The field the target's arguments were read from is the carrier's own:
+    // a carrier that sends them as `args` must not have `args` folded back in
+    // as a target field of the same name.
+    const readFromArgsAlias = record.args_json == null && record.args !== undefined;
+    const { args: _argsAlias, ...carrierWithoutArgsAlias } = record;
     const targetArgs = decodedTarget && typeof decodedTarget === 'object' && !Array.isArray(decodedTarget)
-      ? foldTargetFieldsIntoArgs(record, decodedTarget as Record<string, unknown>).args
+      ? foldTargetFieldsIntoArgs(readFromArgsAlias ? carrierWithoutArgsAlias : record, decodedTarget as Record<string, unknown>).args
       : decodedTarget;
     const alias = resolveCallToolAlias(target, targetArgs);
     if (alias?.ok) {
