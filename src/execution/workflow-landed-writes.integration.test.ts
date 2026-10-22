@@ -698,3 +698,65 @@ test('FRAMEWORK-TEST-landed-carry: a follow-up carries the exact-call step whose
     runner._setWorkflowHarnessLoopImplsForTests();
   }
 });
+
+test('FRAMEWORK-TEST-continue-stopped: retrying a run that stopped after a landed write continues it, and a fresh run of the same inputs is held', async () => {
+  installQuietReportSeams();
+  runner._setWorkflowRunGoalJudgeForTests(null);
+  const { registerOrchestrationTools } = await import('../tools/orchestration-tools.js');
+  const tools = new Map<string, (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>>();
+  registerOrchestrationTools({ tool: (name: string, _d: string, _s: unknown, handler: never) => { tools.set(name, handler); } } as never);
+  const workflowRun = tools.get('workflow_run')!;
+  const provider = installFictionalProviderWrite('continue-stopped');
+  const model = stubModelStep((attempt) => attempt === 1
+    ? {
+        calls: [{ tool: 'framework_test_tracker_read', mutating: false, result: { ok: false, error: 'fixture outage' } }],
+        output: { leads: 0 },
+      }
+    : {
+        calls: [{ tool: 'framework_test_tracker_read', mutating: false, result: { ok: true, data: { rows: [{ id: 'row-1' }] } } }],
+        output: { url: 'https://tracker.example.test/sheet', leads: 1 },
+      });
+  const definition = modelWriteWorkflow('FRAMEWORK-TEST-continue-stopped');
+  delete definition.goal;
+  definition.steps = [
+    { id: 'append_row', prompt: '', sideEffect: 'write', call: { tool: provider.operationId, args: { scope: 'fixture-tracker' } } },
+    { ...definition.steps[0]!, dependsOn: ['append_row'] },
+  ];
+  const persisted = workflowStore.writeWorkflow(definition.name, definition);
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'schedule',
+    workflowSlug: persisted.name,
+    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:1790060000000`,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  try {
+    await runner.processWorkflowRuns({} as never);
+    const first = readRun(queued.id!);
+    assert.equal(first.status, 'blocked', JSON.stringify({ status: first.status, blockedSteps: first.blockedSteps, error: first.error }));
+    assert.equal(provider.bodies(), 1);
+
+    const latest = runner.latestStoppedWorkflowRun(persisted.data.name);
+    assert.equal(latest?.runId, queued.id);
+    assert.deepEqual(latest?.changedSteps, ['append_row']);
+
+    const fresh = await workflowRun({ name: persisted.data.name });
+    assert.match(fresh.content[0]!.text, /^Nothing was started\./, fresh.content[0]!.text);
+    assert.match(fresh.content[0]!.text, /"append_row"/);
+    assert.equal(queuedRunsFor(persisted.data.name).length, 1, 'the held fresh run queued nothing');
+
+    const continued = await workflowRun({ name: persisted.data.name, continue_run: 'latest' });
+    assert.match(continued.content[0]!.text, /^Continuing run /, continued.content[0]!.text);
+    await runner.processWorkflowRuns({} as never);
+
+    const successor = queuedRunsFor(persisted.data.name).find((record) => record.id !== queued.id);
+    assert.ok(successor);
+    const second = readRun(successor!.id);
+    assert.equal(second.status, 'completed', JSON.stringify({ blockedSteps: second.blockedSteps, error: second.error }));
+    assert.equal(provider.bodies(), 1, 'the landed write was carried, never made again');
+    assert.equal(model.prompts.length, 2, 'only the stopped step ran again');
+    assert.equal(runner.latestStoppedWorkflowRun(persisted.data.name), null, 'nothing is left to continue');
+  } finally {
+    runner._setWorkflowHarnessLoopImplsForTests();
+  }
+});

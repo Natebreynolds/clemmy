@@ -10490,6 +10490,66 @@ export function continueWorkflowRunFromCheckpoint(
     continueWorkflowRunFromOwnedCheckpoint(actualRunId, opts));
 }
 
+/** Statuses of a run that stopped short of its objective. */
+const STOPPED_RUN_STATUSES = new Set(['blocked', 'failed', 'error', 'cancelled']);
+
+export interface LatestStoppedWorkflowRun {
+  runId: string;
+  status: string;
+  inputs: Record<string, string>;
+  /** Steps whose changes landed or were sent, or whose outcome is not
+   *  settled: a fresh run of the same inputs would repeat them. */
+  changedSteps: string[];
+}
+
+/**
+ * The workflow's newest run, when it stopped short. Runs this chat started
+ * are preferred, so a retry here continues this chat's run; a single-step
+ * try run is never a run of the workflow. Null when the newest run
+ * completed, is still active, or none can be read.
+ *
+ * Retrying a stopped run means continuing it: a fresh run of the same
+ * inputs repeats every change the stopped run already made. This is how a
+ * chat finds the run to continue.
+ */
+export function latestStoppedWorkflowRun(
+  workflowName: string,
+  opts: { originSessionId?: string } = {},
+): LatestStoppedWorkflowRun | null {
+  const workflow = listWorkflows().find((entry) => entry.data.name === workflowName || entry.name === workflowName);
+  if (!workflow) return null;
+  const records: QueuedRunRecord[] = [];
+  for (const runId of listWorkflowRunIds(workflow.name, 10)) {
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`));
+    if (!record || record.targetStepId) continue;
+    if (record.workflow !== workflow.data.name && record.workflow !== workflow.name) continue;
+    records.push(record);
+  }
+  const fromThisChat = opts.originSessionId
+    ? records.find((record) => [
+      record.originSessionId,
+      ...(record.originSessionIds ?? []),
+      ...readWorkflowRunOriginSessionIds(record.id),
+    ].includes(opts.originSessionId))
+    : undefined;
+  const newest = fromThisChat ?? records[0];
+  if (!newest || !STOPPED_RUN_STATUSES.has(newest.status ?? '')) return null;
+  let changedSteps: string[] = [];
+  try {
+    const resume = computeResumeState(workflow.name, newest.id);
+    const facts = readWorkflowRunWriteFacts({
+      runId: newest.id,
+      steps: workflow.data.steps,
+      completedStepIds: new Set([...resume.completedSteps.keys(), ...resume.failedSteps, ...resume.inFlightStepIds]),
+      sideEffectOf: stepSideEffectClass,
+    });
+    changedSteps = facts.available
+      ? facts.steps.filter((step) => step.disposition !== 'none').map((step) => step.stepId)
+      : [];
+  } catch { /* unreadable history: the continuation itself refuses safely */ }
+  return { runId: newest.id, status: newest.status ?? '', inputs: newest.inputs ?? {}, changedSteps };
+}
+
 /** A never-approved declarative gate is an execution boundary, not a sent
  * action. Certify that exact boundary before exempting an unfinished step from
  * the completed-step write classifier. Quiet effect rows alone prove nothing:

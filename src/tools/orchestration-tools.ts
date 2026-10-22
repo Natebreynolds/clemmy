@@ -1615,12 +1615,15 @@ export function registerOrchestrationTools(server: McpServer): void {
   server.tool(
     'workflow_run',
     'Dispatch a workflow to run in the BACKGROUND (fire-and-forget) — it runs in the daemon and reports its outcome back to this chat automatically on completion; you do not wait or poll. Call workflow_get first and pass every required input, for example inputs.url for URL-based audit workflows. Missing required inputs are rejected without queuing. '
-      + 'You may pass the user\'s loose name (e.g. "prospecting flow"): if it is not an exact match the tool returns the CLOSEST workflow (or asks which of several) so you can confirm with the user — "Just to confirm, did you want me to kick off your <X> workflow? I\'ll report back once it\'s done." — then call again with that exact name. Only an exact name runs straight through.',
+      + 'You may pass the user\'s loose name (e.g. "prospecting flow"): if it is not an exact match the tool returns the CLOSEST workflow (or asks which of several) so you can confirm with the user — "Just to confirm, did you want me to kick off your <X> workflow? I\'ll report back once it\'s done." — then call again with that exact name. Only an exact name runs straight through. '
+      + 'After a run stopped short (blocked, failed or stopped), retrying it means continue_run: it continues that run from where it stopped, keeps every step whose changes already landed, and runs only what is left. A fresh run starts over and repeats every step, including drafts, messages or records the stopped run already made.',
     {
       name: z.string().min(1),
       inputs: z.string().optional().describe('JSON object of the workflow\'s inputs, e.g. {"url":"https://example.com"}. Call workflow_get first to see the required input names.'),
+      continue_run: z.string().optional().describe('Continue a stopped run of this workflow instead of starting over: "latest" for its most recent stopped run (this chat\'s first), or that run\'s id. Inputs are the stopped run\'s own.'),
+      start_over: z.boolean().optional().describe('Start a fresh run even though the last run of the same inputs stopped after making changes; it repeats those changes. Only when the owner wants it run again from the top.'),
     },
-    async ({ name, inputs }) => {
+    async ({ name, inputs, continue_run, start_over }) => {
       const all = listWorkflowFiles();
       const resolverEntries: ResolverEntry[] = all.map((e) => ({
         name: e.data.name,
@@ -1667,13 +1670,48 @@ export function registerOrchestrationTools(server: McpServer): void {
       // external write, 2026-05-31) is carried by the EFFECT layer now: every
       // irreversible send inside a run hits the approval gates and parks a
       // card in the origin chat. Constrain effects, not methods.
+      const toolCtx = getToolOutputContext();
+      const continueRequest = continue_run?.trim();
+      if (continueRequest) {
+        const runner = await import('../execution/workflow-runner.js');
+        const sourceRunId = continueRequest.toLowerCase() === 'latest'
+          ? runner.latestStoppedWorkflowRun(resolution.name, { originSessionId: toolCtx?.sessionId })?.runId
+          : continueRequest;
+        if (!sourceRunId) {
+          return textResult(`"${resolution.name}" has no stopped run to continue: its latest run finished or is still going. Nothing was started.`);
+        }
+        const continued = runner.continueWorkflowRunFromCheckpoint(sourceRunId, { requestedFrom: 'chat' })
+          ?? { status: 'not_found', message: 'That run was not found.' };
+        if (continued.status === 'queued') {
+          return textResult(
+            `Continuing run ${sourceRunId} of "${resolution.name}" from where it stopped (new run ${continued.id ?? 'queued'}): steps whose changes already landed are kept and not repeated. It reports back here when it finishes; do not poll or redo the work yourself.`,
+          );
+        }
+        return textResult(`Run ${sourceRunId} of "${resolution.name}" was not continued: ${continued.message}`);
+      }
       let parsedInputs: Record<string, string>;
       try {
         parsedInputs = parseWorkflowRunInputsJson(inputs);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
       }
-      const toolCtx = getToolOutputContext();
+      if (start_over !== true) {
+        // A fresh run of the same inputs as a run that stopped after its
+        // changes landed would make them again. Continuing keeps them.
+        const runner = await import('../execution/workflow-runner.js');
+        const stopped = runner.latestStoppedWorkflowRun(resolution.name, { originSessionId: toolCtx?.sessionId });
+        const sameInputs = (a: Record<string, string>, b: Record<string, string>): boolean => {
+          const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+          return [...keys].every((key) => (a[key] ?? '') === (b[key] ?? ''));
+        };
+        if (stopped && stopped.changedSteps.length > 0
+          && sameInputs(normalizeWorkflowRunInputs(stopped.inputs), normalizeWorkflowRunInputs(parsedInputs))) {
+          return nonWriteTextResult('workflow_run_would_repeat_changes',
+            `Nothing was started. The last run of "${resolution.name}" with these inputs (${stopped.runId}) stopped ${stopped.status} after step(s) ${stopped.changedSteps.map((id) => `"${id}"`).join(', ')} already made changes, and a fresh run would make them again. `
+              + 'To finish that run without repeating them, call workflow_run with continue_run "latest". To run everything again from the top anyway, call it with start_over true.',
+          );
+        }
+      }
       const admitted = admitNamedWorkflowRunFromAcceptedSource({
         workflowName: resolution.name,
         sessionId: toolCtx?.sessionId,
