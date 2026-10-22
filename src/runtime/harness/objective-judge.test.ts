@@ -580,7 +580,7 @@ for (const clippedPart of ['objective', 'reply'] as const) {
     _setTypesafeKeyForTests('ts_test');
     _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
       text: async () => JSON.stringify(jevCompletionReading('done')) }));
-    const padding = 'Retained report context. '.repeat(clippedPart === 'objective' ? 150 : 600);
+    const padding = 'Retained report context. '.repeat(600);
     const hidden = clippedPart === 'objective'
       ? 'Also report the unresolved appendix exception.'
       : 'Every appendix exception was resolved.';
@@ -1750,6 +1750,19 @@ test('an answer that wrote or created nothing is checked by Jev alone, with part
   assert.equal(unread.done, true, 'the answer ships');
   assert.equal(unread.failedOpen, true, 'and is recorded as unreviewed, never as reviewed');
   assert.equal(reviewerCalls, 0, 'the second model never reviews an answer that produced nothing');
+  // Already delivered, the answer costs the owner no wait to review: Jev's
+  // silence hands it to the configured reviewer, once, instead of leaving it
+  // unreviewed (live 10-18→10-22: 71 chat answers shipped "Not checked").
+  let jevAsks = 0;
+  _setSystemOneFetchForTests(async () => { jevAsks += 1; throw new Error('jev unreachable'); });
+  const delivered = await judgeObjectiveComplete('Find me a pokemon pillow on Target.',
+    'The Poké Ball decorative throw pillow is $16.99 among the listings I inspected.',
+    { sessionId: 'probe-jev-only-delivered', skills: [], toolCallSummary: 'none', reviewStakes: 'read', producedNoOutput: true,
+      verifiedReadResults: partialRead, reviewAfterDelivery: true });
+  assert.equal(reviewerCalls, 1, 'the configured reviewer rules on a delivered answer Jev could not settle');
+  assert.ok(jevAsks <= 1, 'Jev is not asked a second time');
+  assert.equal(delivered.done, true);
+  assert.notEqual(delivered.failedOpen, true, 'the delivered answer is reviewed, not left unreviewed');
   _setCompletionJudgeForTests(unavailableSettingsJudge);
   _setTypesafeKeyForTests(undefined);
 });

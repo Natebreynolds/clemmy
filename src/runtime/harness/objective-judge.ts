@@ -2645,6 +2645,10 @@ export async function judgeObjectiveComplete(
   // NOT-DONE drives the ordinary bounded revision, and a reply that closes on
   // a real question waits for the owner. With no verdict from Jev the answer
   // ships recorded as unreviewed, never as reviewed.
+  // Set when Jev already read this no-output answer and could not settle it,
+  // and the answer is already in front of the owner: the configured reviewer
+  // rules on it now, with no second Jev ask.
+  let jevUnsettledAfterDelivery = false;
   if (skillContext?.producedNoOutput === true && !reviewsPlan && !reviewsWrite
     && !reviewsMemory && !reviewsInherited) {
     const fast = await askJev(true);
@@ -2680,7 +2684,13 @@ export async function judgeObjectiveComplete(
     // this invocation's original producer witness and unchanged input/memory
     // view can qualify that diagnostic; scores or public metadata cannot.
     const abstention = !fast && currentCompletedScreenAssessment();
-    if (abstention) {
+    // An answer already delivered costs the owner no wait to review, so an
+    // abstention or a silent Jev is not left unreviewed: the configured
+    // reviewer rules on it below. Live 10-18→10-22: 71 chat answers shipped
+    // "Not checked" because Jev abstained and no reviewer ever started.
+    if (skillContext?.reviewAfterDelivery === true) {
+      jevUnsettledAfterDelivery = true;
+    } else if (abstention) {
       const producer = abstention.producer;
       return {
         done: true, failedOpen: true, reviewFailure: 'invalid',
@@ -2704,7 +2714,7 @@ export async function judgeObjectiveComplete(
         },
       };
     }
-    return {
+    if (!jevUnsettledAfterDelivery) return {
       done: true,
       failedOpen: true,
       reviewFailure: 'unavailable',
@@ -2713,7 +2723,7 @@ export async function judgeObjectiveComplete(
       ...(jevAttempt ? { jevAttempt } : {}),
     };
   }
-  if (!reviewsPlan && !reviewsWrite && !reviewsMemory && !reviewsInherited
+  if (!jevUnsettledAfterDelivery && !reviewsPlan && !reviewsWrite && !reviewsMemory && !reviewsInherited
     && (coverage.complete || directionQuestion || historicalEligible)) {
     const jevPromise = askJev(true);
     // The owner's rule: a read is checked by Jev alone. A complete read with
