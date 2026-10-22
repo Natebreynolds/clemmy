@@ -980,6 +980,25 @@ function acceptedSourceIdentityForReplay(request: AssistantRequest): EventRow | 
   return source;
 }
 
+/** An accepted source no run has started yet: its first dispatch, not a
+ * replay. Admission may accept the owner's words before any run attempt
+ * exists (an approved suggestion is accepted, then dispatched); refusing it as
+ * a mismatched replay returned without running, and the accepted message sat
+ * until the liveness reaper closed it. The words and the run correlation must
+ * still be the accepted source's own; the inner bridge binds the new attempt
+ * to that exact source, so no second copy is written. */
+function unstartedAcceptedSourceMatches(request: AssistantRequest): boolean {
+  const source = durableSourceEventForRequest(request);
+  if (!source || getRunAttemptBySourceUserSeq(request.sessionId, source.seq)) return false;
+  const acceptedText = typeof source.data.displayText === 'string'
+    ? source.data.displayText
+    : typeof source.data.text === 'string' ? source.data.text : null;
+  if (acceptedText === null || acceptedText !== (request.displayMessage ?? request.message)) return false;
+  const correlation = request.runId?.trim();
+  const acceptedRunId = typeof source.data.runId === 'string' ? source.data.runId.trim() : '';
+  return correlation ? correlation === acceptedRunId : !acceptedRunId;
+}
+
 function exactTerminalReplayForRequest(request: AssistantRequest): AcceptedSourceTerminalOutcome | null {
   const source = acceptedSourceIdentityForReplay(request);
   return source ? exactTerminalForAcceptedSource(source) : null;
@@ -2550,7 +2569,8 @@ async function respondPreferHarnessOnce(
   // delivered answer temporarily unreadable during an outage.
   if (Number.isSafeInteger(request.sourceUserSeq) && Number(request.sourceUserSeq) > 0) {
     try {
-      if (durableSourceEventForRequest(request) && !acceptedSourceIdentityForReplay(request)) {
+      if (durableSourceEventForRequest(request) && !acceptedSourceIdentityForReplay(request)
+        && !unstartedAcceptedSourceMatches(request)) {
         return responseForAcceptedSourceIdentityMismatch(surface, request);
       }
       const committed = exactTerminalReplayForRequest(request);

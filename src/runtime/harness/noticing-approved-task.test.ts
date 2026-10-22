@@ -84,6 +84,32 @@ test('approved noticing task actual bridge and Jev objective consume the same co
   assert.equal(log.listEvents(f.session.id, { types: ['user_input_received'] }).length, 1);
 });
 
+test('an approved suggestion dispatched through the production entry starts its turn', async () => {
+  // The daemon binds the noticing answer to respondPreferHarness, not the
+  // inner bridge: an accepted source with no run attempt yet is a turn to
+  // start, never a mismatched replay that returns without running.
+  const f = accepted();
+  let ran = 0;
+  bridge._setBridgeImplsForTests({
+    configure: (async () => ({ ok: true })) as never,
+    resolveTurnCandidates: (async () => ({ candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false })) as never,
+    buildAgent: (async () => ({})) as never,
+    runConversation: (async (input: { sessionId: string; sourceUserSeq: number }) => {
+      ran += 1;
+      const identity = { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, turn: 1 };
+      return { sessionId: input.sessionId, status: 'completed', steps: 0, lastTurn: 1,
+        publicPresentation: outcomes.presentationEventForOutcome({ version: 2, id: outcomes.turnOutcomeId(identity),
+          identity, status: 'done', resumable: false, presentation: { kind: 'answer', text: 'Controlled fixture response.' } }) };
+    }) as never,
+  });
+  const response = await bridge.respondPreferHarness('home', { sessionId: f.session.id, sourceUserSeq: f.source.seq,
+    runId: f.runId, message: f.packet.checkIn.answer, channel: 'desktop' } as never,
+  async () => { throw new Error('the legacy path is never taken'); });
+  assert.equal(ran, 1, JSON.stringify({ text: response.text, stopped: response.stoppedReason, raw: response.raw }).slice(0, 900));
+  assert.ok(log.getRunAttemptBySourceUserSeq(f.session.id, f.source.seq), 'the accepted source is bound to its run');
+  assert.equal(log.listEvents(f.session.id, { types: ['user_input_received'] }).length, 1, 'no second copy of the message');
+});
+
 test('approved noticing task rejects changed proposal, answer, run and request bindings instead of judging bare yes', () => {
   for (const change of ['proposal', 'answer', 'run', 'receipt'] as const) {
     const f = accepted();
