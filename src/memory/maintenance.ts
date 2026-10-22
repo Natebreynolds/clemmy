@@ -48,6 +48,8 @@ import {
 import { prepareMeetingAnalysisRequest } from '../integrations/recall/meeting-analysis-handoff.js';
 import { queuePreparedMeetingAnalysis } from '../integrations/recall/meeting-analysis-queue.js';
 import { startCanonicalTranscriptBackfill } from '../integrations/recall/backfill.js';
+import { startRecallSdkUploadReconciliation } from '../integrations/recall/sdk-upload-reconcile.js';
+import { handOffReapedCapture } from '../integrations/recall/reaped-capture-handoff.js';
 import { recoverPendingLocalAudioDeletions } from '../integrations/local-meetings/meeting-capture.js';
 import { createBackgroundTask } from '../execution/background-tasks.js';
 import { checkAllSkillUpdates } from '../runtime/skill-installer.js';
@@ -901,22 +903,21 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
           if (artifactPath && !reindexed) {
             try { reindexVault(); reindexed = true; } catch { /* maintenance reindex tick will retry */ }
           }
-          if (record.recordingId) {
-            startCanonicalTranscriptBackfill({
-              windowId: record.windowId,
-              recordingId: record.recordingId,
-              region: record.sdkUploadRegion,
-            });
-          }
-          if (artifactPath && settings.analyzeOnComplete) {
-            queuePreparedMeetingAnalysis(record.id, {
-              title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
-              ...await prepareMeetingAnalysisRequest(record, artifactPath),
-              source: 'daemon',
-              channel: 'electron:meeting-capture',
-              maxMinutes: 30,
-            });
-          }
+          // The same handoff the recording-ended route makes: an upload id is
+          // polled to its recording first (reaped-capture-handoff.ts).
+          await handOffReapedCapture(record, artifactPath, settings, {
+            startSdkUpload: startRecallSdkUploadReconciliation,
+            startBackfill: startCanonicalTranscriptBackfill,
+            queueAnalysis: async () => {
+              queuePreparedMeetingAnalysis(record.id, {
+                title: `Analyze meeting transcript: ${record.title || record.platform || record.id}`,
+                ...await prepareMeetingAnalysisRequest(record, artifactPath!),
+                source: 'daemon',
+                channel: 'electron:meeting-capture',
+                maxMinutes: 30,
+              });
+            },
+          });
         }
         logger.info({ count: finalized.length }, 'recall stuck-recording reaper finalized abandoned captures');
       }
