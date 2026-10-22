@@ -663,6 +663,8 @@ test('a host-run read that exited with its own failure has settled, in a declare
   settleShell(neverWorked, neverSource, 'only', 'stderr');
   const failedOnly = auditAcceptedSourceSettlementTruth({ sessionId: neverWorked, sourceUserSeq: neverSource.seq, requireEveryBusinessReadToSettle: true });
   assert.equal(failedOnly.status, 'unrecovered_failure', 'a source whose every business call failed still has only the failure');
+  // The reason names the call that failed, so the step's reader can act on it.
+  assert.match(failedOnly.reason, /: alpha_script_run \(read, /, failedOnly.reason);
 
   const killed = 'workflow:dark-shell-read:save_books';
   const killedSource = sourceFor(killed);

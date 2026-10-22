@@ -200,6 +200,7 @@ import {
   fixIsAutoApplicable,
   sanitizeOutputContract,
   recordWorkflowEditBackup,
+  listFixBackups,
   revertWorkflowFix,
   judgeHealCrossFamily,
   renderLegibleOutcome,
@@ -17587,8 +17588,17 @@ async function processOneRunFile(
       const autoHealPaused = !isCompiledProjectRun
         && needsAttention
         && prospectiveConsecutiveFailures >= escalateThreshold();
+      // Name the workflow's latest automatic change, if it has one, so the
+      // reader can undo it by its real id. A bare `<id>` placeholder was read
+      // back to the owner as a question only the harness could answer.
+      const latestAutoChange = autoHealPaused
+        ? listFixBackups().find((backup) => backup.workflow === workflow.name || backup.workflow === workflow.data.name)
+        : undefined;
+      const revertLine = latestAutoChange
+        ? ` The latest automatic change to it (${latestAutoChange.createdAt.slice(0, 10)}, step "${latestAutoChange.stepId}") can be undone with \`revert heal ${latestAutoChange.id}\` if it caused this.`
+        : '';
       const escalationBanner = autoHealPaused
-        ? `⚠️ "${workflow.data.name}" has failed ${prospectiveConsecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below; if a recent auto-fix caused this, revert it with \`revert heal <id>\`. It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
+        ? `⚠️ "${workflow.data.name}" has failed ${prospectiveConsecutiveFailures} runs in a row — auto-heal is PAUSED to stop wasting tokens. Review the blocked step(s) below.${revertLine} It resumes automatically after one clean run, and (for a scheduled workflow) consider disabling it until fixed.\n\n`
         : '';
 
       throwIfWorkflowRunCancelled(run.id);

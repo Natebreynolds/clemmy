@@ -149,6 +149,16 @@ export function answeredRefusalSettlement(row: Pick<SettlementRow, 'mutating' | 
       || row.outcome_kind === 'invalid_arguments');
 }
 
+/** Which calls failed and how, so the reader of a blocked step can act on
+ * it: tool, read or write, and the settled outcome. Content-free. */
+function unrecoveredCallSummary(rows: readonly SettlementRow[]): string {
+  const named = rows.slice(0, 3).map((row) => {
+    const detail = row.outcome_detail && !row.outcome_detail.includes(' ') ? `, ${row.outcome_detail.slice(0, 60)}` : '';
+    return `${row.tool_name} (${row.mutating === 1 ? 'write' : 'read'}, ${row.outcome_kind}${detail})`;
+  });
+  return rows.length > 3 ? `${named.join('; ')}; and ${rows.length - 3} more` : named.join('; ');
+}
+
 function boundedReason(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').slice(0, 240);
 }
@@ -867,7 +877,7 @@ export function auditAcceptedSourceSettlementTruthRead(input: {
     if (facts.unrecoveredBusinessFailures > 0) {
       return {
         status: 'unrecovered_failure',
-        reason: `${facts.unrecoveredBusinessFailures} business call failure(s) have no successful recovery`,
+        reason: `${facts.unrecoveredBusinessFailures} business call failure(s) have no successful recovery: ${unrecoveredCallSummary(unrecovered)}`,
         facts,
       };
     }
