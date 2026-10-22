@@ -56,7 +56,7 @@ function legacyConversations(projectId: string): import('./project-views.js').Pr
         FROM sessions WHERE kind = 'chat'
          AND (json_extract(metadata_json, '$.projectId') = ?
            OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(metadata_json, '$.projectIds'), '[]')) WHERE value = ?))
-       ORDER BY updated_at DESC LIMIT ?
+       ORDER BY updated_at DESC, id DESC LIMIT ?
     `).all(projectId, projectId, 50) as Array<{ id: string; title: string | null; updatedAt: string; metadata: string }>;
     return rows.map((row) => {
       let metadata: any = {};
@@ -175,7 +175,9 @@ test('one fresh listing reuses tasks and public approvals and preserves batched 
   finally { watch.restore(); }
   assert.deepEqual(actual, expected);
   assert.equal(watch.observed.taskInventories, 1);
-  assert.equal(watch.observed.taskReads, fileCount);
+  // At most one parse per task file per listing; an unchanged file is not
+  // parsed again at all (2ac630292), so a warm listing may read none.
+  assert.ok(watch.observed.taskReads <= fileCount, `${watch.observed.taskReads} reads of ${fileCount} task files`);
   assert.equal(watch.observed.approvalInventories, 1);
   assert.equal(watch.observed.batches, 1);
   assert.equal(watch.observed.legacyQueries, 0);

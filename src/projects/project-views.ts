@@ -334,7 +334,7 @@ export function conversationsForProject(projectId: string, limit = 20): ProjectC
        WHERE kind = 'chat'
          AND (json_extract(metadata_json, '$.projectId') = ?
            OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(metadata_json, '$.projectIds'), '[]')) WHERE value = ?))
-       ORDER BY updated_at DESC LIMIT ?
+       ORDER BY updated_at DESC, id DESC LIMIT ?
     `).all(projectId, projectId, Math.max(1, Math.min(100, limit))) as Array<{ id: string; title: string | null; updatedAt: string; metadata: string | null }>;
     return rows.map((row) => {
       let metadata: Record<string, unknown> = {};
@@ -374,7 +374,7 @@ function conversationsForProjects(projectIds: string[], limit: number): Map<stri
       ),
       project_matches AS (
         SELECT requested_projects.projectId, chat_projection.*,
-               row_number() OVER (PARTITION BY requested_projects.projectId ORDER BY updatedAt DESC) AS position
+               row_number() OVER (PARTITION BY requested_projects.projectId ORDER BY updatedAt DESC, id DESC) AS position
           FROM requested_projects CROSS JOIN chat_projection
          WHERE json_extract(metadata, '$[0]') = requested_projects.projectId
             OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(metadata, '$[1]'), '[]'))
