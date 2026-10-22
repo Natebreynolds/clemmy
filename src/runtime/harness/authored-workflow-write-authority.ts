@@ -1533,10 +1533,20 @@ async function authoredLocalWriteRisk(input: {
     ));
     if (matching.length !== 1) return null;
     const definition = matching[0]!;
+    // An ordinary non-destructive local write (a Space's dataset recomputed
+    // from its own declared sources) is a write step's accepted work too,
+    // carried at its true reversibility; the consent reducer proceeds it as
+    // ordinary work. Live 10-21 (a scheduled channel review, two runs): the
+    // step's own "refresh the board" call was refused as coverage_missing on
+    // every run because only reversible or create-only declarations were
+    // covered, the goal review scored the run 67% for it, and the follow-up
+    // re-ran the whole workflow into the same refusal.
+    const ordinary = definition.reversibility === 'ordinary_non_destructive'
+      && input.receipt.stepSideEffect !== 'read';
     if (
       definition.destructive
       || definition.descriptor.effect !== 'local_write'
-      || (definition.reversibility !== 'reversible' && definition.reversibility !== 'create_only')
+      || (definition.reversibility !== 'reversible' && definition.reversibility !== 'create_only' && !ordinary)
     ) return null;
     // A read step's receipt covers the instruments a read drives and nothing
     // that produces or configures: only a registry row declared as a
@@ -1546,7 +1556,7 @@ async function authoredLocalWriteRisk(input: {
     const posture = definition.descriptor.destinationPosture ?? 'not_applicable';
     return {
       risk: {
-        reversibility: 'reversible',
+        reversibility: ordinary ? 'ordinary_non_destructive' : 'reversible',
         consequence: posture === 'create_new'
           ? 'create'
           : posture === 'named_existing'

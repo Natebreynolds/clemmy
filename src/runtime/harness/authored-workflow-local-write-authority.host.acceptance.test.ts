@@ -146,7 +146,18 @@ interface FixtureTool {
   parameters: Record<string, unknown>;
 }
 
-const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_delete' | 'workflow_state', FixtureTool> = {
+const TOOLS: Record<'task_hygiene' | 'goal_upsert' | 'write_file' | 'workflow_delete' | 'workflow_state' | 'space_refresh', FixtureTool> = {
+  // A Space's dataset recomputed from its own declared sources: the registry
+  // declares it an ordinary non-destructive local write.
+  space_refresh: {
+    name: 'space_refresh',
+    parameters: {
+      type: 'object',
+      properties: { slug: { type: 'string' }, source_id: { type: ['string', 'null'] } },
+      required: ['slug', 'source_id'],
+      additionalProperties: false,
+    },
+  },
   // The workflow's own memory across runs: reads by action, keyed by workflow.
   workflow_state: {
     name: 'workflow_state',
@@ -654,6 +665,38 @@ test('authored local work covers recoverable file revisions and ledger writes, w
     nonRefusedSettlements(fixture).map((row) => row.logical_tool_call_id),
     ['hyg-2', 'ow-1'],
   );
+});
+
+test('a write step refreshes a Space it feeds; a read step still may not', async () => {
+  // Live 10-21 (a scheduled channel review, two runs): the step's own
+  // "refresh the board" call was refused as coverage_missing every run, the
+  // goal review scored the run 67% for it, and the follow-up re-ran the whole
+  // workflow into the same refusal.
+  const write = createStepFixture({ kind: 'workflow', sideEffect: 'write',
+    prompt: 'Update the tracker, then refresh the fixture-board Space with space_refresh.' });
+  const written = fixtureTools(['space_refresh']);
+  const writeModel = stubModel([
+    [toolCall('refresh-1', 'space_refresh', { slug: 'fixture-board', source_id: null })],
+    [textMsg('board refreshed')],
+  ]);
+  const writeAgent = { model: writeModel, tools: written.tools };
+  bindSurface(write, writeAgent, written.tools);
+  const writeOutcome = await runProductionHost(write, writeAgent);
+  assert.equal(written.bodies.space_refresh, 1, JSON.stringify(writeOutcome.history));
+  assert.deepEqual(dispositionMarkers(writeOutcome.history), []);
+  assert.equal(pendingApprovalCount(write), 0);
+
+  const read = createStepFixture({ kind: 'workflow', sideEffect: 'read',
+    prompt: 'Read the tracker and refresh the fixture-board Space with space_refresh.' });
+  const readTools = fixtureTools(['space_refresh']);
+  const readModel = stubModel([
+    [toolCall('refresh-read', 'space_refresh', { slug: 'fixture-board', source_id: null })],
+    [textMsg('the refresh is outside this read step')],
+  ]);
+  const readAgent = { model: readModel, tools: readTools.tools };
+  bindSurface(read, readAgent, readTools.tools);
+  await runProductionHost(read, readAgent);
+  assert.equal(readTools.bodies.space_refresh, 0, 'a read step gets no write coverage');
 });
 
 test('a READ step covers the browser instrument it drives and nothing else: the tab opens, the artifact write and the ledger compaction stay refused', async () => {
