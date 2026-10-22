@@ -370,6 +370,9 @@
    own width, which the Memory screen's detail pane narrows independently of
    the window. `.is-still` is the owner's "still" live-status style. */
 .memory-work { container-type: inline-size; container-name: memory-work; }
+.memory-fold > summary { list-style: none; }
+.memory-fold > summary::-webkit-details-marker { display: none; }
+.memory-fold > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 4px; }
 
 /* Tinted edges. Tailwind's `/40`-style opacity modifiers compile to nothing
    on this app's var() colours, so a mixed edge is written out here. */

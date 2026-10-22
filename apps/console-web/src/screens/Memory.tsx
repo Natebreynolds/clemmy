@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
   Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
-  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Layers, Globe,
+  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Globe,
 } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
@@ -100,7 +100,7 @@ function MemoryOverview() {
   const [scope, setScope] = useState<Scope>('all');
   const [selected, setSelected] = useState<MemoryHit | null>(null);
   const [selectedPinned, setSelectedPinned] = useState(false);
-  const [counts, setCounts] = useState({ review: 0, duplicates: 0 });
+  const [counts, setCounts] = useState<{ review: number | null; duplicates: number | null }>({ review: null, duplicates: null });
   useEffect(() => { const t = setTimeout(() => setDebouncedQ(q.trim()), 350); return () => clearTimeout(t); }, [q]);
   const searching = debouncedQ.length >= 2;
   // A filter that is set must never be invisible: hiding the chips while one
@@ -113,6 +113,13 @@ function MemoryOverview() {
     enabled: searching, staleTime: 30_000,
   });
   const health = usePoll(['mem-health'], getMemoryHealth, 30_000);
+  const brain = usePoll(['brain-health'], getBrainHealth, 30_000);
+  const memoryFiles = usePoll(['memory-files'], getMemoryFiles, 60_000);
+  // A failed health read must not become "0 told · 0 learned". The words below
+  // are the label the tabs use when a store count did not load.
+  const statsUnknown = brain.isError && !brain.data;
+  const sub = (text: string) => (statsUnknown ? 'count unavailable' : text);
+  const sourcesUnknown = memoryFiles.isError && !memoryFiles.data;
   const hits = (search.data?.hits ?? []).filter((h) => inScope(h, scope));
   const searchInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -120,17 +127,23 @@ function MemoryOverview() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
-  // What Clementine is holding for YOU, on the tab that holds it. These counts
-  // already exist on this screen (ReviewPane reports them into `counts` for the
-  // health strip) — but they lived only inside the Overview, so a memory she
-  // wanted confirmed, or two identities she suspected were one person, waited
-  // behind a tab that gave no sign anything was there.
+  // What Clementine is holding for YOU, on the tab that holds it. Review and
+  // duplicate badges come from the queue. Store totals come from the health
+  // read, and stay blank when that read failed.
+  const storeCount = (key: Tab): string | null => {
+    if (statsUnknown) return null;
+    if (key === 'facts') return typeof brain.data?.activeFacts === 'number' ? brain.data.activeFacts.toLocaleString() : null;
+    if (key === 'entities') return typeof brain.data?.entitiesTotal === 'number' ? brain.data.entitiesTotal.toLocaleString() : null;
+    if (key === 'episodes') return typeof brain.data?.memoryEpisodesTotal === 'number' ? brain.data.memoryEpisodesTotal.toLocaleString() : null;
+    if (key === 'sources') return !sourcesUnknown && typeof memoryFiles.data?.files?.length === 'number' ? memoryFiles.data.files.length.toLocaleString() : null;
+    return null;
+  };
   const tabs: { key: Tab; label: string; icon: typeof Search; badge?: number; badgeLabel?: string }[] = [
-    { key: 'overview', label: 'Overview', icon: Brain, badge: counts.review, badgeLabel: 'to review' },
+    { key: 'overview', label: 'Overview', icon: Brain, badge: counts.review ?? undefined, badgeLabel: 'to review' },
     { key: 'facts', label: 'Facts', icon: BookOpen },
     { key: 'tools', label: 'Learned tools', icon: Wrench },
     { key: 'episodes', label: 'Timeline', icon: History },
-    { key: 'entities', label: 'People & things', icon: Users, badge: counts.duplicates, badgeLabel: 'possible duplicates' },
+    { key: 'entities', label: 'People & things', icon: Users, badge: counts.duplicates ?? undefined, badgeLabel: 'possible duplicates' },
     { key: 'sources', label: 'Sources', icon: FileText },
   ];
   const showDetail = Boolean(selected) || searching;
@@ -185,34 +198,48 @@ function MemoryOverview() {
               </div>
             )
           ) : (
-            <div className="space-y-5">
-              <MemoryWorkPanel />
+            <div className="space-y-4">
               <HealthStrip health={health.data} review={counts.review} duplicates={counts.duplicates} unavailable={health.isError && !health.data} />
-              <div className="grid gap-4 lg:grid-cols-2">
-                <ReviewPane onCounts={(n) => { if (n.review !== counts.review || n.duplicates !== counts.duplicates) setCounts(n); }} />
-                <LearnedPane onPick={(f) => { setSelected(factToHit(f)); setSelectedPinned(Boolean(f.pinned)); }} />
+              <ReviewPane
+                quietEmpty={tab !== 'overview'}
+                onOpen={setTab}
+                onCounts={(n) => {
+                  setCounts((prev) => {
+                    const next = { review: n.review ?? prev.review, duplicates: n.duplicates ?? prev.duplicates };
+                    return next.review === prev.review && next.duplicates === prev.duplicates ? prev : next;
+                  });
+                }}
+              />
+              {(statsUnknown || sourcesUnknown) && (
+                <p className="text-caption text-muted">{statsUnknown ? 'Store counts couldn’t be read.' : 'The sources count couldn’t be read.'}</p>
+              )}
+              <div className="sticky top-0 z-20 border-b border-border bg-canvas">
+                <div className="flex flex-wrap gap-1" role="group" aria-label="Memory stores">
+                  {tabs.map((t) => {
+                    const Icon = t.icon; const active = tab === t.key;
+                    const count = storeCount(t.key);
+                    const unknownLabel = statsUnknown ? sub(t.label) : t.key === 'sources' && sourcesUnknown ? 'count unavailable' : null;
+                    return (
+                      <button key={t.key} type="button" aria-current={active ? 'page' : undefined} onClick={() => setTab(t.key)}
+                        aria-label={unknownLabel ? `${t.label}, ${unknownLabel}` : undefined}
+                        className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
+                          active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
+                        <Icon className="h-4 w-4" aria-hidden /> {t.label}
+                        {count && <span className="text-caption tabular-nums text-faint">{count}</span>}
+                        {t.badge ? (
+                          <span
+                            className="inline-flex min-w-5 items-center justify-center rounded-full bg-warning-tint px-1.5 py-0.5 text-caption font-semibold text-warning"
+                            aria-label={`${t.badge} ${t.badgeLabel}`}
+                          >
+                            {t.badge > 99 ? '99+' : t.badge}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <div className="flex flex-wrap gap-1 border-b border-border">
-                {tabs.map((t) => {
-                  const Icon = t.icon; const active = tab === t.key;
-                  return (
-                    <button key={t.key} type="button" onClick={() => setTab(t.key)}
-                      className={cn('inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-body font-medium transition-colors cursor-pointer -mb-px',
-                        active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>
-                      <Icon className="h-4 w-4" aria-hidden /> {t.label}
-                      {t.badge ? (
-                        <span
-                          className="inline-flex min-w-5 items-center justify-center rounded-full bg-warning-tint px-1.5 py-0.5 text-caption font-semibold text-warning"
-                          aria-label={`${t.badge} ${t.badgeLabel}`}
-                        >
-                          {t.badge > 99 ? '99+' : t.badge}
-                        </span>
-                      ) : null}
-                    </button>
-                  );
-                })}
-              </div>
-              {tab === 'overview' && <OverviewTab onNavigate={setTab} />}
+              {tab === 'overview' && <OverviewTab onNavigate={setTab} onPickLearned={(f) => { setSelected(factToHit(f)); setSelectedPinned(Boolean(f.pinned)); }} />}
               {tab === 'facts' && <FactsTab qc={qc} initialScope={linkedScope} />}
               {tab === 'tools' && <ToolRecallSection />}
               {tab === 'episodes' && <EpisodesTab />}
@@ -229,44 +256,26 @@ function MemoryOverview() {
   );
 }
 
-// ─────────── Overview: short-term/long-term hero + review queue + graph ───────────
-// (Formerly two tabs — "Short-term & Long-term" and "Overview" — that showed the
-// same counts twice. Deep diagnostics live behind ONE fold at the bottom.)
-function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
+// ─────────── Overview ───────────
+// Store totals live on the tabs. This tab holds what those tabs do not:
+// what memory work is doing, the session's working set, recent learning,
+// repairs, and the map. Diagnostics stay behind one fold.
+function OverviewTab({ onNavigate, onPickLearned }: { onNavigate: (tab: Tab) => void; onPickLearned: (fact: Fact) => void }) {
   const ctx = usePoll(['context'], getContext, 20000);
-  const health = usePoll(['brain-health'], getBrainHealth, 30000);
   const memHealth = usePoll(['memory-health'], getMemoryHealth, 30000);
   const readiness = usePoll(['memory-readiness'], getMemoryReadiness, 30000);
-  const files = usePoll(['memory-files'], getMemoryFiles, 60000);
-  const h = health.data ?? {};
+  const [mapOpen, setMapOpen] = useState(false);
   const workingMem = (ctx.data?.files ?? []).find((f) => f.key === 'working_memory');
   const assurance = readiness.data ? memoryAssuranceView(readiness.data) : null;
   const firstIssue = readiness.data?.checks.find((c) => c.status === 'fail') ?? readiness.data?.checks.find((c) => c.status !== 'pass');
-
-  // On THIS screen an unanswered question must never read as an empty memory.
-  // The stat values already fall back to "—", but their sub-lines interpolated
-  // `?? 0`, so a health call that failed rendered "0 told · 0 learned" — a
-  // confident claim that Clementine has learned nothing, made on no evidence.
-  const statsUnknown = health.isError && !health.data;
   const contextUnknown = ctx.isError && !ctx.data;
-  const sub = (text: string) => (statsUnknown ? 'count unavailable' : text);
-  const longTerm: { label: string; value?: number; sub: string; tab: Tab; icon: typeof Database }[] = [
-    { label: 'Facts', value: h.activeFacts, sub: sub(`${h.directFacts ?? 0} told · ${h.derivedFacts ?? 0} learned`), tab: 'facts', icon: BookOpen },
-    { label: 'People & things', value: h.entitiesTotal, sub: sub(`${h.entitiesPerson ?? 0} people · ${h.entitiesCompany ?? 0} orgs`), tab: 'entities', icon: Users },
-    { label: 'Timeline', value: h.memoryEpisodesTotal, sub: sub(`${h.memoryEpisodesRecent ?? 0} recent episodes`), tab: 'episodes', icon: History },
-    { label: 'Knowledge files', value: files.data?.files?.length, sub: files.isError && !files.data ? 'count unavailable' : 'indexed & searchable', tab: 'sources', icon: Database },
-  ];
 
   return (
     <div className="space-y-6">
-      <p className="text-small text-muted">
-        Clementine keeps two kinds of memory. <span className="font-medium text-fg">Short-term</span> is the live working set for your current session — rewritten as you chat.{' '}
-        <span className="font-medium text-fg">Long-term</span> is everything durable she's learned, stored permanently and recalled on demand.
-      </p>
+      <MemoryWorkPanel />
       <div className="grid gap-5 lg:grid-cols-2">
         <section>
-          <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Clock className="h-5 w-5 text-primary" aria-hidden /> Short-term</h3>
-          <p className="mb-3 text-small text-muted">Working memory & current session focus. Rewritten every turn and retained while the session remains resumable.</p>
+          <h3 className="mb-3 flex items-center gap-2 text-h3 text-fg"><Clock className="h-5 w-5 text-primary" aria-hidden /> Short-term</h3>
           {ctx.isLoading ? <Skeleton className="h-32 w-full" />
             : contextUnknown
             ? <Card className="p-4 text-body text-muted">Working memory couldn’t be read just now — nothing has been lost.{' '}
@@ -275,28 +284,7 @@ function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
             ? <ContextFileCard file={workingMem} onNavigate={onNavigate} />
             : <Card className="p-4 text-body text-muted">No working memory yet — it fills in as you chat.</Card>}
         </section>
-
-        <section>
-          <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Layers className="h-5 w-5 text-primary" aria-hidden /> Long-term</h3>
-          <p className="mb-3 text-small text-muted">Durable knowledge — facts, people, timeline, and indexed files. Open any store to explore it.</p>
-          <div className="grid grid-cols-2 gap-3">
-            {longTerm.map((s) => {
-              const Icon = s.icon;
-              return (
-                <button key={s.label} type="button" onClick={() => onNavigate(s.tab)}
-                  className="group rounded-lg border border-border bg-surface p-4 text-left transition-colors hover:border-primary cursor-pointer">
-                  <div className="mb-1 flex items-center gap-2 text-faint group-hover:text-primary">
-                    <Icon className="h-4 w-4" aria-hidden />
-                    <ArrowRight className="ml-auto h-3.5 w-3.5 opacity-0 transition-opacity group-hover:opacity-100" aria-hidden />
-                  </div>
-                  <div className="text-h2 text-fg">{typeof s.value === 'number' ? s.value.toLocaleString() : '—'}</div>
-                  <div className="text-small font-medium text-fg">{s.label}</div>
-                  <div className="mt-0.5 text-caption text-faint">{s.sub}</div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
+        <LearnedPane onPick={onPickLearned} />
       </div>
 
       <MemoryReviewQueue
@@ -318,10 +306,18 @@ function OverviewTab({ onNavigate }: { onNavigate: (tab: Tab) => void }) {
         </div>
       )}
 
-      <div>
-        <p className="mb-2 text-small text-muted">Explore stored memory truth first. Text matches and semantic similarity are optional, labeled overlays.</p>
-        <MemoryGraphContainer height={540} />
-      </div>
+      <details
+        className="memory-fold rounded-lg border border-border bg-surface px-4"
+        onToggle={(event) => setMapOpen(event.currentTarget.open)}
+      >
+        <summary className="cursor-pointer list-none py-3 text-body font-medium text-fg">Knowledge map</summary>
+        {mapOpen && (
+          <div className="pb-4">
+            <p className="mb-2 text-small text-muted">Stored links first. Text matches and semantic similarity are labeled overlays.</p>
+            <MemoryGraphContainer height={480} />
+          </div>
+        )}
+      </details>
 
       <details className="rounded-lg border border-border bg-surface p-4">
         <summary className="cursor-pointer text-body font-medium text-fg">Memory diagnostics</summary>
@@ -346,8 +342,7 @@ function MemoryReviewQueue({
   onNavigate: (tab: Tab) => void;
   onUpdated: () => void;
 }) {
-  const reviews = usePoll(['memory-review-candidates', 'overview'], () => listMemoryReviewCandidates(25), 30000);
-  const people = usePoll(['entity-duplicate-candidates', 'overview'], () => listEntityDuplicateCandidates(100, 'person'), 60000);
+  const qc = useQueryClient();
   const [repairing, setRepairing] = useState<'identity' | 'evidence' | ''>('');
   const [message, setMessage] = useState('');
   const reliability = health?.reliability;
@@ -361,11 +356,6 @@ function MemoryReviewQueue({
   const unreconciledEvidence = reliability?.unreconciledEvidence ?? 0;
   const unavailableEvidence = reliability?.evidenceUnavailable ?? 0;
   const identityBlockers = readiness?.inventory?.identity.exactEmailCollisionGroups ?? 0;
-  const factReviews = reviews.data?.total;
-  const peopleReviews = people.data?.total;
-  const queuesLoading = factReviews == null || peopleReviews == null;
-  const manualReviewCount = (factReviews ?? 0) + (peopleReviews ?? 0) + promptOnly;
-  const totalReviewCount = manualReviewCount + pendingClaims;
   const repairCount = identityBlockers + unreconciledEvidence;
 
   const repairIdentity = async () => {
@@ -375,7 +365,8 @@ function MemoryReviewQueue({
     try {
       const report = await reconcileMemoryRelationships();
       setMessage(`${report.identities.entitiesRedirected} duplicate identities redirected · ${report.groundedFactEntityLinks.promoted + report.groundedFactResourceLinks.promoted} evidence-backed graph links promoted.`);
-      await Promise.all([people.refetch(), reviews.refetch()]);
+      await qc.invalidateQueries({ queryKey: ['mem-review'] });
+      await qc.invalidateQueries({ queryKey: ['mem-dups'] });
       onUpdated();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : String(err));
@@ -399,73 +390,44 @@ function MemoryReviewQueue({
     }
   };
 
+  // Hand decisions already have a queue. This section only appears for the
+  // counts that queue does not decide, and for the backup-first repairs.
+  const items: Array<{ key: string; icon: typeof Users; label: string; count: number; detail: string; action: string; tab: Tab; tone: 'neutral' | 'warning' }> = [];
+  if (pendingClaims > 0) items.push({
+    key: 'claims', icon: History, label: 'Learned claims', count: pendingClaims,
+    detail: overdueClaims > 0
+      ? `${overdueClaims} overdue. Replay stays bounded.`
+      : ledgerPendingClaims === 0 && bufferedExtractions > 0
+        ? `${bufferedExtractions} legacy buffers enter the decision ledger on daemon start.`
+        : `${ledgerPendingObservations.toLocaleString()} source observation${ledgerPendingObservations === 1 ? '' : 's'} collapse to ${ledgerPendingClaims.toLocaleString()} unique claim${ledgerPendingClaims === 1 ? '' : 's'}${knownExactPending > 0 ? `. ${knownExactPending} already-known will auto-attach` : ''}.`,
+    action: 'Inspect learning', tab: 'episodes', tone: overdueClaims > 0 ? 'warning' : 'neutral',
+  });
+  if (promptOnly > 0) items.push({ key: 'prompt', icon: ShieldCheck, label: 'Prompt-only instructions', count: promptOnly, detail: 'Legacy constraint-shaped facts are not enforced.', action: 'Review policies', tab: 'facts', tone: 'warning' });
+  if (items.length === 0 && repairCount === 0 && unavailableEvidence === 0 && !message) return null;
+
   return (
-    <Card className="overflow-hidden p-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-body-lg font-semibold text-fg">Memory upkeep &amp; repairs</h3>
-            {queuesLoading
-              ? <StatusPill tone="neutral">Loading queues…</StatusPill>
-              : totalReviewCount > 0
-                ? <StatusPill tone="warning">{totalReviewCount.toLocaleString()} to review</StatusPill>
-                : <StatusPill tone="success">Caught up</StatusPill>}
-            {repairCount > 0 && <StatusPill tone="danger">{repairCount.toLocaleString()} repair item{repairCount === 1 ? '' : 's'}</StatusPill>}
-          </div>
-          {/* "Needs you" means exactly one thing in this product: a person is
-              blocking work, and it lives in the Inbox. What this panel owns is
-              the upkeep ReviewPane cannot do — identity convergence and
-              evidence reconciliation — plus the counts that feed it. Calling it
-              a second review queue put the same words on two different jobs. */}
-          <p className="mt-0.5 text-small text-muted">Decisions you make by hand live in the review queue above. These are safe, backup-first repairs Clementine can run for you.</p>
-        </div>
-        {unavailableEvidence > 0 && <div className="max-w-sm rounded-md bg-subtle px-3 py-2 text-caption text-muted">
-          <span className="font-medium text-fg">Known historical limit:</span> {unavailableEvidence.toLocaleString()} pre-upgrade evidence links are honestly unavailable and are never presented as source-backed.
-        </div>}
+    <section aria-labelledby="memory-upkeep-h" className="space-y-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h3 id="memory-upkeep-h" className="text-body font-semibold text-fg">Upkeep</h3>
+        {/* "Needs you" means exactly one thing in this product: a person is
+            blocking work, and it lives in the Inbox. What this section owns is
+            the upkeep ReviewPane cannot do — identity convergence and evidence
+            reconciliation — plus counts that are not hand decisions. */}
+        {repairCount > 0 && (
+          <p className="text-small text-muted">Hand decisions are in the queue above. These repairs back memory up first.</p>
+        )}
       </div>
-
-      <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-        <ReviewQueueItem
-          icon={Users}
-          label="Possible duplicate people"
-          count={peopleReviews}
-          detail="Name and alias matches always require your choice."
-          action="Review people"
-          onAction={() => onNavigate('entities')}
-        />
-        <ReviewQueueItem
-          icon={BookOpen}
-          label="Fact cleanup"
-          count={factReviews}
-          detail="Possible duplicate facts and transient chat requests."
-          action="Review facts"
-          onAction={() => onNavigate('facts')}
-        />
-        <ReviewQueueItem
-          icon={History}
-          label="Learned claims"
-          count={pendingClaims}
-          detail={overdueClaims > 0
-            ? `${overdueClaims} overdue; replay remains bounded and durable.`
-            : ledgerPendingClaims === 0 && bufferedExtractions > 0
-              ? `${bufferedExtractions} legacy buffers will enter the decision ledger on daemon start.`
-              : `${ledgerPendingObservations.toLocaleString()} source observation${ledgerPendingObservations === 1 ? '' : 's'} collapse to ${ledgerPendingClaims.toLocaleString()} unique claim${ledgerPendingClaims === 1 ? '' : 's'}${knownExactPending > 0 ? `; ${knownExactPending} already-known will auto-attach` : ''}.`}
-          action="Inspect learning"
-          onAction={() => onNavigate('episodes')}
-          tone={overdueClaims > 0 ? 'warning' : 'neutral'}
-        />
-        <ReviewQueueItem
-          icon={ShieldCheck}
-          label="Prompt-only instructions"
-          count={promptOnly}
-          detail="Legacy constraint-shaped facts are not mislabeled as enforced."
-          action="Review policies"
-          onAction={() => onNavigate('facts')}
-          tone={promptOnly > 0 ? 'warning' : 'neutral'}
-        />
-      </div>
-
-      {(identityBlockers > 0 || unreconciledEvidence > 0) && <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-danger/25 bg-danger/5 p-3 text-small">
+      {unavailableEvidence > 0 && (
+        <p className="text-caption text-muted">
+          <span className="font-medium text-fg">Known historical limit.</span> {unavailableEvidence.toLocaleString()} pre-upgrade evidence links are honestly unavailable and are never presented as source-backed.
+        </p>
+      )}
+      {items.length > 0 && (
+        <ul className="divide-y divide-border rounded-lg border border-border bg-surface">
+          {items.map(({ key, tab, ...item }) => <ReviewQueueItem key={key} {...item} onAction={() => onNavigate(tab)} />)}
+        </ul>
+      )}
+      {(identityBlockers > 0 || unreconciledEvidence > 0) && <div className="flex flex-wrap items-center gap-2 rounded-lg border border-danger/25 bg-danger/5 p-3 text-small">
         <AlertTriangle className="h-4 w-4 shrink-0 text-danger" aria-hidden />
         <span className="mr-auto text-muted">
           {identityBlockers > 0 ? `${identityBlockers} exact-email identity group${identityBlockers === 1 ? '' : 's'} can be safely converged. ` : ''}
@@ -478,8 +440,8 @@ function MemoryReviewQueue({
           <Database className="h-3.5 w-3.5" aria-hidden /> {repairing === 'evidence' ? 'Reconciling…' : 'Back up & classify evidence'}
         </Button>}
       </div>}
-      {message && <p className="mt-2 text-caption text-muted">{message}</p>}
-    </Card>
+      {message && <p className="text-caption text-muted">{message}</p>}
+    </section>
   );
 }
 
@@ -494,22 +456,21 @@ function ReviewQueueItem({
 }: {
   icon: typeof Users;
   label: string;
-  count?: number;
+  count: number;
   detail: string;
   action: string;
   onAction: () => void;
   tone?: 'neutral' | 'warning';
 }) {
   return (
-    <div className="flex min-h-32 flex-col rounded-lg border border-border bg-surface p-3">
-      <div className="flex items-center gap-2">
-        <Icon className={cn('h-4 w-4', tone === 'warning' ? 'text-warning' : 'text-primary')} aria-hidden />
-        <div className="min-w-0 flex-1 text-small font-medium text-fg">{label}</div>
-        <StatusPill tone={(count ?? 0) > 0 && tone === 'warning' ? 'warning' : 'neutral'}>{count == null ? '—' : count.toLocaleString()}</StatusPill>
+    <li className="flex flex-wrap items-center gap-3 px-3 py-2.5">
+      <Icon className={cn('h-4 w-4 shrink-0', tone === 'warning' ? 'text-warning' : 'text-primary')} aria-hidden />
+      <div className="min-w-0 flex-1">
+        <div className="text-small font-medium text-fg">{label} <span className="tabular-nums text-muted">{count.toLocaleString()}</span></div>
+        <p className="text-caption text-muted">{detail}</p>
       </div>
-      <p className="mt-2 flex-1 text-caption text-muted">{detail}</p>
-      <button type="button" onClick={onAction} className="mt-2 w-fit cursor-pointer text-caption font-medium text-primary hover:underline">{action} →</button>
-    </div>
+      <button type="button" onClick={onAction} className="cursor-pointer text-small font-semibold text-primary hover:underline">{action}</button>
+    </li>
   );
 }
 

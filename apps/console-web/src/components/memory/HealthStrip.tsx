@@ -1,19 +1,10 @@
 /**
- * Three things the header does not already say: people & things, what needs
- * review, and when memory was last tidied. Idle state only — a search
- * replaces it with matches.
+ * One line the header does not already say: people and things, what needs a
+ * decision, and when memory was last tidied. A search replaces the whole
+ * idle view, including this line.
  */
 import type { MemoryHealth } from '@/lib/memory';
 import { relativeTime } from '@/lib/inbox';
-
-function Tile({ value, label, note, tone }: { value: string; label: string; note?: string; tone?: 'up' | 'warn' }) {
-  return (
-    <div className="grid grid-cols-[auto_1fr] items-center gap-3 rounded-lg border border-border bg-surface px-3.5 py-2.5 shadow-xs">
-      <span className="text-h2 tabular-nums text-fg">{value}</span>
-      <span className="min-w-0"><span className="block truncate text-small text-fg">{label}</span>{note && <span className={`block truncate text-caption ${tone === 'up' ? 'text-success' : tone === 'warn' ? 'text-warning' : 'text-faint'}`}>{note}</span>}</span>
-    </div>
-  );
-}
 
 /**
  * `unavailable` is not the same as zero. Without it this strip answered a
@@ -21,24 +12,35 @@ function Tile({ value, label, note, tone }: { value: string; label: string; note
  * "caught up" — three confident statements about a memory it had not been able
  * to read. On this screen of all screens, say so instead.
  */
-export function HealthStrip({ health, review, duplicates, unavailable }: { health?: MemoryHealth; review: number; duplicates: number; unavailable?: boolean }) {
+export function HealthStrip({ health, review, duplicates, unavailable }: { health?: MemoryHealth; review: number | null; duplicates: number | null; unavailable?: boolean }) {
   if (unavailable) {
-    return (
-      <div className="grid gap-2.5 sm:grid-cols-3">
-        <Tile value="—" label="people & things" note="couldn’t be read" />
-        <Tile value="—" label="to review" note="couldn’t be read" />
-        <Tile value="—" label="last tidied" note="couldn’t be read" />
-      </div>
-    );
+    return <p className="text-small text-muted">People, the review queue, and the last tidy couldn’t be read.</p>;
   }
-  const tidy = health?.lastHygiene ?? null;
+  // Still loading is not a count. A zero here used to flash before the read landed.
+  if (!health) return <p className="text-small text-faint">Reading memory health…</p>;
+  const entities = typeof health.entities === 'number' ? health.entities.toLocaleString() : '—';
+  const conflicts = health.entityIdentity?.conflicts ?? 0;
+  const reviewKnown = review != null && duplicates != null;
+  const waiting = (review ?? 0) + (duplicates ?? 0);
+  const tidy = health.lastHygiene ?? null;
   const tidyWhen = tidy ? relativeTime(tidy.at) : '';
-  const tidyWhat = tidy ? `${tidy.kind.replace(/-/g, ' ')} · ${tidy.count} ${tidy.count === 1 ? 'memory' : 'memories'}` : 'no tidy recorded yet';
   return (
-    <div className="grid gap-2.5 sm:grid-cols-3">
-      <Tile value={String(health?.entities ?? 0)} label="people & things" note={health?.entityIdentity?.conflicts ? `${health.entityIdentity.conflicts} identity ${health.entityIdentity.conflicts === 1 ? 'conflict' : 'conflicts'}` : 'no identity conflicts'} tone={health?.entityIdentity?.conflicts ? 'warn' : undefined} />
-      <Tile value={String(review + duplicates)} label="to review" note={duplicates > 0 ? `${duplicates} possible ${duplicates === 1 ? 'duplicate' : 'duplicates'}` : review > 0 ? 'facts to keep or fold' : 'caught up'} tone={review + duplicates > 0 ? 'warn' : 'up'} />
-      <Tile value={tidy ? tidyWhen : '—'} label={tidy ? 'last tidied' : 'last tidied'} note={tidyWhat} />
-    </div>
+    <p className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-small text-muted">
+      <span>
+        <span className="font-semibold tabular-nums text-fg">{entities}</span>
+        {' '}people & things
+        {conflicts > 0 && <span className="text-warning"> · {conflicts} identity {conflicts === 1 ? 'conflict' : 'conflicts'}</span>}
+      </span>
+      {reviewKnown ? (
+        <span className={waiting > 0 ? 'text-warning' : 'text-success'}>
+          <span className="font-semibold tabular-nums">{waiting}</span>
+          {' '}to review
+          {(duplicates ?? 0) > 0 ? ` · ${duplicates} possible ${duplicates === 1 ? 'duplicate' : 'duplicates'}` : ''}
+        </span>
+      ) : (
+        <span>Review queue still loading</span>
+      )}
+      <span>{tidy ? <>Last tidied {tidyWhen} · {tidy.kind.replace(/-/g, ' ')} · {tidy.count} {tidy.count === 1 ? 'memory' : 'memories'}</> : 'No tidy recorded yet'}</span>
+    </p>
   );
 }
