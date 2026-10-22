@@ -2499,7 +2499,7 @@
           "bytes": 18475
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 76343
+          "bytes": 77908
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -6570,7 +6570,7 @@
           "bytes": 18475
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 76343
+          "bytes": 77908
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
