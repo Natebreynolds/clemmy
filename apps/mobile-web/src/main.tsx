@@ -1,18 +1,27 @@
 import { render } from 'preact';
-import { App } from './app';
-import { ChatPreview } from './screens/ChatPreview';
+import { Suspense } from 'preact/compat';
+import { App, ScreenBoundary } from './app';
+import { deferredScreen } from './lib/lazy-screen';
 import { installNativeBridge } from './lib/native-bridge';
 import './styles.css';
 // Styles load once, here at the entry, so screens stay loadable in tests.
 import './components/cloud-browser.css';
+import './adaptive-layout.css';
+import './components/composer-layout.css';
 
 // Before first render so a native shell can hand in its APNs token whenever
 // it likes — including during the pairing load.
 installNativeBridge();
 
 const preview = new URLSearchParams(window.location.search).get('preview');
+const chatPreview = deferredScreen(async () => ({ default: (await import('./screens/ChatPreview')).ChatPreview }));
+const ChatPreview = chatPreview.Component;
 render(
-  preview === 'chat' ? <ChatPreview /> : <App />,
+  preview === 'chat' ? (
+    <ScreenBoundary tab="preview" onRetry={chatPreview.retry}>
+      <Suspense fallback={<p class="empty" role="status">Loading chat preview…</p>}><ChatPreview /></Suspense>
+    </ScreenBoundary>
+  ) : <App />,
   document.getElementById('app')!,
 );
 

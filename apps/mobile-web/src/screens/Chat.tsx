@@ -114,7 +114,6 @@ import { REFRESH_EVENT, haptic } from '../lib/native-bridge';
 import { chatApprovalDecided, chatApprovalReply } from '../lib/chat-approval';
 import { stopObservedChatTurn, stopQualificationOwnsChat } from '../lib/chat-control';
 import { getNextAnsweringModel, getModelSettings, type NextAnsweringModel, type BrainOptionRow } from '../lib/api';
-import { useKeyboardInset } from '../lib/use-keyboard-inset';
 import { BrainSheet } from '../components/BrainSheet';
 import { CloudBrowserDock } from '../components/CloudBrowserDock';
 import { Composer } from '../components/Composer';
@@ -305,7 +304,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
   const autoSent = useRef(false);
-  const keyboardInset = useKeyboardInset();
   const [dockH, setDockH] = useState(140);
 
   const engine = useMemo(() => new ChatEngine({
@@ -833,7 +831,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   return (
     <div
       class="chat-shell"
-      style={{ '--kb-inset': `${keyboardInset}px`, '--chat-dock-h': `${dockH}px` }}
+      style={{ '--chat-dock-h': `${dockH}px` }}
     >
       <div class="chat-header chat-header-compact">
         <ChatBackButton onClick={onBack} />
@@ -1007,19 +1005,21 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class="chat-dock">
-        {initialComposeMode === 'dictate' && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">Tap the microphone to dictate a draft.</p> : null}
-        {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
-        <VoiceModeControl
-          scope={voiceScope}
-          messages={messages}
-          busy={busy}
-          onSend={submitVoice}
-          onActiveChange={setVoiceActive}
-          clearErrorRequest={voiceErrorReset}
-          disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
-          disabled={dictationActive || preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
-        />
         <Composer
+          leading={<>
+            {initialComposeMode === 'dictate' && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">Tap the microphone to dictate a draft.</p> : null}
+            {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
+            <VoiceModeControl
+              scope={voiceScope}
+              messages={messages}
+              busy={busy}
+              onSend={submitVoice}
+              onActiveChange={setVoiceActive}
+              clearErrorRequest={voiceErrorReset}
+              disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
+              disabled={dictationActive || preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
+            />
+          </>}
           value={draft}
           onChange={setDraft}
           textareaRef={textareaRef}
@@ -1158,6 +1158,10 @@ function MessageRow({
 }) {
   const [editing, setEditing] = useState(false);
   const [editedValue, setEditedValue] = useState('');
+  // Draft typing and unrelated stream updates revisit this row. Reparse only
+  // changed reply text; permissions and current decision controls stay live.
+  const replyHtml = useMemo(() => message.role === 'user' ? ''
+    : renderMarkdown(message.text, { appPlaceLinks: 'phone' }), [message.role, message.text]);
   const approvalResult = useMobileApprovalResult(message.approval);
   const approvalDecided = recordedApprovalDecision || approvalResult.presentation?.mode === 'durable';
   if (message.role === 'user') {
@@ -1190,7 +1194,7 @@ function MessageRow({
     return (
       <div class="turn turn-assistant" aria-label="Progress update">
         {speaker ? <div class="reply-speaker">{speaker}</div> : null}
-        <div class="reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text, { appPlaceLinks: 'phone' }) }} />
+        <div class="reply bubble-md" dangerouslySetInnerHTML={{ __html: replyHtml }} />
       </div>
     );
   }
@@ -1415,7 +1419,7 @@ function MessageRow({
               reviewer sent back dims, since those words will not stand. */}
           <div
             class={`reply bubble-md${thinking && !draftStatus ? ' reply-writing' : ''}${thinking && message.answerDraft?.phase === 'withdrawn' && message.answerDraft.withdrawn === 'review' ? ' reply-withdrawn' : ''}`}
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(message.text, { appPlaceLinks: 'phone' }) }}
+            dangerouslySetInnerHTML={{ __html: replyHtml }}
           />
           {draftStatus ? (
             <p class={`reply-draft-status${message.answerDraft?.withdrawn === 'review' ? ' is-correcting' : ''}`} role="status">

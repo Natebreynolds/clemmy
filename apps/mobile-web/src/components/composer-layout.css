@@ -1,0 +1,55 @@
+/* The visible viewport owns one height budget. Only the draft body scrolls;
+   sending and stopping remain outside it, even with files or a tall keyboard. */
+.chat-dock,
+.ask-capsule {
+  --composer-available-height: max(0px, calc(var(--mobile-viewport-height, 100dvh) - var(--mobile-dock-top-clearance, 64px) - var(--mobile-dock-gap, max(22px, env(safe-area-inset-bottom) + 10px))));
+  max-height: var(--composer-available-height);
+  overflow: hidden;
+}
+
+.composer.composer-layout {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: calc(var(--composer-available-height, 100dvh) - 2px);
+  overflow: hidden;
+}
+
+.composer-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
+}
+.composer-body > * { flex-shrink: 0; }
+
+.composer-layout > .composer-row {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding-top: 4px;
+}
+
+/* Keep text-size preferences while retaining iOS's no-zoom input minimum. */
+.composer-layout .composer-input {
+  font-size: max(16px, 1rem);
+  min-height: max(40px, calc(1.45em + 12px));
+}
+.composer-layout.composer-slim .composer-body {
+  flex: 1 1 0;
+  overflow: hidden;
+}
+.composer-layout.composer-slim .composer-input {
+  width: 100%;
+  max-height: none;
+  min-height: max(40px, calc(1.45em + 18px));
+}
+.composer-layout.composer-slim > .composer-row { display: contents; }
+
+/* Empty voice status has no height. Real status and errors remain in the
+   scrollable body; opening the keyboard never removes a recovery control. */
+.composer-body .voice-mode-control { margin: 0; }
+.composer-body .chat-mode-status { padding: 4px 8px; }

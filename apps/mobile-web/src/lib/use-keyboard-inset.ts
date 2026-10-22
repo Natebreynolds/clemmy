@@ -1,5 +1,6 @@
 import { useLayoutEffect, useState } from 'preact/hooks';
 import { visibleViewportBounds, type VisibleViewport } from './visible-viewport';
+import { observeViewport } from './observe-viewport';
 
 function readViewport(): VisibleViewport {
   return visibleViewportBounds(window.innerHeight, window.visualViewport);
@@ -13,23 +14,10 @@ const getViewport = () => snapshot ?? (snapshot = readViewport());
 function subscribe(listener: (viewport: VisibleViewport) => void): () => void {
   listeners.add(listener);
   if (!disconnect) {
-    const vv = window.visualViewport;
-    const measure = () => {
-      const next = readViewport();
-      const old = snapshot;
-      if (old?.top === next.top && old.height === next.height && old.bottomInset === next.bottomInset) return;
+    disconnect = observeViewport(window, (next) => {
       snapshot = next;
       listeners.forEach((notify) => notify(next));
-    };
-    window.addEventListener('resize', measure);
-    vv?.addEventListener('resize', measure);
-    vv?.addEventListener('scroll', measure);
-    disconnect = () => {
-      window.removeEventListener('resize', measure);
-      vv?.removeEventListener('resize', measure);
-      vv?.removeEventListener('scroll', measure);
-    };
-    measure();
+    });
   }
   listener(getViewport());
   return () => {
@@ -47,16 +35,24 @@ export function useVisibleViewport(enabled = true): VisibleViewport {
 
 /** Older floating surfaces consume the same measurement through CSS. */
 export function useMobileViewportVariables(): void {
-  const { top, height } = useVisibleViewport();
   useLayoutEffect(() => {
     const style = document.documentElement.style;
-    style.setProperty('--mobile-viewport-top', `${top}px`);
-    style.setProperty('--mobile-viewport-height', `${height}px`);
+    // Geometry belongs to CSS. Do not rerender App (and the open transcript)
+    // on every keyboard animation frame just to publish these measurements.
+    const unsubscribe = subscribe(({ top, height, bottomInset }) => {
+      style.setProperty('--mobile-viewport-top', `${top}px`);
+      style.setProperty('--mobile-viewport-height', `${height}px`);
+      style.setProperty('--kb-inset', `${bottomInset}px`);
+      style.setProperty('--mobile-dock-gap', bottomInset > 80 ? '10px' : 'max(22px, calc(env(safe-area-inset-bottom) + 10px))');
+    });
     return () => {
+      unsubscribe();
       style.removeProperty('--mobile-viewport-top');
       style.removeProperty('--mobile-viewport-height');
+      style.removeProperty('--kb-inset');
+      style.removeProperty('--mobile-dock-gap');
     };
-  }, [top, height]);
+  }, []);
 }
 
 /**

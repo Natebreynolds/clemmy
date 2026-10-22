@@ -8,7 +8,6 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ChatAttachment } from '@clem/chat-engine';
 import { Composer } from './Composer';
 import { uploadChatAttachment } from '../lib/api';
-import { useKeyboardInset } from '../lib/use-keyboard-inset';
 
 interface Props {
   onAsk: (text: string, attachments?: ChatAttachment[]) => void;
@@ -16,9 +15,6 @@ interface Props {
 
 export function AskCapsule({ onAsk }: Props) {
   const [draft, setDraft] = useState('');
-  // iOS Safari keeps a fixed element behind the keyboard; the visual
-  // viewport says exactly how much of the layout viewport is covered.
-  const keyboardInset = useKeyboardInset();
   // The page reserves exactly the capsule's height below its content, so the
   // last row is never hidden behind the card (live 09-26: Needs you's first
   // card sat under the composer on Home).
@@ -34,8 +30,8 @@ export function AskCapsule({ onAsk }: Props) {
   }, []);
   return (
     <>
-      <div class="ask-capsule-fade" aria-hidden="true" style={keyboardInset ? { bottom: `${keyboardInset}px` } : undefined} />
-      <div ref={wrap} class="ask-capsule" style={keyboardInset ? { '--kb-inset': `${keyboardInset}px` } : undefined}>
+      <div class="ask-capsule-fade" aria-hidden="true" />
+      <div ref={wrap} class="ask-capsule">
         <Composer
           compact
           value={draft}

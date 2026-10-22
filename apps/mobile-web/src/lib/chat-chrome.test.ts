@@ -45,7 +45,9 @@ test('thread title beats the page h2 and truncates beside Brain', () => {
 test('chat preview is gated behind ?preview=chat and never the default render', () => {
   const main = read('../main.tsx');
   assert.match(main, /get\('preview'\)/);
-  assert.match(main, /preview === 'chat' \? <ChatPreview \/> : <App \/>/);
+  assert.match(main, /preview === 'chat' \? \([\s\S]*?<ScreenBoundary[^>]*>[\s\S]*?<Suspense[^>]*>[\s\S]*?<ChatPreview \/>[\s\S]*?\) : <App \/>/);
+  assert.match(main, /import\('\.\/screens\/ChatPreview'\)/);
+  assert.doesNotMatch(main, /import\s+\{\s*ChatPreview\s*\}\s+from/, 'preview code must not be an eager entry dependency');
 });
 
 test('the phone shows a confirmed change in another app while the turn is still live', () => {

@@ -1,0 +1,101 @@
+/* Adapt to the app window, not a device name or a physical pixel resolution. */
+:root {
+  --mobile-dock-gap: max(22px, calc(env(safe-area-inset-bottom) + 10px));
+  --mobile-dock-top-clearance: 64px;
+  --mobile-navigation-width: 0px;
+}
+
+.adaptive-navigation { display: none; }
+
+/* Use one shared geometry owner for the dock, its fade, and the last message. */
+.chat-dock, .ask-capsule {
+  bottom: calc(var(--kb-inset, 0px) + var(--mobile-dock-gap));
+}
+.chat-dock-fade {
+  height: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + 36px);
+  bottom: var(--kb-inset, 0px);
+}
+.ask-capsule-fade { bottom: var(--kb-inset, 0px); }
+.chat-transcript {
+  padding-bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 12px);
+}
+.chat-jump {
+  bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 12px);
+}
+.app-main-capsule {
+  padding-bottom: calc(var(--capsule-h, 96px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 16px);
+}
+
+/* Navigation and close actions must remain reachable above the keyboard. */
+.drawer-layer {
+  top: var(--mobile-viewport-top, 0px);
+  bottom: auto;
+  height: var(--mobile-viewport-height, 100dvh);
+}
+.drawer { min-height: 0; }
+.drawer-brand, .drawer-foot { flex-shrink: 0; }
+
+/* At this width a useful navigation column and a readable conversation fit
+   together. Narrow split windows retain exactly the same menu destinations. */
+@media (min-width: 880px) {
+  #app:has(.adaptive-navigation) {
+    --mobile-navigation-width: clamp(180px, 22vw, 224px);
+    display: grid;
+    grid-template-columns: var(--mobile-navigation-width) minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .adaptive-navigation {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    max-height: var(--mobile-viewport-height, 100dvh);
+    padding: 12px 12px max(12px, env(safe-area-inset-bottom));
+    border-right: 1px solid var(--line);
+    background: var(--bg-1);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .adaptive-navigation-brand { display: flex; align-items: center; gap: 8px; padding: 4px 8px 16px; font-weight: 650; }
+  .adaptive-navigation-brand img { flex: 0 0 auto; }
+  .adaptive-navigation button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--fg-2);
+    font-size: var(--t-sm);
+    line-height: 1.35;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .adaptive-navigation button[aria-current='page'] { background: var(--accent-soft); color: var(--accent-deep); font-weight: 650; }
+  .adaptive-navigation button:active { background: var(--bg-2); }
+  .adaptive-navigation button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .adaptive-navigation .adaptive-new-chat { margin-bottom: 16px; color: var(--accent-deep); font-weight: 650; }
+  .adaptive-new-chat svg { width: 18px; height: 18px; flex-shrink: 0; }
+  .adaptive-navigation-sections { display: flex; flex-direction: column; gap: 2px; }
+  .adaptive-navigation-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .adaptive-navigation .adaptive-settings { margin-top: auto; }
+  .app-header { grid-column: 2; grid-row: 1; width: 100%; }
+  .app-main { grid-column: 2; grid-row: 2; min-width: 0; }
+  .chat-dock, .ask-capsule { left: calc(var(--mobile-navigation-width) + max(16px, env(safe-area-inset-left))); }
+  .chat-dock-fade, .ask-capsule-fade { left: var(--mobile-navigation-width); }
+}
+
+/* A wide window with a sidebar still has a compact content pane. Home only
+   earns two columns once each has enough room for its actual controls. */
+@media (min-width: 880px) and (max-width: 1099px) {
+  .home { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* No animated relayout while the keyboard, hinge, or window changes size. */
+.chat-dock, .ask-capsule { transition-property: border-color; }

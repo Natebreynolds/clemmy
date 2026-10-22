@@ -1,5 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { Component } from 'preact';
+import { Suspense } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   adoptOriginSession,
@@ -54,12 +55,7 @@ import { Login } from './screens/Login';
 import { Home } from './screens/Home';
 import { Activity } from './screens/Activity';
 import { Chats } from './screens/Chats';
-import { Agents } from './screens/Agents';
-import { Projects } from './screens/Projects';
-import { Memory } from './screens/Memory';
-import { Workflows } from './screens/Workflows';
-import { Workspaces } from './screens/Workspaces';
-import { Settings } from './screens/Settings';
+import { deferredScreen } from './lib/lazy-screen';
 import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
@@ -76,6 +72,23 @@ import { mobileChatLocation } from './lib/chat-location';
 import { installNativeVoiceBridge } from './lib/native-voice-bridge';
 import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
 import { saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
+
+// Keep the everyday conversation and decision surfaces in the first load.
+// Other destinations load inside the existing shell, including deep links.
+const deferredScreens = {
+  agents: deferredScreen(async () => ({ default: (await import('./screens/Agents')).Agents })),
+  projects: deferredScreen(async () => ({ default: (await import('./screens/Projects')).Projects })),
+  memory: deferredScreen(async () => ({ default: (await import('./screens/Memory')).Memory })),
+  workflows: deferredScreen(async () => ({ default: (await import('./screens/Workflows')).Workflows })),
+  spaces: deferredScreen(async () => ({ default: (await import('./screens/Workspaces')).Workspaces })),
+  settings: deferredScreen(async () => ({ default: (await import('./screens/Settings')).Settings })),
+};
+const Agents = deferredScreens.agents.Component;
+const Projects = deferredScreens.projects.Component;
+const Memory = deferredScreens.memory.Component;
+const Workflows = deferredScreens.workflows.Component;
+const Workspaces = deferredScreens.spaces.Component;
+const Settings = deferredScreens.settings.Component;
 
 export function App() {
   useMobileViewportVariables();
@@ -683,6 +696,29 @@ export function App() {
 
   return (
     <MobileNavigationProvider openNavigation={openDrawer} navigationOpen={drawerOpen} onDetailHeaderChange={setDetailHeaderOwned}>
+      {/* The same destinations stay mounted across a fold/rotation. Only CSS
+          changes their placement; the open screen and draft keep their identity. */}
+      <nav class="adaptive-navigation" aria-label="Sections" inert={drawerOpen ? true : undefined}>
+        <div class="adaptive-navigation-brand">
+          <img src="/m/clemmy.png" alt="" width="28" height="28" />
+          <span>Clementine</span>
+        </div>
+        <button type="button" class="adaptive-new-chat" onClick={() => { haptic('light'); goToChat({}); }}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          New chat
+        </button>
+        <div class="adaptive-navigation-sections">
+          {[...PRIMARY_TABS, ...QUIET_TABS].map(id => (
+            <button key={id} type="button" aria-current={tab === id ? 'page' : undefined}
+              onClick={() => { if (tab !== id) haptic('light'); navigateTo(id); }}>
+              {TABS.find(section => section.id === id)!.label}
+              {id === 'inbox' && needsYou.show ? <span class="adaptive-navigation-count" aria-label={needsYou.badgeAriaLabel}>{needsYou.badgeText}</span> : null}
+            </button>
+          ))}
+        </div>
+        <button type="button" class="adaptive-settings" aria-current={tab === 'settings' ? 'page' : undefined}
+          onClick={() => { haptic('light'); navigateTo('settings'); }}>Settings</button>
+      </nav>
       <header
         class="app-header"
         hidden={detailHeaderOwned}
@@ -923,7 +959,10 @@ export function App() {
       ) : null}
 
       <main class={`app-main${capsuleShown ? ' app-main-capsule' : ''}`} key={tab}>
-        <ScreenBoundary tab={tab}>
+        <ScreenBoundary tab={tab} onRetry={() => {
+          if (tab in deferredScreens) deferredScreens[tab as keyof typeof deferredScreens].retry();
+        }}>
+          <Suspense fallback={<p class="empty" role="status">Loading {TAB_TITLES[tab]}…</p>}>
           {tab === 'home' ? (
             <Home
               name={name}
@@ -1029,6 +1068,7 @@ export function App() {
                 onRunChange={(sessionId) => navigateTo('activity', { runId: sessionId })}
               />
             )}
+          </Suspense>
         </ScreenBoundary>
       </main>
 
@@ -1043,7 +1083,7 @@ export function App() {
  * boundary resets the error state when the user switches tabs, so a crash on
  * Memory never follows them to Chats.
  */
-class ScreenBoundary extends Component<{ tab: string; children: ComponentChildren }, { failed: boolean }> {
+export class ScreenBoundary extends Component<{ tab: string; children: ComponentChildren; onRetry?: () => void }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError(): { failed: boolean } {
     return { failed: true };
@@ -1054,11 +1094,11 @@ class ScreenBoundary extends Component<{ tab: string; children: ComponentChildre
   render() {
     if (this.state.failed) {
       return (
-        <div class="empty">
+        <div class="empty" role="alert">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
           <p class="empty-title">This screen hit a snag</p>
-          <p class="empty-body">The rest of the app is fine — try again or switch tabs.</p>
-          <button class="login-repair" onClick={() => this.setState({ failed: false })}>Try again</button>
+          <p class="empty-body">If you’re offline, reconnect and try again. You can still open another screen.</p>
+          <button class="login-repair" onClick={() => { this.props.onRetry?.(); this.setState({ failed: false }); }}>Try again</button>
         </div>
       );
     }
