@@ -139,6 +139,7 @@ import {
 import { reduceShardMembers, reduceShardSize, reduceTierEnabled, shardFingerprint } from '../runtime/harness/fanout-reduce.js';
 import { resolveRunTokenCeiling, runTokenBudgetEnforcementEnabled } from '../runtime/harness/run-token-budget.js';
 import { listEvents, sumSessionTokensUsedByPrefix } from '../runtime/harness/eventlog.js';
+import { workflowRunAuthorityRefusals, type WorkflowRunAuthorityRefusal } from './workflow-run-authority-refusals.js';
 import { getHarnessBudgetSettings } from '../runtime/harness/budget-settings.js';
 import {
   actionTopologyRoleForRuntimeCall,
@@ -14533,6 +14534,8 @@ export function decideGoalRunOutcome(args: {
   /** Ledger facts for the run's completed steps; absent keeps the rules that
    *  predate them. */
   landedWrites?: GoalRunLandedWrites;
+  /** Calls this run's own definition refused (workflowRunAuthorityRefusals). */
+  definitionRefusals?: readonly WorkflowRunAuthorityRefusal[];
 }): GoalRunDecision {
   const attemptsUsed = args.priorRepursuits + 1;
   if (args.verdict.pass) return { action: 'satisfied', reason: 'all success criteria met' };
@@ -14543,6 +14546,16 @@ export function decideGoalRunOutcome(args: {
   const provenMiss = args.verdict.perCriterion.some((c) => !c.pass && c.method === 'deterministic');
   if (args.verdict.judgeFailedOpen && !provenMiss) {
     return { action: 'advisory', reason: 'goal validation unavailable (judge error) — not re-running on an unverifiable verdict' };
+  }
+  // A call the workflow's own definition refused is refused again on every
+  // run of that definition: running again cannot close the gap, only a change
+  // to the workflow can.
+  if (args.definitionRefusals && args.definitionRefusals.length > 0) {
+    const named = [...new Set(args.definitionRefusals.map((refusal) => refusal.tool))].join(', ');
+    const why = `this workflow's own permissions refused ${named}, and running it again unchanged would be refused the same way; the workflow itself needs a change`;
+    return args.landedWrites?.landed
+      ? { action: 'gap', reason: `the run's writes landed; ${why}` }
+      : { action: 'escalate', reason: `goal unmet: ${why}` };
   }
   if (args.landedWrites?.landed) {
     if (attemptsUsed >= args.maxAttempts) {
@@ -17243,6 +17256,9 @@ async function processOneRunFile(
           unsafeStepId: runUnsafeToRepursue(workflow.data.steps, completedStepIds, runWriteFacts),
           chronicallyFailing: shouldStopAutoHeal(workflow.name),
           landedWrites,
+          definitionRefusals: (() => {
+            try { return workflowRunAuthorityRefusals(run.id, workflow.data.steps.map((step) => step.id)); } catch { return []; }
+          })(),
         });
         landedWritesKept = landedWrites.landed && (
           goalDecision.action === 'repursue'

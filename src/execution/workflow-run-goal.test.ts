@@ -352,3 +352,18 @@ test('whole-objective failure after a completed write escalates without rerunnin
     blockedSteps: 0, forEachFailures: 0, targetMissed: false,
   }), false);
 });
+
+test('decideGoalRunOutcome: a call the definition refused is a gap to fix, never a re-run', () => {
+  // Live 10-21 (a scheduled channel review): the step's board refresh was
+  // refused by the workflow's own permissions, the goal scored 67%, and the
+  // follow-up re-ran the whole workflow into the same refusal.
+  const refusals = [{ stepId: 'main', tool: 'space_refresh', reason: 'coverage_missing' as const }];
+  const landed = decideGoalRunOutcome({ ...baseDecision, verdict: failVerdict, definitionRefusals: refusals,
+    landedWrites: { landed: true, followUpStepIds: ['main'] } });
+  assert.equal(landed.action, 'gap');
+  assert.match(landed.reason, /space_refresh/);
+  assert.equal(decideGoalRunOutcome({ ...baseDecision, verdict: failVerdict, definitionRefusals: refusals }).action, 'escalate');
+  // Nothing refused by the definition keeps today's re-pursuit; a pass still passes.
+  assert.equal(decideGoalRunOutcome({ ...baseDecision, verdict: failVerdict, definitionRefusals: [] }).action, 'repursue');
+  assert.equal(decideGoalRunOutcome({ ...baseDecision, verdict: passVerdict, definitionRefusals: refusals }).action, 'satisfied');
+});
