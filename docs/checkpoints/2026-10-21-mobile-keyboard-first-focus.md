@@ -2,7 +2,7 @@
 
 ## Integration boundary
 
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/mobile-adaptive/clementine-next`.
+- Worktree: `~/.codex/worktrees/mobile-adaptive/clementine-next`.
 - Branch: `codex/mobile-keyboard-first-focus-2026-10-21`.
 - Base: `153e0bdcca5a5f1dc37f871630a49c03b36e4962` (current integration source when this branch began).
 - Scope: mobile web shell, shared composer, transcript resize handling, and focused regression tests. No production Swift, widget, authentication, provider, runtime, or personal/business data changes.

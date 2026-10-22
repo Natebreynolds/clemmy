@@ -5,7 +5,7 @@
 The owner requested a premium desktop Memory experience: dependable scrolling, less visual overload, visible learning, clear evidence and correction controls, and questions to Clem inside Memory. They explicitly assigned integration before the next tag to another agent. This branch does not install, restart, hotpatch, release, or modify personal memory.
 
 - Branch: `codex/memory-workspace-2026-10-21`
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/memory-workspace/clementine-next`
+- Worktree: `~/.codex/worktrees/memory-workspace/clementine-next`
 - Main base: `14fa578bc` (v3.18.37)
 - Inherited baseline: `7035f3d95`
 - New implementation: `57105efc4`

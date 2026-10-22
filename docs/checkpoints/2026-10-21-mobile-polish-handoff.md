@@ -5,7 +5,7 @@ Follow-up to [mobile adaptive layout](2026-10-21-mobile-adaptive-handoff.md). Th
 ## Integration
 
 - Branch: `codex/mobile-adaptive-2026-10-21`.
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/mobile-adaptive/clementine-next`.
+- Worktree: `~/.codex/worktrees/mobile-adaptive/clementine-next`.
 - Parent: `c3ce8cd0f`.
 - Integrating peer rechecked clean at `6a22f36ff` on `claude/r45-efficiency`; it already includes the preceding mobile commits and the separate Memory work.
 - Apply only this follow-up commit to the current integration tree. No restart, installed hotpatch, release/tag, native packaging, provider request, or live-data modification was performed here.

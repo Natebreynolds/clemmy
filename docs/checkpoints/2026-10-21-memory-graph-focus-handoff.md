@@ -5,7 +5,7 @@ The owner rejected the previous Memory layout's second left sidebar and the grap
 ## Integration
 
 - Branch: `codex/memory-graph-focus-2026-10-21`.
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/memory-workspace/clementine-next`.
+- Worktree: `~/.codex/worktrees/memory-workspace/clementine-next`.
 - Base: `153e0bdcca5a5f1dc37f871630a49c03b36e4962`, rechecked clean in the integrating agent's `claude/r45-efficiency` checkout. The previous Memory and mobile changes are already in that base; do not replay the old Memory branch.
 - Apply only this follow-up to the current integration tree. Release/install ownership remains with the other agent.
 

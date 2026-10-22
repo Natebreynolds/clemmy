@@ -5,7 +5,7 @@
 This pass addresses the owner's disappearing Send button, mobile responsiveness, narrow outside-screen use and wider unfolded-window use. It is an implementation candidate with source/test/build evidence; it is **not installed-app, physical iOS, or full iPhone Duo acceptance**.
 
 - Branch: `codex/mobile-adaptive-2026-10-21`
-- Worktree: `/Users/nathan.reynolds/.codex/worktrees/mobile-adaptive/clementine-next`
+- Worktree: `~/.codex/worktrees/mobile-adaptive/clementine-next`
 - Base: `1443b1fc921778f8ab0ed72571fad3b8113200f8`, rechecked clean in the active `claude/r45-efficiency` checkout.
 - Native assessment: commit `0a71b0318`; [assessment and platform sources](2026-10-21-mobile-native-assessment.md).
 - Implementation: commit `d71eec3bf`.
