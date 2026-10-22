@@ -57,3 +57,15 @@ test('new clients render structured actions once while legacy fallback remains i
   assert(!approvalReview(preview)!.common.some(field => field.name === 'Prepared actions'));
   assert(approvalPreviewFrom(preview)!.fields.some(field => field.name === 'Prepared actions'));
 });
+
+test('each grouped action says what Clem will do: as its title when unnamed, under its name otherwise', () => {
+  // Live 2026-10-22: a card grouping two off-machine commands listed each by
+  // its operation name ("run_shell_command") with no line of what will happen.
+  const command = (does: string): ApprovalPreview => ({ operation: 'run_shell_command', fields: [{ name: 'command', value: 'ssh -G localhost' }], does });
+  const review = approvalReview(group(command('Run a read-only ssh config check for the user setting.'), { ...item('One'), does: 'Create the fixture event.' }))!;
+  assert.equal(review.items[0]!.title, 'Run a read-only ssh config check for the user setting.');
+  assert.equal(review.items[0]!.does, undefined);
+  assert.equal(review.items[1]!.title, 'One');
+  assert.equal(review.items[1]!.does, 'Create the fixture event.');
+  assert.deepEqual(approvalPreviewFrom(group(command('Run it.'), item('Two')))?.items?.[0]?.does, 'Run it.');
+});

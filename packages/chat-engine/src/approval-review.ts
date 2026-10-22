@@ -44,7 +44,11 @@ export function approvalReview(preview: ApprovalPreview) {
     items: items.map(item => {
       const fields = item.fields.filter(field => !common.some(shared => JSON.stringify(shared) === JSON.stringify(field)));
       const get = (key: string) => item.fields.find(field => field.name === key)?.value;
-      const title = get('subject') ?? get('title') ?? item.operation;
+      // An action with no subject is titled by what Clem will do, never by
+      // its operation name; a named one keeps its name and shows the line under it.
+      const named = get('subject') ?? get('title');
+      const title = named ?? item.does ?? item.operation;
+      const does = named && item.does ? item.does : undefined;
       const start = get('start_datetime');
       const end = get('end_datetime');
       const allDay = get('is_all_day') === 'true';
@@ -68,7 +72,7 @@ export function approvalReview(preview: ApprovalPreview) {
       if (when && common.some(field => field.name === 'time_zone')) when = when.replace(` · ${zone}`, '');
       const availability = get('show_as');
       if (when && (availability === 'free' || availability === 'busy')) when += ` · ${availability === 'free' ? 'Free' : 'Busy'}`;
-      return { title, when, check: item.check,
+      return { title, ...(does ? { does } : {}), when, check: item.check,
         fields: fields.filter(field => !['subject', 'title'].includes(field.name)
           && !(when && ['start_datetime', 'end_datetime', 'is_all_day', 'time_zone', 'body'].includes(field.name))
           && !(when && ['free', 'busy'].includes(availability ?? '') && field.name === 'show_as')),

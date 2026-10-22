@@ -13,6 +13,7 @@ export function ApprovalReview({ preview }: { preview: ApprovalPreview }) {
     {fields(review.common.filter(field => !(review.items.every(item => item.when) && field.name === 'is_all_day')))}
     <ol className="approval-review-list">{review.items.map((item, index) => <li key={index}>
       <p className="approval-review-title">{item.title}</p>
+      {item.does && <p className="approval-review-does">{item.does}</p>}
       {item.when && <p className="approval-review-when">{item.when}</p>}
       {fields(item.fields)}
       {item.check && item.check.status !== 'clear' && <p className="approval-review-warning" role="note">{item.check.status === 'conflicts'

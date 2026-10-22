@@ -512,7 +512,9 @@ function groupHostStagedSiblings(
         const record = item.transition.record;
         const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
           ? record.payload as Record<string, unknown> : null;
-        return payload ? approvalCallPreview({ toolName: record.toolName, args: payload, rawArgs: JSON.stringify(payload) }, true, true) : null;
+        const preview = payload ? approvalCallPreview({ toolName: record.toolName, args: payload, rawArgs: JSON.stringify(payload) }, true, true) : null;
+        // Each action on a grouped card says what Clem will do, as it does on its own card.
+        return preview && record.does?.trim() ? { ...preview, does: record.does.trim() } : preview;
       });
       if (items.some((item) => !item)) continue;
       const typedItems = items as NonNullable<(typeof items)[number]>[];

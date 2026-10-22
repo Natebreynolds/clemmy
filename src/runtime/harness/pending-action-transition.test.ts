@@ -179,6 +179,32 @@ test('a staged card carries the one plain line of what Clem will do', () => {
   assert.equal(card.preview?.ask, 'Send the launch update now?');
 });
 
+test('each command on a grouped staged card carries what Clem will do', () => {
+  // Live 2026-10-22: two off-machine checks staged for one request became one
+  // card listing each by "run_shell_command" with no line of what will happen.
+  const session = createSession({ kind: 'chat', channel: 'discord' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Run both checks.' } });
+  const lines = ['Check the ssh user setting for localhost.', 'Check the ssh port setting for localhost.'];
+  lines.forEach((does, index) => {
+    const record = queuePendingAction({
+      title: `check ${index}`, summary: 'The exact command prepared for this request.', kind: 'external_write',
+      toolName: 'run_shell_command', payload: { command: `ssh -G localhost # ${index}` }, does,
+      sessionId: session.id, sourceUserSeq: source.seq, createdBy: 'host_off_machine_door',
+    });
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'autonomy_note', data: {
+      kind: 'pending_action_queued', pendingActionId: record.id, actionKind: record.kind, approvalRequired: true,
+      payloadHash: record.payloadHash, sourceUserSeq: source.seq, runScopeId: 'proof-run', callId: `stage-${index}`,
+      approvalIntent: 'request_now', autoMaterialize: true,
+    } });
+  });
+  materializeQueuedApprovals(session.id, 1, source.seq, queuedApprovalTransitionsForRequest(session.id, source.seq));
+  const groupCard = listEvents(session.id, { types: ['approval_requested'] })
+    .map((event) => event.data as { preview?: { items?: { does?: string }[] } })
+    .find((data) => data.preview?.items);
+  assert.ok(groupCard, 'the two staged commands share one card');
+  assert.deepEqual(groupCard!.preview!.items!.map((item) => item.does), lines);
+});
+
 test('queue -> one card -> approve -> resume -> exact payload dispatches once', async () => {
   const { session, source, record } = queueRequestOwnedSend();
   const transitions = queuedApprovalTransitionsForRequest(session.id, source.seq);

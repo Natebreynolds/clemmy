@@ -1380,7 +1380,7 @@
           "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
-          "bytes": 23927
+          "bytes": 24129
         },
         "src/memory/work-episodes.ts": {
           "bytes": 7913
@@ -5451,7 +5451,7 @@
           "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
-          "bytes": 23927
+          "bytes": 24129
         },
         "src/memory/work-episodes.ts": {
           "bytes": 7913

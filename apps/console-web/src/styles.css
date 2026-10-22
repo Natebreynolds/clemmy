@@ -531,6 +531,7 @@
 .approval-review-list > li { padding: 14px 0; border-top: 1px solid currentColor; border-top-color: color-mix(in srgb, currentColor 18%, transparent); }
 .approval-review-title { margin: 0; font-weight: 600; }
 .approval-review-when { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.approval-review-does { margin: 4px 0 0; }
 .approval-review details { margin-top: 8px; font-size: .75rem; }
 .approval-review summary { cursor: pointer; padding: 4px 0; width: fit-content; }
 .approval-review summary:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
