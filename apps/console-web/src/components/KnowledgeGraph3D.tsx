@@ -24,6 +24,10 @@ import { cn } from '@/lib/cn';
 
 const reduceMotion = () =>
   typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+/** How long the intro orbit turns before the camera rests. */
+const ORBIT_MS = 8000;
+/** Still this long with no touch and nothing moving → stop rendering. */
+const IDLE_MS = 8000;
 
 function hasWebGL(): boolean {
   try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); }
@@ -131,6 +135,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
   const orbitRaf = useRef<number | null>(null);
   const orbitAngle = useRef(0);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bloomPassRef = useRef<UnrealBloomPass | null>(null);
 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
@@ -252,7 +257,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
       fg.cameraPosition({ z: 760 });
       const t1 = setTimeout(() => fg.cameraPosition({ x: 0, y: H, z: R }, { x: 0, y: 0, z: 0 }, 2600), 120);
       const t2 = setTimeout(() => {
+        const orbitEnds = performance.now() + ORBIT_MS;
         const tick = () => {
+          if (performance.now() >= orbitEnds) { orbitRaf.current = null; return; }
           orbitAngle.current += 0.0016;
           fg.cameraPosition({ x: R * Math.sin(orbitAngle.current), y: H, z: R * Math.cos(orbitAngle.current) });
           orbitRaf.current = requestAnimationFrame(tick);
@@ -270,9 +277,54 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
     return () => stopOrbit();
   }, [status]);
 
+  // ── idle sleep ─────────────────────────────────────────────────────
+  // The graph and its bloom pass re-render every frame for as long as they
+  // run, which kept the GPU near a full core with the Memory screen merely
+  // open (owner 10-22: Clem hogged the machine). Render while something
+  // moves or the owner is touching it; sleep once still and hidden.
+  const wake = () => {
+    const fg = fgRef.current;
+    if (!fg || document.hidden) return;
+    fg.resumeAnimation();
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    const sleep = () => {
+      // the intro orbit and a camera fly-to still need frames
+      if (orbitRaf.current != null) { idleTimer.current = setTimeout(sleep, 1000); return; }
+      idleTimer.current = null;
+      fgRef.current?.pauseAnimation();
+    };
+    idleTimer.current = setTimeout(sleep, IDLE_MS);
+  };
+  const wakeRef = useRef(wake);
+  wakeRef.current = wake;
+
+  useEffect(() => {
+    if (status !== 'ready') return;
+    const el = wrap.current;
+    const onWake = () => wakeRef.current();
+    const onVisibility = () => {
+      if (!document.hidden) { wakeRef.current(); return; }
+      if (idleTimer.current) { clearTimeout(idleTimer.current); idleTimer.current = null; }
+      fgRef.current?.pauseAnimation();
+    };
+    for (const ev of ['pointermove', 'pointerdown', 'wheel', 'keydown'] as const) el?.addEventListener(ev, onWake, { passive: true });
+    document.addEventListener('visibilitychange', onVisibility);
+    wakeRef.current();
+    return () => {
+      for (const ev of ['pointermove', 'pointerdown', 'wheel', 'keydown'] as const) el?.removeEventListener(ev, onWake);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (idleTimer.current) { clearTimeout(idleTimer.current); idleTimer.current = null; }
+    };
+  }, [status]);
+
+  // A change of view or data needs frames to show (and the layout to settle).
+  useEffect(() => { if (status === 'ready') wakeRef.current(); },
+    [status, data, selected, query, hideType, showSimilar, showOverlays, bloomOn, dims.w, dims.h]);
+
   // ── teardown ───────────────────────────────────────────────────────
   useEffect(() => () => {
     if (orbitRaf.current != null) cancelAnimationFrame(orbitRaf.current);
+    if (idleTimer.current) clearTimeout(idleTimer.current);
     try { bloomPassRef.current?.dispose(); } catch { /* ignore */ }
     bloomPassRef.current = null;
   }, []);
