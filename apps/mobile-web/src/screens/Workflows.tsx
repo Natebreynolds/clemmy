@@ -410,6 +410,7 @@ function WorkflowRunEvents({ workflowName, run, onBack, onAsk }: WorkflowRunEven
             {detail.verdicts.map((verdict, i) => (
               <div key={i} class={`wf-verdict ${verdict.pass ? 'wf-verdict-pass' : 'wf-verdict-fail'}`}>
                 Verdict · {verdict.door.replace(/_/g, ' ')}: {verdict.pass ? 'passed' : 'not passed'}
+                {typeof verdict.durationMs === 'number' ? ` · ${Math.max(1, Math.round(verdict.durationMs / 1000))} s` : null}
                 {verdict.reason ? <span class="wf-verdict-reason"> — {verdict.reason}</span> : null}
               </div>
             ))}

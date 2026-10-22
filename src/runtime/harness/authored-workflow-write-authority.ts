@@ -790,6 +790,26 @@ function landedWriteInEarlierAttempt(input: {
  * Run before reserving an authored send, so a corrected proposal can still use
  * its one occurrence. Errors return a non-null hold and cannot fall through. */
 /** The owner's exact approval of this write was the consent basis. */
+/** One write review as a verdict in the run's own log, so the run window
+ * shows it beside the goal verdict: which write, what the checker said, how
+ * long it took. Live 10-18→10-22 this checker made 381 calls, about two hours
+ * of a scheduled channel review's time, and appeared nowhere the owner looks. */
+function recordWriteCheckVerdict(receipt: { workflowName: string; workflowRunId: string; stepId: string }, tool: string,
+  result: { verdict: string; reason: string; checkerFailure?: string }, durationMs: number): void {
+  void import('../../execution/workflow-events.js').then(({ appendWorkflowEvent }) => {
+    appendWorkflowEvent(receipt.workflowName, receipt.workflowRunId, {
+      kind: 'verdict_recorded',
+      meta: {
+        door: 'write_check',
+        pass: result.verdict === 'compatible',
+        failedOpen: Boolean(result.checkerFailure),
+        reason: `${tool} (step ${receipt.stepId}): ${result.reason}`.slice(0, 400),
+        durationMs: Math.max(0, Math.round(durationMs)),
+      },
+    } as never);
+  }).catch(() => { /* the run log is observability; the review decides */ });
+}
+
 function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, result: { reason: string; checkerFailure?: string; invalidReason?: string }): void {
   try {
     appendEvent({
@@ -955,6 +975,7 @@ async function reviewAuthoredWriteConstraints(input: {
     // to clear these exact arguments; the full-evidence review, with evidence
     // read fresh, is the one that decides them.
     const retryAfterCheckerFailure = stakes === 'ordinary' && checkerFailedWrites.get(roundsKey) === argsDigest;
+    const reviewStartedAt = Date.now();
     let result = retryAfterCheckerFailure ? await fullEvidenceReview() : await review({
       sessionId: input.attestation.sessionId,
       instructions: input.reopened.step.prompt,
@@ -978,6 +999,7 @@ async function reviewAuthoredWriteConstraints(input: {
       // write (a send) gets its one review at full stakes; its doubt holds.
       result = await fullEvidenceReview();
     }
+    recordWriteCheckVerdict(input.reopened.receipt, toolLabel, result, Date.now() - reviewStartedAt);
     // Model review is asynchronous. Do not project a verdict into an attempt
     // that ended or whose adopted authority changed while it was running.
     const current = reopenAuthoredStepAuthority(input.attestation);

@@ -126,6 +126,7 @@ export function WorkflowRunDetail({ events }: { events: ReadonlyArray<Record<str
                   {typeof v.criteriaMet === 'number' && typeof v.criteriaTotal === 'number' && (
                     <span className="text-muted"> · {v.criteriaMet}/{v.criteriaTotal} criteria</span>
                   )}
+                  {typeof v.durationMs === 'number' && <span className="text-muted"> · {Math.max(1, Math.round(v.durationMs / 1000))} s</span>}
                   {v.reason && <span className="text-muted"> — {v.reason}</span>}
                 </span>
               </li>

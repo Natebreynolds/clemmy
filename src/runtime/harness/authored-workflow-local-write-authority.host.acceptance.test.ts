@@ -963,6 +963,15 @@ test('the same write proposed again after an unreadable review goes straight to 
     await runProductionHost(fixture, agent);
     assert.deepEqual(depths, ['ordinary', 'high', 'high'], 'the retry is not read compactly again; the full review decides it');
     assert.equal(bodies.goal_upsert, 1, 'the cleared write runs once');
+    // Each write review is a verdict in the run's own log, shown in the run
+    // window: which write, what the checker said, how long it took.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const { readWorkflowEvents } = await import('../../execution/workflow-events.js');
+    const checks = readWorkflowEvents(fixture.workflowName, fixture.workflowRunId)
+      .filter((event) => event.kind === 'verdict_recorded' && (event.meta as { door?: string } | undefined)?.door === 'write_check')
+      .map((event) => event.meta as { pass: boolean; failedOpen: boolean; reason: string; durationMs: number });
+    assert.deepEqual(checks.map((check) => [check.pass, check.failedOpen]), [[false, true], [true, false]]);
+    assert.ok(checks.every((check) => typeof check.durationMs === 'number' && /goal_upsert/.test(check.reason)));
   } finally {
     authorityAdapter._setWorkflowMutationReviewerForTests(null);
     authority._resetConstraintReviewRoundsForTests();

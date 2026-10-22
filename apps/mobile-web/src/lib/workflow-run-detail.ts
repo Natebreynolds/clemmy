@@ -68,6 +68,8 @@ export interface WorkflowRunVerdict {
   failedOpen: boolean;
   criteriaMet?: number;
   criteriaTotal?: number;
+  /** How long the check took, when it recorded it (a write check does). */
+  durationMs?: number;
 }
 
 /** Mid-run watcher steer (trajectory co-pilot): step_advisory rows with
@@ -253,6 +255,7 @@ export function buildWorkflowRunDetail(events: ReadonlyArray<Ev> | undefined): W
         failedOpen: meta.failedOpen === true,
         ...(num(meta.criteriaMet) !== undefined ? { criteriaMet: num(meta.criteriaMet) } : {}),
         ...(num(meta.criteriaTotal) !== undefined ? { criteriaTotal: num(meta.criteriaTotal) } : {}),
+        ...(num(meta.durationMs) !== undefined ? { durationMs: num(meta.durationMs) } : {}),
       });
       continue;
     }
