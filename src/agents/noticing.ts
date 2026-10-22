@@ -99,7 +99,8 @@ export interface NoticingObservation {
   alreadyAskingOwner?: Array<{ from: string; about: string }>;
   /** Workflows whose recent runs fell short in ways only a change to the
    * workflow fixes (workflow-improvement-signals): content-free facts. */
-  workflowImprovements?: Array<{ workflow: string; runsSeen: number; refusedByOwnDefinition: string[]; goalShortfalls: string[] }>;
+  workflowImprovements?: Array<{ workflow: string; runsSeen: number; refusedByOwnDefinition: string[]; goalShortfalls: string[];
+    recurringStepProblems?: string[] }>;
 }
 
 // ── what the model answers ────────────────────────────────────────────────────

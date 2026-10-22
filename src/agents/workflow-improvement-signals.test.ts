@@ -26,6 +26,10 @@ test('a workflow its own permissions refused, or whose goal fell short, is named
     { runId: 'repair', workflow: 'digest', status: 'completed', createdAt: at(1), targetStepId: 'main' },
   ], {
     now,
+    pendingStepProposals: () => [
+      { kind: 'workflow_step', target: 'digest::main', evidence: 'same problem in 2 distinct runs: "missing required output key \"summary\""' },
+      { kind: 'doctor_fix', target: 'digest', evidence: 'not a step problem' },
+    ],
     readEvents: (_workflow, runId) => events[runId] ?? [],
     refusals: (runId, stepIds) => {
       stepsAsked.push([...stepIds]);
@@ -33,6 +37,11 @@ test('a workflow its own permissions refused, or whose goal fell short, is named
       return runId === 'r1' || runId === 'r2' ? [{ stepId: 'main', tool: 'space_refresh', reason: 'coverage_missing' }] : [];
     },
   });
-  assert.deepEqual(signals, [{ workflow: 'channel-review', runsSeen: 2, refusedByOwnDefinition: ['space_refresh'], goalShortfalls: ['2/3'] }]);
+  assert.deepEqual(signals, [
+    { workflow: 'channel-review', runsSeen: 2, refusedByOwnDefinition: ['space_refresh'], goalShortfalls: ['2/3'] },
+    // A clean recent run still carries the queue's recurring step problem.
+    { workflow: 'digest', runsSeen: 1, refusedByOwnDefinition: [], goalShortfalls: [],
+      recurringStepProblems: ['same problem in 2 distinct runs: "missing required output key \"summary\""'] },
+  ]);
   assert.ok(stepsAsked.every((ids) => ids.every((id) => !id.startsWith('('))), 'bookkeeping nodes are not steps');
 });

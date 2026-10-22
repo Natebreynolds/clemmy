@@ -14,6 +14,7 @@
  */
 import { readWorkflowEvents } from '../execution/workflow-events.js';
 import { workflowRunAuthorityRefusals } from '../execution/workflow-run-authority-refusals.js';
+import { listPendingProposals } from '../autoresearch/improvement-proposer.js';
 
 export interface WorkflowImprovementSignal {
   workflow: string;
@@ -23,6 +24,10 @@ export interface WorkflowImprovementSignal {
   refusedByOwnDefinition: string[];
   /** Goal reviews that found a gap, as criteria met / total, newest first. */
   goalShortfalls: string[];
+  /** The same step problem seen across runs, from the nightly improvement
+   * queue (a recorded failure, never step output). Owner 10-22: that queue
+   * sat in a developer-only screen; Clem now raises it herself. */
+  recurringStepProblems?: string[];
 }
 
 interface RunRef { runId: string; workflow: string; status: string; createdAt?: string; targetStepId?: string | null }
@@ -31,6 +36,7 @@ interface SignalDeps {
   readEvents?: (workflow: string, runId: string) => Array<{ kind?: string; stepId?: string; meta?: Record<string, unknown> }>;
   refusals?: typeof workflowRunAuthorityRefusals;
   now?: number;
+  pendingStepProposals?: () => Array<{ kind: string; target: string; evidence: string }>;
 }
 
 const RUNS_PER_WORKFLOW = 3;
@@ -59,6 +65,18 @@ export function workflowImprovementSignals(runs: readonly RunRef[], deps: Signal
     if (list.length < RUNS_PER_WORKFLOW) list.push(run);
     byWorkflow.set(run.workflow, list);
   }
+  const problemsByWorkflow = new Map<string, string[]>();
+  try {
+    for (const proposal of (deps.pendingStepProposals ?? listPendingProposals)()) {
+      if (proposal.kind !== 'workflow_step') continue;
+      const workflow = proposal.target.split('::')[0]?.trim() ?? '';
+      const evidence = proposal.evidence.replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (!workflow || !evidence) continue;
+      const list = problemsByWorkflow.get(workflow) ?? [];
+      if (list.length < 3 && !list.includes(evidence)) list.push(evidence);
+      problemsByWorkflow.set(workflow, list);
+    }
+  } catch { /* the queue is unavailable; the run facts still count */ }
   const out: WorkflowImprovementSignal[] = [];
   for (const [workflow, recent] of byWorkflow) {
     const refused = new Set<string>();
@@ -78,8 +96,10 @@ export function workflowImprovementSignals(runs: readonly RunRef[], deps: Signal
         if (typeof met === 'number' && typeof total === 'number') goalShortfalls.push(`${met}/${total}`);
       }
     }
-    if (refused.size === 0 && goalShortfalls.length === 0) continue;
-    out.push({ workflow, runsSeen: recent.length, refusedByOwnDefinition: [...refused].sort(), goalShortfalls });
+    const recurringStepProblems = problemsByWorkflow.get(workflow) ?? [];
+    if (refused.size === 0 && goalShortfalls.length === 0 && recurringStepProblems.length === 0) continue;
+    out.push({ workflow, runsSeen: recent.length, refusedByOwnDefinition: [...refused].sort(), goalShortfalls,
+      ...(recurringStepProblems.length > 0 ? { recurringStepProblems } : {}) });
     if (out.length >= MAX_WORKFLOWS) break;
   }
   return out;
