@@ -62,11 +62,17 @@ export async function nominateReadCapabilitiesWithJev(
   });
   if (!result.ok) return null;
   const answer = result.answers.which as ChoiceAnswer | undefined;
-  if (!answer || answer.type !== 'choice' || answer.confidence < READ_NOMINATION_CONFIDENCE_MIN) return null;
-  if (answer.choice === 'none') return [];
-  if (answer.choice === 'ambiguous') return candidates.length > 1 ? candidates.map(row => row.name) : null;
+  // What the host did with the nomination, so its coverage is measurable.
+  const noted = (outcome: string) => noteJevDecisionOutcome(result.decisionId, outcome, { candidates: candidates.length });
+  if (!answer || answer.type !== 'choice' || answer.confidence < READ_NOMINATION_CONFIDENCE_MIN) {
+    noted('below_confidence');
+    return null;
+  }
+  if (answer.choice === 'none') { noted('none'); return []; }
+  if (answer.choice === 'ambiguous') { noted('ambiguous'); return candidates.length > 1 ? candidates.map(row => row.name) : null; }
   const selectedIndex = candidates.findIndex((_row, index) => answer.choice === `candidate_${index}`);
-  if (selectedIndex < 0) return null;
+  if (selectedIndex < 0) { noted('unmatched'); return null; }
+  noted('nominated');
   const selected = candidates[selectedIndex]!;
   // A semantic preference cannot pick one credential/account for an operation.
   return candidates.filter(row => selected.operationId
@@ -1038,8 +1044,13 @@ export async function tryJevTrajectoryVerdict(input: {
   });
   if (!result.ok) return null;
   const answer = result.answers.verdict as ChoiceAnswer | undefined;
-  if (!answer || (answer.choice !== 'on_track' && answer.choice !== 'drift')) return null;
+  if (!answer || (answer.choice !== 'on_track' && answer.choice !== 'drift')) {
+    noteJevDecisionOutcome(result.decisionId, 'unreadable');
+    return null;
+  }
   const kind = (result.answers.driftKind as ChoiceAnswer | undefined)?.choice;
+  noteJevDecisionOutcome(result.decisionId, answer.choice === 'on_track' ? 'on_track' : `drift:${kind ?? 'unspecified'}`,
+    { confidence: answer.confidence });
   return {
     onTrack: answer.choice === 'on_track',
     confidence: answer.confidence,
@@ -1117,7 +1128,11 @@ const COMPLETION_REASONS = {
  *  the research turns. The state stays well inside it, counted in characters
  *  as a conservative stand-in for tokens. */
 const COMPLETION_STATE_BUDGET_CHARS = 72_000;
-const COMPLETION_REQUEST_CHARS = 3_000;
+// A request is read whole up to the response's own bound. Live 10-19→10-22:
+// 94 completion screens were skipped as "task text clipped" at 3,000 chars,
+// nearly all saved workflow-step instructions, and each fell to the slower
+// configured reviewer. The state budget (72,000) still bounds the whole view.
+const COMPLETION_REQUEST_CHARS = 12_000;
 const COMPLETION_RESPONSE_CHARS = 12_000;
 /** Each yes/no answer counts only this sure; Jev settles a review only when
  *  every question it rests on is, except the support question below. */

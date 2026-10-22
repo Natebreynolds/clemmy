@@ -97,6 +97,13 @@ test('read nomination preserves accounts, ambiguity and unavailable outcomes', a
   for (choice of ['uncertain', 'candidate_99']) {
     assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
   }
+  // Each nomination records what the host did with it, so its coverage is
+  // measurable (live 10-19→10-22: 412 nominations, none with an outcome).
+  const { readRecentJevDecisions } = await import('./decision-log.js');
+  const outcomes = readRecentJevDecisions('jev-read-nomination').map((row) => row.outcome).filter(Boolean);
+  for (const expected of ['nominated', 'ambiguous', 'none', 'unmatched']) {
+    assert.ok(outcomes.includes(expected), `${expected} is recorded: ${JSON.stringify(outcomes)}`);
+  }
   _setTypesafeKeyForTests(null);
   assert.equal(await nominateReadCapabilitiesWithJev('List available documentation', rows), null);
 });
@@ -541,7 +548,7 @@ for (const clippedPart of ['request', 'response'] as const) {
     const hidden = clippedPart === 'request'
       ? 'Also report the unresolved exception in the appendix.'
       : 'The appendix confirms that every exception was resolved.';
-    const padding = 'Report context. '.repeat(clippedPart === 'request' ? 200 : 800);
+    const padding = 'Report context. '.repeat(800);
     const clipped = `${padding}\n${hidden}\n${padding}`;
     const objective = clippedPart === 'request' ? clipped : 'Summarize the report.';
     const response = clippedPart === 'response' ? clipped : 'The report is ready.';
@@ -565,7 +572,7 @@ test('a clipped completion screen skips Jev so the configured reviewer can start
     return { status: 200, ok: true, text: async () => completionAnswers({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }) };
   });
   for (const [objective, response] of [
-    ['Read the report. '.repeat(300), 'The report is ready.'],
+    ['Read the report. '.repeat(800), 'The report is ready.'],
     ['Read the report.', 'The report is ready. '.repeat(800)],
   ]) {
     assert.equal(await tryJevCompletionVerdict(objective, response, { screening: true }), null);
@@ -590,11 +597,27 @@ test('completion keeps positive decisions at the full request and response size 
   assert.equal((await tryJevCompletionVerdict(objective, response))?.awaitingUser, true);
 });
 
+test('a long saved step instruction reaches the completion screen whole instead of being skipped', async () => {
+  // Live 10-19→10-22: 94 screens were skipped as "task text clipped" at
+  // 3,000 characters, nearly all saved workflow-step instructions.
+  _setTypesafeKeyForTests('ts_test');
+  let posted: Record<string, any> | undefined;
+  _setSystemOneFetchForTests(async (_url, init) => {
+    posted = JSON.parse(String(init.body));
+    return { status: 200, ok: true, text: async () => completionAnswers({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }) };
+  });
+  const objective = 'Workflow: fixture review\nStep: main\n\n' + 'Read the channel, classify each request and update the tracker. '.repeat(90);
+  assert.ok(objective.length > 5_000 && objective.length < 12_000);
+  await tryJevCompletionVerdict(objective, 'The tracker is updated with each classified request.', { screening: true });
+  assert.ok(posted, 'the screen asked Jev instead of skipping');
+  assert.equal(posted!.state.request, objective.trim(), 'the whole instruction is read');
+});
+
 test('a clipped task still retains a negative reading for unavailable-review recovery', async () => {
   _setTypesafeKeyForTests('ts_test');
   _setSystemOneFetchForTests(async () => ({ status: 200, ok: true,
     text: async () => completionAnswers({ delivered: 0.1, unaddressed: 0.95 }) }));
-  const verdict = await tryJevCompletionVerdict('Read the report. '.repeat(300), 'I will read it next.');
+  const verdict = await tryJevCompletionVerdict('Read the report. '.repeat(800), 'I will read it next.');
   assert.equal(verdict?.done, false);
   assert.equal(verdict?.choice, 'incomplete');
 });
