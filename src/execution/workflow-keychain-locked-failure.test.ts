@@ -21,6 +21,7 @@ const { processWorkflowRuns } = await import('./workflow-runner.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const { __loginKeychainTest__ } = await import('../runtime/login-keychain.js');
 const { listNotifications } = await import('../runtime/notifications.js');
+const { appendWorkflowEvent } = await import('./workflow-events.js');
 
 after(() => { rmSync(tmp, { recursive: true, force: true }); });
 afterEach(() => {
@@ -122,4 +123,34 @@ test('a step whose output failed its own contract is not told as a locked keycha
   assert.equal(run.failureContext, undefined);
   const notice = listNotifications(50).find((row) => row.metadata?.runId === runId);
   assert.equal(notice?.metadata?.failureCause, undefined, 'no follow-up on unlock for a contract failure');
+});
+
+test('a write step a restart cut off is not told as a locked keychain, even while it is locked', async () => {
+  // Live 2026-10-21: the supervisor restarted the service while a team
+  // update's write step was running; the host rightly refused to re-run it,
+  // and the owner was told first to unlock the keychain.
+  __loginKeychainTest__.setPlatform(() => 'darwin');
+  __loginKeychainTest__.setRunner(async () => ({ code: 51 }));
+  const slug = 'locked-interrupted';
+  const workflowName = 'Keychain locked-interrupted';
+  writeWorkflow(slug, {
+    name: workflowName, description: 'Posts an update.', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'post_update', prompt: 'Post the update.', sideEffect: 'write', deterministic: { runner: 'post.mjs' } }],
+  } as never);
+  const scripts = path.join(tmp, 'vault', '00-System', 'workflows', slug, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  writeFileSync(path.join(scripts, 'post.mjs'), 'process.stdout.write("posted");\n', 'utf-8');
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const runId = `${slug}-${Date.now()}`;
+  const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
+  // A record a dead process left running, its write step started and never finished.
+  writeFileSync(file, JSON.stringify({ id: runId, workflow: workflowName, status: 'running', inputs: {},
+    createdAt: new Date().toISOString(), startedAt: new Date().toISOString() }), 'utf-8');
+  appendWorkflowEvent(slug, runId, { kind: 'step_started', stepId: 'post_update' } as never);
+  await processWorkflowRuns({} as never);
+  const run = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, any>;
+  assert.equal(run.status, 'error', JSON.stringify(run).slice(0, 400));
+  assert.match(run.error, /was interrupted mid-run on a prior attempt/, run.error);
+  assert.doesNotMatch(run.error, /keychain/i, 'the host diagnosed this itself');
+  assert.equal(run.failureContext?.loginKeychain, undefined, 'not marked for a keychain follow-up');
 });

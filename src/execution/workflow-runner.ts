@@ -7809,6 +7809,18 @@ export class WorkflowContractViolationError extends Error {
   }
 }
 
+/**
+ * The host's own refusal to re-run a write step a restart cut off mid-run.
+ * Same message text as before; typed so the failure path knows the host
+ * diagnosed it rather than a tool failing in its own words.
+ */
+export class WorkflowResumeHaltError extends Error {
+  constructor(message: string, public readonly stepId: string) {
+    super(message);
+    this.name = 'WorkflowResumeHaltError';
+  }
+}
+
 // isBlockedStepOutput moved to step-output-verify.ts (one truth for both gates).
 export { coerceOutputForContract } from './step-output-verify.js';
 
@@ -11698,7 +11710,7 @@ async function executeWorkflow(
     const ledgerClause = uncertainEvidence
       ? ` Its own dispatch ledger shows ${uncertainEvidence.mutatingSettlements} mutating and ${uncertainEvidence.uncertainSettlements} uncertain settlement(s), ${uncertainEvidence.openLogicalCalls} call(s) still open and ${uncertainEvidence.unsettledDispatches} dispatch(es) without a verdict, so re-running could repeat a write.`
       : '';
-    throw new Error(
+    throw new WorkflowResumeHaltError(
       `${uncertainEvidence ? 'mutation_uncertain_awaiting_readback: ' : ''}` +
       `Step "${resumeHalt.stepId}" was interrupted mid-run on a prior attempt and may have already ` +
       `${resumeHalt.cls === 'send' ? 'sent or published' : 'written'} some items. It was NOT automatically ` +
@@ -11707,6 +11719,7 @@ async function executeWorkflow(
       `NOTE: this step's class was ${resumeHalt.declared ? `declared sideEffect: ${resumeHalt.cls}` : `INFERRED as "${resumeHalt.cls}" from its prose (no sideEffect declared)`}. ` +
       `If the step is actually read-only (scrape/fetch/query — safe to repeat), declare \`sideEffect: read\` on it ` +
       `in the workflow definition and it will auto-resume after interruptions instead of parking here.`,
+      resumeHalt.stepId,
     );
   }
   const learnedPatternMatches = targetStepId
@@ -18401,7 +18414,10 @@ async function processOneRunFile(
       // path was told to the owner as "your login keychain is locked, run
       // security unlock-keychain", true of the machine and nothing to do with
       // the run.
-      const hostDiagnosed = error instanceof WorkflowContractViolationError;
+      // The same for a step the host itself refused to re-run after a restart
+      // cut it off (live 2026-10-21: "keychain is locked" led a team update
+      // that a supervisor restart had interrupted).
+      const hostDiagnosed = error instanceof WorkflowContractViolationError || error instanceof WorkflowResumeHaltError;
       let keychainLockedAt: string | null = null;
       if (!cancelled && !hostDiagnosed) {
         try {
