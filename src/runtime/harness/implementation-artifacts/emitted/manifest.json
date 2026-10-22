@@ -555,7 +555,7 @@
           "bytes": 102495
         },
         "src/runtime/notifications.ts": {
-          "bytes": 117507
+          "bytes": 117794
         },
         "src/runtime/harness/pending-actions.ts": {
           "bytes": 60192
@@ -1377,7 +1377,7 @@
           "bytes": 6825
         },
         "src/runtime/harness/approval-call-preview.ts": {
-          "bytes": 15057
+          "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
           "bytes": 23857
@@ -2415,10 +2415,10 @@
           "bytes": 2699
         },
         "src/runtime/harness/approval-preview-labels.ts": {
-          "bytes": 13561
+          "bytes": 13755
         },
         "src/runtime/harness/approval-precheck.ts": {
-          "bytes": 11040
+          "bytes": 13896
         },
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
@@ -2460,7 +2460,7 @@
           "bytes": 2005
         },
         "src/runtime/harness/turn-decision.ts": {
-          "bytes": 65667
+          "bytes": 66668
         },
         "src/runtime/harness/answer-stream.ts": {
           "bytes": 14015
@@ -3015,7 +3015,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740584
+          "bytes": 740666
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3327,7 +3327,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 878975
+          "bytes": 879677
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
@@ -3969,7 +3969,7 @@
           "bytes": 155596
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 116269
+          "bytes": 116087
         },
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3782
@@ -4626,7 +4626,7 @@
           "bytes": 102495
         },
         "src/runtime/notifications.ts": {
-          "bytes": 117507
+          "bytes": 117794
         },
         "src/runtime/harness/pending-actions.ts": {
           "bytes": 60192
@@ -5448,7 +5448,7 @@
           "bytes": 6825
         },
         "src/runtime/harness/approval-call-preview.ts": {
-          "bytes": 15057
+          "bytes": 15232
         },
         "src/runtime/harness/pending-action-transition.ts": {
           "bytes": 23857
@@ -6486,10 +6486,10 @@
           "bytes": 2699
         },
         "src/runtime/harness/approval-preview-labels.ts": {
-          "bytes": 13561
+          "bytes": 13755
         },
         "src/runtime/harness/approval-precheck.ts": {
-          "bytes": 11040
+          "bytes": 13896
         },
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
@@ -6531,7 +6531,7 @@
           "bytes": 2005
         },
         "src/runtime/harness/turn-decision.ts": {
-          "bytes": 65667
+          "bytes": 66668
         },
         "src/runtime/harness/answer-stream.ts": {
           "bytes": 14015
@@ -7086,7 +7086,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740584
+          "bytes": 740666
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7398,7 +7398,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 878975
+          "bytes": 879677
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
@@ -8040,7 +8040,7 @@
           "bytes": 155596
         },
         "src/tools/computer-tools.ts": {
-          "bytes": 116269
+          "bytes": 116087
         },
         "src/runtime/harness/local-file-workflow-carrier.ts": {
           "bytes": 3782
