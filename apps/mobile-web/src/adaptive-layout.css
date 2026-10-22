@@ -1,29 +1,44 @@
 /* Adapt to the app window, not a device name or a physical pixel resolution. */
 :root {
   --mobile-dock-gap: max(22px, calc(env(safe-area-inset-bottom) + 10px));
-  --mobile-dock-top-clearance: 64px;
+  --mobile-dock-top-clearance: calc(env(safe-area-inset-top) + max(64px, 3.75rem));
   --mobile-navigation-width: 0px;
 }
 
 .adaptive-navigation { display: none; }
 
-/* Use one shared geometry owner for the dock, its fade, and the last message. */
+/* The shell stays inside the visible viewport while WebKit reveals a focused
+   field. Only the transcript/pages scroll, never the whole app/header. Keep
+   this root untransformed: sheets still use viewport coordinates. */
+#app {
+  position: fixed;
+  top: var(--mobile-viewport-top, 0px);
+  left: 0;
+  right: 0;
+  height: var(--mobile-viewport-height, 100dvh);
+}
+
+/* Anchor composers to the corrected shell, not WebKit's shifting fixed-position
+   viewport. The shell already accounts for keyboard height and focus panning. */
 .chat-dock, .ask-capsule {
-  bottom: calc(var(--kb-inset, 0px) + var(--mobile-dock-gap));
+  position: absolute;
+  bottom: var(--mobile-dock-gap);
 }
+.chat-dock { left: 0; right: 0; }
 .chat-dock-fade {
+  position: absolute;
   height: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + 36px);
-  bottom: var(--kb-inset, 0px);
+  bottom: 0;
 }
-.ask-capsule-fade { bottom: var(--kb-inset, 0px); }
+.ask-capsule-fade { position: absolute; bottom: 0; }
 .chat-transcript {
-  padding-bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 12px);
+  padding-bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + 12px);
 }
 .chat-jump {
-  bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 12px);
+  bottom: calc(var(--chat-dock-h, 140px) + var(--mobile-dock-gap) + 12px);
 }
 .app-main-capsule {
-  padding-bottom: calc(var(--capsule-h, 96px) + var(--mobile-dock-gap) + var(--kb-inset, 0px) + 16px);
+  padding-bottom: calc(var(--capsule-h, 96px) + var(--mobile-dock-gap) + 16px);
 }
 
 /* Navigation and close actions must remain reachable above the keyboard. */
@@ -87,8 +102,8 @@
   .adaptive-navigation .adaptive-settings { margin-top: auto; }
   .app-header { grid-column: 2; grid-row: 1; width: 100%; }
   .app-main { grid-column: 2; grid-row: 2; min-width: 0; }
-  .chat-dock, .ask-capsule { left: calc(var(--mobile-navigation-width) + max(16px, env(safe-area-inset-left))); }
-  .chat-dock-fade, .ask-capsule-fade { left: var(--mobile-navigation-width); }
+  .ask-capsule { left: calc(var(--mobile-navigation-width) + max(16px, env(safe-area-inset-left))); }
+  .ask-capsule-fade { left: var(--mobile-navigation-width); }
 }
 
 /* A wide window with a sidebar still has a compact content pane. Home only

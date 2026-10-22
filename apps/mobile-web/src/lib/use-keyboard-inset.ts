@@ -26,7 +26,7 @@ function subscribe(listener: (viewport: VisibleViewport) => void): () => void {
   };
 }
 
-/** Shared visible bounds for floating surfaces, without resizing the app root. */
+/** Shared visible bounds for the app shell and floating surfaces. */
 export function useVisibleViewport(enabled = true): VisibleViewport {
   const [viewport, setViewport] = useState(getViewport);
   useLayoutEffect(() => enabled ? subscribe(setViewport) : undefined, [enabled]);
@@ -40,10 +40,14 @@ export function useMobileViewportVariables(): void {
     // Geometry belongs to CSS. Do not rerender App (and the open transcript)
     // on every keyboard animation frame just to publish these measurements.
     const unsubscribe = subscribe(({ top, height, bottomInset }) => {
+      // WKWebView can shrink innerHeight too, making bottomInset zero even
+      // while the keyboard covers the full-height document. Its resting home
+      // indicator gap is unnecessary above that keyboard.
+      const covered = bottomInset > 80 || document.documentElement.getBoundingClientRect().height - height > 80;
       style.setProperty('--mobile-viewport-top', `${top}px`);
       style.setProperty('--mobile-viewport-height', `${height}px`);
       style.setProperty('--kb-inset', `${bottomInset}px`);
-      style.setProperty('--mobile-dock-gap', bottomInset > 80 ? '10px' : 'max(22px, calc(env(safe-area-inset-bottom) + 10px))');
+      style.setProperty('--mobile-dock-gap', covered ? '10px' : 'max(22px, calc(env(safe-area-inset-bottom) + 10px))');
     });
     return () => {
       unsubscribe();

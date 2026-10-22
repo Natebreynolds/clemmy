@@ -60,3 +60,16 @@ test('unmount cancels the pending frame and all viewport listeners', () => {
   fixture.burst(); fixture.flush();
   assert.equal(calls, 1);
 });
+
+test('first-focus resize preserves usable height and follows the native focus pan', () => {
+  const fixture = viewportHost();
+  const updates: Array<{ top: number; height: number; bottomInset: number }> = [];
+  const stop = observeViewport(fixture.host, value => updates.push(value));
+  fixture.change(320, 340); fixture.resizeLayout(320); fixture.flush();
+  assert.deepEqual(updates.at(-1), { top: 340, height: 320, bottomInset: 0 });
+  fixture.change(320, 0); fixture.burst(); fixture.flush();
+  assert.deepEqual(updates.at(-1), { top: 0, height: 320, bottomInset: 0 }, 'the shell must follow a cleared pan without losing height');
+  fixture.change(844, 0); fixture.resizeLayout(844); fixture.flush();
+  assert.deepEqual(updates.at(-1), { top: 0, height: 844, bottomInset: 0 });
+  stop();
+});

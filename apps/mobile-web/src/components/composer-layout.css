@@ -12,6 +12,8 @@
   min-height: 0;
   max-height: calc(var(--composer-available-height, 100dvh) - 2px);
   overflow: hidden;
+  gap: 0;
+  padding: 6px;
 }
 
 .composer-body {
@@ -26,30 +28,46 @@
   scrollbar-width: thin;
 }
 .composer-body > * { flex-shrink: 0; }
+.composer-body:empty { display: none; }
+.composer-body:not(:empty) { margin-bottom: 4px; }
 
 .composer-layout > .composer-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+  align-items: end;
   flex: 0 0 auto;
   min-height: 44px;
-  padding-top: 4px;
+  gap: 0;
+  padding: 0;
 }
+.composer-layout .composer-attach { grid-column: 1; grid-row: 1; }
+.composer-layout .composer-input { grid-column: 2; grid-row: 1; }
+.composer-layout .chat-mic { grid-column: 3; grid-row: 1; }
+.composer-layout .chat-stop { grid-column: 4; grid-row: 1; }
+.composer-layout .chat-send, .composer-voice-slot { grid-column: 5; grid-row: 1; }
+.composer-layout .chat-send[hidden], .composer-voice-slot[hidden] { display: none; }
 
 /* Keep text-size preferences while retaining iOS's no-zoom input minimum. */
-.composer-layout .composer-input {
-  font-size: max(16px, 1rem);
-  min-height: max(40px, calc(1.45em + 12px));
-}
-.composer-layout.composer-slim .composer-body {
-  flex: 1 1 0;
-  overflow: hidden;
-}
-.composer-layout.composer-slim .composer-input {
+.composer-layout .composer-input,
+.composer-layout .composer-input:focus,
+.composer-layout .composer-input:focus-visible {
   width: 100%;
-  max-height: none;
-  min-height: max(40px, calc(1.45em + 18px));
+  min-width: 0;
+  font-size: max(16px, 1rem);
+  min-height: max(44px, calc(1.45em + 20px));
+  max-height: min(132px, calc(var(--composer-available-height, 100dvh) * .45));
+  padding: 10px 6px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
 }
-.composer-layout.composer-slim > .composer-row { display: contents; }
+.composer-layout .composer-input:placeholder-shown { white-space: pre; overflow-x: hidden; }
 
 /* Empty voice status has no height. Real status and errors remain in the
    scrollable body; opening the keyboard never removes a recovery control. */
 .composer-body .voice-mode-control { margin: 0; }
 .composer-body .chat-mode-status { padding: 4px 8px; }
+.composer-layout .voice-mode-toggle-compact { width: 44px; height: 44px; min-height: 44px; padding: 0; border-radius: 50%; }
+.composer-layout .voice-mode-toggle-compact[aria-pressed='true'] { color: var(--accent); background: var(--accent-soft); }
+.composer-body .voice-mode-feedback { padding: 4px 8px; }
+.composer-body .voice-mode-status { display: block; }
+.composer-body .voice-mode-error, .composer-body .voice-mode-heard { margin: 4px 0 0; }

@@ -657,7 +657,24 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     } else {
       setShowJumpToLatest(transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight >= 72);
     }
-  }, [messages]);
+  }, [messages, dockH]);
+
+  useEffect(() => {
+    const transcript = scrollRef.current;
+    if (!transcript) return;
+    // Keyboard/window resizing changes the visible transcript without a new
+    // message. Keep its tail in view only while the reader is following it;
+    // never pull someone away from older messages they deliberately scrolled to.
+    let height = transcript.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const next = transcript.clientHeight;
+      if (next === height) return;
+      height = next;
+      if (followingTail.current) transcript.scrollTop = transcript.scrollHeight;
+    });
+    observer.observe(transcript);
+    return () => observer.disconnect();
+  }, []);
 
   function releaseTail() {
     const transcript = scrollRef.current;
@@ -1005,46 +1022,50 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       ) : null}
       <div class="chat-dock-fade" aria-hidden="true" />
       <div ref={dockRef} class="chat-dock">
-        <Composer
-          leading={<>
-            {initialComposeMode === 'dictate' && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">Tap the microphone to dictate a draft.</p> : null}
-            {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
-            <VoiceModeControl
-              scope={voiceScope}
-              messages={messages}
-              busy={busy}
-              onSend={submitVoice}
-              onActiveChange={setVoiceActive}
-              clearErrorRequest={voiceErrorReset}
-              disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
-              disabled={dictationActive || preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
+        <VoiceModeControl
+          scope={voiceScope}
+          messages={messages}
+          busy={busy}
+          onSend={submitVoice}
+          onActiveChange={setVoiceActive}
+          clearErrorRequest={voiceErrorReset}
+          disabledHint={dictationActive ? 'Finish dictation first' : draft.trim() || voiceHasFiles || fileContext ? 'Send or clear your draft to talk' : busy ? 'Available when Clem finishes' : 'Getting this conversation ready…'}
+          disabled={dictationActive || preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(draft.trim() || voiceHasFiles || fileContext) || (!voiceActive && (busy || Boolean(initialSessionId && !snapshot)))}
+          render={({ control, feedback }) => (
+            <Composer
+              voiceControl={control}
+              leading={<>
+                {initialComposeMode === 'dictate' && !voiceActive && !dictationActive && messages.length === 0 && !draft ? <p class="chat-mode-status" role="status">Tap the microphone to dictate a draft.</p> : null}
+                {planning || executing ? <p class="chat-mode-status" role="status">{executing ? 'Executing your approved plan' : 'Plan mode · Review before execution'}</p> : null}
+                {feedback}
+              </>}
+              value={draft}
+              onChange={setDraft}
+              textareaRef={textareaRef}
+              placeholder={busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : workflowScoped ? 'Ask about or change this workflow…' : `Message ${agent?.name || 'Clem'}…`}
+              ariaLabel={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
+              upload={uploadChatAttachment}
+              disabled={executing || (workflowScoped && !workflowHistoryReady)}
+              voiceActive={voiceActive}
+              onDictationActiveChange={setDictationActive}
+              onDictationStart={() => setVoiceErrorReset(value => value + 1)}
+              canStop={canStop}
+              stopping={stopping}
+              onStop={stopTurn}
+              onSend={submitDraft}
+              reservedAttachments={fileContext ? 1 : 0}
+              contextKey={fileContext ? fileContextKey(fileContext) : undefined}
+              settledAttachmentIds={settledAttachmentIds}
+              attachmentScope={draftOwner.current}
+              sendBlocked={fileContext && busy ? 'This selected file will go with your next message after Clem finishes.' : undefined}
+              context={fileContext ? <div class="composer-file-context" aria-label="Selected file context">
+                <span><strong>{fileContext.ref.name}</strong><span>Selected version · Attached to your next message</span></span>
+                <button type="button" class="composer-icon" disabled={preparingContext} aria-label={`Remove ${fileContext.ref.name} context`} onClick={() => rememberDraft({ context: null, prepared: undefined })}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+                </button>
+              </div> : null}
             />
-          </>}
-          value={draft}
-          onChange={setDraft}
-          textareaRef={textareaRef}
-          placeholder={busy ? 'Add to what she’s doing…' : planning ? 'What should we plan?' : workflowScoped ? 'Ask about or change this workflow…' : `Message ${agent?.name || 'Clem'}…`}
-          ariaLabel={agent?.name ? `Message ${agent.name}` : 'Message Clem'}
-          upload={uploadChatAttachment}
-          disabled={executing || (workflowScoped && !workflowHistoryReady)}
-          voiceActive={voiceActive}
-          onDictationActiveChange={setDictationActive}
-          onDictationStart={() => setVoiceErrorReset(value => value + 1)}
-          canStop={canStop}
-          stopping={stopping}
-          onStop={stopTurn}
-          onSend={submitDraft}
-          reservedAttachments={fileContext ? 1 : 0}
-          contextKey={fileContext ? fileContextKey(fileContext) : undefined}
-          settledAttachmentIds={settledAttachmentIds}
-          attachmentScope={draftOwner.current}
-          sendBlocked={fileContext && busy ? 'This selected file will go with your next message after Clem finishes.' : undefined}
-          context={fileContext ? <div class="composer-file-context" aria-label="Selected file context">
-            <span><strong>{fileContext.ref.name}</strong><span>Selected version · Attached to your next message</span></span>
-            <button type="button" class="composer-icon" disabled={preparingContext} aria-label={`Remove ${fileContext.ref.name} context`} onClick={() => rememberDraft({ context: null, prepared: undefined })}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
-            </button>
-          </div> : null}
+          )}
         />
       </div>
     </div>

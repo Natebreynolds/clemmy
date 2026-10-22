@@ -1,6 +1,6 @@
 /**
- * The one composer: a floating card with the words on top and the controls
- * in a quiet row beneath (attach, who answers with what, mic, send). It is
+ * The one composer: words and actions share a stable row; extra context and
+ * feedback scroll above it. It is
  * the capsule on Home, Needs you and the Chats list, and the docked composer
  * in a thread; the two differ only in what the row carries and where the
  * card sits. No focus ring: the card darkens its own edge when it has focus,
@@ -27,6 +27,8 @@ export interface ComposerProps {
   onSend: (text: string, attachments: ChatAttachment[]) => void | boolean | Promise<void | boolean>;
   /** Optional voice/mode controls share the bounded draft scroller. */
   leading?: ComponentChildren;
+  /** A mounted conversation-voice toggle shares Send's place when the draft is empty. */
+  voiceControl?: ComponentChildren;
   /** Context is rendered above the words and never folded out of sight. */
   context?: ComponentChildren;
   contextKey?: string;
@@ -58,6 +60,15 @@ export interface ComposerProps {
 
 type Staged = MobileStagedAttachment;
 const NO_ATTACHMENTS: Staged[] = [];
+
+/** A real draft always retains Send, even when admission is temporarily blocked. */
+export function composerUsesVoiceControl(input: {
+  hasVoiceControl: boolean; value: string; stagedCount: number; hasContext: boolean;
+  busy: boolean; submitting: boolean; voiceActive: boolean;
+}): boolean {
+  return input.hasVoiceControl && (input.voiceActive || (!input.value.trim()
+    && input.stagedCount === 0 && !input.hasContext && !input.busy && !input.submitting));
+}
 
 export function Composer(props: ComposerProps) {
   const { value, onChange, onSend, placeholder, ariaLabel, upload, chips, disabled, canStop, stopping, onStop, compact } = props;
@@ -235,28 +246,15 @@ export function Composer(props: ComposerProps) {
     return () => observer.disconnect();
   }, [compact]);
 
-  // Resting, empty and untouched, the card is one slim line: "+", the words,
-  // the mic and send. Touching it opens the full card with its chips. Leaving
-  // waits a beat before it folds, so a tap on a chip lands on the chip.
-  const [focused, setFocused] = useState(false);
-  const foldTimer = useRef<number | null>(null);
-  const onFieldFocus = () => {
-    if (foldTimer.current !== null) { window.clearTimeout(foldTimer.current); foldTimer.current = null; }
-    setFocused(true);
-  };
-  const onFieldBlur = () => {
-    if (foldTimer.current !== null) window.clearTimeout(foldTimer.current);
-    foldTimer.current = window.setTimeout(() => { foldTimer.current = null; setFocused(false); }, 240);
-  };
-  useEffect(() => () => { if (foldTimer.current !== null) window.clearTimeout(foldTimer.current); }, []);
-
   const ready = staged.filter((s) => !s.uploading && !s.error);
   const attachmentLimit = Math.max(0, MAX_ATTACHMENTS - (props.reservedAttachments ?? 0));
   const uploading = staged.some((s) => s.uploading);
   const fileSteeringBlocked = Boolean(canStop && staged.length);
   const sendBlocked = props.sendBlocked || (staged.length > attachmentLimit ? 'Remove one attachment to include the selected file. A message can include up to 10 files.' : fileSteeringBlocked ? 'Files can be sent after Clem finishes this turn.' : '');
   const canSend = !disabled && !props.voiceActive && !dictationActive && !submitting && !sendBlocked && !uploading && (value.trim().length > 0 || ready.length > 0);
-  const slim = !props.leading && !focused && !value.trim() && staged.length === 0 && !props.context && !dictationActive && !submitting && !sendBlocked && !sendProblem && !voiceNote && (!speechError || props.voiceActive);
+  const showVoiceControl = composerUsesVoiceControl({ hasVoiceControl: Boolean(props.voiceControl), value,
+    stagedCount: staged.length, hasContext: Boolean(props.context), busy: Boolean(canStop), submitting,
+    voiceActive: Boolean(props.voiceActive) });
 
   const submit = async (event?: Event) => {
     event?.preventDefault();
@@ -322,7 +320,7 @@ export function Composer(props: ComposerProps) {
   const onFiles = (event: Event) => { void pick((event.currentTarget as HTMLInputElement).files); (event.currentTarget as HTMLInputElement).value = ''; };
 
   return (
-    <form class={`composer composer-layout${compact ? ' composer-compact' : ''}${slim ? ' composer-slim' : ''}${listening ? ' listening' : ''}`} onSubmit={event => { void submit(event); }}>
+    <form class={`composer composer-layout${compact ? ' composer-compact' : ''}${listening ? ' listening' : ''}`} onSubmit={event => { void submit(event); }}>
       <div class="composer-body">
         {props.leading}
         {props.context}
@@ -344,6 +342,19 @@ export function Composer(props: ComposerProps) {
             ))}
           </div>
         ) : null}
+        {chips ? <div class="composer-chips">{chips}</div> : null}
+        {submitting ? <p class="composer-note" role="status">Preparing and sending…</p> : null}
+        {sendBlocked ? <p class="composer-note" role="status">{sendBlocked}</p> : null}
+        {sendProblem ? <p class="composer-note" role="alert">{sendProblem}</p> : null}
+        {dictationActive ? <p class="composer-note" role="status">{starting ? 'Starting microphone… Allow access if asked. Tap the mic again to cancel.' : transcribing ? 'Transcribing… Tap the mic again to cancel.' : 'Listening. Tap the mic again to finish.'}</p> : null}
+        {voiceNote || (!holdable && speechError) ? <p class="composer-note" role="alert">{voiceNote || speechError}</p> : null}
+      </div>
+      <div class="composer-row" role="group" aria-label="Message and actions">
+        {upload ? (
+          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || props.voiceActive || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+        ) : null}
         <textarea
           ref={textareaRef}
           class="composer-input chat-input"
@@ -354,28 +365,12 @@ export function Composer(props: ComposerProps) {
           enterkeyhint="send"
           autocomplete="off"
           disabled={disabled || props.voiceActive}
-          onFocus={onFieldFocus}
-          onBlur={onFieldBlur}
           onInput={(event) => onChange((event.currentTarget as HTMLTextAreaElement).value)}
           onKeyDown={(event) => {
             if (event.isComposing) return;
             if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit(); }
           }}
         />
-        {chips ? <div class="composer-chips">{chips}</div> : null}
-        {submitting ? <p class="composer-note" role="status">Preparing and sending…</p> : null}
-        {sendBlocked ? <p class="composer-note" role="status">{sendBlocked}</p> : null}
-        {sendProblem ? <p class="composer-note" role="alert">{sendProblem}</p> : null}
-        {dictationActive ? <p class="composer-note" role="status">{starting ? 'Starting microphone… Allow access if asked. Tap the mic again to cancel.' : transcribing ? 'Transcribing… Tap the mic again to cancel.' : 'Listening. Tap the mic again to finish.'}</p> : null}
-        {voiceNote || (!holdable && speechError) ? <p class="composer-note" role="alert">{voiceNote || speechError}</p> : null}
-      </div>
-      <div class="composer-row" role="group" aria-label="Message actions">
-        {upload ? (
-          <button type="button" class="composer-icon composer-attach" aria-label="Attach a photo or file" aria-haspopup="dialog" aria-expanded={attachOpen} disabled={disabled || props.voiceActive || submitting || staged.length >= attachmentLimit} onClick={() => { haptic('light'); setAttachOpen(true); }}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-          </button>
-        ) : null}
-        <span class="composer-spacer" aria-hidden="true" />
           <button
             type="button"
             class={`composer-icon chat-mic${listening ? ' holding' : ''}${transcribing || starting ? ' transcribing' : ''}`}
@@ -395,7 +390,8 @@ export function Composer(props: ComposerProps) {
             )}
           </button>
         ) : null}
-        <button class="chat-send" type="submit" disabled={!canSend} aria-label={canStop ? 'Send while she works' : 'Send'}>
+        <span class="composer-voice-slot" hidden={!showVoiceControl}>{props.voiceControl}</span>
+        <button class="chat-send" type="submit" hidden={showVoiceControl} disabled={!canSend} aria-label={canStop ? 'Send while she works' : 'Send'}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 19V5M5 12l7-7 7 7" />
           </svg>

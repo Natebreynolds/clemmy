@@ -18,5 +18,13 @@ test('transient invalid or overscrolled viewport measurements cannot produce neg
   assert.deepEqual(visibleViewportBounds(320, { height: Number.NaN, offsetTop: 0 }), { top: 0, height: 320, bottomInset: 0 });
   assert.deepEqual(visibleViewportBounds(320, { height: 500, offsetTop: -10 }), { top: 0, height: 320, bottomInset: 0 });
   const panned = visibleViewportBounds(320, { height: 100, offsetTop: 340 });
-  assert.ok(panned.height > 0 && panned.top + panned.height <= 320);
+  assert.deepEqual(panned, { top: 340, height: 100, bottomInset: 0 });
+});
+
+// Recorded WKWebView first focus: document874, innerHeight471, pan403.
+test('a focus pan and resized innerHeight keep independent visible origin and height', () => {
+  assert.deepEqual(visibleViewportBounds(471, { height: 471, offsetTop: 403 }),
+    { top: 403, height: 471, bottomInset: 0 });
+  assert.deepEqual(visibleViewportBounds(320, { height: 280, offsetTop: 100 }),
+    { top: 100, height: 280, bottomInset: 0 });
 });
