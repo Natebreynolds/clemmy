@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Trash2, Pin, Target, User, Network, FileText, BookOpen, Plus, X, Database,
   Users, MapPin, Wrench, CheckCircle2, XCircle, Download, Undo2, FolderSearch, Pencil, History,
-  ShieldCheck, AlertTriangle, ArrowRight, Brain, Clock, Globe, MessageCircle, Activity, ChevronRight,
+  ShieldCheck, AlertTriangle, ArrowRight, Clock, Globe, MessageCircle, Activity, ChevronRight,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -103,7 +103,7 @@ function MemoryOverview() {
   const [selectedActive, setSelectedActive] = useState<boolean | null>(null);
   const [correctSelection, setCorrectSelection] = useState(false);
   const [selectionVersion, setSelectionVersion] = useState(0);
-  const [panel, setPanel] = useState<'ask' | 'detail' | null>(() => window.innerWidth >= 1440 ? 'ask' : null);
+  const [panel, setPanel] = useState<'ask' | 'detail' | null>(null);
   const [askContext, setAskContext] = useState<MemoryHit | null>(null);
   const [asking, setAsking] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -174,7 +174,7 @@ function MemoryOverview() {
     return null;
   };
   const tabs: { key: Tab; label: string; icon: typeof Search; description: string }[] = [
-    { key: 'overview', label: 'Overview', icon: Brain, description: 'Recent learning and the context Clem carries forward.' },
+    { key: 'overview', label: 'Memory graph', icon: Network, description: 'Explore the connections between memories and their sources.' },
     { key: 'facts', label: 'Facts', icon: BookOpen, description: 'What you told Clem and what she learned, with sources and history.' },
     { key: 'entities', label: 'People & things', icon: Users, description: 'People, organizations, and the connections between them.' },
     { key: 'tools', label: 'Procedures & tools', icon: Wrench, description: 'How Clem learns to do things, and which tools worked.' },
@@ -197,8 +197,7 @@ function MemoryOverview() {
           <MessageCircle className="h-4 w-4" aria-hidden /> {asking ? 'Clem is working…' : 'Ask Clem'}
         </Button>
       </header>
-      <div className="memory-layout" data-panel-open={Boolean(panel)}>
-        <nav className="memory-navigation" aria-label="Memory sections">
+        <nav className="memory-navigation" aria-label="Memory views">
           {tabs.map((item, index) => {
             const count = storeCount(item.key); const Icon = item.icon;
             return <button key={item.key} type="button" aria-current={!searching && item.key === tab ? 'page' : undefined}
@@ -207,9 +206,16 @@ function MemoryOverview() {
               {count != null && <span className={cn('memory-nav-count', item.key === 'review' && count > 0 && 'memory-nav-attention')}>{count.toLocaleString()}</span>}
             </button>;
           })}
+          <label className="memory-view-select">View
+            <select value={searching ? '' : tab} onChange={(event) => navigate(event.target.value as Tab)}>
+              {searching && <option value="" disabled>Search results</option>}
+              {tabs.map((item) => <option key={item.key} value={item.key}>{item.label}{storeCount(item.key) != null ? ` (${storeCount(item.key)!.toLocaleString()})` : ''}</option>)}
+            </select>
+          </label>
         </nav>
+      <div className="memory-layout" data-panel-open={Boolean(panel)}>
         <div ref={contentRef} className="memory-content" tabIndex={0} aria-label={searching ? 'Memory search results' : `${current.label} content`}>
-          <div className="memory-content-inner">
+          <div className="memory-content-inner" data-map={!searching && tab === 'overview' || undefined}>
             <div className="memory-section-heading">
               <div><h2 ref={headingRef} tabIndex={-1}>{searching ? 'Search results' : current.label}</h2>
                 <p>{searching ? `Across memory${kind === 'all' ? '' : ` · ${KIND_FACETS.find((facet) => facet.key === kind)?.label ?? kind}`}` : current.description}</p></div>
@@ -252,23 +258,21 @@ function MemoryOverview() {
 }
 
 // ─────────── Overview ───────────
-// Store totals live on the tabs. This tab holds what those tabs do not:
-// what memory work is doing, the session's working set, recent learning,
-// repairs, and the map. Diagnostics stay behind one fold.
+// The graph is the landing workspace. Recent learning and working context
+// follow it; diagnostics and the assistant never take space until requested.
 function OverviewTab({ onNavigate, onPickLearned }: { onNavigate: (tab: Tab) => void; onPickLearned: (fact: Fact) => void }) {
   const ctx = usePoll(['context'], getContext, 20000);
-  const [mapOpen, setMapOpen] = useState(false);
   const workingMem = (ctx.data?.files ?? []).find((file) => file.key === 'working_memory');
   return <div className="memory-overview">
+    <section className="memory-graph-stage" aria-label="Memory graph">
+      <MemoryGraphContainer height="clamp(18rem, calc(100dvh - 21rem), 48rem)" />
+      <p className="memory-graph-caption">Stored links first. Text matches and semantic similarity are labeled overlays.</p>
+    </section>
     <MemoryLearningGlance onOpen={() => onNavigate('activity')} />
     <LearnedPane onPick={onPickLearned} />
     <details className="memory-overview-disclosure">
       <summary><Clock size={18} aria-hidden /><span><strong>Current working context</strong><small>What Clem carries forward as you work together</small></span><ChevronRight size={17} aria-hidden /></summary>
       <div>{ctx.isLoading ? <Skeleton className="h-24 w-full" /> : ctx.isError && !ctx.data ? <CouldNotRead what="Working memory" onRetry={() => void ctx.refetch()} /> : workingMem ? <ContextFileCard file={workingMem} onNavigate={onNavigate} /> : <p className="text-small text-muted">No working context is recorded yet.</p>}</div>
-    </details>
-    <details className="memory-overview-disclosure" onToggle={(event) => setMapOpen(event.currentTarget.open)}>
-      <summary><Network size={18} aria-hidden /><span><strong>Knowledge map</strong><small>Explore the connections between memories and their sources</small></span><ChevronRight size={17} aria-hidden /></summary>
-      {mapOpen && <div><p className="mb-3 text-small text-muted">Stored links first. Text matches and semantic similarity are labeled overlays.</p><MemoryGraphContainer height={420} /></div>}
     </details>
     <button type="button" className="memory-review-link" onClick={() => onNavigate('review')}><ShieldCheck size={18} aria-hidden /><span>Review decisions and memory health</span><ArrowRight size={17} aria-hidden /></button>
   </div>;

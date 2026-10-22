@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import ForceGraph3D, { type ForceGraphMethods } from 'react-force-graph-3d';
 import { Vector2 } from 'three';
 import { sentence } from '@/lib/sentence-case';
@@ -126,7 +126,7 @@ interface RelationshipEvidence {
   episodeStatus?: string;
 }
 
-export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) {
+export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSProperties['height'] }) {
   const wrap = useRef<HTMLDivElement>(null);
   const fgRef = useRef<ForceGraphMethods<GNode, GLink> | undefined>(undefined);
   const orbitRaf = useRef<number | null>(null);
@@ -136,7 +136,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: number }) 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
   const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0, relationships: 0, totalRelationships: 0, stored: 0, inferred: 0, semantic: 0 });
-  const [dims, setDims] = useState({ w: 0, h: height });
+  const [dims, setDims] = useState({ w: 0, h: typeof height === 'number' ? height : 540 });
 
   // view state
   const [hideType, setHideType] = useState<Set<string>>(new Set());

@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, type ReactNode } from 'react';
+import { Component, lazy, Suspense, type CSSProperties, type ReactNode } from 'react';
 
 /**
  * Hosts the Memory tab graph.
@@ -12,12 +12,13 @@ import { Component, lazy, Suspense, type ReactNode } from 'react';
 
 const KnowledgeGraph3D = lazy(() => import('./KnowledgeGraph3D'));
 
-const Box = ({ height, children }: { height: number; children: ReactNode }) => (
+type GraphHeight = CSSProperties['height'];
+const Box = ({ height, children }: { height: GraphHeight; children: ReactNode }) => (
   <div className="flex items-center justify-center rounded-xl border border-border bg-subtle px-6 text-center text-body text-muted" style={{ height }}>{children}</div>
 );
 
 /** Shows a message (not a 2D fallback) if the 3D view ever throws at runtime. */
-class GraphErrorBoundary extends Component<{ children: ReactNode; height: number }, { failed: boolean }> {
+class GraphErrorBoundary extends Component<{ children: ReactNode; height: GraphHeight }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
   render() {
@@ -26,7 +27,7 @@ class GraphErrorBoundary extends Component<{ children: ReactNode; height: number
   }
 }
 
-export function MemoryGraphContainer({ height = 540 }: { height?: number }) {
+export function MemoryGraphContainer({ height = 540 }: { height?: GraphHeight }) {
   return (
     <GraphErrorBoundary height={height}>
       <Suspense fallback={<Box height={height}>Loading the constellation…</Box>}>
