@@ -8,6 +8,7 @@ This pass addresses the owner's disappearing Send button, mobile responsiveness,
 - Worktree: `/Users/nathan.reynolds/.codex/worktrees/mobile-adaptive/clementine-next`
 - Base: `1443b1fc921778f8ab0ed72571fad3b8113200f8`, rechecked clean in the active `claude/r45-efficiency` checkout.
 - Native assessment: commit `0a71b0318`; [assessment and platform sources](2026-10-21-mobile-native-assessment.md).
+- Implementation: commit `d71eec3bf`.
 - Memory UI work remains on its separate branch, `codex/memory-workspace-2026-10-21`; it is not a dependency of this mobile change.
 
 The owner already assigned integration before the next tag to the other task. No shared-checkout edits, runtime restart/hotpatch, native installation, tag, provider request, or personal data changes were performed here. Integrate only this branch's commits after the base into the current release tree; preserve the other agent's later changes and token-meter work. Rebuild and verify served assets from the integrated tree before accepting it.
@@ -33,7 +34,7 @@ Production build: `npm --prefix apps/mobile-web run build` passed, including Typ
 - `assets/main-BBJBLebA.js`: 561,225 bytes; local gzip 173,529 bytes.
 - `assets/main-DK0ONltX.css`: 189,102 bytes; local gzip 32,304 bytes.
 
-The comparable baseline installed-source mobile JavaScript was 725,175 bytes, local gzip 216,959 bytes. The initial compressed JavaScript is about **20% smaller**. There are no static child-module imports from the new entry. This measures built asset sizes, **not network timing, frame rate, interaction latency, or physical-device speed**. An unvisited deferred destination needs network access initially; previously visited hashed chunks retain the service worker's existing cache behavior. CSS increased by approximately 1.1kB compressed.
+The comparable baseline mobile JavaScript was 725,175 bytes, local gzip 217,869 bytes. The peer build and installed app entry were independently hashed and matched (`main-CACk9vtR.js`, SHA256 `aee9a9dd61238da7654a8b0e10492028b88ea29349d48762fd901c7fa7c98e80`). Both baseline and candidate were compressed with the same Node `gzipSync` defaults. The initial compressed JavaScript is about **20% smaller**. There are no static child-module imports from the new entry. This measures built asset sizes, **not network timing, frame rate, interaction latency, or physical-device speed**. An unvisited deferred destination needs network access initially; previously visited hashed chunks retain the service worker's existing cache behavior.
 
 Focused tests: **39 passed** across viewport geometry/frame batching/cancellation, draft/file lifecycle, compose routes, lazy-loader failure/retry/current props, and existing chat chrome guards. The three lazy checks are included in that total, not counted twice. No browser DOM renderer was available in existing dependencies, so no invented DOM/layout pass is reported.
 
@@ -41,6 +42,7 @@ Focused tests: **39 passed** across viewport geometry/frame batching/cancellatio
 - `output/mobile-adaptive/lazy-screen-chat-chrome-tests.log`: 9 passed.
 - `output/mobile-adaptive/build.log`: production build.
 - `output/mobile-adaptive/bundle-comparison.json`: raw size evidence.
+- `output/mobile-adaptive/baseline-installed-assets.json`: matching peer/installed baseline entry hashes.
 - `output/mobile-adaptive/design-detect.json`: mechanical detector returned `[]`.
 - `git diff --check`: passed.
 
