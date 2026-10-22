@@ -8,10 +8,11 @@ The owner requested a premium desktop Memory experience: dependable scrolling, l
 - Worktree: `/Users/nathan.reynolds/.codex/worktrees/memory-workspace/clementine-next`
 - Main base: `14fa578bc` (v3.18.37)
 - Inherited baseline: `7035f3d95`
+- New implementation: `57105efc4`
 
 The shared main checkout already contained five uncommitted Memory refinements. Baseline `7035f3d95` preserves their exact contents; it is **not newly authored work in this pass**. Files: `Memory.tsx`, `HealthStrip.tsx`, `ReviewPane.tsx`, `MemoryWorkPanel.tsx`, and three disclosure rules in `styles.css`. Their original SHA256s are in `output/memory-workspace/inherited-files.json`. All five were rechecked unchanged in the shared checkout after implementation.
 
-Integration must preserve that baseline and any later changes by other agents. If the receiving branch already contains those refinements, apply the commits after `7035f3d95` rather than replaying the baseline as new work. If it is still at clean `14fa578bc`, the full branch contains the baseline plus this pass. Do not reset, stash away, or overwrite the shared dirty checkout to make a merge easy. Stage only intended paths after reconciling shared changes.
+Integration must preserve that baseline and any later changes by other agents. If the receiving branch already contains those refinements, apply the commits after `7035f3d95` rather than replaying the baseline as new work. If the baseline remains uncommitted, reconcile and commit the intended shared changes safely before applying the implementation. If it is still at clean `14fa578bc`, the full branch contains the baseline plus this pass. Do not reset, stash away, or overwrite the shared dirty checkout to make a merge easy. Stage only intended paths after reconciling shared changes.
 
 ## Findings and resulting behavior
 
@@ -35,7 +36,7 @@ Desktop is the primary target. Container-aware navigation and an explicit side p
 
 ## Verification
 
-- Production console build and TypeScript: passed (`npm --prefix apps/console-web run build`). Existing large-bundle advisory remains.
+- Final production console build and TypeScript at source commit `57105efc4`: passed (`npm --prefix apps/console-web run build`). Built assets include `Memory-Ca5OXbcN.js` and `index-BrDhyZqB.js`; log: `output/memory-workspace/build.log`. Existing large-bundle advisory remains.
 - 65 focused tests passed: memory assistant draft/retry/handoff, composer drafts, scope semantics, memory work view model and Memory unknown/error-state guards.
 - Nine controlled React render checks passed for inspector current/historical/unknown states, bounded memory selection and read failures. These replaced network fetch with a throwing guard.
 - Impeccable detector: no findings on the changed Memory surfaces (`output/memory-workspace/design-detect.json`).
@@ -47,7 +48,11 @@ The isolated test runner reported its live-home comparison **NOT PERFORMED** bec
 
 ### Controlled browser acceptance
 
-First rendered batch passed at 1440×900, 1024×900 and 720×645. Facts stayed at scrollTop 1706 and navigation Y 133 after a delayed 900 ms refresh/revision; deliberate store navigation reset content to zero. Correction, Pin and Forget used the replacement ID. An Ask draft survived hide/reopen and a synthetic submission completed in the same pane. Learning activity remained readable at desktop and smaller-window widths. No document/content horizontal overflow was found; the small-window section rail intentionally scrolls horizontally. The final bounded recheck covers shorter composer copy and direct correction focus. The fixture serves the actual built console at `http://127.0.0.1:58921/console/memory`, with named synthetic records only. It has no live daemon proxy and blocks unrelated writes. Its correction fixture returns `10001 → 20001`; only `20001` accepts follow-up Pin/Forget/Restore. Its chat endpoint returns a synthetic local stream and makes no provider calls. Source, request log, mutation log and screenshots live under `output/memory-workspace/`. These local evidence files are ignored by Git; preserve needed evidence before archiving the worktree.
+First rendered batch passed at 1440×900, 1024×900 and 720×645. Facts stayed at scrollTop 1706 and navigation Y 133 after a delayed 900 ms refresh/revision; deliberate store navigation reset content to zero. Correction, Pin and Forget used the replacement ID. An Ask draft survived hide/reopen and a synthetic submission completed in the same pane. Learning activity remained readable at desktop and smaller-window widths. No document/content horizontal overflow was found; the small-window section rail intentionally scrolls horizontally.
+
+After that batch, the final polish shortened the Ask placeholder, clarified that the overview shows a ranked selection ordered by recency within that selection, clarified no-results and source-excerpt wording, focused the correction editor directly, and cleared carried scope when adding a memory from Overview. The final production build includes these changes. The bounded final browser recheck was **NOT PERFORMED**: the Mac was locked and automatic unlock failed before any final-browser action. Final copy and keyboard-focus behavior therefore remain unverified in the browser. `output/memory-workspace/verification-final.json` records this limitation; `verification-first-pass.json` and its screenshots retain the earlier passing evidence.
+
+The fixture serves the final built console at `http://127.0.0.1:58921/console/memory`, with named synthetic records only. It has no live daemon proxy and blocks unrelated writes. Its correction fixture returns `10001 → 20001`; only `20001` accepts follow-up Pin/Forget/Restore. Its chat endpoint returns a synthetic local stream and makes no provider calls. Source, request log, mutation log and screenshots live under `output/memory-workspace/`. These local evidence files are ignored by Git; preserve needed evidence before archiving the worktree.
 
 ### Acceptance after integration
 
