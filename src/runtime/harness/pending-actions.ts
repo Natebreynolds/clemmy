@@ -106,6 +106,9 @@ export interface PendingActionRecord {
    * the go-ahead question. The card's heading on every surface. */
   ask?: string;
   why?: string;
+  /** One plain sentence of what will happen, to which named record, in
+   * which app (approval-precheck). Shown under "What I'll do". */
+  does?: string;
   sessionId: string | null;
   /** Exact accepted source that prepared this immutable action. A replay of
    * that same source reuses the durable record; a genuinely new user source
@@ -158,6 +161,7 @@ export interface QueuePendingActionInput {
   rollback?: string | null;
   ask?: string | null;
   why?: string | null;
+  does?: string | null;
   sessionId?: string | null;
   sourceUserSeq?: number | null;
   createdBy?: string | null;
@@ -683,6 +687,7 @@ export function queuePendingAction(input: QueuePendingActionInput): PendingActio
     rollback: cleanLine(input.rollback, 'no rollback noted', 1000),
     ...(cleanLine(input.ask, '', 200) ? { ask: cleanLine(input.ask, '', 200) } : {}),
     ...(cleanLine(input.why, '', 260) ? { why: cleanLine(input.why, '', 260) } : {}),
+    ...(cleanLine(input.does, '', 240) ? { does: cleanLine(input.does, '', 240) } : {}),
     sessionId: input.sessionId?.trim() || null,
     sourceUserSeq: Number.isSafeInteger(input.sourceUserSeq) && (input.sourceUserSeq ?? 0) > 0
       ? input.sourceUserSeq as number

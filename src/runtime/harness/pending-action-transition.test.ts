@@ -55,7 +55,7 @@ test.after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-function queueRequestOwnedSend(approvalIntent?: 'request_now' | 'queue_only') {
+function queueRequestOwnedSend(approvalIntent?: 'request_now' | 'queue_only', card: { ask?: string; does?: string } = {}) {
   const session = createSession({ kind: 'chat', channel: 'discord' });
   const source = appendEvent({
     sessionId: session.id,
@@ -77,6 +77,7 @@ function queueRequestOwnedSend(approvalIntent?: 'request_now' | 'queue_only') {
         body: 'The reviewed release update.',
       },
     },
+    ...card,
     sessionId: session.id,
   });
   appendEvent({
@@ -161,6 +162,21 @@ test('typed approval intent owns the graph edge while old events retain narrow c
   assert.equal(legacyTransition?.approvalIntent, 'legacy');
   assert.equal(queuedApprovalTransitionShouldMaterialize(legacyTransition!, false), false);
   assert.equal(queuedApprovalTransitionShouldMaterialize(legacyTransition!, true), true);
+});
+
+test('a staged card carries the one plain line of what Clem will do', () => {
+  // Live 2026-10-22: the card writer's "does" line reached cards Clem raised
+  // herself but not cards the host staged for an off-machine command; those
+  // showed her question with no "What I'll do".
+  const does = 'Email the reviewed launch update to launch-proof@example.com.';
+  const { session, source, record } = queueRequestOwnedSend(undefined, { ask: 'Send the launch update now?', does });
+  assert.equal(record.does, does);
+  assert.equal(pendingActionApprovalView(record).does, does);
+  const transitions = queuedApprovalTransitionsForRequest(session.id, source.seq);
+  assert.ok(materializeQueuedApprovals(session.id, 1, source.seq, transitions)[0]?.created);
+  const card = listEvents(session.id, { types: ['approval_requested'] })[0]!.data as { preview?: { does?: string; ask?: string } };
+  assert.equal(card.preview?.does, does);
+  assert.equal(card.preview?.ask, 'Send the launch update now?');
 });
 
 test('queue -> one card -> approve -> resume -> exact payload dispatches once', async () => {

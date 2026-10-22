@@ -12,6 +12,7 @@ export interface PendingActionApprovalView {
   /** Clem's question to the owner; the card's heading. */
   ask: string;
   why?: string;
+  does?: string;
   kind: string;
   status: string;
   toolName: string;
@@ -57,6 +58,7 @@ export function pendingActionApprovalView(record: PendingActionRecord): PendingA
     summary: record.summary,
     ask: pendingActionAsk(record),
     ...(record.why?.trim() ? { why: record.why.trim() } : {}),
+    ...(record.does?.trim() ? { does: record.does.trim() } : {}),
     kind: record.kind,
     status: record.status,
     toolName: record.toolName,

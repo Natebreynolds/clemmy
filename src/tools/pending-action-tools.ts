@@ -281,6 +281,7 @@ export interface QueueExactPendingActionInput {
   summary: string;
   ask?: string;
   why?: string;
+  does?: string;
   kind: PendingActionKind;
   toolName: string;
   payloadJson: string;
@@ -429,6 +430,7 @@ export async function queueExactPendingAction(
       rollback: input.rollback,
       ask: input.ask,
       why: input.why,
+      does: input.does,
       sessionId,
       // The accepted source this action was prepared for. An approval
       // that arrives with no turn of its own (a card button) settles the

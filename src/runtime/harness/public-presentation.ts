@@ -59,7 +59,7 @@ import {
 /** The host-built approval preview (operation + argument values the owner is
  * approving), admitted only in its exact bounded shape. */
 type ApprovalPreviewField = { name: string; value: string; label?: string; detail?: true; display?: string };
-type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[]; ask?: string; why?: string };
+type ApprovalPreview = { operation: string; fields: ApprovalPreviewField[]; check?: ApprovalPreviewCheck; items?: ApprovalPreview[]; does?: string; ask?: string; why?: string };
 type ApprovalPreviewCheck = { status: 'clear' | 'conflicts' | 'unavailable'; conflicts?: string[] };
 
 function approvalPreviewCheck(value: unknown): ApprovalPreviewCheck | null | undefined {
@@ -120,10 +120,11 @@ export function approvalPreviewProjection(value: unknown): { preview: ApprovalPr
   const line = (value: unknown, max: number): string | undefined => (
     typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined
   );
+  const does = line(record.does, 240);
   const ask = line(record.ask, 200);
   const why = line(record.why, 260);
   return { preview: { operation: record.operation, fields, ...(check ? { check } : {}), ...(items ? { items } : {}),
-    ...(ask ? { ask } : {}), ...(why ? { why } : {}) } };
+    ...(does ? { does } : {}), ...(ask ? { ask } : {}), ...(why ? { why } : {}) } };
 }
 
 export function publicPlanArtifactRef(value: unknown): PlanRevisionRef | undefined {

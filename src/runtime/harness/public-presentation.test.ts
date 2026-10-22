@@ -1122,6 +1122,18 @@ test('a complete grouped approval preview survives public projection without tru
 });
 
 
+test('the card\'s plain line of what Clem will do reaches every surface', () => {
+  // Live 2026-10-22: the public card dropped "does", so the chat never showed
+  // "What I'll do" although the card writer had written it.
+  const preview = {
+    operation: 'GREENHOUSE_CREATE_NOTE', fields: [{ name: 'body', value: 'Debrief.' }],
+    does: 'Add a public note to the fixture candidate\'s Greenhouse record.',
+    ask: 'Add this note now?', why: 'It is visible to the hiring team.',
+  };
+  const projected = projectHarnessEventForPublic(event('approval_requested', { approvalId: 'apr-does', subject: 'note', preview }));
+  assert.deepEqual(projected?.data.preview, preview);
+});
+
 test('structured grouped approval preserves exact members and rejects nested or oversized sets', () => {
   const item = { operation: 'Create event', fields: [{ name: 'subject', value: 'One' }] };
   const group = { operation: 'Review 2 prepared actions', fields: [], items: [item, item] };

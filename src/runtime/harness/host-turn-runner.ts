@@ -7237,6 +7237,7 @@ const runHostTurnBody = async (
         summary: `The exact ${toolName} call prepared for this request; it leaves this computer, so it runs once after the owner's go-ahead.`,
         ...(voice?.ask ? { ask: voice.ask } : {}),
         ...(voice?.why ? { why: voice.why } : {}),
+        ...(voice?.does ? { does: voice.does } : {}),
         kind: 'external_write',
         toolName,
         payloadJson,

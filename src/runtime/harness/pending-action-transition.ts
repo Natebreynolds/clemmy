@@ -281,6 +281,7 @@ function materializeQueuedApproval(
         ],
         ask: pendingActionAsk(record),
         ...(record.why?.trim() ? { why: record.why.trim() } : {}),
+        ...(record.does?.trim() ? { does: record.does.trim() } : {}),
       },
       pendingActionId: record.id,
       // Immutable authority snapshot stored inside the approval row itself.
