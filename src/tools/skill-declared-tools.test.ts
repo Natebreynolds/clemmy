@@ -54,7 +54,7 @@ test("a skill's declared tools come after its body with their argument shapes", 
     'a JSON-document argument reads as an object, so it is never nested as escaped text');
 
   const watch = await readSkill('watch-setup');
-  assert.match(watch, /- workflow_run\(name: string, inputs\?: string\)/);
+  assert.match(watch, /- workflow_run\(name: string, inputs\?: string, continue_run\?: string, start_over\?: boolean\)/);
 });
 
 test('the skill read is not cut on its way to the model', async () => {

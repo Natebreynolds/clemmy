@@ -76,7 +76,8 @@ for (const disposition of ['queued', 'disabled']) {
       : 'The daily-brief workflow is disabled. Carry out the request directly; do not retry this workflow.';
     innerDispatch._setInnerDispatchToolsForTests(new Map([['workflow_run', tool({
       name: 'workflow_run', description: 'Fixture workflow dispatcher; no background job is created.',
-      parameters: z.object({ name: z.string(), inputs: z.string().nullable().optional() }),
+      parameters: z.object({ name: z.string(), inputs: z.string().nullable().optional(),
+        continue_run: z.string().nullable().optional(), start_over: z.boolean().nullable().optional() }),
       execute: async (input) => {
         bodies += 1;
         assert.equal(input.name, 'daily-brief');

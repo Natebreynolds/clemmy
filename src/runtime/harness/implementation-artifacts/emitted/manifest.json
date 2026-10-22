@@ -1053,7 +1053,7 @@
           "bytes": 32904
         },
         "src/runtime/harness/task-continuity-runtime.ts": {
-          "bytes": 142355
+          "bytes": 143371
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
           "bytes": 25531
@@ -2270,29 +2270,65 @@
         "src/execution/workflow-commit.ts": {
           "bytes": 1325
         },
-        "src/agents/heartbeat-contracts.ts": {
-          "bytes": 5463
+        "src/execution/workflow-worker-standing-instructions.ts": {
+          "bytes": 2390
         },
-        "src/agents/phone-push-readiness.ts": {
-          "bytes": 1148
+        "src/execution/workflow-file-evidence.ts": {
+          "bytes": 1591
         },
-        "src/runtime/apns.ts": {
-          "bytes": 8553
+        "src/execution/goal-validate.ts": {
+          "bytes": 20145
         },
-        "src/dashboard/working-now-policy.ts": {
-          "bytes": 566
+        "src/execution/workflow-goal-review.ts": {
+          "bytes": 6809
         },
-        "src/execution/workflow-result-steps.ts": {
-          "bytes": 729
+        "src/runtime/login-keychain.ts": {
+          "bytes": 5022
         },
-        "src/execution/workflow-diagnosis.ts": {
-          "bytes": 70407
+        "src/execution/automation-opportunity.ts": {
+          "bytes": 32083
         },
-        "src/agents/work-review.ts": {
-          "bytes": 21168
+        "src/execution/automation-opportunity-store.ts": {
+          "bytes": 21142
         },
-        "src/agents/work-review-runtime.ts": {
-          "bytes": 13075
+        "src/runtime/automation-review-preview.ts": {
+          "bytes": 3006
+        },
+        "src/runtime/approval-summary.ts": {
+          "bytes": 30104
+        },
+        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
+          "bytes": 13206
+        },
+        "src/runtime/harness/pending-unacknowledged-writes.ts": {
+          "bytes": 707
+        },
+        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
+          "bytes": 47387
+        },
+        "src/runtime/harness/accepted-source-settlement-audit.ts": {
+          "bytes": 1481
+        },
+        "src/memory/automatic-recall-opt-out.ts": {
+          "bytes": 7083
+        },
+        "src/memory/workflow-certified-binding.ts": {
+          "bytes": 10618
+        },
+        "src/execution/bounded-pool.ts": {
+          "bytes": 1563
+        },
+        "src/execution/workflow-run-concurrency.ts": {
+          "bytes": 659
+        },
+        "src/execution/revision-judge.ts": {
+          "bytes": 8152
+        },
+        "src/execution/step-refusal-summary.ts": {
+          "bytes": 3138
+        },
+        "src/execution/review-draft-render.ts": {
+          "bytes": 3731
         },
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
@@ -2300,23 +2336,17 @@
         "src/execution/workflow-live-call-compiler.ts": {
           "bytes": 27653
         },
-        "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18493
-        },
-        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 61144
-        },
-        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
-          "bytes": 24685
-        },
-        "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 46337
-        },
         "src/execution/workflow-step-external-catalog.ts": {
           "bytes": 36674
         },
-        "src/agents/calendar-watch-runtime.ts": {
-          "bytes": 53047
+        "src/runtime/harness/accepted-source-catalog-scope.ts": {
+          "bytes": 2643
+        },
+        "src/runtime/harness/reconciliation-stop.ts": {
+          "bytes": 694
+        },
+        "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
+          "bytes": 68232
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
@@ -2344,9 +2374,6 @@
         },
         "src/runtime/harness/dispatch-streak.ts": {
           "bytes": 4739
-        },
-        "src/runtime/harness/reconciliation-stop.ts": {
-          "bytes": 694
         },
         "src/runtime/harness/planned-native-direct-carry.ts": {
           "bytes": 2469
@@ -2423,17 +2450,8 @@
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
         },
-        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
-          "bytes": 13206
-        },
-        "src/runtime/harness/pending-unacknowledged-writes.ts": {
-          "bytes": 707
-        },
         "src/runtime/harness/carrier-reader.ts": {
           "bytes": 12340
-        },
-        "src/runtime/harness/accepted-source-catalog-scope.ts": {
-          "bytes": 2643
         },
         "src/runtime/harness/exact-checkpoint-reentry.ts": {
           "bytes": 4190
@@ -2492,15 +2510,6 @@
         "src/runtime/harness/clarification-prompt-context.ts": {
           "bytes": 7265
         },
-        "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
-          "bytes": 68232
-        },
-        "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 19916
-        },
-        "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 80043
-        },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
         },
@@ -2545,12 +2554,6 @@
         },
         "src/runtime/harness/accepted-task-terminal-preparation.ts": {
           "bytes": 45418
-        },
-        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
-          "bytes": 46747
-        },
-        "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 1481
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -2840,12 +2843,6 @@
         "src/runtime/harness/terminal-delivery-judge.ts": {
           "bytes": 20502
         },
-        "src/execution/workflow-file-evidence.ts": {
-          "bytes": 1591
-        },
-        "src/execution/goal-validate.ts": {
-          "bytes": 20145
-        },
         "src/execution/verdict.ts": {
           "bytes": 4782
         },
@@ -2863,9 +2860,6 @@
         },
         "src/runtime/harness/provider-billing.ts": {
           "bytes": 17283
-        },
-        "src/memory/automatic-recall-opt-out.ts": {
-          "bytes": 7083
         },
         "src/memory/recall-auto-credit.ts": {
           "bytes": 9543
@@ -3023,182 +3017,17 @@
         "src/execution/workflow-target-evidence.ts": {
           "bytes": 41479
         },
-        "src/agents/goal-outcome-progress.ts": {
-          "bytes": 26486
+        "src/runtime/harness/workflow-mutation-review.ts": {
+          "bytes": 19916
         },
-        "src/dashboard/from-clem.ts": {
-          "bytes": 14415
-        },
-        "src/agents/check-in-templates.ts": {
-          "bytes": 19566
-        },
-        "src/agents/check-in-proposals.ts": {
-          "bytes": 14095
-        },
-        "src/agents/trust-graduation.ts": {
-          "bytes": 49916
-        },
-        "src/execution/workflow-binding-stops.ts": {
-          "bytes": 1449
-        },
-        "src/spaces/workflow-surface-binding.ts": {
-          "bytes": 28917
-        },
-        "src/spaces/canonical-entity-workspace-binding-contract.ts": {
-          "bytes": 11860
-        },
-        "src/execution/automation-opportunity.ts": {
-          "bytes": 32083
-        },
-        "src/execution/automation-opportunity-store.ts": {
-          "bytes": 21142
-        },
-        "src/execution/automation-opportunity-review-control-plane.ts": {
-          "bytes": 45456
-        },
-        "src/execution/workflow-graph-boundaries.ts": {
-          "bytes": 4098
-        },
-        "src/execution/workflow-graph.ts": {
-          "bytes": 27821
-        },
-        "src/execution/automation-pilot-target.ts": {
-          "bytes": 5929
-        },
-        "src/execution/workflow-read-pilot-admission.ts": {
-          "bytes": 14363
-        },
-        "src/execution/automation-workflow-bridge.ts": {
-          "bytes": 55423
-        },
-        "src/execution/automation-read-pilot-workspace-control-plane.ts": {
-          "bytes": 28485
-        },
-        "src/spaces/workflow-surface-binding-store.ts": {
-          "bytes": 16436
-        },
-        "src/execution/automation-read-pilot-run.ts": {
-          "bytes": 12747
-        },
-        "src/execution/automation-read-pilot-control-plane.ts": {
-          "bytes": 67213
-        },
-        "src/execution/automation-pilot-advancement-control-plane.ts": {
-          "bytes": 68069
-        },
-        "src/execution/automation-pilot-workspace-destination-authority.ts": {
-          "bytes": 32433
-        },
-        "src/dashboard/needs-you.ts": {
-          "bytes": 20518
-        },
-        "src/runtime/app-guide/app-places.ts": {
-          "bytes": 3294
-        },
-        "src/runtime/jev/connect.ts": {
-          "bytes": 1824
-        },
-        "src/runtime/mobile-ingress.ts": {
-          "bytes": 12869
-        },
-        "src/runtime/mobile-relay-health.ts": {
-          "bytes": 3230
-        },
-        "src/runtime/mobile-tls.ts": {
-          "bytes": 9980
-        },
-        "src/runtime/mobile-relay.ts": {
-          "bytes": 23043
-        },
-        "src/runtime/mobile-pairing.ts": {
-          "bytes": 4820
-        },
-        "src/runtime/mobile-pin.ts": {
-          "bytes": 9903
-        },
-        "src/runtime/mobile-device-proof.ts": {
-          "bytes": 7631
-        },
-        "src/runtime/mobile-sessions.ts": {
-          "bytes": 25952
-        },
-        "src/runtime/mobile-device-policy.ts": {
-          "bytes": 754
-        },
-        "src/runtime/mobile-auth-posture.ts": {
-          "bytes": 2509
-        },
-        "src/integrations/mobile-setup.ts": {
-          "bytes": 9871
-        },
-        "src/integrations/mobile-access.ts": {
-          "bytes": 7933
-        },
-        "src/runtime/app-guide/abilities.ts": {
-          "bytes": 12382
-        },
-        "src/dashboard/from-clem-setup.ts": {
-          "bytes": 4232
-        },
-        "src/dashboard/from-clem-runtime.ts": {
-          "bytes": 29535
-        },
-        "src/execution/workflow-run-authority-refusals.ts": {
-          "bytes": 2937
-        },
-        "src/autoresearch/memory-approve.ts": {
-          "bytes": 13025
-        },
-        "src/autoresearch/improvement-proposer.ts": {
-          "bytes": 38777
-        },
-        "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 5553
-        },
-        "src/agents/noticing-runtime.ts": {
-          "bytes": 46557
-        },
-        "src/agents/workflow-suggestions.ts": {
-          "bytes": 34442
-        },
-        "src/agents/heartbeats.ts": {
-          "bytes": 18218
-        },
-        "src/execution/workflow-worker-standing-instructions.ts": {
-          "bytes": 2390
-        },
-        "src/execution/workflow-goal-review.ts": {
-          "bytes": 6809
-        },
-        "src/runtime/login-keychain.ts": {
-          "bytes": 5022
-        },
-        "src/runtime/automation-review-preview.ts": {
-          "bytes": 3006
-        },
-        "src/runtime/approval-summary.ts": {
-          "bytes": 30104
-        },
-        "src/memory/workflow-certified-binding.ts": {
-          "bytes": 10618
-        },
-        "src/execution/bounded-pool.ts": {
-          "bytes": 1563
-        },
-        "src/execution/workflow-run-concurrency.ts": {
-          "bytes": 659
-        },
-        "src/execution/revision-judge.ts": {
-          "bytes": 8152
-        },
-        "src/execution/step-refusal-summary.ts": {
-          "bytes": 3138
-        },
-        "src/execution/review-draft-render.ts": {
-          "bytes": 3731
+        "src/runtime/harness/authored-workflow-write-authority.ts": {
+          "bytes": 80043
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
+        },
+        "src/execution/workflow-run-authority-refusals.ts": {
+          "bytes": 2937
         },
         "src/execution/workflow-goal-evidence.ts": {
           "bytes": 3951
@@ -3212,6 +3041,12 @@
         "src/runtime/harness/response-route.ts": {
           "bytes": 2404
         },
+        "src/execution/workflow-result-steps.ts": {
+          "bytes": 729
+        },
+        "src/execution/workflow-diagnosis.ts": {
+          "bytes": 70407
+        },
         "src/execution/workflow-run-terminal-status.ts": {
           "bytes": 781
         },
@@ -3223,6 +3058,9 @@
         },
         "src/execution/workflow-dead-occurrences.ts": {
           "bytes": 7574
+        },
+        "src/agents/heartbeat-contracts.ts": {
+          "bytes": 5463
         },
         "src/agents/watches.ts": {
           "bytes": 15682
@@ -3296,8 +3134,14 @@
         "src/execution/canonical-entity-store.ts": {
           "bytes": 141652
         },
+        "src/spaces/workflow-surface-binding.ts": {
+          "bytes": 28917
+        },
         "src/spaces/canonical-entity-workspace-projection.ts": {
           "bytes": 53842
+        },
+        "src/spaces/workflow-surface-binding-store.ts": {
+          "bytes": 16436
         },
         "src/spaces/canonical-entity-workspace-store-projection.ts": {
           "bytes": 54434
@@ -3311,14 +3155,50 @@
         "src/runtime/harness/reviewed-local-workflow-capability.ts": {
           "bytes": 9846
         },
+        "src/execution/workflow-node-invocation-admission.ts": {
+          "bytes": 18493
+        },
+        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
+          "bytes": 61144
+        },
+        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
+          "bytes": 24685
+        },
+        "src/execution/workflow-node-invocation-executor.ts": {
+          "bytes": 46337
+        },
+        "src/spaces/canonical-entity-workspace-binding-contract.ts": {
+          "bytes": 11860
+        },
         "src/execution/canonical-entity-workflow-lineage-producer.ts": {
           "bytes": 32053
+        },
+        "src/execution/workflow-read-pilot-admission.ts": {
+          "bytes": 14363
         },
         "src/execution/automation-recurrence-control-plane.ts": {
           "bytes": 76285
         },
         "src/execution/workflow-recurring-read-admission.ts": {
           "bytes": 13981
+        },
+        "src/execution/workflow-graph-boundaries.ts": {
+          "bytes": 4098
+        },
+        "src/execution/workflow-graph.ts": {
+          "bytes": 27821
+        },
+        "src/execution/automation-pilot-target.ts": {
+          "bytes": 5929
+        },
+        "src/execution/automation-workflow-bridge.ts": {
+          "bytes": 55423
+        },
+        "src/execution/automation-read-pilot-run.ts": {
+          "bytes": 12747
+        },
+        "src/execution/automation-read-pilot-control-plane.ts": {
+          "bytes": 67213
         },
         "src/execution/automation-recurrence-live-authority.ts": {
           "bytes": 4447
@@ -3339,10 +3219,130 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 881719
+          "bytes": 884981
+        },
+        "src/agents/phone-push-readiness.ts": {
+          "bytes": 1148
+        },
+        "src/runtime/apns.ts": {
+          "bytes": 8553
+        },
+        "src/dashboard/working-now-policy.ts": {
+          "bytes": 566
+        },
+        "src/agents/work-review.ts": {
+          "bytes": 21168
+        },
+        "src/agents/work-review-runtime.ts": {
+          "bytes": 13075
+        },
+        "src/agents/calendar-watch-runtime.ts": {
+          "bytes": 53047
+        },
+        "src/agents/goal-outcome-progress.ts": {
+          "bytes": 26486
+        },
+        "src/dashboard/from-clem.ts": {
+          "bytes": 14415
+        },
+        "src/agents/check-in-templates.ts": {
+          "bytes": 19566
+        },
+        "src/agents/check-in-proposals.ts": {
+          "bytes": 14095
+        },
+        "src/agents/trust-graduation.ts": {
+          "bytes": 49916
+        },
+        "src/execution/workflow-binding-stops.ts": {
+          "bytes": 1449
+        },
+        "src/execution/automation-opportunity-review-control-plane.ts": {
+          "bytes": 45456
+        },
+        "src/execution/automation-read-pilot-workspace-control-plane.ts": {
+          "bytes": 28485
+        },
+        "src/execution/automation-pilot-advancement-control-plane.ts": {
+          "bytes": 68069
+        },
+        "src/execution/automation-pilot-workspace-destination-authority.ts": {
+          "bytes": 32433
+        },
+        "src/dashboard/needs-you.ts": {
+          "bytes": 20518
+        },
+        "src/runtime/app-guide/app-places.ts": {
+          "bytes": 3294
+        },
+        "src/runtime/jev/connect.ts": {
+          "bytes": 1824
+        },
+        "src/runtime/mobile-ingress.ts": {
+          "bytes": 12869
+        },
+        "src/runtime/mobile-relay-health.ts": {
+          "bytes": 3230
+        },
+        "src/runtime/mobile-tls.ts": {
+          "bytes": 9980
+        },
+        "src/runtime/mobile-relay.ts": {
+          "bytes": 23043
+        },
+        "src/runtime/mobile-pairing.ts": {
+          "bytes": 4820
+        },
+        "src/runtime/mobile-pin.ts": {
+          "bytes": 9903
+        },
+        "src/runtime/mobile-device-proof.ts": {
+          "bytes": 7631
+        },
+        "src/runtime/mobile-sessions.ts": {
+          "bytes": 25952
+        },
+        "src/runtime/mobile-device-policy.ts": {
+          "bytes": 754
+        },
+        "src/runtime/mobile-auth-posture.ts": {
+          "bytes": 2509
+        },
+        "src/integrations/mobile-setup.ts": {
+          "bytes": 9871
+        },
+        "src/integrations/mobile-access.ts": {
+          "bytes": 7933
+        },
+        "src/runtime/app-guide/abilities.ts": {
+          "bytes": 12382
+        },
+        "src/dashboard/from-clem-setup.ts": {
+          "bytes": 4232
+        },
+        "src/dashboard/from-clem-runtime.ts": {
+          "bytes": 29535
+        },
+        "src/autoresearch/memory-approve.ts": {
+          "bytes": 13025
+        },
+        "src/autoresearch/improvement-proposer.ts": {
+          "bytes": 38777
+        },
+        "src/agents/workflow-improvement-signals.ts": {
+          "bytes": 5553
+        },
+        "src/agents/noticing-runtime.ts": {
+          "bytes": 46557
+        },
+        "src/agents/workflow-suggestions.ts": {
+          "bytes": 34442
+        },
+        "src/agents/heartbeats.ts": {
+          "bytes": 18218
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 184061
+          "bytes": 187450
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -5136,7 +5136,7 @@
           "bytes": 32904
         },
         "src/runtime/harness/task-continuity-runtime.ts": {
-          "bytes": 142355
+          "bytes": 143371
         },
         "src/runtime/graph/turn-graph-shadow.ts": {
           "bytes": 25531
@@ -6353,29 +6353,65 @@
         "src/execution/workflow-commit.ts": {
           "bytes": 1325
         },
-        "src/agents/heartbeat-contracts.ts": {
-          "bytes": 5463
+        "src/execution/workflow-worker-standing-instructions.ts": {
+          "bytes": 2390
         },
-        "src/agents/phone-push-readiness.ts": {
-          "bytes": 1148
+        "src/execution/workflow-file-evidence.ts": {
+          "bytes": 1591
         },
-        "src/runtime/apns.ts": {
-          "bytes": 8553
+        "src/execution/goal-validate.ts": {
+          "bytes": 20145
         },
-        "src/dashboard/working-now-policy.ts": {
-          "bytes": 566
+        "src/execution/workflow-goal-review.ts": {
+          "bytes": 6809
         },
-        "src/execution/workflow-result-steps.ts": {
-          "bytes": 729
+        "src/runtime/login-keychain.ts": {
+          "bytes": 5022
         },
-        "src/execution/workflow-diagnosis.ts": {
-          "bytes": 70407
+        "src/execution/automation-opportunity.ts": {
+          "bytes": 32083
         },
-        "src/agents/work-review.ts": {
-          "bytes": 21168
+        "src/execution/automation-opportunity-store.ts": {
+          "bytes": 21142
         },
-        "src/agents/work-review-runtime.ts": {
-          "bytes": 13075
+        "src/runtime/automation-review-preview.ts": {
+          "bytes": 3006
+        },
+        "src/runtime/approval-summary.ts": {
+          "bytes": 30104
+        },
+        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
+          "bytes": 13206
+        },
+        "src/runtime/harness/pending-unacknowledged-writes.ts": {
+          "bytes": 707
+        },
+        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
+          "bytes": 47387
+        },
+        "src/runtime/harness/accepted-source-settlement-audit.ts": {
+          "bytes": 1481
+        },
+        "src/memory/automatic-recall-opt-out.ts": {
+          "bytes": 7083
+        },
+        "src/memory/workflow-certified-binding.ts": {
+          "bytes": 10618
+        },
+        "src/execution/bounded-pool.ts": {
+          "bytes": 1563
+        },
+        "src/execution/workflow-run-concurrency.ts": {
+          "bytes": 659
+        },
+        "src/execution/revision-judge.ts": {
+          "bytes": 8152
+        },
+        "src/execution/step-refusal-summary.ts": {
+          "bytes": 3138
+        },
+        "src/execution/review-draft-render.ts": {
+          "bytes": 3731
         },
         "src/execution/workflow-capability-digest.ts": {
           "bytes": 645
@@ -6383,23 +6419,17 @@
         "src/execution/workflow-live-call-compiler.ts": {
           "bytes": 27653
         },
-        "src/execution/workflow-node-invocation-admission.ts": {
-          "bytes": 18493
-        },
-        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
-          "bytes": 61144
-        },
-        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
-          "bytes": 24685
-        },
-        "src/execution/workflow-node-invocation-executor.ts": {
-          "bytes": 46337
-        },
         "src/execution/workflow-step-external-catalog.ts": {
           "bytes": 36674
         },
-        "src/agents/calendar-watch-runtime.ts": {
-          "bytes": 53047
+        "src/runtime/harness/accepted-source-catalog-scope.ts": {
+          "bytes": 2643
+        },
+        "src/runtime/harness/reconciliation-stop.ts": {
+          "bytes": 694
+        },
+        "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
+          "bytes": 68232
         },
         "src/runtime/harness/discovered-tool-context.ts": {
           "bytes": 3966
@@ -6427,9 +6457,6 @@
         },
         "src/runtime/harness/dispatch-streak.ts": {
           "bytes": 4739
-        },
-        "src/runtime/harness/reconciliation-stop.ts": {
-          "bytes": 694
         },
         "src/runtime/harness/planned-native-direct-carry.ts": {
           "bytes": 2469
@@ -6506,17 +6533,8 @@
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
         },
-        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
-          "bytes": 13206
-        },
-        "src/runtime/harness/pending-unacknowledged-writes.ts": {
-          "bytes": 707
-        },
         "src/runtime/harness/carrier-reader.ts": {
           "bytes": 12340
-        },
-        "src/runtime/harness/accepted-source-catalog-scope.ts": {
-          "bytes": 2643
         },
         "src/runtime/harness/exact-checkpoint-reentry.ts": {
           "bytes": 4190
@@ -6575,15 +6593,6 @@
         "src/runtime/harness/clarification-prompt-context.ts": {
           "bytes": 7265
         },
-        "src/runtime/harness/accepted-model-batch-checkpoint.ts": {
-          "bytes": 68232
-        },
-        "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 19916
-        },
-        "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 80043
-        },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
         },
@@ -6628,12 +6637,6 @@
         },
         "src/runtime/harness/accepted-task-terminal-preparation.ts": {
           "bytes": 45418
-        },
-        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
-          "bytes": 46747
-        },
-        "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 1481
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -6923,12 +6926,6 @@
         "src/runtime/harness/terminal-delivery-judge.ts": {
           "bytes": 20502
         },
-        "src/execution/workflow-file-evidence.ts": {
-          "bytes": 1591
-        },
-        "src/execution/goal-validate.ts": {
-          "bytes": 20145
-        },
         "src/execution/verdict.ts": {
           "bytes": 4782
         },
@@ -6946,9 +6943,6 @@
         },
         "src/runtime/harness/provider-billing.ts": {
           "bytes": 17283
-        },
-        "src/memory/automatic-recall-opt-out.ts": {
-          "bytes": 7083
         },
         "src/memory/recall-auto-credit.ts": {
           "bytes": 9543
@@ -7106,182 +7100,17 @@
         "src/execution/workflow-target-evidence.ts": {
           "bytes": 41479
         },
-        "src/agents/goal-outcome-progress.ts": {
-          "bytes": 26486
+        "src/runtime/harness/workflow-mutation-review.ts": {
+          "bytes": 19916
         },
-        "src/dashboard/from-clem.ts": {
-          "bytes": 14415
-        },
-        "src/agents/check-in-templates.ts": {
-          "bytes": 19566
-        },
-        "src/agents/check-in-proposals.ts": {
-          "bytes": 14095
-        },
-        "src/agents/trust-graduation.ts": {
-          "bytes": 49916
-        },
-        "src/execution/workflow-binding-stops.ts": {
-          "bytes": 1449
-        },
-        "src/spaces/workflow-surface-binding.ts": {
-          "bytes": 28917
-        },
-        "src/spaces/canonical-entity-workspace-binding-contract.ts": {
-          "bytes": 11860
-        },
-        "src/execution/automation-opportunity.ts": {
-          "bytes": 32083
-        },
-        "src/execution/automation-opportunity-store.ts": {
-          "bytes": 21142
-        },
-        "src/execution/automation-opportunity-review-control-plane.ts": {
-          "bytes": 45456
-        },
-        "src/execution/workflow-graph-boundaries.ts": {
-          "bytes": 4098
-        },
-        "src/execution/workflow-graph.ts": {
-          "bytes": 27821
-        },
-        "src/execution/automation-pilot-target.ts": {
-          "bytes": 5929
-        },
-        "src/execution/workflow-read-pilot-admission.ts": {
-          "bytes": 14363
-        },
-        "src/execution/automation-workflow-bridge.ts": {
-          "bytes": 55423
-        },
-        "src/execution/automation-read-pilot-workspace-control-plane.ts": {
-          "bytes": 28485
-        },
-        "src/spaces/workflow-surface-binding-store.ts": {
-          "bytes": 16436
-        },
-        "src/execution/automation-read-pilot-run.ts": {
-          "bytes": 12747
-        },
-        "src/execution/automation-read-pilot-control-plane.ts": {
-          "bytes": 67213
-        },
-        "src/execution/automation-pilot-advancement-control-plane.ts": {
-          "bytes": 68069
-        },
-        "src/execution/automation-pilot-workspace-destination-authority.ts": {
-          "bytes": 32433
-        },
-        "src/dashboard/needs-you.ts": {
-          "bytes": 20518
-        },
-        "src/runtime/app-guide/app-places.ts": {
-          "bytes": 3294
-        },
-        "src/runtime/jev/connect.ts": {
-          "bytes": 1824
-        },
-        "src/runtime/mobile-ingress.ts": {
-          "bytes": 12869
-        },
-        "src/runtime/mobile-relay-health.ts": {
-          "bytes": 3230
-        },
-        "src/runtime/mobile-tls.ts": {
-          "bytes": 9980
-        },
-        "src/runtime/mobile-relay.ts": {
-          "bytes": 23043
-        },
-        "src/runtime/mobile-pairing.ts": {
-          "bytes": 4820
-        },
-        "src/runtime/mobile-pin.ts": {
-          "bytes": 9903
-        },
-        "src/runtime/mobile-device-proof.ts": {
-          "bytes": 7631
-        },
-        "src/runtime/mobile-sessions.ts": {
-          "bytes": 25952
-        },
-        "src/runtime/mobile-device-policy.ts": {
-          "bytes": 754
-        },
-        "src/runtime/mobile-auth-posture.ts": {
-          "bytes": 2509
-        },
-        "src/integrations/mobile-setup.ts": {
-          "bytes": 9871
-        },
-        "src/integrations/mobile-access.ts": {
-          "bytes": 7933
-        },
-        "src/runtime/app-guide/abilities.ts": {
-          "bytes": 12382
-        },
-        "src/dashboard/from-clem-setup.ts": {
-          "bytes": 4232
-        },
-        "src/dashboard/from-clem-runtime.ts": {
-          "bytes": 29535
-        },
-        "src/execution/workflow-run-authority-refusals.ts": {
-          "bytes": 2937
-        },
-        "src/autoresearch/memory-approve.ts": {
-          "bytes": 13025
-        },
-        "src/autoresearch/improvement-proposer.ts": {
-          "bytes": 38777
-        },
-        "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 5553
-        },
-        "src/agents/noticing-runtime.ts": {
-          "bytes": 46557
-        },
-        "src/agents/workflow-suggestions.ts": {
-          "bytes": 34442
-        },
-        "src/agents/heartbeats.ts": {
-          "bytes": 18218
-        },
-        "src/execution/workflow-worker-standing-instructions.ts": {
-          "bytes": 2390
-        },
-        "src/execution/workflow-goal-review.ts": {
-          "bytes": 6809
-        },
-        "src/runtime/login-keychain.ts": {
-          "bytes": 5022
-        },
-        "src/runtime/automation-review-preview.ts": {
-          "bytes": 3006
-        },
-        "src/runtime/approval-summary.ts": {
-          "bytes": 30104
-        },
-        "src/memory/workflow-certified-binding.ts": {
-          "bytes": 10618
-        },
-        "src/execution/bounded-pool.ts": {
-          "bytes": 1563
-        },
-        "src/execution/workflow-run-concurrency.ts": {
-          "bytes": 659
-        },
-        "src/execution/revision-judge.ts": {
-          "bytes": 8152
-        },
-        "src/execution/step-refusal-summary.ts": {
-          "bytes": 3138
-        },
-        "src/execution/review-draft-render.ts": {
-          "bytes": 3731
+        "src/runtime/harness/authored-workflow-write-authority.ts": {
+          "bytes": 80043
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
+        },
+        "src/execution/workflow-run-authority-refusals.ts": {
+          "bytes": 2937
         },
         "src/execution/workflow-goal-evidence.ts": {
           "bytes": 3951
@@ -7295,6 +7124,12 @@
         "src/runtime/harness/response-route.ts": {
           "bytes": 2404
         },
+        "src/execution/workflow-result-steps.ts": {
+          "bytes": 729
+        },
+        "src/execution/workflow-diagnosis.ts": {
+          "bytes": 70407
+        },
         "src/execution/workflow-run-terminal-status.ts": {
           "bytes": 781
         },
@@ -7306,6 +7141,9 @@
         },
         "src/execution/workflow-dead-occurrences.ts": {
           "bytes": 7574
+        },
+        "src/agents/heartbeat-contracts.ts": {
+          "bytes": 5463
         },
         "src/agents/watches.ts": {
           "bytes": 15682
@@ -7379,8 +7217,14 @@
         "src/execution/canonical-entity-store.ts": {
           "bytes": 141652
         },
+        "src/spaces/workflow-surface-binding.ts": {
+          "bytes": 28917
+        },
         "src/spaces/canonical-entity-workspace-projection.ts": {
           "bytes": 53842
+        },
+        "src/spaces/workflow-surface-binding-store.ts": {
+          "bytes": 16436
         },
         "src/spaces/canonical-entity-workspace-store-projection.ts": {
           "bytes": 54434
@@ -7394,14 +7238,50 @@
         "src/runtime/harness/reviewed-local-workflow-capability.ts": {
           "bytes": 9846
         },
+        "src/execution/workflow-node-invocation-admission.ts": {
+          "bytes": 18493
+        },
+        "src/runtime/harness/workflow-read-only-call-kernel.ts": {
+          "bytes": 61144
+        },
+        "src/runtime/harness/workflow-paginated-read-kernel.ts": {
+          "bytes": 24685
+        },
+        "src/execution/workflow-node-invocation-executor.ts": {
+          "bytes": 46337
+        },
+        "src/spaces/canonical-entity-workspace-binding-contract.ts": {
+          "bytes": 11860
+        },
         "src/execution/canonical-entity-workflow-lineage-producer.ts": {
           "bytes": 32053
+        },
+        "src/execution/workflow-read-pilot-admission.ts": {
+          "bytes": 14363
         },
         "src/execution/automation-recurrence-control-plane.ts": {
           "bytes": 76285
         },
         "src/execution/workflow-recurring-read-admission.ts": {
           "bytes": 13981
+        },
+        "src/execution/workflow-graph-boundaries.ts": {
+          "bytes": 4098
+        },
+        "src/execution/workflow-graph.ts": {
+          "bytes": 27821
+        },
+        "src/execution/automation-pilot-target.ts": {
+          "bytes": 5929
+        },
+        "src/execution/automation-workflow-bridge.ts": {
+          "bytes": 55423
+        },
+        "src/execution/automation-read-pilot-run.ts": {
+          "bytes": 12747
+        },
+        "src/execution/automation-read-pilot-control-plane.ts": {
+          "bytes": 67213
         },
         "src/execution/automation-recurrence-live-authority.ts": {
           "bytes": 4447
@@ -7422,10 +7302,130 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 881719
+          "bytes": 884981
+        },
+        "src/agents/phone-push-readiness.ts": {
+          "bytes": 1148
+        },
+        "src/runtime/apns.ts": {
+          "bytes": 8553
+        },
+        "src/dashboard/working-now-policy.ts": {
+          "bytes": 566
+        },
+        "src/agents/work-review.ts": {
+          "bytes": 21168
+        },
+        "src/agents/work-review-runtime.ts": {
+          "bytes": 13075
+        },
+        "src/agents/calendar-watch-runtime.ts": {
+          "bytes": 53047
+        },
+        "src/agents/goal-outcome-progress.ts": {
+          "bytes": 26486
+        },
+        "src/dashboard/from-clem.ts": {
+          "bytes": 14415
+        },
+        "src/agents/check-in-templates.ts": {
+          "bytes": 19566
+        },
+        "src/agents/check-in-proposals.ts": {
+          "bytes": 14095
+        },
+        "src/agents/trust-graduation.ts": {
+          "bytes": 49916
+        },
+        "src/execution/workflow-binding-stops.ts": {
+          "bytes": 1449
+        },
+        "src/execution/automation-opportunity-review-control-plane.ts": {
+          "bytes": 45456
+        },
+        "src/execution/automation-read-pilot-workspace-control-plane.ts": {
+          "bytes": 28485
+        },
+        "src/execution/automation-pilot-advancement-control-plane.ts": {
+          "bytes": 68069
+        },
+        "src/execution/automation-pilot-workspace-destination-authority.ts": {
+          "bytes": 32433
+        },
+        "src/dashboard/needs-you.ts": {
+          "bytes": 20518
+        },
+        "src/runtime/app-guide/app-places.ts": {
+          "bytes": 3294
+        },
+        "src/runtime/jev/connect.ts": {
+          "bytes": 1824
+        },
+        "src/runtime/mobile-ingress.ts": {
+          "bytes": 12869
+        },
+        "src/runtime/mobile-relay-health.ts": {
+          "bytes": 3230
+        },
+        "src/runtime/mobile-tls.ts": {
+          "bytes": 9980
+        },
+        "src/runtime/mobile-relay.ts": {
+          "bytes": 23043
+        },
+        "src/runtime/mobile-pairing.ts": {
+          "bytes": 4820
+        },
+        "src/runtime/mobile-pin.ts": {
+          "bytes": 9903
+        },
+        "src/runtime/mobile-device-proof.ts": {
+          "bytes": 7631
+        },
+        "src/runtime/mobile-sessions.ts": {
+          "bytes": 25952
+        },
+        "src/runtime/mobile-device-policy.ts": {
+          "bytes": 754
+        },
+        "src/runtime/mobile-auth-posture.ts": {
+          "bytes": 2509
+        },
+        "src/integrations/mobile-setup.ts": {
+          "bytes": 9871
+        },
+        "src/integrations/mobile-access.ts": {
+          "bytes": 7933
+        },
+        "src/runtime/app-guide/abilities.ts": {
+          "bytes": 12382
+        },
+        "src/dashboard/from-clem-setup.ts": {
+          "bytes": 4232
+        },
+        "src/dashboard/from-clem-runtime.ts": {
+          "bytes": 29535
+        },
+        "src/autoresearch/memory-approve.ts": {
+          "bytes": 13025
+        },
+        "src/autoresearch/improvement-proposer.ts": {
+          "bytes": 38777
+        },
+        "src/agents/workflow-improvement-signals.ts": {
+          "bytes": 5553
+        },
+        "src/agents/noticing-runtime.ts": {
+          "bytes": 46557
+        },
+        "src/agents/workflow-suggestions.ts": {
+          "bytes": 34442
+        },
+        "src/agents/heartbeats.ts": {
+          "bytes": 18218
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 184061
+          "bytes": 187450
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
