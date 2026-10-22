@@ -7465,6 +7465,13 @@ test('park relay: discord/slack origins suppress the proactive prose, desktop ke
   }
   // Unknown session → default to relaying (never silence the prose blindly).
   assert.equal(originChannelRendersOwnApprovalCard('sess-does-not-exist'), false);
+  // Live 10-22: with the review card already in the desktop chat, the prose
+  // ("Reply approve apr-…") duplicated it in fixed words. The card is the
+  // message; the prose stays only when no card reached the conversation.
+  const { parkedRunProseIsProactive } = await import('./workflow-runner.js');
+  assert.equal(parkedRunProseIsProactive({ channelHasOwnApprovalCard: false, cardInChat: true }), false);
+  assert.equal(parkedRunProseIsProactive({ channelHasOwnApprovalCard: false, cardInChat: false }), true);
+  assert.equal(parkedRunProseIsProactive({ channelHasOwnApprovalCard: true, cardInChat: false }), false);
 });
 
 

@@ -1185,6 +1185,14 @@ export function originChannelRendersOwnApprovalCard(originSessionId: string): bo
   }
 }
 
+/** Whether a parked run also publishes a prose report into its origin chat.
+ * Never when the review card itself reached that chat, or the channel shows
+ * its own card: one decision is one message, in Clem's card, not a second
+ * fixed sentence naming an approval id. */
+export function parkedRunProseIsProactive(input: { channelHasOwnApprovalCard: boolean; cardInChat: boolean }): boolean {
+  return !input.channelHasOwnApprovalCard && !input.cardInChat;
+}
+
 export function emitParkedApprovalCardToOriginChat(input: {
   originSessionId: string;
   approvalId: string | undefined;
@@ -18370,7 +18378,7 @@ async function processOneRunFile(
         // that parks on several gates over its life gets one turn per gate.
         for (const originSessionId of workflowRunOriginSessionIds(run)) {
           const gateKey = approvalIds[0] ?? error.parkedSteps[0]?.stepId ?? 'gate';
-          emitParkedApprovalCardToOriginChat({
+          const cardInChat = emitParkedApprovalCardToOriginChat({
             originSessionId,
             approvalId: approvalIds[0],
             workflowName: workflow.data.name,
@@ -18387,9 +18395,11 @@ async function processOneRunFile(
           deliverOutcome(
             {
               status: 'needs_input',
+              // Context for Clem's next turn, in plain words: no approval id
+              // for her to repeat to the owner.
               detail:
-                `The run is PARKED waiting on your approval (step ${error.parkedSteps.map((step) => step.stepId).join(', ') || 'approval gate'}). `
-                + `Reply \`approve ${approvalIds[0] ?? ''}\` or \`reject ${approvalIds[0] ?? ''}\` — it resumes automatically after you decide.`,
+                `The run is paused for the owner's review before step ${error.parkedSteps.map((step) => step.stepId).join(', ') || 'the approval gate'}; `
+                + 'the review card with the draft is in this conversation. It resumes when they approve, and a change they ask for revises the draft and asks again.',
             },
             {
               originSessionId,
@@ -18397,7 +18407,10 @@ async function processOneRunFile(
               sourceId: `${run.id}#parked-${gateKey}`,
               title: workflow.data.name,
               statusHint: `workflow_run_status run_id="${run.id}"`,
-              proactiveTurn: !channelHasOwnApprovalCard,
+              // The card in this conversation IS the message: a second,
+              // fixed prose report ("Reply approve apr-…") duplicated it in
+              // the harness's words (live 10-22, a review workflow fixture).
+              proactiveTurn: parkedRunProseIsProactive({ channelHasOwnApprovalCard, cardInChat }),
             },
           );
         }
