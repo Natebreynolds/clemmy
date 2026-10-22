@@ -264,6 +264,11 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
       .map((f) => ({ text: clip(f.content), ageDays: Math.max(0, Math.round((now - Date.parse(f.updatedAt)) / 86_400_000)) }));
   } catch { memories = []; }
   const upcomingMeetings = upcomingMeetingPreparations(now);
+  let workflowImprovements: NonNullable<NoticingObservation['workflowImprovements']> = [];
+  try {
+    const { workflowImprovementSignals } = await import('./workflow-improvement-signals.js');
+    workflowImprovements = workflowImprovementSignals(work.runs);
+  } catch { workflowImprovements = []; }
   return {
     at: new Date(now).toISOString(),
     goals,
@@ -278,6 +283,7 @@ export async function observeForNoticing(now = Date.now()): Promise<NoticingObse
     conversations,
     memories,
     ...(alreadyAskingOwner.length > 0 ? { alreadyAskingOwner } : {}),
+    ...(workflowImprovements.length > 0 ? { workflowImprovements } : {}),
   };
 }
 

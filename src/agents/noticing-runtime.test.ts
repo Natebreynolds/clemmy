@@ -537,3 +537,28 @@ test('approved noticing corrupt current state or rules cannot publish from an em
     writeFileSync(rulesFile, JSON.stringify({ version: 1, contracts: {} }));
   }
 });
+
+test('noticing sees a workflow whose own permissions refused a call and whose goal fell short', async () => {
+  // Owner 10-21: Clem should always be offering to improve workflows. Live
+  // the same day, a scheduled channel review's board refresh was refused by
+  // the workflow's own permissions on every run and nothing offered a fix.
+  const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+  const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
+  const workflow = 'noticing-fixture-review';
+  const runId = 'noticing-fixture-run-1';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow, workflowSlug: workflow, status: 'completed', createdAt: new Date().toISOString(),
+  }));
+  appendWorkflowEvent(workflow, runId, { kind: 'step_started', stepId: 'main' } as never);
+  appendWorkflowEvent(workflow, runId, { kind: 'verdict_recorded', stepId: '(run goal)',
+    meta: { door: 'goal_validation', pass: false, criteriaMet: 2, criteriaTotal: 3 } } as never);
+  const session = log.createSession({ id: `workflow:${runId}:main`, kind: 'workflow' } as never);
+  log.appendEvent({ sessionId: session.id, turn: 1, role: 'tool', type: 'tool_attempt_settled',
+    data: { tool: 'space_refresh', kind: 'policy_denial', detail: 'work_binding:consent_repair_coverage_missing' } });
+  const observed = await runtime.observeForNoticing();
+  assert.deepEqual(observed.workflowImprovements?.find((row) => row.workflow === workflow),
+    { workflow, runsSeen: 1, refusedByOwnDefinition: ['space_refresh'], goalShortfalls: ['2/3'] });
+  const { NOTICING_PROPOSAL_SYSTEM } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
+  assert.match(NOTICING_PROPOSAL_SYSTEM, /workflowImprovements/);
+});

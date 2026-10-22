@@ -97,6 +97,9 @@ export interface NoticingObservation {
    * Home (a reply-needed invite, a double booking, a stuck wait): one open
    * thing is one card, so it is never proposed again from here. */
   alreadyAskingOwner?: Array<{ from: string; about: string }>;
+  /** Workflows whose recent runs fell short in ways only a change to the
+   * workflow fixes (workflow-improvement-signals): content-free facts. */
+  workflowImprovements?: Array<{ workflow: string; runsSeen: number; refusedByOwnDefinition: string[]; goalShortfalls: string[] }>;
 }
 
 // ── what the model answers ────────────────────────────────────────────────────
