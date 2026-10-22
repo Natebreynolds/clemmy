@@ -24,6 +24,10 @@ function Usage() {
   const d = usage.data;
   const bySource = d?.bySource ?? [];
   const byModel = Object.entries(d?.byModel ?? {});
+  // The work and its checks apart: Jev is the `router` role.
+  const ROLE_LABELS: Record<string, string> = { brain: 'Task work', worker: 'Delegated work', reviewer: 'Model review',
+    router: 'Jev checks', writer: 'Reply writing', memory: 'Memory work', quick: 'Quick checks', other: 'Other' };
+  const byRole = Object.entries(d?.byRole ?? {}).sort((a, b) => b[1].tokens - a[1].tokens);
   const kpis = [
     { label: 'Total tokens', value: fmtNum(d?.totalTokens) },
     { label: 'Calls', value: fmtNum(d?.totalCalls) },
@@ -42,6 +46,19 @@ function Usage() {
               </Card>
             ))}
           </div>
+          {byRole.length > 0 && (
+            <Card className="p-5">
+              <h3 className="mb-3 text-h3 text-fg">By role</h3>
+              <ul className="space-y-2">
+                {byRole.map(([role, v]) => (
+                  <li key={role} className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-body text-fg">{ROLE_LABELS[role] ?? role}</span>
+                    <span className="shrink-0 text-small text-muted">{fmtNum(v.tokens)} · {fmtNum(v.calls)} calls · {fmtNum(Math.round(v.durationMs / 1000))} s</span>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
           <div className="grid gap-4 lg:grid-cols-2">
             <Card className="p-5">
               <h3 className="mb-3 text-h3 text-fg">By source</h3>

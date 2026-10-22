@@ -759,3 +759,16 @@ test('direct memory bookkeeping rejects exotic marked contexts without unused se
   }
   assert.equal(hooks, 0);
 });
+
+test('rollupUsage keeps the work, the model review and Jev apart by role', () => {
+  // Owner 10-22: Jev and the model reviewer must be visible beside the work.
+  const r = rollupUsage([
+    ev({ role: 'brain', totalTokens: 1000, durationMs: 2000 }),
+    ev({ channel: 'judge:completion', totalTokens: 400, durationMs: 9000 }),
+    ev({ channel: 'jev-trajectory', totalTokens: 100, durationMs: 300 }),
+    ev({ channel: 'jev-rank', totalTokens: 50, durationMs: 200 }),
+  ]);
+  assert.deepEqual(r.byRole.brain, { tokens: 1000, calls: 1, durationMs: 2000 });
+  assert.deepEqual(r.byRole.reviewer, { tokens: 400, calls: 1, durationMs: 9000 });
+  assert.deepEqual(r.byRole.router, { tokens: 150, calls: 2, durationMs: 500 });
+});

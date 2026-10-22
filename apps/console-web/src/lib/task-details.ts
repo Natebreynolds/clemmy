@@ -106,7 +106,7 @@ export function recordedDuration(ms: number | undefined): string | null {
 
 const ROLE_WORDS: Record<string, string> = {
   brain: 'Did the work', worker: 'Helped in parallel', judge: 'Review call',
-  reviewer: 'Review call', router: 'Routing', writer: 'Wrote the reply', memory: 'Memory work', quick: 'Quick check',
+  reviewer: 'Review call', router: 'Jev check', writer: 'Wrote the reply', memory: 'Memory work', quick: 'Quick check',
 };
 export function taskModelRole(role: string): string {
   return Object.hasOwn(ROLE_WORDS, role) ? ROLE_WORDS[role]! : plainRecordName(role);
@@ -190,14 +190,18 @@ export function taskAuxiliaryStatus(row: TaskAuxiliaryModelRecord): string {
 }
 
 const USAGE_ROLE_WORDS: Record<string, string> = {
-  brain: 'Task work', worker: 'Delegated work', reviewer: 'Review', judge: 'Review', router: 'Routing',
+  // `router` is the usage role of every Jev request (usageRoleFromChannel).
+  brain: 'Task work', worker: 'Delegated work', reviewer: 'Review', judge: 'Review', router: 'Jev checks',
   writer: 'Reply writing', memory: 'Memory work', quick: 'Quick checks',
 };
 /** Only the canonical request meter supplies call counts. Route selections
  * and transport observations are not additional usage or elapsed time. */
-export function taskUsageRoles(detail: TaskHandlingDetails): Array<{ label: string; calls: number }> {
+export function taskUsageRoles(detail: TaskHandlingDetails): Array<{ label: string; calls: number; tokens: number; modelMs: number }> {
   return Object.entries(detail.usage?.byRole ?? {}).map(([role, totals]) => ({
     label: Object.hasOwn(USAGE_ROLE_WORDS, role) ? USAGE_ROLE_WORDS[role]! : 'Other recorded work', calls: totals.calls,
+    // What each role spent on this reply: prompt plus output tokens, and
+    // the model time it took (owner 10-22: brain, reviewer and Jev apart).
+    tokens: totals.promptTokens + totals.outputTokens, modelMs: totals.modelMs,
   }));
 }
 

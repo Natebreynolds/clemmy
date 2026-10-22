@@ -220,11 +220,13 @@ export function TaskDetailsContent({ detail }: { detail: TaskHandlingDetails }) 
           </dl>
         )}
         {usageRoles.length > 0 && <div className="space-y-1.5 pt-1">
-          <p className="text-caption font-medium text-fg">Recorded calls by role</p>
+          <p className="text-caption font-medium text-fg">Recorded work by role</p>
           <ul className="space-y-1 text-caption" aria-label="Recorded model calls by role">
             {usageRoles.map((row, index) => <li key={`${row.label}:${index}`} className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5">
               <span className="min-w-0 break-words text-muted [overflow-wrap:anywhere]">{row.label}</span>
-              <span className="font-medium tabular-nums text-fg">{recordedCount(row.calls)} {row.calls === 1 ? 'call' : 'calls'}</span>
+              <span className="font-medium tabular-nums text-fg">{recordedCount(row.calls)} {row.calls === 1 ? 'call' : 'calls'}
+                {row.tokens > 0 && <span className="text-muted"> · {row.tokens >= 1000 ? `${(row.tokens / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })}k` : row.tokens} tokens</span>}
+                {row.modelMs > 0 && <span className="text-muted"> · {recordedDuration(row.modelMs)}</span>}</span>
             </li>)}
           </ul>
           <p className="text-caption text-muted">Roles describe the type of work, not its result. A routing role doesn’t identify the exact purpose of a request.</p>

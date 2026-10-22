@@ -8,6 +8,7 @@ export interface UsageRollup {
   totalOutputTokens?: number;
   bySource?: Array<{ source: string; tokens: number; calls: number; kind?: string }>;
   byModel?: Record<string, { tokens: number; calls: number }>;
+  byRole?: Record<string, { tokens: number; calls: number; durationMs: number }>;
   byKind?: Record<string, { tokens: number; calls: number }>;
   [k: string]: unknown;
 }

@@ -142,9 +142,12 @@ test('call counts come only from canonical role totals, not route and observatio
   const detail = details(); detail.models = [model()]; detail.auxiliaryModels = [auxiliary(), auxiliary({ callId: 'auxiliary-b' })];
   detail.usage = { scope: 'accepted_source', meteringStartedAt: detail.acceptedAt, sourcePredatesMetering: false, totals: total,
     byRole: { brain: { ...total, calls: 1 }, router: { ...total, calls: 2 } } };
-  assert.deepEqual(taskUsageRoles(detail), [{ label: 'Task work', calls: 1 }, { label: 'Routing', calls: 2 }]);
+  const counts = () => taskUsageRoles(detail).map(({ label, calls }) => ({ label, calls }));
+  assert.deepEqual(counts(), [{ label: 'Task work', calls: 1 }, { label: 'Jev checks', calls: 2 }]);
+  // Each role says what it spent on this reply, so brain, review and Jev read apart.
+  assert.deepEqual(taskUsageRoles(detail)[1], { label: 'Jev checks', calls: 2, tokens: 120, modelMs: 4000 });
   detail.models.push(model({ callId: 'second-route' })); detail.auxiliaryModels.push(auxiliary({ callId: 'auxiliary-c' }));
-  assert.deepEqual(taskUsageRoles(detail), [{ label: 'Task work', calls: 1 }, { label: 'Routing', calls: 2 }]);
+  assert.deepEqual(counts(), [{ label: 'Task work', calls: 1 }, { label: 'Jev checks', calls: 2 }]);
   assert.match(taskUsageNotes(detail).join(' '), /do not have complete usage records.*Cost is unknown/);
   assert.deepEqual(taskUsageRoles({ ...detail, usage: null }), []);
 });

@@ -1146,6 +1146,10 @@ export interface UsageRollup {
   }>;
   /** Per-hour buckets for the chart (24 entries, 00:00–23:00, current day local time). */
   byHour: Array<{ hour: string; tokens: number; calls: number }>;
+  /** Tokens, calls and model time by request role (brain, reviewer, Jev =
+   *  router, memory, …), so the owner sees the work and its checks apart.
+   *  Owner 10-22: Jev and the model reviewer must be visible. */
+  byRole: Record<string, { tokens: number; calls: number; durationMs: number }>;
   /** When the underlying log was last updated. */
   generatedAt: string;
 }
@@ -1169,6 +1173,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     promptTokens: number; durationSamples: number; totalDurationMs: number;
   }> = {};
   const bySourceMap = new Map<string, { tokens: number; calls: number; kind: string }>();
+  const byRole: Record<string, { tokens: number; calls: number; durationMs: number }> = {};
   const byModel: Record<string, {
     tokens: number; calls: number; inputTokens: number; cachedInputTokens: number;
     promptTokens: number;
@@ -1227,6 +1232,12 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
       bySourceMap.set(srcKey, { tokens: ev.totalTokens, calls: 1, kind: k });
     }
 
+    const role = ev.role ?? usageRoleFromChannel((ev as { channel?: string }).channel) ?? 'other';
+    const roleTotals = byRole[role] ?? (byRole[role] = { tokens: 0, calls: 0, durationMs: 0 });
+    roleTotals.tokens += ev.totalTokens;
+    roleTotals.calls += 1;
+    if (Number.isFinite(ev.durationMs) && (ev.durationMs ?? 0) > 0) roleTotals.durationMs += ev.durationMs!;
+
     const m = ev.model || 'unknown';
     if (!byModel[m]) {
       byModel[m] = { tokens: 0, calls: 0, inputTokens: 0, cachedInputTokens: 0, promptTokens: 0 };
@@ -1273,6 +1284,7 @@ export function rollupUsage(events: UsageEvent[], windowDate: Date = new Date())
     bySource,
     byModel,
     byHour,
+    byRole,
     generatedAt: new Date().toISOString(),
   };
 }
