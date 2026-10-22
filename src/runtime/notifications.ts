@@ -78,6 +78,10 @@ function atomicWriteJson(filePath: string, value: unknown): void {
     // (A hard SIGKILL between create and rename can still orphan a tmp;
     // that residue is swept separately, not here.)
     try { unlinkSync(tmp); } catch { /* tmp may not exist — ignore */ }
+    // Writers change the parsed notification store in place before saving.
+    // A save that did not land leaves the file as it was, so that changed
+    // list must not be served as the file: forget it and read disk again.
+    if (filePath === NOTIFICATIONS_FILE) parsedStore = null;
     throw err;
   }
 }
