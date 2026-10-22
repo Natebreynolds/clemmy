@@ -16,7 +16,7 @@ import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { brainOptions, effectiveBrainValue } from '../runtime/harness/model-role-options.js';
 import { pinSessionBrain, resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { resolveDeclaredByoProviderForModel } from '../runtime/harness/byo-providers.js';
+import { captureByoRoutingSnapshot, resolveDeclaredByoProviderForModelFromSnapshot } from '../runtime/harness/byo-providers.js';
 import { removeEnvKey, updateEnvKey } from '../tools/shared.js';
 
 export type ActiveBrainClass = 'codex_oauth' | 'claude_oauth' | 'api_key';
@@ -71,11 +71,22 @@ export async function switchActiveBrain(input: {
           error: 'Choose a connected API model under Settings → Models first.', needsLogin: true,
         } };
       }
-      const owner = resolveDeclaredByoProviderForModel(selectedId);
+      // Ownership is judged as routing will stand after the switch (all-in).
+      // The default account's worker model is offered as a brain, but it is
+      // that account's model only in all-in; judged in the current mode it
+      // was refused as "no longer connected" while the picker listed it.
+      const snapshot = captureByoRoutingSnapshot();
+      const owner = resolveDeclaredByoProviderForModelFromSnapshot(selectedId, { ...snapshot, mode: 'all_in' });
       if (!owner?.configured) return { ok: false, status: 409, body: {
         error: 'The selected API model is no longer connected. Reconnect it before switching.', needsLogin: true,
       } };
-      byoWorkerDefault = legacy.configured && legacy.primaryId ? legacy.primaryId : selectedId;
+      // A brain that only the worker slot ties to the default account keeps
+      // that slot, or the switch would leave its own brain unowned.
+      const workerOnly = selectedId === snapshot.workerModel
+        && selectedId !== legacy.primaryId && selectedId !== legacy.judgeId
+        && !snapshot.configuredOwnersForModel(selectedId).some(({ provider }) => provider.id !== 'default');
+      byoWorkerDefault = workerOnly ? selectedId
+        : legacy.configured && legacy.primaryId ? legacy.primaryId : selectedId;
     }
 
     if (brain === 'claude_oauth') {

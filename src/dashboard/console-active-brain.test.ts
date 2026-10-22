@@ -372,6 +372,26 @@ test('a missing or multiply-owned API pick cannot change the current route or bo
   });
 });
 
+test('the API account\'s worker model the picker offers switches to the brain and stays routable', async () => {
+  // Windows tester 10-22: the picker listed it; the switch said "no longer connected".
+  await withPrimaryRouteFixture({
+    BYO_MODEL_BASE_URL: 'https://api.example.test/v1', BYO_MODEL_API_KEY: 'test-only-key',
+    BYO_MODEL_ID: 'controlled-primary', OPENAI_MODEL_WORKER: 'controlled-worker',
+  }, async () => {
+    const { brainOptions } = await import('../runtime/harness/model-role-options.js');
+    assert.ok(brainOptions().some((o) => o.id === 'api_key' && o.modelId === 'controlled-worker' && o.available));
+    const harness = await boot();
+    try {
+      const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'controlled-worker' });
+      assert.equal(selected.response.status, 200, selected.body.error);
+      assert.equal(process.env.BYO_BRAIN_MODEL_ID, 'controlled-worker');
+      assert.equal(process.env.OPENAI_MODEL_WORKER, 'controlled-worker');
+      const { getSelectedByoBrainBackendConfig } = await import('../runtime/harness/byo-providers.js');
+      assert.equal(getSelectedByoBrainBackendConfig().configured, true);
+    } finally { await harness.close(); }
+  });
+});
+
 test('an unavailable saved API primary refuses runtime setup even when another legacy account and Claude are connected', async () => {
   await withPrimaryRouteFixture({ AUTH_MODE: 'claude_oauth', MODEL_ROUTING_MODE: 'all_in',
     BYO_BRAIN_MODEL_ID: 'missing-controlled-selection', BYO_MODEL_BASE_URL: 'https://other.example.test/v1',
