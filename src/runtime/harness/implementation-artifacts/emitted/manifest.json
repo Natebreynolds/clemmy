@@ -1026,7 +1026,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 34558
+          "bytes": 34839
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -1047,7 +1047,7 @@
           "bytes": 1231
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 78914
+          "bytes": 79457
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 32904
@@ -2496,10 +2496,10 @@
           "bytes": 68232
         },
         "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 18475
+          "bytes": 19916
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 77908
+          "bytes": 78785
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -3015,7 +3015,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740720
+          "bytes": 742104
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3143,8 +3143,14 @@
         "src/dashboard/from-clem-runtime.ts": {
           "bytes": 29535
         },
+        "src/execution/workflow-run-authority-refusals.ts": {
+          "bytes": 2937
+        },
+        "src/agents/workflow-improvement-signals.ts": {
+          "bytes": 3624
+        },
         "src/agents/noticing-runtime.ts": {
-          "bytes": 46183
+          "bytes": 46557
         },
         "src/agents/workflow-suggestions.ts": {
           "bytes": 34442
@@ -3327,7 +3333,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 879677
+          "bytes": 880814
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
@@ -5097,7 +5103,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 34558
+          "bytes": 34839
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -5118,7 +5124,7 @@
           "bytes": 1231
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 78914
+          "bytes": 79457
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 32904
@@ -6567,10 +6573,10 @@
           "bytes": 68232
         },
         "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 18475
+          "bytes": 19916
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 77908
+          "bytes": 78785
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -7086,7 +7092,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 740720
+          "bytes": 742104
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7214,8 +7220,14 @@
         "src/dashboard/from-clem-runtime.ts": {
           "bytes": 29535
         },
+        "src/execution/workflow-run-authority-refusals.ts": {
+          "bytes": 2937
+        },
+        "src/agents/workflow-improvement-signals.ts": {
+          "bytes": 3624
+        },
         "src/agents/noticing-runtime.ts": {
-          "bytes": 46183
+          "bytes": 46557
         },
         "src/agents/workflow-suggestions.ts": {
           "bytes": 34442
@@ -7398,7 +7410,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 879677
+          "bytes": 880814
         },
         "src/tools/orchestration-tools.ts": {
           "bytes": 183904
