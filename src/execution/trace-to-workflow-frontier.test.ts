@@ -37,8 +37,11 @@ test('a late settled side-store output cannot cross a frozen frontier with no in
   const session = log.createSession({ kind: 'chat' });
   const invoked = call(session.id, 'not-yet-returned');
   const throughSeq = log.getLatestEventSeq(session.id);
-  returned(session.id, invoked, 'late parked result');
+  // Production order: the result is stored inside the call's occurrence,
+  // before its return. Written after the return, the stored row only counted
+  // when both landed in the same millisecond, so a slow runner failed this.
   log.writeToolOutput({ sessionId: session.id, callId: 'not-yet-returned', tool: 'read_file', output: 'late parked result' });
+  returned(session.id, invoked, 'late parked result');
   assert.equal(trace.readSessionToolReturns(session.id).get('not-yet-returned'), 'late parked result');
   assert.equal(trace.readSessionToolReturns(session.id, { throughSeq }).has('not-yet-returned'), false);
 });
