@@ -1533,7 +1533,7 @@
           "bytes": 7984
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 91251
+          "bytes": 92464
         },
         "src/runtime/harness/tool-correlation.ts": {
           "bytes": 2051
@@ -3339,10 +3339,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 880814
+          "bytes": 881719
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 183904
+          "bytes": 184061
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
@@ -5616,7 +5616,7 @@
           "bytes": 7984
         },
         "src/runtime/harness/tool-guardrail.ts": {
-          "bytes": 91251
+          "bytes": 92464
         },
         "src/runtime/harness/tool-correlation.ts": {
           "bytes": 2051
@@ -7422,10 +7422,10 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 880814
+          "bytes": 881719
         },
         "src/tools/orchestration-tools.ts": {
-          "bytes": 183904
+          "bytes": 184061
         },
         "src/tools/automation-opportunity-tools.ts": {
           "bytes": 10949
