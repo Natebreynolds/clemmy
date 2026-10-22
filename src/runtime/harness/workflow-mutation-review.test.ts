@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getJudgeMetricsSnapshot, resetJudgeMetricsForTests } from './judge-family.js';
-import { parseWorkflowMutationReview, reviewWorkflowMutation, type WorkflowMutationReviewInput } from './workflow-mutation-review.js';
+import { parseWorkflowMutationReview, reviewWorkflowMutation, workflowMutationReviewInvalidReason, type WorkflowMutationReviewInput } from './workflow-mutation-review.js';
 
 const input: WorkflowMutationReviewInput = {
   sessionId: 'fixture-write-review', instructions: 'Preserve the header. Update only the data row.',
@@ -269,4 +269,23 @@ test('observations past the default canonical string limit are still reviewed, n
     },
   });
   assert.equal(result.verdict, 'compatible', result.reason);
+});
+
+test('an answer that cannot be read says which part of the verdict it missed', async () => {
+  // Live 10-21 (source 633820): a full review "answered in a shape that could
+  // not be read" and the write was refused unjudged; nothing recorded why.
+  const result = await reviewWorkflowMutation({ ...input, observations: { ...input.observations, complete: false } }, {
+    evaluate: async () => { throw new Error('offline'); },
+    judge: (async (_system: string, _prompt: string, parse: (output: unknown) => unknown) => {
+      parse(JSON.stringify({ verdict: 'compatible', reason: 'The write keeps every saved constraint.' }));
+      return { value: null, failure: 'invalid' };
+    }) as never,
+  });
+  assert.equal(result.checkerFailure, 'invalid');
+  assert.equal(result.invalidReason, 'digest_missing');
+  const digest = result.proposalDigest;
+  assert.equal(workflowMutationReviewInvalidReason('prose only', digest), 'not_json');
+  assert.equal(workflowMutationReviewInvalidReason({ verdict: 'maybe', proposalDigest: digest }, digest), 'no_verdict');
+  assert.equal(workflowMutationReviewInvalidReason({ verdict: 'conflict', proposalDigest: digest.slice(0, 40) }, digest), 'digest_mismatch');
+  assert.equal(workflowMutationReviewInvalidReason({ verdict: 'conflict', proposalDigest: digest, reason: '' }, digest), 'no_reason');
 });

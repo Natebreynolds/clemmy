@@ -790,12 +790,13 @@ function landedWriteInEarlierAttempt(input: {
  * Run before reserving an authored send, so a corrected proposal can still use
  * its one occurrence. Errors return a non-null hold and cannot fall through. */
 /** The owner's exact approval of this write was the consent basis. */
-function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, result: { reason: string; checkerFailure?: string }): void {
+function journalConstraintCheckerUnavailable(attestation: HostCallAttestation, result: { reason: string; checkerFailure?: string; invalidReason?: string }): void {
   try {
     appendEvent({
       sessionId: attestation.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
       data: { kind: 'workflow_write_checker_unavailable', sourceUserSeq: attestation.sourceUserSeq,
-        tool: attestation.toolName, failure: result.checkerFailure ?? 'error', reason: result.reason },
+        tool: attestation.toolName, failure: result.checkerFailure ?? 'error', reason: result.reason,
+        ...(result.invalidReason ? { invalidReason: result.invalidReason } : {}) },
     });
   } catch { /* a journal miss never changes the decision */ }
 }

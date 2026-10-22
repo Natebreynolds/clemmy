@@ -15,6 +15,9 @@ export type WorkflowMutationReview = {
    * an error). A caller must not send the model to "reconcile" evidence the
    * reviewer never weighed. */
   checkerFailure?: 'timeout' | 'invalid' | 'error';
+  /** For an answer that could not be read: which part of the verdict
+   * contract it missed (content-free), so the cause is on record. */
+  invalidReason?: WorkflowMutationReviewInvalidReason;
   /** On a conflict the reviewer could fix by changing values alone: the
    * complete proposed arguments with exactly its corrections applied. The
    * model resubmits them and they are reviewed again; a model that cannot
@@ -137,6 +140,23 @@ function correctedArgumentsOf(
   return corrected;
 }
 
+export type WorkflowMutationReviewInvalidReason =
+  | 'not_json' | 'no_verdict' | 'digest_missing' | 'digest_mismatch' | 'no_reason';
+
+/** Which part of the verdict contract an unreadable answer missed. */
+export function workflowMutationReviewInvalidReason(value: unknown, expectedDigest: string): WorkflowMutationReviewInvalidReason {
+  let parsed: unknown = value;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { return 'not_json'; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'not_json';
+  const row = parsed as Record<string, unknown>;
+  if (typeof row.verdict !== 'string' || !['compatible', 'conflict', 'uncertain'].includes(row.verdict)) return 'no_verdict';
+  if (row.proposalDigest === undefined || row.proposalDigest === null || row.proposalDigest === '') return 'digest_missing';
+  if (row.proposalDigest !== expectedDigest) return 'digest_mismatch';
+  return 'no_reason';
+}
+
 export function parseWorkflowMutationReview(
   value: unknown,
   expectedDigest: string,
@@ -254,7 +274,12 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   // circles until its clock ran out. A timed-out review is retried once as a
   // plain read of the proposal, and a checker that still cannot answer says so.
   const judge = deps.judge ?? runHedgedJudge;
-  const parse = (output: unknown) => parseWorkflowMutationReview(output, proposalDigest, { args: input.args, schema: input.schema });
+  let invalidReason: WorkflowMutationReviewInvalidReason | undefined;
+  const parse = (output: unknown) => {
+    const parsed = parseWorkflowMutationReview(output, proposalDigest, { args: input.args, schema: input.schema });
+    if (!parsed) invalidReason = workflowMutationReviewInvalidReason(output, proposalDigest);
+    return parsed;
+  };
   const pass = (value: WorkflowMutationReview) => value.verdict === 'compatible';
   let failure: WorkflowMutationReview['checkerFailure'] = 'error';
   // Depth by stakes. Live 2026-09-30: every proposed write of one workflow
@@ -289,5 +314,6 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   }
   const said = failure === 'timeout' ? 'did not answer within its deadline'
     : failure === 'invalid' ? 'answered in a shape that could not be read' : 'could not be reached';
-  return { ...uncertain(`The constraint checker ${said}; this write was not judged.`), checkerFailure: failure };
+  return { ...uncertain(`The constraint checker ${said}; this write was not judged.`), checkerFailure: failure,
+    ...(failure === 'invalid' && invalidReason ? { invalidReason } : {}) };
 }
