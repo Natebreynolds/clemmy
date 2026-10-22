@@ -3015,7 +3015,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 742104
+          "bytes": 743080
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3147,7 +3147,7 @@
           "bytes": 2937
         },
         "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 3624
+          "bytes": 4277
         },
         "src/agents/noticing-runtime.ts": {
           "bytes": 46557
@@ -7092,7 +7092,7 @@
           "bytes": 4480
         },
         "src/runtime/harness/host-turn-runner.ts": {
-          "bytes": 742104
+          "bytes": 743080
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7224,7 +7224,7 @@
           "bytes": 2937
         },
         "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 3624
+          "bytes": 4277
         },
         "src/agents/noticing-runtime.ts": {
           "bytes": 46557
