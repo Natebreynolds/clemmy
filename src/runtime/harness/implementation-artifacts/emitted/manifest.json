@@ -183,7 +183,7 @@
           "bytes": 7754
         },
         "src/runtime/harness/tool-effect.ts": {
-          "bytes": 45387
+          "bytes": 45786
         },
         "src/runtime/harness/retained-work-checkpoint.ts": {
           "bytes": 3209
@@ -4254,7 +4254,7 @@
           "bytes": 7754
         },
         "src/runtime/harness/tool-effect.ts": {
-          "bytes": 45387
+          "bytes": 45786
         },
         "src/runtime/harness/retained-work-checkpoint.ts": {
           "bytes": 3209
