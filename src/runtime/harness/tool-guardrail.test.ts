@@ -1474,3 +1474,17 @@ test('a generic local read whose retained bytes keep changing does not escalate'
   assert.equal(last?.action, 'allow');
 });
 
+
+test('evaluateToolCall: a repeated read is told it returns the same result, not that it keeps failing', () => {
+  // Live 10-22 (a tester): a parked workflow's status was re-read a dozen
+  // times under "keeps failing" though every read returned; the brain never
+  // told the owner the run was waiting on a retry and their answer.
+  _resetAllTrackersForTests();
+  const args = { workflow: 'fixture-staggered-send', run_id: null, step_id: null, offset: null };
+  let d;
+  for (let i = 0; i < 7; i += 1) d = evaluateToolCall('sess-read-repeat', 'workflow_run_status', args);
+  assert.equal(d?.action, 'block');
+  assert.match(d!.reason, /returned the same result/);
+  assert.match(d!.reason, /tell the owner/);
+  assert.doesNotMatch(d!.reason, /keeps failing/);
+});

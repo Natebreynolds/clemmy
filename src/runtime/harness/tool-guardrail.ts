@@ -1428,7 +1428,18 @@ export function evaluateToolCall(
   }
   if (exactCount >= thresholds.exactArgsBlockAt) {
     const provablyStuck = exactCount >= thresholds.exactArgsBlockAt + 2;
-    const reason = provablyStuck
+    // A read that keeps returning the same answer has not failed: telling the
+    // model it "keeps failing" sent it looking for an error that was never
+    // there. Live 10-22 (a tester): a parked send workflow's status said a
+    // retry was scheduled and to ask the owner; the brain re-read that status
+    // and the workflow a dozen times each under "keeps failing" until the
+    // turn was ended, and never asked.
+    const readRepeat = !isMut;
+    const reason = readRepeat
+      ? (provablyStuck
+        ? `${toolName} has now returned the same result ${exactCount}× for IDENTICAL arguments — nothing has changed, and you are provably stuck re-checking it. Act on what it already told you; if you are waiting on something (a scheduled retry, the owner's answer), tell the owner that now and stop checking. Do NOT call ${toolName} with these same arguments again — continuing to repeat it will end the turn.`
+        : `Loop detected: ${toolName} has returned the same result ${exactCount}× for IDENTICAL arguments. STOP re-checking — it will not change by being asked again. Act on what it told you, or tell the owner what you are waiting for. Do NOT call ${toolName} with these same arguments again.`)
+      : provablyStuck
       ? `${toolName} has now been called ${exactCount}× with IDENTICAL arguments and keeps failing — you are provably stuck. Read the specific error above: change the call materially (different args, tool, or approach) or report the exact blocker to the user and move on. Do NOT call ${toolName} with these same arguments again — continuing to repeat it will end the turn.`
       : `Loop detected: ${toolName} has been called ${exactCount}× with IDENTICAL arguments and keeps failing/returning the same result. Repeating it will not help. STOP — do something different: change the arguments, try another tool/approach, or if you're blocked, report the specific blocker to the user. Do NOT call ${toolName} with these same arguments again.`;
     return {
