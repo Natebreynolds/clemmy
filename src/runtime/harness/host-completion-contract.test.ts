@@ -1157,6 +1157,13 @@ async function eventuallyEvent(sessionId: string, find: (row: ReturnType<typeof 
   }
 }
 
+/** Why the review stayed in front of the reply, as the turn recorded it. */
+function replyHoldReasons(sessionId: string): string[] {
+  return events.listEvents(sessionId, { types: ['guardrail_tripped'] })
+    .filter((event) => event.data.kind === 'completion_review_holds_reply')
+    .map((event) => String(event.data.reason));
+}
+
 test('an ordinary chat answer publishes before its review, which then rules on the exact published text', async () => {
   const reply = 'The controlled report value is present.';
   const run = await runHost({ captured: true, incoming: true, reviewAfterDelivery: true, keepJudge: true,
@@ -1165,6 +1172,7 @@ test('an ordinary chat answer publishes before its review, which then rules on t
   try {
     assert.equal(run.calls, 1);
     assert.equal(run.judged.length, 0, 'the turn ends without waiting for its review');
+    assert.deepEqual(replyHoldReasons(run.identity.sessionId), [], 'nothing held this reply');
     assert.equal(run.outcome.finalOutput, reply);
     assert.equal(run.outcome.terminal, undefined);
     assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 1);
@@ -1234,6 +1242,7 @@ test('a caller that cannot run the review after delivery keeps the review before
     firstVerdict: { done: true, reason: 'The controlled report value is supported.' } });
   assert.equal(run.judged.length, 1);
   assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+  assert.deepEqual(replyHoldReasons(run.identity.sessionId), ['after_delivery_off'], 'the held reply says why');
 });
 
 test('a reply that only promises the work is reviewed before delivery and sent back to do it', async () => {
@@ -1242,6 +1251,7 @@ test('a reply that only promises the work is reviewed before delivery and sent b
   assert.equal(run.judged[0]?.reply, promise);
   assert.equal(run.calls, 2, 'the turn goes back to work instead of publishing the promise');
   assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+  assert.equal(replyHoldReasons(run.identity.sessionId)[0], 'promise_shaped');
 });
 
 test('an owner format contract is reviewed before its answer leaves, even for a caller that can review after', async () => {
@@ -1253,6 +1263,7 @@ test('an owner format contract is reviewed before its answer leaves, even for a 
     firstVerdict: { done: true, reason: 'The retained value is reported.' } });
   assert.ok(run.judged.length >= 1);
   assert.equal(events.listEvents(run.identity.sessionId, { types: ['completion_review_deferred'] }).length, 0);
+  assert.equal(replyHoldReasons(run.identity.sessionId)[0], 'owner_format');
 });
 
 test('host completion journals bounded author comparison diagnostics without revising legacy verdict or candidate joins', async () => {

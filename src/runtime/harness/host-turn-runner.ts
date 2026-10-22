@@ -4685,18 +4685,42 @@ const runHostTurnBody = async (
     // to the accepted objective that neither promises work still to do (the
     // review sends that back to work) nor ends by asking the owner something,
     // and a delivery the committer would publish without a verdict.
-    if (!deliveredReviewRun && hostReviewAfterDelivery && policy.status === 'captured'
-      && !planCandidate && !turnIsPlanMode() && !completionReviewFeedback && !reviewDisclosureArmed
-      && objectiveJudgeContinuations === 0 && !formatRepairReviewRequired && !ownerFormatCapture
-      && !ownerFormatRequiredAtRequest && !responseFormatRequirement && !responseFormatFinding
-      && !responseNormalization && !explicitMemoryRequired && !memoryRequirementRequired && !openApprovalCard
-      && !inheritedReads && !inheritedReadReviewRequired && !resumedHostState && !resumedRecoveryState
-      && (decision?.nextAction ?? 'completed') === 'completed' && !replyEndsOnQuestion(judgedReply)
-      && !gateInput.promiseShaped
-      && acceptedObjectiveForSource(identity) === objective
-      && !workflowParentActivation(identity.sessionId, identity.sourceUserSeq)
-      && (() => { try { return !acceptedPlanPreparationReadEvidence(identity); } catch { return false; } })()
-      && await reviewCanFollowDelivery(identity, judgedReply)) {
+    // The first condition that keeps the review in front of the reply, in the
+    // order they were always checked, so a held reply says why (live 10-21: 21
+    // of 63 reviewed chat turns waited ~30 s, p90 63 s, for the ruling).
+    const reviewHoldsReply = async (): Promise<string | null> => {
+      if (!hostReviewAfterDelivery) return 'after_delivery_off';
+      if (policy.status !== 'captured') return 'policy_not_captured';
+      if (planCandidate) return 'plan';
+      if (turnIsPlanMode()) return 'plan_mode';
+      if (completionReviewFeedback) return 'review_feedback';
+      if (reviewDisclosureArmed) return 'review_disclosure';
+      if (objectiveJudgeContinuations !== 0) return 'review_continuation';
+      if (formatRepairReviewRequired || ownerFormatCapture || ownerFormatRequiredAtRequest
+        || responseFormatRequirement || responseFormatFinding || responseNormalization) return 'owner_format';
+      if (explicitMemoryRequired || memoryRequirementRequired) return 'memory_requirement';
+      if (openApprovalCard) return 'open_card';
+      if (inheritedReads || inheritedReadReviewRequired) return 'inherited_reads';
+      if (resumedHostState || resumedRecoveryState) return 'resumed';
+      if ((decision?.nextAction ?? 'completed') !== 'completed') return 'not_completed';
+      if (replyEndsOnQuestion(judgedReply)) return 'ends_on_question';
+      if (gateInput.promiseShaped) return 'promise_shaped';
+      if (acceptedObjectiveForSource(identity) !== objective) return 'objective_changed';
+      if (workflowParentActivation(identity.sessionId, identity.sourceUserSeq)) return 'workflow_parent';
+      if ((() => { try { return Boolean(acceptedPlanPreparationReadEvidence(identity)); } catch { return true; } })()) {
+        return 'plan_preparation_reads';
+      }
+      if (!(await reviewCanFollowDelivery(identity, judgedReply))) return 'delivery_gap';
+      return null;
+    };
+    const replyHold = deliveredReviewRun ? 'review_already_running' : await reviewHoldsReply();
+    if (replyHold !== null && replyHold !== 'review_already_running') {
+      try {
+        appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+          data: { kind: 'completion_review_holds_reply', sourceUserSeq: identity.sourceUserSeq, reason: replyHold } });
+      } catch { /* observability does not decide completion */ }
+    }
+    if (replyHold === null) {
       const ambientAttribution = modelUsageAttributionStorage.getStore();
       const attemptId = ambientAttribution?.sessionId === identity.sessionId
         && ambientAttribution.sourceUserSeq === identity.sourceUserSeq ? ambientAttribution.attemptId : undefined;
