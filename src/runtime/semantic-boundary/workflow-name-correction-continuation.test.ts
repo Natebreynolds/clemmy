@@ -578,6 +578,38 @@ test(`${relation} without an answer reoffers the exact question as an adjacent a
 
 }
 
+test('a tapped choice from outside the chat is not held by a question still open in its thread', async () => {
+  // Every Home "do it" runs in Clem's own thread; a question left open there
+  // (here, one the owner never saw) held every later tap as "continuation
+  // unresolved" and refused it with a catalog message.
+  const session = eventlog.createSession({ id: 'owner-choice-past-open-question', kind: 'chat', channel: 'desktop' });
+  const parentAttempt = eventlog.beginRunAttempt(session.id, { runId: 'owner-choice-parent' });
+  const parent = eventlog.recordRunAttemptUserInput(parentAttempt, { turn: 1, role: 'user', data: { text: PARENT, displayText: PARENT } });
+  eventlog.appendEvent({ sessionId: session.id, turn: parent.turn, role: 'Clem', type: 'awaiting_user_input',
+    data: { question: QUESTION, options: OPTIONS, purpose: 'clarification', sourceUserSeq: parent.seq } });
+  const parentIdentity = { sessionId: session.id, turn: parent.turn, sourceUserSeq: parent.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(parentIdentity), identity: parentIdentity, status: 'needs_input',
+    resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: QUESTION } });
+  eventlog.finishRunAttempt(parentAttempt, 'completed');
+  assert.equal(taskContinuity.peekTaskContinuityPacket({ sessionId: session.id }).status, 'available');
+
+  const tap = (withChoice: boolean, turn: number) => {
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `owner-choice-tap-${turn}` });
+    return eventlog.recordRunAttemptUserInput(attempt, { turn, role: 'user', data: {
+      text: 'You told me: a fixture invite is waiting.\n\nMy reply: Accept', displayText: 'Accept',
+      ...(withChoice ? { ownerChoice: { version: 1, rowKey: 'notif:fixture-invite', voiceDigest: 'fixture-digest',
+        said: 'A fixture invite is waiting on your reply.', facts: 'Fixture invite.', choice: 'Accept',
+        tappedAt: '2026-10-22T22:31:36.000Z' } } : {}),
+    } });
+  };
+  const typed = tap(false, 2);
+  assert.deepEqual(await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: typed.seq }),
+    { ok: false, reason: 'durable accepted-source continuation is unresolved' }, 'an ordinary message still meets the open question');
+  const tapped = tap(true, 3);
+  const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: tapped.seq });
+  assert.notDeepEqual(primed, { ok: false, reason: 'durable accepted-source continuation is unresolved' }, JSON.stringify(primed));
+});
+
 test('a legitimately new goal with open slots never clones the prior clarification', async () => {
   const session = eventlog.createSession({
     id: 'workflow-name-correction-new-goal',
