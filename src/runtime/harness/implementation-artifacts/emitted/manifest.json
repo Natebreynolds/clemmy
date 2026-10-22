@@ -477,7 +477,7 @@
           "bytes": 5820
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 71068
+          "bytes": 71844
         },
         "src/runtime/harness/review-input-observation.ts": {
           "bytes": 37495
@@ -894,7 +894,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 85778
+          "bytes": 86652
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -1026,7 +1026,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 34839
+          "bytes": 34877
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -1047,7 +1047,7 @@
           "bytes": 1231
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 79457
+          "bytes": 79525
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 32904
@@ -1359,7 +1359,7 @@
           "bytes": 2065
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 191440
+          "bytes": 192147
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 21414
@@ -2499,7 +2499,7 @@
           "bytes": 19916
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 78785
+          "bytes": 80043
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -3146,8 +3146,14 @@
         "src/execution/workflow-run-authority-refusals.ts": {
           "bytes": 2937
         },
+        "src/autoresearch/memory-approve.ts": {
+          "bytes": 13025
+        },
+        "src/autoresearch/improvement-proposer.ts": {
+          "bytes": 38777
+        },
         "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 4277
+          "bytes": 5553
         },
         "src/agents/noticing-runtime.ts": {
           "bytes": 46557
@@ -4554,7 +4560,7 @@
           "bytes": 5820
         },
         "src/runtime/usage-log.ts": {
-          "bytes": 71068
+          "bytes": 71844
         },
         "src/runtime/harness/review-input-observation.ts": {
           "bytes": 37495
@@ -4971,7 +4977,7 @@
           "bytes": 4911
         },
         "src/runtime/jev/control-plane.ts": {
-          "bytes": 85778
+          "bytes": 86652
         },
         "src/runtime/semantic-boundary/same-root-continuation.ts": {
           "bytes": 4768
@@ -5103,7 +5109,7 @@
           "bytes": 468
         },
         "src/agents/noticing.ts": {
-          "bytes": 34839
+          "bytes": 34877
         },
         "src/spaces/workspace-deliverables-contract.ts": {
           "bytes": 1170
@@ -5124,7 +5130,7 @@
           "bytes": 1231
         },
         "src/runtime/semantic-boundary/configured-brain-semantic-port.ts": {
-          "bytes": 79457
+          "bytes": 79525
         },
         "src/runtime/semantic-boundary/clarification-revision.ts": {
           "bytes": 32904
@@ -5436,7 +5442,7 @@
           "bytes": 2065
         },
         "src/runtime/harness/objective-judge.ts": {
-          "bytes": 191440
+          "bytes": 192147
         },
         "src/runtime/harness/autonomous-send-consent.ts": {
           "bytes": 21414
@@ -6576,7 +6582,7 @@
           "bytes": 19916
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 78785
+          "bytes": 80043
         },
         "src/runtime/harness/authored-call-authority.ts": {
           "bytes": 3431
@@ -7223,8 +7229,14 @@
         "src/execution/workflow-run-authority-refusals.ts": {
           "bytes": 2937
         },
+        "src/autoresearch/memory-approve.ts": {
+          "bytes": 13025
+        },
+        "src/autoresearch/improvement-proposer.ts": {
+          "bytes": 38777
+        },
         "src/agents/workflow-improvement-signals.ts": {
-          "bytes": 4277
+          "bytes": 5553
         },
         "src/agents/noticing-runtime.ts": {
           "bytes": 46557
