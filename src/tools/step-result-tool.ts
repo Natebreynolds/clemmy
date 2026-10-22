@@ -266,6 +266,14 @@ export function registerStepResultTool(server: McpServer): void {
       if (sessionId) {
         const gate = contractRefusal(sessionId, value);
         if ('refusal' in gate) return textResult(gate.refusal);
+        // This step's recoverable writes ran when proposed; they are checked
+        // together against its saved instructions before the result counts.
+        const { checkStepWritesBeforeResult } = await import('../runtime/harness/authored-workflow-write-authority.js');
+        const check = await checkStepWritesBeforeResult(sessionId);
+        if (check.status === 'correct') {
+          return textResult(`Not recorded yet. A check of the writes this step made found: ${check.reason} `
+            + 'Correct those writes now (they can be changed), then call workflow_step_result again with the result.');
+        }
         recordStepResult(sessionId, gate.accept);
         return textResult(stepResultAckText(data.length));
       }

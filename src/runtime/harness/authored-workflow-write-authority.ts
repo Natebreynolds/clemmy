@@ -896,6 +896,133 @@ function reviewedToolLabel(input: { attestation: HostCallAttestation; carrierToo
     : `${carrier} → ${toolName}`;
 }
 
+/** WRITES THAT CAN BE UNDONE RUN NOW; THE STEP IS CHECKED ONCE.
+ *
+ * Every recoverable write a saved step made (a row, a board refresh, a file)
+ * used to wait on a standing-rules review before it ran, several model calls
+ * per write, and a checker that could not answer refused work that could have
+ * been undone. A recoverable write now runs when proposed and is queued here; before
+ * the step reports its result, its writes are reviewed together once. A
+ * conflict comes back to the step to correct; a checker that cannot answer is
+ * recorded, never a refusal of work that can be undone. Sends, deletes and
+ * other high-stakes writes are still reviewed before they run. */
+interface QueuedStepWrite {
+  receipt: { workflowName: string; workflowRunId: string; stepId: string };
+  stepPrompt: string;
+  sessionId: string;
+  sourceUserSeq: number;
+  tool: string;
+  account?: string;
+  args: Record<string, unknown>;
+}
+const queuedStepWrites = new Map<string, QueuedStepWrite[]>();
+const stepCheckCorrections = new Map<string, number>();
+const QUEUED_STEP_SESSIONS_MAX = 200;
+/** One correction round per step; a second conflict is recorded, not looped. */
+const MAX_STEP_CHECK_CORRECTIONS = 1;
+
+function queueOrdinaryWriteForStepCheck(input: {
+  attestation: HostCallAttestation;
+  args: Record<string, unknown>;
+  reopened: ReopenedAuthoredStep;
+  carrierToolName?: string;
+}): void {
+  const key = input.attestation.sessionId;
+  const boundAccount = input.attestation.accountId?.trim() ?? '';
+  const boundEmail = boundAccount ? cachedIdentityEmail(boundAccount) : undefined;
+  const list = queuedStepWrites.get(key) ?? [];
+  list.push({
+    receipt: input.reopened.receipt,
+    stepPrompt: input.reopened.step.prompt,
+    sessionId: input.attestation.sessionId,
+    sourceUserSeq: input.attestation.sourceUserSeq,
+    tool: reviewedToolLabel(input),
+    ...(boundAccount ? { account: `${boundAccount}${boundEmail ? ` (mailbox ${boundEmail})` : ''}` } : {}),
+    args: structuredClone(input.args),
+  });
+  queuedStepWrites.delete(key);
+  queuedStepWrites.set(key, list);
+  while (queuedStepWrites.size > QUEUED_STEP_SESSIONS_MAX) {
+    const oldest = queuedStepWrites.keys().next().value as string;
+    queuedStepWrites.delete(oldest);
+    stepCheckCorrections.delete(oldest);
+  }
+}
+
+export type StepWriteCheck =
+  | { status: 'clear' }
+  | { status: 'correct'; reason: string }
+  | { status: 'noted'; reason: string };
+
+/** Review the recoverable writes this step made, together, once, before it
+ * reports its result. 'correct' asks the step to fix them first; 'noted'
+ * lets it finish with the check's doubt or outage on record. */
+export async function checkStepWritesBeforeResult(sessionId: string): Promise<StepWriteCheck> {
+  const writes = queuedStepWrites.get(sessionId);
+  if (!writes || writes.length === 0) return { status: 'clear' };
+  const first = writes[0]!;
+  const finish = (result: StepWriteCheck): StepWriteCheck => {
+    if (result.status !== 'correct') { queuedStepWrites.delete(sessionId); stepCheckCorrections.delete(sessionId); }
+    return result;
+  };
+  const label = writes.length === 1 ? writes[0]!.tool : `${writes.length} writes`;
+  const startedAt = Date.now();
+  let result: Awaited<ReturnType<typeof reviewWorkflowMutation>>;
+  try {
+    const { readWorkflowTargetEvidence } = await import('../../execution/workflow-target-evidence.js');
+    const evidence = readWorkflowTargetEvidence(first.receipt.workflowRunId, {
+      compactResults: true,
+      consumerStepId: first.receipt.stepId,
+    });
+    const review = mutationReviewerOverride ?? (await import('./workflow-mutation-review.js')).reviewWorkflowMutation;
+    const accounts = [...new Set(writes.map((write) => write.account).filter((account): account is string => Boolean(account)))];
+    result = await review({
+      sessionId,
+      instructions: first.stepPrompt,
+      tool: 'the recoverable writes this step made',
+      ...(accounts.length === 1 ? { account: accounts[0] } : {}),
+      schema: { type: 'object', properties: { writes: { type: 'array', items: { type: 'object',
+        properties: { tool: { type: 'string' }, account: { type: 'string' }, arguments: { type: 'object' } } } } } },
+      args: { writes: writes.map((write) => ({ tool: write.tool, ...(write.account ? { account: write.account } : {}), arguments: write.args })) },
+      observations: { summary: evidence.summary, complete: evidence.available, evidence: evidence.evidence },
+      stakes: 'ordinary',
+      phase: 'landed',
+    });
+  } catch (error) {
+    result = { verdict: 'uncertain', reason: `the write check could not run: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
+      proposalDigest: '', checkerFailure: 'error' };
+  }
+  recordWriteCheckVerdict(first.receipt, label, result, Date.now() - startedAt);
+  if (result.verdict === 'compatible') return finish({ status: 'clear' });
+  if (result.checkerFailure) {
+    journalConstraintCheckerUnavailable({ sessionId, sourceUserSeq: first.sourceUserSeq, toolName: label } as HostCallAttestation, result);
+    return finish({ status: 'noted', reason: `The write check did not run (${result.reason}); this step's writes were not checked.` });
+  }
+  if (result.verdict === 'conflict' && (stepCheckCorrections.get(sessionId) ?? 0) < MAX_STEP_CHECK_CORRECTIONS) {
+    stepCheckCorrections.set(sessionId, (stepCheckCorrections.get(sessionId) ?? 0) + 1);
+    return { status: 'correct', reason: result.reason };
+  }
+  return finish({ status: 'noted', reason: result.reason });
+}
+
+/** A step that ended without the result tool (an output-schema lane, a
+ * salvaged result) still gets its writes checked, in the background and with
+ * no correction round: the verdict lands in the run's log. */
+export function settleUncheckedStepWrites(sessionId: string): void {
+  if (!queuedStepWrites.get(sessionId)?.length) return;
+  stepCheckCorrections.set(sessionId, MAX_STEP_CHECK_CORRECTIONS);
+  void checkStepWritesBeforeResult(sessionId).catch(() => { /* recorded by the check itself */ });
+}
+
+export function _queueStepWriteForTests(write: QueuedStepWrite): void {
+  queuedStepWrites.set(write.sessionId, [...(queuedStepWrites.get(write.sessionId) ?? []), write]);
+}
+
+export function _resetStepWriteChecksForTests(): void {
+  queuedStepWrites.clear();
+  stepCheckCorrections.clear();
+}
+
 async function reviewAuthoredWriteConstraints(input: {
   attestation: HostCallAttestation;
   args: Record<string, unknown>;
@@ -1486,10 +1613,15 @@ async function evaluateAuthoredCatalogWrite(input: {
       // covers the ordinary writes a follow-up may continue.
       const landed = gate === 'send' ? null : landedWriteInEarlierAttempt({ reopened, attestation, args: input.args });
       if (landed) return landed;
-      const refusal = await reviewAuthoredWriteConstraints({ ...input, schema,
-        ownerApprovedExactly: decision.basis === 'exact_user_grant',
-        stakes: gate === 'ordinary_write' ? 'ordinary' : 'high' });
-      if (refusal) return refusal;
+      if (gate === 'ordinary_write') {
+        // A recoverable write runs now; the step's writes are checked
+        // together once before it finishes (checkStepWritesBeforeResult).
+        queueOrdinaryWriteForStepCheck({ ...input, reopened });
+      } else {
+        const refusal = await reviewAuthoredWriteConstraints({ ...input, schema,
+          ownerApprovedExactly: decision.basis === 'exact_user_grant', stakes: 'high' });
+        if (refusal) return refusal;
+      }
     }
     if (gate === 'send' && decision.basis === 'exact_user_grant') {
       rememberSendGrant({
@@ -1737,8 +1869,7 @@ async function evaluateAuthoredLocalWrite(input: {
     // reviewed. Live 2026-10-18: a step that saved four branch results to
     // /tmp before writing its CSV spent six constraint reviews (~45 s).
     if (!localWriteTargetsOnlyScratch(attestation.toolName, input.args)) {
-      const refusal = await reviewAuthoredWriteConstraints({ ...input, stakes: 'ordinary' });
-      if (refusal) return refusal;
+      queueOrdinaryWriteForStepCheck({ ...input, reopened });
     }
   }
   return { status: 'decided', decision, call, coverage };

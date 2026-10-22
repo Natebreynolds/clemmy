@@ -2195,150 +2195,6 @@
         "src/execution/step-output-verify.ts": {
           "bytes": 15628
         },
-        "src/tools/step-result-tool.ts": {
-          "bytes": 12085
-        },
-        "src/execution/workflow-run-workspace.ts": {
-          "bytes": 24015
-        },
-        "src/tools/workspace-artifact-tools.ts": {
-          "bytes": 11141
-        },
-        "src/runtime/harness/budget-settings.ts": {
-          "bytes": 12957
-        },
-        "src/runtime/graph/admission-envelope.ts": {
-          "bytes": 10427
-        },
-        "src/agents/capability-envelope.ts": {
-          "bytes": 10550
-        },
-        "src/agents/workflow-step-agent.ts": {
-          "bytes": 45366
-        },
-        "src/execution/trace-to-workflow.ts": {
-          "bytes": 27421
-        },
-        "src/execution/workflow-failure-ledger.ts": {
-          "bytes": 4026
-        },
-        "src/runtime/skill-installer.ts": {
-          "bytes": 22816
-        },
-        "src/runtime/workflow-installer.ts": {
-          "bytes": 16736
-        },
-        "src/tools/workflow-turn-scoped-hold.ts": {
-          "bytes": 2381
-        },
-        "src/execution/workflow-improvement-session.ts": {
-          "bytes": 723
-        },
-        "src/runtime/workflow-origin-authority.ts": {
-          "bytes": 1769
-        },
-        "src/runtime/harness/workflow-chat-dispatch-prepare.ts": {
-          "bytes": 3718
-        },
-        "src/execution/workflow-quality-contract.ts": {
-          "bytes": 7158
-        },
-        "src/execution/workflow-certification-view.ts": {
-          "bytes": 5545
-        },
-        "src/execution/workflow-dry-run-simulation.ts": {
-          "bytes": 13827
-        },
-        "src/execution/workflow-resource-binding.ts": {
-          "bytes": 26528
-        },
-        "src/execution/workflow-certification.ts": {
-          "bytes": 13261
-        },
-        "src/tools/admit-named-workflow-run.ts": {
-          "bytes": 8295
-        },
-        "src/execution/workflow-visual-contract-fixes.ts": {
-          "bytes": 8969
-        },
-        "src/dashboard/workflow-graph.ts": {
-          "bytes": 12267
-        },
-        "src/execution/workflow-saved-event.ts": {
-          "bytes": 4727
-        },
-        "src/execution/workflow-commit.ts": {
-          "bytes": 1325
-        },
-        "src/execution/workflow-worker-standing-instructions.ts": {
-          "bytes": 2390
-        },
-        "src/execution/workflow-file-evidence.ts": {
-          "bytes": 1591
-        },
-        "src/execution/goal-validate.ts": {
-          "bytes": 20145
-        },
-        "src/execution/workflow-goal-review.ts": {
-          "bytes": 6809
-        },
-        "src/runtime/login-keychain.ts": {
-          "bytes": 5022
-        },
-        "src/execution/automation-opportunity.ts": {
-          "bytes": 32083
-        },
-        "src/execution/automation-opportunity-store.ts": {
-          "bytes": 21142
-        },
-        "src/runtime/automation-review-preview.ts": {
-          "bytes": 3006
-        },
-        "src/runtime/approval-summary.ts": {
-          "bytes": 30104
-        },
-        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
-          "bytes": 13206
-        },
-        "src/runtime/harness/pending-unacknowledged-writes.ts": {
-          "bytes": 707
-        },
-        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
-          "bytes": 47387
-        },
-        "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 1481
-        },
-        "src/memory/automatic-recall-opt-out.ts": {
-          "bytes": 7083
-        },
-        "src/memory/workflow-certified-binding.ts": {
-          "bytes": 10618
-        },
-        "src/execution/bounded-pool.ts": {
-          "bytes": 1563
-        },
-        "src/execution/workflow-run-concurrency.ts": {
-          "bytes": 659
-        },
-        "src/execution/revision-judge.ts": {
-          "bytes": 8152
-        },
-        "src/execution/step-refusal-summary.ts": {
-          "bytes": 3138
-        },
-        "src/execution/review-draft-render.ts": {
-          "bytes": 3731
-        },
-        "src/execution/workflow-capability-digest.ts": {
-          "bytes": 645
-        },
-        "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 27653
-        },
-        "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 36674
-        },
         "src/runtime/harness/accepted-source-catalog-scope.ts": {
           "bytes": 2643
         },
@@ -2408,6 +2264,9 @@
         "src/runtime/harness/completion-review-setting.ts": {
           "bytes": 1287
         },
+        "src/runtime/harness/budget-settings.ts": {
+          "bytes": 12957
+        },
         "src/runtime/harness/run-token-budget.ts": {
           "bytes": 7387
         },
@@ -2438,6 +2297,12 @@
         "src/runtime/build-info.ts": {
           "bytes": 10169
         },
+        "src/runtime/graph/admission-envelope.ts": {
+          "bytes": 10427
+        },
+        "src/agents/capability-envelope.ts": {
+          "bytes": 10550
+        },
         "src/runtime/harness/failed-attempt-note.ts": {
           "bytes": 2699
         },
@@ -2449,6 +2314,12 @@
         },
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
+        },
+        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
+          "bytes": 13206
+        },
+        "src/runtime/harness/pending-unacknowledged-writes.ts": {
+          "bytes": 707
         },
         "src/runtime/harness/carrier-reader.ts": {
           "bytes": 12340
@@ -2494,6 +2365,33 @@
         },
         "src/runtime/harness/existing-workflow-authority.ts": {
           "bytes": 3795
+        },
+        "src/execution/workflow-quality-contract.ts": {
+          "bytes": 7158
+        },
+        "src/execution/workflow-certification-view.ts": {
+          "bytes": 5545
+        },
+        "src/execution/workflow-dry-run-simulation.ts": {
+          "bytes": 13827
+        },
+        "src/execution/workflow-resource-binding.ts": {
+          "bytes": 26528
+        },
+        "src/execution/workflow-certification.ts": {
+          "bytes": 13261
+        },
+        "src/runtime/workflow-origin-authority.ts": {
+          "bytes": 1769
+        },
+        "src/runtime/harness/workflow-chat-dispatch-prepare.ts": {
+          "bytes": 3718
+        },
+        "src/tools/admit-named-workflow-run.ts": {
+          "bytes": 8295
+        },
+        "src/execution/workflow-improvement-session.ts": {
+          "bytes": 723
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
           "bytes": 9578
@@ -2554,6 +2452,12 @@
         },
         "src/runtime/harness/accepted-task-terminal-preparation.ts": {
           "bytes": 45418
+        },
+        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
+          "bytes": 47387
+        },
+        "src/runtime/harness/accepted-source-settlement-audit.ts": {
+          "bytes": 1481
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -2843,6 +2747,12 @@
         "src/runtime/harness/terminal-delivery-judge.ts": {
           "bytes": 20502
         },
+        "src/execution/workflow-file-evidence.ts": {
+          "bytes": 1591
+        },
+        "src/execution/goal-validate.ts": {
+          "bytes": 20145
+        },
         "src/execution/verdict.ts": {
           "bytes": 4782
         },
@@ -2860,6 +2770,9 @@
         },
         "src/runtime/harness/provider-billing.ts": {
           "bytes": 17283
+        },
+        "src/memory/automatic-recall-opt-out.ts": {
+          "bytes": 7083
         },
         "src/memory/recall-auto-credit.ts": {
           "bytes": 9543
@@ -3008,8 +2921,17 @@
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
+        "src/execution/workflow-capability-digest.ts": {
+          "bytes": 645
+        },
+        "src/execution/workflow-live-call-compiler.ts": {
+          "bytes": 27653
+        },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 743080
+        },
+        "src/execution/workflow-run-workspace.ts": {
+          "bytes": 24015
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -3018,10 +2940,88 @@
           "bytes": 41479
         },
         "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 19916
+          "bytes": 21023
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 80043
+          "bytes": 86552
+        },
+        "src/tools/step-result-tool.ts": {
+          "bytes": 12710
+        },
+        "src/tools/workspace-artifact-tools.ts": {
+          "bytes": 11141
+        },
+        "src/agents/workflow-step-agent.ts": {
+          "bytes": 45366
+        },
+        "src/execution/trace-to-workflow.ts": {
+          "bytes": 27421
+        },
+        "src/execution/workflow-failure-ledger.ts": {
+          "bytes": 4026
+        },
+        "src/runtime/skill-installer.ts": {
+          "bytes": 22816
+        },
+        "src/runtime/workflow-installer.ts": {
+          "bytes": 16736
+        },
+        "src/tools/workflow-turn-scoped-hold.ts": {
+          "bytes": 2381
+        },
+        "src/execution/workflow-visual-contract-fixes.ts": {
+          "bytes": 8969
+        },
+        "src/dashboard/workflow-graph.ts": {
+          "bytes": 12267
+        },
+        "src/execution/workflow-saved-event.ts": {
+          "bytes": 4727
+        },
+        "src/execution/workflow-commit.ts": {
+          "bytes": 1325
+        },
+        "src/execution/workflow-worker-standing-instructions.ts": {
+          "bytes": 2390
+        },
+        "src/execution/workflow-goal-review.ts": {
+          "bytes": 6809
+        },
+        "src/runtime/login-keychain.ts": {
+          "bytes": 5022
+        },
+        "src/execution/automation-opportunity.ts": {
+          "bytes": 32083
+        },
+        "src/execution/automation-opportunity-store.ts": {
+          "bytes": 21142
+        },
+        "src/runtime/automation-review-preview.ts": {
+          "bytes": 3006
+        },
+        "src/runtime/approval-summary.ts": {
+          "bytes": 30104
+        },
+        "src/memory/workflow-certified-binding.ts": {
+          "bytes": 10618
+        },
+        "src/execution/bounded-pool.ts": {
+          "bytes": 1563
+        },
+        "src/execution/workflow-run-concurrency.ts": {
+          "bytes": 659
+        },
+        "src/execution/revision-judge.ts": {
+          "bytes": 8152
+        },
+        "src/execution/step-refusal-summary.ts": {
+          "bytes": 3138
+        },
+        "src/execution/review-draft-render.ts": {
+          "bytes": 3731
+        },
+        "src/execution/workflow-step-external-catalog.ts": {
+          "bytes": 36674
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
@@ -3219,7 +3219,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 884981
+          "bytes": 885225
         },
         "src/agents/phone-push-readiness.ts": {
           "bytes": 1148
@@ -3819,7 +3819,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 158099
+          "bytes": 159384
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -3960,7 +3960,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 193054
+          "bytes": 193428
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544
@@ -6278,150 +6278,6 @@
         "src/execution/step-output-verify.ts": {
           "bytes": 15628
         },
-        "src/tools/step-result-tool.ts": {
-          "bytes": 12085
-        },
-        "src/execution/workflow-run-workspace.ts": {
-          "bytes": 24015
-        },
-        "src/tools/workspace-artifact-tools.ts": {
-          "bytes": 11141
-        },
-        "src/runtime/harness/budget-settings.ts": {
-          "bytes": 12957
-        },
-        "src/runtime/graph/admission-envelope.ts": {
-          "bytes": 10427
-        },
-        "src/agents/capability-envelope.ts": {
-          "bytes": 10550
-        },
-        "src/agents/workflow-step-agent.ts": {
-          "bytes": 45366
-        },
-        "src/execution/trace-to-workflow.ts": {
-          "bytes": 27421
-        },
-        "src/execution/workflow-failure-ledger.ts": {
-          "bytes": 4026
-        },
-        "src/runtime/skill-installer.ts": {
-          "bytes": 22816
-        },
-        "src/runtime/workflow-installer.ts": {
-          "bytes": 16736
-        },
-        "src/tools/workflow-turn-scoped-hold.ts": {
-          "bytes": 2381
-        },
-        "src/execution/workflow-improvement-session.ts": {
-          "bytes": 723
-        },
-        "src/runtime/workflow-origin-authority.ts": {
-          "bytes": 1769
-        },
-        "src/runtime/harness/workflow-chat-dispatch-prepare.ts": {
-          "bytes": 3718
-        },
-        "src/execution/workflow-quality-contract.ts": {
-          "bytes": 7158
-        },
-        "src/execution/workflow-certification-view.ts": {
-          "bytes": 5545
-        },
-        "src/execution/workflow-dry-run-simulation.ts": {
-          "bytes": 13827
-        },
-        "src/execution/workflow-resource-binding.ts": {
-          "bytes": 26528
-        },
-        "src/execution/workflow-certification.ts": {
-          "bytes": 13261
-        },
-        "src/tools/admit-named-workflow-run.ts": {
-          "bytes": 8295
-        },
-        "src/execution/workflow-visual-contract-fixes.ts": {
-          "bytes": 8969
-        },
-        "src/dashboard/workflow-graph.ts": {
-          "bytes": 12267
-        },
-        "src/execution/workflow-saved-event.ts": {
-          "bytes": 4727
-        },
-        "src/execution/workflow-commit.ts": {
-          "bytes": 1325
-        },
-        "src/execution/workflow-worker-standing-instructions.ts": {
-          "bytes": 2390
-        },
-        "src/execution/workflow-file-evidence.ts": {
-          "bytes": 1591
-        },
-        "src/execution/goal-validate.ts": {
-          "bytes": 20145
-        },
-        "src/execution/workflow-goal-review.ts": {
-          "bytes": 6809
-        },
-        "src/runtime/login-keychain.ts": {
-          "bytes": 5022
-        },
-        "src/execution/automation-opportunity.ts": {
-          "bytes": 32083
-        },
-        "src/execution/automation-opportunity-store.ts": {
-          "bytes": 21142
-        },
-        "src/runtime/automation-review-preview.ts": {
-          "bytes": 3006
-        },
-        "src/runtime/approval-summary.ts": {
-          "bytes": 30104
-        },
-        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
-          "bytes": 13206
-        },
-        "src/runtime/harness/pending-unacknowledged-writes.ts": {
-          "bytes": 707
-        },
-        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
-          "bytes": 47387
-        },
-        "src/runtime/harness/accepted-source-settlement-audit.ts": {
-          "bytes": 1481
-        },
-        "src/memory/automatic-recall-opt-out.ts": {
-          "bytes": 7083
-        },
-        "src/memory/workflow-certified-binding.ts": {
-          "bytes": 10618
-        },
-        "src/execution/bounded-pool.ts": {
-          "bytes": 1563
-        },
-        "src/execution/workflow-run-concurrency.ts": {
-          "bytes": 659
-        },
-        "src/execution/revision-judge.ts": {
-          "bytes": 8152
-        },
-        "src/execution/step-refusal-summary.ts": {
-          "bytes": 3138
-        },
-        "src/execution/review-draft-render.ts": {
-          "bytes": 3731
-        },
-        "src/execution/workflow-capability-digest.ts": {
-          "bytes": 645
-        },
-        "src/execution/workflow-live-call-compiler.ts": {
-          "bytes": 27653
-        },
-        "src/execution/workflow-step-external-catalog.ts": {
-          "bytes": 36674
-        },
         "src/runtime/harness/accepted-source-catalog-scope.ts": {
           "bytes": 2643
         },
@@ -6491,6 +6347,9 @@
         "src/runtime/harness/completion-review-setting.ts": {
           "bytes": 1287
         },
+        "src/runtime/harness/budget-settings.ts": {
+          "bytes": 12957
+        },
         "src/runtime/harness/run-token-budget.ts": {
           "bytes": 7387
         },
@@ -6521,6 +6380,12 @@
         "src/runtime/build-info.ts": {
           "bytes": 10169
         },
+        "src/runtime/graph/admission-envelope.ts": {
+          "bytes": 10427
+        },
+        "src/agents/capability-envelope.ts": {
+          "bytes": 10550
+        },
         "src/runtime/harness/failed-attempt-note.ts": {
           "bytes": 2699
         },
@@ -6532,6 +6397,12 @@
         },
         "src/runtime/harness/reviewed-claim-removal.ts": {
           "bytes": 3162
+        },
+        "src/runtime/harness/pending-unacknowledged-writes-read.ts": {
+          "bytes": 13206
+        },
+        "src/runtime/harness/pending-unacknowledged-writes.ts": {
+          "bytes": 707
         },
         "src/runtime/harness/carrier-reader.ts": {
           "bytes": 12340
@@ -6577,6 +6448,33 @@
         },
         "src/runtime/harness/existing-workflow-authority.ts": {
           "bytes": 3795
+        },
+        "src/execution/workflow-quality-contract.ts": {
+          "bytes": 7158
+        },
+        "src/execution/workflow-certification-view.ts": {
+          "bytes": 5545
+        },
+        "src/execution/workflow-dry-run-simulation.ts": {
+          "bytes": 13827
+        },
+        "src/execution/workflow-resource-binding.ts": {
+          "bytes": 26528
+        },
+        "src/execution/workflow-certification.ts": {
+          "bytes": 13261
+        },
+        "src/runtime/workflow-origin-authority.ts": {
+          "bytes": 1769
+        },
+        "src/runtime/harness/workflow-chat-dispatch-prepare.ts": {
+          "bytes": 3718
+        },
+        "src/tools/admit-named-workflow-run.ts": {
+          "bytes": 8295
+        },
+        "src/execution/workflow-improvement-session.ts": {
+          "bytes": 723
         },
         "src/runtime/harness/named-workflow-host-dispatch.ts": {
           "bytes": 9578
@@ -6637,6 +6535,12 @@
         },
         "src/runtime/harness/accepted-task-terminal-preparation.ts": {
           "bytes": 45418
+        },
+        "src/runtime/harness/accepted-source-settlement-audit-read.ts": {
+          "bytes": 47387
+        },
+        "src/runtime/harness/accepted-source-settlement-audit.ts": {
+          "bytes": 1481
         },
         "src/runtime/harness/workflow-step-result-continuation.ts": {
           "bytes": 3166
@@ -6926,6 +6830,12 @@
         "src/runtime/harness/terminal-delivery-judge.ts": {
           "bytes": 20502
         },
+        "src/execution/workflow-file-evidence.ts": {
+          "bytes": 1591
+        },
+        "src/execution/goal-validate.ts": {
+          "bytes": 20145
+        },
         "src/execution/verdict.ts": {
           "bytes": 4782
         },
@@ -6943,6 +6853,9 @@
         },
         "src/runtime/harness/provider-billing.ts": {
           "bytes": 17283
+        },
+        "src/memory/automatic-recall-opt-out.ts": {
+          "bytes": 7083
         },
         "src/memory/recall-auto-credit.ts": {
           "bytes": 9543
@@ -7091,8 +7004,17 @@
         "src/execution/workflow-parent-checkpoint.ts": {
           "bytes": 4480
         },
+        "src/execution/workflow-capability-digest.ts": {
+          "bytes": 645
+        },
+        "src/execution/workflow-live-call-compiler.ts": {
+          "bytes": 27653
+        },
         "src/runtime/harness/host-turn-runner.ts": {
           "bytes": 743080
+        },
+        "src/execution/workflow-run-workspace.ts": {
+          "bytes": 24015
         },
         "src/execution/workflow-completion-stakes.ts": {
           "bytes": 4624
@@ -7101,10 +7023,88 @@
           "bytes": 41479
         },
         "src/runtime/harness/workflow-mutation-review.ts": {
-          "bytes": 19916
+          "bytes": 21023
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 80043
+          "bytes": 86552
+        },
+        "src/tools/step-result-tool.ts": {
+          "bytes": 12710
+        },
+        "src/tools/workspace-artifact-tools.ts": {
+          "bytes": 11141
+        },
+        "src/agents/workflow-step-agent.ts": {
+          "bytes": 45366
+        },
+        "src/execution/trace-to-workflow.ts": {
+          "bytes": 27421
+        },
+        "src/execution/workflow-failure-ledger.ts": {
+          "bytes": 4026
+        },
+        "src/runtime/skill-installer.ts": {
+          "bytes": 22816
+        },
+        "src/runtime/workflow-installer.ts": {
+          "bytes": 16736
+        },
+        "src/tools/workflow-turn-scoped-hold.ts": {
+          "bytes": 2381
+        },
+        "src/execution/workflow-visual-contract-fixes.ts": {
+          "bytes": 8969
+        },
+        "src/dashboard/workflow-graph.ts": {
+          "bytes": 12267
+        },
+        "src/execution/workflow-saved-event.ts": {
+          "bytes": 4727
+        },
+        "src/execution/workflow-commit.ts": {
+          "bytes": 1325
+        },
+        "src/execution/workflow-worker-standing-instructions.ts": {
+          "bytes": 2390
+        },
+        "src/execution/workflow-goal-review.ts": {
+          "bytes": 6809
+        },
+        "src/runtime/login-keychain.ts": {
+          "bytes": 5022
+        },
+        "src/execution/automation-opportunity.ts": {
+          "bytes": 32083
+        },
+        "src/execution/automation-opportunity-store.ts": {
+          "bytes": 21142
+        },
+        "src/runtime/automation-review-preview.ts": {
+          "bytes": 3006
+        },
+        "src/runtime/approval-summary.ts": {
+          "bytes": 30104
+        },
+        "src/memory/workflow-certified-binding.ts": {
+          "bytes": 10618
+        },
+        "src/execution/bounded-pool.ts": {
+          "bytes": 1563
+        },
+        "src/execution/workflow-run-concurrency.ts": {
+          "bytes": 659
+        },
+        "src/execution/revision-judge.ts": {
+          "bytes": 8152
+        },
+        "src/execution/step-refusal-summary.ts": {
+          "bytes": 3138
+        },
+        "src/execution/review-draft-render.ts": {
+          "bytes": 3731
+        },
+        "src/execution/workflow-step-external-catalog.ts": {
+          "bytes": 36674
         },
         "src/execution/workflow-scheduled-lateness.ts": {
           "bytes": 2655
@@ -7302,7 +7302,7 @@
           "bytes": 25768
         },
         "src/execution/workflow-runner.ts": {
-          "bytes": 884981
+          "bytes": 885225
         },
         "src/agents/phone-push-readiness.ts": {
           "bytes": 1148
@@ -7902,7 +7902,7 @@
           "bytes": 18007
         },
         "src/runtime/harness/respond-bridge.ts": {
-          "bytes": 158099
+          "bytes": 159384
         },
         "src/memory/verified-write-origin.ts": {
           "bytes": 2505
@@ -8043,7 +8043,7 @@
           "bytes": 4679
         },
         "src/runtime/semantic-boundary/admit-and-compile-accepted-source.ts": {
-          "bytes": 193054
+          "bytes": 193428
         },
         "src/runtime/graph/admitted-turn-semantics.ts": {
           "bytes": 9544

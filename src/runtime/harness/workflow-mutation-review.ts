@@ -46,6 +46,10 @@ export interface WorkflowMutationReviewInput {
    * that read does not clear gets the full review. False skips that first read
    * when this step's writes have already needed the full review. */
   measuredFirst?: boolean;
+  /** 'landed': the step's recoverable writes, already made, are judged
+   * together once before the step finishes; a conflict is corrected by
+   * the step with further writes, so no corrected arguments are returned. */
+  phase?: 'proposed' | 'landed';
 }
 
 const SYSTEM = [
@@ -63,6 +67,14 @@ const SYSTEM = [
   'When the verdict is conflict or uncertain and the write becomes acceptable by changing the proposed values alone (correcting a value, removing a claim the evidence does not support, or stating an assumption explicitly instead of a read), also return correctedArguments: the complete proposed arguments with exactly those corrections applied and nothing else changed, same fields and shape. Otherwise return correctedArguments as null.',
   'Return JSON with verdict (compatible, conflict, uncertain), reason (specific correction or missing evidence), correctedArguments, and the supplied proposalDigest exactly.',
 ].join(' ');
+
+/** The same constraints, read over the recoverable writes one step already
+ * made, judged together before the step finishes. */
+const LANDED_SYSTEM = SYSTEM
+  .replace('Review ONE PROPOSED workflow write before execution, not whether the whole workflow is complete.',
+    'Review the recoverable writes ONE workflow step has already made, together, before the step finishes; not whether the whole workflow is complete. args.writes lists each write in the order it was made.')
+  .replace(/When the verdict is conflict or uncertain and the write becomes acceptable[^]*?Otherwise return correctedArguments as null\./,
+    'Always return correctedArguments as null: on a conflict, name in reason each write to correct and the exact change, which the step makes with further writes.');
 
 const PROVENANCE_MIN_CHARS = 6;
 const PROVENANCE_MAX_VALUES = 40;
@@ -197,6 +209,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     schema: input.schema, args: input.args, observations: input.observations.summary }, SEALED_CALL_CANONICAL_LIMITS));
   const proposalDigest = createHash('sha256').update(closedCanonicalJson(proposal, SEALED_CALL_CANONICAL_LIMITS)).digest('hex');
   const uncertain = (reason: string): WorkflowMutationReview => ({ verdict: 'uncertain', reason, proposalDigest });
+  const system = input.phase === 'landed' ? LANDED_SYSTEM : SYSTEM;
   // The parts that do not change between the reviews of one step (its saved
   // instructions, the tool, its schema) lead the prompt; what changes with
   // each proposed write (arguments, observations, the digest) follows. Live
@@ -252,7 +265,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
       const started = Date.now();
       const result = await (deps.evaluate ?? evaluateSystemOne)({ sessionId: input.sessionId,
         channel: 'workflow-mutation-review', state: { ...proposal, proposalDigest }, questions: {
-          compatibility: { type: 'choice', instructions: SYSTEM, criteria: {
+          compatibility: { type: 'choice', instructions: system, criteria: {
             compatible: 'The exact proposed write satisfies every applicable saved constraint.',
             conflict: 'The proposed write violates at least one saved constraint.',
             uncertain: 'Required evidence is missing or ambiguous.',
@@ -290,7 +303,7 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   if (input.stakes === 'ordinary' && input.measuredFirst !== false) {
     try {
       const started = Date.now();
-      const measured = await judge(SYSTEM, prompt, parse, pass, 'mutation_constraints',
+      const measured = await judge(system, prompt, parse, pass, 'mutation_constraints',
         { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs(), effort: 'medium' });
       if (measured.value?.verdict === 'compatible') {
         recordJudgeMetric({ lane: 'mutation_constraints', outcome: 'passed', durationMs: Date.now() - started, fast: true });
@@ -299,14 +312,14 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     } catch { /* the full review decides */ }
   }
   try {
-    const reviewed = await judge(SYSTEM, prompt, parse, pass,
+    const reviewed = await judge(system, prompt, parse, pass,
       'mutation_constraints', { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs() });
     if (reviewed.value) return reviewed.value;
     failure = reviewed.failure ?? 'error';
   } catch { failure = 'error'; }
   if (failure === 'timeout') {
     try {
-      const plain = await judge(SYSTEM, serialized, parse, pass,
+      const plain = await judge(system, serialized, parse, pass,
         'mutation_constraints', { requireCompletePrompt: false, timeoutMs: mutationReviewTimeoutMs() });
       if (plain.value) return plain.value;
       failure = plain.failure ?? 'error';

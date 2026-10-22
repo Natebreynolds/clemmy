@@ -805,40 +805,43 @@ test('a real schema-on-demand workflow agent writes through its configured carri
   assert.equal(writes[0].outcome_kind, 'succeeded');
 });
 
-test('native workflow write constraints reject before execution and allow corrected arguments', async () => {
+test('a recoverable native write runs when proposed; the step is checked once, before its result', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
     prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
   const { bodies, tools } = fixtureTools(['goal_upsert']);
-  const reviewed: unknown[] = [];
+  const reviewed: Array<{ tool: string; phase?: string; titles: unknown[] }> = [];
   authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
-    assert.equal(input.tool, 'goal_upsert');
+    const writes = input.args.writes as Array<{ tool: string; arguments: Record<string, unknown> }>;
+    reviewed.push({ tool: input.tool, phase: input.phase, titles: writes.map(write => write.arguments.title) });
     assert.match(input.instructions, /Approved title/);
-    reviewed.push(input.args.title);
-    return { verdict: input.args.title === 'Approved title' ? 'compatible' : 'conflict',
-      reason: 'Use the authored goal title.', proposalDigest: 'fixture-review' };
+    return { verdict: writes.every(write => write.arguments.title === 'Approved title') ? 'compatible' : 'conflict',
+      reason: 'Set the title to Approved title.', proposalDigest: 'fixture-review' };
   });
   try {
     const model = stubModel([
-      [toolCall('native-conflict', 'goal_upsert', { title: 'Wrong title', status: 'active' })],
-      [toolCall('native-corrected', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Approved goal saved.')],
+      [toolCall('native-wrong', 'goal_upsert', { title: 'Wrong title', status: 'active' })],
+      [textMsg('Goal saved.')],
     ]);
     const agent = { model, tools };
     bindSurface(fixture, agent, tools);
     const outcome = await runProductionHost(fixture, agent);
-    assert.deepEqual(reviewed, ['Wrong title', 'Approved title']);
-    assert.equal(bodies.goal_upsert, 1);
-    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['native-corrected']);
-    assert.match(JSON.stringify(outcome.history), /workflow_write_constraint_conflict/);
-    assert.match(JSON.stringify(outcome.history), /repair_arguments/);
+    assert.equal(bodies.goal_upsert, 1, 'the recoverable write ran when proposed');
+    assert.equal(reviewed.length, 0, 'no review held the write');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /workflow_write_constraint/);
+    assert.deepEqual(await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id),
+      { status: 'correct', reason: 'Set the title to Approved title.' });
+    assert.deepEqual(reviewed, [{ tool: 'the recoverable writes this step made', phase: 'landed', titles: ['Wrong title'] }]);
+    const second = await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id);
+    assert.equal(second.status, 'noted', 'one correction round, then the doubt is recorded, never a loop');
+    assert.deepEqual(await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id), { status: 'clear' });
     assert.equal(pendingApprovalCount(fixture), 0);
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+  } finally {
+    authorityAdapter._setWorkflowMutationReviewerForTests(null);
+    authorityAdapter._resetStepWriteChecksForTests();
+  }
 });
 
-
-test('the constraint reviewer is shown the write as its author named it: the carrier and the operation it carried', async () => {
-  // Shown only the host's normalized operation name, a reviewer refuses a
-  // correct write whose saved instructions name the carrier.
+test('the step check is shown each write as its author named it: the carrier and the operation it carried', async () => {
   const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
   const target = path.join(TEST_HOME, 'workspace', 'carried-label.md');
   mkdirSync(path.dirname(target), { recursive: true });
@@ -847,7 +850,7 @@ test('the constraint reviewer is shown the write as its author named it: the car
   assert.equal(fixture.recorded.status, 'ready');
   const seen: string[] = [];
   authorityAdapter._setWorkflowMutationReviewerForTests(async (input) => {
-    seen.push(input.tool);
+    seen.push(...(input.args.writes as Array<{ tool: string }>).map(write => write.tool));
     return { verdict: 'compatible', reason: 'The carried write matches the saved instructions.', proposalDigest: 'fixture-label' };
   });
   try {
@@ -859,199 +862,42 @@ test('the constraint reviewer is shown the write as its author named it: the car
     agent.model = model as never;
     const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
     assert.ok(existsSync(target), JSON.stringify(outcome.history));
-    assert.deepEqual(seen, ['call_tool → write_file'], 'the reviewer sees the carrier and the operation, never the operation alone');
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
+    assert.deepEqual(await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id), { status: 'clear' });
+    assert.deepEqual(seen, ['call_tool → write_file'], 'the check sees the carrier and the operation, never the operation alone');
+  } finally {
+    authorityAdapter._setWorkflowMutationReviewerForTests(null);
+    authorityAdapter._resetStepWriteChecksForTests();
+  }
 });
 
-test('a corrected write the model serialized twice still reaches the reviewer after a constraint refusal', async () => {
-  // Double-encoded, a retry unwraps to no operation and the very retry the
-  // refusal asked for is refused as off the recovery surface; the step then
-  // exhausts into a blocked terminal with the write undone.
-  const { buildWorkflowStepAgent } = await import('../../agents/workflow-step-agent.js');
-  const target = path.join(TEST_HOME, 'workspace', 'carried-twice.md');
-  mkdirSync(path.dirname(target), { recursive: true });
-  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: `Write ${target} with the text Prepared.` });
-  assert.equal(fixture.recorded.status, 'ready');
-  const reviewed: string[] = [];
-  authorityAdapter._setWorkflowMutationReviewerForTests(async (input) => {
-    reviewed.push(String(input.args.content));
-    const ok = input.args.content === 'Prepared.\n';
-    return { verdict: ok ? 'compatible' : 'conflict', reason: ok ? 'ok' : 'The saved instructions name the text Prepared.', proposalDigest: 'fixture-twice' };
-  });
-  try {
-    const corrected = { path: target, content: 'Prepared.\n', mode: 'create', append: null };
-    const model = stubModel([
-      [toolCall('twice-conflict', 'call_tool', { name: 'write_file', args_json: JSON.stringify({ ...corrected, content: 'Wrong.\n' }) })],
-      [toolCall('twice-corrected', 'call_tool', { name: 'write_file', args_json: JSON.stringify(JSON.stringify(corrected)) })],
-      [textMsg('Prepared.')],
-    ]);
-    const agent = await buildWorkflowStepAgent({ sessionId: fixture.session.id, userInput: fixture.source.data.text as string });
-    agent.model = model as never;
-    const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
-    assert.deepEqual(reviewed, ['Wrong.\n', 'Prepared.\n'], JSON.stringify(outcome.history).slice(0, 3000));
-    assert.ok(existsSync(target), JSON.stringify(outcome.history).slice(0, 3000));
-    assert.equal(readFileSync(target, 'utf8'), 'Prepared.\n');
-    assert.doesNotMatch(JSON.stringify(outcome.history), /only these capabilities are available/);
-    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['twice-corrected']);
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
-});
-
-test('a constraint checker that cannot answer stops the step truthfully instead of looping the model', async () => {
-  // Live 2026-09-30: three reviewer timeouts in one step were reported as
-  // "could not be verified"; the model re-proposed the same write each time
-  // until the step's clock ran out.
+test('a write check that cannot answer leaves the recoverable write done and the step finishing with a note', async () => {
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
     prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
   const { bodies, tools } = fixtureTools(['goal_upsert']);
-  let reviews = 0;
-  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
-    reviews++;
-    return { verdict: 'uncertain', reason: 'The constraint checker did not answer within its deadline; this write was not judged.',
-      proposalDigest: 'fixture-review', checkerFailure: 'timeout' };
-  });
+  authorityAdapter._setWorkflowMutationReviewerForTests(async () => ({ verdict: 'uncertain',
+    reason: 'The constraint checker did not answer within its deadline; this write was not judged.',
+    proposalDigest: 'fixture-review', checkerFailure: 'timeout' }));
   try {
     const model = stubModel([
       [toolCall('native-unjudged', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      // A model that ignores the edge and retries is refused the same way; it
-      // must be told to finish, not to reconcile.
-      [toolCall('native-unjudged-again', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('The goal title could not be saved: the constraint checker was unavailable. It would have set the title to Approved title, status active.')],
+      [textMsg('Goal saved.')],
     ]);
     const agent = { model, tools };
     bindSurface(fixture, agent, tools);
     const outcome = await runProductionHost(fixture, agent);
-    assert.equal(bodies.goal_upsert ?? 0, 0, 'an unjudged write under a standing grant does not run');
-    const history = JSON.stringify(outcome.history);
-    assert.match(history, /workflow_write_checker_unavailable/);
-    assert.match(history, /publish_partial/, 'the typed edge is to finish, not to repair');
-    assert.doesNotMatch(history, /workflow_write_constraints_unverified/);
-    assert.doesNotMatch(history, /retain the proposal and reconcile/);
-    assert.equal(pendingApprovalCount(fixture), 0);
+    assert.equal(bodies.goal_upsert, 1, 'the checker\'s outage never refuses work that can be undone');
+    assert.doesNotMatch(JSON.stringify(outcome.history), /workflow_write_checker_unavailable/);
+    const check = await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id);
+    assert.equal(check.status, 'noted');
+    assert.match(check.status === 'noted' ? check.reason : '', /not checked/);
     const journaled = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
       .filter(event => event.data.kind === 'workflow_write_checker_unavailable');
-    assert.equal(journaled.length, reviews, 'each outage is journaled');
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
-});
-
-test('the same write proposed again after an unreadable review goes straight to the full-evidence review', async () => {
-  // Live 2026-10-21 (a scheduled channel review, accepted source 633820): the
-  // compact first read said uncertain, the full-evidence review could not be
-  // read, and the identical sheet update, with nothing new read, was read
-  // compactly again before the full review cleared it: four reviews, ~6 min.
-  const authority = await import('./authored-workflow-write-authority.js');
-  authority._resetConstraintReviewRoundsForTests();
-  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
-  const { bodies, tools } = fixtureTools(['goal_upsert']);
-  const depths: string[] = [];
-  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
-    depths.push(input.stakes ?? 'high');
-    if (depths.length === 1) return { verdict: 'uncertain', reason: 'The compact view does not show the record is absent.', proposalDigest: 'fixture-review' };
-    if (depths.length === 2) return { verdict: 'uncertain', reason: 'The constraint checker answered in a shape that could not be read; this write was not judged.',
-      proposalDigest: 'fixture-review', checkerFailure: 'invalid' };
-    return { verdict: 'compatible', reason: 'The full evidence shows the record is absent.', proposalDigest: 'fixture-review' };
-  });
-  try {
-    const model = stubModel([
-      [toolCall('unread-first', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [toolCall('unread-again', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Approved goal saved.')],
-    ]);
-    const agent = { model, tools };
-    bindSurface(fixture, agent, tools);
-    await runProductionHost(fixture, agent);
-    assert.deepEqual(depths, ['ordinary', 'high', 'high'], 'the retry is not read compactly again; the full review decides it');
-    assert.equal(bodies.goal_upsert, 1, 'the cleared write runs once');
-    // Each write review is a verdict in the run's own log, shown in the run
-    // window: which write, what the checker said, how long it took.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const { readWorkflowEvents } = await import('../../execution/workflow-events.js');
-    const checks = readWorkflowEvents(fixture.workflowName, fixture.workflowRunId)
-      .filter((event) => event.kind === 'verdict_recorded' && (event.meta as { door?: string } | undefined)?.door === 'write_check')
-      .map((event) => event.meta as { pass: boolean; failedOpen: boolean; reason: string; durationMs: number });
-    assert.deepEqual(checks.map((check) => [check.pass, check.failedOpen]), [[false, true], [true, false]]);
-    assert.ok(checks.every((check) => typeof check.durationMs === 'number' && /goal_upsert/.test(check.reason)));
-  } finally {
-    authorityAdapter._setWorkflowMutationReviewerForTests(null);
-    authority._resetConstraintReviewRoundsForTests();
-  }
-});
-
-test('a constraint checker whose objections keep changing gets two refusals, then an ordinary write proceeds with its note', async () => {
-  // Live 2026-10-13: a scheduled sheet review's one digest row was refused six
-  // times in ten minutes, each for a different reason, until the run was
-  // cancelled by hand; the day before it had ended the same way with no row.
-  const authority = await import('./authored-workflow-write-authority.js');
-  authority._resetConstraintReviewRoundsForTests();
-  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
-  const { bodies, tools } = fixtureTools(['goal_upsert']);
-  const objections = ['The title case does not match the saved style.', 'The status must be confirmed against the current record.', 'The retained read does not establish the record is absent.'];
-  const reviewed: string[] = [];
-  authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
-    reviewed.push(String(input.args.title));
-    return { verdict: 'conflict', reason: objections[Math.min(reviewed.length - 1, objections.length - 1)]!, proposalDigest: 'fixture-review' };
-  });
-  try {
-    const model = stubModel([
-      [toolCall('bounded-first', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [toolCall('bounded-second', 'goal_upsert', { title: 'Approved Title', status: 'active' })],
-      [toolCall('bounded-third', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Approved goal saved; the checker still objected to the status confirmation, which I noted.')],
-    ]);
-    const agent = { model, tools };
-    bindSurface(fixture, agent, tools);
-    const outcome = await runProductionHost(fixture, agent);
-    assert.equal(reviewed.length, 2, 'the third proposal is not reviewed again: the review decides');
-    assert.equal(bodies.goal_upsert, 1, 'the ordinary write proceeds once after two refusals');
-    assert.deepEqual(nonRefusedSettlements(fixture).map(row => row.logical_tool_call_id), ['bounded-third']);
-    const history = JSON.stringify(outcome.history);
-    assert.match(history, /workflow_write_constraint_conflict/);
-    assert.match(history, /refused this write twice/, 'the checker\'s standing objection rides with the result');
-    assert.match(history, /status must be confirmed/, 'the last objection is quoted');
+    assert.equal(journaled.length, 1, 'the outage is journaled once');
     assert.equal(pendingApprovalCount(fixture), 0);
-    const bounded = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
-      .filter(event => event.data.kind === 'workflow_write_review_bounded');
-    assert.equal(bounded.length, 1);
-    assert.equal(bounded[0]!.data.decision, 'proceeded_with_note');
   } finally {
     authorityAdapter._setWorkflowMutationReviewerForTests(null);
-    authority._resetConstraintReviewRoundsForTests();
+    authorityAdapter._resetStepWriteChecksForTests();
   }
-});
-
-test('an attempt superseded while its write was under review is told so, not sent to repair or route around the write', async () => {
-  // Live 2026-09-30: a second attempt of the same step began during a
-  // minute-long review; the first attempt's write was then held as
-  // "authority changed" and the model, told to repair, tried four other
-  // tools before the turn ended blocked.
-  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
-  const { bodies, tools } = fixtureTools(['goal_upsert']);
-  let reviews = 0;
-  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
-    reviews++;
-    // Another attempt of this step begins while the review runs.
-    eventlog.beginRunAttempt(fixture.session.id, { runId: `takeover:${fixture.session.id}`, attemptId: `attempt:takeover:${reviews}` });
-    return { verdict: 'compatible', reason: 'Fine.', proposalDigest: 'fixture-review' };
-  });
-  try {
-    const model = stubModel([
-      [toolCall('native-superseded', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Another attempt of this step took over; this attempt did not save the title.')],
-    ]);
-    const agent = { model, tools };
-    bindSurface(fixture, agent, tools);
-    const outcome = await runProductionHost(fixture, agent);
-    assert.equal(bodies.goal_upsert ?? 0, 0, 'a superseded attempt writes nothing');
-    const history = JSON.stringify(outcome.history);
-    assert.match(history, /workflow_write_authority_changed_during_review/);
-    assert.match(history, /publish_partial/, 'the typed edge is to finish');
-    assert.match(history, /no longer owns the step/);
-    assert.doesNotMatch(history, /repair_arguments/);
-    assert.ok(reviews >= 1);
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
 });
 
 test('an authored native write gets its current schema before consent when required arguments are missing', async () => {
@@ -1095,7 +941,7 @@ test(`real workflow host repairs an off-surface native call through ${repairedCa
   let reviews = 0;
   authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
     reviews++;
-    assert.equal(input.args.content, 'Prepared.\n');
+    assert.equal((input.args.writes as Array<{ arguments: Record<string, unknown> }>)[0]?.arguments.content, 'Prepared.\n');
     return { verdict: 'compatible', reason: 'Correct fixture content.', proposalDigest: 'fixture-review' };
   });
   const model = stubModel([
@@ -1111,7 +957,9 @@ test(`real workflow host repairs an off-surface native call through ${repairedCa
   agent.model = model as never;
   const outcome = await runProductionHost(fixture, agent as unknown as Record<string, unknown>);
   assert.equal(readFileSync(target, 'utf8'), 'Prepared.\n');
-  assert.equal(reviews, 1, 'only the structurally valid proposal invokes semantic review');
+  assert.equal(reviews, 0, 'the recoverable write ran without waiting on a review');
+  assert.deepEqual(await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id), { status: 'clear' });
+  assert.equal(reviews, 1, 'only the structurally valid proposal reaches the step check');
   assert.match(JSON.stringify(outcome.history), /Current schema for write_file/);
   assert.match(JSON.stringify(outcome.history), /Missing required field.*content/);
   assert.equal(pendingApprovalCount(fixture), 0);
@@ -1250,49 +1098,3 @@ test('a creation test grants no write or send authority, and a finished one gran
   assert.deepEqual(finished.recorded, { status: 'refused', reason: 'workflow_definition_authority_missing_or_changed' });
 });
 
-test('a constraint check that throws is asked once more; a second throw holds with the reason attached, never a bare "unavailable"', async () => {
-  // Live 10-19/10-20: every sheet write of a scheduled review was held as
-  // workflow_write_constraints_unavailable for two days, and nothing said why.
-  const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
-  const { bodies, tools } = fixtureTools(['goal_upsert']);
-  let reviews = 0;
-  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
-    reviews += 1;
-    if (reviews === 1) throw new Error('plan-scopes-state is busy');
-    return { verdict: 'compatible', reason: 'The write matches the saved instructions.', proposalDigest: 'fixture-review' };
-  });
-  try {
-    const model = stubModel([
-      [toolCall('native-once', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Approved goal saved.')],
-    ]);
-    const agent = { model, tools };
-    bindSurface(fixture, agent, tools);
-    const outcome = await runProductionHost(fixture, agent);
-    assert.equal(reviews, 2, 'the check is asked once more after it threw');
-    assert.equal(bodies.goal_upsert, 1, 'the write proceeds on the second answer');
-    assert.doesNotMatch(JSON.stringify(outcome.history), /workflow_write_constraints_unavailable/);
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
-
-  const second = createStepFixture({ kind: 'workflow', sideEffect: 'write',
-    prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
-  const twice = fixtureTools(['goal_upsert']);
-  let attempts = 0;
-  authorityAdapter._setWorkflowMutationReviewerForTests(async () => {
-    attempts += 1;
-    throw new Error('plan-scopes-state is busy');
-  });
-  try {
-    const model = stubModel([
-      [toolCall('native-twice', 'goal_upsert', { title: 'Approved title', status: 'active' })],
-      [textMsg('Could not save.')],
-    ]);
-    const agent = { model, tools: twice.tools };
-    bindSurface(second, agent, twice.tools);
-    const outcome = await runProductionHost(second, agent);
-    assert.equal(attempts, 2);
-    assert.equal(twice.bodies.goal_upsert, 0, 'nothing ran');
-    assert.match(JSON.stringify(outcome.history), /workflow_write_constraints_unavailable: plan-scopes-state is busy/, 'the reason names what threw');
-  } finally { authorityAdapter._setWorkflowMutationReviewerForTests(null); }
-});

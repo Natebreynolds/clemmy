@@ -9979,6 +9979,9 @@ export function adoptCapturedStepResult(
   sessionId: string,
   allowedSourceUserSeqs: ReadonlySet<number>,
 ): { found: boolean; value: unknown } {
+  void import('../runtime/harness/authored-workflow-write-authority.js')
+    .then(({ settleUncheckedStepWrites }) => settleUncheckedStepWrites(sessionId))
+    .catch(() => { /* the step's result stands; its write check is observability */ });
   const local = takeStepResult(sessionId);
   if (local.found) return local;
   return durableCapturedStepResult(sessionId, allowedSourceUserSeqs);

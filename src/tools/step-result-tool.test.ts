@@ -180,3 +180,33 @@ test('submission gate binds like the reduce gate: fenced JSON accepted, fenced b
   clearStepContract('sess-fence');
   if (ok) assert.equal(takeStepResult('sess-fence').found, true);
 });
+
+test('workflow_step_result is held once for a conflict the step\'s write check found, then recorded', async () => {
+  const authority = await import('../runtime/harness/authored-workflow-write-authority.js');
+  const handlers = new Map<string, (args: { data: string }) => Promise<{ content: Array<{ text: string }> }>>();
+  registerStepResultTool({ tool: (name: string, _d: string, _s: unknown, handler: never) => { handlers.set(name, handler); } } as unknown as McpServer);
+  const sessionId = 'sess-step-write-check';
+  authority._queueStepWriteForTests({ receipt: { workflowName: 'fixture', workflowRunId: 'fixture-run', stepId: 'main' },
+    stepPrompt: 'Append the row with status Open.', sessionId, sourceUserSeq: 1, tool: 'fixture_sheet_append',
+    args: { status: 'Closed' } });
+  let reviews = 0;
+  authority._setWorkflowMutationReviewerForTests(async () => {
+    reviews += 1;
+    return { verdict: 'conflict', reason: 'The row says Closed; the instructions say Open.', proposalDigest: 'fixture' };
+  });
+  try {
+    const call = () => withToolOutputContext({ sessionId, toolName: 'workflow_step_result' }, () =>
+      handlers.get('workflow_step_result')!({ data: '{"rows":1}' }));
+    const held = await call();
+    assert.match(held.content[0]!.text, /^Not recorded yet\. A check of the writes this step made found: The row says Closed/);
+    assert.equal(peekStepResult(sessionId).found, false);
+    const recorded = await call();
+    assert.doesNotMatch(recorded.content[0]!.text, /Not recorded yet/);
+    assert.deepEqual(peekStepResult(sessionId), { found: true, value: { rows: 1 } });
+    assert.equal(reviews, 2, 'the same writes are judged again after the correction round, then the result stands with the note');
+  } finally {
+    authority._setWorkflowMutationReviewerForTests(null);
+    authority._resetStepWriteChecksForTests();
+    clearStepResult(sessionId);
+  }
+});
