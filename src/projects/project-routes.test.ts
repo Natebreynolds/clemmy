@@ -144,10 +144,10 @@ test('a project made on the desktop is the same project on the phone, with the s
     [['question', task.id, 'Which region should the briefing cover?', 'Route Analyst', ['East', 'West']]]);
   assert.equal((await phone('get', '/api/project-records')).body.projects.find((row: any) => row.id === id).needsYou, 1);
   assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { answer: ' ' })).status, 400);
-  const answered = await phone('post', `/api/delegated-tasks/${task.id}/answer`, { answer: 'East' });
+  const answered = await phone('post', `/api/delegated-tasks/${task.id}/answer`, { questionId: 'q-region', answer: 'East' });
   assert.equal(answered.status, 200);
   assert.equal((await desktop('get', `/api/console/project-records/${id}`)).body.overview.decisions.length, 0);
-  assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { answer: 'West' })).status, 409, 'a question is answered once');
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { questionId: 'q-region', answer: 'West' })).status, 409, 'a question is answered once');
 
   // An approval asked by the task's own run belongs to the project too.
   const approval = approvals.register({ sessionId: task.runSessionId, subject: 'Save the draft to the shared folder', tool: 'fixture_write', args: { path: 'draft.md' } });
@@ -328,12 +328,12 @@ test('a plain task shown in Home can be read and answered once on either surface
   assert.equal(waiting.controls.canAnswer, true);
   assert.equal(waiting.question.id, 'q-plain-home');
   assert.equal((await desktop('post', `/api/console/delegated-tasks/${plain.id}/answer`, { answer: ' ' })).status, 400);
-  const answered = await phone('post', `/api/delegated-tasks/${plain.id}/answer`, { answer: 'Amber' });
+  const answered = await phone('post', `/api/delegated-tasks/${plain.id}/answer`, { questionId: 'q-plain-home', answer: 'Amber' });
   assert.equal(answered.status, 200);
   assert.deepEqual([answered.body.task.taskId, answered.body.task.runSessionId, answered.body.task.status, answered.body.task.controls.canAnswer],
     [plain.id, plain.runSessionId, 'pending', false]);
   assert.equal(tasks.getBackgroundTask(plain.id)?.inputResolution?.answer, 'Amber');
-  assert.equal((await desktop('post', `/api/console/delegated-tasks/${plain.id}/answer`, { answer: 'Violet' })).status, 409);
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${plain.id}/answer`, { questionId: 'q-plain-home', answer: 'Violet' })).status, 409);
   assert.equal(tasks.getBackgroundTask(plain.id)?.inputResolution?.answer, 'Amber', 'a second answer cannot replace the accepted answer');
 });
 
@@ -418,4 +418,66 @@ test('large delegated jobs count every worker and expose an incomplete item beyo
   assert.deepEqual(view.work.remaining, { count: 1, labels: ['row-40'] });
   assert.equal(view.work.items[0].id, 'row-40');
   assert.equal(view.work.items[0].state, 'failed');
+});
+
+
+for (const [label, call, prefix] of [
+  ['desktop', desktop, '/api/console/delegated-tasks'],
+  ['phone', phone, '/api/delegated-tasks'],
+] as const) {
+  test(`Home answer identity: ${label} rejects missing displayed question identity`, async () => {
+    const task = tasks.createBackgroundTask({ title: `Named missing-question fixture ${label}`,
+      prompt: 'Ask before writing.', source: 'desktop' });
+    tasks.markBackgroundTaskAwaitingInput(task.id, `q-home-missing-${label}`, 'Which colour?', { options: ['Amber', 'Violet'] });
+    const route = `${prefix}/${task.id}/answer`;
+    for (const questionId of [undefined, null, '', ' ', 7]) {
+      const before = tasks.getBackgroundTask(task.id);
+      const missing = await call('post', route, { answer: 'Amber', ...(questionId === undefined ? {} : { questionId }) });
+      assert.deepEqual([missing.status, missing.body.error], [400, 'QUESTION_ID_REQUIRED']);
+      assert.deepEqual(tasks.getBackgroundTask(task.id), before, 'missing displayed identity has no effect');
+    }
+  });
+  test(`Home answer identity: ${label} rejects a stale displayed question and preserves free text`, async () => {
+    const task = tasks.createBackgroundTask({ title: `Named stale-question fixture ${label}`,
+      prompt: 'Ask before writing.', source: 'desktop' });
+    const route = `${prefix}/${task.id}/answer`;
+    const firstId = `q-home-identity-${label}-first`, secondId = `q-home-identity-${label}-second`;
+    tasks.markBackgroundTaskAwaitingInput(task.id, firstId, 'Which colour?', { options: ['Amber', 'Violet'] });
+    const first = await call('post', route, { questionId: firstId, answer: 'Amber' });
+    assert.equal(first.status, 200);
+    assert.equal(tasks.getBackgroundTask(task.id)?.inputResolution?.questionId, firstId);
+    tasks.markBackgroundTaskRunning(task.id);
+    tasks.markBackgroundTaskAwaitingInput(task.id, secondId, 'Finish or wait?', { options: ['Finish', 'Wait'] });
+    const before = tasks.getBackgroundTask(task.id);
+    const stale = await call('post', route, { questionId: firstId, answer: 'Amber' });
+    assert.deepEqual([stale.status, stale.body.error], [409, 'QUESTION_CHANGED']);
+    assert.equal(stale.body.task.question.id, secondId);
+    assert.deepEqual(tasks.getBackgroundTask(task.id), before, 'an old option cannot answer the new question');
+    const text = 'Wait until I have checked the figures; this is my own answer.';
+    const current = await call('post', route, { questionId: secondId, answer: text });
+    assert.equal(current.status, 200, 'answers need not match an offered option');
+    assert.deepEqual(tasks.getBackgroundTask(task.id)?.inputResolution && {
+      questionId: tasks.getBackgroundTask(task.id)!.inputResolution!.questionId,
+      answer: tasks.getBackgroundTask(task.id)!.inputResolution!.answer,
+    }, { questionId: secondId, answer: text });
+    const duplicate = await call('post', route, { questionId: secondId, answer: 'Finish' });
+    assert.equal(duplicate.status, 409);
+    assert.equal(tasks.getBackgroundTask(task.id)?.inputResolution?.answer, text);
+  });
+}
+
+test('Home answer identity: a changed question during the existing CAS is not answered', async () => {
+  const task = tasks.createBackgroundTask({ title: 'Named question CAS fixture', prompt: 'Ask before writing.', source: 'desktop' });
+  tasks.markBackgroundTaskAwaitingInput(task.id, 'q-home-cas-first', 'Which colour?', { options: ['Amber', 'Violet'] });
+  tasks._setBackgroundTaskResolutionCasHookForTests(() => {
+    tasks._setBackgroundTaskResolutionCasHookForTests(null);
+    tasks.markBackgroundTaskAwaitingInput(task.id, 'q-home-cas-second', 'Finish or wait?', { options: ['Finish', 'Wait'] });
+  });
+  try {
+    const stale = await desktop('post', `/api/console/delegated-tasks/${task.id}/answer`, { questionId: 'q-home-cas-first', answer: 'Amber' });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.task.question.id, 'q-home-cas-second');
+    assert.equal(tasks.getBackgroundTask(task.id)?.inputResolution, undefined);
+    assert.equal(tasks.getBackgroundTask(task.id)?.status, 'awaiting_input');
+  } finally { tasks._setBackgroundTaskResolutionCasHookForTests(null); }
 });

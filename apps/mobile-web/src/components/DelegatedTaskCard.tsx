@@ -128,8 +128,9 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
   };
   const sendAnswer = (value: string) => {
     const text = value.trim().slice(0, 4_000);
-    if (!text) return;
-    void act('answer', () => answerDelegatedTask(task.taskId, text), 'Answer sent.');
+    const questionId = task.question?.id;
+    if (!text || !questionId) return;
+    void act('answer', () => answerDelegatedTask(task.taskId, questionId, text), 'Answer sent.');
   };
 
   const waiting = view.phase.tone === 'warning' && task.phase === 'needs_you';

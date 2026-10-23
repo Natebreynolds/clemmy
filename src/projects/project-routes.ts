@@ -561,14 +561,23 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   add('post', `${mount.tasks}/:taskId/answer`, (req, res) => {
     const taskId = param(req, 'taskId');
     if (!visibleBackgroundTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
-    const answer = typeof body(req).answer === 'string' ? String(body(req).answer).trim() : '';
+    const input = body(req);
+    const answer = typeof input.answer === 'string' ? input.answer.trim() : '';
     if (!answer) { res.status(400).json({ error: 'ANSWER_REQUIRED' }); return; }
+    const questionId = typeof input.questionId === 'string' ? input.questionId : '';
+    if (!questionId.trim()) { res.status(400).json({ error: 'QUESTION_ID_REQUIRED' }); return; }
     const task = getBackgroundTask(taskId);
     if (!task || task.status !== 'awaiting_input' || !task.pendingQuestionId) {
       res.status(409).json({ error: 'TASK_NOT_WAITING', task: visibleBackgroundTaskById(taskId) });
       return;
     }
-    const queued = queueBackgroundTaskInputResolution(task.pendingQuestionId, answer);
+    if (task.pendingQuestionId !== questionId) {
+      res.status(409).json({ error: 'QUESTION_CHANGED', task: visibleBackgroundTaskById(taskId) });
+      return;
+    }
+    // The owner answered the displayed question, not whichever question is
+    // current now. The existing CAS also rejects a change after this check.
+    const queued = queueBackgroundTaskInputResolution(questionId, answer);
     if (!queued) { res.status(409).json({ error: 'ALREADY_ANSWERED', task: visibleBackgroundTaskById(taskId) }); return; }
     res.json({ task: visibleBackgroundTaskById(taskId) });
   });

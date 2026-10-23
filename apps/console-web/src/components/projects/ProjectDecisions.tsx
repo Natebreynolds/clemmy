@@ -54,11 +54,12 @@ function QuestionRow({ decision, onDecided }: {
 
   const send = async (text: string) => {
     const value = text.trim();
-    if (!value || busy || !decision.taskId) return;
+    const questionId = decision.questionId;
+    if (!value || busy || !decision.taskId || !questionId) return;
     setBusy(true);
     setError('');
     try {
-      await answerTask(decision.taskId, value);
+      await answerTask(decision.taskId, questionId, value);
       setAnswer('');
     } catch (failure) {
       setError(refusalText(failure, 'Your answer did not go through. Try again.'));

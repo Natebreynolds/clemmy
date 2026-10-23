@@ -88,6 +88,8 @@ const REFUSALS: Record<string, string> = {
   TASK_NOT_RESUMABLE: 'This task cannot be resumed from where it is.',
   TASK_NOT_WAITING: 'This task is no longer waiting on an answer.',
   ALREADY_ANSWERED: 'That was already answered somewhere else.',
+  QUESTION_CHANGED: 'This task is asking a different question now. Review it before answering.',
+  QUESTION_ID_REQUIRED: 'Refresh this task to answer its current question.',
   ANSWER_REQUIRED: 'Type an answer first.',
 };
 
@@ -109,7 +111,7 @@ export function refusalWords(error: unknown, fallback = 'That did not go through
 export function refusalIsStale(error: unknown): boolean {
   const body = (error as { body?: unknown } | null | undefined)?.body as { error?: unknown } | null | undefined;
   const code = body && typeof body === 'object' && typeof body.error === 'string' ? body.error : '';
-  return code === 'TASK_NOT_OPEN' || code === 'TASK_NOT_RESUMABLE' || code === 'TASK_NOT_WAITING' || code === 'ALREADY_ANSWERED';
+  return code === 'TASK_NOT_OPEN' || code === 'TASK_NOT_RESUMABLE' || code === 'TASK_NOT_WAITING' || code === 'ALREADY_ANSWERED' || code === 'QUESTION_CHANGED';
 }
 
 export type AccountBindStep =

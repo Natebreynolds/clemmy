@@ -717,12 +717,13 @@ function LooseQuestion({ decision, onAnswered }: {
 
   const submit = async () => {
     const text = answer.trim().slice(0, 4_000);
-    if (!text || !decision.taskId || lock.current) return;
+    const questionId = decision.questionId;
+    if (!text || !decision.taskId || !questionId || lock.current) return;
     lock.current = true;
     setBusy(true);
     setFailure(null);
     try {
-      await answerDelegatedTask(decision.taskId, text);
+      await answerDelegatedTask(decision.taskId, questionId, text);
       haptic('success');
       onAnswered('Answer sent.');
     } catch (err) {

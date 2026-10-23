@@ -88,6 +88,8 @@ const REFUSALS: Record<string, string> = {
   TASK_NOT_RESUMABLE: 'This task cannot be resumed from where it is.',
   TASK_NOT_WAITING: 'This task is no longer waiting on an answer.',
   ALREADY_ANSWERED: 'This question was already answered.',
+  QUESTION_CHANGED: 'This task is asking a different question now. Review it before answering.',
+  QUESTION_ID_REQUIRED: 'Refresh this task to answer its current question.',
   INSTRUCTION_REQUIRED: 'Say what should change, in a few words or more.',
   ANSWER_REQUIRED: 'Type an answer first.',
 };
@@ -418,8 +420,8 @@ export const stopTask = (taskId: string) =>
 export const resumeTask = (taskId: string) =>
   apiPost<{ task: DelegatedTask }>(`${TASKS}/${id(taskId)}/resume`).then(taskOf);
 
-export const answerTask = (taskId: string, answer: string) =>
-  apiPost<{ task: DelegatedTask }>(`${TASKS}/${id(taskId)}/answer`, { answer }).then(taskOf);
+export const answerTask = (taskId: string, questionId: string, answer: string) =>
+  apiPost<{ task: DelegatedTask }>(`${TASKS}/${id(taskId)}/answer`, { questionId, answer }).then(taskOf);
 
 /** The task's view when a refusal carries the record as it stands now. */
 export function taskFromRefusal(error: unknown): DelegatedTask | null {

@@ -55,7 +55,7 @@ test('a refusal is said in words; its code never reaches the screen', () => {
 });
 
 test('a task that moved on is a refresh, not a failure', () => {
-  for (const code of ['TASK_NOT_OPEN', 'TASK_NOT_RESUMABLE', 'TASK_NOT_WAITING', 'ALREADY_ANSWERED']) {
+  for (const code of ['TASK_NOT_OPEN', 'TASK_NOT_RESUMABLE', 'TASK_NOT_WAITING', 'ALREADY_ANSWERED', 'QUESTION_CHANGED']) {
     assert.equal(refusalIsStale(refused(code)), true, code);
   }
   assert.equal(refusalIsStale(refused('INSTRUCTION_REQUIRED')), false);

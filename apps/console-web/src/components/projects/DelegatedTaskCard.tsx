@@ -148,8 +148,9 @@ export function DelegatedTaskCard({
   };
   const sendAnswer = async (text: string) => {
     const value = text.trim();
-    if (!value) return;
-    if (await run('answer', () => answerTask(shown.taskId, value))) setAnswer('');
+    const questionId = shown.question?.id;
+    if (!value || !questionId) return;
+    if (await run('answer', () => answerTask(shown.taskId, questionId, value))) setAnswer('');
   };
   const stop = async () => { if (await run('stop', () => stopTask(shown.taskId))) setPanel(null); };
 

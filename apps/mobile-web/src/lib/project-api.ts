@@ -216,8 +216,8 @@ export async function resumeDelegatedTask(taskId: string): Promise<{ task: Deleg
   return post(`${TASKS}/${id(taskId)}/resume`);
 }
 
-export async function answerDelegatedTask(taskId: string, answer: string): Promise<{ task: DelegatedTask }> {
-  return post(`${TASKS}/${id(taskId)}/answer`, { answer });
+export async function answerDelegatedTask(taskId: string, questionId: string, answer: string): Promise<{ task: DelegatedTask }> {
+  return post(`${TASKS}/${id(taskId)}/answer`, { questionId, answer });
 }
 
 export async function getAgentWork(agentId: string): Promise<{ work: AgentAssignments }> {
