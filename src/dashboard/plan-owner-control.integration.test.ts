@@ -11,6 +11,7 @@ import express from 'express';
 const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-plan-owner-control-'));
 process.env.CLEMENTINE_HOME = fixtureHome;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
+process.env.CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT = 'off';
 process.env.AUTH_MODE = 'claude_oauth';
 process.env.CLEMMY_CLAUDE_AGENT_SDK_BRAIN = 'read_only';
 process.env.CLEMMY_DEBATE_MODE = 'off';
@@ -29,6 +30,11 @@ const { createMobileRouter, MOBILE_SESSION_COOKIE } = await import('../channels/
 const { setPin } = await import('../runtime/mobile-pin.js');
 const { revokeSessionByDeviceId } = await import('../runtime/mobile-sessions.js');
 const { _setBridgeImplsForTests } = await import('../runtime/harness/respond-bridge.js');
+const continuity = await import('../memory/task-continuity.js');
+const continuityRuntime = await import('../runtime/harness/task-continuity-runtime.js');
+const { presentationEventForOutcome, turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+const { installTurnSemanticModelPort } = await import('../runtime/semantic-boundary/turn-semantic-port-registry.js');
+const { checkClarificationAnswerCompleteness } = await import('../runtime/semantic-boundary/clarification-revision.js');
 after(() => { _setBridgeImplsForTests({}); log.closeEventLog(); rmSync(fixtureHome, { recursive: true, force: true }); });
 
 async function waitForSource(sessionId: string, runId: string) {
@@ -166,3 +172,142 @@ test('paired phone and desktop review and Execute either origin, preserving prin
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
+
+for (const replyMode of ['normal', 'plan'] as const) {
+  for (const priorKind of ['execute', 'legacy'] as const) {
+  test(`desktop ${priorKind} question accepts an exact ${replyMode} reply with the same durable audience`, async () => {
+    const app = express(); app.use(express.json());
+    const question = 'Which synthetic color should the revised task keep?';
+    const assistant = { respond: async (request: { sessionId: string }) => ({ text: 'Fixture reply.', sessionId: request.sessionId }),
+      getRuntime: () => ({ listPendingApprovals: () => [] }) };
+    _setBridgeImplsForTests({ configure: (async () => ({ ok: true })) as never,
+      resolveTurnCandidates: (async () => ({ candidates: [], requirements: [], matches: [], pinnedTools: [], semanticApplied: false })) as never,
+      runConversation: (async (request: { sessionId: string; sourceUserSeq: number }) => {
+        const source = log.listEvents(request.sessionId, { types: ['user_input_received'] })
+          .find(event => event.seq === request.sourceUserSeq)!;
+        if ((source.data.taskMode as { kind?: string } | undefined)?.kind === 'execute') {
+          log.appendEvent({ sessionId: request.sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+            data: { sourceUserSeq: source.seq, question, purpose: 'clarification' } });
+          return { sessionId: request.sessionId, status: 'awaiting_user_input', steps: 1, lastTurn: 1,
+            lastDecision: { reply: question, done: false, nextAction: 'awaiting_user_input' } };
+        }
+        return { sessionId: request.sessionId, status: 'completed', steps: 1, lastTurn: 1,
+          lastDecision: { reply: 'Fixture reply.', done: true, nextAction: 'completed' } };
+      }) as never });
+    registerConsoleRoutes(app, req => req.headers['x-fixture-owner'] === 'yes', assistant as never, { serveLegacyAtRoot: false });
+    const server = createServer(app);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const headers = { 'Content-Type': 'application/json', 'x-fixture-owner': 'yes' };
+    const sessionId = `plan-owner-continuation-${priorKind}-${replyMode}`;
+    const waitForFinished = async (runId: string, targetSessionId = sessionId) => {
+      for (let tries = 0; tries < 150; tries++) {
+        if (log.getLatestRunAttemptByRunId(targetSessionId, runId)?.finishedAt) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.fail('fixture turn did not finish');
+    };
+    const submit = async (input: string, taskMode: Record<string, unknown>, key: string, targetSessionId = sessionId) => {
+      const response = await fetch(`${url}/api/harness/chat`, { method: 'POST', headers,
+        body: JSON.stringify({ sessionId: targetSessionId, input, taskMode, clientRequestId: key, async: true,
+          userId: 'client-forged-principal', principalId: 'client-forged-principal' }) });
+      assert.equal(response.status, 202, await response.clone().text());
+      return await response.json() as { runId: string };
+    };
+    try {
+      if (priorKind === 'execute') {
+        const freshId = `${sessionId}-fresh`;
+        log.createSession({ id: freshId, kind: 'chat', channel: 'desktop', userId: 'desktop',
+          metadata: { source: 'desktop', channelId: freshId, userId: 'desktop' } });
+        const fresh = await submit('Review the synthetic example.', { version: 1, kind: replyMode }, `${replyMode}-fresh-audience`, freshId);
+        const freshSource = (await waitForSource(freshId, fresh.runId))!;
+        await waitForFinished(fresh.runId, freshId);
+        assert.equal(freshSource.data.userId, 'desktop', 'a fresh authenticated conversation starts with explicit desktop identity');
+      }
+      log.createSession({ id: sessionId, kind: 'chat', channel: 'desktop', userId: 'desktop',
+        metadata: { source: 'desktop', channelId: sessionId, userId: 'desktop' } });
+      const planSource = log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+        data: { text: 'Plan this synthetic reasoning task.', taskMode: { version: 1, kind: 'plan' } } });
+      const artifact = plans.publishPlanRevision({ sessionId, principalId: 'desktop', sourceUserSeq: planSource.seq,
+        fullText: 'Review the synthetic answer.', readiness: 'ready', structuredPlan: {
+          steps: [{ id: 'review', action: 'Review the synthetic answer.', effect: 'none', capabilityRef: null,
+            staticArguments: {}, dynamicBindings: [], dependsOn: [], subagentRole: null,
+            verification: 'The reply describes the synthetic answer.' }], preparedBindings: [], preparationIssues: [],
+        } });
+      const execute = await submit('Execute the reviewed plan.', { version: 1, kind: 'execute',
+        executeRef: { planId: artifact.planId, revision: artifact.revision, digest: artifact.digest } }, `${priorKind}-${replyMode}-execute`);
+      const executeSource = (await waitForSource(sessionId, execute.runId))!;
+      await waitForFinished(execute.runId);
+      assert.equal(executeSource.data.userId, 'desktop');
+      const frozenExecute = JSON.stringify(executeSource.data);
+      const questionSource = priorKind === 'execute' ? executeSource
+        : log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: {
+          text: 'Legacy ordinary source after an earlier Execute.', taskMode: { version: 1, kind: 'normal' },
+        } });
+      const frozenQuestionSource = JSON.stringify(questionSource.data);
+
+      // Retain the exact public question produced by this Execute source. The
+      // transport and source admission remain real; only model work is stubbed.
+      const awaiting = priorKind === 'execute'
+        ? log.listEvents(sessionId, { types: ['awaiting_user_input'] }).find(event => event.data.sourceUserSeq === executeSource.seq)!
+        : log.appendEvent({ sessionId, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+          data: { sourceUserSeq: questionSource.seq, question, purpose: 'clarification' } });
+      assert.ok(awaiting);
+      assert.equal(log.listEvents(sessionId, { types: ['conversation_completed'] })
+        .filter(event => event.data.sourceUserSeq === questionSource.seq).length, 0);
+      const identity = { sessionId, turn: 1, sourceUserSeq: questionSource.seq };
+      const presentation = presentationEventForOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+        status: 'needs_input', resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: question } });
+      const terminal = log.appendEvent({ sessionId, turn: 1, role: 'system', type: 'conversation_completed', data: {
+        sourceUserSeq: questionSource.seq, reply: question, presentation,
+        turnOutcome: { version: 2, id: presentation.outcomeId, status: presentation.status,
+          resumable: presentation.resumable, needs: presentation.needs },
+      } });
+      assert.equal(log.listEvents(sessionId, { types: ['conversation_completed'] })
+        .filter(event => event.data.sourceUserSeq === questionSource.seq).length, 1,
+      'the question fixture has one needs-input terminal, never a prior done terminal');
+      const slot = { goalId: `goal:${sessionId}:${questionSource.seq}`, revision: 0,
+        questionId: `question:${questionSource.seq}`, slotKey: 'reply' };
+      const packet = continuity.createTaskContinuityPacket({ sessionId, originatingSourceUserSeq: questionSource.seq,
+        pause: { kind: 'clarification', question, slot },
+        publicDeliveryBinding: { awaitingEventId: awaiting.id, terminalEventId: terminal.id } });
+      log.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: {
+        text: 'Synthetic input does not choose the human audience convention.', synthetic: true,
+        ...(priorKind === 'legacy' ? { userId: 'desktop' } : {}),
+      } });
+      installTurnSemanticModelPort({ interpret: async () => ({ raw: {
+        version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+        goal: null, work: null, slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: 'Amber' }],
+        rationale: 'The synthetic reply supplies the requested color.',
+      }, modelIdentity: 'fixture-continuation-reader', inputTokens: 1, outputTokens: 1, latencyMs: 1 }) });
+      continuityRuntime._setClarificationAnswerCompletenessForTests(input => checkClarificationAnswerCompleteness(input,
+        async () => ({ ok: true, model: 'fixture-answer-completeness',
+          answers: { complete_answer: { type: 'noul', noul: 0.99 } }, usage: { input_tokens: 1, output_tokens: 1 },
+          decisionId: `fixture-complete-${priorKind}-${replyMode}` })));
+
+      const reply = await submit('Keep Amber for the revised task.', { version: 1, kind: replyMode }, `${priorKind}-${replyMode}-reply`);
+      const replySource = (await waitForSource(sessionId, reply.runId))!;
+      await waitForFinished(reply.runId);
+      assert.equal(replySource.data.userId, questionSource.data.userId,
+        'normal and Plan ingress must preserve the immediate source audience convention');
+      assert.deepEqual(replySource.data.taskMode, { version: 1, kind: replyMode });
+      const consumed = continuity.readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: replySource.seq });
+      assert.equal(consumed.status, 'consumed', 'the exact public question/reply edge must pass strict audience checks');
+      if (consumed.status === 'consumed') assert.equal(consumed.packet.packetId, packet.packetId);
+      assert.equal(JSON.stringify(log.getEvent(executeSource.id)!.data), frozenExecute, 'historical Execute bytes stay frozen');
+      assert.equal(JSON.stringify(log.getEvent(questionSource.id)!.data), frozenQuestionSource, 'legacy source bytes stay frozen');
+      const beforeReplay = JSON.stringify(replySource.data);
+      const replay = await submit('Keep Amber for the revised task.', { version: 1, kind: replyMode }, `${priorKind}-${replyMode}-reply`);
+      assert.equal(replay.runId, reply.runId);
+      assert.equal(JSON.stringify(log.getEvent(replySource.id)!.data), beforeReplay, 'replay never rewrites its accepted source');
+      assert.equal(log.listEvents(sessionId, { types: ['tool_called', 'external_write', 'external_write_succeeded', 'approval_resolved'] }).length, 0);
+      assert.equal(log.listEvents(sessionId, { types: ['model_transport_observed'] }).length, 0, 'all model decisions use deterministic test ports');
+    } finally {
+      installTurnSemanticModelPort(null);
+      continuityRuntime._setClarificationAnswerCompletenessForTests(null);
+      _setBridgeImplsForTests({});
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+  }
+}

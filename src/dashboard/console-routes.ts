@@ -3381,6 +3381,22 @@ function harnessChatPayloadHash(input: string, attachmentIds: string[], taskMode
     .digest('hex');
 }
 
+/** Authenticated desktop input keeps the immediately preceding real source's
+ * audience convention. Older ordinary inputs omitted it; filling those in
+ * would break their sealed clarification edges. Never copy another principal. */
+function desktopAcceptedSourceAudience(sessionId: string): { userId?: 'desktop' } {
+  const previous = openEventLog().prepare(`SELECT data_json FROM events
+    WHERE session_id = ? AND type = 'user_input_received' AND role = 'user'
+      AND CASE WHEN json_valid(data_json)
+        THEN json_type(data_json, '$.synthetic') IS NOT 'true' ELSE 1 END
+    ORDER BY seq DESC LIMIT 1`).get(sessionId) as { data_json: string } | undefined;
+  if (!previous) return { userId: 'desktop' };
+  try {
+    const data = JSON.parse(previous.data_json) as Record<string, unknown> | null;
+    return data?.userId === 'desktop' ? { userId: 'desktop' } : {};
+  } catch { return {}; }
+}
+
 interface ConsoleHomeAcceptedSource {
   sessionId: string;
   requestId: string;
@@ -18203,7 +18219,8 @@ export function registerConsoleRoutes(
             ...(attachmentFiles.length ? { attachmentFiles } : {}),
             ...taskModeFields(taskMode),
             ...turnLearningPolicyFields(learningPolicy),
-            ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input) : {}),
+            ...(connectionContext ? connectionContinuationAudience(connectionContext, requestRunId, input)
+              : reviewedPlanOwnerControl ? {} : desktopAcceptedSourceAudience(sessionId)),
             displayText: input || (attachmentIds.length ? 'Attached file' : ''),
             ...(meetingLookup ? { meetingLookupPresentation: {
               version: 1, kind: 'meeting_lookup', question: meetingLookup.question,
