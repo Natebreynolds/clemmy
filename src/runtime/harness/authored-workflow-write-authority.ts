@@ -952,7 +952,7 @@ function queueOrdinaryWriteForStepCheck(input: {
 export type StepWriteCheck =
   | { status: 'clear' }
   | { status: 'correct'; reason: string }
-  | { status: 'noted'; reason: string }
+  | { status: 'noted'; reason: string; conflict?: true }
   /** Still running past the caller's wait: it finishes in the background,
    * its verdict lands in the run's log, and it cannot hold the result. */
   | { status: 'pending' };
@@ -960,6 +960,11 @@ export type StepWriteCheck =
 /** One check per step at a time: a retried result call waits on the check
  * already running rather than starting another review of the same writes. */
 const inflightStepChecks = new Map<string, Promise<StepWriteCheck>>();
+/** How each step's check ended, for the run to report before it finishes:
+ * verified, a conflict still standing, or not verified. */
+const settledStepChecks = new Map<string, StepWriteCheck>();
+/** Steps whose result was recorded while their check was still running. */
+const pendingAtResult = new Set<string>();
 
 /** The step's check, waited on for at most `waitMs`. A check that is still
  * running when the wait ends is left to finish in the background with no
@@ -974,6 +979,16 @@ export async function checkStepWritesWithin(sessionId: string, waitMs: number): 
   ]).finally(() => { if (timer) clearTimeout(timer); });
   if (waited !== 'pending') return waited;
   stepCheckCorrections.set(sessionId, MAX_STEP_CHECK_CORRECTIONS);
+  pendingAtResult.add(sessionId);
+  const first = queuedStepWrites.get(sessionId)?.[0];
+  if (first) {
+    void import('../../execution/workflow-events.js').then(({ appendWorkflowEvent }) => {
+      appendWorkflowEvent(first.receipt.workflowName, first.receipt.workflowRunId, {
+        kind: 'step_advisory', stepId: first.receipt.stepId,
+        meta: { reason: 'write_check_pending', note: 'The step finished; its writes are still being checked.' },
+      } as never);
+    }).catch(() => { /* the run reads the settled check either way */ });
+  }
   return { status: 'pending' };
 }
 
@@ -983,7 +998,13 @@ export async function checkStepWritesWithin(sessionId: string, waitMs: number): 
 export function checkStepWritesBeforeResult(sessionId: string): Promise<StepWriteCheck> {
   const running = inflightStepChecks.get(sessionId);
   if (running) return running;
-  const check = runStepWriteCheck(sessionId).finally(() => {
+  const check = runStepWriteCheck(sessionId).then((result) => {
+    if (result.status !== 'correct' && (result.status !== 'clear' || pendingAtResult.has(sessionId))) {
+      settledStepChecks.set(sessionId, result);
+    }
+    if (result.status !== 'correct') pendingAtResult.delete(sessionId);
+    return result;
+  }).finally(() => {
     if (inflightStepChecks.get(sessionId) === check) inflightStepChecks.delete(sessionId);
   });
   inflightStepChecks.set(sessionId, check);
@@ -1035,7 +1056,7 @@ async function runStepWriteCheck(sessionId: string): Promise<StepWriteCheck> {
     stepCheckCorrections.set(sessionId, (stepCheckCorrections.get(sessionId) ?? 0) + 1);
     return { status: 'correct', reason: result.reason };
   }
-  return finish({ status: 'noted', reason: result.reason });
+  return finish({ status: 'noted', reason: result.reason, ...(result.verdict === 'conflict' ? { conflict: true as const } : {}) });
 }
 
 /** A step that ended without the result tool (an output-schema lane, a
@@ -1047,12 +1068,45 @@ export function settleUncheckedStepWrites(sessionId: string): void {
   void checkStepWritesBeforeResult(sessionId).catch(() => { /* recorded by the check itself */ });
 }
 
+export interface RunStepWriteCheckOutcome {
+  sessionId: string;
+  outcome: 'verified' | 'conflict' | 'unverified';
+  reason?: string;
+}
+
+/** Before a run reports: wait (bounded) for its steps' checks still running,
+ * then say how each ended. A conflict still standing is a correction the run
+ * owes; an unverified check is shown, never silently passed. */
+export async function settleRunStepWriteChecks(runId: string, waitMs: number): Promise<RunStepWriteCheckOutcome[]> {
+  const prefix = `workflow:${runId}:`;
+  const running = [...inflightStepChecks.entries()].filter(([sessionId]) => sessionId.startsWith(prefix));
+  if (running.length > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(running.map(([, check]) => check)),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.max(0, waitMs)); }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
+  }
+  const outcomes: RunStepWriteCheckOutcome[] = [];
+  for (const [sessionId, result] of [...settledStepChecks.entries()].filter(([id]) => id.startsWith(prefix))) {
+    settledStepChecks.delete(sessionId);
+    if (result.status === 'clear') outcomes.push({ sessionId, outcome: 'verified' });
+    else if (result.status === 'noted') outcomes.push({ sessionId, outcome: result.conflict ? 'conflict' : 'unverified', reason: result.reason });
+  }
+  for (const sessionId of [...inflightStepChecks.keys()].filter((id) => id.startsWith(prefix))) {
+    outcomes.push({ sessionId, outcome: 'unverified', reason: 'its write check was still running when the run finished' });
+  }
+  return outcomes;
+}
+
 export function _queueStepWriteForTests(write: QueuedStepWrite): void {
   queuedStepWrites.set(write.sessionId, [...(queuedStepWrites.get(write.sessionId) ?? []), write]);
 }
 
 export function _resetStepWriteChecksForTests(): void {
   inflightStepChecks.clear();
+  settledStepChecks.clear();
+  pendingAtResult.clear();
   queuedStepWrites.clear();
   stepCheckCorrections.clear();
 }

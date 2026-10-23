@@ -760,3 +760,53 @@ test('FRAMEWORK-TEST-continue-stopped: retrying a run that stopped after a lande
     runner._setWorkflowHarnessLoopImplsForTests();
   }
 });
+
+test('FRAMEWORK-TEST-late-write-conflict: a step check that finds a conflict after the step finished leaves the run needing a correction, checked once, the write not repeated', async () => {
+  installQuietReportSeams();
+  runner._setWorkflowRunGoalJudgeForTests(null);
+  const authority = await import('../runtime/harness/authored-workflow-write-authority.js');
+  const provider = installFictionalProviderWrite('late-write-conflict');
+  let reviews = 0;
+  authority._setWorkflowMutationReviewerForTests(async () => {
+    reviews += 1;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return { verdict: 'conflict', reason: 'The row was logged under the wrong section; it belongs under Reporting.', proposalDigest: 'fixture' };
+  });
+  const model = stubModelStep(() => ({
+    calls: [{ tool: 'framework_test_tracker_update', mutating: true, result: { ok: true, data: { id: 'row-late' } } }],
+    output: { url: 'https://tracker.example.test/sheet', leads: 1 },
+  }));
+  const definition = modelWriteWorkflow('FRAMEWORK-TEST-late-write-conflict');
+  delete definition.goal;
+  definition.steps = [
+    { id: 'append_row', prompt: '', sideEffect: 'write', call: { tool: provider.operationId, args: { scope: 'fixture-tracker' } } },
+    { ...definition.steps[0]!, dependsOn: ['append_row'] },
+  ];
+  const persisted = workflowStore.writeWorkflow(definition.name, definition);
+  const queued = workflowQueue.queueWorkflowRun(persisted.data.name, {}, {
+    source: 'schedule',
+    workflowSlug: persisted.name,
+    triggerReceiptId: `workflow-schedule:v1:${persisted.name}:1790070000000`,
+    dedupe: false,
+  });
+  assert.equal(queued.status, 'queued', queued.message);
+  // The model step's recoverable write ran when proposed; its result arrives
+  // without the result tool, so the check runs after the step finished.
+  authority._queueStepWriteForTests({ receipt: { workflowName: persisted.name, workflowRunId: queued.id!, stepId: 'review' },
+    stepPrompt: definition.steps[1]!.prompt, sessionId: `workflow:${queued.id}:review`, sourceUserSeq: 1,
+    tool: 'framework_test_tracker_update', args: { section: 'Billing', row: 'fixture' } });
+  try {
+    await runner.processWorkflowRuns({} as never);
+    const run = readRun(queued.id!);
+    assert.ok(run.finishedAt, 'the run finishes');
+    assert.equal(reviews, 1, 'the step\'s writes are checked once');
+    assert.equal(provider.bodies(), 1, 'the landed write is never repeated');
+    assert.equal(model.prompts.length, 1, 'the step that wrote is not run again');
+    assert.equal(run.needsAttention, true, JSON.stringify({ status: run.status, reason: run.needsAttentionReason }));
+    assert.match(String(run.needsAttentionReason), /need a correction — The row was logged under the wrong section/);
+  } finally {
+    authority._setWorkflowMutationReviewerForTests(null);
+    authority._resetStepWriteChecksForTests();
+    runner._setWorkflowHarnessLoopImplsForTests();
+  }
+});

@@ -4909,9 +4909,12 @@ function applyWorkflowOriginLineage(ctx: Pick<StepExecutionContext, 'originSessi
 export interface WorkflowQualityAdvisory {
   stepId: string;
   itemKey?: string;
-  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'goal_validation_unmet' | 'goal_gap_after_landed_writes' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded';
+  kind: 'skill_not_executed' | 'target_missed' | 'target_unverified' | 'goal_validation_unavailable' | 'goal_validation_unmet' | 'goal_gap_after_landed_writes' | 'foreach_overflow' | 'idempotent_skip' | 'ungrounded_output' | 'inferred_output_contract' | 'synthesis_degraded' | 'write_check_conflict' | 'write_check_unverified';
   note: string;
 }
+
+/** How long a finishing run waits for its steps' write checks still running. */
+const RUN_WRITE_CHECK_SETTLE_MS = 120_000;
 
 export function workflowAdvisoryRequiresAttention(
   advisory: Pick<WorkflowQualityAdvisory, 'kind'>,
@@ -4951,6 +4954,14 @@ export function workflowAdvisoryRequiresAttention(
       // Every step already completed and verified — only the final prose
       // rollup fell back to the deterministic step-output format. Substance
       // is intact; surface it as an advisory, not a failed run.
+      return false;
+    case 'write_check_conflict':
+      // A step's writes, checked together, still conflict with its saved
+      // instructions: a correction the run owes, never a clean success.
+      return true;
+    case 'write_check_unverified':
+      // The checker could not judge the writes (outage, doubt, or still
+      // running). Shown with the report; not proof the writes are wrong.
       return false;
   }
 }
@@ -17520,6 +17531,29 @@ async function processOneRunFile(
           kind: 'goal_validation_unmet',
           note: `Pinned goal review: ${unmet.length} of ${goalVerdict?.perCriterion.length ?? unmet.length} criteria not evidenced to the judge — ${unmet.map((criterion) => criterion.detail ?? criterion.criterion).join(' | ').slice(0, 600)}`,
         });
+      }
+      // Each step's recoverable writes ran when proposed and were checked
+      // together; a check still running when its step finished is waited on
+      // here (bounded), so a late conflict reaches this report as a
+      // correction owed rather than a line in the run log.
+      try {
+        const { settleRunStepWriteChecks } = await import('../runtime/harness/authored-workflow-write-authority.js');
+        const stepOf = (sessionId: string) => sessionId.slice(`workflow:${run.id}:`.length) || '(step)';
+        for (const check of await settleRunStepWriteChecks(run.id, RUN_WRITE_CHECK_SETTLE_MS)) {
+          const stepId = stepOf(check.sessionId);
+          if (check.outcome === 'conflict') {
+            qualityAdvisories.push({ stepId, kind: 'write_check_conflict',
+              note: `step "${stepId}": its writes were checked after they ran and need a correction — ${check.reason ?? 'the check found a conflict with the saved instructions'}` });
+          } else if (check.outcome === 'unverified') {
+            qualityAdvisories.push({ stepId, kind: 'write_check_unverified',
+              note: `step "${stepId}": its writes were not verified — ${check.reason ?? 'the check did not finish'}` });
+          } else {
+            appendWorkflowEvent(workflow.name, run.id, { kind: 'step_advisory', stepId,
+              meta: { reason: 'write_check_verified', note: 'The step\'s writes were checked after they ran and match its instructions.' } });
+          }
+        }
+      } catch (err) {
+        logger.warn({ runId: run.id, err: err instanceof Error ? err.message : String(err) }, 'run write-check settle skipped');
       }
       const publicQualityAdvisories = isCompiledProjectRun
         ? qualityAdvisories.filter((advisory) => advisory.stepId === publicTerminalStepId)
