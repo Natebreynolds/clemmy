@@ -1345,6 +1345,28 @@ function quotaRefusalWords(error: unknown): string | null {
   return redactSensitiveText(providerCapacityErrorText(error)).replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
+export type JudgeParseRejectionReason = 'malformed_output' | 'missing_verdict' | 'missing_binding'
+  | 'binding_mismatch' | 'missing_reason' | 'unknown';
+export type JudgeInitialParseDiagnostic = { status: 'parsed'; reason: null }
+  | { status: 'rejected'; reason: JudgeParseRejectionReason };
+const JUDGE_PARSE_REJECTION_REASONS = new Set<unknown>([
+  'malformed_output', 'missing_verdict', 'missing_binding', 'binding_mismatch', 'missing_reason', 'unknown',
+]);
+
+/** Reconstruct only content-free host fields; callers may not attach output,
+ * error text, bindings or new reason strings to this diagnostic. */
+export function sanitizeJudgeInitialParseDiagnostic(value: unknown): JudgeInitialParseDiagnostic | null {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const row = value as Record<string, unknown>;
+    if (row.status === 'parsed') return { status: 'parsed', reason: null };
+    if (row.status !== 'rejected') return null;
+    const reason = row.reason;
+    return { status: 'rejected', reason: JUDGE_PARSE_REJECTION_REASONS.has(reason)
+      ? reason as JudgeParseRejectionReason : 'unknown' };
+  } catch { return null; }
+}
+
 /** Host observation of one reviewer attempt. Observers never change what the
  * reviewer receives or what the attempt returns. */
 export interface JudgeAttemptObservers {
@@ -1356,6 +1378,8 @@ export interface JudgeAttemptObservers {
   /** The reviewer's output carried no verdict line and it was asked to state
    * one; `head` is the start of what it had written. */
   restated?: (head: string) => void;
+  /** The first parser result only, before any repair; never an assessment verdict. */
+  initialParse?: (diagnostic: JudgeInitialParseDiagnostic) => unknown;
 }
 
 /** A reviewer restating its own verdict decides nothing new, so it is asked
@@ -1466,6 +1490,7 @@ export async function runRoutedJudgeAttempt<T>(
   verdictRepairContract?: CompletionVerdictRepairContract,
   reviewInput?: ReviewInputSeed,
   assessment?: SameCallAssessment<T>,
+  classifyParseRejection?: (output: unknown) => unknown,
 ): Promise<T> {
   signal?.throwIfAborted();
   // One immutable budget owns this route's admission, request and any verdict
@@ -1588,6 +1613,22 @@ export async function runRoutedJudgeAttempt<T>(
   let inputObservation = inputCollector?.finish(result.rawResponses, result.finalOutput);
   let value = assessment ? assessment.answer(result.finalOutput, originalCapture?.finish(result.rawResponses, result.finalOutput))
     : parse(result.finalOutput);
+  // Classify only an actual first parser rejection. A repaired answer cannot
+  // replace its cause; assessment answers have a different admission contract.
+  if (!assessment) try {
+    let reason: unknown = 'unknown';
+    if (value === null) try { reason = classifyParseRejection?.(result.finalOutput); } catch { /* unknown */ }
+    if (reason && typeof (reason as PromiseLike<unknown>).then === 'function') {
+      void Promise.resolve(reason).catch(() => {});
+      reason = 'unknown'; // classifiers are synchronous observations, never awaited work
+    }
+    const diagnostic = sanitizeJudgeInitialParseDiagnostic(value === null
+      ? { status: 'rejected', reason } : { status: 'parsed', reason: null });
+    const observed = diagnostic && observe?.initialParse?.(diagnostic);
+    if (observed && typeof (observed as PromiseLike<unknown>).then === 'function') {
+      void Promise.resolve(observed).catch(() => {});
+    }
+  } catch { /* diagnostics never affect the verdict or its repair */ }
   // The round answered in its own words: keep its exact conversation so a
   // later round of this request can continue it. A restated verdict below is
   // a separate call and is not part of that conversation.
@@ -1713,6 +1754,8 @@ export async function runHedgedJudge<T>(
     verdictRepairContract?: CompletionVerdictRepairContract;
     reviewInput?: ReviewInputSeed;
     assessment?: SameCallAssessment<T>;
+    /** Optional host-only classifier. Only the fixed diagnostic vocabulary is retained. */
+    classifyParseRejection?: (output: unknown) => unknown;
     /** Cancellation belongs to the caller, never to review/fallback policy. */
     signal?: AbortSignal;
   } = {},
@@ -1722,6 +1765,8 @@ export async function runHedgedJudge<T>(
   /** Set when that attempt's verdict line had to be asked for separately:
    *  the start of what the reviewer first wrote. */
   restatedFrom?: string;
+  /** First parser disposition from the exact returned attempt; absent means unobserved. */
+  initialParse?: JudgeInitialParseDiagnostic;
   reviewInputObservation?: ReviewInputObservation; priorOpinionDisposition?: PriorOpinionDisposition;
   comparisonDiagnostic?: CompletionJudgeComparisonDiagnostic }> {
   const startedAt = Date.now();
@@ -1756,6 +1801,7 @@ export async function runHedgedJudge<T>(
     // inspected nothing on behalf of the verdict that won.
     const attemptLookups = new Map<BoundaryJudgeRouting, JudgeEvidenceLookup[]>();
     const attemptRestated = new Map<BoundaryJudgeRouting, string>();
+    const attemptInitialParse = new Map<BoundaryJudgeRouting, JudgeInitialParseDiagnostic>();
     const attemptInputs = new Map<BoundaryJudgeRouting, ReviewInputObservation>();
     const attemptOpinions = new Map<BoundaryJudgeRouting, PriorOpinionDisposition>();
     const attempt = (r: BoundaryJudgeRouting, signal?: AbortSignal) => (deadlineSignal?: AbortSignal): Promise<T> => {
@@ -1763,6 +1809,7 @@ export async function runHedgedJudge<T>(
       const lookups: JudgeEvidenceLookup[] = [];
       attemptLookups.set(r, lookups);
       attemptRestated.delete(r);
+      attemptInitialParse.delete(r);
       attemptInputs.delete(r);
       attemptOpinions.delete(r);
       return runRoutedJudgeAttempt<T>(r, instructions, prompt, parse, opts.requireCompletePrompt === true,
@@ -1773,9 +1820,10 @@ export async function runHedgedJudge<T>(
             substituteReason: r.substituteReason ?? 'provider_reported_model',
           });
         }, { lookup: (lookup) => { lookups.push(lookup); }, restated: (head) => { attemptRestated.set(r, head); },
+          initialParse: (diagnostic) => { attemptInitialParse.set(r, diagnostic); },
           input: (record) => { attemptInputs.set(r, record); },
           priorOpinion: (disposition) => { attemptOpinions.set(r, disposition); } },
-        opts.verdictRepairContract, opts.reviewInput, opts.assessment);
+        opts.verdictRepairContract, opts.reviewInput, opts.assessment, opts.classifyParseRejection);
     };
     // An explicit caller deadline still wins; otherwise use the deadline the
     // ROUTE carries. resolveBoundaryJudge returns timeoutMs (90s) for an honoured
@@ -1858,6 +1906,7 @@ export async function runHedgedJudge<T>(
       return { value: raced.value, failure: null, routing: winner, lookups: [...(attemptLookups.get(winningRoute) ?? [])],
         comparisonDiagnostic: completionJudgeComparisonForRoute(winner),
         ...(attemptRestated.has(winningRoute) ? { restatedFrom: attemptRestated.get(winningRoute)! } : {}),
+        ...(attemptInitialParse.has(winningRoute) ? { initialParse: { ...attemptInitialParse.get(winningRoute)! } } : {}),
         ...(attemptInputs.has(winningRoute) ? { reviewInputObservation: attemptInputs.get(winningRoute)! } : {}),
         ...(attemptOpinions.has(winningRoute) ? { priorOpinionDisposition: attemptOpinions.get(winningRoute)! } : {}) };
     }

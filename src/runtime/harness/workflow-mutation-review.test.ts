@@ -366,6 +366,7 @@ test('review diagnostics distinguish missing observations from zero and preserve
     assert.equal(stage.lookups, null);
     assert.equal(stage.omittedLookupCount, null);
     assert.equal(stage.verdictRestated, null);
+    assert.equal(stage.initialParse, null);
   }
   assert.equal(JSON.stringify(result.diagnostics).includes('private-fixture-failure-text'), false);
 });
@@ -385,4 +386,20 @@ test('diagnostic lookup records stay bounded while the verdict and total observe
   assert.ok(stage.lookups!.length <= 16);
   assert.equal(stage.omittedLookupCount, 30 - stage.lookups!.length);
   assert.ok(stage.lookups!.every(lookup => lookup.status === 'budget'));
+});
+
+test('mutation diagnostics use only the returned attempt parse observation and discard private metadata', async () => {
+  const result = await reviewWorkflowMutation({ ...input, observations: { ...input.observations, complete: false } }, {
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      assert.equal(opts?.classifyParseRejection?.('private-prose'), 'malformed_output');
+      assert.equal(opts?.classifyParseRejection?.({ verdict: 'compatible', proposalDigest: 'foreign', reason: 'ok' }), 'binding_mismatch');
+      // A rejected parse from another attempt cannot override the winner.
+      parse('private-losing-review');
+      return { value: parse({ verdict: 'compatible', reason: 'Checked.', proposalDigest: JSON.parse(prompt).proposalDigest,
+        initialParse: { status: 'rejected', reason: 'private-forged-reason' } }), failure: null,
+        initialParse: { status: 'parsed' as const, reason: null, privateText: 'private-host-extra' } };
+    },
+  });
+  assert.deepEqual(result.diagnostics?.stages[0]?.initialParse, { status: 'parsed', reason: null });
+  assert.equal(JSON.stringify(result.diagnostics).includes('private-'), false);
 });

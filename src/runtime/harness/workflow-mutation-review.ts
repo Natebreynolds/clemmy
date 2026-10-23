@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
-import { runHedgedJudge } from './objective-judge.js';
+import { runHedgedJudge, sanitizeJudgeInitialParseDiagnostic, type JudgeInitialParseDiagnostic,
+  type JudgeParseRejectionReason } from './objective-judge.js';
 import { mutationReviewTimeoutMs, recordJudgeMetric } from './judge-family.js';
 import type { JudgeEvidenceSource, JudgeEvidenceEntry, JudgeEvidenceLookup } from './judge-evidence-tools.js';
 import { describeJsonShape } from './tool-output-digest.js';
@@ -53,6 +54,8 @@ type ReviewDiagnosticStage = {
   lookups: ReviewLookupDiagnostic[] | null;
   omittedLookupCount: number | null;
   verdictRestated: boolean | null;
+  /** Absent on older records; null when the returned attempt was unobserved. */
+  initialParse?: JudgeInitialParseDiagnostic | null;
 };
 export type WorkflowMutationReviewDiagnostics = {
   version: 1;
@@ -210,6 +213,10 @@ function correctedArgumentsOf(
 
 export type WorkflowMutationReviewInvalidReason =
   | 'not_json' | 'no_verdict' | 'digest_missing' | 'digest_mismatch' | 'no_reason';
+const PARSE_REJECTION_DIAGNOSTIC: Record<WorkflowMutationReviewInvalidReason, JudgeParseRejectionReason> = {
+  not_json: 'malformed_output', no_verdict: 'missing_verdict', digest_missing: 'missing_binding',
+  digest_mismatch: 'binding_mismatch', no_reason: 'missing_reason',
+};
 
 /** Which part of the verdict contract an unreadable answer missed. */
 export function workflowMutationReviewInvalidReason(value: unknown, expectedDigest: string): WorkflowMutationReviewInvalidReason {
@@ -362,14 +369,16 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
         lookupCount: lookups?.length ?? null,
         lookups: lookups ? lookups.slice(0, MAX_DIAGNOSTIC_LOOKUPS).map(lookup => lookupDiagnostic(lookup, diagnosticSalt!)) : null,
         omittedLookupCount: lookups ? Math.max(0, lookups.length - MAX_DIAGNOSTIC_LOOKUPS) : null,
-        verdictRestated: result?.value ? typeof result.restatedFrom === 'string' : null });
+        verdictRestated: result?.value ? typeof result.restatedFrom === 'string' : null,
+        initialParse: result?.value ? sanitizeJudgeInitialParseDiagnostic(result.initialParse) : null });
     } catch { /* diagnostics cannot change a review, its fallback or verdict */ }
   };
   const runStage = async (stage: ReviewDiagnosticStage['stage'], stagePrompt: string,
     options: Parameters<typeof runHedgedJudge<WorkflowMutationReview>>[5]) => {
     const started = Date.now();
     try {
-      const result = await judge(system, stagePrompt, parse, pass, 'mutation_constraints', options);
+      const result = await judge(system, stagePrompt, parse, pass, 'mutation_constraints', { ...options,
+        classifyParseRejection: output => PARSE_REJECTION_DIAGNOSTIC[workflowMutationReviewInvalidReason(output, proposalDigest)] });
       recordStage(stage, started, result);
       return result;
     } catch (error) {
