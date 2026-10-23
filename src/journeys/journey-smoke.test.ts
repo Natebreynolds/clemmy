@@ -331,19 +331,20 @@ test('J1b: a parked task can be answered directly from its Tasks-board drawer', 
     const res = await fetch(`${harness.url}/api/console/board/background/${task.id}/answer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer: 'US-West please.' }),
+      body: JSON.stringify({ questionId: 'j1b-question', answer: 'US-West please.' }),
     });
     assert.equal(res.status, 200);
     const body = await res.json() as { ok: boolean; task?: { status?: string } };
     assert.equal(body.ok, true);
     assert.equal(body.task?.status, 'pending', 'the board answer queued the continuation');
+    assert.equal(getBackgroundTask(task.id)?.inputResolution?.questionId, 'j1b-question');
     assert.equal(getBackgroundTask(task.id)?.inputResolution?.answer, 'US-West please.');
 
     // A second answer is refused honestly — the question was consumed.
     const again = await fetch(`${harness.url}/api/console/board/background/${task.id}/answer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer: 'EU instead.' }),
+      body: JSON.stringify({ questionId: 'j1b-question', answer: 'EU instead.' }),
     });
     assert.equal(again.status, 409);
   } finally {

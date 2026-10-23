@@ -954,10 +954,10 @@ export type BoardButtonIntent = BoardActionIntent | 'approve' | 'reject' | 'retr
 /** Answer a parked task's clarifying question from the board drawer — the same
  *  resume machinery as the chat/Home/Discord/Slack bridges, making the Tasks
  *  board a first-class answer surface (interact-in-place, 2026-07-22). */
-export async function answerBackgroundTaskQuestion(taskId: string, answer: string): Promise<{ ok: boolean; reason?: string }> {
+export async function answerBackgroundTaskQuestion(taskId: string, questionId: string, answer: string): Promise<{ ok: boolean; reason?: string }> {
   return await apiPost<{ ok: boolean; reason?: string }>(
     `/api/console/board/background/${encodeURIComponent(taskId)}/answer`,
-    { answer },
+    { questionId, answer },
   );
 }
 

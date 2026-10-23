@@ -331,6 +331,67 @@ function PendingActionReview({
   );
 }
 
+/** Remount for each task/question pair so a draft or late response cannot carry
+ * over to a replacement question received by polling. */
+function BackgroundTaskQuestion({ taskId, questionId, question }: {
+  taskId: string;
+  questionId?: string;
+  question?: string;
+}) {
+  const [answerDraft, setAnswerDraft] = useState('');
+  const [answerState, setAnswerState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [answerError, setAnswerError] = useState('');
+  return (
+    <div className="border-b border-warning/40 bg-warning-tint px-5 py-4">
+      <div className="flex items-center gap-1.5 text-caption font-semibold text-warning">
+        <Hand className="h-3.5 w-3.5" aria-hidden />
+        Waiting on you
+      </div>
+      <p className="mt-1.5 whitespace-pre-wrap text-body text-fg">
+        {question || 'This task asked a question — answer below to resume it.'}
+      </p>
+      {!questionId ? (
+        <p className="mt-2 text-small text-muted">Loading the current question…</p>
+      ) : answerState === 'sent' ? (
+        <p className="mt-2 text-small text-success">Answer sent — the task is resuming and will report back when done.</p>
+      ) : (
+        <form
+          className="mt-2.5 flex flex-col gap-2"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            const answer = answerDraft.trim();
+            if (!answer || answerState === 'sending') return;
+            setAnswerState('sending');
+            setAnswerError('');
+            try {
+              const out = await answerBackgroundTaskQuestion(taskId, questionId, answer);
+              if (out.ok) { setAnswerState('sent'); setAnswerDraft(''); }
+              else { setAnswerState('error'); setAnswerError(out.reason || 'The answer could not be delivered.'); }
+            } catch (err) {
+              setAnswerState('error');
+              setAnswerError(err instanceof Error ? err.message : 'The answer could not be delivered.');
+            }
+          }}
+        >
+          <textarea
+            value={answerDraft}
+            onChange={(e) => setAnswerDraft(e.target.value)}
+            rows={2}
+            placeholder="Type your answer — the task resumes with it immediately."
+            className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg placeholder:text-faint outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          />
+          <div className="flex items-center gap-2">
+            <Button size="sm" type="submit" disabled={!answerDraft.trim() || answerState === 'sending'}>
+              <Send className="h-3.5 w-3.5" aria-hidden /> {answerState === 'sending' ? 'Sending…' : 'Answer & resume'}
+            </Button>
+            {answerState === 'error' && <span className="text-caption text-danger">{answerError}</span>}
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
 export function LiveTraceDrawer({
   card,
   onClose,
@@ -350,10 +411,6 @@ export function LiveTraceDrawer({
   const [targetType, setTargetType] = useState<BackgroundReportBackTargetType>('slack_user');
   const [targetId, setTargetId] = useState('');
   const [targetThreadTs, setTargetThreadTs] = useState('');
-  // Interact-in-place: answer a parked question right here in the drawer.
-  const [answerDraft, setAnswerDraft] = useState('');
-  const [answerState, setAnswerState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
-  const [answerError, setAnswerError] = useState('');
   const [targetKey, setTargetKey] = useState('');
   const [targetNotice, setTargetNotice] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [channelKey, setChannelKey] = useState('');
@@ -790,52 +847,15 @@ export function LiveTraceDrawer({
           </div>
         )}
 
-        {isBackground && (taskDetail?.task.status === 'awaiting_input' || card.status === 'awaiting_input') && (
-          <div className="border-b border-warning/40 bg-warning-tint px-5 py-4">
-            <div className="flex items-center gap-1.5 text-caption font-semibold text-warning">
-              <Hand className="h-3.5 w-3.5" aria-hidden />
-              Waiting on you
-            </div>
-            <p className="mt-1.5 whitespace-pre-wrap text-body text-fg">
-              {taskDetail?.task.pendingQuestion || (card.raw as { pendingQuestion?: string }).pendingQuestion || 'This task asked a question — answer below to resume it.'}
-            </p>
-            {answerState === 'sent' ? (
-              <p className="mt-2 text-small text-success">Answer sent — the task is resuming and will report back when done.</p>
-            ) : (
-              <form
-                className="mt-2.5 flex flex-col gap-2"
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  const answer = answerDraft.trim();
-                  if (!answer || answerState === 'sending') return;
-                  setAnswerState('sending');
-                  setAnswerError('');
-                  try {
-                    const out = await answerBackgroundTaskQuestion(card.id, answer);
-                    if (out.ok) { setAnswerState('sent'); setAnswerDraft(''); }
-                    else { setAnswerState('error'); setAnswerError(out.reason || 'The answer could not be delivered.'); }
-                  } catch (err) {
-                    setAnswerState('error');
-                    setAnswerError(err instanceof Error ? err.message : 'The answer could not be delivered.');
-                  }
-                }}
-              >
-                <textarea
-                  value={answerDraft}
-                  onChange={(e) => setAnswerDraft(e.target.value)}
-                  rows={2}
-                  placeholder="Type your answer — the task resumes with it immediately."
-                  className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-body text-fg placeholder:text-faint outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                />
-                <div className="flex items-center gap-2">
-                  <Button size="sm" type="submit" disabled={!answerDraft.trim() || answerState === 'sending'}>
-                    <Send className="h-3.5 w-3.5" aria-hidden /> {answerState === 'sending' ? 'Sending…' : 'Answer & resume'}
-                  </Button>
-                  {answerState === 'error' && <span className="text-caption text-danger">{answerError}</span>}
-                </div>
-              </form>
-            )}
-          </div>
+        {isBackground && (taskDetail
+          ? taskDetail.task.id === card.id && taskDetail.task.status === 'awaiting_input'
+          : card.status === 'awaiting_input') && (
+          <BackgroundTaskQuestion
+            key={JSON.stringify([card.id, taskDetail?.task.pendingQuestionId ?? null])}
+            taskId={card.id}
+            questionId={taskDetail?.task.pendingQuestionId}
+            question={taskDetail ? taskDetail.task.pendingQuestion : (card.raw as { pendingQuestion?: string }).pendingQuestion}
+          />
         )}
 
         {/* Everything below the fixed header/current/answer bars is ONE scroll

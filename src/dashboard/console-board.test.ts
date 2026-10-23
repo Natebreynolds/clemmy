@@ -995,6 +995,96 @@ test('GET /api/console/active-work scans beyond filtered dormant session pages',
   }
 });
 
+test('board answer identity: missing displayed question identity cannot answer the current question', async (t) => {
+  const task = createBackgroundTask({ title: 'FRAMEWORK-TEST board missing question identity', prompt: 'Ask before proceeding.' });
+  const questionId = 'q-board-missing-identity';
+  markBackgroundTaskAwaitingInput(task.id, questionId, 'Which colour?', { options: ['Amber', 'Violet'] });
+  const before = getBackgroundTask(task.id);
+  const h = await boot();
+  try {
+    // This is the existing board helper's task-only request shape.
+    const res = await fetch(`${h.url}/api/console/board/background/${task.id}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer: 'Amber' }),
+    });
+    const body = await res.json() as { ok: boolean };
+    t.diagnostic(JSON.stringify({ status: res.status, ok: body.ok,
+      queuedQuestionId: getBackgroundTask(task.id)?.inputResolution?.questionId ?? null }));
+    assert.equal(res.status, 400, 'an answer without the displayed question identity must be refused');
+    assert.equal(body.ok, false);
+    assert.deepEqual(getBackgroundTask(task.id), before, 'missing identity must leave the parked question and task unchanged');
+  } finally {
+    await h.close();
+  }
+});
+
+test('board answer identity: a stale displayed Q1 cannot answer a newer Q2 on the same task', async (t) => {
+  const task = createBackgroundTask({ title: 'FRAMEWORK-TEST board stale question identity', prompt: 'Keep each answer bound to its question.' });
+  const firstId = 'q-board-stale-first', secondId = 'q-board-stale-second';
+  markBackgroundTaskAwaitingInput(task.id, firstId, 'Which colour?', { options: ['Amber', 'Violet'] });
+  const h = await boot();
+  try {
+    const displayedResponse = await fetch(`${h.url}/api/console/background-tasks/${task.id}`);
+    assert.equal(displayedResponse.status, 200);
+    const displayed = await displayedResponse.json() as { task: { pendingQuestionId: string } };
+    assert.equal(displayed.task.pendingQuestionId, firstId, 'retain the actual drawer detail identity before the task advances');
+    const first = await fetch(`${h.url}/api/console/board/background/${task.id}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId: firstId, answer: 'Violet' }),
+    });
+    assert.equal(first.status, 200, 'another current answer may legitimately advance the task');
+    await first.json();
+    markBackgroundTaskRunning(task.id);
+    markBackgroundTaskAwaitingInput(task.id, secondId, 'Finish or wait?', { options: ['Finish', 'Wait'] });
+    const before = getBackgroundTask(task.id);
+    assert.equal(before?.pendingQuestionId, secondId);
+    const stale = await fetch(`${h.url}/api/console/board/background/${task.id}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId: displayed.task.pendingQuestionId, answer: 'Amber' }),
+    });
+    const body = await stale.json() as { ok: boolean };
+    t.diagnostic(JSON.stringify({ status: stale.status, ok: body.ok,
+      submittedQuestionId: displayed.task.pendingQuestionId,
+      queuedQuestionId: getBackgroundTask(task.id)?.inputResolution?.questionId ?? null }));
+    assert.equal(stale.status, 409, 'the stale Q1 answer must not be rebound to current Q2');
+    assert.equal(body.ok, false);
+    assert.deepEqual(getBackgroundTask(task.id), before, 'stale identity must preserve all current Q2 state');
+  } finally {
+    await h.close();
+  }
+});
+
+test('board answer identity: current Q2 free text queues once and duplicate refusal leaves state unchanged', async () => {
+  const task = createBackgroundTask({ title: 'FRAMEWORK-TEST board current question identity', prompt: 'Allow a free-text answer to the current question.' });
+  const questionId = 'q-board-current-second';
+  markBackgroundTaskAwaitingInput(task.id, questionId, 'Finish or wait?', { options: ['Finish', 'Wait'] });
+  const h = await boot();
+  try {
+    const answer = 'Wait until I have checked the figures; this is my own answer.';
+    const current = await fetch(`${h.url}/api/console/board/background/${task.id}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId, answer }),
+    });
+    assert.equal(current.status, 200, 'current free text need not equal an offered option');
+    const body = await current.json() as { ok: boolean };
+    assert.equal(body.ok, true);
+    const queued = getBackgroundTask(task.id);
+    assert.equal(queued?.status, 'pending');
+    assert.deepEqual(queued?.inputResolution && {
+      questionId: queued.inputResolution.questionId, answer: queued.inputResolution.answer,
+    }, { questionId, answer });
+    const duplicate = await fetch(`${h.url}/api/console/board/background/${task.id}/answer`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId, answer: 'Finish' }),
+    });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json() as { ok: boolean }).ok, false);
+    assert.deepEqual(getBackgroundTask(task.id), queued, 'the refused duplicate must not alter the first queued answer');
+  } finally {
+    await h.close();
+  }
+});
+
 test('board action route: resume re-queues an awaiting_continue background task', async () => {
   const task = createBackgroundTask({ title: 'needs continue', prompt: 'p' });
   markBackgroundTaskRunning(task.id);

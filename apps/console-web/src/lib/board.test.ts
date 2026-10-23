@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  answerBackgroundTaskQuestion,
   boardCardFromRunDetail,
   boardDropHighlight,
   boardLaneId,
@@ -21,6 +22,45 @@ import {
   workflowCatchupActionPath,
   type BoardCard,
 } from './board';
+
+test('board answer transport preserves the opaque displayed question identity and arbitrary free text', async t => {
+  const priorWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { __CLEM_BOOTSTRAP__: { token: 'synthetic-board-fixture' } } });
+  t.after(() => { if (priorWindow) Object.defineProperty(globalThis, 'window', priorWindow); else Reflect.deleteProperty(globalThis, 'window'); });
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ path: String(url), init });
+    return Response.json({ ok: true });
+  });
+  const taskId = 'bg-fixture/encoded-target';
+  const questionId = 'q:fixture/first?opaque=1+2#β';
+  const answer = '  My own answer, outside the suggested choices.\nKeep the next choice open.  ';
+  assert.deepEqual(await answerBackgroundTaskQuestion(taskId, questionId, answer), { ok: true });
+  assert.equal(calls.length, 1);
+  assert.equal(new URL(calls[0]!.path, 'https://fixture.invalid').pathname,
+    '/api/console/board/background/bg-fixture%2Fencoded-target/answer');
+  assert.equal(calls[0]!.init?.method, 'POST');
+  assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), { questionId, answer });
+});
+
+test('board answer transport propagates a stale-question refusal without retrying or retargeting', async t => {
+  const priorWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { __CLEM_BOOTSTRAP__: { token: 'synthetic-board-fixture' } } });
+  t.after(() => { if (priorWindow) Object.defineProperty(globalThis, 'window', priorWindow); else Reflect.deleteProperty(globalThis, 'window'); });
+  const calls: Array<{ path: string; init?: RequestInit }> = [];
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ path: String(url), init });
+    return Response.json({ ok: false, reason: 'The displayed question changed.' }, { status: 409 });
+  });
+  await assert.rejects(answerBackgroundTaskQuestion('bg-fixture', 'q-displayed-first', 'Amber'),
+    error => typeof error === 'object' && error !== null
+      && (error as { status?: number }).status === 409);
+  assert.equal(calls.length, 1, 'a refused answer cannot trigger a new read or resend against another question');
+  assert.equal(new URL(calls[0]!.path, 'https://fixture.invalid').pathname,
+    '/api/console/board/background/bg-fixture/answer');
+  assert.equal(calls[0]!.init?.method, 'POST');
+  assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), { questionId: 'q-displayed-first', answer: 'Amber' });
+});
 
 function card(input: Partial<BoardCard> & Pick<BoardCard, 'id'>): BoardCard {
   const { id, ...overrides } = input;

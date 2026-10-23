@@ -13700,11 +13700,25 @@ export function registerConsoleRoutes(
           ? (req.body as { answer: string }).answer.trim()
           : '';
         if (!answer) { res.status(400).json({ ok: false, reason: 'answer required' }); return; }
+        const questionId = typeof (req.body as { questionId?: unknown })?.questionId === 'string'
+          ? (req.body as { questionId: string }).questionId
+          : '';
+        if (!questionId.trim()) {
+          res.status(400).json({ ok: false, reason: 'questionId required', message: 'Reload the current question before answering.' });
+          return;
+        }
         if (task.status !== 'awaiting_input' || !task.pendingQuestionId) {
           res.status(409).json({ ok: false, reason: `Task is not waiting on a question (status: ${task.status}).` });
           return;
         }
-        const queued = queueBackgroundTaskInputResolution(task.pendingQuestionId, answer);
+        if (task.pendingQuestionId !== questionId) {
+          const reason = 'This question has changed. Read the current question and answer again.';
+          res.status(409).json({ ok: false, reason, message: reason });
+          return;
+        }
+        // Bind the answer to the question the owner saw, then let the existing
+        // CAS reject any intervening resolution. Never substitute today's ID.
+        const queued = queueBackgroundTaskInputResolution(questionId, answer);
         if (!queued) { res.status(409).json({ ok: false, reason: 'The question was already answered.' }); return; }
         res.json({ ok: true, task: queued });
         return;
