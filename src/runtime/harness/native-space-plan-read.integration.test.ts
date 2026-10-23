@@ -683,7 +683,7 @@ for (const repair of ['none', 'plan', 'definition'] as const) test(`a created wo
     assert.ok(model.requests().every(request => !request.inputTail.includes('STALE_PLAN_REPAIR_SENTINEL')),
       'the repaired plan cannot receive advice about its failed predecessor');
   }
-  if (repairedDefinition) assert.match(historyResult(history, 'lifecycle-invalid-create'), /Invalid workflow transform/);
+  if (repairedDefinition) assert.match(historyResult(history, 'lifecycle-invalid-create'), /Invalid workflow steps:\n- steps\[0\]\.transform: /);
   assert.match(historyResult(history, 'lifecycle-create'), /Created workflow/);
   assert.match(historyResult(history, 'lifecycle-enable'), /now approved/);
   const { expectedWorkPlanLines } = await import('./expected-work-admission.js');
