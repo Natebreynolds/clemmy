@@ -26,7 +26,7 @@ import { codifyMechanicalSteps } from './workflow-codify.js';
 import { describeCycle, findCycle } from './graph-cycle.js';
 import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
-import { parseWorkflowTransformAuthoringValue } from './workflow-transform.js';
+import { validateWorkflowTransform } from './workflow-transform.js';
 export {
   deleteWorkflowAndSyncTriggers,
   syncWorkflowTriggersBestEffort,
@@ -196,19 +196,77 @@ type WorkflowStepNormalizeInput = Omit<Partial<WorkflowStepInput>, 'transform'> 
   transform?: unknown;
 };
 
-function optionalTransform(value: unknown): WorkflowStepInput['transform'] | undefined {
+// Normalization feedback may be returned to a model. Retain schema paths and
+// fixed validator language, never JSON parser excerpts, literal keys/values,
+// unknown operation names, or caller-controlled step IDs.
+const SAFE_TRANSFORM_ISSUE_SUFFIXES = new Set([
+  'must be JSON-compatible.', 'must be an object.', 'must equal 1.',
+  'must be an expression object.', 'must name a reviewed transform operation.', 'is required.',
+  'must be a safe field name (1-128 letters, numbers, space, "_", "-", or ".").',
+  'must be input.<key>, steps.<id>.output[.<path>], or item[.<path>].',
+  'contains a reserved path segment.', 'uses item outside a map.each expression.',
+  'must be {key,value}.', 'must contain 1-32 fields.', 'must be {column,direction}.',
+  'must be asc or desc.', 'must be an object.', 'must be eq, ne, contains, empty, or nonempty.',
+  'must be a string when supplied.', 'must contain 1-32 field names.',
+  'must be {fn,column?}.', 'must be count, sum, avg, min, or max.',
+  'exceeds the JSON nesting ceiling.', 'contains a non-finite number.',
+  'contains a cycle.', 'must be a plain JSON object.',
+]);
+
+function safeTransformIssue(message: string): string {
+  const match = /^(transform(?:\.(?:version|expression|op|value|from|fields|key|items|each|by|keys|column|direction|where|limit|columns|groupBy|metrics|fn)|\[\d{1,6}\])*) (.+)$/.exec(message);
+  if (match && (SAFE_TRANSFORM_ISSUE_SUFFIXES.has(match[2]!)
+    || /^(?:specification is \d{1,12} bytes \(cap \d{1,12}\)|has more than \d{1,6} expression nodes|exceeds the transform depth ceiling of \d{1,6}|must be an array of at most \d{1,6} (?:fields|expressions|field names|metrics)|must be an integer from 1 to \d{1,6}|contains a non-JSON (?:undefined|function|symbol|bigint) value|is required for (?:count|sum|avg|min|max))\.$/.test(match[2]!))) {
+    return message;
+  }
+  return 'transform violates the closed v1 expression schema; check its operation, fields and literal values.';
+}
+
+type NormalizationIssueSink = (field: 'transform' | 'call', message: string) => void;
+
+function optionalTransform(value: unknown, issue: NormalizationIssueSink): WorkflowStepInput['transform'] | undefined {
   if (value === undefined || value === null) return undefined;
-  const parsed = parseWorkflowTransformAuthoringValue(value);
-  // Preserve the actual validation error. Returning the original JSON string
-  // after semantic validation failed made the next validator report only
-  // "must be an object", hiding the fields the author needed to repair.
-  if (!parsed.ok) throw new Error(`Invalid workflow transform: ${parsed.message}`);
+  let candidate = value;
+  if (typeof candidate === 'string') {
+    try { candidate = JSON.parse(candidate); }
+    catch { issue('transform', 'transform must contain valid JSON object text.'); return undefined; }
+  }
+  const parsed = validateWorkflowTransform(candidate);
+  if (!parsed.ok) {
+    for (const message of new Set(parsed.errors.map(safeTransformIssue))) issue('transform', message);
+    return undefined;
+  }
   return parsed.transform;
 }
 
 export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): WorkflowStepInput[] {
-  return steps.map((raw) => {
+  let issueCount = 0;
+  const lines: string[] = [];
+  let diagnosticBytes = 0;
+  const normalized = steps.map((raw, index) => {
+    const issue: NormalizationIssueSink = (field, message) => {
+      issueCount += 1;
+      const line = `- steps[${index}].${field}: ${message}`;
+      // Count all errors even after output fills: the cap can never turn an
+      // invalid definition into a partial executable graph.
+      if (lines.length < 16 && diagnosticBytes + Buffer.byteLength(line, 'utf8') < 3800) {
+        lines.push(line);
+        diagnosticBytes += Buffer.byteLength(line, 'utf8') + 1;
+      }
+    };
     const s = raw as Partial<WorkflowStepInput> & Record<string, unknown>;
+    const transform = optionalTransform(s.transform, issue);
+    let call: WorkflowStepInput['call'];
+    try { call = normalizeWorkflowCallArguments(optionalObject<WorkflowStepInput['call']>(s.call)); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      const safe = new Set([
+        'call.args_json must be JSON object text.', 'call.args_json must contain valid JSON object text.',
+        'call.args_json must encode an object, not an array or scalar.',
+        'call.args and call.args_json disagree; provide one argument carrier.',
+      ]);
+      issue('call', safe.has(message) ? message : 'call arguments could not be normalized.');
+    }
     const step: EveryWorkflowStepField = {
       id: typeof s.id === 'string' ? s.id : String(s.id ?? ''),
       prompt: typeof s.prompt === 'string' ? s.prompt : '',
@@ -226,9 +284,9 @@ export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): Wor
       // validate its exact shape; dashboard/file inputs still fail closed in
       // checkWorkflowForWrite instead of being normalized into a flat step.
       subgraph: optionalObject<WorkflowStepInput['subgraph']>(s.subgraph),
-      transform: optionalTransform(s.transform),
+      transform,
       deterministic: optionalObject<WorkflowStepInput['deterministic']>(s.deterministic),
-      call: normalizeWorkflowCallArguments(optionalObject<WorkflowStepInput['call']>(s.call)),
+      call,
       invocationPlan: optionalObject<WorkflowStepInput['invocationPlan']>(
         s.invocationPlan ?? s.invocation_plan,
       ),
@@ -248,6 +306,12 @@ export function normalizeWorkflowSteps(steps: WorkflowStepNormalizeInput[]): Wor
     };
     return step;
   });
+  if (issueCount > 0) {
+    const omitted = issueCount - lines.length;
+    throw new Error(['Invalid workflow steps:', ...lines,
+      ...(omitted > 0 ? [`${omitted} additional normalization issues omitted; correct these fields and validate again.`] : [])].join('\n'));
+  }
+  return normalized;
 }
 
 function normalizeCodifiedFrom(step: Partial<WorkflowStepInput> & Record<string, unknown>): WorkflowStepInput['codifiedFrom'] | undefined {
