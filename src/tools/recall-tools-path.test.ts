@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import Database from 'better-sqlite3';
 
 const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-retained-path-'));
 process.env.CLEMENTINE_HOME = fixtureHome;
@@ -17,6 +18,9 @@ const { RecallBudget, ToolCallsCounter, withHarnessRunContext } =
 const { inlineResultBudgetForModel, retainedReaderMaxChars } =
   await import('../runtime/harness/tool-output-format.js');
 const { extractByPath } = await import('../runtime/harness/tool-output-reference.js');
+const { projectHostNoProgressAttempt } = await import('../runtime/harness/host-no-progress-projection.js');
+const { initializeNoProgressGovernor, observeNoProgress, NO_PROGRESS_RETRY_BUDGET } =
+  await import('../runtime/harness/no-progress-governor.js');
 
 type QueryHandler = (input: Record<string, unknown>) => Promise<{ content: Array<{ type: 'text'; text: string }> }>;
 let query: QueryHandler | undefined;
@@ -110,6 +114,78 @@ test('bad or missing pointers fail exactly instead of choosing another array or 
     assert.match(result, /ERROR: path/);
     assert.match(result, /No alternate data was selected/);
     assert.doesNotMatch(result, /never-selected|\$fromToolOutput/);
+  }
+});
+
+test('two failed exact retained paths spend bounded repairs before the correct path returns only its own evidence', async () => {
+  const fixture = park({
+    records: Array.from({ length: 30 }, (_, i) => ({ id: `unrelated-${i}`, state: 'irrelevant' })),
+    workflow: { proof: [{ id: 'exact-proof', state: 'verified' }] },
+  });
+  const source = appendEvent({ sessionId: fixture.sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Read the exact controlled workflow proof from the saved result.' } });
+  const identity = { sessionId: fixture.sessionId, sourceUserSeq: source.seq };
+  const authority = { operation: [], account: [], target: [], evidence: [], effect: [] };
+  let state = initializeNoProgressGovernor({ taskKey: `retained-path:${source.seq}`, authority });
+  // Only the lifecycle facts needed by the projector are staged here. The
+  // retained bytes, exact-path failures and selected data come from the real
+  // reader above, inside this file's scoped fixture home.
+  const settlements = new Database(':memory:');
+  settlements.exec(`CREATE TABLE logical_call_settlements (
+    logical_tool_call_id TEXT NOT NULL, observer_call_id TEXT,
+    execution_kind TEXT NOT NULL, outcome_kind TEXT NOT NULL, recovery_action TEXT NOT NULL,
+    business_call INTEGER NOT NULL, mutating INTEGER NOT NULL, requires_reconciliation INTEGER NOT NULL,
+    physical_crossing_count INTEGER NOT NULL, host_crossing_count INTEGER, outcome_detail TEXT,
+    session_id TEXT NOT NULL, source_user_seq INTEGER NOT NULL
+  )`);
+  const settle = settlements.prepare(`INSERT INTO logical_call_settlements VALUES
+    (?, ?, 'local_execution', ?, ?, 0, 0, 0, 0, 1, NULL, ?, ?)`);
+  try {
+    const paths = ['/result/workflow/proof', '/workflow/proofs', '/workflow/proof'];
+    for (const [index, selected] of paths.entries()) {
+      const args = { call_id: fixture.callId, path: selected, fields: ['id', 'state'] };
+      const text = await read(fixture.sessionId, args);
+      const failed = index < 2;
+      if (failed) {
+        assert.match(text, /ERROR: path/);
+        assert.match(text, /No alternate data was selected/);
+        assert.doesNotMatch(text, /unrelated-|exact-proof|\$fromToolOutput/);
+      } else {
+        assert.deepEqual(shownRows(text), [{ id: 'exact-proof', state: 'verified' }]);
+        assert.doesNotMatch(text, /unrelated-|ERROR:|\$fromToolOutput/);
+        assert.ok(text.includes(`path=${JSON.stringify(selected)}`));
+      }
+      const callId = `fixture-path-attempt-${index}`;
+      settle.run(callId, callId, failed ? 'unknown' : 'succeeded', failed ? 'stop_and_explain' : 'settle',
+        identity.sessionId, identity.sourceUserSeq);
+      const projected = projectHostNoProgressAttempt({ ...identity, historyDelta: [
+        { type: 'function_call', callId, name: 'tool_output_query', arguments: JSON.stringify(args) },
+        { type: 'function_call_result', callId, name: 'tool_output_query', output: { type: 'text', text } },
+      ] }, settlements);
+      assert.equal(projected.status, 'ok');
+      if (projected.status !== 'ok') throw new Error('retained-path frame did not project');
+      assert.equal(projected.attemptClass, failed ? 'read_repair' : 'task_work');
+      if (failed) {
+        assert.equal(projected.consequence?.effectState, 'known_terminal');
+        assert.equal(projected.consequence?.recovery, 'repair_model');
+        assert.deepEqual(projected.consequence?.recoveryToolNames, [], 'a failed control read grants no tool authority');
+      } else {
+        assert.equal(projected.consequence, undefined);
+      }
+      const decision = observeNoProgress(state, { taskKey: state.taskKey, authority,
+        attemptClass: projected.attemptClass, consequence: projected.consequence });
+      assert.equal(decision.action, 'continue', 'the second path error must leave the existing correction opportunity available');
+      assert.equal(decision.reason, failed ? 'retry_available' : 'unmetered_attempt');
+      assert.equal(decision.state.retriesRemaining, NO_PROGRESS_RETRY_BUDGET - Math.min(index + 1, 2));
+      assert.deepEqual(decision.gained, [], 'neither an error nor a selector edit manufactures authority');
+      assert.deepEqual(decision.state.authority, authority);
+      assert.equal(decision.state.stageTransitionsRemaining, state.stageTransitionsRemaining);
+      state = decision.state;
+      assert.equal(getToolOutput(fixture.sessionId, fixture.callId)?.output, fixture.output,
+        'repairing the selector never changes the retained producer output');
+    }
+  } finally {
+    settlements.close();
   }
 });
 

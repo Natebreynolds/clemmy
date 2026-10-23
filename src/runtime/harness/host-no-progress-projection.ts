@@ -1218,6 +1218,19 @@ function isProviderCrossedInvalidArguments(settlement: NoProgressSettlementRow):
     && settlement.physical_crossing_count > 0;
 }
 
+function isLocalRetainedReader(call: HistoryCall, settlement: NoProgressSettlementRow): boolean {
+  if (settlement.execution_kind !== 'local_execution'
+    || settlement.business_call !== 0
+    || settlement.mutating !== 0
+    || settlement.requires_reconciliation !== 0
+    || settlement.physical_crossing_count !== 0) return false;
+  const effective = unwrapRuntimeEffectiveToolIdentity(call.name, call.arguments);
+  const name = effective.toolName;
+  return Boolean(name
+    && isPlainOrClementineLocalTool(name, name.split('__').at(-1)!)
+    && toolReadsRetainedOutput(name));
+}
+
 function settlementConsequence(input: {
   call: HistoryCall;
   settlement: NoProgressSettlementRow;
@@ -1643,9 +1656,12 @@ export function projectHostNoProgressAttempt(input: HostNoProgressIdentity & {
       attemptClass: isProviderCrossedInvalidArguments(failed.settlement)
         ? 'provider_repair'
         : failed.settlement.mutating === 0
-          && failed.settlement.business_call === 1
+          && (failed.settlement.business_call === 1 || isLocalRetainedReader(failed.call, failed.settlement))
           && failed.settlement.outcome_kind === 'unknown'
           && failed.consequence.effectState === 'known_terminal'
+          // A failed local retained read has finished without changing anything.
+          // Spend the existing read-repair budget; keep its empty tool surface
+          // and unchanged consequence key so path/error churn cannot refill it.
           ? 'read_repair'
           : 'zero_crossing_repair',
       consequence: failed.consequence,

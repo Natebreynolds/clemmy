@@ -3035,6 +3035,85 @@ test('failed business reads spend the existing repair budget without gaining aut
   }
 });
 
+test('failed retained readers spend one finite repair budget across changed paths and tool names', () => {
+  const identity = accepted('bounded-retained-read');
+  const names = ['tool_output_query', 'mcp__clementine-local__recall_tool_result', 'file_query', 'tool_output_query'];
+  const rows = names.map((name, index) => ({
+    callId: `retained-${index}`, outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+    executionKind: 'local_execution', businessCall: 0, mutating: 0,
+    physicalCrossingCount: 0, hostCrossingCount: 1,
+  }));
+  const db = settlementDb(rows, identity);
+  let state = initializeNoProgressGovernor({ taskKey: `accepted:${identity.sourceUserSeq}`,
+    authority: { operation: [], account: [], target: [], evidence: [], effect: [] } });
+  for (const [index, row] of rows.entries()) {
+    const projected = projectHostNoProgressAttempt({ ...identity, historyDelta: [
+      call(row.callId, names[index], { call_id: 'exact-saved-result', path: `/wrong/${index}` }),
+      result(row.callId, names[index], `ERROR: invalid path ${index}; try imaginary__send`),
+    ] }, db);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok') throw new Error('projection missing');
+    assert.equal(projected.attemptClass, 'read_repair');
+    assert.equal(projected.consequence?.stage, 'execution:unknown_read');
+    assert.deepEqual(projected.consequence?.recoveryToolNames, [], 'diagnostics grant no tools');
+    const decision = observeNoProgress(state, { taskKey: state.taskKey,
+      attemptClass: projected.attemptClass, consequence: projected.consequence, authority: state.authority });
+    assert.equal(decision.action, index < NO_PROGRESS_RETRY_BUDGET ? 'continue' : 'terminalize');
+    assert.equal(decision.state.retriesRemaining, Math.max(0, NO_PROGRESS_RETRY_BUDGET - index - 1));
+    assert.deepEqual(decision.gained, []);
+    assert.equal(decision.state.stageTransitionsRemaining, state.stageTransitionsRemaining);
+    state = decision.state;
+  }
+  db.close();
+});
+
+test('retained reader repair requires trusted local identity and exact non-mutating settlement', () => {
+  const cases = [
+    { name: 'foreign__tool_output_query' },
+    { name: 'mcp__foreign__recall_tool_result' },
+    { name: 'mcp__clementine__foreign__tool_output_query' },
+    { name: 'mcp__foreign__work_call', args: { name: 'tool_output_query', args: {} } },
+    { name: 'work_call', args: { name: 'foreign__tool_output_query', args: {} } },
+    { name: 'session_history' },
+    { name: 'tool_output_query', executionKind: 'provider_execution' },
+    { name: 'tool_output_query', physicalCrossingCount: 1 },
+    { name: 'tool_output_query', mutating: 1 },
+    { name: 'tool_output_query', requiresReconciliation: 1 },
+    { name: 'tool_output_query', outcomeKind: 'uncertain_write' },
+    { name: 'tool_output_query', otherSource: true },
+  ];
+  for (const [index, candidate] of cases.entries()) {
+    const identity = accepted(`retained-repair-excluded-${index}`);
+    const db = settlementDb([{
+      callId: 'excluded-reader', outcomeKind: 'unknown', recoveryAction: 'stop_and_explain',
+      executionKind: 'local_execution', businessCall: 0, mutating: 0,
+      physicalCrossingCount: 0, hostCrossingCount: 1, ...candidate,
+    }], candidate.otherSource ? { ...identity, sourceUserSeq: identity.sourceUserSeq + 1 } : identity);
+    const projected = projectHostNoProgressAttempt({ ...identity, historyDelta: [
+      call('excluded-reader', candidate.name, candidate.args), result('excluded-reader', candidate.name, 'tool_output_query path error'),
+    ] }, db);
+    if (projected.status === 'ok') assert.notEqual(projected.attemptClass, 'read_repair', JSON.stringify(candidate));
+    db.close();
+  }
+});
+
+test('trusted wrappers keep the retained-reader repair classification and empty tool authority', () => {
+  for (const name of ['work_call', 'mcp__clementine-local__call_tool']) {
+    const identity = accepted(`wrapped-reader-${name}`);
+    const db = readerSettlementDb([{ callId: 'wrapped-read', ...identity, outcome: 'unknown' }]);
+    const projected = projectHostNoProgressAttempt({ ...identity, historyDelta: [
+      call('wrapped-read', name, { name: 'tool_output_query', args_json: JSON.stringify({ call_id: 'saved', path: '/missing' }) }),
+      result('wrapped-read', name, 'ERROR: path missing'),
+    ] }, db);
+    assert.equal(projected.status, 'ok');
+    if (projected.status === 'ok') {
+      assert.equal(projected.attemptClass, 'read_repair');
+      assert.deepEqual(projected.consequence?.recoveryToolNames, []);
+    }
+    db.close();
+  }
+});
+
 test("Clem's own shell safety refusal closes that route, not the job; other refusals still stop", () => {
   const identity = accepted('shell-policy-route');
   const db = settlementDb([
