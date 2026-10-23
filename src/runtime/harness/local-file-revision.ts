@@ -99,7 +99,26 @@ type LocalFileRevisionInput = {
   /** Host-owned occurrence identity, never a model-supplied write argument. */
   operationKey?: string;
 };
-type LocalFileRevisionResult = { createdId: string; committedPath: string; previousPath: string | null; unchanged: boolean };
+export type LocalFileRevisionResult = { createdId: string; committedPath: string; previousPath: string | null; unchanged: boolean };
+type LocalFileRevisionSnapshot = { target: string; handle: string; descriptorBytes: Buffer; contentBytes: Buffer };
+const revisionSnapshots = new WeakMap<LocalFileRevisionResult, LocalFileRevisionSnapshot>();
+
+/** Keep this operation's verified bytes before releasing its lock. The public
+ * handle still names current.json: a later revision must invalidate current
+ * verification, without being relabelled as this operation's result. */
+function captureRevision(result: LocalFileRevisionResult, snapshot: LocalFileRevisionSnapshot): LocalFileRevisionResult {
+  revisionSnapshots.set(result, { ...snapshot,
+    descriptorBytes: Buffer.from(snapshot.descriptorBytes), contentBytes: Buffer.from(snapshot.contentBytes) });
+  return result;
+}
+
+/** Only genuine store results carry a snapshot; callers receive defensive
+ * copies, never mutable ownership of the retained operation bytes. */
+export function getLocalFileRevisionSnapshot(result: LocalFileRevisionResult): LocalFileRevisionSnapshot {
+  const saved = revisionSnapshots.get(result);
+  if (!saved) throw new Error('No captured local file revision for this result.');
+  return { ...saved, descriptorBytes: Buffer.from(saved.descriptorBytes), contentBytes: Buffer.from(saved.contentBytes) };
+}
 
 export function commitLocalFileRevision(input: LocalFileRevisionInput): LocalFileRevisionResult {
   return applyLocalFileRevision(input, false);
@@ -153,16 +172,18 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
       const currentBytes = existsSync(current) ? readDirectFile(current).bytes : null;
       const priorDescriptorMatches = (currentBytes ? digest(currentBytes) : null)
         === saved.operation.previousRevisionDigest;
+      const recovered = existsSync(target) ? readDirectFile(target) : null;
       if ((!currentBytes?.equals(encoded) && !priorDescriptorMatches)
-        || !existsSync(target) || digest(readDirectFile(target).bytes) !== saved.contentDigest) {
+        || !recovered || digest(recovered.bytes) !== saved.contentDigest) {
         throw new LocalFileRevisionConflict('The recorded file operation cannot be recovered from the current bytes. No file content was changed.');
       }
       // The mutation landed but current.json may not have been published.
       // Recover only its receipt; never append or replace target bytes again.
       if (!currentBytes?.equals(encoded)) writeDurable(current, encoded, 0o600);
-      return { createdId, committedPath: current,
+      return captureRevision({ createdId, committedPath: current,
         previousPath: saved.previous ? path.join(dir, `${saved.revisionId}.before`) : null,
-        unchanged: true };
+        unchanged: true }, { target, handle: path.relative(root, current).split(path.sep).join('/'),
+        descriptorBytes: encoded, contentBytes: recovered.bytes });
     }
     if (recoveryOnly) {
       throw new LocalFileRevisionConflict('No matching recorded file operation exists for recovery.');
@@ -204,7 +225,9 @@ function applyLocalFileRevision(input: LocalFileRevisionInput, recoveryOnly: boo
     const committed = readDirectFile(target);
     if (!committed.bytes.equals(bytes)) throw new Error('Local file changed before its receipt could be published.');
     writeDurable(current, encoded, 0o600);
-    return { createdId, committedPath: current, previousPath, unchanged };
+    return captureRevision({ createdId, committedPath: current, previousPath, unchanged },
+      { target, handle: path.relative(root, current).split(path.sep).join('/'),
+        descriptorBytes: encoded, contentBytes: committed.bytes });
   });
 }
 

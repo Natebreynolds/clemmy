@@ -1,10 +1,9 @@
 /**
  * Canonical host-owned proof carried by successful local authoring writes.
  *
- * The authoring implementation supplies only the stable created identity and
- * the committed file path. This leaf reopens that path beneath Clementine's
- * local root, derives the relative handle, hashes the bytes that are actually
- * on disk, and stamps those exact facts as the first result line. Consumers
+ * Authoring stores supply a committed path, or a file revision snapshot
+ * captured under their lock. This leaf derives the relative handle and hashes
+ * those verified bytes, stamping the exact facts as the first result line. Consumers
  * still have to prove registered local-write effect and host execution; the
  * marker by itself grants no authority.
  */
@@ -25,7 +24,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../../config.js';
-import { isLocalFileRevisionHandle, readLocalFileRevisionContent } from './local-file-revision.js';
+import { getLocalFileRevisionSnapshot, isLocalFileRevisionHandle, readLocalFileRevisionContent, type LocalFileRevisionResult } from './local-file-revision.js';
 
 export const HOST_LOCAL_WRITE_COMMIT_PREFIX = '[clementine:host-local-write-commit:v1]' as const;
 export const HOST_LOCAL_WORKSPACE_COMMIT_BASENAME = '.clementine-workspace-commit.json' as const;
@@ -871,6 +870,30 @@ export function withHostLocalWriteCommitFromFile(input: Parameters<typeof withHo
     : withHostLocalWriteCommitFromFileUnlocked(input);
 }
 
+/** File tools already verified these exact bytes under their revision lock.
+ * Do not reopen current.json here: another operation may have superseded it.
+ * Current-content verification remains a separate, unchanged requirement. */
+export function withHostLocalFileRevisionCommit(input: { revision: LocalFileRevisionResult; result: string }): string {
+  const snapshot = getLocalFileRevisionSnapshot(input.revision);
+  const descriptor = JSON.parse(snapshot.descriptorBytes.toString('utf8'));
+  const targetDigest = createHash('sha256').update(snapshot.target).digest('hex');
+  const root = realpathSync(path.resolve(BASE_DIR));
+  if (descriptor.version !== 1 || descriptor.kind !== 'local_file_revision_v1'
+    || !path.isAbsolute(snapshot.target) || path.resolve(snapshot.target) !== snapshot.target
+    || descriptor.target !== snapshot.target || descriptor.createdId !== `file-${targetDigest}`
+    || descriptor.createdId !== input.revision.createdId
+    || !isLocalFileRevisionHandle(snapshot.handle)
+    || snapshot.handle !== `state/local-file-revisions/${targetDigest}/current.json`
+    || input.revision.committedPath !== path.resolve(root, snapshot.handle)
+    || descriptor.bytes !== snapshot.contentBytes.length
+    || descriptor.contentDigest !== createHash('sha256').update(snapshot.contentBytes).digest('hex')) {
+    throw new Error('Invalid captured local file revision.');
+  }
+  const identity: HostLocalWriteCommitIdentity = { createdId: descriptor.createdId, handle: snapshot.handle,
+    contentDigest: createHash('sha256').update(snapshot.descriptorBytes).digest('hex') };
+  return `${HOST_LOCAL_WRITE_COMMIT_PREFIX} ${canonicalIdentity(identity)}\n${input.result}`;
+}
+
 function withHostLocalWriteCommitFromFileUnlocked(input: {
   createdId: string;
   committedPath: string;
@@ -986,7 +1009,7 @@ export function withHostLocalWorkspaceCommitFromCurrentFiles(input: {
 }
 
 /** Test-only fixture constructor for transport tests that do not own a real
- * artifact. Production authoring code must use withHostLocalWriteCommitFromFile. */
+ * artifact. Production authoring code must use a verified store result. */
 export function _withHostLocalWriteCommitFactsForTest(
   input: HostLocalWriteCommitIdentity & { result: string },
 ): string {

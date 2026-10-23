@@ -14,10 +14,10 @@ import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { BASE_DIR } from '../config.js';
 import { observedLocalFileBase, recordLocalFileObservation } from '../runtime/harness/local-file-observation.js';
-import { canonicalLocalFileTarget, commitLocalFileRevision, isLocalFileRevisionHandle, recordedLocalFileAtRevision, recordLocalFileRevisionAfterCommand, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
+import { canonicalLocalFileTarget, commitLocalFileRevision, getLocalFileRevisionSnapshot, isLocalFileRevisionHandle, recordedLocalFileAtRevision, recordLocalFileRevisionAfterCommand, recoverLocalFileRevision, LocalFileRevisionConflict } from '../runtime/harness/local-file-revision.js';
 import { currentExpectedWorkBinding } from '../runtime/harness/expected-work-admission.js';
 import { reviewedFileCorrectionPrecondition } from '../runtime/harness/reviewed-file-correction.js';
-import { parseHostLocalWriteCommitFacts, withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
+import { parseHostLocalWriteCommitFacts, withHostLocalFileRevisionCommit, withHostLocalWriteCommitFromFile } from '../runtime/harness/host-local-write-commit.js';
 import type { RuntimeContextValue } from '../types.js';
 import {
   AGENTS_DIR,
@@ -1789,8 +1789,9 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
   if (!options?.recoveryOnly && observerSession) {
     try {
       const context = getToolOutputContext();
+      const snapshot = getLocalFileRevisionSnapshot(revision);
       recordLocalFileObservation({ sessionId: observerSession, sourceUserSeq: context?.sourceUserSeq, callId: context?.callId,
-        tool: 'write_file', target: canonicalTarget, bytes: readFileSync(canonicalTarget) });
+        tool: 'write_file', target: snapshot.target, bytes: snapshot.contentBytes });
     } catch { /* the receipt below still proves the write; only the base for a later write is missing */ }
   }
   const notice = workspaceAuthoringNotice(filePath);
@@ -1799,7 +1800,7 @@ export async function executeLocalFileWrite(input: z.infer<z.ZodObject<typeof WR
     : mode === 'replace'
       ? `Replaced one passage in ${filePath} (${(input.find ?? '').length} chars → ${input.content.length} chars); the rest of the file is unchanged.`
       : `${mode === 'append' ? 'Appended' : mode === 'overwrite' ? 'Overwrote' : 'Wrote'} ${filePath} (${input.content.length} chars).`;
-  return withHostLocalWriteCommitFromFile({ ...revision,
+  return withHostLocalFileRevisionCommit({ revision,
     result: [text, revision.previousPath ? `Previous bytes retained at ${revision.previousPath}.` : null, notice].filter(Boolean).join('\n\n') });
 }
 
