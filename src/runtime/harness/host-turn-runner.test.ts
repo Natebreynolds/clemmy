@@ -14387,6 +14387,152 @@ function freshComputationFixture(session: ReturnType<typeof eventlog.createSessi
     context: { sessionId: session.id, sourceUserSeq: source.seq } };
 }
 
+// This diagnostic starts from the production work-manifest declaration API,
+// not a model-authored worker plan. Actual host calls produce every successful
+// result; production item settlement, task lifecycle and final delivery gates
+// then consume those results. It does not model the complete native drain.
+for (const variant of ['missing-b', 'complete-b', 'foreign-b', 'cancelled'] as const) {
+  test(`background contract continuation: ${variant}`, async (t) => {
+    const background = await import('../../execution/background-tasks.js');
+    const work = await import('./work-manifest.js');
+    const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+    const priorFanout = process.env.CLEMMY_FANOUT_LEDGER;
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    process.env.CLEMMY_FANOUT_LEDGER = 'on';
+    t.after(() => {
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+      if (priorFanout === undefined) delete process.env.CLEMMY_FANOUT_LEDGER;
+      else process.env.CLEMMY_FANOUT_LEDGER = priorFanout;
+    });
+    const task = background.createBackgroundTask({
+      title: `FRAMEWORK-TEST background contract ${variant}`,
+      prompt: 'Read both named controlled records A and B. Pause after A, then finish B when continued.',
+      source: 'desktop',
+    });
+    t.after(() => background.archiveBackgroundTask(task.id));
+    // Plain-task sessions are created by respondViaHarness, not by task
+    // creation. Use that same execution-session shape at this host seam.
+    const session = eventlog.getSession(task.runSessionId) ?? eventlog.createSession({
+      id: task.runSessionId, kind: 'execution', channel: 'background', title: task.title,
+      metadata: { source: 'bridge:background' },
+    });
+    assert.equal(background.markBackgroundTaskRunning(task.id)?.status, 'running');
+    const first = freshComputationFixture(session, task.prompt, `background-${variant}-first`);
+    const declaration = work.prepareWorkerManifest({
+      sessionId: session.id, sourceUserSeq: first.source.seq,
+      items: ['A', 'B'], objective: task.prompt,
+      descriptor: { id: 'controlled-records', contractVersion: task.contractVersion ?? 1,
+        phase: 'read', phases: [{ id: 'read' }], mode: 'declare' },
+    });
+    assert.equal(declaration.ok, true, JSON.stringify(declaration));
+    const files = { A: path.join(TMP_HOME, `${task.id}-A.txt`), B: path.join(TMP_HOME, `${task.id}-B.txt`) };
+    writeFileSync(files.A, 'controlled record A\n');
+    writeFileSync(files.B, 'controlled record B\n');
+    const actualReads: string[] = [];
+    const reader = brackets.wrapToolForHarness(tool({
+      name: 'read_file', description: 'Read only one of the two named controlled records.',
+      parameters: z.object({ path: z.string() }).strict(), needsApproval: async () => false,
+      execute: async ({ path: target }) => {
+        assert.ok(Object.values(files).includes(target), 'the tool cannot read outside the disposable fixture');
+        actualReads.push(target);
+        return readFileSync(target, 'utf8');
+      },
+    }));
+    const question = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+    const aCall = `background-A-${first.source.seq}`;
+    const firstAgent = { model: stubModel([
+      [toolCall(aCall, 'read_file', { path: files.A })],
+      [toolCall(`background-question-${first.source.seq}`, 'ask_user_question', {
+        question: 'Continue with controlled record B?', options: ['Continue', 'Wait'], purpose: 'clarification',
+      })],
+    ]), tools: [reader, question], toolUseBehavior: userChoiceToolUseBehavior };
+    bindHostCanarySurface(first, firstAgent, firstAgent.tools);
+    const paused = await runProductionHost(first, firstAgent, undefined, { hostJudgeCompletion: false });
+    assert.match(String(paused.finalOutput), /^\[clementine:awaiting-user-input:final\]/);
+    assert.deepEqual(actualReads, [files.A]);
+    assert.equal(work.settleWorkItemFromOwnCalls({ sessionId: session.id, sourceUserSeq: first.source.seq,
+      item: 'A', phase: 'read', callIds: [aCall] }).ok, true, 'only the actual successful A call supplies its receipt');
+    const aState = work.summarizeWorkManifest(session.id, 'controlled-records')!.items.find(item => item.id === 'A')!;
+    assert.equal(aState.complete, true);
+    assert.deepEqual(aState.phases.read!.evidence, [{ kind: 'tool_result', ref: aCall }]);
+    const aSettlement = eventlog.openEventLog().prepare(`SELECT * FROM logical_call_settlements
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(session.id, first.source.seq, aCall);
+    assert.ok(aSettlement, 'A has a durable host settlement, not just a checkpoint label');
+    eventlog.finishRunAttempt(first.attempt, 'interrupted');
+    const asked = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] })
+      .find(event => event.data.sourceUserSeq === first.source.seq)!;
+    assert.ok(asked && typeof asked.data.question === 'string');
+    assert.equal(background.markBackgroundTaskAwaitingInput(task.id, `controlled-question-${first.source.seq}`,
+      String(asked.data.question), { options: ['Continue', 'Wait'] })?.status, 'awaiting_input');
+    assert.equal(background.cancelBackgroundTask(task.id, 'Controlled Stop at the parked question.')?.status, 'aborted');
+    const resumed = background.resumeBackgroundTask(task.id);
+    assert.equal(resumed?.id, task.id);
+    assert.equal(resumed?.runSessionId, session.id);
+    assert.equal(resumed?.prompt, task.prompt);
+    assert.equal(resumed?.resumeCount, 1);
+    assert.equal(resumed?.resumedFromTaskId, undefined, 'Continue creates no replacement task');
+    assert.deepEqual(work.summarizeWorkManifest(session.id, 'controlled-records')!.items.find(item => item.id === 'A'), aState);
+    assert.equal(background.markBackgroundTaskRunning(task.id)?.status, 'running');
+    const second = freshComputationFixture(session, `${task.prompt}\n\nContinue.`, `background-${variant}-second`);
+    const bCall = `background-B-${second.source.seq}`;
+    if (variant === 'foreign-b') {
+      const foreign = acceptHostCanarySource(`background-foreign-${second.source.seq}`, 'Read controlled record B.');
+      const foreignAgent = { model: stubModel([[toolCall(bCall, 'read_file', { path: files.B })],
+        [textMsg('The controlled foreign read is complete.')]]), tools: [reader] };
+      bindHostCanarySurface(foreign, foreignAgent, foreignAgent.tools);
+      await runProductionHost(foreign, foreignAgent);
+      assert.equal(actualReads.filter(target => target === files.B).length, 1,
+        'the foreign negative uses a real successful read, not a missing call');
+      assert.deepEqual(eventlog.openEventLog().prepare(`SELECT outcome_kind, business_call, host_crossing_count
+        FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+        .get(foreign.session.id, foreign.source.seq, bCall),
+      { outcome_kind: 'succeeded', business_call: 1, host_crossing_count: 1 });
+      const refused = work.settleWorkItemFromOwnCalls({ sessionId: session.id, sourceUserSeq: second.source.seq,
+        item: 'B', phase: 'read', callIds: [bCall] });
+      assert.equal(refused.ok, false, 'another session cannot discharge this task item');
+      if (!refused.ok) assert.match(refused.reason, /not successful work calls of this run/);
+    }
+    const finishB = variant === 'complete-b' || variant === 'cancelled';
+    const secondAgent = { model: stubModel([
+      ...(finishB ? [[toolCall(bCall, 'read_file', { path: files.B })]] : []),
+      [textMsg('Both controlled records are complete.')],
+    ]), tools: [reader] };
+    bindHostCanarySurface(second, secondAgent, secondAgent.tools);
+    const finalCandidate = await runProductionHost(second, secondAgent, undefined, { hostJudgeCompletion: false });
+    assert.equal(finalCandidate.finalOutput, 'Both controlled records are complete.',
+      'the downstream task verifier receives the actual host final candidate');
+    if (finishB) {
+      assert.equal(work.settleWorkItemFromOwnCalls({ sessionId: session.id, sourceUserSeq: second.source.seq,
+        item: 'B', phase: 'read', callIds: [bCall] }).ok, true);
+    }
+    const manifest = work.summarizeWorkManifest(session.id, 'controlled-records')!;
+    assert.equal(manifest.remaining, finishB ? 0 : 1);
+    assert.deepEqual(manifest.items.find(item => item.id === 'A'), aState, 'the later source preserves A without re-crediting it');
+    assert.deepEqual(eventlog.openEventLog().prepare(`SELECT * FROM logical_call_settlements
+      WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`).get(session.id, first.source.seq, aCall), aSettlement);
+    assert.equal(actualReads.filter(target => target === files.A).length, 1, 'A never repeats after Continue');
+    assert.equal(actualReads.filter(target => target === files.B).length, variant === 'missing-b' ? 0 : 1);
+    const verdict = await background.verifyBackgroundTaskDelivery(background.getBackgroundTask(task.id)!, String(finalCandidate.finalOutput));
+    if (!finishB) {
+      assert.equal(verdict.outcome, 'blocked', 'a fresh final claim cannot erase the old open obligation');
+      assert.match(verdict.reason ?? '', /Logical work is incomplete under contract 1.*1\/2/);
+      assert.notEqual(background.getBackgroundTask(task.id)?.status, 'done');
+    } else {
+      assert.equal(verdict.outcome, 'done', JSON.stringify(verdict));
+      if (variant === 'cancelled') {
+        assert.equal(background.cancelBackgroundTask(task.id, 'Controlled cancellation before final publication.')?.status, 'cancelling');
+        assert.equal(background.markBackgroundTaskDone(task.id, String(finalCandidate.finalOutput)), null,
+          'even complete evidence cannot overwrite cancellation at the final state transition');
+        assert.equal(background.getBackgroundTask(task.id)?.status, 'cancelling');
+      } else {
+        assert.equal(background.markBackgroundTaskDone(task.id, String(finalCandidate.finalOutput))?.status, 'done');
+      }
+    }
+    eventlog.finishRunAttempt(second.attempt, variant === 'cancelled' ? 'cancelled' : 'completed');
+  });
+}
+
 for (const variant of ['fresh', 'current_refusal', 'prior_uncertain', 'missing_attempt_payload',
   'null_attempt_payload', 'missing_run_payload', 'no_ambient_attempt', 'foreign_ambient_attempt'] as const) {
   test(`fresh computation over an actual retained read keeps exact source ownership: ${variant}`, async t => {
