@@ -282,7 +282,7 @@ test('Claude switch fails closed before changing the live or persisted brain whe
 async function withPrimaryRouteFixture(values: Record<string, string>, action: () => Promise<void>): Promise<void> {
   const initial: Record<string, string> = {
     AUTH_MODE: 'codex_oauth', MODEL_ROUTING_MODE: 'off', BYO_MODEL_BASE_URL: '', BYO_MODEL_API_KEY: '',
-    BYO_MODEL_ID: '', BYO_MODEL_JUDGE_ID: '', BYO_MODEL_PROVIDER: '', BYO_BRAIN_MODEL_ID: '', BYO_PROVIDERS: '',
+    BYO_MODEL_ID: '', BYO_MODEL_IDS: '', BYO_MODEL_JUDGE_ID: '', BYO_MODEL_PROVIDER: '', BYO_BRAIN_MODEL_ID: '', BYO_PROVIDERS: '',
     BYO_PROVIDER_CONTROLLED_API_KEY: '', BYO_PROVIDER_OTHER_API_KEY: '', BYO_PROVIDER_XAI_API_KEY: '',
     OPENAI_MODEL_PRIMARY: 'gpt-5.6-terra', OPENAI_MODEL_WORKER: 'gpt-5.6-luna', CLAUDE_MODEL: 'claude-sonnet-5',
     CLEMMY_MODEL_ROLES: '[]', CLEMMY_BRAIN_BACKUPS: '["gpt-5.6-sol"]',
@@ -412,6 +412,63 @@ test('the API account\'s worker model the picker offers switches to the brain an
       assert.equal(process.env.OPENAI_MODEL_WORKER, 'controlled-worker');
       const { getSelectedByoBrainBackendConfig } = await import('../runtime/harness/byo-providers.js');
       assert.equal(getSelectedByoBrainBackendConfig().configured, true);
+    } finally { await harness.close(); }
+  });
+});
+
+// Windows tester 10-23: a single-account Together setup (one chat model, a
+// separate checker model) on a Codex brain in worker mode. Picking a catalog
+// model that is not on the account "did not stick". The owner's path is: add
+// it to the account from its catalog, then give it the jobs; each must take.
+test('a catalog model added to the original API account becomes the brain and takes the other jobs', async () => {
+  const base = 'https://api.example.test/v1';
+  await withPrimaryRouteFixture({
+    MODEL_ROUTING_MODE: 'worker', BYO_MODEL_BASE_URL: base, BYO_MODEL_API_KEY: 'test-only-key',
+    BYO_MODEL_PROVIDER: 'Controlled Together', BYO_MODEL_ID: 'controlled/chat-70b', BYO_MODEL_JUDGE_ID: 'controlled/coder-14b',
+    BYO_PROVIDERS: JSON.stringify([{ id: 'xai', label: 'Controlled Grok', baseURL: 'https://api.grok.example.test/v1', modelIds: ['controlled-grok'] }]),
+    OPENAI_MODEL_PRIMARY: 'gpt-6-luna', OPENAI_MODEL_WORKER: 'gpt-5.6-terra',
+  }, async () => {
+    const harness = await boot();
+    const json = async (route: string, init?: RequestInit) => {
+      const response = await fetch(`${harness.url}${route}`, { headers: { 'content-type': 'application/json' }, ...init });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    try {
+      const before = await json('/api/console/settings/model-providers');
+      const account = (before.body.providers as Array<{ id: string; label: string; baseURL: string; modelIds: string[]; configured: boolean }>)
+        .find((row) => row.baseURL === base);
+      assert.ok(account, JSON.stringify(before.body));
+      assert.equal(account.configured, true);
+      assert.ok(!account.modelIds.includes('controlled/deep-flash'));
+
+      // Not on the account yet: refused, in words that say what to do.
+      const refused = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'controlled/deep-flash' });
+      assert.equal(refused.response.status, 400);
+      assert.match(String(refused.body.error), /isn't on any of your API accounts.*Settings → Models/);
+
+      // Save the account's list with the catalog model ticked (no key resent).
+      const saved = await json('/api/console/settings/model-providers', { method: 'POST', body: JSON.stringify({
+        id: account.id, label: account.label, baseURL: account.baseURL, modelIds: [...account.modelIds, 'controlled/deep-flash'] }) });
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      const after = (await json('/api/console/settings/model-providers')).body.providers
+        .find((row: { id: string }) => row.id === account.id);
+      assert.ok(after.modelIds.includes('controlled/deep-flash'));
+      assert.equal(after.configured, true, 'the saved key is kept');
+
+      const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'controlled/deep-flash' });
+      assert.equal(selected.response.status, 200, selected.body.error);
+      assert.equal(resolveRoleModel('brain').modelId, 'controlled/deep-flash');
+
+      for (const [role, modelId] of [['worker', 'controlled/deep-flash'], ['judge', 'controlled/chat-70b']] as const) {
+        const bound = await json('/api/console/settings/models/roles', { method: 'PATCH', body: JSON.stringify({ role, modelId }) });
+        assert.equal(bound.status, 200, JSON.stringify(bound.body));
+        assert.equal(resolveRoleModel(role).modelId, modelId, `${role} takes the pick`);
+      }
+      // The settings the screen re-reads agree.
+      const roles = (await json('/api/console/settings')).body.modelRoles.roles;
+      assert.equal(roles.brain.modelId, 'controlled/deep-flash');
+      assert.equal(roles.worker.modelId, 'controlled/deep-flash');
+      assert.equal(roles.judge.modelId, 'controlled/chat-70b');
     } finally { await harness.close(); }
   });
 });

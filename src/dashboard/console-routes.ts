@@ -10132,6 +10132,8 @@ export function registerConsoleRoutes(
         updateEnvKey('BYO_MODEL_ID', modelIds[0]);
         updateEnvKey('BYO_MODEL_PROVIDER', label);
         if (modelIds.length > 1) updateEnvKey('BYO_MODEL_JUDGE_ID', modelIds[1]);
+        // The two slot keys hold only the first two; the account keeps them all.
+        updateEnvKey('BYO_MODEL_IDS', JSON.stringify(modelIds));
         if (apiKey) updateEnvKey('BYO_MODEL_API_KEY', apiKey);
       } else {
         const id = body.id && body.id.trim() ? slugifyProviderId(body.id) : slugifyProviderId(label || baseURL);
@@ -10164,7 +10166,7 @@ export function registerConsoleRoutes(
       const id = (req.params.id || '').trim();
       if (!id) { res.status(400).json({ error: 'provider id is required.' }); return; }
       if (id === 'default') {
-        for (const k of ['BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_PROVIDER', 'BYO_MODEL_API_KEY']) updateEnvKey(k, '');
+        for (const k of ['BYO_MODEL_BASE_URL', 'BYO_MODEL_ID', 'BYO_MODEL_JUDGE_ID', 'BYO_MODEL_IDS', 'BYO_MODEL_PROVIDER', 'BYO_MODEL_API_KEY']) updateEnvKey(k, '');
       } else {
         const extras = getByoProviders().filter((p) => p.id !== 'default' && p.id !== id);
         updateEnvKey('BYO_PROVIDERS', serializeExtraProviders(extras));

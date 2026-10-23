@@ -150,6 +150,18 @@ export function recordDiscoveredProviderModels(providerId: string, ids: readonly
   }
 }
 
+/** Every model the owner saved on the original single account, in order. */
+function savedDefaultModelIds(): string[] {
+  const raw = (getRuntimeEnv('BYO_MODEL_IDS', '') || '').trim();
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 export function getByoProviders(): ByoProvider[] {
   const providers: ByoProvider[] = [];
 
@@ -162,7 +174,9 @@ export function getByoProviders(): ByoProvider[] {
     // explicit provider choice, so preserve legitimate same-endpoint models such
     // as primary=glm-5.2 + worker=gpt-4o.
     const byoWorker = worker && (getModelRoutingMode() === 'all_in' || resolveProvider(worker) === 'byo') ? worker : '';
-    const modelIds = [legacy.primaryId, legacy.judgeId, byoWorker]
+    // The slot's own keys name at most a primary and a checker; the models the
+    // owner saved on this account beyond those are kept beside them.
+    const modelIds = [legacy.primaryId, legacy.judgeId, byoWorker, ...savedDefaultModelIds()]
       .map(cleanId)
       .filter(Boolean);
     providers.push({ id: 'default', label: legacy.providerLabel, baseURL: legacy.baseURL, modelIds: Array.from(new Set(modelIds)) });
@@ -603,13 +617,10 @@ export function resolveDeclaredByoProviderForModelFromSnapshot(
   const owners = snapshot.configuredOwnersForModel(id);
   const explicit = owners.find(({ provider }) => provider.id !== 'default');
   if (explicit) return explicit.backend;
-  const defaultProvider = owners.find(({ provider }) => provider.id === 'default');
-  if (!defaultProvider) return undefined;
-  const declared = snapshot.defaultBackend;
-  const ownsModel = id === declared.primaryId
-    || id === declared.judgeId
-    || (snapshot.mode === 'all_in' && id === snapshot.workerModel);
-  return ownsModel ? defaultProvider.backend : undefined;
+  // The original account owns every model it lists, as any account does: its
+  // primary and checker slots, the models saved on it, and the catalog it was
+  // seen serving. Listing a model the switch then refuses was the defect.
+  return owners.find(({ provider }) => provider.id === 'default')?.backend;
 }
 
 // ── persistence helpers (pure — the console route does the updateEnvKey writes) ──
