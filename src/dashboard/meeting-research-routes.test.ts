@@ -125,6 +125,9 @@ test('research and document GETs are passive before and after permission, withou
     assert.equal(response.status, 200); await response.json(); await settle();
     const enabled = await readResearch(url); assert.equal(enabled.enabled, true); assert.equal(enabled.useMemory, true);
     assert.equal(enabled.status, 'ready'); assert.deepEqual(enabled.jobs, []);
+    // The requested check is queued after the save settles; a loaded runner can
+    // take more than one turn of the event loop to get there.
+    for (let turn = 0; turn < 200 && scheduledScans < scans + 1; turn++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(scheduledScans, scans + 1, 'only explicit saved permission requests the tool-free suggestion check');
     const afterEnable = snapshotFiles(); const scansAfterEnable = scheduledScans;
     for (let index = 0; index < 3; index++) { assert.deepEqual(await readResearch(url), enabled); await readDocuments(url); }
