@@ -255,6 +255,45 @@ function acknowledged(run: Record<string, unknown>, i: InlineCreationTestDeliver
       && carries(parked.output, { runId: i.runId, token: i.token, reportDigest: digest }, report.detail));
   });
 }
+
+/** Exact historical delivery evidence, not a rehearsal verdict or execution
+ * authority. Timely retained returns remain valid after their lease expires. */
+export function readExactAcknowledgedCreationTest(input: {
+  sessionId: string; sourceUserSeq: number; logicalToolCallId: string; result: unknown;
+}): { run: Record<string, unknown>; callTool: string; callArguments: unknown;
+  calledAt: string; intentCreatedAt: string; returnedAt: string } | null {
+  try {
+    const rows = openEventLog().prepare(`SELECT id FROM events WHERE session_id=? AND type='tool_returned'
+      AND json_extract(data_json,'$.sourceUserSeq')=? AND json_extract(data_json,'$.callId')=?
+      AND json_extract(data_json,'$.accounting')='top_level' ORDER BY seq LIMIT 2`)
+      .all(input.sessionId,input.sourceUserSeq,input.logicalToolCallId) as Array<{id:string}>;
+    if (rows.length !== 1) return null;
+    const returned = getEvent(rows[0]!.id), metadata = returned?.data.inlineCreationTestDelivery;
+    if (!returned?.parentEventId || !object(metadata) || !Array.isArray(metadata.receipts)
+      || metadata.receipts.length !== 1 || !object(metadata.receipts[0])) return null;
+    const runId = metadata.receipts[0].runId;
+    if (typeof runId !== 'string') return null;
+    const run = readRun(runId), intent = run && intentOf(run);
+    const origin = run?.creationTestSource;
+    if (!run || !intent || intent.originSessionId !== input.sessionId || intent.sourceUserSeq !== input.sourceUserSeq
+      || intent.logicalToolCallId !== input.logicalToolCallId || intent.callId !== input.logicalToolCallId
+      || !object(origin) || origin.sessionId !== input.sessionId || origin.sourceUserSeq !== input.sourceUserSeq
+      || origin.logicalToolCallId !== input.logicalToolCallId || !acknowledged(run, intent)) return null;
+    const parent = getEvent(returned.parentEventId);
+    if (!parent || typeof parent.data.tool !== 'string' || typeof metadata.invocationNonce !== 'string') return null;
+    const calledAt = Date.parse(parent.createdAt), returnedAt = Date.parse(returned.createdAt);
+    if (!Number.isFinite(calledAt) || !Number.isFinite(returnedAt)
+      || calledAt > Date.parse(intent.createdAt) || calledAt > returnedAt) return null;
+    const parked = getToolOutputForInvocation(input.sessionId,input.logicalToolCallId,metadata.invocationNonce);
+    // Compare the same retained invocation to the host-redeemed result. Only
+    // formal MCP text envelopes are normalized; no fuzzy report matching.
+    if (!parked || resultText(input.result) !== resultText(parked.output)) return null;
+    const args = parent.data.arguments;
+    return { run, callTool: parent.data.tool, calledAt: parent.createdAt, intentCreatedAt: intent.createdAt, returnedAt: returned.createdAt,
+      callArguments: typeof args === 'string' ? JSON.parse(args) : args };
+  } catch { return null; }
+}
+
 export function inlineCreationTestOriginDisposition(run: Record<string, unknown>, originSessionId: string, now = Date.now()): 'acknowledged' | 'pending' | 'fallback' {
   try {
     const i = intentOf(run); if (!i || i.originSessionId !== originSessionId) return 'fallback';

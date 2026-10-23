@@ -19,7 +19,8 @@ import {
   analyzeWorkflowGaps,
   type WorkflowGap,
 } from './workflow-gap-test.js';
-import { missingWorkflowRunInputs, normalizeWorkflowRunInputs } from './workflow-inputs.js';
+import { missingWorkflowRunInputs, workflowSmokeInputs } from './workflow-inputs.js';
+export { workflowDefaultRunInputs, workflowSmokeInputs } from './workflow-inputs.js';
 import { validateCronExpression } from '../shared/cron.js';
 import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { codifyMechanicalSteps } from './workflow-codify.js';
@@ -106,17 +107,6 @@ export function workflowModelPortabilityFromUnknown(body: Record<string, unknown
 export function renderReadinessHold(name: string): string {
   return `Workflow "${name}" stayed DISABLED because the readiness gap test still has unanswered questions. `
     + 'Answer/refine those gaps with workflow_update, then enable it.';
-}
-
-export function workflowDefaultRunInputs(def: WorkflowDefinition): Record<string, string> {
-  return Object.fromEntries(Object.entries(def.inputs ?? {}).map(([k, m]) => [k, m.default ?? '']));
-}
-
-export function workflowSmokeInputs(def: WorkflowDefinition, provided: Record<string, string>): Record<string, string> {
-  return normalizeWorkflowRunInputs({
-    ...workflowDefaultRunInputs(def),
-    ...provided,
-  });
 }
 
 export function renderMissingSmokeInputs(name: string, missing: string[]): string {

@@ -1,4 +1,5 @@
 import { proveWorkflowDispatchCommitWithPorts } from './workflow-dispatch-commit.js';
+import { proveWorkflowRehearsalWithPorts } from './workflow-rehearsal-proof.js';
 /** Runtime store adapters for the shared native revision verifier. */
 import { openEventLog } from './eventlog.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
@@ -24,6 +25,9 @@ export function proveNativeRevisionCommit(input: RevisionProofInput) {
 }
 export function proveWorkflowDispatchCommit(input: RevisionProofInput) {
   return proveWorkflowDispatchCommitWithPorts(input, runtimePorts());
+}
+export function proveWorkflowRehearsal(input: RevisionProofInput) {
+  return proveWorkflowRehearsalWithPorts(input, runtimePorts());
 }
 
 /** Reuse the execution proof for artifact identity dependencies. Content

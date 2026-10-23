@@ -74,7 +74,9 @@ import {
 import {
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
+  parseWorkflowRunInputsJson,
 } from '../execution/workflow-inputs.js';
+export { parseWorkflowRunInputsJson } from '../execution/workflow-inputs.js';
 import {
   buildWorkflowExecutionPlanWithReadiness,
   renderWorkflowVisualContract,
@@ -867,22 +869,6 @@ export function renderWorkflowRunsOverview(limit = 15): string {
     parts.push('', 'Recently finished:', ...recent.map(fmt));
   }
   return parts.join('\n');
-}
-
-export function parseWorkflowRunInputsJson(raw: string | null | undefined): Record<string, string> {
-  if (raw === null || raw === undefined) return {};
-  const trimmed = raw.trim();
-  if (trimmed === '') return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (error) {
-    throw new Error(`Invalid workflow inputs JSON: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error('Workflow inputs must be a JSON object, e.g. {"url":"https://example.com"}.');
-  }
-  return parsed as Record<string, string>;
 }
 
 /**

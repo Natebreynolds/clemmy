@@ -1,5 +1,21 @@
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
 
+export function parseWorkflowRunInputsJson(raw: string | null | undefined): Record<string, string> {
+  if (raw === null || raw === undefined) return {};
+  const trimmed = raw.trim();
+  if (trimmed === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`Invalid workflow inputs JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('Workflow inputs must be a JSON object, e.g. {"url":"https://example.com"}.');
+  }
+  return parsed as Record<string, string>;
+}
+
 export const COMMON_WORKFLOW_INPUT_KEYS = new Set([
   'url',
   'website',
@@ -79,6 +95,17 @@ export function normalizeWorkflowRunInputs(inputs: Record<string, string> | unde
   }
   if (!normalized.website && normalized.url) normalized.website = normalized.url;
   return normalized;
+}
+
+export function workflowDefaultRunInputs(def: WorkflowDefinition): Record<string, string> {
+  return Object.fromEntries(Object.entries(def.inputs ?? {}).map(([k, m]) => [k, m.default ?? '']));
+}
+
+export function workflowSmokeInputs(def: WorkflowDefinition, provided: Record<string, string>): Record<string, string> {
+  return normalizeWorkflowRunInputs({
+    ...workflowDefaultRunInputs(def),
+    ...provided,
+  });
 }
 
 export function missingWorkflowRunInputs(workflow: WorkflowDefinition, inputs: Record<string, string>): string[] {

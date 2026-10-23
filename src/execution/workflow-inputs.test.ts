@@ -8,7 +8,16 @@ import {
   collectRequiredWorkflowInputs,
   missingWorkflowRunInputs,
   normalizeWorkflowRunInputs,
+  parseWorkflowRunInputsJson,
 } from './workflow-inputs.js';
+
+test('workflow run JSON parsing retains object values and rejects non-object or malformed input', () => {
+  for (const raw of [null, undefined, '', '   ']) assert.deepEqual(parseWorkflowRunInputsJson(raw), {});
+  assert.deepEqual(parseWorkflowRunInputsJson(' {"count":2,"flag":false,"note":" text "} '),
+    { count: 2, flag: false, note: ' text ' });
+  for (const raw of ['null', '[]', '2', '"text"']) assert.throws(() => parseWorkflowRunInputsJson(raw), /must be a JSON object/);
+  assert.throws(() => parseWorkflowRunInputsJson('{'), /Invalid workflow inputs JSON/);
+});
 
 function workflow(patch: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
   return {
