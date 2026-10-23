@@ -2678,6 +2678,28 @@ export async function judgeObjectiveComplete(
         : {}),
     };
   };
+  // Correlate only an initial accepted fast reading. A later fallback or
+  // configured verdict must never inherit the earlier screen's original.
+  const retainAcceptedOriginalReading = (): void => {
+    if (!jevAttempt?.accepted) return;
+    try {
+      const expected = assessmentExpected();
+      const assessment = expected && assessmentReader?.(readyAssessment, { ...expected, signal: callerSignal });
+      if (assessment?.outcome === 'typed_assessment' && jevAttempt) {
+        const producer = assessment.producer;
+        jevAttempt = { ...jevAttempt, originalReading: {
+          scope: 'diagnostic_only', modelCallId: producer.modelCallId, physicalAttempt: producer.physicalAttempt,
+          owner: { ...producer.owner }, requestBodySha256: producer.requestBodySha256,
+          questionnaireSha256: assessment.questionnaireSha256, originalResultSha256: producer.originalResultSha256,
+          reviewInvocationId: assessment.reviewInvocationId, objectiveDigest: assessment.objectiveDigest,
+          candidateDigest: assessment.candidateDigest, contextDigest: assessment.contextDigest,
+          requestedModel: producer.requestedModel,
+          ...(producer.providerReportedModel ? { providerReportedModel: producer.providerReportedModel } : {}),
+          accountBackend: producer.accountBackend, providerResponseIdentity: producer.providerResponseIdentity,
+        } };
+      }
+    } catch { /* unavailable observation never changes the accepted verdict */ }
+  };
   // A plan is reviewed before anything runs, so it has no delivered result for
   // Jev's completion reading to find, and that reading would send back every
   // plan. A plan is left to the configured reviewer alone.
@@ -2706,6 +2728,7 @@ export async function judgeObjectiveComplete(
       || (fast!.awaitingUser === true && directionQuestion));
     if (fast) noteJev(fast, settled);
     if (fast && settled) {
+      retainAcceptedOriginalReading();
       return {
         done: fast.done,
         reason: fast.reason,
@@ -2805,25 +2828,7 @@ export async function judgeObjectiveComplete(
     if (fast) noteJev(fast, acceptJev);
     if (fast && acceptJev) {
       if (judgePromise) reviewerController.abort();
-      // Correlate only this initial accepted fast reading. A later fallback or
-      // configured verdict must never inherit the earlier screen's original.
-      try {
-        const expected = assessmentExpected();
-        const assessment = expected && assessmentReader?.(readyAssessment, { ...expected, signal: callerSignal });
-        if (assessment?.outcome === 'typed_assessment' && jevAttempt) {
-          const producer = assessment.producer;
-          jevAttempt = { ...jevAttempt, originalReading: {
-            scope: 'diagnostic_only', modelCallId: producer.modelCallId, physicalAttempt: producer.physicalAttempt,
-            owner: { ...producer.owner }, requestBodySha256: producer.requestBodySha256,
-            questionnaireSha256: assessment.questionnaireSha256, originalResultSha256: producer.originalResultSha256,
-            reviewInvocationId: assessment.reviewInvocationId, objectiveDigest: assessment.objectiveDigest,
-            candidateDigest: assessment.candidateDigest, contextDigest: assessment.contextDigest,
-            requestedModel: producer.requestedModel,
-            ...(producer.providerReportedModel ? { providerReportedModel: producer.providerReportedModel } : {}),
-            accountBackend: producer.accountBackend, providerResponseIdentity: producer.providerResponseIdentity,
-          } };
-        }
-      } catch { /* unavailable observation never changes the accepted verdict */ }
+      retainAcceptedOriginalReading();
       return {
         done: fast.done,
         reason: fast.reason,

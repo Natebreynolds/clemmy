@@ -776,13 +776,16 @@ test('Stop during the read window clears the hedge and a later Jev DONE cannot d
   assert.equal(state.reviewerCalls(), 0);
 });
 
+for (const lane of ['complete_read', 'no_output', 'delivered_no_output'] as const) {
 for (const reportedModel of [true, false]) {
-  test(`accepted Jev-fast original reading joins its actual invocation and usage: reported model ${reportedModel}`, async t => {
+  test(`accepted Jev-fast original reading joins its actual invocation and usage: ${lane}, reported model ${reportedModel}`, async t => {
     const state = setup(t);
-    const session = createSession({ id: `fast-reading-original-${reportedModel}`, kind: 'chat' });
+    const session = createSession({ id: `fast-reading-original-${lane}-${reportedModel}`, kind: 'chat' });
     const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
-    const owner = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: `attempt:fast-reading-${reportedModel}` };
+    const owner = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: `attempt:fast-reading-${lane}-${reportedModel}` };
     const context: Context = { ...read, sessionId: session.id, reviewInputOwner: owner,
+      ...(lane !== 'complete_read' ? { producedNoOutput: true } : {}),
+      ...(lane === 'delivered_no_output' ? { reviewAfterDelivery: true } : {}),
       agentInstructions: 'PRIVATE_FAST_READING_INSTRUCTIONS' };
     const { withModelTransportRecorder } = await import('./model-transport-observation.js');
     const { readUsageEventsForDate } = await import('../usage-log.js');
@@ -825,12 +828,16 @@ for (const reportedModel of [true, false]) {
     assert.doesNotMatch(JSON.stringify(reading), /PRIVATE_FAST_READING_INSTRUCTIONS|read_file|source says|ts_read_first_fixture/);
   });
 }
+}
 
+for (const lane of ['complete_read', 'no_output', 'delivered_no_output'] as const) {
 for (const change of ['stale_context', 'stale_owner', 'foreign_owner', 'unowned', 'projection_error'] as const) {
-  test(`accepted Jev-fast omits an unavailable original reading without changing its verdict: ${change}`, async t => {
+  test(`accepted Jev-fast omits an unavailable original reading without changing its verdict: ${lane}, ${change}`, async t => {
     const state = setup(t), jev = pendingJev();
-    const owner = { sessionId: read.sessionId!, sourceUserSeq: 71, attemptId: `attempt:fast-reading-${change}` };
-    const context: Context = { ...read, reviewInputOwner: { ...owner }, agentInstructions: 'Original standing requirement.' };
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 71, attemptId: `attempt:fast-reading-${lane}-${change}` };
+    const context: Context = { ...read, reviewInputOwner: { ...owner }, agentInstructions: 'Original standing requirement.',
+      ...(lane !== 'complete_read' ? { producedNoOutput: true } : {}),
+      ...(lane === 'delivered_no_output' ? { reviewAfterDelivery: true } : {}) };
     if (change === 'foreign_owner') context.reviewInputOwner = { ...owner, attemptId: 'attempt:foreign-reading' };
     const invoke = () => judgeObjectiveComplete(objective, reply, context);
     const run = change === 'unowned' ? invoke() : modelUsageAttributionStorage.run(owner, invoke);
@@ -845,6 +852,25 @@ for (const change of ['stale_context', 'stale_owner', 'foreign_owner', 'unowned'
     assert.equal(verdict.done, true); assert.equal(verdict.fast, true); assert.equal(verdict.jevAttempt?.accepted, true);
     assert.equal(verdict.jevAttempt?.originalReading, undefined);
     assert.equal(verdict.jevAttempt?.reviewerStarted, false); assert.equal(state.reviewerCalls(), 0); assert.equal(jev.calls(), 1);
+  });
+}
+}
+
+for (const delivered of [false, true]) {
+  test(`no-output unavailable Jev keeps original reading absent: delivered ${delivered}`, async t => {
+    const state = setup(t);
+    const owner = { sessionId: read.sessionId!, sourceUserSeq: 74, attemptId: `attempt:no-output-unavailable-${delivered}` };
+    let calls = 0;
+    _setSystemOneFetchForTests(async () => { calls++; throw new Error('Controlled unavailable transport'); });
+    const verdict = await modelUsageAttributionStorage.run(owner, () => judgeObjectiveComplete(objective, reply, {
+      ...read, reviewInputOwner: owner, producedNoOutput: true,
+      ...(delivered ? { reviewAfterDelivery: true } : {}),
+    }));
+    assert.equal(calls, 1, 'no retry or second Jev review is introduced');
+    assert.equal(state.reviewerCalls(), delivered ? 1 : 0, 'existing delivered-answer fallback policy is unchanged');
+    assert.equal(verdict.done, true);
+    assert.equal(verdict.failedOpen === true, !delivered);
+    assert.equal(verdict.jevAttempt?.originalReading, undefined, 'an unavailable producer cannot supply an original reading');
   });
 }
 
