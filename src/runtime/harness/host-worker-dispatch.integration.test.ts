@@ -2,6 +2,7 @@
  * Child model responses are deterministic; local file reads, packet authority,
  * host dispatch, concurrency, consent and settlement are real. */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -40,6 +41,135 @@ after(() => {
   catalogs.installHostCapabilityCatalogFactory(priorCatalog);
   eventlog.closeEventLog();
   rmSync(TEST_HOME, { recursive: true, force: true });
+});
+
+test('packet worker usage: real sibling dispatch owns its exact source and attempt under parent attribution', async (t) => {
+  assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'run through scripts/run-tests-isolated.mjs');
+  const { getByoModel, resetByoModelCache } = await import('./byo-model.js');
+  const { withModelRouteMetrics } = await import('../model-route-metrics.js');
+  const { acceptedSourceIdentity, modelUsageAttributionStorage, readUsageEventsForDate, withModelUsageAttribution } = await import('../usage-log.js');
+  const parity = process.env.CLEMMY_MODEL_PARITY;
+  process.env.CLEMMY_MODEL_PARITY = 'on';
+  t.after(() => {
+    if (parity === undefined) delete process.env.CLEMMY_MODEL_PARITY;
+    else process.env.CLEMMY_MODEL_PARITY = parity;
+    resetByoModelCache();
+  });
+  catalogs.installHostCapabilityCatalogFactory(catalogs.createHostCapabilityCatalogFactory());
+  const session = eventlog.createSession({ id: 'packet-worker-usage-parent', kind: 'chat' });
+  const attempt = eventlog.beginRunAttempt(session.id);
+  t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
+  const packet = {
+    objective: 'Return a short synthetic acknowledgement for each supplied item.',
+    item: null, items: ['usage-sibling-a', 'usage-sibling-b'],
+    resolvedTools: 'none needed', externalMcpToolNames: [],
+    context: 'All required facts are supplied here. This is a synthetic accounting fixture.',
+    instructions: 'Return one short acknowledgement. Do not use any tools or external data.',
+    expectedOutput: 'A short synthetic acknowledgement.', intent: 'analysis', model: 'gpt-5.6-terra',
+    workManifest: null, expectedWork: null,
+  };
+  const prompt = `Call run_worker once with this synthetic packet, then acknowledge the two replies: ${JSON.stringify(packet)}`;
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: prompt } });
+  const parentUsage = { sessionId: session.id, sourceUserSeq: source.seq, attemptId: attempt.attemptId, role: 'brain' as const };
+  type Boundary = { sessionId: string; sourceUserSeq: number; attemptId: string; responseId: string;
+    usage: { sessionId?: string; sourceUserSeq?: number; attemptId?: string; role?: string } };
+  const boundaries: Boundary[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: unknown, init?: RequestInit) => {
+    assert.equal(String(url), 'https://packet-worker-usage-fixture.invalid/v1/chat/completions', 'all network is replaced by this exact fixture');
+    const sent = JSON.parse(String(init?.body));
+    assert.equal(sent.model, 'glm-5.3');
+    const child = brackets.harnessRunContextStorage.getStore();
+    assert.equal(child?.workerScope, true);
+    assert.ok(child?.sessionId && Number.isInteger(child.sourceUserSeq) && child.runAttemptId);
+    const responseId = `packet-usage-provider-${child.sourceUserSeq}`;
+    const usage = modelUsageAttributionStorage.getStore();
+    boundaries.push({ sessionId: child.sessionId, sourceUserSeq: child.sourceUserSeq!, attemptId: child.runAttemptId,
+      responseId, usage: { sessionId: usage?.sessionId, sourceUserSeq: usage?.sourceUserSeq, attemptId: usage?.attemptId, role: usage?.role } });
+    const result = { id: responseId, created: 1, model: 'glm-5.3', object: 'chat.completion',
+      usage: { prompt_tokens: 11, completion_tokens: 3, total_tokens: 14 },
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Synthetic acknowledgement.' } }] };
+    if (!sent.stream) return new Response(JSON.stringify(result), { headers: { 'content-type': 'application/json' } });
+    const start = { ...result, object: 'chat.completion.chunk', usage: undefined,
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'Synthetic acknowledgement.' }, finish_reason: null }] };
+    const end = { ...result, object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+    return new Response(`data: ${JSON.stringify(start)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`,
+      { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const originalGetModel = RouterModelProvider.prototype.getModel;
+  RouterModelProvider.prototype.getModel = function () {
+    const child = brackets.harnessRunContextStorage.getStore();
+    assert.equal(child?.workerScope, true);
+    // Replace only transport selection. The actual SDK, resilience/public
+    // capture, usage writer and route-response instrumentation remain real.
+    return withModelRouteMetrics(getByoModel('glm-5.3', {
+      configured: true, baseURL: 'https://packet-worker-usage-fixture.invalid/v1',
+      apiKey: 'synthetic-no-auth', providerId: 'zai', primaryId: 'glm-5.3', judgeId: 'glm-5.3',
+    }), { sessionId: child!.sessionId, role: 'worker', requestedModel: 'glm-5.3',
+      resolvedModel: 'glm-5.3', provider: 'byo', source: 'explicit' });
+  };
+  t.after(() => { RouterModelProvider.prototype.getModel = originalGetModel; });
+  let parentCalls = 0;
+  const model = {
+    async getResponse() {
+      parentCalls++;
+      return { responseId: `packet-usage-parent-${parentCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        output: parentCalls === 1
+          ? [{ type: 'function_call', callId: 'packet-usage-dispatch', name: 'run_worker', arguments: JSON.stringify(packet) }]
+          : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Both synthetic replies received.' }] }] };
+    }, getStreamedResponse: modelStream,
+  };
+  const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: source.seq });
+  assert.ok(primed.ok);
+  if (!primed.ok) return;
+  const agent = await buildOrchestratorAgent({ sessionId: session.id, sourceUserSeq: source.seq, userInput: prompt,
+    hostFreshPlanning: primed.planning, allowedToolNames: ['run_worker'],
+    mcpToolScope: { authority: 'none', reason: 'packet usage fixture', allowedServerSlugs: [], toolPatterns: [], maxTools: 0 }, model: model as never });
+  const ambient = modelUsageAttributionStorage.getStore();
+  const runner = new EventEmitter();
+  Object.assign(runner, { run() { throw new Error('The legacy model loop must never run'); } });
+  await withModelUsageAttribution(parentUsage, async () => {
+    await brackets.withHarnessRunContext({ sessionId: session.id, sourceUserSeq: source.seq, runAttemptId: attempt.attemptId,
+      counter: new brackets.ToolCallsCounter(3), behaviorScopeId: `${session.id}::turn:1` },
+    () => hostRunRunner(runner as never, agent as never, [{ type: 'message', role: 'user', content: prompt }] as never,
+      { maxTurns: 3, hostTurnEngine: 'host_v1', context: { sessionId: session.id, sourceUserSeq: source.seq } } as never));
+    assert.equal(modelUsageAttributionStorage.getStore(), parentUsage, 'child completion restores the exact parent accounting scope');
+  });
+  assert.equal(modelUsageAttributionStorage.getStore(), ambient, 'the parent scope also unwinds');
+  const started = eventlog.listEvents(session.id, { types: ['worker_started'] });
+  assert.equal(started.length, 2, 'both packets crossed the actual worker dispatch door');
+  assert.equal(boundaries.length, 2, 'each tool-free child made exactly one real SDK transport request');
+  assert.equal(new Set(boundaries.map(row => row.sessionId)).size, 2, 'siblings have separate accepted sessions');
+  const usageRows = readUsageEventsForDate().filter(row => boundaries.some(boundary => boundary.responseId === row.responseId));
+  assert.equal(usageRows.length, 2, 'actual adapter usage must be retained, not supplied by the fixture');
+  for (const boundary of boundaries) {
+    const lineage = started.find(row => row.data.childSessionId === boundary.sessionId);
+    assert.equal(lineage?.data.childSourceUserSeq, boundary.sourceUserSeq);
+    assert.equal(lineage?.data.childAttemptId, boundary.attemptId);
+    const childAttempt = eventlog.getRunAttemptBySourceUserSeq(boundary.sessionId, boundary.sourceUserSeq);
+    assert.equal(childAttempt?.attemptId, boundary.attemptId, 'the accounting expectation comes from the real accepted child attempt');
+    const responses = eventlog.listEvents(boundary.sessionId, { types: ['worker_model_response_completed'] });
+    assert.equal(responses.length, 1);
+    assert.equal(responses[0]!.data.sourceUserSeq, boundary.sourceUserSeq);
+    assert.equal(responses[0]!.data.runAttemptId, boundary.attemptId);
+    assert.equal(responses[0]!.data.providerResponseIdDigest, createHash('sha256').update(boundary.responseId).digest('hex'));
+    const usage = usageRows.find(row => row.responseId === boundary.responseId)!;
+    assert.notEqual(usage.trace?.modelCallId, responses[0]!.data.modelCallId, 'transport and route UUIDs remain distinct; the provider response proves their bridge');
+  }
+  assert.deepEqual(boundaries.map(({ sessionId, sourceUserSeq, attemptId, usage }) => ({
+    expected: { sessionId, sourceUserSeq, attemptId, role: 'worker' }, actual: usage,
+  })), boundaries.map(({ sessionId, sourceUserSeq, attemptId }) => ({
+    expected: { sessionId, sourceUserSeq, attemptId, role: 'worker' }, actual: { sessionId, sourceUserSeq, attemptId, role: 'worker' },
+  })), 'every actual child model call must own its child accounting scope, never the parent or a sibling');
+  for (const boundary of boundaries) {
+    const usage = usageRows.find(row => row.responseId === boundary.responseId)!;
+    assert.equal(usage.source, boundary.sessionId);
+    assert.equal(usage.trace?.acceptedSource, acceptedSourceIdentity(boundary.sessionId, boundary.sourceUserSeq));
+    assert.equal(usage.trace?.attemptId, boundary.attemptId);
+    assert.equal(usage.role, 'worker');
+    assert.equal(usageRows.filter(row => row.trace?.attemptId === boundary.attemptId).length, 1, 'no sibling usage is credited to this attempt');
+  }
+  assert.equal(usageRows.filter(row => row.trace?.acceptedSource === acceptedSourceIdentity(session.id, source.seq)).length, 0,
+    'the parent cannot receive child transport usage');
 });
 
 // Copied byte-for-byte from accepted_model_batch_admissions batch 3, call

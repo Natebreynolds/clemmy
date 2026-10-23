@@ -30,6 +30,7 @@ import {
 import pino from 'pino';
 import { workerComposeOnlyActions } from '../../agents/worker-parent-actions.js';
 import { joinWorkerRouteOutcome, scheduleRouteOutcomeJoin } from './route-outcome-join.js';
+import { withModelUsageAttribution } from '../usage-log.js';
 
 const workerLogger = pino({ name: 'worker-host-runner' });
 
@@ -155,7 +156,11 @@ export async function runPacketWorkerWithHost(input: {
     return qualified;
   };
   try {
-    return await withAcceptedSourceSessionContext({ sessionId: session.id, sourceUserSeq: childSource.seq }, () => withHarnessRunContext({
+    // The child owns its model usage as well as its execution. A parent's
+    // accounting scope must not override the child's captured transport owner.
+    return await withModelUsageAttribution({
+      sessionId: session.id, sourceUserSeq: childSource.seq, attemptId: attempt.attemptId, role: 'worker',
+    }, () => withAcceptedSourceSessionContext({ sessionId: session.id, sourceUserSeq: childSource.seq }, () => withHarnessRunContext({
       // The child's own accepted turn: plan_task (a delegated child plans its
       // item itself) requires the exact turn in the run context.
       sessionId: session.id, sourceUserSeq: childSource.seq, turn: 1, runAttemptId: attempt.attemptId,
@@ -276,7 +281,7 @@ export async function runPacketWorkerWithHost(input: {
       const text = normalizeWorkerOutput(outcome.finalOutput);
       input.onParentActions?.(workerComposeOnlyActions({ sessionId: session.id, sinceSeq: childSource.seq }));
       return withCallRecord(text);
-    }), { newlyAccepted: true });
+    }), { newlyAccepted: true }));
   } catch (error) {
     // A child failure is an item result, never an exception that can poison
     // the parent's still-open coordinator call or force checkpoint re-entry.
