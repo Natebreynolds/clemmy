@@ -17,6 +17,22 @@ import {
   queueWorkflowRunInputResolution,
 } from './workflow-awaiting-input.js';
 
+
+/** A person-facing name for the agent that asked: Clem herself, or the
+ *  agent's name in words rather than its saved slug. */
+function agentLabelFor(slug: string | null | undefined): string {
+  const raw = (slug ?? '').trim();
+  if (!raw) return 'Clem';
+  if (/^(clementine|clem)$/i.test(raw)) return 'Clem';
+  return raw.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+}
+
+/** A workflow's saved name in words, for a sentence. */
+function readableWorkflowLabel(name: string): string {
+  const words = name.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return words ? `“${words.replace(/^\w/, (c) => c.toUpperCase())}”` : 'a workflow';
+}
+
 export type InboxQuestionSource = 'check_in' | 'background_task' | 'workflow';
 
 export interface InboxQuestionItem {
@@ -282,7 +298,7 @@ export function listInboxQuestions(): InboxQuestionItem[] {
       context: boundedContext(row.contextSummary ?? task?.result),
       askedAt: row.askedAt,
       urgency: row.urgency,
-      agentLabel: row.agentSlug,
+      agentLabel: agentLabelFor(row.agentSlug),
       sessionId: task?.originSessionId ?? task?.runSessionId ?? null,
       taskId: row.linkedTaskId ?? null,
       workflowName: null,
@@ -322,7 +338,7 @@ export function listInboxQuestions(): InboxQuestionItem[] {
       source: 'workflow',
       question: pending.question,
       options: [],
-      context: `Clem paused “${row.workflowName}” at “${pending.stepId}”. Completed work is preserved.`,
+      context: `Clem paused ${readableWorkflowLabel(row.workflowName)} to ask you this. What it already finished is kept.`,
       askedAt: pending.askedAt,
       urgency: 'normal',
       agentLabel: row.workflowName,

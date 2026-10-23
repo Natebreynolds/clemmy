@@ -89,3 +89,19 @@ test('a suggested check-in is decided in place, and a stopped workflow opens by 
       detail: 'Open it to resume the run or skip it.', workflow: 'Weekly Digest', workflowSlug: 'weekly-digest' } });
   assert.equal(stopped.href, '/automate?workflow=weekly-digest');
 });
+
+test('every kind of ask lands in one of four sections, the same as on the phone', async () => {
+  const { needsYouSection, NEEDS_YOU_SECTIONS } = await import('./needs-you-list.js');
+  assert.deepEqual(NEEDS_YOU_SECTIONS.map((section) => section.id), ['ok', 'questions', 'stopped', 'suggestions']);
+  const unlisted = (kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal') =>
+    needsYouSection({ kind: 'unlisted', id: kind, row: { key: kind, kind, title: 't', detail: 'd' } });
+  assert.equal(unlisted('check_in_proposal'), 'suggestions');
+  assert.equal(unlisted('workflow_binding'), 'stopped');
+  assert.equal(unlisted('workflow_paused'), 'stopped');
+  assert.equal(needsYouSection({ kind: 'workspace', id: 'c', row: {} as never }), 'ok');
+  assert.equal(needsYouSection({ kind: 'trust', id: 't', row: {} as never }), 'suggestions');
+  assert.equal(needsYouSection({ kind: 'question', id: 'q', row: {} as never }), 'questions');
+  assert.equal(needsYouSection({ kind: 'attention', id: 'n', collapsedCount: 0,
+    row: { id: 'n', title: 'Pick an account', workflowCapability: { notificationId: 'n', workflow: 'w' } } as never }), 'ok',
+    'a stopped workflow that needs an account picked is a choice to make');
+});

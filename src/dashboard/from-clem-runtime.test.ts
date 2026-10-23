@@ -553,3 +553,27 @@ test('a tapped choice carries the owner\'s approval of exactly that action; type
   await replyToFromClem('notif:wr', 'Accept', run.all, { choiceIndex: 1, requestId: 'tap-mismatch-0001' });
   assert.equal(tokens.at(-1), undefined, 'an index that is not the shown choice is nothing');
 });
+
+test('what came of a tap is read from Clem\'s thread: working, then her final words', async () => {
+  const { fromClemTurnOutcome, CLEM_THREAD_ID } = await import('./from-clem-runtime.js');
+  const eventlog = await import('../runtime/harness/eventlog.js');
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  if (!eventlog.getSession(CLEM_THREAD_ID)) eventlog.createSession({ id: CLEM_THREAD_ID, kind: 'chat', channel: 'desktop' });
+  const since = new Date(Date.now() - 1_000).toISOString();
+  const key = 'notif:fixture-invite';
+  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }), { state: 'working' }, 'a tap moments ago is still starting');
+  const attempt = eventlog.beginRunAttempt(CLEM_THREAD_ID, { runId: 'fixture-tap' });
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+    text: 'You told me: A fixture invite is waiting.\n\nMy reply: Accept', displayText: 'Accept',
+    ownerChoice: { version: 1, rowKey: key, voiceDigest: 'fixture', said: 'A fixture invite is waiting.', facts: 'Fixture.', choice: 'Accept', tappedAt: new Date().toISOString() },
+  } });
+  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }), { state: 'working' });
+  const identity = { sessionId: CLEM_THREAD_ID, turn: source.turn, sourceUserSeq: source.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+    presentation: { kind: 'answer', text: 'Accepted the fixture invite.' } });
+  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }),
+    { state: 'done', text: 'Accepted the fixture invite.', sessionId: CLEM_THREAD_ID });
+  assert.deepEqual(fromClemTurnOutcome({ key: 'notif:other', reply: 'Accept', since: new Date(Date.now() - 10 * 60_000).toISOString() }),
+    { state: 'not_found' }, 'a tap that never started says so after a while');
+});

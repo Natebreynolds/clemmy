@@ -10,6 +10,7 @@ import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
 import { AnswerRow } from './NeedsYouPane';
 import { LoadFailedLine, PaneCard, PaneRow, RowSkeleton, SectionHeader } from './HomeSection';
+import { TapOutcomes, type RecentTap } from './TapOutcome';
 
 interface RowState {
   voiceDigest: string;
@@ -63,6 +64,10 @@ export function FromClemPane({
   // One reply box open at a time. Drafts outlive closing.
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // Taps that started work: what came of each shows here, where the owner
+  // tapped, instead of only "Started a conversation."
+  const [taps, setTaps] = useState<RecentTap[]>([]);
+  const dismissTap = (tap: RecentTap) => setTaps((all) => all.filter((each) => each !== tap));
   const [showAll, setShowAll] = useState<{ waiting: boolean; updates: boolean }>({ waiting: false, updates: false });
   const rows = data?.rows ?? [];
   const latestRows = useRef(rows);
@@ -112,10 +117,17 @@ export function FromClemPane({
       }))).finally(() => { inFlight.current.delete(row.key); });
   };
 
-  const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
-    const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
-    return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, fromClemSourceName(row)), ...(outcome.outcome === 'started' ? { sessionId: outcome.sessionId } : {}) };
-  });
+  const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => {
+    const since = new Date().toISOString();
+    return act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
+      const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
+      if (outcome.outcome === 'started') {
+        setTaps((all) => [{ key: row.key, title: row.say ?? row.text, reply: text, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+        return { settled: true, text: 'Clem is on it — see Just now.' };
+      }
+      return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, fromClemSourceName(row)) };
+    });
+  };
 
   /** The answers on the row itself: hers when she offered some, else the
    *  record's own (yes/no for a suggestion). */
@@ -331,6 +343,7 @@ export function FromClemPane({
     if (!data) return null;
     return section === 'waiting'
       ? <>
+          <TapOutcomes taps={taps} onDismiss={dismissTap} />
           {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
           {offers.length > 0 && <PaneCard>{offers.map(offerRow)}</PaneCard>}
         </>
@@ -355,6 +368,7 @@ export function FromClemPane({
         Couldn’t refresh what Clem noticed. Showing the last saved reading.{' '}
         <button type="button" onClick={onRetry} className="rounded-sm font-semibold underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Try again</button>
       </p>}
+      <TapOutcomes taps={taps} onDismiss={dismissTap} />
       {error && !data ? (
         <PaneCard><LoadFailedLine what="what Clem noticed" onRetry={onRetry} /></PaneCard>
       ) : loading && !data ? (

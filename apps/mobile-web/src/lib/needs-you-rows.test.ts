@@ -39,12 +39,16 @@ test('every kind is one row, in screen order, keyed like its card and deep link'
     unlisted: [{ key: 'u1', kind: 'workflow_paused', title: 'Weekly report is paused', detail: 'Waiting for a connection', workflow: 'weekly-report' }],
     attention: [{ row: notification({ needsYouKey: 'flow:weekly-report' }), earlier: 2 }],
   });
-  assert.deepEqual(rows.map((row) => row.key), ['checkin:q1', 'plan:p1', 'approval:a1', 'unlisted:u1', 'notification:n1']);
+  // The desktop's sections, in its order: things to OK, Clem's questions,
+  // then work that stopped.
+  assert.deepEqual(rows.map((row) => row.key), ['plan:p1', 'approval:a1', 'checkin:q1', 'unlisted:u1', 'notification:n1']);
+  assert.deepEqual(rows.map((row) => row.section), ['ok', 'ok', 'questions', 'stopped', 'stopped']);
   assert.ok(rows.every((row) => row.title.length <= 120), 'a title is one line, never a wall');
-  assert.equal(rows[0]!.preview, undefined, 'a reference id is never the preview');
-  assert.equal(rows[2]!.preview, 'Weekly update: three deals moved forward.', 'an approval previews the draft');
+  const byKey = (key: string) => rows.find((row) => row.key === key)!;
+  assert.equal(byKey('checkin:q1').preview, undefined, 'a reference id is never the preview');
+  assert.equal(byKey('approval:a1').preview, 'Weekly update: three deals moved forward.', 'an approval previews the draft');
   assert.deepEqual(rows.map((row) => row.urgent), [false, false, false, true, true], 'only a stopped workflow is urgent');
-  assert.match(rows[4]!.context ?? '', /\+2 earlier/);
+  assert.match(byKey('notification:n1').context ?? '', /\+2 earlier/);
 });
 
 test('a project name, when the Mac says so, leads the context', () => {

@@ -14,11 +14,13 @@ import { usePoll } from '@/lib/poll';
 import { ProjectLabelTag } from '@/components/projects/ProjectLabelTag';
 import { useProjectLabels, type SessionProjectLabel } from '@/lib/project-labels';
 import { applyTidy, describeTidy } from '@/lib/tidy';
+import { replyFromClem, useFromClem, type FromClemRow } from '@/lib/from-clem';
+import { TapOutcomes, type RecentTap } from '@/components/home/TapOutcome';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
 import { useMediaQuery } from '@/lib/use-media-query';
-import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, type NeedsYouItem, type NeedsYouRowView } from '@/lib/needs-you-list';
+import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, type NeedsYouItem, type NeedsYouRowView, NEEDS_YOU_SECTIONS } from '@/lib/needs-you-list';
 import { DecisionFrame, DecisionRow, Disclosure } from '@/components/inbox/DecisionList';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
@@ -89,6 +91,39 @@ export function Inbox() {
   const capabilityLockRef = useRef<string | null>(null);
   const [trustBusy, setTrustBusy] = useState<string | null>(null);
   const [proposalBusy, setProposalBusy] = useState<string | null>(null);
+  // An item Clem also offers on Home (a meeting invite) is answered with her
+  // own choices, through the same tap path; what came of it shows in Just now.
+  const fromClem = useFromClem(tab === 'needs');
+  const clemRowByNotification = useMemo(() => {
+    const byId = new Map<string, FromClemRow>();
+    for (const row of fromClem.data?.rows ?? []) {
+      if (row.key.startsWith('notif:')) byId.set(row.key.slice('notif:'.length), row);
+    }
+    return byId;
+  }, [fromClem.data]);
+  const [taps, setTaps] = useState<RecentTap[]>([]);
+  const [clemBusy, setClemBusy] = useState<string | null>(null);
+  const onClemChoice = async (row: FromClemRow, choice: string, index: number) => {
+    if (clemBusy) return;
+    setClemBusy(row.key);
+    setDecisionNotice(null);
+    const since = new Date().toISOString();
+    try {
+      const outcome = await replyFromClem(row.key, choice, row.voiceDigest, undefined, index);
+      if (outcome.outcome === 'started') {
+        setTaps((all) => [{ key: row.key, title: row.say ?? row.text, reply: choice, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+      } else {
+        setDecisionNotice({ tone: outcome.outcome === 'changed' || outcome.outcome === 'gone' ? 'error' : 'success',
+          text: outcome.outcome === 'changed' ? 'This changed while you were looking. Have another look.'
+            : outcome.outcome === 'gone' ? 'This was already handled.' : 'Done.' });
+      }
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'That didn’t reach Clem. Nothing changed; try again.') });
+    } finally {
+      setClemBusy(null);
+      invalidate('notifications', 'home-from-clem', 'command-center');
+    }
+  };
   const trustLockRef = useRef<string | null>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
@@ -173,7 +208,15 @@ export function Inbox() {
     attention: collapsedAttention,
     unlisted: unlistedRows,
   }), [workspaceChooserRows, questionRows, planRows, approvalRows, trustRows, collapsedAttention, unlistedRows]);
-  const needsViews = useMemo(() => needsItems.map(needsYouRowView), [needsItems]);
+  // Grouped by what each asks of the owner, in the one section order; within
+  // a section, the feeds' own order (live decisions first) is kept.
+  const needsViews = useMemo(() => {
+    const rank = new Map(NEEDS_YOU_SECTIONS.map((section, index) => [section.id, index]));
+    return needsItems.map(needsYouRowView)
+      .map((view, index) => ({ view, index }))
+      .sort((a, b) => (rank.get(a.view.section) ?? 0) - (rank.get(b.view.section) ?? 0) || a.index - b.index)
+      .map(({ view }) => view);
+  }, [needsItems]);
   needsViewsRef.current = needsViews;
   // The badge is the server's total whenever it has answered: the sidebar and
   // the phone show that same number. The local sum is only the fallback.
@@ -474,7 +517,7 @@ export function Inbox() {
         text: result.status === 'already_selected' || result.status === 'already_resumed'
           ? 'That exact gate was already handled. The same run remains on its one-time resume path.'
           : choice
-            ? `Account ${choice.label} (${choice.accountId}) saved. Clem is resuming the same run once.`
+            ? `${choice.label} saved. Clem is resuming the same run once.`
             : 'The exact gate was reopened. Clem is resuming the same run once.',
       });
     } catch (error) {
@@ -635,6 +678,8 @@ export function Inbox() {
               />
             )}
 
+            {tab === 'needs' && <TapOutcomes taps={taps} onDismiss={(tap) => setTaps((all) => all.filter((each) => each !== tap))} />}
+
             {!loading && partiallyUnavailable && (
               <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2 text-body text-fg">
                 <span>Couldn’t check {failedNeedsFeeds.join(', ')} just now, so this list may be missing something.</span>
@@ -665,20 +710,31 @@ export function Inbox() {
                   {/* What is current first; anything waiting more than a few
                       days folds below (owner 2026-10-18: a newcomer facing 32
                       rows, a week old among them, could not tell what mattered). */}
-                  <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border" aria-label="Decisions waiting on you">
-                    {currentViews.map((view) => (
-                      <li key={view.id}>
-                        <DecisionRow
-                          view={view}
-                          selected={selected === view.id}
-                          checked={checked.has(view.id)}
-                          disabled={bulkBusy || decisionStates[view.id]?.busy === true}
-                          onToggleCheck={() => toggleChecked(view.id)}
-                          onSelect={() => pick(view.id)}
-                        />
-                      </li>
-                    ))}
-                  </ul>
+                  {NEEDS_YOU_SECTIONS.map((section) => {
+                    const inSection = currentViews.filter((view) => view.section === section.id);
+                    if (inSection.length === 0) return null;
+                    return (
+                      <section key={section.id} aria-label={section.label} className="flex flex-col gap-1.5">
+                        <h3 className="px-1 text-caption font-semibold uppercase tracking-wide text-faint">
+                          {section.label}{inSection.length > 1 ? ` · ${inSection.length}` : ''}
+                        </h3>
+                        <ul className="overflow-hidden rounded-lg border border-border bg-surface divide-y divide-border">
+                          {inSection.map((view) => (
+                            <li key={view.id}>
+                              <DecisionRow
+                                view={view}
+                                selected={selected === view.id}
+                                checked={checked.has(view.id)}
+                                disabled={bulkBusy || decisionStates[view.id]?.busy === true}
+                                onToggleCheck={() => toggleChecked(view.id)}
+                                onSelect={() => pick(view.id)}
+                              />
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    );
+                  })}
                   {olderViews.length > 0 && (
                     <div className="flex flex-col gap-2">
                       <button type="button" aria-expanded={showOlder} onClick={() => setShowOlder((open) => !open)}
@@ -755,7 +811,11 @@ export function Inbox() {
                   onResolve: (choice?: WorkflowCapabilityAccountChoice) => {
                     if (selItem.kind === 'attention' && selItem.row.workflowCapability) void onResolveCapability(selItem.row.workflowCapability, choice);
                   } }}
-                notification={{ onRead: () => onRead(selItem.id, selItem.kind === 'attention' ? selItem.groupIds : undefined), onRetry: () => onRetry(selItem.id) }}
+                notification={{ onRead: () => onRead(selItem.id, selItem.kind === 'attention' ? selItem.groupIds : undefined), onRetry: () => onRetry(selItem.id),
+                  ...(() => {
+                    const clemRow = selItem.kind === 'attention' ? clemRowByNotification.get(selItem.row.id) : undefined;
+                    return clemRow ? { clemRow, clemBusy: clemBusy !== null, onClemChoice: (choice: string, index: number) => { void onClemChoice(clemRow, choice, index); } } : {};
+                  })() }}
               />
             ) : selNotif ? (
               <NotifDetail key={selNotif.id} row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} onBack={back} />
@@ -794,7 +854,7 @@ type QuestionHandlers = { answer: string; busy: boolean; globallyBusy: boolean; 
 type WorkspaceHandlers = { busy: boolean; onChoose: (choiceId: string) => void };
 type TrustHandlers = { busy: boolean; globallyBusy: boolean; onApprove: () => void; onDecline: () => void };
 type CapabilityHandlers = { busy: boolean; globallyBusy: boolean; onResolve: (choice?: WorkflowCapabilityAccountChoice) => void };
-type NotificationHandlers = { onRead: () => void; onRetry: () => void };
+type NotificationHandlers = { onRead: () => void; onRetry: () => void; clemRow?: FromClemRow; onClemChoice?: (choice: string, index: number) => void; clemBusy?: boolean };
 
 /** The selected decision, whatever its kind, in the one detail shape. */
 type ProposalHandlers = { busy: boolean; globallyBusy: boolean; onKeep: () => void; onDecline: () => void };
@@ -1210,10 +1270,15 @@ function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pend
   );
 }
 
-function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: NotificationHandlers & {
+function NotifDetail({ row, view, destination, onRead, onRetry, onBack, clemRow, onClemChoice, clemBusy }: NotificationHandlers & {
   row: NotificationRow; view?: Pick<NeedsYouRowView, 'state' | 'context' | 'at'>; onBack?: () => void;
   /** Where the item is resolved, when the server's key names a place. */
   destination?: { href: string; label: string };
+  /** The same item as Clem offers it on Home, with her own choices (a
+   *  meeting to accept or decline): tapping one does it, as on Home. */
+  clemRow?: FromClemRow;
+  onClemChoice?: (choice: string, index: number) => void;
+  clemBusy?: boolean;
 }) {
   const failed = notifFailed(row);
   // A workflow the system switched off is a decision, and the decision is one
@@ -1240,9 +1305,15 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: Notifi
   };
   const frameView = view ?? { state: notifTone(row), at: row.createdAt };
   const runHref = notificationRunHref(row);
-  const actions = enableGate || !row.read || failed || destination || runHref ? (
+  const clemChoices = clemRow?.choices?.length && onClemChoice ? clemRow.choices : null;
+  const actions = clemChoices || enableGate || !row.read || failed || destination || runHref ? (
     <>
-      {destination && !enableGate && (
+      {clemChoices && clemChoices.map((choice, index) => (
+        <Button key={choice} variant={index === 0 ? 'primary' : 'secondary'} disabled={clemBusy} onClick={() => onClemChoice!(choice, index)}>
+          {choice}
+        </Button>
+      ))}
+      {destination && !enableGate && !clemChoices && (
         <Link to={destination.href} className="inline-flex h-11 items-center rounded-md bg-primary px-4 text-body font-medium text-primary-fg hover:bg-primary-hover active:bg-primary-press">
           {destination.label}
         </Link>
@@ -1264,7 +1335,8 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack }: Notifi
   return (
     <DecisionFrame view={frameView} title={row.title || 'Notification'} onBack={onBack} actions={actions}
       notice={enableError ? { tone: 'error', text: enableError } : enableState === 'done' ? { tone: 'success', text: 'It runs on its schedule again.' } : null}>
-      {row.body ? <p className="whitespace-pre-wrap">{linkify(row.body)}</p> : null}
+      {clemChoices && clemRow?.say ? <p className="whitespace-pre-wrap">{clemRow.say}</p>
+        : row.body ? <p className="whitespace-pre-wrap">{linkify(row.body)}</p> : null}
       {enableGate && <p className="text-small text-muted">{enableGate.reason}</p>}
       {row.deliveryError && <Field label="Delivery error"><span className="text-danger">{row.deliveryError}</span></Field>}
     </DecisionFrame>

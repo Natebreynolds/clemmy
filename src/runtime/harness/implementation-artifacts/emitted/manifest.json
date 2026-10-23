@@ -3321,7 +3321,7 @@
           "bytes": 4232
         },
         "src/dashboard/from-clem-runtime.ts": {
-          "bytes": 29535
+          "bytes": 31716
         },
         "src/autoresearch/memory-approve.ts": {
           "bytes": 13025
@@ -3747,7 +3747,7 @@
           "bytes": 12980
         },
         "src/execution/inbox-questions.ts": {
-          "bytes": 16012
+          "bytes": 16728
         },
         "src/tools/autonomy-action-tools.ts": {
           "bytes": 31581
@@ -7404,7 +7404,7 @@
           "bytes": 4232
         },
         "src/dashboard/from-clem-runtime.ts": {
-          "bytes": 29535
+          "bytes": 31716
         },
         "src/autoresearch/memory-approve.ts": {
           "bytes": 13025
@@ -7830,7 +7830,7 @@
           "bytes": 12980
         },
         "src/execution/inbox-questions.ts": {
-          "bytes": 16012
+          "bytes": 16728
         },
         "src/tools/autonomy-action-tools.ts": {
           "bytes": 31581
