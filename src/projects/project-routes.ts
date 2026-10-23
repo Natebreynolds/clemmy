@@ -23,7 +23,7 @@ import {
   saveAssignment, saveResource, updateProject, type ProjectOrigin, type ProjectResourceKind,
 } from './project-record.js';
 import {
-  agentWork, delegatedTaskById, delegatedTasksForSession, openBackgroundTaskViews, projectLabelsForSessions, projectOverview, projectSummaries,
+  agentWork, delegatedTasksForSession, openBackgroundTaskViews, projectLabelsForSessions, projectOverview, projectSummaries, visibleBackgroundTaskById,
 } from './project-views.js';
 import { setSessionProject } from './session-project.js';
 import { admitLocalProject, chooseLocalProject, foundLocalProjects, localProjects } from './local-projects.js';
@@ -508,7 +508,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   });
 
   add('get', `${mount.tasks}/:taskId`, (req, res) => {
-    const task = delegatedTaskById(param(req, 'taskId'));
+    const task = visibleBackgroundTaskById(param(req, 'taskId'));
     if (!task) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     res.json({ task, generatedAt: new Date().toISOString() });
   });
@@ -518,7 +518,7 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
   // same project; the answer says which happened.
   add('post', `${mount.tasks}/:taskId/steer`, (req, res) => {
     const taskId = param(req, 'taskId');
-    if (!delegatedTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
+    if (!visibleBackgroundTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     const input = body(req);
     const policy = input.evidencePolicy === 'preserve' || input.evidencePolicy === 'invalidate' ? input.evidencePolicy : 'revalidate';
     const corrected = correctDelegatedTask(taskId, {
@@ -528,48 +528,48 @@ export function registerProjectRecordRoutes(mount: ProjectRouteMount): void {
       const status = corrected.reason === 'instruction_required' ? 400 : corrected.reason === 'task_not_found' ? 404 : 409;
       const code = corrected.reason === 'not_resumable' || corrected.reason === 'resume_first'
         ? 'TASK_NOT_RESUMABLE' : corrected.reason.toUpperCase();
-      res.status(status).json({ error: code, task: delegatedTaskById(taskId) });
+      res.status(status).json({ error: code, task: visibleBackgroundTaskById(taskId) });
       return;
     }
     if (corrected.kind === 'revised') {
       try {
         updateLinkedFocusAction(corrected.task.id, { status: 'running', note: `Course-corrected to request v${corrected.task.contractVersion ?? 1}.` });
       } catch { /* the revision is on the task; the focus note is a convenience */ }
-      res.json({ task: delegatedTaskById(taskId), applied: 'revised', resumed: corrected.resumed });
+      res.json({ task: visibleBackgroundTaskById(taskId), applied: 'revised', resumed: corrected.resumed });
       return;
     }
-    res.json({ task: delegatedTaskById(corrected.task.id), applied: 'followed', follows: delegatedTaskById(taskId) });
+    res.json({ task: visibleBackgroundTaskById(corrected.task.id), applied: 'followed', follows: visibleBackgroundTaskById(taskId) });
   });
 
   add('post', `${mount.tasks}/:taskId/stop`, (req, res) => {
     const taskId = param(req, 'taskId');
-    if (!delegatedTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
+    if (!visibleBackgroundTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     cancelBackgroundTask(taskId, `Stopped by the owner from ${mount.surfaceName}.`);
-    res.json({ task: delegatedTaskById(taskId) });
+    res.json({ task: visibleBackgroundTaskById(taskId) });
   });
 
   add('post', `${mount.tasks}/:taskId/resume`, (req, res) => {
     const taskId = param(req, 'taskId');
-    const view = delegatedTaskById(taskId);
+    const view = visibleBackgroundTaskById(taskId);
     if (!view) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     if (!view.controls.canResume) { res.status(409).json({ error: 'TASK_NOT_RESUMABLE', task: view }); return; }
     const resumed = resumeBackgroundTask(taskId);
-    if (!resumed) { res.status(409).json({ error: 'TASK_NOT_RESUMABLE', task: delegatedTaskById(taskId) }); return; }
-    res.json({ task: delegatedTaskById(taskId) });
+    if (!resumed) { res.status(409).json({ error: 'TASK_NOT_RESUMABLE', task: visibleBackgroundTaskById(taskId) }); return; }
+    res.json({ task: visibleBackgroundTaskById(taskId) });
   });
 
   add('post', `${mount.tasks}/:taskId/answer`, (req, res) => {
     const taskId = param(req, 'taskId');
-    if (!delegatedTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
+    if (!visibleBackgroundTaskById(taskId)) { res.status(404).json({ error: 'TASK_NOT_FOUND' }); return; }
     const answer = typeof body(req).answer === 'string' ? String(body(req).answer).trim() : '';
     if (!answer) { res.status(400).json({ error: 'ANSWER_REQUIRED' }); return; }
     const task = getBackgroundTask(taskId);
     if (!task || task.status !== 'awaiting_input' || !task.pendingQuestionId) {
-      res.status(409).json({ error: 'TASK_NOT_WAITING', task: delegatedTaskById(taskId) });
+      res.status(409).json({ error: 'TASK_NOT_WAITING', task: visibleBackgroundTaskById(taskId) });
       return;
     }
     const queued = queueBackgroundTaskInputResolution(task.pendingQuestionId, answer);
-    if (!queued) { res.status(409).json({ error: 'ALREADY_ANSWERED', task: delegatedTaskById(taskId) }); return; }
-    res.json({ task: delegatedTaskById(taskId) });
+    if (!queued) { res.status(409).json({ error: 'ALREADY_ANSWERED', task: visibleBackgroundTaskById(taskId) }); return; }
+    res.json({ task: visibleBackgroundTaskById(taskId) });
   });
 }

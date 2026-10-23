@@ -266,5 +266,10 @@ test('the open-work list carries every task still moving, whoever owns it, and n
   assert.ok(!ids.includes(ended.id), 'ended work is not open');
   assert.equal(open.find((row) => row.taskId === agentTask.id)?.owner.agentName, 'Build the landing page');
   assert.equal(open.find((row) => row.taskId === clemTask.id)?.owner.agentName, null, 'no agent: the owner reads as Clem');
+  assert.equal(open.find((row) => row.taskId === clemTask.id)?.controls.canSteer, false,
+    'plain tasks do not offer the delegated correction flow');
+  assert.equal(views.delegatedTaskById(clemTask.id), null, 'Home visibility does not confer delegation');
+  assert.ok(!views.delegatedTasksForProject(p.id).some((row) => row.taskId === clemTask.id));
+  assert.ok(!views.delegatedTasksForAgent('fixture-worker').some((row) => row.taskId === clemTask.id));
   assert.equal(open.find((row) => row.taskId === agentTask.id)?.phase, 'working');
 });

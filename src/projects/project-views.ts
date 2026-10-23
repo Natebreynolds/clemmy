@@ -233,9 +233,9 @@ export function delegatedTaskView(task: BackgroundTaskRecord): DelegatedTaskView
     completedAt: task.completedAt ?? null,
     updatedAt: task.updatedAt,
     controls: {
-      // A finished task can still be corrected: the correction becomes a
-      // task that follows it.
-      canSteer: !task.archived && task.status !== 'cancelling',
+      // The correction flow belongs to delegated work; a finished delegated
+      // task can still be corrected by creating a task that follows it.
+      canSteer: Boolean(task.delegation) && !task.archived && task.status !== 'cancelling',
       canStop: !task.archived && !TERMINAL.has(task.status) && task.status !== 'cancelling',
       canResume: !task.archived && RESUMABLE.has(task.status),
       canAnswer: task.status === 'awaiting_input' && Boolean(task.pendingQuestionId),
@@ -254,6 +254,14 @@ function delegatedTasks(filter: (task: BackgroundTaskRecord) => boolean, limit: 
 export function delegatedTaskById(taskId: string): DelegatedTaskView | null {
   const task = getBackgroundTask(taskId);
   return task?.delegation && !task.internal ? delegatedTaskView(task) : null;
+}
+
+/** Home also lists work Clem owns directly. Its existing task controls use
+ * this visibility boundary without adding plain work to delegated lists.
+ * Ended tasks stay readable so Stop/Resume can return their current state. */
+export function visibleBackgroundTaskById(taskId: string): DelegatedTaskView | null {
+  const task = getBackgroundTask(taskId);
+  return task && !task.internal && !task.archived ? delegatedTaskView(task) : null;
 }
 
 export function delegatedTasksForSession(sessionId: string, limit = 20): DelegatedTaskView[] {

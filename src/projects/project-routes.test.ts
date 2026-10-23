@@ -308,11 +308,60 @@ test('a linked local project says what it offers, to the work and on both surfac
   }
 });
 
-test('a task nobody delegated is not a delegated task on any surface', async () => {
-  const plain = tasks.createBackgroundTask({ title: 'Plain', prompt: 'plain', source: 'desktop' });
-  assert.equal((await desktop('get', `/api/console/delegated-tasks/${plain.id}`)).status, 404);
-  assert.equal((await phone('post', `/api/delegated-tasks/${plain.id}/stop`)).status, 404);
-  assert.equal(tasks.getBackgroundTask(plain.id)?.status, 'pending', 'and these routes cannot touch it');
+test('a plain task shown in Home can be read and answered once on either surface', async () => {
+  const chat = createSession({ kind: 'chat' });
+  const plain = tasks.createBackgroundTask({ title: 'Plain question', prompt: 'Ask before writing.', source: 'desktop', originSessionId: chat.id });
+  assert.ok((await desktop('get', '/api/console/delegated-tasks')).body.tasks.some((row: any) => row.taskId === plain.id));
+  const shown = await desktop('get', `/api/console/delegated-tasks/${plain.id}`);
+  assert.equal(shown.status, 200);
+  assert.deepEqual(shown.body.task.controls, { canSteer: false, canStop: true, canResume: false, canAnswer: false });
+  assert.equal(shown.body.task.owner.agentId, null);
+  assert.equal(shown.body.task.project, null);
+  assert.deepEqual((await phone('get', `/api/chat/sessions/${chat.id}/delegated-tasks`)).body.tasks, [],
+    'Home eligibility does not make plain work a delegated conversation task');
+  const steering = await phone('post', `/api/delegated-tasks/${plain.id}/steer`, { instruction: 'Use a different colour.' });
+  assert.deepEqual([steering.status, steering.body.error], [409, 'NOT_DELEGATED']);
+  assert.equal(tasks.getBackgroundTask(plain.id)?.contractVersion ?? 1, 1, 'unsupported steering leaves the task unchanged');
+
+  tasks.markBackgroundTaskAwaitingInput(plain.id, 'q-plain-home', 'Which colour?', { options: ['Amber', 'Violet'] });
+  const waiting = (await phone('get', `/api/delegated-tasks/${plain.id}`)).body.task;
+  assert.equal(waiting.controls.canAnswer, true);
+  assert.equal(waiting.question.id, 'q-plain-home');
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${plain.id}/answer`, { answer: ' ' })).status, 400);
+  const answered = await phone('post', `/api/delegated-tasks/${plain.id}/answer`, { answer: 'Amber' });
+  assert.equal(answered.status, 200);
+  assert.deepEqual([answered.body.task.taskId, answered.body.task.runSessionId, answered.body.task.status, answered.body.task.controls.canAnswer],
+    [plain.id, plain.runSessionId, 'pending', false]);
+  assert.equal(tasks.getBackgroundTask(plain.id)?.inputResolution?.answer, 'Amber');
+  assert.equal((await desktop('post', `/api/console/delegated-tasks/${plain.id}/answer`, { answer: 'Violet' })).status, 409);
+  assert.equal(tasks.getBackgroundTask(plain.id)?.inputResolution?.answer, 'Amber', 'a second answer cannot replace the accepted answer');
+});
+
+test('a plain Home task stops and resumes in place without acquiring delegation', async () => {
+  const plain = tasks.createBackgroundTask({ title: 'Plain stop', prompt: 'Bounded work.', source: 'desktop' });
+  const stopped = await phone('post', `/api/delegated-tasks/${plain.id}/stop`);
+  assert.equal(stopped.status, 200);
+  assert.deepEqual([stopped.body.task.taskId, stopped.body.task.status, stopped.body.task.controls.canResume], [plain.id, 'aborted', true]);
+  const resumed = await desktop('post', `/api/console/delegated-tasks/${plain.id}/resume`);
+  assert.equal(resumed.status, 200);
+  assert.deepEqual([resumed.body.task.taskId, resumed.body.task.runSessionId, resumed.body.task.status], [plain.id, plain.runSessionId, 'pending']);
+  assert.equal(tasks.getBackgroundTask(plain.id)?.delegation, undefined);
+});
+
+test('hidden internal and archived tasks cannot be addressed through Home controls', async () => {
+  const internal = tasks.createBackgroundTask({ title: 'Internal work', prompt: 'Internal work.', source: 'desktop', internal: true });
+  const archived = tasks.createBackgroundTask({ title: 'Archived work', prompt: 'Archived work.', source: 'desktop' });
+  tasks.archiveBackgroundTask(archived.id);
+  for (const hidden of [internal, archived]) {
+    const before = tasks.getBackgroundTask(hidden.id);
+    assert.ok(!(await desktop('get', '/api/console/delegated-tasks')).body.tasks.some((row: any) => row.taskId === hidden.id));
+    assert.equal((await phone('get', `/api/delegated-tasks/${hidden.id}`)).status, 404);
+    for (const action of ['answer', 'stop', 'resume', 'steer']) {
+      const result = await desktop('post', `/api/console/delegated-tasks/${hidden.id}/${action}`, { answer: 'Amber', instruction: 'Change the work.' });
+      assert.equal(result.status, 404, action);
+    }
+    assert.deepEqual(tasks.getBackgroundTask(hidden.id), before, 'hidden records remain unchanged');
+  }
 });
 
 test('the owner sees who each memory is for, by name, and can move it', async () => {
