@@ -147,11 +147,13 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   const [busy, setBusy] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Which control the error belongs to, so it shows beside that control. */
+  const [errorKey, setErrorKey] = useState<string | null>(null);
   const [claudeSignInFor, setClaudeSignInFor] = useState<string | null>(null);
   const generation = useRef(0);
   useEffect(() => {
     generation.current += 1;
-    setBusy(null); setError(null); setSaved(null); setClaudeSignInFor(null);
+    setBusy(null); setError(null); setErrorKey(null); setSaved(null); setClaudeSignInFor(null);
     return () => { generation.current += 1; };
   }, [opts.sessionId]);
 
@@ -169,12 +171,16 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
   };
   const run = async (key: string, fn: () => Promise<unknown>) => {
     const current = ++generation.current;
-    setBusy(key); setError(null); setSaved(null);
+    setBusy(key); setError(null); setErrorKey(null); setSaved(null);
     try { await fn(); if (current === generation.current) { setSaved(key); refresh(); } }
     catch (err) {
       if (current !== generation.current) return;
       const e = err as { body?: { error?: string }; message?: string };
       setError(e?.body?.error ?? e?.message ?? String(err));
+      setErrorKey(key);
+      // A refused change may still have moved something: read the saved
+      // settings again so every control shows what is really in effect.
+      refresh();
     } finally { if (current === generation.current) setBusy(null); }
   };
 
@@ -223,7 +229,7 @@ export function useModelRoles(opts: { sessionId?: string } = {}) {
     fetching: settings.isFetching,
     mr,
     claudeAuth,
-    busy, saved, error, claudeSignInFor,
+    busy, saved, error, errorKey, claudeSignInFor,
     run, refresh, onBrain, onRole, onJudgeFallback, onBrainBackup,
     brainValue: mr ? currentBrainValue(mr) : '',
     brains: mr ? brainChoices(mr, claudeAuth) : [],

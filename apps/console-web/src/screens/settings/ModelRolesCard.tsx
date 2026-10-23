@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { AlertTriangle, Check, ChevronRight, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { getModelScorecard, judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, useModelRoles } from '@/lib/model-roles';
+import { getModelScorecard, judgeFallbackChoices, judgeFallbackValue, PROVIDER_LABEL, ROLE_WORDS, roleLabel, useModelRoles } from '@/lib/model-roles';
 import { CHECKER_ROLE_WORDS, QUICK_ROLE_WORDS, modelScoreLine, checkerAutomaticText, checkerBackupAutomaticLabel, checkerSameFamilyWarning, jevFirstChecksText, memoryModelUnavailableText, memoryRoleAutomaticText, modelDisplayName } from '@clem/chat-engine';
 import { memoryTimeFormat } from '@/lib/memory-work';
 import { Select, Input } from '@/components/ui/Field';
@@ -77,6 +77,9 @@ function JudgeMetrics({ metrics }: { metrics?: JudgeMetricsSnapshot }) {
   );
 }
 
+/** Controls whose outcome shows under the control itself. */
+const INLINE_FEEDBACK = new Set(['brain', 'worker', 'writer', 'judge', 'memory', 'quick']);
+
 export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const r = useModelRoles({ sessionId });
   const mr = r.mr;
@@ -87,6 +90,11 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
     const line = modelScoreLine(scorecard.data, role, modelId);
     return line ? <div className="mt-1 text-caption text-muted">{line}</div> : null;
   };
+  // The brain the owner just picked, until the saved settings confirm it.
+  const [pickedBrain, setPickedBrain] = useState<string | null>(null);
+  useEffect(() => {
+    if (pickedBrain !== null && r.saved === 'brain' && !r.fetching && r.brainValue === pickedBrain) setPickedBrain(null);
+  }, [pickedBrain, r.saved, r.fetching, r.brainValue]);
   const [newIntent, setNewIntent] = useState('');
   const [newIntentModel, setNewIntentModel] = useState('');
   // The Memory tab's "Change" lands on the memory row. The row exists only once
@@ -180,7 +188,37 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   };
   const onRemoveIntent = (whenIntent: string) => r.run(`intent-rm-${whenIntent}`, () => patchModelRole({ role: 'worker', whenIntent, clear: true }));
 
-  const row = (label: string, hint: string, control: React.ReactNode, note?: React.ReactNode) => (
+  // What came of a change shows under the control that made it: a refused
+  // switch leaves the menu on the current model, so the reason must be here.
+  const brainDidNotTake = pickedBrain !== null && r.saved === 'brain' && !r.fetching && r.brainValue !== pickedBrain;
+  const feedback = (key?: string) => {
+    if (!key || busy === key) return null;
+    if (r.error && r.errorKey === key) {
+      return (
+        <div className="mt-1 flex items-start gap-1.5 text-caption text-danger" role="alert">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden /><span className="min-w-0">{r.error}</span>
+        </div>
+      );
+    }
+    if (key === 'brain' && brainDidNotTake) {
+      return (
+        <div className="mt-1 flex items-start gap-1.5 text-caption text-danger" role="alert">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0">That change didn’t take: Clem is still on {roleLabel(mr, 'brain')}. Try again, or check the account under Connected.</span>
+        </div>
+      );
+    }
+    if (r.saved !== key) return null;
+    return (
+      <div className="mt-1 inline-flex items-center gap-1 text-caption text-success" role="status">
+        <Check className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        {key === 'memory' ? 'Saved — the next memory job uses it'
+          : key === 'brain' ? (pickedBrain !== null ? 'Switching…' : `Switched — ${roleLabel(mr, 'brain')} answers your next message`)
+          : 'Saved — applies on the next message'}
+      </div>
+    );
+  };
+  const row = (label: string, hint: string, control: React.ReactNode, note?: React.ReactNode, key?: string) => (
     // One control column for every role, so Brain, Workers and Judge line up
     // (an `auto` column sized each row to its own select).
     <div className="grid grid-cols-1 items-center gap-2 border-t border-border px-4 py-3 first:border-t-0 sm:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)] sm:gap-4">
@@ -188,6 +226,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         <div className="text-body font-semibold text-fg">{label}</div>
         <div className="text-small text-muted">{hint}</div>
         {note}
+        {feedback(key)}
       </div>
       <div className="flex min-w-0 items-center gap-2 sm:justify-end [&>select]:w-full">{control}</div>
     </div>
@@ -209,9 +248,9 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
     <div>
       <div className="overflow-hidden rounded-lg border border-border bg-surface">
         {row(ROLE_WORDS.brain.title, ROLE_WORDS.brain.hint,
-          <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => void r.onBrain(e.target.value)} aria-label="Model that does the work">
+          <Select disabled={busy === 'brain'} value={r.brainValue} onChange={(e) => { setPickedBrain(e.target.value); void r.onBrain(e.target.value); }} aria-label="Model that does the work">
             {r.brains.map((o) => <option key={o.value} value={o.value} disabled={!o.available}>{o.label}{o.note ? ` (${o.note})` : ''}</option>)}
-          </Select>, <>{score('brain', mr.roles.brain.modelId)}{inactive('brain')}</>)}
+          </Select>, <>{score('brain', mr.roles.brain.modelId)}{inactive('brain')}</>, 'brain')}
         {backups && row(ROLE_WORDS.backups.title, ROLE_WORDS.backups.hint,
           <div className="flex w-full flex-col gap-2">
             {[0, 1, 2].filter((slot) => slot <= backups.modelIds.length).map((slot) => (
@@ -234,7 +273,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           <Select disabled={busy === 'worker'} value={mr.roles.worker.source === 'default' ? '__default__' : mr.roles.worker.modelId} onChange={(e) => void r.onRole('worker', e.target.value)} aria-label="Model that helps in parallel">
             <option value="__default__">Same model that does the work</option>
             {workerFlat.map((m) => <option key={`w-${m.provider}-${m.id}`} value={m.id}>{m.label} · {PROVIDER_LABEL[m.provider] ?? m.provider}</option>)}
-          </Select>, <>{score('worker', mr.roles.worker.modelId)}{inactive('worker')}</>)}
+          </Select>, <>{score('worker', mr.roles.worker.modelId)}{inactive('worker')}</>, 'worker')}
         {writer && row(ROLE_WORDS.writer.title, ROLE_WORDS.writer.hint,
           <Select disabled={busy === 'writer'} value={writer.source === 'default' ? '__default__' : writer.modelId} onChange={(e) => void r.onRole('writer', e.target.value)} aria-label="Model that writes the final answer">
             <option value="__default__">Same model that does the work</option>
@@ -243,7 +282,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
           <>
             {score('writer', writer.modelId)}
             {inactive('writer')}
-          </>)}
+          </>, 'writer')}
         {row(ROLE_WORDS.judge.title, ROLE_WORDS.judge.hint,
           <Select disabled={busy === 'judge'} value={mr.roles.judge.source === 'default' ? '__default__' : mr.roles.judge.modelId} onChange={(e) => void r.onRole('judge', e.target.value)} aria-label="Model that checks the work">
             <option value="__default__">Automatic{judge.source === 'default' && judge.modelId ? ` · ${modelDisplayName(judge.modelId)}` : ''}</option>
@@ -270,7 +309,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             {secondOpinionOn && judgeSameAsBrain && (
               <div className="mt-1 flex items-center gap-1.5 text-caption text-warning"><AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />The checker is the same model that does the work, so a second opinion adds little.</div>
             )}
-          </>)}
+          </>, 'judge')}
         {fallback && row(ROLE_WORDS.fallback.title, ROLE_WORDS.fallback.hint,
           <Select disabled={busy !== null} value={judgeFallbackValue(fallback)} onChange={(event) => void r.onJudgeFallback(event.target.value)} aria-label="Backup checker model" aria-describedby="judge-fallback-note">
             <option value="automatic">{checkerBackupAutomaticLabel(checkerFacts, modelDisplayName)}</option>
@@ -310,6 +349,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
                   <span className="min-w-0">{memoryModelUnavailableText(memory.unavailable, memory.modelId ? modelDisplayName(memory.modelId) : null, memoryTimeFormat(Date.now()))}</span>
                 </div>
               )}
+              {feedback('memory')}
               <Link to="/memory" className="mt-1 inline-block text-caption font-semibold text-primary hover:underline">See it at work in Memory</Link>
             </div>
             <div className="flex min-w-0 items-center gap-2 sm:justify-end [&>select]:w-full">
@@ -330,7 +370,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
             {score('quick', quick.modelId)}
             {quick.source === 'default' && <div className="mt-1 text-caption text-muted">{QUICK_ROLE_WORDS.automatic}</div>}
             {inactive('quick')}
-          </>)}
+          </>, 'quick')}
         <details className="group border-t border-border">
           <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-small text-muted hover:text-fg">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" aria-hidden />
@@ -390,8 +430,8 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
         </details>
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-3 text-small">
-        {r.saved && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> {r.saved === 'memory' ? 'Saved — the next memory job uses it' : 'Saved — applies on the next message'}</span>}
-        {r.error && <span className="text-danger">{r.error}</span>}
+        {r.saved && !INLINE_FEEDBACK.has(r.saved) && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
+        {r.error && !INLINE_FEEDBACK.has(r.errorKey ?? '') && <span className="text-danger" role="alert">{r.error}</span>}
         {mr.available.length === 0 && <span className="text-muted">No models connected yet — sign in or add a key under Connected.</span>}
       </div>
       {r.claudeSignInFor && <div className="mt-3"><ClaudeLoginForm embedded /></div>}

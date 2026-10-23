@@ -221,7 +221,23 @@ export function ModelAccountsCard() {
   if (!ready) return <Skeleton className="h-40 w-full" />;
 
   const byId = new Map(meters.map((m) => [m.id, m]));
-  const notConnected = SIGN_IN_ACCOUNTS.filter((a) => !byId.has(a.id));
+  // An API account added without a working key keeps its place here, saying
+  // why its models are greyed out in the pickers, instead of vanishing.
+  const unusable = (p: ModelProvider) => {
+    const models = p.modelIds.length === 1 ? p.modelIds[0] : `its ${p.modelIds.length} models`;
+    return p.baseURL ? `Added, but no API key is saved, so ${models} can't be used. Add the key or remove the account.`
+      : `Added, but no web address is saved, so ${models} can't be used.`;
+  };
+  const notConnected = [
+    ...SIGN_IN_ACCOUNTS.filter((a) => !byId.has(a.id)).map((a) => {
+      const added = providers.find((p) => p.id === a.id && !p.configured && p.modelIds.length > 0);
+      if (!added) return a;
+      const models = added.modelIds.length === 1 ? added.modelIds[0] : `its ${added.modelIds.length} models`;
+      return { ...a, what: `${a.what} · added, but not signed in and no key saved, so ${models} can't be used` };
+    }),
+    ...providers.filter((p) => !p.configured && !byId.has(p.id) && !SIGN_IN_ACCOUNTS.some((a) => a.id === p.id))
+      .map((p) => ({ id: p.id, label: p.label || 'API account', what: unusable(p) })),
+  ];
   // The alarm is for an account doing a job for Clem; an idle one out of
   // credit says so in its own row (2026-10-18: the same rule as the header dot).
   const refusing = meters.filter((m) => m.outOfCredit && (m.uses?.length ?? 0) > 0);
