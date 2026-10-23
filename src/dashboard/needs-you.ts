@@ -31,6 +31,7 @@ import { listPlanProposals } from '../agents/plan-proposals.js';
 import { listProposals as listCheckInProposals } from '../agents/check-in-proposals.js';
 import { listTrustProposals } from '../agents/trust-graduation.js';
 import { listInboxQuestions } from '../execution/inbox-questions.js';
+import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import { listPendingRuns, type PendingRun } from '../execution/workflow-events.js';
 import { loadNotifications, type NotificationRecord } from '../runtime/notifications.js';
@@ -172,6 +173,19 @@ export function bootParkedWorkflows(pendingRuns: readonly PendingRun[] = listPen
 }
 
 // ─── What is live right now ──────────────────────────────────────────────────
+
+/** A legacy runtime approval can still be decided only through a background
+ * task waiting on it or a registry card for it; any other is retired, and
+ * deciding it rejects it whatever was tapped. Such a card is not a decision
+ * the owner can make, so it is neither listed nor counted. */
+export function decidableRuntimeApprovalIds(ids: readonly string[]): string[] {
+  if (ids.length === 0) return [];
+  let bound = new Set<string>();
+  try {
+    bound = new Set(listBackgroundTasks().map((task) => task.pendingApprovalId).filter((id): id is string => Boolean(id)));
+  } catch { /* no task store: only registry cards remain decidable */ }
+  return ids.filter((id) => bound.has(id) || Boolean(approvalRegistry.get(id)));
+}
 
 export interface NeedsYouReferents extends LiveReferents {
   approvalIds: ReadonlySet<string>;
@@ -341,6 +355,8 @@ export interface NeedsYouUnlistedItem {
   detail: string;
   /** The workflow's display name, when the item is about one. */
   workflow?: string;
+  /** Its saved name, which its page is opened by. */
+  workflowSlug?: string;
 }
 
 export async function summarizeNeedsYou(
@@ -352,7 +368,8 @@ export async function summarizeNeedsYou(
   const add = (key: string) => { if (key) keys.add(key); };
 
   for (const id of ref.approvalIds) add(`approval:${id}`);
-  for (const id of input.runtimeApprovalIds ?? []) add(`approval:${id}`);
+  const runtimeApprovalIds = decidableRuntimeApprovalIds(input.runtimeApprovalIds ?? []);
+  for (const id of runtimeApprovalIds) add(`approval:${id}`);
   for (const id of ref.planIds) add(`plan:${id}`);
   for (const id of ref.trustIds) add(`trust:${id}`);
   for (const id of ref.questionIds) add(id);
@@ -369,17 +386,17 @@ export async function summarizeNeedsYou(
     const { listAutomationPilotWorkspaceChoosers } = await import('../execution/automation-pilot-workspace-destination-authority.js');
     const choosers = listAutomationPilotWorkspaceChoosers({ status: 'pending', limit: 100 });
     workspaceChoices = choosers.length;
-    for (const row of choosers) add(`chooser:${(row as { id?: string }).id ?? ''}`);
+    for (const row of choosers) add(`chooser:${(row as { chooserId?: string }).chooserId ?? ''}`);
   } catch { /* no chooser store: none pending */ }
 
   const workflowKeys = new Set<string>();
-  const bindingStops = new Map<string, { workflow: string }>();
+  const bindingStops = new Map<string, { workflow: string; slug?: string }>();
   try {
     for (const stop of listWorkflowBindingStops()) {
       if (!stop.scheduled) continue;
       const key = workflowKey(stop.slug || stop.workflow);
       workflowKeys.add(key);
-      bindingStops.set(key, { workflow: stop.workflow });
+      bindingStops.set(key, { workflow: stop.workflow, ...(stop.slug ? { slug: stop.slug } : {}) });
     }
   } catch { /* no binding stops */ }
   const paused = new Map<string, BootParkedWorkflow>();
@@ -419,6 +436,7 @@ export async function summarizeNeedsYou(
       title: `${stop.workflow} can't run on its schedule`,
       detail: 'Pick the account or source it should use.',
       workflow: stop.workflow,
+      ...(stop.slug ? { workflowSlug: stop.slug } : {}),
     });
   }
   for (const [key, group] of paused) {
@@ -430,10 +448,11 @@ export async function summarizeNeedsYou(
       key,
       kind: 'workflow_paused',
       title: n === 1
-        ? `Paused after repeated restarts: ${name}`
-        : `${n} paused runs of ${name} after repeated restarts`,
-      detail: 'Resume or skip them.',
-      workflow: group.workflowName,
+        ? `${name} stopped after restarting several times`
+        : `${n} runs of ${name} stopped after restarting several times`,
+      detail: n === 1 ? 'Open it to resume the run or skip it.' : 'Open it to resume the runs or skip them.',
+      workflow: name,
+      workflowSlug: group.workflowName,
     });
   }
   for (const key of workflowKeys) add(key);
@@ -442,7 +461,7 @@ export async function summarizeNeedsYou(
 
   return {
     total: keys.size,
-    approvals: ref.approvalIds.size + (input.runtimeApprovalIds?.length ?? 0),
+    approvals: ref.approvalIds.size + runtimeApprovalIds.length,
     plans: ref.planIds.size,
     checkInProposals: checkIns.length,
     questions: ref.questionIds.size,

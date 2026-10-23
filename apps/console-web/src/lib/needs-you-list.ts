@@ -24,7 +24,7 @@ export type NeedsYouItem =
   | { kind: 'plan'; id: string; row: PlanProposalRow }
   | { kind: 'approval'; id: string; row: ApprovalRow; aged: boolean }
   | { kind: 'trust'; id: string; row: TrustProposalRow }
-  | { kind: 'attention'; id: string; row: CollapsedAttentionRow['row']; collapsedCount: number }
+  | { kind: 'attention'; id: string; row: CollapsedAttentionRow['row']; collapsedCount: number; groupIds?: string[] }
   | { kind: 'unlisted'; id: string; row: NeedsYouSummary['unlisted'][number] };
 
 export interface NeedsYouRowView {
@@ -132,7 +132,10 @@ export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
       return { ...base, title, preview: previewFor(title, [item.row.detail]),
         context: item.row.workflow ? `${item.row.workflow} workflow` : undefined,
         state: stopped ? { tone: 'warning', label: item.row.kind === 'workflow_binding' ? 'Stopped' : 'Paused' } : { tone: 'neutral', label: 'Needs you' },
-        href: item.row.workflow ? `/automate?workflow=${encodeURIComponent(item.row.workflow)}` : '/chat' };
+        // A suggested check-in is decided right here; a stopped workflow is
+        // fixed on its own page.
+        ...(item.row.kind === 'check_in_proposal' ? {}
+          : { href: (item.row.workflowSlug ?? item.row.workflow) ? `/automate?workflow=${encodeURIComponent(item.row.workflowSlug ?? item.row.workflow ?? '')}` : '/automate' }) };
     }
   }
 }
@@ -153,7 +156,7 @@ export function buildNeedsYouItems(input: {
     ...input.plans.map((row): NeedsYouItem => ({ kind: 'plan', id: row.id, row })),
     ...input.approvals.filter((row) => !row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: false })),
     ...input.trust.map((row): NeedsYouItem => ({ kind: 'trust', id: row.id, row })),
-    ...input.attention.map(({ row, collapsedCount }): NeedsYouItem => ({ kind: 'attention', id: row.id, row, collapsedCount })),
+    ...input.attention.map(({ row, collapsedCount, groupIds }): NeedsYouItem => ({ kind: 'attention', id: row.id, row, collapsedCount, ...(groupIds ? { groupIds } : {}) })),
     ...input.unlisted.map((row): NeedsYouItem => ({ kind: 'unlisted', id: row.key, row })),
     ...input.approvals.filter((row) => row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: true })),
   ];

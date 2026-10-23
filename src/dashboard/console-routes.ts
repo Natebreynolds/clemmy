@@ -12526,8 +12526,16 @@ export function registerConsoleRoutes(
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
       const { listPending, isApprovalStaleForHeader, isFormalApprovalSurface } = await import('../runtime/harness/approval-registry.js');
-      const harnessRows = listPending({ status: 'pending' }).filter(isFormalApprovalSurface);
-      const runtimeRows = assistant.getRuntime().listPendingApprovals();
+      // An expired card can no longer be decided (its decision returns 409),
+      // and a retired runtime approval rejects whatever is tapped: neither
+      // is a decision the owner can make, so neither is listed (the count
+      // in summarizeNeedsYou excludes both the same way).
+      const { isExpired } = await import('../runtime/harness/approval-registry.js');
+      const { decidableRuntimeApprovalIds } = await import('./needs-you.js');
+      const harnessRows = listPending({ status: 'pending' }).filter(isFormalApprovalSurface).filter((row) => !isExpired(row));
+      const allRuntimeRows = assistant.getRuntime().listPendingApprovals();
+      const decidableRuntime = new Set(decidableRuntimeApprovalIds(allRuntimeRows.map((approval) => approval.id)));
+      const runtimeRows = allRuntimeRows.filter((approval) => decidableRuntime.has(approval.id));
       const backgroundTaskByApprovalId = new Map(
         listBackgroundTasks()
           .filter((task) => task.pendingApprovalId)

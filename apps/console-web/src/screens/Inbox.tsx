@@ -29,7 +29,7 @@ import {
   listInboxQuestions, answerInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
-  approvalDecisionSuccessText, collapseAttentionRows, getNeedsYouSummary, notifTone, notifFailed, notificationRunHref,
+  approvalDecisionSuccessText, collapseAttentionRows, decideCheckInProposal, getNeedsYouSummary, notifTone, notifFailed, notificationRunHref,
   summarizeApprovalDecisionBatch,
   type ApprovalRow, type NotificationRow, type TrustProposalRow, type PlanProposalRow, type InboxQuestionRow,
   type WorkspaceDestinationChooser, type WorkflowCapabilityAccountChoice, type WorkflowCapabilityInboxGate,
@@ -88,6 +88,7 @@ export function Inbox() {
   const questionLockRef = useRef<string | null>(null);
   const capabilityLockRef = useRef<string | null>(null);
   const [trustBusy, setTrustBusy] = useState<string | null>(null);
+  const [proposalBusy, setProposalBusy] = useState<string | null>(null);
   const trustLockRef = useRef<string | null>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
@@ -150,7 +151,10 @@ export function Inbox() {
     ...trustRows.map((row) => `trust:${row.id}`),
     ...questionRows.map((row) => row.id),
   ]);
-  const attentionRows = notifRows.filter((n) => !n.read && needsAttentionNotif(n)
+  // A heartbeat's own notice is its open item, counted once by the summary
+  // and skipped on the phone; listing it here as well made two of one thing.
+  const attentionRows = notifRows.filter((n) => !n.read && !n.silent && n.metadata?.heartbeat !== true
+    && needsAttentionNotif(n)
     && !(n.needsYouKey && listedDecisionKeys.has(n.needsYouKey)));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
   const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
@@ -179,9 +183,22 @@ export function Inbox() {
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
+  // One feed that cannot answer hides only its own items; what did load
+  // still shows, with a plain note of what could not be checked. Only when
+  // nothing could be checked is the whole list unavailable.
+  const needsFeeds = [
+    { label: 'approvals', failed: approvals.isError },
+    { label: 'record locations', failed: workspaceChoosers.isError },
+    { label: 'updates', failed: notifications.isError },
+    { label: 'suggestions', failed: trustProposals.isError },
+    { label: 'plans', failed: planProposals.isError },
+    { label: 'questions', failed: questions.isError },
+  ];
+  const failedNeedsFeeds = needsFeeds.filter((feed) => feed.failed).map((feed) => feed.label);
   const queryUnavailable = tab === 'needs'
-    ? approvals.isError || workspaceChoosers.isError || notifications.isError || trustProposals.isError || planProposals.isError || questions.isError
+    ? failedNeedsFeeds.length === needsFeeds.length
     : notifications.isError;
+  const partiallyUnavailable = tab === 'needs' && !queryUnavailable && failedNeedsFeeds.length > 0;
   // Gate the reading pane on the SAME denominator the list renders from.
   // `needsCount` excludes stale approvals; `anyDecisionRows` does not — so with
   // only aged approvals pending, every card still drew and stayed clickable
@@ -316,12 +333,31 @@ export function Inbox() {
   const onCancelStale = async () => {
     setDecisionNotice(null);
     try {
-      await cancelStaleApprovals();
-      setDecisionNotice({ tone: 'success', text: 'Stale approval cards were cleared.' });
+      const result = await cancelStaleApprovals() as { cancelled?: number } | undefined;
+      const cancelled = Number(result?.cancelled ?? 0);
+      setDecisionNotice({ tone: 'success', text: cancelled > 0
+        ? `Cancelled ${cancelled} approval${cancelled === 1 ? '' : 's'} that had waited over an hour. Nothing was sent.`
+        : 'No approval had waited over an hour, so nothing changed.' });
     } catch (error) {
       setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not clear stale approvals.') });
     } finally {
       invalidate('approvals', 'approvals-count', 'working-now-badge', 'command-center');
+    }
+  };
+  const onDecideProposal = async (key: string, title: string, decision: 'keep' | 'decline') => {
+    if (proposalBusy) return;
+    setProposalBusy(key);
+    setDecisionNotice(null);
+    try {
+      await decideCheckInProposal(key, decision);
+      setDecisionNotice({ tone: 'success', text: decision === 'keep'
+        ? `Kept — “${title}” is set up and will run on its schedule.`
+        : `Turned down — Clem won't set up “${title}”.` });
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not record that. Nothing changed.') });
+    } finally {
+      setProposalBusy(null);
+      invalidate('command-center');
     }
   };
   const onChooseWorkspace = async (chooser: WorkspaceDestinationChooser, choiceId: string) => {
@@ -452,9 +488,12 @@ export function Inbox() {
       invalidate('notifications', 'command-center');
     }
   };
-  const onRead = async (id: string) => {
+  // A collapsed row stands for every notification behind it: reading one
+  // left the next older copy to take its place, and the count never moved.
+  const onRead = async (id: string, groupIds?: readonly string[]) => {
     try {
-      await markNotificationRead(id);
+      const ids = [...new Set([id, ...(groupIds ?? [])])];
+      await Promise.all(ids.map((each) => markNotificationRead(each)));
     } catch (error) {
       setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not mark that notification as read.') });
     } finally {
@@ -508,7 +547,7 @@ export function Inbox() {
   const cleanupMenu = tab === 'needs' && anyDecisionRows > 0 ? (
     confirmClearAsks ? (
       <span className="inline-flex flex-wrap items-center gap-2 text-small text-muted">
-        Decline all {needsCount} pending decisions? Nothing is sent or approved.
+        Decline every waiting approval, plan, suggestion and check-in question? Nothing is sent or approved.
         <Button variant="danger" size="sm" onClick={onClearAsks}>Decline all</Button>
         <Button variant="ghost" size="sm" onClick={() => setConfirmClearAsks(false)}>Keep them</Button>
       </span>
@@ -525,8 +564,8 @@ export function Inbox() {
             </button>
           )}
           <button type="button" onClick={() => setConfirmClearAsks(true)} className="block w-full rounded px-3 py-2 text-left hover:bg-hover">
-            <span className="block text-small font-medium text-danger">Decline all {needsCount} decisions…</span>
-            <span className="block text-caption text-muted">Approvals, plans, suggestions and check-ins are declined.</span>
+            <span className="block text-small font-medium text-danger">Decline everything waiting…</span>
+            <span className="block text-caption text-muted">Approvals, plans, suggestions and check-in questions are declined. Record locations and workflow setup stay.</span>
           </button>
         </div>
       </details>
@@ -596,8 +635,17 @@ export function Inbox() {
               />
             )}
 
+            {!loading && partiallyUnavailable && (
+              <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2 text-body text-fg">
+                <span>Couldn’t check {failedNeedsFeeds.join(', ')} just now, so this list may be missing something.</span>
+                <Button size="sm" variant="secondary" className="ml-auto" onClick={retryCurrentTab}>Try again</Button>
+              </div>
+            )}
+
             {!loading && !queryUnavailable && tab === 'needs' && (anyDecisionRows === 0
-              ? <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
+              ? partiallyUnavailable
+                ? <EmptyState title="Nothing to show yet" description="Some of what might need you couldn’t be checked. Try again in a moment." />
+                : <EmptyState title="You're all caught up" description="Nothing needs a decision from you right now." />
               : (
                 <>
                   {checkedCount > 0 && (
@@ -700,11 +748,14 @@ export function Inbox() {
                 trust={{ busy: trustBusy === selItem.id, globallyBusy: trustBusy !== null,
                   onApprove: () => { if (selItem.kind === 'trust') void onDecideTrust(selItem.row, 'approve'); },
                   onDecline: () => { if (selItem.kind === 'trust') void onDecideTrust(selItem.row, 'decline'); } }}
+                proposal={{ busy: proposalBusy === selItem.id, globallyBusy: proposalBusy !== null,
+                  onKeep: () => { if (selItem.kind === 'unlisted') void onDecideProposal(selItem.row.key, selItem.row.title, 'keep'); },
+                  onDecline: () => { if (selItem.kind === 'unlisted') void onDecideProposal(selItem.row.key, selItem.row.title, 'decline'); } }}
                 capability={{ busy: capabilityBusy === selItem.id, globallyBusy: capabilityBusy !== null,
                   onResolve: (choice?: WorkflowCapabilityAccountChoice) => {
                     if (selItem.kind === 'attention' && selItem.row.workflowCapability) void onResolveCapability(selItem.row.workflowCapability, choice);
                   } }}
-                notification={{ onRead: () => onRead(selItem.id), onRetry: () => onRetry(selItem.id) }}
+                notification={{ onRead: () => onRead(selItem.id, selItem.kind === 'attention' ? selItem.groupIds : undefined), onRetry: () => onRetry(selItem.id) }}
               />
             ) : selNotif ? (
               <NotifDetail key={selNotif.id} row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} onBack={back} />
@@ -746,7 +797,9 @@ type CapabilityHandlers = { busy: boolean; globallyBusy: boolean; onResolve: (ch
 type NotificationHandlers = { onRead: () => void; onRetry: () => void };
 
 /** The selected decision, whatever its kind, in the one detail shape. */
-function NeedsYouDetail({ item, view, project, onBack, approval, plan, question, workspace, trust, capability, notification }: {
+type ProposalHandlers = { busy: boolean; globallyBusy: boolean; onKeep: () => void; onDecline: () => void };
+
+function NeedsYouDetail({ item, view, project, onBack, approval, plan, question, workspace, trust, capability, notification, proposal }: {
   item: NeedsYouItem;
   view: NeedsYouRowView;
   project?: SessionProjectLabel;
@@ -758,6 +811,7 @@ function NeedsYouDetail({ item, view, project, onBack, approval, plan, question,
   trust: TrustHandlers;
   capability: CapabilityHandlers;
   notification: NotificationHandlers;
+  proposal: ProposalHandlers;
 }) {
   switch (item.kind) {
     case 'approval': return <ApprovalDetail row={item.row} view={view} project={project} onBack={onBack} {...approval} />;
@@ -770,7 +824,12 @@ function NeedsYouDetail({ item, view, project, onBack, approval, plan, question,
       : <NotifDetail row={item.row} view={view} onBack={onBack} destination={attentionDestination(item.row.needsYouKey)} {...notification} />;
     case 'unlisted': return (
       <DecisionFrame view={view} title={item.row.title} onBack={onBack}
-        actions={view.href ? <Link to={view.href} className="text-small font-medium text-primary hover:underline">Open</Link> : undefined}>
+        actions={item.row.kind === 'check_in_proposal' ? (
+          <>
+            <Button disabled={proposal.globallyBusy} onClick={proposal.onKeep}><Check className="h-4 w-4" aria-hidden /> {proposal.busy ? 'Saving…' : 'Keep it'}</Button>
+            <Button variant="secondary" disabled={proposal.globallyBusy} onClick={proposal.onDecline}><X className="h-4 w-4" aria-hidden /> {proposal.busy ? 'Saving…' : 'No thanks'}</Button>
+          </>
+        ) : view.href ? <Link to={view.href} className="text-small font-medium text-primary hover:underline">Open the workflow</Link> : undefined}>
         {item.row.detail && <p className="whitespace-pre-wrap">{item.row.detail}</p>}
       </DecisionFrame>
     );

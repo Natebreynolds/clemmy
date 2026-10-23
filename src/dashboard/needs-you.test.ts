@@ -121,11 +121,21 @@ test('runs paused after repeated restarts are one decision per workflow, even af
   assert.equal(summary.keys.includes('flow:invoice-chase'), false);
   const row = summary.unlisted.find((item) => item.key === 'flow:weekly-digest');
   assert.equal(row?.kind, 'workflow_paused');
-  assert.match(row?.title ?? '', /^2 paused runs of weekly-digest/);
+  assert.match(row?.title ?? '', /^2 runs of weekly-digest stopped after restarting several times/);
 });
 
 test('the total is exactly the distinct keys, and every key is either listed or unlisted', async () => {
   const summary = await summarizeNeedsYou({ nowMs: NOW });
   assert.equal(summary.total, new Set(summary.keys).size);
   for (const item of summary.unlisted) assert.ok(summary.keys.includes(item.key));
+});
+
+test('a retired runtime approval is not a decision: it is neither counted nor listed', async () => {
+  // Deciding a runtime approval with no waiting task and no registry card
+  // rejects it whatever was tapped, so it is not something the owner can do.
+  const before = await summarizeNeedsYou();
+  const summary = await summarizeNeedsYou({ runtimeApprovalIds: ['retired-runtime-approval'] });
+  assert.equal(summary.approvals, before.approvals);
+  assert.equal(summary.total, before.total);
+  assert.ok(!summary.keys.includes('approval:retired-runtime-approval'));
 });

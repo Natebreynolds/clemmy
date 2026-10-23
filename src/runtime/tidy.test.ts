@@ -90,3 +90,13 @@ test('class lists from a surface are validated, never trusted', () => {
   assert.deepEqual(parseTidyClasses(undefined), ['updates', 'staleAsks', 'stuckRuns', 'oldConversations']);
   assert.deepEqual(parseTidyClasses([]), ['updates', 'staleAsks', 'stuckRuns', 'oldConversations']);
 });
+
+test('declining everything waiting closes an open check-in question, by its own id', async () => {
+  const { createCheckIn, getCheckIn } = await import('../agents/check-ins.js');
+  const asked = createCheckIn({ agentSlug: 'clementine', question: 'Fixture: should the weekly summary include drafts?' });
+  const plan = await planTidy({}, Date.now() + 1_000, 'all');
+  const planned = plan.staleAsks.find((ask) => ask.kind === 'checkin' && ask.id === asked.id);
+  assert.ok(planned, JSON.stringify(plan.staleAsks.filter((ask) => ask.kind === 'checkin')));
+  await applyTidy(plan, ['staleAsks'], Date.now() + 1_000);
+  assert.notEqual(getCheckIn(asked.id)?.status, 'open', 'the check-in is closed, not left asking');
+});

@@ -238,6 +238,11 @@ export function approvalDecisionSuccessText(
     return 'Changes requested — this draft stops here and your note goes back to Clem to revise before anything is saved or sent.';
   }
   if (decision === 'reject') return 'Rejected — this action will not be dispatched.';
+  // The server's own answer decides what is said: an approval it recorded as
+  // rejected (a retired card) or as already decided is never "Approved".
+  const answered = response?.status ?? '';
+  if (answered === 'rejected') return 'This could not be approved — it was from an older version and has been closed without running. Ask Clem to do it again if you still want it.';
+  if (answered === 'already_resolved') return 'This was already decided, so nothing changed.';
   if (row.pendingAction) {
     const status = response?.status ?? '';
     if (/workflow.*resume/i.test(status)) {
@@ -481,10 +486,19 @@ export interface NeedsYouSummary {
     title: string;
     detail: string;
     workflow?: string;
+    workflowSlug?: string;
   }>;
 }
 
 export const getNeedsYouSummary = () => apiGet<NeedsYouSummary>('/api/console/needs-you/summary');
+
+/** Keep or turn down a check-in Clem suggested (its summary key is
+ *  `proposal:<id>`). Keeping it installs the check-in. */
+export const decideCheckInProposal = (key: string, decision: 'keep' | 'decline') => {
+  const id = key.startsWith('proposal:') ? key.slice('proposal:'.length) : key;
+  return apiPost(`/api/console/check-in-proposals/${encodeURIComponent(id)}/${decision === 'keep' ? 'approve' : 'reject'}`,
+    decision === 'keep' ? {} : { reason: 'Declined from Needs you.' });
+};
 
 /** What a needs-you row is, from its server key: a meeting to reply to, a
  *  stopped workflow, a chat waiting on an answer. One pill for every row said

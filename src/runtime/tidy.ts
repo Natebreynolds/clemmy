@@ -133,7 +133,8 @@ async function planStaleAsks(cutoff: number): Promise<TidyPlanItem[]> {
   try {
     const { listPlanProposals } = await import('../agents/plan-proposals.js');
     for (const row of listPlanProposals({ status: 'pending', limit: 500 })) {
-      const at = (row as { createdAt?: string }).createdAt;
+      // A plan's age is when it was proposed; it has no createdAt.
+      const at = (row as { proposedAt?: string; createdAt?: string }).proposedAt ?? (row as { createdAt?: string }).createdAt;
       if (!olderThan(cutoff, at)) continue;
       items.push({ id: row.id, kind: 'plan', label: clip((row as { title?: string }).title ?? row.id), ...(at ? { at } : {}) });
     }
@@ -163,10 +164,14 @@ async function planStaleAsks(cutoff: number): Promise<TidyPlanItem[]> {
   try {
     const { listInboxQuestions } = await import('../execution/inbox-questions.js');
     for (const q of listInboxQuestions()) {
+      // Only a check-in is closed here; a workflow's or a task's question is
+      // settled by its own run, and the listed id carries a 'checkin:' prefix
+      // the check-in store does not.
+      if ((q as { source?: string }).source !== 'check_in') continue;
       if ((q as { taskId?: string | null }).taskId) continue;
       const at = (q as { createdAt?: string; askedAt?: string }).createdAt ?? (q as { askedAt?: string }).askedAt;
       if (at && !olderThan(cutoff, at)) continue;
-      items.push({ id: q.id, kind: 'checkin', label: clip((q as { question?: string }).question ?? q.id), ...(at ? { at } : {}) });
+      items.push({ id: q.id.startsWith('checkin:') ? q.id.slice('checkin:'.length) : q.id, kind: 'checkin', label: clip((q as { question?: string }).question ?? q.id), ...(at ? { at } : {}) });
     }
   } catch { /* no check-ins */ }
   return items;
@@ -321,7 +326,7 @@ export async function applyTidy(
           }
           case 'approval': settled = resolve(ask.id, 'cancelled_by_user', 'tidy').ok; break;
           case 'plan': settled = Boolean(rejectPlanProposal(ask.id, 'Cleared as clutter')); break;
-          case 'trust': settled = Boolean(declineTrustProposal(ask.id, 'tidy')); break;
+          case 'trust': settled = declineTrustProposal(ask.id, 'tidy').ok; break;
           case 'checkin': settled = Boolean(closeCheckIn(ask.id, 'Cleared as clutter.')); break;
           default: break;
         }
