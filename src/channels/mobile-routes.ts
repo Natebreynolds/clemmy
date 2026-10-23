@@ -184,6 +184,7 @@ import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { queueWorkflowRun } from '../tools/workflow-run-queue.js';
 import { getPlanProposal, listPlanProposals, planProposalNeedsUserInput, rejectPlanProposal, type PlanProposal } from '../agents/plan-proposals.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
+import { approveProposal as approveCheckInProposal, rejectProposal as rejectCheckInProposal } from '../agents/check-in-proposals.js';
 import { setSessionAgent } from '../agents/session-agent.js';
 import { registerProjectRecordRoutes } from '../projects/project-routes.js';
 import { sessionProjectState } from '../projects/session-project-state.js';
@@ -2638,6 +2639,29 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
     try {
       const proposals = listTrustProposals('pending').map(serializeInboxTrustProposal);
       res.json({ proposals, count: proposals.length });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // A check-in Clem suggested, kept (installed) or turned down from the
+  // phone's Needs you; the same decision the desktop makes.
+  router.post('/api/inbox/check-in-proposals/:id/:decision', requireMobileSession, (req, res) => {
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const decision = Array.isArray(req.params.decision) ? req.params.decision[0] : req.params.decision;
+    if (decision !== 'keep' && decision !== 'decline') {
+      res.status(400).json({ error: 'INVALID_CHECK_IN_PROPOSAL_DECISION' });
+      return;
+    }
+    try {
+      const result = decision === 'keep'
+        ? approveCheckInProposal(id, { enabledOnInstall: true })
+        : rejectCheckInProposal(id, 'Declined from Needs you on the phone.');
+      if (!result) {
+        res.status(404).json({ error: 'CHECK_IN_PROPOSAL_NOT_FOUND' });
+        return;
+      }
+      res.json({ ok: true, decision });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -171,3 +171,11 @@ test('a notification about a workflow run opens that run when it names both', ()
   assert.equal(notificationRunHref({ metadata: { workflowRunId: 'trigger-9' } }), null);
   assert.equal(notificationRunHref({}), null);
 });
+
+test('an approval the server recorded as rejected or already decided never reads as Approved', async () => {
+  const { approvalDecisionSuccessText } = await import('./inbox.js');
+  const row = { approvalId: 'fixture' } as Parameters<typeof approvalDecisionSuccessText>[0];
+  assert.match(approvalDecisionSuccessText(row, 'approve', { ok: true, status: 'rejected' }), /could not be approved/);
+  assert.match(approvalDecisionSuccessText(row, 'approve', { ok: true, status: 'already_resolved' }), /already decided/);
+  assert.equal(approvalDecisionSuccessText(row, 'approve', { ok: true }), 'Approved.');
+});

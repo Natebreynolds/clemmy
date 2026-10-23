@@ -79,3 +79,13 @@ test('an approval row is named in words: Clem\'s question, then the subject, nev
   assert.equal(named({ presentation: { ...kind!, ask: 'Can I keep your dashboard up to date?' } as ApprovalRow['presentation'] }), 'Can I keep your dashboard up to date?');
   assert.equal(named({ subject: '', presentation: kind }), 'Workspace source script consent', 'the kind names it only when nothing else does');
 });
+
+test('a suggested check-in is decided in place, and a stopped workflow opens by its saved name', () => {
+  const proposal = needsYouRowView({ kind: 'unlisted', id: 'proposal:p1',
+    row: { key: 'proposal:p1', kind: 'check_in_proposal', title: 'Weekly pipeline check', detail: 'Keep it or turn it down.' } });
+  assert.equal(proposal.href, undefined, 'selectable, with Keep it / No thanks in its detail');
+  const stopped = needsYouRowView({ kind: 'unlisted', id: 'flow:weekly-digest',
+    row: { key: 'flow:weekly-digest', kind: 'workflow_paused', title: 'Weekly Digest stopped after restarting several times',
+      detail: 'Open it to resume the run or skip it.', workflow: 'Weekly Digest', workflowSlug: 'weekly-digest' } });
+  assert.equal(stopped.href, '/automate?workflow=weekly-digest');
+});

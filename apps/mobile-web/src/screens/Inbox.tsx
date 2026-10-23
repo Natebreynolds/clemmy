@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import {
   answerInboxQuestion,
   cancelWorkflowRunById,
+  decideCheckInProposal,
   getInboxNotification,
   getInboxSummary,
   listApprovals,
@@ -710,7 +711,9 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
               <CardMeta label={item.kind === 'workflow_binding' ? 'Flow · stopped' : item.kind === 'workflow_paused' ? 'Flow · paused' : 'Needs you'} urgent />
               <h2>{item.title}</h2>
               <p class="inbox-card-body">{item.detail}</p>
-              {item.workflow ? (
+              {item.kind === 'check_in_proposal' ? (
+                <CheckInProposalActions itemKey={item.key} title={item.title} onResolved={resolved} />
+              ) : item.workflow ? (
                 <div class="inbox-card-actions">
                   <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Automations</button>
                 </div>
@@ -933,6 +936,39 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
  * only where it can act. The 409 path stays for the race between the poll and
  * the tap, which is the only staleness left.
  */
+/** Keep or turn down a check-in Clem suggested, right on its card. */
+function CheckInProposalActions({ itemKey, title, onResolved }: {
+  itemKey: string;
+  title: string;
+  onResolved: (message: string, tone?: 'success' | 'error') => void;
+}) {
+  const [busy, setBusy] = useState<'keep' | 'decline' | null>(null);
+  const decide = async (decision: 'keep' | 'decline') => {
+    if (busy) return;
+    setBusy(decision);
+    try {
+      await decideCheckInProposal(itemKey, decision);
+      haptic('success');
+      onResolved(decision === 'keep'
+        ? `Kept — “${title}” is set up and will run on its schedule.`
+        : `Turned down — Clem won't set up “${title}”.`);
+    } catch (err) {
+      haptic('error');
+      onResolved((err as { status?: number }).status === 404
+        ? 'That suggestion was already decided, so nothing changed.'
+        : err instanceof Error ? err.message : 'I could not record that. Nothing changed.', 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <div class="inbox-card-actions">
+      <button type="button" class="btn-approve" disabled={busy !== null} onClick={() => void decide('keep')}>{busy === 'keep' ? 'Saving…' : 'Keep it'}</button>
+      <button type="button" class="btn-reply" disabled={busy !== null} onClick={() => void decide('decline')}>{busy === 'decline' ? 'Saving…' : 'No thanks'}</button>
+    </div>
+  );
+}
+
 function EndRunButton({ runId, workflow, onResolved }: {
   runId: string;
   workflow: string;

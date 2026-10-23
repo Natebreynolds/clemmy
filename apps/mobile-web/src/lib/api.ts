@@ -714,6 +714,13 @@ export async function resolveInboxTrustProposal(
   });
 }
 
+/** Keep (install) or turn down a check-in Clem suggested; `key` is the
+ *  summary's `proposal:<id>`. */
+export async function decideCheckInProposal(key: string, decision: 'keep' | 'decline'): Promise<{ ok: boolean }> {
+  const id = key.startsWith('proposal:') ? key.slice('proposal:'.length) : key;
+  return api(`/m/api/inbox/check-in-proposals/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: '{}' });
+}
+
 export async function answerInboxQuestion(id: string, answer: string): Promise<{
   ok: boolean;
   status: 'answered' | 'resuming';
