@@ -10968,8 +10968,10 @@ test('durable memory completion obligation holds pending intake without a duplic
   const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
   t.after(() => _setHostObjectiveJudgeForTests(null));
   let reviews = 0;
-  _setHostObjectiveJudgeForTests(async () => {
-    reviews += 1;
+  // A review still settling from an earlier test's delivered reply can land on
+  // this stub; only a review of this request counts.
+  _setHostObjectiveJudgeForTests(async (objective) => {
+    if (objective.includes('Cedar')) reviews += 1;
     return { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'controlled reviewer unavailable' };
   });
   const fixture = acceptJudgedSource('memory-automatic-pending',
@@ -10995,8 +10997,8 @@ test('durable memory completion obligation holds pending Remember exactly wordin
   const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
   t.after(() => _setHostObjectiveJudgeForTests(null));
   let reviews = 0;
-  _setHostObjectiveJudgeForTests(async () => {
-    reviews += 1;
+  _setHostObjectiveJudgeForTests(async (objective) => {
+    if (objective.includes('MEMTOK-999999')) reviews += 1;
     return { done: true, reason: 'Controlled positive completion review.' };
   });
   const fixture = acceptJudgedSource('memory-exact-marker-pending',
