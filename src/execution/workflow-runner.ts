@@ -1348,6 +1348,10 @@ export function reviewerChangeLeadIn(revisions: readonly WorkflowRunRevision[] |
     '=== REVIEWER REQUESTED CHANGES ===',
     `The reviewer declined the previous output of this step at the approval gate and asked: "${latest.note}"`,
     'Produce a revised output that applies this request exactly. Keep everything the reviewer did not mention as it was. Output the complete revised result, not only the changed part.',
+    // The reviewer is the owner. A fact they add here is their information,
+    // not an invention, so a step's "only what the source says" rule does not
+    // forbid it (live: a revision refused an owner-stated fact twice).
+    'The reviewer is the owner. Anything they state in this request is their own information to include, not something you invented; where it conflicts with this step\'s original instructions, the request wins.',
     '=== END REVIEWER REQUESTED CHANGES ===',
   ].join('\n');
 }

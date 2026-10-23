@@ -41,6 +41,8 @@ test('the revised step is told exactly what the reviewer asked, and only that st
   }];
   const lead = reviewerChangeLeadIn(revisions, 'draft_emails');
   assert.match(lead, /=== REVIEWER REQUESTED CHANGES ===/);
+  // A fact the owner adds in the note is theirs to include, not an invention.
+  assert.match(lead, /The reviewer is the owner\. Anything they state in this request is their own information/);
   assert.match(lead, /asked: "Add one line to Dana's email offering a free local SEO audit\."/);
   assert.match(lead, /Keep everything the reviewer did not mention as it was/);
   assert.equal(reviewerChangeLeadIn(revisions, 'read_prospects'), '');
