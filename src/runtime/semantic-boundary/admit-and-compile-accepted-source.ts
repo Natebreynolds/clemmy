@@ -2081,7 +2081,7 @@ function refusePrimaryModelPlanningPrime(input: {
   turn: number;
   stage: PrimaryModelPlanningPrimeStage;
   reason: string;
-}): { ok: false; reason: string } {
+}): { ok: false; stage: PrimaryModelPlanningPrimeStage; reason: string } {
   try {
     appendEvent({
       sessionId: input.sessionId,
@@ -2102,7 +2102,7 @@ function refusePrimaryModelPlanningPrime(input: {
       'planning-catalog priming refusal could not be recorded',
     );
   }
-  return { ok: false, reason: input.reason };
+  return { ok: false, stage: input.stage, reason: input.reason };
 }
 
 /** Zero-model catalog preparation for the initial foreground model surface.
@@ -2113,7 +2113,7 @@ function refusePrimaryModelPlanningPrime(input: {
 export async function primePrimaryModelPlanningCatalog(input: {
   sessionId: string;
   sourceUserSeq: number;
-}): Promise<{ ok: true; planning: HostFreshPlanningContextV1 } | { ok: false; reason: string }> {
+}): Promise<{ ok: true; planning: HostFreshPlanningContextV1 } | { ok: false; stage: PrimaryModelPlanningPrimeStage; reason: string }> {
   const accepted = listEvents(input.sessionId, {
     sinceSeq: input.sourceUserSeq - 1,
     types: ['user_input_received'],

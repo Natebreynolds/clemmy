@@ -482,6 +482,7 @@ test(`${relation} without an answer reoffers the exact question as an adjacent a
   });
   assert.deepEqual(unresolvedCatalog, {
     ok: false,
+    stage: 'accepted_source_continuation',
     reason: 'durable accepted-source continuation is unresolved',
   });
 
@@ -604,10 +605,10 @@ test('a tapped choice from outside the chat is not held by a question still open
   };
   const typed = tap(false, 2);
   assert.deepEqual(await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: typed.seq }),
-    { ok: false, reason: 'durable accepted-source continuation is unresolved' }, 'an ordinary message still meets the open question');
+    { ok: false, stage: 'accepted_source_continuation', reason: 'durable accepted-source continuation is unresolved' }, 'an ordinary message still meets the open question');
   const tapped = tap(true, 3);
   const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: tapped.seq });
-  assert.notDeepEqual(primed, { ok: false, reason: 'durable accepted-source continuation is unresolved' }, JSON.stringify(primed));
+  assert.notDeepEqual(primed, { ok: false, stage: 'accepted_source_continuation', reason: 'durable accepted-source continuation is unresolved' }, JSON.stringify(primed));
 });
 
 test('a legitimately new goal with open slots never clones the prior clarification', async () => {

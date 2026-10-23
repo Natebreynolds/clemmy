@@ -568,6 +568,7 @@ test('a refused prime records the stage and the exact reason it refused', async 
   assert.equal(recorded.length, 1, 'the refusal left exactly one durable row');
   assert.equal(recorded[0]!.data.sourceUserSeq, source.seq, 'the row names the source that refused');
   assert.equal(recorded[0]!.data.stage, 'durable_card_reopen', 'the row names WHICH priming step refused');
+  assert.equal(refused.stage, 'durable_card_reopen', 'the caller receives the same typed refusal stage');
   assert.equal(recorded[0]!.data.reason, refused.reason,
     'the recorded reason is the exact string the caller receives, not a summary');
 
@@ -591,6 +592,7 @@ test('a source that was never readable refuses on its own stage', async () => {
   const recorded = eventlog.listEvents(session.id, { types: [REFUSED_TYPE] });
   assert.equal(recorded.length, 1, 'a missing accepted source is still evidence, not silence');
   assert.equal(recorded[0]!.data.stage, 'accepted_source');
+  assert.equal(refused.stage, 'accepted_source');
   assert.equal(recorded[0]!.data.reason, refused.reason);
 });
 

@@ -7252,16 +7252,20 @@ async function runConversationWithinRuntimeConfig(
     logger.warn({
       sessionId: options.sessionId,
       sourceUserSeq,
+      stage: hostPlanningCatalog.stage,
       reason: hostPlanningCatalog.reason,
     }, 'planning catalog priming refused the turn');
     // Same rule as the revalidation stop below: a pre-turn stop commits the
     // typed blocked terminal, or the person watches a spinner.
-    const catalogStopText = acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute'
-      ? 'I could not load the capability catalog to start this plan. Nothing was started. A reviewed revision runs once, so ask me to publish the plan again and Execute that new revision.'
-      : 'I could not safely load the current capability catalog for this request. Nothing was started. Please retry.';
+    const continuityRefused = hostPlanningCatalog.stage === 'accepted_source_continuation';
+    const catalogStopText = continuityRefused
+      ? 'I could not safely verify how this request connects to the earlier question. Nothing was started in this turn. Please restate your request in a new chat.'
+      : acceptedTaskMode(options.sessionId, sourceUserSeq)?.kind === 'execute'
+        ? 'I could not load the capability catalog to start this plan. Nothing was started. A reviewed revision runs once, so ask me to publish the plan again and Execute that new revision.'
+        : 'I could not safely load the current capability catalog for this request. Nothing was started. Please retry.';
     try {
       commitStandardBlockedTerminal({ sessionId: options.sessionId, sourceUserSeq, turn: acceptedSource.turn, text: catalogStopText,
-        legacyReason: 'planning_catalog_unavailable' });
+        legacyReason: continuityRefused ? 'accepted_source_continuation_unavailable' : 'planning_catalog_unavailable' });
     } catch { /* the blocked result below still carries the reason */ }
     return {
       sessionId: options.sessionId,
