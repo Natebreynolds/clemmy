@@ -15,7 +15,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-needs-you-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { summarizeNeedsYou, needsYouReferents, needsYouKey, notificationNeedsYou } = await import('./needs-you.js');
+const { summarizeNeedsYou, needsYouReferents, needsYouKey, notificationNeedsYou, questionsByWorkflow } = await import('./needs-you.js');
 const { addNotification } = await import('../runtime/notifications.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
@@ -51,6 +51,38 @@ test('a workflow notice counts while its newest run is stopped, once per workflo
   assert.ok(summary.keys.includes('flow:daily-standup'));
   assert.equal(summary.keys.filter((key) => key === 'flow:daily-standup').length, 1);
   assert.equal(summary.keys.includes('flow:friday-report'), false, 'a workflow that ran since is not stopped');
+});
+
+test('failed runs a heartbeat reports are their workflow: one stopped item, not one per run', async () => {
+  writeRun('run-f1', 'team-slack-updates', 'failed', iso(-2 * 86_400_000));
+  writeRun('run-f2', 'team-slack-updates', 'failed', iso(-86_400_000));
+  for (const run of ['run-f1', 'run-f2']) {
+    notify(`hb-${run}`, 'execution', 'Something went wrong: Team Slack Updates', {
+      needsAttention: true, heartbeatId: 'work-review', itemKey: `run_failed:${run}`,
+      changeKind: 'run_failed', refType: 'workflow_run', refId: run,
+    });
+  }
+  // A run the index has never seen keeps the heartbeat's own identity.
+  notify('hb-unknown', 'execution', 'Something went wrong: elsewhere', {
+    needsAttention: true, heartbeatId: 'work-review', itemKey: 'run_failed:run-unknown',
+    changeKind: 'run_failed', refType: 'workflow_run', refId: 'run-unknown',
+  });
+
+  const summary = await summarizeNeedsYou({ nowMs: NOW });
+  assert.equal(summary.keys.filter((key) => key === 'flow:team-slack-updates').length, 1);
+  assert.equal(summary.keys.some((key) => key.startsWith('heartbeat:work-review:run_failed:run-f')), false);
+  assert.ok(summary.keys.includes('heartbeat:work-review:run_failed:run-unknown'));
+});
+
+test('a workflow stopped on an open question is that question, on every surface', () => {
+  writeRun('run-q-open', 'swim-blog', 'awaiting_input', iso(-3_600_000));
+  const ref = needsYouReferents(NOW);
+  const questionId = 'workflow:run-q-open|workflow-input:run-q-open:draft:1';
+  const questionByWorkflow = questionsByWorkflow([questionId, 'task:bgq-1', 'workflow:run-never-seen|q'], ref.runs);
+  assert.deepEqual([...questionByWorkflow], [['flow:swim-blog', questionId]]);
+  const finished = { id: 'wf-finished', kind: 'workflow' as const, title: 'Finished: Swim Blog', metadata: { workflow: 'swim-blog', runId: 'run-q-open' } };
+  assert.equal(needsYouKey(finished, { ...ref, questionByWorkflow }), questionId);
+  assert.equal(needsYouKey(finished, { ...ref, questionByWorkflow: new Map() }), 'flow:swim-blog');
 });
 
 test('a meeting invite counts until the meeting starts; a moved meeting is news', async () => {

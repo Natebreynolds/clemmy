@@ -194,6 +194,8 @@ export interface NeedsYouReferents extends LiveReferents {
   questionIds: ReadonlySet<string>;
   /** sessionId → the pending approval that conversation is waiting on. */
   approvalBySession: ReadonlyMap<string, string>;
+  /** workflow key → the open question one of its runs is stopped on. */
+  questionByWorkflow?: ReadonlyMap<string, string>;
   runs: RunIndex;
   nowMs: number;
 }
@@ -210,13 +212,15 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   const planIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
   const trustIds = new Set(listTrustProposals('pending').map((row) => row.id));
   const questionIds = new Set(listInboxQuestions().map((row) => row.id));
+  const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs);
   return {
     approvalIds,
     planIds,
     trustIds,
     questionIds,
     approvalBySession,
-    runs: readRunIndex(WORKFLOW_RUNS_DIR, nowMs),
+    questionByWorkflow: questionsByWorkflow(questionIds, runs),
+    runs,
     nowMs,
     approvalPending: (id) => approvalIds.has(id),
     planPending: (id) => planIds.has(id),
@@ -248,6 +252,20 @@ export function notificationActionItemId(notification: Pick<NotificationRecord, 
   return null;
 }
 
+/** A workflow stopped on a question is that question: the question row is
+ *  where it is answered, so its notices add no second item. Read from the
+ *  question's own identity (`workflow:<runId>|<questionId>`). */
+export function questionsByWorkflow(questionIds: Iterable<string>, runs: Pick<RunIndex, 'workflowOfRun'>): Map<string, string> {
+  const byWorkflow = new Map<string, string>();
+  for (const id of questionIds) {
+    if (!id.startsWith('workflow:')) continue;
+    const bar = id.indexOf('|');
+    const workflow = bar > 0 ? runs.workflowOfRun.get(id.slice('workflow:'.length, bar)) : undefined;
+    if (workflow && !byWorkflow.has(workflow)) byWorkflow.set(workflow, id);
+  }
+  return byWorkflow;
+}
+
 function notificationWorkflowKey(notification: Pick<NotificationRecord, 'metadata'>, runs: RunIndex): string {
   const meta = notification.metadata;
   const runId = str(meta, 'runId', 'workflowRunId');
@@ -267,15 +285,24 @@ function notificationWorkflowKey(notification: Pick<NotificationRecord, 'metadat
  */
 export function needsYouKey(
   notification: Pick<NotificationRecord, 'id' | 'kind' | 'metadata'>,
-  ref: Pick<NeedsYouReferents, 'runs'> & { approvalBySession?: ReadonlyMap<string, string> },
+  ref: Pick<NeedsYouReferents, 'runs'> & {
+    approvalBySession?: ReadonlyMap<string, string>;
+    questionByWorkflow?: ReadonlyMap<string, string>;
+  },
 ): string {
   const meta = notification.metadata;
   const actionItemId = notificationActionItemId(notification);
   if (actionItemId) return actionItemId;
   if (str(meta, 'watch') === 'calendar' && str(meta, 'itemKey')) return `calendar:${str(meta, 'itemKey')}`;
-  if (str(meta, 'heartbeatId') && str(meta, 'itemKey')) return `heartbeat:${str(meta, 'heartbeatId')}:${str(meta, 'itemKey')}`;
+  const asWorkflow = (key: string) => ref.questionByWorkflow?.get(key) ?? key;
+  if (str(meta, 'heartbeatId') && str(meta, 'itemKey')) {
+    // A run the heartbeat reports on is its workflow's: five failed runs of
+    // one workflow are one stopped workflow, not five updates.
+    const ranWorkflow = str(meta, 'refType') === 'workflow_run' ? ref.runs.workflowOfRun.get(str(meta, 'refId')) : undefined;
+    return ranWorkflow ? asWorkflow(ranWorkflow) : `heartbeat:${str(meta, 'heartbeatId')}:${str(meta, 'itemKey')}`;
+  }
   const workflow = notificationWorkflowKey(notification, ref.runs);
-  if (workflow) return workflow;
+  if (workflow) return asWorkflow(workflow);
   const sessionId = str(meta, 'sessionId', 'targetSessionId');
   const sessionApproval = sessionId ? ref.approvalBySession?.get(sessionId) : undefined;
   if (sessionApproval) return `approval:${sessionApproval}`;
