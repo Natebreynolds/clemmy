@@ -29,7 +29,7 @@ import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { AgentForm } from '@/components/agents/AgentForm';
 import { AgentAssignments } from '@/components/agents/AgentAssignments';
 import { ScopedFacts } from '@/components/memory/ScopedFacts';
-import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
+import { chatAnswerInput, chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { usePoll } from '@/lib/poll';
@@ -380,7 +380,7 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
               onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
               onSendHeld={chat.sendHeld}
-              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send(chatAnswerInput(m, text)) : undefined}
               traceHref={traceHref}
             />
             </Fragment>
