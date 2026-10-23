@@ -10826,6 +10826,36 @@ async function retainAutomaticMemoryForHost(
   return queued;
 }
 
+// Live 2026-10-23: the owner restated a rule memory already held. The review
+// found nothing to save and judged the reply complete, but the zero-work floor
+// still ended the turn blocked and Clem said the save had not happened.
+for (const kind of ['none', 'retain'] as const) {
+  test(`durable memory completion obligation ${kind === 'none' ? 'completes a restated rule memory already holds' : 'still holds a new rule with no save'}`, async (t) => {
+    const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+    t.after(() => _setHostObjectiveJudgeForTests(null));
+    _setHostObjectiveJudgeForTests(async () => ({ done: true, reason: 'Controlled review of the reply.',
+      memoryRequirement: { version: 1, kind, corrections: [],
+        reason: kind === 'none' ? 'Durable memory already holds this exact rule.' : 'The owner asks to retain a new rule.' } }));
+    const { captureFreshSourceSessionContext } = await import('./source-session-context.js');
+    const fixture = acceptJudgedSource(`memory-restated-${kind}`,
+      'Remember that every Sequoia report heading uses title case, for all future chats.');
+    // Automatic intake saved nothing here (live: it could not resolve the
+    // rule's destination), so only the request's frozen context exists.
+    assert.ok(captureFreshSourceSessionContext(fixture.context));
+    const model = scriptedRecordingModel([[textMsg('That rule is already in my memory, so nothing new was saved.')]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const result = await runJudgedHost(fixture, agent, true);
+    if (kind === 'none') {
+      assert.equal(result.terminal, undefined, 'a reviewed "already held" request is not unfinished memory work');
+    } else {
+      assert.equal(result.terminal?.status, 'blocked');
+      assert.equal(result.terminal?.reason, 'memory_work_unverified');
+    }
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
+  });
+}
+
 test('durable memory completion obligation reuses verified automatic evidence without another save', async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');

@@ -4358,7 +4358,14 @@ const runHostTurnBody = async (
     const automatic = verifiedMemoryConsolidationEvidence(identity);
     if (automatic?.some(result => result.status === 'pending')) return 'pending';
     if (automatic?.length && automatic.every(result => result.verified)) return null;
-    return sourceAttemptedCompletionWork(identity) ? null : 'no_evidence';
+    if (sourceAttemptedCompletionWork(identity)) return null;
+    // The owner restated something memory already holds: a completed review
+    // of this exact request found nothing to save, so no save is owed.
+    try {
+      const source = readMemoryRequirementSource(identity, judgedObjective());
+      if (source && readRetainedMemoryRequirement(source)?.assessment.kind === 'none') return null;
+    } catch { /* an unreadable assessment waives nothing */ }
+    return 'no_evidence';
   };
 
   let queuedApprovalRegistrationEvidence: string | undefined;
