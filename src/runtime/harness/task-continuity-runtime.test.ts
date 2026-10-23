@@ -1950,10 +1950,7 @@ test('a fully answered first clarification uses one exact completeness receipt a
   } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
 });
 
-test('an option picked verbatim settles the question without asking a model whether its own option answers it', async () => {
-  // Live 2026-10-21 (a tester): the completeness call failed and tapping the
-  // recommended option twice got "I couldn't verify how it changes the
-  // pending question" both times; "yes exclude them" got it a third time.
+test('a checked complete simple option settles once and replays its exact receipt', async () => {
   const sessionId = 'continuity-offered-option';
   const origin = accepted(sessionId, 'Draft outreach for ten of my untouched accounts.');
   const options = ['Exclude customers and open opportunities from outreach (recommended)', 'Use all report-matched accounts'];
@@ -1966,15 +1963,194 @@ test('an option picked verbatim settles the question without asking a model whet
   const slot = open.packet.pause.slot!;
   seedSemanticReading(sessionId, reply.seq, 'admitted', { version: 1, relation: 'answer_open_slot',
     targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null,
-    slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: text }],
+    slotAnswers: [{ kind: 'option', questionId: slot.questionId, slotKey: slot.slotKey, optionId: 'opt-1' }],
     rationale: 'The person picked the recommended option.' });
   let checks = 0;
-  runtime._setClarificationAnswerCompletenessForTests(async () => { checks++; return { status: 'unavailable' as const, reason: 'review_failed' }; });
+  runtime._setClarificationAnswerCompletenessForTests(input => { checks++; return fixtureCompleteness(input, 0.99); });
   try {
     const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
     assert.equal(route?.route, 'settled', JSON.stringify(route));
-    assert.equal(checks, 0, 'the host offered the option; no model is asked whether it answers');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: text }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'selected', selectedOption: 'opt-1' } });
+    assert.equal(enriched.taskContinuation?.selectedOption, 'opt-1');
+    assert.equal(enriched.taskContinuation?.answer, text);
     assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled', 'replay reads the receipt');
+    assert.equal(checks, 1, 'only the new exact-source reading calls the checker');
+  } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
+});
+
+test('a compound offered option cannot certify a still-unanswered count or consume its hold', async () => {
+  const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
+  const sessionId = 'continuity-compound-offered-option-count';
+  const origin = accepted(sessionId, 'Keep Amber selected. Summarize the synthetic interview only after format and item count are both answered.');
+  const question = 'Amber is selected. Which format: Bullets or Paragraph? How many items: one or two?';
+  commitClarification({ sessionId, sourceSeq: origin.seq, question, options: ['Bullets', 'Paragraph'] });
+  const before = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(before.status, 'available');
+  if (before.status !== 'available') return;
+  const reply = accepted(sessionId, 'Bullets');
+  const slot = before.packet.pause.slot!;
+  seedSemanticReading(sessionId, reply.seq, 'admitted', {
+    version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+    goal: null, work: null,
+    slotAnswers: [{ kind: 'option', questionId: slot.questionId, slotKey: slot.slotKey, optionId: 'opt-1' }],
+    rationale: 'The exact first format option was selected; no item count was supplied.',
+  });
+  let checks = 0;
+  let revisions = 0;
+  runtime._setClarificationAnswerCompletenessForTests(input => {
+    checks++;
+    return fixtureCompleteness(input, input.acceptedReply === 'Bullets' ? 0.01 : 0.99);
+  });
+  runtime._setClarificationRevisionProposerForTests(input => {
+    revisions++;
+    return revisionAdapter.proposeClarificationRevision(input, {
+      complete: async () => ({ raw: {
+        kind: 'revision', acknowledgment: 'Amber and Bullets are selected.',
+        question: 'How many items: one or two?', options: [], decisions: [
+          { id: 'format', questionQuote: 'Which format: Bullets or Paragraph?', disposition: 'answered',
+            claim: 'Bullets', replyQuote: 'Bullets', residualQuote: null },
+          { id: 'count', questionQuote: 'How many items: one or two?', disposition: 'unresolved',
+            claim: null, replyQuote: null, residualQuote: 'How many items: one or two?' },
+        ],
+      }, modelIdentity: 'fixture-quick', inputTokens: 10, outputTokens: 4, latencyMs: 1, usageRecorded: true }),
+      evaluate: async () => ({ ok: true, model: 'fixture-jev', answers: { grounded_revision: { type: 'noul', noul: 0.99 } },
+        usage: { input_tokens: 20, output_tokens: 2 }, decisionId: 'fixture-format-count' }),
+    });
+  });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'Bullets' }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'selected', selectedOption: 'opt-1' } });
+    assert.deepEqual({ route: route?.route, checks, revisions, hasExecutionContext: Boolean(enriched.taskContinuation),
+      pending: continuity.peekTaskContinuityPacket({ sessionId }).status },
+    { route: 'revise', checks: 1, revisions: 1, hasExecutionContext: false, pending: 'available' },
+    'matching a visible format option proves its identity, not every decision in the compound question');
+    const stopped = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: reply.seq, turn: reply.turn });
+    assert.equal(stopped?.steps, 0);
+    assert.equal(stopped?.status, 'awaiting_user_input');
+    assert.ok(stopped?.lastDecision?.reply?.endsWith('How many items: one or two?'));
+    const pending = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(pending.status, 'available');
+    if (pending.status !== 'available') return;
+    assert.equal(pending.packet.parentPacketId, before.packet.packetId);
+    assert.equal(pending.packet.rootSourceUserSeq, origin.seq);
+    assert.deepEqual(pending.packet.pause.slot, before.packet.pause.slot);
+    assert.equal(continuity.readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: reply.seq }).status, 'none');
+    await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.deepEqual({ checks, revisions }, { checks: 1, revisions: 1 }, 'exact replay reuses checked evidence');
+    const final = accepted(sessionId, 'two');
+    seedSemanticReading(sessionId, final.seq, 'admitted', {
+      version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+      goal: null, work: null,
+      slotAnswers: [{ kind: 'value', questionId: slot.questionId, slotKey: slot.slotKey, value: 'two' }],
+      rationale: 'The only residual count is supplied.',
+    });
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: final.seq }))?.route, 'settled');
+    const completed = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'two' }, final.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
+    assert.ok(completed.taskContinuation?.parentInput.includes('Bullets'));
+    assert.ok(completed.taskContinuation?.parentInput.includes(question));
+    assert.equal(completed.taskContinuation?.answer, 'two');
+    assert.equal(checks, 2);
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  } finally {
+    runtime._setClarificationRevisionProposerForTests(null);
+    runtime._setClarificationAnswerCompletenessForTests(null);
+  }
+});
+
+test('an offered option with an unavailable completeness check stays unqualified and preserves the exact reply', async () => {
+  const sessionId = 'continuity-offered-option-completeness-unavailable';
+  const origin = accepted(sessionId, 'Plan only. Keep Amber selected and leave format and count undecided until I answer.');
+  const question = 'Which format: Bullets or Paragraph? How many items: one or two?';
+  commitClarification({ sessionId, sourceSeq: origin.seq, question, options: ['Bullets', 'Paragraph'] });
+  const before = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(before.status, 'available');
+  if (before.status !== 'available') return;
+  const reply = accepted(sessionId, 'Bullets');
+  const slot = before.packet.pause.slot!;
+  seedSemanticReading(sessionId, reply.seq, 'admitted', {
+    version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+    goal: null, work: null,
+    slotAnswers: [{ kind: 'option', questionId: slot.questionId, slotKey: slot.slotKey, optionId: 'opt-1' }],
+    rationale: 'The exact first format option was selected.',
+  });
+  let checks = 0;
+  let revisions = 0;
+  runtime._setClarificationAnswerCompletenessForTests(async () => {
+    checks++;
+    return { status: 'unavailable', reason: 'review_unavailable' };
+  });
+  runtime._setClarificationRevisionProposerForTests(async () => {
+    revisions++;
+    return { status: 'no_revision', reason: 'not_grounded' };
+  });
+  try {
+    const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq });
+    assert.equal(route?.route, 'respond');
+    assert.equal(route?.replyReading, 'completeness_unavailable');
+    const retained = eventlog.listEvents(sessionId, { types: ['guardrail_tripped'] })
+      .filter(row => row.data.kind === 'open_question_reply_classified' && row.data.sourceUserSeq === reply.seq);
+    assert.equal(retained.length, 1);
+    assert.equal(retained[0]?.data.completeness, undefined, 'no synthetic complete score or reviewer receipt');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'Bullets' }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'selected', selectedOption: 'opt-1' } });
+    assert.equal(enriched.taskContinuation, undefined, 'an unavailable check grants no consumed answer authority');
+    assert.ok(enriched.semanticTaskInput?.includes(`[root-task]\n${origin.data.text}`));
+    assert.ok(enriched.semanticTaskInput?.includes(`[current-question]\n${question}`));
+    assert.ok(enriched.semanticTaskInput?.includes('[user-reply]\nBullets'));
+    assert.ok(enriched.semanticTaskInput?.includes('No checked reading'));
+    assert.equal(continuity.readConsumedTaskContinuityPacket({ sessionId, consumingSourceUserSeq: reply.seq }).status, 'none');
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'respond');
+    assert.deepEqual({ checks, revisions }, { checks: 1, revisions: 0 });
+    assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
+  } finally {
+    runtime._setClarificationRevisionProposerForTests(null);
+    runtime._setClarificationAnswerCompletenessForTests(null);
+  }
+});
+
+test('a historical persisted offered-option receipt replays without a new completeness call', async () => {
+  const sessionId = 'continuity-historical-offered-option-replay';
+  const origin = accepted(sessionId, 'Choose the synthetic summary format.');
+  const question = 'Which format: Bullets or Paragraph?';
+  const options = ['Bullets', 'Paragraph'];
+  commitClarification({ sessionId, sourceSeq: origin.seq, question, options });
+  const before = continuity.peekTaskContinuityPacket({ sessionId });
+  assert.equal(before.status, 'available');
+  if (before.status !== 'available') return;
+  const reply = accepted(sessionId, 'Bullets');
+  const slot = before.packet.pause.slot!;
+  seedSemanticReading(sessionId, reply.seq, 'admitted', {
+    version: 1, relation: 'answer_open_slot', targetGoal: { goalId: slot.goalId, baseRevision: slot.revision },
+    goal: null, work: null,
+    slotAnswers: [{ kind: 'option', questionId: slot.questionId, slotKey: slot.slotKey, optionId: 'opt-1' }],
+    rationale: 'The exact first format option was selected.',
+  });
+  const checked = await fixtureCompleteness({ sessionId, sourceUserSeq: reply.seq, rootTask: origin.data.text as string,
+    deliveredQuestion: question, deliveredOptions: options, acceptedReply: 'Bullets' }, 0.99);
+  assert.notEqual(checked.status, 'unavailable');
+  if (checked.status === 'unavailable') return;
+  // These are the exact retained receipt fields written by the former host
+  // shortcut. Replaying them is distinct from minting that proof for a new reply.
+  eventlog.appendEvent({ sessionId, turn: reply.turn, role: 'system', type: 'guardrail_tripped', data: {
+    kind: 'open_question_reply_classified', sourceUserSeq: reply.seq, parentPacketId: before.packet.packetId,
+    parentSlot: slot, route: 'settled', reading: 'checked_residual_answer', answerCompletenessRequired: true,
+    completeness: { ...checked.receipt, review: { modelIdentity: 'host:offered_option_v1', decisionId: null, noul: 1 } },
+  } });
+  let checks = 0;
+  runtime._setClarificationAnswerCompletenessForTests(async () => {
+    checks++;
+    return { status: 'unavailable', reason: 'review_unavailable' };
+  });
+  try {
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled');
+    const enriched = await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: 'Bullets' }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'selected', selectedOption: 'opt-1' } });
+    assert.equal(enriched.taskContinuation?.selectedOption, 'opt-1');
+    assert.deepEqual(runtime.rehydrateConsumedClarificationContext({ sessionId, sourceUserSeq: reply.seq, answer: 'Bullets' }), enriched.taskContinuation);
+    assert.equal(checks, 0);
   } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
 });
 
