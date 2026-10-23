@@ -289,3 +289,100 @@ test('an answer that cannot be read says which part of the verdict it missed', a
   assert.equal(workflowMutationReviewInvalidReason({ verdict: 'conflict', proposalDigest: digest.slice(0, 40) }, digest), 'digest_mismatch');
   assert.equal(workflowMutationReviewInvalidReason({ verdict: 'conflict', proposalDigest: digest, reason: '' }, digest), 'no_reason');
 });
+
+test('review diagnostics retain ordered stages and scoped lookup metadata without private review content', async () => {
+  const privateRef = 'private-fixture-evidence-ref';
+  const privatePath = 'private.fixture.records';
+  const privateField = 'private-fixture-field';
+  const privateReview = 'private-fixture-reviewer-prose';
+  const calls: Array<{ effort: unknown; complete: unknown; evidence: boolean }> = [];
+  const run = () => reviewWorkflowMutation({ ...input, stakes: 'ordinary', phase: 'landed',
+    observations: { ...input.observations, complete: false } }, {
+    judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+      calls.push({ effort: opts?.effort, complete: opts?.requireCompletePrompt, evidence: Boolean(opts?.evidence) });
+      const measured = opts?.effort === 'medium';
+      return { value: parse({ verdict: measured ? 'uncertain' : 'compatible', reason: 'Fixture evidence checked.',
+        proposalDigest: JSON.parse(prompt).proposalDigest, diagnostics: { forged: privateReview } }), failure: null,
+        lookups: [{ tool: 'query_evidence', ref: privateRef, recordPath: privatePath,
+          recordsTotal: 12, recordsMatched: 2, recordsReturned: 2, offset: 0,
+          filter: { field: privateField, mode: 'equals' }, fields: [privateField] }],
+        ...(measured ? { restatedFrom: privateReview } : {}) };
+    },
+  });
+  const result = await run();
+  assert.equal(result.verdict, 'compatible');
+  assert.deepEqual(calls, [
+    { effort: 'medium', complete: true, evidence: true },
+    { effort: undefined, complete: true, evidence: true },
+  ], 'diagnostics never change review depth or evidence access');
+  const diagnostic = result.diagnostics;
+  assert.ok(diagnostic, 'host review metadata must reach its caller');
+  assert.equal(diagnostic.scope, 'review_invocation');
+  assert.equal(diagnostic.phase, 'landed');
+  assert.deepEqual(diagnostic.stages.map(stage => [stage.stage, stage.outcome, stage.verdictRestated]),
+    [['measured', 'uncertain', true], ['full', 'compatible', false]]);
+  for (const stage of diagnostic.stages) {
+    assert.equal(stage.lookupScope, 'returned_attempt');
+    assert.equal(stage.lookupCount, 1);
+    assert.equal(stage.omittedLookupCount, 0);
+    assert.ok(Number.isSafeInteger(stage.durationMs) && stage.durationMs >= 0);
+    const lookup = stage.lookups![0]!;
+    assert.equal(lookup.tool, 'query_evidence');
+    assert.equal(lookup.status, 'returned');
+    assert.equal(lookup.recordsReturned, 2);
+    assert.equal(lookup.fieldsCount, 1);
+    assert.match(lookup.refHash!, /^[a-f0-9]{64}$/);
+    assert.match(lookup.pathHash!, /^[a-f0-9]{64}$/);
+  }
+  assert.equal(diagnostic.stages[0]!.lookups![0]!.refHash, diagnostic.stages[1]!.lookups![0]!.refHash,
+    'same retained reference is comparable within this review');
+  const serialized = JSON.stringify(diagnostic);
+  for (const secret of [privateRef, privatePath, privateField, privateReview, 'forged']) assert.equal(serialized.includes(secret), false);
+  const next = await run();
+  assert.notEqual(diagnostic.stages[0]!.lookups![0]!.refHash, next.diagnostics!.stages[0]!.lookups![0]!.refHash,
+    'hashes cannot join private evidence across separate reviews');
+});
+
+test('review diagnostics distinguish missing observations from zero and preserve plain timeout retry behavior', async () => {
+  const options: Array<{ complete: unknown; evidence: boolean; effort: unknown }> = [];
+  const result = await reviewWorkflowMutation({ ...input, stakes: 'high',
+    observations: { ...input.observations, complete: false } }, {
+    judge: async (_system, _prompt, _parse, _pass, _lane, opts) => {
+      options.push({ complete: opts?.requireCompletePrompt, evidence: Boolean(opts?.evidence), effort: opts?.effort });
+      return { value: null, failure: options.length === 1 ? 'timeout' : 'invalid', invalidDetail: 'private-fixture-failure-text' };
+    },
+  });
+  assert.equal(result.verdict, 'uncertain');
+  assert.equal(result.checkerFailure, 'invalid');
+  assert.deepEqual(options, [
+    { complete: true, evidence: true, effort: undefined },
+    { complete: false, evidence: false, effort: undefined },
+  ]);
+  assert.ok(result.diagnostics);
+  assert.deepEqual(result.diagnostics.stages.map(stage => [stage.stage, stage.outcome]),
+    [['full', 'timeout'], ['plain_retry', 'invalid']]);
+  for (const stage of result.diagnostics.stages) {
+    assert.equal(stage.lookupCount, null);
+    assert.equal(stage.lookups, null);
+    assert.equal(stage.omittedLookupCount, null);
+    assert.equal(stage.verdictRestated, null);
+  }
+  assert.equal(JSON.stringify(result.diagnostics).includes('private-fixture-failure-text'), false);
+});
+
+test('diagnostic lookup records stay bounded while the verdict and total observed count remain intact', async () => {
+  const result = await reviewWorkflowMutation({ ...input, observations: { ...input.observations, complete: false } }, {
+    judge: async (_system, prompt, parse) => ({
+      value: parse({ verdict: 'conflict', reason: 'Keep the protected record.', proposalDigest: JSON.parse(prompt).proposalDigest }),
+      failure: null, lookups: Array.from({ length: 30 }, () => ({ tool: 'open_evidence', ref: 'private-ref', refused: 'budget' })),
+    }),
+  });
+  assert.equal(result.verdict, 'conflict');
+  assert.equal(result.reason, 'Keep the protected record.');
+  const stage = result.diagnostics?.stages[0];
+  assert.ok(stage);
+  assert.equal(stage.lookupCount, 30);
+  assert.ok(stage.lookups!.length <= 16);
+  assert.equal(stage.omittedLookupCount, 30 - stage.lookups!.length);
+  assert.ok(stage.lookups!.every(lookup => lookup.status === 'budget'));
+});

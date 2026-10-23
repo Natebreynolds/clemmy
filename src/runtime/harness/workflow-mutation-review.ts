@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge } from './objective-judge.js';
 import { mutationReviewTimeoutMs, recordJudgeMetric } from './judge-family.js';
-import type { JudgeEvidenceSource, JudgeEvidenceEntry } from './judge-evidence-tools.js';
+import type { JudgeEvidenceSource, JudgeEvidenceEntry, JudgeEvidenceLookup } from './judge-evidence-tools.js';
 import { describeJsonShape } from './tool-output-digest.js';
 
 export type WorkflowMutationReview = {
@@ -23,7 +23,63 @@ export type WorkflowMutationReview = {
    * model resubmits them and they are reviewed again; a model that cannot
    * rewrite a whole message correctly can still send a corrected one. */
   correctedArguments?: Record<string, unknown>;
+  /** Host observations only; never parsed from the reviewer's answer. */
+  diagnostics?: WorkflowMutationReviewDiagnostics;
 };
+
+type ReviewLookupDiagnostic = {
+  tool: 'open_evidence' | 'query_evidence' | 'unknown';
+  status: 'returned' | 'budget' | 'unknown_ref' | 'no_records' | 'unknown';
+  /** Comparable only inside this review invocation; no raw refs or paths. */
+  refHash?: string;
+  pathHash?: string;
+  fieldsCount?: number;
+  charStart?: number;
+  charEnd?: number;
+  charTotal?: number;
+  recordsTotal?: number;
+  recordsMatched?: number;
+  recordsReturned?: number;
+  offset?: number;
+};
+type ReviewDiagnosticStage = {
+  stage: 'measured' | 'full' | 'plain_retry';
+  outcome: WorkflowMutationReview['verdict'] | 'timeout' | 'invalid' | 'error';
+  durationMs: number;
+  /** Generic judge metadata describes its returned attempt, not losing hedges
+   * or every physical model call. Missing observations remain unknown. */
+  lookupScope: 'returned_attempt';
+  lookupCount: number | null;
+  lookups: ReviewLookupDiagnostic[] | null;
+  omittedLookupCount: number | null;
+  verdictRestated: boolean | null;
+};
+export type WorkflowMutationReviewDiagnostics = {
+  version: 1;
+  scope: 'review_invocation';
+  phase: 'proposed' | 'landed';
+  stages: ReviewDiagnosticStage[];
+};
+
+// Bound diagnostic storage only. This does not change the review's tool budget.
+const MAX_DIAGNOSTIC_LOOKUPS = 16;
+function lookupDiagnostic(lookup: JudgeEvidenceLookup, salt: Buffer): ReviewLookupDiagnostic {
+  const hash = (kind: string, value: string): string => createHash('sha256')
+    .update(salt).update(`\0${kind}\0`).update(value).digest('hex');
+  const out: ReviewLookupDiagnostic = {
+    tool: lookup.tool === 'open_evidence' || lookup.tool === 'query_evidence' ? lookup.tool : 'unknown',
+    status: lookup.refused === undefined ? 'returned'
+      : ['budget', 'unknown_ref', 'no_records'].includes(lookup.refused) ? lookup.refused : 'unknown',
+    ...(typeof lookup.ref === 'string' ? { refHash: hash('ref', lookup.ref) } : {}),
+    ...(typeof lookup.recordPath === 'string' ? { pathHash: hash('path', lookup.recordPath) } : {}),
+    ...(Array.isArray(lookup.fields) ? { fieldsCount: lookup.fields.length } : {}),
+  };
+  for (const key of ['charStart', 'charEnd', 'charTotal', 'recordsTotal', 'recordsMatched', 'recordsReturned', 'offset'] as const) {
+    const count = lookup[key];
+    if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) out[key] = count;
+  }
+  return out;
+}
 export interface WorkflowMutationReviewInput {
   sessionId: string;
   /** Reopened immutable authored instructions, not a model paraphrase. */
@@ -294,6 +350,36 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     return parsed;
   };
   const pass = (value: WorkflowMutationReview) => value.verdict === 'compatible';
+  const stages: ReviewDiagnosticStage[] = [];
+  let diagnosticSalt: Buffer | undefined;
+  const recordStage = (stage: ReviewDiagnosticStage['stage'], started: number,
+    result?: Awaited<ReturnType<typeof runHedgedJudge<WorkflowMutationReview>>>): void => {
+    try {
+      const lookups = result?.lookups;
+      diagnosticSalt ??= randomBytes(16);
+      stages.push({ stage, outcome: result?.value?.verdict ?? result?.failure ?? 'error',
+        durationMs: Math.max(0, Date.now() - started), lookupScope: 'returned_attempt',
+        lookupCount: lookups?.length ?? null,
+        lookups: lookups ? lookups.slice(0, MAX_DIAGNOSTIC_LOOKUPS).map(lookup => lookupDiagnostic(lookup, diagnosticSalt!)) : null,
+        omittedLookupCount: lookups ? Math.max(0, lookups.length - MAX_DIAGNOSTIC_LOOKUPS) : null,
+        verdictRestated: result?.value ? typeof result.restatedFrom === 'string' : null });
+    } catch { /* diagnostics cannot change a review, its fallback or verdict */ }
+  };
+  const runStage = async (stage: ReviewDiagnosticStage['stage'], stagePrompt: string,
+    options: Parameters<typeof runHedgedJudge<WorkflowMutationReview>>[5]) => {
+    const started = Date.now();
+    try {
+      const result = await judge(system, stagePrompt, parse, pass, 'mutation_constraints', options);
+      recordStage(stage, started, result);
+      return result;
+    } catch (error) {
+      recordStage(stage, started);
+      throw error;
+    }
+  };
+  const withDiagnostics = (value: WorkflowMutationReview): WorkflowMutationReview => ({ ...value,
+    ...(stages.length ? { diagnostics: { version: 1 as const, scope: 'review_invocation' as const,
+      phase: input.phase ?? 'proposed', stages } } : {}) });
   let failure: WorkflowMutationReview['checkerFailure'] = 'error';
   // Depth by stakes. Live 2026-09-30: every proposed write of one workflow
   // ran the full evidence review at the provider's default depth, eight
@@ -303,30 +389,30 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
   if (input.stakes === 'ordinary' && input.measuredFirst !== false) {
     try {
       const started = Date.now();
-      const measured = await judge(system, prompt, parse, pass, 'mutation_constraints',
+      const measured = await runStage('measured', prompt,
         { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs(), effort: 'medium' });
       if (measured.value?.verdict === 'compatible') {
         recordJudgeMetric({ lane: 'mutation_constraints', outcome: 'passed', durationMs: Date.now() - started, fast: true });
-        return measured.value;
+        return withDiagnostics(measured.value);
       }
     } catch { /* the full review decides */ }
   }
   try {
-    const reviewed = await judge(system, prompt, parse, pass,
-      'mutation_constraints', { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs() });
-    if (reviewed.value) return reviewed.value;
+    const reviewed = await runStage('full', prompt,
+      { requireCompletePrompt: true, evidence, timeoutMs: mutationReviewTimeoutMs() });
+    if (reviewed.value) return withDiagnostics(reviewed.value);
     failure = reviewed.failure ?? 'error';
   } catch { failure = 'error'; }
   if (failure === 'timeout') {
     try {
-      const plain = await judge(system, serialized, parse, pass,
-        'mutation_constraints', { requireCompletePrompt: false, timeoutMs: mutationReviewTimeoutMs() });
-      if (plain.value) return plain.value;
+      const plain = await runStage('plain_retry', serialized,
+        { requireCompletePrompt: false, timeoutMs: mutationReviewTimeoutMs() });
+      if (plain.value) return withDiagnostics(plain.value);
       failure = plain.failure ?? 'error';
     } catch { failure = 'error'; }
   }
   const said = failure === 'timeout' ? 'did not answer within its deadline'
     : failure === 'invalid' ? 'answered in a shape that could not be read' : 'could not be reached';
-  return { ...uncertain(`The constraint checker ${said}; this write was not judged.`), checkerFailure: failure,
-    ...(failure === 'invalid' && invalidReason ? { invalidReason } : {}) };
+  return withDiagnostics({ ...uncertain(`The constraint checker ${said}; this write was not judged.`), checkerFailure: failure,
+    ...(failure === 'invalid' && invalidReason ? { invalidReason } : {}) });
 }

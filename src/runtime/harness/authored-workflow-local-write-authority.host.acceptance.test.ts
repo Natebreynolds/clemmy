@@ -806,16 +806,20 @@ test('a real schema-on-demand workflow agent writes through its configured carri
 });
 
 test('a recoverable native write runs when proposed; the step is checked once, before its result', async () => {
+  const { readWorkflowEvents } = await import('../../execution/workflow-events.js');
   const fixture = createStepFixture({ kind: 'workflow', sideEffect: 'write',
     prompt: 'Use goal_upsert to set the title to Approved title and status active.' });
   const { bodies, tools } = fixtureTools(['goal_upsert']);
   const reviewed: Array<{ tool: string; phase?: string; titles: unknown[] }> = [];
+  const diagnostics = { version: 1 as const, scope: 'review_invocation' as const, phase: 'landed' as const,
+    stages: [{ stage: 'full' as const, outcome: 'conflict' as const, durationMs: 3,
+      lookupScope: 'returned_attempt' as const, lookupCount: 0, lookups: [], omittedLookupCount: 0, verdictRestated: false }] };
   authorityAdapter._setWorkflowMutationReviewerForTests(async input => {
     const writes = input.args.writes as Array<{ tool: string; arguments: Record<string, unknown> }>;
     reviewed.push({ tool: input.tool, phase: input.phase, titles: writes.map(write => write.arguments.title) });
     assert.match(input.instructions, /Approved title/);
     return { verdict: writes.every(write => write.arguments.title === 'Approved title') ? 'compatible' : 'conflict',
-      reason: 'Set the title to Approved title.', proposalDigest: 'fixture-review' };
+      reason: 'Set the title to Approved title.', proposalDigest: 'fixture-review', diagnostics };
   });
   try {
     const model = stubModel([
@@ -830,6 +834,16 @@ test('a recoverable native write runs when proposed; the step is checked once, b
     assert.doesNotMatch(JSON.stringify(outcome.history), /workflow_write_constraint/);
     assert.deepEqual(await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id),
       { status: 'correct', reason: 'Set the title to Approved title.' });
+    // Event append is deliberately asynchronous and cannot hold the review.
+    let verdict: ReturnType<typeof readWorkflowEvents>[number] | undefined;
+    for (let wait = 0; wait < 100 && !verdict; wait++) {
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+      verdict = readWorkflowEvents(fixture.workflowName, fixture.workflowRunId)
+        .find(event => event.kind === 'verdict_recorded' && event.meta?.door === 'write_check');
+    }
+    assert.ok(verdict, 'the existing asynchronous write-check event must arrive');
+    assert.deepEqual(verdict?.meta?.reviewDiagnostics, diagnostics, 'sanitized review metadata must survive the existing run log');
+    assert.equal(verdict?.meta?.pass, false, 'diagnostics never replace the actual verdict');
     assert.deepEqual(reviewed, [{ tool: 'the recoverable writes this step made', phase: 'landed', titles: ['Wrong title'] }]);
     const second = await authorityAdapter.checkStepWritesBeforeResult(fixture.session.id);
     assert.equal(second.status, 'noted', 'one correction round, then the doubt is recorded, never a loop');
@@ -1097,4 +1111,3 @@ test('a creation test grants no write or send authority, and a finished one gran
   const finished = createStepFixture({ kind: 'workflow', sideEffect: 'read', rehearsal: 'finished' });
   assert.deepEqual(finished.recorded, { status: 'refused', reason: 'workflow_definition_authority_missing_or_changed' });
 });
-

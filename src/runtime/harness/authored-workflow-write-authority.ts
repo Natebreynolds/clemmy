@@ -70,7 +70,7 @@ import { canonicalLogicalToolName, durableLogicalCallContract } from './logical-
 import { callableContractIdentity, normalizeCallableArguments } from './callable-contract.js';
 import { loadPersistedCallAuthority, loadPhysicalRequestEvidence } from './dispatch-ledger.js';
 import { normalizeWorkflowGoalFollowUpLineage } from '../../execution/workflow-run-write-facts.js';
-import type { reviewWorkflowMutation } from './workflow-mutation-review.js';
+import type { reviewWorkflowMutation, WorkflowMutationReview } from './workflow-mutation-review.js';
 import { classifyStepSideEffect } from '../../execution/workflow-enforce.js';
 import { cachedIdentityEmail } from '../../integrations/composio/identity-cache.js';
 
@@ -795,7 +795,7 @@ function landedWriteInEarlierAttempt(input: {
  * long it took. Live 10-18→10-22 this checker made 381 calls, about two hours
  * of a scheduled channel review's time, and appeared nowhere the owner looks. */
 function recordWriteCheckVerdict(receipt: { workflowName: string; workflowRunId: string; stepId: string }, tool: string,
-  result: { verdict: string; reason: string; checkerFailure?: string }, durationMs: number): void {
+  result: Pick<WorkflowMutationReview, 'verdict' | 'reason' | 'checkerFailure' | 'diagnostics'>, durationMs: number): void {
   void import('../../execution/workflow-events.js').then(({ appendWorkflowEvent }) => {
     appendWorkflowEvent(receipt.workflowName, receipt.workflowRunId, {
       kind: 'verdict_recorded',
@@ -805,6 +805,7 @@ function recordWriteCheckVerdict(receipt: { workflowName: string; workflowRunId:
         failedOpen: Boolean(result.checkerFailure),
         reason: `${tool} (step ${receipt.stepId}): ${result.reason}`.slice(0, 400),
         durationMs: Math.max(0, Math.round(durationMs)),
+        ...(result.diagnostics ? { reviewDiagnostics: result.diagnostics } : {}),
       },
     } as never);
   }).catch(() => { /* the run log is observability; the review decides */ });
