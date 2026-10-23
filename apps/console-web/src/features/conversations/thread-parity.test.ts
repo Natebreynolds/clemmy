@@ -19,7 +19,17 @@ import { fileURLToPath } from 'node:url';
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 const thread = read('./chat/ConversationThread.tsx');
+const chat = read('../../screens/Chat.tsx');
 const bubble = read('../../components/chat/ChatBubble.tsx');
+
+test('new and reopened question buttons send the originating message’s task mode', () => {
+  for (const surface of [chat, thread]) {
+    assert.match(surface, /onAnswer=\{[^\n]*send\(chatAnswerInput\(m, text\)\)/,
+      'an option answer must carry the question’s mode through the same send preparation as typed messages');
+    assert.match(surface, /connectionResume \? chat\.send\(\{ text, connectionResume \}\)/,
+      'a connection resume keeps its separately bound server continuation');
+  }
+});
 
 test('a reopened conversation keeps every control the new-chat surface has', () => {
   for (const [prop, what] of [

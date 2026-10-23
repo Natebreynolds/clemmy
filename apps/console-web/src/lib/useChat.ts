@@ -1727,6 +1727,22 @@ type ChatSendInput = { text: string; displayText?: string; attachmentIds?: strin
   /** Sends an unread addition on as its own turn: this request id, and its existing bubble instead of a new one. */
   followsSteerNote?: string };
 
+/** Preserve a question's Plan/Normal choice before asynchronous preparation.
+ * Execute is a fresh admission intent, not a mode generic answers may repeat:
+ * leave those answers to existing server continuation routing. Only the
+ * dedicated Execute action sends the reviewed revision for admission. */
+export function chatAnswerInput(message: Pick<ChatMessage, 'taskMode'>, text: string): ChatSendInput & { attachmentIds: string[]; attachmentNames: string[] } {
+  const originMode = snapshotTaskMode(message.taskMode);
+  const taskMode = originMode?.kind === 'execute' ? undefined : originMode;
+  return { text, attachmentIds: [], attachmentNames: [], ...(taskMode ? { taskMode } : {}) };
+}
+
+/** An unread addition keeps its Plan/Normal choice, whether sent on now or
+ * held for an owner tap. Its durable note still fixes the request id. */
+export function chatSteerFollowUpInput(message: Pick<ChatMessage, 'text' | 'taskMode'>, receipt: SteerReceipt): ChatSendInput {
+  return { ...chatAnswerInput(message, message.text), followsSteerNote: steerFollowUpRequestId(receipt) };
+}
+
 export function useChat(options?: UseChatOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
   const [busy, setBusyState] = useState(false);
@@ -2557,8 +2573,7 @@ export function useChat(options?: UseChatOptions) {
     if (unhandled.length === 0) return;
     const ended = [...messages].reverse().find((message) => message.role === 'assistant')?.status;
     if (!stoppedRef.current && (ended === undefined || ended === 'thinking')) return;
-    const inputFor = (message: ChatMessage): ChatSendInput => ({ text: message.text,
-      followsSteerNote: steerFollowUpRequestId(message.steerReceipt!) });
+    const inputFor = (message: ChatMessage): ChatSendInput => chatSteerFollowUpInput(message, message.steerReceipt!);
     const goes = !stoppedRef.current && followUpSendsAfter(ended) ? unhandled[0]! : null;
     const held = unhandled.filter((message) => message.id !== goes?.id);
     for (const message of held) heldFollowUpsRef.current.set(message.id, inputFor(message));

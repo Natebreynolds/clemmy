@@ -1335,6 +1335,87 @@ test('a delivered rescue completion is a SUCCESS, never "Didn\'t finish"', () =>
 });
 
 
+test('an offered answer keeps the question’s Plan mode through an unconfirmed send and retry', async () => {
+  const { chatAnswerInput } = await import('./useChat');
+  const question: ChatMessage = { id: 'plan-question', role: 'assistant', text: 'Choose a fixture color.',
+    status: 'awaiting-reply', taskMode: { version: 1, kind: 'plan' } };
+  const input = chatAnswerInput(question, 'Amber');
+  if (question.taskMode?.kind === 'plan') question.taskMode.kind = 'normal';
+  assert.deepEqual(input, { text: 'Amber', attachmentIds: [], attachmentNames: [], taskMode: { version: 1, kind: 'plan' } });
+  const pending = retainPendingChatPost(null, { input: input.text, sessionId: 'plan-answer-fixture',
+    attachments: input.attachmentIds, taskMode: input.taskMode }, () => 'plan-answer-request');
+  const calls: unknown[][] = [];
+  await postPendingChatWithRetry(pending, { retryDelaysMs: [0], wait: async () => {}, transport: async (...args) => {
+    calls.push(args);
+    if (calls.length === 1) throw new TypeError('offline');
+    return { sessionId: 'plan-answer-fixture', streamUrl: '/api/sessions/plan-answer-fixture/events', status: 'started', mode: 'fresh' };
+  } });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], ['Amber', 'plan-answer-fixture', [], 'plan-answer-request', { version: 1, kind: 'plan' }]);
+  assert.deepEqual(calls[1], calls[0]);
+});
+
+test('offered answers preserve explicit Normal and leave unknown historical mode unspecified', async () => {
+  const { chatAnswerInput } = await import('./useChat');
+  assert.deepEqual(chatAnswerInput({ taskMode: { version: 1, kind: 'normal' } }, 'Bullet list').taskMode,
+    { version: 1, kind: 'normal' });
+  assert.equal(chatAnswerInput({}, 'Bullet list').taskMode, undefined,
+    'an old question must not borrow mode or Execute authority from a different turn or the current composer');
+});
+
+test('an answer to a restored question uses that normalized turn’s Plan mode', async () => {
+  const { chatAnswerInput } = await import('./useChat');
+  const restored = historyToMessages([
+    { role: 'assistant', text: 'Earlier normal turn', createdAt: 'now', taskMode: { version: 1, kind: 'normal' } },
+    { role: 'user', text: 'Plan the named fixture', createdAt: 'now', taskMode: { version: 1, kind: 'plan' } },
+    { role: 'assistant', text: 'Choose a fixture color.', createdAt: 'now', taskMode: { version: 1, kind: 'plan' } },
+  ]);
+  assert.deepEqual(chatAnswerInput(restored[2], 'Amber').taskMode, { version: 1, kind: 'plan' });
+  assert.deepEqual(chatAnswerInput(restored[0], 'Bullet list').taskMode, { version: 1, kind: 'normal' });
+});
+
+test('an offered answer from Execute does not manufacture another explicit execution admission', async () => {
+  const { chatAnswerInput } = await import('./useChat');
+  const ref = { planId: 'plan-answer-reviewed', revision: 2, digest: 'c'.repeat(64) };
+  const input = chatAnswerInput({ taskMode: { version: 1, kind: 'execute', executeRef: ref } }, 'Use the selected row');
+  assert.equal(input.taskMode, undefined,
+    'a different answer must use existing continuation routing, not the reviewed revision’s fresh Execute ingress');
+  assert.equal(Object.hasOwn(input, 'taskMode'), false);
+  assert.deepEqual(ref, { planId: 'plan-answer-reviewed', revision: 2, digest: 'c'.repeat(64) },
+    'the selected revision used by the dedicated Execute action is not changed');
+});
+
+test('an unread Plan addition keeps its originating mode and fixed request identity when held or sent on', async () => {
+  const { chatSteerFollowUpInput } = await import('./useChat');
+  const { applySteerReceiptEvent, unhandledSteerFollowUps } = await import('@clem/chat-engine');
+  const echo: ChatMessage = { id: 'plan-addition', role: 'user', text: 'Include the second fixture row',
+    taskMode: { version: 1, kind: 'plan' }, steer: 'pending', idempotencyKey: 'plan-note-request', requestSessionId: 'plan-steer-fixture' };
+  const receipt = { version: 1 as const, sessionId: 'plan-steer-fixture', sourceUserSeq: 10, noteSeq: 12,
+    clientRequestId: 'plan-note-request', state: 'unhandled' as const, changedAtSeq: 14 };
+  const messages = applySteerReceiptEvent([echo], { type: 'conversation_completed', sessionId: 'plan-steer-fixture', seq: 14,
+    data: { sourceUserSeq: 10, steerReceipts: [receipt] } }, 'plan-steer-fixture');
+  const waiting = unhandledSteerFollowUps(messages);
+  assert.equal(waiting.length, 1);
+  const input = chatSteerFollowUpInput(waiting[0], waiting[0].steerReceipt!);
+  const heldMessage: ChatMessage = { ...waiting[0], steerFollowUp: 'held' };
+  const held = chatSteerFollowUpInput(heldMessage, heldMessage.steerReceipt!);
+  assert.deepEqual(input.taskMode, { version: 1, kind: 'plan' });
+  assert.equal(input.text, echo.text);
+  assert.equal(input.followsSteerNote, 'steer-followup:plan-steer-fixture:12');
+  assert.deepEqual(held, input, 'holding the same addition for an owner tap does not change its mode or request');
+});
+
+test('an unread Execute-origin addition retains its request identity without synthesizing Execute intent', async () => {
+  const { chatSteerFollowUpInput } = await import('./useChat');
+  const receipt = { version: 1 as const, sessionId: 'execute-steer-fixture', sourceUserSeq: 10, noteSeq: 12,
+    clientRequestId: 'execute-note-request', state: 'unhandled' as const, changedAtSeq: 14 };
+  const input = chatSteerFollowUpInput({ text: 'Use the selected row',
+    taskMode: { version: 1, kind: 'execute', executeRef: { planId: 'reviewed-plan', revision: 2, digest: 'c'.repeat(64) } } }, receipt);
+  assert.equal(input.taskMode, undefined);
+  assert.equal(Object.hasOwn(input, 'taskMode'), false);
+  assert.equal(input.followsSteerNote, 'steer-followup:execute-steer-fixture:12');
+});
+
 test('pending Plan and Execute posts survive reopen with exact mode, revision, attachments, and request identity', async () => {
   const values = new Map<string, string>();
   const storage = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };

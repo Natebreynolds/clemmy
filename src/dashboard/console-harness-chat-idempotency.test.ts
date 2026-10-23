@@ -517,6 +517,17 @@ test('Execute taps with different request IDs rejoin the accepted revision befor
       assert.equal(body.replayed, true);
       assert.notEqual(body.steered, true);
     }
+    // A question answer is different input, not another Execute tap. Generic
+    // answer buttons must not copy executeRef into a fresh admission request.
+    const answer = await fetch(`${harness.url}/api/harness/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: 'Amber', sessionId, clientRequestId: 'desktop-plan-option-answer', taskMode }),
+    });
+    assert.equal(answer.status, 409);
+    const refused = await answer.json() as { code: string; error: string };
+    assert.equal(refused.code, 'PLAN_EXECUTE_CONFLICT');
+    assert.match(refused.error, /already has an execution with different input/);
+    assert.equal(getHarnessChatRequestReceipt('desktop-plan-option-answer'), null);
     assert.equal(brainCalls, 0);
     assert.equal(getActiveRunAttempt(sessionId)?.attemptId, lease.attempt.attemptId);
     assert.equal(listEvents(sessionId, { types: ['user_input_received'] }).length, 2);

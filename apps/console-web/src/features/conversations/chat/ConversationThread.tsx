@@ -18,7 +18,7 @@ import { useConversationProject } from '@/lib/conversation-project';
 import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
 import { ChatBubble } from '@/components/chat/ChatBubble';
-import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
+import { chatAnswerInput, chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { decidePlanProposal } from '@/lib/inbox';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import { Tag } from '@/components/ui/StatusPill';
@@ -220,7 +220,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
               onSendHeld={chat.sendHeld}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
-              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send(chatAnswerInput(m, text)) : undefined}
               onContinue={index === chat.messages.length - 1 && !chat.busy && !chat.pendingPost ? () => continuePaused(m) : undefined}
               traceHref={`/tasks?select=${encodeURIComponent(session.id)}`}
             />

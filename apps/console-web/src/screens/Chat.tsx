@@ -7,7 +7,7 @@ import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Navigate, useLocation, useSearchParams } from 'react-router-dom';
 import { decidePlanProposal } from '@/lib/inbox';
-import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
+import { chatAnswerInput, chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 import { lastChatSession, rememberLastChatSession } from '@/lib/last-session';
 import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
@@ -230,7 +230,7 @@ export function Chat() {
               onBackground={chat.background}
               // Suggested answers stay tappable only while the question is the
               // newest message; once anything follows it, they are a record.
-              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send({ text, attachmentIds: [], attachmentNames: [] }) : undefined}
+              onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send(chatAnswerInput(m, text)) : undefined}
               onContinue={index === chat.messages.length - 1 && !chat.busy && !chat.pendingPost ? () => continuePaused(m) : undefined}
               traceHref={chat.sessionId.current ? `/tasks?select=${encodeURIComponent(chat.sessionId.current)}` : undefined}
             />
