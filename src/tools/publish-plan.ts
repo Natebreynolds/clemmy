@@ -402,6 +402,16 @@ export async function preparePlanOutline(input: { planning?: HostFreshPlanningCo
         const validation = parsedArguments ? { ok: true as const } : validateProofProviderArguments({ schema, payload: step.staticArguments });
         if (parsedArguments?.success === false || !validation.ok) throw new Error(`Step ${step.id}: static arguments do not match the exact local schema: ${JSON.stringify(parsedArguments?.success === false ? issueDetails(parsedArguments.error) : !validation.ok ? validation.failures : [])}. Repair those fields in this step; its selected local tool is already known.`);
       }
+      // These authoring tools carry transforms and call arguments as JSON
+      // text. Validate their known step values before approval freezes them;
+      // Execute cannot repair static arguments without changing that contract.
+      // Discard the normalized result so reviewed bytes stay exactly authored.
+      if ((localDefinition.name === 'workflow_create' || localDefinition.name === 'workflow_update')
+        && Array.isArray(step.staticArguments.steps)
+        && !argumentBindings.some(binding => binding.targetPath === '/steps' || binding.targetPath.startsWith('/steps/'))) {
+        const { normalizeWorkflowSteps } = await import('../execution/workflow-authoring.js');
+        normalizeWorkflowSteps(step.staticArguments.steps as Parameters<typeof normalizeWorkflowSteps>[0]);
+      }
     } else {
       // ONE identity comparison, shared with Execute revalidation and call
       // admission. The catalog seals the provider schema digest for every

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -17,6 +17,7 @@ const semantic = await import('../runtime/semantic-boundary/admit-and-compile-ac
 const catalog = await import('../runtime/harness/host-capability-catalog-factory.js');
 const manifests = await import('../runtime/harness/capability-manifest-store.js');
 const { closedCanonicalJson } = await import('../shared/closed-canonical-json.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
 test.after(() => { log.closeEventLog(); catalog.installHostCapabilityCatalogFactory(null); manifests.installCapabilityManifestStore(null); rmSync(home, { recursive: true, force: true }); });
 function outline(capabilityRef: string | null, args: Record<string, unknown>): any {
   return { executionDraft: capabilityRef ? {
@@ -87,6 +88,115 @@ test('ready workflow plan records real native schema/ref/effect and canonical re
   assert.equal(revalidated.ok, true, JSON.stringify(revalidated));
   assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0, 'preparation does not invoke native workflow creation');
 });
+
+for (const toolName of ['workflow_create', 'workflow_update']) test(`static ${toolName} preparation rejects compound normalization defects without freezing or changing the authored bytes`, async () => {
+  const f = await fixture(toolName);
+  const aggregate = (groupBy?: string[]) => JSON.stringify({ version: 1, expression: {
+    op: 'aggregate', value: { op: 'get', from: 'input.rows' },
+    ...(groupBy ? { groupBy } : {}), metrics: [{ fn: 'count' }],
+  } }, null, 2);
+  const args = { name: 'FRAMEWORK-TEST-static-normalization', description: 'A synthetic prepared workflow.',
+    ...(toolName === 'workflow_create' ? { enabled: false } : {}),
+    steps: [{ id: 'summary', transform: aggregate(), sideEffect: 'read' },
+      { id: 'output', call: { tool: 'write_file', args_json: '{"content":{{steps.summary.output}}}' }, sideEffect: 'write' }] };
+  const raw = outline(f.capabilityRef, args);
+  const before = JSON.stringify(raw);
+  assert.ok(WORKFLOWS_DIR.startsWith(`${home}${path.sep}`), 'the workflow store must use the disposable home');
+  const workflowFiles = () => existsSync(WORKFLOWS_DIR)
+    ? readdirSync(WORKFLOWS_DIR, { recursive: true }) : [];
+  const beforeFiles = workflowFiles();
+  const dispatches = () => log.openEventLog().prepare('SELECT COUNT(*) AS n FROM physical_dispatches').get() as { n: number };
+  const beforeDispatches = dispatches();
+  const { withHarnessRunContext } = await import('../runtime/harness/brackets.js');
+  const { withPlanCompletionReview } = await import('../runtime/harness/plan-publication-review.js');
+  const plans = await import('../runtime/harness/plan-artifacts.js');
+  let reviews = 0;
+  const publish = async (candidate: typeof raw) => {
+    const { executionDraft: _draft, ...structured_plan } = candidate;
+    return JSON.parse(String(await withHarnessRunContext(f, () => withPlanCompletionReview(async () => {
+      reviews += 1; return 'done';
+    }, () => publisher.buildPublishPlanTool(f.planning).invoke(new RunContext(), JSON.stringify({
+      full_text: 'Prepare the synthetic workflow without running it.', structured_plan,
+      readiness: 'ready', missing_prerequisites: [], base_ref_json: null,
+    }))))));
+  };
+  const checkDiagnostic = (message: string) => {
+    assert.match(message, /steps\[0\]\.transform:.*groupBy/);
+    assert.match(message, /steps\[1\]\.call:.*args_json must contain valid JSON object text/);
+    assert.doesNotMatch(message, /\{\{steps\.summary\.output\}\}/, 'invalid authored payload is not echoed');
+  };
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw, ready: true }), error => {
+    checkDiagnostic(String(error)); return true;
+  });
+  const refused = await publish(raw);
+  assert.equal(refused.published, false);
+  assert.equal(refused.error, 'plan_preparation_failed');
+  checkDiagnostic(refused.message);
+  assert.equal(reviews, 0, 'known invalid arguments do not reach model review');
+  assert.equal(plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId }), null,
+    'the real publication tool cannot seal the invalid ready candidate');
+  const draft = await publisher.preparePlanOutline({ ...f, raw, ready: false }) as any;
+  checkDiagnostic(draft.preparationIssues.join('\n'));
+  assert.equal(draft.executionDraft, null, 'a draft with known normalization defects is not executable');
+  assert.deepEqual(draft.steps[0].staticArguments, args, 'draft feedback preserves the submitted candidate');
+  assert.equal(JSON.stringify(raw), before, 'validation never normalizes or repairs caller-owned arguments');
+
+  const corrected = structuredClone(raw);
+  corrected.steps[0].staticArguments.steps[0].transform = aggregate(['category']);
+  corrected.steps[0].staticArguments.steps[1].call.args_json = '{ "content": "{{steps.summary.output}}" }';
+  const correctedBefore = JSON.stringify(corrected);
+  const prepared = await publisher.preparePlanOutline({ ...f, raw: corrected, ready: true }) as any;
+  assert.deepEqual(prepared.preparationIssues, []);
+  assert.ok(prepared.executionDraft);
+  assert.deepEqual(prepared.steps[0].staticArguments, corrected.steps[0].staticArguments,
+    'approved JSON strings and templates remain exact, rather than being replaced by normalized objects');
+  assert.equal(JSON.stringify(corrected), correctedBefore);
+  const published = await publish(corrected);
+  assert.equal(published.ok, true, JSON.stringify(published));
+  assert.equal(reviews, 1);
+  log.closeEventLog();
+  const saved = plans.getPlanRevisionForSource({ ...f, principalId: f.sessionId });
+  assert.equal(saved?.readiness, 'ready');
+  assert.deepEqual((saved?.structuredPlan?.steps as any[])[0].staticArguments, corrected.steps[0].staticArguments,
+    'canonical publication and reopen preserve the exact approved argument bytes');
+  assert.deepEqual(workflowFiles(), beforeFiles, 'preparation never saves or updates a workflow');
+  assert.deepEqual(dispatches(), beforeDispatches, 'preparation never dispatches a host or provider call');
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
+});
+
+test('static workflow preparation defers step bindings but still checks steps when another field is dynamic', async () => {
+  const f = await fixture();
+  const base = { name: 'FRAMEWORK-TEST-bound-normalization', description: 'Synthetic bound authoring.', enabled: false };
+  const producer = { id: 'synthesize', action: 'Prepare the workflow definition.', effect: 'compute', capabilityRef: null,
+    staticArguments: {}, dynamicBindings: [], dependsOn: [], subagentRole: null, verification: 'Definition is recorded.' };
+  for (const targetPath of ['/steps', '/steps/0/transform']) {
+    const args = targetPath === '/steps' ? base : { ...base, steps: [{ id: 'summary', sideEffect: 'read' }] };
+    const raw = outline(f.capabilityRef, args);
+    raw.steps[0].dynamicBindings = [{ producerStepId: 'synthesize', outputPath: '/value', targetPath,
+      expectedType: targetPath === '/steps' ? 'array' : 'string' }];
+    raw.steps.unshift(producer);
+    const prepared = await publisher.preparePlanOutline({ ...f, raw, ready: true }) as any;
+    assert.deepEqual(prepared.preparationIssues, []);
+    assert.equal(prepared.preparedBindings[0].argumentValidation, 'validate_after_bound_results');
+    assert.deepEqual(prepared.steps[1].staticArguments, args, 'future step values are neither invented nor normalized');
+  }
+  const raw = outline(f.capabilityRef, { ...base, description: undefined,
+    steps: [{ id: 'summary', transform: '{invalid', sideEffect: 'read' }] });
+  delete raw.steps[0].staticArguments.description;
+  raw.steps[0].dynamicBindings = [{ producerStepId: 'synthesize', outputPath: '/value', targetPath: '/description', expectedType: 'string' }];
+  raw.steps.unshift(producer);
+  await assert.rejects(publisher.preparePlanOutline({ ...f, raw, ready: true }), /steps\[0\]\.transform:.*valid JSON/);
+});
+
+test('static workflow update preparation does not require replacement steps for a metadata-only update', async () => {
+  const f = await fixture('workflow_update');
+  const args = { name: 'FRAMEWORK-TEST-metadata-only', description: 'Changed description only.' };
+  const prepared = await publisher.preparePlanOutline({ ...f, raw: outline(f.capabilityRef, args), ready: true }) as any;
+  assert.deepEqual(prepared.preparationIssues, []);
+  assert.deepEqual(prepared.steps[0].staticArguments, args);
+  assert.equal(log.listEvents(f.sessionId, { types: ['tool_called'] }).length, 0);
+});
+
 test('missing tools remain inspectable draft prerequisites, never ready capabilities', async () => {
   const f = await fixture();
   const draft = await publisher.preparePlanOutline({ ...f, raw: outline(null, {}), ready: false });
