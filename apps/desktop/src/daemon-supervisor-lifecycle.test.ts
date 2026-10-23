@@ -66,7 +66,7 @@ function fixture(t: TestContext, opts: { logInMissingFolder?: boolean } = {}) {
     t.mock.restoreAll(); syncBuiltinESMExports(); t.mock.timers.reset();
     if (oldHome === undefined) delete process.env.CLEMENTINE_HOME;
     else process.env.CLEMENTINE_HOME = oldHome;
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
   return { root, supervisor, children, events, setResponse(fn: () => Promise<Response>) { response = fn; } };
 }
