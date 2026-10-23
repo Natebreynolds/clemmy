@@ -10,7 +10,7 @@
  * shown. A reply is read by the same brain into a decision; the host then
  * takes the one path that already settles that kind of item.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -20,8 +20,8 @@ import type { FromClemSetup } from './from-clem-setup.js';
 import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
-import { appendEvent, getSession, listEvents, updateSession } from '../runtime/harness/eventlog.js';
-import { mintOwnerChoiceToken, ownerChoiceForSource } from '../runtime/harness/owner-choice.js';
+import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
+import { mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
@@ -384,8 +384,9 @@ export function startFromClemVoice(): { stop: () => void } {
 
 // ── the owner's reply ─────────────────────────────────────────────────────────
 export interface FromClemRespond {
-  (request: { sessionId: string; channel: string; message: string; displayMessage?: string; ownerChoiceToken?: string }): Promise<unknown>;
+  (request: { sessionId: string; runId: string; channel: string; message: string; displayMessage?: string; ownerChoiceToken?: string }): Promise<unknown>;
 }
+export interface FromClemTurnRef { sessionId: string; runId: string }
 let respondImpl: FromClemRespond | null = null;
 export function bindFromClemRespond(respond: FromClemRespond | null): void { respondImpl = respond; }
 
@@ -393,7 +394,7 @@ export type FromClemReplyOutcome =
   | { outcome: 'gone' }
   | { outcome: 'changed' }
   | { outcome: 'unclear'; decision: 'unclear' }
-  | { outcome: 'started'; decision: ClemReplyResult['decision']; sessionId: string }
+  | ({ outcome: 'started'; decision: ClemReplyResult['decision'] } & FromClemTurnRef)
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added'; decision: ClemReplyResult['decision'] }
   | { outcome: 'answered'; questionId: string };
 
@@ -410,7 +411,7 @@ export interface FromClemReplyDeps {
   /** Hide the row until the next morning, or for good; the item itself is
    *  untouched. */
   later: (key: string, forever?: boolean) => void;
-  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }) => string;
+  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }) => FromClemTurnRef;
   /** The owner's answer to "switch back?" after a brain outage. */
   resolveBrainOutage?: (outageId: string, choice: 'switch_back' | 'stay') => Promise<boolean>;
 }
@@ -512,7 +513,7 @@ async function replyOnce(
       // exactly that action; typed words are an ordinary reply.
       const tapped = typeof choiceIndex === 'number' && row.asks
         && Array.isArray(row.choices) && row.choices[choiceIndex] === reply;
-      const sessionId = deps.startTurn({
+      const started = deps.startTurn({
         title: row.text.slice(0, 120),
         message: [
           `You told me: ${said}`,
@@ -530,7 +531,7 @@ async function replyOnce(
       });
       if (notificationId) deps.markRead(notificationId);
       if (planId) deps.rejectPlan(planId, `Taken up in conversation: ${reply}`);
-      return { outcome: 'started', decision: read.decision, sessionId };
+      return { outcome: 'started', decision: read.decision, ...started };
     }
     case 'done':
       if (planId) return deps.rejectPlan(planId, reply) ? { outcome: 'declined', decision: read.decision } : { outcome: 'gone' };
@@ -555,10 +556,8 @@ async function replyOnce(
   }
 }
 
-/** What came of a "do it" the owner gave on one of her items, read from her
- *  thread: still working, or the turn's own final words and how it ended.
- *  The tap is found by the choice it carried; typed words by the reply the
- *  host composed for them, at or after the moment the owner replied. */
+/** Read only the accepted source bound to the host-generated dispatch ID.
+ * The display words, item key and clock never select a different turn. */
 export type FromClemTurnOutcome =
   | { state: 'working' }
   | { state: 'not_found' }
@@ -566,23 +565,15 @@ export type FromClemTurnOutcome =
 
 const OUTCOME_TEXT_MAX = 600;
 
-export function fromClemTurnOutcome(input: { key: string; reply: string; since: string }, nowMs = Date.now()): FromClemTurnOutcome {
+export function fromClemTurnOutcome(input: { runId: string; since: string }, nowMs = Date.now()): FromClemTurnOutcome {
   const sinceMs = Date.parse(input.since);
-  if (!Number.isFinite(sinceMs)) return { state: 'not_found' };
-  let sources: ReturnType<typeof listEvents> = [];
-  try { sources = listEvents(CLEM_THREAD_ID, { types: ['user_input_received'], desc: true, limit: 40 }); }
-  catch { return { state: 'not_found' }; }
-  const reply = input.reply.trim();
-  const source = sources.find((event) => {
-    if (event.role !== 'user' || Date.parse(event.createdAt) < sinceMs - 5_000) return false;
-    const choice = event.data.ownerChoice ? ownerChoiceForSource(CLEM_THREAD_ID, event.seq) : null;
-    if (choice) return choice.rowKey === input.key;
-    return typeof event.data.text === 'string' && event.data.text.startsWith('You told me:')
-      && (event.data.displayText ?? '') === reply;
-  });
-  // A tap is accepted within moments; past two minutes with nothing found,
-  // it did not start (the item said why) rather than still starting.
+  if (!Number.isFinite(sinceMs) || !/^from-clem:[A-Za-z0-9-]{1,80}$/.test(input.runId)) return { state: 'not_found' };
+  const attempt = getLatestRunAttemptByRunId(CLEM_THREAD_ID, input.runId);
+  const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
+  // The asynchronous dispatch may not yet have accepted its input. Missing
+  // evidence is unconfirmed, never proof that the owner can safely repeat it.
   if (!source) return nowMs - sinceMs > 120_000 ? { state: 'not_found' } : { state: 'working' };
+  if (source.role !== 'user' || source.data.synthetic === true || source.data.runId !== input.runId) return { state: 'not_found' };
   const terminal = exactTerminalForAcceptedSource(source);
   if (!terminal) return { state: 'working' };
   const { status, text } = terminal.presentation;
@@ -594,16 +585,17 @@ export function fromClemTurnOutcome(input: { key: string; reply: string; since: 
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */
-export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): string {
+export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): FromClemTurnRef {
   if (!respondImpl) throw new Error('no turn runner is bound');
   thread.ensure();
   const sessionId = CLEM_THREAD_ID;
   const respond = respondImpl;
+  const runId = `from-clem:${randomUUID()}`;
   void respond({
-    sessionId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage,
+    sessionId, runId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage,
     ...(input.ownerChoiceToken ? { ownerChoiceToken: input.ownerChoiceToken } : {}),
   }).catch((error: unknown) => {
     logger.warn({ sessionId, err: error instanceof Error ? error.message : String(error) }, 'from clem: the reply turn failed');
   });
-  return sessionId;
+  return { sessionId, runId };
 }

@@ -65,7 +65,7 @@ test('a button with a fixed meaning settles without reading words, and never hid
     answerQuestion: () => false, markRead: () => {}, addRule: (h: string) => { log.push(`rule:${h}`); },
     approvePlan: () => false, rejectPlan: () => false, snoozePlan: () => {},
     later: (key: string, forever?: boolean) => { log.push(`later:${key}:${forever ? 'forever' : 'tomorrow'}`); },
-    startTurn: (input: { displayMessage: string }) => { log.push(`turn:${input.displayMessage}`); return 'clem'; },
+    startTurn: (input: { displayMessage: string }) => { log.push(`turn:${input.displayMessage}`); return { sessionId: 'clem', runId: 'from-clem:fixture-setup' }; },
   };
   assert.equal((await replyToFromClem('setup:phone', "Don't suggest this", deps as never, { decision: 'never' })).outcome, 'cleared');
   assert.equal((await replyToFromClem('setup:phone', 'Not now', deps as never, { decision: 'not_now' })).outcome, 'later');

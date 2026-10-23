@@ -39,3 +39,14 @@ test('missing and failed background status is visible without pretending it is o
   ]);
   assert.deepEqual(pulses.map(pulse=>pulse.heartbeat), ['missing','failed']);
 });
+
+
+test('inline reply feedback preserves unclear, later and rule receipts', async () => {
+  const { replyOutcomeNotice, tapOutcomeHeadline } = await import('./from-clem');
+  assert.deepEqual(replyOutcomeNotice({ outcome: 'unclear' }, 'Fixture'),
+    { tone: 'info', text: 'That didn’t settle it. Try “do it”, “not now” or “never”, or say what you want.' });
+  assert.deepEqual(replyOutcomeNotice({ outcome: 'later' }, 'Fixture'), { tone: 'success', text: 'Back tomorrow morning.' });
+  assert.deepEqual(replyOutcomeNotice({ outcome: 'rule_added' }, 'Fixture'), { tone: 'success', text: 'Saved as a rule for Fixture.' });
+  assert.doesNotMatch(tapOutcomeHeadline({ state: 'not_found' }).text, /didn.t start|try again/i,
+    'missing correlation evidence cannot authorize a repeated action');
+});

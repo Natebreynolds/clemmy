@@ -18,6 +18,15 @@ import {
   type WorkspaceDestinationChooser,
 } from './inbox';
 
+/** Every contributing feed participates in the empty/error state, including
+ * summary-only check-in proposals and stopped workflows. */
+export function needsYouFeedAvailability(errors: Record<'approvals' | 'locations' | 'updates' | 'suggestions' | 'plans' | 'questions' | 'summary', boolean>): { failed: string[]; unavailable: boolean } {
+  const labels = { approvals: 'approvals', locations: 'record locations', updates: 'updates', suggestions: 'suggestions',
+    plans: 'plans', questions: 'questions', summary: 'check-in suggestions and stopped workflows' };
+  const failed = (Object.keys(labels) as Array<keyof typeof labels>).filter((key) => errors[key]).map((key) => labels[key]);
+  return { failed, unavailable: failed.length === Object.keys(labels).length };
+}
+
 export type NeedsYouItem =
   | { kind: 'workspace'; id: string; row: WorkspaceDestinationChooser }
   | { kind: 'question'; id: string; row: InboxQuestionRow }

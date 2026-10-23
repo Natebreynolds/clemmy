@@ -153,7 +153,7 @@ function deps(over: Partial<FromClemReplyDeps> = {}, decision: { decision: strin
     rejectPlan: (id, reason) => { log.push(`reject:${id}:${reason}`); return true; },
     snoozePlan: (id) => { log.push(`snooze:${id}`); },
     later: (key) => { log.push(`later:${key}`); },
-    startTurn: (input) => { log.push(`turn:${input.displayMessage}:${input.message}`); return 'sess-1'; },
+    startTurn: (input) => { log.push(`turn:${input.displayMessage}:${input.message}`); return { sessionId: 'sess-1', runId: 'from-clem:fixture' }; },
     ...over,
   };
   return { all, log };
@@ -176,7 +176,7 @@ test('a finding: done clears it, never becomes a rule in the owner\'s words, do 
 
   run = deps({}, { decision: 'do_it' });
   const started = await replyToFromClem('notif:cal', 'let the organizer know', run.all);
-  assert.deepEqual(started, { outcome: 'started', decision: 'do_it', sessionId: 'sess-1' });
+  assert.deepEqual(started, { outcome: 'started', decision: 'do_it', sessionId: 'sess-1', runId: 'from-clem:fixture' });
   const turn = run.log.find((line) => line.startsWith('turn:'))!;
   assert.match(turn, /^turn:let the organizer know:You told me: Your 4:00 interview was cancelled; that hour is free\./);
   assert.match(turn, /What it was about: Cancelled: Interview\nWas 4:00 PM\./);
@@ -335,7 +335,7 @@ test('one reply is one action: a retried send returns the first answer, and a se
   const run = deps({
     read: async () => stream(undefined, readIds),
     markRead: (id) => { readIds.add(id); },
-    startTurn: () => { turns += 1; return 'sess-1'; },
+    startTurn: () => { turns += 1; return { sessionId: 'sess-1', runId: 'from-clem:fixture' }; },
   }, { decision: 'do_it' });
   const [first, retried] = await Promise.all([
     replyToFromClem('notif:cal', 'let the organizer know', run.all, { requestId: 'reply-aaaaaaaa' }),
@@ -535,7 +535,7 @@ test('a tapped choice carries the owner\'s approval of exactly that action; type
   const tokens: Array<string | undefined> = [];
   const run = deps({
     read: async () => stream((key) => (key === 'notif:wr' ? { message: 'Standup is still waiting on you. Accept it?', choices: ['Accept', 'Decline'] } : undefined)),
-    startTurn: (input) => { tokens.push(input.ownerChoiceToken); return 'sess-1'; },
+    startTurn: (input) => { tokens.push(input.ownerChoiceToken); return { sessionId: 'sess-1', runId: 'from-clem:fixture' }; },
   }, { decision: 'do_it' });
   const row = (await run.all.read()).rows.find((candidate) => candidate.key === 'notif:wr')!;
   assert.deepEqual(row.ref, { itemKey: 'k2' }, 'the row carries what it is about');
@@ -554,26 +554,53 @@ test('a tapped choice carries the owner\'s approval of exactly that action; type
   assert.equal(tokens.at(-1), undefined, 'an index that is not the shown choice is nothing');
 });
 
-test('what came of a tap is read from Clem\'s thread: working, then her final words', async () => {
+test('tap outcomes bind the exact dispatched run, never identical words or a newer choice', async () => {
   const { fromClemTurnOutcome, CLEM_THREAD_ID } = await import('./from-clem-runtime.js');
   const eventlog = await import('../runtime/harness/eventlog.js');
   const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
   const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
   if (!eventlog.getSession(CLEM_THREAD_ID)) eventlog.createSession({ id: CLEM_THREAD_ID, kind: 'chat', channel: 'desktop' });
   const since = new Date(Date.now() - 1_000).toISOString();
-  const key = 'notif:fixture-invite';
-  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }), { state: 'working' }, 'a tap moments ago is still starting');
-  const attempt = eventlog.beginRunAttempt(CLEM_THREAD_ID, { runId: 'fixture-tap' });
-  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
-    text: 'You told me: A fixture invite is waiting.\n\nMy reply: Accept', displayText: 'Accept',
-    ownerChoice: { version: 1, rowKey: key, voiceDigest: 'fixture', said: 'A fixture invite is waiting.', facts: 'Fixture.', choice: 'Accept', tappedAt: new Date().toISOString() },
-  } });
-  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }), { state: 'working' });
-  const identity = { sessionId: CLEM_THREAD_ID, turn: source.turn, sourceUserSeq: source.seq };
-  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
-    presentation: { kind: 'answer', text: 'Accepted the fixture invite.' } });
-  assert.deepEqual(fromClemTurnOutcome({ key, reply: 'Accept', since }),
-    { state: 'done', text: 'Accepted the fixture invite.', sessionId: CLEM_THREAD_ID });
-  assert.deepEqual(fromClemTurnOutcome({ key: 'notif:other', reply: 'Accept', since: new Date(Date.now() - 10 * 60_000).toISOString() }),
-    { state: 'not_found' }, 'a tap that never started says so after a while');
+  const accept = (runId: string, rowKey: string, choice?: string) => {
+    const attempt = eventlog.beginRunAttempt(CLEM_THREAD_ID, { runId });
+    return eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+      text: 'Do it', displayText: 'Do it', runId,
+      ...(choice ? { ownerChoice: { version: 1, rowKey, voiceDigest: 'fixture', said: 'Controlled fixture.', facts: 'Fixture.', choice, tappedAt: new Date().toISOString() } } : {}),
+    } });
+  };
+  const finish = (source: ReturnType<typeof accept>, text: string) => {
+    const identity = { sessionId: CLEM_THREAD_ID, turn: source.turn, sourceUserSeq: source.seq };
+    commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'done', resumable: false,
+      presentation: { kind: 'answer', text } });
+  };
+  const first = accept('from-clem:fixture-first', 'notif:first');
+  finish(first, 'First controlled result.');
+  const second = accept('from-clem:fixture-second', 'notif:second');
+  finish(second, 'Second controlled result.');
+  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-first', since }),
+    { state: 'done', text: 'First controlled result.', sessionId: CLEM_THREAD_ID });
+  const earlier = accept('from-clem:fixture-choice-1', 'notif:repeat', 'Accept');
+  finish(earlier, 'Earlier controlled choice.');
+  const later = accept('from-clem:fixture-choice-2', 'notif:repeat', 'Decline');
+  finish(later, 'Later controlled choice.');
+  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-choice-1', since }),
+    { state: 'done', text: 'Earlier controlled choice.', sessionId: CLEM_THREAD_ID });
+  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-never-accepted', since }), { state: 'working' });
+  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-never-accepted', since: new Date(Date.now() - 180_000).toISOString() }), { state: 'not_found' });
+});
+
+test('a From Clem start returns the same host run identity passed into dispatch', async () => {
+  const { bindFromClemRespond, startFromClemTurn, CLEM_THREAD_ID } = await import('./from-clem-runtime.js');
+  const requests: Array<Record<string, unknown>> = [];
+  bindFromClemRespond(async (request) => { requests.push(request); });
+  try {
+    const input = { title: 'Controlled fixture', message: 'Read the controlled item.', displayMessage: 'Do it' };
+    const first = startFromClemTurn(input, { ensure() {} });
+    const second = startFromClemTurn(input, { ensure() {} });
+    assert.equal(first.sessionId, CLEM_THREAD_ID);
+    assert.match(first.runId, /^from-clem:/);
+    assert.notEqual(first.runId, second.runId);
+    assert.equal(requests[0]?.runId, first.runId);
+    assert.equal(requests[1]?.runId, second.runId);
+  } finally { bindFromClemRespond(null); }
 });

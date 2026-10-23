@@ -60,7 +60,7 @@ export function DecisionFrame({ view, title, aside, children, actions, notice, o
   aside?: ReactNode;
   children?: ReactNode;
   actions?: ReactNode;
-  notice?: { tone: 'success' | 'error'; text: string } | null;
+  notice?: { tone: 'success' | 'error' | 'info'; text: string } | null;
   onBack?: () => void;
 }) {
   const { heading, body } = detailHeading(title);
@@ -94,7 +94,7 @@ export function DecisionFrame({ view, title, aside, children, actions, notice, o
           {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
           {notice && (
             <p role={notice.tone === 'error' ? 'alert' : 'status'}
-              className={cn('mt-2 text-small', notice.tone === 'error' ? 'text-danger' : 'text-success')}>
+              className={cn('mt-2 text-small', notice.tone === 'error' ? 'text-danger' : notice.tone === 'success' ? 'text-success' : 'text-muted')}>
               {notice.text}
             </p>
           )}

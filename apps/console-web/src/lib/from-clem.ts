@@ -1,4 +1,4 @@
-import type { HeartbeatPresentation } from '@clem/chat-engine';
+import { proactiveReplySettled, type HeartbeatPresentation } from '@clem/chat-engine';
 /** From Clem on Home: what the heartbeats brought the owner, as one stream
  *  (server: src/dashboard/from-clem.ts). */
 import { apiGet, apiPost } from './api';
@@ -57,7 +57,7 @@ export type FromClemReplyOutcome =
   | { outcome: 'gone' }
   | { outcome: 'changed' }
   | { outcome: 'unclear' }
-  | { outcome: 'started'; sessionId: string }
+  | { outcome: 'started'; sessionId: string; runId: string }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
   | { outcome: 'answered'; questionId: string };
 
@@ -92,6 +92,11 @@ export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: 
     default: return 'Already handled.';
   }
 }
+/** Inline feedback uses the same receipt meanings as Home. */
+export function replyOutcomeNotice(outcome: FromClemReplyOutcome, sourceName: string): { tone: 'success' | 'error' | 'info'; text: string } {
+  return { tone: outcome.outcome === 'changed' || outcome.outcome === 'gone' ? 'error'
+    : proactiveReplySettled(outcome.outcome) ? 'success' : 'info', text: replyOutcomeText(outcome, sourceName) };
+}
 export const useFromClem = (enabled = true) => usePoll(['home-from-clem'], getFromClem, 20_000, { enabled });
 
 /** What came of a "do it" given on one of Clem's items. */
@@ -100,8 +105,8 @@ export type FromClemTurnOutcome =
   | { state: 'not_found' }
   | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string };
 
-export const getFromClemOutcome = (key: string, reply: string, since: string) =>
-  apiGet<FromClemTurnOutcome>(`/api/console/home/from-clem/outcome?key=${encodeURIComponent(key)}&reply=${encodeURIComponent(reply)}&since=${encodeURIComponent(since)}`);
+export const getFromClemOutcome = (runId: string, since: string) =>
+  apiGet<FromClemTurnOutcome>(`/api/console/home/from-clem/outcome?runId=${encodeURIComponent(runId)}&since=${encodeURIComponent(since)}`);
 
 /** How an outcome reads beside the item it came from. */
 export function tapOutcomeHeadline(outcome: FromClemTurnOutcome | undefined): { tone: 'info' | 'success' | 'warning' | 'error'; text: string } {
@@ -109,7 +114,7 @@ export function tapOutcomeHeadline(outcome: FromClemTurnOutcome | undefined): { 
     case 'done': return { tone: 'success', text: 'Done' };
     case 'needs_you': return { tone: 'warning', text: 'Clem needs one more thing' };
     case 'stopped': return { tone: 'error', text: 'This didn’t finish' };
-    case 'not_found': return { tone: 'error', text: 'This didn’t start — try again, or ask Clem in chat' };
+    case 'not_found': return { tone: 'error', text: 'Couldn’t confirm this turn — check the conversation before trying again' };
     default: return { tone: 'info', text: 'Clem is working on it…' };
   }
 }

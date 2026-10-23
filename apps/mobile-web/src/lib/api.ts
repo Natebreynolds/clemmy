@@ -716,7 +716,7 @@ export async function resolveInboxTrustProposal(
 
 /** Keep (install) or turn down a check-in Clem suggested; `key` is the
  *  summary's `proposal:<id>`. */
-export async function decideCheckInProposal(key: string, decision: 'keep' | 'decline'): Promise<{ ok: boolean }> {
+export async function decideCheckInProposal(key: string, decision: 'keep' | 'decline'): Promise<{ ok: boolean; status?: string }> {
   const id = key.startsWith('proposal:') ? key.slice('proposal:'.length) : key;
   return api(`/m/api/inbox/check-in-proposals/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: '{}' });
 }
@@ -2272,7 +2272,7 @@ export interface FromClem {
 
 export type FromClemReplyOutcome =
   | { outcome: 'gone' | 'changed' | 'unclear' }
-  | { outcome: 'started'; sessionId: string }
+  | { outcome: 'started'; sessionId: string; runId: string }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
   | { outcome: 'answered'; questionId: string };
 

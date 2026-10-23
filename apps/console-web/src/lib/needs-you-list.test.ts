@@ -105,3 +105,12 @@ test('every kind of ask lands in one of four sections, the same as on the phone'
     row: { id: 'n', title: 'Pick an account', workflowCapability: { notificationId: 'n', workflow: 'w' } } as never }), 'ok',
     'a stopped workflow that needs an account picked is a choice to make');
 });
+
+
+test('a missing summary leaves summary-only decisions unqualified even when the other feeds loaded', async () => {
+  const { needsYouFeedAvailability } = await import('./needs-you-list.js');
+  const result = needsYouFeedAvailability({ approvals: false, locations: false, updates: false,
+    suggestions: false, plans: false, questions: false, summary: true });
+  assert.equal(result.unavailable, false);
+  assert.deepEqual(result.failed, ['check-in suggestions and stopped workflows']);
+});

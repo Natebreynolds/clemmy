@@ -2661,7 +2661,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         res.status(404).json({ error: 'CHECK_IN_PROPOSAL_NOT_FOUND' });
         return;
       }
-      res.json({ ok: true, decision });
+      res.json({ ok: true, decision, status: 'proposal' in result ? result.proposal.status : result.status });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

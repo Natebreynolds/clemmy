@@ -10,3 +10,15 @@ test('a late receipt cannot settle a newer version of the same item', () => {
   assert.equal(currentProactiveReceipt(receipt, 'after'), undefined);
   assert.equal(currentProactiveReceipt(receipt, 'before'), receipt);
 });
+
+
+test('a stale check-in decline reports the persisted disposition, never the clicked intention', async () => {
+  const { checkInProposalDecisionFeedback } = await import('./proactive-reply.js');
+  const stale = checkInProposalDecisionFeedback('decline', 'approved', 'Controlled fixture');
+  assert.equal(stale.tone, 'error');
+  assert.match(stale.text, /already approved/);
+  assert.doesNotMatch(stale.text, /turned down|won.t set up/i);
+  assert.equal(checkInProposalDecisionFeedback('decline', 'rejected', 'Controlled fixture').tone, 'success');
+  assert.equal(checkInProposalDecisionFeedback('keep', 'approved', 'Controlled fixture').tone, 'success');
+  assert.equal(checkInProposalDecisionFeedback('decline', undefined, 'Controlled fixture').tone, 'error');
+});

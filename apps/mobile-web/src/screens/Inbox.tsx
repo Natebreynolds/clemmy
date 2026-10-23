@@ -53,7 +53,7 @@ import {
 import { listProjectLabels } from '../lib/project-api';
 import { useScreenData } from '../lib/use-screen-data';
 import { buildNeedsRows, NEEDS_SECTIONS, type NeedsRow, type NeedsRowKind } from '../lib/needs-you-rows';
-import { decisionHeading, isIdentifierLike } from '@clem/chat-engine';
+import { decisionHeading, isIdentifierLike, checkInProposalDecisionFeedback } from '@clem/chat-engine';
 
 type InboxTab = 'needs' | 'updates';
 
@@ -958,16 +958,15 @@ function CheckInProposalActions({ itemKey, title, onResolved }: {
     if (busy) return;
     setBusy(decision);
     try {
-      await decideCheckInProposal(itemKey, decision);
-      haptic('success');
-      onResolved(decision === 'keep'
-        ? `Kept — “${title}” is set up and will run on its schedule.`
-        : `Turned down — Clem won't set up “${title}”.`);
+      const result = await decideCheckInProposal(itemKey, decision);
+      const feedback = checkInProposalDecisionFeedback(decision, result.status, title);
+      haptic(feedback.tone);
+      onResolved(feedback.text, feedback.tone);
     } catch (err) {
       haptic('error');
       onResolved((err as { status?: number }).status === 404
         ? 'That suggestion was already decided, so nothing changed.'
-        : err instanceof Error ? err.message : 'I could not record that. Nothing changed.', 'error');
+        : err instanceof Error ? err.message : 'Couldn’t confirm that decision. Check the suggestion before trying again.', 'error');
     } finally {
       setBusy(null);
     }

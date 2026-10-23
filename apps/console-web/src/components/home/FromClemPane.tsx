@@ -122,7 +122,7 @@ export function FromClemPane({
     return act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
       const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
       if (outcome.outcome === 'started') {
-        setTaps((all) => [{ key: row.key, title: row.say ?? row.text, reply: text, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+        setTaps((all) => [{ key: row.key, runId: outcome.runId, title: row.say ?? row.text, reply: text, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
         return { settled: true, text: 'Clem is on it — see Just now.' };
       }
       return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, fromClemSourceName(row)) };

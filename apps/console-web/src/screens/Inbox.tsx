@@ -1,4 +1,4 @@
-import { APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import { APPROVAL_ANSWER_WORDS, checkInProposalDecisionFeedback } from '@clem/chat-engine';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -14,13 +14,13 @@ import { usePoll } from '@/lib/poll';
 import { ProjectLabelTag } from '@/components/projects/ProjectLabelTag';
 import { useProjectLabels, type SessionProjectLabel } from '@/lib/project-labels';
 import { applyTidy, describeTidy } from '@/lib/tidy';
-import { replyFromClem, useFromClem, type FromClemRow } from '@/lib/from-clem';
+import { replyFromClem, replyOutcomeNotice, useFromClem, type FromClemRow } from '@/lib/from-clem';
 import { TapOutcomes, type RecentTap } from '@/components/home/TapOutcome';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
 import { useMediaQuery } from '@/lib/use-media-query';
-import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, type NeedsYouItem, type NeedsYouRowView, NEEDS_YOU_SECTIONS } from '@/lib/needs-you-list';
+import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, needsYouFeedAvailability, type NeedsYouItem, type NeedsYouRowView, NEEDS_YOU_SECTIONS } from '@/lib/needs-you-list';
 import { DecisionFrame, DecisionRow, Disclosure } from '@/components/inbox/DecisionList';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
@@ -46,7 +46,7 @@ function needsAttentionNotif(n: NotificationRow): boolean {
 }
 
 type Tab = 'needs' | 'notifications';
-type DecisionNotice = { tone: 'success' | 'error'; text: string };
+type DecisionNotice = { tone: 'success' | 'error' | 'info'; text: string };
 type RowDecisionState = {
   busy: boolean;
   intent?: 'approve' | 'reject';
@@ -111,14 +111,12 @@ export function Inbox() {
     try {
       const outcome = await replyFromClem(row.key, choice, row.voiceDigest, undefined, index);
       if (outcome.outcome === 'started') {
-        setTaps((all) => [{ key: row.key, title: row.say ?? row.text, reply: choice, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+        setTaps((all) => [{ key: row.key, runId: outcome.runId, title: row.say ?? row.text, reply: choice, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
       } else {
-        setDecisionNotice({ tone: outcome.outcome === 'changed' || outcome.outcome === 'gone' ? 'error' : 'success',
-          text: outcome.outcome === 'changed' ? 'This changed while you were looking. Have another look.'
-            : outcome.outcome === 'gone' ? 'This was already handled.' : 'Done.' });
+        setDecisionNotice(replyOutcomeNotice(outcome, row.heartbeatTitle));
       }
     } catch (error) {
-      setDecisionNotice({ tone: 'error', text: actionError(error, 'That didn’t reach Clem. Nothing changed; try again.') });
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Couldn’t confirm whether that reached Clem. Check the item or conversation before trying again.') });
     } finally {
       setClemBusy(null);
       invalidate('notifications', 'home-from-clem', 'command-center');
@@ -229,18 +227,13 @@ export function Inbox() {
   // One feed that cannot answer hides only its own items; what did load
   // still shows, with a plain note of what could not be checked. Only when
   // nothing could be checked is the whole list unavailable.
-  const needsFeeds = [
-    { label: 'approvals', failed: approvals.isError },
-    { label: 'record locations', failed: workspaceChoosers.isError },
-    { label: 'updates', failed: notifications.isError },
-    { label: 'suggestions', failed: trustProposals.isError },
-    { label: 'plans', failed: planProposals.isError },
-    { label: 'questions', failed: questions.isError },
-  ];
-  const failedNeedsFeeds = needsFeeds.filter((feed) => feed.failed).map((feed) => feed.label);
-  const queryUnavailable = tab === 'needs'
-    ? failedNeedsFeeds.length === needsFeeds.length
-    : notifications.isError;
+  const availability = needsYouFeedAvailability({
+    approvals: approvals.isError, locations: workspaceChoosers.isError, updates: notifications.isError,
+    suggestions: trustProposals.isError, plans: planProposals.isError, questions: questions.isError,
+    summary: needsSummary.isError,
+  });
+  const failedNeedsFeeds = availability.failed;
+  const queryUnavailable = tab === 'needs' ? availability.unavailable : notifications.isError;
   const partiallyUnavailable = tab === 'needs' && !queryUnavailable && failedNeedsFeeds.length > 0;
   // Gate the reading pane on the SAME denominator the list renders from.
   // `needsCount` excludes stale approvals; `anyDecisionRows` does not — so with
@@ -392,12 +385,10 @@ export function Inbox() {
     setProposalBusy(key);
     setDecisionNotice(null);
     try {
-      await decideCheckInProposal(key, decision);
-      setDecisionNotice({ tone: 'success', text: decision === 'keep'
-        ? `Kept — “${title}” is set up and will run on its schedule.`
-        : `Turned down — Clem won't set up “${title}”.` });
+      const result = await decideCheckInProposal(key, decision);
+      setDecisionNotice(checkInProposalDecisionFeedback(decision, result.proposal?.status, title));
     } catch (error) {
-      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not record that. Nothing changed.') });
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Couldn’t confirm that decision. Check the suggestion before trying again.') });
     } finally {
       setProposalBusy(null);
       invalidate('command-center');
@@ -657,7 +648,8 @@ export function Inbox() {
             'mb-4 rounded-md border px-3.5 py-2.5 text-small',
             decisionNotice.tone === 'error'
               ? 'border-danger/35 bg-danger-tint text-danger'
-              : 'border-success/35 bg-success-tint text-success',
+              : decisionNotice.tone === 'success' ? 'border-success/35 bg-success-tint text-success'
+                : 'border-border bg-subtle text-fg',
           )}
         >
           {decisionNotice.text}

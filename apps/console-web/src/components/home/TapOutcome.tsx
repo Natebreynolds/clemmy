@@ -8,8 +8,9 @@ import { PaneCard, PaneRow } from './HomeSection';
 
 /** One "do it" the owner just gave on an item outside a chat. */
 export interface RecentTap {
-  /** The item's key, which the tap is found by. */
+  /** The item as displayed; outcome authority is the exact dispatch ID. */
   key: string;
+  runId: string;
   /** The item, as it read. */
   title: string;
   /** What the owner tapped or typed. */
@@ -31,8 +32,8 @@ const toneClass = {
 
 function TapOutcomeRow({ tap, onDismiss }: { tap: RecentTap; onDismiss: () => void }) {
   const outcome = useQuery({
-    queryKey: ['from-clem-outcome', tap.key, tap.since],
-    queryFn: () => getFromClemOutcome(tap.key, tap.reply, tap.since),
+    queryKey: ['from-clem-outcome', tap.runId],
+    queryFn: () => getFromClemOutcome(tap.runId, tap.since),
     refetchInterval: (query) => (query.state.data && SETTLED.has(query.state.data.state) ? false : POLL_MS),
   });
   const data = outcome.data;
@@ -70,7 +71,7 @@ export function TapOutcomes({ taps, onDismiss }: { taps: readonly RecentTap[]; o
     <div className="flex flex-col gap-1.5">
       <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">Just now</h3>
       <PaneCard>
-        {taps.map((tap) => <TapOutcomeRow key={`${tap.key}@${tap.since}`} tap={tap} onDismiss={() => onDismiss(tap)} />)}
+        {taps.map((tap) => <TapOutcomeRow key={tap.runId} tap={tap} onDismiss={() => onDismiss(tap)} />)}
       </PaneCard>
     </div>
   );

@@ -14911,13 +14911,12 @@ export function registerConsoleRoutes(
   // the owner tapped it instead of only "Started a conversation."
   app.get('/api/console/home/from-clem/outcome', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const key = typeof req.query.key === 'string' ? req.query.key : '';
-    const reply = typeof req.query.reply === 'string' ? req.query.reply : '';
+    const runId = typeof req.query.runId === 'string' ? req.query.runId : '';
     const since = typeof req.query.since === 'string' ? req.query.since : '';
-    if (!key || !since) { res.status(400).json({ error: 'key and since are required' }); return; }
+    if (!/^from-clem:[A-Za-z0-9-]{1,80}$/.test(runId) || !since) { res.status(400).json({ error: 'runId and since are required' }); return; }
     try {
       const { fromClemTurnOutcome } = await import('./from-clem-runtime.js');
-      res.json(fromClemTurnOutcome({ key, reply, since }));
+      res.json(fromClemTurnOutcome({ runId, since }));
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

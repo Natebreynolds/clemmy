@@ -496,7 +496,7 @@ export const getNeedsYouSummary = () => apiGet<NeedsYouSummary>('/api/console/ne
  *  `proposal:<id>`). Keeping it installs the check-in. */
 export const decideCheckInProposal = (key: string, decision: 'keep' | 'decline') => {
   const id = key.startsWith('proposal:') ? key.slice('proposal:'.length) : key;
-  return apiPost(`/api/console/check-in-proposals/${encodeURIComponent(id)}/${decision === 'keep' ? 'approve' : 'reject'}`,
+  return apiPost<{ proposal?: { status?: string } }>(`/api/console/check-in-proposals/${encodeURIComponent(id)}/${decision === 'keep' ? 'approve' : 'reject'}`,
     decision === 'keep' ? {} : { reason: 'Declined from Needs you.' });
 };
 
