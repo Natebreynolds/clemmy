@@ -16,7 +16,7 @@ import { resetHarnessRuntimeConfig } from '../runtime/harness/codex-client.js';
 import { brainOptions, effectiveBrainValue } from '../runtime/harness/model-role-options.js';
 import { pinSessionBrain, resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
-import { captureByoRoutingSnapshot, resolveDeclaredByoProviderForModelFromSnapshot } from '../runtime/harness/byo-providers.js';
+import { captureByoRoutingSnapshot, resolveDeclaredByoProviderForModelFromSnapshot, type ByoRoutingProviderSnapshot, type ByoRoutingSnapshot } from '../runtime/harness/byo-providers.js';
 import { removeEnvKey, updateEnvKey } from '../tools/shared.js';
 
 export type ActiveBrainClass = 'codex_oauth' | 'claude_oauth' | 'api_key';
@@ -33,6 +33,30 @@ export function activeBrainClass(raw: unknown): ActiveBrainClass | null {
 export function activeBrainClassForModel(modelId: string): ActiveBrainClass | null {
   const option = brainOptions().find((o) => o.available && o.modelId === modelId);
   return option ? option.id : null;
+}
+
+/**
+ * Why an API model cannot become the brain, in the owner's words: the model,
+ * the account it belongs to, and what is missing. A refused switch leaves the
+ * picker on the current model, so this sentence is the only account of why.
+ */
+export function apiBrainRefusal(modelId: string, snapshot: ByoRoutingSnapshot): string {
+  if (!modelId) return 'No API model is set up yet. Add an API account under Settings → Models first.';
+  const accountName = (row: ByoRoutingProviderSnapshot) => row.provider.label || (row.provider.id === 'default' ? 'Your API account' : row.provider.id);
+  const owners = snapshot.ownersForModel(modelId);
+  if (owners.length === 0) {
+    return `${modelId} isn't on any of your API accounts, so Clem stayed on her current model. Add it to an account under Settings → Models first.`;
+  }
+  const configured = snapshot.configuredOwnersForModel(modelId);
+  if (configured.length > 1) {
+    return `${modelId} is listed on more than one API account (${configured.map(accountName).join(' and ')}), so Clem can't tell which one to use. Keep it on one account under Settings → Models.`;
+  }
+  if (configured.length === 0) {
+    const row = owners[0]!;
+    const missing = row.backend.baseURL ? 'API key' : 'web address';
+    return `${accountName(row)} has no ${missing} saved, so ${modelId} can't be used yet and Clem stayed on her current model. Add it under Settings → Models.`;
+  }
+  return `${modelId} on ${accountName(configured[0]!)} can't do the work right now, so Clem stayed on her current model. Check that account under Settings → Models.`;
 }
 
 export async function switchActiveBrain(input: {
@@ -68,7 +92,7 @@ export async function switchActiveBrain(input: {
       const options = brainOptions().filter(o => o.id === 'api_key' && o.modelId === selectedId);
       if (options.length !== 1 || options[0]!.available !== true) {
         return { ok: false, status: brainModelId ? 400 : 409, body: {
-          error: 'Choose a connected API model under Settings → Models first.', needsLogin: true,
+          error: apiBrainRefusal(selectedId, captureByoRoutingSnapshot()), needsLogin: true,
         } };
       }
       // Ownership is judged as routing will stand after the switch (all-in).
@@ -78,7 +102,7 @@ export async function switchActiveBrain(input: {
       const snapshot = captureByoRoutingSnapshot();
       const owner = resolveDeclaredByoProviderForModelFromSnapshot(selectedId, { ...snapshot, mode: 'all_in' });
       if (!owner?.configured) return { ok: false, status: 409, body: {
-        error: 'The selected API model is no longer connected. Reconnect it before switching.', needsLogin: true,
+        error: apiBrainRefusal(selectedId, snapshot), needsLogin: true,
       } };
       // A brain that only the worker slot ties to the default account keeps
       // that slot, or the switch would leave its own brain unowned.
@@ -105,7 +129,7 @@ export async function switchActiveBrain(input: {
       if (brainModelId) {
         const eligible = brainOptions().filter(o => o.id === 'claude_oauth' && o.modelId === brainModelId);
         if (eligible.length !== 1 || eligible[0]!.available !== true) {
-          return { ok: false, status: 400, body: { error: `Model "${brainModelId}" is not a connected Claude model.` } };
+          return { ok: false, status: 400, body: { error: `${brainModelId} isn't offered on your Claude sign-in right now, so Clem stayed on her current model. Choose another Claude model.` } };
         }
       }
     }

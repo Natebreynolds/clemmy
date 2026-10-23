@@ -367,7 +367,31 @@ test('a missing or multiply-owned API pick cannot change the current route or bo
         const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId });
         assert.equal(selected.response.status, 400);
         assert.deepEqual({ auth: process.env.AUTH_MODE, mode: process.env.MODEL_ROUTING_MODE, pin: process.env.BYO_BRAIN_MODEL_ID }, before);
+        // The refusal is the only account of why the picker stayed put: it
+        // names the model and what stands in the way.
+        assert.match(String(selected.body.error), new RegExp(modelId));
       }
+      const shared = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'shared-controlled-model' });
+      assert.match(String(shared.body.error), /Controlled A and Controlled B/);
+      const missing = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'unconnected-controlled-model' });
+      assert.match(String(missing.body.error), /isn't on any of your API accounts/);
+    } finally { await harness.close(); }
+  });
+});
+
+test('a pick from an account with no key saved says which account and what is missing', async () => {
+  await withPrimaryRouteFixture({
+    BYO_PROVIDERS: JSON.stringify([
+      { id: 'keyless', label: 'Controlled Keyless', baseURL: 'https://keyless.example.test/v1', modelIds: ['keyless-controlled-model'] },
+    ]),
+  }, async () => {
+    const harness = await boot();
+    const before = { auth: process.env.AUTH_MODE, mode: process.env.MODEL_ROUTING_MODE, pin: process.env.BYO_BRAIN_MODEL_ID };
+    try {
+      const selected = await patchActiveBrain(harness.url, { brain: 'api_key', modelId: 'keyless-controlled-model' });
+      assert.equal(selected.response.status, 400);
+      assert.match(String(selected.body.error), /Controlled Keyless has no API key saved, so keyless-controlled-model can't be used yet/);
+      assert.deepEqual({ auth: process.env.AUTH_MODE, mode: process.env.MODEL_ROUTING_MODE, pin: process.env.BYO_BRAIN_MODEL_ID }, before);
     } finally { await harness.close(); }
   });
 });
