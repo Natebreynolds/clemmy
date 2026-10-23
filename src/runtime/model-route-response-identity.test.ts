@@ -96,6 +96,8 @@ for (const callPath of paths) {
     const recorded = outcome(String(event.data.modelCallId));
     assert.equal(recorded.status, 'success');
     assert.equal(recorded.metadata.providerResponseIdDigest, hash(id));
+    assert.equal(Object.hasOwn(recorded.metadata, 'responseIdScope'), false, 'undeclared historical identity scope stays unknown');
+    assert.equal(Object.hasOwn(recorded.metadata, 'usageScope'), false, 'undeclared historical usage scope stays unknown');
     assert.deepEqual([recorded.input_tokens, recorded.output_tokens, recorded.total_tokens], [12, 5, 17]);
     assert.ok(!JSON.stringify(event.data).includes(id));
     assert.ok(!recorded.metadata_json.includes(id));
@@ -176,6 +178,7 @@ test('stream: early return before completion cannot infer identity from a start 
 test('stream: cancellation after an observed completion retains its digest in the outcome without adding a success event', async () => {
   const active = scope();
   const completion = response('observed-before-close', 'getStreamedResponse');
+  Object.assign(completion.providerData!, { responseIdScope: 'local_invocation', usageScope: 'cli_result_aggregate' });
   const done = { type: 'response_done', response: completion } as unknown as StreamEvent;
   await harnessRunContextStorage.run(active as never, async () => {
     const iterator = instrument(body(completion, done)).getStreamedResponse(request)[Symbol.asyncIterator]();
@@ -186,16 +189,22 @@ test('stream: cancellation after an observed completion retains its digest in th
   const recorded = latestOutcome(active);
   assert.equal(recorded.status, 'cancelled');
   assert.equal(recorded.metadata.providerResponseIdDigest, hash('observed-before-close'));
+  assert.equal(recorded.metadata.responseIdScope, 'local_invocation');
+  assert.equal(recorded.metadata.usageScope, 'cli_result_aggregate');
   assert.equal(recorded.total_tokens, 17);
 });
 
 test('stream: a later completion with no ID cannot inherit an earlier response identity', async () => {
   const active = scope();
   const model = instrument({ ...body(response(undefined, 'getResponse')), async *getStreamedResponse() {
-    yield { type: 'response_done', response: response('earlier-id', 'getStreamedResponse') } as never;
+    const earlier = response('earlier-id', 'getStreamedResponse');
+    Object.assign(earlier.providerData!, { responseIdScope: 'local_invocation', usageScope: 'cli_result_aggregate' });
+    yield { type: 'response_done', response: earlier } as never;
     yield { type: 'response_done', response: response(undefined, 'getStreamedResponse') } as never;
   } });
   await call(model, 'getStreamedResponse', active);
   assert.equal(completed(active).length, 1);
   assert.equal(Object.hasOwn(completed(active)[0]!.data, 'providerResponseIdDigest'), false);
+  assert.equal(Object.hasOwn(latestOutcome(active).metadata, 'responseIdScope'), false);
+  assert.equal(Object.hasOwn(latestOutcome(active).metadata, 'usageScope'), false);
 });

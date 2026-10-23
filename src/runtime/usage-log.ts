@@ -64,6 +64,9 @@ export interface UsageEvent {
   /** Model explicitly named by the provider response. Absent when unreported;
    *  unlike legacy `model`, this field never falls back to the request. */
   providerReportedModel?: string;
+  /** Model of an observed assistant message inside an adapter result. This
+   * does not qualify the provider model of an aggregate usage summary. */
+  observedMessageModel?: string;
   /** Explicit request role (brain/worker/reviewer/router/writer/memory) and
    *  how it was set (`explicit` call, attribution `scope`, `channel`
    *  convention, or `unset`). Rollups group by this, never by model name or
@@ -119,6 +122,12 @@ export interface UsageEvent {
   providerApiDurationMs?: number;
   /** Optional response ID for cross-reference with provider logs. */
   responseId?: string;
+  /** Adapter-declared identity scope. A local invocation can join its usage
+   * summary but does not identify a physical provider request. Absent = unknown. */
+  responseIdScope?: 'provider_message' | 'local_invocation';
+  /** CLI result usage can aggregate hidden requests; never count this row as
+   * their physical inventory. Absent = unknown, including historical rows. */
+  usageScope?: 'assistant_message' | 'cli_result_aggregate';
   /** Approx token share of the assembled prompt by component (instructions =
    *  rubric+context, tools = tool schemas, history = input items). Answers
    *  "where do my tokens go each turn?". Estimated from wire bytes (≈chars/4)
@@ -791,6 +800,7 @@ export function recordModelUsage(args: {
   requestModel?: string;
   backendId?: string;
   providerReportedModel?: string;
+  observedMessageModel?: string;
   /** Declared by the adapter that owns the wire format. Absent = 'unknown'
    *  (legacy): visible, uncertifiable, conservatively debited. */
   cacheDialect?: CacheDialectProvenance;
@@ -812,6 +822,8 @@ export function recordModelUsage(args: {
   reasoningEffort?: string;
   providerApiDurationMs?: number;
   responseId?: string;
+  responseIdScope?: UsageEvent['responseIdScope'];
+  usageScope?: UsageEvent['usageScope'];
   /** Measurements of THIS request's prompt, computed by the caller. */
   promptComponents?: Record<string, number>;
   /** The enclosing frame's per-request measurements (the harness context an
@@ -917,6 +929,7 @@ export function recordModelUsage(args: {
     ...(usageModelIdentity(args.requestModel) ? { requestModel: args.requestModel } : {}),
     ...(usageBackendIdentity(args.backendId) ? { backendId: args.backendId } : {}),
     ...(usageModelIdentity(args.providerReportedModel) ? { providerReportedModel: args.providerReportedModel } : {}),
+    ...(usageModelIdentity(args.observedMessageModel) ? { observedMessageModel: args.observedMessageModel } : {}),
     cacheDialect: args.cacheDialect ?? 'unknown' as const,
     // Sealed at persistence: an unsealable (content-shaped) envelope is
     // dropped, never appended raw.
@@ -948,6 +961,10 @@ export function recordModelUsage(args: {
     ...(args.account ? { account: args.account } : {}),
     providerApiDurationMs: args.providerApiDurationMs,
     responseId: args.responseId,
+    ...((args.responseIdScope === 'provider_message' || args.responseIdScope === 'local_invocation')
+      ? { responseIdScope: args.responseIdScope } : {}),
+    ...((args.usageScope === 'assistant_message' || args.usageScope === 'cli_result_aggregate')
+      ? { usageScope: args.usageScope } : {}),
     promptComponents: reconcilePromptComponents(
       attribution?.promptComponents
         ?? (standaloneMode ? undefined : args.promptComponents)
@@ -1014,6 +1031,9 @@ export function recordModelUsage(args: {
       roleReason,
       usageKind: event.kind,
       model: event.model,
+      requestModel: event.requestModel,
+      providerReportedModel: event.providerReportedModel,
+      observedMessageModel: event.observedMessageModel,
       inputTokens: event.inputTokens,
       cachedInputTokens: event.cachedInputTokens,
       cacheCreationInputTokens: event.cacheCreationInputTokens,
@@ -1025,6 +1045,8 @@ export function recordModelUsage(args: {
       reasoningEffort: event.reasoningEffort,
       providerApiDurationMs: event.providerApiDurationMs,
       responseId: event.responseId,
+      responseIdScope: event.responseIdScope,
+      usageScope: event.usageScope,
       runId: event.runId,
       stepId: event.stepId,
       itemKey: event.itemKey,

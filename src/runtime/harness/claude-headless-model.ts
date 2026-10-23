@@ -356,8 +356,15 @@ type ClaudeUsageShape = {
 interface HeadlessRunState {
   responseId: string;
   requestId?: string;
+  usageMessageId?: string;
+  usageScope?: 'assistant_message' | 'cli_result_aggregate';
   sessionId?: string;
   model?: string;
+  reportedModels: Set<string>;
+  modelMetadataUnqualified: boolean;
+  requestModel: string;
+  startedAt: number;
+  reasoningEffort?: string;
   text: string;
   emittedText: string;
   usage?: ClaudeUsageShape;
@@ -379,12 +386,26 @@ function textFromClaudeContent(content: unknown): string {
 }
 
 function deltaFromAssistantMessage(state: HeadlessRunState, evt: ClaudeHeadlessEvent): string {
+  // A metadata-only assistant event still supplies identity and usage. Keep
+  // these attached to THIS message, never a preceding message with text.
+  state.requestId = typeof evt.message?.id === 'string' && evt.message.id.trim()
+    ? evt.message.id : undefined;
+  const model = evt.message?.model;
+  if (typeof model === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(model) && !model.includes('://')) {
+    state.model = model;
+    state.reportedModels.add(model);
+  } else {
+    state.model = undefined;
+    state.modelMetadataUnqualified = true;
+  }
+  if (evt.message?.usage) {
+    state.usage = evt.message.usage;
+    state.usageMessageId = state.requestId;
+    state.usageScope = 'assistant_message';
+  }
   const text = textFromClaudeContent(evt.message?.content);
   if (!text) return '';
   state.text = text;
-  if (evt.message?.usage) state.usage = evt.message.usage;
-  if (evt.message?.model) state.model = evt.message.model;
-  if (evt.message?.id) state.requestId = evt.message.id;
   if (text.startsWith(state.emittedText)) {
     const delta = text.slice(state.emittedText.length);
     state.emittedText = text;
@@ -397,8 +418,32 @@ function deltaFromAssistantMessage(state: HeadlessRunState, evt: ClaudeHeadlessE
 function applyResultEvent(state: HeadlessRunState, evt: ClaudeHeadlessEvent): void {
   state.resultEvent = evt;
   if (typeof evt.result === 'string') state.text = evt.result;
-  if (evt.usage) state.usage = evt.usage;
+  if (evt.usage) {
+    state.usage = evt.usage;
+    state.usageScope = 'cli_result_aggregate';
+    state.usageMessageId = undefined;
+  }
   if (typeof evt.session_id === 'string') state.sessionId = evt.session_id;
+}
+
+function headlessResponseIdentity(state: HeadlessRunState): {
+  responseId: string; responseIdScope: 'provider_message' | 'local_invocation';
+} {
+  // CLI result usage may span hidden requests. It cannot borrow the final
+  // message's identity or turn the CLI session into a physical-call receipt.
+  if (state.usageScope === 'assistant_message' && state.usageMessageId
+    && state.usageMessageId === state.requestId) {
+    return { responseId: state.usageMessageId, responseIdScope: 'provider_message' };
+  }
+  return { responseId: state.responseId, responseIdScope: 'local_invocation' };
+}
+
+function headlessReportedModel(state: HeadlessRunState): string | undefined {
+  // Visible assistant metadata cannot certify the hidden requests represented
+  // by a CLI aggregate. Preserve the observed message model separately; it
+  // must not clear the aggregate's canonical provider-identity gap.
+  if (state.usageScope === 'cli_result_aggregate') return undefined;
+  return !state.modelMetadataUnqualified && state.reportedModels.size === 1 ? state.model : undefined;
 }
 
 function usageFromClaude(u: ClaudeUsageShape | undefined): Usage {
@@ -472,13 +517,20 @@ function recordClaudeHeadlessUsage(state: HeadlessRunState): void {
       sourceUserSeq: harnessContext?.sourceUserSeq,
       attemptId: harnessContext?.runAttemptId,
       model: state.model || 'claude-headless',
+      requestModel: state.requestModel,
+      providerReportedModel: headlessReportedModel(state),
+      observedMessageModel: state.model,
       // inputTokens above pre-folds cache_read/cache_creation: inclusive.
       cacheDialect: 'inclusive',
       inputTokens,
       cachedInputTokens: n(u.cache_read_input_tokens),
+      cacheCreationInputTokens: n(u.cache_creation_input_tokens),
       outputTokens,
       totalTokens: inputTokens + outputTokens,
-      responseId: state.requestId || state.responseId,
+      ...headlessResponseIdentity(state),
+      usageScope: state.usageScope,
+      durationMs: Math.max(0, Date.now() - state.startedAt),
+      reasoningEffort: state.reasoningEffort,
       framePromptComponents: harnessContext?.promptComponents,
     });
   } catch { /* observability must never break the response path */ }
@@ -547,18 +599,27 @@ function modelResponseFromState(state: HeadlessRunState, outputType: ModelReques
   recordClaudeHeadlessUsage(state);
   const errored = headlessResultIsError(state.resultEvent);
   const termination = canonicalTerminationFromResult(state.resultEvent);
+  const identity = headlessResponseIdentity(state);
+  const reportedModel = headlessReportedModel(state);
   return {
     // An errored run's partial text is never presented as a completed
     // assistant message. It stays available privately in `rawEvents` for
     // diagnostics; it does not become an answer or future model context.
     output: text && !errored ? [assistantMessage(text)] : [],
     usage: usageFromClaude(state.usage),
-    responseId: state.sessionId || state.requestId || state.responseId,
+    responseId: identity.responseId,
     requestId: state.requestId,
     providerData: {
       transport: 'claude_code_headless',
       sessionId: state.sessionId,
-      model: state.model,
+      providerMessageId: state.requestId,
+      observedMessageModel: state.model,
+      responseIdScope: identity.responseIdScope,
+      usageScope: state.usageScope,
+      requestModel: state.requestModel,
+      model: reportedModel,
+      providerReportedModel: reportedModel,
+      ...(reportedModel ? {} : { providerReportedModelUnqualified: true }),
       rawEvents: state.rawEvents,
       // Raw subtype preserved for private diagnostics, alongside the canonical
       // projection the admission boundary actually reads.
@@ -668,6 +729,11 @@ async function* runClaudeHeadlessAttempt(
   assertConversationProtocolAtProviderBoundary(request.input, 'claude.headless');
   const state: HeadlessRunState = {
     responseId: `claude-headless-${randomUUID()}`,
+    requestModel: args[args.indexOf('--model') + 1],
+    startedAt: Date.now(),
+    ...(args.includes('--effort') ? { reasoningEffort: args[args.indexOf('--effort') + 1] } : {}),
+    reportedModels: new Set(),
+    modelMetadataUnqualified: false,
     text: '',
     emittedText: '',
     rawEvents: 0,

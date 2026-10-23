@@ -849,6 +849,22 @@ function completedProviderResponseIdDigest(response: unknown, field: 'responseId
   } catch { return undefined; /* missing identity never changes model behavior */ }
 }
 
+/** Preserve an adapter's explicit scope alongside the identity bridge. A
+ * matching local invocation digest proves attribution, not a physical call.
+ * Historical adapters without these declarations stay unknown. */
+function completedResponseAccountingScope(response: unknown): Record<string, string> {
+  const metadata = inertAuthorField(response, 'providerData');
+  const responseIdScope = inertAuthorField(metadata, 'responseIdScope');
+  const usageScope = inertAuthorField(metadata, 'usageScope');
+  const observedMessageModel = inertAuthorField(metadata, 'observedMessageModel');
+  return {
+    ...((responseIdScope === 'provider_message' || responseIdScope === 'local_invocation') ? { responseIdScope } : {}),
+    ...((usageScope === 'assistant_message' || usageScope === 'cli_result_aggregate') ? { usageScope } : {}),
+    ...(typeof observedMessageModel === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(observedMessageModel)
+      && !observedMessageModel.includes('://') ? { observedMessageModel } : {}),
+  };
+}
+
 class ModelRouteMetricsModel implements Model {
   constructor(
     private readonly inner: Model,
@@ -874,6 +890,7 @@ class ModelRouteMetricsModel implements Model {
       const resolution = fallbackRouteResolution(response);
       const providerResponseIdDigest = completedProviderResponseIdDigest(response, 'responseId');
       const outcome = successfulRouteOutcome(resolution, { path: 'getResponse', responseCompleted: true,
+        ...completedResponseAccountingScope(response),
         ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       const servedModel = providerReportedModel(response);
       if (servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
@@ -911,6 +928,7 @@ class ModelRouteMetricsModel implements Model {
     let completed = false;
     let responseCompleted = false;
     let providerResponseIdDigest: string | undefined;
+    let accountingScope: Record<string, string> = {};
     let servedModel: string | undefined;
     let failed = false;
     let resolution: FallbackRouteResolution | undefined;
@@ -947,12 +965,14 @@ class ModelRouteMetricsModel implements Model {
           responseCompleted = true;
           providerResponseIdDigest = event.type === 'response_done'
             ? completedProviderResponseIdDigest(event.response, 'id') : undefined;
+          accountingScope = event.type === 'response_done' ? completedResponseAccountingScope(event.response) : {};
         }
         resolution = fallbackRouteResolution(event) ?? resolution;
         yield event;
       }
       completed = true;
       const outcome = successfulRouteOutcome(resolution, { path: 'getStreamedResponse', responseCompleted,
+        ...accountingScope,
         ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       if (responseCompleted && servedModel) Object.assign(outcome.metadata, { actualModel: servedModel, providerReportedModel: servedModel });
       this.finishCall(
@@ -971,6 +991,7 @@ class ModelRouteMetricsModel implements Model {
       failed = true;
       this.finishCall(decisionId, 'failed', startedAt, usage, {
         path: 'getStreamedResponse',
+        ...accountingScope,
         ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}),
       }, errorClass(err));
       throw err;
@@ -983,6 +1004,7 @@ class ModelRouteMetricsModel implements Model {
       }
       if (!completed && !failed) {
         this.finishCall(decisionId, 'cancelled', startedAt, usage, { path: 'getStreamedResponse',
+          ...accountingScope,
           ...(providerResponseIdDigest ? { providerResponseIdDigest } : {}) });
       }
     }
@@ -1080,6 +1102,9 @@ class ModelRouteMetricsModel implements Model {
         appendEvent({ sessionId: active.sessionId, turn: active.turn ?? 0, role: 'system', type: 'worker_model_response_completed', data: {
           sourceUserSeq: active.sourceUserSeq, runAttemptId: active.runAttemptId, modelCallId: decisionId,
           ...(typeof metadata.providerResponseIdDigest === 'string' ? { providerResponseIdDigest: metadata.providerResponseIdDigest } : {}),
+          ...(typeof metadata.responseIdScope === 'string' ? { responseIdScope: metadata.responseIdScope } : {}),
+          ...(typeof metadata.usageScope === 'string' ? { usageScope: metadata.usageScope } : {}),
+          ...(typeof metadata.observedMessageModel === 'string' ? { observedMessageModel: metadata.observedMessageModel } : {}),
           model: typeof metadata.actualModel === 'string' ? metadata.actualModel : this.context.resolvedModel,
           requestedModel: this.context.resolvedModel,
           ...(typeof metadata.providerReportedModel === 'string' ? { providerReportedModel: metadata.providerReportedModel } : {}),

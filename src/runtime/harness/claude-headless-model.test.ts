@@ -312,7 +312,8 @@ test('ClaudeHeadlessModel streams deltas and emits a conformant done event', asy
   assert.equal(events[1].delta, 'Hello');
   assert.equal(events[2].delta, ' world');
   const done = events[3];
-  assert.equal(done.response.id, 'session-1');
+  assert.equal(done.response.id, 'msg-1');
+  assert.equal(done.response.providerData.sessionId, 'session-1');
   assert.equal(done.response.output[0].content[0].text, 'Hello world');
   assert.equal(done.response.usage.inputTokens, 5);
   assert.equal(done.response.usage.outputTokens, 2);
@@ -369,7 +370,8 @@ test('ClaudeHeadlessModel.getResponse returns assistant output and usage', async
     tracing: false,
   } as any);
 
-  assert.equal(response.responseId, 'session-2');
+  assert.match(response.responseId!, /^claude-headless-/);
+  assert.equal((response.providerData as Record<string, unknown>).sessionId, 'session-2');
   assert.equal((response.output[0] as any).content[0].text, 'Final only');
   assert.equal(response.usage.inputTokens, 7);
   assert.equal(response.usage.outputTokens, 3);
