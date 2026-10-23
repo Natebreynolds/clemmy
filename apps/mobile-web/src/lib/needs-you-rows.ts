@@ -32,7 +32,18 @@ export interface NeedsRow {
   label: string;
   /** Only a real problem (a stopped workflow) reads as urgent. */
   urgent: boolean;
+  /** Which part of the list it belongs to; the same sections, in the same
+   *  order, as the desktop's Needs you. */
+  section: NeedsSection;
 }
+
+export type NeedsSection = 'ok' | 'questions' | 'stopped' | 'suggestions';
+export const NEEDS_SECTIONS: ReadonlyArray<{ id: NeedsSection; label: string }> = [
+  { id: 'ok', label: 'Waiting on your OK' },
+  { id: 'questions', label: 'Clem’s questions' },
+  { id: 'stopped', label: 'Stopped' },
+  { id: 'suggestions', label: 'Suggestions' },
+];
 
 const TITLE_MAX = 120;
 
@@ -79,7 +90,7 @@ export function buildNeedsRows(input: {
       key: question.id, kind: 'question', title,
       preview: decisionPreview(title, [question.context]),
       context: joinContext(project('question', question), questionSource(question)),
-      at: question.askedAt, label: 'Question', urgent: false,
+      at: question.askedAt, label: 'Question', urgent: false, section: 'questions',
     });
   }
   for (const proposal of input.trustProposals) {
@@ -88,14 +99,14 @@ export function buildNeedsRows(input: {
     rows.push({
       key: `trust:${proposal.id}`, kind: 'trust', title,
       preview: decisionPreview(title, [proposal.rationale]),
-      at: proposal.createdAt, label: 'Suggestion', urgent: false,
+      at: proposal.createdAt, label: 'Suggestion', urgent: false, section: 'suggestions',
     });
   }
   for (const chooser of input.workspaceChoosers) {
     rows.push({
       key: `chooser:${chooser.chooserId}`, kind: 'workspace', title: 'Where should these records live?',
       preview: 'Choose a Workspace for the records Clem is preparing.',
-      at: chooser.createdAt, label: 'Choose', urgent: false,
+      at: chooser.createdAt, label: 'Choose', urgent: false, section: 'ok',
     });
   }
   for (const plan of input.plans) {
@@ -104,7 +115,7 @@ export function buildNeedsRows(input: {
       key: `plan:${plan.id}`, kind: 'plan', title,
       preview: decisionPreview(title, [plan.context, plan.steps[0]?.action]),
       context: joinContext(project('plan', plan)),
-      at: plan.proposedAt, label: plan.needsUserInput.some((q) => q.trim()) ? 'Needs answers' : 'Plan', urgent: false,
+      at: plan.proposedAt, label: plan.needsUserInput.some((q) => q.trim()) ? 'Needs answers' : 'Plan', urgent: false, section: 'ok',
     });
   }
   for (const approval of input.approvals) {
@@ -115,7 +126,7 @@ export function buildNeedsRows(input: {
       key: `approval:${approval.approvalId}`, kind: 'approval', title,
       preview: decisionPreview(title, [approval.presentation?.why, approval.contentPreview?.body, approval.subject]),
       context: joinContext(project('approval', approval), approval.presentation?.app),
-      at: approval.requestedAt, label: 'Approve', urgent: false,
+      at: approval.requestedAt, label: 'Approve', urgent: false, section: 'ok',
     });
   }
   for (const item of input.unlisted) {
@@ -125,8 +136,9 @@ export function buildNeedsRows(input: {
       key: `unlisted:${item.key}`, kind: 'unlisted', title,
       preview: decisionPreview(title, [item.detail ? namedWorkflows(item.detail, item.workflow) : item.detail]),
       context: joinContext(item.workflow && !title.includes(workflowDisplayName(item.workflow)) ? workflowDisplayName(item.workflow) : null),
-      label: item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Needs you',
+      label: item.kind === 'workflow_binding' ? 'Stopped' : item.kind === 'workflow_paused' ? 'Paused' : 'Suggestion',
       urgent: stopped,
+      section: stopped ? 'stopped' : 'suggestions',
     });
   }
   for (const { row, earlier } of input.attention) {
@@ -141,7 +153,12 @@ export function buildNeedsRows(input: {
       context: joinContext(project('attention', row), gate?.workflow && !title.includes(workflowDisplayName(gate.workflow)) ? workflowDisplayName(gate.workflow) : null, earlier > 0 ? `+${earlier} earlier` : null),
       at: row.createdAt, label,
       urgent: Boolean(gate) || label === 'Flow · stopped',
+      // A stopped workflow that needs an account picked is a choice to make.
+      section: gate ? 'ok' : label === 'Flow · stopped' ? 'stopped' : 'questions',
     });
   }
-  return rows;
+  const rank = new Map(NEEDS_SECTIONS.map((section, index) => [section.id, index]));
+  return rows.map((row, index) => ({ row, index }))
+    .sort((a, b) => (rank.get(a.row.section) ?? 0) - (rank.get(b.row.section) ?? 0) || a.index - b.index)
+    .map(({ row }) => row);
 }

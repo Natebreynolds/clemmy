@@ -94,6 +94,26 @@ export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: 
 }
 export const useFromClem = (enabled = true) => usePoll(['home-from-clem'], getFromClem, 20_000, { enabled });
 
+/** What came of a "do it" given on one of Clem's items. */
+export type FromClemTurnOutcome =
+  | { state: 'working' }
+  | { state: 'not_found' }
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string };
+
+export const getFromClemOutcome = (key: string, reply: string, since: string) =>
+  apiGet<FromClemTurnOutcome>(`/api/console/home/from-clem/outcome?key=${encodeURIComponent(key)}&reply=${encodeURIComponent(reply)}&since=${encodeURIComponent(since)}`);
+
+/** How an outcome reads beside the item it came from. */
+export function tapOutcomeHeadline(outcome: FromClemTurnOutcome | undefined): { tone: 'info' | 'success' | 'warning' | 'error'; text: string } {
+  switch (outcome?.state) {
+    case 'done': return { tone: 'success', text: 'Done' };
+    case 'needs_you': return { tone: 'warning', text: 'Clem needs one more thing' };
+    case 'stopped': return { tone: 'error', text: 'This didn’t finish' };
+    case 'not_found': return { tone: 'error', text: 'This didn’t start — try again, or ask Clem in chat' };
+    default: return { tone: 'info', text: 'Clem is working on it…' };
+  }
+}
+
 /** Home's other lists, without what From Clem already shows. */
 export function withoutFromClem<T extends { questionId?: string; planProposalId?: string; notifId?: string }>(
   items: readonly T[],

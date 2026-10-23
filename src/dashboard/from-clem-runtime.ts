@@ -21,7 +21,8 @@ import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { appendEvent, getSession, listEvents, updateSession } from '../runtime/harness/eventlog.js';
-import { mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
+import { mintOwnerChoiceToken, ownerChoiceForSource } from '../runtime/harness/owner-choice.js';
+import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
@@ -552,6 +553,44 @@ async function replyOnce(
     default:
       return { outcome: 'unclear', decision: 'unclear' };
   }
+}
+
+/** What came of a "do it" the owner gave on one of her items, read from her
+ *  thread: still working, or the turn's own final words and how it ended.
+ *  The tap is found by the choice it carried; typed words by the reply the
+ *  host composed for them, at or after the moment the owner replied. */
+export type FromClemTurnOutcome =
+  | { state: 'working' }
+  | { state: 'not_found' }
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string };
+
+const OUTCOME_TEXT_MAX = 600;
+
+export function fromClemTurnOutcome(input: { key: string; reply: string; since: string }, nowMs = Date.now()): FromClemTurnOutcome {
+  const sinceMs = Date.parse(input.since);
+  if (!Number.isFinite(sinceMs)) return { state: 'not_found' };
+  let sources: ReturnType<typeof listEvents> = [];
+  try { sources = listEvents(CLEM_THREAD_ID, { types: ['user_input_received'], desc: true, limit: 40 }); }
+  catch { return { state: 'not_found' }; }
+  const reply = input.reply.trim();
+  const source = sources.find((event) => {
+    if (event.role !== 'user' || Date.parse(event.createdAt) < sinceMs - 5_000) return false;
+    const choice = event.data.ownerChoice ? ownerChoiceForSource(CLEM_THREAD_ID, event.seq) : null;
+    if (choice) return choice.rowKey === input.key;
+    return typeof event.data.text === 'string' && event.data.text.startsWith('You told me:')
+      && (event.data.displayText ?? '') === reply;
+  });
+  // A tap is accepted within moments; past two minutes with nothing found,
+  // it did not start (the item said why) rather than still starting.
+  if (!source) return nowMs - sinceMs > 120_000 ? { state: 'not_found' } : { state: 'working' };
+  const terminal = exactTerminalForAcceptedSource(source);
+  if (!terminal) return { state: 'working' };
+  const { status, text } = terminal.presentation;
+  return {
+    state: status === 'done' ? 'done' : status === 'needs_input' ? 'needs_you' : 'stopped',
+    text: text.length > OUTCOME_TEXT_MAX ? `${text.slice(0, OUTCOME_TEXT_MAX - 1).trimEnd()}…` : text,
+    sessionId: CLEM_THREAD_ID,
+  };
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */

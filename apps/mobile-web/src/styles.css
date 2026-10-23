@@ -6092,3 +6092,15 @@ textarea.cz-input { resize: vertical; }
   font-family: var(--font-body); font-size: 15px; font-weight: 600; cursor: pointer;
 }
 .home-link-btn:disabled { opacity: .5; }
+
+/* Needs you reads in four sections, the same as the desktop. */
+.needs-sections { display: flex; flex-direction: column; gap: 14px; }
+.needs-section-title {
+  margin: 0 0 6px;
+  padding: 0 4px;
+  font-size: var(--t-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+}

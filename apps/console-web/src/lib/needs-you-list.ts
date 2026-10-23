@@ -44,6 +44,35 @@ export interface NeedsYouRowView {
   aged: boolean;
   /** Rows that are a link to where they are resolved, not a selection. */
   href?: string;
+  /** Which part of the list it belongs to, by what it asks of the owner. */
+  section: NeedsYouSection;
+}
+
+/** Needs you reads as four kinds of asks, in this order, the same on every
+ *  surface: something to OK, Clem's questions, work that stopped, and her
+ *  suggestions. Anything waiting more than a few days folds into Older. */
+export type NeedsYouSection = 'ok' | 'questions' | 'stopped' | 'suggestions';
+export const NEEDS_YOU_SECTIONS: ReadonlyArray<{ id: NeedsYouSection; label: string }> = [
+  { id: 'ok', label: 'Waiting on your OK' },
+  { id: 'questions', label: 'Clem’s questions' },
+  { id: 'stopped', label: 'Stopped' },
+  { id: 'suggestions', label: 'Suggestions' },
+];
+
+/** The section a row belongs to, from what it is. */
+export function needsYouSection(item: NeedsYouItem): NeedsYouSection {
+  switch (item.kind) {
+    case 'workspace': case 'plan': case 'approval': return 'ok';
+    case 'question': return 'questions';
+    case 'trust': return 'suggestions';
+    case 'unlisted': return item.row.kind === 'check_in_proposal' ? 'suggestions' : 'stopped';
+    case 'attention': {
+      // A stopped workflow that needs an account picked is a choice to make.
+      if (item.row.workflowCapability) return 'ok';
+      if (item.row.workflowEnableGate) return 'stopped';
+      return attentionPill(item.row).label === 'Stopped' ? 'stopped' : 'questions';
+    }
+  }
 }
 
 const TITLE_MAX = 160;
@@ -74,7 +103,7 @@ function questionContext(row: InboxQuestionRow): string {
 }
 
 export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
-  const base = { id: item.id, kind: item.kind, checkable: false, aged: false } as const;
+  const base = { id: item.id, kind: item.kind, checkable: false, aged: false, section: needsYouSection(item) } as const;
   switch (item.kind) {
     case 'workspace': {
       const title = 'Where should these records live?';

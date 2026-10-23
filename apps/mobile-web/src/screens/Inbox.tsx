@@ -52,7 +52,7 @@ import {
 } from '../lib/inbox-projects';
 import { listProjectLabels } from '../lib/project-api';
 import { useScreenData } from '../lib/use-screen-data';
-import { buildNeedsRows, type NeedsRowKind } from '../lib/needs-you-rows';
+import { buildNeedsRows, NEEDS_SECTIONS, type NeedsRow, type NeedsRowKind } from '../lib/needs-you-rows';
 import { decisionHeading, isIdentifierLike } from '@clem/chat-engine';
 
 type InboxTab = 'needs' | 'updates';
@@ -656,24 +656,35 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
           {/* The list: one row per waiting item. Opening one shows only that
               item, full width, with Back — never every card expanded at once. */}
           {openKey === null && needsRows.length > 0 ? (
-            <ul class="needs-list" aria-label="Waiting on you">
-              {needsRows.map((row) => (
-                <li key={row.key}>
-                  <button id={`needs-row-${row.key}`} type="button" class="needs-row" onClick={() => openRow(row.key)}>
-                    <span class="needs-row-main">
-                      <span class="needs-row-title">{row.title}</span>
-                      {row.preview ? <span class="needs-row-preview">{row.preview}</span> : null}
-                      <span class="needs-row-meta">
-                        <span class={row.urgent ? 'needs-row-label urgent' : 'needs-row-label'}>{row.label}</span>
-                        {row.context ? <span class="needs-row-context">{row.context}</span> : null}
-                        {row.at ? <time dateTime={row.at}>{relativeTime(row.at)}</time> : null}
-                      </span>
-                    </span>
-                    <svg class="needs-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <div class="needs-sections">
+              {NEEDS_SECTIONS.map((section) => {
+                const inSection = needsRows.filter((row: NeedsRow) => row.section === section.id);
+                if (inSection.length === 0) return null;
+                return (
+                  <section key={section.id} aria-label={section.label}>
+                    <h3 class="needs-section-title">{section.label}{inSection.length > 1 ? ` · ${inSection.length}` : ''}</h3>
+                    <ul class="needs-list">
+                      {inSection.map((row) => (
+                    <li key={row.key}>
+                      <button id={`needs-row-${row.key}`} type="button" class="needs-row" onClick={() => openRow(row.key)}>
+                        <span class="needs-row-main">
+                          <span class="needs-row-title">{row.title}</span>
+                          {row.preview ? <span class="needs-row-preview">{row.preview}</span> : null}
+                          <span class="needs-row-meta">
+                            <span class={row.urgent ? 'needs-row-label urgent' : 'needs-row-label'}>{row.label}</span>
+                            {row.context ? <span class="needs-row-context">{row.context}</span> : null}
+                            {row.at ? <time dateTime={row.at}>{relativeTime(row.at)}</time> : null}
+                          </span>
+                        </span>
+                        <svg class="needs-row-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+                      </button>
+                    </li>
+                      ))}
+                    </ul>
+                  </section>
+                );
+              })}
+            </div>
           ) : null}
 
           {openKey !== null ? (

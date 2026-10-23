@@ -14907,6 +14907,22 @@ export function registerConsoleRoutes(
   });
 
   // The owner's reply to one From Clem row, in their own words.
+  // What came of a "do it" on one of Clem's items, for the item to show where
+  // the owner tapped it instead of only "Started a conversation."
+  app.get('/api/console/home/from-clem/outcome', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const key = typeof req.query.key === 'string' ? req.query.key : '';
+    const reply = typeof req.query.reply === 'string' ? req.query.reply : '';
+    const since = typeof req.query.since === 'string' ? req.query.since : '';
+    if (!key || !since) { res.status(400).json({ error: 'key and since are required' }); return; }
+    try {
+      const { fromClemTurnOutcome } = await import('./from-clem-runtime.js');
+      res.json(fromClemTurnOutcome({ key, reply, since }));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post('/api/console/home/from-clem/reply', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
