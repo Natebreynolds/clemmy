@@ -2943,10 +2943,10 @@
           "bytes": 21023
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 86552
+          "bytes": 88235
         },
         "src/tools/step-result-tool.ts": {
-          "bytes": 12710
+          "bytes": 12919
         },
         "src/tools/workspace-artifact-tools.ts": {
           "bytes": 11141
@@ -7026,10 +7026,10 @@
           "bytes": 21023
         },
         "src/runtime/harness/authored-workflow-write-authority.ts": {
-          "bytes": 86552
+          "bytes": 88235
         },
         "src/tools/step-result-tool.ts": {
-          "bytes": 12710
+          "bytes": 12919
         },
         "src/tools/workspace-artifact-tools.ts": {
           "bytes": 11141

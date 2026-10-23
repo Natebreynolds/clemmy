@@ -246,6 +246,10 @@ export function recordStepResultFromTranscript(sessionId: string, text: string):
   return true;
 }
 
+/** How long the result call waits on its step's write check, well inside
+ * the call's own deadline; a check still running then finishes on its own. */
+const STEP_WRITE_CHECK_WAIT_MS = 40_000;
+
 export function registerStepResultTool(server: McpServer): void {
   server.tool(
     'workflow_step_result',
@@ -268,8 +272,8 @@ export function registerStepResultTool(server: McpServer): void {
         if ('refusal' in gate) return textResult(gate.refusal);
         // This step's recoverable writes ran when proposed; they are checked
         // together against its saved instructions before the result counts.
-        const { checkStepWritesBeforeResult } = await import('../runtime/harness/authored-workflow-write-authority.js');
-        const check = await checkStepWritesBeforeResult(sessionId);
+        const { checkStepWritesWithin } = await import('../runtime/harness/authored-workflow-write-authority.js');
+        const check = await checkStepWritesWithin(sessionId, STEP_WRITE_CHECK_WAIT_MS);
         if (check.status === 'correct') {
           return textResult(`Not recorded yet. A check of the writes this step made found: ${check.reason} `
             + 'Correct those writes now (they can be changed), then call workflow_step_result again with the result.');

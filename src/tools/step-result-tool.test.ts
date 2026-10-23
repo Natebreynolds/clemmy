@@ -210,3 +210,32 @@ test('workflow_step_result is held once for a conflict the step\'s write check f
     clearStepResult(sessionId);
   }
 });
+
+test('a step write check runs once however often it is asked, and a slow one never holds the result', async () => {
+  const authority = await import('../runtime/harness/authored-workflow-write-authority.js');
+  const sessionId = 'sess-step-write-check-slow';
+  const queue = () => authority._queueStepWriteForTests({ receipt: { workflowName: 'fixture', workflowRunId: 'fixture-run', stepId: 'main' },
+    stepPrompt: 'Append the row with status Open.', sessionId, sourceUserSeq: 1, tool: 'fixture_sheet_append', args: { status: 'Closed' } });
+  let reviews = 0;
+  let release: () => void = () => {};
+  authority._setWorkflowMutationReviewerForTests(async () => {
+    reviews += 1;
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { verdict: 'conflict', reason: 'The row says Closed; the instructions say Open.', proposalDigest: 'fixture' };
+  });
+  try {
+    queue();
+    const first = authority.checkStepWritesBeforeResult(sessionId);
+    const second = authority.checkStepWritesBeforeResult(sessionId);
+    assert.deepEqual(await authority.checkStepWritesWithin(sessionId, 10), { status: 'pending' });
+    assert.equal(reviews, 1, 'a retried call waits on the check already running');
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.status, 'noted', 'a check that outlived the wait records its doubt; it cannot hold a result already given');
+    assert.deepEqual(a, b);
+    assert.deepEqual(await authority.checkStepWritesBeforeResult(sessionId), { status: 'clear' }, 'the queue is settled');
+  } finally {
+    authority._setWorkflowMutationReviewerForTests(null);
+    authority._resetStepWriteChecksForTests();
+  }
+});

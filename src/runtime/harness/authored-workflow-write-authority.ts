@@ -952,12 +952,45 @@ function queueOrdinaryWriteForStepCheck(input: {
 export type StepWriteCheck =
   | { status: 'clear' }
   | { status: 'correct'; reason: string }
-  | { status: 'noted'; reason: string };
+  | { status: 'noted'; reason: string }
+  /** Still running past the caller's wait: it finishes in the background,
+   * its verdict lands in the run's log, and it cannot hold the result. */
+  | { status: 'pending' };
+
+/** One check per step at a time: a retried result call waits on the check
+ * already running rather than starting another review of the same writes. */
+const inflightStepChecks = new Map<string, Promise<StepWriteCheck>>();
+
+/** The step's check, waited on for at most `waitMs`. A check that is still
+ * running when the wait ends is left to finish in the background with no
+ * correction round, so a slow checker never fails a step whose writes can be
+ * undone; the result call itself has a deadline of its own. */
+export async function checkStepWritesWithin(sessionId: string, waitMs: number): Promise<StepWriteCheck> {
+  const check = checkStepWritesBeforeResult(sessionId);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const waited = await Promise.race([
+    check,
+    new Promise<'pending'>((resolve) => { timer = setTimeout(() => resolve('pending'), Math.max(0, waitMs)); }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+  if (waited !== 'pending') return waited;
+  stepCheckCorrections.set(sessionId, MAX_STEP_CHECK_CORRECTIONS);
+  return { status: 'pending' };
+}
 
 /** Review the recoverable writes this step made, together, once, before it
  * reports its result. 'correct' asks the step to fix them first; 'noted'
  * lets it finish with the check's doubt or outage on record. */
-export async function checkStepWritesBeforeResult(sessionId: string): Promise<StepWriteCheck> {
+export function checkStepWritesBeforeResult(sessionId: string): Promise<StepWriteCheck> {
+  const running = inflightStepChecks.get(sessionId);
+  if (running) return running;
+  const check = runStepWriteCheck(sessionId).finally(() => {
+    if (inflightStepChecks.get(sessionId) === check) inflightStepChecks.delete(sessionId);
+  });
+  inflightStepChecks.set(sessionId, check);
+  return check;
+}
+
+async function runStepWriteCheck(sessionId: string): Promise<StepWriteCheck> {
   const writes = queuedStepWrites.get(sessionId);
   if (!writes || writes.length === 0) return { status: 'clear' };
   const first = writes[0]!;
@@ -1019,6 +1052,7 @@ export function _queueStepWriteForTests(write: QueuedStepWrite): void {
 }
 
 export function _resetStepWriteChecksForTests(): void {
+  inflightStepChecks.clear();
   queuedStepWrites.clear();
   stepCheckCorrections.clear();
 }
