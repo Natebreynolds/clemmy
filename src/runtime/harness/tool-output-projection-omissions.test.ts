@@ -111,3 +111,25 @@ test('a clipped structured view says the whole result is stored and that the sam
   assert.match(meta.projectionSemantics, /not by re-sending the call/);
   assert.deepEqual(meta.recovery.tool_output_query, { call_id: 'call_clip', limit: 50 });
 });
+
+test('in a clipped record list an opaque id is shown whole or not at all, never clipped', () => {
+  const id = (i: number) => `AAMkADExOGRmNmY1LWQ1MmEtNGUwMi05MTk0LTA4MmY5NTg2NTgxYQBGAAAAAAD-yrYzWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA${i}AAA=`;
+  const value = Array.from({ length: 8 }, (_, i) => ({
+    receivedDateTime: `2026-10-${10 + i}T15:00:23Z`,
+    subject: `Your flight ${i} is confirmed`,
+    from: { emailAddress: { address: 'no-reply@example.test', name: 'Travel' } },
+    bodyPreview: 'Trip details follow. '.repeat(14),
+    webLink: `https://outlook.example.test/owa/?ItemID=${id(i)}&exvsurl=1&viewmodel=ReadMessageItem`,
+    id: id(i),
+  }));
+  for (const maxChars of [2000, 3900, 8000]) {
+    const shown = compactStructuredJsonToolOutput(JSON.stringify({ data: { value } }),
+      { callId: 'call_list', maxChars, exactOutputReceipt: '[exact-output-receipt:v1 nonce=n sha256=s]' });
+    assert.ok(shown);
+    const rows = JSON.parse(shown!).data.value as Array<Record<string, unknown>>;
+    for (const [index, row] of rows.entries()) {
+      if ('id' in row) assert.equal(row.id, id(index), `${maxChars}: an id is whole or absent`);
+    }
+    assert.doesNotMatch(shown!, /"id":"[^"]*…\[/, `${maxChars}: never a clipped handle`);
+  }
+});

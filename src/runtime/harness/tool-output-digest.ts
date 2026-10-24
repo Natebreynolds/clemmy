@@ -241,6 +241,18 @@ function valueLooksOpaque(serialized: string): boolean {
   return /^[A-Za-z0-9+/_=-]{16,}$/.test(body) && !/^[a-z]+$/i.test(body);
 }
 
+/**
+ * An opaque handle a follow-up call needs whole: a record id, a message id, a
+ * page token. Judged by the value's shape, not its key: one unbroken run of
+ * id characters with a digit in it. Clipped, it reads "…[152 chars total]",
+ * which no next call can use, so it is kept whole or left out. Its rank is
+ * unchanged: the fields that answer still come first in a tight view.
+ */
+function opaqueHandle(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 12 && value.length <= 512
+    && /\d/.test(value) && /^[A-Za-z0-9_\-=+/.:]+$/.test(value);
+}
+
 function projectionKeyPriority(key: string): number {
   const priority = [
     'data', 'successful', 'success', 'error',
@@ -445,6 +457,11 @@ function compactJsonValue(
   const projectField = (key: string, available: number): unknown => {
     const local: StructuredProjectionStats = { clippedStrings: 0, omittedArrayItems: 0,
       omittedObjectKeys: 0, omittedValues: 0 };
+    if (opaqueHandle(record[key]) && jsonChars(record[key]) > available) {
+      local.omittedValues += 1;
+      fieldStats.set(key, local);
+      return OMITTED_JSON_VALUE;
+    }
     const entry = compactJsonValue(record[key], available, local, depth + 1);
     fieldStats.set(key, local);
     return entry;
