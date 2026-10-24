@@ -290,6 +290,31 @@ test('an answer that cannot be read says which part of the verdict it missed', a
   assert.equal(workflowMutationReviewInvalidReason({ verdict: 'conflict', proposalDigest: digest, reason: '' }, digest), 'no_reason');
 });
 
+test('malformed review structures are measured without changing rejected formats or retaining private output', async () => {
+  for (const [output, structure] of [
+    [undefined, 'empty_output'], [null, 'empty_output'], ['', 'empty_output'], [' \n\t', 'empty_output'],
+    ['private-review-prose', 'json_syntax'], ['{"verdict":', 'json_syntax'],
+    ['```json\n{"verdict":"compatible"}\n```', 'json_syntax'],
+    ['null', 'top_level_shape'], ['[]', 'top_level_shape'], ['42', 'top_level_shape'],
+    ['"private-json-scalar"', 'top_level_shape'], [[], 'top_level_shape'], [true, 'top_level_shape'],
+  ] as const) {
+    const result = await reviewWorkflowMutation({ ...input, observations: { ...input.observations, complete: false } }, {
+      judge: async (_system, prompt, parse, _pass, _lane, opts) => {
+        assert.equal(parse(output), null);
+        assert.equal(workflowMutationReviewInvalidReason(output, JSON.parse(prompt).proposalDigest), 'not_json',
+          'the existing failure reason remains compatible');
+        const classification = opts?.classifyParseRejection?.(output);
+        assert.deepEqual(classification, { reason: 'malformed_output', structure });
+        return { value: parse({ verdict: 'compatible', reason: 'Synthetic review checked.', proposalDigest: JSON.parse(prompt).proposalDigest }),
+          failure: null, initialParse: { status: 'rejected', ...classification as object, privateOutput: 'private-review' } as never };
+      },
+    });
+    assert.equal(result.verdict, 'compatible');
+    assert.deepEqual(result.diagnostics?.stages[0]?.initialParse, { status: 'rejected', reason: 'malformed_output', structure });
+    assert.equal(JSON.stringify(result.diagnostics).includes('private-'), false);
+  }
+});
+
 test('review diagnostics retain ordered stages and scoped lookup metadata without private review content', async () => {
   const privateRef = 'private-fixture-evidence-ref';
   const privatePath = 'private.fixture.records';
@@ -391,7 +416,7 @@ test('diagnostic lookup records stay bounded while the verdict and total observe
 test('mutation diagnostics use only the returned attempt parse observation and discard private metadata', async () => {
   const result = await reviewWorkflowMutation({ ...input, observations: { ...input.observations, complete: false } }, {
     judge: async (_system, prompt, parse, _pass, _lane, opts) => {
-      assert.equal(opts?.classifyParseRejection?.('private-prose'), 'malformed_output');
+      assert.deepEqual(opts?.classifyParseRejection?.('private-prose'), { reason: 'malformed_output', structure: 'json_syntax' });
       assert.equal(opts?.classifyParseRejection?.({ verdict: 'compatible', proposalDigest: 'foreign', reason: 'ok' }), 'binding_mismatch');
       // A rejected parse from another attempt cannot override the winner.
       parse('private-losing-review');

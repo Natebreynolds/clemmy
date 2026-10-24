@@ -1347,11 +1347,13 @@ function quotaRefusalWords(error: unknown): string | null {
 
 export type JudgeParseRejectionReason = 'malformed_output' | 'missing_verdict' | 'missing_binding'
   | 'binding_mismatch' | 'missing_reason' | 'unknown';
+export type JudgeParseRejectionStructure = 'empty_output' | 'json_syntax' | 'top_level_shape';
 export type JudgeInitialParseDiagnostic = { status: 'parsed'; reason: null }
-  | { status: 'rejected'; reason: JudgeParseRejectionReason };
+  | { status: 'rejected'; reason: JudgeParseRejectionReason; structure?: JudgeParseRejectionStructure };
 const JUDGE_PARSE_REJECTION_REASONS = new Set<unknown>([
   'malformed_output', 'missing_verdict', 'missing_binding', 'binding_mismatch', 'missing_reason', 'unknown',
 ]);
+const JUDGE_PARSE_REJECTION_STRUCTURES = new Set<unknown>(['empty_output', 'json_syntax', 'top_level_shape']);
 
 /** Reconstruct only content-free host fields; callers may not attach output,
  * error text, bindings or new reason strings to this diagnostic. */
@@ -1359,11 +1361,14 @@ export function sanitizeJudgeInitialParseDiagnostic(value: unknown): JudgeInitia
   try {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const row = value as Record<string, unknown>;
-    if (row.status === 'parsed') return { status: 'parsed', reason: null };
-    if (row.status !== 'rejected') return null;
-    const reason = row.reason;
-    return { status: 'rejected', reason: JUDGE_PARSE_REJECTION_REASONS.has(reason)
-      ? reason as JudgeParseRejectionReason : 'unknown' };
+    const status = row.status;
+    if (status === 'parsed') return { status: 'parsed', reason: null };
+    if (status !== 'rejected') return null;
+    const candidateReason = row.reason;
+    const reason = JUDGE_PARSE_REJECTION_REASONS.has(candidateReason) ? candidateReason as JudgeParseRejectionReason : 'unknown';
+    const structure = reason === 'malformed_output' ? row.structure : undefined;
+    return { status: 'rejected', reason,
+      ...(JUDGE_PARSE_REJECTION_STRUCTURES.has(structure) ? { structure: structure as JudgeParseRejectionStructure } : {}) };
   } catch { return null; }
 }
 
@@ -1617,13 +1622,18 @@ export async function runRoutedJudgeAttempt<T>(
   // replace its cause; assessment answers have a different admission contract.
   if (!assessment) try {
     let reason: unknown = 'unknown';
-    if (value === null) try { reason = classifyParseRejection?.(result.finalOutput); } catch { /* unknown */ }
-    if (reason && typeof (reason as PromiseLike<unknown>).then === 'function') {
-      void Promise.resolve(reason).catch(() => {});
-      reason = 'unknown'; // classifiers are synchronous observations, never awaited work
-    }
+    let structure: unknown;
+    if (value === null) try {
+      const classification = classifyParseRejection?.(result.finalOutput);
+      if (classification && typeof (classification as PromiseLike<unknown>).then === 'function') {
+        void Promise.resolve(classification).catch(() => {}); // synchronous observation, never awaited work
+      } else if (classification && typeof classification === 'object' && !Array.isArray(classification)) {
+        reason = (classification as Record<string, unknown>).reason;
+        structure = (classification as Record<string, unknown>).structure;
+      } else reason = classification;
+    } catch { reason = 'unknown'; structure = undefined; }
     const diagnostic = sanitizeJudgeInitialParseDiagnostic(value === null
-      ? { status: 'rejected', reason } : { status: 'parsed', reason: null });
+      ? { status: 'rejected', reason, structure } : { status: 'parsed', reason: null });
     const observed = diagnostic && observe?.initialParse?.(diagnostic);
     if (observed && typeof (observed as PromiseLike<unknown>).then === 'function') {
       void Promise.resolve(observed).catch(() => {});
@@ -1754,7 +1764,7 @@ export async function runHedgedJudge<T>(
     verdictRepairContract?: CompletionVerdictRepairContract;
     reviewInput?: ReviewInputSeed;
     assessment?: SameCallAssessment<T>;
-    /** Optional host-only classifier. Only the fixed diagnostic vocabulary is retained. */
+    /** Optional host-only classifier: a reason or { reason, structure }. Only fixed vocabulary is retained. */
     classifyParseRejection?: (output: unknown) => unknown;
     /** Cancellation belongs to the caller, never to review/fallback policy. */
     signal?: AbortSignal;

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closedCanonicalJson, SEALED_CALL_CANONICAL_LIMITS } from '../../shared/closed-canonical-json.js';
 import { evaluateSystemOne } from '../jev/client.js';
 import { runHedgedJudge, sanitizeJudgeInitialParseDiagnostic, type JudgeInitialParseDiagnostic,
-  type JudgeParseRejectionReason } from './objective-judge.js';
+  type JudgeParseRejectionReason, type JudgeParseRejectionStructure } from './objective-judge.js';
 import { mutationReviewTimeoutMs, recordJudgeMetric } from './judge-family.js';
 import type { JudgeEvidenceSource, JudgeEvidenceEntry, JudgeEvidenceLookup } from './judge-evidence-tools.js';
 import { describeJsonShape } from './tool-output-digest.js';
@@ -220,16 +220,29 @@ const PARSE_REJECTION_DIAGNOSTIC: Record<WorkflowMutationReviewInvalidReason, Ju
 
 /** Which part of the verdict contract an unreadable answer missed. */
 export function workflowMutationReviewInvalidReason(value: unknown, expectedDigest: string): WorkflowMutationReviewInvalidReason {
+  return workflowMutationReviewRejection(value, expectedDigest).reason;
+}
+
+/** Content-free distinctions within the existing not_json rejection. These
+ * describe the rejected representation; they never repair or accept it. */
+function workflowMutationReviewRejection(value: unknown, expectedDigest: string): {
+  reason: WorkflowMutationReviewInvalidReason; structure?: JudgeParseRejectionStructure;
+} {
   let parsed: unknown = value;
-  if (typeof parsed === 'string') {
-    try { parsed = JSON.parse(parsed); } catch { return 'not_json'; }
+  if (parsed === undefined || parsed === null || (typeof parsed === 'string' && !parsed.trim())) {
+    return { reason: 'not_json', structure: 'empty_output' };
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'not_json';
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { return { reason: 'not_json', structure: 'json_syntax' }; }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { reason: 'not_json', structure: 'top_level_shape' };
+  }
   const row = parsed as Record<string, unknown>;
-  if (typeof row.verdict !== 'string' || !['compatible', 'conflict', 'uncertain'].includes(row.verdict)) return 'no_verdict';
-  if (row.proposalDigest === undefined || row.proposalDigest === null || row.proposalDigest === '') return 'digest_missing';
-  if (row.proposalDigest !== expectedDigest) return 'digest_mismatch';
-  return 'no_reason';
+  if (typeof row.verdict !== 'string' || !['compatible', 'conflict', 'uncertain'].includes(row.verdict)) return { reason: 'no_verdict' };
+  if (row.proposalDigest === undefined || row.proposalDigest === null || row.proposalDigest === '') return { reason: 'digest_missing' };
+  if (row.proposalDigest !== expectedDigest) return { reason: 'digest_mismatch' };
+  return { reason: 'no_reason' };
 }
 
 export function parseWorkflowMutationReview(
@@ -378,7 +391,11 @@ export async function reviewWorkflowMutation(input: WorkflowMutationReviewInput,
     const started = Date.now();
     try {
       const result = await judge(system, stagePrompt, parse, pass, 'mutation_constraints', { ...options,
-        classifyParseRejection: output => PARSE_REJECTION_DIAGNOSTIC[workflowMutationReviewInvalidReason(output, proposalDigest)] });
+        classifyParseRejection: output => {
+          const rejected = workflowMutationReviewRejection(output, proposalDigest);
+          const reason = PARSE_REJECTION_DIAGNOSTIC[rejected.reason];
+          return rejected.structure ? { reason, structure: rejected.structure } : reason;
+        } });
       recordStage(stage, started, result);
       return result;
     } catch (error) {

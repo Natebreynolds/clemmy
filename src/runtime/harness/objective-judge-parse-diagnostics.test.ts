@@ -15,7 +15,7 @@ mkdirSync(path.join(testHome, 'state'), { recursive: true });
 writeFileSync(path.join(testHome, 'state/auth.json'), JSON.stringify({ codexOauth: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh' } }));
 writeFileSync(path.join(testHome, 'state/claude-auth.json'), JSON.stringify({ accessToken: 'sk-ant-oat01-fixture', expiresAt: Date.now() + 3_600_000 }));
 const { Usage } = await import('@openai/agents');
-const { runRoutedJudgeAttempt, runHedgedJudge } = await import('./objective-judge.js');
+const { runRoutedJudgeAttempt, runHedgedJudge, sanitizeJudgeInitialParseDiagnostic } = await import('./objective-judge.js');
 const { parseWorkflowMutationReview, workflowMutationReviewInvalidReason } = await import('./workflow-mutation-review.js');
 const { ClaudeModelProvider } = await import('./claude-model.js');
 const { CodexModelProvider } = await import('./codex-model.js');
@@ -91,13 +91,71 @@ test('diagnostic classifier and observer failures cannot change verdict or reque
   assert.equal(requests.length, 1);
 });
 
+test('structural parse diagnostics retain only finite malformed-output details', () => {
+  for (const structure of ['empty_output', 'json_syntax', 'top_level_shape']) {
+    assert.deepEqual(sanitizeJudgeInitialParseDiagnostic({ status: 'rejected', reason: 'malformed_output',
+      structure, output: 'private-review', error: 'private-error' }), { status: 'rejected', reason: 'malformed_output', structure });
+  }
+  for (const structure of ['private-forged-detail', { text: 'private-review' }, null]) {
+    assert.deepEqual(sanitizeJudgeInitialParseDiagnostic({ status: 'rejected', reason: 'malformed_output', structure }),
+      { status: 'rejected', reason: 'malformed_output' });
+  }
+  assert.deepEqual(sanitizeJudgeInitialParseDiagnostic({ status: 'parsed', reason: null, structure: 'json_syntax' }),
+    { status: 'parsed', reason: null });
+  assert.deepEqual(sanitizeJudgeInitialParseDiagnostic({ status: 'rejected', reason: 'binding_mismatch', structure: 'json_syntax' }),
+    { status: 'rejected', reason: 'binding_mismatch' });
+});
+
+for (const [field, allowed] of [['status', 'rejected'], ['reason', 'malformed_output'], ['structure', 'json_syntax']] as const) {
+  test(`structural diagnostics snapshot ${field} once before validation`, () => {
+    const expected = { status: 'rejected', reason: 'malformed_output', structure: 'json_syntax' };
+    let reads = 0;
+    const candidate = Object.defineProperty({ ...expected }, field, { get: () => ++reads === 1 ? allowed : 'private-late-value' });
+    const diagnostic = sanitizeJudgeInitialParseDiagnostic(candidate);
+    assert.equal(JSON.stringify(diagnostic).includes('private-'), false);
+    assert.deepEqual(diagnostic, expected);
+    assert.equal(reads, 1);
+    assert.equal(sanitizeJudgeInitialParseDiagnostic(Object.defineProperty({ ...expected }, field,
+      { get: () => { throw new Error('private-getter-error'); } })), null);
+  });
+}
+
+for (const [first, structure] of [
+  ['private-review-prose', 'json_syntax'], ['[]', 'top_level_shape'], [`\`\`\`json\n${valid}\n\`\`\``, 'json_syntax'],
+] as const) test(`structural parse detail ${structure} for ${first === '[]' ? 'array' : first.startsWith('```') ? 'fenced JSON' : 'prose'} preserves repair requests`, async () => {
+  const baseline = scripted([first, valid]);
+  const fixture = scripted([first, valid]);
+  const observed: unknown[] = [];
+  assert.equal(parse(first), null, 'diagnostics never make the first output acceptable');
+  const original = await attempt(baseline.model, () => {});
+  const result = await attempt(fixture.model, value => observed.push(value), () => ({ reason: 'malformed_output', structure,
+    output: 'private-review', error: 'private-error' }));
+  assert.deepEqual(result, original);
+  assert.deepEqual(observed, [{ status: 'rejected', reason: 'malformed_output', structure }]);
+  assert.equal(fixture.requests.length, 2);
+  const requestBytes = (requests: ModelRequest[]) => requests.map(request => ({ instructions: request.systemInstructions,
+    input: request.input, settings: request.modelSettings, tools: request.tools }));
+  assert.deepEqual(requestBytes(fixture.requests), requestBytes(baseline.requests));
+  assert.equal(fixture.requests[1]!.modelSettings.reasoning?.effort, 'low');
+  assert.equal(fixture.requests[1]!.tools?.length ?? 0, 0);
+});
+
+test('empty structural rejection remains one failed request without a restatement', async () => {
+  const { model, requests } = scripted(['']);
+  const observed: unknown[] = [];
+  await assert.rejects(attempt(model, value => observed.push(value), () => ({ reason: 'malformed_output', structure: 'empty_output' })),
+    /reviewer returned no text/);
+  assert.deepEqual(observed, [{ status: 'rejected', reason: 'malformed_output', structure: 'empty_output' }]);
+  assert.equal(requests.length, 1);
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
 }
 
-for (const repairedWinner of [false, true]) test(`a losing hedge cannot contaminate a ${repairedWinner ? 'repaired' : 'first-parse'} winner, even after late completion`, { timeout: 5_000 }, async () => {
+for (const repairedWinner of [false, true, 'structural'] as const) test(`a losing hedge cannot contaminate a ${repairedWinner === 'structural' ? 'structurally rejected' : repairedWinner ? 'repaired' : 'first-parse'} winner, even after late completion`, { timeout: 5_000 }, async () => {
   const primaryReply = deferred<ModelResponse>();
   const hedgeRepair = deferred<ModelResponse>();
   const hedgeStartedRepair = deferred<void>();
@@ -117,17 +175,19 @@ for (const repairedWinner of [false, true]) test(`a losing hedge cannot contamin
     value => value.verdict === 'compatible', 'mutation_constraints', { timeoutMs: 4_000,
       boundaryJudgeSelection: { status: 'captured', role: { modelId: 'gpt-5.6-terra', provider: 'codex', source: 'default' },
         crossFamily: true, defaultModels: { claude: 'claude-sonnet-5', codex: 'gpt-5.6-terra' } },
-      classifyParseRejection: classify });
+      classifyParseRejection: output => output === '[]' ? { reason: 'malformed_output', structure: 'top_level_shape' }
+        : output === 'private-losing-hedge-review' ? { reason: 'malformed_output', structure: 'json_syntax' } : classify(output) });
   try {
     await hedgeStartedRepair.promise;
-    primaryReply.resolve(response(repairedWinner
+    primaryReply.resolve(response(repairedWinner === 'structural' ? '[]' : repairedWinner
       ? JSON.stringify({ verdict: 'compatible', reason: 'Synthetic review.', proposalDigest: 'b'.repeat(64) }) : valid));
     const result = await running;
     assert.equal(result.value?.verdict, 'compatible');
     assert.equal(result.routing?.modelId, 'gpt-5.6-terra');
-    const expected = repairedWinner ? { status: 'rejected', reason: 'binding_mismatch' } : { status: 'parsed', reason: null };
+    const expected = repairedWinner === 'structural' ? { status: 'rejected', reason: 'malformed_output', structure: 'top_level_shape' }
+      : repairedWinner ? { status: 'rejected', reason: 'binding_mismatch' } : { status: 'parsed', reason: null };
     assert.deepEqual(result.initialParse, expected);
-    assert.equal(typeof result.restatedFrom === 'string', repairedWinner);
+    assert.equal(typeof result.restatedFrom === 'string', Boolean(repairedWinner));
     hedgeRepair.resolve(response(valid));
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(result.initialParse, expected);
