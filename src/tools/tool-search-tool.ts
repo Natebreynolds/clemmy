@@ -2541,6 +2541,14 @@ export function registerToolSearchTool(
           page,
           page_count: pageCount,
           total_results: deferredPage?.totalResults ?? rankedWindow.length,
+          // Before the results: a long result list is clipped from the end,
+          // and a cut cursor is one the model can only guess.
+          ...(nextCursor ? {
+            next_cursor: nextCursor,
+            continuation_hint: canDeferPages
+              ? 'Use this cursor for the next retained page. Only that page receives current account and exact definition checks; broad discovery is not repeated.'
+              : 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
+          } : {}),
           results: rows.map(row => {
             const result = publicResult(row);
             if (!compactSecondaryProse || row.name === primarySchemaName) return result;
@@ -2568,12 +2576,6 @@ export function registerToolSearchTool(
           hint: hintForRows(rows, schemaReadRequired.size > 0),
           ...(appHintFor() ? { app_hint: appHintFor() } : {}),
           ...(discoveryAdvisory ? { discovery_advisory: discoveryAdvisory } : {}),
-          ...(nextCursor ? {
-            next_cursor: nextCursor,
-            continuation_hint: canDeferPages
-              ? 'Use this cursor for the next retained page. Only that page receives current account and exact definition checks; broad discovery is not repeated.'
-              : 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
-          } : {}),
         });
 
         let text = render();
