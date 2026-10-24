@@ -147,7 +147,9 @@ test('a clean CLI run\'s JSON stdout is viewed as records with its totals, not a
   assert.ok(shown);
   const view = JSON.parse(shown!);
   assert.equal(view.result.stdout, undefined, 'the JSON string is not shown clipped');
-  assert.equal(view.result.stdout_json.result.totalSize, 84, 'the total survives');
-  assert.ok(view.result.stdout_json.result.records.length > 0, 'records are visible');
-  assert.equal(view.result.operationId, 'fixture_cli_query');
+  assert.equal(view.result.totalSize, 84, 'the total survives');
+  assert.ok(view.result.records.length > 0, 'records are visible');
+  assert.equal(view.__clementine.records.path, 'result.records',
+    'the view\'s paths are the record query\'s paths: the command\'s JSON is the root');
+  assert.equal(view.__clementine.records.total, 84);
 });

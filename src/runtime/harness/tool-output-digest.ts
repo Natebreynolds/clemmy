@@ -542,22 +542,15 @@ function projectedRecordCoverage(
 /**
  * A clean CLI run's envelope carries the command's JSON as one string in
  * `stdout`; clipped as a string it shows no records and no totals. The view
- * shows that JSON parsed, as `stdout_json` (the name the shell result uses),
- * the way tool_output_query reads it. Only the view changes: the stored bytes
- * and their receipt are the envelope as it came.
+ * is that JSON itself, the root tool_output_query reads, so a path seen here
+ * is the path the query takes. Only the view changes: the stored bytes and
+ * their receipt are the envelope as it came.
  */
 function hostCliJsonView(parsed: Record<string, unknown>): Record<string, unknown> | null {
   const reading = readHostCliEnvelope(parsed);
   if (reading?.kind !== 'clean') return null;
-  const withParsedStdout = (envelope: Record<string, unknown>): Record<string, unknown> => {
-    const { stdout: _stdout, ...rest } = envelope;
-    return { ...rest, stdout_json: reading.stdoutJson };
-  };
-  const wrapped = parsed.result && typeof parsed.result === 'object' && !Array.isArray(parsed.result)
-    ? parsed.result as Record<string, unknown> : null;
-  return wrapped && typeof wrapped.stdout === 'string'
-    ? { ...parsed, result: withParsedStdout(wrapped) }
-    : withParsedStdout(parsed);
+  const json = reading.stdoutJson;
+  return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
 }
 
 export function compactStructuredJsonToolOutput(
