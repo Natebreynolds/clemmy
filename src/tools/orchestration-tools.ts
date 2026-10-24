@@ -715,9 +715,13 @@ const STEP_OUTPUT_PAGE_CHARS = 12_000;
  * JSON document or a record whose retained identity belongs to another run. */
 function readExactWorkflowRunForStatus(runId: string):
   | { ok: true; record: Record<string, unknown> }
-  | { ok: false; message: string } {
+  | { ok: false; message: string; missing?: true } {
   if (!runId || !/^[a-zA-Z0-9_.:-]+$/.test(runId)) {
-    return { ok: false, message: 'Cannot read workflow run: the run id must be a safe exact basename.' };
+    // A display name (spaces, punctuation) may still be a workflow's name; an
+    // id that reaches for a path never is.
+    const pathLike = /[\\/\u0000-\u001f]|\.\./.test(runId ?? '');
+    return { ok: false, ...(pathLike ? {} : { missing: true as const }),
+      message: 'Cannot read workflow run: the run id must be a safe exact basename.' };
   }
   try {
     const record: unknown = JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), 'utf-8'));
@@ -729,9 +733,9 @@ function readExactWorkflowRunForStatus(runId: string):
     }
     return { ok: true, record: record as Record<string, unknown> };
   } catch (err) {
-    return { ok: false, message: (err as NodeJS.ErrnoException)?.code === 'ENOENT'
-      ? `Workflow run "${runId}" not found.`
-      : `Failed to read workflow run "${runId}": its saved record is unavailable or invalid. No run evidence was returned.` };
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT'
+      ? { ok: false, missing: true, message: `Workflow run "${runId}" not found.` }
+      : { ok: false, message: `Failed to read workflow run "${runId}": its saved record is unavailable or invalid. No run evidence was returned.` };
   }
 }
 
@@ -2819,7 +2823,18 @@ export function registerOrchestrationTools(server: McpServer): void {
       // Preserve blank optional inputs as the existing overview/history form.
       // Every nonempty supplied identity must still pass the exact-file fence.
       const exactRun = run_id?.trim() ? readExactWorkflowRunForStatus(run_id) : undefined;
-      if (exactRun && !exactRun.ok) return textResult(exactRun.message);
+      if (exactRun && !exactRun.ok) {
+        // A workflow's name given as the run id names that workflow's runs:
+        // answer with its history instead of a not-found the next call repairs.
+        const named = exactRun.missing && !step_id?.trim()
+          ? listWorkflows().find((entry) => workflowNamesEqual(entry.data.name, run_id!.trim())
+            || workflowNamesEqual(entry.name, run_id!.trim()))
+          : undefined;
+        if (named) {
+          return textResult(`"${run_id!.trim()}" is a workflow, not a run id. ${renderWorkflowRunHistory(named.data.name ?? named.name)}`);
+        }
+        return textResult(exactRun.message);
+      }
       if (run_id !== undefined && exactRun?.ok && step_id && step_id.trim()) {
         try {
           return textResult(renderWorkflowRunStepOutput(exactRun.record, run_id, step_id.trim(), offset ?? 0));

@@ -202,3 +202,20 @@ test('registered status keeps omitted-id active overview and named history forms
     assert.doesNotMatch(history, /unrelated-status-history|framework-status-other-history/);
   }
 });
+
+test('a workflow name given as the run id answers with that workflow\'s runs', async () => {
+  const entry = writeWorkflow('framework-status-name-as-run', {
+    name: 'FRAMEWORK-TEST Name as run id', description: 'Controlled status-only fixture.',
+    enabled: false, trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read supplied text.', sideEffect: 'read' }],
+  });
+  saveRun('framework-status-name-run-1', {
+    id: 'framework-status-name-run-1', workflow: entry.data.name, status: 'failed',
+    createdAt: '2026-10-16T02:00:00.000Z', finishedAt: '2026-10-16T02:00:05.000Z', error: 'Controlled failure.',
+  });
+  for (const spelled of [entry.name, entry.data.name]) {
+    const reply = await status({ run_id: spelled });
+    assert.match(reply, /is a workflow, not a run id\./, spelled);
+    assert.match(reply, /framework-status-name-run-1/, `${spelled}: its run history, not a not-found`);
+  }
+  assert.match(await status({ run_id: 'no-such-run-or-workflow' }), /Workflow run "no-such-run-or-workflow" not found\./);
+});
