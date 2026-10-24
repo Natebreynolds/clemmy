@@ -699,6 +699,13 @@ function buildVisualContract(input: {
     input.criticalPath.length ? [`critical path: ${input.criticalPath.join(' -> ')}`] : [],
   );
 
+  return visualContractOf(checks, remediations);
+}
+
+function visualContractOf(
+  checks: WorkflowVisualContractCheck[],
+  remediations: WorkflowVisualContractRemediation[],
+): WorkflowExecutionVisualContract {
   const blockedCount = checks.filter((check) => check.status === 'block').length;
   const warningCount = checks.filter((check) => check.status === 'warn').length;
   const passCount = checks.filter((check) => check.status === 'pass').length;
@@ -709,6 +716,28 @@ function buildVisualContract(input: {
       ? `${warningCount} contract warning${warningCount === 1 ? '' : 's'} should be reviewed before unattended use.`
       : 'Workflow graph contract is trusted for repeatable execution.';
   return { status, summary, passCount, warningCount, blockedCount, checks, remediations };
+}
+
+/** The contract once a test run reached its tools for real: a tool the plan
+ *  could not confirm is confirmed for the steps that ran it, so its warning
+ *  and "confirm" fix do not contradict the run. */
+export function visualContractAfterRun(
+  contract: WorkflowExecutionVisualContract,
+  ranStepIds: ReadonlySet<string>,
+): WorkflowExecutionVisualContract {
+  const ran = (stepIds: readonly string[]) => stepIds.length > 0 && stepIds.every((id) => ranStepIds.has(id));
+  let changed = false;
+  const checks = contract.checks.map((check) => {
+    if (check.kind !== 'tool_readiness' || check.status !== 'warn' || !ran(check.stepIds)) return check;
+    changed = true;
+    return { ...check, status: 'pass' as const, detail: 'Every tool it reaches answered in the test run.', evidence: [] };
+  });
+  const remediations = contract.remediations.filter((fix) => {
+    const covered = fix.kind === 'confirm_tool_connection' && ran(fix.stepIds);
+    if (covered) changed = true;
+    return !covered;
+  });
+  return changed ? visualContractOf(checks, remediations) : contract;
 }
 
 function remediationAction(

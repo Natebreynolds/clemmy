@@ -81,8 +81,8 @@ import {
   buildWorkflowExecutionPlanWithReadiness,
   renderWorkflowVisualContract,
 } from '../execution/workflow-run-readiness.js';
-import type { WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
-import { listFinalFailedItems } from '../execution/workflow-events.js';
+import { visualContractAfterRun, type WorkflowExecutionPlan } from '../dashboard/workflow-execution-plan.js';
+import { listFinalFailedItems, readWorkflowEvents } from '../execution/workflow-events.js';
 import {
   awaitWorkflowCreationTestSettlement,
   type WorkflowCreationTestSettlement,
@@ -358,8 +358,9 @@ export function renderAuthoringAdvisories(warnings: string[] | undefined): strin
   return `\n\nHeads up (advisory — the workflow was saved):\n- ${warnings.join('\n- ')}`;
 }
 
-function appendVisualContract(plan: WorkflowExecutionPlan | undefined): string {
-  const block = renderWorkflowVisualContract(plan);
+function appendVisualContract(plan: WorkflowExecutionPlan | undefined, settled?: WorkflowCreationTestSettlement | null): string {
+  const ran = settled?.pass ? new Set(settled.steps.filter((row) => row.status === 'ok').map((row) => row.stepId)) : null;
+  const block = renderWorkflowVisualContract(ran && plan?.visualContract ? visualContractAfterRun(plan.visualContract, ran) : plan);
   return block ? `\n\n${block}` : '';
 }
 
@@ -1504,7 +1505,7 @@ export function registerOrchestrationTools(server: McpServer): void {
             dirName,
             `${headline} Here's what it will do:\n\n${describeWorkflowPlainEnglish(readWorkflow(dirName)?.data ?? created.savedDef)}\n\n`
             + `${appendDataSources(created.savedDef)}`
-            + `${appendVisualContract(created.executionPlan)}`
+            + `${appendVisualContract(created.executionPlan, settled)}`
             + `\n\nSaved to workflows/${dirName}/SKILL.md.${createBindReport}\n\n`
             + `${renderCreationTestSettlementReceipt(settled, readWorkflow(dirName)?.data ?? created.savedDef, name)}${advisoryTail}`,
             { before: null },
@@ -3058,8 +3059,15 @@ function creationTestProducedLines(settled: WorkflowCreationTestSettlement): str
   const exact = readExactWorkflowRunForStatus(settled.runId);
   if (!exact.ok) return [];
   const record = exact.record;
-  let produced = typeof record.output === 'string' ? record.output.trim() : '';
-  if (!produced && record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)) {
+  // A creation test's record holds only its verdict; what its steps returned
+  // is in the run's own step journal.
+  const journaled = record.status === 'creation_test' && typeof record.workflow === 'string'
+    ? readWorkflowEvents(record.workflow, settled.runId).filter((event) => event.kind === 'step_completed' && event.output !== undefined).at(-1)?.output
+    : undefined;
+  let produced = journaled !== undefined
+    ? (typeof journaled === 'string' ? journaled.trim() : JSON.stringify(journaled))
+    : record.status !== 'creation_test' && typeof record.output === 'string' ? record.output.trim() : '';
+  if (!produced && record.status !== 'creation_test' && record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)) {
     const last = Object.values(record.stepOutputs as Record<string, unknown>).at(-1);
     produced = typeof last === 'string' ? last.trim() : last === undefined ? '' : JSON.stringify(last);
   }

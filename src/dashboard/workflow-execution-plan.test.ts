@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildWorkflowExecutionPlan } from './workflow-execution-plan.js';
+import { buildWorkflowExecutionPlan, visualContractAfterRun } from './workflow-execution-plan.js';
 
 test('buildWorkflowExecutionPlan exposes DAG batches, critical path, fanout, gates, and tool surface', () => {
   const plan = buildWorkflowExecutionPlan([
@@ -329,4 +329,18 @@ test('buildWorkflowExecutionPlan distinguishes default, intent-routed, exact-mod
     { stepId: 'lookup', binding: 'non_model', provider: null, portable: true },
     { stepId: 'render', binding: 'non_model', provider: null, portable: true },
   ]);
+});
+
+test('a tool the plan could not confirm is confirmed once a test run reached it for that step', () => {
+  const plan = buildWorkflowExecutionPlan([
+    { id: 'pull', prompt: '', call: { tool: 'CALENDAR_VIEW_FIXTURE', args: { top: 5 } }, sideEffect: 'read' },
+  ], { readiness: { availableTools: ['composio_execute_tool'] } });
+  const before = plan.visualContract;
+  assert.equal(before.checks.find((check) => check.kind === 'tool_readiness')?.status, 'warn');
+  assert.ok(before.remediations.some((fix) => fix.kind === 'confirm_tool_connection'));
+  const after = visualContractAfterRun(before, new Set(['pull']));
+  assert.equal(after.checks.find((check) => check.kind === 'tool_readiness')?.status, 'pass');
+  assert.equal(after.remediations.some((fix) => fix.kind === 'confirm_tool_connection'), false);
+  assert.equal(after.warningCount, before.warningCount - 1);
+  assert.equal(visualContractAfterRun(before, new Set(['other'])), before, 'a step that did not run proves nothing');
 });
