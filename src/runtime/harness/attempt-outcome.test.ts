@@ -92,3 +92,13 @@ test('a non-mutating call the provider answered with its own error is an answer,
   assert.equal(providerAnsweredNonMutatingCall(read, Object.assign(new Error('x'), { name: 'ProviderAnsweredError' })), true,
     'the class name is the nominal marker across a module boundary');
 });
+
+test('a read the provider answered with its own error is named as such; a write keeps its uncertain reading', async () => {
+  const { classifyAttemptOutcome } = await import('./attempt-outcome.js');
+  const read = classifyAttemptOutcome({ providerAnsweredFailure: true, mutating: false, errorName: 'ProviderAnsweredError' });
+  assert.equal(read.kind, 'unknown', 'it proves no data');
+  assert.equal(read.detail, 'provider_answered_read');
+  const write = classifyAttemptOutcome({ providerAnsweredFailure: true, mutating: true, errorName: 'ProviderAnsweredError' });
+  assert.equal(write.kind, 'uncertain_write');
+  assert.equal(write.detail, 'provider_refused_envelope');
+});

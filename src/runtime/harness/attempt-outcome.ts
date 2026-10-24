@@ -455,6 +455,14 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
     if (status >= 200 && status < 300) return outcome('succeeded', 'structured', `http_${status}`);
   }
 
+  // A read the provider answered with its own error, thrown as
+  // ProviderAnsweredError (a native MCP isError: a record not found, an
+  // invalid argument): nothing changed, and the provider's words are the
+  // answer. Still `unknown` (it proves no data); the detail names it.
+  if (signals.mutating !== true && signals.providerAnsweredFailure === true && signals.preDispatch !== true) {
+    return outcome('unknown', 'nominal', PROVIDER_ANSWERED_READ);
+  }
+
   // MCP's own error flag says that THIS ATTEMPT failed; it does not say why.
   // Candidate elimination requires narrower capability evidence (for example
   // an explicit 404/405/501 above). Treating every generic MCP error as
@@ -551,6 +559,9 @@ export function providerRepliedWithoutProof(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'uncertain_write'
     && (outcome.detail === 'provider_refused_envelope' || outcome.detail === 'provider_envelope_contradiction');
 }
+
+/** Settlement detail of a read the provider answered with its own error. */
+export const PROVIDER_ANSWERED_READ = 'provider_answered_read';
 
 /** A call its settlement holds as non-mutating (a read, including a learned
  * read of an operation that can also write) whose provider answered with its

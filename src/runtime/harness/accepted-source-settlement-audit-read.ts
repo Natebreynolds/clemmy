@@ -796,6 +796,21 @@ export function auditAcceptedSourceSettlementTruthRead(input: {
         && (row.outcome_detail.startsWith('read_answered:') || row.outcome_detail === 'read_exited')
         && successful.length > 0
       ) return false;
+      // A READ THE PROVIDER ANSWERED IS AN ANSWER IN A CONVERSATION. The
+      // provider said why it could not return the record (not found, an
+      // invalid argument); nothing changed, and that answer is what the owner
+      // is told, so a chat whose only read was answered this way is not an
+      // unrecovered failure. The completion review still judges the reply. A
+      // declared step (its caller sets requireEveryBusinessReadToSettle,
+      // true or false) keeps the stricter rules below: its read is the
+      // result the step owes.
+      if (
+        row.mutating === 0 && row.outcome_kind === 'unknown'
+        // PROVIDER_ANSWERED_READ in attempt-outcome.ts; spelled here because
+        // this read core imports no application module.
+        && row.outcome_detail === 'provider_answered_read'
+        && input.requireEveryBusinessReadToSettle === undefined
+      ) return false;
       // A FAILED READ THAT WAS WORKED AROUND IS NOT AN UNRECOVERED FAILURE.
       // Recovery identity is the exact call (requirement, or tool+arguments),
       // so trying a query, having it rejected, and getting the same facts from

@@ -1416,3 +1416,35 @@ test('a read that returned a reply the host could not classify does not veto its
     assert.equal(audit.facts.unrecoveredBusinessFailures, returned ? 0 : 1, `${runId}: ${JSON.stringify(audit)}`);
   }
 });
+
+test('a read the provider answered is an answer in a chat; a declared step keeps the stricter rule', () => {
+  for (const mode of ['chat', 'step-strict', 'step-read'] as const) {
+    const sessionId = mode === 'chat' ? `answered-read-${mode}` : `workflow:answered-read-${mode}:lookup`;
+    eventlog.createSession({ id: sessionId, kind: mode === 'chat' ? 'chat' : 'workflow' });
+    const source = eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Show the record named fixture-missing.' } });
+    recordSemanticParticipation(sessionId, source.seq, 'participated');
+    assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId, turn: source.turn, sourceUserSeq: source.seq } }));
+    const acceptedTaskId = identities.acceptedTaskIdFor(sessionId, source.seq);
+    const begun = dispatch.beginPhysicalDispatch({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId,
+        logicalToolCallId: 'logical:lookup', physicalDispatchId: 'dispatch:lookup', ordinal: 0 },
+      tool: 'alpha_record_lookup',
+      args: { name: 'fixture-missing' },
+    });
+    if (begun.status !== 'inserted') throw new Error('fixture dispatch was not admitted');
+    dispatch.settlePhysicalDispatch({ identity: begun.identity, tool: 'alpha_record_lookup', args: { name: 'fixture-missing' }, outcome: 'threw' });
+    settlements.commitLogicalCallSettlement({
+      identity: { sessionId, sourceUserSeq: source.seq, turn: source.turn, acceptedTaskId, logicalToolCallId: 'logical:lookup' },
+      contract: { toolName: 'alpha_record_lookup', args: { name: 'fixture-missing' } },
+      execution: { kind: 'provider_execution' },
+      outcome: outcomes.classifyAttemptOutcome({ providerAnsweredFailure: true, mutating: false, errorName: 'ProviderAnsweredError' }),
+      recovery: { businessCall: true, mutating: false },
+      observer: { lane: 'byo', turn: source.turn },
+    });
+    const audit = auditAcceptedSourceSettlementTruth({
+      sessionId, sourceUserSeq: source.seq,
+      ...(mode === 'step-strict' ? { requireEveryBusinessReadToSettle: true } : mode === 'step-read' ? { requireEveryBusinessReadToSettle: false } : {}),
+    });
+    assert.equal(audit.facts.unrecoveredBusinessFailures, mode === 'chat' ? 0 : 1, `${mode}: ${JSON.stringify(audit)}`);
+  }
+});
