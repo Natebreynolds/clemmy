@@ -65,6 +65,11 @@ export function carrierOwnFieldsOnly(carrier: Record<string, unknown>): Record<s
   return Object.fromEntries(Object.entries(carrier).filter(([field]) => CARRIER_OWN_FIELDS.has(field)));
 }
 
+/** The one change that corrects nothing: args_json sent as a JSON object,
+ * a form the carrier accepts, encoded once for dispatch. Kept on the record;
+ * never told to the model as a repair, since that reads as "resend it". */
+export const ARGS_JSON_OBJECT_ENCODED = 'encoded args_json once for internal dispatch; a JSON object and JSON-object text are both supported';
+
 export interface LiftedCarrierFields {
   argumentsJson: string;
   target: string;
@@ -122,9 +127,7 @@ export function liftNestedCarrierFields(argumentsJson: string): LiftedCarrierFie
   if (outerName && innerName && innerName !== outerName) return strayOnly();
   const target = outerName || innerName;
   if (!target) return null;
-  const changes: string[] = [...strayChange, ...(sentAsObject
-    ? ['encoded args_json once for internal dispatch; a JSON object and JSON-object text are both supported']
-    : [])];
+  const changes: string[] = [...strayChange, ...(sentAsObject ? [ARGS_JSON_OBJECT_ENCODED] : [])];
   if (nested.length === 0) {
     return { argumentsJson: JSON.stringify({ ...outer, args_json: JSON.stringify(inner) }), target, changes };
   }

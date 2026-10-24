@@ -7183,7 +7183,8 @@ test('production host external reads require one exact frozen manifest/account/s
       assert.deepEqual(repair[0]?.data.changes, ['carrier_arguments_completed']);
       assert.ok(requests[1]?.includes(`Host repair for call ${input.label}-external-call:`),
         'the next model request receives the bounded per-call correction');
-      assert.ok(requests[1]?.includes('Use the corrected carrier shape on subsequent calls.'));
+      assert.ok(requests[1]?.includes('That call already ran in the repaired form and its result is its answer; do not send it again.'),
+        'a real repair says the call already ran, so it is not sent twice');
       assert.equal(requests[2]?.includes(`Host repair for call ${input.label}-external-call:`), false,
         'the correction is consumed once and does not leak into later model steps');
       const authority = noProgressProjection.projectHostNoProgressAuthority({

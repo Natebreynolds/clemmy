@@ -137,6 +137,9 @@ test('call_tool with args_json as an object runs the target in the same round', 
   const repaired = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] })
     .filter((event) => event.data.kind === 'carrier_repaired' && event.data.callId === 'roots-object');
   assert.equal(repaired.length, 1, 'the repair is journaled');
-  assert.match(JSON.stringify(requests[1]), /encoded args_json once/, 'the model is told the expected shape');
+  // An object args_json is a form the carrier accepts. Told as a "repair",
+  // it read as "send it again" and every read went out two or three times.
+  assert.doesNotMatch(JSON.stringify(requests[1]), /Host repair for call roots-object|encoded args_json once/,
+    'a supported form is not reported to the model as a repair');
   assert.equal(outcome.finalOutput, 'Here are the folders.');
 });

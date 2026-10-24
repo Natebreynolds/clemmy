@@ -8,7 +8,7 @@ export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT, identicalRefusalKey } from './dispatch-streak.js';
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
-import { carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
+import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -12203,8 +12203,16 @@ const runHostTurnBody = async (
             operation: completed.toolSlug,
             changes: ['carrier_arguments_completed'],
           });
-          const repairLine = `Host repair for call ${call.callId}: ${completed.changes.join('; ').slice(0, 300)}. Use the corrected carrier shape on subsequent calls.`;
-          pendingHostModelDirective = [pendingHostModelDirective, repairLine].filter(Boolean).join('\n').slice(0, 2400);
+          // Only a real correction is told, and it says the call already ran
+          // in the repaired form: "use the corrected shape" alone reads as
+          // "send it again", and the same read went out two and three times.
+          const told = completed.changes.filter((change) => change !== ARGS_JSON_OBJECT_ENCODED);
+          if (told.length > 0) {
+            const repairLine = `Host repair for call ${call.callId}: ${told.join('; ').slice(0, 300)}. `
+              + 'That call already ran in the repaired form and its result is its answer; do not send it again. '
+              + 'Use the repaired form on later calls.';
+            pendingHostModelDirective = [pendingHostModelDirective, repairLine].filter(Boolean).join('\n').slice(0, 2400);
+          }
         }
         if (materialized.boundTargets) {
           (call as { argumentsJson: string }).argumentsJson = argumentsJson;
