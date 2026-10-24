@@ -290,8 +290,9 @@ export type MemoryCorrectionCompletion =
 export function hostVerifiedMemoryRetention(source: MemoryRequirementSource): MemoryCorrectionCompletion | null {
   try {
     const retained = readRetainedMemoryRequirement(source);
-    // An exact correction keeps its bound postcondition: only its proof closes it.
-    if (retained?.assessment.kind === 'correct') return null;
+    // A partial save cannot discharge an unresolved request or an exact
+    // correction: the retained obligation still needs its own proof.
+    if (retained?.assessment.kind === 'correct' || retained?.assessment.kind === 'unresolved') return null;
     // The brain stored the memory itself in this request and its receipt says
     // an older fact was retired (or the fact was already held): host storage,
     // not prose. Live 2026-10-21 (a tester): "commit this to memory …" → the
@@ -333,7 +334,7 @@ export function memoryCorrectionCompletion(source: MemoryRequirementSource): Mem
     const retained = readRetainedMemoryRequirement(source);
     if (!retained) return { status: 'unverified', reason: 'The memory requirement has not been checked.' };
     if (retained.assessment.kind === 'none' || retained.assessment.kind === 'retain') return { status: 'not_required', assessmentDigest: retained.assessmentDigest };
-    if (retained.assessment.kind === 'unresolved' || retained.assessment.kind === 'replaced') {
+    if (retained.assessment.kind === 'replaced') {
       // The brain's own settled supersede retired the older fact: host storage.
       const explicit = explicitRememberStored(source);
       if (explicit?.action === 'supersede') return { status: 'verified', assessmentDigest: retained.assessmentDigest };

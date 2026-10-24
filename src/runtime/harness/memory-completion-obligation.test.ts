@@ -497,3 +497,88 @@ test('manual correction validates all exact arguments before accepting a matchin
       'a fast-return check neither writes another fact nor enters provider review');
   }
 });
+
+
+for (const action of ['supersede', 'reinforce'] as const) test(`actual host keeps unresolved memory after partial ${action}`, async () => {
+  const identity = source('Correct both synthetic report headings: change HAZEL RIDGE to LILAC GROVE for report A and resolve report B before claiming both are corrected. Preserve both footers.');
+  const unresolved = { version: 1 as const, kind: 'unresolved' as const, corrections: [],
+    reason: 'Report B has not been bound to its exact original fact. Report A alone does not complete both requested corrections.' };
+  retain(identity, unresolved);
+  const first = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report A: heading HAZEL RIDGE; footer COPPER KITE.`, scope: null, sessionId: identity.sessionId });
+  const second = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report B: heading HAZEL RIDGE; footer COPPER KITE.`, scope: null, sessionId: identity.sessionId });
+  let storedId = first.id;
+  settle(identity, 'memory_remember', `partial-${action}-${serial}`, () => {
+    if (action === 'supersede') {
+      const stored = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report A: heading LILAC GROVE; footer COPPER KITE.`, scope: null, sessionId: identity.sessionId });
+      assert.equal(facts.markFactSupersededBy(first.id, stored.id, { validTo: identity.retained.occurredAt }), true);
+      storedId = stored.id;
+    }
+    return receipts.formatMemoryRememberReceipt({ action, factId: storedId })
+      + '\nOne synthetic record was saved. Memory conflict unresolved: the second requested target remains active.';
+  }, { kind: 'project', content: action === 'supersede' ? 'Synthetic report A heading LILAC GROVE; footer COPPER KITE.' : 'Synthetic report A heading HAZEL RIDGE; footer COPPER KITE.' });
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'unresolved');
+  assert.deepEqual(memory.explicitRememberStored(identity.retained), { action, factId: storedId });
+  assert.equal(factState.readFactObservation(second.id)?.active, true);
+  const result = await runHost(identity, { done: true, reason: 'The model claims both requested corrections are complete.', memoryRequirement: unresolved });
+  const finalRequirement = memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind;
+  console.log('MEMORY_UNRESOLVED_RED_OBSERVATION ' + JSON.stringify({ action, calls: result.calls, reviews: result.reviews,
+    terminalStatus: result.outcome.terminal?.status ?? null, terminalReason: result.outcome.terminal?.reason ?? null,
+    retainedKind: finalRequirement, secondTargetActive: factState.readFactObservation(second.id)?.active,
+    finalOutputClaimsSaved: /saved and corrected/.test(result.outcome.finalOutput ?? '') }));
+  assert.ok(result.calls > 0 && result.reviews > 0, 'the real installed host completion boundary must run');
+  assert.equal(finalRequirement, 'unresolved', 'the retained requirement remains unresolved');
+  assert.equal(factState.readFactObservation(second.id)?.active, true, 'verification never repairs the other target');
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'a partial save must not complete the unresolved request');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'the exact completion helper preserves unresolved');
+  assert.equal(memory.hostVerifiedMemoryRetention(identity.retained), null, 'the early-save helper cannot override unresolved');
+});
+
+test('unresolved becomes exact correction and closes only with full proof', async () => {
+  const identity = source(ownerText + ' Also replace the stored word Fixture with Record.'); const fixture = observed(identity);
+  retain(identity, { version: 1, kind: 'unresolved', corrections: [], reason: 'The exact target has not yet been bound.' });
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified');
+  const toolEdits = [{ before: 'Fixture', after: 'Record' }, ...fixture.correction.edits];
+  fixture.correction.edits = [...toolEdits].reverse();
+  const retained = retain(identity, fixture.assessment, 'prewrite');
+  const callId = `bound-correction-${serial}`;
+  const args = { content: fixture.observation.content.replace('Fixture', 'Record').replace('HAZEL RIDGE', 'LILAC GROVE'), kind: 'project',
+    correct: { ...fixture.correction, edits: toolEdits } };
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, args.correct)?.assessmentDigest, retained.assessmentDigest);
+  let result: ReturnType<typeof factState.correctFactExact> | undefined;
+  settle(identity, 'memory_remember', callId, () => {
+    result = factState.correctFactExact({ targetId: fixture.fact.id, expectedObservationDigest: fixture.observation.digest,
+      patches: toolEdits, owner: { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        sourceEventId: identity.retained.sourceEventId, sourceContextDigest: identity.retained.sourceContextDigest,
+        logicalToolCallId: callId, argumentsDigest: contracts.durableLogicalCallContract(identity.retained.acceptedTaskId, 'memory_remember', args)!.argumentDigest,
+        assessmentDigest: retained.assessmentDigest, ownerText: identity.retained.ownerText, occurredAt: identity.retained.occurredAt } });
+    return JSON.stringify({ protocol: 'fact_correction_v1', ...result });
+  }, args);
+  assert.ok(result && result.status === 'corrected');
+  const afterId = result.proof.after.id;
+  assert.match(result.proof.after.content, /footer COPPER KITE\.$/);
+  assert.deepEqual(result.proof.patches, toolEdits, 'the immutable operation keeps the original tool patch order');
+  const count = memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get();
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  const record = events.openEventLog().prepare('SELECT data_json FROM events WHERE id=?').get(retained.eventId) as { data_json: string };
+  const changed = JSON.parse(record.data_json);
+  changed.review.phase = 'completion'; delete changed.review.ownerQuote;
+  events.openEventLog().prepare('UPDATE events SET data_json=? WHERE id=?').run(JSON.stringify(changed), retained.eventId);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'an operation alone cannot replace prewrite owner-intent authority');
+  changed.review.phase = 'prewrite'; changed.review.ownerQuote = 'A different person authorized this.';
+  events.openEventLog().prepare('UPDATE events SET data_json=? WHERE id=?').run(JSON.stringify(changed), retained.eventId);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'reopen revalidates the original owner quote');
+  events.openEventLog().prepare('UPDATE events SET data_json=? WHERE id=?').run(record.data_json, retained.eventId);
+  const done = await runHost(identity, { done: true, reason: 'The exact old/new postconditions hold.', memoryRequirement: fixture.assessment });
+  assert.equal(done.outcome.terminal, undefined);
+  assert.equal(done.calls, 1);
+  assert.deepEqual(memoryDb.openMemoryDb().prepare('SELECT COUNT(*) AS n FROM consolidated_facts').get(), count);
+  scope.stampMemoryScope('fact', afterId, { projectId: 'different-project', agentKey: null });
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'actual stored scope drift defeats historical success');
+  const heldSource = source(); const heldFact = observed(heldSource);
+  retain(heldSource, heldFact.assessment);
+  const held = await runHost(heldSource, { done: true, reason: 'ignored under disabled review' }, false);
+  assert.equal(held.reviews, 0);
+  assert.equal(held.outcome.terminal?.status, 'blocked', 'disabled review cannot waive a retained correction');
+});
