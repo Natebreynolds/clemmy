@@ -1157,7 +1157,7 @@ test('idle inbox: a proactive report-back renders; the user\'s own turns never r
 test('idle inbox: Clem\'s correction after a no takes the answer\'s place instead of a second reply', async () => {
   const { inboxAdditionsFromEvents, placeAnswerCheckCorrections } = await import('./useChat');
   const answer = { id: 'a-1', role: 'assistant' as const, text: 'The meeting is at 10:00.', status: 'complete' as const,
-    acceptedSource: { sessionId: 's', sourceUserSeq: 7, turn: 1 }, terminal: { review: 'rejected' as const, reviewNote: 'The record says 9:00.' } };
+    acceptedSource: { sessionId: 's', sourceUserSeq: 7, turn: 1 }, terminal: { status: 'done' as const, review: 'rejected' as const, reviewNote: 'The record says 9:00.' } };
   const additions = inboxAdditionsFromEvents([
     { seq: 30, turn: 0, type: 'user_input_received', data: { text: '[answer check] …', synthetic: true, source: 'outcome', sourceId: 'answer-check:7', sourceLabel: 'answer check' } },
     { seq: 31, turn: 0, type: 'conversation_completed', data: { reply: 'The meeting is at 9:00.' } },

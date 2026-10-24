@@ -118,7 +118,7 @@ test('only an answer-check report names an answer to correct', () => {
   assert.equal(answerCheckCorrectedSource({ sourceId: 'answer-check:12x' }), null);
   assert.equal(answerCheckCorrectedSource({ sourceId: 'bg-task:12' }), null);
   assert.equal(answerCheckCorrectedSource(null), null);
-  const rejected = [{ id: 'a', role: 'assistant', text: 'x', correctableSource: 2, terminal: { review: 'rejected' as const } }];
+  const rejected = [{ id: 'a', role: 'assistant', text: 'x', correctableSource: 2, terminal: { status: 'done' as const, review: 'rejected' as const } }];
   assert.equal(applyAnswerCheckCorrection(rejected, 3, { text: 'y' }), null, 'another answer is not touched');
   assert.equal(applyAnswerCheckCorrection(rejected, 2, { text: '   ' }), null, 'an empty correction replaces nothing');
 });
