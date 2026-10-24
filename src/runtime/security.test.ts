@@ -67,6 +67,17 @@ test('secret-key classification and assignment redaction cover camelCase credent
   assert.match(redacted, /safeValue=visible/);
 });
 
+test('a parser\'s "unexpected token" stays readable while credential-shaped token values are redacted', () => {
+  const soql = "MALFORMED_QUERY: LIKE '%Brett%' AND ActivityDate = THIS WEEK ORDER BY ActivityDate ^ ERROR at Row:1:Column:164 unexpected token: WEEK";
+  assert.equal(redactSensitiveText(soql), soql);
+  assert.match(redactSensitiveText("SyntaxError: Unexpected token: ')'"), /Unexpected token: '\)'/);
+  for (const secret of ['eyJhbGciOiJIUzI1NiJ9abcdef', 'ghp_abcdefghij1234567890', 'abc12345xyz', 'Bearer abcdefghijklmnop']) {
+    assert.doesNotMatch(redactSensitiveText(`invalid token: ${secret}`), new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), secret);
+  }
+  // Named credential fields never look at the value.
+  assert.doesNotMatch(redactSensitiveText('authToken: WEEK password: hunter secret=blue'), /WEEK|hunter|blue/);
+});
+
 test('redactSensitiveValue does not treat ordinary MCP telemetry as a secret', () => {
   const value = redactSensitiveValue({
     mcp: true,

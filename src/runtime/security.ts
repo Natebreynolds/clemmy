@@ -90,10 +90,30 @@ function redactSecretAssignments(input: string): string {
         : match,
   );
   return redactQuoted.replace(
-    /\b([A-Za-z][A-Za-z0-9_.-]{0,80})(\s*[:=]\s*)(?:(?:Bearer|Basic|Bot)\s+[A-Za-z0-9._~+/=-]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
-    (match, key: string, separator: string) =>
-      isSecretLikeKey(key) ? `${key}${separator}[REDACTED]` : match,
+    /\b([A-Za-z][A-Za-z0-9_.-]{0,80})(\s*[:=]\s*)((?:Bearer|Basic|Bot)\s+[A-Za-z0-9._~+/=-]+|"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+    (match, key: string, separator: string, value: string) => {
+      if (!isSecretLikeKey(key)) return match;
+      // The bare word "token" is also a parser's word: "unexpected token:
+      // WEEK" in a query error names the input to fix, not a credential.
+      // Live 2026-10-24: a Salesforce MALFORMED_QUERY reached the brain as
+      // "unexpected token: [REDACTED]", it retried the same query, and the
+      // owner's question first ended "I couldn't retrieve…". Only a bare
+      // token/tokens key looks at its value; every named credential field
+      // (authToken, access_token, password, secret …) stays redacted whatever
+      // the value looks like.
+      if (/^tokens?$/i.test(key) && !credentialShapedValue(value)) return match;
+      return `${key}${separator}[REDACTED]`;
+    },
   );
+}
+
+/** A value a credential could be: long, or letters mixed with digits, or a
+ *  scheme/prefixed token. A parser token (WEEK, FROM, ')') is none of these. */
+function credentialShapedValue(raw: string): boolean {
+  const value = raw.replace(/^["']|["']$/g, '').trim();
+  if (/^(?:Bearer|Basic|Bot)\s/i.test(value)) return true;
+  if (value.length >= 16) return true;
+  return value.length >= 8 && /[A-Za-z]/.test(value) && /\d/.test(value);
 }
 
 export function redactSensitiveText(input: unknown): string {
