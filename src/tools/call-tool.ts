@@ -69,6 +69,7 @@ import {
   isHarnessRefusalText,
   isSdkToolInputValidationError,
   textResult,
+  toolErrorText,
 } from './shared.js';
 import type { McpToolScope } from '../runtime/mcp-tool-scope.js';
 import { mcpToolAllowedByScope } from '../runtime/mcp-tool-authority.js';
@@ -963,8 +964,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
       if (error instanceof ToolCallsLimitExceeded) throw error;
       if (error instanceof ToolGuardrailEscalated) throw error;
       if (options.propagateInvocationError?.(error) === true) throw error;
-      const details = error instanceof Error ? error.toString() : String(error);
-      const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+      const base = toolErrorText(error);
       // The outer envelope failed before execute/inner dispatch. The host may
       // already own the exact inner read identity; the nominal refusal closes
       // that call without claiming the target ran.

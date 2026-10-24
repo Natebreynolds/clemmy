@@ -15,7 +15,7 @@ import { existsSync, writeFileSync, mkdirSync, readFileSync, realpathSync, statS
 import os from 'node:os';
 import path from 'node:path';
 import { tool, type Tool } from '@openai/agents';
-import { isSdkToolInputValidationError } from './shared.js';
+import { isSdkToolInputValidationError, toolErrorText } from './shared.js';
 import { BASE_DIR, getRuntimeEnv } from '../config.js';
 import { z } from 'zod';
 import type { RuntimeContextValue } from '../types.js';
@@ -5232,8 +5232,7 @@ export async function getDynamicComposioRuntimeTools(options: {
           if (isSdkToolInputValidationError(error)) {
             return invalidComposioArgumentsPreDispatchResult(error) as unknown as string;
           }
-          const details = error instanceof Error ? error.toString() : String(error);
-          return `An error occurred while running the tool. Please try again. Error: ${details}`;
+          return toolErrorText(error);
         },
         execute: async (input, context, details) => runComposioExecute(
           toolSlug,
@@ -5683,14 +5682,13 @@ export function getComposioRuntimeTools(): Tool<RuntimeContextValue>[] {
     // Safety net (call-tool.ts precedent): any FUTURE code path that still
     // throws the typed pre-dispatch refusal from inside execute must escape
     // the SDK's error_as_result so the bracket settles it `failed`, never
-    // `orphaned`. Ordinary errors keep the SDK's exact default prose.
+    // `orphaned`. Ordinary errors read as toolErrorText.
     errorFunction: (_context, error) => {
       if (error instanceof ExternalWritePreDispatchError) throw error;
       if (isSdkToolInputValidationError(error)) {
         return invalidComposioArgumentsPreDispatchResult(error) as unknown as string;
       }
-      const details = error instanceof Error ? error.toString() : String(error);
-      return `An error occurred while running the tool. Please try again. Error: ${details}`;
+      return toolErrorText(error);
     },
     execute: async ({ tool_slug, arguments: args, connected_account_id }, context, details) => {
       let parsedArgs: Record<string, unknown>;

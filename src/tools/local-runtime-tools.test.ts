@@ -19,6 +19,7 @@ const {
   buildScopedLocalToolSearch,
 } = await import('./local-runtime-tools.js');
 const { toolOutputContextFromSdk } = await import('../runtime/harness/tool-output-context.js');
+const { toolErrorText } = await import('./shared.js');
 const {
   HostLocalExecutionFailureResult,
   InvalidArgumentsPreDispatchResult,
@@ -94,9 +95,12 @@ test('invalid tool input returns violated paths and current schema or discovery 
   assert.match(forged as string, /Call tool_search with/);
   assert.doesNotMatch(forged as string, /Input schema \(complete\)/);
 
-  // A plain execution error keeps the exact SDK default shape — no guidance.
+  // A plain execution error keeps the SDK's opening sentence and says to
+  // change the input rather than resend it — no schema guidance.
   const executionMessage = await errorFunction(undefined, new Error('disk full'));
-  assert.equal(executionMessage, 'An error occurred while running the tool. Please try again. Error: Error: disk full');
+  assert.equal(executionMessage, toolErrorText(new Error('disk full')));
+  assert.match(executionMessage as string, /^An error occurred while running the tool. The same input will get the same error .* Error: Error: disk full$/);
+  assert.doesNotMatch(executionMessage as string, /Please try again/);
 
   // Unparseable JSON (no zod issues) gets the single-escaping guidance.
   const parseGuidance = describeInvalidToolInput(

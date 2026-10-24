@@ -13954,7 +13954,7 @@ export function concreteBlockerFromNewestToolResult(
     if (!cleaned) return null;
     return cleaned.length > 240 ? `${cleaned.slice(0, 237)}…` : cleaned;
   };
-  const error = /An error occurred while running the tool\.?\s*(?:Please try again\.)?\s*Error:\s*([\s\S]+)/i.exec(text);
+  const error = /An error occurred while running the tool\.?[^\n]*?\s*Error:\s*([\s\S]+)/i.exec(text);
   if (error) return bounded(error[1]!);
   try {
     const parsed = JSON.parse(text) as { ok?: unknown; message?: unknown; error?: unknown };

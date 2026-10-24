@@ -81,6 +81,7 @@ import {
   localNonWriteStatus,
   localNonWriteClassification,
   localExecutionFailureEffect,
+  toolErrorText,
 } from './shared.js';
 import { formatRecallableToolText } from '../runtime/harness/tool-output-format.js';
 import { toolOutputContextFromSdk, withToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -309,8 +310,9 @@ function invalidLocalToolInputResult(
     : text;
 }
 
-/** Error handler for every local runtime tool. Non-input errors keep the exact
- * SDK default text (downstream failure detection keys on that prefix);
+/** Error handler for every local runtime tool. Non-input errors keep the
+ * SDK's opening sentence (downstream failure detection keys on that prefix)
+ * and say to change the input rather than resend it (toolErrorText);
  * input-validation errors append schema guidance and ride the nominal
  * invalid-arguments carrier (same bytes in `.output`), and memory_remember
  * keeps only schema-preserving omitted-nullable recovery. */
@@ -443,10 +445,7 @@ export function buildLocalToolErrorFunction(
       // Only the SDK's nominal validation refusal proves the body did not
       // execute. Runtime failures keep their existing error truth, never a
       // newly asserted no-effect guarantee or an automatic repair invocation.
-      if (!isSdkToolInputValidationError(error)) {
-        const details = error instanceof Error ? error.toString() : String(error);
-        return `An error occurred while running the tool. Please try again. Error: ${details}`;
-      }
+      if (!isSdkToolInputValidationError(error)) return toolErrorText(error);
       // A memory save may carry scope, source provenance and requested graph
       // work. A valid required prefix cannot authorize dropping those fields.
       const normalizedShape = normalizeShapeForResponses(localTool.parameters);
@@ -493,8 +492,7 @@ export function buildLocalToolErrorFunction(
         async () => resultToText(await localTool.handler(repaired)),
       );
     }
-    const details = error instanceof Error ? error.toString() : String(error);
-    const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+    const base = toolErrorText(error);
     let inputSchema: unknown;
     if (isSdkToolInputValidationError(error)) {
       try {
@@ -530,8 +528,8 @@ function localToolToRuntimeTool(localTool: CapturedLocalTool): Tool<RuntimeConte
       async () => resultToText(await localTool.handler(input as Record<string, unknown>)),
     ),
     // Input-validation failures return the violated paths + this exact schema
-    // (or the existing discovery fallback); execution errors keep the
-    // SDK's default text; memory_remember keeps only exact omitted-nullable recovery.
+    // (or the existing discovery fallback); execution errors read as
+    // toolErrorText; memory_remember keeps only exact omitted-nullable recovery.
     errorFunction: buildLocalToolErrorFunction(localTool,
       () => parserInputSchema(parameters)) as unknown as SdkStringErrorFunction,
   });

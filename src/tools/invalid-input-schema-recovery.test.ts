@@ -19,7 +19,7 @@ const {
   getLocalToolSchemas,
   normalizeShapeForResponses,
 } = await import('./local-runtime-tools.js');
-const { describeInvalidToolInput, INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS } = await import('./shared.js');
+const { describeInvalidToolInput, INVALID_INPUT_SCHEMA_GUIDANCE_MAX_CHARS, toolErrorText } = await import('./shared.js');
 const { registerToolSearchTool } = await import('./tool-search-tool.js');
 const { InvalidArgumentsPreDispatchResult, attemptSignalsFromTypedResult } = await import('../runtime/harness/attempt-settlement.js');
 
@@ -208,6 +208,6 @@ test('forged validation names and execution failures gain neither schema nor no-
   assert.equal(effects, 0);
   assert.equal(schemaReads, 0);
   assert.equal(await errorFunction(undefined, new Error('disk full')),
-    'An error occurred while running the tool. Please try again. Error: Error: disk full');
+    toolErrorText(new Error('disk full')));
   assert.equal(schemaReads, 0);
 });

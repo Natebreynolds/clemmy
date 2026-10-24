@@ -231,6 +231,17 @@ test('an SDK-laundered non-validation error string settles as a failure, not suc
   assert.equal(successHandleCount(task), 0);
 });
 
+test('a thrown tool error in the host wording (change the input, not resend) settles as a failure', async () => {
+  const { toolErrorText } = await import('../../tools/shared.js');
+  const text = toolErrorText(new Error('MALFORMED_QUERY: unexpected token: WEEK'));
+  assert.doesNotMatch(text, /Please try again/);
+  const task = accept('host-worded execution error');
+  const settled = settleHostString(task, 'logical:host-worded-execution', text);
+  assert.notEqual(settled.outcome.kind, 'succeeded',
+    'the opening sentence still marks a thrown error; dispatch state is unknown, success is not');
+  assert.equal(successHandleCount(task), 0);
+});
+
 test('an ordinary local string result still settles succeeded with host evidence (forward-only)', () => {
   const task = accept('plain local result');
   const settled = settleHostString(task, 'logical:plain-result',

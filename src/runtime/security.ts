@@ -94,10 +94,8 @@ function redactSecretAssignments(input: string): string {
     (match, key: string, separator: string, value: string) => {
       if (!isSecretLikeKey(key)) return match;
       // The bare word "token" is also a parser's word: "unexpected token:
-      // WEEK" in a query error names the input to fix, not a credential.
-      // Live 2026-10-24: a Salesforce MALFORMED_QUERY reached the brain as
-      // "unexpected token: [REDACTED]", it retried the same query, and the
-      // owner's question first ended "I couldn't retrieve…". Only a bare
+      // WEEK" in a query error names the input to fix, not a credential, and
+      // hiding it leaves the brain nothing to correct. Only a bare
       // token/tokens key looks at its value; every named credential field
       // (authToken, access_token, password, secret …) stays redacted whatever
       // the value looks like.

@@ -936,8 +936,10 @@ function providerConfirmedNotFoundString(result: unknown): boolean {
 }
 
 /** The Agents SDK's errorFunction launders EVERY invoke error into "An error
- * occurred while running the tool. Please try again. Error: …" and returns it
- * as the tool's own result. The prefix is host/SDK-authored, never provider
+ * occurred while running the tool. Please try again. Error: …" (or the host's
+ * own next-step sentence in place of "Please try again.", see
+ * toolErrorText) and returns it as the tool's own result. The
+ * opening sentence is host/SDK-authored, never provider
  * prose. An InvalidToolInputError detail proves validation refused the call
  * BEFORE the body ran (repairable arguments); any other detail proves only
  * that the attempt failed — dispatch state stays unknown, success does not.
@@ -945,7 +947,7 @@ function providerConfirmedNotFoundString(result: unknown): boolean {
  * success=1 across four sessions (sess-desktop-8823/b3a7/f58f/e0e9). */
 function sdkLaunderedErrorString(result: unknown): 'invalid_input' | 'execution' | null {
   for (const candidate of stringCandidates(result)) {
-    if (!/^\s*An error occurred while running the tool\. Please try again\. Error:/.test(candidate)) continue;
+    if (!/^\s*An error occurred while running the tool\.[^\n]*? Error:/.test(candidate)) continue;
     return /InvalidToolInputError|Invalid JSON input for tool/.test(candidate)
       ? 'invalid_input'
       : 'execution';

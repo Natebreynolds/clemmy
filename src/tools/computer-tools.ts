@@ -28,6 +28,7 @@ import {
   describeInvalidToolInput,
   getWorkspaceDirs,
   isSdkToolInputValidationError,
+  toolErrorText,
 } from './shared.js';
 import { HostLocalReadSuccessResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { LocalFileCreateConflict } from '../runtime/harness/local-file-create-conflict.js';
@@ -2117,8 +2118,7 @@ export function getComputerTools(): Tool<RuntimeContextValue>[] {
       }
       if (error instanceof ShellCommandExecutionError && (error.outcome.timeoutCleanup === 'incomplete'
         || error.outcome.errorKind === 'process_cleanup_unconfirmed')) return error.message;
-      const details = error instanceof Error ? error.toString() : String(error);
-      const base = `An error occurred while running the tool. Please try again. Error: ${details}`;
+      const base = toolErrorText(error);
       // A malformed argument object never reached execute: keep the exact
       // SDK bytes for the model and the nominal no-dispatch carrier for
       // settlement, as every other tool surface does (see shared.js).

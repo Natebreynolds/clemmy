@@ -235,6 +235,27 @@ export function isSdkToolInputValidationError(error: unknown): error is SdkToolI
 }
 
 /**
+ * What a tool whose body threw reads as. The SDK default opens with "Please
+ * try again.", which reads as "send the same call again"; an error the tool
+ * answered with (a parser, a refusal, a missing record) comes back the same
+ * way for the same input, so the text says what to do instead. The opening
+ * sentence stays the anchor every failure detector reads, and the details stay
+ * last, after "Error:", where settlement and blocker extraction take them.
+ * Input-validation refusals keep their own repair text.
+ */
+const TOOL_EXECUTION_ERROR_NEXT_STEP = 'The same input will get the same error '
+  + 'unless the error names something temporary (a timeout, a rate limit, a lost connection), '
+  + 'so read what it names and change the input or the approach before calling again.';
+
+export function toolErrorText(error: unknown): string {
+  const details = error instanceof Error ? error.toString() : String(error);
+  if (error && typeof error === 'object' && (error as { name?: unknown }).name === 'InvalidToolInputError') {
+    return `An error occurred while running the tool. Please try again. Error: ${details}`;
+  }
+  return `An error occurred while running the tool. ${TOOL_EXECUTION_ERROR_NEXT_STEP} Error: ${details}`;
+}
+
+/**
  * Actionable guidance for an input-validation failure on a tool surface. The
  * SDK default ("Invalid JSON input for tool") names nothing the model can
  * correct — observed live (proof workspace-build, 2026-07-27): three blind
