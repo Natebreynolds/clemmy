@@ -99,3 +99,15 @@ test('a view that shows the whole list with every field declares no partial cove
   assert.deepEqual(shown.data.value, original.data.value);
   assert.equal(shown.__clementine.records, undefined);
 });
+
+test('a clipped structured view says the whole result is stored and that the same call returns the same clip', async () => {
+  const { compactStructuredJsonToolOutput } = await import('./tool-output-digest.js');
+  const records = Array.from({ length: 300 }, (_, i) => ({ Id: `00T${i}`, Subject: `Email ${i}`, Status: 'Completed' }));
+  const shown = compactStructuredJsonToolOutput(JSON.stringify({ result: { records, totalSize: 300 } }),
+    { callId: 'call_clip', maxChars: 4000, exactOutputReceipt: '[exact-output-receipt:v1 nonce=n sha256=s]' });
+  assert.ok(shown);
+  const meta = JSON.parse(shown!).__clementine;
+  assert.match(meta.projectionSemantics, /All of it is stored/);
+  assert.match(meta.projectionSemantics, /not by re-sending the call/);
+  assert.deepEqual(meta.recovery.tool_output_query, { call_id: 'call_clip', limit: 50 });
+});

@@ -531,7 +531,9 @@ export function compactStructuredJsonToolOutput(
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
-  const projectionSemantics = 'Omitted fields and array suffixes are unavailable in this view, not null or empty source values. Arrays retain original prefix order.';
+  // Also the brain's next step: the readers alone, as data, did not stop a
+  // re-sent read that only returns this same clipped view.
+  const projectionSemantics = 'Omitted fields and array tails are unshown, not null or empty; prefix order kept. All of it is stored: read on via recovery, not by re-sending the call.';
   const fullMetadata = {
     kind: 'structured_projection_v1',
     truncated: true,
