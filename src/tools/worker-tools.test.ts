@@ -375,7 +375,10 @@ test('SDK-brain handler reuses a completed logical manifest item when the resume
         assert.ok(getToolOutputForInvocation(sessionId, resumeCallId, resumeContext.settlementNonce)?.output === largeResult,
           'the exact resumed invocation retains raw work without host annotations');
         const visible = second.content[0].text;
-        assert.ok(visible.length <= DEFAULT_TOOL_RESULT_MAX_CHARS, 'reuse guidance stays inside the existing model-output ceiling');
+        // The host's annotations sit beside the result's ceiling, never inside it.
+        const annotationFrame = visible.startsWith('[Host annotations') ? visible.slice(0, visible.indexOf('\n\n') + 2) : '';
+        assert.ok(visible.length <= DEFAULT_TOOL_RESULT_MAX_CHARS + annotationFrame.length,
+          'reuse guidance stays inside the existing model-output ceiling');
         assert.ok(exactToolOutputForInvocation({ ...resumeContext, compactResult: visible }) === largeResult,
           'the annotated model return redeems the original bytes for this invocation');
         const wrappedAgain = withToolOutputContext(resumeContext, () => formatRecallableToolText(visible));

@@ -43,7 +43,7 @@ const { registerSpaceTools } = await import('../../tools/space-tools.js');
 const { hostRunRunner } = await import('./host-turn-runner.js');
 const schemas = await import('../../tools/composio-schema-cache.js');
 const { digestSchema } = await import('../../tools/tool-contract-store.js');
-const { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, inlineResultBudgetForModel } = await import('./tool-output-format.js');
+const { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, BUSINESS_RESULT_INLINE_CHARS, inlineResultBudgetForModel } = await import('./tool-output-format.js');
 const { recordWindowRejection } = await import('./model-window-observations.js');
 
 after(() => {
@@ -245,9 +245,10 @@ test('an explicit 20000-character local preview delivers a medium file whole thr
       const shown = result.results.get(callId)!;
       assert.equal(events.getToolOutput(result.sessionId, callId)?.output, payload, 'raw retention is unchanged for both preview choices');
       if (requested === null) {
-        assert.ok(shown.length <= PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
-        assert.match(shown, /middle omitted/);
-        assert.doesNotMatch(shown, /CRITICAL-MIDDLE-EVIDENCE/);
+        // Under the default business bound, a medium file arrives whole too.
+        assert.ok(shown.length <= BUSINESS_RESULT_INLINE_CHARS + 2_000);
+        assert.match(shown, /CRITICAL-MIDDLE-EVIDENCE/);
+        assert.doesNotMatch(shown, /middle omitted/);
       } else {
         const visible = carrier ? shown : wholeInlinePayload(shown, callId);
         assert.deepEqual(Buffer.from(visible), Buffer.from(payload), 'every UTF-8 byte, including the missing middle, reaches the next model request');
@@ -457,7 +458,7 @@ test('the per-turn RecallBudget governs recalls made through a carrier', async (
   assert.ok(/^ERROR: /.test(second), `the second carrier recall is refused by the turn budget: ${second.slice(0, 300)}`);
 });
 
-test('a provider result through the real work_call carrier keeps the 4,000-char keyhole and its digest', async () => {
+test('a provider result over the business bound keeps a bounded digest through the real work_call carrier', async () => {
   const operationId = 'GOOGLESHEETS_VALUES_GET';
   const accountId = 'ca_presentationfixture';
   const schema = { type: 'object', additionalProperties: false, properties: { city: { type: 'string' } }, required: ['city'] };
@@ -479,8 +480,10 @@ test('a provider result through the real work_call carrier keeps the 4,000-char 
   assert.deepEqual(ports.registerFixtureCapabilityPort(ports.productionPortIdentityFromManifest(manifest), {
     invoke: refuse as never, admitPreparation() {}, prepareInvocation: async () => ({}), invokeWithPreparation: async (_proof, work) => work(),
   }), { ok: true });
-  // Same size and shape of text as the Space read: only the origin differs.
-  const providerText = wholeSpaceRead.replaceAll('Workspace', 'Provider sheet');
+  // Same shape of text as the larger Space read, over the business bound:
+  // only the origin differs.
+  const providerText = largeSpaceRead.replaceAll('Workspace', 'Provider sheet');
+  assert.ok(providerText.length > BUSINESS_RESULT_INLINE_CHARS, `over the business bound (got ${providerText.length})`);
   inner._setInnerDispatchToolsForTests(new Map([['composio_execute_tool', tool({
     name: 'composio_execute_tool', description: 'Injected provider body.',
     parameters: z.object({ tool_slug: z.string(), arguments: z.string().nullable(), connected_account_id: z.string().nullable() }),
@@ -500,8 +503,8 @@ test('a provider result through the real work_call carrier keeps the 4,000-char 
     });
     const shown = results.get('provider-read');
     assert.ok(shown);
-    assert.ok(shown.length <= PROMPT_INLINE_RECALLABLE_RESULT_CHARS, `provider result stays in the keyhole (got ${shown.length})`);
-    assert.match(shown, /middle omitted/, 'the keyhole is a head/tail digest');
+    assert.ok(shown.length <= BUSINESS_RESULT_INLINE_CHARS, `provider result stays within its bound (got ${shown.length})`);
+    assert.match(shown, /middle omitted/, 'the bounded view is a head/tail digest');
     assert.match(shown, /recall_tool_result/, 'the digest names the lossless recall');
     assert.equal(shown.includes(MIDDLE_EVIDENCE), false);
   } finally {

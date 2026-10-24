@@ -18,7 +18,7 @@ mkdirSync(path.join(home, 'state'), { recursive: true });
 
 const {
   DEFAULT_TOOL_RESULT_MAX_CHARS,
-  PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+  BUSINESS_RESULT_INLINE_CHARS,
   MCP_TRANSPORT_MAX_CHARS,
   inlineResultBudgetForModel,
   presentationBudgetFor,
@@ -37,6 +37,9 @@ const SMALL_WINDOW_MODEL = 'fixture-small-window-model';
 const LARGE_WINDOW_MODEL = 'fixture-large-window-model';
 recordWindowRejection(SMALL_WINDOW_MODEL, 32_001);
 recordCatalogWindow(LARGE_WINDOW_MODEL, 1_000_000, 'fixture');
+
+/** A provider or business result: whole up to its own bound, never above the window's. */
+const business = (routedModelId?: string) => Math.min(BUSINESS_RESULT_INLINE_CHARS, inlineResultBudgetForModel(routedModelId));
 
 const carried = (carrier: 'call_tool' | 'work_call', name: string, args: Record<string, unknown>) => ({
   toolName: carrier,
@@ -64,7 +67,7 @@ test('a carrier resolves exactly the budget of the inner tool it names', () => {
   }
 });
 
-test('Clementine state reads keep the whole-result budget; provider results keep the keyhole', () => {
+test('Clementine state reads keep the whole-result budget; provider results keep the business budget', () => {
   assert.equal(presentationBudgetFor({ toolName: 'space_get', args: { slug: 'x' } }), DEFAULT_TOOL_RESULT_MAX_CHARS);
   assert.equal(presentationBudgetFor(carried('call_tool', 'space_get', { slug: 'x' })), DEFAULT_TOOL_RESULT_MAX_CHARS);
   for (const input of [
@@ -75,13 +78,13 @@ test('Clementine state reads keep the whole-result budget; provider results keep
     { toolName: 'call_tool', args: 'not a carrier envelope' },
     { toolName: 'run_shell_command', args: { command: 'ls' } },
   ]) {
-    assert.equal(presentationBudgetFor(input), PROMPT_INLINE_RECALLABLE_RESULT_CHARS, JSON.stringify(input));
+    assert.equal(presentationBudgetFor(input), business(), JSON.stringify(input));
   }
   // A local reader's explicit larger preview survives a carrier too.
   assert.equal(presentationBudgetFor(carried('work_call', 'read_file', { path: '/tmp/x', max_chars: 40_000 })), 40_000);
 });
 
-test('explicit medium local previews keep their requested budget while default and foreign reads keep the keyhole', () => {
+test('explicit medium local previews keep their requested budget while default and foreign reads keep the business budget', () => {
   for (const name of ['read_file', 'convert_to_markdown']) {
     for (const requested of [4001, 5000, 20_000]) {
       const args = { path: '/tmp/controlled-medium-read.txt', max_chars: requested };
@@ -90,11 +93,11 @@ test('explicit medium local previews keep their requested budget while default a
       }
     }
     for (const requested of [undefined, null, 1000, 4000]) {
-      assert.equal(presentationBudgetFor({ toolName: name, args: { max_chars: requested } }), PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+      assert.equal(presentationBudgetFor({ toolName: name, args: { max_chars: requested } }), business());
     }
   }
   for (const name of ['fixtureserver__read_file', 'external_api']) {
-    assert.equal(presentationBudgetFor(carried('work_call', name, { max_chars: 20_000 })), PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+    assert.equal(presentationBudgetFor(carried('work_call', name, { max_chars: 20_000 })), business());
   }
 });
 
@@ -107,9 +110,11 @@ test('the whole-result budget scales down for a small window and never up for a 
   for (const large of [LARGE_WINDOW_MODEL, 'fixture-unknown-model']) {
     assert.equal(inlineResultBudgetForModel(large), DEFAULT_TOOL_RESULT_MAX_CHARS, large);
   }
-  // Provider results never widen with the window.
-  assert.equal(presentationBudgetFor({ toolName: 'fixtureserver__read', routedModelId: SMALL_WINDOW_MODEL }),
-    PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+  // Provider results keep their own bound, never above what a small window takes.
+  assert.equal(business(SMALL_WINDOW_MODEL), 11_200);
+  assert.equal(presentationBudgetFor({ toolName: 'fixtureserver__read', routedModelId: SMALL_WINDOW_MODEL }), 11_200);
+  assert.equal(presentationBudgetFor({ toolName: 'fixtureserver__read', routedModelId: LARGE_WINDOW_MODEL }),
+    BUSINESS_RESULT_INLINE_CHARS);
 });
 
 test('a transport mirror child presents into the same routed model; a batch item does not inherit it', async () => {
@@ -141,7 +146,7 @@ test('retained-output readers own their slice: presentation never clips them, di
   }
   // A foreign tool that merely shares a reader's name is not a reader.
   assert.equal(presentationBudgetFor({ toolName: 'fixtureserver__recall_tool_result', args: { call_id: 'c' } }),
-    PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
+    business());
 });
 
 test('a bare recall slice is one inline result for the window; an explicit one is honored up to the ceiling', () => {

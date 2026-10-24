@@ -31,6 +31,7 @@ const {
   exactToolOutputForInvocation,
   truncateToolText,
   PROMPT_INLINE_RECALLABLE_RESULT_CHARS,
+  BUSINESS_RESULT_INLINE_CHARS,
   TOOL_OUTPUT_REASONING_GUIDANCE,
 } = await import('./tool-output-format.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
@@ -180,17 +181,20 @@ test('an authenticated whole inline frame is reused or resized without persistin
   });
 });
 
-test('a parked result uses the prompt-inline budget and a recall handle by default', () => {
+test('a business result is whole up to its bound; past it, a bounded view and a recall handle by default', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
-  const full = `${'row '.repeat(2_000)}END`;
+  const medium = `${'row '.repeat(2_000)}END`;
+  assert.ok(medium.length > PROMPT_INLINE_RECALLABLE_RESULT_CHARS && medium.length < BUSINESS_RESULT_INLINE_CHARS);
+  assert.equal(formatRecallableToolText(medium, { sessionId: sess.id, callId: 'call_medium', toolName: 'list_records' }), medium);
+  const full = `${'row '.repeat(4_000)}END`;
   const visible = formatRecallableToolText(full, {
     sessionId: sess.id,
     callId: 'call_prompt_inline',
     toolName: 'list_records',
   });
-  assert.ok(full.length > PROMPT_INLINE_RECALLABLE_RESULT_CHARS);
-  assert.ok(visible.length <= PROMPT_INLINE_RECALLABLE_RESULT_CHARS + 400);
+  assert.ok(full.length > BUSINESS_RESULT_INLINE_CHARS);
+  assert.ok(visible.length <= BUSINESS_RESULT_INLINE_CHARS + 400);
   assert.match(visible, /recall_tool_result \{"call_id":"call_prompt_inline"\}/);
   assert.equal(getToolOutput(sess.id, 'call_prompt_inline')?.output, full);
 });
@@ -616,7 +620,7 @@ test('fitting deep subtrees survive projection depth limits with original null a
     toolName: 'composio_execute_tool', compactResult: visible, settlementNonce: nonce }), full);
 });
 
-test('a text digest keeps its whole footer when host annotations share its budget', () => {
+test('a text digest keeps its whole footer, with host annotations beside it in room of their own', () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });
   const nonce = '55555555-5555-4555-8555-555555555555';
@@ -635,7 +639,9 @@ test('a text digest keeps its whole footer when host annotations share its budge
       '[sender-verify] The view belongs to this workspace.',
     ],
   })) as string;
-  assert.ok(compact.length <= maxChars, `within its budget: ${compact.length}`);
+  const annotationFrame = compact.slice(0, compact.indexOf('\n\n') + 2);
+  assert.ok(compact.length <= maxChars + annotationFrame.length, `within its budget: ${compact.length}`);
+  assert.ok(compact.length > maxChars - 200, 'the annotations take none of the result\'s room');
   assert.match(compact, /\[Host annotations — separate from provider result\]/);
   assert.match(compact, /\[digest: space_get_view returned [\d,]+ chars/);
   assert.match(compact, /These readers are available now; do NOT say the data is unavailable or that the call is still pending\.\]/,

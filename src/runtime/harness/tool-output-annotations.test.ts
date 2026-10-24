@@ -10,7 +10,7 @@ const { withToolOutputContext } = await import('./tool-output-context.js');
 const { formatRecallableToolText, exactToolOutputForInvocation } = await import('./tool-output-format.js');
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
-test('host annotations share the JSON budget while exact raw bytes and idempotent rendering survive', async () => {
+test('host annotations sit beside the JSON budget while exact raw bytes and idempotent rendering survive', async () => {
   const session = events.createSession({ kind: 'chat' });
   const context = { sessionId: session.id, callId: 'annotated-source', toolName: 'composio_execute_tool',
     settlementNonce: '33333333-3333-4333-8333-333333333333' };
@@ -18,16 +18,18 @@ test('host annotations share the JSON budget while exact raw bytes and idempoten
     id: i, value: 2, zero: 0, absent: null, long: 'source text '.repeat(900),
   })) } });
   const annotation = '[account-route] Using the exact account frozen by the accepted host plan (ca_123456789012).';
+  // The notes take room of their own, never the result's.
+  const room = JSON.stringify({ hostAnnotations: [annotation] }).length;
   await withToolOutputContext(context, () => {
     const rendered = formatRecallableToolText(original, { maxChars: 20000, hostAnnotations: [annotation] });
     const parsed = JSON.parse(rendered);
-    assert.ok(rendered.length <= 20000);
+    assert.ok(rendered.length <= 20000 + room && rendered.length > 20000 - room);
     assert.deepEqual(parsed.__clementine.hostAnnotations, [annotation]);
     assert.equal(parsed.__clementine.projection.clippedStrings > 0, true);
     assert.equal(exactToolOutputForInvocation({ ...context, compactResult: rendered }), original);
     assert.equal(formatRecallableToolText(rendered), rendered);
     const smaller = formatRecallableToolText(rendered, { maxChars: 4000 });
-    assert.ok(smaller.length <= 4000); assert.deepEqual(JSON.parse(smaller).__clementine.hostAnnotations, [annotation]);
+    assert.ok(smaller.length <= 4000 + room); assert.deepEqual(JSON.parse(smaller).__clementine.hostAnnotations, [annotation]);
     assert.equal(exactToolOutputForInvocation({ ...context, compactResult: smaller }), original);
     assert.equal(events.getToolOutputForInvocation(session.id, context.callId, context.settlementNonce)?.output, original);
     for (const wrong of [{ ...context, settlementNonce: '44444444-4444-4444-8444-444444444444' }, { ...context, toolName: 'another_tool' }]) {

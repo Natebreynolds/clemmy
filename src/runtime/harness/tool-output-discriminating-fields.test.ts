@@ -87,7 +87,8 @@ test('a generous budget is unchanged — nothing is dropped that used to fit', (
   const text = typeof out === 'string' ? out : JSON.stringify(out);
   assert.ok(text.includes('person0.of.event0@example.com'),
     'when everything fits, ranking must not elide anything');
-  assert.ok(text.includes('"omittedValues":0'), `nothing omitted at a generous budget: ${text.slice(-160)}`);
+  assert.ok(text.includes('"truncated":false') && !text.includes('projectionSemantics'),
+    `nothing omitted at a generous budget, and no omission notes: ${text.slice(-160)}`);
 });
 
 

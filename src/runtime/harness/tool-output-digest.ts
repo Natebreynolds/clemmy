@@ -687,11 +687,17 @@ export function compactStructuredJsonToolOutput(
       ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) },
   ];
   const fullForms = new Set<Record<string, unknown>>([fullMetadata]);
+  // The host's annotations (an account route, a standing policy) sit beside
+  // the result with room of their own, bounded by their maker: they never
+  // show less of the result. Everything else stays inside the budget.
+  const annotationRoom = options.hostAnnotations?.length
+    ? JSON.stringify({ hostAnnotations: options.hostAnnotations }).length : 0;
+  const limit = maxChars + annotationRoom;
   const project = (candidates: ReadonlyArray<Record<string, unknown>>): {
     output: string; records: ReturnType<typeof projectedRecordCoverage>;
   } | null => {
     for (const metadataBase of candidates) {
-      let payloadBudget = maxChars
+      let payloadBudget = limit
         - JSON.stringify(STRUCTURED_PROJECTION_META_KEY).length
         - JSON.stringify(metadataBase).length
         - 4; // root braces, colon, and comma
@@ -706,17 +712,24 @@ export function compactStructuredJsonToolOutput(
         const value = compactJsonValue(parsed, payloadBudget, stats);
         const projected = value === OMITTED_JSON_VALUE ? {} : value;
         if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
-        const records = fullForms.has(metadataBase) ? projectedRecordCoverage(parsed, projected) : null;
-        const metadata = fullForms.has(metadataBase)
-          ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats,
-            ...(records ? { records } : {}) }
-          : metadataBase;
+        const lossless = stats.clippedStrings === 0 && stats.omittedArrayItems === 0
+          && stats.omittedObjectKeys === 0 && stats.omittedValues === 0;
+        const records = fullForms.has(metadataBase) && !lossless ? projectedRecordCoverage(parsed, projected) : null;
+        // Nothing left out: no omission semantics or reader pointers to spend
+        // tokens on, only what the host adds and the receipt.
+        const metadata = lossless
+          ? { kind: 'structured_projection_v1', truncated: false, receipt: options.exactOutputReceipt,
+            ...(options.resourceIndex ? { resourceIndex: options.resourceIndex } : {}),
+            ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) }
+          : fullForms.has(metadataBase)
+            ? { ...metadataBase, truncated: true, projection: stats, ...(records ? { records } : {}) }
+            : metadataBase;
         const output = JSON.stringify({
           ...(projected as Record<string, unknown>),
           [STRUCTURED_PROJECTION_META_KEY]: metadata,
         });
-        if (output.length <= maxChars) return { output, records };
-        payloadBudget -= output.length - maxChars + 8;
+        if (output.length <= limit) return { output, records };
+        payloadBudget -= output.length - limit + 8;
       }
     }
     return null;

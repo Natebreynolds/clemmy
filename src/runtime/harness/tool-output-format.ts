@@ -21,6 +21,12 @@ export const DEFAULT_TOOL_RESULT_MAX_CHARS = 20_000;
 /** When the full payload is parked for recall, the prompt keeps a smaller
  *  field/index view plus a source reference instead of re-reading the dump. */
 export const PROMPT_INLINE_RECALLABLE_RESULT_CHARS = 4_000;
+/** A provider or business result shown whole up to this size (about 3K
+ *  tokens), so a typical list or record read arrives complete: a view that
+ *  leaves fields out costs a reader step that re-sends the whole context, far
+ *  more than the characters it saved, or an answer built on the gaps. Larger
+ *  results keep the bounded view with their full payload parked. */
+export const BUSINESS_RESULT_INLINE_CHARS = 12_000;
 
 /** These local readers already validate max_chars and format their preview.
  * The outer bracket must not silently impose its smaller recallable keyhole
@@ -140,8 +146,9 @@ export interface PresentationBudgetInput {
  *   RecallBudget.
  * - A registry control read (Clementine's own state and control tools) is
  *   shown whole up to the routed window's inline budget.
- * - Everything else (provider and business results, foreign tools) keeps the
- *   recallable keyhole: a bounded view plus the parked full payload.
+ * - Everything else (provider and business results, foreign tools) is shown
+ *   whole up to BUSINESS_RESULT_INLINE_CHARS (never above the window's inline
+ *   budget); beyond that, a bounded view plus the parked full payload.
  */
 export function presentationBudgetFor(input: PresentationBudgetInput): number {
   let effectiveName: string | null = null;
@@ -164,7 +171,7 @@ export function presentationBudgetFor(input: PresentationBudgetInput): number {
     const declared = toolPresentationMaxChars(effectiveName);
     if (declared !== undefined) return declared;
   }
-  if (role !== 'control') return PROMPT_INLINE_RECALLABLE_RESULT_CHARS;
+  if (role !== 'control') return Math.min(BUSINESS_RESULT_INLINE_CHARS, inlineResultBudgetForModel(input.routedModelId));
   if (effectiveName && toolReadsRetainedOutput(effectiveName)) {
     return retainedReaderMaxChars(input.routedModelId) + RETAINED_OUTPUT_READER_FRAME_CHARS;
   }
@@ -491,6 +498,21 @@ function wholeInlineToolPresentation(text: string, input: {
   } catch { return null; }
 }
 
+/** The room a structured projection's own host annotations take beside its
+ *  budget (they never take the result's): a carrier passing that projection
+ *  through measures the result against its budget, not the notes. */
+function annotationRoomOf(text: string, maxChars: number): number {
+  if (!text.startsWith('{') || !text.includes('"hostAnnotations"')) return 0;
+  try {
+    const notes = (JSON.parse(text) as { __clementine?: { kind?: unknown; hostAnnotations?: unknown } }).__clementine;
+    const room = notes?.kind === 'structured_projection_v1' && Array.isArray(notes.hostAnnotations)
+      ? JSON.stringify({ hostAnnotations: notes.hostAnnotations }).length : 0;
+    // Never more than the host's own annotation bound plus its frame, so
+    // look-alike metadata in a provider payload cannot widen the view.
+    return Math.min(room, Math.floor(maxChars * HOST_ANNOTATION_BUDGET_SHARE) + 200);
+  } catch { return 0; }
+}
+
 export function formatRecallableToolText(
   text: string,
   options: RecallableToolTextOptions = {},
@@ -533,7 +555,8 @@ export function formatRecallableToolText(
       if (options.verifiedProjectionMaxChars !== undefined) {
         maxChars = Math.max(maxChars, options.verifiedProjectionMaxChars);
       }
-      if ((options.maxChars === undefined || text.length <= maxChars) && hostAnnotations.length === 0) return text;
+      if ((options.maxChars === undefined || text.length <= maxChars + annotationRoomOf(text, maxChars))
+        && hostAnnotations.length === 0) return text;
       // Only an explicit smaller display request should re-render a verified
       // projection; a second formatter's default must not reinterpret it.
       // Only after exact same-invocation redemption may a smaller rendering
@@ -565,7 +588,9 @@ export function formatRecallableToolText(
       });
     } catch { persistenceFailed = true; }
   }
-  if (text.length <= maxChars && hostAnnotations.length === 0) {
+  // A child's structured projection passes through its carrier whole: its
+  // host annotations sit beside the budget, as they did when it was made.
+  if (text.length <= maxChars + annotationRoomOf(text, maxChars) && hostAnnotations.length === 0) {
     if (wholeInlineAllowed && !persistenceFailed && sessionId && callId
       && exactActiveInvocation && active?.settlementNonce) {
       return wholeInlineToolPresentation(text, {
@@ -587,9 +612,9 @@ export function formatRecallableToolText(
 
   if (!sessionId || !callId || persistenceFailed) {
     const dense = `${annotationText}${densifyMarkdownForModelHead(text)}`;
-    if (!idIndex) return truncateToolTextWithin(dense, maxChars);
+    if (!idIndex) return truncateToolTextWithin(dense, maxChars + annotationText.length);
     const boundedIndex = truncateToolTextWithin(idIndex, Math.max(1, Math.floor(maxChars * 0.5)));
-    const bodyBudget = Math.max(1, maxChars - boundedIndex.length - 2);
+    const bodyBudget = Math.max(1, maxChars + annotationText.length - boundedIndex.length - 2);
     return `${boundedIndex}\n\n${truncateToolTextWithin(dense, bodyBudget)}`;
   }
 
@@ -632,10 +657,12 @@ export function formatRecallableToolText(
       .slice(0, Math.max(0, maxChars));
   }
   const receiptReserve = exactReceipt ? exactReceipt.length + 1 : 0;
-  // The digest fits its head, tail and footer inside what the host
-  // annotations and the id index leave, so the frame around it never pushes
-  // the footer (the exact reader call) past the cap below.
-  const frameReserve = annotationText.length + (idIndex ? idIndex.length + 2 : 0);
+  // The host's annotations sit beside the result with room of their own, as
+  // in the structured view: they never show less of it. The digest fits its
+  // head, tail and footer inside what the id index leaves, so the frame
+  // around it never pushes the footer (the exact reader call) past the cap.
+  const cap = maxChars + annotationText.length;
+  const frameReserve = idIndex ? idIndex.length + 2 : 0;
   const compactBudget = Math.max(200, maxChars - receiptReserve - frameReserve);
   let compact = annotationText + withIndex(digestToolOutput(densifyMarkdownForModelHead(text), {
     maxChars: compactBudget,
@@ -646,11 +673,11 @@ export function formatRecallableToolText(
     // from the durable lifecycle whether this call has returned yet.
     readerAdvice: () => retainedResultWayThrough({ sessionId, callId }),
   }));
-  if (exactReceipt && compact.length > maxChars - receiptReserve) {
+  if (exactReceipt && compact.length > cap - receiptReserve) {
     // Defensive absolute cap for non-JSON and root-array fallbacks. Preserve
     // the exact receipt and a bounded raw-recovery instruction; never slice the
     // receipt itself. Structure-aware object output takes the JSON path above.
-    const bodyLimit = Math.max(0, maxChars - receiptReserve);
+    const bodyLimit = Math.max(0, cap - receiptReserve);
     const recovery = `Full output: recall_tool_result ${JSON.stringify({ call_id: callId })}`;
     if (bodyLimit === 0) compact = '';
     else if (recovery.length <= bodyLimit) {
