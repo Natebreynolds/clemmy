@@ -333,3 +333,14 @@ test('unfamiliar record collections unwrap only when structurally unambiguous', 
   assert.equal(resolveDominantArray({ alpha: rows, beta: [{ id: 'c' }] }), null);
   assert.equal(resolveDominantArray({ tags: ['a', 'b'] }), null);
 });
+
+test('a command output cut at its capture cap says the stored result is partial, never "the full result is stored"', () => {
+  const rows = Array.from({ length: 400 }, (_, i) => `{"Id":"00T${i}","Subject":"Email ${i}","Description":"${'x'.repeat(400)}"}`).join(',\n');
+  const cut = `exit_code: 0\n\nstdout:\n{"status":0,"result":{"records":[${rows}${'\n'}...[capture stopped after 200000 chars]\n\nstderr:\n`;
+  const digest = digestToolOutput(cut, { toolName: 'run_shell_command', callId: 'call_cut', maxChars: 4000 });
+  assert.match(digest, /cut at 200,000 characters/);
+  assert.match(digest, /partial, never the whole/);
+  assert.doesNotMatch(digest, /The full result is stored/);
+  const whole = digestToolOutput(`exit_code: 0\n\nstdout:\n${'plain line\n'.repeat(2000)}`, { toolName: 'run_shell_command', callId: 'call_whole', maxChars: 4000 });
+  assert.match(whole, /The full result is stored/, 'an output captured whole keeps the ordinary note');
+});

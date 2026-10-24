@@ -30,6 +30,7 @@ import {
   isSdkToolInputValidationError,
   toolErrorText,
 } from './shared.js';
+import { captureStoppedMarker } from '../runtime/harness/shell-tool-output.js';
 import { HostLocalReadSuccessResult, InvalidArgumentsPreDispatchResult } from '../runtime/harness/attempt-settlement.js';
 import { LocalFileCreateConflict } from '../runtime/harness/local-file-create-conflict.js';
 import { needsApprovalFromTaxonomy } from '../agents/tool-taxonomy.js';
@@ -501,7 +502,7 @@ function appendCapturedOutput(current: string, chunk: string): string {
   if (current.length >= MAX_COMMAND_CAPTURE_CHARS) return current;
   const next = current + chunk;
   if (next.length <= MAX_COMMAND_CAPTURE_CHARS) return next;
-  return `${next.slice(0, MAX_COMMAND_CAPTURE_CHARS)}\n...[capture stopped after ${MAX_COMMAND_CAPTURE_CHARS} chars]`;
+  return `${next.slice(0, MAX_COMMAND_CAPTURE_CHARS)}\n${captureStoppedMarker(MAX_COMMAND_CAPTURE_CHARS)}`;
 }
 
 /**

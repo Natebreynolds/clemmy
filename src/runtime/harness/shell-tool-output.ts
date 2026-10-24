@@ -77,3 +77,15 @@ export function parseShellToolOutput(raw: string, opts: { callId?: string; trunc
   if (stdoutJson !== undefined) result.stdout_json = stdoutJson;
   return result;
 }
+
+/** What a command's capture leaves when it stops at its cap: everything after
+ *  it is gone, so the stored output is not the command's whole output. */
+export function captureStoppedMarker(limit: number): string {
+  return `...[capture stopped after ${limit} chars]`;
+}
+
+/** The cap a stored output was cut at, or null when it was captured whole. */
+export function captureStoppedAt(text: string): number | null {
+  const match = /\.\.\.\[capture stopped after (\d+) chars\]/.exec(text);
+  return match ? Number(match[1]) : null;
+}

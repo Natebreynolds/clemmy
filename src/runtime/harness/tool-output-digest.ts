@@ -18,6 +18,7 @@
  */
 
 import { toolCallHint } from './tool-call-hint.js';
+import { captureStoppedAt } from './shell-tool-output.js';
 
 export interface DigestOptions {
   maxChars?: number;
@@ -655,12 +656,20 @@ function recoveryHint(callId: string | null | undefined, sampleFields?: string[]
  * stored bytes, says the output does hold structured data. Without the router
  * (no session), recall is the reader that serves any stored text.
  */
-function textRecoveryHint(callId: string | null | undefined, readerAdvice?: () => string): string {
+function textRecoveryHint(callId: string | null | undefined, readerAdvice?: () => string, cutAt?: number | null): string {
   if (!callId) return recoveryHint(callId);
   let advice = '';
   try { advice = readerAdvice?.() ?? ''; } catch { advice = ''; }
   const readers = advice.trim()
     || `Read it with ${toolCallHint('recall_tool_result', { call_id: callId })} (add "offset" to page).`;
+  // A capture that stopped at its cap kept only the start of the output:
+  // "the full result is stored" would let a slice of it pass for the whole.
+  if (cutAt) {
+    return `The output was cut at ${cutAt.toLocaleString()} characters when it ran, so what is stored is only `
+      + 'the start of it: a count or list read from it is partial, never the whole. Run it again narrower '
+      + '(fewer fields, a filter, or a count) for a complete answer. '
+      + `What was captured can still be read: ${readers}`;
+  }
   return `The full result is stored. ${readers} `
     + 'These readers are available now; do NOT say the data is unavailable or that the call is still pending.';
 }
@@ -928,7 +937,7 @@ function digestText(
   readerAdvice?: () => string,
 ): string {
   const lines = text.split('\n');
-  const hint = textRecoveryHint(callId, readerAdvice);
+  const hint = textRecoveryHint(callId, readerAdvice, captureStoppedAt(text));
   // The footer is sized first so the head and tail fit around it: a footer
   // cut by a later cap loses the one exact call that reaches the rest.
   const footerFor = (withTail: boolean) =>
