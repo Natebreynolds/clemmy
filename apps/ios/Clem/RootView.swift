@@ -213,6 +213,7 @@ private struct CommandCenterView: View {
         // all. Unpair — a rare recovery action — lives on shake.
         PinnedWebView(model: model)
             .ignoresSafeArea()
+            .onFoldDivisionChange { model.setFoldDivision($0) }
             .overlay {
                 if !model.hasLoadedOnce {
                     InitialConnectionCover(

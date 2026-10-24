@@ -200,6 +200,9 @@ final class WebViewModel: NSObject, ObservableObject {
     /// Set only by an explicit server-trust challenge failure, so the native
     /// shell can distinguish a changed certificate from ordinary reachability.
     @Published private(set) var certificatePinFailed = false
+    /// The fold the page lays out around. Kept here so a reload or a new
+    /// origin gets it again before the owner sees the page.
+    fileprivate var foldDivision: FoldDivision?
     /// Exact navigation requested by the native shell. Besides being useful
     /// diagnostics, this gives the hosted tests a causal oracle without
     /// asking the simulator to contact a real daemon.
@@ -920,9 +923,16 @@ extension WebViewModel: WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    func setFoldDivision(_ division: FoldDivision?) {
+        guard division != foldDivision else { return }
+        foldDivision = division
+        webView.evaluateJavaScript(FoldDivision.script(division))
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         finishPendingPushNavigation(navigation)
         finishConnectionRouteNavigation(navigation)
+        webView.evaluateJavaScript(FoldDivision.script(foldDivision))
         hasLoadedOnce = true
         prepareNativeVoice()
         connectionLost = false
