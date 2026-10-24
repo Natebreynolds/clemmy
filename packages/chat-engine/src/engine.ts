@@ -1392,6 +1392,10 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const awaitingMessage = awaitingIndex === undefined
           ? undefined
           : messages[awaitingIndex];
+        // A question's canonical terminal keeps the answers its question drew.
+        const askedOptions = presentation.status === 'awaiting-reply'
+          ? (awaitingMessage ?? (pendingAwaitingMessageIndex !== null ? messages[pendingAwaitingMessageIndex] : undefined))?.options
+          : undefined;
         const terminalMessage: ChatMessage = {
           id: delegatedMessage?.id ?? awaitingMessage?.id ?? `a-${event.seq}`,
           role: 'assistant',
@@ -1401,6 +1405,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           // chip as it did live; without its typed facts a notice reopened
           // as an empty reply.
           ...(presentation.terminal ? { terminal: presentation.terminal } : {}),
+          ...(askedOptions?.length ? { options: askedOptions } : {}),
           ...reviewPendingSourceFor(presentation.terminal, sourceUserSeq),
           taskMode: taskModesBySource.get(sourceUserSeq ?? currentSourceUserSeq ?? -1),
           planArtifactRef: readPlanRevisionRef(d.planArtifactRef ?? d.artifact) ?? (sourceUserSeq === null ? undefined : planRefsBySource.get(sourceUserSeq)),
@@ -1498,11 +1503,15 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         const question = typeof d.question === 'string' && d.question.trim()
           ? d.question.trim()
           : 'I have a question for you.';
+        // The same answers the live stream draws: a reopened chat keeps its
+        // choice buttons (and the connection setup they carry).
+        const options = readQuestionOptions(d.options);
         const message: ChatMessage = {
           id: `a-awaiting-${event.seq}`,
           role: 'assistant',
           text: question,
           status: 'awaiting-reply',
+          ...(options.length ? { options } : {}),
           activity: settleTerminalActivity(activity ?? [], 'interrupted'),
         };
         const sourceUserSeq = sourceUserSeqOf(event) ?? currentSourceUserSeq;

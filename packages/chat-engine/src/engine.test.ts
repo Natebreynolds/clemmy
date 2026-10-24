@@ -1188,3 +1188,24 @@ for (const manualRetry of [false, true]) test(`steer receipt unknown handling: $
     } finally { engine.dispose(); }
   }
 });
+
+test('a reopened chat keeps a question\'s answers through its canonical terminal', () => {
+  const messages = foldTranscript([
+    ev(10, 'user_input_received', { text: 'Connect the notes app so you can read my notes.' }),
+    ev(11, 'awaiting_user_input', {
+      sourceUserSeq: 10,
+      question: 'The notes app needs to be connected before I can continue this task.',
+      options: ['I’ve connected it — continue this same task', 'Pause so I can change this request'],
+    }),
+    ev(12, 'conversation_completed', {
+      sourceUserSeq: 10,
+      presentation: { version: 1, kind: 'question', status: 'needs_input', phase: 'final', audience: 'user',
+        text: 'The notes app needs to be connected before I can continue this task.' },
+    }),
+  ], 's-reopened-question');
+  const asked = messages.filter((message) => message.role === 'assistant');
+  assert.equal(asked.length, 1, 'one logical pause, one bubble');
+  assert.equal(asked[0]!.status, 'awaiting-reply');
+  assert.deepEqual(asked[0]!.options, ['I’ve connected it — continue this same task', 'Pause so I can change this request'],
+    'the answers (and the connection setup they carry) survive a reopen');
+});
