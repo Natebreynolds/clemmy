@@ -3855,6 +3855,12 @@ a.home-btn { text-decoration: none; }
 .from-clem-reply { display: flex; gap: 8px; width: 100%; }
 .from-clem-report { font-size: var(--t-sm); color: var(--fg-2); white-space: pre-line; overflow-wrap: anywhere; }
 .from-clem-report-clamped { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.from-clem-summary { font-size: var(--t-body); font-weight: 600; line-height: 1.45; white-space: pre-line; overflow-wrap: anywhere; }
+.from-clem-summary-clamped { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.from-clem-updates .home-card { border: 0; border-radius: 0; background: transparent; }
+.from-clem-updates .from-clem-update { padding: 16px 0; }
+.from-clem-update .from-clem-report { font-size: var(--t-body); line-height: 1.5; }
+.from-clem-update .from-clem-read { align-self: flex-start; min-height: 44px; }
 .from-clem-reply .cz-input { flex: 1 1 auto; min-width: 0; }
 .home-btn-primary:active:not(:disabled) { background: var(--accent-deep); }
 .home-row-receipt { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; color: var(--accent-2); font-size: var(--t-sm); font-weight: 700; }
@@ -6112,6 +6118,9 @@ textarea.cz-input { resize: vertical; }
 .home-pin-picker { margin: 4px 0 12px; padding-left: 12px; border-left: 2px solid var(--line); }
 .home-pin-picker .home-row > span:first-child { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .ws-details { margin-top: 24px; border-top: 1px solid var(--line); }
+.ws-about { margin: 0 0 var(--sp-3); }
+.ws-about .ws-objective-full { white-space: pre-line; overflow-wrap: anywhere; }
+.app-main .ws-detail-header h2.chat-title { white-space: normal; overflow: visible; overflow-wrap: anywhere; }
 .ws-details > summary { display: flex; align-items: center; min-height: 48px; cursor: pointer; color: var(--fg-2); font-weight: 600; }
 .ws-details > summary::after { content: '+'; margin-left: auto; font-size: 1.25rem; font-weight: 400; }
 .ws-details[open] > summary::after { content: '−'; }

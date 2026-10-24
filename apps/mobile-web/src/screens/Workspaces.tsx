@@ -23,6 +23,7 @@ import {
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 import { ChatBackButton } from '../components/ChatBackButton';
+import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -297,6 +298,13 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
     <div>
       <DetailHeader title={detail.title} onBack={onBack} onDetails={() => { setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('space-details')?.scrollIntoView({ block: 'start' })); }} />
 
+      {detail.objective ? (
+        <details class="ws-details ws-about">
+          <summary>About this Space</summary>
+          <p class="ws-objective-full">{detail.objective}</p>
+        </details>
+      ) : null}
+
       <div class="ws-status">
         <span class="card-when">
           <FreshnessDot state={detail.freshness} />
@@ -376,7 +384,6 @@ function WorkspaceDetailView({ id, onBack, onOpenNeedsYou }: { id: string; onBac
             </div>
             {widgetNote ? <p class="card-when" role="status">{widgetNote}</p> : null}
           </div> : null}
-          {detail.objective ? <p class="ws-objective-full">{detail.objective}</p> : null}
           {canRefresh ? <div class="ws-details-actions"><button type="button" class="btn-quiet" disabled={refreshing} onClick={pullFresh}>{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div> : null}
           {needsSourceRepair ? <div class="ws-refresh-note"><p>This Space has no data source, so it can’t refresh on its own.</p><button type="button" class="link-btn" onClick={() => setChatOpen({ draft: FIX_REFRESH_ASK })}>Ask Clem to connect a source</button></div> : null}
           {failed[0]?.error ? <code class="ws-warn-detail">{failed[0].error}</code> : null}
@@ -572,10 +579,11 @@ function IssueDisclosure({ issues }: { issues: string[] }) {
 
 function DetailHeader({ title, onBack, onDetails }: { title: string; onBack: () => void; onDetails?: () => void }) {
   return (
-    <div class="chat-header detail-header">
+    <div class="chat-header detail-header ws-detail-header">
       <ChatBackButton onClick={() => { haptic('light'); onBack(); }} />
       <h2 class="chat-title">{title}</h2>
       {onDetails ? <button type="button" class="btn-quiet" onClick={onDetails}>Details</button> : null}
+      <NavigationMenuButton />
     </div>
   );
 }

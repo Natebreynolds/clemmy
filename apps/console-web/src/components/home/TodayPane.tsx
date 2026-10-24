@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { ChevronDown } from 'lucide-react';
 import type { HomeToday, HomeTodayEvent } from '@/lib/home-data';
 import { cn } from '@/lib/cn';
 import { clockLabel } from './home-model';
@@ -22,15 +24,17 @@ export function TodayPane({ headingId, today, loading, error, onRetry, nowMs = D
   nowMs?: number;
   maxRows?: number;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const asOfMs = today?.asOf ? Date.parse(today.asOf) : NaN;
   const old = Number.isFinite(asOfMs) && nowMs - asOfMs > DISCLOSE_AFTER_MS;
-  const events = (today?.events ?? []).slice(0, maxRows);
+  const allEvents = today?.events ?? [];
+  const events = expanded ? allEvents : allEvents.slice(0, maxRows);
   const nextIndex = events.findIndex((e) => e.startMs > nowMs);
   const todayKey = new Date(nowMs).toDateString();
   // In the evening the watch's next day is tomorrow: say so once in the
   // heading instead of on every row.
   const allTomorrow = events.length > 0 && events.every((e) => new Date(e.startMs).toDateString() !== todayKey);
-  const more = (today?.events.length ?? 0) - events.length;
+  const more = Math.max(0, allEvents.length - maxRows);
   return (
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
@@ -49,8 +53,16 @@ export function TodayPane({ headingId, today, loading, error, onRetry, nowMs = D
           <QuietLine>{today.asOf ? 'Nothing else on your calendar today.' : 'Clem hasn’t read your calendar yet.'}</QuietLine>
         ) : (
           <>
-            {events.map((event, i) => <EventRow key={event.key} event={event} next={i === nextIndex} nowMs={nowMs} sayDay={!allTomorrow} />)}
-            {more > 0 && <PaneRow className="text-caption text-faint">{more} more after that</PaneRow>}
+            <div id={`${headingId}-events`}>
+              {events.map((event, i) => <EventRow key={event.key} event={event} next={i === nextIndex} nowMs={nowMs} sayDay={!allTomorrow} />)}
+            </div>
+            {more > 0 && <PaneRow>
+              <button type="button" aria-expanded={expanded} aria-controls={`${headingId}-events`}
+                className="min-h-11 rounded-sm text-small font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                onClick={() => setExpanded(!expanded)}>
+                {expanded ? 'Show fewer' : `Show ${more} more`}
+              </button>
+            </PaneRow>}
           </>
         )}
         {today?.lastError && today.events.length > 0 && (
@@ -83,17 +95,24 @@ function EventRow({ event, next, nowMs, sayDay }: { event: HomeTodayEvent; next:
       <span className={cn('w-[4.5rem] shrink-0 pt-px text-small font-semibold tabular-nums', next || now ? 'text-primary' : 'text-fg')}>
         {now ? 'Now' : time}
       </span>
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate text-body font-medium text-fg" title={event.title}>{event.title}</span>
-        {(meta || event.needsReply) && (
-          <span className="flex min-w-0 items-baseline gap-2 text-small">
-            {event.needsReply && (
-              <Link to="/inbox?tab=needs" className="shrink-0 font-semibold text-info hover:underline">Reply needed</Link>
-            )}
-            {meta && <span className={cn('min-w-0 truncate', soon ? 'text-primary' : 'text-muted')}>{meta}</span>}
-          </span>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <details className="group min-w-0">
+          <summary className="flex min-h-11 cursor-pointer list-none items-start gap-2 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+            <span className="flex min-w-0 flex-1 flex-col gap-1">
+              <span className="truncate text-body font-medium text-fg group-open:whitespace-normal group-open:[overflow-wrap:anywhere]">{event.title}</span>
+              {meta && <span className={cn('truncate text-small group-open:hidden', soon ? 'text-primary' : 'text-muted')}>{meta}</span>}
+            </span>
+            <ChevronDown className="mt-1 h-4 w-4 shrink-0 text-muted group-open:rotate-180" aria-hidden />
+          </summary>
+          <div className="space-y-1 pb-2 text-small text-muted [overflow-wrap:anywhere]">
+            <p>{start.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })} · {event.allDay ? 'All day' : `${time}–${new Date(event.endMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`}</p>
+            {meta && <p className="whitespace-pre-line">{meta}</p>}
+          </div>
+        </details>
+        {event.needsReply && (
+          <Link to="/inbox?tab=needs" className="self-start text-small font-semibold text-info hover:underline">Reply needed</Link>
         )}
-      </span>
+      </div>
     </PaneRow>
   );
 }

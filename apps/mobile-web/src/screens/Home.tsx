@@ -236,9 +236,12 @@ export function Home({
 
   // The day in one list: calendar next, what Clementine noticed on her own,
   // what came back. Open decisions live in Needs you, never here.
-  const dayRows: TodayRow[] = paneSet.has('while_away')
-    ? todayRows({ reminders, notifications, nowMs: Date.now(), limit: MAX_TODAY_ROWS })
+  const [todayExpanded, setTodayExpanded] = useState(false);
+  const allDayRows: TodayRow[] = paneSet.has('while_away')
+    ? todayRows({ reminders, notifications, nowMs: Date.now(), limit: reminders.length + notifications.length })
     : [];
+  const dayRows = todayExpanded ? allDayRows : allDayRows.slice(0, MAX_TODAY_ROWS);
+  const moreDayRows = Math.max(0, allDayRows.length - MAX_TODAY_ROWS);
   const digest = digestOpen ? todayDigest({ notifications, sinceMs: sinceMs.current }) : '';
 
   // The decision rows this screen can actually put on the glass. The shell's
@@ -301,11 +304,15 @@ export function Home({
       {dayRows.length > 0 ? (
         <section class="home-section" aria-labelledby="home-today">
           <h2 id="home-today" class="section-head pane-head">Today</h2>
-          <div class="home-card">
+          <div class="home-card" id="home-today-rows">
             {dayRows.map((row) => (
               <TodayLine key={row.key} row={row} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
             ))}
           </div>
+          {moreDayRows > 0 ? <button type="button" class="home-pinned-more" aria-expanded={todayExpanded} aria-controls="home-today-rows"
+            onClick={() => { haptic('light'); setTodayExpanded(!todayExpanded); }}>
+            {todayExpanded ? 'Show fewer' : `Show ${moreDayRows} more`}
+          </button> : null}
         </section>
       ) : null}</> : null,
     projects: () => (recent.length > 0 ? (

@@ -63,6 +63,7 @@ export function FromClemPane({
   const [states, setStates] = useState<Record<string, RowState>>({});
   // One reply box open at a time. Drafts outlive closing.
   const [openKey, setOpenKey] = useState<string | null>(null);
+  const [readingKey, setReadingKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   // Taps that started work: what came of each shows here, where the owner
   // tapped, instead of only "Started a conversation."
@@ -225,20 +226,25 @@ export function FromClemPane({
 
   const updateRow = (row: FromClemRow) => {
     const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
-    const open = openKey === row.key;
+    const open = readingKey === row.key;
+    const replying = openKey === row.key;
     const done = row.done;
     // A report leads with its title; opened, it reads as she wrote it.
     const report = row.authored === true;
     const runHref = fromClemRunHref(row);
     return (
-      <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 py-3.5">
-        <button type="button" aria-expanded={open} onClick={() => setOpenKey(open ? null : row.key)}
+      <PaneRow key={row.key} className="flex-col items-stretch gap-1.5 px-0 py-4">
+        <button type="button" aria-expanded={open} onClick={() => setReadingKey(open ? null : row.key)}
           className="flex flex-col items-stretch gap-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
           {meta(row)}
           {report && <span className="text-body font-semibold text-fg">{row.text}</span>}
-          <span className={cn('text-body text-fg', open ? report && 'whitespace-pre-line [overflow-wrap:anywhere]' : 'line-clamp-2')}>{row.say || row.text}</span>
+          <span className={cn('text-body text-fg [overflow-wrap:anywhere]', open ? 'whitespace-pre-line' : 'line-clamp-2')}>{row.say || row.text}</span>
         </button>
-        {open && !report && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
+        {open && !report && source(row) && <p className="whitespace-pre-line text-body text-muted [overflow-wrap:anywhere]">{source(row)}</p>}
+        <button type="button" aria-expanded={open} onClick={() => setReadingKey(open ? null : row.key)}
+          className="min-h-11 self-start rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+          {open ? 'Show less' : 'Read more'}
+        </button>
         {row.handoff && <div className="space-y-1 text-small text-muted">
           <p>{row.handoff.reason || (row.handoff.state === 'dispatched' ? 'The approved task is in its conversation.' : 'This suggestion needs another look before work continues.')}</p>
           <Link to={row.handoff.sessionId ? `/chat/${encodeURIComponent(unifiedChatSessionId(row.handoff.sessionId))}` : `/chat/${encodeURIComponent(unifiedChatSessionId('clem'))}`} className="font-semibold text-primary hover:underline">{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</Link>
@@ -257,7 +263,7 @@ export function FromClemPane({
                 {state.busy === 'done' ? 'Saving…' : 'Done'}
               </Button>
             )}
-            {open ? (
+            {replying && (
               <AnswerRow
                 busy={state.busy === 'answer'}
                 placeholder="Tell Clem what to do with it…"
@@ -265,12 +271,11 @@ export function FromClemPane({
                 onValueChange={(text) => setDrafts((all) => ({ ...all, [row.key]: text }))}
                 onAnswer={(text) => { if (text.trim()) reply(row, text.trim()); }}
               />
-            ) : (
-              <button type="button" onClick={() => setOpenKey(row.key)}
-                className="rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
-                Read more
-              </button>
             )}
+            <button type="button" aria-expanded={replying} onClick={() => setOpenKey(replying ? null : row.key)}
+              className="min-h-11 rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              {replying ? 'Close reply' : 'Reply to Clem'}
+            </button>
           </div>
         )}
       </PaneRow>
@@ -322,7 +327,7 @@ export function FromClemPane({
         {section === 'all' && <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">
           {label}{list.length > 1 ? ` · ${list.length}` : ''}
         </h3>}
-        <PaneCard>
+        <PaneCard className={which === 'updates' ? 'rounded-none border-0 bg-transparent' : undefined}>
           {visible.map(render)}
           {list.length > shown && (
             <PaneRow className="justify-center text-small">

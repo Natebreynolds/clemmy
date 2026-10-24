@@ -34,6 +34,22 @@ test('the digest counts since you last looked and says nothing when nothing happ
   assert.equal(todayDigest({ notifications: [], sinceMs: NOW - 12 * 3_600_000 }), '', 'the lead already says who needs you');
 });
 
+test('expanding the loaded day preserves ordering and excludes open decisions', () => {
+  const reminders = [r({ id: 'calendar' })];
+  const notifications = [
+    ...Array.from({ length: 8 }, (_, index) => n({ id: `saved-${index}`, createdAt: new Date(NOW - index * 60_000).toISOString() })),
+    n({ id: 'open-decision', kind: 'approval', needsAttention: true }),
+  ];
+  const input = { reminders, notifications, nowMs: NOW };
+  const initial = todayRows(input);
+  const expanded = todayRows({ ...input, limit: reminders.length + notifications.length });
+  assert.equal(initial.length, 6);
+  assert.equal(expanded.length, 9, 'only rows already present in the loaded inputs');
+  assert.deepEqual(expanded.slice(0, 6), initial);
+  assert.deepEqual(expanded.slice(6).map(row => row.key), ['n:saved-5', 'n:saved-6', 'n:saved-7']);
+  assert.ok(expanded.every(row => row.key !== 'n:open-decision'));
+});
+
 test('the digest shows once a day', () => {
   assert.equal(shouldShowDigest(null, NOW), true);
   assert.equal(shouldShowDigest(new Date(NOW - 60_000).toISOString(), NOW), false);
