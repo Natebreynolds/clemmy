@@ -133,6 +133,7 @@ import {
   type WorkflowTerminalOutcome,
 } from '../execution/workflow-terminal-outcome.js';
 import { withWorkflowCommit, workflowConsoleUrl } from '../execution/workflow-commit.js';
+import { loadUserProfile, ownerLocalTimeLabel } from '../runtime/user-profile.js';
 
 function originatingAcceptedUserText(): string {
   const ctx = getToolOutputContext();
@@ -773,6 +774,7 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
   const displayName = entry?.data.name ?? workflow;
   if (!existsSync(WORKFLOW_RUNS_DIR)) return `"${displayName}" has no runs yet.`;
   const lines: string[] = [];
+  const profile = loadUserProfile();
   for (const { record: r } of workflowRunInventory()) {
     if (lines.length >= limit) break;
     if (typeof r.id !== 'string' || typeof r.workflow !== 'string') continue;
@@ -797,7 +799,7 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
     const steps = Array.isArray(r.stepOutputKeys) ? r.stepOutputKeys.map(String) : [];
     const why = typeof r.needsAttentionReason === 'string' ? r.needsAttentionReason
       : typeof r.error === 'string' ? r.error : '';
-    lines.push(`- ${r.id} · ${kind} · ${String(r.createdAt ?? '')} · ${outcome}${took ? ` · ${took}` : ''}`
+    lines.push(`- ${r.id} · ${kind} · ${ownerLocalTimeLabel(r.createdAt, profile)} · ${outcome}${took ? ` · ${took}` : ''}`
       + `${steps.length > 0 ? ` · steps with output: ${steps.join(', ')}` : ''}${why ? ` · ${why.slice(0, 200)}` : ''}`);
   }
   if (lines.length === 0) return `"${displayName}" has no runs yet.`;
@@ -2922,8 +2924,8 @@ export function registerOrchestrationTools(server: McpServer): void {
             heldLine,
             `Status: ${record.status ?? '(unknown)'}${record.needsAttention || capabilityNeedsAttention || mutationNeedsAttention ? ' · NEEDS ATTENTION' : ''}`,
             terminalOutcome ? `Outcome: ${workflowTerminalOutcomeLabel(terminalOutcome)}` : '',
-            record.createdAt ? `Created: ${record.createdAt}` : '',
-            record.finishedAt ? `Finished: ${record.finishedAt}` : '',
+            record.createdAt ? `Created: ${ownerLocalTimeLabel(record.createdAt)}` : '',
+            record.finishedAt ? `Finished: ${ownerLocalTimeLabel(record.finishedAt)}` : '',
             record.inputs && Object.keys(record.inputs).length > 0 ? `Inputs: ${JSON.stringify(record.inputs)}` : '',
             record.goalOutcome ? `Pinned goal: ${record.goalOutcome}${record.goalReason ? ` — ${record.goalReason}` : ''}` : '',
             record.error ? `Error: ${record.error}` : '',

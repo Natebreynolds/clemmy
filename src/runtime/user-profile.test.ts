@@ -171,3 +171,11 @@ test('saveUserProfile updates updatedAt timestamp', async () => {
   const b = saveUserProfile({ displayName: 'B' });
   assert.ok(b.updatedAt > a.updatedAt, 'updatedAt should advance');
 });
+
+test('a recorded UTC moment reads on the owner\'s clock, never as a stamp for the model to convert', async () => {
+  const { ownerLocalTimeLabel, normalizeUserProfile } = await import('./user-profile.js');
+  const pacific = normalizeUserProfile({ timezone: 'America/Los_Angeles' });
+  assert.equal(ownerLocalTimeLabel('2026-10-24T15:00:10.141Z', pacific), 'Sat, Oct 24, 8:00 AM PDT');
+  assert.equal(ownerLocalTimeLabel('2026-10-23T23:00:02.560Z', pacific), 'Fri, Oct 23, 4:00 PM PDT');
+  assert.equal(ownerLocalTimeLabel('not a time', pacific), 'not a time');
+});

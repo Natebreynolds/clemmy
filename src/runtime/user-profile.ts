@@ -204,6 +204,26 @@ export function saveUserProfile(patch: RawProfile): UserProfile {
 }
 
 /**
+ * A recorded moment on the owner's clock ("Sat, Oct 24, 8:00 AM PDT"), so a
+ * tool result never hands the model a UTC stamp to convert: a converted
+ * "15:00Z" was reported to the owner as "3:00 a.m.". The profile timezone
+ * wins, then the machine's; an unreadable value is returned as given.
+ */
+export function ownerLocalTimeLabel(value: unknown, profile?: UserProfile): string {
+  const raw = typeof value === 'string' || typeof value === 'number' ? value : value instanceof Date ? value.getTime() : '';
+  const at = typeof raw === 'number' ? raw : Date.parse(raw);
+  if (!Number.isFinite(at)) return String(value ?? '');
+  try {
+    const timeZone = (profile ?? loadUserProfile()).timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+    }).format(new Date(at));
+  } catch {
+    return new Date(at).toISOString();
+  }
+}
+
+/**
  * Render the profile as a compact directive for assistant instructions.
  * Designed to slot in alongside Persistent Facts and the Operating
  * Policy block — not a replacement, an addition. Returns '' when the
