@@ -183,6 +183,59 @@ test('a data source with no schedule never fires', async () => {
   assert.deepEqual(data.readData(slug), {});
 });
 
+test('a quiet failing source keeps the in-minute skip; one the last pass did not evaluate runs it', async () => {
+  // Live 2026-10-23: fifteen failing sources, each told and backing off, kept
+  // every 15 s tick reading all 103 Space manifests (720 holds / 218 s in 9 h).
+  const backoff = await import('./source-refresh-backoff.js');
+  const stateFile = path.join(process.env.CLEMENTINE_HOME!, 'state', 'space-schedule-state.json');
+  store.spaceStore.save({ id: 'sched-quiet-streak', title: 'Quiet streak', dataSources: [{ id: 'pull', runner: 'pull.mjs', schedule: '0 3 * * *' }] });
+  const quietSource = store.spaceStore.get('sched-quiet-streak')!.dataSources[0];
+  const addStreak = (key: string) => {
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    state.sourceStreakByKey = {
+      ...state.sourceStreakByKey,
+      [key]: backoff.recordSourceRefreshFailure(undefined, {
+        code: 'not_approved',
+        error: 'declined',
+        at: new Date('2026-06-01T03:00:00.000Z'),
+        identity: backoff.sourceIdentity(quietSource, []),
+        okObservationId: null,
+      }).streak,
+    };
+    writeFileSync(stateFile, JSON.stringify(state));
+  };
+  const streaks = () => JSON.parse(readFileSync(stateFile, 'utf8')).sourceStreakByKey as Record<string, unknown>;
+  const original = store.spaceStore.listWhere;
+  let listings = 0;
+  store.spaceStore.listWhere = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
+    listings += 1;
+    return original.apply(this, args);
+  } as typeof original;
+  try {
+    const minute = new Date('2026-06-10T09:20:00.000Z');
+    await sched.processSpaceSchedules(new Date(minute.getTime() - 60_000));
+    addStreak('sched-quiet-streak:pull');
+    listings = 0;
+    await sched.processSpaceSchedules(minute);
+    assert.equal(listings, 1, 'the first tick of a minute evaluates the Spaces');
+    const quiet = await sched.processSpaceSchedules(new Date(minute.getTime() + 15_000));
+    assert.equal(listings, 1, 'a failing source with nothing new keeps the skip');
+    assert.deepEqual(quiet, { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 });
+    assert.ok(streaks()['sched-quiet-streak:pull'], 'the streak is kept');
+    // A streak for a source no pass evaluated (its Space is gone) still gets
+    // the pass that drops it.
+    addStreak('sched-gone-streak:pull');
+    await sched.processSpaceSchedules(new Date(minute.getTime() + 30_000));
+    assert.equal(listings, 2, 'a failing source the last pass did not evaluate runs the pass');
+    assert.equal(streaks()['sched-gone-streak:pull'], undefined, 'and that pass drops it');
+    await sched.processSpaceSchedules(new Date(minute.getTime() + 45_000));
+    assert.equal(listings, 2, 'after which the skip holds again');
+  } finally {
+    store.spaceStore.listWhere = original;
+    store.spaceStore.archive('sched-quiet-streak');
+  }
+});
+
 test('a due installed legacy runner reports an executor failure without asking the owner', async () => {
   const slug = 'sched-legacy-trust';
   store.spaceStore.save({

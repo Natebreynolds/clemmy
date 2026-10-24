@@ -3,7 +3,7 @@
  * projections before an application reader observes them. This is not a claim
  * that unrelated raw filesystem readers see an atomic multi-file rename. */
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
@@ -197,6 +197,44 @@ export function withWorkspaceSnapshotRead<T>(slug: string, read: () => T): T {
   rootFor(slug);
   if (held.has(slug)) return read();
   return withWorkspaceSnapshotMutation(slug, () => read());
+}
+
+/** Each file's generation: every committed write is a rename or a recovery,
+ *  and either changes its inode, size or modification time. */
+function fileGenerations(files: readonly string[]): string | null {
+  const out: string[] = [];
+  for (const file of files) {
+    try {
+      const stat = statSync(file, { bigint: true });
+      out.push(`${stat.ino}:${stat.size}:${stat.mtimeNs}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      out.push('absent');
+    }
+  }
+  return out.join('|');
+}
+
+/**
+ * A read for a screen or a pass that looks at many Workspaces. The strict
+ * lock is a durable lock-file create and removal (about 7 ms), so listing a
+ * hundred Workspaces held the daemon for most of a second on every poll.
+ * When no update is pending and none of the files the read depends on
+ * changed while it ran, its result is what the locked read returns at that
+ * instant; anything else (a journal, a changed or unreadable file, a throw)
+ * is read again under the lock.
+ */
+export function withWorkspaceSnapshotView<T>(slug: string, files: readonly string[], read: () => T): T {
+  const journal = path.join(rootFor(slug), JOURNAL);
+  if (held.has(slug)) return read();
+  const locked = () => withWorkspaceSnapshotRead(slug, read);
+  if (existsSync(journal)) return locked();
+  const before = fileGenerations(files);
+  if (before === null) return locked();
+  let result: T;
+  try { result = read(); } catch { return locked(); }
+  if (existsSync(journal) || fileGenerations(files) !== before) return locked();
+  return result;
 }
 
 export function withWorkspaceSnapshotMutation<T>(slug: string, write: (recovery?: WorkspaceUpdateRecovery) => T): T {
