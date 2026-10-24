@@ -9,6 +9,7 @@ import {
 } from './workflow-validator.js';
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
+import { unwrapRuntimeEffectiveToolIdentity } from '../runtime/harness/tool-effect.js';
 import { operationIdentity } from '../tools/operation-name-identity.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
@@ -622,6 +623,26 @@ export function autoRepairWorkflowDefinition(
     dependsOn: Array.isArray(s.dependsOn) ? [...s.dependsOn] : s.dependsOn,
   }));
   const ids = new Set(steps.map((s) => s.id).filter(Boolean));
+
+  // 0. A call through a carrier that names its operation literally (a gateway
+  // with the operation in its arguments) is that operation's own call: it
+  // runs on the exact-call path with no model in between, where the carrier
+  // itself has no exact-call contract and would become a prompt step below.
+  // A carrier call that pins an account keeps its form: the account is a
+  // choice of its own (call.account), never dropped by this repair.
+  for (const step of steps) {
+    const tool = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+    const args = step.call?.args;
+    if (!tool || step.invocationPlan || !args || !registryToolHasNoExactCallContract(tool)) continue;
+    if (Object.entries(args).some(([key, value]) => /account/i.test(key) && value !== null && value !== undefined && value !== '')) continue;
+    const effective = unwrapRuntimeEffectiveToolIdentity(tool, args);
+    const operation = effective.toolName?.trim() ?? '';
+    const operationArgs = effective.args;
+    if (!operation || operation === tool || !operationArgs || typeof operationArgs !== 'object' || Array.isArray(operationArgs)) continue;
+    if (registryToolHasNoExactCallContract(operation)) continue; // one of Clem's own tools: repair 4 below
+    step.call = { ...step.call!, tool: operation, args: operationArgs as Record<string, unknown> };
+    repairs.push(`Step "${step.id}" calls ${operation} directly; ${tool} only carried it.`);
+  }
 
   // 4 first, so a binding written in the call's arguments is wired below like
   // any other prompt reference.

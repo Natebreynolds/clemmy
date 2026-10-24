@@ -1061,3 +1061,24 @@ test('auto-repair restores the codified prompt of an own-tool call step instead 
   assert.deepEqual(step.allowedTools, ['run_shell_command']);
   assert.equal(step.codifiedFrom, undefined);
 });
+
+test('autoRepair: a gateway call naming its operation runs as that operation\'s own call, with no model step', () => {
+  const def = wf({
+    steps: [{
+      id: 'read_today', sideEffect: 'read',
+      call: { tool: 'composio_execute_tool', args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments: { start: '{{date}}', user_id: 'me' } } },
+    }],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[0].call, { tool: 'FIXTURE_LIST_EVENTS', args: { start: '{{date}}', user_id: 'me' } });
+  assert.equal(repaired.steps[0].prompt, undefined, 'still a call step: no model in between');
+  assert.match(repairs.join(' '), /calls FIXTURE_LIST_EVENTS directly/);
+  // A carrier call that pins an account keeps its form (and so its account).
+  const pinned = wf({
+    steps: [{
+      id: 'read_today', sideEffect: 'read',
+      call: { tool: 'composio_execute_tool', args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments: {}, connected_account_id: 'ca_fixture' } },
+    }],
+  });
+  assert.notEqual(autoRepairWorkflowDefinition(pinned).def.steps[0].call?.tool, 'FIXTURE_LIST_EVENTS');
+});
