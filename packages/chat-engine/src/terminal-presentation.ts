@@ -92,6 +92,8 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
     // A finding with no ruling has no chip to sit under, so it is dropped.
     const reviewNote = boundedText(data.reviewNote, REVIEW_NOTE_MAX);
     if (reviewNote) facts.reviewNote = reviewNote;
+    const correctedFrom = review === 'corrected' ? correctedAnswerText(data.correctedFrom) : undefined;
+    if (correctedFrom) facts.correctedFrom = correctedFrom;
   }
   const retained = retainedFrom(data.retained);
   if (retained) facts.retained = retained;
@@ -114,6 +116,18 @@ const NOTICE_NAME_MAX = 120;
 const PROVIDER_SAID_MAX = 400;
 
 /** One line of display text, bounded; anything else is absent. */
+/** Longest first answer kept behind a corrected chip. */
+export const CORRECTED_FROM_MAX = 6000;
+
+/** The first answer of a corrected turn, kept as written (line breaks too)
+ *  and bounded. */
+export function correctedAnswerText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  if (!text) return undefined;
+  return text.length > CORRECTED_FROM_MAX ? `${text.slice(0, CORRECTED_FROM_MAX - 1).trimEnd()}…` : text;
+}
+
 function boundedText(value: unknown, max: number): string | undefined {
   if (typeof value !== 'string') return undefined;
   const text = value.replace(/\s+/g, ' ').trim();

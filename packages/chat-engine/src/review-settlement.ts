@@ -5,7 +5,7 @@
  * with no `checking` answer to land on changes nothing.
  */
 import type { BackgroundOutcomeReport } from './background-outcome-report.js';
-import { REVIEW_NOTE_MAX } from './terminal-presentation.js';
+import { REVIEW_NOTE_MAX, correctedAnswerText } from './terminal-presentation.js';
 import type { ChatMessage, HarnessEvent, TerminalReview } from './types.js';
 
 export interface ReviewSettlement {
@@ -109,11 +109,12 @@ export function applyAnswerCheckCorrection<M extends CorrectableMessage>(
   return messages.map((message, i) => {
     if (i !== index) return message;
     const { correctableSource: _source, ...rest } = message;
+    const correctedFrom = correctedAnswerText(message.text);
     return {
       ...rest,
       text,
       ...(correction.status ? { status: correction.status } : {}),
-      terminal: { ...message.terminal, review: 'corrected' as const },
+      terminal: { ...message.terminal, review: 'corrected' as const, ...(correctedFrom ? { correctedFrom } : {}) },
     } as M;
   });
 }

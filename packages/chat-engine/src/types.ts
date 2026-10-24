@@ -353,6 +353,10 @@ export interface TerminalFacts {
   /** The reviewer's finding, bounded. Shown only as the review chip's detail,
    *  labelled as the review: it is never Clem's words. */
   reviewNote?: string;
+  /** For a `corrected` answer: the answer as first delivered, before Clem's
+   *  correction took its place. Shown only behind the corrected chip, so a
+   *  check that was wrong never makes the first answer disappear. */
+  correctedFrom?: string;
   /** What the turn kept for when it continues, and what happened outside this
    *  machine. Present only when something was kept or an outside change has a
    *  settled state. Drawn on the status pill, never as prose. */

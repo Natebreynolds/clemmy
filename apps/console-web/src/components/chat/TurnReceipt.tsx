@@ -340,18 +340,18 @@ const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boole
   unchecked: { label: 'Not checked', title: 'The review didn’t rule on this answer, so it wasn’t checked. Ask Clem to re-check it.', ok: false },
   rejected: { label: 'Didn’t pass review', title: 'The last review did not accept this answer.', ok: false },
   needs_recheck: { label: 'Needs a fresh check', title: 'Part of this answer rests on earlier results that need a fresh check. Ask Clem to re-check before relying on it.', ok: false },
-  corrected: { label: 'Corrected after checking', title: 'A check that ran after this answer was sent found a problem, and Clem corrected the answer here.', ok: true },
+  corrected: { label: 'Corrected after checking', title: 'A check that ran after this answer was sent found a problem, and Clem corrected the answer here. Open it for what the check found and the answer as first sent.', ok: true },
 };
 
 /** The review chip. With the reviewer's finding it opens to show it, on its
  *  own line and labelled as the review. */
-function ReviewChip({ review, note }: { review: TurnReview; note?: string }) {
+function ReviewChip({ review, note, original }: { review: TurnReview; note?: string; original?: string }) {
   const [open, setOpen] = useState(false);
   const chip = REVIEW_CHIP[review];
   const Icon = chip.pending ? Loader2 : chip.ok ? CheckCircle2 : AlertCircle;
   const look = chip.pending ? 'font-medium text-muted' : chip.ok ? 'font-semibold text-success' : 'font-medium text-warning';
   const content = <><Icon className={cn('h-3.5 w-3.5', chip.pending && 'animate-spin motion-reduce:animate-none')} aria-hidden /> {chip.label}</>;
-  if (!note) return <span className={cn('inline-flex items-center gap-1', look)} title={chip.title}>{content}</span>;
+  if (!note && !original) return <span className={cn('inline-flex items-center gap-1', look)} title={chip.title}>{content}</span>;
   return (
     <>
       <button
@@ -363,7 +363,9 @@ function ReviewChip({ review, note }: { review: TurnReview; note?: string }) {
       >
         {content}
       </button>
-      {open && <p className="order-last basis-full text-caption text-muted">Review: {note}</p>}
+      {open && note && <p className="order-last basis-full text-caption text-muted">Review: {note}</p>}
+      {/* The answer as first delivered: a check that was wrong never makes it disappear. */}
+      {open && original && <p className="order-last basis-full whitespace-pre-line text-caption text-muted">Before the check: {original}</p>}
     </>
   );
 }
@@ -390,7 +392,7 @@ export function TurnReceipt({
       <OutsideWorkCards activity={activity}>{saved ? (saved.deliverables ?? [saved.deliverable!]).map(file => <DeliverableCard key={`${file.dir}/${file.name}`} row={{ ...saved, count: 1, deliverable: file }} sessionId={sessionId} />) : null}</OutsideWorkCards>
       {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
-        {review && <ReviewChip review={review} note={reviewNote} />}
+        {review && <ReviewChip review={review} note={reviewNote} original={terminal?.correctedFrom} />}
         {byline && <span className="text-muted">{byline}</span>}
         <TurnEvidenceLine terminal={terminal} activity={activity} inline />
         <span className="ml-auto flex items-center gap-2 opacity-0 transition-opacity duration-base group-hover/turn:opacity-100 group-focus-within/turn:opacity-100">

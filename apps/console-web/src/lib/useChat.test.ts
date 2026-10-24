@@ -1169,6 +1169,7 @@ test('idle inbox: Clem\'s correction after a no takes the answer\'s place instea
   assert.equal(placed.messages[0]!.text, 'The meeting is at 9:00.');
   assert.equal(placed.messages[0]!.terminal?.review, 'corrected');
   assert.equal(placed.messages[0]!.terminal?.reviewNote, 'The record says 9:00.');
+  assert.equal(placed.messages[0]!.terminal?.correctedFrom, 'The meeting is at 10:00.', 'the first answer stays behind the chip');
   assert.deepEqual(placed.rest.map((message) => message.text), ['The export finished.'], 'other report-backs stay their own reply');
   // Nothing to replace: the correction still shows.
   assert.equal(placeAnswerCheckCorrections([], additions).rest.length, 2);

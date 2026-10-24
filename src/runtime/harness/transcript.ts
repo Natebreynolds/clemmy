@@ -336,8 +336,10 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     const answerKey = sourceKey(source.event.sessionId, corrects);
     const answer = assistantBySource.get(answerKey);
     if (answer?.terminal?.review !== 'rejected') continue;
+    // The first answer stays behind the corrected chip: a check that was
+    // wrong must not make it disappear.
     assistantBySource.set(answerKey, { ...answer, text: correction.text,
-      terminal: { ...answer.terminal, review: 'corrected' } });
+      terminal: { ...answer.terminal, review: 'corrected', correctedFrom: answer.text } });
     assistantBySource.delete(source.key);
   }
 

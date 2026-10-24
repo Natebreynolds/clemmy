@@ -1922,6 +1922,7 @@ function TurnReceipt({ message, sessionId }: { message: ChatMessage; sessionId?:
           {review ? <span class={REVIEW_CHIP[review].pending ? 'receipt-pending' : REVIEW_CHIP[review].ok ? 'receipt-ok' : 'receipt-warn'}>{REVIEW_CHIP[review].label}</span> : null}
           {touched ? <span>{touched}</span> : null}
           {reveal && reviewNote ? <span class="receipt-model receipt-review-note">Review: {reviewNote}</span> : null}
+          {reveal && message.terminal?.correctedFrom ? <span class="receipt-model receipt-review-note receipt-corrected-from">Before the check: {message.terminal.correctedFrom}</span> : null}
           {reveal && byline ? <span class="receipt-model">{byline}</span> : null}
         </button>
       ) : null}

@@ -4466,6 +4466,7 @@ textarea.cz-input { resize: vertical; }
 .receipt-pending { color: var(--fg-2); font-weight: 600; }
 .receipt-model { flex-basis: 100%; color: var(--fg-2); }
 .receipt-review-note { overflow-wrap: anywhere; }
+.receipt-corrected-from { white-space: pre-line; }
 
 /* Work outside Clem that the app confirmed: one card per app and kind. */
 .reply-outside { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-3); }

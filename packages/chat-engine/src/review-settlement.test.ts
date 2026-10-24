@@ -90,6 +90,7 @@ test('a correction after a no takes the answer\'s place: one ask, one reply', ()
   assert.equal(replies[0]!.text, 'The meeting is at 9:00.');
   assert.equal(replies[0]!.terminal?.review, 'corrected');
   assert.equal(replies[0]!.terminal?.reviewNote, 'The calendar record says 9:00.', 'what the check found stays on the chip');
+  assert.equal(replies[0]!.terminal?.correctedFrom, 'The meeting is at 10:00.', 'the first answer stays behind the chip');
 });
 
 test('a correction that ends on a question leaves the answer waiting on the owner', () => {

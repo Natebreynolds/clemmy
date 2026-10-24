@@ -1235,6 +1235,8 @@ test('a review that says no after delivery lets Clem correct herself once, in he
     const replies = reconstructHarnessTranscript(run.identity.sessionId).filter((turn) => turn.role === 'assistant');
     assert.deepEqual(replies.map((turn) => turn.text), [correction]);
     assert.equal((replies[0]!.terminal as { review?: string } | undefined)?.review, 'corrected');
+    assert.equal((replies[0]!.terminal as { correctedFrom?: string } | undefined)?.correctedFrom, reply,
+      'reopened, the first answer stays behind the corrected chip');
   } finally {
     host._setHostObjectiveJudgeForTests(null);
   }
