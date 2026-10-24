@@ -159,3 +159,19 @@ test('dotted fields reach nested values', () => {
   const rows = [{ m: { rank: 6 } }, { m: { rank: 42 } }];
   assert.equal(applyWhere(rows, [{ field: 'm.rank', op: 'lt', value: 10 }]).rows.length, 1);
 });
+
+test('a true/false field matches true/false, "true"/"false" and 1/0', () => {
+  const events = [
+    { subject: 'kept', isCancelled: false },
+    { subject: 'dropped', isCancelled: true },
+    { subject: 'also kept', isCancelled: false },
+  ];
+  for (const value of [false, 'false', 0, '0']) {
+    const result = applyWhere(events, [{ field: 'isCancelled', op: 'eq', value }]);
+    assert.deepEqual(result.rows.map((row) => (row as { subject: string }).subject), ['kept', 'also kept'], String(value));
+    assert.equal(result.skipped, 0, `${JSON.stringify(value)} is comparable with a true/false field`);
+  }
+  assert.deepEqual(applyWhere(events, [{ field: 'isCancelled', op: 'ne', value: 1 }]).rows.length, 2);
+  // A number field keeps its numbers: 0 there is the number zero.
+  assert.equal(applyWhere([{ n: 0 }, { n: 2 }], [{ field: 'n', op: 'eq', value: 0 }]).rows.length, 1);
+});

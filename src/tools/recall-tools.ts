@@ -322,10 +322,10 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
     .array(z.object({
       field: z.string().min(1).describe('A dotted path reaches nested values.'),
       op: z.enum(['eq', 'ne', 'contains', 'lt', 'lte', 'gt', 'gte']),
-      value: z.union([z.string(), z.number()]),
+      value: z.union([z.string(), z.number(), z.boolean()]),
     }))
     .optional()
-    .describe('All must hold. Numbers and ISO dates compare by value; text case-insensitively.'),
+    .describe('All must hold. Numbers, ISO dates, true/false by value; text ignores case.'),
   sort_by: z.string().optional(),
   order: z.enum(['asc', 'desc']).optional().describe('Default asc.'),
   aggregate: z
@@ -755,7 +755,7 @@ export function registerRecallTools(server: McpServer): void {
           skipped = filtered.skipped;
         }
         const skippedNote = skipped > 0
-          ? ` ${skipped} record(s) were left out because a condition's field held no value comparable with it (missing, empty, or a different kind: number, date or text).`
+          ? ` ${skipped} record(s) were left out because a condition's field held no value comparable with it (missing, empty, or a different kind: number, date, true/false or text).`
           : '';
         const sortBy = typeof input.sort_by === 'string' && input.sort_by.trim() ? input.sort_by.trim() : undefined;
         const aggregate = typeof input.aggregate === 'string' ? input.aggregate as RecordAggregateOp : undefined;

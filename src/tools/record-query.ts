@@ -17,7 +17,7 @@ export type RecordQueryOp = 'eq' | 'ne' | 'contains' | 'lt' | 'lte' | 'gt' | 'gt
 export interface RecordCondition {
   field: string;
   op: RecordQueryOp;
-  value: string | number;
+  value: string | number | boolean;
 }
 
 export type RecordAggregateOp = 'count' | 'sum' | 'avg' | 'min' | 'max';
@@ -126,7 +126,11 @@ function matches(record: unknown, condition: RecordCondition): boolean | null {
 
 function valueMatches(raw: unknown, condition: RecordCondition): boolean | null {
   const left = comparable(raw);
-  const right = comparable(condition.value);
+  // A true/false field compares with true/false, "true"/"false", or 1/0: a
+  // condition of 0 on such a field means false, not an incomparable number.
+  const flag = typeof raw === 'boolean' && (condition.value === 0 || condition.value === 1
+    || condition.value === '0' || condition.value === '1');
+  const right = comparable(flag ? String(Number(condition.value) === 1) : condition.value);
   if (condition.op === 'ne') {
     if (!left || !right) return left !== right;
     const order = compare(left, right);
