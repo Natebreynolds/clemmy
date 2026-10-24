@@ -1213,3 +1213,23 @@ test('wrap(text stream): usage reported on the final choice still closes the str
   const chunks = await collect(await wrapCompletionsCreate(backend.fn)(plainParams()));
   assert.deepEqual(chunks.at(-1)!.usage, usage);
 });
+
+test('a streamed reply ends where special-token markup begins; the markup never reaches the owner', async () => {
+  const chunk = (content: string, finish: string | null = null) => ({
+    id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm',
+    choices: [{ index: 0, delta: { content }, finish_reason: finish }],
+  });
+  async function* realStream() {
+    yield chunk('The calendar read did not run, so I have no events to report. ');
+    yield chunk('Rerun when ready.\n\n<');
+    yield chunk('｜CTRL｜ calls>\n<｜CTRL｜ invoke name="step_result">');
+    yield chunk('{"data":"x"}</｜CTRL｜ invoke>', 'stop');
+  }
+  const fake = makeFake([() => realStream()]);
+  const stream = await wrapCompletionsCreate(fake.fn)({ model: 'm', messages: [{ role: 'user', content: 'run it' }], stream: true });
+  const chunks = await collect(stream);
+  const text = chunks.map((c) => ((c.choices as AnyObj[])?.[0]?.delta as AnyObj | undefined)?.content).filter((v) => typeof v === 'string').join('');
+  // Whitespace streamed before the markup arrived is harmless; the words are exact.
+  assert.equal(text.trimEnd(), 'The calendar read did not run, so I have no events to report. Rerun when ready.');
+  assert.doesNotMatch(JSON.stringify(chunks), /｜/);
+});

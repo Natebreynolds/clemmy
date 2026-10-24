@@ -463,6 +463,24 @@ async function reAskForJson(
  *  tasks — the "8 tool calls then drift" failure). Also strips a leading
  *  <think> block out of content so raw think-tags aren't fed back as content.
  *  Mutates the completion in place. */
+/** A tokenizer's special-token markup ("<\uFF5C…\uFF5C…>") that an endpoint
+ *  returned as plain text: an undecoded control sequence (a tool call it did
+ *  not parse), never words for the owner. The reply ends where it starts. */
+const SPECIAL_TOKEN_MARKUP_START = '<\uFF5C';
+
+export function withoutSpecialTokenMarkup(text: string): string {
+  const at = text.indexOf(SPECIAL_TOKEN_MARKUP_START);
+  return at < 0 ? text : text.slice(0, at).trimEnd();
+}
+
+/** The finished reply without trailing special-token markup. */
+export function stripSpecialTokenMarkup(completion: CompatCompletion): void {
+  const msg = completion?.choices?.[0]?.message;
+  if (msg && typeof msg.content === 'string' && msg.content.includes(SPECIAL_TOKEN_MARKUP_START)) {
+    msg.content = withoutSpecialTokenMarkup(msg.content);
+  }
+}
+
 export function liftReasoning(completion: CompatCompletion): void {
   const msg = completion?.choices?.[0]?.message;
   if (!msg) return;
@@ -852,6 +870,7 @@ async function wrappedCompletionsCreate(
     const plainStartedAt = Date.now();
     const completion = (await original(relaxed, options)) as CompatCompletion;
     liftReasoning(completion);
+    stripSpecialTokenMarkup(completion);
     promoteReasoningFinal(completion);
     recordByoUsage(completion, relaxed.model, undefined, plainStartedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
     const msg = completion?.choices?.[0]?.message;
@@ -905,6 +924,7 @@ async function finishedCompletionStream(
   startedAt: number,
 ): Promise<AsyncGenerator<unknown>> {
   liftReasoning(completion);
+  stripSpecialTokenMarkup(completion);
   promoteReasoningFinal(completion);
   recordByoUsage(completion, relaxed.model, undefined, startedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
   const msg = completion?.choices?.[0]?.message;
@@ -1016,6 +1036,7 @@ async function* replyTextStream(
   }
   const completion = streamed.completion();
   liftReasoning(completion);
+  stripSpecialTokenMarkup(completion);
   promoteReasoningFinal(completion);
   recordByoUsage(completion, relaxed.model, harnessContext, owner.startedAt, { reasoningEffort: relaxed.reasoning_effort, identity: requestIdentities.get(relaxed) });
   const msg = completion.choices?.[0]?.message;
@@ -1028,6 +1049,12 @@ async function* replyTextStream(
 }
 
 const LEADING_THINK_BLOCK = /^\s*<think\b[^>]*>([\s\S]*?)<\/think\s*>\s*/i;
+
+/** A streamed reply that ends on "<" may be starting special-token markup:
+ *  hold that one character until the next chunk shows what it is. */
+function withoutTrailingMarkupStart(text: string): string {
+  return text.endsWith('<') ? text.slice(0, -1) : text;
+}
 
 /** A chat-completions stream accumulated into the completion the
  * non-streaming request returns, by the SDK converter's own rules: choice 0
@@ -1099,6 +1126,12 @@ class StreamedCompletion {
    * leading think block becomes reasoning (see liftReasoning) when no
    * reasoning field carries it, so it is held until it closes. */
   forwardableContent(): string {
+    // Special-token markup never reaches the owner: forward only what precedes
+    // it, and hold a trailing "<" that may begin it.
+    return withoutTrailingMarkupStart(withoutSpecialTokenMarkup(this.rawForwardableContent()));
+  }
+
+  private rawForwardableContent(): string {
     if (this.reasoning || this.reasoningContent.trim() || this.reasoningDetails.trim()) return this.content;
     const head = this.content.trimStart();
     if (!head) return '';
