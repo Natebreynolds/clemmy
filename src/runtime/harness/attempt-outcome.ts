@@ -552,6 +552,20 @@ export function providerRepliedWithoutProof(outcome: AttemptOutcome): boolean {
     && (outcome.detail === 'provider_refused_envelope' || outcome.detail === 'provider_envelope_contradiction');
 }
 
+/** A call its settlement holds as non-mutating (a read, including a learned
+ * read of an operation that can also write) whose provider answered with its
+ * own error, thrown as ProviderAnsweredError: nothing changed and nothing is
+ * in the dark. The provider's words are the call's result for the model to
+ * read and act on, whatever else the operation's contract allows. */
+export function providerAnsweredNonMutatingCall(
+  settlement: { recovery: { mutating: boolean } },
+  thrown: unknown,
+): boolean {
+  if (settlement.recovery.mutating !== false) return false;
+  return thrown instanceof ProviderAnsweredError
+    || (thrown instanceof Error && thrown.name === 'ProviderAnsweredError');
+}
+
 /** A write that ended with no acknowledgement at all: a timeout, a dropped
  * connection, a process that ended early. It may have landed. Whether the
  * turn goes on under a write freeze or stops depends on the crossing: one

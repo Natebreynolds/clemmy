@@ -802,7 +802,7 @@ function signalsFromResult(result: unknown): AttemptSignals {
  * The settled adapter proof, never a second reading of provider bytes.
  * A generic unsuccessful envelope cannot prove that nothing committed.
  */
-export { providerAnsweredWithRefusal, providerLeftInTheDark, providerRepliedWithoutProof } from './attempt-outcome.js';
+export { providerAnsweredNonMutatingCall, providerAnsweredWithRefusal, providerLeftInTheDark, providerRepliedWithoutProof } from './attempt-outcome.js';
 
 export function providerRefusedExactRequest(outcome: AttemptOutcome): boolean {
   return outcome.kind === 'invalid_arguments'

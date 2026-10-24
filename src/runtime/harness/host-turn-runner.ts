@@ -146,6 +146,7 @@ import {
 import {
   InvalidArgumentsPreDispatchResult,
   settleAdmittedLogicalCallPreDispatchDisposition,
+  providerAnsweredNonMutatingCall,
   providerAnsweredWithRefusal,
   providerLeftInTheDark,
   providerRepliedWithoutProof,
@@ -8515,6 +8516,11 @@ const runHostTurnBody = async (
       // provider's words and answers; a refusal the app spelled out is never
       // reported as "may have begun" with a blank effect marker.
       if (providerRepliedWithoutProof(settlement.outcome)) return 'answered_refusal';
+      // The same holds for a call the settlement keeps as non-mutating: a
+      // read the provider refused ("404 profile not found") is an answer the
+      // model reads, even when the operation's contract cannot be read as a
+      // plain read because the same tool can also write.
+      if (providerAnsweredNonMutatingCall(settlement, attempt.error)) return 'answered_refusal';
       // A WRITE THAT ENDED WITHOUT ACKNOWLEDGEMENT, where the crossing itself
       // answered (it threw) and proved nothing, goes on under a write freeze:
       // the error is the call's result, reads are open, every further

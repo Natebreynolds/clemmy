@@ -78,3 +78,17 @@ test('a mutation the provider answered with its own refusal stays uncertain with
   const proven = classifyAttemptOutcome({ mutating: true, providerRejectedBeforeEffect: true });
   assert.equal(providerAnsweredWithRefusal(proven), false, 'a trusted pre-effect proof is a different, stronger reading');
 });
+
+test('a non-mutating call the provider answered with its own error is an answer, not the dark', async () => {
+  const { ProviderAnsweredError, providerAnsweredNonMutatingCall } = await import('./attempt-outcome.js');
+  const answered = new ProviderAnsweredError('native MCP operation failed: error in manage_profiles (get): 404 profile not found');
+  const read = { recovery: { mutating: false } };
+  assert.equal(providerAnsweredNonMutatingCall(read, answered), true,
+    'a read the provider refused is read by the model, even when the same tool can also write');
+  assert.equal(providerAnsweredNonMutatingCall({ recovery: { mutating: true } }, answered), false,
+    'a write keeps its own uncertain-write reading');
+  assert.equal(providerAnsweredNonMutatingCall(read, new Error('socket hang up')), false,
+    'a throw the provider never answered stays in the dark');
+  assert.equal(providerAnsweredNonMutatingCall(read, Object.assign(new Error('x'), { name: 'ProviderAnsweredError' })), true,
+    'the class name is the nominal marker across a module boundary');
+});
