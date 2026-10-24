@@ -61,6 +61,7 @@ import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
 import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
+import { useFoldPages } from './lib/fold-pages';
 import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
@@ -118,6 +119,8 @@ export function App() {
   // Left drawer (owner directive 2026-08-25): sections live in a slide-in
   // menu, never a bottom dock — content gets the full height.
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Opened across a fold, the sections and recent chats fill the first page.
+  const foldPages = useFoldPages();
   const [detailHeaderOwned, setDetailHeaderOwned] = useState(false);
   // 'closing' keeps the drawer mounted through its exit animation — an
   // instant unmount is the one visible tell next to a native drawer.
@@ -716,6 +719,13 @@ export function App() {
             </button>
           ))}
         </div>
+        {foldPages ? (
+          <DrawerRecents
+            open={!drawerOpen}
+            onOpen={(session) => goToChat({ session, sessionId: session.id, title: session.title })}
+            onAll={() => navigateTo('chats')}
+          />
+        ) : null}
         <button type="button" class="adaptive-settings" aria-current={tab === 'settings' ? 'page' : undefined}
           onClick={() => { haptic('light'); navigateTo('settings'); }}>Settings</button>
       </nav>

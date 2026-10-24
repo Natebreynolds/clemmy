@@ -106,6 +106,25 @@
   .ask-capsule-fade { left: var(--mobile-navigation-width); }
 }
 
+/* Opened across a vertical fold, the window is two pages. The shell reports
+   the crease (--fold-start to --fold-end); the sections and recent chats fill
+   the first page, the open screen and its sheets the second, and nothing is
+   laid across the crease. */
+@media (min-width: 880px) {
+  :root[data-fold-axis='vertical'] #app:has(.adaptive-navigation) {
+    --mobile-navigation-width: var(--fold-end);
+    grid-template-columns: var(--fold-start) calc(var(--fold-end) - var(--fold-start)) minmax(0, 1fr);
+  }
+  :root[data-fold-axis='vertical'] .adaptive-navigation { padding-left: max(16px, env(safe-area-inset-left)); padding-right: 16px; }
+  /* A page is wide enough for the sections in two columns, which leaves the
+     recent chats in view below them instead of under a scroll. */
+  :root[data-fold-axis='vertical'] .adaptive-navigation-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 8px; }
+  :root[data-fold-axis='vertical'] .adaptive-navigation .drawer-recents { flex-shrink: 0; margin-bottom: var(--sp-3); }
+  :root[data-fold-axis='vertical'] .app-header,
+  :root[data-fold-axis='vertical'] .app-main { grid-column: 3; }
+  :root[data-fold-axis='vertical'] .sheet-layer { left: var(--fold-end); }
+}
+
 /* A wide window with a sidebar still has a compact content pane. Home only
    earns two columns once each has enough room for its actual controls. */
 @media (min-width: 880px) and (max-width: 1099px) {
