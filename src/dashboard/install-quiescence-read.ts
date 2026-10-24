@@ -19,6 +19,8 @@ export interface InstallQuiescenceReader {
   readCodingMachineId?: () => string;
   /** Allows one already-fenced, bounded directory snapshot in the observer. */
   listDirectoryFiles?: (directory: string) => string[];
+  /** Reuse selected raw metadata only within the supplied read snapshot. */
+  observeSessionMetadata?: (sessionId: string, metadataJson: string | null) => void;
   getUserInputEventAtSequence: typeof import('../runtime/harness/eventlog.js').getUserInputEventAtSequence;
   getBackgroundTask: typeof import('../execution/background-tasks.js').getBackgroundTask;
   readWorkflowRunInventoryFile: typeof import('../execution/workflow-run-inventory.js').readWorkflowRunInventoryFile;
@@ -237,6 +239,8 @@ export function readInstallQuiescenceRead(options: { nowMs?: number; maxEntries?
         ${OWNER_KEYS.map(key => `json_type(metadata_json, '$.${key}') IS NOT NULL`).join(' OR ')}
       ) ELSE 1 END LIMIT ?`, 'session_owner', ...workflowIds);
     for (const session of sessions) {
+      if ('observeSessionMetadata' in reader && reader.observeSessionMetadata)
+        reader.observeSessionMetadata(session.id, session.metadata_json);
       const metadata = decoded(session.metadata_json);
       if (!metadata) { issues.add('session_owner_metadata_unreadable'); continue; }
       if (text(metadata.workflowRunId) && workflowOwners.has(metadata.workflowRunId)) {

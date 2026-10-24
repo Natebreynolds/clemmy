@@ -13,6 +13,7 @@ import { buildSync } from 'esbuild';
 import { ACTIVE_WORK_OBSERVER_LIMITS as observerLimits, observationIdentityDigest, observationFailureIssue,
   policyMapDigest, type ObservationIdentity, type ObserverToMain } from './active-work-observer-protocol.js';
 import { HARNESS_SCHEMA_VERSION } from '../runtime/harness/schema-version.js';
+import { HostRecoveryState } from '../runtime/harness/host-checkpoint-state.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-active-work-worker-'));
 Object.assign(process.env, { CLEMENTINE_HOME: home, CLEMMY_TEST_ISOLATED_HOME: '1',
@@ -69,6 +70,57 @@ test('actual RO worker preserves current owners and302 historical compatibility 
   assert.equal(result.activeSessions, 302);
   assert.equal(result.items.length, 302);
   assert.equal(digest(file), before, 'the worker does not initialize, migrate or repair this database');
+});
+
+function controlledMetadataCheckpoint(bytes: number, index: number) {
+  const session = events.createSession({ kind: 'execution', title: `Controlled metadata owner ${index}` });
+  const source = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled retained metadata objective.' } });
+  const state = new HostRecoveryState(session.id, source.seq, 'continue', [], [], [], undefined, undefined,
+    'host_v1', undefined, 0, { sessionId: session.id, sourceUserSeq: source.seq,
+      acceptedTaskId: `task:${session.id}#${source.seq}`, batchOrdinal: 1, batchId: 'a'.repeat(64), authorityDigest: 'b'.repeat(64) });
+  events.openEventLog().prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(JSON.stringify({
+    __host_recovery_state: state.toString(), __continuation_owner: { sourceUserSeq: source.seq },
+    controlledPrivateMetadata: 'x'.repeat(bytes),
+  }), session.id);
+  return session;
+}
+
+test('one observation reuses exact large session metadata across owners, recovery and compatibility display', async () => {
+  for (let index = 0; index < 10; index++) controlledMetadataCheckpoint(650_000, index);
+  const canonical = readInstallQuiescence();
+  assert.equal(canonical.quiescence.state, 'work_pending'); assert.equal(canonical.currentWork.total, 10);
+  const file = path.join(home, 'state', 'harness.db'); const before = digest(file);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, canonical.quiescence.state, JSON.stringify(result.quiescence.issues));
+  assert.deepEqual(result.currentWork, canonical.currentWork);
+  assert.deepEqual(result.quiescence.issues, canonical.quiescence.issues);
+  assert.equal(result.activeSessions, 10); assert.equal(result.items.length, 10);
+  assert.equal(JSON.stringify(result).includes('controlledPrivateMetadata'), false);
+  assert.equal(digest(file), before, 'reuse does not mutate or normalize retained metadata');
+});
+
+test('unique required session metadata still exceeds the unchanged total byte bound', async () => {
+  for (let index = 0; index < 30; index++) controlledMetadataCheckpoint(850_000, index);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.quiescence.issues, ['active_work_observation_total_bytes_bound']);
+  assert.equal(result.activityAvailable, false); assert.deepEqual(result.currentWork.items, []);
+});
+
+test('metadata reuse preserves malformed holds and observes changed bytes on the next observation', async () => {
+  const session = controlledMetadataCheckpoint(100_000, 0);
+  const service = observer();
+  const first = await service.read();
+  assert.equal(first.quiescence.state, 'work_pending'); assert.equal(first.currentWork.total, 1);
+  events.openEventLog().prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{controlled-private-malformed', session.id);
+  const malformed = await service.read();
+  assert.equal(malformed.quiescence.state, 'unverified'); assert.ok(malformed.total >= 1);
+  assert.equal(JSON.stringify(malformed).includes('controlled-private-malformed'), false);
+  events.openEventLog().prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run('{}', session.id);
+  const cleared = await service.read();
+  assert.equal(cleared.quiescence.state, 'quiescent'); assert.equal(cleared.currentWork.total, 0);
+  assert.equal(cleared.activeSessions, 1, 'compatibility membership is independent of the former checkpoint');
 });
 
 test('new requests during an observation await a fresh followup and completed idle is never reused', async () => {

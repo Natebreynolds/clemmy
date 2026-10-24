@@ -254,8 +254,13 @@ async function observe(): Promise<void> {
         { parseResolvedCallAuthority: bytes => policy('sealed', bytes) as ReturnType<typeof import('../runtime/harness/resolved-call-authority.js').parseResolvedCallAuthority> }),
     };
     const audit = (input: Parameters<typeof auditAcceptedSourceSettlementTruthRead>[0]) => auditAcceptedSourceSettlementTruthRead(input, auditReader);
+    // Exact raw bytes from this BEGIN snapshot, never shared across observations.
+    // An absent row is distinct from an existing row with null/empty metadata.
+    const sessionMetadata = new Map<string, { metadata_json: string | null } | undefined>();
     const getSessionMetadata = (sessionId: string) => {
-      const row = db.prepare('SELECT metadata_json FROM sessions WHERE id = ?').get(sessionId) as { metadata_json: string | null } | undefined;
+      if (!sessionMetadata.has(sessionId)) sessionMetadata.set(sessionId,
+        db.prepare('SELECT metadata_json FROM sessions WHERE id = ?').get(sessionId) as { metadata_json: string | null } | undefined);
+      const row = sessionMetadata.get(sessionId);
       return row ? row.metadata_json ? JSON.parse(row.metadata_json) : {} : undefined;
     };
     const getApproval = (id: string) => {
@@ -274,6 +279,7 @@ async function observe(): Promise<void> {
         if (!names) failObservation(new Error('directory_unprepared'));
         return names;
       },
+      observeSessionMetadata: (sessionId, metadataJson) => sessionMetadata.set(sessionId, { metadata_json: metadataJson }),
       getUserInputEventAtSequence: (sessionId, seq) => {
         const row = db.prepare("SELECT * FROM events WHERE seq = ? AND session_id = ? AND type = 'user_input_received'").get(seq, sessionId) as RawEventRow | undefined;
         return row ? rowToEvent(row) : undefined;
@@ -296,8 +302,19 @@ async function observe(): Promise<void> {
       workflowRunInventoryEntry: (id: string): WorkflowRunInventoryEntry | null => { const value = workflow.get(id + '.json'); return value?.kind === 'record' ? value.entry : null; },
       auditAcceptedSourceSettlementTruth: audit };
     const pendingSessionIds = new Set(approvals.map(row => row.sessionId));
-    const sessions = (db.prepare("SELECT * FROM sessions WHERE kind IN ('workflow','execution','agent') AND status IN ('active','paused') ORDER BY updated_at DESC,id DESC").all() as RawSessionRow[])
-      .map(rowToSession).filter(session => !isIgnorableActiveWorkSessionRead(session, { pendingSessionIds, nowMs: identity.requestedAt }, sessionReader));
+    const retainedMetadataIds = [...sessionMetadata].filter(([, row]) => row !== undefined).map(([id]) => id);
+    const metadataProjection = retainedMetadataIds.length
+      ? `CASE WHEN id IN (${retainedMetadataIds.map(() => '?').join(',')}) THEN NULL ELSE metadata_json END`
+      : 'metadata_json';
+    // Keep every RawSessionRow field and the exact display membership/order.
+    // Previously selected metadata is hydrated from its unchanged raw bytes.
+    const sessions = (db.prepare(`SELECT id, kind, channel, user_id, created_at, updated_at, status, title, objective,
+      token_budget, tokens_used, current_plan_id, ${metadataProjection} AS metadata_json FROM sessions
+      WHERE kind IN ('workflow','execution','agent') AND status IN ('active','paused') ORDER BY updated_at DESC,id DESC`)
+      .all(...retainedMetadataIds) as RawSessionRow[]).map(row => {
+        const retained = sessionMetadata.has(row.id) ? sessionMetadata.get(row.id) : undefined;
+        return rowToSession(retained === undefined ? row : { ...row, metadata_json: retained.metadata_json });
+      }).filter(session => !isIgnorableActiveWorkSessionRead(session, { pendingSessionIds, nowMs: identity.requestedAt }, sessionReader));
     const tasks = [...background.values()].filter(task => !task.archived).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .filter(task => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval');
     const items = [
