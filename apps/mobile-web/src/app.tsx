@@ -898,7 +898,8 @@ export function App() {
               <button class="drawer-close" type="button" aria-label="Close menu" onClick={() => closeDrawer()}>×</button>
             </div>
             <nav class="drawer-nav" aria-label="Sections">
-              {MENU_PLACES.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
+              {/* Detail screens hide the tab bar, so their menu must include its destinations. */}
+              {(detailHeaderOwned ? PRIMARY_TABS : MENU_PLACES).map((id) => TABS.find((t) => t.id === id)!).map((t) => (
                 <button
                   key={t.id}
                   class="drawer-item"
