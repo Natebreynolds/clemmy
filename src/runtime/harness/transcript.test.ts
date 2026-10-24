@@ -513,3 +513,21 @@ test('legacy file facts attach only inside one completed sequence window, never 
   const turns = reconstructHarnessTranscript(session.id);
   assert.deepEqual(turns.filter(turn => turn.files?.length).map(turn => turn.files), [[{ name: 'first.pdf', dir: 'out' }]]);
 });
+
+test('a reopened question carries the answers its question offered', () => {
+  const session = createSession({ kind: 'chat', title: 'connect an app' });
+  const ask = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Connect the notes app.' } });
+  const choices = ['I’ve connected it — continue this same task', 'Pause so I can change this request'];
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'awaiting_user_input',
+    data: { sourceUserSeq: ask.seq, question: 'The notes app needs to be connected first.', options: choices, purpose: 'clarification' } });
+  const question = typedTerminalData({ sessionId: session.id, sourceUserSeq: ask.seq, text: 'The notes app needs to be connected first.' });
+  const presentation = question.presentation as Record<string, unknown>;
+  presentation.status = 'needs_input';
+  presentation.kind = 'question';
+  presentation.resumable = true;
+  presentation.needs = { kind: 'input' };
+  question.turnOutcome = { version: 2, id: presentation.outcomeId, status: 'needs_input', resumable: true, needs: { kind: 'input' } };
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: question });
+  const reopened = reconstructHarnessTranscript(session.id).find((turn) => turn.role === 'assistant');
+  assert.deepEqual(reopened?.questionOptions, choices);
+});

@@ -90,6 +90,8 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       'user_input_received',
       ...(includeDecorations ? ['user_steer_note' as const] : []),
       'conversation_completed',
+      // A question's own answers, kept on its reopened turn.
+      'awaiting_user_input',
       'conversation_superseded',
       // Her mid-task words replay too: the point of a check-in is that
       // someone who walked away can reopen the session and read it.
@@ -150,7 +152,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; terminal?: Record<string, unknown> };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -281,6 +283,18 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       : turns
   );
 
+  // A question's own answers, by the source that asked it: its typed
+  // terminal carries the question's words but not its choices.
+  const questionOptionsBySource = new Map<string, string[]>();
+  for (const event of events) {
+    if (event.type !== 'awaiting_user_input') continue;
+    const asked = positiveSeq(event.data.sourceUserSeq);
+    const options = Array.isArray(event.data.options)
+      ? event.data.options.filter((option): option is string => typeof option === 'string' && option.trim().length > 0).slice(0, 8)
+      : [];
+    if (asked !== null && options.length > 0) questionOptionsBySource.set(sourceKey(event.sessionId, asked), options);
+  }
+
   // Pair typed terminals by the exact accepted event and elect the durable
   // first writer. This deliberately ignores physical attempt/run identity.
   const assistantBySource = new Map<string, AssistantTurn>();
@@ -307,6 +321,8 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         planProposalId: planProposalIdFrom(event.data),
         planArtifactRef: publicPlanArtifactRef(event.data.planArtifactRef),
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
+        ...(presentation.kind === 'question' && questionOptionsBySource.has(key)
+          ? { questionOptions: questionOptionsBySource.get(key)! } : {}),
         terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
@@ -485,6 +501,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             planProposalId: assistant.planProposalId,
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
+            ...(assistant.questionOptions ? { questionOptions: assistant.questionOptions } : {}),
             ...(assistant.terminal ? { terminal: assistant.terminal } : {}),
           }),
         ]),

@@ -144,6 +144,8 @@ function historyMessage(turn: Turn): ChatMessage {
     planArtifactRef: readPlanRevisionRef(turn.planArtifactRef),
     status: typed ? typed.status : turn.role === 'assistant' ? ('complete' as const) : undefined,
     ...(typed?.terminal ? { terminal: typed.terminal } : {}),
+    // A reopened question keeps its choices (and the connection setup they carry).
+    ...(typed?.status === 'awaiting-reply' && turn.questionOptions?.length ? { options: [...turn.questionOptions] } : {}),
   };
 }
 

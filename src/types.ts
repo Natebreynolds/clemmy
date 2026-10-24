@@ -177,6 +177,9 @@ export interface UnifiedSessionSummary {
 
 /** A single normalized turn for rendering a conversation's history. */
 export interface UnifiedSessionTurn {
+  /** A question's answers as its question offered them (the paired
+   *  awaiting_user_input), so a reopened chat keeps its choices. */
+  questionOptions?: string[];
   /** Exact retained human request; never inferred from display pairing. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
   steerNote?: true;
