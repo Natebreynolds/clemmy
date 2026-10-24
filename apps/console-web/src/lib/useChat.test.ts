@@ -1154,6 +1154,26 @@ test('idle inbox: a proactive report-back renders; the user\'s own turns never r
   assert.deepEqual(additions[0].taskRef, { id: 'bg-report-1', label: 'background task' });
 });
 
+test('idle inbox: Clem\'s correction after a no takes the answer\'s place instead of a second reply', async () => {
+  const { inboxAdditionsFromEvents, placeAnswerCheckCorrections } = await import('./useChat');
+  const answer = { id: 'a-1', role: 'assistant' as const, text: 'The meeting is at 10:00.', status: 'complete' as const,
+    acceptedSource: { sessionId: 's', sourceUserSeq: 7, turn: 1 }, terminal: { review: 'rejected' as const, reviewNote: 'The record says 9:00.' } };
+  const additions = inboxAdditionsFromEvents([
+    { seq: 30, turn: 0, type: 'user_input_received', data: { text: '[answer check] …', synthetic: true, source: 'outcome', sourceId: 'answer-check:7', sourceLabel: 'answer check' } },
+    { seq: 31, turn: 0, type: 'conversation_completed', data: { reply: 'The meeting is at 9:00.' } },
+    { seq: 40, turn: 0, type: 'user_input_received', data: { text: '[background task bg-9 completed] …', synthetic: true, source: 'outcome', sourceId: 'bg-9', sourceLabel: 'background task' } },
+    { seq: 41, turn: 0, type: 'conversation_completed', data: { reply: 'The export finished.' } },
+  ], createInboxOutcomeDeliveryState());
+  const placed = placeAnswerCheckCorrections([answer], additions);
+  assert.equal(placed.messages.length, 1);
+  assert.equal(placed.messages[0]!.text, 'The meeting is at 9:00.');
+  assert.equal(placed.messages[0]!.terminal?.review, 'corrected');
+  assert.equal(placed.messages[0]!.terminal?.reviewNote, 'The record says 9:00.');
+  assert.deepEqual(placed.rest.map((message) => message.text), ['The export finished.'], 'other report-backs stay their own reply');
+  // Nothing to replace: the correction still shows.
+  assert.equal(placeAnswerCheckCorrections([], additions).rest.length, 2);
+});
+
 test('idle inbox: LIVE turn shapes pair — relay completion on a different turn, parked retry question, and user-turn cutoff', async () => {
   const { inboxAdditionsFromEvents } = await import('./useChat');
   // Live 2026-07-28: the outcome directive is recorded turn 0; the relay's

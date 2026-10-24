@@ -1199,7 +1199,7 @@ test('an ordinary chat answer publishes before its review, which then rules on t
   }
 });
 
-test('a review that says no after delivery lets Clem correct herself in the thread, once, in her own words', async () => {
+test('a review that says no after delivery lets Clem correct herself once, in her own words, in the answer\'s place', async () => {
   const reply = 'The controlled report value is present.';
   const correction = 'One correction to my last answer: the controlled value carries an unknown qualification, which I left out.';
   const finding = 'The reply leaves out the controlled qualification shown in the retained read.';
@@ -1230,6 +1230,11 @@ test('a review that says no after delivery lets Clem correct herself in the thre
     const terminals = events.listEvents(run.identity.sessionId, { types: ['conversation_completed'] });
     assert.equal(terminals.filter((row) => row.id === committed.event.id).length, 1);
     assert.equal(committed.event.data.review, 'checking', 'the published answer row is never rewritten');
+    // One ask, one reply: reopened, the correction stands in the answer's place.
+    const { reconstructHarnessTranscript } = await import('./transcript.js');
+    const replies = reconstructHarnessTranscript(run.identity.sessionId).filter((turn) => turn.role === 'assistant');
+    assert.deepEqual(replies.map((turn) => turn.text), [correction]);
+    assert.equal((replies[0]!.terminal as { review?: string } | undefined)?.review, 'corrected');
   } finally {
     host._setHostObjectiveJudgeForTests(null);
   }

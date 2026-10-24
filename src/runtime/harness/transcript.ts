@@ -11,6 +11,7 @@ import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import type { WorkflowSavedEventData } from '../../execution/workflow-saved-event.js';
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
+import { ANSWER_CHECK_SOURCE_PREFIX } from './review-after-delivery.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
 import {
   isPublicRunFailureText,
@@ -322,6 +323,22 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     const { reviewNote: _note, ...terminal } = assistant.terminal;
     assistantBySource.set(key, { ...assistant, terminal: { ...terminal, review: settled.review,
       ...(typeof settled.reviewNote === 'string' ? { reviewNote: settled.reviewNote } : {}) } });
+  }
+  // One ask, one reply: Clem's correction after that review said no takes the
+  // answer's place; its report's source id names the answer it corrects.
+  for (const source of sources.values()) {
+    const data = source.event.data;
+    if (data.synthetic !== true || data.source !== 'outcome' || typeof data.sourceId !== 'string'
+      || !data.sourceId.startsWith(ANSWER_CHECK_SOURCE_PREFIX)) continue;
+    const corrects = positiveSeq(Number(data.sourceId.slice(ANSWER_CHECK_SOURCE_PREFIX.length)));
+    const correction = assistantBySource.get(source.key);
+    if (corrects === null || !correction?.text.trim()) continue;
+    const answerKey = sourceKey(source.event.sessionId, corrects);
+    const answer = assistantBySource.get(answerKey);
+    if (answer?.terminal?.review !== 'rejected') continue;
+    assistantBySource.set(answerKey, { ...answer, text: correction.text,
+      terminal: { ...answer.terminal, review: 'corrected' } });
+    assistantBySource.delete(source.key);
   }
 
   const orphanAssistants: Unit[] = [];

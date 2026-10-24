@@ -340,6 +340,7 @@ const REVIEW_CHIP: Record<TurnReview, { label: string; title?: string; ok: boole
   unchecked: { label: 'Not checked', title: 'The review didn’t rule on this answer, so it wasn’t checked. Ask Clem to re-check it.', ok: false },
   rejected: { label: 'Didn’t pass review', title: 'The last review did not accept this answer.', ok: false },
   needs_recheck: { label: 'Needs a fresh check', title: 'Part of this answer rests on earlier results that need a fresh check. Ask Clem to re-check before relying on it.', ok: false },
+  corrected: { label: 'Corrected after checking', title: 'A check that ran after this answer was sent found a problem, and Clem corrected the answer here.', ok: true },
 };
 
 /** The review chip. With the reviewer's finding it opens to show it, on its

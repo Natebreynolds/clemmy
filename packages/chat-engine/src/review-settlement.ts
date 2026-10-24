@@ -4,6 +4,7 @@
  * this module lands it on the answer's chip, live and on reopen. A ruling
  * with no `checking` answer to land on changes nothing.
  */
+import type { BackgroundOutcomeReport } from './background-outcome-report.js';
 import { REVIEW_NOTE_MAX } from './terminal-presentation.js';
 import type { ChatMessage, HarnessEvent, TerminalReview } from './types.js';
 
@@ -47,6 +48,7 @@ type SettleableMessage = {
   role: string;
   terminal?: ChatMessage['terminal'];
   reviewPendingSource?: number;
+  correctableSource?: number;
   acceptedSource?: { sourceUserSeq: number };
 };
 
@@ -60,8 +62,58 @@ export function applyReviewSettlement<M extends SettleableMessage>(messages: M[]
     const { reviewNote: _note, ...terminal } = message.terminal;
     return {
       ...rest,
+      // A no leaves the answer findable by the correction that replaces it.
+      ...(settled.review === 'rejected' ? { correctableSource: settled.sourceUserSeq } : {}),
       terminal: { ...terminal, review: settled.review, ...(settled.reviewNote ? { reviewNote: settled.reviewNote } : {}) },
     } as M;
   });
   return changed ? next : messages;
+}
+
+/** A correction Clem wrote after a review said no names the answer it
+ *  corrects in its report's source id (ANSWER_CHECK_SOURCE_PREFIX in
+ *  src/runtime/harness/review-after-delivery.ts): that answer's source. */
+const ANSWER_CHECK_SOURCE = /^answer-check:([1-9]\d{0,15})$/;
+
+export function answerCheckCorrectedSource(report: Pick<BackgroundOutcomeReport, 'sourceId'> | null): number | null {
+  const match = report ? ANSWER_CHECK_SOURCE.exec(report.sourceId) : null;
+  const seq = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+}
+
+/** What a correction brings to the answer it replaces. */
+export interface AnswerCheckCorrection {
+  text: string;
+  status?: ChatMessage['status'];
+}
+
+type CorrectableMessage = SettleableMessage & { text: string; status?: ChatMessage['status'] };
+
+/**
+ * One ask, one reply: Clem's correction takes the place of the answer its
+ * review said no to, and the chip says it was corrected (the finding stays
+ * on it). Returns null when that answer is not among these messages, so the
+ * caller shows the correction as a reply of its own rather than dropping it.
+ */
+export function applyAnswerCheckCorrection<M extends CorrectableMessage>(
+  messages: M[],
+  sourceUserSeq: number,
+  correction: AnswerCheckCorrection,
+): M[] | null {
+  const text = correction.text.trim();
+  if (!text) return null;
+  const index = messages.findIndex((message) => message.role === 'assistant'
+    && message.terminal?.review === 'rejected'
+    && (message.correctableSource ?? message.acceptedSource?.sourceUserSeq) === sourceUserSeq);
+  if (index < 0) return null;
+  return messages.map((message, i) => {
+    if (i !== index) return message;
+    const { correctableSource: _source, ...rest } = message;
+    return {
+      ...rest,
+      text,
+      ...(correction.status ? { status: correction.status } : {}),
+      terminal: { ...message.terminal, review: 'corrected' as const },
+    } as M;
+  });
 }

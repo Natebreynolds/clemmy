@@ -3,7 +3,7 @@ import type { PendingActionResultRecord } from '@clem/chat-engine';
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
-import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
+import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, answerCheckCorrectedSource, applyAnswerCheckCorrection, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
 import { applySteerReceiptEvent, hasSteerAdmission, steerFollowUpRequestId, unhandledSteerFollowUps, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
@@ -1884,12 +1884,13 @@ export function useChat(options?: UseChatOptions) {
           setMessages((prev) => {
             const seenIds = new Set(prev.map((m) => m.id));
             const seenApprovals = new Set(prev.map((m) => m.approval?.approvalId).filter(Boolean));
-            const fresh = additions.filter((m) => !seenIds.has(m.id)
+            const unseen = additions.filter((m) => !seenIds.has(m.id)
               && (!m.approval?.approvalId || !seenApprovals.has(m.approval.approvalId)));
-            if (!fresh.length) return prev;
+            const { messages: current, rest: fresh } = placeAnswerCheckCorrections(prev, unseen);
+            if (!fresh.length) return current;
             // A report-back or approval card landing supersedes the live
             // delegated-work strip — the real outcome replaces the live view.
-            return [...prev.filter((m) => m.id !== DELEGATED_STRIP_ID), ...fresh];
+            return [...current.filter((m) => m.id !== DELEGATED_STRIP_ID), ...fresh];
           });
         }
       } catch { /* transient poll failure — next tick retries; reopen remains the floor */ }
@@ -2786,6 +2787,24 @@ export function createInboxOutcomeCursor(sessionId: string | null = null): Inbox
 
 /** Actual idle inbox polling owner, extracted so private-page continuation and
  * first-open watermark behavior are qualified through the real producer. */
+/** One ask, one reply: a report-back that is Clem's correction of an answer
+ *  its review said no to takes that answer's place (chat-engine
+ *  review-settlement.ts). Every other report-back stays its own reply. */
+export function placeAnswerCheckCorrections(
+  messages: ChatMessage[], additions: readonly ChatMessage[],
+): { messages: ChatMessage[]; rest: ChatMessage[] } {
+  let current = messages;
+  const rest: ChatMessage[] = [];
+  for (const addition of additions) {
+    const corrects = addition.taskRef ? answerCheckCorrectedSource({ sourceId: addition.taskRef.id }) : null;
+    const corrected = corrects === null ? null
+      : applyAnswerCheckCorrection(current, corrects, { text: addition.text, ...(addition.status ? { status: addition.status } : {}) });
+    if (corrected) current = corrected;
+    else rest.push(addition);
+  }
+  return { messages: current, rest };
+}
+
 export async function pollInboxOutcomeEvents(cursor: InboxOutcomeCursor, input: {
   fetchPage(url: string): Promise<RecentEventsPage>;
   active(): boolean;

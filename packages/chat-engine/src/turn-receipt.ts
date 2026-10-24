@@ -16,8 +16,9 @@ import type { ActivityItem, ModelRuleOffer, TerminalFacts, WorkflowCardData } fr
  *  never ran or could not rule: it must never read as a pass. `rejected` is
  *  the last review saying no. `needs_recheck` is an answer resting on earlier
  *  work that needs a fresh look before it is relied on. `checking` is an
- *  answer already delivered whose review is still running. */
-export type TurnReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking';
+ *  answer already delivered whose review is still running. `corrected` is
+ *  such an answer replaced by Clem's correction after its review said no. */
+export type TurnReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking' | 'corrected';
 
 /** The host's own ruling on the terminal decides when it sent one. Otherwise
  *  the latest verdict decides; an earlier rejection followed by a passing

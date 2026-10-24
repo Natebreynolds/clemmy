@@ -26,7 +26,7 @@ import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
 import { terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
-import { applyReviewSettlement, readReviewSettlement, reviewPendingSourceFor } from './review-settlement.js';
+import { answerCheckCorrectedSource, applyAnswerCheckCorrection, applyReviewSettlement, readReviewSettlement, reviewPendingSourceFor } from './review-settlement.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
 import { acceptedConversationSource, appendConversationCheckIn } from './conversation-check-in.js';
@@ -733,11 +733,17 @@ export class ChatEngine {
       this.emit();
       return;
     }
-    if (readBackgroundOutcomeReport(event, this.sessionId)) {
+    const backgroundReport = readBackgroundOutcomeReport(event, this.sessionId);
+    if (backgroundReport) {
       if (event.type === 'conversation_completed') {
         const id = `background-report-${event.seq}`;
-        if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
-          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        const presentation = terminalCompletionPresentation(d, '');
+        const corrects = answerCheckCorrectedSource(backgroundReport);
+        const corrected = corrects === null ? null
+          : applyAnswerCheckCorrection(this.messages, corrects, { text: presentation.text, status: presentation.status });
+        if (corrected) this.messages = corrected;
+        else if (!this.messages.some(message => message.id === id)) this.messages = [...this.messages, {
+          id, role: 'assistant', ...presentation,
         }];
         this.emit();
       }
@@ -1226,11 +1232,17 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
       continue;
     }
     const d = (event.data ?? {}) as Record<string, unknown>;
-    if (readBackgroundOutcomeReport(event, sessionId)) {
+    const backgroundReport = readBackgroundOutcomeReport(event, sessionId);
+    if (backgroundReport) {
       if (event.type === 'conversation_completed') {
         const id = `background-report-${event.seq}`;
-        if (!messages.some(message => message.id === id)) messages.push({
-          id, role: 'assistant', ...terminalCompletionPresentation(d, ''),
+        const presentation = terminalCompletionPresentation(d, '');
+        const corrects = answerCheckCorrectedSource(backgroundReport);
+        const corrected = corrects === null ? null
+          : applyAnswerCheckCorrection(messages, corrects, { text: presentation.text, status: presentation.status });
+        if (corrected) messages = corrected;
+        else if (!messages.some(message => message.id === id)) messages.push({
+          id, role: 'assistant', ...presentation,
         });
       }
       // Retain the foreground's source, opening, activity and pending question.

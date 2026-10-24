@@ -368,8 +368,10 @@ export interface TerminalFacts {
 
 /** `needs_recheck` is an answer the host held because the evidence under it
  *  came from earlier work that needs a fresh look. `checking` is an answer
- *  published before its review, which rules on it right after. */
-export type TerminalReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking';
+ *  published before its review, which rules on it right after. `corrected`
+ *  is such an answer the review said no to, now showing Clem's correction in
+ *  its place. */
+export type TerminalReview = 'checked' | 'unchecked' | 'rejected' | 'needs_recheck' | 'checking' | 'corrected';
 
 export type RetainedOutsideChange = 'went_through' | 'did_not' | 'mixed' | 'refused' | 'uncertain' | 'none';
 
@@ -469,6 +471,9 @@ export interface ChatMessage {
   /** The accepted source of an answer still being checked: its review's
    *  later ruling lands on this message's chip (review-settlement.ts). */
   reviewPendingSource?: number;
+  /** The accepted source of an answer its review said no to: Clem's
+   *  correction takes this message's place (review-settlement.ts). */
+  correctableSource?: number;
   /** Live, accumulated tool calls + spawned agents for THIS turn. */
   activity?: ActivityItem[];
   approval?: {

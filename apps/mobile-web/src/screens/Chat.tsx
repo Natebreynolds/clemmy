@@ -1867,6 +1867,7 @@ const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean; pending?: tr
   unchecked: { label: 'Not checked', ok: false },
   rejected: { label: 'Didn’t pass review', ok: false },
   needs_recheck: { label: 'Needs a fresh check', ok: false },
+  corrected: { label: 'Corrected after checking', ok: true },
 };
 
 /** A turn no model spoke for, as the app's own status line: what happened,
