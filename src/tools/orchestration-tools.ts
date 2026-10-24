@@ -808,7 +808,10 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
   ].join('\n');
 }
 
-export function renderWorkflowRunsOverview(limit = 15): string {
+/** Most rows one time-window listing returns before it says how many more. */
+const RUNS_WINDOW_MAX_ROWS = 100;
+
+export function renderWorkflowRunsOverview(limit = 15, options: { sinceHours?: number; nowMs?: number } = {}): string {
   if (!existsSync(WORKFLOW_RUNS_DIR)) return 'No workflow runs yet — nothing is running.';
   interface RunRow {
     id: string;
@@ -858,10 +861,34 @@ export function renderWorkflowRunsOverview(limit = 15): string {
         : r.status;
     return `- ${r.workflow} · ${state}${r.needsAttention ? ' · NEEDS ATTENTION' : ''} · run ${r.id}${r.createdAt ? ` · ${formatRunAge(r.createdAt)}` : ''}`;
   };
+  // A time window answers "what ran today / this week" completely, which the
+  // capped overview cannot (live 2026-10-24: asked which of 94 workflows ran
+  // in the last day, the brain re-polled the overview four times and paged a
+  // 39K workflow_list until the no-progress governor ended the turn).
+  if (options.sinceHours !== undefined) {
+    const cutoff = (options.nowMs ?? Date.now()) - options.sinceHours * 3_600_000;
+    const inWindow = rows
+      .filter((r) => r.createdAt !== undefined && Date.parse(r.createdAt) >= cutoff)
+      .sort(byCreated);
+    const hours = `${options.sinceHours} hour${options.sinceHours === 1 ? '' : 's'}`;
+    if (inWindow.length === 0) return `No workflow runs started in the last ${hours}.`;
+    const workflows = new Set(inWindow.map((r) => r.workflow)).size;
+    const shown = inWindow.slice(0, RUNS_WINDOW_MAX_ROWS);
+    return [
+      `${inWindow.length} run${inWindow.length === 1 ? '' : 's'} of ${workflows} workflow${workflows === 1 ? '' : 's'} started in the last ${hours}, newest first:`,
+      ...shown.map(fmt),
+      ...(inWindow.length > shown.length
+        ? [`…and ${inWindow.length - shown.length} older in this window. Pass workflow for one workflow's history.`]
+        : []),
+    ].join('\n');
+  }
   const parts: string[] = [];
   if (active.length > 0) {
     parts.push(`${active.length} active run${active.length === 1 ? '' : 's'} (in-flight / needs attention):`);
     parts.push(...active.slice(0, limit).map(fmt));
+    if (active.length > limit) {
+      parts.push(`…and ${active.length - limit} more in flight or needing attention. Pass since_hours for a time window, or workflow for one workflow's history.`);
+    }
   } else {
     parts.push('No workflows are running right now.');
   }
@@ -2764,14 +2791,15 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_run_status',
-    'Check workflow runs and read what they produced. Pass run_id for one run\'s detail (each step\'s result, clipped); add step_id to read that step\'s full output, paged with offset. Pass workflow (and no run_id) for that workflow\'s run history. Omit both to LIST what is running right now — use that form to answer "what workflows are running / how is my flow going".',
+    'Check workflow runs and read what they produced. Pass run_id for one run\'s detail (each step\'s result, clipped); add step_id to read that step\'s full output, paged with offset. Pass workflow (and no run_id) for that workflow\'s run history. Pass since_hours (and neither) for every run started in that window — "what ran today / this week". Omit all three to LIST what is running right now — use that form to answer "what workflows are running / how is my flow going".',
     {
       run_id: z.string().optional().describe('A specific run id for its full record. Omit to list active + recent runs.'),
       workflow: z.string().optional().describe('A workflow name: list its runs, newest first. Ignored when run_id is given.'),
       step_id: z.string().optional().describe('With run_id: return this step\'s full output instead of the run summary.'),
       offset: z.number().int().min(0).optional().describe('With step_id: the character to continue reading from.'),
+      since_hours: z.number().min(1).max(720).optional().describe('Without run_id or workflow: list every run started in this many past hours, newest first.'),
     },
-    async ({ run_id, workflow, step_id, offset }) => {
+    async ({ run_id, workflow, step_id, offset, since_hours }) => {
       // Preserve blank optional inputs as the existing overview/history form.
       // Every nonempty supplied identity must still pass the exact-file fence.
       const exactRun = run_id?.trim() ? readExactWorkflowRunForStatus(run_id) : undefined;
@@ -2902,8 +2930,9 @@ export function registerOrchestrationTools(server: McpServer): void {
           return textResult(`Failed to read run ${run_id}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      // No id → list active + recent runs so Clem can answer "what's running?".
-      return textResult(renderWorkflowRunsOverview());
+      // No id → list active + recent runs so Clem can answer "what's running?",
+      // or every run in a time window when she asks what ran.
+      return textResult(renderWorkflowRunsOverview(15, since_hours !== undefined ? { sinceHours: since_hours } : {}));
     },
   );
 

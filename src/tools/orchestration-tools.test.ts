@@ -2164,6 +2164,25 @@ test('a workflow\'s run history lists its runs newest first, and a step\'s full 
   assert.match(renderWorkflowRunStepOutput(record, '1792100500000-bbbbbb', 'missing'), /Steps with output: pull, draft/);
 });
 
+test('a time window lists every run started in it, newest first, and the capped overview says how many more', () => {
+  resetState();
+  const now = Date.parse('2026-10-24T08:00:00.000Z');
+  const at = (hoursAgo: number) => new Date(now - hoursAgo * 3_600_000).toISOString();
+  writeRunRecord({ id: 'w-1', workflow: 'daily-brief', status: 'completed', createdAt: at(1) });
+  writeRunRecord({ id: 'w-2', workflow: 'team-update', status: 'completed', needsAttention: true, createdAt: at(5) });
+  writeRunRecord({ id: 'w-3', workflow: 'daily-brief', status: 'completed', createdAt: at(23) });
+  writeRunRecord({ id: 'w-old', workflow: 'old-flow', status: 'completed', createdAt: at(30) });
+  const day = renderWorkflowRunsOverview(15, { sinceHours: 24, nowMs: now });
+  assert.match(day, /^3 runs of 2 workflows started in the last 24 hours, newest first:/);
+  assert.ok(day.indexOf('run w-1') < day.indexOf('run w-2') && day.indexOf('run w-2') < day.indexOf('run w-3'), day);
+  assert.doesNotMatch(day, /old-flow/);
+  assert.equal(renderWorkflowRunsOverview(15, { sinceHours: 1, nowMs: now + 48 * 3_600_000 }), 'No workflow runs started in the last 1 hour.');
+
+  for (let i = 0; i < 4; i += 1) writeRunRecord({ id: `attn-${i}`, workflow: `flow-${i}`, status: 'blocked_capability', createdAt: at(i) });
+  const capped = renderWorkflowRunsOverview(2);
+  assert.match(capped, /…and \d+ more in flight or needing attention\. Pass since_hours for a time window/);
+});
+
 test('renderWorkflowRunsOverview: nothing active → says so (still lists recent)', () => {
   resetState();
   writeRunRecord({ id: 'r-old', workflow: 'x', status: 'completed', createdAt: new Date().toISOString() });
