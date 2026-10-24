@@ -168,6 +168,71 @@ test('required tool arguments remain fully bounded when unrelated event types ar
   assert.equal(JSON.stringify(result).includes('controlled-required-argument'), false);
 });
 
+function appendDistinctPolicyCalls(source: { sessionId: string; sourceUserSeq: number }) {
+  const db = events.openEventLog();
+  const insert = db.prepare(`INSERT INTO events (id,session_id,turn,role,type,data_json,created_at)
+    VALUES (?, ?, 2, 'assistant', 'tool_called', ?, '2026-01-01T00:00:00Z')`);
+  db.transaction(() => {
+    for (let index = 0; index <= observerLimits.policyInputs; index++) insert.run(`controlled-policy-${index}`, source.sessionId,
+      JSON.stringify({ tool: 'alpha__records_create', arguments: { value: `controlled-private-policy-${index}` },
+        sourceUserSeq: source.sourceUserSeq, acceptedTaskId: `task:${source.sessionId}#${source.sourceUserSeq}` }));
+  })();
+}
+
+test('policy preflight scopes source A before later B inputs while retaining exact late A write evidence', async () => {
+  const sourceA = controlledCrossing({ value: 'controlled source A argument' });
+  const sourceB = events.appendEvent({ sessionId: sourceA.sessionId, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Controlled later source B.' } });
+  const attribution = { sourceUserSeq: sourceA.sourceUserSeq, acceptedTaskId: `task:${sourceA.sessionId}#${sourceA.sourceUserSeq}`,
+    canonicalCallId: 'controlled-filtered-call', shapeKey: 'UPDATE_RECORD', targets: ['controlled-record:A'] };
+  const reservation = events.appendEvent({ sessionId: sourceA.sessionId, turn: 1, role: 'system', type: 'external_write',
+    data: { ...attribution, preDispatch: true } });
+  events.appendEvent({ sessionId: sourceA.sessionId, turn: 1, role: 'system', type: 'external_write_succeeded',
+    parentEventId: reservation.id, data: attribution });
+  const audit = auditAcceptedSourceSettlementTruth(sourceA);
+  assert.equal(audit.status, 'in_flight'); assert.equal(audit.facts.confirmedWrites, 1);
+  const canonical = readInstallQuiescence();
+  assert.equal(canonical.quiescence.state, 'work_pending');
+  const beforeLaterInputs = await observer().read();
+  assert.deepEqual(beforeLaterInputs.currentWork, canonical.currentWork);
+  assert.equal(beforeLaterInputs.quiescence.state, 'work_pending');
+  appendDistinctPolicyCalls({ sessionId: sourceA.sessionId, sourceUserSeq: sourceB.seq });
+  assert.deepEqual(auditAcceptedSourceSettlementTruth(sourceA), audit);
+  assert.deepEqual(readInstallQuiescence().currentWork, canonical.currentWork);
+  const file = path.join(home, 'state', 'harness.db'); const before = digest(file);
+  const result = await observer().read();
+  assert.deepEqual(result.quiescence.issues, canonical.quiescence.issues);
+  assert.equal(result.quiescence.state, 'work_pending'); assert.equal(result.total, canonical.total);
+  assert.deepEqual(result.currentWork, canonical.currentWork); assert.deepEqual(result.items, beforeLaterInputs.items);
+  assert.equal(JSON.stringify(result).includes('controlled-private-policy'), false);
+  assert.equal(digest(file), before);
+});
+
+test('excessive policy inputs required by the current accepted source still refuse verification', async () => {
+  const source = controlledCrossing({ value: 'controlled current source' });
+  appendDistinctPolicyCalls(source);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.quiescence.issues, ['active_work_observation_policy_inputs_bound']);
+  assert.equal(result.activityAvailable, false); assert.deepEqual(result.currentWork.items, []);
+});
+
+test('non-user workflow source retains its typed owner hold without a chat-source failure', async () => {
+  const source = controlledCrossing({ value: 'controlled workflow evidence' });
+  // This disposable retained ledger is not workflow execution authority. Its
+  // system activation must remain held by the canonical workflow-owner branch.
+  events.openEventLog().prepare("UPDATE events SET role = 'system', type = 'workflow_node_invocation_activated' WHERE seq = ?")
+    .run(source.sourceUserSeq);
+  const canonical = readInstallQuiescence();
+  assert.ok(canonical.quiescence.issues.includes('workflow_effect_owner_unverified'));
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.currentWork, canonical.currentWork);
+  assert.deepEqual(result.quiescence.issues, canonical.quiescence.issues);
+  assert.ok(!result.quiescence.issues.includes('active_work_observation_unverified'));
+  assert.ok(!result.quiescence.issues.includes('effect_evidence_unreadable'));
+});
+
 test('actual worker caps record bytes and all directory entries without returning idle', async () => {
   const dbFile = path.join(home, 'state', 'harness.db'); const before = digest(dbFile);
   for (let index = 0; index <= observerLimits.files; index++) writeFileSync(path.join(WORKFLOW_RUNS_DIR, `partial-${index}.json`), JSON.stringify({

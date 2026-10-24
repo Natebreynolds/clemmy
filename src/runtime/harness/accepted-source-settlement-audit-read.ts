@@ -207,7 +207,10 @@ function acceptedTaskAttributionIsCompatible(
     || event.data.acceptedTaskId === acceptedTaskId;
 }
 
-function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number, reader: AcceptedSourceSettlementAuditReader): EventRow[] {
+/** Exact source attribution shared by settlement audit and policy preflight.
+ * Reading this selection grants no execution or reconciliation authority. */
+export function readAcceptedSourceSettlementEvents(sessionId: string, sourceUserSeq: number,
+  reader: Pick<AcceptedSourceSettlementAuditReader, 'database' | 'listEvents'>): EventRow[] {
   const events = reader.listEvents(sessionId, acceptedSourceSettlementEventWindow(sourceUserSeq));
   const source = events.find((event) => event.seq === sourceUserSeq && event.type === 'user_input_received');
   if (!source) throw new Error('accepted source event is missing');
@@ -578,7 +581,7 @@ export function auditAcceptedSourceSettlementTruthRead(input: {
     };
     const localMutations = localSettlements.filter(localMutates);
 
-    const turnEvents = turnEventsForAcceptedSource(input.sessionId, input.sourceUserSeq, reader);
+    const turnEvents = readAcceptedSourceSettlementEvents(input.sessionId, input.sourceUserSeq, reader);
     const successfulSdkBusinessResults = turnEvents.filter((event) =>
       event.type === 'tool_returned'
       && event.data.accounting === 'top_level'

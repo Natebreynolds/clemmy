@@ -4,7 +4,7 @@ import { lstatSync, opendirSync, openSync, readSync, closeSync, realpathSync } f
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { readInstallQuiescenceRead, unverifiedInstallQuiescence } from './install-quiescence-read.js';
-import { acceptedSourceSettlementEventWindow, auditAcceptedSourceSettlementTruthRead } from '../runtime/harness/accepted-source-settlement-audit-read.js';
+import { acceptedSourceSettlementEventWindow, readAcceptedSourceSettlementEvents, auditAcceptedSourceSettlementTruthRead } from '../runtime/harness/accepted-source-settlement-audit-read.js';
 import { readPendingUnacknowledgedWritesForSourceRead } from '../runtime/harness/pending-unacknowledged-writes-read.js';
 import { readRecoveryActivationRead } from '../runtime/harness/recovery-activation-read.js';
 import { parseCurrentManifestRecoverySemantics } from '../runtime/harness/current-manifest-recovery-data.js';
@@ -212,7 +212,14 @@ async function observe(): Promise<void> {
     for (const source of sources) {
       const calls = db.prepare('SELECT tool_name FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?').all(source.session_id, source.source_user_seq) as Array<{ tool_name: string }>;
       for (const call of calls) add('effect', [call.tool_name, {}]);
-      for (const event of listEvents(source.session_id, acceptedSourceSettlementEventWindow(source.source_user_seq))) if (event.type === 'tool_called') {
+      const window = listEvents(source.session_id, acceptedSourceSettlementEventWindow(source.source_user_seq));
+      // Non-user sources retain the conservative preflight; the inventory's
+      // workflow-owner branch must preserve their typed hold, not a chat error.
+      const selected = window.some(event => event.sessionId === source.session_id
+        && event.seq === source.source_user_seq && event.type === 'user_input_received')
+        ? readAcceptedSourceSettlementEvents(source.session_id, source.source_user_seq, { database: () => db, listEvents })
+        : window;
+      for (const event of selected) if (event.type === 'tool_called') {
         let args = event.data.arguments;
         if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* canonical model-visible bytes */ } }
         const tool = typeof event.data.tool === 'string' ? event.data.tool : undefined;
