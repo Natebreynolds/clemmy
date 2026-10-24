@@ -11,7 +11,6 @@ import { useState } from 'preact/hooks';
 import type { AgentAssignments } from '@clem/chat-engine';
 import type { MobileAgent } from '../lib/api';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { DelegatedTaskList } from '../components/DelegatedTaskCard';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -60,7 +59,6 @@ export function AgentDetail({ agent, onBack, onMessage, onEdit, onOpenProject, o
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{agent.name}</h2>
         <button type="button" class="btn-quiet" onClick={() => { haptic('light'); onEdit(agent); }}>Edit</button>
-        <NavigationMenuButton />
       </div>
 
       <div class="project-sections">

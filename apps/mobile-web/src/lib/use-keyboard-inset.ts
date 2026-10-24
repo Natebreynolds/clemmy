@@ -48,9 +48,12 @@ export function useMobileViewportVariables(): void {
       style.setProperty('--mobile-viewport-height', `${height}px`);
       style.setProperty('--kb-inset', `${bottomInset}px`);
       style.setProperty('--mobile-dock-gap', covered ? '10px' : 'max(22px, calc(env(safe-area-inset-bottom) + 10px))');
+      // The tab bar steps aside for the keyboard, the way a native one does.
+      document.documentElement.toggleAttribute('data-keyboard-up', covered);
     });
     return () => {
       unsubscribe();
+      document.documentElement.removeAttribute('data-keyboard-up');
       style.removeProperty('--mobile-viewport-top');
       style.removeProperty('--mobile-viewport-height');
       style.removeProperty('--kb-inset');

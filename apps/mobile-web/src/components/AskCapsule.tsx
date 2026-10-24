@@ -36,8 +36,8 @@ export function AskCapsule({ onAsk }: Props) {
           compact
           value={draft}
           onChange={setDraft}
-          placeholder="Ask Clementine…"
-          ariaLabel="Ask Clementine"
+          placeholder="Ask Clem…"
+          ariaLabel="Ask Clem"
           upload={uploadChatAttachment}
           onSend={(text, attachments) => onAsk(text, attachments)}
         />

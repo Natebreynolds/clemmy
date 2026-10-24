@@ -23,7 +23,6 @@ import {
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { relativeTime } from '../components/Approvals';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -32,15 +31,19 @@ import { failedWorkspaceSources, workspaceNeedsSourceRepair } from '../lib/works
 import { Chat } from './Chat';
 import { WorkspaceSourceControls } from '../components/WorkspaceSourceControls';
 import { reportWidgetLanding, saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, widgetText } from '../lib/widget-bridge';
+import { EmptyState } from '../components/EmptyState';
 
 export function Workspaces({
   initialOpenId = null,
   onOpenNeedsYou,
   onOpenChange = () => undefined,
+  onAsk,
 }: {
   initialOpenId?: string | null;
   onOpenNeedsYou: () => void;
   onOpenChange?: (id: string | null) => void;
+  /** Opens a new conversation with this draft for the owner to finish. */
+  onAsk: (draft: string) => void;
 }) {
   const widgetNavigation = widgetNavigationFromSearch(window.location.search);
   useEffect(() => { if (!initialOpenId) reportWidgetLanding(widgetNavigation, { tab: 'spaces' }); }, [initialOpenId, widgetNavigation]);
@@ -68,11 +71,11 @@ export function Workspaces({
   }
   if (spaces.length === 0) {
     return (
-      <div class="empty">
-        <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
-        <p class="empty-title">No workspaces yet</p>
-        <p class="empty-body">Ask Clem to build one on your computer and it shows up here.</p>
-      </div>
+      <EmptyState
+        title="No Spaces yet"
+        body="A Space is a live page Clem keeps up to date for you, like a tracker or a dashboard."
+        action={{ label: 'Ask Clem to build one', onClick: () => onAsk('Build me a Space that ') }}
+      />
     );
   }
 
@@ -573,7 +576,6 @@ function DetailHeader({ title, onBack, onDetails }: { title: string; onBack: () 
       <ChatBackButton onClick={() => { haptic('light'); onBack(); }} />
       <h2 class="chat-title">{title}</h2>
       {onDetails ? <button type="button" class="btn-quiet" onClick={onDetails}>Details</button> : null}
-      <NavigationMenuButton />
     </div>
   );
 }
