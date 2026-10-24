@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-work-call-name-repair-'));
-const { carrierMissingNameRepair } = await import('./host-turn-runner.js');
+const { carrierMissingNameRepair, carrierTargetShapeRepair } = await import('./host-turn-runner.js');
 
 test('a work_call without its own name is told the local operation its requirement selects', () => {
   const args = {
@@ -31,4 +31,32 @@ test('it says nothing when the name is present, the carrier differs, or the requ
   assert.equal(carrierMissingNameRepair('work_call', { requirement_id: 'cap:resolved:gmail_send_email', args_json: '{}' }), null);
   assert.equal(carrierMissingNameRepair('work_call', { requirement_id: 'cap:local:bad name:x', args_json: '{}' }), null);
   assert.equal(carrierMissingNameRepair('work_call', null), null);
+});
+
+// Live 2026-10-24: a memory correction's first two shapes, both refused
+// effect_unknown with no repair before the third try ran.
+test('a call_tool with no name is told its name is missing', () => {
+  const repair = carrierTargetShapeRepair('call_tool', {
+    args_json: { kind: 'project', content: 'Fixture project "Lilac Kite": the color is COPPER.' },
+  });
+  assert.match(repair ?? '', /`name` is missing\. Set name to the tool these arguments are for/);
+  assert.match(repair ?? '', /No local or external mutation was attempted/);
+});
+
+test('a carrier whose args_json is a whole second call is told to send that call directly', () => {
+  const nested = JSON.stringify({ name: 'memory_remember', args_json: { kind: 'project', content: 'Fixture.' } });
+  for (const carrier of ['work_call', 'call_tool'] as const) {
+    const repair = carrierTargetShapeRepair(carrier, { name: 'tool_call', args_json: nested });
+    assert.match(repair ?? '', /args_json holds a whole second call/);
+    assert.match(repair ?? '', /Send that inner call directly/);
+    assert.doesNotMatch(repair ?? '', /memory_remember/, 'no tool is named from the model\'s text');
+  }
+});
+
+test('the shape repair says nothing for a well-formed carrier or a non-carrier', () => {
+  assert.equal(carrierTargetShapeRepair('call_tool', { name: 'memory_remember', args_json: '{"kind":"project","content":"x"}' }), null);
+  assert.equal(carrierTargetShapeRepair('work_call', { requirement_id: 'cap:local:x:y', args_json: '{}' }), null,
+    'a nameless work_call keeps its own requirement-based repair');
+  assert.equal(carrierTargetShapeRepair('memory_remember', { args_json: '{}' }), null);
+  assert.equal(carrierTargetShapeRepair('call_tool', 'not an object'), null);
 });

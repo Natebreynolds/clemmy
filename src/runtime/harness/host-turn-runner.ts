@@ -1519,6 +1519,39 @@ export function carrierMissingNameRepair(name: string, args: unknown): string | 
   return `Tool 'work_call' was refused before dispatch: its own \`name\` is missing. Set name to "${local[1]}", the operation requirement_id ${requirement} selects, and keep args_json to that operation's own arguments. No local or external mutation was attempted.`;
 }
 
+/** The object a carrier slot holds: parsed when it is one JSON string, as-is
+ *  when the model sent an object; null for anything else. */
+function carrierSlotObject(value: unknown): Record<string, unknown> | null {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { return null; }
+  }
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+}
+
+/** A carrier refused because the host could not tell which tool it targets is
+ * told the one shape fact that fixes it: call_tool sent with no `name`, or a
+ * carrier whose args_json is itself a whole call (a name with its own
+ * args_json). Live 2026-10-24: a memory correction went out as call_tool with
+ * no name, then as work_call named "tool_call" wrapping the real call; both
+ * were refused effect_unknown with no repair, and only the third try ran.
+ * Structural only: no tool is named, inferred or granted, and every gate
+ * still runs on the next call. */
+export function carrierTargetShapeRepair(name: string, args: unknown): string | null {
+  if (name !== 'call_tool' && name !== 'work_call') return null;
+  const record = carrierSlotObject(args);
+  if (!record) return null;
+  const inner = carrierSlotObject(record.args_json ?? record.args);
+  if (inner && typeof inner.name === 'string' && inner.name.trim() && (inner.args_json !== undefined || inner.args !== undefined)) {
+    return `Tool '${name}' was refused before dispatch: its args_json holds a whole second call (a name with its own args_json) instead of the target's own arguments.`
+      + ' Send that inner call directly: its name as this call\'s name and its args_json as this call\'s args_json. No local or external mutation was attempted.';
+  }
+  if (name === 'call_tool' && !(typeof record.name === 'string' && record.name.trim())) {
+    return "Tool 'call_tool' was refused before dispatch: its own `name` is missing. Set name to the tool these arguments are for and keep args_json to that tool's own arguments. No local or external mutation was attempted.";
+  }
+  return null;
+}
+
 /** The business operation a refused call named, read the way the carrier
  * reader reads it; '' when none can be read. A carrier, gateway or built-in
  * tool name is never returned as the operation. */
@@ -7428,6 +7461,10 @@ const runHostTurnBody = async (
       if (lastExactProductionMiss === OFF_MACHINE_CALL_NEEDS_CARD) {
         const effective = unwrapRuntimeEffectiveToolIdentity(name, args ?? parsedArgs(argumentsJson));
         return offMachineCallNeedsCardRepair(name, effective.toolName?.trim() ?? '', effective.args);
+      }
+      if (lastExactProductionMiss?.startsWith('effect_unknown:')) {
+        const shape = carrierTargetShapeRepair(name, args ?? parsedArgs(argumentsJson));
+        if (shape) return shape;
       }
       const boundOperations = plannedWriteOperationIds(
         refusalIdentity.sessionId,
