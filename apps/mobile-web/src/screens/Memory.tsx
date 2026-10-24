@@ -3,9 +3,8 @@
  *
  * Four surfaces, same canonical data the desktop uses:
  *  - SEARCH (top, unchanged): unified recall with "why recalled" chips.
- *  - MEMORY AT WORK: what the background memory jobs are doing now, which
- *    model does their thinking (changeable in place), today's numbers and
- *    the latest runs with undo; "See all" opens the full record.
+ *  - MEMORY AT WORK: a compact background status; "View activity" opens the
+ *    full record with the model picker, today's numbers and runs with undo.
  *    (components/MemoryWorkCard.tsx, lib/memory-work.ts)
  *  - MEMORIES: browsable facts; every card opens a full detail view with
  *    evidence and validity history, and the actions that matter — pin,
@@ -85,6 +84,7 @@ export function Memory() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [tab, setTab] = useState<MemoryTab>('facts');
+  const [adding, setAdding] = useState(false);
   const [kindFilter, setKindFilter] = useState<FactKindFilter>('all');
   const [openFactId, setOpenFactId] = useState<number | null>(null);
   const [openEntityId, setOpenEntityId] = useState<number | null>(null);
@@ -253,11 +253,12 @@ export function Memory() {
   }
 
   return (
-    <div>
+    <div class="memory-screen">
       <form class="memory-search" onSubmit={(ev) => ev.preventDefault()}>
         <input
           class="memory-search-input"
           type="search"
+          aria-label="Search memory"
           placeholder="Search everything Clem knows…"
           value={query}
           onInput={(ev) => setQuery((ev.currentTarget as HTMLInputElement).value)}
@@ -281,18 +282,25 @@ export function Memory() {
             read={workRead}
             loading={work.loading}
             modelName={nameModel}
-            onChangeModel={openModelSheet}
             onOpen={openWork}
-            onUndo={undoWork}
             onRetry={retryWork}
           />
-          <div class="memory-tabs" role="tablist">
-            <button role="tab" aria-selected={tab === 'facts'} class={`memory-tab ${tab === 'facts' ? 'active' : ''}`} onClick={() => setTab('facts')}>Memories</button>
-            <button role="tab" aria-selected={tab === 'people'} class={`memory-tab ${tab === 'people' ? 'active' : ''}`} onClick={() => setTab('people')}>People</button>
+          <div class="memory-library-head">
+            <div class="memory-tabs" role="group" aria-label="Memory views">
+              <button type="button" aria-pressed={tab === 'facts'} class={`memory-tab ${tab === 'facts' ? 'active' : ''}`} onClick={() => setTab('facts')}>Memories</button>
+              <button type="button" aria-pressed={tab === 'people'} class={`memory-tab ${tab === 'people' ? 'active' : ''}`} onClick={() => setTab('people')}>People</button>
+            </div>
+            {tab === 'facts' ? (
+              <button type="button" class="memory-add-toggle" aria-expanded={adding} aria-controls="memory-add-composer" onClick={() => setAdding((open) => !open)}>
+                {adding ? 'Close' : 'Add memory'}
+              </button>
+            ) : null}
           </div>
           {tab === 'facts' ? (
             <>
-              <AddFactComposer onAdded={() => void refreshFacts()} />
+              <div id="memory-add-composer" hidden={!adding}>
+                <AddFactComposer open={adding} onAdded={() => void refreshFacts()} />
+              </div>
               <ScreenNotice error={factsError} offline={factsOffline} onRetry={() => void refreshFacts()} hasData={facts.length > 0} />
               <Browse
                 facts={facts}
@@ -343,7 +351,9 @@ function useLiveExpiry(working: boolean, receivedAt: number | null): void {
 
 /** "Remember this" — rides the daemon's dedup-aware consolidation, so adding
  *  a duplicate reinforces instead of double-storing. */
-function AddFactComposer({ onAdded }: { onAdded: () => void }) {
+function AddFactComposer({ open, onAdded }: { open: boolean; onAdded: () => void }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
   const [text, setText] = useState('');
   const [saving, setSaving] = useState(false);
   const [outcome, setOutcome] = useState<string | null>(null);
@@ -375,7 +385,9 @@ function AddFactComposer({ onAdded }: { onAdded: () => void }) {
   return (
     <form class="memory-add" onSubmit={(ev) => { ev.preventDefault(); void save(); }}>
       <input
+        ref={inputRef}
         class="memory-add-input"
+        aria-label="New memory"
         placeholder="Tell Clem something to remember…"
         value={text}
         onInput={(ev) => setText((ev.currentTarget as HTMLInputElement).value)}
@@ -470,30 +482,31 @@ function Browse(props: {
 
   return (
     <div class="memory-section">
-      {scopeFilter ? (
-        <button
-          type="button"
-          class={`memory-scope-pick${narrowed ? ' active' : ''}`}
-          aria-haspopup="dialog"
-          onClick={onScope}
+      <div class="memory-filters">
+        <select
+          class="memory-kind-select"
+          aria-label="Memory type"
+          value={kindFilter}
+          onChange={(event) => onKind(event.currentTarget.value as FactKindFilter)}
         >
-          <span class="memory-scope-pick-label">Applies to</span>
-          <span class="memory-scope-pick-value truncate">{memoryScopeFilterLabel(scopeFilter)}</span>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="m6 9 6 6 6-6" />
-          </svg>
-        </button>
-      ) : null}
-      <div class="memory-filter">
-        {KIND_OPTIONS.map((option) => (
+          {KIND_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>{option.value === 'all' ? 'All types' : option.label}</option>
+          ))}
+        </select>
+        {scopeFilter ? (
           <button
-            key={option.value}
-            class={`memory-filter-chip ${kindFilter === option.value ? 'active' : ''}`}
-            onClick={() => onKind(option.value)}
+            type="button"
+            class={`memory-scope-pick${narrowed ? ' active' : ''}`}
+            aria-label={`Applies to: ${memoryScopeFilterLabel(scopeFilter)}`}
+            aria-haspopup="dialog"
+            onClick={onScope}
           >
-            {option.label}
+            <span class="memory-scope-pick-value truncate">{memoryScopeFilterLabel(scopeFilter)}</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
           </button>
-        ))}
+        ) : null}
       </div>
 
       {/* A plain count of what is actually loaded. Deliberately not a total:
@@ -501,7 +514,7 @@ function Browse(props: {
           rest?" question this screen exists to avoid. */}
       {!loading && facts.length > 0 ? (
         <div class="memory-overview">
-          {facts.length} {facts.length === 1 ? 'memory' : 'memories'}
+          {facts.length} {facts.length === 1 ? 'memory' : 'memories'} shown
           {pinnedCount > 0 ? ` · ${pinnedCount} pinned` : ''}
         </div>
       ) : null}
@@ -520,18 +533,13 @@ function Browse(props: {
 
       {facts.map((fact) => (
         <button key={fact.id} class={`memory-fact memory-fact-tap memory-fact-${fact.kind}`} onClick={() => onOpen(fact.id)}>
-          <div class="memory-fact-head">
-            <span class={`fact-kind kind-${fact.kind}`}>{fact.kind}</span>
-            {fact.pinned ? (
-              <PinIcon />
-            ) : null}
-            {typeof fact.importance === 'number' ? (
-              <span class="fact-importance" title="importance">★ {fact.importance.toFixed(1)}</span>
-            ) : null}
+          <div class="memory-fact-content memory-fact-summary">{fact.content}</div>
+          <div class="memory-fact-foot">
+            {fact.pinned ? <PinIcon /> : null}
+            <span>{KIND_OPTIONS.find((option) => option.value === fact.kind)?.label ?? fact.kind}</span>
             {fact.scope ? <ScopeChip scope={fact.scope} /> : null}
+            <span class="memory-fact-meta">Updated {formatDate(fact.updatedAt)}</span>
           </div>
-          <div class="memory-fact-content">{fact.content}</div>
-          <div class="memory-fact-meta">updated {formatDate(fact.updatedAt)}</div>
         </button>
       ))}
     </div>
@@ -572,7 +580,7 @@ function FactDetailView({ id, onBack, onOpenFact }: {
   }
 
   return (
-    <div class="workflow-detail">
+    <div class="workflow-detail memory-screen">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <div class="chat-title">Memory</div>
@@ -751,10 +759,8 @@ function People({ entities, loading, onOpen }: {
     <div class="memory-section">
       {entities.map((entity) => (
         <button key={entity.id} class="memory-fact memory-fact-tap" onClick={() => onOpen(entity.id)}>
-          <div class="memory-fact-head">
-            <span class="fact-kind kind-reference">{entity.entityType}</span>
-            <span class="memory-entity-name">{entity.canonicalName}</span>
-          </div>
+          <div class="memory-entity-name">{entity.canonicalName}</div>
+          <div class="memory-fact-foot"><span>{entity.entityType}</span></div>
           <div class="memory-fact-meta">
             {entity.groundedFactCount} {entity.groundedFactCount === 1 ? 'fact' : 'facts'}
             {entity.aliases.length > 0 ? ` · also “${entity.aliases[0]}”` : ''}
@@ -787,7 +793,7 @@ function EntityDetailView({ id, onBack, onOpenFact }: {
   const past = claims.filter((c) => !c.active || c.validTo);
 
   return (
-    <div class="workflow-detail">
+    <div class="workflow-detail memory-screen">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <div class="chat-title">{dossier?.entity?.canonicalName ?? 'Person'}</div>
