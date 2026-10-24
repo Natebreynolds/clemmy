@@ -133,23 +133,3 @@ test('in a clipped record list an opaque id is shown whole or not at all, never 
     assert.doesNotMatch(shown!, /"id":"[^"]*…\[/, `${maxChars}: never a clipped handle`);
   }
 });
-
-test('a clean CLI run\'s JSON stdout is viewed as records with its totals, not as one clipped string', () => {
-  const records = Array.from({ length: 84 }, (_, i) => ({
-    attributes: { type: 'Task', url: `/services/data/v68.0/sobjects/Task/00T${String(i).padStart(15, '0')}` },
-    Id: `00T${String(i).padStart(15, '0')}`, Subject: `Email: follow-up ${i}`, Status: 'Completed', Type: 'Email', ActivityDate: '2026-10-22',
-  }));
-  const stdout = JSON.stringify({ status: 0, result: { records, totalSize: 84, done: true }, warnings: [] }, null, 2);
-  const envelope = { result: { version: 1, status: 'exited', operationId: 'fixture_cli_query', executableRealpath: '/usr/local/bin/fixture',
-    argv: ['data', 'query', '--json'], exitCode: 0, signal: null, stdout, stderr: '', stdoutTruncated: false, stderrTruncated: false }, complete: true };
-  const shown = compactStructuredJsonToolOutput(JSON.stringify(envelope),
-    { callId: 'call_cli', maxChars: 4000, exactOutputReceipt: '[exact-output-receipt:v1 nonce=n sha256=s]' });
-  assert.ok(shown);
-  const view = JSON.parse(shown!);
-  assert.equal(view.result.stdout, undefined, 'the JSON string is not shown clipped');
-  assert.equal(view.result.totalSize, 84, 'the total survives');
-  assert.ok(view.result.records.length > 0, 'records are visible');
-  assert.equal(view.__clementine.records.path, 'result.records',
-    'the view\'s paths are the record query\'s paths: the command\'s JSON is the root');
-  assert.equal(view.__clementine.records.total, 84);
-});

@@ -19,7 +19,6 @@
 
 import { toolCallHint } from './tool-call-hint.js';
 import { captureStoppedAt } from './shell-tool-output.js';
-import { readHostCliEnvelope } from './json-repair.js';
 
 export interface DigestOptions {
   maxChars?: number;
@@ -539,28 +538,13 @@ function projectedRecordCoverage(
  * host metadata property: downstream typed JSON proof can still parse the
  * provider envelope while exact raw redemption continues to use the receipt.
  */
-/**
- * A clean CLI run's envelope carries the command's JSON as one string in
- * `stdout`; clipped as a string it shows no records and no totals. The view
- * is that JSON itself, the root tool_output_query reads, so a path seen here
- * is the path the query takes. Only the view changes: the stored bytes and
- * their receipt are the envelope as it came.
- */
-function hostCliJsonView(parsed: Record<string, unknown>): Record<string, unknown> | null {
-  const reading = readHostCliEnvelope(parsed);
-  if (reading?.kind !== 'clean') return null;
-  const json = reading.stdoutJson;
-  return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
-}
-
 export function compactStructuredJsonToolOutput(
   text: string,
   options: StructuredJsonToolOutputOptions,
 ): string | null {
-  const stored = tryParse(text);
-  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return null;
-  if (Object.hasOwn(stored, STRUCTURED_PROJECTION_META_KEY)) return null;
-  const parsed = hostCliJsonView(stored as Record<string, unknown>) ?? stored;
+  const parsed = tryParse(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (Object.hasOwn(parsed, STRUCTURED_PROJECTION_META_KEY)) return null;
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
