@@ -97,7 +97,7 @@ function settledHostRead(identity: ReturnType<typeof accepted>) {
     .run(identity.sessionId, identity.sourceUserSeq, callId, digest, digest, settlementEvent.id, now);
 }
 function retainedRead(identity: ReturnType<typeof accepted>, name: string, payload: unknown, mutating = false, hostOwned = false, failed = false,
-  call: { id?: string; args?: Record<string, unknown>; hostExecution?: boolean } = {}) {
+  call: { id?: string; args?: Record<string, unknown>; hostExecution?: boolean; outcome?: ReturnType<typeof outcomes.classifyAttemptOutcome> } = {}) {
   const task = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq) };
   if (!hostOwned) assert.ok(shadow.recordTurnGraphShadow({ identity: task }));
   const logicalToolCallId = call.id ?? `read:${name}`;
@@ -130,7 +130,7 @@ function retainedRead(identity: ReturnType<typeof accepted>, name: string, paylo
   assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity, tool: name, outcome: 'returned' }).status, 'inserted');
   const committed = settlements.commitLogicalCallSettlement({ identity: { ...task, logicalToolCallId },
     contract: { toolName: name, args }, execution: { kind: call.hostExecution === false ? 'provider_execution' : 'local_execution' },
-    result: { payload }, outcome: outcomes.classifyAttemptOutcome(failed ? { argumentValidationFailed: true } : { envelopeSuccessful: true }),
+    result: { payload }, outcome: call.outcome ?? outcomes.classifyAttemptOutcome(failed ? { argumentValidationFailed: true } : { envelopeSuccessful: true }),
     recovery: { businessCall: true, mutating }, observer: { lane: 'byo', turn: identity.turn } });
   assert.equal(committed.status, 'committed', JSON.stringify(committed));
   if (committed.status !== 'committed') throw new Error('Fixture settlement did not commit');
@@ -353,6 +353,17 @@ test('a read carried by a host command-line envelope names the program that ran 
   const evidence = sourceSettledReadEvidence(identity);
   assert.match(evidence.summary, /CARRIED BY the local command-line program \/opt\/fixture\/bin\/recordcli on this machine, run by the host with arguments \["data","query","--json"\]/);
   assert.equal(evidence.summary.match(/CARRIED BY/g)?.length, 1, 'only the enveloped read names a carrier');
+});
+
+test('a read the provider answered with an error is shown to a review as a call that ran, not an unknown one', () => {
+  const identity = accepted();
+  retainedRead(identity, 'records_lookup', 'Record not found: FIXTURE-404', false, false, true, {
+    outcome: outcomes.classifyAttemptOutcome({ providerAnsweredFailure: true, mutating: false, errorName: 'ProviderAnsweredError' }),
+  });
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.match(evidence.summary, /records_lookup \[logicalCall=read:records_lookup, outcome=answered with an error\]: this call ran/);
+  assert.doesNotMatch(evidence.summary, /outcome=unknown/);
 });
 
 test('an unrelated accepted source and check-in alone do not make ordinary chat eligible', () => {
