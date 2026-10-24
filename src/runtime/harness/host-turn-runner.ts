@@ -12605,7 +12605,7 @@ const runHostTurnBody = async (
       );
       if (
         canaryRefusal
-        && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
+        && jitProvisionableMiss(lastExactProductionMiss)
         && await jitProvisionCarriedOperation(call.name, parsedArguments)
       ) {
         // Acquire before consent, not inside executeCall: the newly current
@@ -12636,7 +12636,7 @@ const runHostTurnBody = async (
         );
         if (
           !exactProduction
-          && lastExactProductionMiss.startsWith('catalog_entry_or_manifest_missing')
+          && jitProvisionableMiss(lastExactProductionMiss)
           && await jitProvisionCarriedOperation(call.name, parsedArguments)
         ) {
           exactProduction = exactProductionHostCall(
@@ -13290,6 +13290,14 @@ export function _setHostJitLiveReadAcquirerForTests(acquirer: HostJitLiveReadAcq
 const HOST_SIBLING_NOT_RUN_SENTENCE = 'did not run because another call in this same batch needs a fix first';
 
 export const HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX = 'literal_workflow_operation_not_frozen:';
+
+/** A miss the host may answer by provisioning the carried operation just in
+ *  time: its catalog entry is absent, or a workflow step named it literally
+ *  and the run's catalog never froze it. A literal operation is a host fault
+ *  only when provisioning it fails too. */
+function jitProvisionableMiss(miss: string): boolean {
+  return miss.startsWith('catalog_entry_or_manifest_missing') || miss.startsWith(HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX);
+}
 
 export function literalOperationNotFrozenReason(operationId: string): string {
   return `${HOST_LITERAL_OPERATION_NOT_FROZEN_REASON_PREFIX}${operationId}`;

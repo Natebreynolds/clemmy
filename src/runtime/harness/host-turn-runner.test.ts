@@ -9748,9 +9748,10 @@ test('a carried provider READ is provisioned and dispatched; a newly resolved WR
   const priorPorts = productionPorts.listProductionCapabilityPorts();
   process.env.HARNESS_TOOL_BRACKETS = 'on';
 
-  const runVariant = async (input: { label: string; effect: 'read' | 'external_write'; shouldExecute: boolean }) => {
+  const runVariant = async (input: { label: string; effect: 'read' | 'external_write'; shouldExecute: boolean; literalScope?: boolean }) => {
     const fixture = acceptHostCanarySource(`jit-read-${input.label}`);
-    const operationId = `market_${input.label}__lookup_sheet_info`;
+    // A step scope holds provider-shaped ids; the carried names stay as before.
+    const operationId = input.literalScope ? 'MARKET_LITERAL_LOOKUP_SHEET_INFO' : `market_${input.label}__lookup_sheet_info`;
     const manifest = capabilityManifests.attachSemanticContract({
       version: 1,
       manifestId: `cap:${input.label}:sheet-info`,
@@ -9827,11 +9828,19 @@ test('a carried provider READ is provisioned and dispatched; a newly resolved WR
       ]);
       const agent = { model, tools: [carrier] };
       bindHostCanarySurface(fixture, agent, [carrier]);
-      const outcome = await runProductionHost(fixture, agent);
+      // A workflow step names its operation in its own catalog scope; the run's
+      // catalog never froze it. That is provisioned like any carried read.
+      const outcome = input.literalScope
+        ? await catalogScope.withAcceptedSourceCatalogManifestScope(
+          { manifestIds: [manifest.manifestId], operationIds: [operationId] },
+          () => runProductionHost(fixture, agent),
+        )
+        : await runProductionHost(fixture, agent);
       const db = eventlog.openEventLog();
       const physical = (db.prepare(`
         SELECT COUNT(*) AS n FROM physical_dispatches WHERE session_id = ? AND source_user_seq = ?
       `).get(fixture.session.id, fixture.source.seq) as { n: number }).n;
+      if (input.literalScope) assert.doesNotMatch(JSON.stringify(outcome.terminal ?? {}), /literal_workflow_operation_not_frozen/);
       assert.equal(provisionCalls.length, 1, `exactly one JIT provisioning attempt per operation per turn; history: ${
         JSON.stringify(outcome.history).match(/Failed check: [^."]*/)?.[0] ?? JSON.stringify(outcome.history).slice(0, 1200)
       }`);
@@ -9856,6 +9865,9 @@ test('a carried provider READ is provisioned and dispatched; a newly resolved WR
     }));
     await t.test('carried WRITE: provisioned once, still refused pre-dispatch', () => runVariant({
       label: 'write', effect: 'external_write', shouldExecute: false,
+    }));
+    await t.test('a workflow step\'s literally named READ the run never froze: provisioned once and dispatched', () => runVariant({
+      label: 'literal', effect: 'read', shouldExecute: true, literalScope: true,
     }));
   } finally {
     productionPorts.clearProductionCapabilityPorts();
