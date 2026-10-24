@@ -290,6 +290,7 @@ final class WebViewModel: NSObject, ObservableObject {
         // SYSTEM appearance, so a phone in dark mode summons a dark keyboard
         // and dark form accessories over the light page (live 2026-08-26).
         webView.overrideUserInterfaceStyle = .light
+        webView.hideFormAccessoryBar()
         super.init()
         scriptProxy.attach(self)
         webView.navigationDelegate = self
