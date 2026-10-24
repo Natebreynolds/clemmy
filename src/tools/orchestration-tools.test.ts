@@ -2173,9 +2173,11 @@ test('a time window lists every run started in it, newest first, and the capped 
   writeRunRecord({ id: 'w-3', workflow: 'daily-brief', status: 'completed', createdAt: at(23) });
   writeRunRecord({ id: 'w-old', workflow: 'old-flow', status: 'completed', createdAt: at(30) });
   const day = renderWorkflowRunsOverview(15, { sinceHours: 24, nowMs: now });
-  assert.match(day, /^3 runs of 2 workflows started in the last 24 hours, newest first:/);
-  assert.ok(day.indexOf('run w-1') < day.indexOf('run w-2') && day.indexOf('run w-2') < day.indexOf('run w-3'), day);
-  assert.doesNotMatch(day, /old-flow/);
+  assert.match(day, /^3 runs of 2 workflows started in the last 24 hours\. This is the complete list, one line per workflow, latest first:/);
+  assert.match(day, /- daily-brief · 2 runs · 2 Succeeded · latest /);
+  assert.match(day, /- team-update · 1 run · Blocked · NEEDS ATTENTION · latest /);
+  assert.ok(day.indexOf('daily-brief') < day.indexOf('team-update'), 'ordered by each workflow\'s latest run');
+  assert.doesNotMatch(day, /old-flow|run w-/, 'outside the window, and no run ids');
   assert.equal(renderWorkflowRunsOverview(15, { sinceHours: 1, nowMs: now + 48 * 3_600_000 }), 'No workflow runs started in the last 1 hour.');
 
   for (let i = 0; i < 4; i += 1) writeRunRecord({ id: `attn-${i}`, workflow: `flow-${i}`, status: 'blocked_capability', createdAt: at(i) });

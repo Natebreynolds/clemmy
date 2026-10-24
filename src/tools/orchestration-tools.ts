@@ -808,7 +808,7 @@ export function renderWorkflowRunHistory(workflow: string, limit = 10): string {
   ].join('\n');
 }
 
-/** Most rows one time-window listing returns before it says how many more. */
+/** Most workflows one time-window listing names before it says how many more. */
 const RUNS_WINDOW_MAX_ROWS = 100;
 
 export function renderWorkflowRunsOverview(limit = 15, options: { sinceHours?: number; nowMs?: number } = {}): string {
@@ -872,14 +872,28 @@ export function renderWorkflowRunsOverview(limit = 15, options: { sinceHours?: n
       .sort(byCreated);
     const hours = `${options.sinceHours} hour${options.sinceHours === 1 ? '' : 's'}`;
     if (inWindow.length === 0) return `No workflow runs started in the last ${hours}.`;
-    const workflows = new Set(inWindow.map((r) => r.workflow)).size;
-    const shown = inWindow.slice(0, RUNS_WINDOW_MAX_ROWS);
+    // One line per workflow, in order of its latest run: how many runs, their
+    // outcomes and how long ago. Run ids are one call away (workflow=…); a
+    // line per run (42 for 28 workflows) read as unfinished, and a model
+    // re-asked the same window until the loop guard ended the turn.
+    const byWorkflow = new Map<string, RunRow[]>();
+    for (const r of inWindow) byWorkflow.set(r.workflow, [...(byWorkflow.get(r.workflow) ?? []), r]);
+    const groups = [...byWorkflow.entries()];
+    const shown = groups.slice(0, RUNS_WINDOW_MAX_ROWS);
+    const outcomeOf = (r: RunRow) => (r.terminalOutcome ? workflowTerminalOutcomeLabel(r.terminalOutcome)
+      : r.status === TURN_SCOPED_HOLD_STATUS ? TURN_SCOPED_HOLD_LABEL : r.status);
+    const line = ([workflow, runs]: [string, RunRow[]]) => {
+      const outcomes = new Map<string, number>();
+      for (const r of runs) outcomes.set(outcomeOf(r), (outcomes.get(outcomeOf(r)) ?? 0) + 1);
+      const summary = [...outcomes.entries()].map(([label, n]) => (runs.length === 1 ? label : `${n} ${label}`)).join(', ');
+      const attention = runs.some((r) => r.needsAttention) ? ' · NEEDS ATTENTION' : '';
+      return `- ${workflow} · ${runs.length} run${runs.length === 1 ? '' : 's'} · ${summary}${attention}${runs[0].createdAt ? ` · latest ${formatRunAge(runs[0].createdAt)}` : ''}`;
+    };
     return [
-      `${inWindow.length} run${inWindow.length === 1 ? '' : 's'} of ${workflows} workflow${workflows === 1 ? '' : 's'} started in the last ${hours}, newest first:`,
-      ...shown.map(fmt),
-      ...(inWindow.length > shown.length
-        ? [`…and ${inWindow.length - shown.length} older in this window. Pass workflow for one workflow's history.`]
-        : []),
+      `${inWindow.length} run${inWindow.length === 1 ? '' : 's'} of ${groups.length} workflow${groups.length === 1 ? '' : 's'} started in the last ${hours}. This is the complete list, one line per workflow, latest first:`,
+      ...shown.map(line),
+      ...(groups.length > shown.length ? [`…and ${groups.length - shown.length} more workflows in this window.`] : []),
+      'Pass workflow for one workflow\'s run ids and details.',
     ].join('\n');
   }
   const parts: string[] = [];
