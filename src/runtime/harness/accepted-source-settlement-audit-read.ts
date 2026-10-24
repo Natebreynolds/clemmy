@@ -1,10 +1,22 @@
 /** Canonical read-only settlement audit. Dependencies are supplied by the
  * caller; importing this module opens no stores and grants no execution authority. */
 import type Database from 'better-sqlite3';
-import type { EventRow } from './eventlog.js';
+import type { EventRow, EventType, ListEventsOptions } from './eventlog.js';
 import { createHash } from 'node:crypto';
 import { isExecutionSourceBoundary } from './accepted-source-kind.js';
 import { catalogOperationIdentitiesEqual } from './runtime-tool-identity.js';
+
+const SETTLEMENT_EVENT_TYPES = Object.freeze([
+  'user_input_received', 'tool_called', 'tool_returned', 'external_write',
+  'external_write_succeeded', 'external_write_failed', 'external_write_orphaned',
+] satisfies EventType[]);
+
+/** Shared with worker policy preflight so its bounded decoded window is reused.
+ * Keep full evidence rows and later source boundaries/receipts: a new user input
+ * does not end the lifetime of this source's physical write. */
+export function acceptedSourceSettlementEventWindow(sourceUserSeq: number): ListEventsOptions {
+  return { sinceSeq: sourceUserSeq - 1, types: [...SETTLEMENT_EVENT_TYPES] };
+}
 
 /** Every callback is observational and must use this same read snapshot. The
  * runtime wrapper supplies existing canonical functions; a worker may supply
@@ -196,7 +208,7 @@ function acceptedTaskAttributionIsCompatible(
 }
 
 function turnEventsForAcceptedSource(sessionId: string, sourceUserSeq: number, reader: AcceptedSourceSettlementAuditReader): EventRow[] {
-  const events = reader.listEvents(sessionId, { sinceSeq: sourceUserSeq - 1 });
+  const events = reader.listEvents(sessionId, acceptedSourceSettlementEventWindow(sourceUserSeq));
   const source = events.find((event) => event.seq === sourceUserSeq && event.type === 'user_input_received');
   if (!source) throw new Error('accepted source event is missing');
   const nextSource = events.find((event) => event.seq > sourceUserSeq && isExecutionSourceBoundary(event));

@@ -27,6 +27,7 @@ const ledger = await import('../runtime/harness/dispatch-ledger.js');
 const leases = await import('../runtime/harness/dispatch-lease.js');
 const contracts = await import('../runtime/harness/logical-call-contract.js');
 const effects = await import('../runtime/harness/tool-effect.js');
+const { auditAcceptedSourceSettlementTruth } = await import('../runtime/harness/accepted-source-settlement-audit.js');
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const workerEntry = new URL('./active-work-observer.worker.ts', import.meta.url);
 const codingBase = path.join(home, 'state', 'coding-runs');
@@ -94,6 +95,77 @@ test('main event loop remains available during the whole filesystem inventory', 
     assert.equal(result.quiescence.state, 'quiescent');
     assert.ok(ticks >= 3, 'filesystem+DB observation runs off the daemon event loop');
   } finally { clearInterval(timer); }
+});
+
+function controlledCrossing(args: Record<string, unknown>) {
+  const session = events.createSession({ kind: 'chat' });
+  const run = events.beginRunAttempt(session.id, { runId: 'controlled-filtered-event-owner' });
+  const source = events.recordRunAttemptUserInput(run, { turn: 1, role: 'user', data: { text: 'Controlled retained effect.' } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq,
+    acceptedTaskId: `task:${session.id}#${source.seq}`, logicalToolCallId: 'controlled-filtered-call' };
+  assert.ok(shadow.recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: source.turn } }));
+  const tool = 'alpha__records_create';
+  assert.equal(ledger.admitLogicalCall({ identity, tool, args }).status, 'inserted');
+  const material = contracts.durableLogicalCallRecoveryMaterial(identity.acceptedTaskId, tool, args); assert.ok(material);
+  const parent = leases.activateDispatchLease({ sessionId: session.id, scopeId: session.id + ':parent' });
+  const call = leases.activateDispatchLease({ sessionId: session.id, scopeId: session.id + ':call', parentLease: parent,
+    sourceUserSeq: source.seq, acceptedTaskId: identity.acceptedTaskId, logicalToolCallId: identity.logicalToolCallId,
+    recovery: { effect: effects.classifyRuntimeToolEffect(tool, args).effect, businessCall: true, material, turn: source.turn } });
+  assert.equal(ledger.beginPhysicalDispatch({ identity: { ...identity, physicalDispatchId: 'controlled-filtered-crossing', ordinal: 0 },
+    tool, args, executionSite: 'host', dispatchLease: call }).status, 'inserted');
+  leases.revokeDispatchLease(call); leases.revokeDispatchLease(parent);
+  events.appendEvent({ sessionId: session.id, turn: 1, role: 'assistant', type: 'tool_called',
+    data: { tool, arguments: args, sourceUserSeq: source.seq, acceptedTaskId: identity.acceptedTaskId,
+      canonicalCallId: identity.logicalToolCallId } });
+  return { sessionId: session.id, sourceUserSeq: source.seq };
+}
+
+test('actual worker excludes oversized unrelated history and reuses the full required audit window', async () => {
+  const source = controlledCrossing({ value: 'controlled required argument' });
+  const db = events.openEventLog();
+  const insert = db.prepare(`INSERT INTO events (id,session_id,turn,role,type,data_json,created_at)
+    VALUES (?, ?, 1, 'assistant', ?, ?, '2026-01-01T00:00:00Z')`);
+  const required = JSON.stringify({ accounting: 'top_level', sourceUserSeq: source.sourceUserSeq,
+    successfulBusinessResult: true, result: 'controlled-required-result:' + 'x'.repeat(30_000) });
+  assert.ok(Buffer.byteLength(required) * 450 > observerLimits.totalBytes / 2,
+    'decoding this required window separately in preflight and audit would exceed the unchanged budget');
+  db.transaction(() => {
+    for (let index = 0; index < 450; index++) insert.run(`required-${index}`, source.sessionId, 'tool_returned', required);
+  })();
+  const originalAudit = auditAcceptedSourceSettlementTruth(source);
+  assert.equal(originalAudit.status, 'in_flight'); assert.equal(originalAudit.facts.successfulSdkBusinessResults, 450);
+  const originalInventory = readInstallQuiescence();
+  assert.equal(originalInventory.quiescence.state, 'work_pending');
+  const beforeHistory = await observer().read();
+  assert.equal(beforeHistory.quiescence.state, 'work_pending');
+  assert.deepEqual(beforeHistory.currentWork, originalInventory.currentWork);
+
+  const unrelated = JSON.stringify({ text: 'controlled-private-unrelated-history:' + 'x'.repeat(64_000) });
+  assert.ok(Buffer.byteLength(unrelated) * 400 > observerLimits.totalBytes);
+  db.transaction(() => {
+    for (let index = 0; index < 400; index++) insert.run(`unrelated-${index}`, source.sessionId, 'conversation_check_in', unrelated);
+  })();
+  assert.deepEqual(auditAcceptedSourceSettlementTruth(source), originalAudit,
+    'unrelated presentation events do not change the canonical settlement audit');
+  const canonical = readInstallQuiescence();
+  assert.deepEqual(canonical.currentWork, originalInventory.currentWork);
+  const file = path.join(home, 'state', 'harness.db'); const before = digest(file);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'work_pending');
+  assert.deepEqual(result.currentWork, canonical.currentWork);
+  assert.equal(result.total, canonical.total); assert.deepEqual(result.quiescence.issues, canonical.quiescence.issues);
+  assert.deepEqual(result.items, beforeHistory.items);
+  assert.equal(JSON.stringify(result).includes('controlled-private-unrelated-history'), false);
+  assert.equal(digest(file), before);
+});
+
+test('required tool arguments remain fully bounded when unrelated event types are excluded', async () => {
+  controlledCrossing({ value: 'controlled-required-argument:' + 'x'.repeat(observerLimits.policyItemBytes + 1) });
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.quiescence.issues, ['active_work_observation_policy_item_bytes_bound']);
+  assert.equal(result.activityAvailable, false); assert.deepEqual(result.currentWork.items, []);
+  assert.equal(JSON.stringify(result).includes('controlled-required-argument'), false);
 });
 
 test('actual worker caps record bytes and all directory entries without returning idle', async () => {

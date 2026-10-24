@@ -4,7 +4,7 @@ import { lstatSync, opendirSync, openSync, readSync, closeSync, realpathSync } f
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { readInstallQuiescenceRead, unverifiedInstallQuiescence } from './install-quiescence-read.js';
-import { auditAcceptedSourceSettlementTruthRead } from '../runtime/harness/accepted-source-settlement-audit-read.js';
+import { acceptedSourceSettlementEventWindow, auditAcceptedSourceSettlementTruthRead } from '../runtime/harness/accepted-source-settlement-audit-read.js';
 import { readPendingUnacknowledgedWritesForSourceRead } from '../runtime/harness/pending-unacknowledged-writes-read.js';
 import { readRecoveryActivationRead } from '../runtime/harness/recovery-activation-read.js';
 import { parseCurrentManifestRecoverySemantics } from '../runtime/harness/current-manifest-recovery-data.js';
@@ -212,7 +212,7 @@ async function observe(): Promise<void> {
     for (const source of sources) {
       const calls = db.prepare('SELECT tool_name FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?').all(source.session_id, source.source_user_seq) as Array<{ tool_name: string }>;
       for (const call of calls) add('effect', [call.tool_name, {}]);
-      for (const event of listEvents(source.session_id, { sinceSeq: source.source_user_seq - 1 })) if (event.type === 'tool_called') {
+      for (const event of listEvents(source.session_id, acceptedSourceSettlementEventWindow(source.source_user_seq))) if (event.type === 'tool_called') {
         let args = event.data.arguments;
         if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* canonical model-visible bytes */ } }
         const tool = typeof event.data.tool === 'string' ? event.data.tool : undefined;
