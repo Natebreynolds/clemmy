@@ -1825,6 +1825,21 @@ test('writes that did not complete and calls refused before they ran are evidenc
   assert.equal(sourceIncompleteAttemptsEvidence(accepted('Nothing attempted.')), undefined);
 });
 
+test('a read the provider answered with its own error is evidence of that answer; a refused write is not described that way', () => {
+  const identity = accepted('Show the record named fixture-missing.');
+  retainedRead(identity, 'fixture_record_get', { error: 'not found' }, false, false, true, { id: 'read:answered' });
+  retainedRead(identity, 'fixture_record_update', { error: 'rejected' }, true, false, true, { id: 'write:answered' });
+  for (const [callId, tool, said] of [['read:answered', 'fixture_record_get', '404 record not found'],
+    ['write:answered', 'fixture_record_update', 'update rejected by provider']] as const) {
+    events.appendEvent({ ...identity, role: 'system', type: 'guardrail_tripped', data: {
+      kind: 'provider_answered_refusal', sourceUserSeq: identity.sourceUserSeq, callId, tool, said } });
+  }
+  events.closeEventLog();
+  const summary = sourceIncompleteAttemptsEvidence(identity) ?? '';
+  assert.match(summary, /fixture_record_get \[logicalCall=read:answered\] was answered by the provider itself: 404 record not found \| This is the provider's answer to that call/);
+  assert.doesNotMatch(summary, /update rejected by provider \| This is the provider's answer/, 'a refused write stays a write that did not complete');
+});
+
 test('a real refused zero-crossing write carries only exact call no-dispatch evidence, not fresh effect authority', () => {
   const identity = accepted('Update the controlled fixture record.');
   const exact = { ...identity, acceptedTaskId: identities.acceptedTaskIdFor(identity.sessionId, identity.sourceUserSeq),

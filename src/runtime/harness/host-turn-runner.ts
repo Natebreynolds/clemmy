@@ -8655,6 +8655,14 @@ const runHostTurnBody = async (
   const answeredRefusalResult = (call: CanonicalHostCall, error: unknown): AgentInputItem => {
     const raw = error instanceof Error ? error.message : String(error ?? '');
     const said = redactSensitiveText(raw).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1_500);
+    // The provider's own words are evidence of what it answered: the
+    // completion review reads them (sourceIncompleteAttemptsEvidence), so a
+    // reply that reports them is never judged as missing the work.
+    journalHostGuide('provider_answered_refusal', {
+      callId: call.callId,
+      tool: edgeToolName(call.name, parsedArgs(call.argumentsJson)),
+      said: said.slice(0, 600),
+    });
     return functionResultItem(
       call.callId,
       call.name,
