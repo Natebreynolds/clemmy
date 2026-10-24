@@ -10,6 +10,8 @@ import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
 import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { abbreviatedArgumentNote, abbreviatedArguments } from './abbreviated-argument.js';
+import { argumentCorrectionRepairLine, repairWithArgumentCorrections } from './argument-correction-repair.js';
+import { ARGUMENT_CORRECTION_APPLIED, loadArgumentCorrections } from '../../memory/argument-corrections-store.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -12226,6 +12228,28 @@ const runHostTurnBody = async (
         if (materialized.boundTargets) {
           (call as { argumentsJson: string }).argumentsJson = argumentsJson;
           journalHostGuide('reviewed_arguments_bound', { callId: call.callId, targets: materialized.boundTargets });
+        }
+        // A value this read's tool has already rejected, each time fixed by
+        // leaving it out, goes without it (learned from use).
+        if (hostProduction) {
+          try {
+            const value = parsedArgs(argumentsJson);
+            const operation = unwrapRuntimeEffectiveToolIdentity(call.name, value).toolName?.trim().toLowerCase() ?? '';
+            if (operation && classifyRuntimeToolEffect(call.name, value).effect === 'read') {
+              const repaired = repairWithArgumentCorrections({ argumentsJson, operation, corrections: loadArgumentCorrections() });
+              if (repaired) {
+                argumentsJson = repaired.argumentsJson;
+                (call as { argumentsJson: string }).argumentsJson = repaired.argumentsJson;
+                for (const correction of repaired.applied) {
+                  journalHostGuide(ARGUMENT_CORRECTION_APPLIED, {
+                    callId: call.callId, operation, argument: correction.argument, rejectedValue: correction.rejectedValue,
+                  });
+                  pendingHostModelDirective = [pendingHostModelDirective, argumentCorrectionRepairLine(call.callId, correction)]
+                    .filter(Boolean).join('\n');
+                }
+              }
+            }
+          } catch { /* the call goes as written */ }
         }
         // An opaque value shortened with "..." (a page token, an id) goes
         // back whole; the host names the full values this turn returned that

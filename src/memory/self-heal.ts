@@ -12,7 +12,9 @@ import {
 import { backupMemoryDbAsync } from './memory-backup.js';
 import { loadFactEmbeddings, cosine } from './embeddings.js';
 import { canMergeEntitySafe, extractAnchors } from './memory-merge.js';
-import { factScope, factScopes } from './facts.js';
+import { factScope, factScopes, updateFact } from './facts.js';
+import { AUTO_REPAIR_MIN_PAIRS, describeFix, loadArgumentCorrections, markFactRewrittenFromUse } from './argument-corrections-store.js';
+import { draftUseRewrite } from './use-rewrite-draft.js';
 import { sameScope } from './memory-scope.js';
 import { appendHygieneAudit, readHygieneAudit, type HygieneAuditEntry } from './hygiene-audit.js';
 import { readFactRecallTrace, type FactRecallSurface } from './recall-trace.js';
@@ -22,7 +24,7 @@ import { inMemoryJobTurn, memoryVerifyOutcome, memoryWorkSourceFromTurn, noteMem
 
 const logger = pino({ name: 'clementine-next.memory.self-heal' });
 
-export type MemoryFixKind = 'merge_duplicate' | 'retire_internal_noise' | 'retire_transient_request' | 'lift_recall_gap' | 'demote_overexposed_fact' | 'supersede_stale_fact';
+export type MemoryFixKind = 'merge_duplicate' | 'retire_internal_noise' | 'retire_transient_request' | 'lift_recall_gap' | 'demote_overexposed_fact' | 'supersede_stale_fact' | 'rewrite_fact_from_use';
 export type MemoryFixStatus = 'pending' | 'applied' | 'skipped' | 'reverted';
 export type MemoryFixConfidence = 'high' | 'medium' | 'low';
 
@@ -59,7 +61,21 @@ export interface SupersedeStaleFactPayload {
   replacementValue: string;
 }
 
+/** A memory a tool showed to mislead, and its drafted rewrite (learned from use). */
+export interface RewriteFactFromUsePayload {
+  factId: number;
+  beforeContent: string;
+  afterContent: string;
+  operation: string;
+  argument: string;
+  rejectedValue: string;
+  worked: string;
+  error: string;
+  pairs: number;
+}
+
 export type ProposedMemoryFixPayload =
+  | RewriteFactFromUsePayload
   | MergeDuplicatePayload
   | SingleFactPayload
   | LiftRecallGapPayload
@@ -656,7 +672,9 @@ export function detectMemoryHealCandidates(opts: CandidateOptions = {}): Propose
  */
 export async function judgeMemoryFixCrossFamily(fix: ProposedMemoryFix): Promise<{ verdict: 'approve' | 'veto' | 'unavailable'; reason?: string }> {
   if (!memorySelfHealJudgeRequired()) return { verdict: 'unavailable', reason: 'memory fix judge disabled' };
-  if (fix.kind !== 'merge_duplicate' && fix.kind !== 'supersede_stale_fact') return { verdict: 'approve', reason: 'deterministic fix kind' };
+  if (fix.kind !== 'merge_duplicate' && fix.kind !== 'supersede_stale_fact' && fix.kind !== 'rewrite_fact_from_use') {
+    return { verdict: 'approve', reason: 'deterministic fix kind' };
+  }
   // The model check is the `verify` memory job, on "Checks the work".
   return runMemoryModelJob('verify', { source: memoryWorkSourceFromTurn({ kind: 'schedule' }) },
     () => judgeMemoryFixWithModel(fix), memoryVerifyOutcome);
@@ -679,6 +697,7 @@ async function judgeMemoryFixWithModel(fix: ProposedMemoryFix): Promise<{ verdic
         'Approve only if the evidence supports the exact proposed memory mutation and the fix cannot reasonably erase distinct user knowledge.',
         'For duplicate merges, approve only when the two facts express the same durable fact about the same entity. Reject if they may refer to different clients, people, accounts, dates, resources, or requirements.',
         'For supersession, approve only when a newer direct/high-trust fact clearly replaces an older lower-trust derived fact about the same property. Reject user-vs-user ambiguity.',
+        'For a rewrite from use, approve only when the new text keeps every rule, preference, name and fact of the old text except the part the tool evidence shows is wrong, and states that part as the evidence shows. Reject a rewrite that drops, adds, softens or widens anything else.',
         'When uncertain, VETO — a vetoed memory fix is skipped, not lost.',
         'Reply with EXACTLY ONE LINE and nothing else: either "APPROVE: <one-sentence reason>" or "VETO: <one-sentence reason>".',
       ].join('\n'),
@@ -729,6 +748,14 @@ function requireRow(id: number): ConsolidatedFactRow | null {
 
 function validateFixProbe(fix: ProposedMemoryFix): { ok: true } | { ok: false; reason: string } {
   if (!fix.autoApplicable) return { ok: false, reason: 'fix is not auto-applicable' };
+  if (fix.kind === 'rewrite_fact_from_use') {
+    const p = fix.payload as RewriteFactFromUsePayload;
+    const row = rowById(p.factId);
+    if (!row || row.active !== 1) return { ok: false, reason: 'fact missing or inactive' };
+    if (row.content !== p.beforeContent) return { ok: false, reason: 'fact changed since the rewrite was drafted' };
+    if (!p.afterContent.trim() || p.afterContent === p.beforeContent) return { ok: false, reason: 'rewrite is empty or unchanged' };
+    return { ok: true };
+  }
   if (fix.kind === 'retire_internal_noise') {
     const p = fix.payload as SingleFactPayload;
     const row = requireRow(p.id);
@@ -1176,6 +1203,70 @@ function applySupersedeStaleFact(fix: ProposedMemoryFix, nowIso: string, dryRun:
   return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.staleId], auditId: id, message: `Superseded stale fact #${p.staleId} with #${p.replacementId}.` };
 }
 
+function applyRewriteFactFromUse(fix: ProposedMemoryFix, nowIso: string, dryRun: boolean): MemoryHealResult {
+  const p = fix.payload as RewriteFactFromUsePayload;
+  const before = snapshotRows([p.factId]);
+  if (dryRun) return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.factId], message: `Would rewrite fact #${p.factId} from use.` };
+  // The same row is rewritten in place: its id, pin, policy and links stay;
+  // the old text is kept in the audit for undo.
+  const updated = updateFact(p.factId, { content: p.afterContent });
+  if (!updated) return { ok: false, fixId: fix.id, kind: fix.kind, applied: 0, ids: [], message: `Fact #${p.factId} is gone.`, reason: 'fact missing' };
+  try {
+    markFactRewrittenFromUse({ operation: p.operation, argument: p.argument, rejectedValue: p.rejectedValue, factId: p.factId, rewritten: true });
+  } catch { /* the note simply stays until the store is writable */ }
+  const id = appendHealAudit(fix, nowIso, [p.factId], {
+    action: 'rewrite_fact_from_use', before, beforeContent: p.beforeContent, afterContent: updated.content,
+    operation: p.operation, argument: p.argument, rejectedValue: p.rejectedValue,
+  });
+  return { ok: true, fixId: fix.id, kind: fix.kind, applied: 1, ids: [p.factId], auditId: id, message: `Rewrote fact #${p.factId} from use.` };
+}
+
+/**
+ * Draft the rewrites of memories a tool showed to mislead (learned from use):
+ * a read's rejected value, seen at least twice with one fix, still held by an
+ * active memory. One draft per memory and text; a proposal the owner reverted
+ * (or one already applied) is never drafted again.
+ */
+async function draftUseRewrites(nowIso: string, cap: number): Promise<ProposedMemoryFix[]> {
+  const stored = new Map(readProposalFile().proposals.map((p) => [p.id, p]));
+  const out: ProposedMemoryFix[] = [];
+  for (const entry of loadArgumentCorrections()) {
+    if (out.length >= cap) break;
+    if (entry.pairs < AUTO_REPAIR_MIN_PAIRS || entry.conflicting || entry.effect !== 'read'
+      || typeof entry.rejectedValue !== 'string') continue;
+    for (const factId of entry.factIds ?? []) {
+      if (out.length >= cap || entry.rewrittenFactIds?.includes(factId)) continue;
+      const row = rowById(factId);
+      if (!row || row.active !== 1 || !row.content.includes(entry.rejectedValue)) continue;
+      const signature = `use-rewrite:${factId}:${createHash('sha256').update(row.content).digest('hex').slice(0, 16)}:${entry.operation}:${entry.argument}`;
+      const prior = stored.get(stableId('rewrite_fact_from_use', signature));
+      if (prior && prior.status && prior.status !== 'pending') continue;
+      const worked = describeFix(entry);
+      let after: string | null = null;
+      try {
+        after = await runMemoryModelJob('lessons', { source: memoryWorkSourceFromTurn({ kind: 'schedule' }) },
+          () => draftUseRewrite({ memory: row.content, operation: entry.operation, argument: entry.argument,
+            rejectedValue: entry.rejectedValue as string, worked, error: entry.error, pairs: entry.pairs }),
+          (draft) => (draft ? { outcome: 'ok', produced: { lessons: 1 } } : { outcome: 'nothing_new' }));
+      } catch { after = null; }
+      if (!after) continue;
+      out.push(proposal({
+        kind: 'rewrite_fact_from_use',
+        targetIds: [factId],
+        evidence: `${entry.operation} rejected ${entry.argument}=${JSON.stringify(entry.rejectedValue)} ${entry.pairs} times ("${truncate(entry.error, 160)}"); the same call worked ${worked}`,
+        confidence: 'high',
+        autoApplicable: true,
+        signature,
+        payload: {
+          factId, beforeContent: row.content, afterContent: after, operation: entry.operation, argument: entry.argument,
+          rejectedValue: entry.rejectedValue, worked, error: entry.error, pairs: entry.pairs,
+        },
+      }, nowIso));
+    }
+  }
+  return upsertProposals(out);
+}
+
 export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: ApplyOptions = {}): Promise<MemoryHealResult> {
   const fix = typeof input === 'string' ? loadProposedMemoryFix(input) : input;
   if (!fix) return { ok: false, fixId: String(input), kind: 'retire_internal_noise', applied: 0, ids: [], message: `No memory fix found with id "${String(input)}".`, reason: 'not-found' };
@@ -1185,7 +1276,7 @@ export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: Ap
     if (!opts.dryRun) updateStoredProposal(fix.id, { status: 'skipped', skipReason: probe.reason });
     return { ok: false, fixId: fix.id, kind: fix.kind, applied: 0, ids: [], message: `Skipped memory fix ${fix.id}: ${probe.reason}`, reason: probe.reason };
   }
-  if (fix.kind === 'merge_duplicate' || fix.kind === 'supersede_stale_fact') {
+  if (fix.kind === 'merge_duplicate' || fix.kind === 'supersede_stale_fact' || fix.kind === 'rewrite_fact_from_use') {
     const judge = opts.humanApproved
       ? { verdict: 'approve' as const, reason: 'owner reviewed exact candidate' }
       : await (opts.judge ?? judgeMemoryFixCrossFamily)(fix);
@@ -1204,6 +1295,7 @@ export async function applyMemoryFix(input: string | ProposedMemoryFix, opts: Ap
   else if (fix.kind === 'retire_transient_request') result = applyRetireTransientRequest(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'lift_recall_gap') result = applyLiftRecallGap(fix, nowIso, opts.dryRun === true);
   else if (fix.kind === 'demote_overexposed_fact') result = applyDemoteOverexposedFact(fix, nowIso, opts.dryRun === true);
+  else if (fix.kind === 'rewrite_fact_from_use') result = applyRewriteFactFromUse(fix, nowIso, opts.dryRun === true);
   else result = applySupersedeStaleFact(fix, nowIso, opts.dryRun === true);
   if (result.ok && !opts.dryRun) updateStoredProposal(fix.id, { status: 'applied', appliedAt: nowIso, auditId: result.auditId });
   return result;
@@ -1215,11 +1307,14 @@ export async function runMemorySelfHeal(opts: RunOptions = {}): Promise<MemoryHe
   if (!memorySelfHealRealEnabled()) return { ran: false, proposed: 0, applied: 0, skipped: [], results: [], dryRun, reason: 'real-disabled' };
   const maxApply = configuredMaxApply(opts.maxApply);
   if (maxApply === 0) return { ran: false, proposed: 0, applied: 0, skipped: [], results: [], dryRun, reason: 'max-zero' };
-  const candidates = detectMemoryHealCandidates({
+  // Memories a tool showed to mislead are rewritten first (learned from use);
+  // a dry run drafts nothing, since drafting is a model call.
+  const rewrites = dryRun ? [] : await draftUseRewrites(opts.nowIso ?? new Date().toISOString(), maxApply);
+  const candidates = [...rewrites, ...detectMemoryHealCandidates({
     maxCandidates: opts.maxCandidates ?? maxApply,
     nowIso: opts.nowIso,
     persistProposals: !dryRun,
-  });
+  })];
   const results: MemoryHealResult[] = [];
   const skipped: Array<{ id: string; kind: MemoryFixKind; reason: string }> = [];
   // One snapshot for the whole run, taken before the first fix that is really
@@ -1327,6 +1422,16 @@ export function revertMemoryHeal(healAuditId: string, nowIso: string = new Date(
   if (!entry) return { ok: false, message: `No memory-heal audit entry found for "${healAuditId}".`, ids: [] };
   const before = (entry.detail as { before?: FactSnapshot[] } | undefined)?.before;
   if (!Array.isArray(before) || before.length === 0) return { ok: false, message: `Memory heal "${healAuditId}" has no reversible snapshot.`, ids: [] };
+  const detail = entry.detail as { action?: unknown; beforeContent?: unknown; operation?: unknown; argument?: unknown; rejectedValue?: unknown } | undefined;
+  if (detail?.action === 'rewrite_fact_from_use' && typeof detail.beforeContent === 'string') {
+    // Undo a rewrite from use: the memory's own words come back, and so does
+    // the same-day note; the reverted proposal is never drafted again.
+    for (const row of before) updateFact(row.id, { content: detail.beforeContent });
+    try {
+      for (const row of before) markFactRewrittenFromUse({ operation: String(detail.operation ?? ''), argument: String(detail.argument ?? ''),
+        rejectedValue: detail.rejectedValue as string, factId: row.id, rewritten: false });
+    } catch { /* the store follows on its next write */ }
+  }
   restoreSnapshot(before, nowIso);
   const mergeTransfer = (entry.detail as { mergeTransfer?: DuplicateFactMergeTransfer } | undefined)?.mergeTransfer;
   if (mergeTransfer) revertDuplicateFactProvenance(mergeTransfer);

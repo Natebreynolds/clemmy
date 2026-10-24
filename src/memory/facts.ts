@@ -23,6 +23,7 @@ import { getRecallStats } from './recall.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import { appendFactRecallTrace } from './recall-trace.js';
 import { captureFactEvidence, getFactEvidence, linkFactEvidence, listMemoryPolicies, syncMemoryPolicyForFact, type FactEvidence } from './temporal-memory.js';
+import { useCorrectionNoteForFact } from './argument-corrections-store.js';
 import { attachGroundedFactResources, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
 import {
   requireStandingPolicyDescriptor,
@@ -1939,9 +1940,11 @@ export const POLICY_LINE_MAX_CHARS = 600;
  * The marker identifies supplied context, never proof the model used it. */
 export function presentPolicyText(fact: Pick<ConsolidatedFact, 'id' | 'content'>): string {
   const identity = `[fact:${fact.id}] `;
-  if (fact.content.length <= POLICY_LINE_MAX_CHARS) return identity + fact.content;
+  const checked = useCorrectionNoteForFact(fact.id);
+  const note = checked ? ` ${checked}` : '';
+  if (fact.content.length <= POLICY_LINE_MAX_CHARS) return identity + fact.content + note;
   const head = fact.content.replace(/\s+/g, ' ').trim().slice(0, POLICY_LINE_MAX_CHARS).trimEnd();
-  return `${identity}${head}… _(rule #${fact.id} shortened for display; memory_recall_all returns it in full)_`;
+  return `${identity}${head}… _(rule #${fact.id} shortened for display; memory_recall_all returns it in full)_${note}`;
 }
 
 /** Candidate refs for the STABLE Persistent-Facts block (COMPOUNDING wave):
@@ -2121,7 +2124,12 @@ function policyGroupBudgets(
 function fitPolicyRows(
   group: readonly ConsolidatedFact[],
   budget: number,
-  present: (fact: ConsolidatedFact) => string = (fact) => `[fact:${fact.id}] ${fact.content}`,
+  present: (fact: ConsolidatedFact) => string = (fact) => {
+    // A rule a tool has shown to mislead carries what use found, until the
+    // nightly self-heal rewrites it (memory/argument-corrections-store.ts).
+    const checked = useCorrectionNoteForFact(fact.id);
+    return `[fact:${fact.id}] ${fact.content}${checked ? ` ${checked}` : ''}`;
+  },
 ): { lines: string[]; shown: ConsolidatedFact[] } {
   const lines: string[] = [];
   const shown: ConsolidatedFact[] = [];

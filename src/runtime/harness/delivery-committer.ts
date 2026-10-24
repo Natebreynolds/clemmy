@@ -2106,6 +2106,11 @@ export function commitTurnOutcome(
         sessionId: identity.sessionId, sourceUserSeq: workSource, request: acceptedObjective, kind: 'tool',
         cases: toolFixesForSource(identity.sessionId, workSource),
       })).catch(() => { /* learning stays additive */ });
+      // A value a tool rejected and what then worked, from this turn's own
+      // receipts (memory/argument-corrections.ts).
+      void import('../../memory/argument-corrections.js')
+        .then(({ learnArgumentCorrections }) => { learnArgumentCorrections(identity.sessionId, workSource); })
+        .catch(() => { /* learning stays additive */ });
     }
   }
   // NOTE: the run attempt is closed by the terminal publication itself, in the
