@@ -372,6 +372,10 @@ test('unrecognized database and parse failures stay generic without private erro
 test('worker failure envelopes accept only finite codes and never forward a supplied snapshot', async () => {
   const fixture = mkdtempSync(path.join(home, 'controlled-failure-worker-'));
   const workerFile = path.join(fixture, 'active-work-observer.worker.ts');
+  // The fixture directory sits outside the package: without its own module
+  // marker the fake worker loads as CommonJS and never runs, so every case
+  // fell back to the generic code and only the bounded-code case failed.
+  writeFileSync(path.join(fixture, 'package.json'), '{"type":"module"}');
   try {
     for (const issueCode of ['active_work_observation_rows_bound', 'controlled-private-exception', undefined]) {
       writeFileSync(workerFile, `import { parentPort, workerData } from 'node:worker_threads';
