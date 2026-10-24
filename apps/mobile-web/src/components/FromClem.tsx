@@ -133,11 +133,17 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     // A report leads with its title; its text opens in place, as she wrote it.
     const report = row.authored === true && Boolean(row.say);
     const open = reading === row.key;
+    const detail = !report
+      ? (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join('\n\n')
+      : '';
     return (
-      <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
+      <div key={row.key} class="home-row home-row-needs from-clem-update" aria-busy={busy === row.key}>
         {meta(row)}
-        <div class="home-row-title">{report ? row.text : row.say || row.text}</div>
+        <div class={open ? 'from-clem-summary' : 'from-clem-summary from-clem-summary-clamped'}>{report ? row.text : row.say || row.text}</div>
         {report ? <div class={open ? 'from-clem-report' : 'from-clem-report from-clem-report-clamped'}>{row.say}</div> : null}
+        {open && detail ? <div class="from-clem-report">{detail}</div> : null}
+        <button type="button" class="home-link-btn from-clem-read" aria-expanded={open}
+          onClick={() => setReading(open ? null : row.key)}>{open ? 'Show less' : 'Read more'}</button>
         {row.handoff ? <div class="home-row-note">
           <p>{row.handoff.reason || (row.handoff.state === 'dispatched' ? 'The approved task is in its conversation.' : 'This suggestion needs another look before work continues.')}</p>
           <button type="button" class="home-btn" onClick={() => onOpenThread(row.handoff?.sessionId)}>{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</button>
@@ -145,10 +151,6 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
         {notice(row)}
         {!row.handoff && !done ? (
           <div class="home-row-actions">
-            {report ? (
-              <button type="button" class="home-btn" aria-expanded={open}
-                onClick={() => setReading(open ? null : row.key)}>{open ? 'Show less' : 'Read'}</button>
-            ) : null}
             {notificationId ? (
               <button type="button" class="home-btn" disabled={busy !== null}
                 onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return {text: 'Cleared.', settled: true}; })}>Done</button>
@@ -187,7 +189,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
   };
 
   const group = (id: string, label: string, list: FromClemRow[], render: (row: FromClemRow) => JSX.Element) => (list.length > 0 ? (
-    <div class="from-clem-group">
+    <div class={`from-clem-group ${id}`}>
       {showGroupHeading ? <h3 id={`${sectionId}-${id}`} class="from-clem-group-head">{label}{list.length > 1 ? ` · ${list.length}` : ''}</h3> : null}
       <div class="home-card" aria-labelledby={showGroupHeading ? `${sectionId}-${id}` : sectionId}>{list.map(render)}</div>
     </div>
