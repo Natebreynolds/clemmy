@@ -22,3 +22,4 @@ export {
 // Provider registrations (side-effect imports). Add a provider here, never in
 // the kernel.
 import './composio-carrier-completion.js';
+import './reviewed-cli-shell-completion.js';
