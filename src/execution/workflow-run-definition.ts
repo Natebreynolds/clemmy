@@ -239,6 +239,44 @@ export function workflowDefinitionMatchesSnapshotIgnoringEnabled(
   }) === snapshot.definitionHash;
 }
 
+/** The definition a run executed: the admitted one plus the account
+ *  bindings the host routed and saved on its unbound steps while it ran
+ *  (between `since` and `until`). Saving a routed choice is the run keeping
+ *  what it did, not an edit; any other difference still is one. */
+export function withBindingsRoutedDuringRun(
+  admitted: WorkflowDefinition,
+  current: WorkflowDefinition,
+  since: string,
+  until: string,
+): WorkflowDefinition {
+  const from = Date.parse(since), to = Date.parse(until);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return admitted;
+  let changed = false;
+  const steps = admitted.steps.map((step) => {
+    if (!step.call || step.call.account) return step;
+    const saved = current.steps.find((candidate) => candidate.id === step.id)?.call;
+    const account = saved?.tool === step.call.tool ? saved.account : undefined;
+    const at = Date.parse(account?.selectedAt ?? '');
+    if (!account || account.selectedBy !== 'host-origin-routing' || !(at >= from && at <= to)) return step;
+    changed = true;
+    return { ...step, call: { ...step.call, account: structuredClone(account) } };
+  });
+  return changed ? { ...cloneDefinition(admitted), steps } : admitted;
+}
+
+/** Like workflowDefinitionMatchesSnapshotIgnoringEnabled, counting the
+ *  bindings the host routed while the run ran (until `until`) as part of
+ *  what it executed. */
+export function workflowDefinitionMatchesRunIgnoringEnabled(
+  snapshot: WorkflowRunDefinitionSnapshot,
+  current: WorkflowDefinition,
+  until: string,
+): boolean {
+  if (workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot, current)) return true;
+  const ran = withBindingsRoutedDuringRun(snapshot.definition, current, snapshot.admittedAt, until);
+  return ran !== snapshot.definition && workflowRehearsalKey(ran) === workflowRehearsalKey(current);
+}
+
 /**
  * A held scheduled occurrence has already been admitted at one concrete due
  * time. Changing `enabled` or `trigger` controls only future admissions, so it

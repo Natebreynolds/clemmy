@@ -7,7 +7,7 @@ import { WORKFLOWS_DIR } from '../../memory/vault.js';
 import { readWorkflowDefinitionFile } from '../../memory/workflow-store.js';
 import { readExactAcknowledgedCreationTest } from '../../execution/inline-creation-test-delivery.js';
 import { parseWorkflowRunInputsJson, workflowSmokeInputs } from '../../execution/workflow-inputs.js';
-import { resolveWorkflowRunDefinitionSnapshot, workflowCodeRevisionMatchesSnapshot,
+import { resolveWorkflowRunDefinitionSnapshot, withBindingsRoutedDuringRun, workflowCodeRevisionMatchesSnapshot,
   workflowRehearsalKey } from '../../execution/workflow-run-definition.js';
 import { loadHostCallCapabilityBinding } from './host-call-capability-binding.js';
 import { durableLogicalCallRecoveryMaterial } from './logical-call-contract.js';
@@ -83,12 +83,14 @@ export function proveWorkflowRehearsalWithPorts(input: RevisionProofInput, ports
     if (!isDeepStrictEqual(run.inputs, expectedInputs)) {
       return refuse('rehearsal inputs differ from the selected test and definition defaults');
     }
-    const definitionKey = workflowRehearsalKey(snapshot.definition);
-    if (rehearsal.definitionKey !== definitionKey) return refuse('rehearsal verdict belongs to another definition');
     // Pure exact-path reads: unlike catalog discovery these never create a
     // directory or scan unrelated workflows. Retain both supported layouts.
     const skillPath = path.join(WORKFLOWS_DIR,slug,'SKILL.md');
     const current = readWorkflowDefinitionFile(existsSync(skillPath) ? skillPath : path.join(WORKFLOWS_DIR,`${slug}.md`));
+    const definitionKey = workflowRehearsalKey(current
+      ? withBindingsRoutedDuringRun(snapshot.definition, current, snapshot.admittedAt, run.finishedAt)
+      : snapshot.definition);
+    if (rehearsal.definitionKey !== definitionKey) return refuse('rehearsal verdict belongs to another definition');
     if (!current || workflowRehearsalKey(current) !== definitionKey || !workflowCodeRevisionMatchesSnapshot(snapshot,current)) {
       return refuse('current workflow execution surface differs from the passed rehearsal');
     }

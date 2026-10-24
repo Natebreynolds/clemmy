@@ -9,8 +9,11 @@ import {
   isCompiledWorkflowRunDefinitionSnapshot,
   resolveWorkflowRunDefinitionSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  workflowDefinitionMatchesRunIgnoringEnabled,
   workflowDefinitionMatchesScheduledCatchupSnapshot,
   workflowDefinitionHash,
+  workflowRehearsalKey,
+  withBindingsRoutedDuringRun,
 } from './workflow-run-definition.js';
 
 function workflow(): WorkflowDefinition {
@@ -115,6 +118,26 @@ test('creation-test compatibility ignores only the enable bit', () => {
     enabled: true,
     steps: [{ ...original.steps[0], prompt: 'A newer edit.' }],
   }), false);
+});
+
+test('the account the host routed and saved while a run ran is part of what it ran; any other edit is drift', () => {
+  const admittedAt = '2026-10-24T23:46:44.000Z';
+  const original: WorkflowDefinition = { ...workflow(), enabled: false,
+    steps: [{ id: 'pull', prompt: '', sideEffect: 'read', call: { tool: 'CALENDAR_VIEW', args: { top: 10 } } }] };
+  const snapshot = createWorkflowRunDefinitionSnapshot('pinned-workflow', original, admittedAt);
+  const bound = (selectedBy: string, selectedAt = '2026-10-24T23:46:45.793Z'): WorkflowDefinition => ({ ...original,
+    steps: [{ ...original.steps[0]!, call: { ...original.steps[0]!.call!, account: {
+      capabilityId: 'cap:fixture', accountId: 'acct-1', choiceSetDigest: 'd'.repeat(64), selectedAt, selectedBy } } }] });
+  const until = '2026-10-24T23:46:47.000Z';
+  assert.equal(workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot, bound('host-origin-routing')), false, 'the exact admission still sees the write');
+  assert.equal(workflowDefinitionMatchesRunIgnoringEnabled(snapshot, bound('host-origin-routing'), until), true);
+  assert.equal(workflowRehearsalKey(withBindingsRoutedDuringRun(original, bound('host-origin-routing'), admittedAt, until)),
+    workflowRehearsalKey(bound('host-origin-routing')), 'the rehearsal vouches for the saved, bound version');
+  assert.equal(workflowDefinitionMatchesRunIgnoringEnabled(snapshot, bound('owner'), until), false, 'an owner choice is an edit');
+  assert.equal(workflowDefinitionMatchesRunIgnoringEnabled(snapshot, bound('host-origin-routing', '2026-10-24T23:50:00.000Z'), until), false, 'routed after the run ended');
+  const boundAndEdited = bound('host-origin-routing');
+  boundAndEdited.steps[0]!.call!.args = { top: 50 };
+  assert.equal(workflowDefinitionMatchesRunIgnoringEnabled(snapshot, boundAndEdited, until), false, 'a binding never hides an edit beside it');
 });
 
 test('scheduled catch-up compatibility ignores admission controls but pins execution semantics', () => {

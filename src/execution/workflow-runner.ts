@@ -365,6 +365,8 @@ import {
   workflowDefinitionHash,
   workflowCodeRevisionMatchesSnapshot,
   workflowDefinitionMatchesSnapshotIgnoringEnabled,
+  workflowDefinitionMatchesRunIgnoringEnabled,
+  withBindingsRoutedDuringRun,
   workflowRehearsalKey,
   type AnyWorkflowRunDefinitionSnapshot,
   type WorkflowRunDefinitionSnapshot,
@@ -16045,7 +16047,7 @@ async function processOneRunFile(
         definitionHash: snapshot?.definitionHash ?? '',
         currentDefinitionMatches: Boolean(snapshot && current
           && isCatalogWorkflowRunDefinitionSnapshot(snapshot)
-          && workflowDefinitionMatchesSnapshotIgnoringEnabled(snapshot, current.data)
+          && workflowDefinitionMatchesRunIgnoringEnabled(snapshot, current.data, new Date().toISOString())
           && workflowCodeRevisionMatchesSnapshot(snapshot, current.data)),
         enabled: current?.data.enabled === true,
       });
@@ -16236,7 +16238,7 @@ async function processOneRunFile(
         if (!latest) {
           activationCompatible = false;
           activationBlockedReason = 'the workflow was deleted while its creation test was running';
-        } else if (!workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)) {
+        } else if (!workflowDefinitionMatchesRunIgnoringEnabled(catalogSnapshot, latest.data, new Date().toISOString())) {
           activationCompatible = false;
           activationBlockedReason = 'the workflow definition changed while its creation test was running';
         } else if (!workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)) {
@@ -16313,7 +16315,7 @@ async function processOneRunFile(
             activation = { activated: false, reason: 'the test was stopped before it could turn the workflow on' };
           } else if (catalogSnapshot && !(
             latest
-            && workflowDefinitionMatchesSnapshotIgnoringEnabled(catalogSnapshot, latest.data)
+            && workflowDefinitionMatchesRunIgnoringEnabled(catalogSnapshot, latest.data, new Date().toISOString())
             && workflowCodeRevisionMatchesSnapshot(catalogSnapshot, latest.data)
           )) {
             activation = { activated: false, reason: 'the saved workflow changed while its test was finishing' };
@@ -16384,7 +16386,9 @@ async function processOneRunFile(
           // and turning it on later know it was tested without testing again.
           rehearsal: {
             passed: result.pass,
-            definitionKey: workflowRehearsalKey(catalogSnapshot?.definition ?? workflow.data),
+            definitionKey: workflowRehearsalKey(catalogSnapshot
+              ? withBindingsRoutedDuringRun(catalogSnapshot.definition, readWorkflow(catalogSnapshot.workflowSlug)?.data ?? catalogSnapshot.definition, catalogSnapshot.admittedAt, new Date().toISOString())
+              : workflow.data),
           },
           ...(run.capabilityBlock ? { capabilityBlock: { ...run.capabilityBlock, state: 'consumed' as const } } : {}),
         },
