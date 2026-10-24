@@ -31,6 +31,7 @@ import {
 } from '../runtime/harness/expected-work-admission.js';
 import { attestToolLocalInputInvalidity, harnessRunContextStorage, ToolGuardrailEscalated } from '../runtime/harness/brackets.js';
 import { jsonArgumentText, jsonObjectArgument } from './json-argument.js';
+import { actionTopologyRoleFor } from './tool-registry.js';
 import {
   loadExpectedWorkContract,
   prepareActionExpectedWorkContract,
@@ -486,6 +487,17 @@ function clonePreparationValue<T>(value: T): T {
 /** Only semantic plan disagreements are dispensable for a non-mutating host
  * call. A stored binding collision and an already-settled instance are
  * identity/once-ness facts, not proposal advice. */
+/** One of Clem's own controls (memory, Spaces, workflows, timers…) sent through
+ * work_call with no plan is told its door, not sent to plan. Live 2026-10-24:
+ * memory_remember through work_call was told "Call plan_task alone", plan_task
+ * through call_tool was "not on this turn's surface", and Clem told the owner
+ * she could not save a one-sentence fact. Null for business operations, which
+ * keep the plan barrier. */
+export function ownToolCarrierRepair(targetName: string): string | null {
+  if (actionTopologyRoleFor(targetName) !== 'control') return null;
+  return `${targetName} is one of Clem's own tools, not a business operation: call it through call_tool({name: "${targetName}", args_json: …}) with the same arguments. work_call carries planned business writes; this call needs no plan.`;
+}
+
 export function isReadComputeSemanticRefusal(
   kind: ExpectedWorkAdmissionFailureKind,
   reason: string,
@@ -1604,7 +1616,8 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
         frame.refusalKind = 'work_contract_required';
         return refuse(
           frame.refusalKind,
-          'No admitted plan is active for this accepted request. Call plan_task alone before any business operation.',
+          ownToolCarrierRepair(resolved.targetName)
+            ?? 'No admitted plan is active for this accepted request. Call plan_task alone before any business operation.',
         );
       }
       const preparedProposal = !frozenContract && !durableHostContract && proposal

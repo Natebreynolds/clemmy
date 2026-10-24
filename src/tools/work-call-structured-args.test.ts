@@ -10,7 +10,7 @@ process.env.MCP_AUTO_IMPORT_ENABLED = 'false';
 
 const {
   buildWorkCall, WorkCallInputSchema, HostPlannedWorkCallInputSchema,
-  workCallInputFromHostPlan, renderWorkCallReadyBlock,
+  workCallInputFromHostPlan, renderWorkCallReadyBlock, ownToolCarrierRepair,
 } = await import('./work-call.js');
 const { serializeAdvertisedTools } = await import('../runtime/harness/advertised-tool-wire.js');
 const { durableLogicalCallContract } = await import('../runtime/harness/logical-call-contract.js');
@@ -115,4 +115,13 @@ test('ready-operation guidance teaches the supported object form', () => {
   assert.ok(block);
   assert.match(block, /"args_json":\{"<arg>":"<value>"\}/);
   assert.doesNotMatch(block, /JSON STRING, not an object/);
+});
+
+test('one of Clem\'s own tools sent through work_call without a plan is told its door, not sent to plan', () => {
+  const repair = ownToolCarrierRepair('memory_remember');
+  assert.match(repair ?? '', /memory_remember is one of Clem's own tools/);
+  assert.match(repair ?? '', /call_tool\(\{name: "memory_remember"/);
+  assert.doesNotMatch(repair ?? '', /plan_task/);
+  assert.equal(ownToolCarrierRepair('composio_execute_tool'), null, 'a business operation keeps the plan barrier');
+  assert.equal(ownToolCarrierRepair('no_such_tool'), null);
 });
