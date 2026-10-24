@@ -34,6 +34,7 @@ import {
   type ToolOutputRecord,
   type ToolOutputStoredIdentity,
 } from './eventlog.js';
+import { parseShellToolOutput } from './shell-tool-output.js';
 import { parseStoredToolOutputJson } from './json-repair.js';
 import { resolveRetainedOutputRead } from './retained-output-read.js';
 
@@ -102,7 +103,10 @@ function judgeBytes(
   }
   const recovered = (() => {
     try {
-      return parseStoredToolOutputJson(record.output, { producerTool: record.tool ?? undefined });
+      // Judge the bytes the way tool_output_query reads them: a command's
+      // `--json` stdout inside its exit/stdout/stderr frame is records, so
+      // the route names the record query instead of text search.
+      return parseStoredToolOutputJson(record.output, { shell: parseShellToolOutput, producerTool: record.tool ?? undefined });
     } catch {
       return null;
     }

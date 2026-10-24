@@ -71,6 +71,14 @@ test('structured output prefers the server-side query', () => {
   assert.equal(routes[0]?.tool, 'tool_output_query', 'structured records query server-side');
 });
 
+test('a command\'s --json output inside its shell frame routes to the record query, as that query reads it', () => {
+  const records = { status: 0, result: { records: [{ Subject: 'Email: follow-up', Status: 'Completed' }], totalSize: 1, done: true } };
+  const output = `exit_code: 0\n\nstdout:\n${JSON.stringify(records, null, 2)}\n\nstderr:\n update available\n`;
+  const sessionId = stored('toolu_shell_json', output, 'run_shell_command');
+  const routes = retainedResultRoutes({ sessionId, callId: 'toolu_shell_json' });
+  assert.equal(routes[0]?.tool, 'tool_output_query', 'records a CLI printed as JSON are counted server-side, not searched as text');
+});
+
 test('an unknown output yields an HONEST empty answer, not a guess', () => {
   const s = eventlog.createSession({ kind: 'chat', channel: 'desktop', title: 'none' });
   assert.deepEqual(retainedResultRoutes({ sessionId: s.id, callId: 'toolu_absent' }), []);
