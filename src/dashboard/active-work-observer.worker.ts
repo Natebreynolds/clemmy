@@ -15,7 +15,8 @@ import { isIgnorableActiveWorkSessionRead } from '../runtime/harness/session-act
 import { presentationEventFromCompletionData } from '../runtime/harness/turn-outcome.js';
 import { slimWorkflowRunRecord } from '../execution/workflow-run-inventory-data.js';
 import { isTerminalWorkflowRunStatus } from '../execution/workflow-run-terminal-status.js';
-import { ACTIVE_WORK_OBSERVER_LIMITS as limits, policyInput, policyMapDigest, observationDigest, observationIdentityDigest,
+import { ACTIVE_WORK_OBSERVER_LIMITS as limits, ObservationBoundError, observationFailureIssue,
+  policyInput, policyMapDigest, observationDigest, observationIdentityDigest,
   type ObservationIdentity, type MainToObserver, type PolicyInput, type PolicyKind, type ObserverToMain,
   type ActiveWorkSnapshot } from './active-work-observer-protocol.js';
 import type { AcceptedSourceSettlementAuditReader } from '../runtime/harness/accepted-source-settlement-audit-read.js';
@@ -30,14 +31,22 @@ const port = parentPort;
 const fences = new Map<string, string | null>();
 const directoryFiles = new Map<string, string[]>();
 let usedRows = 0, usedBytes = 0, failed = false;
+let firstFailure: unknown;
+function failObservation(error: unknown): never {
+  // Canonical readers may catch a read failure. A later check must retain its
+  // original reason, including an unknown error that must remain generic.
+  if (!failed) { failed = true; firstFailure = error; }
+  throw firstFailure;
+}
 function check(): void {
-  if (failed || Date.now() > identity.deadline) { failed = true; throw new Error('observation_bound'); }
+  if (failed) throw firstFailure;
+  if (Date.now() > identity.deadline) failObservation(new ObservationBoundError('deadline'));
 }
 function measure(value: unknown): void {
   check();
-  if (++usedRows > limits.rows || (usedBytes += Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8')) > limits.totalBytes) {
-    failed = true; throw new Error('observation_bound');
-  }
+  if (++usedRows > limits.rows) failObservation(new ObservationBoundError('rows'));
+  if ((usedBytes += Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8')) > limits.totalBytes)
+    failObservation(new ObservationBoundError('total_bytes'));
 }
 function generation(file: string): string | null {
   try {
@@ -56,7 +65,8 @@ function readText(file: string, maximum: number = limits.fileBytes): string | un
   fence(file);
   if (!fences.get(file)) return undefined;
   const stat = lstatSync(file);
-  if (!stat.isFile() || stat.size > maximum) throw new Error('observation_bound');
+  if (!stat.isFile()) throw new Error('observation_bound');
+  if (stat.size > maximum) failObservation(new ObservationBoundError('file_bytes'));
   const descriptor = openSync(file, 'r');
   let bytes: string;
   try {
@@ -76,7 +86,7 @@ function files(directory: string): string[] {
   try {
     for (let count = 0; ; count++) {
       const entry = handle.readSync(); if (!entry) break;
-      if (count >= limits.files) throw new Error('observation_bound');
+      if (count >= limits.files) failObservation(new ObservationBoundError('files'));
       entries.push(entry.name);
     }
   } finally { handle.closeSync(); }
@@ -89,18 +99,18 @@ function boundedDatabase(raw: Database.Database): Database.Database {
       check();
       if (!/^\s*(SELECT|WITH|EXPLAIN)\b/i.test(sql)) throw new Error('non_read_statement');
       let statement: Database.Statement;
-      try { statement = target.prepare(sql); } catch (error) { failed = true; throw error; }
+      try { statement = target.prepare(sql); } catch (error) { failObservation(error); }
       return new Proxy(statement, { get(stmt, field) {
         if (field === 'all') return (...params: unknown[]) => {
           const result: unknown[] = [];
           try {
             for (const row of Reflect.apply(stmt.iterate, stmt, params) as Iterable<unknown>) { measure(row); result.push(row); }
-          } catch (error) { failed = true; throw error; }
+          } catch (error) { failObservation(error); }
           return result;
         };
         if (field === 'get') return (...params: unknown[]) => {
           try { const row = Reflect.apply(stmt.get, stmt, params); if (row !== undefined) measure(row); return row; }
-          catch (error) { failed = true; throw error; }
+          catch (error) { failObservation(error); }
         };
         const value = Reflect.get(stmt, field); return typeof value === 'function' ? value.bind(stmt) : value;
       } });
@@ -112,7 +122,7 @@ function boundedDatabase(raw: Database.Database): Database.Database {
 function same(value: unknown): boolean { return observationIdentityDigest(value as ObservationIdentity) === observationIdentityDigest(identity); }
 function message(type: MainToObserver['type']): Promise<MainToObserver> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { port?.off('message', listener); reject(new Error('observation_timeout')); }, Math.max(1, identity.deadline - Date.now()));
+    const timer = setTimeout(() => { port?.off('message', listener); reject(new ObservationBoundError('deadline')); }, Math.max(1, identity.deadline - Date.now()));
     const listener = (value: MainToObserver) => {
       if (value?.type !== type || !same(value.identity)) { clearTimeout(timer); port?.off('message', listener); reject(new Error('observation_identity')); return; }
       clearTimeout(timer); port?.off('message', listener); resolve(value);
@@ -164,7 +174,7 @@ async function observe(): Promise<void> {
     const machineFile = path.join(identity.baseDir, 'state', 'machine-id'); fence(machineFile);
     let machineText: string | undefined;
     if (fences.get(machineFile)) {
-      if (lstatSync(machineFile).size > 1_024) throw new Error('observation_bound');
+      if (lstatSync(machineFile).size > 1_024) failObservation(new ObservationBoundError('file_bytes'));
       machineText = readText(machineFile, 1_024);
       const machine = machineText?.trim() ?? '';
       if (/^[A-Za-z0-9._-]+$/.test(machine) && machine !== '.' && machine !== '..') {
@@ -184,7 +194,7 @@ async function observe(): Promise<void> {
         const limit = Math.min(options.limit ?? limits.events + 1, limits.events + 1);
         params.push(limit);
         const rows = db.prepare(`SELECT * FROM events WHERE ${clauses.join(' AND ')} ORDER BY seq ${options.desc ? 'DESC' : 'ASC'} LIMIT ?`).all(...params) as RawEventRow[];
-        if (rows.length > limits.events) { failed = true; throw new Error('observation_bound'); }
+        if (rows.length > limits.events) failObservation(new ObservationBoundError('events'));
         events = rows.map(rowToEvent); if (options.desc) events.reverse(); eventCache.set(cacheKey, events);
       }
       return events;
@@ -195,8 +205,9 @@ async function observe(): Promise<void> {
         (SELECT 1 FROM physical_dispatches p WHERE p.session_id=l.session_id AND p.source_user_seq=l.source_user_seq AND p.logical_tool_call_id=l.logical_tool_call_id)`).all() as Array<{ session_id: string; source_user_seq: number }>;
     const inputs = new Map<string, PolicyInput>();
     const add = (kind: PolicyKind, value: unknown) => {
-      const input = policyInput(kind, value); if (Buffer.byteLength(JSON.stringify(input)) > limits.policyItemBytes) throw new Error('policy_bound');
-      inputs.set(input.key, input); if (inputs.size > limits.policyInputs) throw new Error('policy_bound');
+      const input = policyInput(kind, value);
+      if (Buffer.byteLength(JSON.stringify(input)) > limits.policyItemBytes) failObservation(new ObservationBoundError('policy_item_bytes'));
+      inputs.set(input.key, input); if (inputs.size > limits.policyInputs) failObservation(new ObservationBoundError('policy_inputs'));
     };
     for (const source of sources) {
       const calls = db.prepare('SELECT tool_name FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?').all(source.session_id, source.source_user_seq) as Array<{ tool_name: string }>;
@@ -215,7 +226,7 @@ async function observe(): Promise<void> {
       for (const row of sealed) add('sealed', row.sealed_json);
     }
     const prepared = [...inputs.values()].sort((a, b) => a.key.localeCompare(b.key));
-    if (Buffer.byteLength(JSON.stringify(prepared)) > limits.policyBytes) throw new Error('policy_bound');
+    if (Buffer.byteLength(JSON.stringify(prepared)) > limits.policyBytes) failObservation(new ObservationBoundError('policy_bytes'));
     const waiting = message('policy'); post({ type: 'policy', identity, inputs: prepared });
     const response = await waiting;
     if (response.type !== 'policy' || response.values.length !== prepared.length || policyMapDigest(prepared, response.values) !== response.policyDigest) throw new Error('policy_mismatch');
@@ -223,7 +234,7 @@ async function observe(): Promise<void> {
     if (values.size !== prepared.length || prepared.some(input => !values.has(input.key))) throw new Error('policy_incomplete');
     const policy = (kind: PolicyKind, value: unknown): unknown => {
       const key = policyInput(kind, value).key;
-      if (!inputs.has(key) || !values.has(key)) { failed = true; throw new Error('policy_unprepared'); }
+      if (!inputs.has(key) || !values.has(key)) failObservation(new Error('policy_unprepared'));
       return values.get(key);
     };
     const auditReader: AcceptedSourceSettlementAuditReader = {
@@ -253,7 +264,7 @@ async function observe(): Promise<void> {
       },
       listDirectoryFiles: directory => {
         const names = directoryFiles.get(directory);
-        if (!names) { failed = true; throw new Error('directory_unprepared'); }
+        if (!names) failObservation(new Error('directory_unprepared'));
         return names;
       },
       getUserInputEventAtSequence: (sessionId, seq) => {
@@ -296,7 +307,7 @@ async function observe(): Promise<void> {
     if (tasks.length) summaries.push(`${tasks.length} background task${tasks.length === 1 ? '' : 's'}`);
     const snapshot: ActiveWorkSnapshot = { ...inventory, activeSessions: sessions.length, pendingApprovals: approvals.length,
       activeBackgroundTasks: tasks.length, items, trackedActivitySummary: summaries.join(', ') || 'no tracked activity' };
-    check(); if (Buffer.byteLength(JSON.stringify(snapshot)) > limits.dtoBytes) throw new Error('observation_bound');
+    check(); if (Buffer.byteLength(JSON.stringify(snapshot)) > limits.dtoBytes) failObservation(new ObservationBoundError('dto_bytes'));
     raw.exec('COMMIT');
     const validating = message('validate'); post({ type: 'candidate', identity, policyDigest: response.policyDigest, snapshot });
     const accepted = await validating;
@@ -308,8 +319,9 @@ async function observe(): Promise<void> {
   } finally { if (raw.inTransaction) raw.exec('ROLLBACK'); raw.close(); }
 }
 
-void observe().catch(() => {
-  const snapshot: ActiveWorkSnapshot = { ...unverifiedInstallQuiescence('active_work_observation_unverified'),
+void observe().catch(error => {
+  const issueCode = observationFailureIssue(failed ? firstFailure : error);
+  const snapshot: ActiveWorkSnapshot = { ...unverifiedInstallQuiescence(issueCode),
     activeSessions: 0, pendingApprovals: 0, activeBackgroundTasks: 0, items: [], activityAvailable: false };
-  post({ type: 'result', identity, policyDigest: '', snapshot });
+  post({ type: 'result', identity, policyDigest: '', snapshot, issueCode });
 }).finally(() => port?.close());

@@ -10,7 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { buildSync } from 'esbuild';
-import { ACTIVE_WORK_OBSERVER_LIMITS as observerLimits, observationIdentityDigest, policyMapDigest, type ObservationIdentity, type ObserverToMain } from './active-work-observer-protocol.js';
+import { ACTIVE_WORK_OBSERVER_LIMITS as observerLimits, observationIdentityDigest, observationFailureIssue,
+  policyMapDigest, type ObservationIdentity, type ObserverToMain } from './active-work-observer-protocol.js';
 import { HARNESS_SCHEMA_VERSION } from '../runtime/harness/schema-version.js';
 
 const home = mkdtempSync(path.join(os.tmpdir(), 'clem-active-work-worker-'));
@@ -101,15 +102,78 @@ test('actual worker caps record bytes and all directory entries without returnin
     id: `partial-${index}`, workflow: 'controlled', status: 'running' }));
   const partial = await observer().read();
   assert.equal(partial.quiescence.state, 'unverified'); assert.ok(partial.total >= 1);
+  assert.deepEqual(partial.quiescence.issues, ['active_work_observation_files_bound']);
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true }); mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'too-large.json'), 'x'.repeat(observerLimits.fileBytes + 1));
   const bytes = await observer().read();
   assert.equal(bytes.quiescence.state, 'unverified'); assert.ok(bytes.total >= 1);
+  assert.deepEqual(bytes.quiescence.issues, ['active_work_observation_file_bytes_bound']);
   rmSync(WORKFLOW_RUNS_DIR, { recursive: true, force: true }); mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
   for (let index = 0; index <= observerLimits.files; index++) writeFileSync(path.join(WORKFLOW_RUNS_DIR, `entry-${index}.txt`), '');
   const entries = await observer().read();
   assert.equal(entries.quiescence.state, 'unverified'); assert.ok(entries.total >= 1);
+  assert.deepEqual(entries.quiescence.issues, ['active_work_observation_files_bound']);
   assert.equal(digest(dbFile), before);
+});
+
+test('a byte bound swallowed by the canonical coding reader retains only its safe reason', async () => {
+  const codingFile = path.join(codingBase, 'controlled-machine', 'coding-runs.db');
+  mkdirSync(path.dirname(codingFile), { recursive: true }); writeFileSync(machineFile, 'controlled-machine\n');
+  const coding = new Database(codingFile);
+  coding.exec('CREATE TABLE coding_runs (run_id TEXT, session_id TEXT, state TEXT, lease_owner TEXT, lease_expires_at_ms INTEGER)');
+  const insert = coding.prepare("INSERT INTO coding_runs VALUES (?, ?, 'running', NULL, NULL)");
+  const privateMarker = 'controlled-private-owner-text';
+  coding.transaction(() => {
+    for (let index = 0; index < 1_600; index++) insert.run(`controlled-${index}`, privateMarker + 'x'.repeat(16_000));
+  })();
+  coding.close();
+  const before = digest(codingFile);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.quiescence.issues, ['active_work_observation_total_bytes_bound']);
+  assert.equal(result.activityAvailable, false); assert.deepEqual(result.currentWork.items, []);
+  assert.equal(JSON.stringify(result).includes(privateMarker), false);
+  assert.equal(digest(codingFile), before);
+});
+
+test('unrecognized database and parse failures stay generic without private error text', async () => {
+  const codingFile = path.join(codingBase, 'controlled-machine', 'coding-runs.db');
+  mkdirSync(path.dirname(codingFile), { recursive: true }); writeFileSync(machineFile, 'controlled-machine\n');
+  const coding = new Database(codingFile); coding.exec('CREATE TABLE controlled_private_table (value TEXT)'); coding.close();
+  const before = digest(codingFile);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+  assert.deepEqual(result.quiescence.issues, ['active_work_observation_unverified']);
+  assert.equal(result.activityAvailable, false);
+  assert.equal(digest(codingFile), before);
+  rmSync(codingBase, { recursive: true, force: true }); rmSync(machineFile);
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'controlled-private-path.json'), '{"controlled-private-text":');
+  const malformed = await observer().read();
+  assert.deepEqual(malformed.quiescence.issues, ['active_work_observation_unverified']);
+  assert.equal(JSON.stringify(malformed).includes('controlled-private'), false);
+  assert.equal(observationFailureIssue(new Error('active_work_observation_total_bytes_bound')), 'active_work_observation_unverified');
+  assert.equal(observationFailureIssue({ issueCode: 'active_work_observation_total_bytes_bound' }), 'active_work_observation_unverified');
+});
+
+test('worker failure envelopes accept only finite codes and never forward a supplied snapshot', async () => {
+  const fixture = mkdtempSync(path.join(home, 'controlled-failure-worker-'));
+  const workerFile = path.join(fixture, 'active-work-observer.worker.ts');
+  try {
+    for (const issueCode of ['active_work_observation_rows_bound', 'controlled-private-exception', undefined]) {
+      writeFileSync(workerFile, `import { parentPort, workerData } from 'node:worker_threads';
+        const { tsxApi, entry, ...identity } = workerData;
+        parentPort.postMessage({ type: 'result', identity, policyDigest: '', issueCode: ${JSON.stringify(issueCode) ?? 'undefined'},
+          snapshot: { total: 0, quiescence: { state: 'quiescent' }, privateText: 'controlled-private-snapshot' } });
+        parentPort.close();`);
+      const result = await createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR,
+        schema: HARNESS_SCHEMA_VERSION, moduleUrl: pathToFileURL(path.join(fixture, 'active-work-observer.ts')).href }).read();
+      assert.equal(result.quiescence.state, 'unverified'); assert.ok(result.total >= 1);
+      assert.deepEqual(result.quiescence.issues, [issueCode === 'active_work_observation_rows_bound'
+        ? issueCode : 'active_work_observation_unverified']);
+      assert.equal(result.activityAvailable, false); assert.deepEqual(result.currentWork.items, []); assert.deepEqual(result.items, []);
+      assert.equal(JSON.stringify(result).includes('controlled-private'), false);
+    }
+  } finally { rmSync(fixture, { recursive: true, force: true }); }
 });
 
 test('worker coding inventory shares canonical read-only owners and does not initialize a missing machine database', async () => {
@@ -129,6 +193,7 @@ test('worker coding inventory shares canonical read-only owners and does not ini
   assert.equal(absent.quiescence.state, 'quiescent'); assert.equal(existsSync(codingFile), false);
   writeFileSync(machineFile, 'x'.repeat(1_025)); const oversized = await observer().read();
   assert.equal(oversized.quiescence.state, 'unverified'); assert.ok(oversized.total >= 1);
+  assert.deepEqual(oversized.quiescence.issues, ['active_work_observation_file_bytes_bound']);
   assert.equal(existsSync(codingFile), false);
 });
 
@@ -144,6 +209,7 @@ test('missing DB, wrong schema and deadline stay200-compatible unverified/nonzer
   assert.equal(b.quiescence.state, 'unverified'); assert.ok(b.total >= 1); assert.equal(digest(file), before);
   const c = await createActiveWorkObserver({ baseDir: home, workflowDir: WORKFLOW_RUNS_DIR, schema: HARNESS_SCHEMA_VERSION, timeoutMs: 1 }).read();
   assert.equal(c.quiescence.state, 'unverified'); assert.ok(c.total >= 1);
+  assert.deepEqual(c.quiescence.issues, ['active_work_observation_deadline_bound']);
 });
 
 for (const boundary of ['filesystem', 'database', 'foreign_nonce', 'missing_policy'] as const) test(`${boundary} change after preflight cannot certify the actual worker snapshot`, async () => {

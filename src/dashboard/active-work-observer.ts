@@ -9,7 +9,8 @@ import { classifyExternalWrite } from '../runtime/harness/confirm-first-gate.js'
 import { extractExternalWriteIdentityKeys } from '../runtime/harness/grounding-gate.js';
 import { parseResolvedCallAuthority } from '../runtime/harness/resolved-call-authority.js';
 import { unverifiedInstallQuiescence } from './install-quiescence-read.js';
-import { ACTIVE_WORK_OBSERVER_LIMITS as limits, observationDigest, observationIdentityDigest, policyInput, policyMapDigest,
+import { ACTIVE_WORK_OBSERVER_LIMITS as limits, ObservationBoundError, observationIssueCode, observationFailureIssue,
+  observationDigest, observationIdentityDigest, policyInput, policyMapDigest,
   type ObservationIdentity, type PolicyInput, type PolicyValue, type ObserverToMain, type ActiveWorkSnapshot } from './active-work-observer-protocol.js';
 
 export function resolveActiveWorkWorkerEntry(moduleUrl: string, daemonEntry?: string): URL {
@@ -46,15 +47,17 @@ function validSnapshot(value: unknown, identity: ObservationIdentity): value is 
   return q.state === 'unverified' ? snapshot.total >= 1 : snapshot.total === w.total && w.total > 0 && q.issues.length === 0;
 }
 async function evaluatePolicy(inputs: readonly PolicyInput[], deadline: number): Promise<PolicyValue[]> {
-  if (inputs.length > limits.policyInputs || Buffer.byteLength(JSON.stringify(inputs)) > limits.policyBytes) throw new Error('policy_bound');
+  if (inputs.length > limits.policyInputs) throw new ObservationBoundError('policy_inputs');
+  if (Buffer.byteLength(JSON.stringify(inputs)) > limits.policyBytes) throw new ObservationBoundError('policy_bytes');
   const seen = new Set<string>(); const values: PolicyValue[] = [];
   let outputBytes = 2;
   for (let index = 0; index < inputs.length; index++) {
     if (index % 8 === 0) await new Promise<void>(resolve => setImmediate(resolve));
     const input = inputs[index];
-    if (Date.now() > deadline || !input || !['effect', 'shape', 'targets', 'sealed'].includes(input.kind)
-      || input.key !== policyInput(input.kind, input.value).key || seen.has(input.key)
-      || Buffer.byteLength(JSON.stringify(input)) > limits.policyItemBytes) throw new Error('policy_invalid');
+    if (Date.now() > deadline) throw new ObservationBoundError('deadline');
+    if (!input || !['effect', 'shape', 'targets', 'sealed'].includes(input.kind)
+      || input.key !== policyInput(input.kind, input.value).key || seen.has(input.key)) throw new Error('policy_invalid');
+    if (Buffer.byteLength(JSON.stringify(input)) > limits.policyItemBytes) throw new ObservationBoundError('policy_item_bytes');
     seen.add(input.key);
     let output: unknown;
     switch (input.kind) {
@@ -72,7 +75,7 @@ async function evaluatePolicy(inputs: readonly PolicyInput[], deadline: number):
     }
     const value = { key: input.key, output };
     outputBytes += Buffer.byteLength(JSON.stringify(value)) + 1;
-    if (outputBytes > limits.policyBytes) throw new Error('policy_bound');
+    if (outputBytes > limits.policyBytes) throw new ObservationBoundError('policy_bytes');
     values.push(value);
   }
   return values;
@@ -96,7 +99,8 @@ export function createActiveWorkObserver(options: ActiveWorkObserverOptions): { 
 
   async function readArtifact(file: string): Promise<{ pin: ObservationIdentity['artifacts'][number]; text: string }> {
     const before = await lstat(file, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(limits.fileBytes)) throw new Error('worker_entry_bound');
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('worker_entry_bound');
+    if (before.size > BigInt(limits.fileBytes)) throw new ObservationBoundError('file_bytes');
     const generation = [before.dev, before.ino, before.ctimeNs, before.mtimeNs, before.size].join(':');
     const handle = await open(file, 'r');
     let bytes: string;
@@ -168,19 +172,20 @@ export function createActiveWorkObserver(options: ActiveWorkObserverOptions): { 
       const next = followup; followup = undefined;
       if (next) { clearTimeout(next.timer); if (!next.expired) void start().then(next.resolve); }
     };
-    const fail = () => {
-      settle(unavailable());
+    const fail = (error?: unknown) => {
+      settle(unavailable(observationFailureIssue(error)));
       // Keep the physical single-flight slot until the thread really exits.
       // A timed-out native query must never overlap another inventory worker.
       if (worker) void worker.terminate().catch(() => {}); else finish();
     };
-    const timer = setTimeout(fail, timeout); timer.unref();
+    const timer = setTimeout(() => fail(new ObservationBoundError('deadline')), timeout); timer.unref();
     void (async () => {
       try {
         const entry = resolveActiveWorkWorkerEntry(moduleUrl, options.daemonEntry ?? process.argv[1]);
         const build = await buildIdentity(entry);
         const selections = await Promise.all([directorySelection(options.baseDir, false), directorySelection(options.workflowDir, true)]);
-        if (settled || Date.now() > deadline) { finish(); return; }
+        if (settled) { finish(); return; }
+        if (Date.now() > deadline) { fail(new ObservationBoundError('deadline')); return; }
         identity = { nonce: randomUUID(), epoch, build: build.build, artifacts: build.artifacts,
           baseDir: selections[0].canonical, workflowDir: selections[1].canonical,
           schema: options.schema, requestedAt: Date.now(), deadline };
@@ -211,7 +216,7 @@ export function createActiveWorkObserver(options: ActiveWorkObserverOptions): { 
               for (const selection of selections) if (observationDigest(await directorySelection(selection.file, selection.generation === null)) !== observationDigest(selection)) { fail(); return; }
               if (!settled) worker?.postMessage({ type: 'validate', identity, policyDigest: digest });
             } else if (message.type === 'result') {
-              if (message.policyDigest === '') { accepted = unavailable(); return; }
+              if (message.policyDigest === '') { accepted = unavailable(observationIssueCode(message.issueCode)); return; }
               if (!candidate || message.policyDigest !== digest || observationDigest(message.snapshot) !== observationDigest(candidate)
                 || !validSnapshot(message.snapshot, identity) || Date.now() > deadline) { fail(); return; }
               accepted = message.snapshot;
@@ -220,7 +225,7 @@ export function createActiveWorkObserver(options: ActiveWorkObserverOptions): { 
         });
         worker.once('error', fail);
         worker.once('exit', code => { if (code !== 0) accepted = undefined; finish(); });
-      } catch { fail(); }
+      } catch (error) { fail(error); }
     })();
     return result;
   }

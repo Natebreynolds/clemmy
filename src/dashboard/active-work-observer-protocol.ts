@@ -7,6 +7,26 @@ export const ACTIVE_WORK_OBSERVER_LIMITS = Object.freeze({
   totalBytes: 24_000_000, policyInputs: 1_024, policyBytes: 4_000_000,
   policyItemBytes: 128_000, dtoBytes: 2_000_000, deadlineMs: 15_000,
 });
+const BOUND_REASONS = ['rows', 'total_bytes', 'file_bytes', 'files', 'events', 'policy_inputs',
+  'policy_bytes', 'policy_item_bytes', 'dto_bytes', 'deadline'] as const;
+type ObservationBoundReason = typeof BOUND_REASONS[number];
+export type ObservationIssueCode = 'active_work_observation_unverified' | `active_work_observation_${ObservationBoundReason}_bound`;
+const boundIssues = new Set<string>(BOUND_REASONS.map(reason => `active_work_observation_${reason}_bound`));
+/** Only known guard sites create these errors; arbitrary exception text stays private. */
+export class ObservationBoundError extends Error {
+  readonly issueCode: ObservationIssueCode;
+  constructor(reason: ObservationBoundReason) {
+    super('observation_bound');
+    this.issueCode = `active_work_observation_${reason}_bound`;
+  }
+}
+/** Worker failure codes are diagnostics only, never an accepted worker snapshot. */
+export function observationIssueCode(value: unknown): ObservationIssueCode {
+  return typeof value === 'string' && boundIssues.has(value) ? value as ObservationIssueCode : 'active_work_observation_unverified';
+}
+export function observationFailureIssue(error: unknown): ObservationIssueCode {
+  return observationIssueCode(error instanceof ObservationBoundError ? error.issueCode : undefined);
+}
 export interface ObservationIdentity {
   nonce: string; epoch: string; build: string; baseDir: string; workflowDir: string;
   schema: number; requestedAt: number; deadline: number;
@@ -52,7 +72,7 @@ export function policyMapDigest(inputs: readonly PolicyInput[], values: readonly
 export type ObserverToMain =
   | { type: 'policy'; identity: ObservationIdentity; inputs: PolicyInput[] }
   | { type: 'candidate'; identity: ObservationIdentity; policyDigest: string; snapshot: ActiveWorkSnapshot }
-  | { type: 'result'; identity: ObservationIdentity; policyDigest: string; snapshot: ActiveWorkSnapshot };
+  | { type: 'result'; identity: ObservationIdentity; policyDigest: string; snapshot: ActiveWorkSnapshot; issueCode?: ObservationIssueCode };
 export type MainToObserver =
   | { type: 'policy'; identity: ObservationIdentity; values: PolicyValue[]; policyDigest: string }
   | { type: 'validate'; identity: ObservationIdentity; policyDigest: string };
