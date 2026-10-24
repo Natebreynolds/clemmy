@@ -18,7 +18,8 @@
  */
 
 import { toolCallHint } from './tool-call-hint.js';
-import { captureStoppedAt } from './shell-tool-output.js';
+import { captureStoppedAt, parseShellToolOutput } from './shell-tool-output.js';
+import { parseStoredToolOutputJson, readHostCliEnvelope } from './json-repair.js';
 
 export interface DigestOptions {
   maxChars?: number;
@@ -498,6 +499,113 @@ function compactJsonValue(
 
 const MAX_COVERAGE_FIELD_NAMES = 12;
 
+/** A record list this long gets a summary of all its records. */
+const RECORD_SUMMARY_MIN_RECORDS = 8;
+const SUMMARY_MAX_FACET_FIELDS = 8;
+const SUMMARY_MAX_FACET_VALUES = 8;
+const SUMMARY_MAX_RANGE_FIELDS = 6;
+const SUMMARY_MAX_FIELD_NAMES = 32;
+const SUMMARY_VALUE_CHARS = 48;
+const SUMMARY_LINE_MAX_CHARS = 900;
+
+/**
+ * What a whole record list says, computed from every record rather than the
+ * ones a bounded view can show: how many there are, which fields they carry,
+ * how often each value of a few-valued field occurs (a type, a status, an
+ * owner), and the span of every date or number field (with a number's sum).
+ * A count, a breakdown or a total is then answered from the first result
+ * instead of another read, and a field the view left out still reads as
+ * present. Paths match tool_output_query's (dot paths from the same root).
+ * Generic over any JSON record list; no field is named here.
+ */
+export interface RecordListSummary {
+  path: string;
+  total: number;
+  fields: string[];
+  counts?: Record<string, Record<string, number>>;
+  ranges?: Record<string, { min: string | number; max: string | number; sum?: number; present: number }>;
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
+export function recordListSummary(source: unknown): RecordListSummary | null {
+  const dominant = resolveDominantArray(source);
+  if (!dominant) return null;
+  const rows = dominant.rows.filter((row): row is Record<string, unknown> =>
+    row !== null && typeof row === 'object' && !Array.isArray(row));
+  if (rows.length < RECORD_SUMMARY_MIN_RECORDS) return null;
+  const scalar = (value: unknown): value is string | number | boolean =>
+    typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+  const columns = new Map<string, Array<string | number | boolean>>();
+  const push = (field: string, value: string | number | boolean) => {
+    const column = columns.get(field);
+    if (column) column.push(value); else columns.set(field, [value]);
+  };
+  for (const row of rows) {
+    for (const [key, value] of Object.entries(row)) {
+      if (scalar(value)) push(key, value);
+      else if (value && typeof value === 'object' && !Array.isArray(value)) {
+        for (const [inner, nested] of Object.entries(value as Record<string, unknown>)) {
+          if (scalar(nested)) push(`${key}.${inner}`, nested);
+        }
+      }
+    }
+  }
+  const fields = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(0, SUMMARY_MAX_FIELD_NAMES);
+  const counts: Record<string, Record<string, number>> = {};
+  const ranges: NonNullable<RecordListSummary['ranges']> = {};
+  // Few-valued fields carried by at least half the records; those that vary
+  // first (a type, a status), then the constant ones (one owner for all).
+  // Numbers are spanned and summed below, never counted value by value.
+  const countable = [...columns.entries()]
+    .filter(([, values]) => values.length * 2 >= rows.length && !values.every((value) => typeof value === 'number'))
+    .map(([field, values]) => {
+      // Tally the whole value; shorten only the label shown, so two values
+      // that share a prefix are never counted as one.
+      const tally = new Map<string, number>();
+      for (const value of values) tally.set(String(value), (tally.get(String(value)) ?? 0) + 1);
+      return { field, tally, values };
+    })
+    .filter(({ tally, values }) => tally.size <= SUMMARY_MAX_FACET_VALUES && tally.size < values.length)
+    .sort((left, right) => (left.tally.size === 1 ? 1 : 0) - (right.tally.size === 1 ? 1 : 0));
+  for (const { field, tally } of countable.slice(0, SUMMARY_MAX_FACET_FIELDS)) {
+    counts[field] = Object.fromEntries([...tally.entries()].sort((left, right) => right[1] - left[1])
+      .map(([value, count]) => [value.length > SUMMARY_VALUE_CHARS ? `${value.slice(0, SUMMARY_VALUE_CHARS - 1)}…` : value, count]));
+  }
+  for (const [field, values] of columns) {
+    if (Object.keys(ranges).length >= SUMMARY_MAX_RANGE_FIELDS) break;
+    if (counts[field]) continue;
+    if (values.every((value) => typeof value === 'number')) {
+      const numbers = values as number[];
+      ranges[field] = { min: Math.min(...numbers), max: Math.max(...numbers),
+        sum: Math.round(numbers.reduce((sum, value) => sum + value, 0) * 100) / 100, present: numbers.length };
+    } else if (values.every((value) => typeof value === 'string' && ISO_DATE.test(value))) {
+      const sorted = (values as string[]).slice().sort();
+      ranges[field] = { min: sorted[0]!, max: sorted[sorted.length - 1]!, present: sorted.length };
+    }
+  }
+  return {
+    path: dominant.path,
+    total: rows.length,
+    fields,
+    ...(Object.keys(counts).length > 0 ? { counts } : {}),
+    ...(Object.keys(ranges).length > 0 ? { ranges } : {}),
+  };
+}
+
+/** The same summary as one line of prose, for a text result's footer. */
+export function renderRecordListSummary(summary: RecordListSummary): string {
+  const parts = [`${summary.total} records at ${summary.path || 'the top level'}`];
+  for (const [field, tally] of Object.entries(summary.counts ?? {})) {
+    parts.push(`${field}: ${Object.entries(tally).map(([value, count]) => `${value} ${count}`).join(', ')}`);
+  }
+  for (const [field, range] of Object.entries(summary.ranges ?? {})) {
+    parts.push(`${field}: ${range.min}…${range.max}${range.sum !== undefined ? ` (sum ${range.sum})` : ''}${range.present < summary.total ? ` in ${range.present}` : ''}`);
+  }
+  const line = `Summary of all records: ${parts.join('; ')}.`;
+  return line.length > SUMMARY_LINE_MAX_CHARS ? `${line.slice(0, SUMMARY_LINE_MAX_CHARS - 1)}…` : line;
+}
+
 /** What this view holds of the result's main list: how many records the
  * source returned, how many are shown, and which fields every shown record
  * carries. A reader deciding whether something is absent from the list, or
@@ -548,6 +656,13 @@ export function compactStructuredJsonToolOutput(
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
+  // Summarized from the whole result, as the record query reads it: a clean
+  // CLI run's JSON stdout is that root. The view itself is unchanged.
+  const summarySource = (() => {
+    const reading = readHostCliEnvelope(parsed);
+    return reading?.kind === 'clean' ? reading.stdoutJson : parsed;
+  })();
+  const summary = recordListSummary(summarySource);
   // Also the brain's next step: the readers alone, as data, do not stop a
   // re-sent read, which only returns this same clipped view.
   const projectionSemantics = 'Omitted fields and array tails are unshown, not null or empty; prefix order kept. All of it is stored: read on via recovery, not by re-sending the call.';
@@ -564,44 +679,63 @@ export function compactStructuredJsonToolOutput(
     ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}),
     receipt: options.exactOutputReceipt,
   };
-  const metadataCandidates: Array<Record<string, unknown>> = [
+  const baseCandidates: Array<Record<string, unknown>> = [
     fullMetadata,
     { kind: 'structured_projection_v1', truncated: true, projectionSemantics, receipt: options.exactOutputReceipt,
       ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) },
     { truncated: true, projectionSemantics, receipt: options.exactOutputReceipt,
       ...(options.hostAnnotations?.length ? { hostAnnotations: options.hostAnnotations } : {}) },
   ];
-
-  for (const metadataBase of metadataCandidates) {
-    let payloadBudget = maxChars
-      - JSON.stringify(STRUCTURED_PROJECTION_META_KEY).length
-      - JSON.stringify(metadataBase).length
-      - 4; // root braces, colon, and comma
-    if (payloadBudget < 2) continue;
-    for (let attempt = 0; attempt < 12 && payloadBudget >= 2; attempt += 1) {
-      const stats: StructuredProjectionStats = {
-        clippedStrings: 0,
-        omittedArrayItems: 0,
-        omittedObjectKeys: 0,
-        omittedValues: 0,
-      };
-      const value = compactJsonValue(parsed, payloadBudget, stats);
-      const projected = value === OMITTED_JSON_VALUE ? {} : value;
-      if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
-      const records = metadataBase === fullMetadata ? projectedRecordCoverage(parsed, projected) : null;
-      const metadata = metadataBase === fullMetadata
-        ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats,
-          ...(records ? { records } : {}) }
-        : metadataBase;
-      const output = JSON.stringify({
-        ...(projected as Record<string, unknown>),
-        [STRUCTURED_PROJECTION_META_KEY]: metadata,
-      });
-      if (output.length <= maxChars) return output;
-      payloadBudget -= output.length - maxChars + 8;
+  const fullForms = new Set<Record<string, unknown>>([fullMetadata]);
+  const project = (candidates: ReadonlyArray<Record<string, unknown>>): {
+    output: string; records: ReturnType<typeof projectedRecordCoverage>;
+  } | null => {
+    for (const metadataBase of candidates) {
+      let payloadBudget = maxChars
+        - JSON.stringify(STRUCTURED_PROJECTION_META_KEY).length
+        - JSON.stringify(metadataBase).length
+        - 4; // root braces, colon, and comma
+      if (payloadBudget < 2) continue;
+      for (let attempt = 0; attempt < 12 && payloadBudget >= 2; attempt += 1) {
+        const stats: StructuredProjectionStats = {
+          clippedStrings: 0,
+          omittedArrayItems: 0,
+          omittedObjectKeys: 0,
+          omittedValues: 0,
+        };
+        const value = compactJsonValue(parsed, payloadBudget, stats);
+        const projected = value === OMITTED_JSON_VALUE ? {} : value;
+        if (!projected || typeof projected !== 'object' || Array.isArray(projected)) break;
+        const records = fullForms.has(metadataBase) ? projectedRecordCoverage(parsed, projected) : null;
+        const metadata = fullForms.has(metadataBase)
+          ? { ...metadataBase, truncated: stats.clippedStrings > 0 || stats.omittedArrayItems > 0 || stats.omittedObjectKeys > 0 || stats.omittedValues > 0, projection: stats,
+            ...(records ? { records } : {}) }
+          : metadataBase;
+        const output = JSON.stringify({
+          ...(projected as Record<string, unknown>),
+          [STRUCTURED_PROJECTION_META_KEY]: metadata,
+        });
+        if (output.length <= maxChars) return { output, records };
+        payloadBudget -= output.length - maxChars + 8;
+      }
     }
-  }
-  return null;
+    return null;
+  };
+  const plain = project(baseCandidates);
+  if (!summary || !plain) return plain?.output ?? null;
+  // The whole list's summary is worth its room only when the view cannot
+  // answer for the list: records left out (no count from the rows), records
+  // cut below half their fields, or the list not in the view at all (a CLI's
+  // JSON inside one string). Otherwise the rows already say what it would.
+  const coverage = plain.records;
+  const listInView = summarySource === parsed && resolveDominantArray(parsed)?.path === summary.path;
+  const lossy = !listInView
+    || (coverage !== null && (coverage.shown < coverage.total
+      || coverage.fieldsInEveryShownRecord.length * 2 < summary.fields.length));
+  if (!lossy) return plain.output;
+  const fullWithSummary = { ...fullMetadata, summary };
+  fullForms.add(fullWithSummary);
+  return project([fullWithSummary])?.output ?? plain.output;
 }
 
 /**
@@ -956,12 +1090,23 @@ function digestText(
   readerAdvice?: () => string,
 ): string {
   const lines = text.split('\n');
-  const hint = textRecoveryHint(callId, readerAdvice, captureStoppedAt(text));
+  const cutAt = captureStoppedAt(text);
+  const hint = textRecoveryHint(callId, readerAdvice, cutAt);
+  // A command that printed a JSON record list (a CLI's --json) is summarized
+  // from all of it, read the way the record query reads it. A capture that
+  // was cut is partial, so it gets no summary.
+  const summary = cutAt ? null : (() => {
+    try {
+      const recovered = parseStoredToolOutputJson(text, { shell: parseShellToolOutput, producerTool: toolName });
+      return recovered ? recordListSummary(recovered.value) : null;
+    } catch { return null; }
+  })();
+  const summaryLine = summary ? ` ${renderRecordListSummary(summary)}` : '';
   // The footer is sized first so the head and tail fit around it: a footer
   // cut by a later cap loses the one exact call that reaches the rest.
   const footerFor = (withTail: boolean) =>
     `\n[digest: ${toolName} returned ${text.length.toLocaleString()} chars / ${lines.length.toLocaleString()} lines. ` +
-    `Showing the head${withTail ? ' and tail' : ''}. ${hint}]`;
+    `Showing the head${withTail ? ' and tail' : ''}.${summaryLine} ${hint}]`;
   const omitted = '\n…[middle omitted]…\n';
   const budget = Math.max(200, maxChars - footerFor(true).length - omitted.length);
   const headLen = Math.floor(budget * 0.7);
