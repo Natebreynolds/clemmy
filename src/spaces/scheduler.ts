@@ -222,6 +222,28 @@ export function processSpaceSchedules(now: Date = new Date()): Promise<SpaceFire
  *  changes the signature, so a Space saved inside an already-evaluated minute
  *  still gets that minute. Process-local: a restart evaluates in full. */
 let lastFullyEvaluatedSignature: string | undefined;
+/** Each scheduled source as that evaluation found it, by streak key. Valid
+ *  while the manifest signature is unchanged, which every use requires. */
+let sourcesAtLastEvaluation = new Map<string, { spaceId: string; source: SpaceDataSource }>();
+
+/** Nothing the full pass would act on has happened to a failing source since
+ *  it last ran: no success from another path, no changed declaration or
+ *  connection, no connection digest still to record. */
+function streaksQuietSinceLastEvaluation(streaks: Record<string, SourceRefreshStreak>): boolean {
+  const keys = Object.keys(streaks);
+  if (keys.length === 0) return true;
+  const connections = connectionSnapshot();
+  for (const key of keys) {
+    const known = sourcesAtLastEvaluation.get(key);
+    if (!known) return false;
+    const streak = streaks[key];
+    if (succeededSince(known.spaceId, known.source.id, streak)) return false;
+    const identity = sourceIdentity(known.source, connections);
+    if (sourceIdentityChanged(streak, identity)) return false;
+    if (streak.connectionDigest === null && identity.connectionDigest !== null) return false;
+  }
+  return true;
+}
 function spaceManifestSignature(): string {
   try {
     return readdirSync(SPACES_DIR).sort().map((name) => {
@@ -238,18 +260,23 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   const streaks = state.sourceStreakByKey;
   // Within a minute this pass already evaluated, with no Space manifest
   // written since, no schedule can newly match: skip the per-Space manifest
-  // reads unless a failing source's streak or an undelivered notice still
-  // needs this pass. Live 2026-10-20 (89 Spaces, a tick every 15 s): this
-  // step was the largest steady-state event-loop hold, 160 holds / 185 s in
-  // 2.3 h, on ticks where nothing could fire.
+  // reads unless a failing source or an undelivered notice still needs this
+  // pass. Live 2026-10-20 (89 Spaces, a tick every 15 s): this step was the
+  // largest steady-state event-loop hold, 160 holds / 185 s in 2.3 h, on
+  // ticks where nothing could fire. Live 2026-10-23 (103 Spaces): fifteen old
+  // failing sources, each already told and backing off, kept that skip off
+  // on every tick (720 holds / 218 s in 9 h); a failing source is now checked
+  // by itself, and only a change the pass would act on runs it.
   const minuteAlreadyEvaluated = state.lastEvaluatedAtMs !== undefined
     && Math.floor(state.lastEvaluatedAtMs / 60_000) === Math.floor(now.getTime() / 60_000);
   const signature = spaceManifestSignature();
   if (minuteAlreadyEvaluated && signature === lastFullyEvaluatedSignature
-    && Object.keys(streaks).length === 0 && Object.keys(state.pendingSourceNotices).length === 0) {
+    && Object.keys(state.pendingSourceNotices).length === 0 && streaksQuietSinceLastEvaluation(streaks)) {
     return { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 };
   }
   lastFullyEvaluatedSignature = signature;
+  const sourcesThisEvaluation = new Map<string, { spaceId: string; source: SpaceDataSource }>();
+  sourcesAtLastEvaluation = sourcesThisEvaluation;
   const scheduledKeys = new Set<string>();
   const connections = connectionSnapshot();
   let evaluated = 0;
@@ -298,6 +325,7 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
       evaluated += 1;
       const key = `${space.id}:${ds.id}`;
       scheduledKeys.add(key);
+      sourcesThisEvaluation.set(key, { spaceId: space.id, source: ds });
       // Collapse a long absence into ONE refresh (v3.0.1 incident, sibling of
       // the workflow-scheduler stampede). This loop used to refresh once per
       // MATCHED MINUTE: an hourly source missed for a day fired 24 sequential

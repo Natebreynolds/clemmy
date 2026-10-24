@@ -495,7 +495,7 @@ export function registerSpaceRoutes(app: Express, isAuthorized: IsAuthorized): v
   // ---- Management --------------------------------------------------------
   app.get('/api/console/spaces', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    const spaces = spaceStore.list(req.query.archived === '1');
+    const spaces = spaceStore.listForView(req.query.archived === '1');
     res.json({ spaces: spaces.map((space) => ({ ...space, health: buildSpaceHealthSnapshot(space) })) });
   });
 

@@ -10,7 +10,7 @@ import { backupMemoryDbAsync } from './memory-backup.js';
 import { nightlyAdmission } from './nightly-admission.js';
 import { filePassCursorIO } from './pass-cursor.js';
 import { setSliceResumeHook } from './sliced-pass.js';
-import { resumeDaemonRuntimePhase } from '../daemon/phase.js';
+import { resumeDaemonRuntimePhase, withDaemonRuntimePhase, withDaemonRuntimePhaseSync } from '../daemon/phase.js';
 import { reindexVault } from './indexer.js';
 import { tickMemoryMdRefresh } from './memory-md-builder.js';
 import { tickIdentityMdRefresh } from './identity-md-builder.js';
@@ -652,10 +652,14 @@ export function finalizeGroundedResourceLinksOnBoot(): BootGroundedResourceFinal
  * retention sweep below. Those are what keep the database bounded, and
  * skipping them on a struggling machine makes the machine struggle more.
  */
+/** Each job below runs under its own label, so a loop hold during memory
+ *  maintenance names the job that took the main thread. */
+const MAINTENANCE_PHASE = 'daemon.loop.memory_maintenance';
+
 export async function processMemoryMaintenance(tickCount: number): Promise<void> {
   if (tickCount % REINDEX_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('vault-reindex')) {
     try {
-      const stats = reindexVault();
+      const stats = withDaemonRuntimePhaseSync(`${MAINTENANCE_PHASE}.vault_reindex`, {}, () => reindexVault());
       // Only log when something actually changed — keeps the log clean.
       if (stats.changed > 0 || stats.removed > 0 || stats.errors > 0) {
         logger.info({ stats }, 'vault reindex tick');
@@ -671,7 +675,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // an immediate worker is still finishing the same claim.
   if (tickCount % CONSOLIDATION_REPLAY_EVERY_N_TICKS === 0) {
     try {
-      const replay = await drainDurableConsolidationCandidates({ limit: 8 });
+      const replay = await withDaemonRuntimePhase(`${MAINTENANCE_PHASE}.consolidation_replay`, {}, () => drainDurableConsolidationCandidates({ limit: 8 }));
       if (replay.promoted > 0 || replay.retried > 0 || replay.expired > 0) {
         logger.info({ replay }, 'durable memory consolidation replay tick');
       }
@@ -682,7 +686,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     // no second semantic approval. Attach its independent episode as evidence
     // and resolve only that exact claim; paraphrases/conflicts remain queued.
     try {
-      const known = reconcileKnownPendingCandidates({ limit: 20 });
+      const known = withDaemonRuntimePhaseSync(`${MAINTENANCE_PHASE}.known_evidence`, {}, () => reconcileKnownPendingCandidates({ limit: 20 }));
       if (known.resolved > 0 || known.failed > 0) {
         logger.info({ known }, 'known memory evidence reconciliation tick');
       }
@@ -693,7 +697,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
 
   if (tickCount % TERMINAL_LEARNING_EVERY_N_TICKS === 0) {
     try {
-      const learning = await drainTerminalSemanticLearning({ requireIdle: true, shardLimit: 2 });
+      const learning = await withDaemonRuntimePhase(`${MAINTENANCE_PHASE}.terminal_learning`, {}, () => drainTerminalSemanticLearning({ requireIdle: true, shardLimit: 2 }));
       if (
         learning.intake.batchesCreated > 0
         || learning.intake.resourcePointers > 0
@@ -712,7 +716,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     await runMemoryModelJob('index', { source: { kind: 'schedule' } }, async () => {
       let embedded = 0;
       try {
-        const stats = await embedMissingChunks({ maxChunks: BACKFILL_BATCH });
+        const stats = await withDaemonRuntimePhase(`${MAINTENANCE_PHASE}.chunk_embeddings`, {}, () => embedMissingChunks({ maxChunks: BACKFILL_BATCH }));
         embedded += stats.embedded;
         if (stats.embedded > 0 || stats.failed > 0) {
           logger.info({ stats }, 'embedding backfill tick');
@@ -724,7 +728,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       // conflict resolver's semantic findSimilarFacts has vectors to rank
       // against. Re-embeds facts whose content changed (Mem0 UPDATE).
       try {
-        const factStats = await embedMissingFacts({ maxChunks: BACKFILL_BATCH });
+        const factStats = await withDaemonRuntimePhase(`${MAINTENANCE_PHASE}.fact_embeddings`, {}, () => embedMissingFacts({ maxChunks: BACKFILL_BATCH }));
         embedded += factStats.embedded;
         if (factStats.embedded > 0 || factStats.failed > 0) {
           logger.info({ stats: factStats }, 'fact embedding backfill tick');
@@ -738,7 +742,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
 
   if (tickCount % BACKFILL_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('evidence-backfill')) {
     try {
-      const evidence = backfillTemporalEvidence(BACKFILL_BATCH);
+      const evidence = withDaemonRuntimePhaseSync(`${MAINTENANCE_PHASE}.evidence_backfill`, {}, () => backfillTemporalEvidence(BACKFILL_BATCH));
       if (evidence.linked > 0 || evidence.missing > 0) logger.info({ evidence }, 'temporal evidence backfill tick');
     } catch (err) {
       logger.warn({ err }, 'temporal evidence backfill tick failed');
@@ -769,7 +773,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   // ages out on its own persisted hourly clock: tickCount restarts at every
   // boot, so a tick-count cadence would starve it on a daemon that restarts.
   try {
-    const memoryWork = sweepMemoryWorkIfDue();
+    const memoryWork = withDaemonRuntimePhaseSync(`${MAINTENANCE_PHASE}.work_history`, {}, () => sweepMemoryWorkIfDue());
     if (memoryWork && (memoryWork.detailDeleted > 0 || memoryWork.dailyDeleted > 0)) {
       logger.info({ memoryWork }, 'memory work retention tick');
     }

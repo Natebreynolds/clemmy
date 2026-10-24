@@ -43,7 +43,7 @@ import {
 } from '../runtime/harness/host-local-write-commit.js';
 import { bootstrapWorkspaceObservationHistory, commitWorkspaceObservationBatch, deleteWorkspaceIndex, getCurrentWorkspaceDatasetObservation, indexWorkspaceRecord, openWorkspaceDb, reindexWorkspaceRecords, serializeWorkspaceProjection } from './workspace-db.js';
 import { canonicalWorkspaceJson, workspaceDataContentDigest } from './workspace-set-data-contract.js';
-import { assertWorkspaceUpdateJournalFits, clearWorkspaceUpdateJournal, persistWorkspaceUpdateJournal, recoverWorkspaceSnapshotUnderOwner, withWorkspaceSnapshotMutation, withWorkspaceSnapshotRead, workspaceSnapshotRecoveryPending, workspaceSnapshotRevision, writeWorkspaceSnapshotFile } from './workspace-snapshot.js';
+import { assertWorkspaceUpdateJournalFits, clearWorkspaceUpdateJournal, persistWorkspaceUpdateJournal, recoverWorkspaceSnapshotUnderOwner, withWorkspaceSnapshotMutation, withWorkspaceSnapshotRead, withWorkspaceSnapshotView, workspaceSnapshotRecoveryPending, workspaceSnapshotRevision, writeWorkspaceSnapshotFile } from './workspace-snapshot.js';
 
 export const SPACES_DIR = path.join(BASE_DIR, 'spaces');
 /** Hidden, invalid-as-a-slug directory used as the durable hard-delete marker. */
@@ -1412,6 +1412,16 @@ export class SpaceStore {
   }
 
   /**
+   * The Spaces a screen shows (newest first). Each manifest is the one the
+   * locked read would return, taken without the per-Space lock when no update
+   * is pending or landed while it was read (see withWorkspaceSnapshotView).
+   * For display: a caller that acts on a Space reads it with get().
+   */
+  listForView(includeArchived = false): SpaceRecord[] {
+    return this.listMatching(includeArchived, null, true);
+  }
+
+  /**
    * The Spaces a caller has work for (newest first). A Space whose committed
    * manifest does not match, and that has no update a locked read would first
    * complete, is passed over without taking its lock: the locked read would
@@ -1422,7 +1432,7 @@ export class SpaceStore {
     return this.listMatching(includeArchived, matches);
   }
 
-  private listMatching(includeArchived: boolean, matches: ((space: SpaceRecord) => boolean) | null): SpaceRecord[] {
+  private listMatching(includeArchived: boolean, matches: ((space: SpaceRecord) => boolean) | null, view = false): SpaceRecord[] {
     try {
       recoverWorkspaceDeletionQuarantine();
     } catch {
@@ -1449,7 +1459,11 @@ export class SpaceStore {
         if (committed && !pending && ((committed.status === 'archived' && !includeArchived) || !matches(committed))) continue;
       }
       let rec: SpaceRecord | undefined;
-      try { rec = this.get(name); } catch { continue; } // one unrecoverable snapshot cannot hide unrelated Spaces
+      try {
+        rec = view
+          ? withWorkspaceSnapshotView(name, [manifestPath(name)], () => readManifest(name))
+          : this.get(name);
+      } catch { continue; } // one unrecoverable snapshot cannot hide unrelated Spaces
       if (!rec) continue;
       if (!includeArchived && rec.status === 'archived') continue;
       if (matches && !matches(rec)) continue;

@@ -1050,6 +1050,37 @@ test('manifest-only snapshot preserves data and distinguishes an absent view fro
   assert.throws(() => store.spaceStore.snapshot(slug), (error: unknown) => (error as NodeJS.ErrnoException).code === 'EISDIR', 'non-absence I/O errors must not masquerade as a missing view');
 });
 
+test('a screen read is the locked read: re-read under the lock when a file changes or an update is pending', async () => {
+  const snapshot = await import('./workspace-snapshot.js');
+  store.spaceStore.save({ id: 'lv-plain', title: 'Plain' });
+  store.spaceStore.save({ id: 'lv-other', title: 'Other' });
+  const rows = (spaces: Array<{ id: string; title: string; version: number }>) => spaces.map(({ id, title, version }) => [id, title, version]);
+  assert.deepEqual(rows(store.spaceStore.listForView()), rows(store.spaceStore.list()));
+  assert.deepEqual(rows(store.spaceStore.listForView(true)), rows(store.spaceStore.list(true)));
+
+  const manifest = store.resolveInSpace('lv-plain', 'space.json');
+  let reads = 0;
+  const seen = snapshot.withWorkspaceSnapshotView('lv-plain', [manifest], () => {
+    reads += 1;
+    const title = JSON.parse(readFileSync(manifest, 'utf8')).title as string;
+    // A writer lands while the first (unlocked) read is running.
+    if (reads === 1) store.spaceStore.save({ id: 'lv-plain', title: 'Plain, renamed' });
+    return title;
+  });
+  assert.equal(reads, 2, 'a file that changed during the read is read again under the lock');
+  assert.equal(seen, 'Plain, renamed');
+
+  const journal = path.join(path.dirname(manifest), '.clementine-workspace-update.json');
+  writeFileSync(journal, '{}', 'utf8');
+  try {
+    let unlocked = 0;
+    assert.throws(() => snapshot.withWorkspaceSnapshotView('lv-plain', [manifest], () => { unlocked += 1; return 0; }));
+    assert.equal(unlocked, 0, 'a pending update is completed by the locked read before anything is read');
+  } finally {
+    rmSync(journal, { force: true });
+  }
+});
+
 test('listWhere returns exactly the matching Spaces that list would, and archived ones only when asked', () => {
   store.spaceStore.save({ id: 'lw-match', title: 'Match: pipeline' });
   store.spaceStore.save({ id: 'lw-other', title: 'Unrelated board' });

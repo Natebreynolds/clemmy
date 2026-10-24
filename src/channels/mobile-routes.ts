@@ -5714,11 +5714,14 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   registerWorkspaceSourceControlRoutes(router, '/api/workspaces', requireMobileSession);
   router.get('/api/workspaces', requireMobileSession, async (_req, res) => {
     try {
-      const { spaceStore } = await import('../spaces/store.js');
-      const { readData } = await import('../spaces/data-store.js');
+      const { buildSpaceHealthSnapshot, spaceStore } = await import('../spaces/store.js');
+      const { readDataForView } = await import('../spaces/data-store.js');
       const { projectWorkspaceData, workspacePhonePresence } = await import('../spaces/mobile-projection.js');
-      const spaces = spaceStore.list().map((record) => {
-        const health = spaceStore.health(record.id);
+      // A screen list: each Space is read once, without its lock when nothing
+      // is being written to it (one locked read per Space per call held the
+      // daemon over a second on every phone poll of a hundred Spaces).
+      const spaces = spaceStore.listForView().map((record) => {
+        const health = buildSpaceHealthSnapshot(record);
         // Whether there is anything to LOOK at, decided here rather than
         // guessed in the UI. Half of a real user's workspaces are drafts and
         // abandoned experiments with no data at all; on a laptop they are easy
@@ -5727,7 +5730,7 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         let rows = 0;
         let hasSummary = false;
         try {
-          const projection = projectWorkspaceData(readData(record.id));
+          const projection = projectWorkspaceData(readDataForView(record.id));
           rows = projection.total;
           hasSummary = projection.headline.length > 0;
         } catch { /* unreadable data reads as empty, which is the truth */ }
