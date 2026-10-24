@@ -341,6 +341,20 @@ test('trajectory review omits successful discovery schemas while completion reta
   }
 });
 
+test('a read carried by a host command-line envelope names the program that ran it', () => {
+  const identity = accepted();
+  retainedRead(identity, 'records_query', { complete: true, result: {
+    version: 1, status: 'exited', exitCode: 0, operationId: 'records.query',
+    executableRealpath: '/opt/fixture/bin/recordcli', argv: ['data', 'query', '--json'],
+    stdout: JSON.stringify({ records: [{ Name: 'Fixture One' }] }), stdoutTruncated: false,
+  } });
+  retainedRead(identity, 'read_file', 'plain file text');
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.match(evidence.summary, /CARRIED BY the local command-line program \/opt\/fixture\/bin\/recordcli on this machine, run by the host with arguments \["data","query","--json"\]/);
+  assert.equal(evidence.summary.match(/CARRIED BY/g)?.length, 1, 'only the enveloped read names a carrier');
+});
+
 test('an unrelated accepted source and check-in alone do not make ordinary chat eligible', () => {
   const identity = accepted('Hello');
   attempted({ ...identity, sourceUserSeq: identity.sourceUserSeq + 100 }, 'tool_search');

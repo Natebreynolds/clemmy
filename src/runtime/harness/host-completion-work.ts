@@ -22,6 +22,8 @@ import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settle
 import { incompleteFrameRefusalReviewFacts, incompleteReviewScope,
   incompleteSettlementReviewFacts } from './incomplete-attempt-review-facts.js';
 import { loadExpectedWorkContract } from './expected-work-contract.js';
+import { readHostCliEnvelope } from './json-repair.js';
+import { redactSensitiveText } from '../security.js';
 import { hasPending } from './approval-registry.js';
 import { admitHistoricalReadPacket, historicalEvidenceDigest, historicalReadClosureHasShape, HISTORICAL_COMPLETION_MAX_CHARS,
   type HistoricalReadPacket, type HistoricalReadGroup, type HistoricalReadClosure } from './historical-completion-evidence.js';
@@ -1086,6 +1088,19 @@ export function sourceSettledReadEvidence(input: {
         requestArgs = recorded?.args;
         blocks.push(`${label}: RECORDED INVOCATION SCOPE (source/call-bound requested arguments, not a sealed wire call):\n`
           + (recorded ? requestScopeText(row.toolName, recorded.args, input.writtenContents) : 'unavailable'));
+      }
+      // What carried the read, from its own receipt: a host CLI envelope names
+      // the exact local program that ran, so a review never has to guess the
+      // carrier from the tool's name.
+      const cliEnvelope = (() => {
+        try { return readHostCliEnvelope(value.rawPayload); } catch { return null; }
+      })();
+      if (cliEnvelope) {
+        const envelope = (value.rawPayload as { result?: Record<string, unknown> }).result ?? (value.rawPayload as Record<string, unknown>);
+        const executable = typeof envelope.executableRealpath === 'string' ? envelope.executableRealpath : '';
+        const argv = Array.isArray(envelope.argv) ? (envelope.argv as unknown[]).map(String) : [];
+        blocks.push(`${label}: CARRIED BY the local command-line program ${executable} on this machine, `
+          + `run by the host with arguments ${redactSensitiveText(clipLine(JSON.stringify(argv), 400))}.`);
       }
       const projection = readsRetained ? loadRetainedReaderProjection({
         sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
