@@ -9,6 +9,7 @@ import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REF
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
 import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
+import { abbreviatedArgumentNote, abbreviatedArguments } from './abbreviated-argument.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { assertRecoveryActivationOwned } from './recovery-activation.js';
@@ -186,7 +187,7 @@ import {
   noteExactCheckpointReentry,
 } from './exact-checkpoint-reentry.js';
 import pino from 'pino';
-import { appendEvent, getSession, isKillRequested, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
+import { appendEvent, getSession, getToolOutput, isKillRequested, listEvents, openEventLog, withEventPublicationTransaction } from './eventlog.js';
 import { publicAsyncWorkDispatchedData } from './public-presentation.js';
 import { sessionAgentReviewContext } from './session-composition.js';
 import { nextTurnSteer, recordTurnSteer, appendSteerToResultText } from './turn-steer.js';
@@ -12225,6 +12226,30 @@ const runHostTurnBody = async (
         if (materialized.boundTargets) {
           (call as { argumentsJson: string }).argumentsJson = argumentsJson;
           journalHostGuide('reviewed_arguments_bound', { callId: call.callId, targets: materialized.boundTargets });
+        }
+        // An opaque value shortened with "..." (a page token, an id) goes
+        // back whole; the host names the full values this turn returned that
+        // begin the same way, and the model chooses.
+        if (hostProduction && abbreviatedArguments(parsedArgs(argumentsJson)).length > 0) {
+          try {
+            // What the model was shown, newest first, and each result's
+            // stored whole (a view may have left the value out).
+            const identity = exactHostIdentity();
+            const texts = (history as unknown as Array<Record<string, unknown>>)
+              .filter((row) => row.type === 'function_call_result' && typeof row.callId === 'string' && row.callId !== call.callId)
+              .reverse().slice(0, 12)
+              .flatMap((row) => {
+                const output = row.output as { text?: unknown } | string | undefined;
+                const shown = typeof output === 'string' ? output : typeof output?.text === 'string' ? output.text : '';
+                return [shown, getToolOutput(identity.sessionId, String(row.callId))?.output ?? ''];
+              })
+              .filter((text) => text.length > 0);
+            const note = abbreviatedArgumentNote({ callId: call.callId, args: parsedArgs(argumentsJson), textsNewestFirst: texts });
+            if (note) {
+              journalHostGuide('abbreviated_argument', { callId: call.callId });
+              pendingHostModelDirective = [pendingHostModelDirective, note].filter(Boolean).join('\n');
+            }
+          } catch { /* a note only; the call goes as written */ }
         }
         let argumentsValue = parsedArgs(argumentsJson);
         // The fused frame is classified before plan_task has materialized its
