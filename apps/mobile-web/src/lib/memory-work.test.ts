@@ -540,8 +540,10 @@ test('with no model at all the memory row says so, and a missing pick waits inst
 
 test('Memory shows the card above the tabs, polls only while on screen, and needs no new props', () => {
   const memory = read('../screens/Memory.tsx');
-  assert.match(memory, /<MemoryWorkCard[\s\S]*?<div class="memory-tabs" role="tablist">/,
+  assert.match(memory, /<MemoryWorkCard[\s\S]*?<div class="memory-tabs" role="group" aria-label="Memory views">/,
     'the card sits above Memories / People');
+  assert.match(memory, /aria-pressed=\{tab === 'facts'\}/);
+  assert.match(memory, /aria-pressed=\{tab === 'people'\}/);
   assert.match(memory, /searchQuery \? \([\s\S]*?<SearchResults[\s\S]*?\) : \([\s\S]*?<MemoryWorkCard/,
     'search results replace the card, as they replace the tabs');
   assert.match(memory, /intervalMs: MEMORY_WORK_POLL_MS/);
