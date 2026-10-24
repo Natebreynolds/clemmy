@@ -19,6 +19,7 @@
 
 import { toolCallHint } from './tool-call-hint.js';
 import { captureStoppedAt } from './shell-tool-output.js';
+import { readHostCliEnvelope } from './json-repair.js';
 
 export interface DigestOptions {
   maxChars?: number;
@@ -538,13 +539,35 @@ function projectedRecordCoverage(
  * host metadata property: downstream typed JSON proof can still parse the
  * provider envelope while exact raw redemption continues to use the receipt.
  */
+/**
+ * A clean CLI run's envelope carries the command's JSON as one string in
+ * `stdout`; clipped as a string it shows no records and no totals. The view
+ * shows that JSON parsed, as `stdout_json` (the name the shell result uses),
+ * the way tool_output_query reads it. Only the view changes: the stored bytes
+ * and their receipt are the envelope as it came.
+ */
+function hostCliJsonView(parsed: Record<string, unknown>): Record<string, unknown> | null {
+  const reading = readHostCliEnvelope(parsed);
+  if (reading?.kind !== 'clean') return null;
+  const withParsedStdout = (envelope: Record<string, unknown>): Record<string, unknown> => {
+    const { stdout: _stdout, ...rest } = envelope;
+    return { ...rest, stdout_json: reading.stdoutJson };
+  };
+  const wrapped = parsed.result && typeof parsed.result === 'object' && !Array.isArray(parsed.result)
+    ? parsed.result as Record<string, unknown> : null;
+  return wrapped && typeof wrapped.stdout === 'string'
+    ? { ...parsed, result: withParsedStdout(wrapped) }
+    : withParsedStdout(parsed);
+}
+
 export function compactStructuredJsonToolOutput(
   text: string,
   options: StructuredJsonToolOutputOptions,
 ): string | null {
-  const parsed = tryParse(text);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  if (Object.hasOwn(parsed, STRUCTURED_PROJECTION_META_KEY)) return null;
+  const stored = tryParse(text);
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return null;
+  if (Object.hasOwn(stored, STRUCTURED_PROJECTION_META_KEY)) return null;
+  const parsed = hostCliJsonView(stored as Record<string, unknown>) ?? stored;
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
