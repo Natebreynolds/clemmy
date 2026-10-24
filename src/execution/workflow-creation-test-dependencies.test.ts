@@ -85,7 +85,6 @@ for (const [label, output, expected] of [
   ['typed block', { blocked: true, reason: 'Controlled packet unavailable.' }, 'failed'],
   ['error envelope', { status: 'error', error: 'Controlled source could not return its packet.' }, 'failed'],
   ['absent packet', undefined, 'empty'],
-  ['empty packet', { records: [] }, 'empty'],
 ] as const) {
   test(`creation rehearsal propagates the actual ${label} verdict without treating it as normal upstream data`, async () => {
     const name = `creation-output-${expected}-${label.replaceAll(' ', '-')}`;
@@ -105,6 +104,23 @@ for (const [label, output, expected] of [
     assert.equal(readWorkflowEvents(name, `${name}-run`).some(event => event.kind === 'step_started' && event.stepId === 'shape_packet'), false);
   });
 }
+
+test('a source that answered with nothing right now passes the rehearsal; what depends on it waits for a run with data', async () => {
+  const name = 'creation-output-empty-answer';
+  const models = forbiddenModels();
+  runner._setWorkflowCallNodeForTests(async () => ({ records: [] }));
+  const result = await runner.runCreationTest(workflow(name, [readStep(),
+    literalStep('shape_packet', { wouldInventData: true }, ['read_packet']),
+    { id: 'save_review', prompt: 'Create a controlled unsent draft.', sideEffect: 'write', dependsOn: ['shape_packet'] },
+    literalStep('independent', { available: true }),
+  ]), name, `${name}-run`, {}, models.assistant);
+  assert.equal(result.pass, true);
+  assert.deepEqual(statuses(result), { read_packet: 'ok', shape_packet: 'unverifiable', save_review: 'unverifiable', independent: 'ok' });
+  assert.equal(result.steps.find((step) => step.stepId === 'read_packet')?.emptyAnswer, true);
+  assert.match(result.steps.find((step) => step.stepId === 'save_review')?.detail ?? '', /Shape packet had nothing in it/);
+  assert.equal(models.calls(), 0, 'no model starts on an empty packet');
+  assert.equal(readWorkflowEvents(name, `${name}-run`).some(event => event.kind === 'step_started' && event.stepId === 'shape_packet'), false);
+});
 
 test('creation rehearsal retains the host optional-read declared gap policy, while a returned blocked gap still blocks', async () => {
   const models = forbiddenModels();

@@ -14839,6 +14839,9 @@ export interface CreationTestStepResult {
    */
   status: 'ok' | 'empty' | 'failed' | 'previewed' | 'error' | 'unverifiable' | 'not_run' | 'needs_choice' | 'needs_connection';
   detail?: string;
+  /** An exact call whose source answered with an empty list: the call works,
+   * there is just nothing there right now. */
+  emptyAnswer?: true;
   /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
    * creation test can PARK on it like any run instead of only describing it. */
   block?: WorkflowCapabilityBlockedError;
@@ -14885,7 +14888,7 @@ function missingConnectionApps(steps: readonly CreationTestStepResult[]): string
 export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
   return steps.map((s) => {
     const name = creationTestStepName(s.stepId);
-    if (s.status === 'ok') return `- ${name} — returned data`;
+    if (s.status === 'ok') return `- ${name} — ${s.emptyAnswer ? 'its source answered: nothing there right now' : 'returned data'}`;
     // The one answerable thing leads with the question itself, indented so
     // the enumerated choices stay readable inside the step list.
     if (s.status === 'needs_choice') {
@@ -14947,21 +14950,24 @@ export function persistStepAccountBinding(
   return true;
 }
 
-/** Verdict for a read-only step's output: did it actually return data? */
-export function creationTestVerdict(stepId: string, out: unknown): CreationTestStepResult {
+/** Verdict for a read-only step's output: did it actually return data?
+ *  `directCall` is an exact call step (no model in it): an empty list it got
+ *  back is its source's own answer, not a step that failed to produce. */
+export function creationTestVerdict(stepId: string, out: unknown, options: { directCall?: boolean } = {}): CreationTestStepResult {
   // A read-only step that returns NOTHING is a creation-test failure (the
   // acme mode — a scrape/fetch that silently came back empty): null, an
   // empty/whitespace string, an empty array, or an empty object.
+  const emptyList = Array.isArray(out) && out.length === 0;
   const empty =
     out == null
     || (typeof out === 'string' && out.trim().length === 0)
-    || (Array.isArray(out) && out.length === 0)
     || (typeof out === 'object' && !Array.isArray(out) && Object.keys(out as Record<string, unknown>).length === 0);
-  if (empty) return { stepId, status: 'empty', detail: 'returned no data' };
+  if (empty || (emptyList && !options.directCall)) return { stepId, status: 'empty', detail: 'returned no data' };
   // An EMPTY dominant list is also "no data" even when wrapped in an object —
   // `{records:[]}`, `{data:{records:[]}}` (reuses the 44→4 dominant-list finder).
-  const dom = countDominantArray(out);
-  if (dom && dom.count === 0) return { stepId, status: 'empty', detail: `returned 0 ${dom.key}` };
+  const dom = emptyList ? null : countDominantArray(out);
+  if (dom && dom.count === 0 && !options.directCall) return { stepId, status: 'empty', detail: `returned 0 ${dom.key}` };
+  const answeredEmpty = emptyList || (dom !== null && dom.count === 0);
   // Reuse the engine's CANONICAL failure detector — the SAME one the
   // run-completion path uses (detectBlockedSteps) — so the creation-test
   // verdict can never drift from how a real run judges a step. It catches
@@ -14976,7 +14982,7 @@ export function creationTestVerdict(stepId: string, out: unknown): CreationTestS
   // caught live by the smoke) — never returned real data. Recurse for it.
   const deep = deepSelfReportedFailure(out);
   if (deep) return { stepId, status: 'failed', detail: deep.slice(0, 200) };
-  return { stepId, status: 'ok' };
+  return answeredEmpty ? { stepId, status: 'ok', emptyAnswer: true } : { stepId, status: 'ok' };
 }
 
 /**
@@ -15146,6 +15152,12 @@ export async function runCreationTest(
   const choiceBlocked = new Set<string>();
   const dependsOnChoiceBlock = (step: WorkflowStepInput): boolean =>
     (step.dependsOn ?? []).some((dep) => choiceBlocked.has(dep));
+  // Steps downstream of a source that answered with nothing right now. The
+  // call works; there is just nothing for them to work on, so the first run
+  // that has data checks them and no model starts on an empty packet.
+  const emptyAnswered = new Set<string>();
+  const emptyAnswerDependencies = (step: WorkflowStepInput): string[] =>
+    (step.dependsOn ?? []).filter((dep) => emptyAnswered.has(dep));
   // Readiness says a prerequisite settled, not that it produced usable data.
   // Keep its actual rehearsal verdict so a failed read cannot launch a model
   // or even prepare/preview a dependent write with a missing input packet.
@@ -15161,6 +15173,7 @@ export async function runCreationTest(
       throwIfWorkflowRunCancelled(runId);
       let optionalReadGap = false;
       const failedUpstream = failedDependencies(step);
+      const emptyUpstream = emptyAnswerDependencies(step);
       if (dependsOnChoiceBlock(step)) {
         choiceBlocked.add(step.id);
         stepOutputs[step.id] = { blocked: true, reason: 'a step it depends on could not run yet' };
@@ -15175,6 +15188,14 @@ export async function runCreationTest(
           stepId: step.id,
           status: 'not_run',
           detail: `waits on required upstream ${failedUpstream.map((id) => `"${id}"`).join(', ')}; no dependent work was prepared or run`,
+        });
+      } else if (emptyUpstream.length > 0) {
+        emptyAnswered.add(step.id);
+        stepOutputs[step.id] = { previewed: true, reason: 'an upstream source had nothing in it during the creation test' };
+        results.push({
+          stepId: step.id,
+          status: 'unverifiable',
+          detail: `${emptyUpstream.map(creationTestStepName).join(', ')} had nothing in it during the test`,
         });
       } else if (stepLooksMutating(step)) {
         // Never execute a send/write while authoring — preview it. Downstream
@@ -15218,7 +15239,9 @@ export async function runCreationTest(
             ...(options.capabilityResume ? { capabilityResume: options.capabilityResume } : {}),
           });
           stepOutputs[step.id] = out;
-          results.push(creationTestVerdict(step.id, out));
+          const verdict = creationTestVerdict(step.id, out, { directCall: Boolean(step.call?.tool && !step.forEach) });
+          if (verdict.emptyAnswer) emptyAnswered.add(step.id);
+          results.push(verdict);
         } catch (err) {
           if (err instanceof WorkflowCapabilityBlockedError
             && err.reason === 'ambiguous-account' && err.accountChoiceSet) {
@@ -16317,15 +16340,18 @@ async function processOneRunFile(
       // Checks a rehearsal cannot make honestly (whether the workflow's goal
       // is met judges the changes it only previewed) belong to the first real
       // run; a pass says so instead of implying them.
+      const readsAnswered = result.steps.some((s) => s.emptyAnswer)
+        ? 'the read steps ran and their sources answered'
+        : 'the read steps returned real data';
       const realRunChecks = workflow.data.goal?.objective
         ? '\n\nIts goal is judged on each real run; a rehearsal only previews the changes that goal is judged on.'
         : '';
       const body = creationReady
         ? activateAfterCreationTest
           ? activation && !activation.activated
-            ? `Creation test passed for "${workflow.data.name}" — the read steps returned real data — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
-            : `Creation test passed for "${workflow.data.name}" — the read steps returned real data, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.${realRunChecks}`
-          : `Creation test passed for "${workflow.data.name}" — the read steps returned real data. It is still off.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
+            ? `Creation test passed for "${workflow.data.name}" — ${readsAnswered} — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
+            : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.${realRunChecks}`
+          : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}. It is still off.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
         : result.pass
           ? autoRetestRunId
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`

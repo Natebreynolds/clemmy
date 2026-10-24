@@ -65,6 +65,7 @@ const {
   isTransientStepError,
   runWithStepRetry,
   creationTestVerdict,
+  creationTestStepLines,
   shouldHaltResumeForSideEffect,
   hostStepMutationProof,
   catalogPreparationRefusalToCapabilityBlock,
@@ -6270,6 +6271,21 @@ test('creationTestVerdict: empty dominant list (wrapped) → empty', () => {
   assert.equal(creationTestVerdict('scrape', { data: { records: [] } }).status, 'empty');
   // A NON-empty wrapped list is real data → ok.
   assert.equal(creationTestVerdict('scrape', { data: { records: [{ id: 1 }] } }).status, 'ok');
+});
+
+test('creationTestVerdict: an exact call whose source answered with an empty list passes, and says so', () => {
+  for (const out of [{ value: [] }, [], { data: { records: [] } }]) {
+    const verdict = creationTestVerdict('read_calendar', out, { directCall: true });
+    assert.equal(verdict.status, 'ok', JSON.stringify(out));
+    assert.equal(verdict.emptyAnswer, true);
+  }
+  assert.deepEqual(creationTestStepLines([creationTestVerdict('read_calendar', { value: [] }, { directCall: true })]),
+    ['- Read calendar — its source answered: nothing there right now']);
+  // Nothing at all, or a failure beside the empty list, is still not an answer.
+  assert.equal(creationTestVerdict('read_calendar', null, { directCall: true }).status, 'empty');
+  assert.equal(creationTestVerdict('read_calendar', { value: [], ok: false, error: 'denied' }, { directCall: true }).status, 'failed');
+  // A step with a model in it that produced an empty list stays flagged.
+  assert.equal(creationTestVerdict('read_calendar', { value: [] }).status, 'empty');
 });
 
 // ---------------------------------------------------------------------------
