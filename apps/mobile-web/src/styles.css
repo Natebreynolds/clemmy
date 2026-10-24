@@ -962,6 +962,22 @@ input, textarea, select { font: inherit; font-size: 16px; }
 /* An empty state is still copy someone has to read: keep it at body
    contrast rather than the hint gray the old screens used. */
 .empty-body { margin: 0; font-size: var(--t-sm); max-width: 30ch; color: var(--fg-2); }
+.empty-action {
+  margin-top: var(--sp-4);
+  min-height: 48px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-display);
+  font-size: var(--t-body);
+  font-weight: 650;
+  box-shadow: 0 6px 18px rgba(185, 67, 0, 0.22);
+  transition: transform var(--clem-dur-fast) var(--ease-out), background var(--clem-dur-base) ease;
+}
+.empty-action:active { transform: scale(0.96); background: var(--accent-deep); }
+.empty-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 /* Kept for screens still using the older empty markup. */
 .inbox-empty { text-align: center; color: var(--fg-3); padding: 48px 20px; }
 
@@ -1026,6 +1042,9 @@ input, textarea, select { font: inherit; font-size: 16px; }
   from { opacity: 0; }
   to { opacity: 1; }
 }
+/* The panel takes focus so the menu reads as one dialog; the ring belongs to
+   the rows a keyboard moves through, never the whole panel. */
+.drawer:focus, .drawer[tabindex]:focus-visible { outline: none; }
 .drawer {
   position: absolute;
   top: 0;
@@ -2193,8 +2212,20 @@ input, textarea, select { font: inherit; font-size: 16px; }
   transition: border-color 0.16s ease, box-shadow 0.2s ease;
 }
 .memory-search-input:focus { border-color: var(--line-hot); box-shadow: 0 0 0 4px var(--accent-soft); }
-.memory-filter { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: var(--sp-3); }
+/* One row that scrolls sideways, edge to edge, instead of a ragged second line. */
+.memory-filter {
+  display: flex;
+  gap: 6px;
+  margin: 0 calc(-1 * var(--sp-4)) var(--sp-3);
+  padding: 0 var(--sp-4);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+.memory-filter::-webkit-scrollbar { display: none; }
 .memory-filter button {
+  flex: 0 0 auto;
+  white-space: nowrap;
   min-height: 44px;
   background: var(--bg-2);
   border: 1px solid var(--line);

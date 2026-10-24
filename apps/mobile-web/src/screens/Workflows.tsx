@@ -14,7 +14,6 @@ import {
   type WorkflowRunSummary,
 } from '../lib/api';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -26,6 +25,7 @@ import { whenLabel } from '../lib/schedule-label';
 import { usePendingCommit } from '../lib/pending-commit';
 import { workflowRunFailure, workflowRunNotice } from '../lib/workflow-run-receipt';
 import { Chat } from './Chat';
+import { EmptyState } from '../components/EmptyState';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -35,7 +35,7 @@ const TERMINAL_RUN_STATUSES = new Set([
 /** A finished run whose goal review found a gap is done work with a note:
  *  its pill says so instead of reading as plain success. */
 
-export function Workflows() {
+export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
   useBackGesture(selected !== null, () => setSelected(null));
   const { data, loading, error, offline, refresh } = useScreenData(
@@ -56,11 +56,11 @@ export function Workflows() {
   }
   if (workflows.length === 0) {
     return (
-      <div class="empty">
-        <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
-        <p class="empty-title">No flows yet</p>
-        <p class="empty-body">Automations are the work Clem does for you, on a schedule or with one tap. Ask Clem to set one up and run it from here.</p>
-      </div>
+      <EmptyState
+        title="No automations yet"
+        body="An automation is work Clem does for you on a schedule or with one tap."
+        action={{ label: 'Ask Clem to set one up', onClick: () => onAsk('Set up an automation that ') }}
+      />
     );
   }
 
@@ -187,7 +187,6 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{workflowDisplayName(workflow.name, description)}</h2>
-        <NavigationMenuButton />
       </div>
       <div class="workflow-detail-body">
         {workflowCaption(workflow.name, description) ? <div class="workflow-row-slug">{workflow.name}</div> : null}
@@ -369,8 +368,8 @@ function WorkflowRunEvents({ workflowName, run, onBack, onAsk }: WorkflowRunEven
     <div class="workflow-detail">
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
-        <h2 class="chat-title">{run.id}</h2>
-        <NavigationMenuButton />
+        {/* A run is named by when it ran, never by its id. */}
+        <h2 class="chat-title">{runTitle(run)}</h2>
       </div>
       <div class="workflow-detail-body">
         <div class="memory-section-head">
@@ -509,6 +508,13 @@ function workflowArtifactsText(value: unknown): string {
     ...(Array.isArray(artifacts.urls) ? artifacts.urls.map(String) : []),
   ];
   return parts.slice(0, 3).join(' · ');
+}
+
+function runTitle(run: WorkflowRunSummary): string {
+  const at = run.startedAt ?? run.createdAt;
+  const when = at ? new Date(at) : null;
+  if (!when || Number.isNaN(when.getTime())) return 'Run';
+  return `Run · ${when.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
 }
 
 function relativeTime(iso: string | null): string {

@@ -61,9 +61,12 @@ import { Inbox } from './screens/Inbox';
 import type { ChatHandoff } from './screens/Chats';
 import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
+import { useFoldPages } from './lib/fold-pages';
+import { useDisplayRail } from './lib/display-rail';
 import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
+import { TabBar } from './components/TabBar';
 import { CustomizeSheet } from './components/CustomizeSheet';
 import { MobileNavigationProvider } from './lib/mobile-navigation';
 import { NavigationMenuButton } from './components/NavigationMenuButton';
@@ -111,13 +114,18 @@ export function App() {
   const [agentId, setAgentId] = useState<string | null>(() => agentFromSearch(window.location.search));
   // The header's "+" door asks the open list screen to start a new one.
   const [createRequest, setCreateRequest] = useState(0);
-  // The same drawer is reachable from this header and each detail header.
-  // A rightward swipe across the header also opens the menu.
+  // The menu opens from More, the Clemmy mark in this header, or a rightward
+  // swipe across the header.
   const headerSwipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [customizeOpen, setCustomizeOpen] = useState(false);
-  // Left drawer (owner directive 2026-08-25): sections live in a slide-in
-  // menu, never a bottom dock — content gets the full height.
+  // The left menu holds the places the phone's tab bar has no room for
+  // (owner 10-23: tabs + More, replacing the 08-25 menu-only phone).
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Opened across a fold, the sections and recent chats fill the first page.
+  const foldPages = useFoldPages();
+  // A display with a system rail down one side (the Duo's front screen) gets
+  // the places in that rail, like its home screen dock.
+  useDisplayRail();
   const [detailHeaderOwned, setDetailHeaderOwned] = useState(false);
   // 'closing' keeps the drawer mounted through its exit animation — an
   // instant unmount is the one visible tell next to a native drawer.
@@ -185,10 +193,12 @@ export function App() {
   }, []);
 
   // Drawer dialog contract: Escape closes, focus lands inside on open and is
-  // trapped while open — same idiom as the RunningTasksSheet dialog.
+  // trapped while open — same idiom as the RunningTasksSheet dialog. Focus
+  // lands on the panel itself: on its close button, WebKit drew a focus ring
+  // around the × on every tap that opened the menu.
   useEffect(() => {
     if (!drawerOpen) return;
-    drawerRef.current?.querySelector<HTMLElement>('button:not([disabled])')?.focus();
+    drawerRef.current?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         closeDrawer();
@@ -716,6 +726,13 @@ export function App() {
             </button>
           ))}
         </div>
+        {foldPages ? (
+          <DrawerRecents
+            open={!drawerOpen}
+            onOpen={(session) => goToChat({ session, sessionId: session.id, title: session.title })}
+            onAll={() => navigateTo('chats')}
+          />
+        ) : null}
         <button type="button" class="adaptive-settings" aria-current={tab === 'settings' ? 'page' : undefined}
           onClick={() => { haptic('light'); navigateTo('settings'); }}>Settings</button>
       </nav>
@@ -743,7 +760,7 @@ export function App() {
         }}
       >
         {/* ONE menu (owner 08-25, 09-26): the Clemmy mark is its handle. */}
-        <NavigationMenuButton brand />
+        <NavigationMenuButton />
         <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
           <span class="title-text">{TAB_TITLES[tab]}</span>
           {tab === 'inbox' && needsYou.show ? (
@@ -848,6 +865,7 @@ export function App() {
           <button class="drawer-scrim" type="button" tabIndex={drawerClosing ? -1 : 0} aria-label="Close menu" onClick={() => closeDrawer()} />
           <aside
             ref={drawerRef}
+            tabIndex={-1}
             class="drawer"
             onTouchStart={(event) => {
               const t = event.touches[0];
@@ -880,7 +898,7 @@ export function App() {
               <button class="drawer-close" type="button" aria-label="Close menu" onClick={() => closeDrawer()}>×</button>
             </div>
             <nav class="drawer-nav" aria-label="Sections">
-              {PRIMARY_TABS.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
+              {MENU_PLACES.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
                 <button
                   key={t.id}
                   class="drawer-item"
@@ -1032,9 +1050,9 @@ export function App() {
                 goToChat({ agentId: agent.id, agentName: agent.name });
               }}
             />
-          ) : tab === 'workflows' ? <Workflows />
+          ) : tab === 'workflows' ? <Workflows onAsk={(draft) => goToChat({ draft })} />
             : tab === 'spaces' ? (
-              <Workspaces onOpenNeedsYou={() => navigateTo('inbox')} initialOpenId={workspaceId} onOpenChange={selectWorkspace} />
+              <Workspaces onOpenNeedsYou={() => navigateTo('inbox')} initialOpenId={workspaceId} onOpenChange={selectWorkspace} onAsk={(draft) => goToChat({ draft })} />
             )
             : tab === 'memory' ? <Memory />
             : tab === 'settings' ? (
@@ -1073,6 +1091,21 @@ export function App() {
       </main>
 
       {capsuleShown ? <AskCapsule onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })} /> : null}
+
+      {/* A screen with its own back button (a conversation, a Space, a run)
+          is full screen; the places return with the list it came from. */}
+      {detailHeaderOwned ? null : (
+        <TabBar
+          places={TAB_BAR_PLACES.map((id) => TABS.find((t) => t.id === id)!)}
+          current={tab}
+          currentInMenu={!TAB_BAR_PLACES.includes(tab)}
+          menuOpen={drawerOpen}
+          badge={needsYou.show ? { place: 'inbox', text: needsYou.badgeText, label: needsYou.badgeAriaLabel, stale: needsYou.stale } : null}
+          onSelect={(id) => navigateTo(id)}
+          onReselect={() => document.querySelector<HTMLElement>('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' })}
+          onMenu={openDrawer}
+        />
+      )}
     </MobileNavigationProvider>
   );
 }
@@ -1119,6 +1152,9 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
 const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'chats', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
+/** On a phone the four used most sit in the tab bar (owner 10-23); More opens the menu with the rest. */
+const TAB_BAR_PLACES: ReadonlyArray<Tab> = ['home', 'chats', 'inbox', 'spaces'];
+const MENU_PLACES: ReadonlyArray<Tab> = PRIMARY_TABS.filter((id) => !TAB_BAR_PLACES.includes(id));
 // Recents remain shortcuts; Chats is also a first-class section.
 const QUIET_TABS: ReadonlyArray<Tab> = ['activity'];
 

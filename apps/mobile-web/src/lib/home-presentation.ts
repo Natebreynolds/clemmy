@@ -200,13 +200,15 @@ export function homeLead(facts: HomeLeadFacts): HomeLead {
   if (answerable > 0) {
     // The remainder is disclosed, but the HEADLINE only ever counts rows this
     // screen renders. 86 over three rows is the lie; "3 … 83 more there" isn't.
+    // The remainder is its own door ("83 more in Needs you ›"): one line that
+    // says the number and takes you there, not a sentence and then a link.
     const elsewhere = facts.needsYouCountKnown ? Math.max(0, counted - answerable) : 0;
     return {
       tone: 'answer',
       headline: answerable === 1 ? 'One thing needs your answer' : `${answerable} things need your answer`,
-      detail: elsewhere > 0 ? `${elsewhere} more in Needs you` : note,
+      detail: note,
       asOf,
-      action: elsewhere > 0 ? OPEN_NEEDS_YOU : null,
+      action: elsewhere > 0 ? { label: `${elsewhere} more in Needs you`, target: 'inbox' } : null,
     };
   }
 

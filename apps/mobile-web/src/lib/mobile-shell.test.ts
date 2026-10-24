@@ -36,30 +36,38 @@ test('index.html status bar and theme-color match the light chrome', () => {
 });
 
 /**
- * Owner directive 2026-08-25: "more full screen. No buttons floating at the
- * bottom to navigate. Every menu item should be clean left hand side
- * collapsing menu like a premium iOS app." The six sections live in a left
- * slide-in drawer; the bottom dock is DELETED, not hidden, and content gets
- * the full height back.
+ * Owner 2026-10-23 (replacing the 08-25 menu-only phone): "I need Clem to feel
+ * more premium and put together and easier to navigate on mobile" — chosen:
+ * bottom tabs + menu. Today, Chats, Needs you and Spaces sit in a floating tab
+ * bar; More opens the left menu with everything else. A screen with its own
+ * back button stays full screen, and the bar steps aside for the keyboard.
  */
-test('navigation is a left drawer — the bottom dock is gone from code and styles', () => {
+test('a phone gets four places and More in a tab bar that leaves detail screens and the keyboard alone', () => {
   const app = read('../app.tsx');
-  assert.doesNotMatch(app, /class="dock"|dock-icon|dock-label|dock-badge/,
-    'the dock must be deleted, not hidden');
-  const css = read('../styles.css');
-  assert.doesNotMatch(css, /--dock-height|\.dock\b|\.dock-/,
-    'dock styles and the reserved-height token must be deleted');
-  // Full-screen content: the main scroll area clears only the safe area,
-  // never a reserved dock band.
-  assert.match(css, /\.app-main \{[\s\S]*?env\(safe-area-inset-bottom\)/);
+  assert.match(app, /const TAB_BAR_PLACES: ReadonlyArray<Tab> = \['home', 'chats', 'inbox', 'spaces'\];/);
+  assert.match(app, /const MENU_PLACES: ReadonlyArray<Tab> = PRIMARY_TABS\.filter\(\(id\) => !TAB_BAR_PLACES\.includes\(id\)\);/);
+  assert.match(app, /\{detailHeaderOwned \? null : \(\s*<TabBar/, 'a detail screen owns the full height');
+  assert.match(app, /onMenu=\{openDrawer\}/, 'More opens the one menu');
+  const bar = read('../components/TabBar.tsx');
+  assert.match(bar, /aria-current=\{here \? 'page' : undefined\}/);
+  assert.match(bar, /aria-haspopup="dialog"[\s\S]*?aria-expanded=\{menuOpen\}/);
+  const css = read('../adaptive-layout.css');
+  assert.match(css, /@media \(max-width: 879\.98px\) \{[\s\S]*?:root\[data-keyboard-up\] \.tab-bar \{ display: none; \}/);
+  assert.match(css, /:root:not\(\[data-keyboard-up\]\) #app:has\(> \.tab-bar\) \{\s*--mobile-dock-gap: calc\(var\(--tab-bar-clearance\) \+ 10px\);/,
+    'the ask capsule rests on the bar, then on the keyboard');
+  // The old dock stays deleted: the bar is a new, phone-only surface.
+  assert.doesNotMatch(app, /class="dock"|dock-icon|dock-label|dock-badge/);
+  const styles = read('../styles.css');
+  assert.doesNotMatch(styles, /--dock-height|\.dock\b|\.dock-/);
+  assert.match(styles, /\.app-main \{[\s\S]*?env\(safe-area-inset-bottom\)/);
 });
 
 test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
   const app = read('../app.tsx');
   // ONE menu (owner 2026-08-25, 2026-09-26): the Clemmy mark opens the drawer
-  // with a real touch target, a rightward swipe across the header opens it too,
-  // and the title is words. The title-tap sheet is gone.
-  assert.match(app, /<NavigationMenuButton brand\s*\/>/);
+  // with a real touch target (as More does), a rightward swipe across the
+  // header opens it too, and the title is words. The title-tap sheet is gone.
+  assert.match(app, /<NavigationMenuButton\s*\/>/);
   const menuButton = read('../components/NavigationMenuButton.tsx');
   assert.match(menuButton, /aria-label="Open navigation"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/);
   assert.match(app, /clientX - sw\.x > 48 && !drawerOpen\) openDrawer\(\)/);

@@ -122,7 +122,6 @@ import type { ComposeMode } from '../lib/compose-route';
 import { reportWidgetLanding, widgetNavigationFromSearch } from '../lib/widget-bridge';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
@@ -856,7 +855,6 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         <button ref={optionsTrigger} type="button" class="chat-options-trigger" aria-label="Conversation options" aria-haspopup="dialog" aria-expanded={conversationPanel !== null} onClick={() => { haptic('light'); setConversationPanel('options'); }}>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
         </button>
-        <NavigationMenuButton />
       </div>
       {connection === 'recovering' || connection === 'connecting' ? (
         <p class="chat-connection-status" role="status">Reconnecting…</p>
@@ -956,8 +954,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
         {error ? <div class="global-error">{error}{workflowScoped && !workflowHistoryReady ? <button type="button" class="btn-quiet" onClick={() => retryHistory.current?.()}>Try again</button> : null}</div> : null}
         {(workflowScoped && !workflowHistoryReady) || messages.length === 0 ? (
           <div class="inbox-empty">
-            {workflowScoped ? !workflowHistoryReady ? error ? 'The conversation could not be loaded.' : 'Loading conversation…' : 'Ask a question or describe a change to this workflow.'
-              : initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'Empty session.'
+            {workflowScoped ? !workflowHistoryReady ? error ? 'The conversation could not be loaded.' : 'Loading conversation…' : 'Ask a question or describe a change to this automation.'
+              : initialSessionId && !snapshot ? 'Loading…' : snapshot?.sessionId ? 'No messages yet. Type below to pick it up.'
               : agent?.name ? `Type a message to start a chat with ${agent.name}.` : 'Type a message to start a new chat.'}
           </div>
         ) : null}

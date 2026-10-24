@@ -2,26 +2,24 @@
  * "Memory at work" — the card at the top of the phone's Memory screen.
  *
  * It answers the owner's question at a glance: is Clem working on my memory
- * right now, with which model, and what has it done today. The headline and
- * the pulse move only while a job is running in the daemon; the model row
- * opens the same picker Settings › Models uses; the latest runs can be undone
- * in place. Everything else is one tap away in the full view.
+ * right now, with which model, and what it did last. The headline and the
+ * pulse move only while a job is running in the daemon; the model row opens
+ * the same picker Settings › Models uses; the latest runs can be undone in
+ * place. Today's counts and the hour strip are one tap away in the full view,
+ * so the owner's memories start on the first screen of a phone.
  */
 import type { MemoryWorkUndoResult } from '../lib/api';
 import {
   MEMORY_WORK_CARD_EVENTS,
-  hourStrip,
   memoryEventView,
   memoryModelView,
   memoryWorkStatus,
-  pipelineView,
   recentEmptyText,
   serverNow,
-  todaySinceText,
   type MemoryWorkRead,
   type ModelNamer,
 } from '../lib/memory-work';
-import { EventRow, HourStripView, ModelRow, Pipeline, StatusLine } from './MemoryWorkParts';
+import { EventRow, ModelRow, StatusLine } from './MemoryWorkParts';
 
 export function MemoryWorkCard({ read, loading, modelName, onChangeModel, onOpen, onUndo, onRetry }: {
   read: MemoryWorkRead;
@@ -48,7 +46,6 @@ export function MemoryWorkCard({ read, loading, modelName, onChangeModel, onOpen
     ? snapshot.recent.slice(0, MEMORY_WORK_CARD_EVENTS).map((event) => memoryEventView(event, modelName, now))
     : [];
   const empty = recentEmptyText(snapshot);
-  const since = todaySinceText(snapshot, now);
 
   return (
     <section class={`card mw-card${status.pulse ? ' is-working' : ''}`} aria-labelledby="mw-card-title">
@@ -67,11 +64,6 @@ export function MemoryWorkCard({ read, loading, modelName, onChangeModel, onOpen
       {snapshot ? (
         <>
           {model ? <ModelRow view={model} onChange={onChangeModel} /> : null}
-          <div class="mw-block">
-            <p class="mw-label">{since ? `Today · ${since}` : 'Today'}</p>
-            <Pipeline stages={pipelineView(snapshot, status.pulse)} />
-          </div>
-          <HourStripView strip={hourStrip(snapshot, now)} />
           {latest.length > 0 ? (
             <ul class="mw-events mw-events-compact" aria-label="Latest">
               {latest.map((view) => <EventRow key={view.id} view={view} compact onUndo={onUndo} />)}

@@ -66,9 +66,10 @@ import { haptic } from '../lib/native-bridge';
 type FactKindFilter = 'all' | MemoryFact['kind'];
 const KIND_OPTIONS: { value: FactKindFilter; label: string }[] = [
   { value: 'all', label: 'All' },
-  { value: 'user', label: 'User' },
-  { value: 'project', label: 'Project' },
-  { value: 'feedback', label: 'Feedback' },
+  // The desktop's words for the same kinds, so both screens read alike.
+  { value: 'user', label: 'About you' },
+  { value: 'project', label: 'Projects' },
+  { value: 'feedback', label: 'Preferences' },
   { value: 'reference', label: 'Reference' },
 ];
 

@@ -34,7 +34,6 @@ import {
 import { getRun, runDetailPath } from '../lib/api';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
@@ -112,7 +111,6 @@ export function Run({ sessionId, onBack }: Props) {
       <div class="chat-header">
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{run?.title || 'Run'}</h2>
-        <NavigationMenuButton />
       </div>
       <div class="workflow-detail-body">
         {loading && !run ? <div class="skeleton-stack" aria-hidden="true"><i /><i /></div> : null}

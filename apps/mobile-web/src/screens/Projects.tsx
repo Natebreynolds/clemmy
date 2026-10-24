@@ -23,6 +23,7 @@ import { inWords, refusalWords } from '../lib/project-words';
 import { useScreenData } from '../lib/use-screen-data';
 import type { ChatHandoff } from './Chats';
 import { Project } from './Project';
+import { EmptyState } from '../components/EmptyState';
 
 interface Props {
   /** A project addressed by the URL: a link, a reload, or another screen. */
@@ -102,13 +103,11 @@ export function Projects({ initialProjectId, onProjectChange, onOpenChat, onOpen
       ) : null}
 
       {!loading && !error && !offline && active.length === 0 ? (
-        <div class="empty">
-          <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
-          <p class="empty-title">No projects yet</p>
-          <p class="empty-body">
-            A project keeps one body of work together: what it is for, who answers for what, and every conversation about it.
-          </p>
-        </div>
+        <EmptyState
+          title="No projects yet"
+          body="A project keeps one body of work together: what it is for, who answers for what, and every conversation about it."
+          action={{ label: 'New project', onClick: () => setCreating(true) }}
+        />
       ) : null}
 
       <div class="stack">

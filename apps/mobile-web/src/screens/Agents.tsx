@@ -14,6 +14,7 @@ import { haptic } from '../lib/native-bridge';
 import { useScreenData } from '../lib/use-screen-data';
 import { AgentDetail } from './AgentDetail';
 import { usePendingCommit } from '../lib/pending-commit';
+import { EmptyState } from '../components/EmptyState';
 
 /**
  * Named agents — a person's own standing helpers.
@@ -111,10 +112,11 @@ export function Agents({ onMessage, initialAgentId, onAgentChange, onOpenProject
   return (
     <div class="screen-pad">
       {agents.length === 0 ? (
-        <p class="agent-empty">
-          No agents yet. An agent is a name plus the skills and workflows it should reach for
-          first — useful when you ask for the same kind of thing often.
-        </p>
+        <EmptyState
+          title="No agents yet"
+          body="An agent is a name plus the skills and automations it reaches for first, handy when you ask for the same kind of thing often."
+          action={{ label: 'New agent', onClick: () => setEditing('new') }}
+        />
       ) : null}
 
       <ul class="agent-list">

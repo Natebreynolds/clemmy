@@ -47,7 +47,6 @@ import {
 import { listApprovals, type ApprovalRow } from '../lib/api';
 import { Decisions, relativeTime } from '../components/Approvals';
 import { ChatBackButton } from '../components/ChatBackButton';
-import { NavigationMenuButton } from '../components/NavigationMenuButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { DelegatedTaskCard, DelegatedTaskList } from '../components/DelegatedTaskCard';
 import { ProjectPageViewer } from '../components/ProjectPageViewer';
@@ -174,7 +173,6 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
         {project && !editing ? (
           <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('project-details')?.scrollIntoView({ block: 'start' })); }}>Details</button>
         ) : null}
-        <NavigationMenuButton />
       </div>
 
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={Boolean(overview)} note={note} />

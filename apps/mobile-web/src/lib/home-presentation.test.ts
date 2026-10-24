@@ -75,8 +75,9 @@ test('the lead counts the rows on the screen, and discloses the rest as elsewher
   const lead = homeLead(facts({ answerableShown: 3, needsYouCount: LIVE_NEEDS_YOU_COUNT }));
   assert.equal(lead.tone, 'answer');
   assert.equal(lead.headline, '3 things need your answer');
-  assert.equal(lead.detail, '83 more in Needs you');
-  assert.deepEqual(lead.action, { label: 'Open Needs you', target: 'inbox' });
+  assert.equal(lead.detail, '');
+  assert.deepEqual(lead.action, { label: '83 more in Needs you', target: 'inbox' },
+    'the remainder is the door itself, one line instead of a sentence and a link');
   assert.doesNotMatch(lead.headline, /86/, 'the headline may not claim what the screen cannot show');
 });
 
