@@ -802,6 +802,18 @@ test('space_list + space_get read back', async () => {
   assert.match(got, /Dataset history: no retained observations yet/i);
 });
 
+test('space_list says which Spaces need attention and why, so a failing source needs no per-Space read', async () => {
+  const listed = text(await tools.space_list({}));
+  assert.match(listed, /^\d+ workspaces?, \d+ needing attention:/);
+  for (const space of store.spaceStore.list()) {
+    const issues = store.buildSpaceHealthSnapshot(space).issues;
+    const line = listed.split('\n').find((row) => row.startsWith(`- ${space.id} · `)) ?? '';
+    assert.ok(line, `${space.id} is listed`);
+    if (issues.length === 0) assert.doesNotMatch(line, /needs attention/);
+    else assert.ok(line.includes(`needs attention: ${issues[0].slice(0, 40)}`), line);
+  }
+});
+
 test('a missing workspace read returns current locator candidates without substituting or editing their data', async () => {
   const slug = 'harbor-reference';
   await tools.space_save({ slug, title: 'Harbor comparison', view_html: '<html><body>fixture</body></html>',

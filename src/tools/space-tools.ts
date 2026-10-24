@@ -24,7 +24,7 @@ import { listEvents } from '../runtime/harness/eventlog.js';
 import { selectedSpaceReadAccount } from '../spaces/source-account-binding.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
 import {
-  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract,
+  spaceStore, resolveInSpace, isValidSpaceSlug, runnerFilenameError, mergeSpaceContract, buildSpaceHealthSnapshot,
   SPACE_INITIAL_DATA_MAX_BYTES,
   WorkspaceStaticUpdateError,
   SpaceViewChangedError,
@@ -1387,15 +1387,25 @@ export function registerSpaceTools(server: McpServer): void {
 
   server.tool(
     'space_list',
-    'List the user\'s Workspaces (persistent interactive surfaces you built). Returns slug · title · status · #data-sources · last updated.',
+    'List the user\'s Workspaces (persistent interactive surfaces you built). Returns slug · title · status · #data-sources · last updated, and what needs attention on each (a failed or never-run source, one awaiting approval, a missing runner, stale data) — so "which Spaces are failing" needs no per-Space reads.',
     {},
     async () => {
-      const spaces = spaceStore.list();
+      // A listing for the model to read: the same committed manifests, without
+      // a lock per Space. Live 2026-10-24 ("which of my Spaces have data
+      // sources that are failing?"): with no health here the brain opened
+      // Spaces one at a time — 19 space_get, 7 space_list, 67 s — and still
+      // answered "the others haven't all been checked".
+      const spaces = spaceStore.listForView();
       if (spaces.length === 0) return textResult('No workspaces yet. Use space_save to create one.');
-      const lines = spaces.map((s) =>
-        `- ${s.id} · "${s.title}" · ${s.status} · ${s.dataSources.length} source${s.dataSources.length === 1 ? '' : 's'} · updated ${s.updatedAt}`,
-      );
-      return textResult(`${spaces.length} workspace${spaces.length === 1 ? '' : 's'}:\n${lines.join('\n')}`);
+      let needAttention = 0;
+      const lines = spaces.map((s) => {
+        const issues = buildSpaceHealthSnapshot(s).issues.map((issue) => (issue.length > 160 ? `${issue.slice(0, 159)}…` : issue));
+        if (issues.length > 0) needAttention += 1;
+        const health = issues.length === 0 ? ''
+          : ` · needs attention: ${issues.slice(0, 3).join('; ')}${issues.length > 3 ? ` (+${issues.length - 3} more)` : ''}`;
+        return `- ${s.id} · "${s.title}" · ${s.status} · ${s.dataSources.length} source${s.dataSources.length === 1 ? '' : 's'} · updated ${s.updatedAt}${health}`;
+      });
+      return textResult(`${spaces.length} workspace${spaces.length === 1 ? '' : 's'}, ${needAttention} needing attention:\n${lines.join('\n')}`);
     },
   );
 
