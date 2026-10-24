@@ -62,6 +62,7 @@ import type { ChatHandoff } from './screens/Chats';
 import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
 import { useFoldPages } from './lib/fold-pages';
+import { useDisplayRail } from './lib/display-rail';
 import { greetingName } from './lib/greeting';
 import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
@@ -122,6 +123,9 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   // Opened across a fold, the sections and recent chats fill the first page.
   const foldPages = useFoldPages();
+  // A display with a system rail down one side (the Duo's front screen) gets
+  // the places in that rail, like its home screen dock.
+  useDisplayRail();
   const [detailHeaderOwned, setDetailHeaderOwned] = useState(false);
   // 'closing' keeps the drawer mounted through its exit animation — an
   // instant unmount is the one visible tell next to a native drawer.
@@ -1096,7 +1100,7 @@ export function App() {
           current={tab}
           currentInMenu={!TAB_BAR_PLACES.includes(tab)}
           menuOpen={drawerOpen}
-          badge={needsYou.show ? { place: 'inbox', text: needsYou.drawerBadgeText, label: needsYou.badgeAriaLabel, stale: needsYou.stale } : null}
+          badge={needsYou.show ? { place: 'inbox', text: needsYou.badgeText, label: needsYou.badgeAriaLabel, stale: needsYou.stale } : null}
           onSelect={(id) => navigateTo(id)}
           onReselect={() => document.querySelector<HTMLElement>('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' })}
           onMenu={openDrawer}
