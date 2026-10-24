@@ -119,7 +119,7 @@ test('in a clipped record list an opaque id is shown whole or not at all, never 
     subject: `Your flight ${i} is confirmed`,
     from: { emailAddress: { address: 'no-reply@example.test', name: 'Travel' } },
     bodyPreview: 'Trip details follow. '.repeat(14),
-    webLink: `https://outlook.example.test/owa/?ItemID=${id(i)}&exvsurl=1&viewmodel=ReadMessageItem`,
+    webLink: `https://mail.example.test/read?ItemID=${id(i)}&exvsurl=1&viewmodel=ReadMessageItem`,
     id: id(i),
   }));
   for (const maxChars of [2000, 3900, 8000]) {

@@ -205,9 +205,9 @@ export function saveUserProfile(patch: RawProfile): UserProfile {
 
 /**
  * A recorded moment on the owner's clock ("Sat, Oct 24, 8:00 AM PDT"), so a
- * tool result never hands the model a UTC stamp to convert: a converted
- * "15:00Z" was reported to the owner as "3:00 a.m.". The profile timezone
- * wins, then the machine's; an unreadable value is returned as given.
+ * tool result never hands the model a UTC stamp to convert, where a wrong
+ * offset becomes a wrong time told to the owner. The profile timezone wins,
+ * then the machine's; an unreadable value is returned as given.
  */
 export function ownerLocalTimeLabel(value: unknown, profile?: UserProfile): string {
   const raw = typeof value === 'string' || typeof value === 'number' ? value : value instanceof Date ? value.getTime() : '';

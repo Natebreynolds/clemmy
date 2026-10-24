@@ -94,8 +94,8 @@ function redactSecretAssignments(input: string): string {
     (match, key: string, separator: string, value: string) => {
       if (!isSecretLikeKey(key)) return match;
       // The bare word "token" is also a parser's word: "unexpected token:
-      // WEEK" in a query error names the input to fix, not a credential, and
-      // hiding it leaves the brain nothing to correct. Only a bare
+      // <keyword>" in a query error names the input to fix, not a
+      // credential, and hiding it leaves the brain nothing to correct. Only a bare
       // token/tokens key looks at its value; every named credential field
       // (authToken, access_token, password, secret …) stays redacted whatever
       // the value looks like.
@@ -106,7 +106,7 @@ function redactSecretAssignments(input: string): string {
 }
 
 /** A value a credential could be: long, or letters mixed with digits, or a
- *  scheme/prefixed token. A parser token (WEEK, FROM, ')') is none of these. */
+ *  scheme/prefixed token. A parser token (a keyword, a bracket) is none of these. */
 function credentialShapedValue(raw: string): boolean {
   const value = raw.replace(/^["']|["']$/g, '').trim();
   if (/^(?:Bearer|Basic|Bot)\s/i.test(value)) return true;

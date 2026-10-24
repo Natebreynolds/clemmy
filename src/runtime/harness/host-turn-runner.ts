@@ -8517,9 +8517,9 @@ const runHostTurnBody = async (
       // reported as "may have begun" with a blank effect marker.
       if (providerRepliedWithoutProof(settlement.outcome)) return 'answered_refusal';
       // The same holds for a call the settlement keeps as non-mutating: a
-      // read the provider refused ("404 profile not found") is an answer the
-      // model reads, even when the operation's contract cannot be read as a
-      // plain read because the same tool can also write.
+      // read the provider refused (a record not found, an invalid argument)
+      // is an answer the model reads, even when the operation's contract
+      // cannot be read as a plain read because the same tool can also write.
       if (providerAnsweredNonMutatingCall(settlement, attempt.error)) return 'answered_refusal';
       // A WRITE THAT ENDED WITHOUT ACKNOWLEDGEMENT, where the crossing itself
       // answered (it threw) and proved nothing, goes on under a write freeze:
@@ -12205,7 +12205,7 @@ const runHostTurnBody = async (
           });
           // Only a real correction is told, and it says the call already ran
           // in the repaired form: "use the corrected shape" alone reads as
-          // "send it again", and the same read went out two and three times.
+          // "send it again", and an identical call would go out twice.
           const told = completed.changes.filter((change) => change !== ARGS_JSON_OBJECT_ENCODED);
           if (told.length > 0) {
             const repairLine = `Host repair for call ${call.callId}: ${told.join('; ').slice(0, 300)}. `

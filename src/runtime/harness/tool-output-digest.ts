@@ -245,8 +245,8 @@ function valueLooksOpaque(serialized: string): boolean {
 /**
  * An opaque handle a follow-up call needs whole: a record id, a message id, a
  * page token. Judged by the value's shape, not its key: one unbroken run of
- * id characters with a digit in it. Clipped, it reads "…[152 chars total]",
- * which no next call can use, so it is kept whole or left out. Its rank is
+ * id characters with a digit in it. Clipped to a prefix and a length marker,
+ * no next call can use it, so it is kept whole or left out. Its rank is
  * unchanged: the fields that answer still come first in a tight view.
  */
 function opaqueHandle(value: unknown): value is string {
@@ -571,8 +571,8 @@ export function compactStructuredJsonToolOutput(
 
   const maxChars = options.maxChars ?? 4000;
   const callId = options.callId ?? null;
-  // Also the brain's next step: the readers alone, as data, did not stop a
-  // re-sent read that only returns this same clipped view.
+  // Also the brain's next step: the readers alone, as data, do not stop a
+  // re-sent read, which only returns this same clipped view.
   const projectionSemantics = 'Omitted fields and array tails are unshown, not null or empty; prefix order kept. All of it is stored: read on via recovery, not by re-sending the call.';
   const fullMetadata = {
     kind: 'structured_projection_v1',

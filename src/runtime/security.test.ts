@@ -68,7 +68,7 @@ test('secret-key classification and assignment redaction cover camelCase credent
 });
 
 test('a parser\'s "unexpected token" stays readable while credential-shaped token values are redacted', () => {
-  const soql = "MALFORMED_QUERY: LIKE '%Brett%' AND ActivityDate = THIS WEEK ORDER BY ActivityDate ^ ERROR at Row:1:Column:164 unexpected token: WEEK";
+  const soql = "MALFORMED_QUERY: LIKE '%Fixture%' AND ActivityDate = THIS WEEK ORDER BY ActivityDate ^ ERROR at Row:1:Column:164 unexpected token: WEEK";
   assert.equal(redactSensitiveText(soql), soql);
   assert.match(redactSensitiveText("SyntaxError: Unexpected token: ')'"), /Unexpected token: '\)'/);
   for (const secret of ['eyJhbGciOiJIUzI1NiJ9abcdef', 'ghp_abcdefghij1234567890', 'abc12345xyz', 'Bearer abcdefghijklmnop']) {
