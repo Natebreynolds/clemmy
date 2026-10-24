@@ -243,6 +243,28 @@ test('workflow display retains unknown parents, newer activity and paused or rec
   }
 });
 
+test('default workflow display rereads changed, missing, paused and newly recovery-owned rows', () => {
+  resetEventLog(); mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const now = Date.now() + 1_000;
+  for (const change of ['missing', 'kind', 'paused', 'recovery'] as const) {
+    const runId = `display-current-row-${change}`;
+    const metadata = { workflowRunId: runId, workflowName: 'display-fixture', stepId: 'read' };
+    const stale = createSession({ kind: 'workflow', metadata });
+    appendEvent({ sessionId: stale.id, turn: 1, role: 'tool', type: 'tool_returned', data: { tool: 'read_file', ok: true } });
+    writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({ id: runId, workflow: 'display-fixture',
+      status: 'completed', finishedAt: new Date(now).toISOString(), stepOutputs: { read: { ok: true } } }));
+    assert.equal(isIgnorableActiveWorkSession(stale, { nowMs: now }), true);
+    const db = openEventLog();
+    if (change === 'missing') db.prepare('DELETE FROM sessions WHERE id = ?').run(stale.id);
+    else if (change === 'kind') db.prepare("UPDATE sessions SET kind = 'execution' WHERE id = ?").run(stale.id);
+    else if (change === 'paused') db.prepare("UPDATE sessions SET status = 'paused' WHERE id = ?").run(stale.id);
+    else db.prepare('UPDATE sessions SET metadata_json = ? WHERE id = ?').run(JSON.stringify({
+      ...metadata, __host_recovery_owner: { sourceUserSeq: 1 },
+    }), stale.id);
+    assert.equal(isIgnorableActiveWorkSession(stale, { nowMs: now }), false, change);
+  }
+});
+
 /** Real isolated host call/settlement/reservation producers, with no provider.
  * Once their authority is closed, only the disposable session KIND is changed
  * to exercise the workflow DISPLAY classifier. This is not workflow execution

@@ -5,6 +5,8 @@ import type { SessionRow, EventRow, EventType, SessionStatus } from './eventlog.
 type ReconcileDb = Database.Database;
 export interface ActiveWorkSessionReader {
   database(): Database.Database;
+  /** Reuse raw metadata only from the same SQLite read transaction; reread kind/status. */
+  readCurrentSession?: (sessionId: string) => { kind: string; status: string; metadata_json: string } | undefined;
   listEvents: typeof import('./eventlog.js').listEvents;
   listEventsAtSequences: typeof import('./eventlog.js').listEventsAtSequences;
   workflowRunInventoryEntry: typeof import('../../execution/workflow-run-inventory.js').workflowRunInventoryEntry;
@@ -124,7 +126,7 @@ function isFinishedWorkflowChildForDisplay(session: SessionRow, nowMs: number, r
     // Re-read the exact row so an earlier list snapshot cannot hide a new
     // pause/recovery owner. Workflow child metadata is bounded by the step;
     // arbitrary chat/model history never enters this path.
-    const current = reader.database().prepare(
+    const current = reader.readCurrentSession ? reader.readCurrentSession(session.id) : reader.database().prepare(
       'SELECT kind, status, metadata_json FROM sessions WHERE id = ?',
     ).get(session.id) as { kind: string; status: string; metadata_json: string } | undefined;
     if (!current || current.kind !== 'workflow' || current.status !== 'active') return false;

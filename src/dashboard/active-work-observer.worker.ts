@@ -297,6 +297,14 @@ async function observe(): Promise<void> {
     }));
     const approvals = publicApprovals.filter(row => !grouped.has(row.approvalId)).filter(isFormalApprovalSurface);
     const sessionReader = { database: () => db, listEvents,
+      readCurrentSession: (sessionId: string) => {
+        const retained = sessionMetadata.has(sessionId) ? sessionMetadata.get(sessionId) : undefined;
+        if (retained === undefined) return db.prepare('SELECT kind, status, metadata_json FROM sessions WHERE id = ?')
+          .get(sessionId) as { kind: string; status: string; metadata_json: string } | undefined;
+        const current = db.prepare('SELECT kind, status FROM sessions WHERE id = ?').get(sessionId) as
+          { kind: string; status: string } | undefined;
+        return current ? { ...current, metadata_json: retained.metadata_json as string } : undefined;
+      },
       listEventsAtSequences: (sessionId: string, sequences: readonly number[]) => sequences.length === 0 ? []
         : (db.prepare(`SELECT * FROM events WHERE session_id = ? AND seq IN (${sequences.map(() => '?').join(',')}) ORDER BY seq`).all(sessionId, ...sequences) as RawEventRow[]).map(rowToEvent),
       workflowRunInventoryEntry: (id: string): WorkflowRunInventoryEntry | null => { const value = workflow.get(id + '.json'); return value?.kind === 'record' ? value.entry : null; },
@@ -313,7 +321,9 @@ async function observe(): Promise<void> {
       WHERE kind IN ('workflow','execution','agent') AND status IN ('active','paused') ORDER BY updated_at DESC,id DESC`)
       .all(...retainedMetadataIds) as RawSessionRow[]).map(row => {
         const retained = sessionMetadata.has(row.id) ? sessionMetadata.get(row.id) : undefined;
-        return rowToSession(retained === undefined ? row : { ...row, metadata_json: retained.metadata_json });
+        const hydrated = retained === undefined ? row : { ...row, metadata_json: retained.metadata_json };
+        sessionMetadata.set(row.id, { metadata_json: hydrated.metadata_json });
+        return rowToSession(hydrated);
       }).filter(session => !isIgnorableActiveWorkSessionRead(session, { pendingSessionIds, nowMs: identity.requestedAt }, sessionReader));
     const tasks = [...background.values()].filter(task => !task.archived).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .filter(task => task.status === 'running' || task.status === 'pending' || task.status === 'awaiting_approval');

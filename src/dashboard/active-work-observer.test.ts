@@ -123,6 +123,31 @@ test('metadata reuse preserves malformed holds and observes changed bytes on the
   assert.equal(cleared.activeSessions, 1, 'compatibility membership is independent of the former checkpoint');
 });
 
+for (const status of ['running', 'completed'] as const) test(`workflow display reuses large exact metadata for a ${status} parent`, async () => {
+  const runId = 'controlled-large-workflow-parent';
+  const outputs: Record<string, { ok: boolean }> = {};
+  for (let index = 0; index < 10; index++) {
+    const stepId = `read-${index}`; outputs[stepId] = { ok: true };
+    const child = events.createSession({ kind: 'workflow', metadata: { workflowRunId: runId,
+      workflowName: 'controlled-large-workflow', stepId, controlledPrivateMetadata: 'x'.repeat(1_300_000) } });
+    events.appendEvent({ sessionId: child.id, turn: 1, role: 'tool', type: 'tool_returned',
+      data: { tool: 'read_file', ok: true } });
+  }
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({ id: runId,
+    workflow: 'controlled-large-workflow', status, finishedAt: new Date().toISOString(), stepOutputs: outputs }));
+  const canonical = readInstallQuiescence();
+  assert.equal(canonical.quiescence.state, status === 'running' ? 'work_pending' : 'quiescent');
+  const file = path.join(home, 'state', 'harness.db'); const before = digest(file);
+  const result = await observer().read();
+  assert.equal(result.quiescence.state, canonical.quiescence.state, JSON.stringify(result.quiescence.issues));
+  assert.deepEqual(result.currentWork, canonical.currentWork);
+  assert.deepEqual(result.quiescence.issues, canonical.quiescence.issues);
+  assert.equal(result.activeSessions, status === 'running' ? 10 : 0);
+  assert.equal(result.items.length, result.activeSessions);
+  assert.equal(JSON.stringify(result).includes('controlledPrivateMetadata'), false);
+  assert.equal(digest(file), before);
+});
+
 test('new requests during an observation await a fresh followup and completed idle is never reused', async () => {
   const service = observer();
   const first = service.read();
