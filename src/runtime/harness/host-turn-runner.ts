@@ -1078,7 +1078,8 @@ import {
 import { inspectConversationProtocol } from './conversation-protocol.js';
 
 /** How Clem answers an owner's no to a waiting card. */
-const DECLINED_ANSWER_NOTE = 'The owner declined, so nothing ran and things stay as they were. Answer them in a line or two in plain words; '
+const DECLINED_ANSWER_NOTE = 'The owner declined, so nothing ran and things stay as they were. That is their decision, not a problem to repair: '
+  + 'do not retry or propose the same action again unless they ask. Answer them in a line or two in plain words; '
   + 'do not describe the earlier attempts, refusals or the approval step.';
 const HOST_READ_ONLY_SURFACE_VERSION = 'configured_harness_function_surface_v1';
 const HOST_PREPARATION_REPAIR_DIAGNOSTIC_MAX_CHARS = 8_192;

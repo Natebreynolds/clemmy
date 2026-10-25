@@ -668,6 +668,8 @@ for (const change of ['rejected', 'edited-args', 'wrong-approval', 'expired'] as
   if (change === 'rejected') {
     assert.ok(JSON.stringify(fixture.modelInputs.at(-1)).includes('The owner declined, so nothing ran'),
       'the model hears how to answer a no: a plain line, not the approval mechanics');
+    assert.ok(JSON.stringify(fixture.modelInputs.at(-1)).includes('do not retry or propose the same action again unless they ask'),
+      'a no is the owner\'s decision, not a refusal to repair (live: a moved-on "keep it" got a second card for the same delete)');
   }
 });
 
