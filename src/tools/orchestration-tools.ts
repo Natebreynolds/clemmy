@@ -2730,12 +2730,10 @@ export function registerOrchestrationTools(server: McpServer): void {
     {
       name: z.string().min(1).optional().describe('One workflow to delete.'),
       names: z.array(z.string().min(1)).min(1).max(20).optional().describe('Several workflows the owner named in one request.'),
-      // The owner's card is the confirmation; an omitted confirm means the
-      // same and false still refuses.
-      confirm: z.boolean().optional().describe('Omit or true; false refuses. The owner confirms on the card.'),
+      confirm: z.boolean().describe('Must be true to proceed. Guard against accidental deletion.'),
     },
     async ({ name, names, confirm }) => {
-      if (confirm === false) return textResult('Refusing to delete: confirm was false.');
+      if (!confirm) return textResult('Refusing to delete: pass confirm=true.');
       const targets = [...new Set([...(name ? [name] : []), ...(names ?? [])].map((value) => value.trim()).filter(Boolean))];
       if (targets.length === 0) return textResult('Name the workflow to delete (name, or names for several). Nothing was deleted.');
       const files = listWorkflowFiles();

@@ -1168,13 +1168,3 @@ test('a published local requirement whose arguments miss its mode is told the fi
   assert.match(describeLocalSafeModeMismatch(alternatives, { mode: 'overwrite' }) ?? '', /append: true .* — or — mode: "append"/);
   assert.equal(describeLocalSafeModeMismatch({ safeMode: null } as never, { anything: 1 }), null);
 });
-
-test('a workflow delete without confirm is the confirmed delete; the owner\'s card is the confirmation', async () => {
-  const deletion = await local.observeCurrentLocalPlanningDefinition({ name: 'workflow_delete', carrier: 'work_call' });
-  assert.equal(deletion.ok, true, deletion.ok ? '' : deletion.reason);
-  if (!deletion.ok) return;
-  const definition = deletion.definition;
-  assert.equal(local.localPlanningArgumentsMatch(definition, { names: ['Fixture A', 'Fixture B'] }), true, 'confirm omitted');
-  assert.equal(local.localPlanningArgumentsMatch(definition, { name: 'Fixture A', confirm: true }), true);
-  assert.equal(local.localPlanningArgumentsMatch(definition, { name: 'Fixture A', confirm: false }), false);
-});
