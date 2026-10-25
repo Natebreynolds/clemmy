@@ -10,6 +10,7 @@ import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
 import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
 import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { abbreviatedArgumentNote, abbreviatedArguments } from './abbreviated-argument.js';
+import { PAGING_NOTE_FROM, pagingRunLength, pagingRunNote } from './paging-run.js';
 import { argumentCorrectionRepairLine, repairWithArgumentCorrections } from './argument-correction-repair.js';
 import { ARGUMENT_CORRECTION_APPLIED, loadArgumentCorrections } from '../../memory/argument-corrections-store.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
@@ -4201,6 +4202,8 @@ const runHostTurnBody = async (
     });
   };
   let dispatchStreakCursor = history.length;
+  // Where this turn's own calls begin in the history.
+  const turnHistoryStart = history.length;
   const journalHostGuide = (kind: string, data: Record<string, unknown>): void => {
     if (!hostProduction) return;
     try {
@@ -12272,6 +12275,42 @@ const runHostTurnBody = async (
             if (note) {
               journalHostGuide('abbreviated_argument', { callId: call.callId });
               pendingHostModelDirective = [pendingHostModelDirective, note].filter(Boolean).join('\n');
+            }
+          } catch { /* a note only; the call goes as written */ }
+        }
+        // The same list read page after page: from the third page, the model
+        // hears what paging costs and that a total comes from an operation
+        // that returns it.
+        if (hostProduction) {
+          try {
+            const current = parsedArgs(argumentsJson);
+            const identity = unwrapRuntimeEffectiveToolIdentity(call.name, current);
+            const operation = identity.toolName?.trim() ?? '';
+            if (operation && identity.args && typeof identity.args === 'object' && !Array.isArray(identity.args)
+              && classifyRuntimeToolEffect(call.name, current).effect === 'read') {
+              const turnItems = (history as unknown as Array<Record<string, unknown>>).slice(Math.min(turnHistoryStart, history.length));
+              const earlier = turnItems.flatMap((row) => {
+                if (row.type !== 'function_call' || typeof row.name !== 'string' || row.callId === call.callId) return [];
+                const prior = unwrapRuntimeEffectiveToolIdentity(row.name, parsedArgs(typeof row.arguments === 'string' ? row.arguments : JSON.stringify(row.arguments ?? {})));
+                return prior.toolName && prior.args && typeof prior.args === 'object' && !Array.isArray(prior.args)
+                  ? [{ operation: prior.toolName.trim(), args: prior.args as Record<string, unknown> }] : [];
+              });
+              if (earlier.length >= PAGING_NOTE_FROM - 1) {
+                const sessionId = exactHostIdentity().sessionId;
+                const texts = turnItems
+                  .filter((row) => row.type === 'function_call_result' && typeof row.callId === 'string')
+                  .flatMap((row) => {
+                    const output = row.output as { text?: unknown } | string | undefined;
+                    const shown = typeof output === 'string' ? output : typeof output?.text === 'string' ? output.text : '';
+                    return [shown, getToolOutput(sessionId, String(row.callId))?.output ?? ''];
+                  });
+                const pages = pagingRunLength(earlier, { operation, args: identity.args as Record<string, unknown> },
+                  (value) => texts.some((text) => text.includes(value)));
+                if (pages >= PAGING_NOTE_FROM) {
+                  journalHostGuide('paging_run', { callId: call.callId, operation, pages });
+                  pendingHostModelDirective = [pendingHostModelDirective, pagingRunNote(call.callId, operation, pages)].filter(Boolean).join('\n');
+                }
+              }
             }
           } catch { /* a note only; the call goes as written */ }
         }
