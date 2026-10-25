@@ -98,7 +98,7 @@ function isAcquiredLiveReadCandidate(
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
-const NO_CONNECTED_ACCOUNT_NEXT_STEP = 'No account of this app is connected here, so there is nothing to select and no account_selection to send. Do not search for it again. Ask the owner with ask_user_question; the host makes that question the Connect card for this app, and this same task continues once it is connected.';
+const NO_CONNECTED_ACCOUNT_NEXT_STEP = 'No account of this app is connected here, so there is nothing to select and no account_selection to send. Do not search for it again. Ask the owner with ask_user_question, purpose "connection", in your own words; the host adds the Connect button for this app, and this same task continues once it is connected.';
 const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
 const ACCOUNT_CHECK_PENDING_NOTE = 'its connected account is still being confirmed, and that check finishes before it runs. When you need it, call it with the work_call example on its result; do not search for it again to get a capabilityRef. It has none to cite in plan_task until a later search returns one.';
 /** Same-toolkit operations the host serves today whose names share a word

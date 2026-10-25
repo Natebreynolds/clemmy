@@ -2065,6 +2065,38 @@ test('a connection gap the latest search found still takes over the connection q
   assert.doesNotMatch(String(asked?.data.question), /wrong_app|Le service/, 'model prose with a wrong link never becomes the connection control');
 });
 
+test('a connection question Clem asks as one keeps her words; the host keeps the Connect controls', async () => {
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Connect my notes app so you can read my notes.' } });
+  recordFixtureSearch(sess.id, parent.seq, 'search-notes', 'connect my notes app', 'fixturenotes');
+  const words = 'Your notes app isn\u2019t connected yet. Tap Connect below and sign in, and I\u2019ll pick up right after.';
+  await invokeAskWithArbitration(
+    buildAskUserQuestionTool(),
+    { question: words, options: ['Connect it', 'Not now'], purpose: 'connection' },
+    { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
+  );
+  const asked = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1);
+  assert.equal(asked?.data.question, words, 'her words lead');
+  assert.equal(asked?.data.source, 'host_connection_dependency_projection', 'the Connect control is still the host\u2019s');
+  assert.deepEqual(asked?.data.options, ['I\u2019ve connected Fixturenotes \u2014 continue this same task', 'Pause so I can change this request']);
+  assert.equal(asked?.data.purpose, 'clarification', 'answered like any clarification');
+
+  // Words with a link never stand where the control is.
+  resetEventLog();
+  const linked = createSession({ kind: 'chat' });
+  const linkedParent = appendEvent({ sessionId: linked.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Connect my notes app so you can read my notes.' } });
+  recordFixtureSearch(linked.id, linkedParent.seq, 'search-notes', 'connect my notes app', 'fixturenotes');
+  await invokeAskWithArbitration(
+    buildAskUserQuestionTool(),
+    { question: 'Connect it here: [open](/m/?tab=settings&toolkit=wrong_app)', options: ['Done'], purpose: 'connection' },
+    { sessionId: linked.id, turn: 1, sourceUserSeq: linkedParent.seq },
+  );
+  assert.doesNotMatch(String(listEvents(linked.id, { types: ['awaiting_user_input'] }).at(-1)?.data.question), /wrong_app/);
+});
+
 for (const pinned of [false, true]) test(`fresh CLI alternate ${pinned ? 'preserves a confirmed exact provider pin' : 'keeps Clem’s unrelated question for a generic task'} in actual ask arbitration`, async () => {
   resetEventLog();
   const catalog = await import('../integrations/cli-catalog/catalog.js');

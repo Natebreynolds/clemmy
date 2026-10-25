@@ -591,8 +591,11 @@ type AskUserQuestionCandidate = {
   posted: false;
   question: string;
   options: string[] | null;
-  purpose: 'clarification' | 'approval' | null;
+  purpose: 'clarification' | 'approval' | 'connection' | null;
 };
+
+/** A link in model-written question text: a Markdown link or a URL. */
+const MODEL_LINK = /\]\(|[a-z][a-z0-9+.-]*:\/\//i;
 
 function askUserQuestionCandidate(output: unknown): AskUserQuestionCandidate | null {
   let value = output;
@@ -614,6 +617,7 @@ function askUserQuestionCandidate(output: unknown): AskUserQuestionCandidate | n
       candidate.purpose === null
       || candidate.purpose === 'clarification'
       || candidate.purpose === 'approval'
+      || candidate.purpose === 'connection'
     )
   ) return null;
   return candidate as AskUserQuestionCandidate;
@@ -1270,8 +1274,14 @@ export function userChoiceToolUseBehavior(
     const connectionProjection = sourceUserSeq
       ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq, latestDiscoveryOnly: clemAsked })
       : null;
+    // Clem's own words lead a connection question she asked as one; the host
+    // keeps the controls (its Connect button and continue/pause choices), and
+    // words carrying a link never stand where the control is.
+    const ownConnectionWords = connectionProjection !== null
+      && candidates.length === 1 && candidates[0]!.purpose === 'connection'
+      && rendered.question.trim().length > 0 && !MODEL_LINK.test(rendered.question);
     const publicAsk = connectionProjection
-      ? { question: connectionProjection.question, options: [...connectionProjection.options] }
+      ? { question: ownConnectionWords ? rendered.question : connectionProjection.question, options: [...connectionProjection.options] }
       : rendered;
     const existing = listEvents(sessionId, { types: ['awaiting_user_input'] })
       .find((event) => event.turn === turn && (!sourceUserSeq || event.data.sourceUserSeq === sourceUserSeq));
@@ -1308,7 +1318,8 @@ export function userChoiceToolUseBehavior(
         : {
             question: recoveryProjection.text,
             options: publicAsk.options,
-            purpose,
+            // A connection question is answered like any clarification.
+            purpose: purpose === 'connection' ? 'clarification' : purpose,
             ...(connectionProjection
               ? { source: 'host_connection_dependency_projection' }
               : {}),
@@ -1319,7 +1330,7 @@ export function userChoiceToolUseBehavior(
                   questions: candidates.map((candidate) => ({
                     question: candidate.question,
                     options: candidate.options,
-                    purpose: candidate.purpose,
+                    purpose: candidate.purpose === 'connection' ? 'clarification' : candidate.purpose,
                   })),
                 }
               : {}),
@@ -1726,13 +1737,13 @@ const askUserQuestionParams = z.object({
     .nullable()
     .describe('Pre-canned answers; null if none.'),
   purpose: z
-    .enum(['clarification', 'approval'])
+    .enum(['clarification', 'approval', 'connection'])
     .nullable()
-    .describe('Use "clarification" for a missing fact or choice only the user has; null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
+    .describe('Use "clarification" for a missing fact or choice only the user has; "connection" when asking them to connect an app (the host adds its Connect button); null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
 });
 
 const clarificationQuestionParams = askUserQuestionParams.extend({
-  purpose: z.enum(['clarification']).nullable().describe('Use "clarification" for a missing fact or choice only the user has; null if neither.'),
+  purpose: z.enum(['clarification', 'connection']).nullable().describe('Use "clarification" for a missing fact or choice only the user has; "connection" when asking them to connect an app (the host adds its Connect button); null if neither.'),
 });
 
 export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'legacy_v1') {
