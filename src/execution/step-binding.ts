@@ -43,6 +43,18 @@ function traverse(root: unknown, path: string[]): unknown {
   return cursor;
 }
 
+/** The payload of a tool's successful envelope ({data, successful?, error?}),
+ *  or undefined when the output is not one. */
+function successfulEnvelopePayload(out: unknown): Record<string, unknown> | undefined {
+  if (!out || typeof out !== 'object' || Array.isArray(out)) return undefined;
+  const envelope = out as Record<string, unknown>;
+  const payload = envelope.data;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  if (envelope.successful === false) return undefined;
+  if (envelope.error !== undefined && envelope.error !== null && envelope.error !== '') return undefined;
+  return payload as Record<string, unknown>;
+}
+
 /**
  * Resolve a `from` binding expression against the available sources.
  * Returns undefined when it can't resolve (caller falls back to default).
@@ -76,7 +88,16 @@ export function resolveFrom(
     const out = stepOutputs[id];
     if (out === undefined || out === null) return undefined;
     if (tail === 'output') return out;
-    return traverse(out, tail.slice('output.'.length).split('.'));
+    const path = tail.slice('output.'.length).split('.');
+    const direct = traverse(out, path);
+    if (direct !== undefined) return direct;
+    // A call step's output is the tool's envelope ({data: {...}}); a path the
+    // envelope does not have reads its payload, the way the step's contract
+    // does (live: steps.read.output.content, where the file read answered
+    // {data: {path, content}}).
+    const payload = successfulEnvelopePayload(out);
+    if (!payload || path[0]! in (out as Record<string, unknown>)) return undefined;
+    return traverse(payload, path);
   }
   return undefined;
 }

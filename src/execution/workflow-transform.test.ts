@@ -312,3 +312,14 @@ test('jsonParse of a result that is already JSON data uses it as it is', () => {
   });
   assert.deepEqual(asText, parsedAlready, 'text and data give the same result');
 });
+
+test('a step path the tool envelope does not have reads its successful payload; an envelope that failed does not', () => {
+  const transform = { version: 1, expression: { op: 'jsonParse', value: { op: 'get', from: 'steps.read.output.content' } } };
+  const read = { data: { path: 'fixtures/rows.json', content: '{"rows":[1,2]}' } };
+  assert.deepEqual(executeWorkflowTransform({ transform, inputs: {}, stepOutputs: { read } }), { rows: [1, 2] });
+  assert.deepEqual(
+    executeWorkflowTransform({ transform: { version: 1, expression: { op: 'get', from: 'steps.read.output.data.path' } }, inputs: {}, stepOutputs: { read } }),
+    'fixtures/rows.json', 'a path on the envelope itself reads as written');
+  assert.throws(() => executeWorkflowTransform({ transform, inputs: {}, stepOutputs: { read: { ...read, successful: false } } }), /did not resolve/);
+  assert.throws(() => executeWorkflowTransform({ transform, inputs: {}, stepOutputs: { read: { ...read, error: 'denied' } } }), /did not resolve/);
+});
