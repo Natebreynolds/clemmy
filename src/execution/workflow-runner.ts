@@ -415,6 +415,7 @@ import {
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
 import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
+import { creationTestResultStillCurrent, creationTestReuseAge, readStepsUnchangedSince } from './creation-test-reuse.js';
 import {
   compileWorkflowStepsToGraph,
   toExecutableGraph,
@@ -14892,6 +14893,8 @@ export interface CreationTestStepResult {
   /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
    * creation test can PARK on it like any run instead of only describing it. */
   block?: WorkflowCapabilityBlockedError;
+  /** The earlier creation test whose unchanged result this step reused. */
+  reusedFrom?: { runId: string; finishedAt: string };
 }
 export interface CreationTestResult {
   pass: boolean;
@@ -14935,6 +14938,9 @@ function missingConnectionApps(steps: readonly CreationTestStepResult[]): string
 export function creationTestStepLines(steps: readonly CreationTestStepResult[]): string[] {
   return steps.map((s) => {
     const name = creationTestStepName(s.stepId);
+    if (s.status === 'ok' && s.reusedFrom) {
+      return `- ${name} — returned data in the test ${creationTestReuseAge(s.reusedFrom.finishedAt, Date.now())} ago; unchanged since, so that result was used`;
+    }
     if (s.status === 'ok') return `- ${name} — ${s.emptyAnswer ? 'its source answered: nothing there right now' : 'returned data'}`;
     // The one answerable thing leads with the question itself, indented so
     // the enumerated choices stay readable inside the step list.
@@ -15143,16 +15149,75 @@ async function rehearseWriteCall(step: WorkflowStepInput, ctx: StepExecutionCont
   }
 }
 
+/**
+ * Results this creation test can take from the one that settled just before
+ * it (see creation-test-reuse.ts). Only the newest earlier test is a source,
+ * only when it ran the same workflow code with the same inputs, and never
+ * when the conversation that asked for this test saved a file after that
+ * test began: a script outside the workflow folder may have changed what an
+ * unchanged step does. Each reused result must have been a clean pass.
+ */
+function creationTestReuseSource(input: {
+  workflow: WorkflowDefinition;
+  workflowSlug: string;
+  runId: string;
+  inputs: Record<string, string>;
+  originSessionId?: string;
+}): { runId: string; finishedAt: string; outputs: Map<string, unknown> } | null {
+  const nowMs = Date.now();
+  for (const priorId of listWorkflowRunIds(input.workflowSlug, 8)) {
+    if (priorId === input.runId) continue;
+    const record = readRunRecord(path.join(WORKFLOW_RUNS_DIR, `${priorId}.json`));
+    if (!record || record.status !== 'creation_test' || typeof record.finishedAt !== 'string') continue;
+    if (!creationTestResultStillCurrent(record.finishedAt, nowMs)) return null;
+    const resolved = resolveWorkflowRunDefinitionSnapshot(record.workflowDefinitionSnapshot);
+    if (resolved.status !== 'valid' || !isCatalogWorkflowRunDefinitionSnapshot(resolved.snapshot)) return null;
+    const snapshot = resolved.snapshot;
+    if (snapshot.workflowSlug !== input.workflowSlug || !snapshot.codeRevision
+      || snapshot.codeRevision !== workflowCodeRevisionFingerprint(input.workflow, input.workflowSlug)) return null;
+    const priorInputs = normalizeWorkflowRunInputs({
+      ...Object.fromEntries(Object.entries(snapshot.definition.inputs ?? {}).map(([k, meta]) => [k, meta.default ?? ''])),
+      ...(record.inputs ?? {}),
+    });
+    const sorted = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+    if (sorted(priorInputs) !== sorted(input.inputs)) return null;
+    if (input.originSessionId && listEvents(input.originSessionId, { types: ['deliverable_saved'] })
+      .some((event) => event.createdAt >= snapshot.admittedAt)) return null;
+    const unchanged = readStepsUnchangedSince(snapshot.definition, input.workflow,
+      (step) => !stepLooksMutating(step) && stepSideEffectClass(step) === 'read');
+    if (unchanged.size === 0) return null;
+    const prior = hydrateCompletedOutputArtifacts(computeResumeState(input.workflowSlug, priorId), input.workflowSlug, priorId);
+    const outputs = new Map<string, unknown>();
+    for (const stepId of unchanged) {
+      if (!prior.completedSteps.has(stepId)) continue;
+      const output = prior.completedSteps.get(stepId);
+      const step = input.workflow.steps.find((entry) => entry.id === stepId);
+      const verdict = creationTestVerdict(stepId, output, { directCall: Boolean(step?.call?.tool && !step.forEach) });
+      if (verdict.status === 'ok' && !verdict.emptyAnswer) outputs.set(stepId, output);
+    }
+    return outputs.size > 0 ? { runId: priorId, finishedAt: record.finishedAt, outputs } : null;
+  }
+  return null;
+}
+
 export async function runCreationTest(
   workflow: WorkflowDefinition,
   workflowSlug: string,
   runId: string,
   inputs: Record<string, string>,
   assistant: ClementineAssistant,
-  options: { capabilityResume?: WorkflowCapabilityBlockState } = {},
+  options: { capabilityResume?: WorkflowCapabilityBlockState; originSessionId?: string } = {},
 ): Promise<CreationTestResult> {
   return withWorkflowStepEffectExecutionContext(() => workflow, async () => {
   const stepOutputs: Record<string, unknown> = {};
+  // A resumed test (an answered account question) already has its own
+  // results; reuse is for a fresh test right after another one.
+  let reuse: ReturnType<typeof creationTestReuseSource> = null;
+  if (!options.capabilityResume) {
+    try { reuse = creationTestReuseSource({ workflow, workflowSlug, runId, inputs, originSessionId: options.originSessionId }); }
+    catch { reuse = null; }
+  }
+  const reusedSteps = new Set<string>();
   const forEachFailures: Array<{ stepId: string; itemKey: string; error: string }> = [];
   const qualityAdvisories: WorkflowQualityAdvisory[] = [];
   try { await prepareWorkflowStepEffects(workflow, runId); }
@@ -15274,6 +15339,19 @@ export async function runCreationTest(
           status: 'unverifiable',
           detail: 'verifies a step that was previewed, so its contract cannot be checked until the first real run',
         });
+      } else if (reuse?.outputs.has(step.id) && (step.dependsOn ?? []).every((dep) => reusedSteps.has(dep))) {
+        const out = reuse.outputs.get(step.id);
+        persistAndPublishStepCompletion({
+          workflowSlug,
+          runId,
+          stepId: step.id,
+          output: out,
+          meta: { inheritedFromRunId: reuse.runId, reusedUnchangedInCreationTest: true },
+        });
+        stepOutputs[step.id] = out;
+        reusedSteps.add(step.id);
+        results.push({ ...creationTestVerdict(step.id, out, { directCall: Boolean(step.call?.tool && !step.forEach) }),
+          reusedFrom: { runId: reuse.runId, finishedAt: reuse.finishedAt } });
       } else {
         try {
           const out = await executeStepVerified(step, {
@@ -16229,6 +16307,7 @@ async function processOneRunFile(
       try {
         result = await runCreationTest(workflow.data, workflow.name, run.id, ctInputs, assistant, {
           ...(creationTestResume ? { capabilityResume: creationTestResume } : {}),
+          ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
         });
       } catch (err) {
         if (err instanceof WorkflowRunCancelledError || isWorkflowRunCancelled(run.id)) throw err;

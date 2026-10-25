@@ -360,6 +360,36 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
   ];
 }
 
+/** What one step executes, as an edit's re-smoke and a creation test's
+ * reuse of an earlier test compare it. */
+export function stepExecutionSurface(s: WorkflowStepInput): Record<string, unknown> {
+  return {
+    id: s.id,
+    prompt: s.prompt,
+    project: s.project ?? null,
+    dependsOn: s.dependsOn ?? [],
+    forEach: s.forEach ?? null,
+    forEachNewOnly: s.forEachNewOnly ?? false,
+    subgraph: s.subgraph ?? null,
+    transform: s.transform ?? null,
+    deterministic: s.deterministic ?? null,
+    call: s.call ?? null,
+    allowedTools: s.allowedTools ?? [],
+    usesSkill: s.usesSkill ?? null,
+    inputs: s.inputs ?? null,
+    output: s.output ?? null,
+    requiresApproval: s.requiresApproval ?? false,
+    model: s.model ?? null,
+    intent: s.intent ?? null,
+    tier: s.tier ?? null,
+    useHarness: s.useHarness ?? null,
+    maxTurns: s.maxTurns ?? null,
+    loopUntil: s.loopUntil ?? null,
+    loopSafe: s.loopSafe ?? false,
+    sideEffect: s.sideEffect ?? null,
+  };
+}
+
 /**
  * Re-smoke-on-edit (2026-06-11): does an edit change what the workflow
  * actually EXECUTES? Projects the execution-relevant surface (steps' prompts,
@@ -370,31 +400,7 @@ export function checkSendGate(def: WorkflowDefinition): string[] {
  */
 function executionSurfaceProjection(def: WorkflowDefinition): string {
   return JSON.stringify({
-    steps: (def.steps ?? []).map((s) => ({
-      id: s.id,
-      prompt: s.prompt,
-      project: s.project ?? null,
-      dependsOn: s.dependsOn ?? [],
-      forEach: s.forEach ?? null,
-      forEachNewOnly: s.forEachNewOnly ?? false,
-      subgraph: s.subgraph ?? null,
-      transform: s.transform ?? null,
-      deterministic: s.deterministic ?? null,
-      call: s.call ?? null,
-      allowedTools: s.allowedTools ?? [],
-      usesSkill: s.usesSkill ?? null,
-      inputs: s.inputs ?? null,
-      output: s.output ?? null,
-      requiresApproval: s.requiresApproval ?? false,
-      model: s.model ?? null,
-      intent: s.intent ?? null,
-      tier: s.tier ?? null,
-      useHarness: s.useHarness ?? null,
-      maxTurns: s.maxTurns ?? null,
-      loopUntil: s.loopUntil ?? null,
-      loopSafe: s.loopSafe ?? false,
-      sideEffect: s.sideEffect ?? null,
-    })),
+    steps: (def.steps ?? []).map(stepExecutionSurface),
     project: def.project ?? null,
     allowedTools: def.allowedTools ?? null,
     inputs: def.inputs ?? null,
