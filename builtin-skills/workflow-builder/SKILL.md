@@ -30,6 +30,11 @@ Decide these before calling `workflow_create`:
    - **`call` step:** one exact tool with known arguments, without a reasoning model. Use it for fixed reads and writes; prefer `args_json` (JSON-object text).
    - **`transform` step:** a pure closed JSON expression for supported parsing, filtering, mapping, sorting or aggregation. Use it for deterministic data shaping; it has no tools, files, network or shell. Declare `sideEffect: read` and every upstream dependency.
    - **`prompt` step:** a model that reasons with tools. Use it for judgment, choosing an approach or writing prose. Name the needed discovered tools in `allowedTools`.
+
+   Shapes (a step has no `type`, `kind` or `description` field; `args_json` and `transform` are JSON text):
+   `{"id":"pull","call":{"tool":"<exact operation>","args_json":"{\"top\":5}"},"sideEffect":"read"}`
+   `{"id":"shape","transform":"{\"version\":1,\"expression\":{…}}","dependsOn":["pull"],"sideEffect":"read"}`
+   `{"id":"write_up","prompt":"…","dependsOn":["shape"],"allowedTools":["<tool>"],"sideEffect":"read"}`
 4. **Data flow**: `dependsOn` lists the steps whose output a step needs. Refer to output as `{{steps.<id>.output}}` (add `.path` for a field).
 5. **Per-item work**: `forEach` runs a step once per item of a list. The source can be written `steps.<id>.output[.path]`, `{{steps.<id>.output}}`, `<id>.output`, a bare step id, or `input.<key>`. Inside the step, `{{item}}` is the current item. On a recurring workflow, `forEachNewOnly: true` skips items earlier runs already finished. Structured `call` fan-out supports reads only.
 6. **Trigger**: manual, a schedule (`trigger_schedule` plus `trigger_timezone` in the user's zone), or an event.
