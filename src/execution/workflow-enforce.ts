@@ -10,6 +10,8 @@ import {
 import { LOCAL_MCP_TOOL_NAMES } from '../tools/catalog.js';
 import { registryToolHasNoExactCallContract } from '../tools/tool-registry.js';
 import { unwrapRuntimeEffectiveToolIdentity } from '../runtime/harness/tool-effect.js';
+import { isTrustedComposioGateway } from '../runtime/harness/runtime-tool-identity.js';
+import { normalizeComposioCarrierInput } from '../tools/composio-carrier.js';
 import { operationIdentity } from '../tools/operation-name-identity.js';
 import { collectRequiredWorkflowInputs, COMMON_WORKFLOW_INPUT_KEYS } from './workflow-inputs.js';
 import { listToolChoices } from '../memory/tool-choice-store.js';
@@ -635,7 +637,18 @@ export function autoRepairWorkflowDefinition(
     const args = step.call?.args;
     if (!tool || step.invocationPlan || !args || !registryToolHasNoExactCallContract(tool)) continue;
     if (Object.entries(args).some(([key, value]) => /account/i.test(key) && value !== null && value !== undefined && value !== '')) continue;
-    const effective = unwrapRuntimeEffectiveToolIdentity(tool, args);
+    let effective = unwrapRuntimeEffectiveToolIdentity(tool, args);
+    // A gateway's arguments in one of the spellings its carrier adapter
+    // accepts (an arguments_json string, a double-encoded object) name the
+    // same operation; read them the way that adapter does. One that pinned a
+    // connection keeps its form.
+    if (!effective.toolName && isTrustedComposioGateway(tool)
+      && Object.keys(args).every((key) => key === 'tool_slug' || key === 'arguments' || key === 'arguments_json')) {
+      const normalized = normalizeComposioCarrierInput(args);
+      if (normalized.ok && !normalized.adapted.includes('connection_id_stripped')) {
+        effective = { toolName: normalized.canonical.toolSlug, args: normalized.canonical.args };
+      }
+    }
     const operation = effective.toolName?.trim() ?? '';
     const operationArgs = effective.args;
     if (!operation || operation === tool || !operationArgs || typeof operationArgs !== 'object' || Array.isArray(operationArgs)) continue;

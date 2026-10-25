@@ -1082,3 +1082,26 @@ test('autoRepair: a gateway call naming its operation runs as that operation\'s 
   });
   assert.notEqual(autoRepairWorkflowDefinition(pinned).def.steps[0].call?.tool, 'FIXTURE_LIST_EVENTS');
 });
+
+test('autoRepair: a gateway call whose arguments arrive as arguments_json is lifted the same way', () => {
+  // Live r54c28: authoring stored the carrier's arguments as an arguments_json
+  // string; the lift missed it and the step became a model step on the worker.
+  const def = wf({
+    steps: [{
+      id: 'get_events', sideEffect: 'read',
+      call: { tool: 'composio_execute_tool', args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments_json: '{"start":"{{date}}T00:00:00","top":50}' } },
+    }],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[0].call, { tool: 'FIXTURE_LIST_EVENTS', args: { start: '{{date}}T00:00:00', top: 50 } });
+  assert.equal(repaired.steps[0].prompt, undefined);
+  assert.match(repairs.join(' '), /calls FIXTURE_LIST_EVENTS directly/);
+  // A connection the carrier pinned keeps the call in its form.
+  const pinned = wf({
+    steps: [{
+      id: 'get_events', sideEffect: 'read',
+      call: { tool: 'composio_execute_tool', args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments_json: '{}', connection_id: 'conn_fixture' } },
+    }],
+  });
+  assert.notEqual(autoRepairWorkflowDefinition(pinned).def.steps[0].call?.tool, 'FIXTURE_LIST_EVENTS');
+});
