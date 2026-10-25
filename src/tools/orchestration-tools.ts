@@ -3057,7 +3057,7 @@ export function authorableStepShape(step: WorkflowDefinition['steps'][number]): 
  * patch, a re-test and an enable, never a re-read of the definition and a
  * resend of the whole graph.
  */
-const CREATION_TEST_OUTPUT_MAX_CHARS = 1_500;
+const CREATION_TEST_OUTPUT_MAX_CHARS = 4_000;
 
 /** What a passing creation test produced, from its own run record. The test
  *  is a real run of the read steps: when nothing was only previewed, it is
