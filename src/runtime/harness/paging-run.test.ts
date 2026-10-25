@@ -18,6 +18,9 @@ test('a cursor copied from each result into the next call is paging', () => {
     { operation: 'LIST_ITEMS', args: { ...base, page_token: 'cursor-page-2' } },
   ];
   assert.equal(pagingRunLength(earlier, { operation: 'LIST_ITEMS', args: { ...base, page_token: 'cursor-page-3' } }, isReturned), 3);
+  // A search between pages does not end the run.
+  const interleaved = [earlier[0]!, { operation: 'tool_search', args: { query: 'list items' } }, earlier[1]!, { operation: 'tool_search', args: { query: 'schema' } }];
+  assert.equal(pagingRunLength(interleaved, { operation: 'LIST_ITEMS', args: { ...base, page_token: 'cursor-page-3' } }, isReturned), 3);
   assert.ok(PAGING_NOTE_FROM <= 3);
   assert.match(pagingRunNote('c3', 'LIST_ITEMS', 3), /page 3 of the same LIST_ITEMS list/);
 });

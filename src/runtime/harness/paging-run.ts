@@ -24,8 +24,8 @@ function differingKeys(a: Record<string, unknown>, b: Record<string, unknown>): 
   return [...keys].filter((key) => JSON.stringify(a[key]) !== JSON.stringify(b[key]));
 }
 
-/** How many calls, counting this one, read the same list in a row: the same
- *  operation, arguments that differ from this call's in one key only, always
+/** How many calls, counting this one, read the same list in a row (other
+ *  operations between them aside): the same operation, arguments that differ from this call's in one key only, always
  *  the same key, and that key moving the way a continuation moves (a value a
  *  result of this turn returned, or a number that only grows). A run of
  *  lookups by different ids is not paging. `earlier` is oldest first. */
@@ -38,7 +38,8 @@ export function pagingRunLength(
   let movingKey: string | undefined;
   for (let index = earlier.length - 1; index >= 0; index--) {
     const prior = earlier[index]!;
-    if (prior.operation !== current.operation) break;
+    // A search or another read between pages does not end the run.
+    if (prior.operation !== current.operation) continue;
     const differ = differingKeys(prior.args, current.args);
     if (differ.length > 1) break;
     if (differ.length === 1) {
