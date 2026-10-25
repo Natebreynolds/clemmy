@@ -5,6 +5,13 @@ import AppIntents
 struct ClemEntry: TimelineEntry {
     let date: Date
     let space: ClemWidgetSpace?
+    let workflows: [ClemWidgetWorkflow]
+
+    init(date: Date, space: ClemWidgetSpace?, workflows: [ClemWidgetWorkflow] = []) {
+        self.date = date
+        self.space = space
+        self.workflows = workflows
+    }
 }
 
 /// Clem's widget look: clementine peel ground, one strong orange action, the

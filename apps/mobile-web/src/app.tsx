@@ -74,7 +74,8 @@ import { useMobileViewportVariables } from './lib/use-keyboard-inset';
 import { mobileChatLocation } from './lib/chat-location';
 import { installNativeVoiceBridge } from './lib/native-voice-bridge';
 import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
-import { saveWidgetSpace, widgetAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
+import { saveWidgetSpace, saveWidgetWorkflow, widgetAvailable, widgetWorkflowAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
+import { workflowFromSearch, mobileWorkflowPath } from './lib/workflow-widget';
 
 // Keep the everyday conversation and decision surfaces in the first load.
 // Other destinations load inside the existing shell, including deep links.
@@ -161,6 +162,7 @@ export function App() {
     mobileDrafts.clear(); mobileChatLocation.clear();
     window.webkit?.messageHandlers?.clemNativeVoiceClear?.postMessage(true);
     if (widgetAvailable()) void saveWidgetSpace(null).catch(() => undefined);
+    if (widgetWorkflowAvailable()) void saveWidgetWorkflow(null).catch(() => undefined);
   } }, [authenticated, authStatus !== null]);
   /** Reads the ONE Needs-you count again; set by the poll that owns it. */
   const recountNeedsYou = useRef<() => void>(() => undefined);
@@ -268,6 +270,15 @@ export function App() {
     window.history.pushState({ clemWorkspace: slug }, '', `${mobileWorkspacePath(slug)}${widgetNavigation ? `&widgetNavigation=${widgetNavigation}` : ''}`);
   }, []);
 
+  // A cold workflow shortcut also needs a list parent for native edge-back.
+  useEffect(() => {
+    const slug = workflowFromSearch(window.location.search);
+    if (!slug || window.history.state?.clemWorkflow === slug) return;
+    const widgetNavigation = widgetNavigationFromSearch(window.location.search);
+    window.history.replaceState(null, '', `${window.location.pathname}?tab=workflows`);
+    window.history.pushState({ clemWorkflow: slug }, '', `${mobileWorkflowPath(slug)}${widgetNavigation ? `&widgetNavigation=${widgetNavigation}` : ''}`);
+  }, []);
+
   // Push/native navigation can replace the URL while this shell is alive.
   // Keep the visible destination and exact notification selection in sync.
   useEffect(() => {
@@ -287,7 +298,7 @@ export function App() {
       const { path } = (event as CustomEvent<{ path: string }>).detail;
       event.preventDefault();
       userNavigated.current = true;
-      window.history.pushState(null, '', path);
+      if (`${window.location.pathname}${window.location.search}` !== path) window.history.pushState(null, '', path);
       setDrawerOpen(false);
       syncLocation();
     };

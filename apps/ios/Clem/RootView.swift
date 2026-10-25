@@ -100,6 +100,9 @@ struct RootView: View {
             // Face ID remain the authorities for delivery, including cold start.
             guard let fingerprint = model?.pairing.fingerprint,
                   PendingWidgetNavigationRepository.shared.park(url: url, pairingFingerprint: fingerprint) else { return }
+            // URL navigation is never authority to run a workflow. A newer
+            // navigation also retires any earlier widget Run press.
+            PendingWidgetWorkflowLaunchRepository.shared.clear()
             PendingPushNavigationStore.clear()
             synchronizePendingNavigationDelivery()
         }
@@ -159,7 +162,9 @@ struct RootView: View {
 
     private func clearWidgetState() {
         PendingWidgetNavigationRepository.shared.clear()
+        PendingWidgetWorkflowLaunchRepository.shared.clear()
         ClemWidgetSpaceStore.shared.clear()
+        ClemWidgetWorkflowStore.shared.clear()
         WidgetCenter.shared.reloadAllTimelines()
     }
 }

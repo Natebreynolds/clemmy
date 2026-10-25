@@ -22,6 +22,14 @@ enum WidgetNavigationRoute {
             guard let query = route.queryItems, query.count == 1, query[0].name == "id",
                   let slug = query[0].value, ClemWidgetSpace.validSlug(slug) else { return nil }
             target.queryItems = [URLQueryItem(name: "tab", value: "spaces"), URLQueryItem(name: "workspace", value: slug)]
+        case "workflow":
+            if route.query == nil {
+                target.queryItems = [URLQueryItem(name: "tab", value: "workflows")]
+                break
+            }
+            guard let query = route.queryItems, query.count == 1, query[0].name == "id",
+                  let slug = query[0].value, ClemWidgetWorkflow.validSlug(slug) else { return nil }
+            target.queryItems = [URLQueryItem(name: "tab", value: "workflows"), URLQueryItem(name: "workflow", value: slug)]
         default: return nil
         }
         return target.string
@@ -53,9 +61,9 @@ final class PendingWidgetNavigationRepository {
     }
 
     @discardableResult
-    func park(url: URL, pairingFingerprint: String) -> Bool {
+    func park(url: URL, pairingFingerprint: String, id: UUID = UUID()) -> Bool {
         guard !pairingFingerprint.isEmpty, WidgetNavigationRoute.path(for: url) != nil else { return false }
-        let pending = PendingWidgetNavigation(id: UUID(), url: url, pairingFingerprint: pairingFingerprint, tappedAt: now())
+        let pending = PendingWidgetNavigation(id: id, url: url, pairingFingerprint: pairingFingerprint, tappedAt: now())
         guard let data = try? JSONEncoder().encode(pending) else { return false }
         lock.lock(); defer { lock.unlock() }
         return storage.save(data)

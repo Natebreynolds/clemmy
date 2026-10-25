@@ -1,4 +1,7 @@
+import { WORKFLOW_WIDGET_SLUG, workflowWidgetTarget } from './workflow-widget';
+
 export interface WidgetSpaceSnapshot { slug: string; name: string; summary: string; updatedAt: string }
+export type WidgetWorkflowSnapshot = WidgetSpaceSnapshot;
 interface WidgetReceipt { requestId: string; ok: boolean; slug?: string }
 const waiting = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
@@ -32,6 +35,8 @@ export function openWidgetRoute(value: { path: string; navigationId: string }): 
     const workspaces = params.getAll('workspace');
     if (workspaces.length > 1 || (workspaces.length === 1 && !/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/.test(workspaces[0]))) return false;
     if ([...params.keys()].some(key => !['tab', 'workspace', 'widgetNavigation'].includes(key))) return false;
+  } else if (tab === 'workflows') {
+    if (!workflowWidgetTarget(url.search)) return false;
   } else return false;
   const event = new CustomEvent(WIDGET_ROUTE_EVENT, { cancelable: true, detail: { path: `${url.pathname}${url.search}` } });
   window.dispatchEvent(event);
@@ -39,6 +44,60 @@ export function openWidgetRoute(value: { path: string; navigationId: string }): 
 }
 
 export function widgetAvailable(): boolean { return Boolean(window.webkit?.messageHandlers?.clemWidgetSpace); }
+export function widgetWorkflowAvailable(): boolean { return Boolean(window.webkit?.messageHandlers?.clemWidgetWorkflow); }
+
+const workflowWaiting = new Map<string, { slug: string | null; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; error: string }>();
+function writeWidgetWorkflow(value: WidgetWorkflowSnapshot | { remove: string } | null): Promise<void> {
+  const handler = window.webkit?.messageHandlers?.clemWidgetWorkflow;
+  if (!handler) return Promise.reject(new Error('Workflow widgets need the latest Clem iPhone app.'));
+  const slug = value && ('remove' in value ? value.remove : value.slug);
+  if (slug !== null && !WORKFLOW_WIDGET_SLUG.test(slug)) return Promise.reject(new Error('This workflow has no valid saved shortcut.'));
+  if (value && !('remove' in value) && (typeof value.name !== 'string' || !value.name || widgetText(value.name, 160) !== value.name
+    || typeof value.summary !== 'string' || widgetText(value.summary, 600) !== value.summary
+    || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt)))) return Promise.reject(new Error('This workflow preview is not ready to save.'));
+  const requestId = crypto.randomUUID();
+  const error = value && 'remove' in value ? 'Could not remove this workflow from the widget. Try again.'
+    : 'Could not save this workflow. The widget holds up to three workflows; remove one and try again.';
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { workflowWaiting.delete(requestId); reject(new Error('The iPhone did not confirm the widget update. Check it before trying again.')); }, 6000);
+    workflowWaiting.set(requestId, { slug, resolve, reject, timer, error });
+    try { handler.postMessage({ requestId, ...(value ?? { clear: true }) }); }
+    catch { clearTimeout(timer); workflowWaiting.delete(requestId); reject(new Error(error)); }
+  });
+}
+export function saveWidgetWorkflow(snapshot: WidgetWorkflowSnapshot | null): Promise<void> { return writeWidgetWorkflow(snapshot); }
+export function removeWidgetWorkflow(slug: string): Promise<void> { return writeWidgetWorkflow({ remove: slug }); }
+export function widgetWorkflowStored(receipt: WidgetReceipt): void {
+  if (!receipt || typeof receipt.requestId !== 'string') return;
+  const request = workflowWaiting.get(receipt.requestId);
+  if (!request || (receipt.ok === true && (request.slug === null ? receipt.slug !== undefined : receipt.slug !== request.slug))) return;
+  workflowWaiting.delete(receipt.requestId); clearTimeout(request.timer);
+  if (receipt.ok === true) request.resolve(); else request.reject(new Error(request.error));
+}
+
+interface WorkflowLaunchReceipt { requestId: string; navigationId: string; slug: string; ok: boolean }
+const launchWaiting = new Map<string, { navigationId: string; slug: string; resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
+const launchAttempted = new Set<string>();
+/** Native consumes a separately stored one-shot action. A URL is not one. */
+export function consumeWidgetWorkflowLaunch(navigationId: string, slug: string): Promise<boolean> {
+  if (!UUID.test(navigationId) || !WORKFLOW_WIDGET_SLUG.test(slug) || launchAttempted.has(navigationId)) return Promise.resolve(false);
+  launchAttempted.add(navigationId);
+  const handler = window.webkit?.messageHandlers?.clemWidgetWorkflowLaunch;
+  if (!handler) return Promise.resolve(false);
+  const requestId = crypto.randomUUID();
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { launchWaiting.delete(requestId); resolve(false); }, 6000);
+    launchWaiting.set(requestId, { navigationId, slug, resolve, timer });
+    try { handler.postMessage({ requestId, navigationId, slug }); }
+    catch { clearTimeout(timer); launchWaiting.delete(requestId); resolve(false); }
+  });
+}
+export function widgetWorkflowLaunchConsumed(receipt: WorkflowLaunchReceipt): void {
+  if (!receipt || typeof receipt.requestId !== 'string') return;
+  const request = launchWaiting.get(receipt.requestId);
+  if (!request || request.navigationId !== receipt.navigationId || request.slug !== receipt.slug) return;
+  launchWaiting.delete(receipt.requestId); clearTimeout(request.timer); request.resolve(receipt.ok === true);
+}
 
 /** Native confirms durable storage before the UI says the widget was changed. */
 export function saveWidgetSpace(snapshot: WidgetSpaceSnapshot | null): Promise<void> {
@@ -74,14 +133,18 @@ export function widgetNavigationFromSearch(search: string): string | null {
 }
 
 /** Called by the destination after it is shown, never just by the app shell. */
-export function reportWidgetLanding(navigationId: string | null, destination: { tab: 'chats'; compose: string } | { tab: 'spaces'; workspace?: string | null }, outcome: 'presented' | 'unavailable' = 'presented'): void {
+export function reportWidgetLanding(navigationId: string | null, destination: { tab: 'chats'; compose: string } | { tab: 'spaces'; workspace?: string | null } | { tab: 'workflows'; workflow?: string | null }, outcome: 'presented' | 'unavailable' = 'presented'): void {
   const handler = window.webkit?.messageHandlers?.clemWidgetNavigationHandled;
   if (!navigationId || widgetNavigationFromSearch(window.location.search) !== navigationId || !handler) return;
   const selected = new URLSearchParams(window.location.search);
   if (selected.get('tab') !== destination.tab) return;
   if (destination.tab === 'chats' && selected.get('compose') && selected.get('compose') !== destination.compose) return;
   if (destination.tab === 'spaces' && selected.get('workspace') !== (destination.workspace ?? null)) return;
-  handler.postMessage({ navigationId, outcome });
+  if (destination.tab === 'workflows') {
+    const target = workflowWidgetTarget(window.location.search);
+    if (!target || target.slug !== (destination.workflow ?? null)) return;
+  }
+  try { handler.postMessage({ navigationId, outcome }); } catch { return; }
   const params = new URLSearchParams(window.location.search);
   params.delete('widgetNavigation');
   window.history.replaceState(window.history.state, '', `${window.location.pathname}${params.size ? `?${params}` : ''}`);

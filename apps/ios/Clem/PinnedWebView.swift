@@ -278,6 +278,8 @@ final class WebViewModel: NSObject, ObservableObject {
             "clemWidgetNavigationHandled",
             "clemWidgetNavigationReady",
             "clemWidgetSpace",
+            "clemWidgetWorkflow",
+            "clemWidgetWorkflowLaunch",
             "clemNativeVoiceReady",
             "clemNativeVoiceSession",
             "clemNativeVoiceClear",
@@ -782,6 +784,45 @@ final class WebViewModel: NSObject, ObservableObject {
         if reply["ok"] as? Bool == true { WidgetCenter.shared.reloadAllTimelines() }
         guard let data = try? JSONSerialization.data(withJSONObject: reply), let json = String(data: data, encoding: .utf8) else { return }
         webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetSpaceStored && window.clemNative.widgetSpaceStored(\(json))")
+    }
+
+    fileprivate func storeWidgetWorkflow(_ body: [String: Any]) {
+        guard let requestID = body["requestId"] as? String, UUID(uuidString: requestID) != nil else { return }
+        var reply: [String: Any] = ["requestId": requestID, "ok": false]
+        if Set(body.keys) == Set(["requestId", "clear"]), body["clear"] as? Bool == true {
+            ClemWidgetWorkflowStore.shared.clear()
+            PendingWidgetWorkflowLaunchRepository.shared.clear()
+            reply["ok"] = true
+        } else if pendingPushNavigationAllowed, connectionRouteReady,
+                  Set(body.keys) == Set(["requestId", "remove"]), let slug = body["remove"] as? String,
+                  ClemWidgetWorkflowStore.shared.remove(slug: slug) {
+            reply["ok"] = true
+            reply["slug"] = slug
+        } else if pendingPushNavigationAllowed, connectionRouteReady,
+                  let snapshot = ClemWidgetWorkflow.parse(body), ClemWidgetWorkflowStore.shared.save(snapshot) {
+            reply["ok"] = true
+            reply["slug"] = snapshot.slug
+        }
+        if reply["ok"] as? Bool == true { WidgetCenter.shared.reloadAllTimelines() }
+        guard let data = try? JSONSerialization.data(withJSONObject: reply), let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetWorkflowStored && window.clemNative.widgetWorkflowStored(\(json))")
+    }
+
+    /// Only a native, authenticated widget intent can create this authority.
+    /// Consume before the page submits; a lost response must never replay it.
+    fileprivate func consumeWidgetWorkflowLaunch(_ body: [String: Any]) {
+        guard Set(body.keys) == Set(["requestId", "navigationId", "slug"]),
+              let requestID = body["requestId"] as? String, UUID(uuidString: requestID) != nil,
+              let navigationID = body["navigationId"] as? String, let id = UUID(uuidString: navigationID),
+              let slug = body["slug"] as? String, ClemWidgetWorkflow.validSlug(slug) else { return }
+        var consumed = false
+        if pendingPushNavigationAllowed, connectionRouteReady, inFlightWidgetID == id,
+           let fingerprint = pairing.fingerprint {
+            consumed = PendingWidgetWorkflowLaunchRepository.shared.consume(id: id, slug: slug, pairingFingerprint: fingerprint)
+        }
+        let reply: [String: Any] = ["requestId": requestID, "navigationId": navigationID, "slug": slug, "ok": consumed]
+        guard let data = try? JSONSerialization.data(withJSONObject: reply), let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetWorkflowLaunchConsumed && window.clemNative.widgetWorkflowLaunchConsumed(\(json))")
     }
 
     /// The page sends this only after it rendered/focused the addressed card or
@@ -1307,6 +1348,16 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
         if message.name == "clemWidgetSpace" {
             guard let body = message.body as? [String: Any] else { return }
             MainActor.assumeIsolated { model?.storeWidgetSpace(body) }
+            return
+        }
+        if message.name == "clemWidgetWorkflow" {
+            guard let body = message.body as? [String: Any] else { return }
+            MainActor.assumeIsolated { model?.storeWidgetWorkflow(body) }
+            return
+        }
+        if message.name == "clemWidgetWorkflowLaunch" {
+            guard let body = message.body as? [String: Any] else { return }
+            MainActor.assumeIsolated { model?.consumeWidgetWorkflowLaunch(body) }
             return
         }
         if message.name == "clemWidgetNavigationHandled" {
