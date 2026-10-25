@@ -1271,9 +1271,18 @@ export function userChoiceToolUseBehavior(
         finalOutput: rendered.question,
       };
     }
-    const connectionProjection = sourceUserSeq
+    const observedConnection = sourceUserSeq
       ? observedConnectionDependencyPresentationForSource({ sessionId, sourceUserSeq, latestDiscoveryOnly: clemAsked })
       : null;
+    // A question Clem typed as a clarification asks something else: a gap the
+    // search happened to show does not replace it (live: "make a reservation"
+    // on the moon became "Make needs to be connected"). The connection still
+    // leads when the owner's confirmed source choice requires that provider,
+    // or her words carry a link, which never stands where the control is.
+    const askedSomethingElse = observedConnection !== null && observedConnection.requiredByConfirmedRoute !== true
+      && candidates.length > 0 && candidates.every((candidate) => candidate.purpose === 'clarification')
+      && !MODEL_LINK.test(rendered.question);
+    const connectionProjection = askedSomethingElse ? null : observedConnection;
     // Clem's own words lead a connection question she asked as one; the host
     // keeps the controls (its Connect button and continue/pause choices), and
     // words carrying a link never stand where the control is.

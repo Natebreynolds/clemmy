@@ -2065,6 +2065,27 @@ test('a connection gap the latest search found still takes over the connection q
   assert.doesNotMatch(String(asked?.data.question), /wrong_app|Le service/, 'model prose with a wrong link never becomes the connection control');
 });
 
+test('a clarification Clem asks stands over a connection gap the search happened to show', async () => {
+  // Live r54c35: "make a reservation" surfaced an unconnected app named like
+  // the verb, and the host replaced her moon question with its connect card.
+  resetEventLog();
+  const sess = createSession({ kind: 'chat' });
+  const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Book me a table on the moon tonight.' } });
+  recordFixtureSearch(sess.id, parent.seq, 'search-moon', 'fixturemake a reservation on the moon', 'fixturemake');
+  const question = 'There is no restaurant on the moon. Want a space-themed one near you instead?';
+  const { terminal } = await invokeAskWithArbitration(
+    buildAskUserQuestionTool(),
+    { question, options: ['Find one near me', 'Never mind'], purpose: 'clarification' },
+    { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
+  );
+  assert.equal(terminal.finalOutput, `[clementine:awaiting-user-input:final]\n${question}`);
+  const asked = listEvents(sess.id, { types: ['awaiting_user_input'] }).at(-1);
+  assert.equal(asked?.data.question, question);
+  assert.deepEqual(asked?.data.options, ['Find one near me', 'Never mind']);
+  assert.equal(asked?.data.source, undefined, 'no connect card over her question');
+});
+
 test('a connection question Clem asks as one keeps her words; the host keeps the Connect controls', async () => {
   resetEventLog();
   const sess = createSession({ kind: 'chat' });

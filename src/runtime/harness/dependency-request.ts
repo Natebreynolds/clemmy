@@ -488,6 +488,9 @@ export interface ConnectionDependencyPresentation {
   question: string;
   options: readonly [string, string];
   subject: ConnectionDependencySubject;
+  /** The owner's confirmed source choice requires this exact provider, so
+   *  the connection is the task's blocker whatever else was asked. */
+  requiredByConfirmedRoute?: boolean;
 }
 
 /** The app's own name from the provider catalog ("ElevenLabs"), else the
@@ -686,9 +689,10 @@ function observedConnectionPresentationForSource(input: {
     // generic task. Only a confirmed exact source choice rules that route in.
     // This changes presentation only: no existing dependency or A/Q is closed,
     // and neither CLI account nor operation readiness is inferred.
+    const requiredByConfirmedRoute = subject.kind === 'exact_capability_connection' && exactProviderRouteIsRequired(input, subject);
     if (subject.kind === 'exact_capability_connection' && connectedCliCoveringApp(subject.toolkit)
-      && !exactProviderRouteIsRequired(input, subject)) return null;
-    return connectionPresentationForSubject(subject);
+      && !requiredByConfirmedRoute) return null;
+    return { ...connectionPresentationForSubject(subject), ...(requiredByConfirmedRoute ? { requiredByConfirmedRoute } : {}) };
   }
   return null;
 }
