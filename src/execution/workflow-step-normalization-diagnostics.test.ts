@@ -98,3 +98,17 @@ test('dynamic validator operands and literal object paths cannot enter normaliza
   assert.match(error.message, /metrics\[0\]\.fn must be count, sum, avg, min, or max/);
   assert.match(error.message, /steps\[1\]\.transform/);
 });
+
+test('a field or operation a transform does not take is refused by naming what it takes, never by echoing what was written', () => {
+  const secret = 'synthetic-private-field-name';
+  const error = rejected([
+    { id: 'shape', transform: { version: 1, expression: { op: 'jsonParse', value: { op: 'get', from: 'input.rows' }, [secret]: 'rows' } } },
+    { id: 'shape_two', transform: { version: 1, expression: { op: secret, value: 1 } } },
+    { id: 'shape_three', transform: { version: 1, expression: { op: 'get', from: { op: 'jsonParse', value: { op: 'get', from: 'input.rows' } } } } },
+  ] as unknown as Steps);
+  assert.ok(!error.message.includes(secret));
+  assert.match(error.message, /transform\.expression has a field it does not take \(it takes: op, value\)/);
+  assert.match(error.message, /is not a reviewed transform operation \(the operations: aggregate, array, count, get, jsonParse/);
+  assert.match(error.message, /to read a field of a computed value, compute it in its own transform step/);
+  assert.doesNotMatch(error.message, /closed v1 expression schema/);
+});

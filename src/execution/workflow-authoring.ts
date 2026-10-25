@@ -27,7 +27,7 @@ import { codifyMechanicalSteps } from './workflow-codify.js';
 import { describeCycle, findCycle } from './graph-cycle.js';
 import { exactScheduledSendCandidateToolSlugs } from './workflow-validator.js';
 import { ensureLiveComposioSchemaFingerprint } from '../tools/composio-schema-cache.js';
-import { validateWorkflowTransform } from './workflow-transform.js';
+import { TRANSFORM_FROM_RULE, validateWorkflowTransform } from './workflow-transform.js';
 export {
   deleteWorkflowAndSyncTriggers,
   syncWorkflowTriggersBestEffort,
@@ -193,7 +193,7 @@ const SAFE_TRANSFORM_ISSUE_SUFFIXES = new Set([
   'must be JSON-compatible.', 'must be an object.', 'must equal 1.',
   'must be an expression object.', 'must name a reviewed transform operation.', 'is required.',
   'must be a safe field name (1-128 letters, numbers, space, "_", "-", or ".").',
-  'must be input.<key>, steps.<id>.output[.<path>], or item[.<path>].',
+  'must be input.<key>, steps.<id>.output[.<path>], or item[.<path>].', TRANSFORM_FROM_RULE,
   'contains a reserved path segment.', 'uses item outside a map.each expression.',
   'must be {key,value}.', 'must contain 1-32 fields.', 'must be {column,direction}.',
   'must be asc or desc.', 'must be an object.', 'must be eq, ne, contains, empty, or nonempty.',
@@ -205,6 +205,12 @@ const SAFE_TRANSFORM_ISSUE_SUFFIXES = new Set([
 
 function safeTransformIssue(message: string): string {
   const match = /^(transform(?:\.(?:version|expression|op|value|from|fields|key|items|each|by|keys|column|direction|where|limit|columns|groupBy|metrics|fn)|\[\d{1,6}\])*) (.+)$/.exec(message);
+  // A field or operation the model wrote is never echoed; what the operation
+  // takes, or which operations exist, is fixed validator language.
+  const fieldList = match ? /^has unsupported field "[^"\n]{0,200}" \(it takes: ([A-Za-z, ]{1,400})\)\.$/.exec(match[2]!) : null;
+  if (match && fieldList) return `${match[1]} has a field it does not take (it takes: ${fieldList[1]}).`;
+  const opList = match ? /^"[^"\n]{0,200}" is not a reviewed transform operation \(the operations: ([A-Za-z, ]{1,400})\)\.$/.exec(match[2]!) : null;
+  if (match && opList) return `${match[1]} is not a reviewed transform operation (the operations: ${opList[1]}).`;
   if (match && (SAFE_TRANSFORM_ISSUE_SUFFIXES.has(match[2]!)
     || /^(?:specification is \d{1,12} bytes \(cap \d{1,12}\)|has more than \d{1,6} expression nodes|exceeds the transform depth ceiling of \d{1,6}|must be an array of at most \d{1,6} (?:fields|expressions|field names|metrics)|must be an integer from 1 to \d{1,6}|contains a non-JSON (?:undefined|function|symbol|bigint) value|is required for (?:count|sum|avg|min|max))\.$/.test(match[2]!))) {
     return message;

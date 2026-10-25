@@ -48,6 +48,13 @@ export type WorkflowTransformValidation =
 
 type PlainRecord = Record<string, unknown>;
 
+/** Every operation the switch below reviews, named in the refusal for any other. */
+export const REVIEWED_TRANSFORM_OPS = ['aggregate', 'array', 'count', 'get', 'jsonParse', 'jsonStringify', 'literal', 'map', 'object', 'select', 'sort', 'unique'] as const;
+
+/** `from` reads a saved value; a computed one is read through its own step. */
+export const TRANSFORM_FROM_RULE = 'must be input.<key>, steps.<id>.output[.<path>], or item[.<path>]; '
+  + 'to read a field of a computed value, compute it in its own transform step and read steps.<id>.output.<path>.';
+
 function isRecord(value: unknown): value is PlainRecord {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -55,7 +62,7 @@ function isRecord(value: unknown): value is PlainRecord {
 function ownKeysOnly(record: PlainRecord, allowed: readonly string[], at: string, errors: string[]): void {
   const allow = new Set(allowed);
   for (const key of Object.keys(record)) {
-    if (!allow.has(key)) errors.push(`${at} has unsupported field "${key}".`);
+    if (!allow.has(key)) errors.push(`${at} has unsupported field "${key}" (it takes: ${allowed.join(', ')}).`);
   }
 }
 
@@ -160,7 +167,7 @@ function validateExpression(
       ownKeysOnly(value, ['op', 'from'], at, state.errors);
       const from = value.from;
       if (typeof from !== 'string' || !SAFE_SOURCE_RE.test(from)) {
-        state.errors.push(`${at}.from must be input.<key>, steps.<id>.output[.<path>], or item[.<path>].`);
+        state.errors.push(`${at}.from ${TRANSFORM_FROM_RULE}`);
         return;
       }
       if (from.split('.').some((segment) => RESERVED_KEYS.has(segment))) {
@@ -307,7 +314,7 @@ function validateExpression(
       return;
     }
     default:
-      state.errors.push(`${at}.op "${op}" is not a reviewed transform operation.`);
+      state.errors.push(`${at}.op "${op}" is not a reviewed transform operation (the operations: ${REVIEWED_TRANSFORM_OPS.join(', ')}).`);
   }
 }
 
