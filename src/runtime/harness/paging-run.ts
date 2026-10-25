@@ -26,9 +26,10 @@ function differingKeys(a: Record<string, unknown>, b: Record<string, unknown>): 
 
 /** How many calls, counting this one, read the same list in a row (other
  *  operations between them aside): the same operation, arguments that differ from this call's in one key only, always
- *  the same key, and that key moving the way a continuation moves (a value a
- *  result of this turn returned, or a number that only grows). A run of
- *  lookups by different ids is not paging. `earlier` is oldest first. */
+ *  the same key, and that key moving the way a position moves (a value a
+ *  result of this turn returned, or a number never read before: growing page
+ *  by page, or probing back and forth for where the list ends). A run of
+ *  lookups by different string ids is not paging. `earlier` is oldest first. */
 export function pagingRunLength(
   earlier: readonly PagingCall[],
   current: PagingCall,
@@ -52,8 +53,11 @@ export function pagingRunLength(
   const values = run.map((call) => call.args[movingKey!]);
   // The first page may start anywhere (no cursor, or one the owner gave);
   // every later one moves on from what a result returned.
-  const continued = values.slice(1).every((value) => typeof value === 'string' && value !== '' && returnedByAResult(value))
-    || values.every((value, index) => typeof value === 'number' && (index === 0 || value > (values[index - 1] as number)));
+  const later = values.slice(1);
+  const continued = later.every((value) => typeof value === 'string' && value !== '' && returnedByAResult(value))
+    || ((values[0] === undefined || typeof values[0] === 'number')
+      && later.every((value) => typeof value === 'number')
+      && new Set(values).size === values.length);
   return continued ? run.length : 1;
 }
 
@@ -61,7 +65,7 @@ export const PAGING_NOTE_FROM = 3;
 
 /** What the model is told once a run of pages reaches PAGING_NOTE_FROM. */
 export function pagingRunNote(callId: string, operation: string, pages: number): string {
-  return `Call ${callId} is page ${pages} of the same ${operation} list in this turn, each a round of its own. `
+  return `Call ${callId} reads the same ${operation} list at another position (read ${pages} of it in this turn, each a round of its own). `
     + 'If what the owner asked for is a total, a count or a summary, an operation that returns it directly answers in one call '
     + '(search for one if none is in view); keep paging only when every record itself is needed.';
 }

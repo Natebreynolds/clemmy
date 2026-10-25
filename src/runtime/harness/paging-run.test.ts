@@ -22,16 +22,20 @@ test('a cursor copied from each result into the next call is paging', () => {
   const interleaved = [earlier[0]!, { operation: 'tool_search', args: { query: 'list items' } }, earlier[1]!, { operation: 'tool_search', args: { query: 'schema' } }];
   assert.equal(pagingRunLength(interleaved, { operation: 'LIST_ITEMS', args: { ...base, page_token: 'cursor-page-3' } }, isReturned), 3);
   assert.ok(PAGING_NOTE_FROM <= 3);
-  assert.match(pagingRunNote('c3', 'LIST_ITEMS', 3), /page 3 of the same LIST_ITEMS list/);
+  assert.match(pagingRunNote('c3', 'LIST_ITEMS', 3), /same LIST_ITEMS list at another position \(read 3 of it/);
 });
 
-test('an offset that only grows is paging; one that jumps back is not', () => {
+test('an offset read at a new position is paging, growing or probing back for the end; a position read before is not', () => {
   const earlier = [
     { operation: 'LIST_ITEMS', args: { ...base, skip: 0 } },
     { operation: 'LIST_ITEMS', args: { ...base, skip: 1000 } },
   ];
   assert.equal(pagingRunLength(earlier, { operation: 'LIST_ITEMS', args: { ...base, skip: 2000 } }, isReturned), 3);
-  assert.equal(pagingRunLength(earlier, { operation: 'LIST_ITEMS', args: { ...base, skip: 500 } }, isReturned), 1);
+  // Live: one-record probes at 20000, 100000, 50000, 30000, … to find where the list ends.
+  assert.equal(pagingRunLength(earlier, { operation: 'LIST_ITEMS', args: { ...base, skip: 500 } }, isReturned), 3);
+  assert.equal(pagingRunLength(earlier, { operation: 'LIST_ITEMS', args: { ...base, skip: 1000 } }, isReturned), 1);
+  const firstPageWithoutOffset = [{ operation: 'LIST_ITEMS', args: base }, { operation: 'LIST_ITEMS', args: { ...base, skip: 50000 } }];
+  assert.equal(pagingRunLength(firstPageWithoutOffset, { operation: 'LIST_ITEMS', args: { ...base, skip: 30000 } }, isReturned), 3);
 });
 
 test('lookups by different ids, a different list, or two changed arguments are not paging', () => {

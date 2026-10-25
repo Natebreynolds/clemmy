@@ -75,7 +75,7 @@ test('the third page of the same list carries the host\'s note on what paging co
   } as never));
   assert.ok(requests.length >= 4, `four model requests (got ${requests.length})`);
   assert.equal(requests[2]!.includes('of the same read_file list'), false, 'two pages are not yet a paging run');
-  assert.ok(requests[3]!.includes('Call read-page-3 is page 3 of the same read_file list'), 'the request after page 3 carries the note');
+  assert.ok(requests[3]!.includes('Call read-page-3 reads the same read_file list at another position (read 3 of it'), 'the request after page 3 carries the note');
   assert.equal(events.listEvents(session.id, { types: ['guardrail_tripped'] })
     .filter((event) => event.data.kind === 'paging_run').length, 1);
 });
