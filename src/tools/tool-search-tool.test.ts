@@ -2042,3 +2042,15 @@ test('native transform help examples: broad create summary teaches executable JS
   assert.equal(row.invocation.name, 'workflow_create');
   assert.ok(raw.content[0]!.text.length <= DEFAULT_TOOL_RESULT_MAX_CHARS);
 });
+
+test('a schema cursor copied with a slip, beside one of Clem\'s own tool names, answers the name instead of refusing', async () => {
+  const t = captureToolSearch(new Set(['tool_search', 'workflow_list']));
+  const slipped = `tool_search_schema:v1:${'a'.repeat(61)}:0`;
+  const ownName = await t.handler({ query: 'workflow_list', cursor: slipped });
+  const body = JSON.parse(ownName.content[0]!.text) as { error?: string; results?: Array<{ name: string }> };
+  assert.equal(body.error, undefined, ownName.content[0]!.text.slice(0, 300));
+  assert.ok(body.results?.some((row) => row.name === 'workflow_list'), 'the named tool comes back');
+  // Any other query keeps the refusal: no new discovery for a refused cursor.
+  const other = await t.handler({ query: 'list my saved automations', cursor: slipped });
+  assert.equal(JSON.parse(other.content[0]!.text).error, 'invalid_or_expired_tool_search_cursor');
+});

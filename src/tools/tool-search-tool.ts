@@ -24,7 +24,7 @@ import { SourceAccountNominationSchema, type SourceAccountNomination } from './s
 import { hostStructuralPlanningControlLookup } from './structural-control-lookup.js';
 import { maybeDiscoveryAdvisory } from '../runtime/harness/discovery-advisory.js';
 import { invalidArgumentsTextResult, textResult } from './shared.js';
-import { isEffectDecidedPerCall, runsLocalCommandLines } from './tool-registry.js';
+import { isEffectDecidedPerCall, runsLocalCommandLines, TOOL_REGISTRY } from './tool-registry.js';
 import { connectedCliRunnerText } from '../integrations/cli-catalog/connected-cli-coverage.js';
 import { mcpToolAwaitsEffectLabel, mcpToolEffectApprovalOpen } from '../runtime/mcp-tool-effect-labels.js';
 import { DEFAULT_TOOL_RESULT_MAX_CHARS } from '../runtime/harness/tool-output-format.js';
@@ -1269,8 +1269,18 @@ export function registerToolSearchTool(
       // discovery and cannot import authority from its stored metadata.
       let deferredPage: DeferredToolSearchPage | undefined;
       const continuation = normalizeToolSearchCursor(cursor);
-      if (continuation) {
-        const continued = continuations.read(continuation, continuationSessionId);
+      let continued = continuation ? continuations.read(continuation, continuationSessionId) : undefined;
+      // A schema cursor copied with a slip, sent beside the exact tool name it
+      // was issued for: the name alone returns that schema, so answer it rather
+      // than refuse and cost a round (live: three of 45 schema cursors came
+      // back a few characters off).
+      // Only one of Clem's own tools: its schema is local, so no provider
+      // search runs for a cursor that was refused.
+      if (continued?.isError && continuation?.startsWith(TOOL_SEARCH_SCHEMA_CURSOR_PREFIX)
+        && TOOL_REGISTRY.some((entry) => entry.name === query.trim())) {
+        continued = undefined;
+      }
+      if (continuation && continued) {
         if (continued.isError) return invalidArgumentsTextResult(continued.text);
         let decoded: unknown;
         try { decoded = JSON.parse(continued.text); } catch { /* legacy text below */ }
