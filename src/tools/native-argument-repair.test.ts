@@ -99,6 +99,14 @@ test('an object whose strict schema types it as text moves whole into its JSON-t
   // A field with no JSON-text sibling is not touched.
   const noSibling = z.strictObject({ options: z.record(z.string(), z.string()) });
   assert.equal(repairNativeArguments(noSibling, { options: { limit: 3 } }, { sideEffect: 'write' }), null);
+  // A carrier nested in the open args moves as the call's args into the
+  // declared args_json, never into an invented key inside the record.
+  const gateway = repairNativeArguments(schema, { name: 'pull', steps: [{ id: 'get_events', call: { tool: 'composio_execute_tool',
+    args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments: { user_id: 'me', top: 50 } } } }] }, { sideEffect: 'write' });
+  assert.ok(gateway, 'repaired');
+  const call = (gateway.args.steps as Array<{ call: { args?: unknown; args_json?: string } }>)[0]!.call;
+  assert.equal(call.args, undefined);
+  assert.deepEqual(JSON.parse(call.args_json!), { tool_slug: 'FIXTURE_LIST_EVENTS', arguments: { user_id: 'me', top: 50 } });
 });
 
 test('arguments sent in a carrier\'s shape are read as the call\'s own, for a read or an ordinary write', () => {

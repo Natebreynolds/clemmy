@@ -97,6 +97,11 @@ function moveObjectsToJsonTextSiblings(
       const value = parent[key];
       const sibling = `${key}_json`;
       if (!plainObject(value) || (parent[sibling] !== undefined && parent[sibling] !== null)) continue;
+      // Only a sibling the schema declares. Inside an open record every key
+      // validates, so a nested carrier's `arguments` became an invented
+      // `arguments_json` there instead of its call's `args` moving to the
+      // declared `args_json` (live: the workflow step then ran on a model).
+      if (!declaredKeysAt(schema, parentPath)?.has(sibling)) continue;
       const { [key]: _object, ...rest } = parent;
       const candidate = withValueAt(args, parentPath, { ...rest, [sibling]: JSON.stringify(value) });
       const after = schema.safeParse(candidate);
@@ -118,6 +123,39 @@ function moveObjectsToJsonTextSiblings(
     args,
     detail: `${moved.map((path) => `"${path}"`).join(', ')} sent as JSON text in ${moved.length === 1 ? 'its' : 'their'} _json field`,
   };
+}
+
+type ZodDefLike = { type?: string; innerType?: unknown; in?: unknown; shape?: Record<string, unknown>; element?: unknown };
+const defOf = (schema: unknown): ZodDefLike | undefined => (schema as { _zod?: { def?: ZodDefLike } } | undefined)?._zod?.def;
+
+/** A schema with its optional/nullable/default/pipe wrappers taken off. */
+function unwrapSchema(schema: unknown): unknown {
+  let current = schema;
+  for (let depth = 0; depth < 8; depth += 1) {
+    const def = defOf(current);
+    if (!def) break;
+    if (['optional', 'nullable', 'default', 'readonly', 'catch', 'nonoptional', 'prefault'].includes(def.type ?? '')) {
+      current = def.innerType;
+      continue;
+    }
+    if (def.type === 'pipe') { current = def.in; continue; }
+    break;
+  }
+  return current;
+}
+
+/** The keys the object schema at this path declares, or null when the value
+ *  there is not a declared object (an open record declares none). */
+function declaredKeysAt(schema: z.ZodTypeAny, path: readonly PropertyKey[]): Set<string> | null {
+  let current = unwrapSchema(schema);
+  for (const part of path) {
+    const def = defOf(current);
+    if (def?.type === 'object' && typeof part === 'string') current = unwrapSchema(def.shape?.[part]);
+    else if (def?.type === 'array' && typeof part === 'number') current = unwrapSchema(def.element);
+    else return null;
+  }
+  const def = defOf(current);
+  return def?.type === 'object' ? new Set(Object.keys(def.shape ?? {})) : null;
 }
 
 function valueAt(root: unknown, path: readonly PropertyKey[]): unknown {
