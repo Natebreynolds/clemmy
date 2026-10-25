@@ -1334,7 +1334,12 @@ function reduceStandardConversationTerminal(input: {
           turn: result.lastTurn,
           text: question,
         });
-      const publicQuestion = parked?.text ?? question;
+      // A connection card the host already published shows its question (Clem's
+      // own words when she asked it as one); the chat reply says the same.
+      const shownConnectionCard = terminalQuestionEventForAcceptedSource({
+        sessionId: result.sessionId, sourceUserSeq, turn: result.lastTurn,
+      })?.data.source === 'host_connection_dependency_projection';
+      const publicQuestion = parked && !shownConnectionCard ? parked.text : question;
       if (parked) connectionExecutionPause = prepareConnectionExecutionPause({
         sessionId: result.sessionId, sourceUserSeq, requestId: parked.requestId,
       });
