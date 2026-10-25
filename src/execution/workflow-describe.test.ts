@@ -249,3 +249,11 @@ test('describeWorkflowOneLine: compact list summary', () => {
   const line = describeWorkflowOneLine(def);
   assert.match(line, /Daily Digest — every day at 7:00 AM · 2 steps · pauses for approval/);
 });
+
+test('a step with no prompt reads as what it does, never "(no description)"', () => {
+  assert.equal(describeStep({ id: 'pull', prompt: '', call: { tool: 'FIXTURE_LIST_EVENTS', args: {} }, sideEffect: 'read' } as never, 0),
+    '1. Calls FIXTURE_LIST_EVENTS directly (no AI)');
+  assert.match(describeStep({ id: 'shape', prompt: '', transform: { version: 1, expression: { op: 'literal', value: 1 } } } as never, 1),
+    /^2\. Shapes the data from the steps before it/);
+  assert.match(describeStep({ id: 'write', prompt: 'Write the summary. Then stop.' } as never, 2), /^3\. Write the summary\./);
+});

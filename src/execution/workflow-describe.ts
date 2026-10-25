@@ -161,9 +161,18 @@ function stepAnnotations(step: WorkflowStepInput): string[] {
   return notes;
 }
 
+/** What a step with no prompt does, from its own executor: the operation it
+ *  calls, or the data shaping it does. */
+function promptlessStepLabel(step: WorkflowStepInput): string | null {
+  const tool = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+  if (tool) return `Calls ${tool} directly (no AI)`;
+  if (step.transform) return 'Shapes the data from the steps before it';
+  return null;
+}
+
 /** Render one step as a numbered plain-English line. */
 export function describeStep(step: WorkflowStepInput, index: number): string {
-  const label = shortStepLabel(step.prompt);
+  const label = step.prompt?.trim() ? shortStepLabel(step.prompt) : promptlessStepLabel(step) ?? shortStepLabel(step.prompt);
   const notes = stepAnnotations(step);
   const suffix = notes.length > 0 ? ` _(${notes.join('; ')})_` : '';
   return `${index + 1}. ${label}${suffix}`;
