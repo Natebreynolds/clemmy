@@ -204,3 +204,13 @@ test('verify.path_exists accepts the file\'s own relative path, resolved where r
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an array contract on a tool that answers in an envelope takes the list it carries', () => {
+  const contract = { type: 'array' as const };
+  const envelope = { data: { value: [{ subject: 'One' }, { subject: 'Two' }] }, error: null, successful: true, logId: 'log_x' };
+  assert.deepEqual(coerceOutputForContract(envelope, contract), [{ subject: 'One' }, { subject: 'Two' }]);
+  assert.deepEqual(coerceOutputForContract({ data: { value: [] }, successful: true }, contract), [], 'an empty day is an empty list');
+  const failed = { data: { value: [] }, error: 'denied', successful: false };
+  assert.deepEqual(coerceOutputForContract(failed, contract), failed, 'a failure envelope is left for the failure checks');
+  assert.deepEqual(coerceOutputForContract(envelope, { type: 'object' as const }), envelope, 'an object contract keeps the envelope');
+});

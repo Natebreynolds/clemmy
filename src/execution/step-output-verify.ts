@@ -17,6 +17,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { WorkflowStepOutputContract, WorkflowContractType } from '../memory/workflow-store.js';
+import { countDominantArray, resolveDominantArray } from '../runtime/harness/tool-output-digest.js';
 
 export interface StepOutputVerifyResult {
   ok: boolean;
@@ -304,6 +305,18 @@ export function coerceOutputForContract(
       return JSON.stringify(output, null, 2);
     } catch {
       return output;
+    }
+  }
+  // An array contract on a step whose tool answers in an envelope (a
+  // provider's {data: {value: [...]}, successful: true}) asks for the list it
+  // carries: the step's output is that list. An envelope reporting failure is
+  // left as it came, for the failure checks to read.
+  if (contract.type === 'array' && output !== null && typeof output === 'object' && !Array.isArray(output)) {
+    const envelope = output as Record<string, unknown>;
+    if (envelope.successful !== false && (envelope.error === undefined || envelope.error === null || envelope.error === '')) {
+      const list = resolveDominantArray(output);
+      if (list) return list.rows;
+      if (countDominantArray(output)?.count === 0) return [];
     }
   }
   const structured =
