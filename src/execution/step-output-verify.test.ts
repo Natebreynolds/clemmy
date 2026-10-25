@@ -214,3 +214,12 @@ test('an array contract on a tool that answers in an envelope takes the list it 
   assert.deepEqual(coerceOutputForContract(failed, contract), failed, 'a failure envelope is left for the failure checks');
   assert.deepEqual(coerceOutputForContract(envelope, { type: 'object' as const }), envelope, 'an object contract keeps the envelope');
 });
+
+test('required keys the envelope lacks but its payload has every one of read the payload', () => {
+  const envelope = { data: { value: [{ subject: 'One' }], '@odata.context': 'x' }, error: null, successful: true, logId: 'log_x' };
+  assert.deepEqual(coerceOutputForContract(envelope, { type: 'object', required_keys: ['value'] }), envelope.data);
+  assert.deepEqual(coerceOutputForContract(envelope, { type: 'object', non_empty: ['value'] }), envelope.data);
+  assert.deepEqual(coerceOutputForContract(envelope, { type: 'object', required_keys: ['data'] }), envelope, 'a key the envelope has keeps it');
+  const failed = { data: { value: [] }, error: 'denied', successful: false };
+  assert.deepEqual(coerceOutputForContract(failed, { type: 'object', required_keys: ['value'] }), failed);
+});

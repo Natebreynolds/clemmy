@@ -657,6 +657,23 @@ export function autoRepairWorkflowDefinition(
     repairs.push(`Step "${step.id}" calls ${operation} directly; ${tool} only carried it.`);
   }
 
+  // A call that names its operation and also wraps its arguments in a carrier
+  // for that same operation ({tool_slug: <it>, arguments: {...}}) runs with
+  // the carrier's own arguments: the wrapper was the gateway's, not the
+  // operation's (live: required start/end reported missing one level up).
+  for (const step of steps) {
+    const tool = typeof step.call?.tool === 'string' ? step.call.tool.trim() : '';
+    const args = step.call?.args;
+    if (!tool || step.invocationPlan || !args || registryToolHasNoExactCallContract(tool)) continue;
+    const keys = Object.keys(args);
+    if (typeof args.tool_slug !== 'string' || args.tool_slug.trim().toUpperCase() !== tool.toUpperCase()
+      || !keys.every((key) => key === 'tool_slug' || key === 'arguments' || key === 'arguments_json')) continue;
+    const normalized = normalizeComposioCarrierInput(args);
+    if (!normalized.ok || normalized.adapted.includes('connection_id_stripped')) continue;
+    step.call = { ...step.call!, args: normalized.canonical.args };
+    repairs.push(`Step "${step.id}" passes ${tool} its own arguments; the carrier around them was the gateway's.`);
+  }
+
   // 4 first, so a binding written in the call's arguments is wired below like
   // any other prompt reference.
   for (const step of steps) {

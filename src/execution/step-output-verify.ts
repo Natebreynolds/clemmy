@@ -319,6 +319,18 @@ export function coerceOutputForContract(
       if (countDominantArray(output)?.count === 0) return [];
     }
   }
+  // Required keys a tool's envelope does not have at its top but its
+  // payload (data) has every one of: the contract describes the payload.
+  const requiredKeys = [...(contract.required_keys ?? []), ...(contract.non_empty ?? [])].filter((key) => key && !key.includes('.'));
+  if (requiredKeys.length > 0 && output !== null && typeof output === 'object' && !Array.isArray(output)) {
+    const envelope = output as Record<string, unknown>;
+    const payload = envelope.data;
+    if (envelope.successful !== false && (envelope.error === undefined || envelope.error === null || envelope.error === '')
+      && payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+      && requiredKeys.every((key) => !(key in envelope) && key in (payload as Record<string, unknown>))) {
+      return payload;
+    }
+  }
   const structured =
     contract.type === 'object' ||
     contract.type === 'array' ||

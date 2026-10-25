@@ -1105,3 +1105,19 @@ test('autoRepair: a gateway call whose arguments arrive as arguments_json is lif
   });
   assert.notEqual(autoRepairWorkflowDefinition(pinned).def.steps[0].call?.tool, 'FIXTURE_LIST_EVENTS');
 });
+
+test('autoRepair: a call naming its operation with a carrier for that same operation runs with the carrier\'s arguments', () => {
+  const def = wf({
+    steps: [{
+      id: 'get_today', sideEffect: 'read',
+      call: { tool: 'FIXTURE_LIST_EVENTS', args: { tool_slug: 'FIXTURE_LIST_EVENTS', arguments: { start: '{{date}}T00:00:00', top: 50 } } },
+    }],
+  });
+  const { def: repaired, repairs } = autoRepairWorkflowDefinition(def);
+  assert.deepEqual(repaired.steps[0].call, { tool: 'FIXTURE_LIST_EVENTS', args: { start: '{{date}}T00:00:00', top: 50 } });
+  assert.match(repairs.join(' '), /passes FIXTURE_LIST_EVENTS its own arguments/);
+  // A carrier for a different operation, or extra keys beside it, is left as written.
+  const other = wf({ steps: [{ id: 'x', sideEffect: 'read',
+    call: { tool: 'FIXTURE_LIST_EVENTS', args: { tool_slug: 'FIXTURE_OTHER', arguments: { top: 1 } } } }] });
+  assert.deepEqual(autoRepairWorkflowDefinition(other).def.steps[0].call?.args, { tool_slug: 'FIXTURE_OTHER', arguments: { top: 1 } });
+});
