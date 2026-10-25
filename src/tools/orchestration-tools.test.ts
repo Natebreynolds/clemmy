@@ -3032,3 +3032,25 @@ test('native input declarations preserve omitted updates and legacy loader metad
   assert.deepEqual(inputDeclarationDurableSnapshot(), before);
   assert.deepEqual(workflowRunFiles(), []);
 });
+
+test('workflow_delete takes every workflow the owner named in one call and stops their runs still in flight', async () => {
+  resetState();
+  const definition = (name: string): WorkflowDefinition => ({ name, description: 'controlled fixture', enabled: false,
+    trigger: { manual: true }, steps: [{ id: 'read', prompt: 'Read the fixture.', sideEffect: 'read' }] } as WorkflowDefinition);
+  writeWorkflow('fixture-delete-a', definition('Fixture Delete A'));
+  writeWorkflow('fixture-delete-b', definition('Fixture Delete B'));
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'run-delete-queued.json'), JSON.stringify({
+    id: 'run-delete-queued', workflow: 'Fixture Delete B', status: 'queued', createdAt: new Date().toISOString(), inputs: {} }));
+  const handler = handlers.get('workflow_delete');
+  assert.ok(handler);
+  const result = await handler({ names: ['Fixture Delete A', 'Fixture Delete B', 'Fixture Delete Missing'], confirm: true });
+  const text = result.content[0]!.text;
+  assert.match(text, /Workflow "Fixture Delete A" deleted\./);
+  assert.match(text, /Workflow "Fixture Delete B" deleted\. 1 run still in flight was stopped\./);
+  assert.match(text, /Workflow "Fixture Delete Missing" not found\./);
+  assert.equal(readWorkflow('fixture-delete-a'), null);
+  assert.equal(readWorkflow('fixture-delete-b'), null);
+  assert.equal(JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, 'run-delete-queued.json'), 'utf-8')).status, 'cancelled');
+  assert.match((await handler({ confirm: true })).content[0]!.text, /Nothing was deleted/);
+});

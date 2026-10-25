@@ -15,6 +15,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
+import { workflowRunInventory } from './workflow-run-inventory.js';
 import { markWorkflowCapabilityNotificationsSettled } from '../runtime/notifications.js';
 import { syncExistingFileBytes } from '../runtime/sync-directory.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
@@ -201,6 +202,28 @@ export function requestWorkflowRunCancellation(
     }
     return installCancellationReceiptUnlocked(runId, reason, source);
   });
+}
+
+/**
+ * Lifecycle cleanup for a deleted or disabled workflow: every run of it that
+ * has not ended is cancelled at the shared boundary (a completion that wins
+ * first reads already_terminal), so none is left parked or queued with no
+ * workflow to report back through. Best-effort per run; never blocks the
+ * delete or disable. Returns how many runs stopped.
+ */
+export function cancelInFlightRunsOfWorkflow(workflowName: string, reason: string): number {
+  let cancelled = 0;
+  try {
+    for (const { record } of workflowRunInventory()) {
+      if (record.workflow !== workflowName || typeof record.id !== 'string') continue;
+      if (isTerminalWorkflowRunStatus(record.status)) continue;
+      try {
+        const result = cancelWorkflowRunAtBoundary({ runId: record.id, reason, source: 'workflow-lifecycle-cleanup', expectedWorkflow: workflowName });
+        if (result.status === 'cancelled') cancelled += 1;
+      } catch { /* one bad run must not block the rest */ }
+    }
+  } catch { /* the run directory read is best-effort */ }
+  return cancelled;
 }
 
 /**

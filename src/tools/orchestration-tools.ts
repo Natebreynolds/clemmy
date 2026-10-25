@@ -36,6 +36,7 @@ import { preflightWorkflow } from '../execution/workflow-preflight.js';
 import { applyWorkflowContractUpgrades, proposeWorkflowContractUpgrades, renderWorkflowContractProposalReport } from '../execution/workflow-contract-proposals.js';
 import { listCachedToolkits } from '../integrations/composio/client.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
+import { cancelInFlightRunsOfWorkflow } from '../execution/workflow-run-cancellation.js';
 import { analyzeWorkflowGaps, renderWorkflowGapQuestions } from '../execution/workflow-gap-test.js';
 import {
   applyWorkflowTriggerPatch,
@@ -2725,18 +2726,25 @@ export function registerOrchestrationTools(server: McpServer): void {
 
   server.tool(
     'workflow_delete',
-    'Permanently delete a workflow definition file. Pending queued runs are NOT cancelled — call workflow_run_status on any in-flight runs first.',
+    'Permanently delete workflow definitions; any of their runs still in flight are stopped. Several workflows the owner named in one request go in one call (names), so the owner answers once.',
     {
-      name: z.string().min(1),
+      name: z.string().min(1).optional().describe('One workflow to delete.'),
+      names: z.array(z.string().min(1)).min(1).max(20).optional().describe('Several workflows the owner named in one request.'),
       confirm: z.boolean().describe('Must be true to proceed. Guard against accidental deletion.'),
     },
-    async ({ name, confirm }) => {
+    async ({ name, names, confirm }) => {
       if (!confirm) return textResult('Refusing to delete: pass confirm=true.');
-      const entry = listWorkflowFiles().find((w) => w.data.name === name);
-      if (!entry) return textResult(`Workflow "${name}" not found.`);
-      const ok = deleteWorkflowAndSyncTriggers(entry.name);
-      if (!ok) return textResult(`Workflow "${name}" delete failed (file system error).`);
-      return textResult(`Workflow "${name}" deleted.`);
+      const targets = [...new Set([...(name ? [name] : []), ...(names ?? [])].map((value) => value.trim()).filter(Boolean))];
+      if (targets.length === 0) return textResult('Name the workflow to delete (name, or names for several). Nothing was deleted.');
+      const files = listWorkflowFiles();
+      const lines = targets.map((target) => {
+        const entry = files.find((w) => w.data.name === target || w.name === target);
+        if (!entry) return `Workflow "${target}" not found.`;
+        const stopped = cancelInFlightRunsOfWorkflow(entry.data.name, `Workflow "${entry.data.name}" was deleted; its in-flight run was cancelled.`);
+        if (!deleteWorkflowAndSyncTriggers(entry.name)) return `Workflow "${target}" delete failed (file system error).`;
+        return `Workflow "${entry.data.name}" deleted.${stopped > 0 ? ` ${stopped} run${stopped === 1 ? '' : 's'} still in flight ${stopped === 1 ? 'was' : 'were'} stopped.` : ''}`;
+      });
+      return textResult(lines.join('\n'));
     },
   );
 

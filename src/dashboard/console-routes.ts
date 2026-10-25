@@ -637,7 +637,7 @@ import {
   type QueueWorkflowRunRecoveryIntentInput,
 } from '../tools/workflow-run-queue.js';
 import { clearWorkflowFailures } from '../execution/workflow-failure-ledger.js';
-import { cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
+import { cancelInFlightRunsOfWorkflow, cancelWorkflowRunAtBoundary, isTerminalWorkflowRunStatus } from '../execution/workflow-run-cancellation.js';
 import {
   listHeldWorkflowCatchupRuns,
   resumeWorkflowCatchupRun,
@@ -6772,18 +6772,7 @@ export function registerConsoleRoutes(
   // how many were stopped. Best-effort — a cancel failure never blocks the
   // delete/disable itself.
   function cancelInFlightRunsForWorkflow(workflowName: string, reason: string): number {
-    let cancelled = 0;
-    try {
-      for (const run of readWorkflowRunRecords()) {
-        if (run.workflow !== workflowName) continue;
-        if (isTerminalWorkflowRunStatus(run.status)) continue;
-        try {
-          const result = cancelWorkflowRunAtBoundary({ runId: run.id, reason, source: 'workflow-lifecycle-cleanup', expectedWorkflow: workflowName });
-          if (result.status === 'cancelled') cancelled += 1;
-        } catch { /* one bad run must not block the rest */ }
-      }
-    } catch { /* the run dir read is best-effort */ }
-    return cancelled;
+    return cancelInFlightRunsOfWorkflow(workflowName, reason);
   }
 
   app.delete('/api/console/workflows/:name', (req, res) => {
