@@ -839,6 +839,20 @@ function parseBody(body: string): ParsedBody {
   return { description_body, stepPrompts };
 }
 
+/**
+ * An older engine appended a binding to a step's prompt ("→ Proven tool
+ * (engine-bound): use this exact, proven command (do not substitute another
+ * tool): `…`"). Remembered commands are now optional candidates offered when
+ * a workflow is authored, never part of a step, and a stale binding can
+ * contradict the step it sits on (live: a step whose job is to run one data
+ * runner carried "use `<a different command>`, do not substitute"). The step
+ * is read as its author wrote it; the next save stores it that way.
+ */
+const LEGACY_BIND_DIRECTIVE_RE = /\s*→ Proven tool \(engine-bound\):[^\n]*$/;
+export function withoutLegacyBindDirective(prompt: string): string {
+  return prompt.replace(LEGACY_BIND_DIRECTIVE_RE, '');
+}
+
 /** Clamp a run-goal's attempt ceiling: 1..3 total runs, default 2. */
 /** Name patterns for smoke workflows created before the `origin` field existed
  *  (and by brain-driven creation tests that go through workflow_create, which
@@ -894,9 +908,9 @@ export function readWorkflowDefinitionFile(filePath: string): WorkflowDefinition
       // Prefer the body's `## step: <id>` content when present; fall
       // back to the legacy frontmatter prompt for migration compat.
       const bodyPrompt = body.stepPrompts[id];
-      const prompt = bodyPrompt && bodyPrompt.length > 0
+      const prompt = withoutLegacyBindDirective(bodyPrompt && bodyPrompt.length > 0
         ? bodyPrompt
-        : String(step.prompt ?? '');
+        : String(step.prompt ?? ''));
       const result: WorkflowStepInput = { id, prompt };
       const stepProject = typeof step.project === 'string'
         ? step.project.trim()

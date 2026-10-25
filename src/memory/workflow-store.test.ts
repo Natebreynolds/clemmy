@@ -683,3 +683,19 @@ test('hand-authored input defaults: 0 and false are values, null is none, a list
   assert.ok(enabling.errors.some((e) => e.includes('inputs.regions.default is a list')));
   assert.equal(enabling.errors.some((e) => /inputs\.(limit|dryRun|owner)\.default/.test(e)), false);
 });
+
+test('a binding an older engine appended to a step prompt is read away; the author\'s words stay', () => {
+  writeWorkflow('legacy-bind', {
+    name: 'legacy-bind',
+    description: 'legacy binding test',
+    enabled: false,
+    trigger: { manual: true },
+    steps: [{
+      id: 'refresh',
+      prompt: 'READ-ONLY. Run the controlled data runner and return its JSON.\n\n→ Proven tool (engine-bound): use this exact, proven command (do not substitute another tool): `controlled other command` via run_shell_command.',
+      sideEffect: 'read',
+    }],
+  });
+  const step = readWorkflow('legacy-bind')!.data.steps[0]!;
+  assert.equal(step.prompt, 'READ-ONLY. Run the controlled data runner and return its JSON.');
+});
