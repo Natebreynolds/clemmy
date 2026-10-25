@@ -285,11 +285,12 @@ function foldIntoStore(pairs: readonly LearnedPair[], failedRepairs: readonly Re
  * turn. Settlements are read first (small); only a turn where a call failed
  * and a later call to the same tool succeeded has its calls and replies read,
  * through the per-session index, a few turns at a time with the event loop
- * free between them. Writes the store (empty or not), so it runs once.
+ * free between them. Runs once per process; writes the store only when it
+ * found something.
  * Resolves to how many pairs it found; never rejects.
  */
 export async function seedArgumentCorrectionsFromRecentTurns(days = BACKFILL_DAYS, now = new Date()): Promise<number> {
-  if (argumentCorrectionStoreExists() || seeding) return 0;
+  if (argumentCorrectionStoreExists() || seeding || seededInProcess) return 0;
   seeding = true;
   try {
     const db = openEventLog();
@@ -328,20 +329,31 @@ export async function seedArgumentCorrectionsFromRecentTurns(days = BACKFILL_DAY
       } catch { /* one unreadable turn teaches nothing */ }
       if (index % 8 === 7) await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    foldIntoStore(pairs, [], [], now);
+    // Nothing found writes nothing: a file with no records would only mark
+    // that the read ran, and a fresh home then gains a file on its first
+    // turn. Once per process is the marker instead.
+    if (pairs.length > 0) foldIntoStore(pairs, [], [], now);
     return pairs.length;
   } catch {
     return 0;
   } finally {
     seeding = false;
+    seededInProcess = true;
   }
 }
 let seeding = false;
+let seededInProcess = false;
+
+/** Test seam: forget that this process already read its recent turns. */
+export function _resetArgumentCorrectionSeedForTests(): void {
+  seeding = false;
+  seededInProcess = false;
+}
 
 /** Fold one source's proven rejections into the store. The first time on a
  *  machine, recent turns are read instead, this one among them. Never throws. */
 export function learnArgumentCorrections(sessionId: string, sourceUserSeq: number, now = new Date()): LearnedPair[] {
-  if (!argumentCorrectionStoreExists()) {
+  if (!argumentCorrectionStoreExists() && !seededInProcess) {
     void seedArgumentCorrectionsFromRecentTurns(BACKFILL_DAYS, now);
     return [];
   }

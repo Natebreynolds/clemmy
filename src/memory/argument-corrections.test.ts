@@ -9,7 +9,7 @@
  */
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -23,7 +23,7 @@ const events = await import('../runtime/harness/eventlog.js');
 const { resetMemoryDb } = await import('./db.js');
 const { rememberFact, getFact, setFactPinned, presentPolicyText } = await import('./facts.js');
 const store = await import('./argument-corrections-store.js');
-const { learnArgumentCorrections, rejectionsFromRows, seedArgumentCorrectionsFromRecentTurns } = await import('./argument-corrections.js');
+const { learnArgumentCorrections, rejectionsFromRows, seedArgumentCorrectionsFromRecentTurns, _resetArgumentCorrectionSeedForTests } = await import('./argument-corrections.js');
 const { _setUseRewriteModelForTests } = await import('./use-rewrite-draft.js');
 const { runMemorySelfHeal, revertMemoryHeal, listProposedMemoryFixes } = await import('./self-heal.js');
 
@@ -32,7 +32,7 @@ const ORG = 'ORGID00FIXTURE0001';
 const REJECTION = `An error occurred while running the tool. Error: ReviewedCliProcessError: reviewed CLI process nonzero_exit: NamedOrgNotFoundError: Parsing --target-org No authorization information found for ${ORG}.`;
 
 before(() => { store._setArgumentCorrectionStorePathForTests(STORE); });
-beforeEach(() => { rmSync(STORE, { force: true }); resetMemoryDb(); });
+beforeEach(() => { rmSync(STORE, { force: true }); resetMemoryDb(); _resetArgumentCorrectionSeedForTests(); });
 after(() => { _setUseRewriteModelForTests(null); store._setArgumentCorrectionStorePathForTests(null); events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 
 /** A machine that already seeded: learning folds the turn it is given. */
@@ -159,4 +159,15 @@ test('a machine\'s first learning reads its recent turns once, so what they prov
   const entry = store.loadArgumentCorrections().find((candidate) => candidate.rejectedValue === ORG);
   assert.ok(entry && entry.pairs >= 2 && store.autoRepairable(entry), JSON.stringify(entry));
   assert.equal(await seedArgumentCorrectionsFromRecentTurns(), 0, 'it runs once: the store now exists');
+});
+
+test('a first read that finds nothing writes nothing, and later turns still learn', async () => {
+  const session = events.createSession({ kind: 'chat' });
+  // A window with no turns in it (earlier tests' turns are in the shared log).
+  const empty = new Date(Date.now() + 365 * 86_400_000);
+  assert.equal(await seedArgumentCorrectionsFromRecentTurns(14, empty), 0);
+  assert.equal(existsSync(STORE), false, 'a fresh home gains no file from an empty read');
+  assert.equal(await seedArgumentCorrectionsFromRecentTurns(), 0, 'and does not read again in this process');
+  learnArgumentCorrections(session.id, rejectedThenFixedTurn(session.id));
+  assert.equal(store.loadArgumentCorrections()[0]?.pairs, 1, 'the next real rejection is learned');
 });
