@@ -6804,7 +6804,7 @@ async function runStepViaHarness(
     try {
       const efficiency = usageEfficiencyForSource(realSessionId);
       if (efficiency.frames > 0) {
-        appendWorkflowEvent(workflowName, workflowRunId, {
+        appendWorkflowEvent(workflowStorageName, workflowRunId, {
           kind: 'step_advisory',
           stepId: step.id,
           meta: { reason: 'step_efficiency', ...efficiency },
