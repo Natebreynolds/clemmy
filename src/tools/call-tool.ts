@@ -419,7 +419,7 @@ const DESCRIPTION = [
 
 const CONTROL_ONLY_DESCRIPTION = [
   'Invoke an available native control, recovery, or READ tool: exact `name` plus `args_json`, the arguments as a JSON object; a legacy JSON object string is also accepted. Prefer a tool\'s direct callable when its schema is already loaded.',
-  'This carrier cannot invoke business/provider WRITES or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
+  'This carrier cannot invoke WRITES (a provider\'s or your own) or external MCP tools; those belong inside `work_call`. Local reads are direct here, and the target keeps its own schema, approval class, admission, and settlement.',
   'Invalid arguments dispatch nothing and return the exact schema. Correct the arguments using that schema; use tool_search only when the capability or schema is still missing.',
   FORMAL_APPROVAL_PREPARATION_GUIDANCE,
   SEALED_APPROVAL_GUIDANCE,
