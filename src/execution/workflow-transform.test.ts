@@ -323,3 +323,10 @@ test('a step path the tool envelope does not have reads its successful payload; 
   assert.throws(() => executeWorkflowTransform({ transform, inputs: {}, stepOutputs: { read: { ...read, successful: false } } }), /did not resolve/);
   assert.throws(() => executeWorkflowTransform({ transform, inputs: {}, stepOutputs: { read: { ...read, error: 'denied' } } }), /did not resolve/);
 });
+
+test('the workflow builder guide lists every reviewed transform operation, so authoring never has to read the engine', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { REVIEWED_TRANSFORM_OPS } = await import('./workflow-transform.js');
+  const guide = readFileSync(new URL('../../builtin-skills/workflow-builder/SKILL.md', import.meta.url), 'utf8');
+  for (const op of REVIEWED_TRANSFORM_OPS) assert.ok(guide.includes(`{"op":"${op}"`), `the guide shows ${op}`);
+});

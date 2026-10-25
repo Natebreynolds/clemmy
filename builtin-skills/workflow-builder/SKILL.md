@@ -27,7 +27,7 @@ Decide these before calling `workflow_create`:
 
    Declare it honestly. It decides what a test runs for real and what it only previews.
 3. **How each step runs**:
-   - **`call` step:** one exact tool with known arguments, without a reasoning model. Use it for fixed reads and writes; prefer `args_json` (JSON-object text).
+   - **`call` step:** one exact tool with known arguments, without a reasoning model. Use it for fixed reads and writes; prefer `args_json` (JSON-object text). It runs a connected app's operation or one of Clem's tools with a reviewed local contract (`read_file`, `write_file`, `space_get`, `space_set_data`); a shell command is not one, so a call to `run_shell_command` is saved as a prompt step.
    - **`transform` step:** a pure closed JSON expression for supported parsing, filtering, mapping, sorting or aggregation. Use it for deterministic data shaping; it has no tools, files, network or shell. Declare `sideEffect: read` and every upstream dependency.
    - **`prompt` step:** a model that reasons with tools. Use it for judgment, choosing an approach or writing prose. Name the needed discovered tools in `allowedTools`.
 
@@ -35,6 +35,15 @@ Decide these before calling `workflow_create`:
    `{"id":"pull","call":{"tool":"<exact operation>","args_json":"{\"top\":5}"},"sideEffect":"read"}`
    `{"id":"shape","transform":"{\"version\":1,\"expression\":{…}}","dependsOn":["pull"],"sideEffect":"read"}`
    `{"id":"write_up","prompt":"…","dependsOn":["shape"],"allowedTools":["<tool>"],"sideEffect":"read"}`
+
+   Transform expressions: `{"version":1,"expression":<expr>}`, where each `<expr>` is one of
+   - `{"op":"get","from":"steps.<id>.output.<path>"}` (or `input.<key>`; `item.<path>` inside `map`). `from` is always a reference, never an expression: to read a field of a computed value (a parsed file), compute it in its own transform step and `get` from that step.
+   - `{"op":"literal","value":…}` · `{"op":"jsonParse","value":<expr>}` · `{"op":"jsonStringify","value":<expr>}` · `{"op":"count","value":<expr>}`
+   - `{"op":"object","fields":[{"key":"name","value":<expr>}]}` · `{"op":"array","items":[<expr>,…]}` · `{"op":"map","value":<list>,"each":<expr using item>}`
+   - `{"op":"select","value":<list>,"where":{"column":"status","op":"eq|ne|contains|empty|nonempty","value":"…"},"columns":["…"],"limit":10}` (where, columns and limit are optional)
+   - `{"op":"sort","value":<list>,"by":[{"column":"name","direction":"asc|desc"}]}` · `{"op":"unique","value":<list>,"keys":["id"]}`
+   - `{"op":"aggregate","value":<list>,"groupBy":["owner"],"metrics":[{"fn":"count|sum|avg|min|max","column":"amount"}]}`
+   A call step's output is what its tool returned; a path its `{"data": …}` envelope does not have reads that data. To see the real shape, read the step's output in a test run (`workflow_run_status`) before writing a transform against it.
 4. **Data flow**: `dependsOn` lists the steps whose output a step needs. Refer to output as `{{steps.<id>.output}}` (add `.path` for a field).
 5. **Per-item work**: `forEach` runs a step once per item of a list. The source can be written `steps.<id>.output[.path]`, `{{steps.<id>.output}}`, `<id>.output`, a bare step id, or `input.<key>`. Inside the step, `{{item}}` is the current item. On a recurring workflow, `forEachNewOnly: true` skips items earlier runs already finished. Structured `call` fan-out supports reads only.
 6. **Trigger**: manual, a schedule (`trigger_schedule` plus `trigger_timezone` in the user's zone), or an event.
