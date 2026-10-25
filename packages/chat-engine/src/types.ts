@@ -312,6 +312,8 @@ export interface WorkflowCardData {
   changedStepIds: string[];
   addedStepIds: string[];
   removedStepIds: string[];
+  /** Settings that changed when no step did: goal, schedule, description, … */
+  changedSettings?: string[];
 }
 
 /** "Use <model> for <kind of work> from now on?" — asked once after a turn

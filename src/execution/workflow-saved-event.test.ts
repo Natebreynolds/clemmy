@@ -90,3 +90,16 @@ test('the public projection keeps the bounded shape and drops a malformed row', 
   const bad = { ...row, data: { name: 'x', slug: '', op: 'created', steps: [] } } as never;
   assert.equal(projectHarnessEventForPublic(bad), null);
 });
+
+test('a save that changed no step names the settings it did change, and the public row keeps only known ones', () => {
+  const goalOnly = workflowSavedEventData('weekly-posts', before, { ...before, goal: { objective: 'Post every item.' } } as never);
+  assert.deepEqual(goalOnly.changedStepIds, []);
+  assert.deepEqual(goalOnly.changedSettings, ['goal']);
+  const both = workflowSavedEventData('weekly-posts', before, { ...before, description: 'New words.', trigger: { schedule: '0 9 * * 1' } } as never);
+  assert.deepEqual(both.changedSettings, ['schedule', 'description']);
+  assert.deepEqual(workflowSavedEventData('weekly-posts', null, before).changedSettings, [], 'a creation changes no setting');
+
+  const row = { seq: 1, sessionId: 's', turn: 0, role: 'system', type: 'workflow_saved',
+    data: { ...goalOnly, changedSettings: ['goal', 'not-a-setting'] }, createdAt: 'now' } as never;
+  assert.deepEqual((projectHarnessEventForPublic(row)!.data as Record<string, unknown>).changedSettings, ['goal']);
+});

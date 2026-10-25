@@ -51,6 +51,11 @@ export function modelDisplayName(identity: string): string {
       merged.push(token);
     }
   }
+  // A trailing snapshot or build code after a word ("flash-1017") is the
+  // provider's bookkeeping, not part of the name a person says.
+  const last = merged[merged.length - 1];
+  const before = merged[merged.length - 2];
+  if (last !== undefined && before !== undefined && /^\d{4,8}$/.test(last) && !/^\d/.test(before)) merged.pop();
   const words = merged.map(titleToken).join(' ').trim();
   return words || raw;
 }

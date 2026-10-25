@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewNote, turnReviewerName, workflowCardLevels, workflowCards } from './turn-receipt.js';
+import { outsideWorkCards, turnAgentName, turnByline, turnHelpers, turnModelName, turnModelOffer, turnReview, turnReviewNote, turnReviewerName, workflowCardLevels, workflowCards, workflowCardSubtitle, workflowCardTitle, workflowStepTitle } from './turn-receipt.js';
 import { narrateActivity } from './activity-presentation.js';
 import { boundedModelId, modelDisplayName } from './model-name.js';
 import { readQuestionOptions } from './question-options.js';
@@ -63,6 +63,7 @@ test('a model id reads the way a person says it', () => {
   assert.equal(modelDisplayName('qrs-5.2-mini'), 'QRS 5.2 Mini');
   assert.equal(modelDisplayName('open-coder-70b-latest'), 'Open Coder 70B');
   assert.equal(modelDisplayName('build-4-1106-preview'), 'Build 4 1106 Preview');
+  assert.equal(modelDisplayName('vendor-v4.1-flash-1017'), 'Vendor V4.1 Flash', 'a trailing snapshot code is not part of the name');
   assert.equal(modelDisplayName('  '), '');
 });
 
@@ -209,4 +210,15 @@ test('a saved workflow becomes one card under the reply, from the saved definiti
 
   const malformed = fold([{ type: 'workflow_saved', data: { name: 'x', slug: '', op: 'updated', steps: [] } }]);
   assert.equal(workflowCards(malformed).length, 0);
+});
+
+test('a workflow card reads in words: its name, each step, and what a save changed', () => {
+  assert.equal(workflowCardTitle({ name: 'end-of-week-team-sales-snapshot' }), 'End of week team sales snapshot');
+  assert.equal(workflowCardTitle({ name: 'Weekly posts' }), 'Weekly posts', 'a name with spaces stays as written');
+  assert.equal(workflowStepTitle({ id: 'refresh_workspace', label: 'READ-ONLY.' }), 'Refresh workspace');
+  assert.equal(workflowStepTitle({ id: 'pull', label: 'Pull this week’s posts.' }), 'Pull this week’s posts.', 'a one-word id falls back to what the step does');
+  const card = { op: 'updated' as const, enabled: true, steps: [], changedStepIds: [], removedStepIds: [] };
+  assert.equal(workflowCardSubtitle({ ...card, changedSettings: ['goal'] }), 'Goal changed · steps as before');
+  assert.equal(workflowCardSubtitle({ ...card, changedSettings: ['schedule', 'goal'] }), 'Schedule and goal changed · steps as before');
+  assert.equal(workflowCardSubtitle(card), 'Details changed · steps as before');
 });

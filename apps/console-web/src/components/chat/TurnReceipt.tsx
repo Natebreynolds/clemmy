@@ -14,6 +14,7 @@ import { Link } from 'react-router-dom';
 import { AlertCircle, Check, CheckCircle2, Copy, FileText, Loader2, Lock, Mail, PenLine, Repeat, Send, Sparkles, Workflow } from 'lucide-react';
 import {
   outsideWorkCards, projectPagePlace, projectPageTitle, turnByline, turnModelOffer, turnReview, turnReviewNote, workflowCardLevels, workflowCards,
+  workflowCardSubtitle, workflowCardTitle, workflowStepTitle,
   type ModelRuleOffer, type OutsideWorkCard, type TurnReview, type WorkflowCardData,
 } from '@clem/chat-engine';
 import { cn } from '@/lib/cn';
@@ -149,6 +150,43 @@ function DeliverableCard({ row, sessionId }: { row: ActivityItem; sessionId?: st
   );
 }
 
+/** Scripts, settings and data files she changed while doing the work. They
+ *  are real changes, so they are named, but they are not what she made for
+ *  the owner and do not each get a card beside the documents she did make. */
+const WORKING_FILE = /\.(?:mjs|cjs|js|jsx|ts|tsx|py|rb|go|rs|java|kt|swift|sh|bash|zsh|ps1|json|jsonl|ya?ml|toml|ini|cfg|conf|env|lock|sql|log|map|css|scss)$/i;
+
+export function isWorkingFile(name: string): boolean {
+  return WORKING_FILE.test(name.trim());
+}
+
+/** One quiet line for the working files, each name opening beside the
+ *  conversation where that is possible. */
+function WorkingFilesLine({ files, sessionId }: { files: Array<{ name: string; dir: string }>; sessionId?: string }) {
+  const dock = useFileDock();
+  if (files.length === 0) return null;
+  return (
+    <p className="min-w-0 text-caption text-faint sm:col-span-2">
+      {`Also changed ${files.length === 1 ? 'a working file' : `${files.length} working files`}: `}
+      {files.map((file, i) => (
+        <span key={`${file.dir}/${file.name}`}>
+          {i > 0 ? ', ' : ''}
+          {dock && sessionId
+            ? (
+              <button
+                type="button"
+                onClick={() => dock.open({ kind: 'file', ref: { sessionId, name: file.name, folder: file.dir } })}
+                className="underline-offset-2 hover:text-fg hover:underline"
+              >
+                {file.name}
+              </button>
+            )
+            : file.name}
+        </span>
+      ))}
+    </p>
+  );
+}
+
 /** Something the turn changed in another app, confirmed by that app. Open
  *  goes to the app itself: the provider returns no link to the exact item. */
 function OutsideWorkCardView({ card }: { card: OutsideWorkCard }) {
@@ -184,12 +222,8 @@ function WorkflowCardView({ card }: { card: WorkflowCardData }) {
   const levels = workflowCardLevels(card);
   const changed = new Set(card.changedStepIds);
   const added = new Set(card.addedStepIds);
-  const changedCount = card.changedStepIds.length;
-  const subtitle = card.op === 'created'
-    ? `${card.steps.length} step${card.steps.length === 1 ? '' : 's'} · ${card.enabled ? 'on' : 'off until you turn it on'}`
-    : changedCount === 0
-      ? (card.removedStepIds.length > 0 ? `${card.removedStepIds.length} step${card.removedStepIds.length === 1 ? '' : 's'} removed` : 'Settings changed · steps as before')
-      : `${changedCount} step${changedCount === 1 ? '' : 's'} changed${card.removedStepIds.length > 0 ? `, ${card.removedStepIds.length} removed` : ''}${card.enabled ? '' : ' · off until its test passes'}`;
+  const subtitle = workflowCardSubtitle(card);
+  const title = workflowCardTitle(card);
   return (
     <div className="flex min-w-0 flex-col gap-2 rounded-md border border-border bg-surface px-3 py-2.5 sm:col-span-2">
       <div className="flex min-w-0 items-center gap-3">
@@ -197,7 +231,7 @@ function WorkflowCardView({ card }: { card: WorkflowCardData }) {
           <Workflow className="h-[18px] w-[18px]" aria-hidden />
         </span>
         <span className="flex min-w-0 flex-1 flex-col leading-tight">
-          <span className="truncate text-small font-semibold text-fg" title={card.name}>{card.name}</span>
+          <span className="truncate text-small font-semibold text-fg" title={title}>{title}</span>
           <span className="truncate text-caption text-faint">{subtitle}</span>
         </span>
         <Link
@@ -216,13 +250,13 @@ function WorkflowCardView({ card }: { card: WorkflowCardData }) {
                 {level.map((step) => (
                   <span
                     key={step.id}
-                    title={`${step.id}: ${step.label}`}
+                    title={step.label}
                     className={cn(
                       'inline-flex max-w-[160px] items-center gap-1 whitespace-nowrap rounded-sm border px-2 py-0.5 text-caption font-medium',
                       changed.has(step.id) ? 'border-primary bg-primary-tint text-primary' : 'border-border bg-canvas text-fg',
                     )}
                   >
-                    <span className="truncate">{step.label}</span>
+                    <span className="truncate">{workflowStepTitle(step)}</span>
                     {step.approval ? <Lock className="h-3 w-3 shrink-0" aria-hidden /> : null}
                     {step.forEach ? <Repeat className="h-3 w-3 shrink-0" aria-hidden /> : null}
                     {step.effect === 'send' ? <Send className="h-3 w-3 shrink-0" aria-hidden /> : null}
@@ -386,10 +420,20 @@ export function TurnReceipt({
   const reviewNote = turnReviewNote(terminal);
   const byline = turnByline(activity, terminal);
   const saved = activity?.find((row) => row.id === 'deliverables' && row.deliverable);
+  const savedFiles = saved ? (saved.deliverables ?? [saved.deliverable!]) : [];
+  const documents = savedFiles.filter((file) => !isWorkingFile(file.name));
+  const working = savedFiles.filter((file) => isWorkingFile(file.name));
   const offer = turnModelOffer(activity);
   return (
     <>
-      <OutsideWorkCards activity={activity}>{saved ? (saved.deliverables ?? [saved.deliverable!]).map(file => <DeliverableCard key={`${file.dir}/${file.name}`} row={{ ...saved, count: 1, deliverable: file }} sessionId={sessionId} />) : null}</OutsideWorkCards>
+      <OutsideWorkCards activity={activity}>
+        {saved && savedFiles.length > 0 ? (
+          <>
+            {documents.map(file => <DeliverableCard key={`${file.dir}/${file.name}`} row={{ ...saved, count: 1, deliverable: file }} sessionId={sessionId} />)}
+            <WorkingFilesLine files={working} sessionId={sessionId} />
+          </>
+        ) : null}
+      </OutsideWorkCards>
       {offer && sessionId && <ModelRuleOfferCard key={offer.offerId} offer={offer} sessionId={sessionId} />}
       <div className="flex min-h-7 flex-wrap items-center gap-x-3 gap-y-1 text-caption text-faint">
         {review && <ReviewChip review={review} note={reviewNote} original={terminal?.correctedFrom} />}

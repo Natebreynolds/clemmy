@@ -1214,6 +1214,9 @@ function publicDispatchSlug(data: Record<string, unknown>): string {
  *  metadata (accounting layer), NOT a model-supplied argument — so it is safe
  *  to surface as the row's identity. Lowercase built-in tool names only; a
  *  provider SLUG rides `publicDispatchSlug` already. */
+/** The workflow settings a saved-workflow card may name (closed set). */
+const WORKFLOW_SAVED_SETTINGS: ReadonlySet<string> = new Set(['goal', 'schedule', 'description', 'inputs', 'tools', 'project', 'summary', 'sends']);
+
 const PUBLIC_INNER_TOOL_RE = /^[a-z][a-z0-9_]{1,48}$/;
 function publicInnerTool(data: Record<string, unknown>): string {
   const wrapper = firstString(data.tool, data.toolName, data.name);
@@ -1614,6 +1617,9 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         changedStepIds: ids(data.changedStepIds),
         addedStepIds: ids(data.addedStepIds),
         removedStepIds: ids(data.removedStepIds),
+        ...(Array.isArray(data.changedSettings)
+          ? { changedSettings: data.changedSettings.filter((key): key is string => typeof key === 'string' && WORKFLOW_SAVED_SETTINGS.has(key)) }
+          : {}),
         ...(Number.isSafeInteger(data.sourceUserSeq) && Number(data.sourceUserSeq) > 0 ? { sourceUserSeq: Number(data.sourceUserSeq) } : {}),
       };
     }

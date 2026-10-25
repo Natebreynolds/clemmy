@@ -33,7 +33,24 @@ export interface WorkflowSavedEventData {
   changedStepIds: string[];
   addedStepIds: string[];
   removedStepIds: string[];
+  /** Workflow settings that differ from before, by a closed set of names, so
+   *  a save that changed no step can still say what it changed. */
+  changedSettings: WorkflowSavedSetting[];
 }
+
+export type WorkflowSavedSetting = 'goal' | 'schedule' | 'description' | 'inputs' | 'tools' | 'project' | 'summary' | 'sends';
+
+/** Each setting the card can name, read the same way from both definitions. */
+const SETTING_VALUES: Readonly<Record<WorkflowSavedSetting, (def: WorkflowDefinition) => unknown>> = {
+  goal: (def) => def.goal ?? null,
+  schedule: (def) => def.trigger ?? null,
+  description: (def) => def.description ?? '',
+  inputs: (def) => def.inputs ?? null,
+  tools: (def) => def.allowedTools ?? null,
+  project: (def) => def.project ?? null,
+  summary: (def) => def.synthesis ?? null,
+  sends: (def) => def.allowSends ?? null,
+};
 
 /** The fields that decide what a step does; a change to any of them marks the step. */
 function stepBehaviourKey(step: WorkflowStepInput): string {
@@ -81,6 +98,10 @@ export function workflowSavedEventData(
     if (stepBehaviourKey(prior) !== stepBehaviourKey(step)) changedStepIds.push(step.id);
   }
   const removedStepIds = [...beforeById.keys()].filter((id) => !afterIds.has(id));
+  const changedSettings = before
+    ? (Object.keys(SETTING_VALUES) as WorkflowSavedSetting[]).filter((key) => (
+      JSON.stringify(SETTING_VALUES[key](before)) !== JSON.stringify(SETTING_VALUES[key](after))))
+    : [];
   return {
     name: after.name,
     slug,
@@ -90,6 +111,7 @@ export function workflowSavedEventData(
     changedStepIds,
     addedStepIds,
     removedStepIds,
+    changedSettings,
   };
 }
 

@@ -693,6 +693,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
         workflow: {
           name, slug, op, enabled: d.enabled === true, steps,
           changedStepIds: ids(d.changedStepIds), addedStepIds: ids(d.addedStepIds), removedStepIds: ids(d.removedStepIds),
+          ...(ids(d.changedSettings).length > 0 ? { changedSettings: ids(d.changedSettings) } : {}),
         },
       };
       return prev.some((a) => a.id === row.id) ? prev.map((a) => (a.id === row.id ? row : a)) : [...prev, row];

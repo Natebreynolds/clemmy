@@ -43,15 +43,13 @@ test('the rolling deliverables row contributes its own total, not one', () => {
   assert.equal(chips[0]?.label, '3 files');
 });
 
-test('read work degrades to the weakest kind and never claims a source', () => {
+test('read work never claims a source and is not counted as results', () => {
   const chips = observedEvidenceChips([
     { id: 't1', kind: 'tool', status: 'done', effect: 'read' },
     { id: 't2', kind: 'tool', status: 'done', effect: 'read' },
   ]);
-  assert.equal(chips.length, 1);
-  assert.equal(chips[0]?.kind, 'tool_result',
-    'a `source` chip claims Clem read a named artifact; all the client saw was a tool return');
-  assert.equal(chips[0]?.label, '2 results');
+  assert.deepEqual(chips, [],
+    'a `source` chip claims Clem read a named artifact, and "2 results" tells the owner nothing the step list does not');
 });
 
 test('unfinished work contributes nothing', () => {
@@ -85,5 +83,5 @@ test('ordering puts the load-bearing evidence first', () => {
     { id: 'deliverables', kind: 'event', status: 'done', count: 1 },
     { id: 'x', kind: 'tool', status: 'done', effect: 'external_write', write: { disposition: 'confirmed' } },
   ]);
-  assert.deepEqual(chips.map((c) => c.kind), ['external_receipt', 'artifact', 'tool_result']);
+  assert.deepEqual(chips.map((c) => c.kind), ['external_receipt', 'artifact']);
 });

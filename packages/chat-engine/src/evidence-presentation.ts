@@ -107,9 +107,11 @@ export function openableEvidence(refs: readonly TurnEvidenceRef[] | undefined): 
  *     external_write_succeeded — the very event a server-side receipt would cite.
  *     'reserved' and 'orphaned' are not claims of landing and are left out; a
  *     dispatched-but-unobserved write must never read as a settled one.
- *   - Read work becomes a `tool_result` chip, the weakest kind, and never a
- *     `source` chip. A source claims Clem read a named artifact; all the client
- *     saw was a tool return. Overstating that is how a receipt stops being one.
+ *   - Read work never becomes a `source` chip: a source claims Clem read a
+ *     named artifact, and all the client saw was a tool return. Overstating
+ *     that is how a receipt stops being one. Nor is it counted as "N results":
+ *     a count of tool returns tells the owner nothing the step list above the
+ *     answer does not already show, in words.
  *
  * Terminal refs still win when present: they are the harness's own statement.
  */
@@ -128,9 +130,6 @@ export function observedEvidenceChips(
     // The deliverables row is a rolling aggregate, so its own count is the total.
     else if (item.id === 'deliverables') bump('artifact', item.count ?? 1);
     else if (item.effect === 'local_write' && item.status === 'done') bump('artifact');
-    else if (item.kind === 'tool' && item.status === 'done' && item.effect !== 'external_write') {
-      bump('tool_result', item.repeats ?? 1);
-    }
   }
 
   const chips: EvidenceChip[] = [];

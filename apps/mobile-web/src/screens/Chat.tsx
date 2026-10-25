@@ -73,6 +73,9 @@ import {
   type EngineSnapshot,
   type ProjectSummary,
   workflowCardLevels,
+  workflowCardSubtitle,
+  workflowCardTitle,
+  workflowStepTitle,
   workflowCards,
   type WorkflowCardData,
   APPROVAL_ANSWER_WORDS,
@@ -1777,14 +1780,11 @@ function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (te
 function WorkflowCardView({ card }: { card: WorkflowCardData }) {
   const levels = workflowCardLevels(card);
   const changed = new Set(card.changedStepIds);
-  const n = card.changedStepIds.length;
-  const sub = card.op === 'created'
-    ? `${card.steps.length} step${card.steps.length === 1 ? '' : 's'} · ${card.enabled ? 'on' : 'off until you turn it on'}`
-    : n === 0 ? 'Settings changed · steps as before' : `${n} step${n === 1 ? '' : 's'} changed${card.enabled ? '' : ' · off until its test passes'}`;
+  const sub = workflowCardSubtitle(card);
   return (
     <div class="reply-outside-card reply-workflow">
       <span class="reply-outside-text">
-        <span class="reply-outside-title">{card.name}</span>
+        <span class="reply-outside-title">{workflowCardTitle(card)}</span>
         <span class="reply-outside-sub">{sub}</span>
         {card.steps.length > 0 ? (
           <span class="reply-workflow-chain" aria-label="Steps">
@@ -1794,7 +1794,7 @@ function WorkflowCardView({ card }: { card: WorkflowCardData }) {
                 <span class="reply-workflow-stack">
                   {level.map((step) => (
                     <span key={step.id} class={`reply-workflow-step${changed.has(step.id) ? ' changed' : ''}`} title={step.label}>
-                      {step.label}{step.approval ? ' 🔒' : ''}
+                      {workflowStepTitle(step)}{step.approval ? ' 🔒' : ''}
                     </span>
                   ))}
                 </span>

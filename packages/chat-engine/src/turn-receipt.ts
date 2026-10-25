@@ -242,6 +242,55 @@ export function workflowCards(
   return [...bySlug.values()];
 }
 
+/** An id or slug in words: `end-of-week-team-sales-snapshot` → "End of week
+ *  team sales snapshot". A name already written with spaces stays as it is. */
+export function plainWords(value: string): string {
+  const raw = value.trim();
+  if (!raw || /\s/.test(raw)) return raw;
+  const words = raw.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').trim().toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : raw;
+}
+
+/** The workflow as the card names it. */
+export function workflowCardTitle(card: Pick<WorkflowCardData, 'name'>): string {
+  return plainWords(card.name);
+}
+
+/** A step as its chip names it: the step's own id in words ("Refresh
+ *  workspace") when it reads as words; otherwise the opening words of what
+ *  the step does. */
+export function workflowStepTitle(step: Pick<WorkflowCardData['steps'][number], 'id' | 'label'>): string {
+  const fromId = plainWords(step.id);
+  return fromId.split(' ').length >= 2 ? fromId : step.label;
+}
+
+const SETTING_WORDS: Readonly<Record<string, string>> = {
+  goal: 'goal',
+  schedule: 'schedule',
+  description: 'description',
+  inputs: 'inputs',
+  tools: 'tools',
+  project: 'project',
+  summary: 'final summary',
+  sends: 'send permission',
+};
+
+/** What changed, under the card's name. */
+export function workflowCardSubtitle(card: Pick<WorkflowCardData, 'op' | 'enabled' | 'steps' | 'changedStepIds' | 'removedStepIds' | 'changedSettings'>): string {
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  if (card.op === 'created') return `${plural(card.steps.length, 'step')} · ${card.enabled ? 'on' : 'off until you turn it on'}`;
+  const changed = card.changedStepIds.length;
+  const removed = card.removedStepIds.length;
+  if (changed > 0) {
+    return `${plural(changed, 'step')} changed${removed > 0 ? `, ${removed} removed` : ''}${card.enabled ? '' : ' · off until its test passes'}`;
+  }
+  if (removed > 0) return `${plural(removed, 'step')} removed`;
+  const settings = (card.changedSettings ?? []).map((key) => SETTING_WORDS[key]).filter((word): word is string => Boolean(word));
+  if (settings.length === 0) return 'Details changed · steps as before';
+  const listed = settings.length === 1 ? settings[0]! : `${settings.slice(0, -1).join(', ')} and ${settings[settings.length - 1]}`;
+  return `${listed.charAt(0).toUpperCase()}${listed.slice(1)} changed · steps as before`;
+}
+
 /** Steps arranged by dependency level, for a compact left-to-right chain. */
 export function workflowCardLevels(card: Pick<WorkflowCardData, 'steps'>): WorkflowCardData['steps'][] {
   const known = new Set(card.steps.map((s) => s.id));
