@@ -66,6 +66,7 @@ const {
   runWithStepRetry,
   creationTestVerdict,
   creationTestStepLines,
+  resolveTimeToken,
   shouldHaltResumeForSideEffect,
   hostStepMutationProof,
   catalogPreparationRefusalToCapabilityBlock,
@@ -6271,6 +6272,21 @@ test('creationTestVerdict: empty dominant list (wrapped) → empty', () => {
   assert.equal(creationTestVerdict('scrape', { data: { records: [] } }).status, 'empty');
   // A NON-empty wrapped list is real data → ok.
   assert.equal(creationTestVerdict('scrape', { data: { records: [{ id: 1 }] } }).status, 'ok');
+});
+
+test('{{date}} is today on the owner\'s clock; {{now}} stays the UTC instant', () => {
+  // 5 PM in Los Angeles is already the next day in UTC.
+  const evening = new Date('2026-10-25T00:02:30.000Z');
+  assert.equal(resolveTimeToken('date', evening, 'America/Los_Angeles'), '2026-10-24');
+  assert.equal(resolveTimeToken('date+1d', evening, 'America/Los_Angeles'), '2026-10-25');
+  assert.equal(resolveTimeToken('date-7d', evening, 'America/Los_Angeles'), '2026-10-17');
+  assert.equal(resolveTimeToken('date', evening, 'UTC'), '2026-10-25');
+  assert.equal(resolveTimeToken('now', evening, 'America/Los_Angeles'), '2026-10-25T00:02:30.000Z');
+  assert.equal(resolveTimeToken('now+24h', evening, 'America/Los_Angeles'), '2026-10-26T00:02:30.000Z');
+  // A day step is a calendar day, so the 25-hour day DST ends on is still one day.
+  assert.equal(resolveTimeToken('date+1d', new Date('2026-11-01T07:30:00.000Z'), 'America/Los_Angeles'), '2026-11-02');
+  assert.equal(resolveTimeToken('date', evening, 'Not/AZone'), '2026-10-25', 'an unknown zone reads as UTC');
+  assert.equal(resolveTimeToken('later', evening), null);
 });
 
 test('creationTestVerdict: an exact call whose source answered with an empty list passes, and says so', () => {

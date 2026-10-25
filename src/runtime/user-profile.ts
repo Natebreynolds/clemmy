@@ -203,6 +203,16 @@ export function saveUserProfile(patch: RawProfile): UserProfile {
   return next;
 }
 
+/** The owner's IANA timezone: the profile's, then the machine's; UTC when
+ *  neither is a zone this runtime knows. */
+export function ownerTimeZone(profile?: UserProfile): string {
+  for (const zone of [(profile ?? loadUserProfile()).timezone?.trim(), Intl.DateTimeFormat().resolvedOptions().timeZone]) {
+    if (!zone) continue;
+    try { new Intl.DateTimeFormat('en-US', { timeZone: zone }).format(0); return zone; } catch { /* next */ }
+  }
+  return 'UTC';
+}
+
 /**
  * A recorded moment on the owner's clock ("Sat, Oct 24, 8:00 AM PDT"), so a
  * tool result never hands the model a UTC stamp to convert, where a wrong

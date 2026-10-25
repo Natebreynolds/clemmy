@@ -12,6 +12,7 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { ownerTimeZone } from '../runtime/user-profile.js';
 import { LOGIN_KEYCHAIN_LOCKED_GUIDANCE, probeLoginKeychain } from '../runtime/login-keychain.js';
 import { isIrreversibleSendSlug } from '../runtime/harness/execution-gate.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
@@ -2937,19 +2938,34 @@ function projectContextValue(project: WorkflowStepProjectContext | undefined, ke
 
 // ── time tokens ─────────────────────────────────────────────────────────────
 // {{now}} is the run instant (ISO 8601, UTC); {{now+24h}} / {{now-90m}} /
-// {{now+2d}} shift it. {{date}} is today's UTC date; {{date+1d}} / {{date-7d}}
-// shift it. A relative window ("the next 24 hours") is therefore an exact
-// call: {{now}} .. {{now+24h}}, and a scheduled read never needs a model step
-// to compute its own dates.
+// {{now+2d}} shift it. {{date}} is today's date on the owner's clock (what
+// "today" means to them, beside a timezone argument or not); {{date+1d}} /
+// {{date-7d}} step the calendar. A relative window ("the next 24 hours") is
+// therefore an exact call: {{now}} .. {{now+24h}}, and a scheduled read never
+// needs a model step to compute its own dates.
 const TIME_TOKEN_EXACT_RE = /^(now|date)(?:([+-])(\d{1,5})([mhd]))?$/;
 
-export function resolveTimeToken(token: string, at: Date = new Date()): string | null {
+export function resolveTimeToken(token: string, at: Date = new Date(), timeZone?: string): string | null {
   const m = TIME_TOKEN_EXACT_RE.exec(token.trim());
   if (!m) return null;
+  const sign = m[2] === '-' ? -1 : 1;
+  const amount = m[2] && m[3] ? Number(m[3]) : 0;
+  if (m[1] === 'date' && m[4] === 'd') return calendarDateOn(at, timeZone ?? ownerTimeZone(), sign * amount);
   const unitMs = m[4] === 'm' ? 60_000 : m[4] === 'h' ? 3_600_000 : m[4] === 'd' ? 86_400_000 : 0;
-  const delta = m[2] && m[3] ? (m[2] === '-' ? -1 : 1) * Number(m[3]) * unitMs : 0;
-  const shifted = new Date(at.getTime() + delta);
-  return m[1] === 'now' ? shifted.toISOString() : shifted.toISOString().slice(0, 10);
+  const shifted = new Date(at.getTime() + sign * amount * unitMs);
+  return m[1] === 'now' ? shifted.toISOString() : calendarDateOn(shifted, timeZone ?? ownerTimeZone(), 0);
+}
+
+/** YYYY-MM-DD of `at` on the clock of `timeZone`, `days` calendar days on. */
+function calendarDateOn(at: Date, timeZone: string, days: number): string {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(at);
+  } catch {
+    parts = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(at);
+  }
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value);
+  return new Date(Date.UTC(value('year'), value('month') - 1, value('day') + days)).toISOString().slice(0, 10);
 }
 
 // One grammar for a template reference wherever it appears: a whole tool

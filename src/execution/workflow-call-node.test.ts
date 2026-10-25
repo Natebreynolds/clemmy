@@ -70,7 +70,8 @@ test('time tokens: {{now}}, {{now+24h}}, {{date+1d}} resolve at run time so a re
   const date = renderCallArgValue('{{date}}', INPUTS, OUTPUTS) as string;
   const tomorrow = renderCallArgValue('{{date+1d}}', INPUTS, OUTPUTS) as string;
   const lastWeek = renderCallArgValue('{{date-7d}}', INPUTS, OUTPUTS) as string;
-  assert.equal(date, new Date().toISOString().slice(0, 10));
+  // Today on the owner's clock (no profile here, so the machine's zone).
+  assert.equal(date, new Intl.DateTimeFormat('en-CA', { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }).format(new Date()));
   assert.equal(Math.round((Date.parse(tomorrow) - Date.parse(date)) / 86_400_000), 1);
   assert.equal(Math.round((Date.parse(date) - Date.parse(lastWeek)) / 86_400_000), 7);
   // embedded in a string and nested in objects
