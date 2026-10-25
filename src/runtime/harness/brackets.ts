@@ -1,5 +1,6 @@
 import { acceptedTaskMode, planModeCallRefusal } from './accepted-task-mode.js';
 import { meetingResearchToolRefusal } from '../../integrations/recall/meeting-research-boundary.js';
+import { fullPageNote } from './full-page.js';
 import { retainedResultWayThrough } from './retained-result-routes.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4331,6 +4332,16 @@ export function wrapToolForHarness<T extends WrappableTool>(
     }
   };
 
+  // A read whose list came back exactly as full as the page it asked for is
+  // one page, not a total (full-page.ts). Once, on the outermost call.
+  const fullPageAdvisory = (ctx: HarnessRunContext | undefined, parsedInput: unknown, result: string): string => {
+    if (!ctx || ctx.nestedDispatch || ctx.batchItem) return '';
+    try {
+      if (classifyRuntimeToolEffect(tool.name, parsedInput).effect !== 'read') return '';
+      return fullPageNote(parsedInput, result) ?? '';
+    } catch { return ''; }
+  };
+
   const settledReadSuccessAdvisory = (
     ctx: HarnessRunContext | undefined,
     parsedInput: unknown,
@@ -4834,8 +4845,10 @@ export function wrapToolForHarness<T extends WrappableTool>(
           const settledRead = settledReadSuccessAdvisory(ctx, parsedInput, outwardResult);
           const repeated = repeatedCreationAdvisory(ctx?.sessionId, tool.name, parsedInput,
             classifyExternalWrite(tool.name, parsedInput).shapeKey, invokeCallId);
+          const fullPage = fullPageAdvisory(ctx, parsedInput, outwardResult);
           if (settledRead) settledResultAnnotations.push(settledRead);
           if (repeated) settledResultAnnotations.push(repeated);
+          if (fullPage) settledResultAnnotations.push(fullPage);
         }
         return outwardResult;
       }, (err) => {
