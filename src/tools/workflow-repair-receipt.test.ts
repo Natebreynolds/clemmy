@@ -115,7 +115,8 @@ test('a passed test shows what its run produced; it is the run an owner asked to
   // The record a creation test writes holds only its verdict; the steps'
   // results are in the run's step journal.
   writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
-    id: runId, workflow: 'digest-check', status: 'creation_test', output: 'creation test passed', finishedAt: new Date().toISOString(),
+    id: runId, workflow: 'Digest check', status: 'creation_test', output: 'creation test passed', finishedAt: new Date().toISOString(),
+    workflowDefinitionSnapshot: { workflowSlug: 'digest-check' },
   }));
   appendWorkflowEvent('digest-check', runId, { kind: 'step_completed', stepId: 'read_digest', output: { events: 3 } });
   appendWorkflowEvent('digest-check', runId, { kind: 'step_completed', stepId: 'summarize', output: '- 9:00 Standup\n- 11:00 Review\n- 2:00 Planning' });

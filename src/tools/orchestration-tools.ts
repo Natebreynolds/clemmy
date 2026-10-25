@@ -3060,9 +3060,12 @@ function creationTestProducedLines(settled: WorkflowCreationTestSettlement): str
   if (!exact.ok) return [];
   const record = exact.record;
   // A creation test's record holds only its verdict; what its steps returned
-  // is in the run's own step journal.
-  const journaled = record.status === 'creation_test' && typeof record.workflow === 'string'
-    ? readWorkflowEvents(record.workflow, settled.runId).filter((event) => event.kind === 'step_completed' && event.output !== undefined).at(-1)?.output
+  // is in the run's own step journal, kept under the workflow's slug (the
+  // record names the workflow as the owner sees it).
+  const admittedSlug = (record.workflowDefinitionSnapshot as { workflowSlug?: unknown } | undefined)?.workflowSlug;
+  const slug = typeof admittedSlug === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(admittedSlug) ? admittedSlug : undefined;
+  const journaled = record.status === 'creation_test' && slug
+    ? readWorkflowEvents(slug, settled.runId).filter((event) => event.kind === 'step_completed' && event.output !== undefined).at(-1)?.output
     : undefined;
   let produced = journaled !== undefined
     ? (typeof journaled === 'string' ? journaled.trim() : JSON.stringify(journaled))
