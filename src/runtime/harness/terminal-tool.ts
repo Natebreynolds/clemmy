@@ -210,6 +210,17 @@ export function parseAwaitingUserInputFinalOutput(value: unknown): string | null
   return text || null;
 }
 
+/** The model's own ASK: marker in the same step is a second asking of the
+ *  question the tool asked (live: "ASK: I can't make a real reservation…"
+ *  printed, marker and all, above the card's own wording of it), and a
+ *  CONTINUE: note is private. Only the words before either reach the owner. */
+const SPOKEN_DECISION_MARKER = /(^|[.!?\u2026)\]"'\u2019]|\n)[ \t]*(?:ASK|CONTINUE):/i;
+
+function spokenWordsBeforeAsking(spoken: string): string {
+  const marker = SPOKEN_DECISION_MARKER.exec(spoken);
+  return (marker ? spoken.slice(0, marker.index + marker[1].length) : spoken).trim();
+}
+
 /**
  * A question halt keeps the words the model wrote in the same step. The model
  * answers first and then asks ("here is what works and what I'd change; now,
@@ -220,7 +231,7 @@ export function parseAwaitingUserInputFinalOutput(value: unknown): string | null
  */
 export function awaitingUserInputWithSpokenText(finalOutput: string, spoken: string | undefined): string {
   const question = parseAwaitingUserInputFinalOutput(finalOutput);
-  const words = (spoken ?? '').trim();
+  const words = spokenWordsBeforeAsking(spoken ?? '');
   if (!question || !words) return finalOutput;
   if (words === question || words.endsWith(question)) return formatAwaitingUserInputFinalOutput(words);
   return formatAwaitingUserInputFinalOutput(`${words}\n\n${question}`);

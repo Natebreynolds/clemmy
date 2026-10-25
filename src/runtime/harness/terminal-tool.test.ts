@@ -245,4 +245,15 @@ test('a question halt keeps the words the model wrote in the same step, question
     `${spoken}\n\nWhich firm are you meeting?`);
   // Any other final output is left alone.
   assert.equal(awaitingUserInputWithSpokenText('plain reply', spoken), 'plain reply');
+  // The model's own ASK: line is a second asking of the same question: only
+  // the words before it are kept, and a step that only asked that way shows
+  // the card's question alone. A CONTINUE: note is never shown.
+  assert.equal(awaitingUserInputWithSpokenText(halt, 'ASK: Which firm is it, again?'), halt);
+  assert.equal(parseAwaitingUserInputFinalOutput(awaitingUserInputWithSpokenText(halt, `${spoken}\n\nASK: Which firm is it?`)),
+    `${spoken}\n\nWhich firm are you meeting?`);
+  assert.equal(parseAwaitingUserInputFinalOutput(awaitingUserInputWithSpokenText(halt, `${spoken} ASK: Which firm is it?`)),
+    `${spoken}\n\nWhich firm are you meeting?`);
+  assert.equal(awaitingUserInputWithSpokenText(halt, 'CONTINUE: checking the deck'), halt);
+  assert.equal(parseAwaitingUserInputFinalOutput(awaitingUserInputWithSpokenText(halt, 'Ask the team first. Then decide.')),
+    'Ask the team first. Then decide.\n\nWhich firm are you meeting?', 'the word ask in prose is not a marker');
 });
