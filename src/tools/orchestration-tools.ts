@@ -2732,7 +2732,7 @@ export function registerOrchestrationTools(server: McpServer): void {
       names: z.array(z.string().min(1)).min(1).max(20).optional().describe('Several workflows the owner named in one request.'),
       // The owner's card is the confirmation; an omitted confirm means the
       // same and false still refuses.
-      confirm: z.boolean().optional().describe('Omit or true; false refuses. The owner confirms on the card.'),
+      confirm: z.boolean().nullable().optional().describe('Omit, null or true; false refuses. The owner confirms on the card.'),
     },
     async ({ name, names, confirm }) => {
       if (confirm === false) return textResult('Refusing to delete: confirm was false.');
