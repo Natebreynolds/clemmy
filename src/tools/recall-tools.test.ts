@@ -12,7 +12,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { registerRecallTools } = await import('./recall-tools.js');
+const { registerRecallTools, TOOL_OUTPUT_QUERY_SHAPE } = await import('./recall-tools.js');
 const {
   closeEventLog,
   resetEventLog,
@@ -897,4 +897,11 @@ test('retained query clipping never advertises unseen values as the displayed se
     assert.doesNotMatch(response.content[0].text, /\$fromToolOutput/,
       'a clipped display must not advertise all original values as its exact selection');
   }
+});
+
+test('a limit over the 200 rows the query returns is clamped, not refused (a count beside it reads every record)', async () => {
+  const { z } = await import('zod');
+  const schema = z.object(TOOL_OUTPUT_QUERY_SHAPE);
+  assert.equal(schema.safeParse({ call_id: 'call_x', limit: 1000, aggregate: 'count' }).success, true);
+  assert.equal(schema.safeParse({ call_id: 'call_x', limit: 0 }).success, false, 'a non-positive limit is still refused');
 });

@@ -317,7 +317,9 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
   filter_contains: z.string().optional().describe('Case-insensitive substring of filter_field.'),
   filter_equals: z.string().optional(),
   offset: z.number().int().min(0).optional().describe('Matching records to skip.'),
-  limit: z.number().int().min(1).max(200).optional().describe('Default 50.'),
+  // The handler clamps to 200 rows; a bound re-declared here only turned an
+  // overshoot (limit 1000 beside aggregate:"count") into a refused round.
+  limit: z.number().int().min(1).optional().describe('Default 50; at most 200 rows come back.'),
   where: z
     .array(z.object({
       field: z.string().min(1).describe('A dotted path reaches nested values.'),
