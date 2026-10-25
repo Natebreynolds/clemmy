@@ -2088,13 +2088,14 @@ test('a clarification Clem asks stands over a connection gap the search happened
 
 test('a connection question Clem asks as one keeps her words; the host keeps the Connect controls', async () => {
   resetEventLog();
+  // Connection is a purpose of the edition every fresh source gets (v2); legacy_v1 stays the exact old wire.
   const sess = createSession({ kind: 'chat' });
   const parent = appendEvent({ sessionId: sess.id, turn: 1, role: 'user', type: 'user_input_received',
     data: { text: 'Connect my notes app so you can read my notes.' } });
   recordFixtureSearch(sess.id, parent.seq, 'search-notes', 'connect my notes app', 'fixturenotes');
   const words = 'Your notes app isn\u2019t connected yet. Tap Connect below and sign in, and I\u2019ll pick up right after.';
   await invokeAskWithArbitration(
-    buildAskUserQuestionTool(),
+    buildAskUserQuestionTool('clarification_v2'),
     { question: words, options: ['Connect it', 'Not now'], purpose: 'connection' },
     { sessionId: sess.id, turn: 1, sourceUserSeq: parent.seq },
   );
@@ -2111,7 +2112,7 @@ test('a connection question Clem asks as one keeps her words; the host keeps the
     data: { text: 'Connect my notes app so you can read my notes.' } });
   recordFixtureSearch(linked.id, linkedParent.seq, 'search-notes', 'connect my notes app', 'fixturenotes');
   await invokeAskWithArbitration(
-    buildAskUserQuestionTool(),
+    buildAskUserQuestionTool('clarification_v2'),
     { question: 'Connect it here: [open](/m/?tab=settings&toolkit=wrong_app)', options: ['Done'], purpose: 'connection' },
     { sessionId: linked.id, turn: 1, sourceUserSeq: linkedParent.seq },
   );
