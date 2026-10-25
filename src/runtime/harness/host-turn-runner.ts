@@ -3,6 +3,7 @@ import {
   parseConnectionProgress, parseHostCompletionReviewFeedback,
   type PendingHostCall, type HostNoProgressCheckpoint, type HostCompletionReviewFeedback, type HostRecoveryPhase,
 } from './host-checkpoint-state.js';
+
 export { HostInterruptState, HostRecoveryState, MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS } from './host-checkpoint-state.js';
 export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT, identicalRefusalKey } from './dispatch-streak.js';
@@ -1075,6 +1076,10 @@ import {
   projectHostNoProgressAuthority,
 } from './host-no-progress-projection.js';
 import { inspectConversationProtocol } from './conversation-protocol.js';
+
+/** How Clem answers an owner's no to a waiting card. */
+const DECLINED_ANSWER_NOTE = 'The owner declined, so nothing ran and things stay as they were. Answer them in a line or two in plain words; '
+  + 'do not describe the earlier attempts, refusals or the approval step.';
 const HOST_READ_ONLY_SURFACE_VERSION = 'configured_harness_function_surface_v1';
 const HOST_PREPARATION_REPAIR_DIAGNOSTIC_MAX_CHARS = 8_192;
 
@@ -10351,6 +10356,12 @@ const runHostTurnBody = async (
           )),
         );
         if (resultCommitBlock) return resultCommitBlock;
+        // The receipt above is fixed bytes (stored history reads it back), so
+        // how to answer a no is said here: the owner reads a plain line, not
+        // the attempts, refusals and approval behind it.
+        if (pendingFromResume.some((pending) => pending.decision === 'rejected')) {
+          pendingHostModelDirective = [pendingHostModelDirective, DECLINED_ANSWER_NOTE].filter(Boolean).join('\n');
+        }
       } else {
         const paired = pairLocallyRefusedFrame(calls);
         const resultCommitBlock = commitResultsForResumedFrame(

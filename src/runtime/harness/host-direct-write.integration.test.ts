@@ -665,6 +665,10 @@ for (const change of ['rejected', 'edited-args', 'wrong-approval', 'expired'] as
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['external_write_started', 'external_write_succeeded'] }).length, 0);
   assert.equal(Boolean(outcome.hasInterruptions), false, 'a changed/rejected grant repairs visibly instead of inventing another card');
   assert.ok(outcome.history.some((item) => (item as any).type === 'function_call_result'), 'the refused call stays paired in model history');
+  if (change === 'rejected') {
+    assert.ok(JSON.stringify(fixture.modelInputs.at(-1)).includes('The owner declined, so nothing ran'),
+      'the model hears how to answer a no: a plain line, not the approval mechanics');
+  }
 });
 
 test('an uncertain exact write is never automatically retried', async () => {
