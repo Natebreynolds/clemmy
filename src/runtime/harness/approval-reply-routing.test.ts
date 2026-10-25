@@ -408,7 +408,7 @@ test('Jev receives structured grouped action content without execution keys', ()
   assert.doesNotMatch(describePendingApproval(group), /private-key|__host_approval_group__/);
 });
 
-test('Jev reads the question Clem asked on the card, and an unsure yes becomes that question asked back', async () => {
+test('Jev reads the question Clem asked on the card; an unsure no is the owner moving on, never a question asked back', async () => {
   // Live 2026-10-06: "Yes, delete the draft." to "Delete Outlook message ·
   // message_id: AAMk…" read approves 0.70; a fresh turn then minted the same
   // card four times. The card's own ask is what the owner answered.
@@ -420,9 +420,12 @@ test('Jev reads the question Clem asked on the card, and an unsure yes becomes t
   const described = describePendingApproval(row);
   assert.ok(described.startsWith('Clem asked: Can I send this Slack message to the fixture channel?\nWhy: It posts in your connected Slack.\n'), described);
   reading = { choice: 'declines', confidence: 0.7 };
+  assert.equal(await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'never mind, I handled it elsewhere', parsed: null }), null,
+    'no confirmation is held: the message runs as a turn and the card retires');
+  reading = { choice: 'approves', confidence: 0.7 };
   assert.deepEqual(
-    await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'hmm, maybe not', parsed: null }),
-    { intent: null, confirm: { approvalId: card.approvalId, leaning: 'declines', question: 'Just to be sure — should I send this Slack message to the fixture channel?' } },
+    await routeReplyToPendingApproval({ sessionId: card.sessionId, text: 'yes, the fixture one', parsed: null }),
+    { intent: null, confirm: { approvalId: card.approvalId, leaning: 'approves', question: 'Just to be sure — should I send this Slack message to the fixture channel?' } },
   );
   assert.ok(asked.at(-1)!.includes('Clem asked: Can I send this Slack message'), 'the ask reached Jev');
 });

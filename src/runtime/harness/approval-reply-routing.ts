@@ -216,9 +216,13 @@ export async function routeReplyToPendingApproval(input: {
     if (sure && reading.kind === 'approves') {
       return { intent: { decision: 'approve', approvalId: row.approvalId } };
     }
-    // Leaning yes or no, not sure: ask the card's question back in one line.
-    // A fresh turn here re-plans the same action and mints a duplicate card.
-    if ((reading.kind === 'approves' || reading.kind === 'declines') && (reading.confidence ?? 0) >= APPROVAL_REPLY_LEANING) {
+    // Leaning yes, not sure: ask the card's question back in one line. A
+    // fresh turn here re-plans the same action and mints a duplicate card.
+    // Leaning no is the owner moving on: nothing runs either way, so the
+    // message is not held for a confirmation; the card retires and Clem
+    // answers the message herself (owner, 2026-10-20: a message sent instead
+    // of a tap ends the card's wait).
+    if (reading.kind === 'approves' && (reading.confidence ?? 0) >= APPROVAL_REPLY_LEANING) {
       if (approvalConfirmationAlreadyAsked(input.sessionId, row.approvalId)) return fallback;
       return { intent: null, confirm: { approvalId: row.approvalId, leaning: reading.kind, question: confirmQuestionFor(row) } };
     }
