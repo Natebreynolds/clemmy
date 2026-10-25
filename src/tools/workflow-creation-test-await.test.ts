@@ -112,3 +112,18 @@ for (const terminalStatus of ['cancelled', 'error', 'creation_test'] as const) {
     assert.ok(Date.now() - started < 500);
   });
 }
+
+test('a workflow saved in a folder other than its name is read back by its name, so a passed test that turned it on says so', async () => {
+  const definition = { name: 'Team Calendar Pull', description: 'Controlled fixture.', enabled: true, trigger: { manual: true },
+    steps: [{ id: 'pull', prompt: '', call: { tool: 'read_file', args: { path: '/tmp/controlled.json' } }, sideEffect: 'read' }] } as never;
+  writeWorkflow('team-calendar-pull', definition);
+  const runId = 'run-folder-name';
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({ id: runId, workflow: 'Team Calendar Pull', status: 'creation_test',
+    createdAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
+    rehearsal: { passed: true, definitionKey: workflowRehearsalKey(readWorkflow('team-calendar-pull')!.data) },
+    reportBack: { version: 1, workflowName: 'Team Calendar Pull', outcome: 'done', detail: 'Creation test passed.', acknowledgedOriginSessionIds: [] } }));
+  const settled = await awaitWorkflowCreationTestSettlement(runId, 'Team Calendar Pull', { drainRegistered: () => true, pollMs: 20, boundMs: 2_000 });
+  assert.ok(settled);
+  assert.equal(settled!.enabled, true);
+  assert.equal(settled!.activationCompatible, true, 'an unchanged definition is not reported as changed');
+});

@@ -3186,6 +3186,12 @@ export async function awaitWorkflowCreationTestSettlement(
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
   const started = Date.now();
   let handedOff = false;
+  // A test is queued under the workflow's name, which can differ from the
+  // folder it is saved in ("Team Report" in team-report/): reading only the
+  // folder by that name found nothing, so a test that passed and turned the
+  // workflow on was reported as disabled with a changed definition.
+  const savedWorkflow = (): WorkflowDefinition | undefined => (readWorkflow(workflowName)
+    ?? listWorkflows().find((entry) => entry.data.name === workflowName || entry.name === workflowName))?.data;
   const settledNow = (): WorkflowCreationTestSettlement | null => {
     let record: Record<string, unknown>;
     try { record = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; } catch { return null; }
@@ -3201,7 +3207,7 @@ export async function awaitWorkflowCreationTestSettlement(
         : typeof record.error === 'string' && record.error.trim() ? record.error
         : terminalStatus === 'cancelled' ? 'This creation test was cancelled. No passed rehearsal was recorded.'
         : 'This creation test ended without a recorded rehearsal verdict. Check this saved run before testing again.';
-      return { runId, pass: false, activationCompatible: false, enabled: readWorkflow(workflowName)?.data.enabled === true,
+      return { runId, pass: false, activationCompatible: false, enabled: savedWorkflow()?.enabled === true,
         terminalStatus, body: canonicalDetail, steps: [], waitedMs: Date.now() - started };
     }
     if (record.status !== 'creation_test' || !finished || report?.version !== 1
@@ -3210,7 +3216,7 @@ export async function awaitWorkflowCreationTestSettlement(
     // report. A missing card never fabricates a test/activation verdict.
     const notification = getNotification(`workflow-${runId}-creationtest`);
     const matchingNotification = notification?.metadata?.runId === runId && notification.body === report.detail ? notification : undefined;
-    const workflow = readWorkflow(workflowName)?.data;
+    const workflow = savedWorkflow();
     return {
       runId,
       pass: rehearsal.passed,
