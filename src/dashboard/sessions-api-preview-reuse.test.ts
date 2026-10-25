@@ -100,7 +100,7 @@ function instrument(db: Db) {
 test.after(() => { log.closeEventLog(); rmSync(fixtureHome, { recursive: true, force: true }); });
 test.afterEach(() => { log.closeEventLog(); });
 
-test('unchanged accepted chat previews reuse only scalar output; public nine-type 1000 window and fresh detail/search remain', () => {
+test('unchanged accepted chat previews reuse only scalar output; public ten-type 1000 window and fresh detail/search remain', () => {
   const f = accepted('warm');
   const db = log.openEventLog(); const m = instrument(db);
   try {
@@ -109,7 +109,8 @@ test('unchanged accepted chat previews reuse only scalar output; public nine-typ
     assert.equal(m.count(f.id), 1);
     const args = m.reads[0]!.args;
     assert.equal(args.at(-1), 1000);
-    assert.deepEqual(args.slice(1, -1), ['user_input_received', 'conversation_completed', 'conversation_superseded',
+    // A question's own answers ride on its reopened turn (1dd119752).
+    assert.deepEqual(args.slice(1, -1), ['user_input_received', 'conversation_completed', 'awaiting_user_input', 'conversation_superseded',
       'conversation_check_in', 'plan_revision_published', 'workflow_saved', 'clem_message', 'approval_requested',
       // An answer delivered first carries its later review ruling (8453a6879).
       'completion_review_settled']);

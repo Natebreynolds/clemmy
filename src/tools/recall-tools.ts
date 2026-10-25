@@ -319,7 +319,7 @@ export const TOOL_OUTPUT_QUERY_SHAPE = {
   offset: z.number().int().min(0).optional().describe('Matching records to skip.'),
   // The handler clamps to 200 rows; a bound re-declared here only turned an
   // overshoot (limit 1000 beside aggregate:"count") into a refused round.
-  limit: z.number().int().min(1).optional().describe('Default 50; at most 200 rows come back.'),
+  limit: z.number().int().min(1).optional().describe('Default 50; max 200 rows.'),
   where: z
     .array(z.object({
       field: z.string().min(1).describe('A dotted path reaches nested values.'),

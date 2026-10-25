@@ -1746,9 +1746,9 @@ const askUserQuestionParams = z.object({
     .nullable()
     .describe('Pre-canned answers; null if none.'),
   purpose: z
-    .enum(['clarification', 'approval', 'connection'])
+    .enum(['clarification', 'approval'])
     .nullable()
-    .describe('Use "clarification" for a missing fact or choice only the user has; "connection" when asking them to connect an app (the host adds its Connect button); null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
+    .describe('Use "clarification" for a missing fact or choice only the user has; null if neither. "approval" is retained for compatibility, not for formal execution consent: it creates no approval card and grants no permission.'),
 });
 
 const clarificationQuestionParams = askUserQuestionParams.extend({
@@ -1770,7 +1770,7 @@ export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'leg
       + (legacy ? 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. ' : 'ways forward. ')
       + CLARIFICATION_APPROVAL_GUIDANCE,
     parameters: legacy ? askUserQuestionParams : clarificationQuestionParams,
-    execute: async (args: z.infer<typeof askUserQuestionParams>, runContext) => {
+    execute: async (args: z.infer<typeof askUserQuestionParams> | z.infer<typeof clarificationQuestionParams>, runContext) => {
       const sessionId = extractSessionId(runContext);
       if (sessionId) {
         const lastUser = [...listEvents(sessionId, { types: ['user_input_received'] })].at(-1);

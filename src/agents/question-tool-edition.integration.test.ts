@@ -122,7 +122,8 @@ test('fresh captured source selects v2 through direct, scoped discovery and wrap
   const { input, context } = captured();
   assert.equal(JSON.parse(stored(input).identity_json).questionToolWireEdition, 'clarification_v2');
   const agent = await build(context); const direct = toolOf(agent, 'ask_user_question');
-  assert.deepEqual(purposeValues(direct.parameters), ['clarification']);
+  // v2 drops the legacy approval value; asking the owner to connect an app is its own purpose.
+  assert.deepEqual(purposeValues(direct.parameters), ['clarification', 'connection']);
   assert.doesNotMatch(direct.description, /"approval" is a legacy compatibility value/);
   const search = decode(await invoke(context, toolOf(agent, 'tool_search'), { query: 'ask_user_question', role_key: null,
     limit: 1, account_selection: null, cursor: null }));
@@ -205,7 +206,7 @@ test('shape-spoofed/copied contexts cannot select v2; mutated references and for
   finally { context.digest = originalDigest; }
   const noEdition = { sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: context.digest, mount: context.mount, memoryScope: context.memoryScope };
   assert.equal(scope.withSourceSessionContext(noEdition, () => scope.questionToolWireEditionForSource(input.sessionId, input.sourceUserSeq)), 'legacy_v1');
-  assert.deepEqual(purposeValues(toolOf(await build(context, false), 'ask_user_question').parameters), ['clarification'],
+  assert.deepEqual(purposeValues(toolOf(await build(context, false), 'ask_user_question').parameters), ['clarification', 'connection'],
     'omitted options.sourceUserSeq uses the exact validated active source, never a latest-session lookup');
 });
 
