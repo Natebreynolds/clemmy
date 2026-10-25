@@ -209,7 +209,9 @@ export function WorkLine({
               {running
                 ? <span className="shrink-0 text-caption font-medium text-primary">In progress</span>
                 : inHand.status === 'failed'
-                  ? <XCircle className="h-4 w-4 shrink-0 text-danger" strokeWidth={2} role="img" aria-label="Failed" />
+                  // She is still working: a step that did not go through is
+                  // one she is about to retry or route around, not the turn failing.
+                  ? <AlertCircle className="h-4 w-4 shrink-0 text-warning" strokeWidth={2} role="img" aria-label="Didn’t go through; still working" />
                   : <CheckCircle2 className="h-4 w-4 shrink-0 text-success" strokeWidth={2} role="img" aria-label="Done" />}
             </div>
             {inHand.excerpt && (

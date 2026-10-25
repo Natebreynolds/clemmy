@@ -46,6 +46,8 @@ export interface ActivityItem {
   id: string;
   kind: 'tool' | 'agent' | 'batch' | 'check' | 'event';
   label: string;
+  /** The host refused this call before it ran; nothing happened. */
+  refusedBeforeDispatch?: true;
   detail?: string;
   provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
   /** kind 'tool' only: the step ran in a connected app, so its label leads
@@ -1070,7 +1072,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
     case 'tool_returned': {
       if (d.batchMode === true) return prev; // counted via batch_progress
       // The backend now carries data.ok — a returned tool can have failed.
-      const status: ActivityItem['status'] = d.ok === false && !isContractNegotiationReturn(d) ? 'failed' : 'done';
+      // A call the host refused never ran: never drawn as done.
+      const refused = d.refusedBeforeDispatch === true;
+      const status: ActivityItem['status'] = (d.ok === false || refused) && !isContractNegotiationReturn(d) ? 'failed' : 'done';
       const reused = d.reused === true;
       // The read-result glimpse: "12 records · name, website, phone — Acme
       // Roofing". Runtime-derived structure, so scraped data visibly ARRIVES
@@ -1091,6 +1095,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
           ...a,
           status,
           finishedAt: at,
+          ...(refused ? { refusedBeforeDispatch: true as const } : {}),
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
             ? { detail: glimpseDetail }

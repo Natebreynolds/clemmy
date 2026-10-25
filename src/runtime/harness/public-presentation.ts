@@ -1561,6 +1561,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
         // Derived at the trust boundary from the exact replay marker plus
         // providerDispatched:false. Replay ids and control prose stay private.
         ...(reused ? { reused: true, progress: SETTLED_READ_REUSE_LABEL } : {}),
+        ...(data.refusedBeforeDispatch === true ? { refusedBeforeDispatch: true } : {}),
       };
     }
     case 'deliverable_saved': {

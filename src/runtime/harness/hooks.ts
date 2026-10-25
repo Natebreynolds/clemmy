@@ -157,6 +157,9 @@ function currentSourceAttribution(): { sourceUserSeq?: number; runScopeId?: stri
  * dispatch look like request evidence. No lease remains the compatibility path
  * for explicitly out-of-band hooks.
  */
+/** How every host refusal of a call that never ran begins (host-turn-runner). */
+const HOST_PRE_DISPATCH_REFUSAL = /^Tool '[^'\n]{1,200}' was refused before dispatch\b/;
+
 function currentDispatchLease(): DispatchLeaseRef | undefined {
   return harnessRunContextStorage.getStore()?.dispatchLease;
 }
@@ -639,6 +642,9 @@ export function attachEventLogHooks(
               // Preserve a negative result before its diagnostic text is clipped.
               // Absence of failure does not manufacture positive business proof.
               ...(!toolOutputLooksSuccessful(resultStr) ? { ok: false } : {}),
+              // The host's own pre-dispatch refusal: the call never ran. For
+              // the step list only; success accounting above is unchanged.
+              ...(HOST_PRE_DISPATCH_REFUSAL.test(resultStr ?? '') ? { refusedBeforeDispatch: true } : {}),
               ...(effectiveToolTail(tool?.name ?? '') === 'tool_search'
                 ? { ok: pairedAdmittedStart && toolOutputLooksSuccessful(resultStr) }
                 : {}),

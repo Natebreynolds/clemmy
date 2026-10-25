@@ -117,6 +117,9 @@ export function narrateActivity(
     if (raw.offer) continue;
     // A saved workflow is shown under the reply as its card, not as a row.
     if (raw.workflow) continue;
+    // A call the host refused before it ran did nothing; once the turn has
+    // settled it is not one of the steps (the full trace keeps it).
+    if (raw.refusedBeforeDispatch && options.live !== true) continue;
     const plan = publicWorkPlanRow(raw);
     if (plan === null) continue;
     const item = plan;

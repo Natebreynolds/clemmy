@@ -931,6 +931,12 @@ test('the visibility window ships bounded excerpts and glimpses, re-validated', 
     data: { tool: 'x', callId: 'c10', accounting: 'top_level', ok: true, glimpse: { count: 0, fields: [{ evil: true }] } },
   } as never);
   assert.equal((junk?.data as { glimpse?: unknown }).glimpse, undefined, 'a zero-count or malformed glimpse never ships');
+  const refused = projectHarnessEventForPublic({
+    sessionId: 's', seq: 9, turn: 0, role: 'tool', type: 'tool_returned',
+    data: { tool: 'work_call', callId: 'c11', accounting: 'top_level', refusedBeforeDispatch: true, result: 'never public' },
+  } as never);
+  assert.equal((refused?.data as { refusedBeforeDispatch?: unknown }).refusedBeforeDispatch, true, 'a call that never ran says so');
+  assert.equal('result' in (refused?.data as object), false);
 });
 
 test('expected work progress projects the closed plan card only', async () => {

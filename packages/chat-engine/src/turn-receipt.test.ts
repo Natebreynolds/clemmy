@@ -222,3 +222,17 @@ test('a workflow card reads in words: its name, each step, and what a save chang
   assert.equal(workflowCardSubtitle({ ...card, changedSettings: ['schedule', 'goal'] }), 'Schedule and goal changed · steps as before');
   assert.equal(workflowCardSubtitle(card), 'Details changed · steps as before');
 });
+
+test('a call the host refused before it ran is never drawn as done, and leaves the settled step list', () => {
+  const rows = [
+    { type: 'tool_called', data: { tool: 'work_call', innerTool: 'workspace_get', callId: 'r1', accounting: 'top_level' } },
+    { type: 'tool_returned', data: { tool: 'work_call', innerTool: 'workspace_get', callId: 'r1', accounting: 'top_level', refusedBeforeDispatch: true } },
+    { type: 'tool_called', data: { tool: 'work_call', innerTool: 'workflow_get', callId: 'r2', accounting: 'top_level' } },
+    { type: 'tool_returned', data: { tool: 'work_call', innerTool: 'workflow_get', callId: 'r2', accounting: 'top_level', ok: true } },
+  ].reduce<ActivityItem[]>((acc, ev, i) => reduceActivity(acc, { seq: i + 1, ...ev } as HarnessEvent, () => i + 1), []);
+  const refused = rows.find((row) => row.id === 't-r1');
+  assert.equal(refused?.status, 'failed', 'a call that never ran is not a check mark');
+  assert.equal(refused?.refusedBeforeDispatch, true);
+  assert.ok(narrateActivity(rows, { live: true }).some((row) => row.id === 't-r1'), 'while she works, it shows');
+  assert.deepEqual(narrateActivity(rows).map((row) => row.id), ['t-r2'], 'once settled, only the work that ran is a step');
+});

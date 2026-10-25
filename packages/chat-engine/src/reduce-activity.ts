@@ -540,7 +540,9 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
     }
     case 'tool_returned': {
       if (d.batchMode === true) return prev; // counted via batch_progress
-      const status: ActivityItem['status'] = d.ok === false && !isContractNegotiationReturn(d) ? 'failed' : 'done';
+      // A call the host refused never ran: never drawn as done.
+      const refused = d.refusedBeforeDispatch === true;
+      const status: ActivityItem['status'] = (d.ok === false || refused) && !isContractNegotiationReturn(d) ? 'failed' : 'done';
       const reused = d.reused === true;
       // The read-result glimpse: "12 records · name, website, phone — Acme
       // Roofing". Runtime-derived structure, so scraped data visibly ARRIVES
@@ -561,6 +563,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
           ...a,
           status,
           finishedAt: now(),
+          ...(refused ? { refusedBeforeDispatch: true as const } : {}),
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
             ? { detail: glimpseDetail }

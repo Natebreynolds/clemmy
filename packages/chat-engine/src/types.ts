@@ -229,6 +229,8 @@ export interface ActivityItem {
   id: string;
   kind: 'tool' | 'agent' | 'batch' | 'check' | 'event';
   label: string;
+  /** The host refused this call before it ran; nothing happened. */
+  refusedBeforeDispatch?: true;
   detail?: string;
   provider?: 'claude' | 'codex' | 'byo' | 'glm' | 'unknown';
   status: 'running' | 'done' | 'failed' | 'interrupted';
