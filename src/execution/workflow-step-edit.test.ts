@@ -274,3 +274,20 @@ test('a patch keeps the fields it did not name, including ones the patch cannot 
   assert.equal(step.executionRole, 'specialist');
   assert.equal(step.useHarness, false);
 });
+
+test('a call patch for the same tool changes only what it names; a different tool replaces the call', () => {
+  writeWorkflow('patch-wf', callDef());
+  const argsOnly = applyStepPatch('patch-wf', 'read_digest', { call: { args: { path: '/tmp/digest.txt' } } }, { nowIso: NOW });
+  assert.equal(argsOnly.ok, true, argsOnly.message);
+  const read = readWorkflow('patch-wf')!.data.steps[0] as unknown as { call: { tool: string; args: Record<string, unknown> } };
+  assert.equal(read.call.tool, 'read_file', 'the tool the patch did not name stays');
+  assert.deepEqual(read.call.args, { path: '/tmp/digest.txt' });
+  revertStepEdit(argsOnly.backupId!);
+
+  const otherTool = applyStepPatch('patch-wf', 'read_digest', { call: { tool: 'space_get', args: { slug: 'controlled-space' } } }, { nowIso: NOW });
+  assert.equal(otherTool.ok, true, otherTool.message);
+  const swapped = readWorkflow('patch-wf')!.data.steps[0] as unknown as { call: Record<string, unknown> };
+  assert.equal(swapped.call.tool, 'space_get');
+  assert.deepEqual(swapped.call.args, { slug: 'controlled-space' }, 'a different tool keeps none of the old arguments');
+  assert.equal(swapped.call.account, undefined, 'nor the old call\'s account');
+});

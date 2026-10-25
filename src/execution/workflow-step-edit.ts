@@ -186,6 +186,22 @@ export function applyStepPatch(
     if (value === null) delete merged[key];
     else merged[key] = value;
   }
+  // `call.tool` / `call.args_json` are patchable on their own: a call patch
+  // for the same tool changes only what it names (new arguments, in either
+  // form, replace the old ones; the host's chosen account stays). A
+  // different tool is a different call and replaces it whole.
+  const patchCall = patch.call;
+  const currentCall = current.call;
+  if (patchCall && typeof patchCall === 'object' && !Array.isArray(patchCall)
+    && currentCall && typeof currentCall === 'object' && !Array.isArray(currentCall)) {
+    const next = patchCall as Record<string, unknown>;
+    const before = currentCall as Record<string, unknown>;
+    if (next.tool === undefined || next.tool === before.tool) {
+      const base = { ...before };
+      if ('args' in next || 'args_json' in next) { delete base.args; delete base.args_json; }
+      merged.call = { ...base, ...next };
+    }
+  }
   let normalized: WorkflowDefinition['steps'][number];
   try {
     normalized = normalizeWorkflowSteps([merged as never])[0] as unknown as WorkflowDefinition['steps'][number];
