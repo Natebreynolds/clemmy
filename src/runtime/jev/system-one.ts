@@ -209,8 +209,12 @@ export async function postSystemOne(opts: {
   const timeoutMs = Math.max(250, Math.min(30_000, opts.timeoutMs ?? 4_000));
   const deadline = performance.now() + timeoutMs;
   const controller = new AbortController();
-  const expired = (): boolean => performance.now() >= deadline;
+  // A timer can fire a fraction of a millisecond before the clock reaches the
+  // deadline; once it has released the caller, the transport is past it too.
+  let timedOut = false;
+  const expired = (): boolean => timedOut || performance.now() >= deadline;
   const timeout = (): SystemOneFailure => {
+    timedOut = true;
     controller.abort();
     return { ok: false, reason: 'timeout' };
   };
