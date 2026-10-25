@@ -16358,6 +16358,7 @@ async function processOneRunFile(
       // Checks a rehearsal cannot make honestly (whether the workflow's goal
       // is met judges the changes it only previewed) belong to the first real
       // run; a pass says so instead of implying them.
+      const previewedNote = result.steps.some((s) => s.status === 'previewed') ? 'Steps that make changes were previewed, not run. ' : '';
       const readsAnswered = result.steps.some((s) => s.emptyAnswer)
         ? 'the read steps ran and their sources answered'
         : 'the read steps returned real data';
@@ -16368,8 +16369,8 @@ async function processOneRunFile(
         ? activateAfterCreationTest
           ? activation && !activation.activated
             ? `Creation test passed for "${workflow.data.name}" — ${readsAnswered} — but it is still off: ${activation.reason}.\n\n${lines.join('\n')}\n\nAsk me to turn it on and I'll test the saved version first.`
-            : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}, so I turned it on.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run. It will run on its schedule or when you start it.${realRunChecks}`
-          : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}. It is still off.\n\n${lines.join('\n')}\n\nSteps that make changes were previewed, not run.${realRunChecks}`
+            : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}, so I turned it on.\n\n${lines.join('\n')}\n\n${previewedNote}It will run on its schedule or when you start it.${realRunChecks}`
+          : `Creation test passed for "${workflow.data.name}" — ${readsAnswered}. It is still off.\n\n${lines.join('\n')}${previewedNote ? `\n\n${previewedNote.trim()}` : ''}${realRunChecks}`
         : result.pass
           ? autoRetestRunId
             ? `The creation test passed, but ${activationBlockedReason}, so that pass no longer covers what's saved. I'm testing the newer version now; ${activateAfterCreationTest ? 'it turns on here if it passes' : 'it stays off'}.\n\n${lines.join('\n')}`
