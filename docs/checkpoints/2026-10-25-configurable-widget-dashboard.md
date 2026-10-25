@@ -13,7 +13,7 @@ Owner requested a larger widget with information and workflow actions, then expl
 
 ## Validation retained
 
-Evidence directory: `/Users/nathan.reynolds/clementine-next/output/widget-dashboard-2026-10-25/`.
+Evidence directory: `output/widget-dashboard-2026-10-25/` (in the local checkout).
 
 - Initial regular iPhone simulator run: 23 focused native tests passed. This preceded the Keychain persistence correction.
 - Final Duo simulator run: 24 focused native tests passed, including a unique-fixture real Keychain round trip, consumption replay refusal, exact target/pairing, expiry, storage failures, warm/cold navigation, and native rendering.
