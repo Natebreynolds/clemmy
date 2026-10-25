@@ -139,10 +139,22 @@ struct ClemWidgets: WidgetBundle {
         ClemQuickActionsWidget()
         ClemSpaceWidget()
         ClemDashboardWidget()
-        ClemRecordingActivity()
+        recordingActivity
         if #available(iOS 18.0, *) {
             ClemTalkControl()
             ClemDictateControl()
         }
+    }
+
+    // WidgetBundleBuilder supports #available additions, but not an else or
+    // #unavailable replacement. Its public availability wrapper keeps one
+    // recording configuration registered while preserving iOS 17 support.
+    private var recordingActivity: some Widget {
+        if #available(iOS 18.0, *) {
+            return WidgetBundleBuilder.buildOptional(
+                WidgetBundleBuilder.buildLimitedAvailability(ClemSupplementalRecordingActivity()))
+        }
+        return WidgetBundleBuilder.buildOptional(
+            WidgetBundleBuilder.buildLimitedAvailability(ClemRecordingActivity()))
     }
 }

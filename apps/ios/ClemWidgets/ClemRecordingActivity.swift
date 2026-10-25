@@ -6,9 +6,15 @@ import WidgetKit
 struct ClemRecordingActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: ClemRecordingAttributes.self) { context in
-            ClemRecordingActivityView(attributes: context.attributes, state: context.state, isStale: context.isStale)
-                .padding(.vertical, 14)
-                .padding(.horizontal, 16)
+            Group {
+                if #available(iOS 18.0, *) {
+                    ClemRecordingActivityFamilyView(context: context)
+                } else {
+                    ClemRecordingActivityView(attributes: context.attributes, state: context.state, isStale: context.isStale)
+                        .padding(.vertical, 14)
+                        .padding(.horizontal, 16)
+                }
+            }
                 .activityBackgroundTint(ClemPalette.peel)
                 .activitySystemActionForegroundColor(ClemPalette.ink)
                 .widgetURL(presentation(context).openURL)
@@ -59,6 +65,34 @@ struct ClemRecordingActivity: Widget {
 
     private func presentation(_ context: ActivityViewContext<ClemRecordingAttributes>) -> ClemRecordingPresentation {
         ClemRecordingPresentation(mode: context.attributes.mode, phase: context.state.phase, isStale: context.isStale)
+    }
+}
+
+/// Registered instead of the legacy configuration on iOS 18 and later, so
+/// there is still exactly one configuration for the same recording activity.
+@available(iOS 18.0, *)
+struct ClemSupplementalRecordingActivity: Widget {
+    var body: some WidgetConfiguration {
+        ClemRecordingActivity().body.supplementalActivityFamilies([.small, .medium])
+    }
+}
+
+/// The small supplemental family is the Watch Smart Stack presentation. The
+/// medium family keeps the existing phone banner and its original padding.
+@available(iOS 18.0, *)
+private struct ClemRecordingActivityFamilyView: View {
+    let context: ActivityViewContext<ClemRecordingAttributes>
+    @Environment(\.activityFamily) private var family
+
+    var body: some View {
+        if family == .small {
+            ClemWatchRecordingView(attributes: context.attributes, state: context.state, isStale: context.isStale)
+                .padding(8)
+        } else {
+            ClemRecordingActivityView(attributes: context.attributes, state: context.state, isStale: context.isStale)
+                .padding(.vertical, 14)
+                .padding(.horizontal, 16)
+        }
     }
 }
 
