@@ -432,6 +432,25 @@ test('account review unavailability has consistent global and row recovery witho
   }
 });
 
+test('an app with no connected account is not an account choice: one question, no second search', async () => {
+  let handler!: Handler;
+  registerToolSearchTool({ tool(_name: string, _description: string, _schema: unknown, callback: Handler) { handler = callback; } } as never, {
+    allowedNames: new Set(), dispatchCarrier: 'work_call',
+    candidateSources: [{ kind: 'authorized_composio', async search() { return [{
+      name: 'NOTES_FIXTURE_SEARCH', summary: 'Search notes', score: 1,
+      carrier: 'work_call', schema: { type: 'object', properties: {} },
+    }]; } }],
+    async discloseForPlanning() {
+      return { version: 1, refs: {}, blockers: { NOTES_FIXTURE_SEARCH: { code: 'account_selection_required', choices: [] } } };
+    },
+  });
+  const body = JSON.parse((await handler({ query: 'connect my notes app' })).content[0]!.text);
+  assert.match(body.results[0].accountSelectionNextStep, /No account of this app is connected here/);
+  assert.match(body.results[0].accountSelectionNextStep, /Do not search for it again/);
+  assert.doesNotMatch(body.results[0].accountSelectionNextStep, /repeat tool_search/);
+  assert.equal(body.hint, body.results[0].accountSelectionNextStep);
+});
+
 test('page guidance follows eight published choices and preserves an off-page account blocker on its own page', async () => {
   let handler!: Handler;
   let sourceCalls = 0;

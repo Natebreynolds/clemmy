@@ -98,6 +98,7 @@ function isAcquiredLiveReadCandidate(
 
 const TOP_RESULTS = 8;
 const TOP_SCHEMAS = 3;
+const NO_CONNECTED_ACCOUNT_NEXT_STEP = 'No account of this app is connected here, so there is nothing to select and no account_selection to send. Do not search for it again. Ask the owner with ask_user_question; the host makes that question the Connect card for this app, and this same task continues once it is connected.';
 const ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP = 'The account-routing review did not complete; this is not a missing account or a request for user authorization. Retry the identical account_selection once to reopen its cached review. If it is still unavailable, report that exact host blocker; do not broaden discovery or ask the user to repeat the account.';
 const ACCOUNT_CHECK_PENDING_NOTE = 'its connected account is still being confirmed, and that check finishes before it runs. When you need it, call it with the work_call example on its result; do not search for it again to get a capabilityRef. It has none to cite in plan_task until a later search returns one.';
 /** Same-toolkit operations the host serves today whose names share a word
@@ -2169,6 +2170,7 @@ export function registerToolSearchTool(
             .filter((blocker) => blocker.code === 'account_selection_required');
           if (accountBlockers.length > 0) {
             const choices = [...new Set(accountBlockers.flatMap((blocker) => blocker.choices))];
+            if (choices.length === 0) return NO_CONNECTED_ACCOUNT_NEXT_STEP;
             return `Account selection is required before these provider results can receive a capabilityRef. Ask the user which exact connected account to use${choices.length ? ` (${choices.join(', ')})` : ''}; then repeat one search that names that account. Do not call plan_task or invent a capabilityRef before that search returns one.`;
           }
           const publication = visibleBlockers
@@ -2336,7 +2338,9 @@ export function registerToolSearchTool(
                   ? { accountChoiceLabels: (planningBlockers[r.name] as { labels?: Record<string, string> }).labels }
                   : {}),
                 ...(planningBlockers[r.name]!.reason ? { accountSelectionReason: planningBlockers[r.name]!.reason } : {}),
-                accountSelectionNextStep: planningBlockers[r.name]!.reason === 'review_unavailable'
+                accountSelectionNextStep: planningBlockers[r.name]!.choices.length === 0
+                  ? NO_CONNECTED_ACCOUNT_NEXT_STEP
+                  : planningBlockers[r.name]!.reason === 'review_unavailable'
                   ? ACCOUNT_REVIEW_UNAVAILABLE_NEXT_STEP
                   : planningBlockers[r.name]!.reason === 'not_entailed' || planningBlockers[r.name]!.reason === 'quote_not_in_source'
                   ? 'The quoted user wording did not name this account, so it was not bound. Do not retry the same selection. Ask the user which one of accountChoices to use, offering each by its accountChoiceLabels name (never its id), then repeat tool_search with account_selection quoting their answer verbatim.'
