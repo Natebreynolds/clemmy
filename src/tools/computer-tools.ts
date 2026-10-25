@@ -278,6 +278,12 @@ export function needsApprovalForWriteFile() {
  *  through mailbox searches. write_file emits no external_write event (local
  *  effect), so it needs its own tee. Fire-and-forget by contract. */
 function teeFileDeliverable(filePath: string): void {
+  // A file in a temp folder is working material for the next command, not
+  // something she made for the owner: it never becomes a saved-file card.
+  // The owner's home and Clem's own folder are never scratch, wherever they live.
+  const resolvedFile = path.resolve(filePath);
+  const kept = [os.homedir(), BASE_DIR].some((root) => resolvedFile.startsWith(path.resolve(root) + path.sep));
+  if (shellSavedFileIsScratch(filePath) && !kept) return;
   try {
     const ctx = getToolOutputContext();
     void import('../memory/deliverable-index.js')

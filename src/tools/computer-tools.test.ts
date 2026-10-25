@@ -787,3 +787,26 @@ test('a relative path never lands inside the installed app: it resolves under th
     rmSync(resources, { recursive: true, force: true });
   }
 });
+
+test('a file a shell command writes to a temp folder is working material, not a saved file', async () => {
+  const { createSession, appendEvent, listEvents } = await import('../runtime/harness/eventlog.js');
+  const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
+  const session = createSession({ kind: 'chat', title: 'scratch file' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Check the numbers.' } });
+  const scratchDir = mkdtempSync(path.join(os.tmpdir(), 'clemmy-scratch-'));
+  const scratch = path.join(scratchDir, 'r9.json');
+  const kept = path.join(tmpHome, 'deliver', 'kept.txt');
+  const ran = await withToolOutputContext({ sessionId: session.id, sourceUserSeq: source.seq }, () => invokeShell({
+    command: `mkdir -p "${path.dirname(kept)}" && printf '{}' > "${scratch}" && printf 'kept' > "${kept}"`,
+    cwd: tmpHome,
+  }));
+  assert.match(String(ran), /exit_code: 0/, String(ran));
+  let saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  for (let attempt = 0; saved.length === 0 && attempt < 100; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    saved = listEvents(session.id, { types: ['deliverable_saved'] });
+  }
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.deepEqual(listEvents(session.id, { types: ['deliverable_saved'] }).map((event) => event.data.name), ['kept.txt']);
+  rmSync(scratchDir, { recursive: true, force: true });
+});
