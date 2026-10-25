@@ -2549,9 +2549,12 @@ export function registerToolSearchTool(
           // and a cut cursor is one the model can only guess.
           ...(nextCursor ? {
             next_cursor: nextCursor,
+            // Later pages rank lower: paging past a page of weak matches
+            // finds weaker ones (live: 20 table tools, three pages, for
+            // "book a table for two").
             continuation_hint: canDeferPages
-              ? 'Use this cursor for the next retained page. Only that page receives current account and exact definition checks; broad discovery is not repeated.'
-              : 'Call tool_search again with this exact cursor and the same query. The next page is local and performs no provider search.',
+              ? 'Later pages rank lower than this one; use this cursor only when this page holds near matches but not the one you need. Only that page receives current account and exact definition checks; broad discovery is not repeated.'
+              : 'Later pages rank lower than this one; page on only when this page holds near matches but not the one you need, with this exact cursor and the same query. The next page is local and performs no provider search.',
           } : {}),
           results: rows.map(row => {
             const result = publicResult(row);
