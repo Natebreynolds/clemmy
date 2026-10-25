@@ -15,6 +15,7 @@ const assert = (await import('node:assert/strict')).default;
 const {
   renderCallArgs,
   renderCallArgValue,
+  wallTimeOffset,
   callToolSideEffectClass,
   stepSideEffectClass,
   structuredCallNeedsMutationReceipt,
@@ -78,6 +79,18 @@ test('time tokens: {{now}}, {{now+24h}}, {{date+1d}} resolve at run time so a re
   const args = renderCallArgs({ window: { start: '{{now}}', end: '{{now+2d}}' }, note: 'from {{date}} on' }, INPUTS, OUTPUTS) as { window: { start: string; end: string }; note: string };
   assert.ok(Date.parse(args.window.end) - Date.parse(args.window.start) >= 2 * 86_400_000 - 50);
   assert.equal(args.note, `from ${date} on`);
+  // A time written after a date token is on the owner's clock: it carries
+  // the owner's offset, so a provider never reads it as UTC.
+  const window = renderCallArgs({ start: '{{date}}T00:00:00', end: '{{ date+1d }}T00:00', at: '{{date}}T09:30:00Z', plus: '{{date}}T09:30:00-05:00' }, INPUTS, OUTPUTS) as Record<string, string>;
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  assert.equal(window.start, `${date}T00:00:00${wallTimeOffset(date, '00:00:00', zone)}`);
+  assert.equal(window.end, `${tomorrow}T00:00${wallTimeOffset(tomorrow, '00:00', zone)}`);
+  assert.equal(window.at, `${date}T09:30:00Z`, 'a time that names Z stays as written');
+  assert.equal(window.plus, `${date}T09:30:00-05:00`, 'a time that names its offset stays as written');
+  assert.equal(wallTimeOffset('2026-10-24', '00:00:00', 'America/Los_Angeles'), '-07:00');
+  assert.equal(wallTimeOffset('2026-11-02', '00:00:00', 'America/Los_Angeles'), '-08:00', 'the offset of that day, not today\'s');
+  assert.equal(wallTimeOffset('2026-10-24', '00:00:00', 'Asia/Kolkata'), '+05:30');
+  assert.equal(wallTimeOffset('2026-10-24', '00:00:00', 'UTC'), '+00:00');
   // a malformed unit is not a token: left alone (no silent empty value)
   assert.equal(renderCallArgValue('{{now+2w}}', INPUTS, OUTPUTS), '{{now+2w}}');
 });

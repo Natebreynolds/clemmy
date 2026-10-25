@@ -2749,7 +2749,8 @@ export function isWorkflowStepStructuralResultError(err: unknown): err is Workfl
 
 /**
  * Cheap template renderer. Supports:
- *   {{date}}                  → today (UTC date)
+ *   {{date}}                  → today on the owner's clock (a time written
+ *                                right after it gets the owner's offset)
  *   {{input.<key>}}           → run inputs (merged from workflow defaults + run overrides)
  *   {{steps.<id>.output}}     → upstream step's textual output
  *   {{item}}                  → current forEach item (raw)
@@ -2975,6 +2976,30 @@ function calendarDateOn(at: Date, timeZone: string, days: number): string {
 const TEMPLATE_REFERENCE = String.raw`(input\.[a-zA-Z0-9_-]+|steps\.[a-zA-Z0-9_-]+\.output(?:\.[a-zA-Z0-9_.-]+)?|item(?:\.[a-zA-Z0-9_.-]+)?|project\.[a-zA-Z0-9_-]+|(?:now|date)(?:[+-]\d{1,5}[mhd])?)`;
 const TEMPLATE_REFERENCE_RE = new RegExp(String.raw`\{\{\s*${TEMPLATE_REFERENCE}\s*\}\}`, 'g');
 
+// A wall-clock time written right after a date token ("{{date}}T00:00:00")
+// is a time on the owner's clock, so it gets the owner's offset at that
+// moment. Without it a provider reads the time as UTC and the owner's day
+// moves by their offset. A time that already names Z or an offset is left
+// as written.
+const DATE_TOKEN_WALL_TIME_RE = /\{\{\s*(date(?:[+-]\d{1,5}[mhd])?)\s*\}\}T(\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)(?![\d.:]|\s*(?:Z|[+-]\d{2}))/g;
+
+/** "+HH:MM" / "-HH:MM": the offset `timeZone` has at that wall-clock time. */
+export function wallTimeOffset(date: string, time: string, timeZone: string): string {
+  const [year, month, day] = date.split('-').map(Number);
+  const [hour, minute, second] = time.split(':').map(Number);
+  const wall = Date.UTC(year!, month! - 1, day!, hour!, minute!, Math.floor(second ?? 0));
+  const offsetAt = (instant: number): number => {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit',
+      day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(instant));
+    const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value);
+    return Math.round((Date.UTC(value('year'), value('month') - 1, value('day'), value('hour'), value('minute'), value('second')) - instant) / 60_000);
+  };
+  let minutes = 0;
+  try { minutes = offsetAt(wall - offsetAt(wall) * 60_000); } catch { minutes = 0; }
+  const abs = Math.abs(minutes);
+  return `${minutes < 0 ? '-' : '+'}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+}
+
 function renderTemplate(
   template: string,
   inputs: Record<string, string>,
@@ -2982,7 +3007,11 @@ function renderTemplate(
   item?: unknown,
   project?: WorkflowStepProjectContext,
 ): string {
-  return template.replace(TEMPLATE_REFERENCE_RE, (_m, token: string) => {
+  const zoned = template.replace(DATE_TOKEN_WALL_TIME_RE, (whole, token: string, time: string) => {
+    const date = resolveTimeToken(token);
+    return date ? `${date}T${time}${wallTimeOffset(date, time, ownerTimeZone())}` : whole;
+  });
+  return zoned.replace(TEMPLATE_REFERENCE_RE, (_m, token: string) => {
     const value = resolveCallToken(token, inputs, stepOutputs, item, project);
     if (value === undefined || value === null) return '';
     if (typeof value === 'string') return value;
