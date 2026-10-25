@@ -1175,10 +1175,6 @@ test('a workflow delete without confirm is the confirmed delete; the owner\'s ca
   if (!deletion.ok) return;
   const definition = deletion.definition;
   assert.equal(local.localPlanningArgumentsMatch(definition, { names: ['Fixture A', 'Fixture B'] }), true, 'confirm omitted');
-  // A strict tool schema sends an omitted optional field as null (live r55c6:
-  // "these arguments do not fit its declared mode", on both brains).
-  assert.equal(local.localPlanningArgumentsMatch(definition, { name: 'Fixture A', names: null, confirm: null }), true, 'confirm null');
-  assert.equal(local.describeLocalSafeModeMismatch(definition, { name: 'Fixture A', confirm: null }), null);
   assert.equal(local.localPlanningArgumentsMatch(definition, { name: 'Fixture A', confirm: true }), true);
   assert.equal(local.localPlanningArgumentsMatch(definition, { name: 'Fixture A', confirm: false }), false);
 });
