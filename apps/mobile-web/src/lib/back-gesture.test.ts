@@ -43,6 +43,7 @@ const {
   openBackEntry,
   closeBackEntry,
   abandonBackEntry,
+  abandonBackGesture,
   withDepthTransition,
   _resetBackGestureForTest,
   _backGestureDepthForTest,
@@ -166,6 +167,25 @@ test('unmounting while open drops the entry without navigating', () => {
   assert.equal(_backGestureDepthForTest(), 0,
     'a dangling entry would swallow the next back gesture');
   assert.equal(backCalls, 0, 'a tab switch is not a navigation');
+});
+
+test('normal workflow detail retires its depth before a different widget route takes over history', async () => {
+  reset();
+  const previous = openBackEntry(() => assert.fail('the old detail must not handle the new route'));
+  const owner = { current: previous as number | null };
+  const widgetRoute = { workflow: 'different.saved-flow', widgetNavigation: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' };
+  pushed.push(widgetRoute); // the authenticated shell has delivered the new URL
+  abandonBackGesture(owner);
+  assert.equal(owner.current, null, 'the subsequent active=false effect has no old entry to close');
+  closeBackEntry(previous); // even a retained old cleanup cannot pop the widget URL
+  assert.equal(backCalls, 0);
+  assert.equal(pushed.at(-1), widgetRoute);
+  assert.equal(_backGestureDepthForTest(), 0);
+  const next = openBackEntry(() => {});
+  closeBackEntry(next);
+  assert.equal(backCalls, 1, 'ordinary Back still unwinds only its own subsequent detail');
+  assert.equal(pushed.at(-1), widgetRoute);
+  await settle();
 });
 
 test('a blocked history API still opens and closes the view', () => {

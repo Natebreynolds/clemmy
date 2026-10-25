@@ -17,7 +17,7 @@
  * tab into a previous tab is disorienting, and would also make the very first
  * back gesture leave the app. Only genuine depth registers.
  */
-import { useEffect, useRef } from 'preact/hooks';
+import { useCallback, useEffect, useRef } from 'preact/hooks';
 
 interface Entry {
   id: number;
@@ -152,13 +152,20 @@ export function abandonBackEntry(id: number): void {
   if (index >= 0) stack.splice(index, 1);
 }
 
+/** A new external route owns history now; a later effect must not pop it. */
+export function abandonBackGesture(owner: { current: number | null }): void {
+  const id = owner.current;
+  owner.current = null;
+  if (id !== null) abandonBackEntry(id);
+}
+
 /**
  * Register a deep view.
  *
  * @param active whether the view is open right now
  * @param close  how to close it — called when the user navigates back
  */
-export function useBackGesture(active: boolean, close: () => void): void {
+export function useBackGesture(active: boolean, close: () => void): () => void {
   const idRef = useRef<number | null>(null);
   const closeRef = useRef(close);
   closeRef.current = close;
@@ -183,4 +190,5 @@ export function useBackGesture(active: boolean, close: () => void): void {
     idRef.current = null;
     abandonBackEntry(id);
   }, []);
+  return useCallback(() => abandonBackGesture(idRef), []);
 }

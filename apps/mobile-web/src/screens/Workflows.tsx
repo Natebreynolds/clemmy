@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { workflowCaption, workflowConversationSessionId, workflowDisplayName } from '@clem/chat-engine';
 import { workflowRowStatus } from '../lib/workflow-status';
 import { useBackGesture } from '../lib/back-gesture';
@@ -26,6 +26,8 @@ import { usePendingCommit } from '../lib/pending-commit';
 import { workflowRunFailure, workflowRunNotice } from '../lib/workflow-run-receipt';
 import { Chat } from './Chat';
 import { EmptyState } from '../components/EmptyState';
+import { consumeWidgetWorkflowLaunch, removeWidgetWorkflow, reportWidgetLanding, saveWidgetWorkflow, widgetText, widgetWorkflowAvailable, WIDGET_ROUTE_EVENT } from '../lib/widget-bridge';
+import { readWidgetWorkflow, settleWidgetWorkflowClaim, widgetWorkflowCanRun, workflowWidgetTarget, WORKFLOW_WIDGET_SLUG, type WorkflowWidgetTarget } from '../lib/workflow-widget';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -37,12 +39,44 @@ const TERMINAL_RUN_STATUSES = new Set([
 
 export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
   const [selected, setSelected] = useState<MobileWorkflow | null>(null);
-  useBackGesture(selected !== null, () => setSelected(null));
-  const { data, loading, error, offline, refresh } = useScreenData(
+  const [widgetTarget, setWidgetTarget] = useState(() => workflowWidgetTarget(window.location.search));
+  const abandonSelectedBack = useBackGesture(selected !== null, () => setSelected(null));
+  useEffect(() => {
+    let active = true;
+    const sync = () => {
+      if (!active) return;
+      const next = workflowWidgetTarget(window.location.search);
+      setWidgetTarget(current => current?.slug === next?.slug && current?.navigationId === next?.navigationId ? current : next);
+      if (next) setSelected(null);
+    };
+    // The shell first commits the same-document URL in its own listener.
+    const warm = (event: Event) => { queueMicrotask(() => {
+      if (!active || !event.defaultPrevented) return;
+      abandonSelectedBack();
+      sync();
+    }); };
+    window.addEventListener('popstate', sync); window.addEventListener(WIDGET_ROUTE_EVENT, warm);
+    return () => { active = false; window.removeEventListener('popstate', sync); window.removeEventListener(WIDGET_ROUTE_EVENT, warm); };
+  }, []);
+  const { data, loading, error, offline, stale, refresh } = useScreenData(
     listWorkflows,
-    { intervalMs: 10_000, disabled: selected !== null },
+    { intervalMs: 10_000, disabled: selected !== null || Boolean(widgetTarget?.slug), resourceKey: widgetTarget?.navigationId ?? 'workflow-list' },
   );
   const workflows = data?.workflows ?? [];
+  useEffect(() => {
+    if (widgetTarget && !widgetTarget.slug && data && !loading && !stale && !error && !offline) reportWidgetLanding(widgetTarget.navigationId, { tab: 'workflows' });
+  }, [widgetTarget, data, loading, stale, error, offline]);
+  const closeWidget = () => {
+    setWidgetTarget(null);
+    window.history.replaceState(window.history.state, '', `${window.location.pathname}?tab=workflows`);
+    void refresh();
+  };
+
+  if (widgetTarget?.slug) {
+    const workflow: MobileWorkflow = { name: widgetTarget.slug, description: '', enabled: false, stepCount: 0, schedule: null,
+      requiresInput: false, lastRunId: null, lastRunStatus: null, lastRunOutcome: null, lastRunAt: null };
+    return <WorkflowDetail key={`widget:${widgetTarget.slug}:${widgetTarget.navigationId ?? ''}`} workflow={workflow} widgetTarget={widgetTarget} onBack={closeWidget} />;
+  }
 
   if (selected) {
     return <WorkflowDetail key={selected.name} workflow={selected} onBack={() => { setSelected(null); void refresh(); }} />;
@@ -92,9 +126,10 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
 interface WorkflowDetailProps {
   workflow: MobileWorkflow;
   onBack: () => void;
+  widgetTarget?: WorkflowWidgetTarget;
 }
 
-function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
+function WorkflowDetail({ workflow, onBack, widgetTarget }: WorkflowDetailProps) {
   const [triggering, setTriggering] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [runNotice, setRunNotice] = useState<string | null>(null);
@@ -102,6 +137,13 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const [selectedRun, setSelectedRun] = useState<WorkflowRunSummary | null>(null);
   const [conversation, setConversation] = useState<{ sessionId: string; draft?: string } | null>(null);
   const [definitionRead, setDefinitionRead] = useState(0);
+  const [widgetNote, setWidgetNote] = useState('');
+  const [widgetSaving, setWidgetSaving] = useState(false);
+  const widgetSaveLock = useRef(false);
+  const [widgetClaiming, setWidgetClaiming] = useState(Boolean(widgetTarget?.navigationId));
+  const launchChecked = useRef<string | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
   useMobileDetailHeader(selectedRun === null && conversation === null);
   const [inputValues, setInputValues] = useState<Record<string, string>>({});
   const { data, loading: runsLoading, error, offline, refresh } = useScreenData(
@@ -112,10 +154,24 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   // The FULL workflow — plain-English summary, certified steps, inputs
   // schema. Read on entry and after the conversation closes so a saved edit
   // is reflected by the daemon, rather than inferred from a chat reply.
-  const { data: info, refreshing: infoRefreshing, stale: infoStale, error: infoError, offline: infoOffline, refresh: reloadInfo } = useScreenData(
-    () => getWorkflowDetail(workflow.name),
-    { disabled: conversation !== null, resourceKey: `workflow:${workflow.name}:${definitionRead}` },
+  const { data: definition, refreshing: infoRefreshing, stale: infoStale, error: infoError, offline: infoOffline, updatedAt: infoReadAt, refresh: reloadInfo } = useScreenData(
+    async () => {
+      const read = widgetTarget?.slug ? await readWidgetWorkflow(widgetTarget.slug, getWorkflowDetail)
+        : { kind: 'ready' as const, info: await getWorkflowDetail(workflow.name) };
+      if (read.kind === 'not_found') return read;
+      let widgetRow: MobileWorkflow | null = null;
+      if (widgetTarget) {
+        try {
+          const matches = (await listWorkflows()).workflows.filter(row => row.name === read.info.name);
+          if (matches.length === 1) widgetRow = matches[0];
+        } catch { /* The definition can still be read; an unknown binding state cannot auto-run. */ }
+      }
+      return { ...read, widgetRow };
+    },
+    { disabled: conversation !== null, resourceKey: `workflow:${workflow.name}:${widgetTarget?.navigationId ?? ''}:${definitionRead}` },
   );
+  const info = definition?.kind === 'ready' ? definition.info : null;
+  const widgetRow = definition?.kind === 'ready' ? definition.widgetRow : null;
   const conversationSessionId = info?.slug && !infoStale ? workflowConversationSessionId(info.slug) : null;
   const description = info?.description ?? workflow.description;
   const enabled = info?.enabled ?? workflow.enabled;
@@ -131,7 +187,21 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
   const requiredMissing = (info?.inputs ?? [])
     .filter((input) => input.required && !(inputValues[input.key] ?? '').trim())
     .map((input) => input.key);
-  const bindingGaps = workflow.resourceGaps ?? [];
+  const bindingGaps = widgetRow?.resourceGaps ?? workflow.resourceGaps ?? [];
+  const latest = useRef({ definition, fresh: false, visible: true });
+  latest.current = { definition, fresh: !infoStale && !infoRefreshing && !infoError && !infoOffline, visible: !conversation && !selectedRun };
+
+  async function updateWidget(remove = false) {
+    if (!info?.slug || !WORKFLOW_WIDGET_SLUG.test(info.slug) || infoStale || infoRefreshing || widgetSaveLock.current || !infoReadAt) return;
+    widgetSaveLock.current = true; setWidgetSaving(true); setWidgetNote('');
+    try {
+      if (remove) await removeWidgetWorkflow(info.slug);
+      else await saveWidgetWorkflow({ slug: info.slug, name: widgetText(workflowDisplayName(info.name, info.description), 160),
+        summary: widgetText(info.description || 'Open this automation in Clem.', 600), updatedAt: new Date(infoReadAt).toISOString() });
+      if (mounted.current) setWidgetNote(remove ? 'Workflow shortcut removed from this iPhone.' : 'Workflow shortcut saved on this iPhone. Add the Clem widget to your Home Screen to see it.');
+    } catch (error) { if (mounted.current) setWidgetNote(error instanceof Error ? error.message : 'The widget update was not confirmed.'); }
+    finally { widgetSaveLock.current = false; if (mounted.current) setWidgetSaving(false); }
+  }
 
   async function trigger() {
     const token = commit.begin();
@@ -161,6 +231,38 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
     }
   }
 
+  useEffect(() => {
+    const navigationId = widgetTarget?.navigationId;
+    const slug = widgetTarget?.slug;
+    if (!navigationId || !slug || !definition || infoStale || infoRefreshing || infoError || infoOffline || conversation || selectedRun) return;
+    if (launchChecked.current === navigationId) {
+      // A refresh can invalidate a successful claim. Present fresh evidence,
+      // but never consume or execute the already-attempted action again.
+      if (!widgetClaiming) reportWidgetLanding(navigationId, { tab: 'workflows', workflow: slug }, definition.kind === 'not_found' ? 'unavailable' : 'presented');
+      return;
+    }
+    launchChecked.current = navigationId;
+    const current = () => {
+      const route = workflowWidgetTarget(window.location.search);
+      return mounted.current && latest.current.visible && latest.current.fresh && latest.current.definition === definition
+        && route?.navigationId === navigationId && route.slug === slug;
+    };
+    void settleWidgetWorkflowClaim(() => consumeWidgetWorkflowLaunch(navigationId, slug),
+      () => { if (mounted.current) setWidgetClaiming(false); }, current, launch => {
+      // A separately persisted native one-shot action, never the URL, permits this tap.
+      if (definition.kind === 'not_found') {
+        reportWidgetLanding(navigationId, { tab: 'workflows', workflow: slug }, 'unavailable');
+        return;
+      }
+      if (launch && widgetWorkflowCanRun(definition.info, definition.widgetRow)) {
+        setWidgetNote('Starting the workflow you tapped. Its usual checks and approvals still apply.');
+        void trigger();
+      } else if (launch) setWidgetNote('This workflow needs a look before it can run. Review its inputs, status and connections, then use Run now.');
+      else setWidgetNote('No automatic run was confirmed. Review this workflow before using Run now.');
+      reportWidgetLanding(navigationId, { tab: 'workflows', workflow: slug });
+    });
+  }, [widgetTarget, definition, infoStale, infoRefreshing, infoError, infoOffline, widgetClaiming, conversation, selectedRun]);
+
   if (conversation) {
     return <Chat
       key={conversation.sessionId}
@@ -181,6 +283,11 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
       />
     );
   }
+
+  if (definition?.kind === 'not_found') return <div class="workflow-detail">
+    <div class="chat-header"><ChatBackButton onClick={onBack} /><h2 class="chat-title">Workflow unavailable</h2></div>
+    <p class="muted">This saved workflow is no longer available. Choose another automation from the list.</p>
+  </div>;
 
   return (
     <div class="workflow-detail">
@@ -294,7 +401,7 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
         <div class="workflow-actions">
           <button
             class="btn"
-            disabled={triggering || !info || infoStale || infoRefreshing || !enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
+            disabled={triggering || widgetClaiming || !info || infoStale || infoRefreshing || !enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
             onClick={trigger}
           >
             {triggering ? 'Queuing…'
@@ -308,6 +415,11 @@ function WorkflowDetail({ workflow, onBack }: WorkflowDetailProps) {
           </button>
           <button type="button" class="btn-quiet" disabled={!conversationSessionId} onClick={() => askClem()}>Ask Clem</button>
         </div>
+        {widgetWorkflowAvailable() ? <div class="workflow-actions">
+          <button type="button" class="btn-quiet" disabled={widgetSaving || !info?.slug || infoStale || infoRefreshing} onClick={() => void updateWidget()}>Pin to widget</button>
+          <button type="button" class="btn-quiet" disabled={widgetSaving || !info?.slug || infoStale || infoRefreshing} onClick={() => void updateWidget(true)}>Remove from widget</button>
+        </div> : null}
+        {widgetNote ? <p class="muted" role="status">{widgetNote}</p> : null}
         <p class="muted">Ask about this workflow or describe a change to its saved steps. Runs already in progress keep their own controls.</p>
         {actionError ? <div class="global-error">{actionError}</div> : null}
         {runNotice ? <p class="muted" role="status">{runNotice}</p> : null}

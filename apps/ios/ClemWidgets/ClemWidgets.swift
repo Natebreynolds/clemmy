@@ -46,6 +46,63 @@ struct ClemSpaceWidget: Widget {
     }
 }
 
+/// Edit Widget chooses a view, not a task or an execution policy.
+struct ClemDashboardConfiguration: WidgetConfigurationIntent {
+    static var title: LocalizedStringResource = "Clem dashboard"
+    static var description = IntentDescription("Choose saved information, your pinned workflows, or an overview.")
+
+    @Parameter(title: "Show", default: .overview)
+    var mode: ClemDashboardMode
+}
+
+private struct ClemDashboardEntry: TimelineEntry {
+    let snapshot: ClemEntry
+    let mode: ClemDashboardMode
+    var date: Date { snapshot.date }
+}
+
+private struct ClemDashboardProvider: AppIntentTimelineProvider {
+    typealias Intent = ClemDashboardConfiguration
+    typealias Entry = ClemDashboardEntry
+
+    func placeholder(in context: Context) -> ClemDashboardEntry { ClemDashboardEntry(snapshot: ClemEntry(date: Date(), space: nil), mode: .overview) }
+
+    func snapshot(for configuration: ClemDashboardConfiguration, in context: Context) async -> ClemDashboardEntry {
+        ClemDashboardEntry(snapshot: ClemEntry(date: Date(), space: ClemWidgetSpaceStore.shared.load(), workflows: ClemWidgetWorkflowStore.shared.load()), mode: configuration.mode)
+    }
+
+    func timeline(for configuration: ClemDashboardConfiguration, in context: Context) async -> Timeline<ClemDashboardEntry> {
+        // Same snapshot-only contract as the existing Space widget. Refreshes
+        // advance the displayed age, without fetching or starting any work.
+        let now = Date()
+        let space = ClemWidgetSpaceStore.shared.load()
+        let workflows = ClemWidgetWorkflowStore.shared.load()
+        let entries = (0..<12).map { hour in
+            ClemDashboardEntry(snapshot: ClemEntry(date: now.addingTimeInterval(TimeInterval(hour) * 3_600), space: space, workflows: workflows), mode: configuration.mode)
+        }
+        return Timeline(entries: entries, policy: .atEnd)
+    }
+}
+
+private struct DashboardEntryView: View {
+    @Environment(\.widgetFamily) private var family
+    let entry: ClemEntry
+    let mode: ClemDashboardMode
+    var body: some View { ClemDashboardView(entry: entry, mode: mode, family: family) }
+}
+
+struct ClemDashboardWidget: Widget {
+    let kind = "ClemDashboard"
+    var body: some WidgetConfiguration {
+        AppIntentConfiguration(kind: kind, intent: ClemDashboardConfiguration.self, provider: ClemDashboardProvider()) { entry in
+            DashboardEntryView(entry: entry.snapshot, mode: entry.mode)
+        }
+        .configurationDisplayName("Clem dashboard")
+        .description("Talk to Clem, keep a saved Space in view, or run your pinned workflows. Touch and hold to choose the view.")
+        .supportedFamilies([.systemMedium, .systemLarge])
+    }
+}
+
 /// Control Center, the Lock Screen and the Action button: one press starts
 /// Talk through the same audio intent as the widget's Talk button.
 @available(iOS 18.0, *)
@@ -81,6 +138,7 @@ struct ClemWidgets: WidgetBundle {
     var body: some Widget {
         ClemQuickActionsWidget()
         ClemSpaceWidget()
+        ClemDashboardWidget()
         ClemRecordingActivity()
         if #available(iOS 18.0, *) {
             ClemTalkControl()

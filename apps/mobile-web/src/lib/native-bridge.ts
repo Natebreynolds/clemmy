@@ -14,7 +14,7 @@
  * boot — registration is idempotent per device on the daemon side.
  */
 import { registerApnsToken } from './api';
-import { openWidgetRoute, widgetSpaceStored } from './widget-bridge';
+import { openWidgetRoute, widgetSpaceStored, widgetWorkflowStored, widgetWorkflowLaunchConsumed } from './widget-bridge';
 
 const PENDING_KEY = 'clem.apns.pending';
 
@@ -34,6 +34,8 @@ declare global {
       /** Native durably parked this exact relay lease in Keychain. */
       originHandoffStored?(value: { handoffId: string; generation: number }): void;
       widgetSpaceStored?(value: { requestId: string; ok: boolean; slug?: string }): void;
+      widgetWorkflowStored?(value: { requestId: string; ok: boolean; slug?: string }): void;
+      widgetWorkflowLaunchConsumed?(value: { requestId: string; navigationId: string; slug: string; ok: boolean }): void;
       openWidgetRoute?(value: { path: string; navigationId: string }): boolean;
     };
     webkit?: {
@@ -230,6 +232,8 @@ async function tryRegister(deviceToken: string, environment?: string): Promise<b
 export function installNativeBridge(): void {
   window.clemNative = {
     widgetSpaceStored,
+    widgetWorkflowStored,
+    widgetWorkflowLaunchConsumed,
     openWidgetRoute,
     registerApnsToken(deviceToken: string, environment?: string): void {
       void tryRegister(deviceToken, environment);
