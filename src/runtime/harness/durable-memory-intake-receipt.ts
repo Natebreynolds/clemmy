@@ -508,7 +508,10 @@ export function hostVerifiedStatedRetention(input: { sessionId: string; sourceUs
   } catch { return false; }
 }
 
-export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUserSeq: number }): string | null {
+/** The request keeps the status that produced its notice, rather than
+ * rereading storage after the notice may already have become stale. */
+export function verifiedMemoryIntakeNotice(input: { sessionId: string; sourceUserSeq: number }):
+  { status: 'saved' | 'queued'; text: string } | null {
   const loaded = readVerifiedIntake(input);
   if (loaded.status !== 'ok' || loaded.intake.rows.some(row => !['pending', 'promoted'].includes(row.status))) return null;
   // The notice stops a duplicate save of what the owner stated to keep. A
@@ -520,9 +523,13 @@ export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUs
   // yet"), which the reviewer then bounced as contradicting the verified fact
   // (live 2026-10-20) — a wasted round on a one-sentence save.
   if (hostVerifiedStatedRetention(input)) {
-    return '[Verified memory intake] The automatic layer has durably SAVED these exact accepted claims: verified, active and linked to this request. Say plainly that it is remembered. Do not save it again through memory_remember, do not read it back to check, and do not describe it as queued or pending.';
+    return { status: 'saved', text: '[Verified memory intake] The automatic layer has durably SAVED these exact accepted claims: verified, active and linked to this request. Say plainly that it is remembered. Do not save it again through memory_remember, do not read it back to check, and do not describe it as queued or pending.' };
   }
-  return '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.';
+  return { status: 'queued', text: '[Verified memory intake] The automatic layer has durably queued these exact accepted claims and their original context. Do not duplicate those claims through memory_remember solely to save them again while consolidation is pending. Destination or canonical-fact qualification may still be unresolved; this intake is not saved-memory or completion proof. Report pending work accurately and continue any separate requested work.' };
+}
+
+export function verifiedMemoryIntakeContext(input: { sessionId: string; sourceUserSeq: number }): string | null {
+  return verifiedMemoryIntakeNotice(input)?.text ?? null;
 }
 
 /** Current storage evidence only: exact source, reviewed destination, active
