@@ -17,6 +17,7 @@ import { getFact } from './facts.js';
 import { attachGroundedUserPeople, attachGroundedUserProjects } from './grounded-user-entities.js';
 import { bumpStableContextGeneration } from '../runtime/stable-context-generation.js';
 import { reviewStandingMemory } from './standing-memory-review.js';
+import { acceptedTaskIdFor } from '../runtime/harness/attempt-identity.js';
 
 const AUTO_CAPTURE_SOURCE = 'auto_capture' as const;
 const AUTO_CAPTURE_MAX_ATTEMPTS = 8;
@@ -324,7 +325,7 @@ export async function drainDurableConsolidationCandidates(options: {
         result.skipped += 1; continue;
       }
       const decisionDigest = automaticMemoryDecisionDigest(envelope);
-      const runMutation: NonNullable<ConsolidateOptions['runMutation']> = action => db.transaction(() => {
+      const runOwnedMutation: NonNullable<ConsolidateOptions['runMutation']> = action => db.transaction(() => {
         const current = readOwnedAutomaticMemoryDecision(owner, db);
         if (current.status !== 'owned' || automaticMemoryDecisionDigest(current.envelope) !== decisionDigest
           || !automaticMemoryOriginSourceIsCurrent(origin)) throw new LostAutomaticMemoryOwnership();
@@ -332,7 +333,45 @@ export async function drainDurableConsolidationCandidates(options: {
       }).immediate();
       // Check immediately before entering async consolidation, and at every
       // later mutation through its synchronous transaction hook.
-      runMutation(() => undefined);
+      runOwnedMutation(() => undefined);
+      // The resolver awaits a model after taking its retrieval snapshot. The
+      // brain can save these same-source facts meanwhile, in different words.
+      // Reopen their exact host receipts and current stored scope/content at
+      // the first real mutation, so that stale decision retries with fresh
+      // context. This never decides that an aggregate is semantically covered.
+      const { explicitRemembersStored } = await import('../runtime/harness/memory-completion-obligation.js');
+      const acceptedSource = origin.source.eventType === 'user_input_received' && origin.source.eventSeq !== null
+        ? { sessionId: origin.source.sessionId, sourceUserSeq: origin.source.eventSeq,
+          acceptedTaskId: acceptedTaskIdFor(origin.source.sessionId, origin.source.eventSeq) } : null;
+      const explicitSnapshot = (): string | null => withMemorySettledFor(destination.scope, () => {
+        if (!acceptedSource) return null;
+        const saved = explicitRemembersStored(acceptedSource);
+        if (saved === null) return null;
+        const current = saved.flatMap(receipt => {
+          // Scope failures must stay errors; getFact's visibility filter can
+          // otherwise hide an unreadable scope as a missing fact.
+          const scope = memoryScopeOf('fact', receipt.factId);
+          const fact = getFact(receipt.factId);
+          if (!fact?.active) return [];
+          return sameScope(scope, destination.scope)
+            ? [{ ...receipt, kind: fact.kind, contentDigest: createHash('sha256').update(fact.content).digest('hex'), scope }]
+            : [];
+        });
+        return createHash('sha256').update(JSON.stringify(current)).digest('hex');
+      });
+      const before = acceptedSource ? runOwnedMutation(explicitSnapshot) : null;
+      if (acceptedSource && before === null) throw new Error('same_source_explicit_memory_snapshot_unavailable');
+      let mutationStarted = false;
+      const runMutation: NonNullable<ConsolidateOptions['runMutation']> = action => runOwnedMutation(() => {
+        if (acceptedSource && !mutationStarted) {
+          const current = explicitSnapshot();
+          if (current === null) throw new Error('same_source_explicit_memory_snapshot_unavailable');
+          if (current !== before) throw new Error('same_source_explicit_memory_changed_during_consolidation');
+        }
+        const value = action();
+        mutationStarted = true;
+        return value;
+      });
       const sourceText = origin.source.ownerText;
       const candidateText = destination.claimText;
       const excerpt = selectSupportingExcerpt(sourceText, candidateText);

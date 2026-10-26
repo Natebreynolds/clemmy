@@ -327,6 +327,43 @@ export function explicitRememberStored(source: Pick<MemoryRequirementSource, 'se
     return null;
   } catch { return null; }
 }
+
+/** Complete inventory of this source's successful host saves. Unlike the
+ * first-save completion convenience above, an unreadable successful result is
+ * unknown, never an authoritative empty inventory. No other source's fact or
+ * provider-shaped receipt may stand in for a canonical host settlement. */
+export function explicitRemembersStored(source: Pick<MemoryRequirementSource, 'sessionId' | 'sourceUserSeq' | 'acceptedTaskId'>): Array<{
+  action: 'add' | 'supersede' | 'reinforce'; factId: number; logicalToolCallId: string;
+  resultHandleId: string; rawPayloadSha256: string;
+}> | null {
+  try {
+    if (source.acceptedTaskId !== acceptedTaskIdFor(source.sessionId, source.sourceUserSeq)) return null;
+    const calls = openEventLog().prepare(`SELECT l.logical_tool_call_id AS callId FROM logical_tool_calls l
+      JOIN logical_call_settlements s ON s.session_id = l.session_id AND s.source_user_seq = l.source_user_seq
+        AND s.logical_tool_call_id = l.logical_tool_call_id
+      WHERE l.session_id = ? AND l.source_user_seq = ? AND l.accepted_task_id = ?
+        AND l.tool_name = 'memory_remember' AND l.state = 'settled'
+        AND s.outcome_kind IN ('succeeded', 'empty_result') ORDER BY l.rowid`)
+      .all(source.sessionId, source.sourceUserSeq, source.acceptedTaskId) as Array<{ callId: string }>;
+    const saved: NonNullable<ReturnType<typeof explicitRemembersStored>> = [];
+    for (const call of calls) {
+      const result = redeemSuccessfulSettlementResultForHost({ ...source, logicalToolCallId: call.callId });
+      if (result.status !== 'ok' || result.value.toolName !== 'memory_remember') return null;
+      if (result.value.executionSite !== 'host') continue;
+      const receipt = parseMemoryRememberReceipt(result.value.rawPayload) ?? parseMemoryRememberReceipt(result.value.rawPayloadJson);
+      if (!receipt) return null;
+      if (receipt.action === 'ignore') continue;
+      if (!receipt.factId) return null;
+      const row = openMemoryDb().prepare('SELECT active, source_session_id FROM consolidated_facts WHERE id = ?')
+        .get(receipt.factId) as { active: number; source_session_id: string | null } | undefined;
+      if (row?.active === 1 && row.source_session_id === source.sessionId) saved.push({
+        action: receipt.action, factId: receipt.factId, logicalToolCallId: call.callId,
+        resultHandleId: result.value.resultHandleId, rawPayloadSha256: result.value.rawPayloadSha256,
+      });
+    }
+    return saved;
+  } catch { return null; }
+}
 /** Reopen retained evidence and canonical state. This proves only the bound
  * correction postconditions, never all semantic requirements of the turn. */
 export function memoryCorrectionCompletion(source: MemoryRequirementSource): MemoryCorrectionCompletion {

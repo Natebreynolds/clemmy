@@ -880,7 +880,7 @@ export function toolSearchBrokerCoverage(
 function dispatchHint(carrier: ToolSearchDispatchCarrier): string {
   return carrier === 'work_call'
     ? 'For execution through work_call, copy the selected result carrier example. For publish_plan, use its exact effect and put only the direct selected-tool input fields from its schema into staticArgumentsJson; carrier names, fixedArgs and payload wrappers belong to the work_call example. For each independent proposal-free write, keep example.requirement_id equal to this result\'s exact capabilityRef — never replace it with role_key; the existing tool-edge allow/deny/ask path owns the decision. If a graph is already frozen, use its exact open operation id instead. Replace source_call_ids:null only when the write arguments consume or copy bytes from one settled model-visible result, using that exact function-call id; a prior read used only as a condition or decision is not content lineage and stays null.'
-    : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional/nullable fields you do not need.';
+    : 'Invoke the selected result with call_tool(name, args_json), using the exact name and JSON schema above. Omit optional fields you do not need.';
 }
 
 function queryExplicitlyNamesTool(query: string, toolName: string): boolean {
@@ -2091,7 +2091,10 @@ export function registerToolSearchTool(
         }
         const sourced = sourceCandidates.find((candidate) => candidate.name === name);
         if (sourced?.schema !== undefined) {
-          return relaxJsonSchemaForDeferred(sourced.schema);
+          // Sources supply authoritative ordinary JSON contracts, not the
+          // local strict projection. Nullable does not prove that a required
+          // provider field was originally optional.
+          return sourced.schema;
         }
         const metadata = metadataMap.get(name);
         if (metadata?.schema !== undefined) {

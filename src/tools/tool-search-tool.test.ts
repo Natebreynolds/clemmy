@@ -294,7 +294,7 @@ test('call_tool discovery removes nested nullable placeholders from required lis
     /steps.*REPLACES THE ENTIRE STEP GRAPH/i,
     'exact discovery warns that steps are replacement semantics even when schema annotations are stripped',
   );
-  assert.match(out.hint, /Omit optional\/nullable fields/);
+  assert.match(out.hint, /Omit optional fields/);
 });
 
 test('native write disclosures expose their exact host effect and direct carrier arguments', async () => {
@@ -398,6 +398,62 @@ test('one federated broker returns an authorized provider candidate with exact s
   assert.deepEqual((out.schemas.crm__mass_read as { required?: string[] }).required, ['query']);
   assert.match(out.hint, /work_call/);
 });
+
+for (const sourceKind of ['authorized_external_mcp', 'authorized_composio'] as const) {
+  test(`sourced ${sourceKind} discovery preserves required-nullable provider fields`, async () => {
+    const name = sourceKind === 'authorized_external_mcp' ? 'fixture__nullable_read' : 'FIXTURE_NULLABLE_READ';
+    const schema = {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        cursor: { type: ['string', 'null'] },
+        optional_cursor: { type: ['string', 'null'] },
+        rows: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              clear: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+              optional_clear: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+            },
+            required: ['clear'],
+            additionalProperties: false,
+          },
+        },
+        selection: {
+          oneOf: [
+            {
+              type: 'object',
+              properties: { kind: { const: 'all' }, scope: { type: ['string', 'null'] } },
+              required: ['kind', 'scope'],
+              additionalProperties: false,
+            },
+            {
+              type: 'object',
+              properties: { kind: { const: 'named' }, scope: { type: ['string', 'null'] } },
+              required: ['kind'],
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+      required: ['query', 'cursor', 'rows', 'selection'],
+      additionalProperties: false,
+    };
+    const before = structuredClone(schema);
+    const t = captureToolSearch(new Set(['tool_search']), false, [{
+      kind: sourceKind,
+      async search() {
+        return [{ name, summary: 'Read a synthetic selection with explicit nullable fields.', schema, carrier: 'work_call' }];
+      },
+    }]);
+    const out = await runSearch(t.handler, `${name} exact schema`);
+    assert.deepEqual(out.results.map(result => result.name), [name]);
+    assert.deepEqual(out.schemas[name], before,
+      'authoritative provider JSON must keep required keys even when null is a valid value; genuinely optional keys stay optional');
+    assert.deepEqual(schema, before, 'discovery never mutates the provider definition');
+  });
+}
 
 test('account review unavailability has consistent global and row recovery without reasking the account', async () => {
   for (const reason of ['review_unavailable', undefined] as const) {
