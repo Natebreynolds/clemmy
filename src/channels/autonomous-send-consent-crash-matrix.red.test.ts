@@ -1563,6 +1563,7 @@ test(THREE_ENTRYPOINT_TEST_NAME, async () => {
     delete childEnv.NODE_TEST_CONTEXT;
     const child = spawnSync(tsx, [
       '--test',
+      '--test-reporter=tap',
       '--test-concurrency=1',
       `--test-name-pattern=^${THREE_ENTRYPOINT_TEST_NAME}$`,
       fileURLToPath(import.meta.url),
