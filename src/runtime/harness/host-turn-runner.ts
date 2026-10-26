@@ -10266,11 +10266,16 @@ const runHostTurnBody = async (
     };
     if (hostProduction) {
       for (const pending of pendingFromResume) {
+        // Restore what the pre-approval loop knew about this call (its local
+        // requirement and carry). The admitted bytes are already prepared and
+        // stay exactly as admitted: a second preparation must not rewrite them.
+        const key = `${pending.name}\0${pending.rawItem.arguments}`;
+        const hadPreparation = localArgumentPreparations.has(key);
         await prepareCallBeforeAdmission({ callId: pending.callId, name: pending.name, argumentsJson: pending.rawItem.arguments });
+        if (!hadPreparation) localArgumentPreparations.delete(key);
       }
     }
     for (const pending of pendingFromResume) {
-      const tool = toolByName.get(pending.name);
       let argumentsJson = pending.rawItem.arguments;
       let args: Record<string, unknown> | null = null;
       try {
@@ -10281,14 +10286,34 @@ const runHostTurnBody = async (
         resumeFrameRepair = true;
         break;
       }
-      const effect = args ? classifyRuntimeToolEffect(pending.name, args).effect : 'unknown';
+      // A call the pre-approval loop carried (call_tool{X}, or X named off
+      // this turn's surface) was admitted and consented as its carrier call,
+      // so it is re-checked as that same carrier. Approval matching and replay
+      // keep the authored call, which is what its card and settlement store.
+      const authoredTool = toolByName.get(pending.name);
+      const carry = args
+        ? selectedDirectCarry(pending.name, args, argumentsJson, pending.callId)
+          ?? ((!authoredTool || typeof authoredTool.invoke !== 'function')
+            ? resolveOffSurfaceDirectCarry({
+                authoredName: pending.name,
+                authoredArgs: args,
+                authoredArgumentsJson: argumentsJson,
+                surfaceHas: (name) => toolByName.has(name),
+              })
+            : null)
+        : null;
+      const checkedName = carry ? carry.carrierName : pending.name;
+      const checkedJson = carry ? materializedArgumentsJson(carry.carrierName, JSON.stringify(carry.carrierArgs)) : argumentsJson;
+      const checkedArgs = carry ? parsedArgs(checkedJson) : args;
+      const tool = toolByName.get(checkedName);
+      const effect = checkedArgs ? classifyRuntimeToolEffect(checkedName, checkedArgs).effect : 'unknown';
       const mutation = effect === 'local_write' || effect === 'external_write' || effect === 'admin';
       if (!mutation) continue;
       // Legacy/non-production HostInterruptState remains a pure SDK resume:
       // it has no accepted source or durable logical row to re-materialize.
       // A rejection is still paired visibly below and never executes a body.
       if (!hostProduction) continue;
-      if (!tool || !args) {
+      if (!tool || !args || !checkedArgs) {
         noteResumeFrameRepair('tool_or_arguments_missing', pending);
         resumeFrameRepair = true;
         break;
@@ -10341,9 +10366,9 @@ const runHostTurnBody = async (
       }
 
       const exactProduction = exactProductionHostCall(
-        pending.name,
-        args,
-        argumentsJson,
+        checkedName,
+        checkedArgs,
+        checkedJson,
         tool,
         pending.callId,
         runContext,
@@ -10351,8 +10376,8 @@ const runHostTurnBody = async (
           toolCall: {
             type: 'function_call',
             callId: pending.callId,
-            name: pending.name,
-            arguments: argumentsJson,
+            name: checkedName,
+            arguments: checkedJson,
           },
         },
       );
@@ -10370,7 +10395,7 @@ const runHostTurnBody = async (
       if ((exactProduction.boundary !== 'nested_owned' || exactProduction.graphlessLocalMutation)
         && !actionExpectedWorkRequired(identity)) {
         consent = await evaluateExactHostMutationConsent(exactProduction, durableApproval);
-      } else if (!isPlainOrClementineLocalTool(pending.name, 'work_call') || !isHostPlanRequiredWorkCall(tool)) {
+      } else if (!isPlainOrClementineLocalTool(checkedName, 'work_call') || !isHostPlanRequiredWorkCall(tool)) {
         // The card for this call was raised through the exact-call consent
         // (only a host-planned work_call is prepared), so its approval is
         // re-checked the same way: the exact grant, never a fresh preparation.
@@ -10384,12 +10409,12 @@ const runHostTurnBody = async (
             sessionId: identity.sessionId,
             sourceUserSeq: identity.sourceUserSeq,
             logicalToolCallId: pending.callId,
-            outerArgs: args!,
+            outerArgs: checkedArgs,
             runContext,
             details: {
               toolCall: {
                 type: 'function_call', callId: pending.callId,
-                name: pending.name, arguments: argumentsJson,
+                name: checkedName, arguments: checkedJson,
               },
             },
           }),
