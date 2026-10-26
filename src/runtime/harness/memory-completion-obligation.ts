@@ -196,6 +196,16 @@ export function readRetainedMemoryRequirement(source: MemoryRequirementSource): 
   const rows = requirements(source);
   const corrections = rows.filter(row => row.assessment.kind === 'correct');
   if (corrections.length) {
+    const unresolvedIndex = rows.map(row => row.assessment.kind === 'unresolved').lastIndexOf(true);
+    // A grant for one known target is not a complete objective assessment. If
+    // a later review identifies an unresolved remainder, keep that hold until
+    // a fresh completion assessment covers the retained correction union.
+    // New prewrite grants may finish those operations, but cannot waive it.
+    if (unresolvedIndex >= 0
+      && rows.slice(0, unresolvedIndex).some(row => row.assessment.kind === 'correct')
+      && !rows.slice(unresolvedIndex + 1).some(row => ['correct', 'replaced'].includes(row.assessment.kind) && row.review.phase === 'completion')) {
+      return rows[unresolvedIndex]!;
+    }
     const assessment: MemoryRequirementAssessmentV1 = { version: 1, kind: 'correct',
       corrections: correctionUnion(source, corrections.flatMap(row => row.assessment.corrections)),
       reason: 'Retained correction requirements for this exact accepted owner request.' };
@@ -209,11 +219,13 @@ export function readRetainedMemoryRequirement(source: MemoryRequirementSource): 
 export function findRetainedCorrectionAssessment(source: MemoryRequirementSource,
   correction: MemoryCorrectionRequirementV1): RetainedMemoryRequirement | null {
   const wanted = correctionIdentity(source, correctionSchema.parse(correction));
-  const retained = readRetainedMemoryRequirement(source);
-  if (retained?.assessment.kind !== 'correct') return null;
+  const rows = requirements(source);
+  correctionUnion(source, rows.filter(row => row.assessment.kind === 'correct').flatMap(row => row.assessment.corrections));
   // Return the actual positive prewrite row for this member. Its digest is
-  // what the atomic memory proof retains, even when the union later grows.
-  return requirements(source).find(row => row.review.phase === 'prewrite'
+  // what the atomic memory proof retains, even when the union later grows or
+  // a different target still holds completion. A completion hold is not a
+  // revocation of this exact source-bound execution grant.
+  return rows.find(row => row.review.phase === 'prewrite'
     && row.assessment.corrections.some(target => isDeepStrictEqual(correctionIdentity(source, target), wanted))) ?? null;
 }
 export function retainMemoryRequirementAssessment(input: {
@@ -229,13 +241,17 @@ export function retainMemoryRequirementAssessment(input: {
       throw new Error('No replacement made by this request is in effect.');
     }
     const prior = readRetainedMemoryRequirement(source);
-    if (prior?.assessment.kind === 'correct') {
+    const rows = requirements(source);
+    const bound = correctionUnion(source, rows.filter(row => row.assessment.kind === 'correct')
+      .flatMap(row => row.assessment.corrections));
+    if (bound.length) {
       // The retained correction stays the requirement; completion accepts its
       // targets once this request's intake has made each exact replacement.
-      if (assessment.kind === 'replaced' && intakeReplacedAll(source, prior.assessment.corrections)) return prior;
-      if (assessment.kind !== 'correct') throw new Error('A retained correction cannot be waived by this assessment.');
-      correctionUnion(source, [...prior.assessment.corrections, ...proposed]); // conflict/size fence
-      if (review.phase === 'completion' && prior.assessment.corrections.some(previous => !proposed.some(next =>
+      const fullyReplaced = assessment.kind === 'replaced' && intakeReplacedAll(source, bound);
+      if (fullyReplaced && prior?.assessment.kind !== 'unresolved') return prior!;
+      if (assessment.kind !== 'correct' && assessment.kind !== 'unresolved' && !fullyReplaced) throw new Error('A retained correction cannot be waived by this assessment.');
+      correctionUnion(source, [...bound, ...proposed]); // conflict/size fence
+      if (assessment.kind === 'correct' && review.phase === 'completion' && bound.some(previous => !proposed.some(next =>
         isDeepStrictEqual(correctionIdentity(source, previous), correctionIdentity(source, next))))) {
         throw new Error('A completion assessment cannot omit a retained correction target.');
       }
@@ -244,8 +260,19 @@ export function retainMemoryRequirementAssessment(input: {
       throw new Error('An unresolved memory requirement cannot be waived by this assessment.');
     }
     const hash = assessmentDigest(source, canonical);
-    const existing = requirements(source).find(row => row.assessmentDigest === hash && row.review.phase === review.phase);
-    if (existing) return existing;
+    const existingIndex = rows.map(row => row.assessmentDigest === hash && row.review.phase === review.phase).lastIndexOf(true);
+    if (existingIndex >= 0) {
+      const after = rows.slice(existingIndex + 1);
+      // Replayed prewrite grants stay idempotent. A current review after an
+      // intervening contrary state gets a new event even with the same packet
+      // bytes. Its phase is the existing host review authority, not a separate
+      // cryptographic review ID or stale-completion replay proof.
+      const changed = assessment.kind === 'unresolved'
+        ? after.some(row => row.assessment.kind === 'correct' || row.assessment.kind === 'replaced')
+        : ['correct', 'replaced'].includes(assessment.kind) && review.phase === 'completion'
+          && after.some(row => row.assessment.kind === 'unresolved');
+      if (!changed) return rows[existingIndex]!;
+    }
     const event = appendEvent({ sessionId: source.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged',
       data: { lane: 'host_v1', kind: 'memory_requirement', version: 1,
         sourceUserSeq: source.sourceUserSeq, source, assessment: canonical, assessmentDigest: hash, review } });

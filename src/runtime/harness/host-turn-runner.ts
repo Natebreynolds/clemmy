@@ -5134,6 +5134,7 @@ const runHostTurnBody = async (
     verdict = applyWholeResponseFormatFinding(verdict, responseFormatFinding);
     if (memoryRequirementRequired) {
       let memoryAssessmentAccepted = false;
+      let memoryAssessmentRejected = false;
       try {
         const source = readMemoryRequirementSource(identity, objective);
         if (source && verdict.memoryRequirement && !verdict.failedOpen) {
@@ -5141,8 +5142,15 @@ const runHostTurnBody = async (
             review: { phase: 'completion', ...(verdict.judgeModelId ? { judgeModelId: verdict.judgeModelId } : {}) } });
           memoryAssessmentAccepted = true;
         }
-      } catch { /* The final gate reopens the retained requirement; a rejected replacement cannot waive it. */ }
-      const memoryCheck = memoryAssessmentAccepted ? memoryRequirementCompletion(false)
+      } catch {
+        // The current structured review may identify work beyond an earlier
+        // proved target. A failed retention write or rejected partial packet
+        // cannot turn that current finding into the older target's success.
+        memoryAssessmentRejected = Boolean(verdict.memoryRequirement) && !verdict.failedOpen;
+      }
+      const memoryCheck = memoryAssessmentRejected
+        ? { status: 'unverified' as const, reason: 'The current memory requirement assessment could not be retained and cannot be verified from an earlier partial proof.' }
+        : memoryAssessmentAccepted ? memoryRequirementCompletion(false)
         : (() => {
           // No accepted assessment from THIS review. An earlier review of the
           // same request may already have retained one (live 2026-10-20: the

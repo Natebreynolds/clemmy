@@ -126,6 +126,20 @@ function retain(identity: ReturnType<typeof source>, assessment: import('./memor
   return memory.retainMemoryRequirementAssessment({ source: identity.retained, assessment,
     review: { phase, ...(phase === 'prewrite' ? { ownerQuote: 'Replace my saved report heading HAZEL RIDGE with LILAC GROVE.' } : {}) } });
 }
+function settleExactCorrection(identity: ReturnType<typeof source>, fixture: ReturnType<typeof observed>,
+  grant: ReturnType<typeof retain>, callId: string) {
+  const args = { kind: 'project', content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'),
+    correct: fixture.correction };
+  settle(identity, 'memory_remember', callId, () => {
+    const result = factState.correctFactExact({ targetId: fixture.fact.id, expectedObservationDigest: fixture.observation.digest,
+      patches: fixture.correction.edits, owner: { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
+        sourceEventId: identity.retained.sourceEventId, sourceContextDigest: identity.retained.sourceContextDigest,
+        logicalToolCallId: callId, argumentsDigest: contracts.durableLogicalCallContract(identity.retained.acceptedTaskId, 'memory_remember', args)!.argumentDigest,
+        assessmentDigest: grant.assessmentDigest, ownerText: identity.retained.ownerText, occurredAt: identity.retained.occurredAt } });
+    assert.equal(result.status, 'corrected');
+    return JSON.stringify({ protocol: 'fact_correction_v1', ...result });
+  }, args);
+}
 async function runHost(identity: ReturnType<typeof source>, verdict: import('./objective-judge.js').ObjectiveJudgeVerdict,
   enabled = true) {
   let calls = 0; let reviews = 0;
@@ -498,6 +512,130 @@ test('manual correction validates all exact arguments before accepting a matchin
   }
 });
 
+
+test('actual host keeps a current unresolved target after an earlier exact correction is proved', async () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B before claiming both are corrected.');
+  const first = observed(identity, `mixed-first-${serial}`);
+  const second = observed(identity, `mixed-second-${serial}`);
+  const grant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, grant, `mixed-proved-first-${serial}`);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'A has its complete canonical proof');
+  const unresolved = { version: 1 as const, kind: 'unresolved' as const, corrections: [],
+    reason: 'Report A is corrected, but the requested correction for report B is still unresolved.' };
+  const result = await runHost(identity, { done: true, reason: 'The model claims both records are corrected.', memoryRequirement: unresolved });
+  assert.ok(result.calls > 0 && result.reviews > 0, 'the actual host completion boundary is exercised');
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'the current unresolved remainder cannot be hidden by A proof');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'unresolved');
+  assert.equal(factState.readFactObservation(second.fact.id)?.active, true, 'verification does not repair B');
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, first.correction)?.assessmentDigest, grant.assessmentDigest,
+    'the immutable prewrite grant still owns A execution, independently of completion');
+  assert.equal(retain(identity, first.assessment, 'prewrite').eventId, grant.eventId, 'old prewrite replay is idempotent');
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'unresolved', 'reopen retains the current remainder');
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'old grant replay cannot clear the remainder');
+});
+
+test('mixed unresolved completion keeps grants and requires a fresh full assessment after each hold', () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B.');
+  const first = observed(identity, `mixed-resolution-first-${serial}`);
+  const second = observed(identity, `mixed-resolution-second-${serial}`);
+  const firstGrant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, firstGrant, `mixed-resolution-proved-first-${serial}`);
+  retain(identity, first.assessment); // An earlier completion assessment saw only A.
+  const unresolved = { version: 1 as const, kind: 'unresolved' as const, corrections: [],
+    reason: 'The remaining requested report correction is unresolved.' };
+  const firstHold = retain(identity, unresolved);
+  const secondGrant = retain(identity, second.assessment, 'prewrite');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'unresolved',
+    'a new execution grant does not constitute a full completion assessment');
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, second.correction)?.assessmentDigest, secondGrant.assessmentDigest);
+  settleExactCorrection(identity, second, secondGrant, `mixed-resolution-proved-second-${serial}`);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'both operations may finish while the review hold remains');
+  assert.throws(() => retain(identity, second.assessment), /cannot omit/, 'the pending hold cannot hide the earlier bound target');
+  const full = { ...first.assessment, corrections: [second.correction, first.correction] };
+  const completed = retain(identity, full);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  const nextHold = retain(identity, unresolved);
+  assert.notEqual(nextHold.eventId, firstHold.eventId, 'a repeated packet after completion records the new review rather than resurrecting an old row');
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified');
+  assert.equal(retain(identity, unresolved).eventId, nextHold.eventId, 'an unchanged current hold remains idempotent');
+  // This is a current host completion invocation using an identical packet
+  // value, not a separate cryptographic review identity or replay check.
+  const completedAgain = retain(identity, full);
+  assert.notEqual(completedAgain.eventId, completed.eventId, 'a fresh full review may resolve the later hold even with the same target digest');
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'full proofs and fresh review survive reopening');
+});
+
+test('actual host keeps the current unresolved verdict when retaining it fails', async () => {
+  const identity = source(ownerText + ' Correct both report A and report B before claiming completion.');
+  const first = observed(identity, `mixed-storage-first-${serial}`);
+  const second = observed(identity, `mixed-storage-second-${serial}`);
+  const grant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, grant, `mixed-storage-proved-first-${serial}`);
+  const db = events.openEventLog();
+  db.exec(`CREATE TRIGGER fixture_reject_unresolved_memory BEFORE INSERT ON events
+    WHEN NEW.session_id = '${identity.sessionId}' AND NEW.type = 'goal_alignment_judged'
+      AND json_extract(NEW.data_json, '$.kind') = 'memory_requirement'
+      AND json_extract(NEW.data_json, '$.assessment.kind') = 'unresolved'
+    BEGIN SELECT RAISE(ABORT, 'controlled unresolved receipt storage failure'); END`);
+  try {
+    const result = await runHost(identity, { done: true, reason: 'The model claims both are complete.',
+      memoryRequirement: { version: 1, kind: 'unresolved', corrections: [], reason: 'Report B remains unresolved.' } });
+    assert.equal(result.outcome.terminal?.status, 'blocked', 'a failed retention write cannot make the current unresolved review disappear');
+    assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+    assert.equal(factState.readFactObservation(second.fact.id)?.active, true);
+    assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'correct',
+      'the injected failure really left only the older A grant in storage');
+  } finally { db.exec('DROP TRIGGER fixture_reject_unresolved_memory'); }
+});
+
+test('actual host cannot reuse A proof after rejecting a current correction packet that only names B', async () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B.');
+  const first = observed(identity, `mixed-rejected-first-${serial}`);
+  const second = observed(identity, `mixed-rejected-second-${serial}`);
+  const firstGrant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, firstGrant, `mixed-rejected-proved-first-${serial}`);
+  const result = await runHost(identity, { done: true, reason: 'The model claims both are complete.', memoryRequirement: second.assessment });
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'the rejected current B packet cannot fall back to old A proof');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(factState.readFactObservation(second.fact.id)?.active, true);
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.corrections.length, 1,
+    'the rejected partial packet did not alter the retained correction union');
+  assert.equal(events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').some(row => row.data.fulfills === true), false,
+    'the current rejection is retained as an unverified completion, not a positive review');
+});
+
+test('a fresh full intake replacement assessment resolves a mixed hold without waiving bound targets', () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B.');
+  const first = observed(identity, `mixed-intake-first-${serial}`);
+  const second = observed(identity, `mixed-intake-second-${serial}`);
+  const grants = [retain(identity, first.assessment, 'prewrite'), retain(identity, second.assessment, 'prewrite')];
+  for (const fixture of [first, second]) {
+    const by = facts.rememberFact({ kind: 'project', content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'), scope: null,
+      sessionId: identity.sessionId, occurredAt: identity.retained.occurredAt,
+      sourceUri: `conversation://${encodeURIComponent(identity.sessionId)}/${encodeURIComponent(`auto-capture:user-source:${identity.sourceUserSeq}`)}` });
+    assert.equal(facts.markFactSupersededBy(fixture.fact.id, by.id, { validTo: identity.retained.occurredAt }), true);
+  }
+  const unresolved = { version: 1 as const, kind: 'unresolved' as const, corrections: [], reason: 'The full requested replacement still needs comparison.' };
+  retain(identity, unresolved);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified');
+  const resolved = retain(identity, replacedAssessment);
+  assert.equal(resolved.assessment.kind, 'replaced', 'the fresh completion assessment is retained after the hold');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.corrections.length, 2);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  const nextHold = retain(identity, unresolved);
+  const resolvedAgain = retain(identity, replacedAssessment);
+  assert.notEqual(resolvedAgain.eventId, resolved.eventId, 'a fresh replacement review resolves the newer hold rather than reusing an older row');
+  assert.notEqual(resolvedAgain.eventId, nextHold.eventId);
+  for (const [index, fixture] of [first, second].entries()) {
+    assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, fixture.correction)?.assessmentDigest, grants[index]!.assessmentDigest);
+  }
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+});
 
 for (const action of ['supersede', 'reinforce'] as const) test(`actual host keeps unresolved memory after partial ${action}`, async () => {
   const identity = source('Correct both synthetic report headings: change HAZEL RIDGE to LILAC GROVE for report A and resolve report B before claiming both are corrected. Preserve both footers.');
