@@ -15281,3 +15281,23 @@ test('compatible prepared writes publish one review and one decision approves on
   const resolved = listEventsForConv(session.id, { types: ['approval_resolved'] });
   assert.ok(resolved.some(event => event.data.approvalId === cards[0]!.approvalId), 'shared desktop/mobile card resolves');
 });
+
+test('her own plain-text answer to a decline is what the owner reads; the fixed line stands in only for silence', async () => {
+  for (const [finalOutput, expected] of [
+    ['Got it — the workflow stays as is.', 'Got it — the workflow stays as is.'],
+    ['', 'Okay — I rejected that action. Nothing else was approved.'],
+  ] as const) {
+    resetEventLog();
+    const agent = new Agent({ name: 'ResumeDeclineVoiceTest', instructions: 'test' });
+    const sess = HarnessSession.create({ kind: 'chat', title: 'decline voice' });
+    sess.saveInterruptState(makeApprovalRunState(agent, 'send_tool'));
+    const approval = approvalRegistry.register({ sessionId: sess.id, subject: 'delete the controlled fixture', tool: 'send_tool', args: {} });
+    await runConversationFromResume({
+      agent, sessionId: sess.id, approvalId: approval.approvalId, decision: 'reject', resolver: 'unit-test',
+      makeRunner: makeRunnerStub,
+      runRunner: async (_runner, _agent, items) => ({ history: items, lastResponseId: undefined, finalOutput }),
+    });
+    const completed = listEventsForConv(sess.id, { types: ['conversation_completed'] }).at(-1)!;
+    assert.equal(completed.data.reply ?? (completed.data as { summary?: unknown }).summary, expected);
+  }
+});

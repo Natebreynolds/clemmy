@@ -15222,7 +15222,11 @@ async function runConversationFromResumeCore(opts: {
   // (owner 2026-10-08: "the harness was dictating before given to Clem").
   if (opts.decision === 'reject') {
     const artifactState = standardArtifactTerminalState(opts.sessionId, activeSourceUserSeq);
-    const spokenRejection = (decision?.reply ?? decision?.summary ?? '').trim();
+    // Her words in whatever form the run returned them: a decision's reply or
+    // summary, or the plain text a host turn ends with (live 10-26: "Got it —
+    // the workflow stays as is." was replaced by the fixed line below).
+    const spokenRejection = decision?.reply?.trim() || decision?.summary?.trim()
+      || (typeof firstResult.finalOutput === 'string' ? firstResult.finalOutput.trim() : '');
     const rejectionReply = spokenRejection || 'Okay — I rejected that action. Nothing else was approved.';
     const publicPresentation = commitStandardCancelledTerminal({
       sessionId: opts.sessionId,
