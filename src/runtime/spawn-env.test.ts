@@ -414,17 +414,45 @@ test('CLI declarations refresh after same-sized atomic replacement preserving mt
   assert.equal(mergedSpawnEnv({}, { inherited: {}, platform: 'win32' }).CLI_PROFILE, 'profile-b');
 }));
 
-test('CLI declarations refresh after in-place edit with restored mtime', () => withCliEnvFile(file => {
-  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-a' }));
+test('CLI declarations refresh after in-place edit with restored mtime', t => withCliEnvFile(file => {
+  const first = JSON.stringify({ CLI_PROFILE: 'profile-a' });
+  const second = JSON.stringify({ CLI_PROFILE: 'profile-b' });
+  writeFileSync(file, first);
   const fixed = new Date('2026-10-16T01:00:00.000Z');
   utimesSync(file, fixed, fixed);
   const before = statSync(file);
-  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
-  writeFileSync(file, JSON.stringify({ CLI_PROFILE: 'profile-b' }));
-  utimesSync(file, before.atime, before.mtime);
-  assert.equal(statSync(file).size, before.size);
-  assert.equal(statSync(file).mtimeMs, before.mtimeMs);
-  assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+  const originalStat = fs.statSync;
+  const originalFstat = fs.fstatSync;
+  const actual = originalStat(file, { bigint: true });
+  let changeTime = actual.ctimeNs;
+  // A real same-sized rewrite need not advance the filesystem's clock tick.
+  // Control only this inode's bigint ctime view, consistently for the path
+  // and open handle; bytes, identity, size and restored mtime stay physical.
+  const controlled = <T extends ReturnType<typeof originalStat>>(stat: T): T => {
+    if (!stat || stat.dev !== actual.dev || stat.ino !== actual.ino) return stat;
+    return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ctimeNs: changeTime });
+  };
+  try {
+    t.mock.method(fs, 'statSync', (...args: Parameters<typeof fs.statSync>) => controlled(originalStat(...args)));
+    t.mock.method(fs, 'fstatSync', (...args: Parameters<typeof fs.fstatSync>) => controlled(originalFstat(...args)));
+    syncBuiltinESMExports();
+    assert.equal(readFileSync(file, 'utf8'), first);
+    assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-a');
+    writeFileSync(file, second);
+    utimesSync(file, before.atime, before.mtime);
+    const after = originalStat(file, { bigint: true });
+    assert.equal(after.dev, actual.dev);
+    assert.equal(after.ino, actual.ino, 'the rewrite must stay on the same physical inode');
+    assert.equal(after.size, actual.size);
+    assert.equal(after.mtimeNs, actual.mtimeNs);
+    assert.equal(readFileSync(file, 'utf8'), second, 'the new declaration is written to the real file');
+    changeTime += 1n;
+    assert.equal(statSync(file, { bigint: true }).ctimeNs, changeTime);
+    assert.equal(userDeclaredCliEnv().CLI_PROFILE, 'profile-b');
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
 }));
 
 test('CLI declaration warm cache returns isolated own-key copies without rereading bytes', t => withCliEnvFile(file => {

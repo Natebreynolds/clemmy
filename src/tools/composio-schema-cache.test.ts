@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -44,7 +44,11 @@ function rewriteContract(
   const file = contractPath(identifier);
   const record = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
   mutate(record);
-  writeFileSync(file, JSON.stringify(record, null, 2), 'utf-8');
+  // Publish a new generation as the production contract writer does. A rapid
+  // same-sized in-place fixture edit need not change the filesystem clock.
+  const temporary = `${file}.fixture.tmp`;
+  writeFileSync(temporary, JSON.stringify(record, null, 2), 'utf-8');
+  renameSync(temporary, file);
 }
 
 try {
