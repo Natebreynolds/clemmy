@@ -13,7 +13,7 @@
  * Phase A of the intent-based tool dispatch plan
  * (/Users/example/.claude/plans/intent-based-tool-dispatch.md).
  */
-import {
+import fs, {
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -26,6 +26,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 
 const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-tool-choice-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
@@ -36,7 +37,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 // simulate moving between machines.
 writeFileSync(path.join(TMP_HOME, 'state', 'machine-id'), 'machine-A\n');
 
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { resetMachineIdCacheForTests } = await import('../runtime/machine-id.js');
@@ -1077,6 +1078,124 @@ test('impressions are diagnostic only and never improve procedure score', () => 
   const procedure = listToolProcedures()[0];
   assert.equal(procedure.impressionCount, 12);
   assert.equal(computeChoiceScore(procedure.choice), before, 'exposure does not masquerade as utility');
+});
+
+// Reproduce a filesystem timestamp/size collision without depending on its
+// clock resolution. Actual store writes and reads still use the fixture files.
+function holdToolChoiceFileStats(t: TestContext, filePaths: string[]): void {
+  const realStat = fs.statSync;
+  const held = new Map(filePaths.map((filePath) => [filePath, realStat(filePath)]));
+  t.mock.method(fs, 'statSync', (...args: Parameters<typeof fs.statSync>) => {
+    const actual = Reflect.apply(realStat, fs, args);
+    const fixed = typeof args[0] === 'string' ? held.get(args[0]) : undefined;
+    if (!fixed || !actual || typeof actual.mtimeMs !== 'number') return actual;
+    return Object.assign(Object.create(Object.getPrototypeOf(actual)), actual, {
+      mtimeMs: fixed.mtimeMs,
+      size: fixed.size,
+    });
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+}
+
+test('canonical impression writes remain exact when file stat metadata does not advance', (t) => {
+  switchTestMachine('machine-fixed-stat-impressions');
+  const record = rememberToolChoice({
+    intent: 'fixture.list.records',
+    choice: { kind: 'mcp', identifier: 'fixture__list_records' },
+  });
+  assert.ok(record.procedureId);
+  const initial = listToolProcedures()[0];
+  const score = computeChoiceScore(initial.choice);
+  holdToolChoiceFileStats(t, [initial.filePath]);
+
+  for (let i = 0; i < 12; i += 1) recordToolProcedureImpression(record.procedureId!);
+
+  const current = listToolProcedures()[0];
+  assert.equal(current.impressionCount, 12, 'every canonical write must build on the preceding write');
+  assert.match(readFileSync(initial.filePath, 'utf-8'), /^impressionCount: 12$/m, 'disk and cached reads agree');
+  assert.equal(computeChoiceScore(current.choice), score, 'impressions still add no outcome credit');
+});
+
+test('alias replacement is visible when file stat metadata does not advance', (t) => {
+  switchTestMachine('machine-fixed-stat-alias');
+  const input = {
+    intent: 'fixture.lookup.record',
+    description: 'old lookup',
+    choice: { kind: 'mcp' as const, identifier: 'fixture__lookup_record' },
+  };
+  const record = rememberToolChoice(input);
+  assert.equal(peekToolChoice(input.intent)?.description, 'old lookup');
+  holdToolChoiceFileStats(t, [record.filePath]);
+
+  rememberToolChoice({ ...input, description: 'new lookup' });
+
+  assert.match(readFileSync(record.filePath, 'utf-8'), /^description: new lookup$/m);
+  assert.equal(peekToolChoice(input.intent)?.description, 'new lookup', 'alias reads observe the completed own write');
+});
+
+for (const writer of ['alias', 'procedure'] as const) {
+  test(`${writer} failed writes discard both prior and intermediate cached parses`, (t) => {
+    switchTestMachine(`machine-fixed-stat-failed-${writer}`);
+    const input = {
+      intent: 'fixture.inspect.record',
+      choice: { kind: 'mcp' as const, identifier: 'fixture__inspect_record' },
+    };
+    const record = rememberToolChoice(input);
+    const procedure = listToolProcedures()[0];
+    const target = writer === 'alias' ? record.filePath : procedure.filePath;
+    const read = () => writer === 'alias' ? peekToolChoice(input.intent) : listToolProcedures()[0] ?? null;
+    assert.ok(read(), 'prime the exact file parse');
+    holdToolChoiceFileStats(t, [target]);
+    const prior = readFileSync(target, 'utf-8');
+    const realWrite = fs.writeFileSync;
+    const failure = new Error('controlled partial fixture write');
+    let attempted = false;
+    let duringWrite: unknown;
+    t.mock.method(fs, 'writeFileSync', (...args: Parameters<typeof fs.writeFileSync>) => {
+      if (args[0] !== target) return Reflect.apply(realWrite, fs, args);
+      attempted = true;
+      const torn = '---\nintent: [\n---\n';
+      realWrite(target, torn.padEnd(Buffer.byteLength(prior), ' '), 'utf-8');
+      duringWrite = read();
+      realWrite(target, prior, 'utf-8');
+      throw failure;
+    });
+    syncBuiltinESMExports();
+
+    assert.throws(() => {
+      if (writer === 'alias') rememberToolChoice(input);
+      else recordToolProcedureImpression(record.procedureId!);
+    }, (error) => error === failure, 'the original write failure must propagate');
+    assert.equal(attempted, true);
+    assert.equal(duringWrite, null, 'a torn own write must not return the previous valid cached record');
+    assert.ok(read(), 'a failed write must not retain a null parse from intermediate bytes');
+    assert.equal(readFileSync(target, 'utf-8'), prior, 'the controlled failed fixture restored its original bytes');
+  });
+}
+
+test('own writes preserve warm cached parses for other files', (t) => {
+  switchTestMachine('machine-fixed-stat-unrelated-cache');
+  const selected = rememberToolChoice({
+    intent: 'fixture.list.selected',
+    choice: { kind: 'mcp', identifier: 'fixture__list_selected' },
+  });
+  const unrelated = rememberToolChoice({
+    intent: 'fixture.list.unrelated',
+    choice: { kind: 'mcp', identifier: 'fixture__list_unrelated' },
+  });
+  const unrelatedProcedure = listToolProcedures().find((item) => item.procedureId === unrelated.procedureId)!;
+  assert.ok(peekToolChoice(unrelated.intent), 'prime the unrelated alias and canonical procedure');
+  holdToolChoiceFileStats(t, [unrelated.filePath, unrelatedProcedure.filePath]);
+  const reads = t.mock.method(fs, 'readFileSync');
+  syncBuiltinESMExports();
+
+  recordToolProcedureImpression(selected.procedureId!);
+  rememberToolChoice({ intent: selected.intent, choice: selected.choice!, description: 'selected update' });
+  assert.ok(peekToolChoice(unrelated.intent));
+  assert.equal(reads.mock.calls.filter(({ arguments: args }) => (
+    args[0] === unrelated.filePath || args[0] === unrelatedProcedure.filePath
+  )).length, 0, 'eviction is scoped to the written file, preserving unrelated warm reads');
 });
 
 test('identifier-only outcomes abstain when two canonical operations share a CLI binary', () => {

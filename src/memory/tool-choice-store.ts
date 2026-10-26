@@ -313,9 +313,10 @@ function filePathFor(intent: string): string {
  * (JIT recall pin, context render, composio search recall, workflow binding),
  * and re-parsing ~200 markdown files cost ~70ms PER CALL on a real store
  * (measured 2026-08-05) — a repeating per-turn tax on the exact hot path the
- * latency work is trimming. Writers go through writeFileSync, which bumps
- * mtime and invalidates naturally; a torn write degrades to null exactly as
- * the uncached parse did. Cache hits return a shallow copy so one caller's
+ * latency work is trimming. Own writers evict their exact file before and
+ * after writing: filesystem timestamps can collide for same-size writes.
+ * A torn write degrades to null exactly as the uncached parse did. Cache hits
+ * return a shallow copy so one caller's
  * top-level mutation can never leak into another's read.
  */
 const parseFileCache = new Map<string, { mtimeMs: number; size: number; value: unknown }>();
@@ -518,7 +519,13 @@ function writeRecord(record: Omit<ToolChoiceRecord, 'filePath'> & { filePath?: s
   // partial objects (e.g. choice without invocationTemplate) without
   // having to construct exact-shape literals.
   const stringified = matter.stringify(body, stripUndefined(fm) as object);
-  writeFileSync(filePath, stringified, 'utf-8');
+  parseFileCache.delete(filePath);
+  try {
+    writeFileSync(filePath, stringified, 'utf-8');
+  } finally {
+    // A failed/partial write or reentrant read must not leave a stale parse.
+    parseFileCache.delete(filePath);
+  }
   return { ...record, body, filePath };
 }
 
@@ -644,10 +651,16 @@ function writeProcedure(procedure: ToolProcedureRecord): ToolProcedureRecord {
     updatedAt: procedure.updatedAt,
   });
   const label = procedure.choice ? `${procedure.choice.kind}:${procedure.choice.identifier}` : procedure.procedureId;
-  writeFileSync(filePath, matter.stringify(
+  const stringified = matter.stringify(
     `# Canonical tool procedure — \`${label}\`\n\nThis file owns reusable procedure identity and outcome evidence. Intent-specific legacy files are retained as aliases.\n`,
     fm as object,
-  ), 'utf-8');
+  );
+  parseFileCache.delete(filePath);
+  try {
+    writeFileSync(filePath, stringified, 'utf-8');
+  } finally {
+    parseFileCache.delete(filePath);
+  }
   return { ...procedure, filePath };
 }
 
