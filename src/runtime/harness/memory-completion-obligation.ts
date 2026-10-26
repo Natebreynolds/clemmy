@@ -441,7 +441,8 @@ export function explicitRememberStored(source: Pick<MemoryRequirementSource, 'se
  * first-save completion convenience above, an unreadable successful result is
  * unknown, never an authoritative empty inventory. No other source's fact or
  * provider-shaped receipt may stand in for a canonical host settlement. */
-export function explicitRemembersStored(source: Pick<MemoryRequirementSource, 'sessionId' | 'sourceUserSeq' | 'acceptedTaskId'>): Array<{
+export function explicitRemembersStored(source: Pick<MemoryRequirementSource, 'sessionId' | 'sourceUserSeq' | 'acceptedTaskId'>,
+  requireCurrentFacts = false): Array<{
   action: 'add' | 'supersede' | 'reinforce'; factId: number; logicalToolCallId: string;
   resultHandleId: string; rawPayloadSha256: string;
 }> | null {
@@ -465,12 +466,32 @@ export function explicitRemembersStored(source: Pick<MemoryRequirementSource, 's
       if (!receipt.factId) return null;
       const row = openMemoryDb().prepare('SELECT active, source_session_id FROM consolidated_facts WHERE id = ?')
         .get(receipt.factId) as { active: number; source_session_id: string | null } | undefined;
+      if (requireCurrentFacts && (row?.active !== 1 || row.source_session_id !== source.sessionId)) return null;
       if (row?.active === 1 && row.source_session_id === source.sessionId) saved.push({
         action: receipt.action, factId: receipt.factId, logicalToolCallId: call.callId,
         resultHandleId: result.value.resultHandleId, rawPayloadSha256: result.value.rawPayloadSha256,
       });
     }
     return saved;
+  } catch { return null; }
+}
+/** Current canonical evidence behind all readable saves of this exact source.
+ * This is review input, never semantic coverage of the owner's request. */
+export function explicitMemorySaveEvidence(source: MemoryRequirementSource): Array<{
+  save: NonNullable<ReturnType<typeof explicitRemembersStored>>[number]; fact: FactObservationV1;
+}> | null {
+  try {
+    const saves = explicitRemembersStored(source, true);
+    if (!saves?.length) return null;
+    const evidence: NonNullable<ReturnType<typeof explicitMemorySaveEvidence>> = [];
+    for (const save of saves) {
+      const fact = readFactObservation(save.factId);
+      if (!fact?.active || fact.validTo !== null || fact.supersededByFactId !== null
+        || fact.provenance.sourceSessionId !== source.sessionId
+        || !isDeepStrictEqual(fact.scope, source.memoryScope)) return null;
+      evidence.push({ save, fact });
+    }
+    return evidence;
   } catch { return null; }
 }
 /** Reopen retained evidence and canonical state. This proves only the bound

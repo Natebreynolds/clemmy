@@ -10938,6 +10938,145 @@ async function retainAutomaticMemoryForHost(
   return queued;
 }
 
+// A pending aggregate is background work, not proof that exact explicit saves failed.
+for (const variant of ['complete', 'overruled-positive', 'bound-positive', 'bound-wrong-reply', 'bound-wrong-source', 'bound-wrong-call', 'partial', 'no-save', 'failed-open', 'missing-packet',
+  'substitute', 'unqualified', 'unbound-input', 'null-input', 'malformed-assessment', 'none-packet', 'stale-fact', 'inactive-fact', 'foreign-source', 'wrong-scope', 'inactive-before-review', 'disabled'] as const) {
+ test(`pending automatic memory with sealed explicit saves: ${variant}`, async t => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const obligation = await import('./memory-completion-obligation.js');
+  const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+  const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
+  const { createProject } = await import('../../projects/project-record.js');
+  const { setSessionProject } = await import('../../projects/session-project.js');
+  const { readFactObservation } = await import('../../memory/fact-correction.js');
+  const oldBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => { _setHostObjectiveJudgeForTests(null);
+    if (oldBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = oldBrackets; });
+  const session = eventlog.createSession({ id: `pending-explicit-${variant}-${++acceptedSerial}`, kind: 'chat' });
+  const project = createProject({ name: `Pending explicit ${acceptedSerial}`, context: 'Controlled disposable fixture.' });
+  assert.ok(project.ok); if (!project.ok) throw new Error('controlled project');
+  assert.ok(setSessionProject(session.id, project.project.id, { by: 'owner' }).ok);
+  const clauses = ['The Pinewood heading is COPPER FERN.', 'The cutoff threshold equals 5.'];
+  const objective = `Remember both facts for future chats in this project only: ${clauses.join(' ')} Confirm what was saved.`;
+  const fixture = freshComputationFixture(session, objective, 'pending-explicit');
+  t.after(() => { eventlog.finishRunAttempt(fixture.attempt, 'completed'); });
+  const queued = await retainAutomaticMemoryForHost(fixture, false);
+  assert.equal(queued.candidateIds.length, 1);
+  const source = obligation.readMemoryRequirementSource(fixture.context); assert.ok(source);
+  const selected = getLocalRuntimeTools().filter(entry => entry.type === 'function' && entry.name === 'memory_remember');
+  assert.equal(selected.length, 1);
+  const tools = selected.map(entry => brackets.wrapToolForHarness(entry as never));
+  const reply = 'Both facts are saved in this project: heading COPPER FERN and cutoff 5.';
+  const savedClauses = variant === 'no-save' ? [] : variant === 'partial' ? clauses.slice(0, 1) : clauses;
+  const scripted = scriptedRecordingModel([
+    ...savedClauses.map((content, index) => [toolCall(`pending-explicit-${index}`, 'memory_remember', { kind: 'project', content, keepFor: 'here' })]),
+    [textMsg(reply)],
+  ]);
+  const captures: Array<ReturnType<typeof obligation.explicitRemembersStored>> = [];
+  const invalidate = () => {
+    const inventory = obligation.explicitRemembersStored(source); captures.push(inventory);
+    const id = inventory?.at(-1)?.factId;
+    if (!id) throw new Error('Controlled canonical save missing');
+    if (variant === 'stale-fact') memoryDatabase.openMemoryDb().prepare('UPDATE consolidated_facts SET content=? WHERE id=?').run('Changed after the exact reviewed snapshot.', id);
+    if (variant === 'inactive-fact' || variant === 'inactive-before-review') memoryDatabase.openMemoryDb().prepare('UPDATE consolidated_facts SET active=0 WHERE id=?').run(id);
+    if (variant === 'foreign-source') memoryDatabase.openMemoryDb().prepare('UPDATE consolidated_facts SET source_session_id=? WHERE id=?').run('controlled-foreign-source', id);
+    if (variant === 'wrong-scope') memoryDatabase.openMemoryDb().prepare("UPDATE memory_scopes SET scope_project_id=? WHERE target_kind='fact' AND target_id=?").run('controlled-foreign-project', String(id));
+  };
+  const model = { ...scripted, async getResponse(request: unknown) {
+    if (variant === 'inactive-before-review' && scripted.calls() === savedClauses.length) invalidate();
+    return scripted.getResponse(request);
+  } };
+  const reviews: Array<{ objective: string; reply: string; context: unknown }> = [];
+  const boundInputs: Array<{ input: { status: string }; assessment: { status: string } }> = [];
+  _setHostObjectiveJudgeForTests(async (objective, reply, context) => {
+    reviews.push({ objective, reply, context });
+    let boundProof: Record<string, unknown> = {};
+    if (variant.startsWith('bound-')) {
+      const inputs = await import('./review-input-observation.js');
+      const responses = await import('./model-response-binding.js');
+      const assessments = await import('./completion-decision-assessment.js');
+      const owner = context!.reviewInputOwner!;
+      const seed = { owner: variant === 'bound-wrong-source' ? { ...owner, sourceUserSeq: owner.sourceUserSeq + 1 } : owner,
+        stage: 'completion' as const, objectiveDigest: sha256(objective),
+        candidateDigest: sha256(variant === 'bound-wrong-reply' ? 'A different unpublished reply.' : reply),
+        instructions: inputs.composeReviewInput([{ text: 'Controlled whole-request review.', component: 'judge_rubric' }], ''),
+        prompt: inputs.composeReviewInput([{ text: objective, component: 'effective_objective' },
+          { text: variant === 'bound-wrong-reply' ? 'A different unpublished reply.' : reply, component: 'candidate_response' },
+          { text: context!.memoryRequirementContext!, component: 'memory_requirement_context' }], '\n') };
+      const collector = inputs.createReviewInputObservation(seed, { ownerAtEntry: () => seed.owner });
+      const raw = 'REVIEW_ASSESSMENT: ' + JSON.stringify({ version: 1, coverage: 'complete', decisions: [{
+        claim: 'Both requested facts are retained.', premise: 'The request names two facts in this project.',
+        basis: 'The exact canonical save observations are supplied.', consequence: 'The reply confirms the two retained facts.',
+        contrary: { status: 'resolved', reason: 'The automatic aggregate is still pending, but the explicit saves are current.' }, status: 'supported',
+      }] }) + '\nDONE: The requested facts are retained.';
+      const response = { responseId: `controlled-memory-review-${fixture.source.seq}`, output: [textMsg(raw)],
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1, inputTokensDetails: [], outputTokensDetails: [] } };
+      responses.bindCompletedModelResponse(response, `controlled-memory-review-${fixture.source.seq}`, 1);
+      await collector.wrap({ getResponse: async () => response, async *getStreamedResponse() {} } as never).getResponse({
+        systemInstructions: seed.instructions.text, input: [{ role: 'user', content: seed.prompt.text }],
+        modelSettings: {}, tools: [], handoffs: [], outputType: { type: 'text' }, tracing: 'disabled' });
+      const input = collector.finish([response] as never, raw);
+      const original = responses.completedModelResponseBinding(response)!;
+      const assessment = { ...assessments.parseCompletionDecisionAssessment(raw).diagnostic,
+        originalModelCallId: original.modelCallId + (variant === 'bound-wrong-call' ? '-foreign' : ''),
+        physicalAttempt: original.physicalAttempt, providerResponseIdDigest: original.providerResponseIdDigest };
+      boundInputs.push({ input, assessment }); boundProof = { reviewInputObservation: input, reviewAssessment: assessment };
+    }
+    return { ...boundProof, done: variant !== 'partial', ...(variant === 'partial' ? { blocked: true } : {}),
+      reason: variant === 'partial' ? 'The second requested fact is still missing.' : 'Controlled full review covers both exact stored facts and the reply.',
+      ...(variant === 'failed-open' ? { failedOpen: true, reviewFailure: 'unavailable' as const } : {}),
+      ...(variant === 'substitute' ? { substituteForExactPin: true } : {}),
+      ...(variant === 'unqualified' ? { reviewDisposition: 'answered_unqualified' as const, failedOpen: true } : {}),
+      ...(variant === 'null-input' ? { reviewInputObservation: null as never } : {}),
+      ...(variant === 'malformed-assessment' ? { reviewAssessment: { version: 1, status: 'qualified' } as never } : {}),
+      ...(variant === 'unbound-input' ? { reviewInputObservation: { status: 'unbound', reason: 'Controlled absent SDK binding.' } as never } : {}),
+      ...(variant === 'overruled-positive' ? { reviewDepth: 'full' as const, reviewConfirmation: 'overruled' as const } : {}),
+      ...(variant === 'missing-packet' ? {} : {
+        memoryRequirement: { version: 1 as const, kind: variant === 'none-packet' ? 'none' as const : 'retain' as const, corrections: [], reason: 'Both requested facts require retention in this project.' } }) };
+
+  });
+  let outputChecks = 0;
+  const agent = { model, tools, outputGuardrails: [{ name: 'controlled-current-memory-boundary', execute: async () => {
+    outputChecks++;
+    if (outputChecks === 1 && ['stale-fact', 'inactive-fact', 'foreign-source', 'wrong-scope'].includes(variant)) invalidate();
+    return { tripwireTriggered: false, outputInfo: {} };
+  } }] }; bindHostCanarySurface(fixture, agent, tools);
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const result = await modelUsageAttributionStorage.run({ ...fixture.context, attemptId: fixture.attempt.attemptId }, () =>
+    runProductionHost(fixture, agent, undefined, { hostJudgeCompletion: variant !== 'disabled', maxTurns: 6, hostReviewAfterDelivery: true }));
+  const saves = captures[0] ?? obligation.explicitRemembersStored(source); assert.ok(saves);
+  assert.equal(saves.length, savedClauses.length, 'every intended save really crossed registered tools and settled under this accepted source');
+  if (!captures.length) {
+    assert.deepEqual(saves.map(row => readFactObservation(row.factId)?.content), savedClauses);
+    for (const saved of saves) { const fact = readFactObservation(saved.factId); assert.ok(fact?.active);
+      assert.deepEqual(fact.scope, source.memoryScope); assert.equal(fact.provenance.sourceSessionId, session.id); }
+  }
+  assert.ok(verifiedMemoryConsolidationEvidence(fixture.context)?.some(row => row.status === 'pending'), 'the automatic aggregate remains genuinely pending');
+  const reviewsExpected = ['no-save', 'inactive-before-review', 'disabled'].includes(variant) ? 0 : variant === 'missing-packet' ? 3 : 1;
+  assert.equal(reviews.length, reviewsExpected, 'only exact current saves admit existing whole-request review; its established repair budget stays unchanged');
+  for (const review of reviews) {
+    assert.equal(review.objective, objective); assert.equal(review.reply, reply);
+    const context = review.context as { memoryRequirementContext?: string };
+    for (const saved of savedClauses) assert.ok(context.memoryRequirementContext?.includes(saved), 'current canonical content reaches the existing review');
+  }
+  for (const proof of boundInputs) { assert.equal(proof.input.status, 'bound', JSON.stringify(proof.input)); assert.equal(proof.assessment.status, 'qualified'); }
+  if (variant.startsWith('bound-')) assert.equal(boundInputs.length, 1, 'the nominal original SDK binding was really produced');
+  if (['complete', 'overruled-positive', 'bound-positive'].includes(variant)) {
+    assert.equal(result.finalOutput, reply); assert.equal(result.terminal, undefined);
+    assert.equal(model.calls(), 3, 'no duplicate saves or extra answer pass');
+  } else assert.equal(result.terminal?.status, 'blocked', 'partial, unavailable, changed or unreviewed evidence cannot clear pending');
+  const calls = eventlog.openEventLog().prepare("SELECT s.logical_tool_call_id FROM logical_call_settlements s JOIN logical_tool_calls l ON s.session_id=l.session_id AND s.source_user_seq=l.source_user_seq AND s.logical_tool_call_id=l.logical_tool_call_id WHERE s.session_id=? AND s.source_user_seq=? AND l.tool_name='memory_remember'").all(session.id, fixture.source.seq);
+  assert.equal(calls.length, savedClauses.length, 'continuation never manufactures duplicate saves');
+  const waits = eventlog.listEvents(session.id, { types: ['guardrail_tripped'] }).filter(row => row.data.kind === 'memory_consolidation_review_wait');
+  if (variant === 'no-save') { assert.equal(waits.length, 1); assert.ok(Number(waits[0]!.data.elapsedMs) >= 15_000); }
+  if (['complete', 'overruled-positive', 'bound-positive'].includes(variant)) assert.equal(waits.length, 0, 'settled explicit saves need no automatic wait');
+  assert.equal(eventlog.listEvents(session.id, { types: ['guardrail_tripped'] }).filter(row => row.data.kind === 'completion_review_after_delivery').length, 0,
+    'pending automatic work keeps the existing review in front of delivery');
+});
+}
+
 // Live 2026-10-23: the owner restated a rule memory already held. The review
 // found nothing to save and judged the reply complete, but the zero-work floor
 // still ended the turn blocked and Clem said the save had not happened.
