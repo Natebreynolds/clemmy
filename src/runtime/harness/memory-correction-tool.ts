@@ -44,6 +44,18 @@ export async function executeMemoryCorrection(input: {
     .get(identity.sessionId, identity.sourceUserSeq, logical.acceptedTaskId, logical.logicalToolCallId) as
       { argument_digest: string } | undefined;
   if (!call?.argument_digest) throw new Error('The correction has no admitted exact logical call.');
+  // A read from an earlier request is a repairable prerequisite, not an
+  // uncertain correction outcome. Only this exact absence/tool mismatch is
+  // known here; an existing read still needs full retained-result redemption.
+  const read = openEventLog().prepare(`SELECT tool_name FROM logical_tool_calls
+    WHERE session_id = ? AND source_user_seq = ? AND accepted_task_id = ?
+      AND logical_tool_call_id = ?`)
+    .get(identity.sessionId, identity.sourceUserSeq, logical.acceptedTaskId, input.correct.readCallId) as
+      { tool_name: string } | undefined;
+  if (!read || read.tool_name !== 'memory_read') {
+    return { status: 'refused' as const,
+      reason: 'Reopen the original fact with memory_read in this request before correcting it.' };
+  }
   const observation = retainedFactObservation({ ...identity, acceptedTaskId: logical.acceptedTaskId,
     readCallId: input.correct.readCallId });
   if (observation.digest !== input.correct.expectedDigest || observation.kind !== input.kind) {

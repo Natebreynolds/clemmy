@@ -754,7 +754,7 @@ export function registerMemoryTools(server: McpServer): void {
       content: z.string().min(3),
       sessionId: z.string().optional(),
       sourcePath: z.string().optional(),
-      correct: memoryCorrectionInputSchema.optional().describe('For an owner-requested correction, first memory_read the original fact, then pass its readCallId, observation.digest as expectedDigest and exact unique before/after edits. Set kind to the original kind and content to the full edited original. The original scope and every untouched clause are preserved. Omit sourcePath and graph annotations. A generic save is not a correction.'),
+      correct: memoryCorrectionInputSchema.optional().describe('For an owner-requested correction, first memory_read the original fact in this request, then pass that readCallId, observation.digest as expectedDigest and exact unique before/after edits. A readCallId from an earlier request must be refreshed. Set kind to the original kind and content to the full edited original. The original scope and every untouched clause are preserved. Omit sourcePath and graph annotations. A generic save is not a correction.'),
       keepFor: z.enum(['everywhere', 'here']).optional().describe('Who the memory is for. "here": only the project and agent this conversation is working in. "everywhere": every conversation. Omit to let the kind decide: facts about the owner and standing rules are for everywhere; project facts, references and corrections are for here.'),
       entities: z.array(z.object({
         type: z.enum(MEMORY_ENTITY_TYPES),

@@ -4205,6 +4205,101 @@ test('repair, sibling, backoff, success, and missing durable settlements all con
   }
 });
 
+test('production host repairs a stale memory correction read and changes the fact exactly once', async (t) => {
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const facts = await import('../../memory/facts.js');
+  const corrections = await import('../../memory/fact-correction.js');
+  const memoryRequirement = await import('./memory-completion-obligation.js');
+  const sourceContext = await import('./source-session-context.js');
+  const results = await import('./result-handle.js');
+  const { getLocalRuntimeTools } = await import('../../tools/local-runtime-tools.js');
+  const ownerText = 'Replace my saved report heading HAZEL RIDGE with LILAC GROVE. Keep the separate footer convention unchanged.';
+  const fixture = acceptHostCanarySource('memory-correction-read-repair', ownerText);
+  assert.ok(sourceContext.captureFreshSourceSessionContext(fixture.context));
+  const original = facts.rememberFact({ kind: 'project',
+    content: `CONTROLLED ${fixture.session.id}: report heading HAZEL RIDGE; footer COPPER KITE.`, scope: null,
+    occurredAt: new Date(Date.parse(fixture.source.createdAt) - 60_000).toISOString() });
+  const observed = corrections.readFactObservation(original.id);
+  assert.ok(observed);
+  const expected = observed.content.replace('HAZEL RIDGE', 'LILAC GROVE');
+  const correct = { readCallId: 'current-memory-read', expectedDigest: observed.digest,
+    edits: [{ before: 'HAZEL RIDGE', after: 'LILAC GROVE' }] };
+  const selectedTools = getLocalRuntimeTools().filter(entry =>
+    entry.type === 'function' && ['memory_read', 'memory_remember'].includes(entry.name));
+  assert.equal(selectedTools.length, 2);
+  const tools = selectedTools.map(entry => brackets.wrapToolForHarness(entry as never));
+  const surfaces: string[][] = [];
+  let granted = false;
+  const scripted = scriptedRecordingModel([
+    [toolCall('stale-memory-correction', 'memory_remember', { kind: 'project', content: expected,
+      correct: { ...correct, readCallId: 'read-from-an-earlier-request' } })],
+    [toolCall('current-memory-read', 'memory_read', { target: `fact:${original.id}` })],
+    [toolCall('repaired-memory-correction', 'memory_remember', { kind: 'project', content: expected, correct })],
+    [textMsg('The report heading is now LILAC GROVE, and the footer convention is unchanged.')],
+  ]);
+  const model = { ...scripted, async getResponse(request: unknown) {
+    surfaces.push(((request as { tools?: Array<{ name?: string }> }).tools ?? []).map(entry => entry.name ?? ''));
+    if (scripted.calls() === 2) {
+      const source = memoryRequirement.readMemoryRequirementSource(fixture.context);
+      assert.ok(source);
+      const currentRead = results.redeemSuccessfulSettlementResultForHost({ ...fixture.context,
+        acceptedTaskId: source.acceptedTaskId, logicalToolCallId: correct.readCallId });
+      assert.equal(currentRead.status, 'ok', 'the new read must have really settled under this source before review');
+      // This is a deterministic independent-review fixture. It retains the
+      // normal exact prewrite contract after the actual read; no model/provider
+      // is used to decide semantics in this host recovery test.
+      memoryRequirement.retainMemoryRequirementAssessment({ source,
+        assessment: { version: 1, kind: 'correct', corrections: [correct], reason: 'The exact requested heading changes; the separate footer is retained.' },
+        review: { phase: 'prewrite', failedOpen: false,
+          ownerQuote: 'Replace my saved report heading HAZEL RIDGE with LILAC GROVE.' } });
+      granted = true;
+    }
+    return scripted.getResponse(request);
+  } };
+  const agent = { model, tools };
+  bindHostCanarySurface(fixture, agent, tools);
+  const runner = throwingRunner();
+  const { attachEventLogHooks } = await import('./hooks.js');
+  const detach = attachEventLogHooks(runner, { getSessionId: () => fixture.session.id, getTurn: () => fixture.source.turn });
+  t.after(detach);
+  const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+    runner as never, agent as never, [{ type: 'message', role: 'user', content: ownerText }] as never,
+    { maxTurns: 5, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never));
+  assert.ok(surfaces[1]?.includes('memory_read'), 'argument repair keeps the already admitted fresh read available');
+  assert.ok(granted);
+  assert.equal(model.calls(), 4, 'the host accepts refusal, fresh read and one corrected retry without another owner turn');
+  assert.equal(result.terminal, undefined, JSON.stringify(result.terminal));
+  assert.equal(result.finalOutput, 'The report heading is now LILAC GROVE, and the footer convention is unchanged.');
+  const retained = eventlog.openEventLog().prepare(`SELECT s.logical_tool_call_id, l.tool_name, s.execution_kind,
+    s.outcome_kind, s.requires_reconciliation, s.mutating FROM logical_call_settlements s
+    JOIN logical_tool_calls l ON l.session_id=s.session_id AND l.source_user_seq=s.source_user_seq
+      AND l.logical_tool_call_id=s.logical_tool_call_id
+    WHERE s.session_id=? AND s.source_user_seq=? ORDER BY s.rowid`).all(fixture.session.id, fixture.source.seq) as
+      Array<{ logical_tool_call_id: string; tool_name: string; execution_kind: string; outcome_kind: string;
+        requires_reconciliation: number; mutating: number }>;
+  assert.deepEqual(retained.map(row => [row.logical_tool_call_id, row.tool_name, row.outcome_kind]), [
+    ['stale-memory-correction', 'memory_remember', 'invalid_arguments'],
+    ['current-memory-read', 'memory_read', 'succeeded'],
+    ['repaired-memory-correction', 'memory_remember', 'succeeded'],
+  ]);
+  assert.equal(retained[0]!.execution_kind, 'local_execution', 'the harmless local refusal keeps its real host crossing');
+  assert.ok(retained.every(row => row.requires_reconciliation === 0));
+  const old = corrections.readFactObservation(original.id);
+  assert.equal(old?.active, false);
+  assert.ok(old?.supersededByFactId);
+  assert.equal(corrections.readFactObservation(old.supersededByFactId)?.content, expected);
+  const proofRows = memoryDatabase.openMemoryDb().prepare(`SELECT id FROM memory_episodes
+    WHERE kind='user_turn' AND subtype='fact_correction_v1' AND session_id=?`).all(fixture.session.id);
+  assert.equal(proofRows.length, 1, 'one correction episode, never a repeated effect');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input', 'approval_requested'] }).length, 0,
+    'repair does not ask the owner a placeholder question or another approval');
+});
+
 test('a corrupt stop_and_explain settlement cannot manufacture a host terminal', async () => {
   const task = acceptHostTask('corrupt terminal refusal');
   const callId = 'call-corrupt-stop';

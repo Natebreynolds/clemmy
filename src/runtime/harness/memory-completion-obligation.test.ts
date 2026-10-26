@@ -46,10 +46,12 @@ after(() => {
 let serial = 0;
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 const ownerText = 'Replace my saved report heading HAZEL RIDGE with LILAC GROVE. Keep the separate footer convention unchanged.';
-function source(text = ownerText) {
-  const session = events.createSession({ id: `memory-obligation-${++serial}`, kind: 'chat' });
-  const event = events.appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
-  const identity = { sessionId: session.id, sourceUserSeq: event.seq, turn: 1 };
+function source(text = ownerText, sameSessionId?: string) {
+  const next = ++serial;
+  const session = sameSessionId ? { id: sameSessionId } : events.createSession({ id: `memory-obligation-${next}`, kind: 'chat' });
+  const turn = sameSessionId ? 2 : 1;
+  const event = events.appendEvent({ sessionId: session.id, turn, role: 'user', type: 'user_input_received', data: { text } });
+  const identity = { sessionId: session.id, sourceUserSeq: event.seq, turn };
   assert.ok(context.captureFreshSourceSessionContext(identity));
   // These are host-owned retained local calls followed by a tool-free reporting
   // entry. A turn-graph shadow would instead reserve the source for the typed
@@ -475,6 +477,121 @@ async function invokeCorrection(identity: ReturnType<typeof source>, args: Param
         toolContext.withToolOutputContext({ ...identity, callId, toolName: 'memory_remember' }, () =>
           correctionTool.executeMemoryCorrection(args)))));
 }
+
+async function registeredCorrection(identity: ReturnType<typeof source>, args: Parameters<typeof correctionTool.executeMemoryCorrection>[0]) {
+  const { registerMemoryTools } = await import('../../tools/memory-tools.js');
+  let handler: ((input: unknown) => Promise<unknown>) | undefined;
+  registerMemoryTools({ tool(name: string, ...values: unknown[]) {
+    if (name === 'memory_remember') handler = values.at(-1) as (input: unknown) => Promise<unknown>;
+  } } as never);
+  assert.ok(handler);
+  const callId = `registered-correction-${serial}`;
+  const lease = leases.activateDispatchLease({ sessionId: identity.sessionId, scopeId: `registered:${identity.sourceUserSeq}` });
+  try {
+    return await attested(identity, 'memory_remember', callId, args, () =>
+      logical.withLogicalToolCall({ ...identity, tool: 'memory_remember', logicalToolCallId: callId, args }, () =>
+        leases.runWithDispatchLease(lease, () =>
+          toolContext.withToolOutputContext({ ...identity, callId, toolName: 'memory_remember' }, () => handler!(args))))) as
+            { content: Array<{ text: string }>; isError?: boolean };
+  } finally { leases.revokeDispatchLease(lease); }
+}
+
+function correctionMemorySnapshot() {
+  return {
+    facts: memoryDb.openMemoryDb().prepare('SELECT * FROM consolidated_facts ORDER BY id').all(),
+    episodes: memoryDb.openMemoryDb().prepare('SELECT id,kind,subtype,content_hash FROM memory_episodes ORDER BY id').all(),
+    evidence: memoryDb.openMemoryDb().prepare('SELECT fact_id,episode_id,ordinal FROM fact_evidence ORDER BY fact_id,episode_id,ordinal').all(),
+  };
+}
+
+test('registered correction with an earlier source read is a repairable no-effect prerequisite failure', async () => {
+  const seed = source('Keep the synthetic report heading and footer for this project.');
+  const fixture = observed(seed, `prior-source-read-${serial}`);
+  const current = source(ownerText, seed.sessionId);
+  assert.equal(current.sessionId, seed.sessionId);
+  assert.notEqual(current.sourceUserSeq, seed.sourceUserSeq);
+  const { localNonWriteStatus, localNonWriteClassification } = await import('../../tools/shared.js');
+  const args = { kind: 'project', content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'), correct: fixture.correction };
+  const before = correctionMemorySnapshot();
+  const result = await registeredCorrection(current, args);
+  assert.deepEqual(correctionMemorySnapshot(), before);
+  assert.equal(memory.readRetainedMemoryRequirement(current.retained), null, 'stale read never reaches prewrite review or grants correction');
+  assert.equal(localNonWriteStatus(result), 'memory_correction_refused', 'the actual registered tool must retain nominal known-no-effect classification');
+  assert.deepEqual(localNonWriteClassification(result), { kind: 'invalid_arguments' }, 'existing argument recovery can reopen the fact in this request');
+  const text = result.content[0]!.text;
+  assert.match(text, /memory_read.*this request/);
+  assert.doesNotMatch(text, /Correction outcome could not be verified/);
+});
+
+test('registered correction refuses another current tool as the read without changing memory', async () => {
+  const identity = source(); const fixture = observed(identity);
+  const readCallId = `wrong-tool-read-${serial}`;
+  settle(identity, 'memory_search', readCallId, { facts: [] });
+  const before = correctionMemorySnapshot();
+  const { localNonWriteStatus, localNonWriteClassification } = await import('../../tools/shared.js');
+  const result = await registeredCorrection(identity, { kind: 'project',
+    content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'),
+    correct: { ...fixture.correction, readCallId } });
+  assert.deepEqual(correctionMemorySnapshot(), before);
+  assert.equal(localNonWriteStatus(result), 'memory_correction_refused');
+  assert.deepEqual(localNonWriteClassification(result), { kind: 'invalid_arguments' });
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained), null);
+});
+
+test('registered correction accepts a fresh current-source read with the existing exact grant', async () => {
+  const seed = source(); const fixture = observed(seed);
+  const identity = source(ownerText, seed.sessionId);
+  const readCallId = `fresh-current-read-${serial}`;
+  settle(identity, 'memory_read', readCallId, JSON.stringify({ protocol: 'fact_observation_v1', readCallId,
+    observation: fixture.observation, provenance: 'The complete original fact was reopened in this request.' }));
+  const correct = { ...fixture.correction, readCallId };
+  retain(identity, { ...fixture.assessment, corrections: [correct] }, 'prewrite');
+  const expected = fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE');
+  const result = await registeredCorrection(identity, { kind: 'project', content: expected, correct });
+  const { localNonWriteStatus } = await import('../../tools/shared.js');
+  assert.equal(localNonWriteStatus(result), null);
+  assert.notEqual(result.isError, true);
+  const receipt = JSON.parse(result.content[0]!.text);
+  assert.equal(receipt.protocol, 'fact_correction_v1');
+  assert.equal(receipt.status, 'corrected');
+  assert.equal(receipt.currentStateMatches, true);
+  assert.equal(receipt.proof.before.id, fixture.fact.id);
+  assert.equal(receipt.proof.after.content, expected);
+  assert.equal(factState.readFactObservation(fixture.fact.id)?.active, false);
+});
+
+test('registered correction keeps unavailable or corrupt retained read evidence unknown', async () => {
+  const { localNonWriteStatus, localNonWriteClassification } = await import('../../tools/shared.js');
+  const payloads = await import('./result-payload-storage.js');
+  for (const variation of ['missing-payload', 'corrupt-payload', 'malformed-envelope'] as const) {
+    const identity = source(); const fixture = observed(identity);
+    const readCallId = `unreadable-${variation}-${serial}`;
+    const raw = JSON.stringify({ protocol: variation === 'malformed-envelope' ? 'invalid' : 'fact_observation_v1', readCallId,
+      observation: fixture.observation,
+      provenance: variation === 'malformed-envelope' ? 'Malformed retained observation envelope.'
+        : 'x'.repeat(payloads.RESULT_PAYLOAD_INLINE_MAX_BYTES + 1) });
+    settle(identity, 'memory_read', readCallId, raw);
+    if (variation !== 'malformed-envelope') {
+      const row = events.openEventLog().prepare(`SELECT raw_payload_sha256 FROM durable_result_handles
+        WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id = ?`)
+        .get(identity.sessionId, identity.sourceUserSeq, readCallId) as { raw_payload_sha256: string };
+      assert.ok(row);
+      const file = payloads.resultPayloadFilePath(row.raw_payload_sha256);
+      if (variation === 'missing-payload') rmSync(file);
+      else writeFileSync(file, 'corrupt retained bytes');
+    }
+    const before = correctionMemorySnapshot();
+    const result = await registeredCorrection(identity, { kind: 'project',
+      content: fixture.observation.content.replace('HAZEL RIDGE', 'LILAC GROVE'),
+      correct: { ...fixture.correction, readCallId } });
+    assert.equal(result.isError, true, variation);
+    assert.equal(localNonWriteStatus(result), null, variation);
+    assert.equal(localNonWriteClassification(result), undefined, variation);
+    assert.match(result.content[0]!.text, /Correction outcome could not be verified/, variation);
+    assert.deepEqual(correctionMemorySnapshot(), before, variation);
+    assert.equal(memory.readRetainedMemoryRequirement(identity.retained), null, variation);
+  }
+});
 
 test('manual correction validates all exact arguments before accepting a matching intake replacement', async () => {
   for (const variation of ['exact', 'read-after-intake', 'content-mismatch', 'invalid-patch', 'scope-move', 'lost-footer', 'moved-scope'] as const) {

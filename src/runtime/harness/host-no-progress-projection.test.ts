@@ -1715,6 +1715,100 @@ for (const [label, toolName] of [
   });
 }
 
+test('a nominal local non-write keeps fresh native reads on the known-terminal recovery surface', async () => {
+  const { nonWriteTextResult, localNonWriteStatus, localNonWriteClassification } = await import('../../tools/shared.js');
+  const { HostLocalNonWriteResult, HostLocalExecutionFailureResult, settleToolAttempt } = await import('./attempt-settlement.js');
+  const { acceptedTaskIdFor } = await import('./attempt-identity.js');
+  const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
+  const dispatch = await import('./dispatch-ledger.js');
+  const { redeemDurableLogicalCallSettlementForHost } = await import('./logical-call-settlement-store.js');
+  const { hostNoProgressRecoveryToolNames } = await import('./host-turn-runner.js');
+  const tools = ['memory_remember', 'memory_read', 'workflow_get', 'memory_forget', 'write_file',
+    'call_tool', 'work_call', 'tool_search', 'ask_user_question', 'notify_user', 'mcp__foreign__memory_read',
+    'mcp__clementine__memory_read', 'mcp__clementine__foreign__memory_read'];
+  const settleHost = (label: string, output: unknown, uncertain = false) => {
+    const source = accepted(label);
+    const identity = { ...source, turn: 1, acceptedTaskId: acceptedTaskIdFor(source.sessionId, source.sourceUserSeq) };
+    assert.ok(recordTurnGraphShadow({ identity }));
+    const callId = `${label}-call`;
+    const logical = { ...identity, logicalToolCallId: callId };
+    const crossing = { ...logical, physicalDispatchId: `host:${callId}`, ordinal: 0 };
+    const args = { kind: 'project', content: 'Controlled corrected heading.',
+      correct: { readCallId: 'earlier-source-read', expectedDigest: 'a'.repeat(64),
+        edits: [{ before: 'Original heading', after: 'Controlled corrected heading' }] } };
+    assert.equal(dispatch.beginPhysicalDispatch({ identity: crossing, tool: 'memory_remember', args,
+      executionSite: 'host' }).status, 'inserted');
+    assert.equal(dispatch.settlePhysicalDispatch({ identity: crossing, tool: 'memory_remember', outcome: 'returned' }).status, 'inserted');
+    const settled = settleToolAttempt({ ...identity, callId, toolName: 'memory_remember', args,
+      lane: 'agents_runner', mutating: true, businessCall: false, result: output,
+      ...(uncertain ? { signals: { acknowledged: false } } : {}) });
+    const durable = redeemDurableLogicalCallSettlementForHost(logical);
+    assert.equal(durable.status, 'ok');
+    if (durable.status !== 'ok') throw new Error('The exact local settlement must redeem.');
+    assert.equal(durable.settlement.executionKind, 'local_execution');
+    assert.equal(durable.settlement.hostCrossingCount, 1, 'the handler really ran; no pre-dispatch fiction');
+    assert.equal(durable.settlement.physicalCrossingCount, 0);
+    assert.equal(durable.settlement.crossings[0]!.terminalState, 'returned');
+    assert.deepEqual(durable.settlement.outcome, settled.outcome);
+    const projected = projectHostNoProgressAttempt({ ...identity,
+      historyDelta: [call(callId, 'memory_remember', args), result(callId, 'memory_remember', String(output))] });
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok' || !projected.consequence) throw new Error('A host-derived consequence is required.');
+    return { settled, consequence: projected.consequence,
+      surface: hostNoProgressRecoveryToolNames(projected.consequence, tools) };
+  };
+
+  const unknown = settleHost('uncertain-local-correction',
+    new HostLocalExecutionFailureResult('The correction outcome could not be verified.', 'uncertain'), true);
+  assert.equal(unknown.settled.outcome.kind, 'uncertain_write');
+  assert.equal(unknown.settled.outcome.directive.requiresReconciliation, true);
+  assert.equal(unknown.consequence.effectState, 'unknown_frozen');
+  assert.equal(unknown.surface.has('memory_read'), false, 'this change must not widen uncertain-effect recovery');
+  assert.equal(unknown.surface.has('memory_remember'), false, 'an uncertain write is never offered for replay');
+
+  const providerIdentity = accepted('provider-invalid-arguments-read-control');
+  const providerDb = settlementDb([{ callId: 'provider-invalid', executionKind: 'provider_execution',
+    outcomeKind: 'invalid_arguments', recoveryAction: 'repair_arguments', businessCall: 1,
+    mutating: 1, physicalCrossingCount: 1, outcomeDetail: 'http_400' }], providerIdentity);
+  try {
+    const projected = projectHostNoProgressAttempt({ ...providerIdentity,
+      historyDelta: [call('provider-invalid', 'work_call'), result('provider-invalid', 'work_call')] }, providerDb);
+    assert.equal(projected.status, 'ok');
+    if (projected.status !== 'ok' || !projected.consequence) throw new Error('The provider consequence is required.');
+    assert.equal(projected.attemptClass, 'provider_repair');
+    assert.equal(projected.consequence.effectState, 'known_terminal');
+    assert.deepEqual(projected.consequence.recoveryToolNames, ['tool_search', 'work_call']);
+    const surface = hostNoProgressRecoveryToolNames(projected.consequence, tools);
+    assert.ok(surface.has('work_call') && surface.has('tool_search'), 'existing provider repair doors stay exact');
+    assert.ok(surface.has('memory_read'), 'a settled provider argument refusal may also need fresh native evidence');
+    for (const name of ['memory_remember', 'memory_forget', 'write_file', 'call_tool', 'ask_user_question', 'notify_user']) {
+      assert.equal(surface.has(name), false, `provider argument repair must not add ${name}`);
+    }
+  } finally { providerDb.close(); }
+
+  const produced = nonWriteTextResult('memory_correction_refused',
+    'Reopen the original fact with memory_read in this request before correcting it.',
+    { classification: { kind: 'invalid_arguments' } });
+  // The local adapter carries this nominal producer identity across text
+  // flattening; a raw serialized MCP error envelope cannot prove no effect.
+  const noWrite = settleHost('nominal-local-correction', new HostLocalNonWriteResult(
+    produced.content[0]!.text, localNonWriteStatus(produced)!, localNonWriteClassification(produced)));
+  assert.equal(noWrite.settled.outcome.kind, 'invalid_arguments');
+  assert.equal(noWrite.settled.outcome.detail, 'host_reported:memory_correction_refused');
+  assert.equal(noWrite.settled.outcome.directive.requiresReconciliation, false);
+  assert.equal(noWrite.consequence.effectState, 'known_terminal');
+  assert.equal(noWrite.consequence.recovery, 'repair_model');
+  assert.deepEqual(noWrite.consequence.recoveryToolNames, ['memory_remember']);
+  assert.ok(noWrite.surface.has('memory_remember'), 'the exact refused write remains the repair candidate');
+  for (const name of ['memory_forget', 'write_file', 'call_tool', 'work_call', 'tool_search',
+    'ask_user_question', 'notify_user', 'mcp__foreign__memory_read', 'mcp__clementine__foreign__memory_read']) {
+    assert.equal(noWrite.surface.has(name), false, `a fresh-read repair must not add ${name}`);
+  }
+  assert.ok(noWrite.surface.has('memory_read'), 'the known-no-effect correction must be able to obtain its fresh current-source read');
+  assert.ok(noWrite.surface.has('mcp__clementine__memory_read'), 'the exact local transport preserves the same native read identity');
+  assert.ok(noWrite.surface.has('workflow_get'), 'the rule uses existing native read metadata, not a memory-specific pair');
+});
+
 test('provider-crossed invalid arguments expose bounded alternative authority, never schema repair', () => {
   const identity = accepted('provider-crossed-invalid-arguments');
   const db = settlementDb([

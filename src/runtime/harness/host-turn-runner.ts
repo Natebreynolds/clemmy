@@ -921,7 +921,7 @@ import {
   isTrustedComposioGateway,
 } from './runtime-tool-identity.js';
 import { classifyDiscoveryCall } from './discovery-boundary.js';
-import { hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead, registeredToolReadRevision } from '../../tools/tool-registry.js';
+import { deriveGuardrailIdempotent, hostControlFrameFor, hostReadOnlyExecutionContractFor, isRegistryDeclaredTool, isRegistryDeclaredRead, registeredToolReadRevision } from '../../tools/tool-registry.js';
 import { readPersistedHealth } from '../../integrations/cli-catalog/auth-health.js';
 import {
   isHostPlanRequiredWorkCall,
@@ -1407,11 +1407,19 @@ export function hostNoProgressRecoveryToolNames(
 ): Set<string> {
   if (!consequence) return new Set(toolNames);
   const exact = new Set(consequence.recoveryToolNames);
+  const idempotent = deriveGuardrailIdempotent();
   const hasUnavailableRepairName = [...exact].some((name) => !toolNames.includes(name));
   return new Set(toolNames.filter((name) => {
     const bare = bareTerminalToolName(name);
     if (consequence.recovery === 'ask_user') return bare === 'ask_user_question';
     if (consequence.recovery === 'stop_factual' || consequence.recovery === 'reconcile') return false;
+    // A settled repair can need a fresh observation before the exact retry.
+    // Offer only existing native idempotent reads, not generic discovery
+    // controls, questions, notifications or carriers. This says nothing about the prior
+    // effect; normal source, account, schema and consent checks still apply.
+    if (consequence.recovery === 'repair_model' && consequence.effectState === 'known_terminal'
+      && isPlainOrClementineLocalTool(name, bare)
+      && isRegistryDeclaredRead(bare) && idempotent.has(bare)) return true;
     // PUBLISHING IS ALWAYS AVAILABLE ON A PLAN TURN.
     //
     // A Plan turn's deliverable is a published outline, and publish_plan is a
