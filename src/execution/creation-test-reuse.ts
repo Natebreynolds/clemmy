@@ -1,4 +1,5 @@
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
+import type { WorkflowEvent } from './workflow-events.js';
 import { stepExecutionSurface } from './workflow-enforce.js';
 
 /**
@@ -16,6 +17,58 @@ import { stepExecutionSurface } from './workflow-enforce.js';
  * runs (or is previewed) as before.
  */
 export const CREATION_TEST_REUSE_WINDOW_MS = 15 * 60_000;
+
+/** A copy of a read result does not create a new observation. Keep both its
+ * original completion clock and the admission boundary for file changes. */
+export interface CreationTestReadOrigin {
+  runId: string;
+  observedAt: string;
+  admittedAt: string;
+}
+
+/** Recover provenance alongside the journal's latest completed step outputs.
+ * Old fresh completions have their own observation clock; old inherited
+ * completions without explicit provenance must be read again. */
+export function creationTestReadOrigins(
+  events: readonly WorkflowEvent[],
+  runId: string,
+  admittedAt: string,
+): Map<string, CreationTestReadOrigin> {
+  const origins = new Map<string, CreationTestReadOrigin>();
+  for (const event of events) {
+    if (!event.stepId) continue;
+    if (event.kind === 'step_invalidated' || event.kind === 'step_skipped') {
+      origins.delete(event.stepId);
+      continue;
+    }
+    if (event.kind !== 'step_completed') continue;
+    origins.delete(event.stepId);
+    const meta = event.meta ?? {};
+    const inherited = 'inheritedFromRunId' in meta || 'reusedUnchangedInCreationTest' in meta;
+    let origin: CreationTestReadOrigin;
+    if (inherited) {
+      const value = meta.creationTestReadOrigin;
+      if (meta.reusedUnchangedInCreationTest !== true
+        || typeof meta.inheritedFromRunId !== 'string' || !meta.inheritedFromRunId.trim()
+        || meta.inheritedFromRunId === runId
+        || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const candidate = value as Record<string, unknown>;
+      if (typeof candidate.runId !== 'string' || !candidate.runId.trim() || candidate.runId === runId
+        || typeof candidate.observedAt !== 'string' || typeof candidate.admittedAt !== 'string') continue;
+      origin = { runId: candidate.runId, observedAt: candidate.observedAt, admittedAt: candidate.admittedAt };
+    } else {
+      // Unexpected provenance on a non-inherited completion is not a fresh read.
+      if ('creationTestReadOrigin' in meta) continue;
+      origin = { runId, observedAt: event.t, admittedAt };
+    }
+    const admitted = Date.parse(origin.admittedAt);
+    const observed = Date.parse(origin.observedAt);
+    const copied = Date.parse(event.t);
+    if (![admitted, observed, copied].every(Number.isFinite) || admitted > observed || observed > copied) continue;
+    origins.set(event.stepId, origin);
+  }
+  return origins;
+}
 
 /** The workflow-wide settings every step runs under. */
 function stepContext(def: WorkflowDefinition): string {
@@ -61,16 +114,16 @@ export function readStepsUnchangedSince(
 
 /** True when an earlier test's result is recent enough to stand in: inside
  *  the window and on the same calendar day, since a step may read the date. */
-export function creationTestResultStillCurrent(finishedAt: string, nowMs: number): boolean {
-  const finished = Date.parse(finishedAt);
-  if (!Number.isFinite(finished) || finished > nowMs) return false;
-  if (nowMs - finished > CREATION_TEST_REUSE_WINDOW_MS) return false;
-  return new Date(finished).toDateString() === new Date(nowMs).toDateString();
+export function creationTestResultStillCurrent(observedAt: string, nowMs: number): boolean {
+  const observed = Date.parse(observedAt);
+  if (!Number.isFinite(observed) || observed > nowMs) return false;
+  if (nowMs - observed > CREATION_TEST_REUSE_WINDOW_MS) return false;
+  return new Date(observed).toDateString() === new Date(nowMs).toDateString();
 }
 
 /** How long ago, as the step line says it. */
-export function creationTestReuseAge(finishedAt: string, nowMs: number): string {
-  const seconds = Math.max(0, Math.round((nowMs - Date.parse(finishedAt)) / 1000));
+export function creationTestReuseAge(observedAt: string, nowMs: number): string {
+  const seconds = Math.max(0, Math.round((nowMs - Date.parse(observedAt)) / 1000));
   if (seconds < 90) return `${seconds} s`;
   return `${Math.round(seconds / 60)} min`;
 }

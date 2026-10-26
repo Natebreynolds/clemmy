@@ -11,6 +11,7 @@
  */
 import * as approvalRegistry from './approval-registry.js';
 import { unwrapRuntimeEffectiveToolIdentity } from './tool-effect.js';
+import { isPlainOrClementineLocalTool } from './runtime-tool-identity.js';
 
 /** What Clem is told when the same declined action comes back. */
 export const OWNER_DECLINED_SAME_ACTION = 'The owner already declined exactly this action in this request, so it stays declined: '
@@ -25,6 +26,23 @@ function actionKey(tool: string, args: unknown): string | null {
   const name = (identity.toolName ?? tool).trim();
   const inner = identity.args && typeof identity.args === 'object' && !Array.isArray(identity.args)
     ? identity.args as Record<string, unknown> : record;
+  // workflow_delete alone defines omitted/null/true confirmation identically
+  // and deletes the trimmed union of name + names. Compare that same target
+  // set so another spelling cannot reopen the owner's no. This comparison
+  // grants no execution authority; other schemas and malformed calls keep
+  // their original identity.
+  if (!identity.composioCarrier && isPlainOrClementineLocalTool(name, 'workflow_delete')
+    && Object.keys(inner).every(key => key === 'name' || key === 'names' || key === 'confirm')
+    && (inner.confirm == null || inner.confirm === true)
+    && (inner.name == null || (typeof inner.name === 'string' && inner.name.length > 0))
+    && (inner.names == null || (Array.isArray(inner.names) && inner.names.length > 0 && inner.names.length <= 20
+      && inner.names.every(value => typeof value === 'string' && value.length > 0)))) {
+    const targets = [...new Set([...(typeof inner.name === 'string' ? [inner.name] : []),
+      ...((inner.names ?? []) as string[])].map(value => value.trim()).filter(Boolean))].sort();
+    // A distinct local-only key cannot match raw arguments from a gateway
+    // whose provider operation merely has the same spelling.
+    if (targets.length > 0) return JSON.stringify(['workflow_delete', 'target_set_v1', targets]);
+  }
   const canonical = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(canonical);
     if (!value || typeof value !== 'object') return value;

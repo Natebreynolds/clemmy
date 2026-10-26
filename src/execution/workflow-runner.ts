@@ -415,7 +415,8 @@ import {
   renderWorkflowPatternHint,
 } from '../memory/workflow-pattern-store.js';
 import { workflowCodeRevisionFingerprint } from './workflow-code-certification.js';
-import { creationTestResultStillCurrent, creationTestReuseAge, readStepsUnchangedSince } from './creation-test-reuse.js';
+import { creationTestReadOrigins, creationTestResultStillCurrent, creationTestReuseAge, readStepsUnchangedSince,
+  type CreationTestReadOrigin } from './creation-test-reuse.js';
 import {
   compileWorkflowStepsToGraph,
   toExecutableGraph,
@@ -14893,8 +14894,8 @@ export interface CreationTestStepResult {
   /** The exact proven-pre-dispatch block behind a `needs_choice`, so the
    * creation test can PARK on it like any run instead of only describing it. */
   block?: WorkflowCapabilityBlockedError;
-  /** The earlier creation test whose unchanged result this step reused. */
-  reusedFrom?: { runId: string; finishedAt: string };
+  /** The original read, even when the result passed through several tests. */
+  reusedFrom?: CreationTestReadOrigin;
 }
 export interface CreationTestResult {
   pass: boolean;
@@ -14939,7 +14940,7 @@ export function creationTestStepLines(steps: readonly CreationTestStepResult[]):
   return steps.map((s) => {
     const name = creationTestStepName(s.stepId);
     if (s.status === 'ok' && s.reusedFrom) {
-      return `- ${name} — returned data in the test ${creationTestReuseAge(s.reusedFrom.finishedAt, Date.now())} ago; unchanged since, so that result was used`;
+      return `- ${name} — returned data in the test ${creationTestReuseAge(s.reusedFrom.observedAt, Date.now())} ago; unchanged since, so that result was used`;
     }
     if (s.status === 'ok') return `- ${name} — ${s.emptyAnswer ? 'its source answered: nothing there right now' : 'returned data'}`;
     // The one answerable thing leads with the question itself, indented so
@@ -15153,9 +15154,10 @@ async function rehearseWriteCall(step: WorkflowStepInput, ctx: StepExecutionCont
  * Results this creation test can take from the one that settled just before
  * it (see creation-test-reuse.ts). Only the newest earlier test is a source,
  * only when it ran the same workflow code with the same inputs, and never
- * when the conversation that asked for this test saved a file after that
- * test began: a script outside the workflow folder may have changed what an
- * unchanged step does. Each reused result must have been a clean pass.
+ * when the conversation that asked for this test saved a file after the
+ * original read's test began: a script outside the workflow folder may have
+ * changed what an unchanged step does. Each result must have been a clean
+ * pass, and copying it never renews its observation time.
  */
 function creationTestReuseSource(input: {
   workflow: WorkflowDefinition;
@@ -15163,7 +15165,7 @@ function creationTestReuseSource(input: {
   runId: string;
   inputs: Record<string, string>;
   originSessionId?: string;
-}): { runId: string; finishedAt: string; outputs: Map<string, unknown> } | null {
+}): { runId: string; outputs: Map<string, { output: unknown; origin: CreationTestReadOrigin }> } | null {
   const nowMs = Date.now();
   for (const priorId of listWorkflowRunIds(input.workflowSlug, 8)) {
     if (priorId === input.runId) continue;
@@ -15181,21 +15183,25 @@ function creationTestReuseSource(input: {
     });
     const sorted = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
     if (sorted(priorInputs) !== sorted(input.inputs)) return null;
-    if (input.originSessionId && listEvents(input.originSessionId, { types: ['deliverable_saved'] })
-      .some((event) => event.createdAt >= snapshot.admittedAt)) return null;
+    const savedFiles = input.originSessionId
+      ? listEvents(input.originSessionId, { types: ['deliverable_saved'] }) : [];
     const unchanged = readStepsUnchangedSince(snapshot.definition, input.workflow,
       (step) => !stepLooksMutating(step) && stepSideEffectClass(step) === 'read');
     if (unchanged.size === 0) return null;
     const prior = hydrateCompletedOutputArtifacts(computeResumeState(input.workflowSlug, priorId), input.workflowSlug, priorId);
-    const outputs = new Map<string, unknown>();
+    const origins = creationTestReadOrigins(readWorkflowEvents(input.workflowSlug, priorId), priorId, snapshot.admittedAt);
+    const outputs = new Map<string, { output: unknown; origin: CreationTestReadOrigin }>();
     for (const stepId of unchanged) {
       if (!prior.completedSteps.has(stepId)) continue;
+      const origin = origins.get(stepId);
+      if (!origin || !creationTestResultStillCurrent(origin.observedAt, nowMs)
+        || savedFiles.some((event) => Date.parse(event.createdAt) >= Date.parse(origin.admittedAt))) continue;
       const output = prior.completedSteps.get(stepId);
       const step = input.workflow.steps.find((entry) => entry.id === stepId);
       const verdict = creationTestVerdict(stepId, output, { directCall: Boolean(step?.call?.tool && !step.forEach) });
-      if (verdict.status === 'ok' && !verdict.emptyAnswer) outputs.set(stepId, output);
+      if (verdict.status === 'ok' && !verdict.emptyAnswer) outputs.set(stepId, { output, origin });
     }
-    return outputs.size > 0 ? { runId: priorId, finishedAt: record.finishedAt, outputs } : null;
+    return outputs.size > 0 ? { runId: priorId, outputs } : null;
   }
   return null;
 }
@@ -15339,19 +15345,21 @@ export async function runCreationTest(
           status: 'unverifiable',
           detail: 'verifies a step that was previewed, so its contract cannot be checked until the first real run',
         });
-      } else if (reuse?.outputs.has(step.id) && (step.dependsOn ?? []).every((dep) => reusedSteps.has(dep))) {
-        const out = reuse.outputs.get(step.id);
+      } else if (reuse?.outputs.has(step.id)
+        && creationTestResultStillCurrent(reuse.outputs.get(step.id)!.origin.observedAt, Date.now())
+        && (step.dependsOn ?? []).every((dep) => reusedSteps.has(dep))) {
+        const { output: out, origin } = reuse.outputs.get(step.id)!;
         persistAndPublishStepCompletion({
           workflowSlug,
           runId,
           stepId: step.id,
           output: out,
-          meta: { inheritedFromRunId: reuse.runId, reusedUnchangedInCreationTest: true },
+          meta: { inheritedFromRunId: reuse.runId, reusedUnchangedInCreationTest: true, creationTestReadOrigin: origin },
         });
         stepOutputs[step.id] = out;
         reusedSteps.add(step.id);
         results.push({ ...creationTestVerdict(step.id, out, { directCall: Boolean(step.call?.tool && !step.forEach) }),
-          reusedFrom: { runId: reuse.runId, finishedAt: reuse.finishedAt } });
+          reusedFrom: origin });
       } else {
         try {
           const out = await executeStepVerified(step, {

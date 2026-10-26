@@ -1615,7 +1615,9 @@ function WorkLine({
               </div>
               {running
                 ? <span class="work-card-state">In progress</span>
-                : <span class={`act-mark ${inHand.status === 'failed' ? 'act-fail' : 'act-ok'}`} role="img" aria-label={inHand.status === 'failed' ? 'Failed' : 'Done'}>{inHand.status === 'failed' ? '✗' : '✓'}</span>}
+                : inHand.status === 'failed'
+                  ? <span class="act-mark act-warn" role="img" aria-label="Didn’t go through; still working">!</span>
+                  : <span class="act-mark act-ok" role="img" aria-label="Done">✓</span>}
             </div>
             {inHand.excerpt ? <div class="work-card-excerpt">{inHand.excerpt}</div> : null}
             <div class="work-card-foot">

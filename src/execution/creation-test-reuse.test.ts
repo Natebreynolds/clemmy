@@ -1,10 +1,11 @@
 /** A creation test reuses the unchanged read results of the test just before it, using controlled executors only. */
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { WorkflowDefinition, WorkflowStepInput } from '../memory/workflow-store.js';
+import type { WorkflowEvent } from './workflow-events.js';
 
 const TEST_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-creation-reuse-'));
 process.env.CLEMENTINE_HOME = TEST_HOME;
@@ -19,6 +20,8 @@ const runner = await import('./workflow-runner.js');
 const reuse = await import('./creation-test-reuse.js');
 const { createWorkflowRunDefinitionSnapshot } = await import('./workflow-run-definition.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
+const { WORKFLOWS_DIR } = await import('../memory/vault.js');
+const journal = await import('./workflow-events.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 
 test.afterEach(() => { runner._setWorkflowCallNodeForTests(); });
@@ -44,6 +47,8 @@ function settle(name: string, runId: string, definition: WorkflowDefinition, adm
     id: runId, workflow: name, inputs: {}, status: 'creation_test', createdAt: admittedAt,
     finishedAt: new Date().toISOString(), workflowDefinitionSnapshot: createWorkflowRunDefinitionSnapshot(name, definition, admittedAt),
   }));
+  // The run history is ordered by directory mtime; keep it on the controlled clock too.
+  utimesSync(path.join(WORKFLOWS_DIR, name, 'runs', runId), new Date(), new Date());
 }
 
 test('only read steps that, with everything they read from, run exactly as before are unchanged', () => {
@@ -61,6 +66,10 @@ test('only read steps that, with everything they read from, run exactly as befor
   const now = Date.parse('2026-10-25T18:00:00Z');
   assert.equal(reuse.creationTestResultStillCurrent('2026-10-25T17:50:00Z', now), true);
   assert.equal(reuse.creationTestResultStillCurrent('2026-10-25T17:40:00Z', now), false, 'older than the window');
+  assert.equal(reuse.creationTestResultStillCurrent('2026-10-25T18:01:00Z', now), false, 'future observations cannot be fresh');
+  const midnight = new Date(2026, 9, 26, 0, 5).getTime();
+  assert.equal(reuse.creationTestResultStillCurrent(new Date(midnight - 10 * 60_000).toISOString(), midnight), false,
+    'a recent observation from the previous local calendar day still expires');
 });
 
 test('a goal-only edit re-tests from the test just before it: the source is not read again and the step line says so', async () => {
@@ -103,4 +112,153 @@ test('a file saved from the conversation after the earlier test began means ever
   const again = await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never, { originSessionId: session.id });
   assert.equal(reads, 2, 'the script a step runs may have changed, so the source is read again');
   assert.equal(again.steps.some((step) => step.reusedFrom), false);
+});
+
+test('reuse at ten minutes does not renew the original read at twenty minutes', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-original-age';
+  let reads = 0;
+  runner._setWorkflowCallNodeForTests(async () => ({ records: [{ id: `controlled-${++reads}` }] }));
+  const definition = workflow(name, [readStep(), shapeStep({ v: 1 })]);
+  const firstAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-1`, {}, {} as never);
+  settle(name, `${name}-1`, definition, firstAt);
+
+  t.mock.timers.tick(10 * 60_000);
+  const secondAt = new Date().toISOString();
+  const two = await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never);
+  assert.equal(reads, 1, 'the original read is still fresh at ten minutes');
+  assert.equal(two.steps.every((step) => step.reusedFrom), true);
+  settle(name, `${name}-2`, definition, secondAt);
+
+  t.mock.timers.tick(10 * 60_000);
+  const three = await runner.runCreationTest(definition, name, `${name}-3`, {}, {} as never);
+  assert.equal(reads, 2, 'the original read is twenty minutes old even though its copy is only ten');
+  assert.equal(three.steps.some((step) => step.reusedFrom), false, 'dependent results are refreshed too');
+});
+
+test('valid chained reuse keeps the original read age in its step line and journal', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-chain-age';
+  let reads = 0;
+  runner._setWorkflowCallNodeForTests(async () => { reads++; return { records: [{ id: 'controlled-1' }] }; });
+  const definition = workflow(name, [readStep()]);
+  const firstAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-1`, {}, {} as never);
+  settle(name, `${name}-1`, definition, firstAt);
+  t.mock.timers.tick(10 * 60_000);
+  const secondAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never);
+  settle(name, `${name}-2`, definition, secondAt);
+  t.mock.timers.tick(4 * 60_000);
+  const three = await runner.runCreationTest(definition, name, `${name}-3`, {}, {} as never);
+  assert.equal(reads, 1, 'a valid second reuse is preserved');
+  assert.match(runner.creationTestStepLines(three.steps)[0]!, /test 14 min ago/);
+  const completion = journal.readWorkflowEvents(name, `${name}-3`).find((event) => event.kind === 'step_completed');
+  assert.equal(completion?.meta?.inheritedFromRunId, `${name}-2`, 'the immediate reuse link is retained');
+  assert.deepEqual(completion?.meta?.creationTestReadOrigin,
+    { runId: `${name}-1`, observedAt: firstAt, admittedAt: firstAt }, 'the original observation never advances');
+});
+
+test('a file save between the original read and its copy still invalidates a later reuse', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-chain-file';
+  let reads = 0;
+  runner._setWorkflowCallNodeForTests(async () => { reads++; return { records: [{ id: 'controlled-1' }] }; });
+  const definition = workflow(name, [readStep()]);
+  const firstAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-1`, {}, {} as never);
+  settle(name, `${name}-1`, definition, firstAt);
+  t.mock.timers.tick(5 * 60_000);
+  const session = eventlog.createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop', title: 'Controlled chain fixture' });
+  eventlog.appendEvent({ sessionId: session.id, turn: 0, role: 'system', type: 'deliverable_saved',
+    data: { name: 'controlled-runner.mjs', dir: 'fixtures', bytes: 12 } });
+  t.mock.timers.tick(5 * 60_000);
+  const secondAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never);
+  settle(name, `${name}-2`, definition, secondAt);
+  assert.equal(reads, 1);
+  t.mock.timers.tick(60_000);
+  const three = await runner.runCreationTest(definition, name, `${name}-3`, {}, {} as never, { originSessionId: session.id });
+  assert.equal(reads, 2, 'the saved file is newer than the original evidence, even though older than the copy');
+  assert.equal(three.steps.some((step) => step.reusedFrom), false);
+});
+
+test('an inherited legacy completion without original observation metadata is read again', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-legacy-origin';
+  let reads = 0;
+  const output = { records: [{ id: 'controlled-1' }] };
+  runner._setWorkflowCallNodeForTests(async () => { reads++; return output; });
+  const definition = workflow(name, [readStep()]);
+  const firstAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-1`, {}, {} as never);
+  journal.appendWorkflowEventDurably(name, `${name}-1`, { kind: 'step_completed', stepId: 'read_packet', output,
+    meta: { inheritedFromRunId: 'older-unavailable-fixture', reusedUnchangedInCreationTest: true } });
+  settle(name, `${name}-1`, definition, firstAt);
+  t.mock.timers.tick(60_000);
+  const two = await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never);
+  assert.equal(reads, 2, 'an unknown inherited observation must not become fresh by falling back to its copy timestamp');
+  assert.equal(two.steps.some((step) => step.reusedFrom), false);
+});
+
+test('each step keeps its own observation age when an earlier read expires during a long test', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-per-step-age';
+  let reads = 0;
+  runner._setWorkflowCallNodeForTests(async () => {
+    reads++;
+    if (reads === 2) t.mock.timers.tick(10 * 60_000);
+    return { records: [{ id: `controlled-${reads}` }] };
+  });
+  const definition = workflow(name, [readStep(), { ...readStep(), id: 'later_packet' }]);
+  const admittedAt = new Date().toISOString();
+  await runner.runCreationTest(definition, name, `${name}-1`, {}, {} as never);
+  settle(name, `${name}-1`, definition, admittedAt);
+  t.mock.timers.tick(10 * 60_000);
+  const two = await runner.runCreationTest(definition, name, `${name}-2`, {}, {} as never);
+  assert.equal(reads, 3, 'only the twenty-minute-old read runs again');
+  assert.equal(two.steps.find((step) => step.stepId === 'read_packet')?.reusedFrom, undefined);
+  assert.equal(two.steps.find((step) => step.stepId === 'later_packet')?.reusedFrom?.observedAt, '2026-10-26T12:10:00.000Z');
+});
+
+test('invalid, self-inherited, skipped and invalidated provenance cannot refresh an observation', () => {
+  const original = '2026-10-26T12:00:00.000Z';
+  const copiedAt = '2026-10-26T12:10:00.000Z';
+  const origin = { runId: 'origin-run', admittedAt: original, observedAt: original };
+  const completion = (meta?: Record<string, unknown>): WorkflowEvent =>
+    ({ kind: 'step_completed', stepId: 'read_packet', t: copiedAt, meta });
+  const inherited = { inheritedFromRunId: 'prior-run', reusedUnchangedInCreationTest: true, creationTestReadOrigin: origin };
+  for (const meta of [
+    { ...inherited, creationTestReadOrigin: { ...origin, observedAt: 'unknown' } },
+    { ...inherited, creationTestReadOrigin: { ...origin, observedAt: '2026-10-26T12:11:00.000Z' } },
+    { ...inherited, creationTestReadOrigin: { ...origin, admittedAt: copiedAt } },
+    { ...inherited, creationTestReadOrigin: { ...origin, runId: 'copy-run' } },
+    { ...inherited, inheritedFromRunId: 'copy-run' },
+    { creationTestReadOrigin: origin },
+  ]) assert.equal(reuse.creationTestReadOrigins([completion(meta)], 'copy-run', copiedAt).size, 0);
+  for (const kind of ['step_skipped', 'step_invalidated'] as const) {
+    assert.equal(reuse.creationTestReadOrigins([completion(inherited), { kind, stepId: 'read_packet', t: copiedAt }],
+      'copy-run', copiedAt).size, 0);
+  }
+});
+
+test('a slow changed step cannot carry a later independent reuse past its original freshness window', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-26T12:00:00.000Z') });
+  const name = 'creation-reuse-execution-age';
+  let reads = 0;
+  runner._setWorkflowCallNodeForTests(async () => {
+    reads++;
+    if (reads === 3) t.mock.timers.tick(10 * 60_000);
+    return { records: [{ id: `controlled-${reads}` }] };
+  });
+  const first = workflow(name, [{ ...readStep(), id: 'slow_packet' }, readStep()]);
+  const admittedAt = new Date().toISOString();
+  await runner.runCreationTest(first, name, `${name}-1`, {}, {} as never);
+  settle(name, `${name}-1`, first, admittedAt);
+  t.mock.timers.tick(10 * 60_000);
+  const changed = workflow(name, [{ ...readStep({ scope: 'changed-fixture' }), id: 'slow_packet' }, readStep()]);
+  const two = await runner.runCreationTest(changed, name, `${name}-2`, {}, {} as never);
+  assert.equal(reads, 4, 'the unchanged read expired while the changed step was running');
+  assert.equal(two.steps.some((step) => step.reusedFrom), false);
 });
