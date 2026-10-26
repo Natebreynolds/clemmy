@@ -152,6 +152,7 @@ async function prepareFixture(input: {
   definitionFingerprint?: string;
   effect?: 'read' | 'external_write';
   rememberSchema?: boolean;
+  observedAt?: number;
 }) {
   const inputSchema = input.inputSchema ?? {
     type: 'object',
@@ -198,7 +199,7 @@ async function prepareFixture(input: {
     schemas.rememberToolSchema(
       input.slug,
       observedInputSchema,
-      Date.now(),
+      input.observedAt ?? Date.now(),
       observedVersion,
       observedOutput,
     );
@@ -654,10 +655,16 @@ test('invoke-port drift between the host attestation and registered manifest is 
   assert.equal(fixture.accountLoads(), 1);
 });
 
+// Independent upload cases must remain valid even when their provider
+// observations share one millisecond.
+const uploadObservedAt = Date.now();
 for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missing_required', 'missing_required_file', 'real_file', 'real_files'] as const) {
   test(`prepared call stages only a runtime-present upload (${variant})`, async () => {
     // Same optional scalar/array annotation shape retained from the P3 draft
     // canary. This is provider-neutral preparation, not a draft-name bypass.
+    // Each case declares an independent provider definition; sharing an
+    // identity would correctly conflict when required fields differ.
+    const slug = `ACME_CREATE_DOCUMENT_${variant.toUpperCase()}`;
     const inputSchema = {
       type: 'object', additionalProperties: false,
       required: variant === 'missing_required_file' ? ['subject', 'body', 'attachment'] : ['subject', 'body'],
@@ -670,7 +677,7 @@ for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missin
         ] },
       },
     };
-    const fixture = await prepareFixture({ slug: 'ACME_CREATE_DOCUMENT', effect: 'external_write', inputSchema });
+    const fixture = await prepareFixture({ slug, effect: 'external_write', inputSchema, observedAt: uploadObservedAt });
     const args = {
       subject: 'Prepared document',
       ...(variant === 'missing_required' ? {} : { body: 'Exact local text.' }),
@@ -700,14 +707,14 @@ for (const variant of ['absent', 'null', 'empty_array', 'file', 'files', 'missin
     } else if (variant === 'real_file' || variant === 'real_files') {
       // A real file in the owner's folders is uploaded after approval, right
       // before the one business request, and the provider gets its handle.
-      assert.equal(result.ok, true, result.ok ? '' : result.message);
+      assert.equal(result.ok, true, result.ok ? '' : `${result.message}\nFixture authority conflict: ${contracts.loadToolContract(fixture.manifest.operationId)?.providerAuthorityConflictAt ?? 'none'}`);
       if (!result.ok) return;
       assert.deepEqual(result.args, args, 'the approved arguments keep the path');
       await tools.executePreparedComposioGatewayTool(result.preparedDispatch!);
       assert.equal(fixture.presigns.length, 1);
       assert.equal(fixture.presigns[0]!.filename, 'report.pdf');
       assert.equal(fixture.presigns[0]!.mimetype, 'application/pdf');
-      assert.equal(fixture.presigns[0]!.tool_slug, 'ACME_CREATE_DOCUMENT');
+      assert.equal(fixture.presigns[0]!.tool_slug, slug);
       assert.equal(fixture.presigns[0]!.toolkit_slug, 'acme');
       assert.match(String(fixture.presigns[0]!.md5), /^[a-f0-9]{32}$/);
       assert.deepEqual(puts, [{ url: 'https://storage.example.test/put/1', type: 'application/pdf', bytes: REAL_ATTACHMENT_BYTES }]);
