@@ -621,8 +621,12 @@ test('Execute review reopens only the exact approved Plan observations, labeled 
   assert.equal(preparation.evidence.results[0]?.status, 'verified');
 });
 
-test('typed waiting and stopped decisions cannot become reviewer continuations', () => {
-  for (const state of ['awaiting_user_input', 'awaiting_approval', 'cancelled', 'blocked']) {
+test('proposed questions remain reviewable while approval waits and stopped decisions do not', () => {
+  // This gate selects a candidate for review; it does not grant a continuation
+  // or publish a question. Model-authored questions use the same review before
+  // asking the owner, including when independent work is still outstanding.
+  assert.equal(eligible(true, 'awaiting_user_input'), true);
+  for (const state of ['awaiting_approval', 'cancelled', 'blocked']) {
     assert.equal(eligible(true, state), false, state);
   }
 });

@@ -13,7 +13,7 @@ const { commitTurnOutcome } = await import('./delivery-committer.js');
 const { turnOutcomeId } = await import('./turn-outcome.js');
 const { projectHarnessEventForPublic } = await import('./public-presentation.js');
 const {
-  NO_CORRECTION_REPLY, registerReviewAfterDelivery, replyEndsOnQuestion, reviewAfterDeliveryRecorded, _resetReviewAfterDeliveryForTests,
+  NO_CORRECTION_REPLY, launchReviewAfterDelivery, registerReviewAfterDelivery, replyEndsOnQuestion, reviewAfterDeliveryRecorded, _resetReviewAfterDeliveryForTests,
 } = await import('./review-after-delivery.js');
 type TurnOutcome = import('./turn-outcome.js').TurnOutcome;
 
@@ -23,9 +23,9 @@ test.after(() => {
 
 const OBJECTIVE = 'Summarize the controlled fixture notes.';
 
-function acceptedAnswer(sessionId: string, text: string): TurnOutcome {
+function acceptedAnswer(sessionId: string, text: string, objective = OBJECTIVE): TurnOutcome {
   createSession({ id: sessionId, kind: 'chat' });
-  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: OBJECTIVE } });
+  const source = appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: objective } });
   appendEvent({ sessionId, turn: 0, role: 'system', type: 'completion_policy_captured', data: {
     version: 1, sourceUserSeq: source.seq, enabled: true,
   } });
@@ -153,3 +153,76 @@ test('a correction that ends by asking the owner is published waiting on them, n
   assert.equal(correction.data.awaitingUser, true, 'a correction ending on a question waits on the owner');
   assert.match(String(correction.data.reply), /Shall I proceed\?$/);
 });
+
+for (const status of ['done', 'needs_input'] as const) {
+  test(`an unreviewed deferred correction cannot teach a lasting lesson (${status})`, async (t) => {
+    _resetReviewAfterDeliveryForTests();
+    const { _setCheckLessonModelForTests } = await import('../../memory/check-lessons.js');
+    const { getFact, rememberFact, searchFactsByText } = await import('../../memory/facts.js');
+    t.after(() => _setCheckLessonModelForTests(null));
+    const sessionId = `after-delivery-unreviewed-lesson-${status}`;
+    const objective = `TEST FIXTURE ${sessionId}: remember the four controlled project labels.`;
+    const original = 'The four controlled labels are stored as four separate memories.';
+    const finding = 'No memory_remember calls ran, so none of the four labels were stored.';
+    const correction = status === 'done'
+      ? 'The four controlled labels were not stored.'
+      : 'The four controlled labels were not stored. Shall I save them?';
+    const unsafeLesson = `When retaining ${status} fixture labels, require explicit memory_remember calls because automatic storage never counts.`;
+    const learningRequests: string[] = [];
+    _setCheckLessonModelForTests(async (request) => {
+      // Other fixtures can still finish their own background work. Only this
+      // exact request may produce the deliberately unsupported lesson.
+      if (JSON.parse(request).request !== objective) return { lessons: [] };
+      learningRequests.push(request);
+      return { lessons: [unsafeLesson] };
+    });
+    const outcome = acceptedAnswer(sessionId, original, objective);
+    const fact = rememberFact({ kind: 'project', sessionId,
+      content: 'Controlled labels: A Amber, B Cobalt, C Silver, D Indigo.' });
+    const committed = commitTurnOutcome(outcome);
+    assert.equal(committed.presentation.text, original);
+    // Call the same deferred launcher the committer schedules, using a real
+    // published terminal. Await its entire work, including any attempted
+    // learning, rather than asserting absence after a timer.
+    const reviewed: string[] = [];
+    const corrected: Array<{ published: string; finding: string }> = [];
+    const observedRulings: string[] = [];
+    assert.equal(registerReviewAfterDelivery({ sessionId,
+      sourceUserSeq: outcome.identity.sourceUserSeq, objective,
+      review: async (published) => {
+        reviewed.push(published);
+        return { review: 'rejected', finding };
+      },
+      correct: async (published, rejectedFinding) => {
+        corrected.push({ published, finding: rejectedFinding });
+        return correction;
+      },
+    }), true);
+    await launchReviewAfterDelivery({ sessionId,
+      workSourceUserSeq: outcome.identity.sourceUserSeq,
+      sourceUserSeq: outcome.identity.sourceUserSeq,
+      terminalEventId: committed.event.id,
+      publishedText: original,
+      afterRuling: (ruling) => observedRulings.push(ruling),
+    });
+    const ruling = await settled(sessionId);
+    assert.equal(ruling.terminalEventId, committed.event.id);
+    assert.equal(ruling.review, 'rejected');
+    assert.deepEqual(observedRulings, ['rejected']);
+    assert.deepEqual(reviewed, [original]);
+    assert.deepEqual(corrected, [{ published: original, finding }]);
+    const terminals = listEvents(sessionId, { types: ['conversation_completed'] });
+    assert.equal(terminals.length, 2, 'the correction still publishes exactly once');
+    const replacement = terminals.at(-1)!;
+    assert.equal(replacement.data.reply, correction);
+    assert.equal((replacement.data.presentation as { status?: string }).status, status);
+    assert.notEqual(replacement.data.sourceUserSeq, outcome.identity.sourceUserSeq);
+    const child = listEvents(sessionId, { types: ['user_input_received'] })
+      .find(row => row.seq === replacement.data.sourceUserSeq);
+    assert.equal(child?.data.sourceId, `answer-check:${outcome.identity.sourceUserSeq}`);
+    assert.equal(getFact(fact.id)?.content, fact.content, 'publication never changes the stored labels');
+    assert.equal(learningRequests.length, 0, 'publication is not an accepting review of the correction');
+    assert.equal(searchFactsByText(unsafeLesson, 20).filter(row => row.content.includes(unsafeLesson)).length, 0,
+      'an unreviewed correction must not become persistent feedback');
+  });
+}

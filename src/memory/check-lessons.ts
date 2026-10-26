@@ -3,11 +3,12 @@
  * becomes better").
  *
  * A check that catches a problem in Clem's work — a completion review that
- * sent an answer back, a review after delivery that she corrected, a tool that
- * refused a call she then got right — teaches something that usually applies
+ * accepts a repaired answer, a tool that refused a call she then got right —
+ * teaches something that usually applies
  * beyond the one request. The memory model reads what was caught and what
  * fixed it, and keeps at most a couple of general lessons ("When …, …"), or
- * nothing when the slip was about this data alone.
+ * nothing when the slip was about this data alone. A correction published
+ * after delivery has no accepting review and does not supply a lesson.
  *
  * A lesson is an ordinary derived memory (`feedback`, below anything the owner
  * said): the nearest few ride at turn start in their own short section
