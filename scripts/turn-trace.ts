@@ -14,11 +14,13 @@ import Database from 'better-sqlite3';
 import os from 'node:os';
 import path from 'node:path';
 
-const HOME = process.env.CLEMENTINE_HOME ?? path.join(os.homedir(), '.clementine-next');
-const DB_PATH = path.join(HOME, 'state', 'harness.db');
+const TRACE_HOME = process.env.CLEMENTINE_HOME ?? path.join(os.homedir(), '.clementine-next');
+const DB_PATH = path.join(TRACE_HOME, 'state', 'harness.db');
 const LIMIT = Math.max(1, Math.min(200, Number(process.argv[2]) || 10));
 
 const db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+db.pragma('query_only = ON');
+db.exec('BEGIN');
 
 interface SourceRow {
   session_id: string;
@@ -27,11 +29,27 @@ interface SourceRow {
   data_json: string;
 }
 
+// Ordinary host turns do not create a graph authority. A later plan may add
+// one for the same source, so union the existing roots before applying the
+// recent-source limit. Older graph-only databases remain readable.
+const authorityTables = new Set((db.prepare(`
+  SELECT name FROM sqlite_master WHERE type='table'
+    AND name IN ('accepted_task_authority', 'accepted_turn_call_authorities')
+`).all() as Array<{ name: string }>).map((row) => row.name));
+const sourceSelections = [
+  ...(authorityTables.has('accepted_task_authority')
+    ? ['SELECT session_id, source_user_seq FROM accepted_task_authority'] : []),
+  ...(authorityTables.has('accepted_turn_call_authorities')
+    ? ["SELECT session_id, source_user_seq FROM accepted_turn_call_authorities WHERE authority_kind IN ('host_v1', 'host_v1_read_only')"] : []),
+];
+if (sourceSelections.length === 0) throw new Error('No supported accepted-source authority table.');
 const sources = db.prepare(`
   SELECT a.session_id, a.source_user_seq AS seq, e.created_at, e.data_json
-    FROM accepted_task_authority a
+    FROM (${sourceSelections.join(' UNION ')}) a
     JOIN events e
       ON e.session_id = a.session_id AND e.seq = a.source_user_seq
+   WHERE e.type = 'user_input_received' AND e.role = 'user'
+     AND COALESCE(json_extract(e.data_json, '$.synthetic'), 0) != 1
    ORDER BY a.source_user_seq DESC
    LIMIT ?
 `).all(LIMIT) as SourceRow[];
@@ -50,6 +68,13 @@ for (const source of sources.reverse()) {
   const ask = preview((JSON.parse(source.data_json) as { text?: string }).text ?? '');
   console.log(`\n━━ seq ${source.seq} · ${source.created_at} · ${source.session_id}`);
   console.log(`   ask: ${ask}`);
+
+  const hostAuthority = rows<{ authority_kind: string; state: string }>(`
+    SELECT authority_kind, state FROM accepted_turn_call_authorities
+     WHERE session_id = ? AND source_user_seq = ?
+       AND authority_kind IN ('host_v1', 'host_v1_read_only')
+  `, source.session_id, source.seq)[0];
+  if (hostAuthority) console.log(`   host authority: ${hostAuthority.authority_kind} · ${hostAuthority.state}`);
 
   const graph = rows<{ data_json: string }>(`
     SELECT data_json FROM events
@@ -75,7 +100,9 @@ for (const source of sources.reverse()) {
       .join(' ');
     console.log(`   contract: ${parsed.plannerSource ?? '?'} · ${ops || '(zero operations)'}`);
   } else {
-    console.log('   contract: (none frozen)');
+    console.log(hostAuthority && !graph
+      ? '   contract: (no planned graph observed; host call authority above)'
+      : '   contract: (none frozen)');
   }
 
   for (const s of rows<Record<string, unknown>>(`
@@ -159,3 +186,5 @@ for (const source of sources.reverse()) {
   }
 }
 console.log(`\n${sources.length} source(s) from ${DB_PATH}\n`);
+db.exec('ROLLBACK');
+db.close();
