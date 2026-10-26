@@ -10265,11 +10265,14 @@ const runHostTurnBody = async (
       if ((exactProduction.boundary !== 'nested_owned' || exactProduction.graphlessLocalMutation)
         && !actionExpectedWorkRequired(identity)) {
         consent = await evaluateExactHostMutationConsent(exactProduction, durableApproval);
+      } else if (!isPlainOrClementineLocalTool(pending.name, 'work_call') || !isHostPlanRequiredWorkCall(tool)) {
+        // The card for this call was raised through the exact-call consent
+        // (only a host-planned work_call is prepared), so its approval is
+        // re-checked the same way: the exact grant, never a fresh preparation.
+        // Repairing here made every approved call_tool local write (a delete
+        // the owner tapped Approve on) end as "approval scope changed".
+        consent = await evaluateExactHostMutationConsent(exactProduction, durableApproval);
       } else {
-        if (!isPlainOrClementineLocalTool(pending.name, 'work_call') || !isHostPlanRequiredWorkCall(tool)) {
-          resumeFrameRepair = true;
-          break;
-        }
         const prepared = await withHostCallAttestation(
           exactProduction.attestation,
           () => prepareHostWorkCall(tool, {
