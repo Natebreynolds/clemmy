@@ -20,6 +20,18 @@ test('a faithful retelling keeps the facts, home-relative paths included', () =>
   assert.equal(workflowEndingKeepsFacts('It is in ~/clem-fixtures/out/x.csv.', `Wrote ${home}.`, 'done'), true);
 });
 
+test('current home paths stay equivalent and invented files stay refused outside conventional home roots', (t) => {
+  for (const home of ['/work/clem-fixture', '/sandbox/clem[fixture].home']) {
+    t.mock.method(os, 'homedir', () => home);
+    const named = `${home}/out/known.csv`;
+    assert.equal(workflowEndingKeepsFacts('Saved ~/out/known.csv.', `Wrote ${named}.`, 'done'), true);
+    assert.equal(workflowEndingKeepsFacts(`Saved ${named}.`, 'Wrote ~/out/known.csv.', 'done'), true);
+    assert.equal(workflowEndingKeepsFacts(`Saved ${home}/out/invented.csv.`, `Wrote ${named}.`, 'done'), false);
+    assert.equal(workflowEndingKeepsFacts('Saved ~/out/invented.csv.', `Wrote ${named}.`, 'done'), false);
+    t.mock.restoreAll();
+  }
+});
+
 test('a link or file the report never named, or a blocked run told as done, keeps the report', () => {
   assert.equal(workflowEndingKeepsFacts('Saved to /Users/user/Desktop/books.csv.', report, 'done'), false, 'an invented location');
   assert.equal(workflowEndingKeepsFacts('See https://example.com/run for details.', report, 'done'), false, 'an invented link');

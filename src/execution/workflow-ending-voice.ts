@@ -45,8 +45,11 @@ export type WorkflowEndingOutcome = 'done' | 'blocked' | 'failed';
 /** The links and file paths a text names, home-relative paths expanded. */
 function locations(text: string): string[] {
   const home = os.homedir();
+  const escapedHome = home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const locationPattern = new RegExp("https?://[^\\s)<>\"'`]+|(?:~|" + escapedHome
+    + "|/(?:Users|home|tmp|private|var|Volumes))/[^\\s)<>\"'`,;]+", 'g');
   const found = new Set<string>();
-  for (const match of text.matchAll(/https?:\/\/[^\s)<>"'`]+|(?:~|\/(?:Users|home|tmp|private|var|Volumes))\/[^\s)<>"'`,;]+/g)) {
+  for (const match of text.matchAll(locationPattern)) {
     const raw = match[0].replace(/[.:!?]+$/u, '');
     found.add(raw.startsWith('~/') ? `${home}${raw.slice(1)}` : raw);
   }
