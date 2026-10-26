@@ -11063,11 +11063,10 @@ test('a host-verified memory save publishes before its review when the caller ca
   assert.equal(reviews, 0, 'the review runs after the reply, not inside the turn');
 });
 
-// Live 2026-10-20 (r45v1): the first review retained `retain` ("verified
-// consolidation already retains the exact requested information"), bounced the
-// reply's hedge, and the continuation's review failed open on quota; the gate
-// ignored the retained assessment and the turn ended blocked.
-test('durable memory completion obligation honours an earlier retained assessment when the later review fails open', async (t) => {
+// A retained storage assessment does not resolve an explicit negative
+// completion finding. Without typed narrowing or a later qualified positive
+// review, reviewer unavailability cannot certify the whole memory request.
+test('durable memory completion obligation keeps an earlier unscoped rejection when the later review fails open', async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const { verifiedMemoryIntakeContext } = await import('./durable-memory-intake-receipt.js');
   t.after(() => _setHostObjectiveJudgeForTests(null));
@@ -11091,7 +11090,13 @@ test('durable memory completion obligation honours an earlier retained assessmen
   const agent = { model, tools: [] };
   bindHostCanarySurface(fixture, agent, []);
   const result = await runJudgedHost(fixture, agent, true);
-  assert.equal(result.terminal, undefined, 'a retained retain assessment completes the requirement when the next review is unavailable');
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_correction_unverified',
+    'verified storage remains evidence, but the prior whole-request rejection is unresolved');
+  assert.match(String(result.finalOutput), /could not verify all the memory work/);
+  assert.ok(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').every(row => row.data.fulfills !== true),
+  'the unavailable later review does not publish whole-objective completion');
   assert.equal(reviews, 2);
   assert.equal(model.calls(), 2);
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0);
@@ -11350,6 +11355,35 @@ test('changed replies cannot waive unsupported paraphrases, missing deliverables
       assert.equal(last.data.claimRevision, undefined);
     }
   } finally { _setHostObjectiveJudgeForTests(null); }
+});
+
+test('an ordinary honest failure report still discloses before spending a needless second repair', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const fixture = acceptJudgedSource('honest-failure-after-repair', 'Post the controlled report to the channel.');
+  const account = 'The channel connection is unavailable, so I cannot post this report. Nothing has been sent.';
+  const model = scriptedRecordingModel([
+    [textMsg('Done: posted the controlled report to the channel.')],
+    [textMsg('I cannot post the report because the channel connection is unavailable.')],
+    [textMsg(account)],
+  ]);
+  let reviews = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    reviews++;
+    return { done: false, reason: 'The requested channel delivery has not occurred.' };
+  });
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const outcome = await runJudgedHost(fixture, agent, true);
+  const judged = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion');
+  assert.equal(reviews, 2, 'the repaired ordinary failure report remains a valid stop');
+  assert.equal(model.calls(), 3, 'one repair is followed by the existing honest disclosure call');
+  assert.deepEqual(judged.map(row => row.data.continuation), [true, false]);
+  assert.match(JSON.stringify(model.requests[2]), /YOUR FINAL REPLY TO THE OWNER/);
+  assert.equal(String(outcome.finalOutput), account);
+  assert.equal(outcome.terminal?.reason, 'completion_review_disclosed');
+  assert.ok(judged.every(row => row.data.fulfills === false), 'the failure account is never successful completion');
 });
 
 test('when claims-only repair rounds are spent, Clem drops the claim and says so herself, without certifying the whole task', async () => {
@@ -14011,6 +14045,73 @@ for (const revision of ['same-question', 'changed-question', 'removed-question']
     assert.match(repairText, /not.*permission|never.*authority/);
   });
 }
+
+test('question admission spends the remaining repair on a repeated staged question before honest disclosure', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const progress = 'Measurement A is 17.';
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const options = ['10', '20'];
+  const ask = (id: string) => toolCall(id, 'ask_user_question', { question, options, purpose: 'clarification' });
+  const fixture = ownedQuestionAdmissionFixture('second-question-repair', [
+    [ask('second-question-repair-first')],
+    [ask('second-question-repair-second')],
+    [textMsg(progress), ask('second-question-repair-current')],
+  ], 'Report measurement A as 17, then classify measurement B using my unpublished private cutoff. Ask for that cutoff only after reporting A.');
+  const reviews: Array<{ reply: string; evidence?: string; postedBefore: number }> = [];
+  host._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
+    reviews.push({ reply, evidence: context?.toolCallSummary,
+      postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+    // Controlled findings exercise the actual host budget and publication
+    // boundary; they do not qualify a model's semantic accuracy.
+    return reviews.length < 3
+      ? { done: false, reason: 'Measurement A is missing. Report A before the remaining owner question.' }
+      : { done: true, awaitingUser: true, reason: 'The current candidate reports A and asks only for the missing B cutoff.' };
+  });
+  const result = await fixture.run();
+  const reviewEvents = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion');
+  const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+  const feedbackByRequest = fixture.model.requests.slice(1).map(request =>
+    ((request as { input?: Array<{ content?: unknown }> }).input ?? [])
+      .map(row => row.content).filter((value): value is string => typeof value === 'string'
+        && (value.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]')
+          || value.startsWith('[COMPLETION REVIEW — YOUR FINAL REPLY TO THE OWNER]'))));
+  t.diagnostic(JSON.stringify({ primaryCalls: fixture.model.calls(), reviews: reviews.length,
+    continuations: reviewEvents.map(row => row.data.continuation),
+    continuationsUsed: reviewEvents.map(row => row.data.continuationsUsed),
+    feedbackPhases: feedbackByRequest.map(rows => rows.map(text => JSON.parse(text.slice(text.lastIndexOf('\n') + 1)).phase)),
+    questions: questions.length, status: result.status }));
+  assert.equal(fixture.model.calls(), 3, 'only the two existing primary repairs are used');
+  assert.equal(reviews.length, 3, 'each proposed question gets its own current review');
+  assert.deepEqual(reviewEvents.map(row => row.data.continuation), [true, true, false],
+    'a repeated rejected question is not an honest failure report while the second repair remains');
+  assert.deepEqual(reviewEvents.map(row => row.data.continuationsUsed), [0, 1, 2]);
+  assert.ok(feedbackByRequest.every(rows => rows.length === 1
+    && rows[0]!.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]')),
+  'both actual repair requests retain the finding instead of prematurely asking for failure disclosure');
+  assert.ok(reviews.every(row => row.postedBefore === 0), 'no earlier proposal is published during repair');
+  assert.ok(reviews.slice(0, 2).every(row => !row.reply.includes(progress)));
+  assert.equal(reviews[2]!.reply, `${progress}\n\n${question}`);
+  assert.ok(reviews[2]!.evidence?.includes(JSON.stringify({ question, options })));
+  assert.equal(questions.length, 1, 'only the freshly reviewed complete question is published');
+  assert.equal(questions[0]!.data.question, question);
+  assert.deepEqual(questions[0]!.data.options, options);
+  assert.equal(questions[0]!.data.sourceUserSeq, fixture.source.seq);
+  assert.ok(reviewEvents[2]!.seq < questions[0]!.seq);
+  assert.equal(reviewEvents[2]!.data.questionPresentationDigest,
+    sha256(JSON.stringify([result.publicPresentation?.text, questions[0]!.data.question, questions[0]!.data.options])),
+    'the exact delivered reply and public choices match the final current review');
+  assert.equal(reviewEvents[2]!.data.fulfills, false, 'B remains unresolved rather than falsely completed');
+  assert.equal(reviewEvents[2]!.data.awaitingUser, true);
+  assert.notEqual(reviewEvents[2]!.data.failedOpen, true);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'completion_review_disclosed').length, 0);
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.equal(result.publicPresentation?.text, `${progress}\n\n${question}`);
+  assert.equal(result.publicPresentation!.text.split(progress).length - 1, 1);
+});
 
 test('question admission keeps same-frame independent progress in the reviewed and delivered reply', async (t) => {
   const host = await import('./host-turn-runner.js');

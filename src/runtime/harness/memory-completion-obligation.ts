@@ -312,6 +312,37 @@ const acceptedAssessmentSchema = z.object({ version: z.literal(1), eventId: z.st
   assessmentDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 export type AcceptedMemoryRequirementAssessment = z.infer<typeof acceptedAssessmentSchema>;
 
+function sourceMemoryReviews(source: MemoryRequirementSource) {
+  checkedSource(source);
+  return listEvents(source.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.sourceUserSeq === source.sourceUserSeq && row.data.lane === 'host_v1'
+      && (row.data.kind !== 'completion' || row.data.objectiveDigest === source.objectiveDigest));
+}
+function memoryReviewKeepsWorkOpen(data: Record<string, unknown>): boolean {
+  const judged = data.judgedMemoryRequirement as { status?: unknown } | undefined;
+  return data.awaitingUser === true || data.blocked === true || judged?.status === 'unverified'
+    || (data.fulfills === false && data.failedOpen !== true && data.reviewDisposition !== 'answered_unqualified');
+}
+/** The existing whole-request finding also governs retention fallback. A
+ * stored subset or a claims-only rejection cannot settle the remaining work.
+ * A fresh qualified review clears this floor; it does not supply correction
+ * provenance or replace the independent canonical storage checks. */
+function hasUnresolvedMemoryReview(source: MemoryRequirementSource): boolean {
+  for (const event of sourceMemoryReviews(source).reverse()) {
+    const data = event.data;
+    if (data.kind !== 'completion') continue;
+    if (memoryReviewKeepsWorkOpen(data)) return true;
+    const coverage = data.evidenceCoverage as { status?: unknown; returnedForCorrection?: unknown; followUp?: unknown } | undefined;
+    if (data.fulfills === true && data.failedOpen !== true && data.reviewFailure === undefined
+      && data.substituteForExactPin !== true && data.reviewDisposition !== 'answered_unqualified'
+      && data.reviewConfirmation !== 'unavailable' && data.carriedVerdict !== true
+      && data.settledEvidenceAvailable !== false
+      && (!coverage || (coverage.status === 'sufficient' && coverage.returnedForCorrection !== true
+        && coverage.followUp !== 'unanswered'))) return false;
+  }
+  return false;
+}
+
 /** Reuse a correction assessment only when an actual whole-request verdict
  * accepted that current packet. A prewrite grant or a reviewed question can
  * prove A's operation while B is still pending. The existing completion event
@@ -321,13 +352,14 @@ export function memoryCompletionFromAcceptedAssessment(source: MemoryRequirement
   const unverified = (): MemoryCorrectionCompletion => ({ status: 'unverified',
     reason: 'The requested memory corrections lack a current accepted whole-request assessment.' });
   try {
+    if (hasUnresolvedMemoryReview(source)) return { status: 'unverified',
+      reason: 'The earlier whole-request review still has an unresolved finding. Saved memory alone cannot clear it.' };
     const completion = memoryCorrectionCompletion(source);
     if (completion.status !== 'verified') return completion;
     const rows = requirements(source);
     const bound = correctionUnion(source, rows.filter(row => row.assessment.kind === 'correct')
       .flatMap(row => row.assessment.corrections));
-    const reviews = listEvents(source.sessionId, { types: ['goal_alignment_judged'] })
-      .filter(row => row.data.sourceUserSeq === source.sourceUserSeq && row.data.lane === 'host_v1');
+    const reviews = sourceMemoryReviews(source);
     for (const event of [...reviews].reverse()) {
       const data = event.data;
       if (data.kind === 'memory_requirement' && (data.assessment as { kind?: unknown } | undefined)?.kind === 'unresolved') return unverified();
@@ -335,8 +367,7 @@ export function memoryCompletionFromAcceptedAssessment(source: MemoryRequirement
       const judged = data.judgedMemoryRequirement as { status?: unknown; assessmentDigest?: unknown } | undefined;
       // A later unresolved review or owner question retires earlier coverage.
       // An unavailable reviewer alone cannot undo already accepted work.
-      if (data.awaitingUser === true || data.blocked === true || judged?.status === 'unverified'
-        || (data.fulfills === false && data.failedOpen !== true && data.reviewDisposition !== 'answered_unqualified')) return unverified();
+      if (memoryReviewKeepsWorkOpen(data)) return unverified();
       if (data.acceptedMemoryRequirement === undefined) continue;
       const parsed = acceptedAssessmentSchema.safeParse(data.acceptedMemoryRequirement);
       if (!parsed.success || data.fulfills !== true || data.failedOpen === true
@@ -366,6 +397,7 @@ export function memoryCompletionFromAcceptedAssessment(source: MemoryRequirement
  * "memory_correction_unverified". */
 export function hostVerifiedMemoryRetention(source: MemoryRequirementSource): MemoryCorrectionCompletion | null {
   try {
+    if (hasUnresolvedMemoryReview(source)) return null;
     const retained = readRetainedMemoryRequirement(source);
     // A partial save cannot discharge an unresolved request or an exact
     // correction: the retained obligation still needs its own proof.

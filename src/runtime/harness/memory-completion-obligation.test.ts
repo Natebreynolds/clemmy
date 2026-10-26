@@ -142,16 +142,20 @@ function settleExactCorrection(identity: ReturnType<typeof source>, fixture: Ret
     return JSON.stringify({ protocol: 'fact_correction_v1', ...result });
   }, args);
 }
-async function runHost(identity: ReturnType<typeof source>, verdict: import('./objective-judge.js').ObjectiveJudgeVerdict,
-  enabled = true, reply = 'The requested memory is saved and corrected.') {
+async function runHost(identity: ReturnType<typeof source>, verdict: import('./objective-judge.js').ObjectiveJudgeVerdict
+  | ((review: number, objective: string, reply: string) => import('./objective-judge.js').ObjectiveJudgeVerdict),
+  enabled = true, reply: string | ((call: number) => string) = 'The requested memory is saved and corrected.') {
   let calls = 0; let reviews = 0;
   const contexts: Array<import('./objective-judge.js').SkillExecutionContext | undefined> = [];
-  host._setHostObjectiveJudgeForTests(async (_objective, _reply, options) => { reviews++; contexts.push(options); return verdict; });
+  host._setHostObjectiveJudgeForTests(async (objective, reply, options) => {
+    reviews++; contexts.push(options);
+    return typeof verdict === 'function' ? verdict(reviews, objective, reply) : verdict;
+  });
   const model = {
     async getResponse() {
       calls++;
       return { responseId: `memory-reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: reply }] }] };
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: typeof reply === 'function' ? reply(calls) : reply }] }] };
     },
     async *getStreamedResponse() {
       const response = await this.getResponse(); yield { type: 'response_started' } as never;
@@ -999,6 +1003,213 @@ for (const action of ['supersede', 'reinforce'] as const) test(`actual host keep
   assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'unverified', 'the exact completion helper preserves unresolved');
   assert.equal(memory.hostVerifiedMemoryRetention(identity.retained), null, 'the early-save helper cannot override unresolved');
 });
+
+for (const marker of ['INCOMPLETE', 'CORRECT'] as const) {
+  test(`intake coverage cap distinguishes ${marker} before unavailable review`, async () => {
+    const { selectAutoMemoryCandidates, automaticMemoryOriginsForCapture, autoCaptureProvenanceFromAcceptedEvent } = await import('../../memory/auto-capture.js');
+    const { enqueueAutoCaptureCandidates, drainDurableConsolidationCandidates } = await import('../../memory/durable-consolidation.js');
+    const { hostVerifiedStatedRetention } = await import('./durable-memory-intake-receipt.js');
+    const { parseCompletionVerdict } = await import('./objective-judge.js');
+    const omittedB = marker === 'INCOMPLETE';
+    // Four real commands select only the first three. No selected row is
+    // deleted or forged; the producer's own cap omits the requested B fact.
+    const clauses = ['Remember that my report A heading is LILAC GROVE.',
+      'Remember that my report A footer is COPPER KITE.',
+      ...(omittedB ? ['Remember that my report A style is TITLE CASE.'] : []),
+      'Remember that my report B heading is IVORY FIELD.'];
+    const identity = source(clauses.join('\n'));
+    const sourceEvent = events.listEvents(identity.sessionId, { types: ['user_input_received'] })
+      .find(row => row.seq === identity.sourceUserSeq);
+    assert.ok(sourceEvent);
+    const input = { message: identity.retained.ownerText, sessionId: identity.sessionId,
+      sourceEventId: `user-source:${identity.sourceUserSeq}`,
+      sourceProvenance: autoCaptureProvenanceFromAcceptedEvent(sourceEvent) };
+    const candidates = selectAutoMemoryCandidates(input.message, 3);
+    assert.equal(candidates.length, 3);
+    assert.equal(candidates.some(row => row.content.includes('IVORY FIELD')), !omittedB);
+    if (omittedB) assert.ok(candidates.every(row => row.content.includes('report A')));
+    const queued = enqueueAutoCaptureCandidates({ ...input, candidates,
+      origins: automaticMemoryOriginsForCapture(input, candidates) });
+    assert.ok(queued.episodeId && queued.callId);
+    assert.equal(queued.candidateIds.length, 3);
+    let resolverCalls = 0; let standingReviews = 0;
+    const standingInputs: Array<{ ownerText: string; sourceUserSeq?: number; claim?: string }> = [];
+    const drained = await drainDurableConsolidationCandidates({ ids: queued.candidateIds,
+      limit: queued.candidateIds.length,
+      resolver: async () => { resolverCalls++; return { decision: 'ADD' }; },
+      standingReviewer: async (ownerText, _candidate, _mode, origin) => {
+        standingReviews++;
+        standingInputs.push({ ownerText, sourceUserSeq: origin?.source.context?.sourceUserSeq, claim: origin?.claim });
+        return { scope: 'standing', reason: 'Controlled source-bound promotion of this selected claim.', destinationDecision: {
+          durability: 'standing', claim: origin?.claim ?? '', destination: 'kind_default', destinationSpans: [],
+          reason: 'Controlled full-source destination review; no claim about coverage of other owner requests.',
+        } };
+      },
+    });
+    assert.equal(drained.promoted, 3);
+    assert.equal(drained.retried, 0);
+    assert.equal(drained.expired, 0);
+    assert.equal(drained.skipped, 0);
+    assert.equal(standingInputs.length, 3);
+    for (const standing of standingInputs) {
+      assert.equal(standing.ownerText, input.message);
+      assert.equal(standing.sourceUserSeq, identity.sourceUserSeq);
+      assert.ok(standing.claim);
+    }
+    const promoted = memoryDb.openMemoryDb().prepare(`SELECT status,resulting_fact_id FROM memory_reflection_candidates
+      WHERE session_id = ? AND call_id = ? ORDER BY id`).all(identity.sessionId, queued.callId) as Array<{
+        status: string; resulting_fact_id: number;
+      }>;
+    assert.equal(promoted.length, 3);
+    const stored = promoted.map(row => {
+      assert.equal(row.status, 'promoted');
+      const fact = factState.readFactObservation(row.resulting_fact_id);
+      assert.ok(fact?.active);
+      return fact;
+    });
+    assert.equal(stored.some(row => row.content.includes('IVORY FIELD')), !omittedB);
+    if (omittedB) assert.ok(stored.every(row => row.content.includes('report A')));
+    assert.equal(hostVerifiedStatedRetention(identity), true, 'all producer-selected claims really have exact promoted storage proof');
+    const beforeDigests = stored.map(row => row.digest);
+    const beforeDrainCalls = { resolverCalls, standingReviews };
+    const first = parseCompletionVerdict(marker === 'INCOMPLETE'
+      ? 'INCOMPLETE: Report B heading IVORY FIELD remains unsaved; the three report A facts are stored.'
+      : 'CORRECT: All requested facts are stored. Remove the unsupported claim that consolidation is still pending.');
+    assert.ok(first && !first.done);
+    assert.equal(first.repairScope, omittedB ? undefined : 'claims', 'the existing control parser supplies the distinction, not reason matching');
+    const reviewInputs: Array<{ review: number; objective: string; capturedStorage: boolean;
+      prior: Array<{ fulfills: unknown; repairScope: unknown }> }> = [];
+    const result = await runHost(identity, (review, objective) => {
+      reviewInputs.push({ review, objective, capturedStorage: hostVerifiedStatedRetention(identity),
+        prior: events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+          .filter(row => row.data.kind === 'completion')
+          .map(row => ({ fulfills: row.data.fulfills, repairScope: row.data.repairScope })) });
+      if (review === 1) return { ...first,
+        memoryRequirement: { version: 1, kind: 'retain', corrections: [], reason: 'The owner asked to retain these new report facts.' } };
+      return { done: true, reason: 'Controlled later review is unavailable.', failedOpen: true, reviewFailure: 'unavailable' };
+    }, true, call => call === 1
+      ? omittedB ? 'All four requested facts are saved.' : 'The report facts are captured, but consolidation is still pending.'
+      : omittedB ? 'The three report A facts and report B heading IVORY FIELD are remembered.' : 'The report A heading and footer and report B heading are remembered.');
+    const completed = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+      .filter(row => row.data.kind === 'completion');
+    console.log('MEMORY_INTAKE_CAP_CONTRACT_OBSERVATION ' + JSON.stringify({ marker, ownerClauses: clauses.length,
+      selectedCandidates: candidates.length, promoted: promoted.length, capturedStorageVerified: hostVerifiedStatedRetention(identity),
+      requestedBStored: stored.some(row => row.content.includes('IVORY FIELD')),
+      calls: result.calls, reviews: result.reviews, terminalStatus: result.outcome.terminal?.status ?? null,
+      reviewResults: completed.map(row => ({ fulfills: row.data.fulfills, failedOpen: row.data.failedOpen === true,
+        repairScope: row.data.repairScope ?? null, memoryStatus: (row.data.judgedMemoryRequirement as { status?: string } | undefined)?.status ?? null })) }));
+    assert.equal(result.calls, 2);
+    assert.equal(result.reviews, 2);
+    assert.deepEqual(reviewInputs, [
+      { review: 1, objective: identity.retained.ownerText, capturedStorage: true, prior: [] },
+      { review: 2, objective: identity.retained.ownerText, capturedStorage: true,
+        prior: [{ fulfills: false, repairScope: omittedB ? undefined : 'claims' }] },
+    ], 'callback observations are asserted outside the host catch/fail-open boundary');
+    assert.equal(completed[0]!.data.failedOpen, undefined, 'the first actual review is the intentional negative');
+    assert.equal(completed[1]!.data.failedOpen, true);
+    assert.equal(completed[1]!.data.reviewFailure, 'unavailable');
+    assert.deepEqual({ resolverCalls, standingReviews }, beforeDrainCalls, 'completion review does not restart consolidation');
+    assert.deepEqual(stored.map(row => factState.readFactObservation(row.id)?.digest), beforeDigests, 'no stored fact is changed by review');
+    assert.equal(events.listEvents(identity.sessionId, { types: ['tool_called'] }).length, 0);
+    assert.equal(result.outcome.terminal?.status, 'blocked',
+      'captured storage and claims-only scope cannot clear an unresolved whole-request review');
+    assert.equal(completed.some(row => row.data.fulfills === true), false);
+    if (!omittedB) assert.equal(completed[0]!.data.repairScope, 'claims',
+      'CORRECT is a real claims-only finding, not an accepted revised answer');
+  });
+}
+
+const retainAssessment = { version: 1 as const, kind: 'retain' as const, corrections: [],
+  reason: 'The owner asks to retain the stated project information.' };
+const unavailableMemoryReview = { done: true, failedOpen: true, reviewFailure: 'unavailable' as const,
+  reason: 'Controlled reviewer unavailable.' };
+
+function savedRetention(action: 'add' | 'supersede' | 'reinforce' = 'add') {
+  const identity = source(`Remember the synthetic report A heading LILAC GROVE and report B heading IVORY FIELD for request ${serial + 1}.`);
+  const previous = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report A: heading HAZEL RIDGE.`,
+    scope: null, sessionId: identity.sessionId });
+  let storedId = previous.id;
+  settle(identity, 'memory_remember', `retain-floor-${action}-${serial}`, () => {
+    if (action !== 'reinforce') {
+      storedId = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report A: heading LILAC GROVE.`,
+        scope: null, sessionId: identity.sessionId }).id;
+      if (action === 'supersede') assert.equal(facts.markFactSupersededBy(previous.id, storedId,
+        { validTo: identity.retained.occurredAt }), true);
+    }
+    return receipts.formatMemoryRememberReceipt({ action, factId: storedId });
+  }, { kind: 'project', content: `Synthetic ${serial} report A: heading LILAC GROVE.` });
+  return { identity, storedId };
+}
+
+for (const action of ['supersede', 'reinforce'] as const) {
+  test(`retained negative floor cannot be bypassed by a partial manual ${action}`, async () => {
+    const { identity, storedId } = savedRetention(action);
+    assert.equal(memory.hostVerifiedMemoryRetention(identity.retained)?.status, 'verified',
+      'the existing convenience path is initially eligible');
+    const result = await runHost(identity, review => review === 1
+      ? { done: false, reason: 'Report B still needs its requested heading.', memoryRequirement: retainAssessment }
+      : unavailableMemoryReview, true, call => `Both requested headings are saved, report revision ${call}.`);
+    assert.equal(result.calls, 2); assert.equal(result.reviews, 2);
+    assert.deepEqual(memory.explicitRememberStored(identity.retained), { action, factId: storedId });
+    assert.equal(result.outcome.terminal?.status, 'blocked');
+    assert.equal(memory.hostVerifiedMemoryRetention(identity.retained), null,
+      'the same negative floor applies before the explicit-store fallback');
+    assert.equal(memory.memoryCompletionFromAcceptedAssessment(identity.retained).status, 'unverified');
+  });
+}
+
+for (const variation of ['fresh-positive', 'later-negative', 'later-awaiting', 'wrong-objective', 'wrong-source',
+  'substituted', 'failed-open', 'answered-unqualified', 'insufficient-evidence'] as const) {
+  test(`retained negative floor accepts only the current whole review: ${variation}`, async () => {
+    const { identity } = savedRetention();
+    const b = facts.rememberFact({ kind: 'project', content: `Synthetic ${serial} report B: heading IVORY FIELD.`,
+      scope: null, sessionId: identity.sessionId });
+    settle(identity, 'memory_remember', `retain-floor-B-${serial}`,
+      receipts.formatMemoryRememberReceipt({ action: 'add', factId: b.id }),
+      { kind: 'project', content: `Synthetic ${serial} report B: heading IVORY FIELD.` });
+    // Both writes are real; the first answer falsely says they are pending.
+    // Only an actual current positive review can settle that claims finding.
+    const completed = await runHost(identity, review => review === 1
+      ? { done: false, repairScope: 'claims', reason: 'The pending-save claim contradicts the completed work.', memoryRequirement: retainAssessment }
+      : { done: true, reason: 'Both requested headings are saved and the revised answer is accurate.', memoryRequirement: retainAssessment },
+    true, call => call === 1 ? 'Both report headings are still pending.' : 'Both requested report headings are saved.');
+    assert.equal(completed.outcome.terminal, undefined);
+    assert.equal(completed.calls, 2); assert.equal(completed.reviews, 2);
+    const accepted = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+      .filter(row => row.data.kind === 'completion').at(-1);
+    assert.ok(accepted?.data.fulfills);
+    if (variation === 'later-negative' || variation === 'later-awaiting') {
+      const paused = await runHost(identity, { done: true, awaitingUser: true,
+        reason: 'A requested detail remains unresolved.', memoryRequirement: retainAssessment },
+      true, 'ASK: Which remaining report detail should be retained?');
+      assert.equal(paused.outcome.terminal?.status, 'awaiting_user_input', 'a legitimate current question still publishes');
+      if (variation === 'later-negative') {
+        const row = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+          .filter(item => item.data.kind === 'completion').at(-1)!;
+        events.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?')
+          .run(JSON.stringify({ ...row.data, awaitingUser: false, fulfills: false }), row.id);
+      }
+    } else if (variation !== 'fresh-positive') {
+      const data = structuredClone(accepted.data);
+      if (variation === 'wrong-objective') data.objectiveDigest = digest('another objective');
+      if (variation === 'wrong-source') data.sourceUserSeq = identity.sourceUserSeq + 1;
+      if (variation === 'substituted') data.substituteForExactPin = true;
+      if (variation === 'failed-open') { data.failedOpen = true; data.reviewFailure = 'unavailable'; }
+      if (variation === 'answered-unqualified') data.reviewDisposition = 'answered_unqualified';
+      if (variation === 'insufficient-evidence') data.evidenceCoverage = { status: 'insufficient', returnedForCorrection: true };
+      events.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), accepted.id);
+    }
+    events.closeEventLog(); memoryDb.closeMemoryDb();
+    const later = await runHost(identity, unavailableMemoryReview);
+    assert.equal(later.calls, 1); assert.equal(later.reviews, 1, 'no extra review calls are introduced');
+    if (variation === 'fresh-positive') {
+      assert.equal(later.outcome.terminal, undefined, 'an actual qualified whole review clears the older negative');
+    } else {
+      assert.equal(later.outcome.terminal?.status, 'blocked', 'unqualified, foreign or retired positives cannot clear the hold');
+      assert.equal(memory.memoryCompletionFromAcceptedAssessment(identity.retained).status, 'unverified');
+    }
+  });
+}
 
 test('unresolved becomes exact correction and closes only with full proof', async () => {
   const identity = source(ownerText + ' Also replace the stored word Fixture with Record.'); const fixture = observed(identity);

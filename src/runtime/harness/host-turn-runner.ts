@@ -5204,7 +5204,10 @@ const runHostTurnBody = async (
       }
     }
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
-    const honestStop = !planCandidate && honestFailureReportSettles({
+    // A proposed owner question is not a failure account. A negative review
+    // may still use the existing remaining repair before honest disclosure.
+    const honestStop = !planCandidate && !questionPresentation
+      && decision?.nextAction !== 'awaiting_user_input' && honestFailureReportSettles({
       verdictDone: verdict.done,
       continuationsUsed: objectiveJudgeContinuations,
       reply: judgedReply,
@@ -5799,7 +5802,7 @@ const runHostTurnBody = async (
         if (requiredMemory.status === 'unverified') {
           if (boundary && !boundary.commit()) return undefined;
           return blockedOutcome(
-            'I could not confirm that your correction replaced what I had saved before. The change is still unfinished.',
+            'I could not verify all the memory work you requested. It remains unfinished.',
             'memory_correction_unverified');
         }
       }
