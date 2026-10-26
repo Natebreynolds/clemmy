@@ -2,10 +2,10 @@ import { z } from 'zod';
 import { stableJsonDigest } from '../shared/stable-json-digest.js';
 
 /** Disclosure contract only; never approval or execution authority. */
-export const QUESTION_TOOL_WIRE_EDITIONS = ['legacy_v1', 'clarification_v2'] as const;
+export const QUESTION_TOOL_WIRE_EDITIONS = ['legacy_v1', 'clarification_v2', 'clarification_v3'] as const;
 export type QuestionToolWireEdition = typeof QUESTION_TOOL_WIRE_EDITIONS[number];
 export function parseQuestionToolWireEdition(value: unknown): QuestionToolWireEdition | null {
-  return value === 'legacy_v1' || value === 'clarification_v2' ? value : null;
+  return value === 'legacy_v1' || value === 'clarification_v2' || value === 'clarification_v3' ? value : null;
 }
 
 export interface ConditionalApprovalPreparationRepair {

@@ -2060,6 +2060,92 @@ test('a staged question can be reviewed before one exact immutable public post',
   assert.equal(events[0]!.data.sourceUserSeq, 52);
 });
 
+test('v3 public answer is immutable with its question and dedup restores only published text', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const context = { context: { sessionId: session.id, turn: 2, sourceUserSeq: 52 } };
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const answer = 'Measurement A is 17.';
+  const output = decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool('clarification_v3'), {
+    question, options: ['10', '20'], purpose: 'clarification', publicAnswer: answer,
+  }, context.context)) as { publicAnswer: string; options: string[] };
+  const captures: PreparedQuestionPublication[] = [];
+  const toolResult = { type: 'function_output' as const, tool: { name: 'ask_user_question' }, output };
+  const result = withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(context, [toolResult]));
+  assert.equal(result.finalOutput, formatAwaitingUserInputFinalOutput(`${answer}\n\n${question}`));
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+  output.publicAnswer = 'Measurement A is 99.';
+  withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(context, [toolResult]));
+  output.options[0] = 'Mutated option';
+  assert.equal(captures[0]!.publish(), true);
+  assert.equal(captures[0]!.publish(), true);
+  assert.equal(captures[1]!.publish(), false, 'different answer bytes cannot replace an already-published proposal with identical controls');
+  const [event] = listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(event!.data.publicAnswer, answer);
+  assert.deepEqual(event!.data.options, ['10', '20']);
+  const duplicate = userChoiceToolUseBehavior(context, [toolResult]);
+  assert.equal(duplicate.finalOutput, result.finalOutput, 'later candidates cannot replace already-published answer bytes');
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 1);
+});
+
+test('v3 public answer keeps host-owned connection controls subject to whole-reply review', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Connect my notes app so you can read my notes.' } });
+  recordFixtureSearch(session.id, source.seq, 'search-notes', 'connect my notes app', 'fixturenotes');
+  const output = decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool('clarification_v3'), {
+    question: 'Connect here: [open](/wrong_app)', options: ['Done'], purpose: 'connection', publicAnswer: 'Measurement A is 17.',
+  }, { sessionId: session.id, turn: 1, sourceUserSeq: source.seq }));
+  const captures: PreparedQuestionPublication[] = [];
+  const result = withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(
+    { context: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq } }, [{ type: 'function_output', tool: { name: 'ask_user_question' }, output }]));
+  assert.equal(captures[0]!.modelAuthored, true, 'surviving public claims cannot skip review because the host owns the controls');
+  assert.ok(String(result.finalOutput).includes('Measurement A is 17.'));
+  assert.doesNotMatch(String(result.finalOutput), /wrong_app/);
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+});
+
+test('v3 public answer survives argument-recovery controls and still requires whole-reply review', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const { acceptedTaskIdFor } = await import('../runtime/harness/attempt-identity.js');
+  const { admitLogicalCall } = await import('../runtime/harness/dispatch-ledger.js');
+  const { classifyAttemptOutcome } = await import('../runtime/harness/attempt-outcome.js');
+  const { commitLogicalCallSettlement } = await import('../runtime/harness/logical-call-settlement-store.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Report measurement A and inspect the controlled B records.' } });
+  assert.ok(recordTurnGraphShadow({ identity: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 } }));
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq, acceptedTaskId: acceptedTaskIdFor(session.id, source.seq),
+    logicalToolCallId: 'v3-recovery-rejected-read' };
+  const tool = 'fixture_records_read'; const args = { query: 'controlled-B' };
+  assert.equal(admitLogicalCall({ identity, tool, args }).status, 'inserted');
+  assert.equal(commitLogicalCallSettlement({ identity, contract: { toolName: tool, args },
+    execution: { kind: 'refused_pre_dispatch' }, outcome: classifyAttemptOutcome({ argumentValidationFailed: true }),
+    recovery: { businessCall: true, mutating: false }, observer: { lane: 'agents_runner', callId: identity.logicalToolCallId, turn: 1 },
+  }).status, 'committed');
+  const context = { context: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq } };
+  const output = decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool('clarification_v3'), {
+    question: 'Which cutoff applies to B?', options: ['10', '20'], purpose: 'clarification', publicAnswer: 'Measurement A is 17.',
+  }, context.context));
+  const captures: PreparedQuestionPublication[] = [];
+  const result = withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(context,
+    [{ type: 'function_output', tool: { name: 'ask_user_question' }, output }]));
+  assert.equal(captures.length, 1); assert.equal(captures[0]!.modelAuthored, true);
+  assert.match(captures[0]!.question, /parameters need correction/);
+  assert.equal(captures[0]!.options, null, 'host recovery does not revive obsolete model choices');
+  assert.equal(result.finalOutput, formatAwaitingUserInputFinalOutput(`Measurement A is 17.\n\n${captures[0]!.question}`));
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+  assert.equal(captures[0]!.publish(), true);
+  const [event] = listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(event!.data.source, 'argument_repair_recovery');
+  assert.equal(event!.data.publicAnswer, 'Measurement A is 17.');
+  assert.equal(event!.data.options, undefined);
+});
+
 test('a deferred question cannot replace a different question published during review', async () => {
   resetEventLog();
   const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');

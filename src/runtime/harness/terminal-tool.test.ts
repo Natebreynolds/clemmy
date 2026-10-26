@@ -257,3 +257,14 @@ test('a question halt keeps the words the model wrote in the same step, question
   assert.equal(parseAwaitingUserInputFinalOutput(awaitingUserInputWithSpokenText(halt, 'Ask the team first. Then decide.')),
     'Ask the team first. Then decide.\n\nWhich firm are you meeting?', 'the word ask in prose is not a marker');
 });
+
+test('v3 public answer suppresses only an exact repeated same-frame preamble', async () => {
+  const { awaitingUserInputWithSpokenText, formatAwaitingUserInputFinalOutput } = await import('./terminal-tool.js');
+  const answer = 'Measurement A is 17.';
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const combined = formatAwaitingUserInputFinalOutput(`${answer}\n\n${question}`);
+  assert.equal(awaitingUserInputWithSpokenText(combined, answer), combined);
+  assert.equal(awaitingUserInputWithSpokenText(combined, 'Measurement A is 99.'),
+    formatAwaitingUserInputFinalOutput(`Measurement A is 99.\n\n${answer}\n\n${question}`),
+    'different current-frame claims remain visible to the whole-reply review');
+});

@@ -33,10 +33,92 @@ const { redeemDurableLogicalCallSettlementForHost } = await import('../runtime/h
 const { redeemSuccessfulSettlementResultForHost } = await import('../runtime/harness/result-handle.js');
 const { acceptedTurnCallAuthorityFor } = await import('../runtime/harness/accepted-turn-call-authority.js');
 const { isDispatchLeaseCurrent, revokeDispatchLeaseBeforeRecovery } = await import('../runtime/harness/dispatch-lease.js');
+const hostReview = await import('../runtime/harness/host-turn-runner.js');
+const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
 const priorFetch = globalThis.fetch;
 let networkCalls = 0;
 globalThis.fetch = (async () => { networkCalls += 1; throw new Error('Question wire fixture forbids network.'); }) as typeof fetch;
 after(() => { globalThis.fetch = priorFetch; assert.equal(networkCalls, 0); closeMemoryDb(); events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
+
+test('v3 public answer is required-nullable while retained v2 keeps its exact wire', async (t) => {
+  const first = captured();
+  const old = retainedSibling(first.input, 'clarification_v2'); const before = stored(old);
+  const oldContext = contexts.readSourceSessionContext(old)!;
+  const oldTool = toolOf(await build(oldContext), 'ask_user_question');
+  assert.equal(hash({ description: oldTool.description, parameters: oldTool.parameters }),
+    '19477461c045f132e7603a73b7ddce3e15df7e84462c4b5fc0569422a03f6a0c', 'pre-v3 retained v2 wire stays byte-identical');
+  assert.equal(Object.hasOwn(oldTool.parameters.properties, 'publicAnswer'), false);
+  assert.deepEqual(stored(old), before);
+  const current = toolOf(await build(first.context), 'ask_user_question');
+  assert.equal(scope.sourceQuestionToolWireEdition(first.context), 'clarification_v3');
+  assert.ok(current.parameters.required.includes('publicAnswer'));
+  const args = { question: 'What private cutoff should I use to classify measurement B?', options: ['10', '20'], purpose: 'clarification' };
+  assert.notEqual(decode(await invoke(first.context, current, args))?.kind, 'clementine.ask_user_question.candidate');
+  assert.equal(decode(await invoke(first.context, current, { ...args, publicAnswer: null }))?.publicAnswer, null);
+  assert.equal(decode(await invoke(first.context, current, { ...args, publicAnswer: 'Measurement A is 17.' }))?.publicAnswer, 'Measurement A is 17.');
+});
+
+for (const mode of ['direct', 'wrapped', 'same-frame', 'rejected-first'] as const) {
+test(`v3 public answer reaches actual host review and final publication (${mode})`, async (t) => {
+  const session = events.createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
+  const request = 'Report measurement A as 17, then ask for my private cutoff for B with choices 10 and 20. Do not classify B yet.';
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const publicAnswer = 'Measurement A is 17.';
+  const attempt = events.beginRunAttempt(session.id, { runId: `public-answer:${session.id}` });
+  const source = events.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: request, taskMode: { version: 1, kind: 'normal' } } }, { armRunInFlight: true });
+  contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
+  hostReview.captureEffectiveCompletionPolicyOnce({ sessionId: session.id, sourceUserSeq: source.seq, enabled: true });
+  t.after(() => hostReview._setHostObjectiveJudgeForTests(null));
+  let calls = 0;
+  const reviews: Array<{ reply: string; evidence?: string; posted: number }> = [];
+  hostReview._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
+    reviews.push({ reply, evidence: context?.toolCallSummary,
+      posted: events.listEvents(session.id, { types: ['awaiting_user_input'] }).length });
+    // Controlled verdicts test assembly and admission, not model semantics.
+    return mode === 'rejected-first' && reviews.length === 1
+      ? { done: false, reason: 'CORRECT: Measurement A is 17, not 99.' }
+      : { done: true, awaitingUser: true, reason: 'AWAITING: Only the private B cutoff remains.' };
+  });
+  const model = {
+    async getResponse() {
+      calls++;
+      const args = { question, options: ['10', '20'], purpose: 'clarification',
+        publicAnswer: mode === 'rejected-first' && calls === 1 ? 'Measurement A is 99.' : publicAnswer };
+      return { responseId: `public-answer-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 }, output: [
+        ...(mode === 'same-frame' ? [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: publicAnswer }] }] : []),
+        { type: 'function_call', callId: `public-answer-call-${calls}`, name: mode === 'wrapped' ? 'call_tool' : 'ask_user_question',
+          arguments: JSON.stringify(mode === 'wrapped' ? { name: 'ask_user_question', args_json: args } : args) },
+      ] };
+    },
+    async *getStreamedResponse() {
+      const response = await this.getResponse();
+      yield { type: 'response_started' };
+      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
+    },
+  };
+  const result = await runConversation({ sessionId: session.id, sourceUserSeq: source.seq, input: request, reuseRecordedUserInput: true,
+    runAttemptId: attempt.attemptId, turnEngine: 'host_v1', maxSteps: 3, maxTurns: 3, toolCallsPerTurn: 6, judgeCompletion: true,
+    buildAgent: async context => buildOrchestratorAgent({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
+      hostFreshPlanning: context.hostFreshPlanning, userInput: request, allowToolJit: true, model: model as never }),
+    makeRunner: () => Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not run'); } }) as never,
+  });
+  const asks = events.listEvents(session.id, { types: ['awaiting_user_input'] }).filter(row => row.data.sourceUserSeq === source.seq);
+  assert.equal(calls, mode === 'rejected-first' ? 2 : 1);
+  assert.equal(reviews.length, calls, 'same existing review per candidate; no extra call for narration');
+  assert.ok(reviews.every(row => row.posted === 0), 'all candidates are reviewed before the single public question');
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0]!.data.question, question);
+  assert.deepEqual(asks[0]!.data.options, ['10', '20']);
+  const delivered = result.publicPresentation?.text ?? String(result.finalOutput ?? '');
+  assert.equal(delivered, `${publicAnswer}\n\n${question}`);
+  assert.equal(asks[0]!.data.publicAnswer, publicAnswer);
+  assert.ok(reviews.at(-1)!.reply.includes(delivered), 'the exact full delivered reply was reviewed');
+  assert.ok(reviews.at(-1)!.evidence?.includes(JSON.stringify({ question, options: ['10', '20'] })));
+  assert.doesNotMatch(delivered, /99/);
+  assert.ok(events.listEvents(session.id, { types: ['goal_alignment_judged'] }).every(row => row.seq < asks[0]!.seq));
+});
+}
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function task(sessionId = events.createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' }).id) {
@@ -118,9 +200,9 @@ test('no-context/default construction preserves the exact legacy schema and desc
   assert.equal(toolOf(agent, 'ask_user_question').description, LEGACY_DESCRIPTION);
 });
 
-test('fresh captured source selects v2 through direct, scoped discovery and wrapped SDK invocation', async () => {
+test('fresh captured source selects v3 through direct, scoped discovery and wrapped SDK invocation', async () => {
   const { input, context } = captured();
-  assert.equal(JSON.parse(stored(input).identity_json).questionToolWireEdition, 'clarification_v2');
+  assert.equal(JSON.parse(stored(input).identity_json).questionToolWireEdition, 'clarification_v3');
   const agent = await build(context); const direct = toolOf(agent, 'ask_user_question');
   // v2 drops the legacy approval value; asking the owner to connect an app is its own purpose.
   assert.deepEqual(purposeValues(direct.parameters), ['clarification', 'connection']);
@@ -130,7 +212,7 @@ test('fresh captured source selects v2 through direct, scoped discovery and wrap
   assert.ok(Array.isArray(search.results), `controlled scoped discovery returned ${JSON.stringify(search)}`);
   assert.ok(search.results.some((row: any) => row.name === 'ask_user_question'));
   assert.deepEqual(search.schemas.ask_user_question.properties.purpose, direct.parameters.properties.purpose);
-  const good = { question: 'Which controlled format should I use?', options: ['Short', 'Detailed'], purpose: 'clarification' };
+  const good = { question: 'Which controlled format should I use?', options: ['Short', 'Detailed'], purpose: 'clarification', publicAnswer: null };
   const directResult = decode(await invoke(context, direct, good));
   assert.equal(directResult.kind, 'clementine.ask_user_question.candidate'); assert.equal(directResult.posted, false);
   const wrapped = toolOf(agent, 'call_tool');
@@ -146,7 +228,7 @@ test('fresh captured source selects v2 through direct, scoped discovery and wrap
   assert.deepEqual(pending.listPendingActions({ sessionId: input.sessionId, status: 'all' }), []);
 });
 
-test('old identity bytes/digest stay unchanged, SDK legacy approval repair remains non-halting and a new source gets v2', async () => {
+test('old identity bytes/digest stay unchanged, SDK legacy approval repair remains non-halting and a new source gets v3', async () => {
   const first = captured(); const old = retainedSibling(first.input); const before = stored(old);
   const legacy = contexts.readSourceSessionContext(old, before.identity_digest); assert.ok(legacy);
   assert.equal(scope.sourceQuestionToolWireEdition(legacy), 'legacy_v1');
@@ -166,7 +248,7 @@ test('old identity bytes/digest stay unchanged, SDK legacy approval repair remai
     assert.deepEqual(pending.listPendingActions({ sessionId: old.sessionId, status: 'all' }), []);
     assert.equal(events.listEvents(old.sessionId, { types: ['approval_requested'] }).length, 0);
   } finally { policy.saveProactivityPolicy({ autoApproveScope: 'balanced' }); }
-  const next = captured(task(old.sessionId)); assert.equal(scope.sourceQuestionToolWireEdition(next.context), 'clarification_v2');
+  const next = captured(task(old.sessionId)); assert.equal(scope.sourceQuestionToolWireEdition(next.context), 'clarification_v3');
   events.closeEventLog(); const reopened = contexts.readSourceSessionContext(old, before.identity_digest); assert.ok(reopened);
   assert.equal(scope.sourceQuestionToolWireEdition(reopened), 'legacy_v1'); assert.deepEqual(stored(old), before);
   assert.deepEqual(toolOf(await build(reopened), 'ask_user_question').parameters, buildAskUserQuestionTool().parameters);
@@ -184,17 +266,17 @@ test('fresh capture whitelists source identity and ignores wider caller edition/
     memoryScope: { projectId: 'foreign', agentKey: 'foreign' }, unexpectedSourceExtra: 'not durable' };
   const context = contexts.captureFreshSourceSessionContext(wider); assert.ok(context);
   const before = stored(input); const identity = JSON.parse(before.identity_json);
-  assert.equal(identity.version, 1); assert.equal(identity.questionToolWireEdition, 'clarification_v2');
+  assert.equal(identity.version, 1); assert.equal(identity.questionToolWireEdition, 'clarification_v3');
   assert.equal(Object.hasOwn(identity, 'unexpectedSourceExtra'), false);
   assert.equal(Object.hasOwn(context, 'version'), false); assert.equal(Object.hasOwn(context, 'unexpectedSourceExtra'), false);
   assert.notEqual(context.digest, wider.digest); assert.notDeepEqual(context.memoryScope, wider.memoryScope);
-  assert.equal(scope.sourceQuestionToolWireEdition(context), 'clarification_v2');
+  assert.equal(scope.sourceQuestionToolWireEdition(context), 'clarification_v3');
   const reopened = contexts.readSourceSessionContext(input, context.digest); assert.ok(reopened);
-  assert.equal(scope.sourceQuestionToolWireEdition(reopened), 'clarification_v2');
+  assert.equal(scope.sourceQuestionToolWireEdition(reopened), 'clarification_v3');
   assert.deepEqual(stored(input), before);
 });
 
-test('shape-spoofed/copied contexts cannot select v2; mutated references and foreign source are rejected', async () => {
+test('shape-spoofed/copied contexts cannot select v3; mutated references and foreign source are rejected', async () => {
   const { input, context } = captured();
   const clone = { ...context };
   assert.throws(() => scope.withSourceSessionContext(clone, () => scope.questionToolWireEditionForSource(input.sessionId, input.sourceUserSeq)), /not validated/);
@@ -222,7 +304,7 @@ test('helpers retain parent edition after reopen and a changed child edition can
   assert.equal(scope.sourceQuestionToolWireEdition(parent), 'legacy_v1');
 });
 
-test('verified approval continuation reads its original legacy source rather than capturing the new control as v2', async () => {
+test('verified approval continuation reads its original legacy source rather than capturing the new control as v3', async () => {
   const first = captured(); const old = retainedSibling(first.input); const card = approvals.register({ sessionId: old.sessionId,
     subject: 'Controlled continuation choice', tool: 'request_approval', args: {} });
   assert.equal(approvals.resolve(card.approvalId, 'approved', 'fixture').ok, true);
@@ -239,7 +321,7 @@ test('verified approval continuation reads its original legacy source rather tha
   assert.equal(stored({ sessionId: old.sessionId, sourceUserSeq: control.seq }), undefined, 'control does not mint a fresh composition or wire');
 });
 
-for (const mode of ['wrapped_only', 'duplicate_direct', 'wrapped_foreign_history', 'direct_foreign_history',
+for (const mode of ['wrapped_only', 'retained_v2', 'duplicate_direct', 'wrapped_foreign_history', 'direct_foreign_history',
   'stop_before_post', 'revoked_before_post', 'caller_aborted', 'refused_no_handle', 'foreign_result'] as const) {
 test(`real host wrapped clarification posts once and halts (${mode})`, async () => {
   const duplicateDirect = mode === 'duplicate_direct'; const directOnly = mode === 'direct_foreign_history';
@@ -248,7 +330,8 @@ test(`real host wrapped clarification posts once and halts (${mode})`, async () 
   const refused = mode === 'refused_no_handle';
   const controller = new AbortController();
   const session = events.createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop', title: 'Controlled wrapped clarification fixture' });
-  const args = { question: 'Which controlled output format do you prefer?', options: ['Short', 'Detailed'], purpose: 'clarification' };
+  const args = { question: 'Which controlled output format do you prefer?', options: ['Short', 'Detailed'], purpose: 'clarification',
+    ...(mode === 'retained_v2' ? {} : { publicAnswer: null }) };
   const candidateBytes = JSON.stringify({ kind: 'clementine.ask_user_question.candidate', status: 'staged', posted: false, ...args });
   const fixtureFile = path.join(home, `candidate-${session.id}.txt`);
   if (mode === 'foreign_result') writeFileSync(fixtureFile, candidateBytes);
@@ -263,8 +346,18 @@ test(`real host wrapped clarification posts once and halts (${mode})`, async () 
     : 'Ask which controlled output format I prefer before continuing.';
   const source = events.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
     data: { text: request, taskMode: { version: 1, kind: 'normal' } } }, { armRunInFlight: true });
+  // Insert an old-format fixture before the source is first opened. Production
+  // retained rows are immutable; the host must preserve these exact bytes.
+  if (mode === 'retained_v2') {
+    const template = captured();
+    const identity = { ...JSON.parse(stored(template.input).identity_json),
+      sessionId: session.id, sourceUserSeq: source.seq, questionToolWireEdition: 'clarification_v2' };
+    events.openEventLog().prepare('INSERT INTO source_session_contexts_v1(session_id,source_user_seq,identity_json,identity_digest) VALUES(?,?,?,?)')
+      .run(session.id, source.seq, JSON.stringify(identity), hash(identity));
+  }
   const composition = contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
-  assert.ok(composition); assert.equal(scope.sourceQuestionToolWireEdition(composition), 'clarification_v2');
+  assert.ok(composition); assert.equal(scope.sourceQuestionToolWireEdition(composition), mode === 'retained_v2' ? 'clarification_v2' : 'clarification_v3');
+  const frozenContext = stored({ sessionId: session.id, sourceUserSeq: source.seq });
   const submittedArgs = refused ? { ...args, purpose: 'approval' } : args;
   const outerArgs = { name: 'ask_user_question', args_json: submittedArgs };
   let modelCalls = 0; let witnessed = 0; let callbackFailure: unknown;
@@ -361,6 +454,7 @@ test(`real host wrapped clarification posts once and halts (${mode})`, async () 
           abstain({ ...wrapped, output: ` ${wrapped.output}` });
           abstain({ ...wrapped, runItem: { rawItem: { callId: 'not-an-actual-settled-call' } } });
           abstain({ ...wrapped, argumentsJson: JSON.stringify({ name: 'ask_user_question', args_json: { ...args, question: 'A different controlled question?' } }) });
+          abstain({ ...wrapped, argumentsJson: JSON.stringify({ name: 'ask_user_question', args_json: { ...args, publicAnswer: 'Changed public answer.' } }) });
           abstain({ ...wrapped, argumentsJson: JSON.stringify({ name: 'ask_user_question', args_json: { agentSlug: 'fixture', question: args.question } }) });
           const callbackFields = (callbackContext as { context: Record<string, unknown> }).context;
           abstain(wrapped, { context: { ...callbackFields, sourceUserSeq: source.seq + 10_000 } });
@@ -385,8 +479,15 @@ test(`real host wrapped clarification posts once and halts (${mode})`, async () 
         }
         const decision = userChoiceToolUseBehavior(callbackContext, results);
         if (decision.isFinalOutput) {
-          const repeated = userChoiceToolUseBehavior(callbackContext, results);
+          // Independent restaging has its own capture; it must not claim the
+          // host's one publication slot twice. Commit dedup is tested separately.
+          let restaged = 0;
+          const repeated = withQuestionPublicationCapture(() => { restaged++; },
+            () => userChoiceToolUseBehavior(callbackContext, results));
           assert.equal(repeated.isFinalOutput, true, 'repeated same-source arbitration remains terminal without a second post');
+          assert.equal(restaged, 1);
+          assert.equal(events.listEvents(session.id, { types: ['awaiting_user_input'] })
+            .filter(row => row.data.sourceUserSeq === source.seq).length, 0, 'restaging never publishes an unreviewed question');
         }
         return decision;
         } catch (error) { callbackFailure = error; throw error; }
@@ -401,6 +502,7 @@ test(`real host wrapped clarification posts once and halts (${mode})`, async () 
     if (mode === 'revoked_before_post') assert.equal(callbackFailure.name, 'StaleDispatchLeaseError');
     if (mode === 'caller_aborted') assert.equal(callbackFailure, controller.signal.reason);
   } else if (callbackFailure) throw callbackFailure;
+  assert.deepEqual(stored({ sessionId: session.id, sourceUserSeq: source.seq }), frozenContext, 'actual host reopen preserves source identity bytes and digest');
   assert.equal(witnessed, directOnly ? 0 : 1, 'the actual SDK carrier result reached the host callback with exact durable proof');
   assert.equal(modelCalls, refused ? 2 : 1, refused ? 'the real schema refusal returns to the mock brain without inventing a question' : 'one public question ends the provider activation');
   const allQuestions = events.listEvents(session.id, { types: ['awaiting_user_input'] });

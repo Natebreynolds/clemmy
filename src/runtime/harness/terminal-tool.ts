@@ -233,6 +233,9 @@ export function awaitingUserInputWithSpokenText(finalOutput: string, spoken: str
   const question = parseAwaitingUserInputFinalOutput(finalOutput);
   const words = spokenWordsBeforeAsking(spoken ?? '');
   if (!question || !words) return finalOutput;
+  // A current question tool may already carry this exact public preamble.
+  // Preserve differing claims for review; never infer semantic equivalence.
+  if (question.startsWith(`${words}\n\n`)) return finalOutput;
   if (words === question || words.endsWith(question)) return formatAwaitingUserInputFinalOutput(words);
   return formatAwaitingUserInputFinalOutput(`${words}\n\n${question}`);
 }

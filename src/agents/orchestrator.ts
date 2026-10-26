@@ -593,6 +593,8 @@ type AskUserQuestionCandidate = {
   question: string;
   options: string[] | null;
   purpose: 'clarification' | 'approval' | 'connection' | null;
+  /** Present only on the v3 wire; public prose, never completion authority. */
+  publicAnswer?: string | null;
 };
 
 /** A link in model-written question text: a Markdown link or a URL. */
@@ -610,6 +612,7 @@ function askUserQuestionCandidate(output: unknown): AskUserQuestionCandidate | n
     || candidate.status !== 'staged'
     || candidate.posted !== false
     || typeof candidate.question !== 'string'
+    || (Object.hasOwn(candidate, 'publicAnswer') && candidate.publicAnswer !== null && typeof candidate.publicAnswer !== 'string')
     || !(
       candidate.options === null
       || (Array.isArray(candidate.options) && candidate.options.every((option) => typeof option === 'string'))
@@ -625,16 +628,24 @@ function askUserQuestionCandidate(output: unknown): AskUserQuestionCandidate | n
 }
 
 function exactAskUserQuestionCandidateKey(candidate: AskUserQuestionCandidate): string {
-  return JSON.stringify([candidate.question, candidate.options, candidate.purpose]);
+  return JSON.stringify([candidate.question, candidate.options, candidate.purpose,
+    ...(Object.hasOwn(candidate, 'publicAnswer') ? [candidate.publicAnswer] : [])]);
+}
+
+function questionFinalOutput(question: string, publicAnswer?: string | null): string {
+  const answer = publicAnswer?.trim();
+  return formatAwaitingUserInputFinalOutput(answer ? `${answer}\n\n${question}` : question);
 }
 
 function renderAskUserQuestionCandidates(candidates: AskUserQuestionCandidate[]): {
   question: string;
   options: string[] | null;
+  publicAnswer?: string;
 } {
   const [only] = candidates;
   if (candidates.length === 1 && only) {
-    return { question: only.question, options: only.options };
+    return { question: only.question, options: only.options,
+      ...(only.publicAnswer?.trim() ? { publicAnswer: only.publicAnswer.trim() } : {}) };
   }
   const countLabel = candidates.length === 2 ? 'two' : String(candidates.length);
   const answerLabel = candidates.length === 2 ? 'both answers' : 'each answer';
@@ -656,6 +667,11 @@ function renderAskUserQuestionCandidates(candidates: AskUserQuestionCandidate[])
     // top-level array would make a reply like "2" ambiguous, so the bundled
     // question renders those choices inline and keeps the outer options empty.
     options: null,
+    // These are explicit public answers from this same provider-ordered batch,
+    // never recovered private reasoning or prose from an earlier turn.
+    ...(candidates.some(candidate => candidate.publicAnswer?.trim()) ? {
+      publicAnswer: candidates.map(candidate => candidate.publicAnswer?.trim()).filter(Boolean).join('\n\n'),
+    } : {}),
   };
 }
 
@@ -1080,8 +1096,10 @@ function hostOwnedWrappedQuestionCandidate(context: unknown, result: Orchestrato
     || authority.authority.identity.acceptedTaskId !== acceptedTaskId
     || authority.authority.identity.sourceTurn !== extractTurn(context)) return null;
   const raw = durableLogicalCallRecoveryMaterial(acceptedTaskId, 'call_tool', outer);
+  const answerEdition = questionToolWireEditionForSource(sessionId, sourceUserSeq) === 'clarification_v3';
   if (!raw || raw.toolName !== 'ask_user_question'
-    || Object.keys(raw.args).some(key => !['question', 'options', 'purpose'].includes(key))) return null;
+    || Object.keys(raw.args).some(key => !['question', 'options', 'purpose', ...(answerEdition ? ['publicAnswer'] : [])].includes(key))
+    || (answerEdition && !Object.hasOwn(raw.args, 'publicAnswer'))) return null;
   const identity = { sessionId, sourceUserSeq, acceptedTaskId, logicalToolCallId };
   const read = redeemDurableLogicalCallSettlementForHost(identity);
   if (read.status !== 'ok') return null;
@@ -1097,12 +1115,15 @@ function hostOwnedWrappedQuestionCandidate(context: unknown, result: Orchestrato
   const carrierBytes = typeof retained.value.rawPayload === 'string' ? retained.value.rawPayload : retained.value.rawPayloadJson;
   if (typeof result.output !== 'string' || result.output !== carrierBytes) return null;
   const candidate = askUserQuestionCandidate(result.output);
-  if (!candidate || Object.keys(candidate).sort().join('|') !== 'kind|options|posted|purpose|question|status') return null;
+  if (!candidate || Object.keys(candidate).sort().join('|') !== (answerEdition
+    ? 'kind|options|posted|publicAnswer|purpose|question|status' : 'kind|options|posted|purpose|question|status')) return null;
   const effective = durableLogicalCallContract(acceptedTaskId, 'ask_user_question', {
     question: candidate.question, options: candidate.options, purpose: candidate.purpose,
+    ...(answerEdition ? { publicAnswer: candidate.publicAnswer } : {}),
   });
   const submitted = durableLogicalCallContract(acceptedTaskId, 'ask_user_question', {
     question: raw.args.question, options: raw.args.options ?? null, purpose: raw.args.purpose ?? null,
+    ...(answerEdition ? { publicAnswer: raw.args.publicAnswer } : {}),
   });
   return effective?.argumentDigest === settled.argumentDigest && submitted?.argumentDigest === settled.argumentDigest
     ? candidate : null;
@@ -1269,7 +1290,7 @@ export function userChoiceToolUseBehavior(
       return {
         isFinalOutput: true as const,
         isInterrupted: undefined,
-        finalOutput: rendered.question,
+        finalOutput: rendered.publicAnswer ? `${rendered.publicAnswer}\n\n${rendered.question}` : rendered.question,
       };
     }
     const observedConnection = sourceUserSeq
@@ -1302,7 +1323,8 @@ export function userChoiceToolUseBehavior(
       return {
         isFinalOutput: true as const,
         isInterrupted: undefined,
-        finalOutput: formatAwaitingUserInputFinalOutput(existingQuestion),
+        finalOutput: questionFinalOutput(existingQuestion,
+          typeof existing.data.publicAnswer === 'string' ? existing.data.publicAnswer : null),
       };
     }
     const recoveryProjection = sourceUserSeq
@@ -1315,16 +1337,19 @@ export function userChoiceToolUseBehavior(
     // Copy every public field before a host may await its existing review.
     // The commit closure never re-renders from mutable model result objects.
     const question = recoveryProjection.text;
+    const publicAnswer = rendered.publicAnswer;
     const options = recoveryProjection.constrained || publicAsk.options === null
       ? null : [...publicAsk.options];
     const questionData = recoveryProjection.constrained
         ? {
             question,
+            ...(publicAnswer ? { publicAnswer } : {}),
             source: 'argument_repair_recovery',
             sourceUserSeq,
           }
         : {
             question,
+            ...(publicAnswer ? { publicAnswer } : {}),
             options,
             // A connection question is answered like any clarification.
             purpose: purpose === 'connection' ? 'clarification' : purpose,
@@ -1337,6 +1362,7 @@ export function userChoiceToolUseBehavior(
                   bundled: true,
                   questions: candidates.map((candidate) => ({
                     question: candidate.question,
+                    ...(candidate.publicAnswer?.trim() ? { publicAnswer: candidate.publicAnswer.trim() } : {}),
                     options: candidate.options === null ? null : [...candidate.options],
                     purpose: candidate.purpose === 'connection' ? 'clarification' : candidate.purpose,
                   })),
@@ -1347,7 +1373,7 @@ export function userChoiceToolUseBehavior(
     const ready = publishOrDeferQuestionPublication({
       question,
       options,
-      modelAuthored: clemAsked && (!connectionProjection || ownConnectionWords) && !recoveryProjection.constrained,
+      modelAuthored: Boolean(publicAnswer) || (clemAsked && (!connectionProjection || ownConnectionWords) && !recoveryProjection.constrained),
     }, () => {
       // A review may have awaited. Reopen wrapped ownership immediately before
       // deduplication and append; no await separates this check from the post.
@@ -1362,7 +1388,7 @@ export function userChoiceToolUseBehavior(
     return {
       isFinalOutput: true as const,
       isInterrupted: undefined,
-      finalOutput: formatAwaitingUserInputFinalOutput(question),
+      finalOutput: questionFinalOutput(question, publicAnswer),
     };
   }
 
@@ -1781,6 +1807,10 @@ const clarificationQuestionParams = askUserQuestionParams.extend({
   purpose: z.enum(['clarification', 'connection']).nullable().describe('Use "clarification" for a missing fact or choice only the user has; "connection" when asking them to connect an app (the host adds its Connect button); null if neither.'),
 });
 
+const publicAnswerQuestionParams = clarificationQuestionParams.extend({
+  publicAnswer: z.string().min(1).nullable().describe('Public answer or completed independent work to show before the question; null when there is none. Keep the question and its choices in their own fields.'),
+});
+
 export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'legacy_v1') {
   if (!parseQuestionToolWireEdition(edition)) throw new Error('Unknown question tool wire edition.');
   const legacy = edition === 'legacy_v1';
@@ -1795,8 +1825,8 @@ export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'leg
       + 'independent questions. `purpose`: "clarification" = a fact only they have, or a choice between different '
       + (legacy ? 'ways forward. "approval" is a legacy compatibility value, not a way to request formal execution consent. ' : 'ways forward. ')
       + CLARIFICATION_APPROVAL_GUIDANCE,
-    parameters: legacy ? askUserQuestionParams : clarificationQuestionParams,
-    execute: async (args: z.infer<typeof askUserQuestionParams> | z.infer<typeof clarificationQuestionParams>, runContext) => {
+    parameters: legacy ? askUserQuestionParams : edition === 'clarification_v3' ? publicAnswerQuestionParams : clarificationQuestionParams,
+    execute: async (args: z.infer<typeof askUserQuestionParams> | z.infer<typeof clarificationQuestionParams> | z.infer<typeof publicAnswerQuestionParams>, runContext) => {
       const sessionId = extractSessionId(runContext);
       if (sessionId) {
         const lastUser = [...listEvents(sessionId, { types: ['user_input_received'] })].at(-1);
@@ -1872,6 +1902,7 @@ export function buildAskUserQuestionTool(edition: QuestionToolWireEdition = 'leg
           question: args.question,
           options: args.options ?? null,
           purpose: args.purpose ?? null,
+          ...(edition === 'clarification_v3' && 'publicAnswer' in args ? { publicAnswer: args.publicAnswer } : {}),
         } satisfies AskUserQuestionCandidate;
       }
       return `Question ready for the caller: ${args.question}. No session was available to post it.`;
