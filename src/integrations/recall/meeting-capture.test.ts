@@ -4,6 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -46,6 +48,54 @@ function identifiedFinal(windowId: string, sdkUploadId: string, id = 'a') {
   return { windowId, sdkUploadId, event: 'transcript.data', isFinal: true, text: 'A controlled final utterance',
     eventId: `recall-final-${id.repeat(64)}`, eventIdentity: 'sdk' as const, participantId: '7', sourceStartSeconds: 10, sourceEndSeconds: 11 };
 }
+
+test('owned capture alias migrations refresh the inventory even when the directory generation is stable', (t) => {
+  const directory = path.join(TMP_HOME, 'state', 'meeting-capture', 'recall-recordings');
+  const input = { windowId: 'stable-directory-fixture-window', status: 'recording' as const };
+  const original = noteRecallMeetingDetected(input);
+  const neighbor = noteRecallMeetingDetected({ windowId: 'stable-directory-fixture-neighbor',
+    sdkUploadId: 'stable-directory-fixture-neighbor-upload', status: 'recording' });
+  const neighborPath = path.join(directory, 'stable-directory-fixture-neighbor-upload.json');
+  const neighborBytes = readFileSync(neighborPath, 'utf8');
+  assert.equal(loadRecallMeetingById(original.id)?.id, original.id);
+  const originalLstat = fs.lstatSync;
+  const frozen = originalLstat(directory, { bigint: true });
+  const tuple = () => {
+    const stat = originalLstat(directory, { bigint: true });
+    return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
+  };
+  const before = tuple();
+  const mocked = t.mock.method(fs, 'lstatSync', new Proxy(originalLstat, {
+    apply(target, receiver, args) {
+      return args[0] === directory && args[1]?.bigint === true
+        ? frozen : Reflect.apply(target, receiver, args);
+    },
+  }));
+  syncBuiltinESMExports();
+  try {
+    const sdkUploadId = 'stable-directory-fixture-upload';
+    const recordingId = 'stable-directory-fixture-recording';
+    const uploaded = noteRecallMeetingDetected({ ...input, sdkUploadId });
+    t.diagnostic(JSON.stringify({ fixture: 'owned-stable-directory-alias-migration', actualBefore: before,
+      actualAfterUpload: tuple(), directoryGenerationHeldStable: true }));
+    assert.equal(uploaded.id, original.id);
+    assert.equal(loadRecallMeetingById(original.id)?.sdkUploadId, sdkUploadId,
+      'the owned window-to-upload migration is immediately readable');
+    assert.equal(existsSync(path.join(directory, `${input.windowId}.json`)), false);
+    const recorded = noteRecallMeetingDetected({ ...input, sdkUploadId, recordingId });
+    assert.equal(recorded.id, original.id);
+    assert.equal(loadRecallMeetingById(original.id)?.recordingId, recordingId,
+      'the owned upload-to-recording migration is immediately readable');
+    assert.equal(existsSync(path.join(directory, `${sdkUploadId}.json`)), false);
+    assert.equal(findRecallMeetingRecord({ sdkUploadId })?.id, original.id);
+    assert.equal(findRecallMeetingRecord({ recordingId })?.id, original.id);
+    assert.equal(loadRecallMeetingById(neighbor.id)?.id, neighbor.id);
+    assert.equal(readFileSync(neighborPath, 'utf8'), neighborBytes);
+  } finally {
+    mocked.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
 
 test('native recording epoch enriches only its exact upload and preserves historical detection time through replay and completion', () => {
   const windowId = 'canonical-epoch-fixture-window'; const sdkUploadId = 'canonical-epoch-fixture-upload';

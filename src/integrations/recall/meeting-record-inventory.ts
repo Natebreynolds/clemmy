@@ -52,6 +52,12 @@ export class MeetingRecordInventory {
 
   constructor(private readonly directory: string) {}
 
+  /** Known pathname changes must not depend on filesystem timestamp granularity.
+   * Retain per-file metadata; the next lookup only re-enumerates the directory. */
+  invalidateDirectory(): void {
+    this.directoryGeneration = null;
+  }
+
   observeReadsForTests(observer: MeetingRecordReadObserver | undefined): () => void {
     const previous = this.observer;
     this.observer = observer;
@@ -111,7 +117,12 @@ export class MeetingRecordInventory {
     for (const [filePath, cached] of this.files) {
       let stamp: string;
       try { stamp = generation(filePath); }
-      catch { this.replace(filePath, { generation: null, entry: null }); certain = false; continue; }
+      catch (error) {
+        this.replace(filePath, { generation: null, entry: null });
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') this.invalidateDirectory();
+        certain = false;
+        continue;
+      }
       if (stamp !== cached.generation) {
         try {
           const row = metadata(this.parse(filePath, 'inventory'));

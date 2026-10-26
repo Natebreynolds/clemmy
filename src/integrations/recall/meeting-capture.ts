@@ -792,6 +792,7 @@ function saveMeetingRecord(record: RecallMeetingRecord, options: { projectMemory
     if (alias.filePath === targetPath || !recordInventory.matchesGeneration(alias)) continue;
     try { unlinkSync(alias.filePath); } catch { /* best-effort alias cleanup */ }
   }
+  recordInventory.invalidateDirectory();
   // Meeting persistence owns the canonical projection. A memory-DB failure
   // must not corrupt the already-durable recording; maintenance can replay it.
   if (options.projectMemory !== false) {

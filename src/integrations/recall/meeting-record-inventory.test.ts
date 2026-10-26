@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { MeetingRecordInventory } from './meeting-record-inventory.js';
@@ -91,5 +93,47 @@ test('a new pathname during selected read prevents using a partial identity inve
     assert.equal(f.inventory.readSelected(selected), null);
     f.inventory.observeReadsForTests(undefined);
     assert.equal(f.inventory.lookup('id', 'active').entries.length, 2);
+  } finally { f.cleanup(); }
+});
+
+test('a vanished cached pathname invalidates a stable directory generation before the next lookup', (t) => {
+  const f = fixture();
+  const originalLstat = fs.lstatSync;
+  const tuple = () => {
+    const stat = originalLstat(f.directory, { bigint: true });
+    return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
+  };
+  try {
+    const oldPath = f.writes('old-alias.json', f.record('active'));
+    f.writes('neighbor.json', f.record('neighbor'));
+    const retained = f.inventory.lookup('id', 'active');
+    assert.equal(retained.certain, true);
+    const before = tuple();
+    const frozen = originalLstat(f.directory, { bigint: true });
+    const mocked = t.mock.method(fs, 'lstatSync', new Proxy(originalLstat, {
+      apply(target, receiver, args) {
+        return args[0] === f.directory && args[1]?.bigint === true
+          ? frozen : Reflect.apply(target, receiver, args);
+      },
+    }));
+    syncBuiltinESMExports();
+    try {
+      const currentPath = path.join(f.directory, 'current-alias.json');
+      renameSync(oldPath, currentPath);
+      t.diagnostic(JSON.stringify({ fixture: 'stable-directory-alias-migration', actualBefore: before,
+        actualAfter: tuple(), directoryGenerationHeldStable: true }));
+      assert.equal(f.inventory.lookup('id', 'active').certain, false,
+        'the first missing-path observation remains fail closed');
+      assert.equal(f.inventory.readSelected(retained.entries[0]), null,
+        'a vanished old pathname never retains read authority');
+      const recovered = f.inventory.lookup('id', 'active');
+      assert.equal(recovered.certain, true, 'the next lookup enumerates the actual current paths');
+      assert.deepEqual(recovered.entries.map((entry) => entry.filePath), [currentPath]);
+      assert.equal((f.inventory.readSelected(recovered.entries[0]) as { id: string }).id, 'active');
+      assert.equal(f.inventory.lookup('id', 'neighbor').entries.length, 1);
+    } finally {
+      mocked.mock.restore();
+      syncBuiltinESMExports();
+    }
   } finally { f.cleanup(); }
 });
