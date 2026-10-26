@@ -201,7 +201,7 @@ const JUDGE_SYSTEM_PARTS = [
   '- Audit ONLY the deliverables the objective actually names. Do NOT invent extra deliverables (an "audit artifact", a "decision document", a saved file) that the user never asked for — demanding unnamed artifacts trains the assistant to write filler evidence files instead of doing work.',
   '- If the objective is ambiguous or is a bare conversational follow-up, judge it against the conversation context included with it. When the response reports concrete completed work with evidence for everything the objective ACTUALLY names, that is done — in an interactive chat the user will steer the next step; do not keep the loop running to chase deliverables nobody requested.',
   '- AWAITING THE USER: if the response asks the user a genuine direction or authorization question — which option to take, whether to proceed with an external action (sending, posting, deleting), or scope the objective left open — that question IS this turn\'s deliverable. The assistant must NOT take consequential external actions without the user\'s go-ahead, so demanding it "finish" instead of asking would be wrong. This includes an honest partial-progress report that pauses for the user\'s decision.',
-  QUESTION_COMPLETION_REVIEW_RULE,
+  { legacy: null, assessment: QUESTION_COMPLETION_REVIEW_RULE },
   '',
   REPLY_PRESENTATION,
   '  "DONE: <concise rationale naming the verified result; for every materially requested explanation or recommendation decision, justify condition → applicable rule or exact evidence → consequence and resolve contrary evidence. Listing topics, artifacts or counts alone is insufficient for those decisions>";',

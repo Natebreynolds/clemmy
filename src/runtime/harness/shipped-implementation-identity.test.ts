@@ -310,7 +310,9 @@ test('npm pack file list includes implementation artifacts and manifest', () => 
   assert.match(build, /dist\/runtime\/harness\/implementation-artifacts\/emitted/);
   const distArtifacts = path.join(repoRoot, 'dist/runtime/harness/implementation-artifacts/emitted');
   emitShippedImplementationArtifacts(distArtifacts);
-  const packed = spawnSync('npm', ['pack', '--dry-run', '--json'], {
+  // This checks the file list after explicit emission. Actual prepack/build
+  // and packaged smoke remain separate release gates, including vendored assets.
+  const packed = spawnSync('npm', ['pack', '--ignore-scripts', '--dry-run', '--json'], {
     encoding: 'utf8',
     cwd: repoRoot,
   });

@@ -579,10 +579,11 @@ test('an inherited-read ASK is reviewed against the whole stopped objective and 
 
 test('review-confirmed required input remains a typed inherited-read pause without further execution', async () => {
   const f = await inheritedAskFixture();
-  const ask = 'ASK: The retained lines are FIRST and REMAINING. Which interpretation did you intend?';
+  const question = 'The retained lines are FIRST and REMAINING. Which interpretation did you intend?';
+  const ask = `ASK: ${question}`;
   script = ['AWAITING: the owner must choose the intended interpretation of the retained lines.'].map(withSupportedAssessment);
   const result = await f.run([ask]);
-  assert.equal(result.finalOutput, ask);
+  assert.equal(result.finalOutput, question, 'the internal ASK marker is not owner-facing text');
   assert.deepEqual(result.terminal, { status: 'awaiting_user_input', reason: 'completion_review_needs_input' });
   assert.equal(f.modelCalls(), 1);
   assert.equal(requests.length, 1);

@@ -43,6 +43,14 @@ const read: Context = {
 const objective = 'Read the local status and report it.';
 const reply = 'The source says status=ready.';
 const judged = { verdict: { done: true, reason: 'The configured reviewer verified the exact result.' }, failure: null };
+const questionReviewRule = '- A clarification must identify the actual missing information or decision and make it possible for the user to answer. A vague question, a question already answered by the accepted request or available evidence, or an unnecessary request to authorize already-authorized work is INCOMPLETE. Check the full reply and offered choices together. A necessary question about one unresolved part does not establish completion of other requested work or excuse independent authorized work that can still proceed. Preserve honest partial progress and never invent a missing value or demand an unauthorized action.';
+const liveRequirementPrefix = `${HOST_COMPLETION_EVIDENCE_GUIDANCE}\n${questionReviewRule}`;
+function assertLiveQuestionRule(): void {
+  const instructions = buildCompletionJudgeInstructions({ fullSourceEvidence: true,
+    completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE });
+  assert.equal(instructions.split(questionReviewRule).length - 1, 1,
+    'the configured live reviewer carries the same complete question rule exactly once');
+}
 const flush = async () => {
   for (let i = 0; i < 40; i++) await Promise.resolve();
   await new Promise<void>(resolve => setImmediate(resolve));
@@ -438,7 +446,8 @@ test('Jev receives exact host semantics separately from full source evidence', a
   assert.equal(payload?.state.response, reply);
   assert.ok(payload?.state.evidence?.includes(read.toolCallSummary));
   assert.ok(payload?.state.evidence?.includes(read.verifiedReads!));
-  assert.equal(payload?.state.requirementContext, HOST_COMPLETION_EVIDENCE_GUIDANCE);
+  assert.equal(payload?.state.requirementContext, liveRequirementPrefix);
+  assertLiveQuestionRule();
   assert.equal(payload?.state.evidence?.includes(HOST_COMPLETION_EVIDENCE_GUIDANCE), false);
 });
 
@@ -468,7 +477,8 @@ for (const owner of ['getters', 'proxy'] as const) {
     const verdict = await judgeObjectiveComplete(objective, reply, context);
     assert.equal(verdict.fast, true); assert.equal(state.reviewerCalls(), 0);
     assert.deepEqual(reads, ['memory', ...expected, 'guide'], 'read eligibility and the later requirement-context guide read keep their original order too');
-    assert.equal(payload?.state.requirementContext, HOST_COMPLETION_EVIDENCE_GUIDANCE);
+    assert.equal(payload?.state.requirementContext, liveRequirementPrefix);
+    assertLiveQuestionRule();
     assert.equal(payload?.state.request, objective); assert.equal(payload?.state.response, reply);
   });
 }
@@ -520,9 +530,12 @@ for (const historical of [false, true]) {
     assert.equal(state.reviewerCalls(), 0);
     const requirements = posted!.state.requirementContext as string;
     assert.equal(requirements.split(HOST_COMPLETION_EVIDENCE_GUIDANCE).length - 1, 1);
+    assert.equal(requirements.split(questionReviewRule).length - 1, 1);
+    assert.ok(requirements.startsWith(`${liveRequirementPrefix}\n`));
+    assertLiveQuestionRule();
     assert.ok(requirements.includes(instructions), 'no standing-instruction text is shortened');
     for (const skill of skills) assert.ok(requirements.includes(renderSkillReference(skill)), 'scope, digest, full body and version are unchanged');
-    const dynamicRequirements = requirements.slice(HOST_COMPLETION_EVIDENCE_GUIDANCE.length + 1);
+    const dynamicRequirements = requirements.slice(liveRequirementPrefix.length + 1);
     assert.ok(buildObjectiveJudgePrompt(request, response, context).includes(dynamicRequirements),
       'the configured reviewer gets exactly the same reference and standing blocks');
     assert.match(requirements, /does not adopt every step or add deliverables/);

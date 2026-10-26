@@ -60,12 +60,34 @@ test('after a failed command, the model may re-read the local files it was told 
       stage: 'execution:unknown_read', recovery: 'repair_model', effectState: 'known_terminal',
       recoveryToolNames: ['work_call', 'tool_search'],
     }),
-    ['read_file', 'list_files', 'work_call', 'write_file', 'http_read', 'delegated_task_correct', 'workflow_create'],
+    ['read_file', 'list_files', 'work_call', 'write_file', 'delegated_task_correct', 'workflow_create'],
   );
   assert.ok(permitted.has('read_file'), 'the failure says to check the current state; reading the file is that check');
   assert.ok(permitted.has('list_files'));
-  for (const other of ['write_file', 'http_read', 'delegated_task_correct', 'workflow_create']) {
+  for (const other of ['write_file', 'delegated_task_correct', 'workflow_create']) {
     assert.ok(!permitted.has(other), `${other} is not a local re-read and stays out of this recovery`);
+  }
+});
+
+test('a settled repair also retains declared native idempotent reads without granting mutation or foreign-tool authority', () => {
+  // Native means the published Clementine tool identity, not filesystem
+  // locality. Normal source/account/schema/consent checks still gate dispatch.
+  const nativeReads = ['http_read', 'mcp__clementine__http_read', 'memory_read'];
+  const excluded = ['write_file', 'workflow_create', 'delegated_task_correct', 'notify_user',
+    'tool_search', 'work_call', 'mcp__foreign__http_read', 'unknown_read'];
+  const tools = [...nativeReads, ...excluded];
+  const settled = consequence(['file_query']);
+  assert.deepEqual([...hostNoProgressRecoveryToolNames(settled, tools)], nativeReads);
+  assert.throws(() => createNoProgressConsequence({
+    stage: 'execution:effect_unknown', recovery: 'repair_model', effectState: 'unknown', recoveryToolNames: [],
+  }), /unknown effect state requires reconciliation/,
+  'an unknown effect cannot enter model repair instead of reconciliation');
+  for (const [recovery, effectState] of [
+    ['reconcile', 'unknown'], ['stop_factual', 'known_terminal'],
+  ] as const) {
+    assert.deepEqual([...hostNoProgressRecoveryToolNames(createNoProgressConsequence({
+      stage: 'execution:effect_unknown', recovery, effectState, recoveryToolNames: [],
+    }), tools)], [], `${recovery}/${effectState} does not gain the settled native-read exception`);
   }
 });
 
