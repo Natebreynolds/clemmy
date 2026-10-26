@@ -3101,7 +3101,14 @@ const runHostTurnBody = async (
     const authoredJson = materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson);
     const authoredArgs = parsedArgs(authoredJson);
     const identity = exactHostIdentity();
-    if (!authoredArgs || actionExpectedWorkRequired(identity)) return;
+    if (!authoredArgs) return;
+    if (actionExpectedWorkRequired(identity)) {
+      // Planned work binds a change through its own requirement; a call whose
+      // arguments are wrong is still refused for those arguments.
+      const planned = unwrapRuntimeEffectiveToolIdentity(call.name, authoredArgs);
+      if (planned.toolName && planned.args) await noteLocalArgumentMismatch(call, planned.toolName, planned.args);
+      return;
+    }
     if (plannedNativeDirectCarry({ ...identity, authoredName: call.name, authoredArgs, authoredArgumentsJson: authoredJson })) return;
     const effective = unwrapRuntimeEffectiveToolIdentity(call.name, authoredArgs);
     const name = effective.toolName;
@@ -3115,7 +3122,11 @@ const runHostTurnBody = async (
     }
     const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
     const prepared = await materializeLocalRuntimeToolArguments(name, effective.args);
-    if (!prepared) return;
+    // A definition's variant can match arguments its strict schema refuses.
+    if (!prepared) {
+      await noteLocalArgumentMismatch(call, name, effective.args);
+      return;
+    }
     const carry: OffSurfaceDirectCarry = {
       carrierName: 'work_call',
       carrierArgs: { requirement_id: requirement, name, args_json: JSON.stringify(prepared.args) },
@@ -3169,6 +3180,8 @@ const runHostTurnBody = async (
         // through another carrier before the schema complaint arrives.
         if (requirement) directLocalCallRequirements.set(call.callId, requirement);
         else await noteLocalArgumentMismatch(call, call.name, args);
+      } else if (args) {
+        await noteLocalArgumentMismatch(call, call.name, args);
       }
       return;
     }
