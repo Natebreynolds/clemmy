@@ -35,6 +35,9 @@ export interface RefusedAttempt {
 export function sourceRefusedAttempts(input: {
   sessionId: string;
   sourceUserSeq: number;
+  /** Authority callers must distinguish unavailable evidence from no refusals.
+   * Existing measurement callers retain their best-effort empty fallback. */
+  requireReadableEvidence?: true;
 }): { count: number; attempts: readonly RefusedAttempt[] } {
   const byLogicalCall = new Map<string, RefusedAttempt>();
   const record = (attempt: RefusedAttempt): void => {
@@ -71,7 +74,8 @@ export function sourceRefusedAttempts(input: {
       if (!REFUSED_EXECUTION_KINDS.has(kind)) continue;
       record({ seq: event.seq, source: 'guardrail', logicalToolCallId: logical, tool, kind });
     }
-  } catch {
+  } catch (error) {
+    if (input.requireReadableEvidence) throw error;
     return { count: 0, attempts: [] };
   }
   const attempts = [...byLogicalCall.values()].sort((left, right) => left.seq - right.seq);

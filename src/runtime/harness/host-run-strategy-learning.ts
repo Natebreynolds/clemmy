@@ -19,6 +19,10 @@ import { recordRunStrategy, runStrategyScopeForSession, shapeOfProvenArguments, 
 import { actionTopologyRoleFor, TOOL_REGISTRY } from '../../tools/tool-registry.js';
 import { TOOL_SEARCH_ALWAYS_LOADED } from '../../agents/tool-catalog.js';
 import { readTurnLearningPolicyForSource } from '../../memory/turn-learning-policy.js';
+import { acceptedTaskIdFor } from './attempt-identity.js';
+import { canonicalLogicalToolName } from './logical-call-contract.js';
+import { redeemDurableLogicalCallSettlementForHost } from './logical-call-settlement-store.js';
+import { loadHostCallCapabilityBinding, type HostCallCapabilityBinding } from './host-call-capability-binding.js';
 
 /** Prefer the settled business tools. Kernel inspection tools only count when
  *  they were the whole run — otherwise they pollute the next proven skip. */
@@ -183,26 +187,71 @@ function deliverableForSource(input: { sessionId: string; sourceUserSeq: number 
 /** Tool-call doors (carriers) say nothing about which tool was refused. */
 const CARRIER_NAMES: ReadonlySet<string> = new Set(['work_call', 'call_tool']);
 
-/** The business tools this source was refused on and never settled with:
- * the work got done through a different door than the one the model first
- * reached for, which is a workaround, not a route to remember. */
+function sameCapability(left: HostCallCapabilityBinding, right: HostCallCapabilityBinding): boolean {
+  return left.effect === right.effect && left.bindingKind === right.bindingKind
+    && left.capabilityId === right.capabilityId && left.accountId === right.accountId
+    && left.operationId === right.operationId && left.invokePortId === right.invokePortId
+    && left.schemaFingerprint === right.schemaFingerprint
+    && left.providerInputSchemaDigest === right.providerInputSchemaDigest
+    && left.manifestId === right.manifestId && left.manifestDigest === right.manifestDigest;
+}
+
+/** A refusal is repaired only by later proof of the same work. A successful
+ * use of the same tool on another target must not teach a workaround route.
+ * Altered arguments can execute through the ordinary recovery path, but cannot
+ * teach a route without stronger complete target proof.
+ * Missing identity remains refused; unreadable evidence reaches the learning
+ * boundary as unavailable, never as an empty refusal list. */
 export function refusedToolsNotAmongUsed(
   input: { sessionId: string; sourceUserSeq: number },
   toolsUsed: readonly string[],
 ): string[] {
-  try {
-    const used = new Set(toolsUsed);
-    const refused = new Set<string>();
-    for (const attempt of sourceRefusedAttempts(input).attempts) {
-      const tool = attempt.tool.trim();
-      if (!tool || CARRIER_NAMES.has(tool) || used.has(tool)) continue;
-      if (selectLearnedStrategyTools([tool]).length === 0) continue;
-      refused.add(tool);
-    }
-    return [...refused].sort();
-  } catch {
-    return [];
+  const attempts = sourceRefusedAttempts({ ...input, requireReadableEvidence: true }).attempts;
+  if (attempts.length === 0) return [];
+  const used = new Set(toolsUsed.map(canonicalLogicalToolName));
+  const refused = new Set<string>();
+  const db = openEventLog();
+  const acceptedTaskId = acceptedTaskIdFor(input.sessionId, input.sourceUserSeq);
+  const successes = db.prepare(`
+    SELECT s.logical_tool_call_id AS logicalToolCallId, e.seq AS seq
+      FROM logical_call_settlements s
+      JOIN events e ON e.id = s.settlement_event_id AND e.session_id = s.session_id
+      JOIN logical_tool_calls l ON l.session_id = s.session_id AND l.source_user_seq = s.source_user_seq
+       AND l.logical_tool_call_id = s.logical_tool_call_id
+     WHERE s.session_id = ? AND s.source_user_seq = ? AND l.accepted_task_id = ?
+       AND s.outcome_kind IN ('succeeded', 'empty_result')
+     ORDER BY e.seq
+  `).all(input.sessionId, input.sourceUserSeq, acceptedTaskId) as Array<{ logicalToolCallId: string; seq: number }>;
+  for (const attempt of attempts) {
+    const tool = canonicalLogicalToolName(attempt.tool);
+    if (!tool || CARRIER_NAMES.has(tool) || selectLearnedStrategyTools([tool]).length === 0) continue;
+    const identity = { ...input, acceptedTaskId, logicalToolCallId: attempt.logicalToolCallId };
+    const prior = used.has(tool) ? redeemDurableLogicalCallSettlementForHost(identity) : null;
+    if (prior?.status === 'storage_error') throw new Error('refusal settlement unavailable');
+    const priorCapability = prior?.status === 'ok' ? loadHostCallCapabilityBinding({ db, ...identity }) : null;
+    if (priorCapability?.status === 'storage_error') throw new Error('refusal capability unavailable');
+    const repaired = prior?.status === 'ok' && priorCapability?.status === 'ok'
+      && prior.settlement.toolName === tool && prior.settlement.executionKind === 'refused_pre_dispatch'
+      && prior.settlement.physicalCrossingCount === 0 && prior.settlement.hostCrossingCount === 0
+      && successes.some(candidate => {
+        if (candidate.seq <= attempt.seq) return false;
+        const nextIdentity = { ...input, acceptedTaskId, logicalToolCallId: candidate.logicalToolCallId };
+        const next = redeemDurableLogicalCallSettlementForHost(nextIdentity);
+        if (next.status === 'storage_error') throw new Error('repair settlement unavailable');
+        if (next.status !== 'ok' || next.settlement.toolName !== tool
+          || next.settlement.argumentDigest !== prior.settlement.argumentDigest
+          || next.settlement.recovery.mutating !== prior.settlement.recovery.mutating
+          || next.settlement.recovery.requirementId !== prior.settlement.recovery.requirementId
+          || next.settlement.physicalCrossingCount + next.settlement.hostCrossingCount === 0
+          || (next.settlement.outcome.kind !== 'succeeded'
+            && !(next.settlement.outcome.kind === 'empty_result' && !next.settlement.recovery.mutating))) return false;
+        const capability = loadHostCallCapabilityBinding({ db, ...nextIdentity });
+        if (capability.status === 'storage_error') throw new Error('repair capability unavailable');
+        return capability.status === 'ok' && sameCapability(priorCapability.binding, capability.binding);
+      });
+    if (!repaired) refused.add(tool);
   }
+  return [...refused].sort();
 }
 
 export function learnHostRunStrategyForAcceptedTask(input: {
@@ -226,7 +275,9 @@ export function learnHostRunStrategyForAcceptedTask(input: {
   // 2026-10-21: an edit whose right tool was refused was finished through the
   // shell; that run became the proven strategy for the request, and the next
   // identical request was steered to the shell before the refusal was fixed.
-  const refusedElsewhere = refusedToolsNotAmongUsed(input, toolsUsed);
+  let refusedElsewhere: string[];
+  try { refusedElsewhere = refusedToolsNotAmongUsed(input, toolsUsed); }
+  catch { return { status: 'not_proven', reason: 'refusal_evidence_unavailable' }; }
   if (refusedElsewhere.length > 0) {
     return { status: 'not_proven', reason: `route_found_around_a_refusal:${refusedElsewhere.join(',')}` };
   }

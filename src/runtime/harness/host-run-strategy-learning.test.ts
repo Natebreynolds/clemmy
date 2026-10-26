@@ -202,12 +202,188 @@ test('a route found by going around a refusal is not a proven route', () => {
     kind: 'refused_pre_dispatch', sourceUserSeq: user.seq, tool: 'write_file', callId: 'call-1', refusalDetail: 'outside_accepted_scope: …',
   } });
   assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: user.seq }, ['run_shell_command']), ['write_file']);
-  // The same tool refused and then settled is an ordinary repair, not a workaround.
-  assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: user.seq }, ['write_file']), []);
+  assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: user.seq }, ['write_file']), ['write_file'],
+    'a tool name is not evidence that this refused work was repaired');
   // A refusal of the carrier itself names no tool.
   const other = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'x' } });
   appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'guardrail_tripped', data: {
     kind: 'refused_pre_dispatch', sourceUserSeq: other.seq, tool: 'work_call', callId: 'call-2',
   } });
   assert.deepEqual(refusedToolsNotAmongUsed({ sessionId: session.id, sourceUserSeq: other.seq }, ['run_shell_command']), []);
+});
+
+const authority = await import('./accepted-turn-call-authority.js');
+const hostBindings = await import('./host-call-capability-binding.js');
+const dispatch = await import('./dispatch-ledger.js');
+const contracts = await import('./logical-call-contract.js');
+const settlements = await import('./logical-call-settlement-store.js');
+const outcomes = await import('./attempt-outcome.js');
+const eventlog = await import('./eventlog.js');
+
+let correlationSerial = 0;
+function correlationSource(sessionId?: string) {
+  const session = sessionId ?? createSession({ id: `strategy-correlation-${++correlationSerial}`, kind: 'chat' }).id;
+  const source = appendEvent({ sessionId: session, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Send the final synthetic report to the fixture destination.' } });
+  const armed = authority.armHostCallAuthority({ sessionId: session, sourceUserSeq: source.seq,
+    catalogRevisionDigest: 'a'.repeat(64), bindingRevisionDigest: 'b'.repeat(64), maxLogicalCalls: 20, maxParallelCalls: 8 });
+  assert.equal(armed.status, 'armed', JSON.stringify(armed));
+  if (armed.status !== 'armed') throw new Error('fixture host authority missing');
+  const identity = { sessionId: session, sourceUserSeq: source.seq, acceptedTaskId: armed.authority.identity.acceptedTaskId };
+  return identity;
+}
+
+function correlationCall(task: ReturnType<typeof correlationSource>, input: {
+  id: string; args: Record<string, unknown>; refused?: boolean; tool?: string; account?: string;
+  bindCapability?: boolean; repairAuthority?: boolean; eventSourceUserSeq?: number;
+}) {
+  const tool = input.tool ?? 'write_file';
+  const effect = input.account ? 'external_write' as const : 'local_write' as const;
+  const contract = contracts.durableLogicalCallContract(task.acceptedTaskId, tool, input.args)!;
+  const root = authority.acceptedTurnCallAuthorityFor(task.sessionId, task.sourceUserSeq);
+  assert.equal(root.status, 'ok');
+  if (root.status !== 'ok') throw new Error('fixture root missing');
+  const identity = { ...task, logicalToolCallId: input.id };
+  const base = { ...identity, sourceEventId: root.authority.sourceEventId, sourceEventDigest: root.authority.sourceEventDigest,
+    toolName: contract.toolName, argumentDigest: contract.argumentDigest, effect,
+    bindingKind: input.account ? 'catalog_manifest' as const : 'local_envelope' as const,
+    capabilityId: tool, schemaFingerprint: 'c'.repeat(64), accountId: input.account ?? '', invokePortId: 'fixture:invoke', operationId: tool,
+    manifestId: input.account ? 'fixture:manifest' : '', manifestDigest: input.account ? 'd'.repeat(64) : '',
+    engineVersion: root.authority.engineVersion, surfaceVersion: root.authority.surfaceVersion,
+    authorityDigest: root.authority.authorityDigest, authorityRevision: root.authority.revision,
+    surfaceDigest: root.authority.surfaceDigest, catalogRevisionDigest: root.authority.catalogRevisionDigest!,
+    bindingRevisionDigest: root.authority.bindingRevisionDigest! };
+  const attestation = { ...base, bindingDigest: hostBindings.hostCallAttestationBindingDigest(base) };
+  authority.withHostCallAttestation(attestation, () => {
+    assert.equal(dispatch.admitLogicalCall({ identity, tool, args: input.args }).status, 'inserted');
+    if (input.bindCapability !== false) {
+      const bound = hostBindings.persistHostCallCapabilityBinding({ db: eventlog.openEventLog(), attestation,
+        ...identity, toolName: contract.toolName, argumentDigest: contract.argumentDigest, effect });
+      assert.equal(bound.status, 'bound', JSON.stringify(bound));
+    }
+    if (input.repairAuthority) appendEvent({ sessionId: task.sessionId, turn: 1, role: 'assistant', type: 'tool_called', data: {
+      sourceUserSeq: input.eventSourceUserSeq ?? task.sourceUserSeq, tool: 'composio_execute_tool',
+      effectiveTool: tool, callId: input.id, canonicalCallId: input.id, effect,
+      arguments: JSON.stringify({ tool_slug: tool.toUpperCase(), arguments: JSON.stringify(input.args) }),
+      recoverySemantics: { version: 1, operationId: tool, manifestDigest: base.manifestDigest,
+        basis: 'exact_artifact_reconciliation' },
+    } });
+    if (!input.refused) {
+      const opened = dispatch.beginPhysicalDispatch({ identity: { ...identity, physicalDispatchId: `physical:${input.id}`, ordinal: 0 },
+        tool, args: input.args, ...(input.account ? {} : { executionSite: 'host' as const }) });
+      assert.equal(opened.status, 'inserted', JSON.stringify(opened));
+      if (opened.status !== 'inserted') throw new Error('fixture crossing missing');
+      assert.equal(dispatch.settlePhysicalDispatch({ identity: opened.identity, tool, outcome: 'returned' }).status, 'inserted');
+    }
+    const settled = settlements.commitLogicalCallSettlement({ identity, contract: { toolName: tool, args: input.args },
+      execution: { kind: input.refused ? 'refused_pre_dispatch' : input.account ? 'provider_execution' : 'local_execution' },
+      ...(input.refused ? {} : { result: { payload: { ok: true, id: 'synthetic-result' } } }),
+      outcome: outcomes.classifyAttemptOutcome(input.refused
+        ? { preDispatch: true, argumentValidationFailed: true, schemaAvailable: true } : { envelopeSuccessful: true }),
+      recovery: { businessCall: true, mutating: true }, observer: { lane: 'byo', callId: input.id, turn: 1 } });
+    assert.equal(settled.status, 'committed', JSON.stringify(settled));
+  });
+}
+
+test('success on A cannot erase a same-tool refusal on B before a shell workaround', () => {
+  const task = correlationSource();
+  correlationCall(task, { id: 'write-a', args: { path: '/synthetic/a', content: 'A' } });
+  correlationCall(task, { id: 'refused-b', args: { path: '/synthetic/b', content: 'B' }, refused: true });
+  correlationCall(task, { id: 'shell-b', tool: 'run_shell_command', args: { command: 'synthetic B' } });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file', 'run_shell_command']), ['write_file']);
+  assert.deepEqual(learnHostRunStrategyForAcceptedTask(task), { status: 'not_proven', reason: 'route_found_around_a_refusal:write_file' });
+});
+
+test('a later canonical exact-contract repair clears only its own refusal', () => {
+  const task = correlationSource(), args = { path: '/synthetic/b', content: 'B' };
+  correlationCall(task, { id: 'refused', args, refused: true });
+  correlationCall(task, { id: 'repaired', args });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), []);
+});
+
+test('an earlier success is not a repair of a later refusal, even with identical arguments', () => {
+  const task = correlationSource(), args = { path: '/synthetic/b', content: 'B' };
+  correlationCall(task, { id: 'earlier', args });
+  correlationCall(task, { id: 'later-refused', args, refused: true });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), ['write_file']);
+});
+
+test('another accepted source cannot repair the refused source through a reused call id', () => {
+  const task = correlationSource(), args = { path: '/synthetic/b', content: 'B' };
+  correlationCall(task, { id: 'shared-call-id', args, refused: true });
+  const sibling = correlationSource(task.sessionId);
+  correlationCall(sibling, { id: 'shared-call-id', args });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), ['write_file']);
+  assert.deepEqual(refusedToolsNotAmongUsed(sibling, ['write_file']), []);
+});
+
+test('same arguments on a different capability account do not repair the refused work', () => {
+  const task = correlationSource(), args = { destination: 'fixture-target', body: 'Synthetic body' };
+  correlationCall(task, { id: 'account-a', tool: 'fixture_send', account: 'fixture-account-a', args, refused: true });
+  correlationCall(task, { id: 'account-b', tool: 'fixture_send', account: 'fixture-account-b', args });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['fixture_send']), ['fixture_send']);
+});
+
+test('changed arguments without canonical work and target proof remain unproven', () => {
+  const task = correlationSource();
+  correlationCall(task, { id: 'bad-format', args: { path: '/synthetic/b', content: 'B', format: 'invalid' }, refused: true });
+  correlationCall(task, { id: 'fixed-format', args: { path: '/synthetic/b', content: 'B', format: 'plain' } });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), ['write_file']);
+});
+
+test('a missing capability identity cannot be filled in by a later success', () => {
+  const task = correlationSource(), args = { path: '/synthetic/b', content: 'B' };
+  correlationCall(task, { id: 'unbound-refusal', args, refused: true, bindCapability: false });
+  correlationCall(task, { id: 'bound-success', args });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), ['write_file']);
+});
+
+for (const variant of ['changed-format', 'different-target', 'different-account', 'foreign-event-source', 'different-cell', 'different-sheet'] as const) {
+  test(`coarse host repair semantics cannot prove changed work for learning: ${variant}`, () => {
+    const task = correlationSource();
+    const common = { tool: 'googlesheets_batch_update', account: 'fixture-account', repairAuthority: true };
+    correlationCall(task, { ...common, id: 'bad-range', refused: true,
+      args: { spreadsheet_id: 'fixture-sheet', sheet_name: 'Fixture A', first_cell_location: 'A1', format: 'invalid', values: [['Synthetic']] } });
+    correlationCall(task, { ...common, id: 'fixed-range',
+      ...(variant === 'different-account' ? { account: 'other-account' } : {}),
+      ...(variant === 'foreign-event-source' ? { eventSourceUserSeq: task.sourceUserSeq + 1 } : {}),
+      args: { spreadsheet_id: variant === 'different-target' ? 'other-sheet' : 'fixture-sheet',
+        sheet_name: variant === 'different-sheet' ? 'Fixture B' : 'Fixture A',
+        first_cell_location: variant === 'different-cell' ? 'B2' : 'A1', format: 'plain', values: [['Synthetic']] } });
+    assert.deepEqual(refusedToolsNotAmongUsed(task, [common.tool]), [common.tool]);
+  });
+}
+
+test('unavailable refusal evidence suppresses learning instead of becoming no refusals', t => {
+  const task = correlationSource();
+  correlationCall(task, { id: 'readable-success', args: { path: '/synthetic/a', content: 'A' } });
+  const statement = eventlog.openEventLog().prepare('SELECT * FROM events WHERE session_id = ? AND type IN (?,?) ORDER BY seq ASC');
+  const prototype = Object.getPrototypeOf(statement), original = prototype.all;
+  t.mock.method(prototype, 'all', function (this: { source: string }, ...args: unknown[]) {
+    if (this.source === statement.source) throw new Error('synthetic refusal read unavailable');
+    return original.apply(this, args);
+  });
+  assert.deepEqual(learnHostRunStrategyForAcceptedTask(task), { status: 'not_proven', reason: 'refusal_evidence_unavailable' });
+});
+
+test('unavailable correlation evidence cannot make a refused route learnable', t => {
+  const task = correlationSource(), args = { path: '/synthetic/b', content: 'B' };
+  correlationCall(task, { id: 'correlation-refusal', args, refused: true });
+  correlationCall(task, { id: 'correlation-success', args });
+  const db = eventlog.openEventLog(), original = db.prepare;
+  t.mock.method(db, 'prepare', function (sql: string) {
+    if (sql.includes('SELECT s.logical_tool_call_id AS logicalToolCallId')) throw new Error('synthetic correlation unavailable');
+    return original.call(db, sql);
+  });
+  assert.deepEqual(learnHostRunStrategyForAcceptedTask(task), { status: 'not_proven', reason: 'refusal_evidence_unavailable' });
+});
+
+test('a readable source without refusals does not scan settlement or capability history', t => {
+  const task = correlationSource();
+  const db = eventlog.openEventLog(), original = db.prepare;
+  t.mock.method(db, 'prepare', function (sql: string) {
+    assert.doesNotMatch(sql, /logical_call_settlements|host_call_capability_bindings/);
+    return original.call(db, sql);
+  });
+  assert.deepEqual(refusedToolsNotAmongUsed(task, ['write_file']), []);
 });

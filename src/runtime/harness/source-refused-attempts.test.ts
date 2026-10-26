@@ -94,3 +94,18 @@ test('another source’s refusal is never attributed to this one', () => {
   const second = eventlog.appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'b' } });
   assert.equal(sourceRefusedAttempts({ sessionId: session.id, sourceUserSeq: second.seq }).count, 0);
 });
+
+test('unreadable evidence keeps the measurement fallback but strict learning callers fail closed', t => {
+  const id = source([]);
+  // The cached statement is the same one used by listEvents. Fail only this
+  // read; source creation and the ordinary store remain intact.
+  const statement = eventlog.openEventLog().prepare('SELECT * FROM events WHERE session_id = ? AND type IN (?,?) ORDER BY seq ASC');
+  const prototype = Object.getPrototypeOf(statement);
+  const original = prototype.all;
+  t.mock.method(prototype, 'all', function (this: { source: string }, ...args: unknown[]) {
+    if (this.source === statement.source) throw new Error('synthetic evidence read failure');
+    return original.apply(this, args);
+  });
+  assert.deepEqual(sourceRefusedAttempts(id), { count: 0, attempts: [] });
+  assert.throws(() => sourceRefusedAttempts({ ...id, requireReadableEvidence: true }), /synthetic evidence read failure/);
+});
