@@ -9,6 +9,7 @@ import { listDynamicToolNames } from './dynamic-tools.js';
 import {
   composioExecutionUsesCliOnlyLane,
   getComposioCredentialStatus,
+  peekConnectedToolkits,
 } from '../integrations/composio/client.js';
 import { classifyComposioSlugEffect } from '../integrations/composio/slug-effect.js';
 import {
@@ -271,6 +272,38 @@ export function admitPendingActionCall(
       );
     }
     return { ...canonical, executionAuthority: null };
+  }
+
+  // An approved write on the SDK lane runs only on the exact account its card
+  // binds; default routing can never satisfy that binding, so a card for a
+  // write that names no account is approved and then runs nothing. With one
+  // connected account for the app, that is the account meant: it is pinned so
+  // the card shows it. With several, the call is refused before any card
+  // exists, naming them. An unobserved registry changes nothing here.
+  const unnamedAccounts = !cliOnlyLane && write && formalApproval && !connectedAccountId && !accountAlias
+    ? peekConnectedToolkits().filter((entry) => (
+        entry.slug === registeredToolkitOfSlug(slug) && /^active$/i.test(entry.status ?? '') && Boolean(entry.connectionId)
+      ))
+    : [];
+  if (unnamedAccounts.length > 0) {
+    const toolkit = registeredToolkitOfSlug(slug);
+    const accounts = unnamedAccounts;
+    if (accounts.length === 1) {
+      return {
+        ...canonical,
+        payload: { ...(canonical.payload as Record<string, unknown>), connected_account_id: accounts[0]!.connectionId },
+        executionAuthority: null,
+      };
+    }
+    const named = accounts.slice(0, 6).map((entry) => {
+      const who = entry.accountEmail || entry.accountLabel || entry.accountName;
+      return who ? `${entry.connectionId} (${who})` : entry.connectionId;
+    });
+    throw new Error(
+      `${slug} names no account, and an approved write runs only on the exact account its card names. `
+      + `Connected ${toolkit} accounts: ${named.join(', ')}. Queue it again with connected_account_id set to the one this request is about, or ask the owner which one. `
+      + 'No approval card or provider dispatch was created.',
+    );
   }
 
   if (accountScopedBroadcast && !connectedAccountId && !accountAlias && formalApproval) {
