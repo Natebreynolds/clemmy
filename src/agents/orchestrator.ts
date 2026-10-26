@@ -1311,7 +1311,21 @@ export function userChoiceToolUseBehavior(
     const ownConnectionWords = connectionProjection !== null
       && candidates.length === 1 && candidates[0]!.purpose === 'connection'
       && rendered.question.trim().length > 0 && !MODEL_LINK.test(rendered.question);
-    const publicAsk = connectionProjection
+    // A single explicit connection member identifies the control to replace.
+    // Keep independent questions in the same provider-ordered bundle; the
+    // connection control must not consume their unanswered facts or choices.
+    // Multiple connection members and untyped/required-route projection keep
+    // their existing fallback: this does not guess which provider they mean.
+    const projectedBundle = connectionProjection && candidates.length > 1
+      && candidates.filter(candidate => candidate.purpose === 'connection').length === 1
+      ? candidates.map(candidate => candidate.purpose === 'connection'
+          ? { ...candidate, question: connectionProjection.question, options: [...connectionProjection.options] }
+          : candidate)
+      : null;
+    const publicCandidates = projectedBundle ?? candidates;
+    const publicAsk = projectedBundle
+      ? renderAskUserQuestionCandidates(projectedBundle)
+      : connectionProjection
       ? { question: ownConnectionWords ? rendered.question : connectionProjection.question, options: [...connectionProjection.options] }
       : rendered;
     const existing = listEvents(sessionId, { types: ['awaiting_user_input'] })
@@ -1360,7 +1374,7 @@ export function userChoiceToolUseBehavior(
             ...(candidates.length > 1
               ? {
                   bundled: true,
-                  questions: candidates.map((candidate) => ({
+                  questions: publicCandidates.map((candidate) => ({
                     question: candidate.question,
                     ...(candidate.publicAnswer?.trim() ? { publicAnswer: candidate.publicAnswer.trim() } : {}),
                     options: candidate.options === null ? null : [...candidate.options],
@@ -1373,7 +1387,8 @@ export function userChoiceToolUseBehavior(
     const ready = publishOrDeferQuestionPublication({
       question,
       options,
-      modelAuthored: Boolean(publicAnswer) || (clemAsked && (!connectionProjection || ownConnectionWords) && !recoveryProjection.constrained),
+      modelAuthored: Boolean(publicAnswer)
+        || (clemAsked && (!connectionProjection || ownConnectionWords || projectedBundle !== null) && !recoveryProjection.constrained),
     }, () => {
       // A review may have awaited. Reopen wrapped ownership immediately before
       // deduplication and append; no await separates this check from the post.

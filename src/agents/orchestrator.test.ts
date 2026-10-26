@@ -2108,6 +2108,150 @@ test('v3 public answer keeps host-owned connection controls subject to whole-rep
   assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
 });
 
+for (const variant of [
+  { connectionFirst: true, answer: 'Measurement A is 17.', suffix: '' },
+  { connectionFirst: true, answer: null, suffix: ' (without public answer)' },
+  { connectionFirst: false, answer: 'Measurement A is 17.', suffix: ' (connection second)' },
+  { connectionFirst: false, answer: null, suffix: ' (connection second without public answer)' },
+]) test(`v3 connection projection preserves an independent bundled question and its choices for review and publication${variant.suffix}`, async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Report measurement A as 17, connect the fixture notes app, and ask which private cutoff applies to B.' } });
+  recordFixtureSearch(session.id, source.seq, 'search-bundled-notes', 'connect the fixture notes app', 'fixturenotes');
+  const context = { context: { sessionId: session.id, turn: 1, sourceUserSeq: source.seq } };
+  const tool = buildAskUserQuestionTool('clarification_v3');
+  const answer = variant.answer;
+  const residualQuestion = 'What private cutoff should I use to classify measurement B?';
+  const connection = decodedToolOutput(await invokeFunctionTool(tool, {
+    question: 'Connect here: [open](/wrong_app)', options: ['Done'], purpose: 'connection', publicAnswer: answer,
+  }, context.context));
+  const clarification = decodedToolOutput(await invokeFunctionTool(tool, {
+    question: residualQuestion, options: ['10', '20'], purpose: 'clarification', publicAnswer: null,
+  }, context.context));
+  const captures: PreparedQuestionPublication[] = [];
+  const outputs = variant.connectionFirst ? [connection, clarification] : [clarification, connection];
+  const result = withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(context,
+    outputs.map(output => ({ type: 'function_output' as const, tool: { name: 'ask_user_question' }, output }))));
+  assert.equal(result.isFinalOutput, true);
+  assert.equal(captures.length, 1);
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0,
+    'both staged questions await admission of their exact combined public candidate');
+  const publication = captures[0]!;
+  assert.equal(publication.modelAuthored, true, 'independent public answer and question still require review');
+  assert.match(publication.question, /Fixturenotes needs to be connected/);
+  assert.doesNotMatch(publication.question, /wrong_app|Connect here|\bDone\b/,
+    'the model cannot supply the connection control');
+  assert.ok(publication.question.includes(residualQuestion),
+    'projecting the connection must not discard the independent unresolved question');
+  assert.ok(publication.question.includes(`${variant.connectionFirst ? 1 : 2}. Fixturenotes`));
+  assert.match(publication.question, /- I’ve connected Fixturenotes — continue this same task/);
+  assert.match(publication.question, /- Pause so I can change this request/);
+  assert.ok(publication.question.includes(`${variant.connectionFirst ? 2 : 1}. ${residualQuestion}`));
+  assert.match(publication.question, /What private cutoff should I use to classify measurement B\?\n\s*- 10\n\s*- 20/);
+  assert.equal(publication.options, null, 'independent option sets stay inline rather than becoming ambiguous shortcuts');
+  assert.equal(result.finalOutput, formatAwaitingUserInputFinalOutput(answer ? `${answer}\n\n${publication.question}` : publication.question));
+  assert.equal(String(result.finalOutput).split('Measurement A is 17.').length - 1, answer ? 1 : 0);
+  assert.equal(publication.publish(), true);
+  assert.equal(publication.publish(), true);
+  const events = listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1, 'one admitted bundle publishes once');
+  assert.equal(events[0]!.data.question, publication.question);
+  assert.equal(events[0]!.data.publicAnswer, answer ?? undefined);
+  assert.equal(events[0]!.data.options, null);
+  assert.equal(events[0]!.data.bundled, true);
+  assert.equal(events[0]!.data.source, 'host_connection_dependency_projection');
+  assert.equal(events[0]!.data.sourceUserSeq, source.seq);
+  const questions = events[0]!.data.questions as Array<{ question: string; options: string[]; publicAnswer?: string }>;
+  assert.equal(questions.length, 2);
+  const connectionIndex = variant.connectionFirst ? 0 : 1;
+  assert.match(questions[connectionIndex]!.question, /^Fixturenotes needs to be connected/);
+  assert.deepEqual(questions[connectionIndex]!.options, [
+    'I’ve connected Fixturenotes — continue this same task', 'Pause so I can change this request',
+  ]);
+  assert.deepEqual(questions[1 - connectionIndex]!.options, ['10', '20']);
+  assert.equal(questions[1 - connectionIndex]!.question, residualQuestion);
+  assert.doesNotMatch(JSON.stringify(questions), /wrong_app|Connect here|\bDone\b/,
+    'persisted bundle metadata contains the same safe projection presented for review');
+});
+
+test('v3 connection bundle negative review cannot publish its residual question before a fresh reviewed repair', async (t) => {
+  const disabled = { CLEMMY_COMPLETION_REVIEW: 'off', MODEL_ROUTING_MODE: 'off', CLEMMY_UNIFIED_RECALL: 'off',
+    CLEMMY_UNIFIED_TURN_PRIMER: 'off', CLEMMY_SEMANTIC_RECALL: 'off', CLEMMY_DEBATE_MODE: 'off', MCP_AUTO_IMPORT_ENABLED: 'false' };
+  const prior = Object.fromEntries(Object.keys(disabled).map(key => [key, process.env[key]]));
+  Object.assign(process.env, disabled);
+  t.after(() => { for (const [key, value] of Object.entries(prior)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } });
+  const { EventEmitter } = await import('node:events');
+  const events = await import('../runtime/harness/eventlog.js');
+  const contexts = await import('../runtime/harness/source-session-context.js');
+  const host = await import('../runtime/harness/host-turn-runner.js');
+  const { runConversation } = await import('../runtime/harness/loop.js');
+  resetEventLog();
+  const session = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
+  const request = 'Connect the fixture notes app and ask which private cutoff applies to measurement B with choices 10 and 20. Do not classify B.';
+  const attempt = events.beginRunAttempt(session.id, { runId: `connection-bundle:${session.id}` });
+  const source = events.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: {
+    text: request, taskMode: { version: 1, kind: 'normal' },
+  } }, { armRunInFlight: true });
+  contexts.captureFreshSourceSessionContext({ sessionId: session.id, sourceUserSeq: source.seq });
+  host.captureEffectiveCompletionPolicyOnce({ sessionId: session.id, sourceUserSeq: source.seq, enabled: true });
+  recordFixtureSearch(session.id, source.seq, 'search-host-bundle-notes', 'connect the fixture notes app', 'fixturenotes');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const reviews: Array<{ reply: string; evidence?: string; posted: number }> = [];
+  host._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
+    reviews.push({ reply, evidence: context?.toolCallSummary,
+      posted: listEvents(session.id, { types: ['awaiting_user_input'] }).length });
+    // Controlled decisions prove the real admission/repair boundary, not a model's semantics.
+    return reviews.length === 1
+      ? { done: false, reason: 'The independent cutoff choices must be 10 and 20, not 99 and 200.' }
+      : { done: true, awaitingUser: true, reason: 'Only the connection and the private B cutoff remain.' };
+  });
+  let calls = 0;
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const model = {
+    async getResponse() {
+      calls++;
+      const args = [
+        { question: 'Connect here: [open](/wrong_app)', options: ['Done'], purpose: 'connection', publicAnswer: null },
+        { question, options: calls === 1 ? ['99', '200'] : ['10', '20'], purpose: 'clarification', publicAnswer: null },
+      ];
+      return { responseId: `connection-bundle-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, requests: 1 },
+        output: args.map((args, index) => ({ type: 'function_call', callId: `connection-bundle-${calls}-${index}`,
+          name: 'ask_user_question', arguments: JSON.stringify(args) })) };
+    },
+    async *getStreamedResponse() {
+      const response = await this.getResponse();
+      yield { type: 'response_started' };
+      yield { type: 'response_done', response: { id: response.responseId, usage: response.usage, output: response.output } };
+    },
+  };
+  const result = await runConversation({ sessionId: session.id, sourceUserSeq: source.seq, input: request, reuseRecordedUserInput: true,
+    runAttemptId: attempt.attemptId, turnEngine: 'host_v1', maxSteps: 3, maxTurns: 3, toolCallsPerTurn: 6, judgeCompletion: true,
+    buildAgent: async context => buildOrchestratorAgent({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
+      hostFreshPlanning: context.hostFreshPlanning, userInput: request, allowToolJit: true, model: model as never }),
+    makeRunner: () => Object.assign(new EventEmitter(), { run() { throw new Error('Legacy runner must not run'); } }) as never,
+  });
+  const asks = listEvents(session.id, { types: ['awaiting_user_input'] }).filter(row => row.data.sourceUserSeq === source.seq);
+  assert.equal(calls, 2);
+  assert.equal(reviews.length, 2, 'each fresh bundled candidate uses the existing whole-reply review');
+  assert.ok(reviews.every(review => review.posted === 0), 'the negative candidate never publishes');
+  assert.match(reviews[0]!.reply, /Fixturenotes[\s\S]*private cutoff[\s\S]*- 99\n\s*- 200/);
+  assert.match(reviews[1]!.reply, /Fixturenotes[\s\S]*private cutoff[\s\S]*- 10\n\s*- 20/);
+  assert.equal(asks.length, 1);
+  assert.equal(asks[0]!.data.options, null);
+  assert.equal(asks[0]!.data.publicAnswer, undefined, 'residual questions alone require review');
+  const delivered = result.publicPresentation?.text ?? String(result.finalOutput ?? '');
+  assert.ok(delivered.includes(question));
+  assert.match(delivered, /- 10\n\s*- 20/);
+  assert.doesNotMatch(delivered, /wrong_app|\b99\b|\b200\b/);
+  assert.ok(reviews[1]!.reply.includes(delivered));
+  assert.ok(reviews[1]!.evidence?.includes(JSON.stringify({ question: asks[0]!.data.question, options: null })));
+  assert.ok(listEvents(session.id, { types: ['goal_alignment_judged'] }).every(row => row.seq < asks[0]!.seq));
+});
+
 test('v3 public answer survives argument-recovery controls and still requires whole-reply review', async () => {
   resetEventLog();
   const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');

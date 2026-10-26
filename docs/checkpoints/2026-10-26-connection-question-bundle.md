@@ -1,0 +1,11 @@
+# Preserve independent questions beside connection controls
+
+An observed connection dependency replaced the entire rendered question bundle. When the model asked both a connection question and an independent clarification, that clarification and its choices disappeared from the public candidate even though the original internal metadata still contained them.
+
+For a bundle containing exactly one explicitly typed connection member, the host now replaces only that member with its own connection question and controls, then uses the existing ordered bundle renderer. Independent questions, choices, provider order and public answers survive. Published metadata derives from the same projected members. Residual model-authored questions still require whole-reply review when there is no public answer; rejected candidates remain unpublished.
+
+Single-question and no-projection behavior are unchanged. Multiple connection members and untyped/required-route fallbacks remain unchanged because this patch has no authority to infer provider/member correlation. Wire editions, required-nullable fields, wrapped source ownership, deduplication, recovery behavior and review/model budgets are unchanged. No new reviewer, store or retry layer.
+
+The genuine baseline regression lost the independent B question (one intended failure, three controls passing). Final 50 distinct controlled tests pass, including four order/public-answer variants, safe metadata and an actual host negative-review/fresh-repair admission case. Focused eight tests are a subset of those 50, not additional coverage. Node 24; network and live-home reads denied. Final evidence manifest SHA256: `a5a060a61e53e64446a5ee5ae5e957432f30fb848bb15bb2ccb33a31640748fc`.
+
+Evidence: `output/end-to-end-review-2026-10-26/question-connection-bundle` in the primary checkout. Independent source review found no blocker. At commit time this is source/controlled-test evidence only; installation and live qualification are separate. Earlier q12 review abstention remains unqualified and is not established as caused by this bug. The communicated peer merge boundary stays exact `cc30bc481022decada95027ca31d7131a215560e`, not this moving branch tip.
