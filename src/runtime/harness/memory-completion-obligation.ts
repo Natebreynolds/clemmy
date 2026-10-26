@@ -132,7 +132,7 @@ export function readMemoryRequirementSource(input: { sessionId: string; sourceUs
         || chain.consumedReply.sourceEventId !== event.id || chain.consumedReply.text !== ownerText
         || verified.parentSourceUserSeq !== chain.root.sourceUserSeq) return null;
       const messages: MemoryClarificationHandoff['messages'] = [];
-      for (const literal of [chain.root, ...chain.replies, chain.consumedReply]) {
+      const retainOwner = (literal: typeof chain.root): boolean => {
         const identity = { sessionId: input.sessionId, sourceUserSeq: literal.sourceUserSeq };
         const source = listEvents(input.sessionId, { sinceSeq: literal.sourceUserSeq - 1,
           types: ['user_input_received'], limit: 1 }).find(row => row.seq === literal.sourceUserSeq);
@@ -141,16 +141,20 @@ export function readMemoryRequirementSource(input: { sessionId: string; sourceUs
           || !isEligibleAutoCaptureSourceProvenance(autoCaptureProvenanceFromAcceptedEvent(source),
             { sessionId: input.sessionId, sourceEventId: `user-source:${literal.sourceUserSeq}` })
           || adoptedSteerNotesForSource(identity).length > 0
-          || ['plan', 'execute'].includes(acceptedTaskMode(input.sessionId, literal.sourceUserSeq)?.kind ?? '')) return null;
+          || ['plan', 'execute'].includes(acceptedTaskMode(input.sessionId, literal.sourceUserSeq)?.kind ?? '')) return false;
         const originalContext = readSourceSessionContext(identity);
-        if (!originalContext || !isDeepStrictEqual(originalContext.memoryScope, context.memoryScope)) return null;
-        if ('previousDeliveredQuestion' in literal) messages.push({ role: 'assistant',
-          awaitingEventId: literal.previousDeliveredAwaitingEventId,
-          terminalEventId: literal.previousDeliveredTerminalEventId,
-          text: literal.previousDeliveredQuestion, options: [...literal.previousDeliveredOptions] });
+        if (!originalContext || !isDeepStrictEqual(originalContext.memoryScope, context.memoryScope)) return false;
         messages.push({ role: 'user', sourceUserSeq: literal.sourceUserSeq,
           sourceEventId: literal.sourceEventId, dataHash: literal.dataHash,
           sourceContextDigest: originalContext.digest, text: literal.text });
+        return true;
+      };
+      if (!retainOwner(chain.root)) return null;
+      for (const reply of [...chain.replies, chain.consumedReply]) {
+        messages.push({ role: 'assistant', awaitingEventId: reply.previousDeliveredAwaitingEventId,
+          terminalEventId: reply.previousDeliveredTerminalEventId,
+          text: reply.previousDeliveredQuestion, options: [...reply.previousDeliveredOptions] });
+        if (!retainOwner(reply)) return null;
       }
       clarification = { version: 1, packetId: chain.packetId, sourceDigest: chain.sourceDigest,
         resolution: consumed.resolution, messages };
