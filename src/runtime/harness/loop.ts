@@ -1293,11 +1293,13 @@ function reduceStandardConversationTerminal(input: {
         // when Clem wrote one; the old operator wording is only the fallback.
         const cardAsk = approvalCardAskFromArgs(approval.args)
           ?? approvalCardAsk(approval.sessionId, approval.approvalId);
+        // Several cards each carry their own question; the first one Clem
+        // asked stands in for the turn, so no surface shows tool names or ids.
         const approvalText = publicReplyText(
           result.lastDecision?.reply,
-          pendingCount > 1
+          cardAsk ?? (pendingCount > 1
             ? `${pendingCount} approvals are waiting, starting with ${approval.subject} (${approval.approvalId}). Approve or reject each and I'll continue.`
-            : cardAsk ?? `Can I go ahead with ${approval.subject}? Say yes, or tell me what to change.`,
+            : `Can I go ahead with ${approval.subject}? Say yes, or tell me what to change.`),
         );
         outcome = {
           version: 2,
