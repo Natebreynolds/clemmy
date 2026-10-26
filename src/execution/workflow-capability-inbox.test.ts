@@ -19,6 +19,8 @@ const {
   markNotificationRead,
   markWorkflowCapabilityNotificationsSettled,
   replaceQueuedNotificationDeliveries,
+  settleQueuedNotificationDeliveryPass,
+  _failNextNotificationDeliveryQueueWriteForTest,
 } = await import('../runtime/notifications.js');
 
 test.after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
@@ -207,7 +209,8 @@ test('capability settlement retires only the stable gate, never the terminal rep
   assert.equal(getNotification('workflow-settle-completed')?.read, false);
 });
 
-test('a newer capability gate generation atomically supersedes stale choices for the same run', () => {
+test('a newer capability gate generation atomically supersedes stale choices for the same run', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-08-30T18:04:00.000Z') });
   const stableId = 'workflow-reblock-capability-sheets';
   addNotification({
     id: stableId, kind: 'workflow', title: 'Choose old account', body: 'Old choices',
@@ -219,6 +222,7 @@ test('a newer capability gate generation atomically supersedes stale choices for
   });
   const oldJob = listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId);
   assert.ok(oldJob);
+  assert.equal(oldJob.queuedAt, new Date().toISOString());
   replaceQueuedNotificationDeliveries([
     ...listQueuedNotificationDeliveries().filter((job) => job.notificationId !== stableId),
     { ...oldJob, completedDestinationIds: ['old-generation-destination'] },
@@ -243,10 +247,72 @@ test('a newer capability gate generation atomically supersedes stale choices for
     [],
     'the new carrier generation cannot inherit old completed-destination cursors',
   );
+  const currentJob = listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId);
+  assert.ok(currentJob);
+  assert.ok(Date.parse(currentJob.queuedAt) > Date.parse(oldJob.queuedAt), 'same-clock generations remain distinct');
+  settleQueuedNotificationDeliveryPass([{ ...oldJob, completedDestinationIds: ['old-generation-destination'] }], []);
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId), currentJob);
+  const progressedJob = { ...currentJob, completedDestinationIds: ['current-generation-destination'] };
+  replaceQueuedNotificationDeliveries([
+    ...listQueuedNotificationDeliveries().filter((job) => job.notificationId !== stableId),
+    progressedJob,
+  ]);
+  assert.ok(currentGate);
+  addNotification({ ...currentGate, metadata: { ...currentGate.metadata } });
+  assert.deepEqual(
+    listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId),
+    progressedJob,
+    'reconciliation of the same capability generation preserves delivery progress',
+  );
   assert.equal(
     loadNotifications().filter((row) => row.metadata?.runId === 'reblock-run').length,
     1,
   );
+});
+
+test('newer capability admission recovers a failed queue write with the clock unchanged', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-08-30T18:05:00.000Z') });
+  const stableId = 'workflow-same-clock-recovery-capability-sheets';
+  const gate = (retryCount: number): Parameters<typeof addNotification>[0] => ({
+    id: stableId, kind: 'workflow', title: 'Choose the current account', body: `Choices ${retryCount}`,
+    createdAt: new Date().toISOString(), read: false,
+    metadata: {
+      runId: 'same-clock-recovery-run', status: 'blocked_capability', stepId: 'publish',
+      tool: 'SHEETS_UPDATE', retryCount, needsAttention: true,
+      resolution: { kind: 'choose_account', choiceSetDigest: String(retryCount).repeat(64) },
+    },
+  });
+  addNotification(gate(1));
+  const oldJob = listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId);
+  assert.ok(oldJob);
+  const progressedOldJob = { ...oldJob, completedDestinationIds: ['old-generation-destination'] };
+  replaceQueuedNotificationDeliveries([
+    ...listQueuedNotificationDeliveries().filter((job) => job.notificationId !== stableId),
+    progressedOldJob,
+  ]);
+  _failNextNotificationDeliveryQueueWriteForTest();
+  assert.throws(() => addNotification(gate(2)), /forced notification delivery queue write failure/);
+  const pending = getNotification(stableId);
+  assert.equal(pending?.metadata?.retryCount, 2, 'the carrier landed before the queue fault');
+  assert.ok(pending?.deliveryAdmissionPendingAt, 'recovery authority remains on the carrier');
+  _failNextNotificationDeliveryQueueWriteForTest();
+  assert.throws(() => addNotification(gate(3)), /forced notification delivery queue write failure/);
+  const newerPending = getNotification(stableId);
+  assert.equal(newerPending?.metadata?.retryCount, 3);
+  assert.ok(newerPending?.deliveryAdmissionPendingAt);
+  assert.ok(
+    Date.parse(newerPending.deliveryAdmissionPendingAt) > Date.parse(pending.deliveryAdmissionPendingAt),
+    'another crashed generation advances past the retained admission before queue recovery',
+  );
+  const recovered = listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId);
+  assert.ok(recovered);
+  assert.deepEqual(recovered.completedDestinationIds, []);
+  assert.ok(Date.parse(recovered.queuedAt) > Date.parse(oldJob.queuedAt));
+  assert.equal(getNotification(stableId)?.deliveryAdmissionPendingAt, undefined);
+  settleQueuedNotificationDeliveryPass([progressedOldJob], []);
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId), recovered);
+  addNotification(gate(3));
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === stableId), recovered);
 });
 
 test('Clem model-tool retries use the same exact gate CAS as authenticated Inboxes', () => {

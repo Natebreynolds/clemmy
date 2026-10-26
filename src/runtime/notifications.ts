@@ -896,6 +896,19 @@ function freshDeliveryJob(notificationId: string, queuedAt = new Date().toISOStr
   };
 }
 
+/** The existing admission timestamp also distinguishes queue generations for
+ * crash recovery and stale-worker CAS. Advance past both prior durable
+ * identities even when the clock has not advanced or a queue write failed.
+ * Callers hold the notification-store lock. */
+function nextDeliveryAdmissionAt(...previousTimes: (string | undefined)[]): string {
+  let next = Date.now();
+  for (const value of previousTimes) {
+    const previous = Date.parse(value ?? '');
+    if (Number.isFinite(previous)) next = Math.max(next, previous + 1);
+  }
+  return new Date(next).toISOString();
+}
+
 function notificationDeliveryQueuedAt(item: NotificationRecord): string {
   for (const candidate of [item.deliveryAdmissionPendingAt, item.createdAt]) {
     if (typeof candidate === 'string' && Number.isFinite(Date.parse(candidate))) return candidate;
@@ -1222,6 +1235,7 @@ export function addNotification(item: NotificationRecord): void {
     let existingWithId = item.id
       ? items.find((existing) => existing.id === item.id)
       : undefined;
+    const previousAdmissionAt = existingWithId?.deliveryAdmissionPendingAt;
     // Approval identity, not notification wording, owns the interruption.
     // A reminder/replayed producer reuses the original carrier and its durable
     // per-destination receipts. Never widen routes or revive a read/settled row.
@@ -1515,7 +1529,10 @@ export function addNotification(item: NotificationRecord): void {
         item.deliveryPlan = undefined;
       }
     }
-    if (shouldQueue) item.deliveryAdmissionPendingAt = new Date().toISOString();
+    if (shouldQueue) {
+      const previousJob = loadDeliveryQueueUnlocked().items.find((job) => job.notificationId === item.id);
+      item.deliveryAdmissionPendingAt = nextDeliveryAdmissionAt(previousJob?.queuedAt, previousAdmissionAt);
+    }
     items.push(item);
     saveNotificationsUnlocked(items, {
       extraProtectedIds: shouldQueue ? [item.id] : [],
@@ -2539,7 +2556,10 @@ export function requeueNotificationDelivery(notificationId: string): void {
         `Notification ${notificationId} is local-only and cannot be queued for external delivery.`,
       );
     }
-    const requestedAt = new Date().toISOString();
+    const requestedAt = nextDeliveryAdmissionAt(
+      queueSnapshot.items.find((job) => job.notificationId === notificationId)?.queuedAt,
+      carrier.deliveryAdmissionPendingAt,
+    );
     carrier.deliveryAttempts = 0;
     delete carrier.deliveryError;
     delete carrier.deliveryAttemptCountByDestination;

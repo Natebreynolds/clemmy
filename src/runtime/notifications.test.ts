@@ -32,6 +32,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 const { actionBus } = await import('./action-bus.js');
 const {
   addNotification,
+  getNotification,
   listNotifications,
   markStaleApprovalNotificationsRead,
   markNotificationsReadByApprovalId,
@@ -41,6 +42,7 @@ const {
   isDeliveryJobStale,
   listQueuedNotificationDeliveries,
   replaceQueuedNotificationDeliveries,
+  requeueNotificationDelivery,
   registerNotificationDeliveryKick,
   settleQueuedNotificationDeliveryPass,
   _failNextNotificationDeliveryQueueWriteForTest,
@@ -242,6 +244,41 @@ test('delivery pass settlement preserves newly appended jobs and same-id requeue
   assert.deepEqual(listQueuedNotificationDeliveries(), [requeuedA]);
 
   replaceQueuedNotificationDeliveries([]);
+});
+
+test('same-clock explicit requeue remains distinct from a stale delivery pass', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-08-30T18:06:00.000Z') });
+  const id = 'same-clock-explicit-requeue';
+  addNotification(makeNotification(id));
+  const first = listQueuedNotificationDeliveries().find((job) => job.notificationId === id);
+  assert.ok(first);
+  assert.equal(first.queuedAt, new Date().toISOString());
+  requeueNotificationDelivery(id);
+  const retried = listQueuedNotificationDeliveries().find((job) => job.notificationId === id);
+  assert.ok(retried);
+  assert.ok(Date.parse(retried.queuedAt) > Date.parse(first.queuedAt));
+  settleQueuedNotificationDeliveryPass([first], []);
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === id), retried);
+  requeueNotificationDelivery(id);
+  const retriedAgain = listQueuedNotificationDeliveries().find((job) => job.notificationId === id);
+  assert.ok(retriedAgain);
+  assert.ok(Date.parse(retriedAgain.queuedAt) > Date.parse(retried.queuedAt));
+  settleQueuedNotificationDeliveryPass([retried], []);
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === id), retriedAgain);
+  _failNextNotificationDeliveryQueueWriteForTest();
+  assert.throws(() => requeueNotificationDelivery(id), /forced notification delivery queue write failure/);
+  const pendingAt = getNotification(id)?.deliveryAdmissionPendingAt;
+  assert.ok(pendingAt);
+  _failNextNotificationDeliveryQueueWriteForTest();
+  assert.throws(() => requeueNotificationDelivery(id), /forced notification delivery queue write failure/);
+  const newerPendingAt = getNotification(id)?.deliveryAdmissionPendingAt;
+  assert.ok(newerPendingAt);
+  assert.ok(Date.parse(newerPendingAt) > Date.parse(pendingAt), 'requeue advances past retained failed admission');
+  const recovered = listQueuedNotificationDeliveries().find((job) => job.notificationId === id);
+  assert.ok(recovered);
+  assert.equal(recovered.queuedAt, newerPendingAt);
+  settleQueuedNotificationDeliveryPass([retriedAgain], []);
+  assert.deepEqual(listQueuedNotificationDeliveries().find((job) => job.notificationId === id), recovered);
 });
 
 test('loadNotifications: corrupted JSON is quarantined and surfaced via actionBus', () => {
