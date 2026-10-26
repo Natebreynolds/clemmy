@@ -38,7 +38,7 @@ import {
 import { loadExpectedWorkContract } from './expected-work-contract.js';
 import { isDeterministicImplicitRetrieveContract } from './expected-work-matcher.js';
 import { toResultHandle } from './result-handle.js';
-import { deriveResultHandleFactsFromRaw } from './result-facts.js';
+import { deriveResultHandleFactsFromRaw, reviewedCliObservationOutcome } from './result-facts.js';
 import { inspectProviderEnvelope } from './provider-read-evidence.js';
 import { toolOutputProvesExternalWriteAcknowledgement } from './tool-evidence.js';
 import {
@@ -750,6 +750,18 @@ function completedAdapterProviderEnvelope(
  * "successful", a numeric status, an emptiness that is structural. Nothing here
  * inspects wording, so a provider changing its phrasing changes nothing.
  */
+/** A reviewed CLI read that ran to a clean exit answered: the transport's own
+ * observation of the very operation settled here is its success, never the
+ * words in its output. A write, a thrown call or another operation's
+ * observation proves nothing here. */
+function reviewedCliReadSignals(input: { result?: unknown; thrown?: unknown; mutating?: boolean; toolName?: string }): AttemptSignals {
+  if (input.thrown !== undefined || input.mutating === true || !input.toolName) return {};
+  const observed = reviewedCliObservationOutcome(input.result);
+  return observed?.success && observed.operationId.toLowerCase() === input.toolName.toLowerCase()
+    ? { envelopeSuccessful: true }
+    : {};
+}
+
 function signalsFromResult(result: unknown): AttemptSignals {
   const typed = attemptSignalsFromTypedResult(result);
   const envelope = record(result);
@@ -1205,6 +1217,7 @@ function recordHostExecutionCrossing(
 export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAttempt {
   const extracted: AttemptSignals = {
     ...signalsFromResult(input.result),
+    ...reviewedCliReadSignals(input),
     ...(input.thrown !== undefined ? signalsFromThrown(input.thrown) : {}),
     ...(input.mutating !== undefined ? { mutating: input.mutating } : {}),
     // A lane's own nominal knowledge outranks anything extracted here.

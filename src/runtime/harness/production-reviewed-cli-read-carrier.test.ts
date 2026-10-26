@@ -658,7 +658,7 @@ test('the pinned reviewed process receives current host CLI declarations without
 /** A real local process and production host/judge; only the author model and
  * Jev's HTTP transport answer deterministically. No judge function is replaced. */
 async function reviewedCliAnswer(label: string, mode: 'records' | 'empty_records' | 'nonzero' | 'missing_stdout' | 'truncated',
-  review: 'done' | 'repair' | 'unavailable' = 'done') {
+  review: 'done' | 'repair' | 'unavailable' = 'done', carrier: 'work_call' | 'call_tool' = 'work_call') {
   const { runConversation, _setReviewBeforeDeliveryForTests } = await import('./loop.js');
   // This case tests the review-and-repair loop that runs before delivery.
   _setReviewBeforeDeliveryForTests(true);
@@ -752,9 +752,12 @@ async function reviewedCliAnswer(label: string, mode: 'records' | 'empty_records
           assert.equal(owned.authority.sourceEventId, source.id);
           assert.equal(owned.authority.identity.sourceUserSeq, source.seq);
         }
-        const output = calls === 1 ? [{ type: 'function_call', callId: `${marker}-read`, name: 'work_call',
-          arguments: JSON.stringify({ requirement_id: capabilityId, name: operation, args_json: {},
-            universe_item_id: null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null }) }]
+        const output = calls === 1 ? [carrier === 'call_tool'
+          ? { type: 'function_call', callId: `${marker}-read`, name: 'call_tool',
+            arguments: JSON.stringify({ name: operation, args_json: {} }) }
+          : { type: 'function_call', callId: `${marker}-read`, name: 'work_call',
+            arguments: JSON.stringify({ requirement_id: capabilityId, name: operation, args_json: {},
+              universe_item_id: null, universe_selector: null, seal_amendment: null, source_call_ids: null, source_record_ids: null }) }]
           : [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text',
             text: review === 'repair' && calls === 2 ? `${finalReply} This was also yesterday’s total.` : finalReply }] }];
         return { responseId: `${marker}-${calls}`, output,
@@ -815,6 +818,8 @@ test('reviewed CLI answer reaches the production host and actual completion judg
     }
     assert.equal(run.calls, 2);
     assert.equal(run.read?.status, 'verified'); assert.equal(run.read?.contentComplete, true);
+    // A clean exit is the transport's own success, not an unclassified reply.
+    assert.equal(run.read?.outcome, 'succeeded', JSON.stringify(run.settlements));
     assert.equal(run.retained?.status, 'ok');
     if (run.retained?.status === 'ok') {
       const payload = run.retained.value.rawPayload as { result?: { stdout?: string } };
@@ -831,6 +836,12 @@ test('reviewed CLI answer reaches the production host and actual completion judg
     assert.notEqual(run.verdicts[0]!.data.failedOpen, true);
     assert.equal((run.verdicts[0]!.data.jevAttempt as { reviewerStarted?: boolean })?.reviewerStarted, false);
     assert.ok(run.settlements.length > 0 && run.settlements.every(row => row.mutating === 0));
+  });
+  await t.test('records read through call_tool settles as the success it is', async () => {
+    const run = await reviewedCliAnswer('answer_call_tool', 'records', 'done', 'call_tool');
+    assert.equal(run.bodyLines.length, 1, 'one real subprocess body ran');
+    assert.equal(run.read?.outcome, 'succeeded', JSON.stringify(run.settlements));
+    assert.equal(run.terminal.kind, 'terminal');
   });
   await t.test('claim repair retains the read without redispatch', async () => {
     const run = await reviewedCliAnswer('answer_repair', 'records', 'repair');

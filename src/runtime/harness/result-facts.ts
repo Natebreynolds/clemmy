@@ -1189,6 +1189,25 @@ function reviewedCliObservationPayload(result: unknown): {
   }
 }
 
+/** The reviewed CLI transport's own observation of the operation it ran:
+ * which operation, and whether its process exited cleanly. Null when the
+ * result is not such an observation. */
+export function reviewedCliObservationOutcome(result: unknown): { operationId: string; success: boolean } | null {
+  const sealed = exactSealedInvokeResult(result);
+  const observation = asRecord(sealed.status === 'valid' ? sealed.payload : result);
+  if (
+    !observation
+    || observation.version !== 1
+    || typeof observation.status !== 'string'
+    || typeof observation.operationId !== 'string'
+    || typeof observation.executableRealpath !== 'string'
+    || !Array.isArray(observation.argv)
+    || typeof observation.stdout !== 'string'
+  ) return null;
+  const exitCode = typeof observation.exitCode === 'number' ? observation.exitCode : null;
+  return { operationId: observation.operationId, success: observation.status === 'exited' && (exitCode === null || exitCode === 0) };
+}
+
 export function deriveResultHandleFactsFromRaw(result: unknown): RawResultHandleFacts {
   try {
     const mcp = exactMcpResultPayload(result);
