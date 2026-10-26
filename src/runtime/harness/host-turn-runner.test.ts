@@ -1536,11 +1536,17 @@ test('production host keeps the no-progress recovery directive out of the exact 
   )), 'each checkpoint extends the exact prior balanced history');
 });
 
-test('production host turns an exact plan account choice into one question with no provider body', async () => {
+test('production host turns an exact plan account choice into one question with no provider body', async (t) => {
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
   try {
     const fixture = acceptHostCanarySource('plan-account-choice-recovery');
+    // A published question belongs to a real accepted foreground attempt.
+    const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `plan-question-${fixture.source.seq}` });
+    eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: fixture.source.data },
+      { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+    Object.assign(fixture.parent, { runAttemptId: attempt.attemptId });
+    t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
     let planBodies = 0;
     let providerBodies = 0;
     const accountChoices = ['work@corp.example', 'personal@example.net'];
@@ -6769,8 +6775,13 @@ test('production host carries generic user-question and worker envelopes through
     capabilityCatalogs.createHostCapabilityCatalogFactory(),
   );
   try {
-    await t.test('ask_user_question posts its typed envelope and halts without a second model step', async () => {
+    await t.test('ask_user_question posts its typed envelope and halts without a second model step', async (t) => {
       const fixture = acceptHostCanarySource('production-typed-question');
+      const attempt = eventlog.beginRunAttempt(fixture.session.id, { runId: `typed-question-${fixture.source.seq}` });
+      eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: fixture.source.data },
+        { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+      Object.assign(fixture.parent, { runAttemptId: attempt.attemptId });
+      t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
       const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
       const model = stubModel([[
         toolCall('question-call', 'ask_user_question', {
@@ -10835,8 +10846,48 @@ test('durable memory completion obligation does not turn privacy or current-task
       buildAgent: async () => ({ model, instructions: 'base system', tools: [] } as never),
       makeRunner: () => throwingRunner() as never,
     });
-    assert.equal(result.publicPresentation?.status, 'done');
-    assert.equal(eventlog.listEvents(session.id, { types: ['tool_called', 'memory_signals_captured'] }).length, 0);
+    try {
+      assert.equal(result.publicPresentation?.status, 'done');
+      assert.equal(eventlog.listEvents(session.id, { types: ['tool_called', 'memory_signals_captured'] }).length, 0);
+    } finally {
+      // Publication can finish before this fixture's review. Keep its judge
+      // installed until its exact deferred ruling settles, even if an assertion
+      // fails, so the next fixture cannot receive this source's callback.
+      const source = eventlog.listEvents(session.id, { types: ['user_input_received'] })
+        .find(row => row.data.text === input && row.data.synthetic !== true)!;
+      const deferred = eventlog.listEvents(session.id, { types: ['completion_review_deferred'] })
+        .find(row => row.data.sourceUserSeq === source.seq);
+      if (deferred) {
+        const terminal = eventlog.listEvents(session.id, { types: ['conversation_completed'] })
+          .find(row => row.data.sourceUserSeq === source.seq)!;
+        assert.ok(terminal, 'the deferred review belongs to this published terminal');
+        const findSettled = () => eventlog.listEvents(session.id, { types: ['completion_review_settled'] })
+          .find(row => row.data.sourceUserSeq === source.seq && row.data.terminalEventId === terminal.id);
+        if (!findSettled()) {
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => { detach(); reject(new Error('the exact privacy-control review never settled')); }, 5_000);
+            const detach = actionBus.subscribe(event => {
+              if (event.kind === 'harness.event' && event.sessionId === session.id
+                && event.event.type === 'completion_review_settled'
+                && event.event.data.sourceUserSeq === source.seq
+                && event.event.data.terminalEventId === terminal.id) {
+                clearTimeout(timeout); detach(); resolve();
+              }
+            });
+          });
+        }
+        const settled = findSettled()!;
+        assert.equal(settled.data.review, 'checked');
+        const verdict = eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] })
+          .find(row => row.id === settled.data.verdictEventId)!;
+        assert.ok(verdict, 'the settlement names the exact retained ruling');
+        assert.equal(verdict.data.sourceUserSeq, source.seq);
+        assert.equal(verdict.data.afterDelivery, true);
+        assert.equal(verdict.data.fulfills, true);
+        assert.equal(verdict.data.reason, 'The user excluded durable memory; acknowledgement suffices.');
+        assert.equal(verdict.data.replyDigest, createHash('sha256').update('Understood.').digest('hex'));
+      }
+    }
   }
 });
 

@@ -47,7 +47,7 @@ test('an unchanged credential reuses its observation inside the window and is ob
   assert.deepEqual(observed.slice(2), [`directory:${path.basename(root)}`, 'file:vault.json'], 'the window bounds how long a broadened directory or file can go unobserved');
 }));
 
-test('a changed file, a changed change time and a replaced directory are observed again at once', () => fixture(root => {
+test('a changed file and a replaced directory are observed again at once', () => fixture(root => {
   const state = path.join(root, 'state'); mkdirSync(state); const target = path.join(state, 'vault.json');
   writeFileSync(target, '{"grant":"one"}');
   const clock = { now: 1_000 }; const { policy, observed } = countingPolicy(clock);
@@ -55,17 +55,43 @@ test('a changed file, a changed change time and a replaced directory are observe
   writeFileSync(target, '{"grant":"two, longer"}');
   assert.equal(policy.readCredentialFileSync(target), '{"grant":"two, longer"}');
   assert.deepEqual(observed, ['file:vault.json'], 'new bytes are observed again; the unchanged directory is reused');
-  if (process.platform !== 'win32') {
-    // A permission change moves only the change time. NTFS does the same for
-    // an ACL edit; the real-ACL qualification pins that on Windows.
-    observed.length = 0; chmodSync(target, 0o640);
-    policy.readCredentialFileSync(target);
-    assert.deepEqual(observed, ['file:vault.json'], 'a metadata-only change is observed again');
-  }
   observed.length = 0;
   renameSync(state, path.join(root, 'state-aside')); mkdirSync(state); writeFileSync(target, '{"grant":"replacement"}');
   assert.equal(policy.readCredentialFileSync(target), '{"grant":"replacement"}');
   assert.deepEqual(observed, ['directory:state', 'file:vault.json'], 'a different directory object is never covered by the old observation');
+}));
+
+test('a changed change time is observed immediately even with unchanged bytes and identity', (t) => fixture(root => {
+  const target = path.join(root, 'vault.json'); const raw = '{"grant":"synthetic"}';
+  writeFileSync(target, raw);
+  const actual = lstatSync(target, { bigint: true });
+  const originalLstat = fs.lstatSync; const originalFstat = fs.fstatSync;
+  let changeTime = actual.ctimeNs; let refuse = false;
+  // Linux tmpfs can report an unchanged ctime after a real chmod. Pin the
+  // metadata contract directly; actual Windows ACL edits have a native gate.
+  const controlled = <T extends ReturnType<typeof originalLstat>>(stat: T): T => {
+    if (!stat || stat.dev !== actual.dev || stat.ino !== actual.ino) return stat;
+    return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ctimeNs: changeTime });
+  };
+  t.mock.method(fs, 'lstatSync', (...args: Parameters<typeof fs.lstatSync>) => controlled(originalLstat(...args)));
+  t.mock.method(fs, 'fstatSync', (...args: Parameters<typeof fs.fstatSync>) => controlled(originalFstat(...args)));
+  syncBuiltinESMExports();
+  try {
+    const clock = { now: 1_000 }; const { policy, observed } = countingPolicy(clock, file => refuse && file === target);
+    assert.equal(policy.readCredentialFileSync(target), raw);
+    observed.length = 0;
+    assert.equal(policy.readCredentialFileSync(target), raw);
+    assert.deepEqual(observed, [], 'an equal signature still reuses the observation');
+    changeTime += 1n;
+    assert.equal(policy.readCredentialFileSync(target), raw);
+    assert.deepEqual(observed, ['file:vault.json'], 'ctime alone invalidates the observation');
+    observed.length = 0; changeTime += 1n; refuse = true;
+    assert.throws(() => policy.readCredentialFileSync(target), CredentialStoragePrivacyError);
+    assert.deepEqual(observed, ['file:vault.json'], 'the changed object receives a fresh ACL decision');
+    assert.equal(readFileSync(target, 'utf8'), raw, 'a refused observation preserves the file');
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+  }
 }));
 
 test('a refused observation is never reused, and hardening is never skipped', () => fixture(root => {

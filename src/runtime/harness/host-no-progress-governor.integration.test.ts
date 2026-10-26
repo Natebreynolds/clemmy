@@ -972,9 +972,14 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
       },
       model: model as never,
     });
+    // Exercise exact question authority with the normal accepted attempt owner.
+    const attempt = eventlog.beginRunAttempt(session.id, { runId: `exact-ask-${fixtureCase.label}` });
+    eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: source.data },
+      { existingEventSeq: source.seq, armRunInFlight: true });
     const parent = {
       sessionId: session.id,
       sourceUserSeq: source.seq,
+      runAttemptId: attempt.attemptId,
       turn: 1,
       counter: new brackets.ToolCallsCounter(3),
       behaviorScopeId: `${session.id}::turn:1`,
@@ -988,7 +993,7 @@ test('ask-user recovery publishes only the exact durable question/options/purpos
         hostTurnEngine: 'host_v1',
         context: { sessionId: session.id, sourceUserSeq: source.seq, turn: 1 },
       } as never,
-    ));
+    )).finally(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
     assert.equal(modelCalls, 1, 'an invalid ask never buys a last-word model call');
     const asks = eventlog.listEvents(session.id, { types: ['awaiting_user_input'] });
     if (fixtureCase.exact) {
