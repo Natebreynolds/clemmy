@@ -14,6 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -88,6 +89,55 @@ test('upsertWebPushDestination is idempotent by endpoint URL', () => {
   assert.equal(matching.length, 1);
   assert.equal(matching[0].pushP256dh, 'p256-2', 'keys are updated to the latest values');
   assert.equal(matching[0].name, 'iPhone Renamed');
+});
+
+test('distinct endpoints for one device keep distinct IDs within the same millisecond', () => {
+  // A duplicate ID is correctly quarantined on the next read. Keep the
+  // regression in its own real catalog so a pre-fix failure cannot poison
+  // the independent endpoint/device removal tests below.
+  const script = `
+    import assert from 'node:assert/strict';
+    const { upsertWebPushDestination, listNotificationDestinations } =
+      await import(${JSON.stringify(new URL('./notifications.ts', import.meta.url).href)});
+    const originalNow = Date.now;
+    Date.now = () => 1793000000000;
+    try {
+      const first = upsertWebPushDestination({
+        endpoint: 'https://push.example.com/fixed-clock-a',
+        p256dh: 'first-key', auth: 'first-auth', deviceId: 'fixed-clock-device',
+      });
+      const refreshed = upsertWebPushDestination({
+        endpoint: 'https://push.example.com/fixed-clock-a',
+        p256dh: 'refreshed-key', auth: 'refreshed-auth', deviceId: 'fixed-clock-device',
+      });
+      assert.equal(refreshed.id, first.id, 'resubscribing preserves the existing endpoint ID');
+      const second = upsertWebPushDestination({
+        endpoint: 'https://push.example.com/fixed-clock-b',
+        p256dh: 'second-key', auth: 'second-auth', deviceId: 'fixed-clock-device',
+      });
+      assert.notEqual(first.id, second.id, 'different endpoints must not collide on one device');
+      const destinations = listNotificationDestinations().filter(
+        (destination) => destination.type === 'web_push' && destination.deviceId === 'fixed-clock-device',
+      );
+      assert.equal(destinations.length, 2, 'both subscriptions remain in a valid catalog');
+      assert.equal(new Set(destinations.map(destination => destination.id)).size, 2);
+      assert.equal(destinations.find(destination => destination.id === first.id)?.pushP256dh, 'refreshed-key');
+    } finally {
+      Date.now = originalNow;
+    }
+  `;
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      CLEMENTINE_HOME: path.join(TMP_ROOT, 'fixed-clock-catalog'),
+      CLEMMY_TEST_DISABLE_LIVE_MODELS: '1',
+      CLEMMY_ALLOW_LIVE_MODEL_TRANSPORT: 'off',
+      CLEMMY_LOCAL_EMBEDDINGS: 'off',
+    },
+  });
+  assert.equal(child.status, 0, `${child.error?.message ?? ''}\n${child.stdout}\n${child.stderr}`);
 });
 
 test('different endpoints create distinct destinations', () => {

@@ -2338,7 +2338,7 @@ export function upsertWebPushDestination(input: {
     const existing = items.find(
       (entry) => entry.type === 'web_push' && entry.pushEndpoint === input.endpoint,
     );
-    const id = existing?.id ?? `web-push-${input.deviceId}-${Date.now().toString(36)}`;
+    const id = existing?.id ?? `web-push-${input.deviceId}-${randomUUID()}`;
     const destination: NotificationDestination = {
       id,
       name: input.deviceLabel?.trim() || `Mobile device ${input.deviceId}`,
