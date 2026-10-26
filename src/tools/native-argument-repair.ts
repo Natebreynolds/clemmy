@@ -40,13 +40,20 @@ function plainObject(value: unknown): value is Record<string, unknown> {
 const CANONICAL_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/;
 
 /** The value a canonical scalar spelling denotes, or undefined. */
-function canonicalScalar(expected: unknown, value: unknown): number | boolean | undefined {
+function canonicalScalar(expected: unknown, value: unknown): unknown {
   if (typeof value !== 'string') return undefined;
   if (expected === 'number' && CANONICAL_NUMBER.test(value)) {
     const parsed = Number(value);
     return Number.isFinite(parsed) && String(parsed) === value ? parsed : undefined;
   }
   if (expected === 'boolean' && (value === 'true' || value === 'false')) return value === 'true';
+  // A list or object sent as its own JSON text is that value, read once.
+  if ((expected === 'array' || expected === 'object') && /^\s*[[{]/.test(value)) {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (expected === 'array' ? Array.isArray(parsed) : plainObject(parsed)) return parsed;
+    } catch { /* not that value's text */ }
+  }
   return undefined;
 }
 

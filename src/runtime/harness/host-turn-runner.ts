@@ -3171,9 +3171,22 @@ const runHostTurnBody = async (
       const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
       if (args && !actionExpectedWorkRequired(identity)) {
         const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
-        const requirement = await prepareDirectHostLocalCall(agent, {
+        let requirement = await prepareDirectHostLocalCall(agent, {
           ...identity, operationId: call.name, args,
         });
+        // Arguments the schema reads exactly once completed (a list sent as
+        // its JSON text, "false" for false) run as that completed form, the
+        // same bytes a carried call of this tool would run with.
+        if (!requirement) {
+          const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
+          const prepared = await materializeLocalRuntimeToolArguments(call.name, args);
+          requirement = prepared
+            ? await prepareDirectHostLocalCall(agent, { ...identity, operationId: call.name, args: prepared.args })
+            : null;
+          if (requirement && prepared) {
+            localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`, JSON.stringify(prepared.args));
+          }
+        }
         // A direct call whose arguments match no definition is refused
         // for those arguments, not as uncovered work: a coverage refusal
         // says the arguments are fine and sends the same call back

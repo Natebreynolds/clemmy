@@ -122,3 +122,14 @@ test('arguments sent in a carrier\'s shape are read as the call\'s own, for a re
   assert.equal(repairNativeArguments(status, { ...carried, other: 1 }, { sideEffect: 'read' }), null,
     'any field beyond the carrier\'s two keeps the refusal');
 });
+
+test('a list or object sent as its own JSON text is read as that value, and nothing else is', () => {
+  const steps = [{ find: 'old', replace: 'new' }];
+  const repaired = repairNativeArguments(edit, { slug: 'my-day', edits: JSON.stringify(steps) }, { sideEffect: 'write' });
+  assert.deepEqual(repaired?.args, { slug: 'my-day', edits: steps });
+  assert.equal(repaired?.repair, 'canonical_scalar');
+  for (const edits of ['[{"find": "old"', JSON.stringify({ find: 'old', replace: 'new' }), 'old -> new']) {
+    assert.equal(repairNativeArguments(edit, { slug: 'my-day', edits }, { sideEffect: 'write' }), null, edits);
+  }
+  assert.equal(repairNativeArguments(edit, { slug: 'my-day', edits: JSON.stringify(steps) }, { sideEffect: 'send' }), null);
+});
