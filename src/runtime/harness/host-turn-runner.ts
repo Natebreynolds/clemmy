@@ -3072,6 +3072,16 @@ const runHostTurnBody = async (
   // no definition, so the refusal says what to correct instead of only that
   // coverage was missing (which sent the model searching).
   const carriedArgumentDiagnostics = new Map<string, string>();
+  const noteLocalArgumentMismatch = async (call: { callId: string; name: string }, name: string, args: unknown): Promise<void> => {
+    if (!isRegistryDeclaredLocalPlanningCapability(name)) return;
+    const { prepareNativeToolArguments } = await import('../../tools/call-tool.js');
+    const checked = await prepareNativeToolArguments(name, args);
+    if (checked.status === 'invalid') {
+      carriedArgumentDiagnostics.set(call.callId, `Host refused ${call.name} before dispatch: the ${name} arguments `
+        + `do not match its schema (${checked.detail.slice(0, 300)}). Correct those arguments and call ${name} the same way again; `
+        + 'no search is needed.');
+    }
+  };
   const selectedDirectCarry = (name: string, args: Record<string, unknown> | null, argumentsJson: string, callId?: string) => {
     const carrier = toolByName.get('work_call');
     if (!hostProduction || !carrier || !isHostPlanRequiredWorkCall(carrier)) return null;
@@ -3100,15 +3110,7 @@ const runHostTurnBody = async (
     const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
     const requirement = await prepareDirectHostLocalCall(agent, { ...identity, operationId: name, args: effective.args });
     if (!requirement) {
-      if (isRegistryDeclaredLocalPlanningCapability(name)) {
-        const { prepareNativeToolArguments } = await import('../../tools/call-tool.js');
-        const checked = await prepareNativeToolArguments(name, effective.args);
-        if (checked.status === 'invalid') {
-          carriedArgumentDiagnostics.set(call.callId, `Host refused ${call.name} before dispatch: the ${name} arguments `
-            + `do not match its schema (${checked.detail.slice(0, 300)}). Correct those arguments and call ${name} the same way again; `
-            + 'no search is needed.');
-        }
-      }
+      await noteLocalArgumentMismatch(call, name, effective.args);
       return;
     }
     const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
@@ -11979,7 +11981,12 @@ const runHostTurnBody = async (
             const requirement = await prepareDirectHostLocalCall(agent, {
               ...identity, operationId: call.name, args,
             });
+            // A direct call whose arguments match no definition is refused
+            // for those arguments, not as uncovered work: a coverage refusal
+            // says the arguments are fine and sends the same call back
+            // through another carrier before the schema complaint arrives.
             if (requirement) directLocalCallRequirements.set(call.callId, requirement);
+            else await noteLocalArgumentMismatch(call, call.name, args);
           }
           continue;
         }
