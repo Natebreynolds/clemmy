@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
 import { applyExactFactPatches } from '../../memory/fact-observation.js';
 import { correctFactExact } from '../../memory/fact-correction.js';
 import { reviewFactCorrection } from '../../memory/fact-correction-review.js';
@@ -81,6 +82,7 @@ export async function executeMemoryCorrection(input: {
   let assessment = findRetainedCorrectionAssessment(source, input.correct);
   if (!assessment) {
     const review = await reviewFactCorrection({ ownerText: source.ownerText,
+      ...(source.clarification ? { clarification: source.clarification } : {}),
       currentContext: source.memoryScope, observation, edits: input.correct.edits,
       replacementContent: replacement.content });
     if (review.decision !== 'entailed') {
@@ -96,9 +98,7 @@ export async function executeMemoryCorrection(input: {
   const assertCurrent = () => {
     assertDispatchLeaseCurrent(lease);
     const fresh = readMemoryRequirementSource(identity);
-    if (!fresh || fresh.sourceEventId !== source.sourceEventId
-      || fresh.sourceContextDigest !== source.sourceContextDigest
-      || fresh.objectiveDigest !== source.objectiveDigest) {
+    if (!fresh || !isDeepStrictEqual(fresh, source)) {
       throw new Error('The owner request or project context changed during correction review.');
     }
   };

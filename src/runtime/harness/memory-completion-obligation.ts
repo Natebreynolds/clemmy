@@ -15,6 +15,8 @@ import { acceptedTaskIdFor } from './attempt-identity.js';
 import { readSourceSessionContext } from './source-session-context.js';
 import { acceptedTaskMode } from './accepted-task-mode.js';
 import { rehydrateConsumedClarificationContext } from './task-continuity-runtime.js';
+import { readConsumedTaskContinuityPacket, readTaskContinuityClarificationSources,
+  type TaskContinuityFrozenResolution } from '../../memory/task-continuity.js';
 import { adoptedSteerNotesForSource } from './steer-notes.js';
 import { autoCaptureProvenanceFromAcceptedEvent, isEligibleAutoCaptureSourceProvenance } from '../../memory/auto-capture.js';
 import { hostVerifiedStatedRetention } from './durable-memory-intake-receipt.js';
@@ -50,11 +52,26 @@ export function parseMemoryRequirementPacket(output: unknown): MemoryRequirement
   catch { return null; }
 }
 
+/** Reopened literal lineage, not authority from an assistant's question. The
+ * current owner answer and existing semantic correction review still decide
+ * whether a proposed exact edit is authorized. */
+export interface MemoryClarificationHandoff {
+  version: 1; packetId: string; sourceDigest: string;
+  resolution: TaskContinuityFrozenResolution;
+  messages: Array<{
+    role: 'user'; sourceUserSeq: number; sourceEventId: string; dataHash: string;
+    sourceContextDigest: string; text: string;
+  } | {
+    role: 'assistant'; awaitingEventId: string; terminalEventId: string;
+    text: string; options: string[];
+  }>;
+}
 export interface MemoryRequirementSource {
   sessionId: string; sourceUserSeq: number; sourceEventId: string; acceptedTaskId: string;
   occurredAt: string; ownerText: string; ownerTextDigest: string; objective: string; objectiveDigest: string;
   sourceContextDigest: string;
   memoryScope: { projectId: string | null; agentKey: string | null };
+  clarification?: MemoryClarificationHandoff;
 }
 export interface MemoryRequirementReview {
   phase: 'prewrite' | 'completion'; failedOpen?: boolean; judgeModelId?: string;
@@ -79,7 +96,8 @@ export interface RetainedMemoryRequirement {
 }
 
 /** No current settings or fabricated prompt can reconstruct missing authority.
- * Clarification/Plan/steering objectives require a separate typed handoff. */
+ * Only a verified ordinary clarification can hand off its literal owner history;
+ * Plan, Execute, steering and approved-noticing tasks retain separate authority. */
 export function readMemoryRequirementSource(input: { sessionId: string; sourceUserSeq: number },
   objective?: string): MemoryRequirementSource | null {
   if (adoptedSteerNotesForSource(input).length > 0
@@ -90,13 +108,64 @@ export function readMemoryRequirementSource(input: { sessionId: string; sourceUs
     { sessionId: input.sessionId, sourceEventId: `user-source:${input.sourceUserSeq}` })) return null;
   const display = typeof event.data.displayText === 'string' ? event.data.displayText : '';
   const ownerText = display.trim() ? display : typeof event.data.text === 'string' ? event.data.text : '';
-  if (!ownerText.trim() || (objective !== undefined && objective !== ownerText)
-    || rehydrateConsumedClarificationContext({ ...input, answer: ownerText })) return null;
+  if (!ownerText.trim()) return null;
   const context = readSourceSessionContext(input);
   if (!context) return null;
+  let effectiveObjective = ownerText;
+  let clarification: MemoryClarificationHandoff | undefined;
+  try {
+    const db = openEventLog();
+    const knownBinding = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_continuity_packets'").get()
+      && db.prepare('SELECT 1 FROM task_continuity_packets WHERE session_id = ? AND consumed_by_source_user_seq = ? LIMIT 1')
+        .get(input.sessionId, input.sourceUserSeq);
+    const consumed = readConsumedTaskContinuityPacket({ sessionId: input.sessionId,
+      consumingSourceUserSeq: input.sourceUserSeq });
+    if (knownBinding && consumed.status !== 'consumed') return null;
+    if (consumed.status !== 'none') {
+      if (consumed.status !== 'consumed' || consumed.packet.pause.kind !== 'clarification') return null;
+      const verified = rehydrateConsumedClarificationContext({ ...input, answer: ownerText });
+      const chain = readTaskContinuityClarificationSources({ sessionId: input.sessionId,
+        packetId: consumed.packet.packetId, consumingSourceUserSeq: input.sourceUserSeq });
+      if (!verified || !['selected', 'provided', 'affirmed'].includes(verified.disposition)
+        || chain.status !== 'verified' || !chain.consumedReply
+        || verified.packetId !== chain.packetId || verified.consumingSourceUserSeq !== input.sourceUserSeq
+        || chain.consumedReply.sourceEventId !== event.id || chain.consumedReply.text !== ownerText
+        || verified.parentSourceUserSeq !== chain.root.sourceUserSeq) return null;
+      const messages: MemoryClarificationHandoff['messages'] = [];
+      for (const literal of [chain.root, ...chain.replies, chain.consumedReply]) {
+        const identity = { sessionId: input.sessionId, sourceUserSeq: literal.sourceUserSeq };
+        const source = listEvents(input.sessionId, { sinceSeq: literal.sourceUserSeq - 1,
+          types: ['user_input_received'], limit: 1 }).find(row => row.seq === literal.sourceUserSeq);
+        if (!source || source.id !== literal.sourceEventId || source.data.text !== literal.text
+          || source.data.noticingApprovedTask !== undefined
+          || !isEligibleAutoCaptureSourceProvenance(autoCaptureProvenanceFromAcceptedEvent(source),
+            { sessionId: input.sessionId, sourceEventId: `user-source:${literal.sourceUserSeq}` })
+          || adoptedSteerNotesForSource(identity).length > 0
+          || ['plan', 'execute'].includes(acceptedTaskMode(input.sessionId, literal.sourceUserSeq)?.kind ?? '')) return null;
+        const originalContext = readSourceSessionContext(identity);
+        if (!originalContext || !isDeepStrictEqual(originalContext.memoryScope, context.memoryScope)) return null;
+        if ('previousDeliveredQuestion' in literal) messages.push({ role: 'assistant',
+          awaitingEventId: literal.previousDeliveredAwaitingEventId,
+          terminalEventId: literal.previousDeliveredTerminalEventId,
+          text: literal.previousDeliveredQuestion, options: [...literal.previousDeliveredOptions] });
+        messages.push({ role: 'user', sourceUserSeq: literal.sourceUserSeq,
+          sourceEventId: literal.sourceEventId, dataHash: literal.dataHash,
+          sourceContextDigest: originalContext.digest, text: literal.text });
+      }
+      clarification = { version: 1, packetId: chain.packetId, sourceDigest: chain.sourceDigest,
+        resolution: consumed.resolution, messages };
+      // This is exactly the existing ordinary clarification completion objective
+      // (host-turn-runner.clarificationJudgeObjective), never answer-only scope.
+      effectiveObjective = [verified.parentInput.trim(), '',
+        `Clarification asked before proceeding: ${verified.question.trim()}`,
+        `User's answer: ${verified.answer.trim()}`].join('\n');
+    }
+  } catch { return null; }
+  if (objective !== undefined && objective !== effectiveObjective) return null;
   return { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, sourceEventId: event.id, acceptedTaskId: acceptedTaskIdFor(input.sessionId, input.sourceUserSeq),
-    occurredAt: event.createdAt, ownerText, ownerTextDigest: textDigest(ownerText), objective: ownerText,
-    objectiveDigest: textDigest(ownerText), sourceContextDigest: context.digest, memoryScope: { ...context.memoryScope } };
+    occurredAt: event.createdAt, ownerText, ownerTextDigest: textDigest(ownerText), objective: effectiveObjective,
+    objectiveDigest: textDigest(effectiveObjective), sourceContextDigest: context.digest, memoryScope: { ...context.memoryScope },
+    ...(clarification ? { clarification } : {}) };
 }
 export interface IntakeReplacement { replaced: FactObservationV1; by: FactObservationV1 }
 /** Facts this exact request's own memory intake stored that retired an older
