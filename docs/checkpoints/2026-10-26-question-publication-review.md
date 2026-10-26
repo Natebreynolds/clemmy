@@ -1,0 +1,18 @@
+# 2026-10-26 — Review model-authored questions before publication
+
+The installed q2 memory fixture exposed a schema-valid but unusable question that reached the owner without completion review. The q3 fixture correctly completed one correction and asked for the second missing value, but that ordinary awaiting-input reply also skipped review. These are separate paths through the same framework gap.
+
+The change reuses the existing source-bound objective reviewer. It adds no reviewer, persistent question store, job, execution authority, or retry allowance.
+
+- Ordinary model-authored awaiting-input replies are review-eligible under the captured review policy and existing approval/continuation limits. Self-contained-answer and disclosure shortcuts cannot waive a proposed question's review.
+- The question tool still stages its result. At the existing whole-batch boundary, a scoped in-memory capture defers the public post until review and output guards finish. Review sees the full spoken reply, bundled questions, and exact offered choices. The retained diagnostic binds those choices as well as the reply.
+- Exact host-supplied account, connection, and recovery questions keep their existing fast path when no model wording survives. The canonical async scope terminal remains unchanged.
+- Rejected questions use the existing bounded repair/disclosure flow. An exhausted definitive rejection becomes a resumable `question_review_unmet` stop, not a published question. Disabled/unavailable review preserves the existing unqualified needs-input policy; it is not a semantic pass.
+- The last publication check reopens the original source, attempt, dispatch lease, Stop state and pending owner steering. No await separates that check from the public append. A rejected candidate does not replay settled tools.
+- A reviewed ordinary ASK reply displays its question without the internal ASK marker. An awaiting question never counts as whole-objective fulfillment.
+
+Evidence is retained under the primary checkout's `output/end-to-end-review-2026-10-26/question-admission/`. The initial RED, fixture corrections, intermediate failures, and final receipts are separate. Tests use actual question tools and host boundaries with controlled primary/reviewer responses, sterile temporary homes, denied network access, and denied live-home reads. They do not prove live provider behavior.
+
+Validation: 144 distinct tests passed (100 objective-judge, 21 publication/orchestrator, 11 production question-admission, 12 adjacent terminal/resume cases). The final question cases include direct/wrapped calls, bundled choices with spoken progress, exact-attempt Stop and source replacement during review, ordinary ASK rendering, unavailable review, and a question after a real ordinary-answer disclosure. Repeated rejected questions consume the existing two work repairs plus one disclosure, then stop after four reviewed candidates with no public question. The adjacent resume tests cover settled-history fallthrough, not a terminal function return during approval resume; the string-configured stop modes are unchanged by behavior but lack dedicated tests.
+
+Qualification limits: the new deferred admission covers the fresh production host lane. Legacy SDK rolling-upgrade resume/default synchronous behavior and the separate Claude SDK lane are not newly qualified. Steering prevents stale publication but does not yet cancel this captured question's in-flight reviewer early. Native delivery, Windows acceptance, complete failure-path live acceptance, and whole-task cost/savings remain unqualified. Exact install and live results belong in the coordination checkpoint after observation; this source note does not claim them.

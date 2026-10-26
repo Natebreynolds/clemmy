@@ -164,7 +164,42 @@ test('final verification can review the repaired candidate without granting anot
   assert.equal(shouldRunObjectiveJudge({ ...input, continuationsUsed: 4 }), false);
 });
 
-test('gate: does NOT fire when nextAction is not completed (e.g. awaiting approval)', () => {
+test('gate: reviews a proposed clarification even before any work was attempted', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    nextAction: 'awaiting_user_input',
+    conversationalIntent: true,
+    sourceWorkAttempted: false,
+  }), true);
+});
+
+test('gate: partial work and accepted execution do not certify a proposed clarification', () => {
+  assert.equal(shouldRunObjectiveJudge({
+    ...baseGate,
+    nextAction: 'awaiting_user_input',
+    actionIntent: true,
+    sourceWorkAttempted: true,
+    meaningfulToolEvidence: true,
+    multiResultObjective: true,
+    acceptedExecutionEvidence: true,
+    settledSourceEffects: 1,
+  }), true);
+});
+
+test('gate: clarification review retains opt-in, open approval and continuation boundaries', () => {
+  const input = { ...baseGate, nextAction: 'awaiting_user_input' };
+  assert.equal(shouldRunObjectiveJudge({ ...input, optIn: false }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...input, openApprovalCard: true }), false);
+  assert.equal(shouldRunObjectiveJudge({ ...input, continuationsUsed: 3 }), false);
+  assert.equal(shouldRunObjectiveJudge({
+    ...input, continuationsUsed: 3, reviewAtContinuationLimit: true,
+  }), true);
+  assert.equal(shouldRunObjectiveJudge({
+    ...input, continuationsUsed: 4, reviewAtContinuationLimit: true,
+  }), false);
+});
+
+test('gate: does NOT fire while awaiting approval', () => {
   assert.equal(shouldRunObjectiveJudge({ ...baseGate, actionIntent: true, nextAction: 'awaiting_approval' }), false);
 });
 

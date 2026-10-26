@@ -69,6 +69,7 @@ import {
 import { getCheckIn } from './check-ins.js';
 import { constrainNeedsInputPresentationForRecovery } from '../runtime/harness/recovery-presentation-truth.js';
 import { observedConnectionDependencyPresentationForSource } from '../runtime/harness/dependency-request.js';
+import { publishOrDeferQuestionPublication } from '../runtime/harness/question-publication.js';
 import {
   unresolvedRecipientClarification,
   type ExactRecipientActionPath,
@@ -1311,22 +1312,20 @@ export function userChoiceToolUseBehavior(
           proposedText: publicAsk.question,
         })
       : { text: publicAsk.question, constrained: false };
-    // No await separates this fresh owner check from the public post.
-    if (wrappedQuestion && !currentWrappedQuestionOwner(context)) return { isFinalOutput: false as const, isInterrupted: undefined };
-    appendEvent({
-      sessionId,
-      turn,
-      role: 'Clem',
-      type: 'awaiting_user_input',
-      data: recoveryProjection.constrained
+    // Copy every public field before a host may await its existing review.
+    // The commit closure never re-renders from mutable model result objects.
+    const question = recoveryProjection.text;
+    const options = recoveryProjection.constrained || publicAsk.options === null
+      ? null : [...publicAsk.options];
+    const questionData = recoveryProjection.constrained
         ? {
-            question: recoveryProjection.text,
+            question,
             source: 'argument_repair_recovery',
             sourceUserSeq,
           }
         : {
-            question: recoveryProjection.text,
-            options: publicAsk.options,
+            question,
+            options,
             // A connection question is answered like any clarification.
             purpose: purpose === 'connection' ? 'clarification' : purpose,
             ...(connectionProjection
@@ -1338,17 +1337,32 @@ export function userChoiceToolUseBehavior(
                   bundled: true,
                   questions: candidates.map((candidate) => ({
                     question: candidate.question,
-                    options: candidate.options,
+                    options: candidate.options === null ? null : [...candidate.options],
                     purpose: candidate.purpose === 'connection' ? 'clarification' : candidate.purpose,
                   })),
                 }
               : {}),
-          },
+          };
+    const publicationOwner = { context: { sessionId, sourceUserSeq, turn } };
+    const ready = publishOrDeferQuestionPublication({
+      question,
+      options,
+      modelAuthored: clemAsked && (!connectionProjection || ownConnectionWords) && !recoveryProjection.constrained,
+    }, () => {
+      // A review may have awaited. Reopen wrapped ownership immediately before
+      // deduplication and append; no await separates this check from the post.
+      if (wrappedQuestion && !currentWrappedQuestionOwner(publicationOwner)) return false;
+      const current = listEvents(sessionId, { types: ['awaiting_user_input'] })
+        .find((event) => event.turn === turn && (!sourceUserSeq || event.data.sourceUserSeq === sourceUserSeq));
+      if (current) return JSON.stringify(current.data) === JSON.stringify(questionData);
+      appendEvent({ sessionId, turn, role: 'Clem', type: 'awaiting_user_input', data: questionData });
+      return true;
     });
+    if (!ready) return { isFinalOutput: false as const, isInterrupted: undefined };
     return {
       isFinalOutput: true as const,
       isInterrupted: undefined,
-      finalOutput: formatAwaitingUserInputFinalOutput(recoveryProjection.text),
+      finalOutput: formatAwaitingUserInputFinalOutput(question),
     };
   }
 

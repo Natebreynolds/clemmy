@@ -23,6 +23,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
+import type { PreparedQuestionPublication } from '../runtime/harness/question-publication.js';
 import { compactAdvertisedJsonSchema } from '../runtime/schema-normalizer.js';
 
 const {
@@ -2026,6 +2027,78 @@ test('ask_user_question preserves exact source provenance and a single typed cla
   assert.deepEqual(events[0].data.options, ['staging', 'prod']);
   assert.equal(events[0].data.purpose, 'clarification');
   assert.equal(events[0].data.sourceUserSeq, 41);
+});
+
+test('a staged question can be reviewed before one exact immutable public post', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const question = 'Which heading should Report B use?';
+  const output = decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool(), {
+    question, options: ['Mauve Orchid', 'Indigo Willow'], purpose: 'clarification',
+  }, { sessionId: session.id, turn: 2, sourceUserSeq: 52 })) as { options: string[] };
+  const captures: PreparedQuestionPublication[] = [];
+  const result = withQuestionPublicationCapture(p => captures.push(p), () =>
+    userChoiceToolUseBehavior({ context: { sessionId: session.id, turn: 2, sourceUserSeq: 52 } }, [{
+      type: 'function_output', tool: { name: 'ask_user_question' }, output,
+    }]));
+  assert.equal(result.isFinalOutput, true, 'the exact question is ready for host admission');
+  assert.equal(result.finalOutput, formatAwaitingUserInputFinalOutput(question));
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0);
+  assert.equal(captures.length, 1);
+  const publication = captures[0]!;
+  assert.equal(publication.modelAuthored, true);
+  assert.equal(publication.question, question);
+  output.options[0] = 'Mutation after staging';
+  assert.deepEqual(publication.options, ['Mauve Orchid', 'Indigo Willow']);
+  assert.equal(publication.publish(), true);
+  assert.equal(publication.publish(), true);
+  const events = listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.data.question, question);
+  assert.deepEqual(events[0]!.data.options, ['Mauve Orchid', 'Indigo Willow']);
+  assert.equal(events[0]!.data.sourceUserSeq, 52);
+});
+
+test('a deferred question cannot replace a different question published during review', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const context = { context: { sessionId: session.id, turn: 3, sourceUserSeq: 63 } };
+  const staged = async (question: string) => decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool(),
+    { question, options: null, purpose: 'clarification' }, context.context));
+  const captures: PreparedQuestionPublication[] = [];
+  const first = await staged('Which heading should Report B use?');
+  withQuestionPublicationCapture(p => captures.push(p), () => userChoiceToolUseBehavior(context, [{
+    type: 'function_output', tool: { name: 'ask_user_question' }, output: first,
+  }]));
+  // Publish the other independently staged question under the existing path.
+  const intervening = userChoiceToolUseBehavior(context, [{ type: 'function_output', tool: { name: 'ask_user_question' },
+    output: await staged('Which date should this report cover?') }]);
+  assert.equal(intervening.isFinalOutput, true);
+  assert.equal(captures[0]!.publish(), false);
+  const events = listEvents(session.id, { types: ['awaiting_user_input'] });
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.data.question, 'Which date should this report cover?');
+});
+
+test('independently deferred identical question posts deduplicate at commit', async () => {
+  resetEventLog();
+  const { withQuestionPublicationCapture } = await import('../runtime/harness/question-publication.js');
+  const session = createSession({ kind: 'chat' });
+  const context = { context: { sessionId: session.id, turn: 4, sourceUserSeq: 74 } };
+  const output = decodedToolOutput(await invokeFunctionTool(buildAskUserQuestionTool(),
+    { question: 'Which heading should Report B use?', options: null, purpose: 'clarification' }, context.context));
+  const captures: PreparedQuestionPublication[] = [];
+  withQuestionPublicationCapture(p => captures.push(p), () => {
+    for (let index = 0; index < 2; index += 1) userChoiceToolUseBehavior(context, [{
+      type: 'function_output', tool: { name: 'ask_user_question' }, output,
+    }]);
+  });
+  assert.equal(captures.length, 2);
+  assert.equal(captures[0]!.publish(), true);
+  assert.equal(captures[1]!.publish(), true);
+  assert.equal(listEvents(session.id, { types: ['awaiting_user_input'] }).length, 1);
 });
 
 function recordFixtureSearch(sessionId: string, sourceUserSeq: number, callId: string, query: string, gapToolkit?: string): void {

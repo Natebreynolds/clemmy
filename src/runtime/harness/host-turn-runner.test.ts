@@ -13746,6 +13746,328 @@ test('a completion judge accepting a clarification preserves the resumable quest
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
+for (const variant of ['unhelpful-first', 'partial-complete', 'after-disclosure'] as const) {
+  test(`question admission reviews the staged owner question before posting (${variant})`, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+    process.env.HARNESS_TOOL_BRACKETS = 'on';
+    t.after(() => {
+      host._setHostObjectiveJudgeForTests(null);
+      if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+      else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+    });
+    const objective = variant !== 'unhelpful-first'
+      ? 'Report the controlled value for record A, then classify record B against my unpublished private cutoff. Ask for the cutoff only after reporting A.'
+      : 'Classify record B against my unpublished private cutoff. Ask for the precise cutoff if it is missing.';
+    const fixture = freshComputationFixture(eventlog.createSession({
+      id: `question-admission-review-${++acceptedSerial}-${variant}`, kind: 'chat',
+    }), objective, `question-admission-${variant}`);
+    t.after(() => eventlog.finishRunAttempt(fixture.attempt, 'completed'));
+    // The accepted source's captured policy, rather than a caller's option,
+    // owns whether this final question is reviewed.
+    host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
+    const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+    const unhelpful = 'Would you like me to continue working on this?';
+    const rejectedAnswer = 'The classification is complete even though the private cutoff was not supplied.';
+    const precise = variant !== 'unhelpful-first'
+      ? 'Record A has the controlled value 17. What private cutoff should I use to classify record B?'
+      : 'What private cutoff should I use to classify record B?';
+    const args = (question: string) => ({ question, options: ['10', '20'], purpose: 'clarification' });
+    let reads = 0;
+    const fixtureFile = path.join(TMP_HOME, `question-admission-${variant}.txt`);
+    writeFileSync(fixtureFile, 'CONTROLLED_RECORD_A_VALUE=17\n', 'utf8');
+    const readA = brackets.wrapToolForHarness(tool({ name: 'read_file',
+      description: 'Read the controlled available record A.', parameters: z.object({ path: z.string() }),
+      execute: async ({ path: target }) => {
+        assert.equal(target, fixtureFile); reads++;
+        return readFileSync(target, 'utf8');
+      },
+    }) as never);
+    const model = scriptedRecordingModel([
+      ...(variant !== 'unhelpful-first'
+        ? [[toolCall('question-available-record-a', 'read_file', { path: fixtureFile })]]
+        : [[toolCall('question-unhelpful', 'ask_user_question', args(unhelpful))]]),
+      ...(variant === 'after-disclosure' ? [[textMsg(rejectedAnswer)]] : []),
+      [toolCall('question-precise', 'ask_user_question', args(precise))],
+      [textMsg('This extra primary step must not be needed after the valid question.')],
+    ]);
+    const reviewed: Array<{ objective: string; reply: string; awaitingBefore: number; summary?: string }> = [];
+    host._setHostObjectiveJudgeForTests(async (currentObjective, reply, context) => {
+      reviewed.push({ objective: currentObjective, reply,
+        awaitingBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length,
+        summary: context?.toolCallSummary });
+      return variant !== 'partial-complete' && reviewed.length === 1
+        ? { done: false, ...(variant === 'after-disclosure' ? { blocked: true } : {}),
+          reason: 'INCOMPLETE: This question does not name the missing private cutoff. Ask for that exact value rather than permission to continue.' }
+        : { done: true, awaitingUser: true, reason: 'AWAITING: The available work is reported; the remaining classification needs the owner\'s private cutoff.' };
+    });
+    const tools = variant !== 'unhelpful-first' ? [readA, questionTool] : [questionTool];
+    const agent = { model, tools, toolUseBehavior: userChoiceToolUseBehavior };
+    bindHostCanarySurface(fixture, agent, tools);
+    const runner = throwingRunner();
+    const { attachEventLogHooks } = await import('./hooks.js');
+    const detach = attachEventLogHooks(runner, { getSessionId: () => fixture.session.id, getTurn: () => fixture.source.turn });
+    t.after(detach);
+    const result = await brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
+      runner as never, agent as never, [{ type: 'message', role: 'user', content: objective }] as never,
+      { maxTurns: 4, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: false } as never));
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    t.diagnostic(JSON.stringify({ variant, primaryCalls: model.calls(), reviewCalls: reviewed.length,
+      awaitingEvents: questions.length, postedUnhelpful: questions.some(row => row.data.question === unhelpful) }));
+    const expectedReviews = variant === 'partial-complete' ? 1 : 2;
+    assert.equal(reviewed.length, expectedReviews, 'the captured semantic review must qualify each proposed owner pause');
+    assert.ok(reviewed.every(row => row.awaitingBefore === 0), 'no question may be posted before its successful review');
+    assert.ok(reviewed.every(row => row.objective === objective), 'review retains the complete accepted objective');
+    if (variant !== 'partial-complete') {
+      assert.ok(reviewed[0]!.reply.includes(variant === 'after-disclosure' ? rejectedAnswer : unhelpful));
+      const repairRequest = model.requests[variant === 'after-disclosure' ? 2 : 1];
+      assert.match(JSON.stringify(repairRequest), /missing private cutoff|exact value/, 'the reviewer finding steers the same source to a useful question');
+      if (variant === 'after-disclosure') {
+        assert.equal(reads, 1, 'the initial ordinary answer has real settled partial work to review');
+        const text = (repairRequest as { input?: Array<{ content?: unknown }> }).input
+          ?.map(row => row.content).find(value => typeof value === 'string'
+            && value.startsWith('[COMPLETION REVIEW — YOUR FINAL REPLY TO THE OWNER]'));
+        assert.equal(typeof text, 'string', 'the precise staged question follows an actually armed disclosure directive');
+        const feedback = JSON.parse((text as string).slice((text as string).lastIndexOf('\n') + 1));
+        assert.equal(feedback.phase, 'disclose');
+        assert.equal(feedback.sourceUserSeq, fixture.source.seq);
+      }
+    } else {
+      assert.equal(reads, 1, 'the unblocked record is actually read once before the valid missing-value question');
+      assert.ok(reviewed[0]!.summary?.includes('CONTROLLED_RECORD_A_VALUE=17'), 'review sees the settled partial work');
+    }
+    assert.ok(reviewed.at(-1)!.reply.includes(precise));
+    assert.equal(model.calls(), variant === 'after-disclosure' ? 3 : 2, 'AWAITING admits the precise question without another primary response');
+    assert.equal(questions.length, 1, 'one qualifying question produces one durable owner pause');
+    assert.equal(questions[0]!.data.question, precise);
+    assert.equal(questions[0]!.data.sourceUserSeq, fixture.source.seq);
+    assert.ok(String(result.finalOutput).startsWith('[clementine:awaiting-user-input:final]\n'));
+    assert.ok(String(result.finalOutput).includes(precise));
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['approval_requested'] }).length, 0);
+  });
+}
+
+function ownedQuestionAdmissionFixture(label: string, frames: unknown[][]) {
+  const session = eventlog.createSession({ id: `question-admission-owned-${++acceptedSerial}-${label}`,
+    kind: 'chat', channel: 'desktop', userId: 'desktop' });
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: `question-admission:${session.id}` });
+  const objective = 'Prepare the controlled report using my private cutoff and intended audience. Ask for the exact missing owner choices.';
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
+    data: { text: objective, taskMode: { version: 1, kind: 'normal' } } }, { armRunInFlight: true });
+  const model = scriptedRecordingModel(frames);
+  const run = () => runConversation({ sessionId: session.id, sourceUserSeq: source.seq,
+    input: objective, reuseRecordedUserInput: true, runAttemptId: attempt.attemptId,
+    turnEngine: 'host_v1', maxSteps: 1, maxTurns: 4, toolCallsPerTurn: 6, judgeCompletion: true,
+    buildAgent: async context => buildOrchestratorAgent({ sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq,
+      hostFreshPlanning: context.hostFreshPlanning, userInput: objective, allowToolJit: true, model: model as never }),
+    makeRunner: () => throwingRunner() as never,
+  });
+  return { session, attempt, source, objective, model, run };
+}
+
+for (const shape of ['direct', 'wrapped', 'bundled-spoken'] as const) {
+  test(`question admission reviews the complete production candidate (${shape})`, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    t.after(() => host._setHostObjectiveJudgeForTests(null));
+    const first = { question: 'What private cutoff should I use?', options: ['10', '20'], purpose: 'clarification' };
+    const second = { question: 'Who is the intended audience?', options: ['Team', 'Board'], purpose: 'clarification' };
+    const spoken = 'I need two owner choices to finish the controlled report.';
+    const calls = shape === 'wrapped'
+      ? [toolCall('question-admitted-wrapped', 'call_tool', { name: 'ask_user_question', args_json: first })]
+      : shape === 'bundled-spoken'
+        ? [textMsg(spoken), toolCall('question-admitted-first', 'ask_user_question', first),
+          toolCall('question-admitted-second', 'ask_user_question', second)]
+        : [toolCall('question-admitted-direct', 'ask_user_question', first)];
+    const fixture = ownedQuestionAdmissionFixture(shape, [calls,
+      [textMsg('No extra primary step should run after the reviewed question.')]]);
+    const reviews: Array<{ objective: string; reply: string; postedBefore: number; evidence?: string }> = [];
+    host._setHostObjectiveJudgeForTests(async (objective, reply, context) => {
+      reviews.push({ objective, reply, evidence: context?.toolCallSummary,
+        postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+      return { done: true, awaitingUser: true, reason: 'AWAITING: Only the owner can supply the exact requested choices.' };
+    });
+    const result = await fixture.run();
+    assert.equal(reviews.length, 1, 'direct, wrapped and bundled pauses share one existing semantic review');
+    assert.equal(reviews[0]!.postedBefore, 0, 'review precedes the public event');
+    assert.equal(reviews[0]!.objective, fixture.objective);
+    assert.ok(reviews[0]!.reply.includes(first.question));
+    const reviewedBytes = reviews[0]!.reply + '\n' + (reviews[0]!.evidence ?? '');
+    assert.ok(reviewedBytes.includes('10') && reviewedBytes.includes('20'), 'review includes single-question options as exact candidate evidence');
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0]!.data.sourceUserSeq, fixture.source.seq);
+    if (shape === 'bundled-spoken') {
+      for (const value of [spoken, second.question, 'Team', 'Board']) assert.ok(reviews[0]!.reply.includes(value), value);
+      assert.ok(reviews[0]!.reply.indexOf(first.question) < reviews[0]!.reply.indexOf(second.question), 'review retains provider question order');
+      assert.equal(questions[0]!.data.bundled, true);
+      assert.equal((questions[0]!.data.questions as unknown[]).length, 2);
+      assert.ok(String(result.publicPresentation?.text).includes(spoken), 'the reviewed spoken lead-in reaches the owner');
+    } else {
+      assert.equal(questions[0]!.data.question, first.question);
+      assert.deepEqual(questions[0]!.data.options, first.options);
+    }
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.publicPresentation?.status, 'needs_input');
+    assert.equal(fixture.model.calls(), 1, 'the accepted question requires no narration model call');
+    const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] });
+    assert.equal(terminal.length, 1, 'the same source publishes one resumable terminal');
+    assert.equal(terminal[0]!.data.awaitingUser, true);
+  });
+}
+
+for (const change of ['owner-stop', 'source-replaced'] as const) {
+  test(`question admission does not post from a review whose owner changed (${change})`, { timeout: 15_000 }, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    t.after(() => host._setHostObjectiveJudgeForTests(null));
+    const question = 'What private cutoff should I use?';
+    const fixture = ownedQuestionAdmissionFixture(change, [[toolCall('question-owner-bound', 'ask_user_question',
+      { question, options: ['10', '20'], purpose: 'clarification' })]]);
+    let enter!: () => void; let release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    let reviews = 0;
+    host._setHostObjectiveJudgeForTests(async () => {
+      reviews++; enter(); await paused;
+      return { done: true, awaitingUser: true, reason: 'AWAITING: The private cutoff is missing.' };
+    });
+    const settled = fixture.run().then(value => ({ value }), error => ({ error }));
+    await Promise.race([entered, settled.then(result => {
+      throw new Error(`Question ended before its review boundary: ${JSON.stringify({
+        reviews, primaryCalls: fixture.model.calls(), posted: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length,
+        status: 'value' in result ? result.value.status : 'rejected' })}`);
+    })]);
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length, 0);
+    let successor: ReturnType<typeof eventlog.beginRunAttempt> | undefined;
+    if (change === 'owner-stop') eventlog.requestKill(fixture.session.id,
+      'Controlled owner stopped while the question was reviewed.', { attemptId: fixture.attempt.attemptId });
+    else {
+      eventlog.finishRunAttempt(fixture.attempt, 'interrupted');
+      successor = eventlog.beginRunAttempt(fixture.session.id, { runId: `question-successor:${fixture.session.id}` });
+      eventlog.recordRunAttemptUserInput(successor, { turn: 2, role: 'user',
+        data: { text: 'A new independent controlled request owns this conversation.' } }, { armRunInFlight: true });
+    }
+    release();
+    const result = await settled;
+    assert.equal(reviews, 1);
+    assert.equal(fixture.model.calls(), 1, 'a lost publication owner does not purchase another primary step');
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] })
+      .filter(row => row.data.sourceUserSeq === fixture.source.seq).length, 0, 'the reviewed old question is never published');
+    const oldTerminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+      .filter(row => row.data.sourceUserSeq === fixture.source.seq);
+    assert.ok(oldTerminal.every(row => row.data.awaitingUser !== true), 'a cancelled/lost owner cannot persist a needs-input terminal');
+    if (successor) {
+      const current = eventlog.getRunAttemptBySourceUserSeq(fixture.session.id,
+        eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] }).at(-1)!.seq);
+      assert.ok(current);
+      assert.equal(current?.attemptId, successor.attemptId);
+      assert.equal(current.finishedAt, null, 'late review must not finish the successor');
+      eventlog.finishRunAttempt(successor, 'completed');
+    } else assert.ok('error' in result || ('value' in result && result.value.status !== 'awaiting_user_input'),
+      'owner cancellation stays cancelled or conservatively held');
+  });
+}
+
+for (const variant of ['ordinary-ask', 'review-unavailable'] as const) {
+  test(`question admission preserves an honest needs-input outcome (${variant})`, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    t.after(() => host._setHostObjectiveJudgeForTests(null));
+    const question = 'What private cutoff should I use to finish the controlled report?';
+    const fixture = ownedQuestionAdmissionFixture(variant, [variant === 'ordinary-ask'
+      ? [textMsg(`ASK: ${question}`)]
+      : [toolCall('question-unchecked-review', 'ask_user_question',
+        { question, options: ['10', '20'], purpose: 'clarification' })],
+      [textMsg('This extra primary step must not run.')]]);
+    const reviews: Array<{ reply: string; postedBefore: number }> = [];
+    host._setHostObjectiveJudgeForTests(async (_objective, reply) => {
+      reviews.push({ reply,
+        postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+      return variant === 'review-unavailable'
+        ? { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'Controlled reviewer unavailable; no semantic acceptance was obtained.' }
+        : { done: true, awaitingUser: true, reason: 'AWAITING: This asks for the owner-only private cutoff.' };
+    });
+    const result = await fixture.run();
+    assert.equal(reviews.length, 1, 'ordinary ASK and staged questions use the existing captured review policy');
+    assert.equal(reviews[0]!.postedBefore, 0);
+    assert.ok(reviews[0]!.reply.includes(question));
+    assert.equal(fixture.model.calls(), 1, 'unavailable review does not cause a question rewrite loop');
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.publicPresentation?.status, 'needs_input');
+    assert.equal(result.publicPresentation?.kind, 'question');
+    assert.ok(result.publicPresentation?.text.includes(question));
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0]!.data.question, question);
+    const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] });
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0]!.data.awaitingUser, true);
+    const review = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+      .find(row => row.data.kind === 'completion');
+    assert.ok(review);
+    assert.equal(review.data.fulfills, false, 'a question never certifies the unfinished report as completed');
+    if (variant === 'review-unavailable') {
+      assert.equal(review.data.failedOpen, true);
+      assert.equal(review.data.reviewFailure, 'unavailable');
+      assert.notEqual(terminal[0]!.data.review, 'checked', 'an unavailable reviewer is not successful validation');
+    } else assert.equal(review.data.awaitingUser, true);
+  });
+}
+
+test('question admission stops bounded repeated rejected questions without posting one', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    host._setHostObjectiveJudgeForTests(null);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const objective = 'Classify record B against my unpublished private cutoff. Ask for the exact cutoff if it is missing.';
+  const fixture = freshComputationFixture(eventlog.createSession({
+    id: `question-admission-exhausted-${++acceptedSerial}`, kind: 'chat',
+  }), objective, 'question-repeated-negative');
+  t.after(() => eventlog.finishRunAttempt(fixture.attempt, 'completed'));
+  host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
+  const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+  const maxRepairs = host.MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS;
+  const model = scriptedRecordingModel(Array.from({ length: maxRepairs + 3 }, (_, index) => [
+    toolCall(`question-rejected-${index}`, 'ask_user_question', {
+      // A completed-work claim deliberately excludes the existing honest
+      // failure stop, so this case exercises both task repairs and disclosure.
+      question: `I completed the classification. Would you like me to continue with the report (attempt ${index + 1})?`,
+      options: ['Continue', 'Wait'], purpose: 'clarification',
+    }),
+  ]));
+  const reviewed: Array<{ reply: string; postedBefore: number }> = [];
+  host._setHostObjectiveJudgeForTests(async (_objective, reply) => {
+    reviewed.push({ reply,
+      postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+    return { done: false, reason: 'INCOMPLETE: This still does not ask for the owner-only private cutoff.' };
+  });
+  const agent = { model, tools: [questionTool], toolUseBehavior: userChoiceToolUseBehavior };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const result = await runProductionHost(fixture, agent, undefined,
+    { maxTurns: maxRepairs + 3, hostJudgeCompletion: true });
+  assert.equal(reviewed.length, maxRepairs + 2, 'the new staged question after disclosure is reviewed, too');
+  assert.equal(model.calls(), maxRepairs + 2, 'the existing task repairs plus one disclosure allowance are unchanged');
+  const reviewMessages = model.requests.flatMap(request =>
+    (request as { input?: Array<{ content?: unknown }> }).input?.map(row => row.content) ?? [])
+    .filter((value): value is string => typeof value === 'string');
+  assert.equal(reviewMessages.filter(text => text.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]')).length,
+    maxRepairs, 'the observed path spends exactly the existing task repair allowance');
+  const disclosures = reviewMessages.filter(text => text.startsWith('[COMPLETION REVIEW — YOUR FINAL REPLY TO THE OWNER]'));
+  assert.equal(disclosures.length, 1, 'exactly one existing disclosure activation is observed');
+  const feedback = JSON.parse(disclosures[0]!.slice(disclosures[0]!.lastIndexOf('\n') + 1));
+  assert.equal(feedback.phase, 'disclose');
+  assert.equal(feedback.sourceUserSeq, fixture.source.seq);
+  assert.ok(reviewed.every(row => row.postedBefore === 0));
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length, 0,
+    'an exhausted negative review never grants question publication');
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'question_review_unmet');
+  assert.notEqual(result.terminal?.resumable, false);
+  assert.doesNotMatch(String(result.finalOutput), /Would you like me to continue/, 'the rejected model question is not the public outcome');
+});
+
 
 for (const [review, repairReady] of [[false, false], [true, false], [true, true]]) test(`a published needs-input plan pauses with completion review ${review ? 'on' : 'off'}${repairReady ? ' after correcting ready status' : ''}`, async (t) => {
   const host = await import('./host-turn-runner.js');
