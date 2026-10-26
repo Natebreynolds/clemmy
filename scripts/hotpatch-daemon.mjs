@@ -235,9 +235,16 @@ function recoveryBaseline(parameters, fileOps, commands) {
   return { repository, roots, stamp, stampSha256: report.builtStampSha256, pins };
 }
 
+function recoveryHistoryMode(parameters) {
+  const interrupted = parameters?.interruptionHistory !== undefined;
+  const common = ['app', 'home', 'referenceBundle', 'expectedReferenceCdHash', 'reproducibility', 'builtinGitBinding'];
+  if (!sameKeys(parameters, [...common, ...(interrupted ? ['interruptionHistory'] : ['pristineBackups', 'retainedArchiveReference'])])
+    || (!interrupted && !sameKeys(parameters.pristineBackups, Object.keys(AUTHORIZED_RUNTIME_PARTS)))) guardRefusal('unsupported current-state recovery parameters');
+  return interrupted;
+}
+
 function inspectCurrentStateRecovery(parameters, fileOps, commands, verifySignature, readIdentity) {
-  if (!sameKeys(parameters, ['app', 'home', 'referenceBundle', 'expectedReferenceCdHash', 'reproducibility', 'builtinGitBinding', 'pristineBackups', 'retainedArchiveReference'])
-    || !sameKeys(parameters.pristineBackups, Object.keys(AUTHORIZED_RUNTIME_PARTS))) guardRefusal('unsupported current-state recovery parameters');
+  const interrupted = recoveryHistoryMode(parameters);
   const bundle = parameters.app;
   externalDirectory(bundle, [], fileOps);
   if (!parameters.home || path.resolve(parameters.home) !== parameters.home) guardRefusal('noncanonical recovery home');
@@ -245,18 +252,34 @@ function inspectCurrentStateRecovery(parameters, fileOps, commands, verifySignat
   if (bundle.startsWith(reference + path.sep) || !/^[a-f0-9]{40}$/.test(parameters.expectedReferenceCdHash ?? '')) guardRefusal('invalid current recovery reference');
   const baseline = recoveryBaseline(parameters, fileOps, commands);
   const observed = inspectAppliedUpdateEvidence({ app: bundle, home: parameters.home, retainedArchiveReference: parameters.retainedArchiveReference }, fileOps, readIdentity);
-  if (observed.version !== 2) guardRefusal('current recovery requires exact mixed-generation updater evidence');
+  if (observed.version !== (interrupted ? 1 : 2)) guardRefusal(interrupted
+    ? 'interrupted recovery requires exact same-generation updater evidence'
+    : 'current recovery requires exact mixed-generation updater evidence');
   const referenceTree = typedTree(reference, fileOps, { links: true });
   const archive = path.join(updaterLocations({ app: bundle, home: parameters.home }, fileOps).cache, 'update.zip');
   sameEvidence(archivedBundleTree(archive, path.basename(bundle), fileOps), referenceTree, 'current recovery archive/reference footprint');
-  verifySignature(reference); verifySignature(parameters.retainedArchiveReference.referenceBundle);
+  verifySignature(reference);
+  if (!interrupted) verifySignature(parameters.retainedArchiveReference.referenceBundle);
   const codeIdentity = readIdentity(reference);
   sameEvidence(codeIdentity, { bundleId: observed.identity.bundleId, team: DESKTOP_TEAM_IDENTIFIER, cdHash: parameters.expectedReferenceCdHash }, 'current recovery publisher/identity');
   sameEvidence(nativeIdentity(fileOps.readFileSync(path.join(reference, 'Contents/Info.plist'), 'utf8')), observed.identity, 'current recovery native identity');
   for (const relative of SEALED_SHELL_PARTS) if (fileDigest(path.join(reference, relative), 'sha256', 'hex', fileOps) !== observed.shellSnapshot[relative]) guardRefusal('current recovery native bytes differ');
   if (fileDigest(path.join(reference, 'Contents/Resources/app-update.yml'), 'sha256', 'hex', fileOps) !== observed.files[path.join(bundle, 'Contents/Resources/app-update.yml')]) guardRefusal('current recovery updater config differs');
-  const backups = new Map(); const aliases = new Set();
+  const context = { bundle, observed, verifyNativeSignature: verifySignature, readReferenceCodeIdentity: readIdentity };
+  const history = interrupted ? inspectInterruptionHistory(parameters.interruptionHistory, context, fileOps) : null;
+  if (history) {
+    sameEvidence(history.reference, reference, 'interrupted recovery signed reference');
+    sameEvidence(history.codeIdentity, codeIdentity, 'interrupted recovery signed identity');
+  }
+  const backups = history ? new Map(history.backups) : new Map(); const aliases = new Set();
   for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
+    if (history) {
+      if (!Object.hasOwn(parameters.interruptionHistory.interruptedBackups, name)) {
+        receiptRuntimeFootprint(path.join(bundle, relative), name, history.chain.receipts.at(-1), fileOps);
+      }
+      sameEvidence(typedTree(path.join(bundle, relative), fileOps), baseline.roots[name], 'current recovery installed/build bytes');
+      continue;
+    }
     const target = path.join(bundle, relative); const backup = parameters.pristineBackups[name];
     if (typeof backup !== 'string' || !backup.startsWith(target + '.backup-') || !/^[A-Za-z0-9]+$/.test(backup.slice((target + '.backup-').length))
       || path.resolve(backup) !== backup || aliases.has(backup.normalize('NFC').toLowerCase())) guardRefusal('invalid exact pristine recovery backup');
@@ -279,13 +302,16 @@ function inspectCurrentStateRecovery(parameters, fileOps, commands, verifySignat
   for (const [backup, expected] of backups) sameEvidence(typedTree(backup, fileOps), expected, 'current recovery rollback after verification');
   sameEvidence(typedTree(bundle, fileOps, { links: true, excluded }), immutable, 'current recovery immutable footprint after verification');
   sameEvidence(inspectAppliedUpdateEvidence({ app: bundle, home: parameters.home, retainedArchiveReference: parameters.retainedArchiveReference }, fileOps, readIdentity), observed, 'current recovery updater evidence after verification');
+  const historyPins = history ? [...history.receiptFiles, ...(history.manifest ? [history.manifest] : [])] : [];
+  for (const pin of historyPins) pinnedRepeatJSON(pin.path, pin.sha256, fileOps, pin.limit);
   const state = { sourceStamp: baseline.stamp, stampSha256: baseline.stampSha256, currentRoots: baseline.roots,
-    referenceCodeIdentity: codeIdentity, referenceTreeDigest: treePin(referenceTree), pristineBackups: parameters.pristineBackups };
-  return { baseline, observed, reference, referenceTree, archive, checksum: observed.files[archive], codeIdentity, backups, immutable, state };
+    referenceCodeIdentity: codeIdentity, referenceTreeDigest: treePin(referenceTree),
+    ...(interrupted ? { interruptionHistory: parameters.interruptionHistory } : { pristineBackups: parameters.pristineBackups }) };
+  return { baseline, observed, reference, referenceTree, archive, checksum: observed.files[archive], codeIdentity, backups, immutable, state, historyPins };
 }
 
 /** Read-only capture, never a capability or a fabricated installation receipt.
- * It verifies the independent current source/build and both signed references;
+ * It verifies the independent current source/build and required signed references;
  * the closed-app admission repeats these checks before minting authority. */
 export function captureCurrentStateRecoveryEvidence(parameters, fileOps = fs, commands = execFileSync, readIdentity = referenceCodeIdentity) {
   const verified = inspectCurrentStateRecovery(parameters, fileOps, commands,
@@ -322,7 +348,7 @@ export function verifyCurrentStateRecoveryPatch({ app, home, evidence, shellSnap
     sameEvidence(checked.state, document.state, 'captured current recovery state');
     sameEvidence(checked.observed, document.appliedUpdateEvidence, 'captured current recovery updater state');
     const roots = new Map(Object.entries(AUTHORIZED_RUNTIME_PARTS).map(([name, relative]) => [path.join(app, relative), { expected: checked.state.currentRoots[name], replaced: false }]));
-    ledger = { ...checked, roots, receiptFiles: [{ ...evidence, limit: RECOVERY_JSON_LIMIT }], manifest: null,
+    ledger = { ...checked, roots, receiptFiles: [{ ...evidence, limit: RECOVERY_JSON_LIMIT }, ...checked.historyPins], manifest: null,
       recoveryEvidence: { ...evidence }, recoveryDocument: document, currentStateRecovery: true,
       context: { bundle: app, observed: checked.observed, readReferenceCodeIdentity } };
     ledger.context.reprove = proof => verifyCurrentStateRecoveryPatch({ app, home, evidence, shellSnapshot, appliedUpdateEvidence,
@@ -357,7 +383,8 @@ export function initializeCurrentStateRecoveryArtifacts({ guarded, directory, fo
   const forbidden = [ledger.context.bundle, ...(ledger.baseline ? [ledger.baseline.repository] : []), ...forbiddenRoots];
   for (const root of forbidden) if (typeof root !== 'string' || path.resolve(root) !== root) guardRefusal('noncanonical recovery workspace exclusion');
   externalDirectory(directory, forbidden, fileOps);
-  for (const pin of [ledger.recoveryEvidence, ...(ledger.baseline?.pins ?? []), ledger.recoveryGenesis].filter(Boolean)) {
+  for (const pin of [ledger.recoveryEvidence, ...(ledger.baseline?.pins ?? []), ...(ledger.receiptFiles ?? []), ledger.recoveryGenesis,
+    ledger.manifest].filter(Boolean)) {
     if (forbidden.some(root => pin.path === root || pin.path.startsWith(root + path.sep))) guardRefusal('recovery capture and provenance must be durable outside build workspaces');
     regularPath(pin.path, fileOps);
   }
@@ -620,7 +647,9 @@ function receiptRuntimeFootprint(target, name, receipt, fileOps) {
   return footprint;
 }
 
-function inspectRepeatReference(options, context, fileOps) {
+/** Shared signed reference and ordered rollback proof. Current runtime
+ * admission is deliberately left to the ordinary repeat or recovery caller. */
+function inspectRepeatHistory(options, context, fileOps) {
   const { referenceBundle, authorizedReceipt, authorizedReceiptSha256, expectedPriorFingerprint, expectedReferenceCdHash } = options;
   if (![authorizedReceiptSha256, expectedPriorFingerprint].every(value => /^[a-f0-9]{64}$/.test(value ?? '')) || !/^[a-f0-9]{40}$/.test(expectedReferenceCdHash ?? '')) guardRefusal('missing exact repeat-install identity pins');
   if (typeof referenceBundle !== 'string' || !referenceBundle || typeof authorizedReceipt !== 'string' || !authorizedReceipt) guardRefusal('missing exact repeat-install evidence paths');
@@ -653,9 +682,9 @@ function inspectRepeatReference(options, context, fileOps) {
   if (!anchored && fileDigest(archive, 'sha512', 'base64', fileOps) !== checksum) guardRefusal('verified reference archive changed');
   for (const rel of SEALED_SHELL_PARTS) if (fileDigest(path.join(reference, rel), 'sha256', 'hex', fileOps) !== context.observed.shellSnapshot[rel]) guardRefusal('reference native part differs');
   if (fileDigest(path.join(reference, 'Contents/Resources/app-update.yml'), 'sha256', 'hex', fileOps) !== context.observed.files[path.join(context.bundle, 'Contents/Resources/app-update.yml')]) guardRefusal('reference updater configuration differs');
-  const roots = new Map(); const backups = new Map();
+  const backups = new Map();
   const backupAliases = new Set();
-  let genesis = null;
+  let genesis = null; let inheritedHistory = null;
   if (chain.recoveryGenesis) {
     genesis = recoveryJSON(chain.recoveryGenesis, fileOps);
     if (!sameKeys(genesis, ['version', 'kind', 'verifiedAt', 'historicalInstallationReceipt', 'bundle', 'evidence', 'captured'])
@@ -664,15 +693,25 @@ function inspectRepeatReference(options, context, fileOps) {
     const captured = genesis.captured;
     if (captured?.version !== 1 || captured.kind !== 'verified_current_state_recovery' || captured.parameters?.app !== context.bundle
       || captured.parameters?.home !== context.observed.home || captured.parameters?.referenceBundle !== reference
-      || captured.parameters?.expectedReferenceCdHash !== expectedReferenceCdHash || !sameKeys(captured.state?.currentRoots, Object.keys(AUTHORIZED_RUNTIME_PARTS))
-      || !sameKeys(captured.state?.pristineBackups, Object.keys(AUTHORIZED_RUNTIME_PARTS))) guardRefusal('recovery genesis context or exact roots differ');
+      || captured.parameters?.expectedReferenceCdHash !== expectedReferenceCdHash || !sameKeys(captured.state?.currentRoots, Object.keys(AUTHORIZED_RUNTIME_PARTS))) guardRefusal('recovery genesis context or exact roots differ');
+    const interrupted = recoveryHistoryMode(captured.parameters);
+    if (!interrupted && !sameKeys(captured.state?.pristineBackups, Object.keys(AUTHORIZED_RUNTIME_PARTS))) guardRefusal('recovery genesis pristine roots differ');
     sameEvidence(captured.shellSnapshot, context.observed.shellSnapshot, 'recovery genesis native snapshot');
     sameEvidence(captured.state.referenceCodeIdentity, codeIdentity, 'recovery genesis signed reference identity');
     if (captured.state.referenceTreeDigest !== treePin(referenceTree)) guardRefusal('recovery genesis reference footprint differs');
     // The pinned capture remains separately durable and byte exact; it is not
     // relabelled as the missing historical installation receipt.
     sameEvidence(recoveryJSON(genesis.evidence, fileOps), captured, 'recovery genesis original capture');
-    for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
+    if (interrupted) {
+      if (captured.state.pristineBackups !== undefined) guardRefusal('mixed recovery genesis history');
+      sameEvidence(captured.state.interruptionHistory, captured.parameters.interruptionHistory, 'recovery genesis interruption history');
+      inheritedHistory = inspectInterruptionHistory(captured.state.interruptionHistory, context, fileOps);
+      sameEvidence(inheritedHistory.reference, reference, 'recovery genesis inherited reference');
+      sameEvidence(inheritedHistory.codeIdentity, codeIdentity, 'recovery genesis inherited signed identity');
+      for (const [backup, footprint] of inheritedHistory.backups) {
+        backups.set(backup, footprint); backupAliases.add(backup.normalize('NFC').toLowerCase());
+      }
+    } else for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
       const target = path.join(context.bundle, relative); const backup = captured.state.pristineBackups[name];
       if (typeof backup !== 'string' || path.resolve(backup) !== backup || !backup.startsWith(target + '.backup-')
         || !/^[A-Za-z0-9]+$/.test(backup.slice((target + '.backup-').length))) guardRefusal('recovery genesis pristine backup path differs');
@@ -695,20 +734,52 @@ function inspectRepeatReference(options, context, fileOps) {
       if (index === 0) {
         sameEvidence(footprint, genesis ? genesis.captured.state.currentRoots[name] : typedTree(path.join(reference, relative), fileOps), 'oldest historical backup/reference footprint');
         if (genesis && name === 'daemon') verifyRecoveryStamp(backup, genesis.captured.state.sourceStamp, genesis.captured.state.stampSha256, fileOps);
+        // The original interrupted transaction did not touch this suffix. Its
+        // first recovery rollback must still prove the last genuine receipt.
+        if (inheritedHistory && !Object.hasOwn(genesis.captured.state.interruptionHistory.interruptedBackups, name)) {
+          receiptRuntimeFootprint(backup, name, inheritedHistory.chain.receipts.at(-1), fileOps);
+        }
       }
       backups.set(backup, footprint);
     }
   }
-  const latest = chain.receipts.at(-1);
-  for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
-    const target = path.join(context.bundle, relative);
-    roots.set(target, { expected: receiptRuntimeFootprint(target, name, latest, fileOps), replaced: false });
-  }
   const immutable = typedTree(reference, fileOps, { links: true, excluded: Object.values(AUTHORIZED_RUNTIME_PARTS) });
   sameEvidence(options, optionSnapshot, 'repeat-install authority options');
   const recoveryFiles = genesis ? [{ ...chain.recoveryGenesis, limit: RECOVERY_JSON_LIMIT }, { ...genesis.evidence, limit: RECOVERY_JSON_LIMIT }] : [];
-  const ledger = { reference, referenceTree, archive, checksum, receiptFiles: [...chain.files, ...recoveryFiles], manifest: chain.manifest, optionSnapshot, codeIdentity, roots, backups, immutable, context,
+  const inheritedPins = inheritedHistory ? [...inheritedHistory.receiptFiles, ...(inheritedHistory.manifest ? [inheritedHistory.manifest] : [])] : [];
+  return { reference, referenceTree, archive, checksum, receiptFiles: [...chain.files, ...recoveryFiles, ...inheritedPins], manifest: chain.manifest, optionSnapshot, codeIdentity, backups, immutable, context, chain,
     ...(genesis ? { recoveryGenesis: chain.recoveryGenesis } : {}) };
+}
+
+/** A bounded observed prefix of a failed ordinary repeat. The retained old
+ * chain proves only rollback ancestry; it never authorizes changed currents.
+ * Disallow nested recovery/anchor chains so replay cannot recurse or cycle. */
+function inspectInterruptionHistory(history, context, fileOps) {
+  if (!sameKeys(history, ['version', 'repeatedReference', 'interruptedBackups']) || history.version !== 1
+    || !history.repeatedReference || typeof history.repeatedReference !== 'object' || Array.isArray(history.repeatedReference)
+    || Object.keys(history.repeatedReference).some(key => key === 'authorizedRecoveryGenesis' || key === 'authorizedRecoveryGenesisSha256')
+    || context.observed.version !== 1 || context.observed.mode !== undefined) guardRefusal('unsupported bounded interruption history');
+  const names = Object.keys(AUTHORIZED_RUNTIME_PARTS); const count = Object.keys(history.interruptedBackups ?? {}).length;
+  if (count < 1 || count > names.length || !sameKeys(history.interruptedBackups, names.slice(0, count))) guardRefusal('interrupted backups are not an exact nonempty runtime prefix');
+  const ledger = inspectRepeatHistory(history.repeatedReference, context, fileOps);
+  const aliases = new Set([...ledger.backups.keys()].map(backup => backup.normalize('NFC').toLowerCase()));
+  for (const name of names.slice(0, count)) {
+    const target = path.join(context.bundle, AUTHORIZED_RUNTIME_PARTS[name]); const backup = history.interruptedBackups[name];
+    if (typeof backup !== 'string' || path.resolve(backup) !== backup || !backup.startsWith(target + '.backup-')
+      || !/^[A-Za-z0-9]+$/.test(backup.slice((target + '.backup-').length)) || aliases.has(backup.normalize('NFC').toLowerCase())) guardRefusal('invalid distinct interrupted runtime backup');
+    aliases.add(backup.normalize('NFC').toLowerCase());
+    ledger.backups.set(backup, receiptRuntimeFootprint(backup, name, ledger.chain.receipts.at(-1), fileOps));
+  }
+  return ledger;
+}
+
+function inspectRepeatReference(options, context, fileOps) {
+  const ledger = inspectRepeatHistory(options, context, fileOps);
+  ledger.roots = new Map();
+  for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
+    const target = path.join(context.bundle, relative);
+    ledger.roots.set(target, { expected: receiptRuntimeFootprint(target, name, ledger.chain.receipts.at(-1), fileOps), replaced: false });
+  }
   recheckRepeatReference(ledger, fileOps);
   return ledger;
 }
@@ -1367,7 +1438,7 @@ export function verifyGuardedSealedPatch({ app, home, shellSnapshot, appliedUpda
     sameEvidence(inspectNoActiveUpdateEvidence({ app: bundle, home }, fileOps), noActiveUpdateEvidence,
       'no-active updater evidence after verification');
   }
-  if (appliedUpdateEvidence?.version === 2) {
+  if (appliedUpdateEvidence?.version === 2 || (appliedUpdateEvidence && repeatLedger?.recoveryGenesis)) {
     sameEvidence(inspectAppliedUpdateEvidence({ app: bundle, home, retainedArchiveReference: appliedUpdateEvidence.retainedArchiveReference }, fileOps, readReferenceCodeIdentity), appliedUpdateEvidence,
       'applied-update evidence after verification');
     if (isRunning() || isUpdaterRunning()) guardRefusal('app or installer helper started during applied-update verification');

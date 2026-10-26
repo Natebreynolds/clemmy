@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { deflateRawSync } from 'node:zlib';
-import { SEALED_SHELL_PARTS, AUTHORIZED_RUNTIME_PARTS, captureAppliedUpdateEvidence,
+import { SEALED_SHELL_PARTS, AUTHORIZED_RUNTIME_PARTS, captureAppliedUpdateEvidence, captureNoActiveUpdateEvidence,
   verifyGuardedSealedPatch, captureCurrentStateRecoveryEvidence, verifyCurrentStateRecoveryPatch,
   initializeCurrentStateRecoveryArtifacts, writeCurrentStateRecoveryReceipt,
   recordCurrentStateRecoveryFailure, inspectDaemonBuild, installDaemonPatch, installBundledAssetDirectory,
@@ -213,7 +213,7 @@ function recordedTree(root) {
   visit(''); return entries;
 }
 
-function recoveryFixture(t, { actualGit = false } = {}) {
+function recoveryFixture(t, { actualGit = false, interruptedHistory = false } = {}) {
   const g = mixedAppliedGenerationsFixture(t);
   g.baseline = path.join(g.root, 'independent-clean-build');
   g.durable = path.join(g.root, 'durable-evidence');
@@ -258,9 +258,58 @@ function recoveryFixture(t, { actualGit = false } = {}) {
   fs.cpSync(g.app, g.currentReference, { recursive: true, verbatimSymlinks: true });
   g.writeArchives(fullBundleZip(g.currentReference));
   g.backups = {};
-  for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
-    const target = path.join(g.app, relative); const backup = `${target}.backup-Pristine${name.replaceAll('-', '')}`;
-    fs.renameSync(target, backup); fs.cpSync(path.join(g.baseline, sourceRoots[name]), target, { recursive: true }); g.backups[name] = backup;
+  if (interruptedHistory) {
+    // The held archive is genuinely the same native generation. Do not relabel
+    // mixed-generation evidence or claim that the interrupted install passed.
+    fs.rmSync(path.join(g.cache, 'pending.held-latest'), { recursive: true });
+    g.writeArchives(fullBundleZip(g.currentReference), true);
+    g.retained = undefined;
+    const identity = () => ({ bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: 'd'.repeat(40) });
+    const evidence = captureAppliedUpdateEvidence({ app: g.app, home: g.home }, fs, () => {});
+    assert.equal(evidence.version, 1);
+    const prove = repeatedReference => verifyGuardedSealedPatch({ app: g.app, home: g.home,
+      shellSnapshot: evidence.shellSnapshot, appliedUpdateEvidence: evidence, repeatedReference,
+      isRunning: () => false, isUpdaterRunning: () => false, verifyNativeSignature() {}, readReferenceCodeIdentity: identity });
+    const receipts = [];
+    for (let round = 1; round <= 2; round++) {
+      const proof = prove(g.repeatedReference);
+      const fingerprint = String(round).repeat(64);
+      fs.writeFileSync(path.join(g.sourceDist, 'index.js'), `prior authorized round ${round}`);
+      fs.writeFileSync(path.join(g.sourceDist, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: String(round).repeat(40), sourceFingerprint: fingerprint }));
+      const receipt = { bundle: g.app, wasVersion: '3.18.38', sourceFingerprint: fingerprint, parts: {} };
+      for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
+        const target = path.join(g.app, relative);
+        const source = name === 'mobile-web' ? path.join(g.baseline, sourceRoots[name]) : g.sourceDist;
+        const result = name === 'daemon' ? installDaemonPatch({ sourceDist: source, targetDist: target, guarded: proof })
+          : installBundledAssetDirectory({ sourceDir: source, targetDir: target, guarded: proof });
+        const digest = name === 'daemon' ? inspectDaemonBuild(target).digest : assetDigest(target);
+        receipt.parts[name] = { ...(name === 'daemon' ? { digest } : { built: digest }), served: digest, match: true, backup: result.backup };
+      }
+      const pin = pinJSON(path.join(g.durable, `authorized-round-${round}.json`), receipt);
+      receipts.push(pin);
+      g.repeatedReference = { referenceBundle: g.currentReference, expectedReferenceCdHash: 'd'.repeat(40),
+        authorizedReceipt: pin.path, authorizedReceiptSha256: pin.sha256, expectedPriorFingerprint: fingerprint,
+        ...(round === 2 ? (() => { const manifest = pinJSON(path.join(g.durable, 'authorized-ancestors.json'), { version: 1, receipts: receipts.slice(0, -1) });
+          return { authorizedAncestorManifest: manifest.path, authorizedAncestorManifestSha256: manifest.sha256 }; })() : {}) };
+    }
+    const proof = prove(g.repeatedReference);
+    g.interruptedBackups = {};
+    for (const name of ['daemon', 'builtin-skills', 'console-web']) {
+      const target = path.join(g.app, AUTHORIZED_RUNTIME_PARTS[name]); const source = path.join(g.baseline, sourceRoots[name]);
+      const result = name === 'daemon' ? installDaemonPatch({ sourceDist: source, targetDist: target, guarded: proof })
+        : installBundledAssetDirectory({ sourceDir: source, targetDir: target, guarded: proof });
+      g.interruptedBackups[name] = result.backup;
+    }
+    assert.throws(() => prove(g.repeatedReference), /runtime differs|immutable footprint/,
+      'the genuine old receipt cannot authorize the changed current roots');
+    g.priorPins = receipts;
+    fs.writeFileSync(path.join(g.sourceDist, 'index.js'), 'new recovery candidate');
+    fs.writeFileSync(path.join(g.sourceDist, 'runtime/build-stamp.json'), JSON.stringify({ gitSha: 'a'.repeat(40), sourceFingerprint: 'b'.repeat(64) }));
+  } else {
+    for (const [name, relative] of Object.entries(AUTHORIZED_RUNTIME_PARTS)) {
+      const target = path.join(g.app, relative); const backup = `${target}.backup-Pristine${name.replaceAll('-', '')}`;
+      fs.renameSync(target, backup); fs.cpSync(path.join(g.baseline, sourceRoots[name]), target, { recursive: true }); g.backups[name] = backup;
+    }
   }
   const parts = Object.entries(AUTHORIZED_RUNTIME_PARTS).map(([name, relative]) => {
     const builtRoot = path.join(g.baseline, sourceRoots[name]); const installedRoot = path.join(g.app, relative);
@@ -277,7 +326,8 @@ function recoveryFixture(t, { actualGit = false } = {}) {
   g.parameters = { app: g.app, home: g.home, referenceBundle: g.currentReference, expectedReferenceCdHash: 'd'.repeat(40),
     reproducibility: pinJSON(path.join(g.durable, 'independent-build.json'), g.report),
     builtinGitBinding: pinJSON(path.join(g.durable, 'builtin-binding.json'), g.binding),
-    pristineBackups: g.backups, retainedArchiveReference: g.retained };
+    ...(interruptedHistory ? { interruptionHistory: { version: 1, repeatedReference: g.repeatedReference, interruptedBackups: g.interruptedBackups } }
+      : { pristineBackups: g.backups, retainedArchiveReference: g.retained }) };
   g.readIdentity = bundle => {
     assert.ok([g.reference, g.currentReference].includes(bundle), 'never claim the patched installed seal is pristine');
     return { bundleId: 'com.example.fixture', team: '4AR3Y8XD72', cdHash: (bundle === g.reference ? 'c' : 'd').repeat(40) };
@@ -549,4 +599,156 @@ test('durable evidence failures and partial copy never become successful adoptio
     assert.match(journal.observedTypedDigest, /^[a-f0-9]{64}$/); assert.equal(journal.completion, 'not-certified'); assert.equal(fs.existsSync(journal.staging), false);
     assert.throws(() => writeCurrentStateRecoveryReceipt({ guarded: proof, report: { bundle: g.app, wasVersion: '3.18.38', parts: {} } }), /identity differs/);
   });
+});
+
+
+test('interrupted repeat recovery admits true v1 evidence without adopting a failed transaction', t => {
+  const g = recoveryFixture(t, { actualGit: true, interruptedHistory: true });
+  assert.equal(g.document.appliedUpdateEvidence.version, 1);
+  assert.equal(g.document.parameters.retainedArchiveReference, undefined);
+  assert.deepEqual(Object.keys(g.document.parameters.interruptionHistory.interruptedBackups), ['daemon', 'builtin-skills', 'console-web']);
+  const proof = g.prove();
+  assert.equal(fs.readdirSync(g.durable).some(name => name.startsWith('current-state-recovery-completed-')), false);
+  assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }), /durable recovery genesis/);
+  g.initialize(proof);
+  const completed = writeCurrentStateRecoveryReceipt({ guarded: proof, report: g.patch(proof) });
+  assert.equal(completed.receipt.recoveryStatus, 'four_roots_verified');
+  assert.equal(fs.readdirSync(g.durable).filter(name => name.startsWith('current-state-recovery-root-observed-')).length, 4);
+  for (const backup of Object.values(g.interruptedBackups)) assert.ok(fs.existsSync(backup));
+  for (const pin of g.priorPins) assert.equal(sha(fs.readFileSync(pin.path)), pin.sha256);
+});
+
+test('interrupted repeat recovery replays inherited history on future completed receipts', t => {
+  const g = recoveryFixture(t, { interruptedHistory: true }); const proof = g.prove(); const genesis = g.initialize(proof);
+  const first = writeCurrentStateRecoveryReceipt({ guarded: proof, report: g.patch(proof) });
+  const repeat = { referenceBundle: g.currentReference, authorizedReceipt: first.pin.path, authorizedReceiptSha256: first.pin.sha256,
+    expectedPriorFingerprint: first.receipt.sourceFingerprint, expectedReferenceCdHash: 'd'.repeat(40),
+    authorizedRecoveryGenesis: genesis.path, authorizedRecoveryGenesisSha256: genesis.sha256 };
+  const prove = options => verifyGuardedSealedPatch({ app: g.app, home: g.home, shellSnapshot: g.document.shellSnapshot,
+    appliedUpdateEvidence: g.document.appliedUpdateEvidence, repeatedReference: options,
+    isRunning: () => false, isUpdaterRunning: () => false, verifyNativeSignature() {}, readReferenceCodeIdentity: g.readIdentity });
+  const next = prove(repeat);
+  initializeCurrentStateRecoveryArtifacts({ guarded: next, directory: g.durable });
+  const second = writeCurrentStateRecoveryReceipt({ guarded: next, report: g.patch(next) });
+  const ancestors = pinJSON(path.join(g.durable, 'post-recovery-ancestors.json'), { version: 1, receipts: [first.pin] });
+  const future = { ...repeat, authorizedReceipt: second.pin.path, authorizedReceiptSha256: second.pin.sha256,
+    authorizedAncestorManifest: ancestors.path, authorizedAncestorManifestSha256: ancestors.sha256 };
+  assert.doesNotThrow(() => prove(future));
+  fs.appendFileSync(path.join(g.interruptedBackups.daemon, 'index.js'), 'corrupt interrupted rollback');
+  assert.throws(() => prove(future), /runtime differs|rollback/);
+});
+
+test('interrupted repeat recovery refuses missing, aliased, unordered or unrelated authority', async t => {
+  for (const [name, mutate] of [
+    ['empty prefix', g => { g.parameters.interruptionHistory.interruptedBackups = {}; }],
+    ['nonprefix keys', g => { delete g.parameters.interruptionHistory.interruptedBackups['builtin-skills']; }],
+    ['extra prefix key', g => { g.parameters.interruptionHistory.interruptedBackups.extra = g.interruptedBackups.daemon; }],
+    ['wrong root alias', g => { g.parameters.interruptionHistory.interruptedBackups['console-web'] = g.interruptedBackups.daemon; }],
+    ['older prior root', g => { const old = JSON.parse(fs.readFileSync(g.priorPins[0].path)); g.parameters.interruptionHistory.interruptedBackups.daemon = old.parts.daemon.backup; }],
+    ['missing interrupted backup', g => fs.rmSync(g.interruptedBackups.daemon, { recursive: true })],
+    ['interrupted backup bytes', g => fs.appendFileSync(path.join(g.interruptedBackups.daemon, 'index.js'), 'changed')],
+    ['interrupted backup mode', g => fs.chmodSync(g.interruptedBackups.daemon, 0o700)],
+    ['unknown backup', g => fs.mkdirSync(g.daemonDist + '.backup-Unknown')],
+    ['unknown stage', g => fs.mkdirSync(g.daemonDist + '.stage-Unknown')],
+    ['immutable addition', g => fs.writeFileSync(path.join(g.app, 'Contents/Resources/extra.txt'), 'unaccounted')],
+    ['legacy missing receipt', g => fs.rmSync(g.priorPins[0].path)],
+    ['prior receipt altered', g => fs.appendFileSync(g.priorPins[1].path, ' ')],
+    ['manifest altered', g => fs.appendFileSync(g.repeatedReference.authorizedAncestorManifest, ' ')],
+    ['recursive genesis', g => { g.parameters.interruptionHistory.repeatedReference.authorizedRecoveryGenesis = g.capturePin.path; }],
+    ['extra history field', g => { g.parameters.interruptionHistory.skipVerification = true; }],
+    ['native changed', g => fs.appendFileSync(path.join(g.app, 'Contents/Resources/app.asar'), 'changed')],
+    ['reference changed', g => fs.appendFileSync(path.join(g.currentReference, 'Contents/Resources/app.asar'), 'changed')],
+    ['current baseline drift', g => fs.appendFileSync(path.join(g.baseline, 'dist/index.js'), 'changed')],
+  ]) await t.test(name, t => {
+    const g = recoveryFixture(t, { interruptedHistory: true }); mutate(g);
+    assert.throws(() => g.capture());
+    assert.equal(fs.readdirSync(g.durable).some(file => file.startsWith('current-state-recovery-genesis-')), false);
+  });
+});
+
+test('interrupted repeat recovery keeps pin checks across admission, staging and future replay', async t => {
+  await t.test('closed app required across admission', t => {
+    const g = recoveryFixture(t, { interruptedHistory: true }); let count = 0;
+    assert.throws(() => g.prove({ isRunning: () => ++count > 1 }), /app or installer helper/);
+  });
+  await t.test('inherited receipt change after admission prevents rename', t => {
+    const g = recoveryFixture(t, { interruptedHistory: true }); const proof = g.prove(); g.initialize(proof);
+    let renames = 0;
+    assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }, { ...fs,
+      cpSync(...args) { fs.cpSync(...args); fs.appendFileSync(g.priorPins[0].path, ' '); },
+      renameSync(...args) { renames++; return fs.renameSync(...args); } }));
+    assert.equal(renames, 0);
+    assert.equal(fs.readdirSync(g.durable).some(file => file.startsWith('current-state-recovery-completed-')), false);
+  });
+  await t.test('history pins must be durable outside source workspaces', t => {
+    const g = recoveryFixture(t, { interruptedHistory: true });
+    const prior = g.parameters.interruptionHistory.repeatedReference;
+    const moved = path.join(g.baseline, 'receipt.json'); fs.copyFileSync(prior.authorizedReceipt, moved); prior.authorizedReceipt = moved;
+    g.repinCapture(); const proof = g.prove();
+    assert.throws(() => g.initialize(proof), /durable outside build/);
+  });
+  await t.test('untouched mobile cannot be silently adopted from a different generation', t => {
+    const g = recoveryFixture(t, { interruptedHistory: true });
+    for (const root of [path.join(g.baseline, 'apps/mobile-web/dist'), path.join(g.app, AUTHORIZED_RUNTIME_PARTS['mobile-web'])]) {
+      fs.writeFileSync(path.join(root, 'index.html'), '<p>changed without a rollback</p>');
+    }
+    const part = g.report.parts.find(part => part.name === 'mobile-web');
+    const pin = pinJSON(part.manifestPath, { built: recordedTree(part.builtRoot), installed: recordedTree(part.installedRoot) });
+    part.manifestSha256 = pin.sha256;
+    g.parameters.reproducibility = pinJSON(g.parameters.reproducibility.path, g.report);
+    assert.throws(() => g.capture(), /runtime differs/);
+  });
+});
+
+test('interrupted repeat recovery rechecks future process races before admission and rename', async t => {
+  for (const stage of ['admission', 'staging']) await t.test(stage, t => {
+    const g = recoveryFixture(t, { interruptedHistory: true }); const initial = g.prove(); const genesis = g.initialize(initial);
+    const completed = writeCurrentStateRecoveryReceipt({ guarded: initial, report: g.patch(initial) });
+    const repeatedReference = { referenceBundle: g.currentReference,
+      authorizedReceipt: completed.pin.path, authorizedReceiptSha256: completed.pin.sha256,
+      expectedPriorFingerprint: completed.receipt.sourceFingerprint, expectedReferenceCdHash: 'd'.repeat(40),
+      authorizedRecoveryGenesis: genesis.path, authorizedRecoveryGenesisSha256: genesis.sha256 };
+    let running = false; let staged = false; let renames = 0; let checks = 0;
+    const operations = { ...fs,
+      cpSync(...args) { fs.cpSync(...args); staged = true; },
+      readFileSync(absolute, ...args) {
+        const value = fs.readFileSync(absolute, ...args);
+        if (staged && String(absolute) === g.priorPins[0].path) running = true;
+        return value;
+      },
+      renameSync(...args) { renames++; return fs.renameSync(...args); },
+    };
+    const prove = () => verifyGuardedSealedPatch({ app: g.app, home: g.home,
+      shellSnapshot: g.document.shellSnapshot, appliedUpdateEvidence: g.document.appliedUpdateEvidence,
+      repeatedReference, isRunning: () => stage === 'admission' ? ++checks > 1 : running,
+      isUpdaterRunning: () => false, verifyNativeSignature() {}, readReferenceCodeIdentity: g.readIdentity }, operations);
+    if (stage === 'admission') assert.throws(prove, /app or installer helper/);
+    else {
+      const proof = prove(); initializeCurrentStateRecoveryArtifacts({ guarded: proof, directory: g.durable });
+      const before = fs.readFileSync(path.join(g.daemonDist, 'index.js'));
+      assert.throws(() => installDaemonPatch({ sourceDist: g.sourceDist, targetDist: g.daemonDist, guarded: proof }, operations), /app or installer helper|still running/);
+      assert.equal(renames, 0, 'a process starting during the final staging proof must prevent both renames');
+      assert.deepEqual(fs.readFileSync(path.join(g.daemonDist, 'index.js')), before);
+    }
+  });
+});
+
+test('interrupted repeat recovery preserves existing pristine-genesis no-active compatibility', t => {
+  const g = recoveryFixture(t); const proof = g.prove(); const genesis = g.initialize(proof);
+  const completed = writeCurrentStateRecoveryReceipt({ guarded: proof, report: g.patch(proof) });
+  // Exercise the preexisting no-active route independently of the new history
+  // mode. Its own closing process check must not read absent applied evidence.
+  fs.rmSync(path.join(g.cache, 'pending.held-latest'), { recursive: true });
+  g.writeArchives(fullBundleZip(g.currentReference), true);
+  fs.rmSync(path.join(g.cache, 'pending'), { recursive: true });
+  fs.rmSync(path.join(g.cache, 'update.zip'));
+  fs.rmSync(g.statePath);
+  const noActiveUpdateEvidence = captureNoActiveUpdateEvidence({ app: g.app, home: g.home });
+  assert.doesNotThrow(() => verifyGuardedSealedPatch({ app: g.app, home: g.home,
+    shellSnapshot: g.document.shellSnapshot, noActiveUpdateEvidence,
+    repeatedReference: { referenceBundle: g.currentReference, expectedReferenceCdHash: 'd'.repeat(40),
+      authorizedReceipt: completed.pin.path, authorizedReceiptSha256: completed.pin.sha256,
+      expectedPriorFingerprint: completed.receipt.sourceFingerprint,
+      authorizedRecoveryGenesis: genesis.path, authorizedRecoveryGenesisSha256: genesis.sha256 },
+    isRunning: () => false, isUpdaterRunning: () => false, verifyNativeSignature() {}, readReferenceCodeIdentity: g.readIdentity }));
 });
