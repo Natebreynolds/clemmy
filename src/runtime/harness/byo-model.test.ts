@@ -1233,3 +1233,80 @@ test('a streamed reply ends where special-token markup begins; the markup never 
   assert.equal(text.trimEnd(), 'The calendar read did not run, so I have no events to report. Rerun when ready.');
   assert.doesNotMatch(JSON.stringify(chunks), /｜/);
 });
+
+// q8 retained accepted items had a question call without public narration. The
+// original provider body was not retained, so these are adapter conformance
+// fixtures, not a claim about what that live provider actually returned.
+for (const route of ['non-stream', 'finished-completion-stream', 'held-tool-stream', 'native-stream'] as const) {
+  for (const hasPublicText of [true, false]) {
+    test(`conformance(public text + question): ${route} ${hasPublicText ? 'preserves supplied answer' : 'does not invent an answer from private reasoning'}`, async () => {
+      const publicText = 'Measurement A is 17.';
+      // Entirely synthetic sentinel, never a retained provider reasoning body.
+      const privateText = 'SYNTHETIC_PRIVATE_REASONING_ONLY';
+      const questionArgs = JSON.stringify({
+        question: 'What private cutoff should I use to classify measurement B?',
+        options: ['10', '20'], purpose: 'clarification',
+      });
+      const questionCall = { id: 'question-public-text', type: 'function',
+        function: { name: 'ask_user_question', arguments: questionArgs } };
+      const backend = makeFake([() => {
+        if (route === 'non-stream' || route === 'finished-completion-stream') {
+          return { id: 'question-completion', created: 1, model: 'compat-fixture', object: 'chat.completion',
+            usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+            choices: [{ index: 0, finish_reason: 'tool_calls', message: {
+              role: 'assistant', content: hasPublicText ? publicText : null,
+              reasoning_content: privateText, tool_calls: [questionCall],
+            } }] };
+        }
+        return (async function* () {
+          yield chunk({ role: 'assistant', reasoning_content: privateText });
+          yield chunk({ ...(hasPublicText ? { content: 'Measurement A ' } : {}), tool_calls: [{
+            index: 0, id: questionCall.id, type: 'function',
+            function: { name: questionCall.function.name, arguments: questionArgs.slice(0, 47) },
+          }] });
+          yield chunk({ ...(hasPublicText ? { content: 'is 17.' } : {}), tool_calls: [{
+            index: 0, function: { arguments: questionArgs.slice(47) },
+          }] });
+          yield finish('tool_calls', { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 });
+        })();
+      }]);
+      const create = wrapCompletionsCreate(backend.fn, { nativeChatCompletionsStream: route === 'native-stream' });
+      const model = new OpenAIChatCompletionsModel({ baseURL: 'http://byo.test',
+        chat: { completions: { create } } } as never, 'compat-fixture');
+      const request = conformanceRequest({ tools: [{ type: 'function', name: 'ask_user_question', strict: true,
+        parameters: { type: 'object', properties: { question: { type: 'string' },
+          options: { type: ['array', 'null'], items: { type: 'string' } },
+          purpose: { type: ['string', 'null'] } }, required: ['question', 'options', 'purpose'], additionalProperties: false } }] });
+      const deltas: string[] = [];
+      let output: AnyObj[] = [];
+      await withTrace('byo-public-text-question-conformance', async () => {
+        if (route === 'non-stream') {
+          output = (await model.getResponse(request as never)).output as AnyObj[];
+          return;
+        }
+        for await (const event of model.getStreamedResponse(request as never) as AsyncIterable<AnyObj>) {
+          if (event.type === 'output_text_delta') deltas.push(event.delta as string);
+          if (event.type === 'response_done') output = (event.response as AnyObj).output as AnyObj[];
+        }
+      });
+      assert.equal(backend.calls.length, 1, 'one supplied completion, no repair re-ask');
+      assert.equal(backend.calls[0].stream, route !== 'non-stream');
+      assert.equal(((backend.calls[0].tools as AnyObj[])[0].function as AnyObj).name, 'ask_user_question');
+      assertItemsConform(`public text + question ${route}`, output);
+      assert.deepEqual(output.map(item => item.type), hasPublicText
+        ? ['reasoning', 'message', 'function_call'] : ['reasoning', 'function_call']);
+      const publicParts = output.filter(item => item.type === 'message').flatMap(item => item.content as AnyObj[]);
+      assert.ok(publicParts.every(part => part.type === 'output_text'));
+      assert.equal(publicParts.map(part => part.text).join(''), hasPublicText ? publicText : '',
+        'the terminal SDK message preserves supplied public text exactly once');
+      assert.ok(publicParts.every(part => !String(part.text).includes(privateText)),
+        'private reasoning is not promoted into public message text on a tool turn');
+      if (route !== 'non-stream') assert.equal(deltas.join(''), hasPublicText ? publicText : '',
+        'streamed public deltas agree with the final SDK message');
+      const call = output.find(item => item.type === 'function_call')!;
+      assert.equal(call.callId, questionCall.id);
+      assert.equal(call.name, questionCall.function.name);
+      assert.equal(call.arguments, questionArgs, 'question and structured options survive byte-for-byte');
+    });
+  }
+}
