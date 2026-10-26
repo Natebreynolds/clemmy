@@ -11063,6 +11063,123 @@ test('a host-verified memory save publishes before its review when the caller ca
   assert.equal(reviews, 0, 'the review runs after the reply, not inside the turn');
 });
 
+// The q9 answer said four facts were separate memories; its deferred correction
+// then called them unsaved because there were no explicit memory_remember calls.
+// Canonical storage held all four clauses in one source-bound automatic fact.
+for (const state of ['current', 'inactive', 'scope-drift'] as const) {
+  test(`deferred memory correction author reopens exact canonical evidence (${state})`, async (t) => {
+    const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+    const { verifiedMemoryConsolidationEvidence } = await import('./durable-memory-intake-receipt.js');
+    const { stampMemoryScope } = await import('../../memory/memory-scope.js');
+    const { _setCheckLessonModelForTests } = await import('../../memory/check-lessons.js');
+    t.after(() => {
+      _setHostObjectiveJudgeForTests(null);
+      _setCheckLessonModelForTests(null);
+    });
+    // The existing post-correction learning callback remains local and stores
+    // nothing. This fixture tests author input/publication, not model semantics.
+    _setCheckLessonModelForTests(async () => ({ lessons: [] }));
+    const clauses = ['fixture A cutoff is 17', 'fixture B heading is Cedar',
+      'fixture C footer is Copper', 'fixture D weekday is Tuesday'];
+    const fixture = acceptJudgedSource(`memory-correction-evidence-${state}`,
+      `Remember that ${clauses.join('; ')} for future chats.`);
+    const queued = await retainAutomaticMemoryForHost(fixture, true);
+    const before = verifiedMemoryConsolidationEvidence(fixture.context);
+    assert.equal(queued.candidateIds.length, 1, 'use a genuine combined producer claim');
+    assert.equal(before?.length, 1);
+    const original = before![0]!;
+    assert.equal(original.verified, true);
+    assert.equal(original.sourceLinked, true);
+    assert.equal(original.scopeMatches, true);
+    assert.ok(original.fact && original.fact.contentComplete);
+    for (const clause of clauses) assert.ok(original.fact.content.includes(clause));
+
+    const foreign = acceptJudgedSource(`foreign-correction-evidence-${state}`,
+      `Remember that FOREIGN_CANONICAL_${state} is the separate fixture label for future chats.`);
+    await retainAutomaticMemoryForHost(foreign, true);
+    const foreignEvidence = verifiedMemoryConsolidationEvidence(foreign.context);
+    assert.equal(foreignEvidence?.length, 1);
+    assert.equal(foreignEvidence![0]!.verified, true);
+    const factsBefore = memoryDatabase.openMemoryDb().prepare('SELECT id FROM consolidated_facts ORDER BY id').all();
+    const reply = 'All four fixture facts are saved as four separate active memories.';
+    const finding = 'No memory_remember calls ran, so none of the four facts were saved; save each separately.';
+    const correction = state === 'current'
+      ? 'The four fixture facts are stored together in one active memory. My earlier separate-memory claim was unsupported.'
+      : 'The earlier automatic record is no longer verified in its original scope. I cannot confirm its current storage.';
+    const reviewed: Array<{ objective: string; reply: string; evidence: string }> = [];
+    _setHostObjectiveJudgeForTests(async (objective, candidate, options) => {
+      // Older fixtures may still settle their own deferred review. This seam
+      // can judge/mutate only this exact accepted source, never that work.
+      if (options?.reviewInputOwner?.sessionId !== fixture.session.id
+        || options.reviewInputOwner.sourceUserSeq !== fixture.source.seq) {
+        return { done: true, reason: 'Unrelated earlier deferred fixture is outside this assertion.' };
+      }
+      reviewed.push({ objective, reply: candidate, evidence: options?.toolCallSummary ?? '' });
+      // Change storage only AFTER the host chose deferral and the reviewer
+      // received its snapshot. The correction must reopen, not reuse it.
+      if (state === 'inactive') memoryDatabase.openMemoryDb()
+        .prepare('UPDATE consolidated_facts SET active = 0 WHERE id = ?').run(original.fact!.id);
+      if (state === 'scope-drift') stampMemoryScope('fact', original.fact!.id,
+        { projectId: 'controlled-late-foreign-project', agentKey: null });
+      return { done: false, reason: finding, repairScope: 'claims',
+        memoryRequirement: { version: 1, kind: 'retain', corrections: [], reason: 'The requested clauses require durable retention.' } };
+    });
+    const model = scriptedRecordingModel([[textMsg(reply)], [textMsg(correction)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const result = await runProductionHost(fixture, agent, undefined,
+      { hostJudgeCompletion: true, hostReviewAfterDelivery: true });
+    assert.equal(result.finalOutput, reply);
+    assert.equal(result.terminal, undefined);
+    assert.equal(reviewed.length, 0, 'the actual host deferred the ruling');
+    const identity = { ...fixture.context, turn: fixture.source.turn };
+    const committed = commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity,
+      status: 'done', resumable: false, presentation: { kind: 'answer', text: reply } });
+    assert.equal(committed.event.data.review, 'checking');
+    let correctionTerminal: ReturnType<typeof eventlog.listEvents>[number] | undefined;
+    const deadline = Date.now() + 5_000;
+    while (!correctionTerminal && Date.now() < deadline) {
+      correctionTerminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+        .find(row => row.id !== committed.event.id
+          && (row.data.presentation as { text?: string } | undefined)?.text === correction);
+      if (!correctionTerminal) await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(correctionTerminal, 'the real deferred callback published the scripted correction');
+    assert.equal(reviewed.length, 1);
+    assert.equal(reviewed[0]!.objective, fixture.source.data.text);
+    assert.equal(reviewed[0]!.reply, reply);
+    assert.ok(reviewed[0]!.evidence.includes(JSON.stringify(original)), 'the reviewer had the canonical storage snapshot');
+    const settled = eventlog.listEvents(fixture.session.id, { types: ['completion_review_settled'] }).at(-1)!;
+    assert.equal(settled.data.review, 'rejected');
+    assert.equal(settled.data.terminalEventId, committed.event.id);
+    assert.equal(settled.data.sourceUserSeq, fixture.source.seq);
+    const report = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] })
+      .find(row => row.seq === correctionTerminal!.data.sourceUserSeq);
+    assert.equal(report?.data.sourceId, `answer-check:${fixture.source.seq}`);
+    assert.equal(model.calls(), 2, 'one original answer and one existing tool-free correction request');
+    const correctionRequest = model.requests[1] as { input: Array<{ role?: string; content?: unknown }>; tools?: unknown[] };
+    assert.deepEqual(correctionRequest.tools, []);
+    assert.ok(JSON.stringify(correctionRequest.input).includes(finding));
+    assert.ok(!JSON.stringify(correctionRequest.input).includes(`FOREIGN_CANONICAL_${state}`),
+      'a different accepted source never supplies correction storage evidence');
+    const current = verifiedMemoryConsolidationEvidence(fixture.context)!;
+    assert.equal(current[0]!.verified, state === 'current');
+    assert.equal(current[0]!.fact!.active, state === 'inactive' ? false : true);
+    assert.equal(current[0]!.scopeMatches, state !== 'scope-drift');
+    assert.deepEqual(memoryDatabase.openMemoryDb().prepare('SELECT id FROM consolidated_facts ORDER BY id').all(), factsBefore,
+      'neither correction nor its empty learning fixture creates another memory');
+    assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] }).length, 0,
+      'automatic storage needs no explicit memory save or readback call');
+    // Assert outside callbacks: a host-caught assertion must not masquerade as
+    // the intended negative review or an unavailable correction request.
+    const memoryContext = correctionRequest.input.find(item => item.role === 'system'
+      && typeof item.content === 'string' && item.content.startsWith('[Current automatic memory evidence]'));
+    assert.ok(memoryContext, 'the correction author needs current canonical evidence, not only the reviewer finding');
+    const packet = JSON.parse((memoryContext.content as string).split('\n')[1]!);
+    assert.deepEqual(packet, { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, results: current });
+  });
+}
+
 // A retained storage assessment does not resolve an explicit negative
 // completion finding. Without typed narrowing or a later qualified positive
 // review, reviewer unavailability cannot certify the whole memory request.
