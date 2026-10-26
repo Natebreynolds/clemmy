@@ -8,7 +8,7 @@ export { HostInterruptState, HostRecoveryState, MAX_HOST_OBJECTIVE_JUDGE_CONTINU
 export type { HostNoProgressCheckpoint } from './host-checkpoint-state.js';
 import { classifyStepDispatch, HOST_NO_DISPATCH_STREAK_LIMIT, HOST_IDENTICAL_REFUSAL_LIMIT, identicalRefusalKey } from './dispatch-streak.js';
 import { COMPLETION_REPAIR_GUIDANCE } from '../../agents/clem-rubric.js';
-import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, hostVerifiedMemoryRetention } from './memory-completion-obligation.js';
+import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedMemoryRequirement, retainMemoryRequirementAssessment, sourceHasMemoryToolActivity, memoryCorrectionCompletion, memoryCompletionFromAcceptedAssessment, hostVerifiedMemoryRetention, type AcceptedMemoryRequirementAssessment } from './memory-completion-obligation.js';
 import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { abbreviatedArgumentNote, abbreviatedArguments } from './abbreviated-argument.js';
 import { PAGING_NOTE_FROM, pagingRunLength, pagingRunNote } from './paging-run.js';
@@ -4573,7 +4573,8 @@ const runHostTurnBody = async (
       }
       const source = readMemoryRequirementSource(exactHostIdentity(), judgedObjective());
       if (!source) return { status: 'unverified', reason: 'The original owner request and memory context could not be verified.' };
-      const completion = memoryCorrectionCompletion(source);
+      const completion = includeReview && !currentMemoryReviewCheck
+        ? memoryCompletionFromAcceptedAssessment(source) : memoryCorrectionCompletion(source);
       // A fact the automatic layer already stored and verified for this exact
       // request is complete without a reviewer's assessment of it.
       return completion.status === 'unverified' ? (hostVerifiedMemoryRetention(source) ?? completion) : completion;
@@ -5147,13 +5148,14 @@ const runHostTurnBody = async (
     // semantic verdict cannot waive an explicit whole-output contract; the
     // next candidate is repaired and reviewed normally with all evidence.
     verdict = applyWholeResponseFormatFinding(verdict, responseFormatFinding);
+    let currentMemoryAssessment: ReturnType<typeof retainMemoryRequirementAssessment> | undefined;
     if (memoryRequirementRequired) {
       let memoryAssessmentAccepted = false;
       let memoryAssessmentRejected = false;
       try {
         const source = readMemoryRequirementSource(identity, objective);
         if (source && verdict.memoryRequirement && !verdict.failedOpen) {
-          retainMemoryRequirementAssessment({ source, assessment: verdict.memoryRequirement,
+          currentMemoryAssessment = retainMemoryRequirementAssessment({ source, assessment: verdict.memoryRequirement,
             review: { phase: 'completion', ...(verdict.judgeModelId ? { judgeModelId: verdict.judgeModelId } : {}) } });
           memoryAssessmentAccepted = true;
         }
@@ -5177,7 +5179,7 @@ const runHostTurnBody = async (
           try {
             const source = readMemoryRequirementSource(identity, objective);
             if (source) {
-              const retainedCompletion = memoryCorrectionCompletion(source);
+              const retainedCompletion = memoryCompletionFromAcceptedAssessment(source);
               if (retainedCompletion.status !== 'unverified') return retainedCompletion;
               const stored = hostVerifiedMemoryRetention(source);
               if (stored) return stored;
@@ -5259,6 +5261,16 @@ const runHostTurnBody = async (
         && observation.physicalAttempt === assessment.physicalAttempt
         && observation.providerResponseIdDigest === assessment.providerResponseIdDigest) });
     let judgedVerdictRow: ReturnType<typeof appendEvent> | undefined;
+    // Only this review's accepted packet can establish reusable whole-request
+    // coverage. A valid question may carry a partial correction packet; an
+    // unavailable review may reuse prior proof, but neither mints acceptance.
+    const acceptedMemoryRequirement: AcceptedMemoryRequirementAssessment | undefined = currentMemoryAssessment
+      && ['correct', 'replaced'].includes(currentMemoryAssessment.assessment.kind)
+      && currentMemoryReviewCheck?.status === 'verified' && verdict.done && !verdict.awaitingUser
+      && !verdict.failedOpen && !verdict.reviewFailure && !verdict.substituteForExactPin && !blockedByReview
+      && verdict.reviewDisposition !== 'answered_unqualified' && decision?.nextAction !== 'awaiting_user_input'
+      ? { version: 1, eventId: currentMemoryAssessment.eventId, assessmentDigest: currentMemoryAssessment.assessmentDigest }
+      : undefined;
     try {
       judgedVerdictRow = appendEvent({
         sessionId: identity.sessionId,
@@ -5349,6 +5361,7 @@ const runHostTurnBody = async (
           ...(verdict.historicalEvidence ? { judgedHistoricalReadResults: verdict.historicalEvidence } : {}),
           ...(memoryConsolidation ? { judgedMemoryResults: memoryConsolidation } : {}),
           ...(memoryRequirementRequired ? { judgedMemoryRequirement: currentMemoryReviewCheck ?? memoryRequirementCompletion() } : {}),
+          ...(acceptedMemoryRequirement ? { acceptedMemoryRequirement } : {}),
           ...(preparation ? { judgedPreparationReadResults: {
             source: preparation.source, plan: preparation.plan,
             evidenceAvailable: preparation.evidence.evidenceAvailable, results: preparation.evidence.results,

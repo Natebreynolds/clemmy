@@ -143,7 +143,7 @@ function settleExactCorrection(identity: ReturnType<typeof source>, fixture: Ret
   }, args);
 }
 async function runHost(identity: ReturnType<typeof source>, verdict: import('./objective-judge.js').ObjectiveJudgeVerdict,
-  enabled = true) {
+  enabled = true, reply = 'The requested memory is saved and corrected.') {
   let calls = 0; let reviews = 0;
   const contexts: Array<import('./objective-judge.js').SkillExecutionContext | undefined> = [];
   host._setHostObjectiveJudgeForTests(async (_objective, _reply, options) => { reviews++; contexts.push(options); return verdict; });
@@ -151,7 +151,7 @@ async function runHost(identity: ReturnType<typeof source>, verdict: import('./o
     async getResponse() {
       calls++;
       return { responseId: `memory-reply-${serial}-${calls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The requested memory is saved and corrected.' }] }] };
+        output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: reply }] }] };
     },
     async *getStreamedResponse() {
       const response = await this.getResponse(); yield { type: 'response_started' } as never;
@@ -425,7 +425,8 @@ test('a bound correction whose target this request\'s intake retired is complete
   assert.equal(facts.markFactSupersededBy(fixture.fact.id, by.id, { validTo: identity.retained.occurredAt }), true);
   assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
   const kept = retain(identity, replacedAssessment);
-  assert.equal(kept.assessment.kind, 'correct', 'the bound correction stays the requirement');
+  assert.equal(kept.assessment.kind, 'replaced', 'the actual completion packet is retained separately from its original grant');
+  assert.equal(kept.review.phase, 'completion');
   assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessment.kind, 'correct');
   const unbound = source(); const unboundFixture = observed(unbound);
   retain(unbound, unboundFixture.assessment, 'prewrite');
@@ -629,6 +630,216 @@ test('manual correction validates all exact arguments before accepting a matchin
   }
 });
 
+
+for (const failedOpen of [false, true]) test(`memory assessment coverage keeps unbound B pending when the current packet is ${failedOpen ? 'failed-open' : 'missing'}`, async (t) => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B before claiming both are corrected.');
+  const first = observed(identity, `coverage-first-${serial}`);
+  const second = observed(identity, `coverage-second-${serial}`);
+  const grant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, grant, `coverage-proved-first-${serial}`);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'A has its complete canonical operation proof');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.review.phase, 'prewrite',
+    'the fixture has an execution grant, never a whole-request completion assessment');
+  const result = await runHost(identity, { done: true, reason: 'The model claims both requested corrections are complete.',
+    ...(failedOpen ? { failedOpen: true, reviewFailure: 'unavailable' as const } : {}) });
+  const judged = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion');
+  t.diagnostic(JSON.stringify({ scenario: 'partial-correction-without-completion-packet', failedOpen,
+    calls: result.calls, reviews: result.reviews, terminal: result.outcome.terminal ?? null,
+    secondTargetActive: factState.readFactObservation(second.fact.id)?.active,
+    finalMemoryStatus: (judged.at(-1)?.data.judgedMemoryRequirement as { status?: string } | undefined)?.status,
+    positiveCompletionCount: judged.filter(row => row.data.fulfills === true).length }));
+  assert.ok(result.calls > 0 && result.reviews > 0, 'the actual host completion boundary is exercised');
+  assert.equal(factState.readFactObservation(second.fact.id)?.active, true, 'verification never repairs the unbound target');
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, first.correction)?.assessmentDigest, grant.assessmentDigest,
+    'the original source-bound A execution grant remains redeemable');
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'one corrected target cannot establish whole-request memory coverage');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(judged.some(row => row.data.fulfills === true), false, 'partial proof must not become a positive whole-objective verdict');
+});
+
+for (const variation of ['missing', 'failed-open', 'legacy-positive'] as const) test(`memory assessment coverage keeps a reviewed question pending after a later ${variation} packet`, async (t) => {
+  // Installed q4: A's exact correction was verified while B needed its new
+  // heading. The valid question's reviewer retained correct(A), not unresolved.
+  const identity = source(ownerText + ' That replacement is for report A only. Report B also has the wrong heading, but I have not provided its replacement. Leave B unchanged and ask me for its new heading.');
+  const first = observed(identity, `coverage-question-first-${serial}`);
+  const second = observed(identity, `coverage-question-second-${serial}`);
+  const grant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, grant, `coverage-question-write-${serial}`);
+  const paused = await runHost(identity, { done: true, awaitingUser: true,
+    reason: 'A is corrected. The owner must supply the missing replacement for B.', memoryRequirement: first.assessment },
+  true, 'ASK: Report A is corrected. What heading should replace HAZEL RIDGE in report B?');
+  assert.equal(paused.outcome.terminal?.status, 'awaiting_user_input', 'the actual host admits the precise owner question');
+  assert.equal(paused.calls, 1); assert.equal(paused.reviews, 1);
+  const pausedVerdict = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  assert.ok(pausedVerdict);
+  assert.equal(pausedVerdict.data.awaitingUser, true);
+  assert.equal(pausedVerdict.data.fulfills, false);
+  assert.equal(pausedVerdict.data.acceptedMemoryRequirement, undefined, 'a correct partial packet on a question never mints whole-request acceptance');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.review.phase, 'completion',
+    'a completion-phase packet by itself does not mean the whole request was completed');
+  assert.equal((pausedVerdict.data.judgedMemoryRequirement as { status?: string }).status, 'verified',
+    'the paused review correctly recognizes A\'s canonical operation proof');
+  if (variation === 'legacy-positive') {
+    // Recreate the old missing-packet fallback's stored positive verdict. It
+    // cites the same A digest, but no new accepted memory packet covered B.
+    events.appendEvent({ sessionId: identity.sessionId, turn: identity.turn, role: 'system', type: 'goal_alignment_judged',
+      data: { ...pausedVerdict.data, fulfills: true, awaitingUser: false, failedOpen: false,
+        replyDigest: digest('The requested memory is saved and corrected.'),
+        reason: 'Historical missing-packet fallback accepted the old partial A proof.' } });
+  }
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  const result = await runHost(identity, { done: true, reason: 'The model now claims both corrections are complete.',
+    ...(variation !== 'missing' ? { failedOpen: true, reviewFailure: 'unavailable' as const } : {}) });
+  const later = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion' && row.seq > pausedVerdict.seq);
+  t.diagnostic(JSON.stringify({ scenario: 'paused-partial-correction-cannot-become-completion', variation,
+    calls: result.calls, reviews: result.reviews, terminal: result.outcome.terminal ?? null,
+    secondTargetActive: factState.readFactObservation(second.fact.id)?.active,
+    finalMemoryStatus: (later.at(-1)?.data.judgedMemoryRequirement as { status?: string } | undefined)?.status,
+    finalFulfills: later.at(-1)?.data.fulfills }));
+  assert.equal(factState.readFactObservation(second.fact.id)?.active, true, 'the unanswered target stays unchanged');
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, first.correction)?.assessmentDigest, grant.assessmentDigest,
+    'question/completion coverage does not revoke the settled A grant');
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'a retained question must not be reinterpreted as whole-request completion');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(later.at(-1)?.data.fulfills, false, 'the new boundary cannot bootstrap a misleading historical positive');
+});
+
+for (const failedOpen of [false, true]) test(`memory assessment coverage preserves a complete earlier assessment across later prewrite when the current packet is ${failedOpen ? 'failed-open' : 'missing'}`, async () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B.');
+  const first = observed(identity, `coverage-complete-first-${serial}`);
+  const second = observed(identity, `coverage-complete-second-${serial}`);
+  const firstGrant = retain(identity, first.assessment, 'prewrite');
+  const secondGrant = retain(identity, second.assessment, 'prewrite');
+  settleExactCorrection(identity, first, firstGrant, `coverage-complete-write-first-${serial}`);
+  settleExactCorrection(identity, second, secondGrant, `coverage-complete-write-second-${serial}`);
+  const accepted = await runHost(identity, { done: true, reason: 'The whole accepted request is complete.',
+    memoryRequirement: { ...first.assessment, corrections: [first.correction, second.correction],
+      reason: 'The whole accepted request requires both exact heading replacements; both are now proved.' } });
+  assert.equal(accepted.outcome.terminal, undefined);
+  assert.equal(accepted.calls, 1); assert.equal(accepted.reviews, 1);
+  const acceptedVerdict = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  assert.equal(acceptedVerdict?.data.fulfills, true, 'the actual host accepted the full request before the later absent packet');
+  assert.notEqual(acceptedVerdict?.data.awaitingUser, true);
+  assert.notEqual(acceptedVerdict?.data.failedOpen, true);
+  const full = memory.readRetainedMemoryRequirement(identity.retained);
+  assert.ok(full);
+  assert.deepEqual(acceptedVerdict?.data.acceptedMemoryRequirement,
+    { version: 1, eventId: full.eventId, assessmentDigest: full.assessmentDigest },
+    'the actual current whole-request verdict names the typed assessment it accepted');
+  assert.equal(full.review.phase, 'completion');
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  const laterGrant = retain(identity, { ...full.assessment, reason: 'The same already-covered operations remain authorized.' }, 'prewrite');
+  assert.notEqual(laterGrant.eventId, full.eventId);
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.review.phase, 'prewrite',
+    'latest union metadata is not the source of whole-request completion authority');
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  const result = await runHost(identity, { done: true, reason: 'Both requested corrections are complete.',
+    ...(failedOpen ? { failedOpen: true, reviewFailure: 'unavailable' as const } : {}) });
+  assert.equal(result.outcome.terminal, undefined, 'a complete accepted assessment of this same request survives an absent later packet');
+  assert.equal(result.calls, 1, 'already-settled corrections must not be repeated');
+  assert.equal(result.reviews, 1, 'reuse the existing review, without a new review mechanism');
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.assessmentDigest, full.assessmentDigest);
+  assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified');
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, first.correction)?.assessmentDigest, firstGrant.assessmentDigest);
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, second.correction)?.assessmentDigest, secondGrant.assessmentDigest);
+});
+
+for (const variation of ['later-awaiting', 'later-unresolved', 'wrong-source', 'wrong-digest', 'storage-drift',
+  'new-target', 'substitute-review', 'review-failure'] as const) test(`memory assessment coverage rejects stale acceptance after ${variation}`, async () => {
+  const identity = source(ownerText + ' Apply the heading replacement to both report A and report B.');
+  const first = observed(identity, `coverage-guard-first-${serial}`);
+  const second = observed(identity, `coverage-guard-second-${serial}`);
+  const firstGrant = retain(identity, first.assessment, 'prewrite');
+  settleExactCorrection(identity, first, firstGrant, `coverage-guard-write-first-${serial}`);
+  if (variation !== 'new-target') {
+    const secondGrant = retain(identity, second.assessment, 'prewrite');
+    settleExactCorrection(identity, second, secondGrant, `coverage-guard-write-second-${serial}`);
+  }
+  const assessment = { ...first.assessment, corrections: variation === 'new-target'
+    ? [first.correction] : [first.correction, second.correction] };
+  const firstResult = await runHost(identity, { done: true, reason: 'The current correction set is accepted.', memoryRequirement: assessment });
+  assert.equal(firstResult.outcome.terminal, undefined);
+  const accepted = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  assert.ok(accepted?.data.acceptedMemoryRequirement);
+  assert.equal(memory.memoryCompletionFromAcceptedAssessment(identity.retained).status, 'verified');
+  if (variation === 'later-awaiting') {
+    const paused = await runHost(identity, { done: true, awaitingUser: true, reason: 'The request has an unanswered remainder.',
+      memoryRequirement: assessment }, true, 'ASK: Which remaining report needs the correction?');
+    assert.equal(paused.outcome.terminal?.status, 'awaiting_user_input');
+  } else if (variation === 'later-unresolved') {
+    const held = await runHost(identity, { done: true, reason: 'A remaining requested target is unresolved.',
+      memoryRequirement: { version: 1, kind: 'unresolved', corrections: [], reason: 'The request has an unbound correction remainder.' } });
+    assert.equal(held.outcome.terminal?.status, 'blocked');
+  } else if (variation === 'storage-drift') {
+    const replacementId = factState.readFactObservation(first.fact.id)?.supersededByFactId;
+    assert.ok(replacementId);
+    scope.stampMemoryScope('fact', replacementId, { projectId: 'different-controlled-project', agentKey: null });
+  } else if (variation === 'new-target') {
+    const nextGrant = retain(identity, second.assessment, 'prewrite');
+    settleExactCorrection(identity, second, nextGrant, `coverage-guard-later-write-${serial}`);
+    assert.equal(memory.memoryCorrectionCompletion(identity.retained).status, 'verified', 'all operations are proved, but the older verdict covered only A');
+  } else {
+    const data = structuredClone(accepted.data);
+    if (variation === 'wrong-source') {
+      const other = source(); const foreign = observed(other);
+      const otherAssessment = retain(other, foreign.assessment);
+      data.acceptedMemoryRequirement = { version: 1, eventId: otherAssessment.eventId, assessmentDigest: otherAssessment.assessmentDigest };
+    } else if (variation === 'wrong-digest') {
+      data.acceptedMemoryRequirement = { ...(data.acceptedMemoryRequirement as object), assessmentDigest: '0'.repeat(64) };
+    } else if (variation === 'substitute-review') data.substituteForExactPin = true;
+    else data.reviewFailure = 'unavailable';
+    events.openEventLog().prepare('UPDATE events SET data_json = ? WHERE id = ?').run(JSON.stringify(data), accepted.id);
+  }
+  events.closeEventLog(); memoryDb.closeMemoryDb();
+  const result = await runHost(identity, { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'Controlled later review unavailable.' });
+  assert.equal(result.outcome.terminal?.status, 'blocked', 'historical acceptance must still match this source, remaining work and current storage');
+  assert.equal(result.outcome.terminal?.reason, 'memory_correction_unverified');
+  assert.equal(result.calls, 1, 'an unavailable reviewer adds no repair attempts');
+});
+
+test('memory assessment coverage accepts a fresh whole verdict whose packet was deduped from an earlier question', async () => {
+  const identity = source(); const fixture = observed(identity);
+  const grant = retain(identity, fixture.assessment, 'prewrite');
+  settleExactCorrection(identity, fixture, grant, `coverage-dedup-write-${serial}`);
+  const paused = await runHost(identity, { done: true, awaitingUser: true, reason: 'The owner question still needs an answer.',
+    memoryRequirement: fixture.assessment }, true, 'ASK: Is there another report to correct?');
+  assert.equal(paused.outcome.terminal?.status, 'awaiting_user_input');
+  const packet = memory.readRetainedMemoryRequirement(identity.retained);
+  assert.ok(packet);
+  assert.equal(memory.memoryCompletionFromAcceptedAssessment(identity.retained).status, 'unverified');
+  const completed = await runHost(identity, { done: true, reason: 'The accepted request required only this exact correction, which is complete.',
+    memoryRequirement: fixture.assessment });
+  assert.equal(completed.outcome.terminal, undefined);
+  assert.equal(memory.readRetainedMemoryRequirement(identity.retained)?.eventId, packet.eventId, 'retaining the identical typed packet remains idempotent');
+  const accepted = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  assert.deepEqual(accepted?.data.acceptedMemoryRequirement, { version: 1, eventId: packet.eventId, assessmentDigest: packet.assessmentDigest });
+  const later = await runHost(identity, { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'Controlled later review unavailable.' });
+  assert.equal(later.outcome.terminal, undefined, 'the fresh actual acceptance can reuse the exact retained packet');
+});
+
+test('memory assessment coverage retains a replaced packet separately from its exact bound correction proof', async () => {
+  const identity = source(); const fixture = observed(identity);
+  const grant = retain(identity, fixture.assessment, 'prewrite');
+  replaceObservedAtIntake(identity, fixture);
+  const accepted = await runHost(identity, { done: true, reason: 'The exact requested replacement is already in effect.', memoryRequirement: replacedAssessment });
+  assert.equal(accepted.outcome.terminal, undefined);
+  const verdict = events.listEvents(identity.sessionId, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion').at(-1);
+  const reference = verdict?.data.acceptedMemoryRequirement as { eventId: string; assessmentDigest: string } | undefined;
+  assert.ok(reference);
+  assert.notEqual(reference.eventId, grant.eventId, 'acceptance names a completion assessment, never the earlier execution grant');
+  assert.notEqual(reference.assessmentDigest, (verdict?.data.judgedMemoryRequirement as { assessmentDigest: string }).assessmentDigest,
+    'typed replacement assessment and canonical bound correction projection have distinct digests');
+  const later = await runHost(identity, { done: true, failedOpen: true, reviewFailure: 'unavailable', reason: 'Controlled later review unavailable.' });
+  assert.equal(later.outcome.terminal, undefined);
+  assert.equal(memory.findRetainedCorrectionAssessment(identity.retained, fixture.correction)?.assessmentDigest, grant.assessmentDigest);
+});
 
 test('actual host keeps a current unresolved target after an earlier exact correction is proved', async () => {
   const identity = source(ownerText + ' Apply the heading replacement to both report A and report B before claiming both are corrected.');

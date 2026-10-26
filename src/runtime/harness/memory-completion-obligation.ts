@@ -248,7 +248,9 @@ export function retainMemoryRequirementAssessment(input: {
       // The retained correction stays the requirement; completion accepts its
       // targets once this request's intake has made each exact replacement.
       const fullyReplaced = assessment.kind === 'replaced' && intakeReplacedAll(source, bound);
-      if (fullyReplaced && prior?.assessment.kind !== 'unresolved') return prior!;
+      // Keep the actual completion packet as well as the original grants.
+      // A later completion verdict must be able to name the assessment it
+      // accepted; returning a prewrite row would lose that distinction.
       if (assessment.kind !== 'correct' && assessment.kind !== 'unresolved' && !fullyReplaced) throw new Error('A retained correction cannot be waived by this assessment.');
       correctionUnion(source, [...bound, ...proposed]); // conflict/size fence
       if (assessment.kind === 'correct' && review.phase === 'completion' && bound.some(previous => !proposed.some(next =>
@@ -306,6 +308,54 @@ export const MEMORY_REQUIREMENT_REVIEW_INSTRUCTIONS = [
 export type MemoryCorrectionCompletion =
   | { status: 'not_required' | 'verified'; assessmentDigest?: string }
   | { status: 'unverified'; reason: string };
+const acceptedAssessmentSchema = z.object({ version: z.literal(1), eventId: z.string().min(1),
+  assessmentDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+export type AcceptedMemoryRequirementAssessment = z.infer<typeof acceptedAssessmentSchema>;
+
+/** Reuse a correction assessment only when an actual whole-request verdict
+ * accepted that current packet. A prewrite grant or a reviewed question can
+ * prove A's operation while B is still pending. The existing completion event
+ * names its accepted packet; a missing-packet fallback never creates that
+ * provenance. Every reuse also reopens the current canonical postconditions. */
+export function memoryCompletionFromAcceptedAssessment(source: MemoryRequirementSource): MemoryCorrectionCompletion {
+  const unverified = (): MemoryCorrectionCompletion => ({ status: 'unverified',
+    reason: 'The requested memory corrections lack a current accepted whole-request assessment.' });
+  try {
+    const completion = memoryCorrectionCompletion(source);
+    if (completion.status !== 'verified') return completion;
+    const rows = requirements(source);
+    const bound = correctionUnion(source, rows.filter(row => row.assessment.kind === 'correct')
+      .flatMap(row => row.assessment.corrections));
+    const reviews = listEvents(source.sessionId, { types: ['goal_alignment_judged'] })
+      .filter(row => row.data.sourceUserSeq === source.sourceUserSeq && row.data.lane === 'host_v1');
+    for (const event of [...reviews].reverse()) {
+      const data = event.data;
+      if (data.kind === 'memory_requirement' && (data.assessment as { kind?: unknown } | undefined)?.kind === 'unresolved') return unverified();
+      if (data.kind !== 'completion') continue;
+      const judged = data.judgedMemoryRequirement as { status?: unknown; assessmentDigest?: unknown } | undefined;
+      // A later unresolved review or owner question retires earlier coverage.
+      // An unavailable reviewer alone cannot undo already accepted work.
+      if (data.awaitingUser === true || data.blocked === true || judged?.status === 'unverified'
+        || (data.fulfills === false && data.failedOpen !== true && data.reviewDisposition !== 'answered_unqualified')) return unverified();
+      if (data.acceptedMemoryRequirement === undefined) continue;
+      const parsed = acceptedAssessmentSchema.safeParse(data.acceptedMemoryRequirement);
+      if (!parsed.success || data.fulfills !== true || data.failedOpen === true
+        || data.reviewFailure !== undefined || data.substituteForExactPin === true
+        || data.reviewDisposition === 'answered_unqualified' || data.objectiveDigest !== source.objectiveDigest
+        || judged?.status !== 'verified' || judged.assessmentDigest !== completion.assessmentDigest) return unverified();
+      const accepted = rows.find(row => row.eventId === parsed.data.eventId);
+      const acceptedEvent = reviews.find(row => row.id === parsed.data.eventId);
+      if (!accepted || !acceptedEvent || acceptedEvent.seq >= event.seq
+        || accepted.review.phase !== 'completion' || accepted.assessmentDigest !== parsed.data.assessmentDigest) return unverified();
+      if (accepted.assessment.kind === 'correct') {
+        const covered = correctionUnion(source, accepted.assessment.corrections);
+        if (!isDeepStrictEqual(covered.map(row => correctionIdentity(source, row)), bound.map(row => correctionIdentity(source, row)))) return unverified();
+      } else if (accepted.assessment.kind !== 'replaced' || (bound.length > 0 && !intakeReplacedAll(source, bound))) return unverified();
+      return completion;
+    }
+    return unverified();
+  } catch { return unverified(); }
+}
 /** Completion the host reads from its own storage when no requirement review
  * left an assessment: every claim the owner stated to keep is promoted,
  * verified and linked to this exact source, and none of them is a correction
@@ -319,7 +369,7 @@ export function hostVerifiedMemoryRetention(source: MemoryRequirementSource): Me
     const retained = readRetainedMemoryRequirement(source);
     // A partial save cannot discharge an unresolved request or an exact
     // correction: the retained obligation still needs its own proof.
-    if (retained?.assessment.kind === 'correct' || retained?.assessment.kind === 'unresolved') return null;
+    if (retained && ['correct', 'replaced', 'unresolved'].includes(retained.assessment.kind)) return null;
     // The brain stored the memory itself in this request and its receipt says
     // an older fact was retired (or the fact was already held): host storage,
     // not prose. Live 2026-10-21 (a tester): "commit this to memory …" → the
