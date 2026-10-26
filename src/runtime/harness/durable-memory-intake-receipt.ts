@@ -30,6 +30,8 @@ import {
 } from './eventlog.js';
 import { durableMemoryReceiptAllowsConversationOnly } from './durable-memory-receipt.js';
 import { expectedTaskFor } from './resolution-ledger.js';
+import { readSourceSessionContext } from './source-session-context.js';
+import { sourceMemoryCaptureEdition, type MemoryCaptureEdition } from './source-session-context-scope.js';
 
 export const DURABLE_MEMORY_INTAKE_RECEIPT_PROTOCOL = 2 as const;
 
@@ -259,6 +261,7 @@ type DeriveResult =
 
 interface VerifiedIntake {
   source: { id: string; turn: number };
+  memoryCaptureEdition: MemoryCaptureEdition;
   message: string;
   captureMessage: string;
   callId: string;
@@ -294,6 +297,11 @@ function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number },
     const message = acceptedSourceText(data);
     if (!message) return { status: 'conflict', reason: 'accepted user source has no display text' };
     const normalizedMessage = normalizeMessage(message);
+    // Reconstruct with the producer frozen in this request's checked context.
+    // Old contexts retain their original bytes/digest and legacy extraction;
+    // no candidate span or current parser result may replace that authority.
+    const context = readSourceSessionContext(input);
+    const memoryCaptureEdition = context ? sourceMemoryCaptureEdition(context) : 'legacy_v1';
     const callId = `auto-capture:${sourceEventId}`;
     const sourceUri = `conversation://${encodeURIComponent(input.sessionId)}/${encodeURIComponent(callId)}`;
     const fullSourceIsGraphInput = !graphInputHash || digest(message.trim()) === graphInputHash;
@@ -303,8 +311,8 @@ function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number },
     // no authority and still requires every episode/candidate/fact check below.
     // A narrowed graph input cannot borrow this full-source classification.
     if (completionOnly && fullSourceIsGraphInput) {
-      const sourceCandidates = selectAutoMemoryCandidates(normalizedMessage, 3);
-      if (!durableMemoryReceiptAllowsConversationOnly({ message: normalizedMessage, candidates: sourceCandidates,
+      const sourceCandidates = selectAutoMemoryCandidates(normalizedMessage, 3, memoryCaptureEdition);
+      if (!durableMemoryReceiptAllowsConversationOnly({ message: normalizedMessage, memoryCaptureEdition, candidates: sourceCandidates,
         queuedCandidateCount: sourceCandidates.length, episodeId: callId })) {
         return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
       }
@@ -324,7 +332,7 @@ function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number },
     // character excerpt. Full source/claim authority remains in the origin;
     // an unavailable long narrowed clause cannot be recovered from this prefix.
     const expectedExcerpt = captureMessage.slice(0, 2000);
-    const candidates = selectAutoMemoryCandidates(captureMessage, 3);
+    const candidates = selectAutoMemoryCandidates(captureMessage, 3, memoryCaptureEdition);
     if (!candidates.length) return { status: 'ineligible', reason: 'accepted input produced no durable memory candidates' };
     if (episode.kind !== 'user_turn' || episode.source_app !== 'Conversation'
       || episode.session_id !== input.sessionId || episode.call_id !== callId
@@ -336,7 +344,7 @@ function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number },
     // Ineligible means another task shape may use ordinary verification. An
     // admitted acknowledgement-only memory instruction with missing storage
     // proof instead remains a verification gap, never that fallback door.
-    if (completionOnly && !durableMemoryReceiptAllowsConversationOnly({ message: captureMessage, candidates,
+    if (completionOnly && !durableMemoryReceiptAllowsConversationOnly({ message: captureMessage, memoryCaptureEdition, candidates,
       queuedCandidateCount: candidates.length, episodeId: episode.id })) {
       return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
     }
@@ -369,7 +377,7 @@ function readVerifiedIntake(input: { sessionId: string; sourceUserSeq: number },
       verified.push({ ...row, envelope });
       expected.delete(row.candidate_hash);
     }
-    return { status: 'ok', intake: { source, message, captureMessage, callId, sourceUri, episode, candidates, rows: verified } };
+    return { status: 'ok', intake: { source, message, memoryCaptureEdition, captureMessage, callId, sourceUri, episode, candidates, rows: verified } };
   } catch (error) { return { status: 'storage_error', reason: boundedReason(error) }; }
 }
 
@@ -408,7 +416,8 @@ function deriveExactEvidence(input: { sessionId: string; sourceUserSeq: number }
       const loaded = readVerifiedIntake(input, graphInputHash, true);
       if (loaded.status !== 'ok') return loaded;
       const intake = loaded.intake;
-      if (!durableMemoryReceiptAllowsConversationOnly({ message: intake.captureMessage, candidates: intake.candidates,
+      if (!durableMemoryReceiptAllowsConversationOnly({ message: intake.captureMessage,
+        memoryCaptureEdition: intake.memoryCaptureEdition, candidates: intake.candidates,
         queuedCandidateCount: intake.rows.length, episodeId: intake.episode.id })) {
         return { status: 'ineligible', reason: 'accepted source is not an acknowledgement-only durable-memory action' };
       }

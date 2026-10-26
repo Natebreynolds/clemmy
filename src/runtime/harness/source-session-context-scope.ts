@@ -4,6 +4,11 @@ import type { SessionMount } from './session-composition.js';
 import type { MemoryScope } from '../../memory/memory-scope.js';
 import { parseQuestionToolWireEdition, type QuestionToolWireEdition } from '../../agents/question-tools.js';
 
+export type MemoryCaptureEdition = 'legacy_v1' | 'save_operation_v2';
+export function parseMemoryCaptureEdition(value: unknown): MemoryCaptureEdition | null {
+  return value === 'legacy_v1' || value === 'save_operation_v2' ? value : null;
+}
+
 export interface SourceSessionContextRef {
   sessionId: string;
   sourceUserSeq: number;
@@ -14,10 +19,37 @@ export interface SourceSessionContext extends SourceSessionContextRef {
   memoryScope: MemoryScope;
   /** Present only on contexts read or captured by the durable checked producer. */
   questionToolWireEdition?: QuestionToolWireEdition;
+  memoryCaptureEdition?: MemoryCaptureEdition;
 }
 const scope = new AsyncLocalStorage<SourceSessionContext>();
 const agents = new WeakMap<object, SourceSessionContextRef>();
 const questionEditions = new WeakMap<object, SourceSessionContextRef & { edition: QuestionToolWireEdition }>();
+const memoryEditions = new WeakMap<object, SourceSessionContextRef & { edition: MemoryCaptureEdition }>();
+
+/** Only the checked durable producer may bind an extractor to a request. */
+export function retainValidatedSourceMemoryCaptureEdition(
+  context: SourceSessionContext, edition: MemoryCaptureEdition,
+): SourceSessionContext {
+  if (!parseMemoryCaptureEdition(edition) || !context.sessionId
+    || !Number.isSafeInteger(context.sourceUserSeq) || context.sourceUserSeq <= 0
+    || !/^[a-f0-9]{64}$/.test(context.digest)) throw new Error('Invalid memory capture context.');
+  Object.defineProperty(context, 'memoryCaptureEdition', { value: edition, enumerable: true, writable: false, configurable: false });
+  memoryEditions.set(context, { sessionId: context.sessionId, sourceUserSeq: context.sourceUserSeq, digest: context.digest, edition });
+  return context;
+}
+
+export function sourceMemoryCaptureEdition(context: SourceSessionContext): MemoryCaptureEdition {
+  const retained = memoryEditions.get(context);
+  if (!retained) {
+    if (Object.hasOwn(context, 'memoryCaptureEdition')) throw new Error('Memory capture context is not validated.');
+    return 'legacy_v1';
+  }
+  if (retained.sessionId !== context.sessionId || retained.sourceUserSeq !== context.sourceUserSeq
+    || retained.digest !== context.digest || context.memoryCaptureEdition !== retained.edition) {
+    throw new Error('Memory capture context changed its accepted source.');
+  }
+  return retained.edition;
+}
 
 /** Internal checked producer hook: call only after exact source and durable
  * context validation. Plain context fields alone cannot select a new wire. */

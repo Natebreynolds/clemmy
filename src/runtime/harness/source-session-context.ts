@@ -9,11 +9,13 @@ import { ensureSourceSessionContextStore } from './retained-session-proof-schema
 import type { WorkflowConversationBinding } from '../../shared/workflow-conversation.js';
 import { parseQuestionToolWireEdition, type QuestionToolWireEdition } from '../../agents/question-tools.js';
 import { currentSourceSessionContext, withSourceSessionContext, retainValidatedSourceQuestionToolEdition, sourceQuestionToolWireEdition,
+  parseMemoryCaptureEdition, retainValidatedSourceMemoryCaptureEdition, sourceMemoryCaptureEdition, type MemoryCaptureEdition,
   type SourceSessionContext, type SourceSessionContextRef } from './source-session-context-scope.js';
 
 interface SourceSessionIdentity {
   version: 1;
   questionToolWireEdition?: QuestionToolWireEdition;
+  memoryCaptureEdition?: MemoryCaptureEdition;
   sessionId: string;
   sourceUserSeq: number;
   sessionKind: SessionKind;
@@ -63,6 +65,9 @@ function reopen(identity: SourceSessionIdentity, digest: string): SourceSessionC
   const edition = Object.hasOwn(identity, 'questionToolWireEdition')
     ? parseQuestionToolWireEdition(identity.questionToolWireEdition) : 'legacy_v1';
   if (!edition) throw new Error('The retained question tool wire edition is unavailable.');
+  const memoryEdition = Object.hasOwn(identity, 'memoryCaptureEdition')
+    ? parseMemoryCaptureEdition(identity.memoryCaptureEdition) : 'legacy_v1';
+  if (!memoryEdition) throw new Error('The retained memory capture edition is unavailable.');
   if (!getSession(identity.sessionId) || identity.version !== 1 || !identity.memoryScope
     || ![identity.memoryScope.projectId, identity.memoryScope.agentKey].every(v => v === null || typeof v === 'string')) {
     throw new Error('The retained task composition is unavailable.');
@@ -94,9 +99,10 @@ function reopen(identity: SourceSessionIdentity, digest: string): SourceSessionC
       throw new Error('The worker lost its original parent memory scope.');
     }
     if (sourceQuestionToolWireEdition(parent) !== edition) throw new Error('The worker lost its original question tool wire edition.');
+    if (sourceMemoryCaptureEdition(parent) !== memoryEdition) throw new Error('The worker lost its original memory capture edition.');
   }
-  return retainValidatedSourceQuestionToolEdition({ sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, digest, mount,
-    memoryScope: { ...identity.memoryScope } }, edition);
+  return retainValidatedSourceMemoryCaptureEdition(retainValidatedSourceQuestionToolEdition({ sessionId: identity.sessionId,
+    sourceUserSeq: identity.sourceUserSeq, digest, mount, memoryScope: { ...identity.memoryScope } }, edition), memoryEdition);
 }
 
 /** Does not infer a missing historical identity from today's chat settings. */
@@ -147,7 +153,8 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
     const memoryScope: MemoryScope = parent?.memoryScope ?? {
       projectId: mount.project?.project.id ?? null, agentKey: mount.agent ? agentScopeKey(mount.agent.agent) : null };
     const edition = parent ? sourceQuestionToolWireEdition(parent) : 'clarification_v3';
-    const identity: SourceSessionIdentity = { version: 1, questionToolWireEdition: edition,
+    const memoryEdition = parent ? sourceMemoryCaptureEdition(parent) : 'save_operation_v2';
+    const identity: SourceSessionIdentity = { version: 1, questionToolWireEdition: edition, memoryCaptureEdition: memoryEdition,
       sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, sessionKind: row.kind,
       mountKind: mount.kind, workspaceSlug: mount.workspaceSlug, workflow: mount.workflow,
       ...(mount.workflowConversation ? { workflowConversation: mount.workflowConversation } : {}),
@@ -158,8 +165,8 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
     const digest = hash(identity);
     table().prepare('INSERT INTO source_session_contexts_v1 (session_id, source_user_seq, identity_json, identity_digest) VALUES (?, ?, ?, ?)')
       .run(input.sessionId, input.sourceUserSeq, JSON.stringify(identity), digest);
-    return retainValidatedSourceQuestionToolEdition({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
-      digest, mount, memoryScope }, edition);
+    return retainValidatedSourceMemoryCaptureEdition(retainValidatedSourceQuestionToolEdition({ sessionId: input.sessionId,
+      sourceUserSeq: input.sourceUserSeq, digest, mount, memoryScope }, edition), memoryEdition);
   }).immediate();
 }
 

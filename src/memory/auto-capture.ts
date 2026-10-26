@@ -10,7 +10,7 @@ import { extractNamedResource } from './focus.js';
 import type { UserProfile } from '../runtime/user-profile.js';
 import { openEventLog } from '../runtime/harness/eventlog.js';
 import { readSourceSessionContext } from '../runtime/harness/source-session-context.js';
-import { currentSourceSessionContext } from '../runtime/harness/source-session-context-scope.js';
+import { currentSourceSessionContext, sourceMemoryCaptureEdition, type MemoryCaptureEdition } from '../runtime/harness/source-session-context-scope.js';
 import { parseTurnLearningPolicy, readTurnLearningPolicyForSource, turnLearningPolicyFields, type TurnLearningPolicy } from './turn-learning-policy.js';
 import { createAutomaticMemoryOrigin, type AutomaticMemoryOrigin,
   type AutomaticMemoryOriginInput, type MemoryDestinationSpan } from './memory-destination.js';
@@ -708,9 +708,36 @@ const MEMORY_GENERIC_RESOURCE_SOURCE = '(?:(?:any|new|existing|external|local)\\
 const MEMORY_GENERIC_ACTION_SOURCE = `(?:create|change|delete|edit|send|write|modify|update)\\s+${MEMORY_GENERIC_RESOURCE_SOURCE}`;
 const MEMORY_GENERIC_RESPONSE_RESTRICTION_RE = new RegExp(`^(?:please\\s+)?(?:do\\s+not|don'?t)\\s+${MEMORY_GENERIC_ACTION_SOURCE}(?:\\s*(?:,\\s*(?:(?:or|and)\\s+)?|(?:or|and)\\s+)(?:${MEMORY_GENERIC_ACTION_SOURCE}|${MEMORY_GENERIC_RESOURCE_SOURCE}))*[.!?;]?$`, 'i');
 
+// A receipt about this save may include an honest unsaved/unverified outcome.
+// This is a closed response grammar, not permission to drop arbitrary text
+// after "confirm", "tell me", or a named/conditional restriction.
+const MEMORY_SAVE_RECEIPT_RE = /^(?:please\s+)?(?:(?:briefly|just)\s+)?confirm(?:\s+only)?\s+what\s+you(?:\s+have|'ve)?\s+(?:actually\s+)?(?:saved|stored|remembered|noted)(?:,?\s+and\s+(?:say(?:\s+clearly)?|tell\s+me)\s+(?:if|whether|which)\s+(?:(?:any|the)\s+)?(?:requested\s+(?:facts?|details?|memories|memory)|anything)\s+(?:remains?|is|are)\s+(?:unsaved|unverified)(?:\s+(?:or|and)\s+(?:unsaved|unverified))?)?[.!?;]*$/i;
+const MEMORY_PRESERVATION_CLAUSE_RE = /^(?:please\s+)?(?:preserve|keep)\s+(?:(?:all|every)\s+)?existing\s+(?:memory|memories)(?:\s+(?:intact|unchanged))?[.!?;]*$/i;
+const MEMORY_OPERATION_ACTION_SOURCE = [
+  MEMORY_GENERIC_ACTION_SOURCE,
+  '(?:run|start|trigger)\\s+(?:any\\s+)?workflows',
+  'contact\\s+external\\s+services',
+  'edit\\s+(?:another|other)\\s+projects?',
+  '(?:reset(?:\\s+or\\s+clean\\s+up)?|clean\\s+up)\\s+memory',
+].join('|');
+const MEMORY_OPERATION_RESTRICTION_RE = new RegExp(`^(?:please\\s+)?(?:do\\s+not|don'?t)\\s+(?:${MEMORY_OPERATION_ACTION_SOURCE})(?:\\s*(?:,\\s*(?:(?:or|and)\\s+)?|(?:or|and)\\s+)(?:${MEMORY_OPERATION_ACTION_SOURCE}|${MEMORY_GENERIC_RESOURCE_SOURCE}))*[.!?;]?$`, 'i');
+const MEMORY_OPERATION_DESCRIPTION_RE = /^this\s+(?:(?:request|task|turn)\s+)?is\s+(?:a|an)\s+(?:(?:normal|controlled|routine|simple|one-off|framework)\s+)*memory(?:[- ](?:retention|storage|save))?\s+(?:check|request|task|operation|validation)[.!?;]*$/i;
+
+function memoryProcedureOwnsTail(clauses: ReturnType<typeof memoryClauses>, end: number): boolean {
+  return clauses.slice(0, end).some(({ unquoted }, index) =>
+    /\b(?:procedure|protocol|SOP|policy|rule|routine)\s*(?::|(?:is|means|requires?|says)\b)/i.test(unquoted)
+    // "Remember this archival procedure." introduces the following steps;
+    // the command wrapper was already removed from this first clause.
+    || (index === 0 && /^(?:(?:my|our|the|a|an)\s+)?(?:[\p{L}-]+\s+){0,3}(?:procedure|protocol|SOP|policy|rule|routine)(?:\s+for\s+future\b[^.!?;]*)?[.!?;]$/iu.test(unquoted))
+    || ((PERSISTENT_SCOPE_RE.test(unquoted) || /\b(?:permanently|never|(?:for|after|before|on|during)\s+(?:every|each))\b/i.test(unquoted))
+      && /\b(?:preserve|keep|confirm|acknowledge|disclose|save|store|archive|retain)\b/i.test(unquoted))
+    || (/^(?:please\s+)?(?:preserve|keep)\s+(?:(?:all|every)\s+)?existing\s+(?:memory|memories)\b/i.test(unquoted)
+      && !MEMORY_PRESERVATION_CLAUSE_RE.test(unquoted)));
+}
+
 /** Only remove a contiguous task-only suffix, never splice neighboring claims
  * together. Bare "Confirm both" and substantive procedures remain untouched. */
-function boundedMemoryTaskTail(text: string): number | null {
+function boundedMemoryTaskTail(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): number | null {
   const clauses = memoryClauses(text);
   const acknowledgement = (clause: typeof clauses[number]) => clause.text === clause.unquoted
     && MEMORY_ACKNOWLEDGEMENT_CLAUSE_RE.test(clause.text);
@@ -721,6 +748,24 @@ function boundedMemoryTaskTail(text: string): number | null {
   for (let i = 1; i < clauses.length; i++) {
     const first = clauses[i]!;
     const ack = acknowledgement(first);
+    const receipt = first.text === first.unquoted && MEMORY_SAVE_RECEIPT_RE.test(first.text);
+    const preservation = first.text === first.unquoted && MEMORY_PRESERVATION_CLAUSE_RE.test(first.text);
+    if (edition === 'save_operation_v2' && (ack || receipt || preservation)) {
+      if (memoryProcedureOwnsTail(clauses, i)) return null;
+      const tail = clauses.slice(i);
+      let hasReceipt = false;
+      // Only a contiguous, entirely recognized operation suffix may be
+      // excluded. A later fact/literal/SOP keeps the ambiguous suffix whole.
+      const operationOnly = tail.every((clause, offset) => {
+        if (clause.text !== clause.unquoted) return false;
+        if (acknowledgement(clause) || MEMORY_SAVE_RECEIPT_RE.test(clause.text)) { hasReceipt = true; return true; }
+        if (!hasReceipt) return MEMORY_PRESERVATION_CLAUSE_RE.test(clause.text);
+        const restriction = clause.text.replace(/\s+(?:for|in|during)\s+this\s+(?:task|request|run|turn)([.!?;]*)$/i, '$1');
+        return MEMORY_OPERATION_RESTRICTION_RE.test(restriction)
+          || (offset === tail.length - 1 && MEMORY_OPERATION_DESCRIPTION_RE.test(clause.text));
+      });
+      return operationOnly && hasReceipt ? first.start : null;
+    }
     if (!ack && !(negative(first) && EXPLICIT_EPHEMERAL_SCOPE_RE.test(first.unquoted))) continue;
     // A complete confirmation request owns only a generic no-work response
     // restriction. Named targets/conditions and later facts remain ambiguous.
@@ -731,7 +776,7 @@ function boundedMemoryTaskTail(text: string): number | null {
   return null;
 }
 
-function isolateMemoryFromSecondaryWork(text: string): MemoryClauseIsolation {
+function isolateMemoryFromSecondaryWork(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): MemoryClauseIsolation {
   const mask = memoryLiteralMask(text);
   const matches = [
     SECONDARY_MEMORY_SENTENCE_RE,
@@ -741,7 +786,7 @@ function isolateMemoryFromSecondaryWork(text: string): MemoryClauseIsolation {
   ].map(pattern => [...text.matchAll(new RegExp(pattern.source, 'gi'))]
     .find(match => !mask[match.index!]))
     .filter((match): match is RegExpExecArray => Boolean(match?.index !== undefined));
-  const taskTail = boundedMemoryTaskTail(text);
+  const taskTail = boundedMemoryTaskTail(text, edition);
   const boundaries = [
     ...matches.map(match => (match.index ?? 0) + (match[1]?.length ?? 0)),
     ...(taskTail === null ? [] : [taskTail]),
@@ -756,7 +801,7 @@ function isolateMemoryFromSecondaryWork(text: string): MemoryClauseIsolation {
   };
 }
 
-function parseRememberInstruction(text: string): MemoryClauseIsolation | null {
+function parseRememberInstruction(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): MemoryClauseIsolation | null {
   const commandStart = explicitRememberCommandStart(text);
   if (commandStart === null) return null;
   const command = text.slice(commandStart);
@@ -765,7 +810,7 @@ function parseRememberInstruction(text: string): MemoryClauseIsolation | null {
   // other recognized memory command is cleaned to the user-authored claim.
   const content = leader ? command.replace(leader, '') : command;
 
-  const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(content));
+  const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(content), edition);
   const claimStart = commandStart + (leader ? command.match(leader)![0].length : 0)
     + (content.length - content.trimStart().length);
   return {
@@ -841,11 +886,11 @@ export interface ExplicitMemoryInstructionParse {
  * candidate; callers must keep the original message for transcript, provider,
  * and episode evidence. This module-level seam lets every brain share the same
  * memory/action boundary without importing runtime code into memory. */
-export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryInstructionParse | null {
+export function parseExplicitMemoryInstruction(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): ExplicitMemoryInstructionParse | null {
   const text = clean(message, Infinity);
   if (!text) return null;
   if (isExplicitDurableCorrectionRequest(text)) {
-    const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(text));
+    const isolated = isolateMemoryFromSecondaryWork(stripTerminalMemoryFraming(text), edition);
     const parsed: ExplicitMemoryInstructionParse = {
       kind: 'future_reference_correction',
       memoryContent: isolated.memoryContent || text,
@@ -854,7 +899,7 @@ export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryI
     instructionSourceSpans.set(parsed, { start: 0, end: parsed.memoryContent.length });
     return parsed;
   }
-  const remembered = parseRememberInstruction(text);
+  const remembered = parseRememberInstruction(text, edition);
   if (!remembered) return null;
   const parsed: ExplicitMemoryInstructionParse = {
     kind: 'remember',
@@ -873,22 +918,22 @@ export function parseExplicitMemoryInstruction(message: string): ExplicitMemoryI
  *  retired), never the host's storage evidence alone. */
 export const EXPLICIT_CORRECTION_REASON = 'explicit durable correction';
 
-export function explicitMemoryInstructionFor(message: string): ExplicitMemoryInstructionParse | null {
+export function explicitMemoryInstructionFor(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): ExplicitMemoryInstructionParse | null {
   const text = clean(message, Infinity);
   if (!text) return null;
-  const parsed = parseExplicitMemoryInstruction(text);
+  const parsed = parseExplicitMemoryInstruction(text, edition);
   return parsed && !explicitMemoryInstructionIsSuppressed(text, parsed) ? parsed : null;
 }
 
 /** Automatic intake cannot turn a referential storage directive into a claim.
  * Reuse the ordinary clause boundary as well as the unstripped command so a
  * separate task after it does not make the reference self-contained. */
-export function unresolvedAutomaticMemoryReference(message: string): boolean {
+export function unresolvedAutomaticMemoryReference(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): boolean {
   const text = clean(message, Infinity);
-  const instruction = parseExplicitMemoryInstruction(text);
+  const instruction = parseExplicitMemoryInstruction(text, edition);
   const commandStart = explicitRememberCommandStart(text);
   const isolatedCommand = commandStart === null ? '' : isolateMemoryFromSecondaryWork(
-    stripTerminalMemoryFraming(text.slice(commandStart)),
+    stripTerminalMemoryFraming(text.slice(commandStart)), edition,
   ).memoryContent;
   return instruction?.kind === 'remember'
     && (hasUnresolvedExplicitMemoryReference(text)
@@ -1005,18 +1050,18 @@ export function extractProfilePatchFromMessage(message: string): Record<string, 
  * explicitly declined. That is why this predicate exists rather than a second
  * copy of the conditions.
  */
-export function durableCaptureRefused(message: string): boolean {
+export function durableCaptureRefused(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): boolean {
   const text = clean(message, Infinity);
   if (!text) return false;
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return true;
   // A request to remember "that correction" is still a memory request, but
   // its object is not a fact. Refuse both direct capture and the unmatched
   // owner fallback; the brain keeps the full input to resolve through tools.
-  if (unresolvedAutomaticMemoryReference(text)) return true;
+  if (unresolvedAutomaticMemoryReference(text, edition)) return true;
   // An isolated "remember X" clause is explicit durable authority and overrides
   // the whole-turn task/probe scopes below — but never the harness check above,
   // which is about whether these are the owner's words in the first place.
-  const explicitInstruction = explicitMemoryInstructionFor(text);
+  const explicitInstruction = explicitMemoryInstructionFor(text, edition);
   if (explicitInstruction) return explicitMemoryAuthority(text, explicitInstruction).ambiguous;
   // One-off validation/probe prompts often contain durable-looking words such as
   // "instead of" or "must", but they describe this smoke turn, not user memory.
@@ -1025,7 +1070,7 @@ export function durableCaptureRefused(message: string): boolean {
   return isOneOffValidationOrToolProbe(text) || EXPLICIT_EPHEMERAL_SCOPE_RE.test(text);
 }
 
-function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   if (!text || LOW_SIGNAL.test(text)) return [];
   // Don't fold a pasted workflow definition into facts (it pollutes the store
@@ -1035,12 +1080,12 @@ function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 
   // recorded as user_input_received but must NEVER become durable "user" facts —
   // they were being pinned as "Standing prohibition" and injected into every
   // chat + voice prompt (2026-06-23 fact pollution).
-  if (durableCaptureRefused(text)) return [];
+  if (durableCaptureRefused(text, edition)) return [];
   // Parse explicit durable authority before applying whole-turn task/probe
   // heuristics. The parser isolates a separate "remember X" clause, while the
   // suppression check keeps same-content and turn-wide privacy language
   // authoritative.
-  const explicitMemoryInstruction = explicitMemoryInstructionFor(text);
+  const explicitMemoryInstruction = explicitMemoryInstructionFor(text, edition);
   const explicitAuthority = explicitMemoryInstruction ? explicitMemoryAuthority(text, explicitMemoryInstruction) : null;
 
   const candidates: AutoMemoryCandidate[] = [];
@@ -1225,27 +1270,27 @@ function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 
 
 /** Retain the original extraction interval before wrappers, normalization or
  * candidate previews can discard it. Repeated literal text is never searched. */
-export function extractAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+export function extractAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   // Split only separate, unquoted, command-shaped memory clauses. Each match
   // supplies its original interval; identical claims in different commands
   // keep separate identities. Semantic splitting stays with the reviewer.
-  const instruction = explicitMemoryInstructionFor(text);
+  const instruction = explicitMemoryInstructionFor(text, edition);
   const clauses = instruction?.kind === 'remember' ? memoryClauses(text) : [];
   const commands = clauses.filter(clause => {
     const command = explicitRememberCommandStart(clause.text);
     return command !== null && !memoryLiteralMask(clause.text)[command]
-      && explicitMemoryInstructionFor(clause.text)?.kind === 'remember';
+      && explicitMemoryInstructionFor(clause.text, edition)?.kind === 'remember';
   });
-  const cuts = !durableCaptureRefused(text) && commands.length > 1
+  const cuts = !durableCaptureRefused(text, edition) && commands.length > 1
     ? [0, ...commands.slice(1).map(clause => clause.start), text.length] : [0, text.length];
   const candidates: AutoMemoryCandidate[] = [];
   for (let n = 0; n < cuts.length - 1; n++) {
     const rawBlock = text.slice(cuts[n]!, cuts[n + 1]!);
     const blockStart = cuts[n]! + rawBlock.length - rawBlock.trimStart().length;
     const block = rawBlock.trim();
-    const selected = extractNormalizedAutoMemoryCandidates(block, maxCandidates);
-    const parsed = explicitMemoryInstructionFor(block);
+    const selected = extractNormalizedAutoMemoryCandidates(block, maxCandidates, edition);
+    const parsed = explicitMemoryInstructionFor(block, edition);
     const authority = parsed ? explicitMemoryAuthority(block, parsed) : null;
     const span = parsed ? instructionSourceSpans.get(parsed) : undefined;
     const blockSpan = span && authority
@@ -1324,11 +1369,11 @@ const MAX_REVIEWABLE_OWNER_CHARS = 2000;
  * model should look at it. If the reviewer says `task`, the drain rejects it and
  * the outcome is identical to the drop that happens today.
  */
-function unjudgedOwnerStatement(message: string): AutoMemoryCandidate[] {
+function unjudgedOwnerStatement(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
   const text = message.trim();
   // An explicit decline outranks the reviewer. Re-judging is for phrasing the
   // patterns did not recognize, never for something the owner refused.
-  if (durableCaptureRefused(text)) return [];
+  if (durableCaptureRefused(text, edition)) return [];
   if (text.length < MIN_REVIEWABLE_OWNER_CHARS) return [];
   if (text.length > MAX_REVIEWABLE_OWNER_CHARS) return [];
   return [{ kind: 'user', content: text, reason: UNJUDGED_OWNER_STATEMENT_REASON }];
@@ -1336,9 +1381,9 @@ function unjudgedOwnerStatement(message: string): AutoMemoryCandidate[] {
 
 /** Deterministic producer selection, also replayed by exact-source receipt
  * verification. It carries no completed-save authority. */
-export function selectAutoMemoryCandidates(message: string, maxCandidates = 3): AutoMemoryCandidate[] {
+export function selectAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
   if ((autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(message)) || isSelfContainedComputation(message)) return [];
-  const matched = extractAutoMemoryCandidates(message, maxCandidates);
+  const matched = extractAutoMemoryCandidates(message, maxCandidates, edition);
   if (matched.length > 0) {
     // Several heuristics may label the same entire claim. Keep the producer's
     // first classification (constraints already have priority), not competing
@@ -1351,7 +1396,7 @@ export function selectAutoMemoryCandidates(message: string, maxCandidates = 3): 
       spans.add(key); return true;
     });
   }
-  const candidates = unjudgedOwnerStatement(message);
+  const candidates = unjudgedOwnerStatement(message, edition);
   const start = message.length - message.trimStart().length;
   for (const candidate of candidates) candidateSourceSpans.set(candidate,
     { source: message, span: { start, end: message.trimEnd().length } });
@@ -1372,6 +1417,7 @@ export function captureInteractionSignals(input: {
   })) {
     return emptyAutoCaptureResult();
   }
+  let captureEdition: MemoryCaptureEdition = 'save_operation_v2';
   if (input.sourceProvenance.authority === 'accepted_user_input') {
     // A steer inherits the exact active execution, never the most recent
     // source in this reusable session. The retained origin rechecks it again
@@ -1380,6 +1426,8 @@ export function captureInteractionSignals(input: {
       ? { sessionId: input.sourceProvenance.sessionId, sourceUserSeq: input.sourceProvenance.seq }
       : currentSourceSessionContext(input.sourceProvenance.sessionId);
     if (!source || readTurnLearningPolicyForSource(source).status !== 'allowed') return emptyAutoCaptureResult();
+    const retained = readSourceSessionContext(source, 'digest' in source ? source.digest : undefined);
+    captureEdition = retained ? sourceMemoryCaptureEdition(retained) : 'legacy_v1';
   }
   if (!captureMessageIsOwnerAuthored(input.message, input.sourceProvenance)) {
     logger.warn(
@@ -1401,7 +1449,7 @@ export function captureInteractionSignals(input: {
   if (isSelfContainedComputation(input.message)) {
     return emptyAutoCaptureResult();
   }
-  const candidates = selectAutoMemoryCandidates(input.message, input.maxFacts ?? 3);
+  const candidates = selectAutoMemoryCandidates(input.message, input.maxFacts ?? 3, captureEdition);
 
   // Persist the exact source turn + replayable claim rows synchronously, then
   // run the semantic conflict resolver off the response path. A daemon restart

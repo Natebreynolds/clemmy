@@ -6,6 +6,7 @@ import { hasExplicitActionContinuation } from '../../assistant/message-intent.js
 import { objectiveRequiresFreshExternalWrite } from './tool-evidence.js';
 import { looksLikeToolCallShape } from './tool-narration-shapes.js';
 import { isDirectionSeekingQuestion } from './objective-judge.js';
+import type { MemoryCaptureEdition } from './source-session-context-scope.js';
 
 const EXPLICIT_MEMORY_CAPTURE_REASONS = new Set([
   'explicit remember request',
@@ -72,6 +73,7 @@ const SEGMENT_PASSIVE_MUTATION_RE = /\b(?:should|must|need(?:s)?(?:\s+to)?)\s+(?
 
 export interface DurableMemoryReceiptInput {
   message: string;
+  memoryCaptureEdition?: MemoryCaptureEdition;
   candidates: readonly Pick<AutoMemoryCandidate, 'reason'>[];
   queuedCandidateCount: number;
   episodeId?: string | null;
@@ -163,7 +165,7 @@ function hasOnlyDeclarativeMemoryPayload(message: string): boolean {
  */
 export function durableMemoryReceiptAllowsConversationOnly(input: DurableMemoryReceiptInput): boolean {
   const message = input.message.replace(/\s+/g, ' ').trim();
-  const instruction = parseExplicitMemoryInstruction(message);
+  const instruction = parseExplicitMemoryInstruction(message, input.memoryCaptureEdition);
   return message.length <= 900
     && hasExplicitDurableMemoryReceipt(input)
     && instruction !== null
