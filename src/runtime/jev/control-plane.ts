@@ -1261,7 +1261,7 @@ export async function tryJevCompletionVerdict(
     },
     asksUser: {
       type: 'noul',
-      instructions: 'Does response end by asking the user something they must answer before the work can continue? Check necessity against the whole request, requirementContext, currentReviewContext, receipts, evidence and memory: a choice already settled or delegated there is not a necessary question.',
+      instructions: 'Does response end by asking the user something they must answer before the work can continue? Check necessity against the whole request, requirementContext, currentReviewContext, receipts, evidence and memory: a choice already settled or delegated there is not a necessary question. An affirmative answer must satisfy the question-quality requirements in requirementContext for the full reply and offered choices, including whether independent authorized work can still proceed before this pause.',
     },
     cannotFinish: {
       type: 'noul',

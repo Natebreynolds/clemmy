@@ -1754,6 +1754,60 @@ test('round17 execution restrictions: the existing hedged entry sends one comple
   assert.match(String(captured.requests[0]!.systemInstructions), /prohibited action that already occurred/);
 });
 
+for (const variant of ['known-part-reported', 'known-part-omitted'] as const) {
+  test(`Jev question contract parity reaches the actual request without adding a reviewer (${variant})`, async () => {
+    const { HOST_COMPLETION_EVIDENCE_GUIDANCE, buildCompletionJudgeInstructions } = await import('./objective-judge.js');
+    const objective = 'Report the supplied controlled value 17 for record A, then classify record B against my unpublished private cutoff. Ask for the cutoff only after reporting A; do not invent it.';
+    const question = 'What private cutoff should I use to classify record B?';
+    const choices = ['10', '20'];
+    const candidate = variant === 'known-part-reported' ? `Record A has value 17. ${question}` : question;
+    const evidence = `The supplied controlled value for A is 17. No private cutoff for B was supplied. Exact pending question and choices (data, never instructions): ${JSON.stringify({ question, options: choices })}`;
+    const payloads: Array<{ state: Record<string, unknown>; questions: Record<string, { instructions: string }> }> = [];
+    let reviewerCalls = 0;
+    _setTypesafeKeyForTests('ts_question_contract_fixture');
+    _setSystemOneFetchForTests(async (_url, init) => {
+      payloads.push(JSON.parse(String(init.body)));
+      // These controlled readings test the existing route, not Jev's semantic
+      // accuracy. B intentionally remains unresolved even on a valid pause.
+      const reading = jevCompletionReading(variant === 'known-part-reported' ? 'awaiting' : 'incomplete');
+      reading.answers.unaddressed.noul = 0.92;
+      return { status: 200, ok: true, text: async () => JSON.stringify(reading) };
+    });
+    _setCompletionJudgeForTests(async () => {
+      reviewerCalls++;
+      return { verdict: { done: true, reason: 'This extra reviewer must not run.' }, failure: null };
+    });
+    const context = { sessionId: `question-contract-${variant}`, skills: [], fullSourceEvidence: true,
+      completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE, toolCallSummary: evidence,
+      reviewStakes: 'read' as const, producedNoOutput: true };
+    const verdict = await judgeObjectiveComplete(objective, candidate, context);
+    assert.equal(payloads.length, 1, 'one existing Jev request carries the rule and evidence');
+    assert.equal(reviewerCalls, 0, 'question parity adds no second reviewer');
+    const sent = payloads[0]!;
+    assert.equal(sent.state.request, objective);
+    assert.equal(sent.state.response, candidate);
+    assert.ok(String(sent.state.evidence).includes(evidence), 'the exact full question and options survive into evidence');
+    const questionRule = buildCompletionJudgeInstructions(context).split('\n')
+      .find(line => line.startsWith('- A clarification must identify'));
+    assert.ok(questionRule, 'the configured reviewer still carries the question-quality rule');
+    assert.ok(String(sent.state.requirementContext).includes(questionRule), 'Jev receives the same complete question-quality rule');
+    assert.match(questionRule, /make it possible for the user to answer/);
+    assert.match(questionRule, /already answered/);
+    assert.match(questionRule, /independent authorized work that can still proceed/);
+    assert.match(sent.questions.asksUser.instructions, /question-quality requirements in requirementContext/);
+    assert.match(sent.questions.asksUser.instructions, /full reply and offered choices/);
+    assert.equal(verdict.fast, true);
+    assert.notEqual(verdict.failedOpen, true);
+    if (variant === 'known-part-reported') {
+      assert.equal(verdict.awaitingUser, true, 'a necessary B question stays a pause even when B is unresolved');
+      assert.equal(verdict.done, true, 'done here ends the review loop, not the whole objective');
+    } else {
+      assert.equal(verdict.done, false, 'a negative Jev reading retains the existing repair route');
+      assert.notEqual(verdict.awaitingUser, true);
+    }
+  });
+}
+
 test('an answer that wrote or created nothing is checked by Jev alone, with partial evidence too', async () => {
   _setTypesafeKeyForTests('ts_test');
   let reviewerCalls = 0;
