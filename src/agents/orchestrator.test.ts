@@ -430,6 +430,19 @@ test('ask_user_question check-in receipts halt on the question, not the protocol
   assert.doesNotMatch(String(result.finalOutput), /Check-in created/);
 });
 
+test('ask_user_question with unparsable arguments goes back to the model, never to the owner as the question', () => {
+  const failed = 'An error occurred while running the tool. Please try again. Error: InvalidToolInputError: Invalid JSON input for tool';
+  for (const argumentsJson of ['{"question": "Which event', '{"options":["a","b"]}']) {
+    const result = userChoiceToolUseBehavior({}, [
+      { type: 'function_output', tool: { name: 'ask_user_question' }, output: failed, argumentsJson },
+    ]);
+    assert.equal(result.isFinalOutput, false, argumentsJson);
+  }
+  const asked = userChoiceToolUseBehavior({}, [{ type: 'function_output', tool: { name: 'ask_user_question' },
+    output: 'Question posted: Which event? Awaiting user reply.', argumentsJson: JSON.stringify({ question: 'Which event?' }) }]);
+  assert.equal(asked.isFinalOutput, true);
+});
+
 test('Orchestrator: excludeToolNames narrows the harness surface (unblocks architect/autonomy on the one loop)', async () => {
   // The capability that lets narrowed-surface callers (workflow architect hides
   // workflow_* mutators; autonomy excludes external writes) ride the GATED

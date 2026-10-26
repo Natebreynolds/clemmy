@@ -1363,6 +1363,18 @@ export function userChoiceToolUseBehavior(
     const rawName = result.tool.name ?? '';
     const bare = bareTerminalToolName(rawName);
     if (bare !== 'ask_user_question') continue;
+    // A call whose own arguments carry no question never ran: its output is
+    // the runner's complaint about those arguments, which goes back to the
+    // model to repair, never to the owner as the question.
+    const rawArguments = typeof result.argumentsJson === 'string'
+      ? result.argumentsJson
+      : (result.runItem as { rawItem?: { arguments?: unknown } } | undefined)?.rawItem?.arguments;
+    if (typeof rawArguments === 'string') {
+      let asked: unknown = null;
+      try { asked = JSON.parse(rawArguments); } catch { /* unparsable arguments carry no question */ }
+      const question = asked && typeof asked === 'object' ? (asked as { question?: unknown }).question : undefined;
+      if (typeof question !== 'string' || !question.trim()) continue;
+    }
     const output = stringifyToolOutput(result.output);
     if (!terminalToolShouldHalt(rawName, output, haltContext)) continue;
     const rendered = renderTerminalToolReply(rawName, toolCallInputOf(result), output);
