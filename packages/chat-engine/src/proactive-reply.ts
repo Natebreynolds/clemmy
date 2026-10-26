@@ -8,8 +8,9 @@ export interface ProactiveReplyReceipt {
   text: string;
   sessionId?: string;
 }
-export function proactiveReplySettled(outcome: string): boolean {
-  return ['gone', 'started', 'approved', 'declined', 'cleared', 'later', 'rule_added', 'answered'].includes(outcome);
+export function proactiveReplySettled(outcome: string, itemSettled?: boolean): boolean {
+  return itemSettled !== false
+    && ['gone', 'started', 'approved', 'declined', 'cleared', 'later', 'rule_added', 'answered'].includes(outcome);
 }
 export function currentProactiveReceipt<T extends { voiceDigest: string }>(receipt: T | undefined, voiceDigest: string): T | undefined {
   return receipt?.voiceDigest === voiceDigest ? receipt : undefined;

@@ -50,3 +50,16 @@ test('inline reply feedback preserves unclear, later and rule receipts', async (
   assert.doesNotMatch(tapOutcomeHeadline({ state: 'not_found' }).text, /didn.t start|try again/i,
     'missing correlation evidence cannot authorize a repeated action');
 });
+
+test('a follow-up conversation has an informational receipt without claiming the item settled', async () => {
+  const { replyOutcomeNotice } = await import('./from-clem');
+  const conversation = { outcome: 'started' as const, sessionId: 'sess-controlled-follow-up',
+    runId: 'from-clem:controlled-follow-up' };
+  assert.deepEqual(replyOutcomeNotice({ ...conversation, itemSettled: false }, 'Controlled check'),
+    { tone: 'info', text: 'Started a conversation.' });
+  assert.deepEqual(replyOutcomeNotice(conversation, 'Controlled check'),
+    { tone: 'success', text: 'Started a conversation.' },
+    'an older started receipt keeps its existing settled presentation');
+  assert.deepEqual(replyOutcomeNotice({ ...conversation, itemSettled: true }, 'Controlled check'),
+    { tone: 'success', text: 'Started a conversation.' });
+});

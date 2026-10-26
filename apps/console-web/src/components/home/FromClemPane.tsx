@@ -124,7 +124,9 @@ export function FromClemPane({
       const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
       if (outcome.outcome === 'started') {
         setTaps((all) => [{ key: row.key, runId: outcome.runId, title: row.say ?? row.text, reply: text, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
-        return { settled: true, text: 'Clem is on it — see Just now.' };
+        const settled = proactiveReplySettled(outcome.outcome, outcome.itemSettled);
+        return { settled, sessionId: outcome.sessionId,
+          text: settled ? 'Clem is on it — see Just now.' : 'Started a conversation — see Just now.' };
       }
       return { settled: proactiveReplySettled(outcome.outcome), text: replyOutcomeText(outcome, fromClemSourceName(row)) };
     });

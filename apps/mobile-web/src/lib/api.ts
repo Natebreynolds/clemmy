@@ -2272,7 +2272,7 @@ export interface FromClem {
 
 export type FromClemReplyOutcome =
   | { outcome: 'gone' | 'changed' | 'unclear' }
-  | { outcome: 'started'; sessionId: string; runId: string }
+  | { outcome: 'started'; sessionId: string; runId: string; itemSettled?: boolean }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
   | { outcome: 'answered'; questionId: string };
 

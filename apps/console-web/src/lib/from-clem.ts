@@ -57,7 +57,7 @@ export type FromClemReplyOutcome =
   | { outcome: 'gone' }
   | { outcome: 'changed' }
   | { outcome: 'unclear' }
-  | { outcome: 'started'; sessionId: string; runId: string }
+  | { outcome: 'started'; sessionId: string; runId: string; itemSettled?: boolean }
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added' }
   | { outcome: 'answered'; questionId: string };
 
@@ -95,7 +95,7 @@ export function replyOutcomeText(outcome: FromClemReplyOutcome, heartbeatTitle: 
 /** Inline feedback uses the same receipt meanings as Home. */
 export function replyOutcomeNotice(outcome: FromClemReplyOutcome, sourceName: string): { tone: 'success' | 'error' | 'info'; text: string } {
   return { tone: outcome.outcome === 'changed' || outcome.outcome === 'gone' ? 'error'
-    : proactiveReplySettled(outcome.outcome) ? 'success' : 'info', text: replyOutcomeText(outcome, sourceName) };
+    : proactiveReplySettled(outcome.outcome, outcome.outcome === 'started' ? outcome.itemSettled : undefined) ? 'success' : 'info', text: replyOutcomeText(outcome, sourceName) };
 }
 export const useFromClem = (enabled = true) => usePoll(['home-from-clem'], getFromClem, 20_000, { enabled });
 

@@ -11,7 +11,7 @@ type Decision = 'do_it' | 'done' | 'not_now' | 'never';
 function outcomeText(outcome: FromClemReplyOutcome): string {
   switch (outcome.outcome) {
     case 'answered': return 'Sent.';
-    case 'started': return 'Clem is on it in her thread.';
+    case 'started': return outcome.itemSettled === false ? 'Started a conversation.' : 'Clem is on it in her thread.';
     case 'approved': return 'Approved.';
     case 'declined': return 'Declined.';
     case 'cleared': return 'Cleared.';
@@ -54,7 +54,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     : mode === 'updates' ? (updates.length > 0 ? 'Updates from Clem' : 'Set up next') : 'From Clem';
   const showGroupHeading = mode === 'all' || [waiting, updates, offers].filter(group => group.length > 0).length > 1;
 
-  const run = async (row: FromClemRow, work: () => Promise<{text: string; settled: boolean}>) => {
+  const run = async (row: FromClemRow, work: () => Promise<{text: string; settled: boolean; sessionId?: string}>) => {
     if (inFlight.current) return;
     inFlight.current = true;
     haptic('light');
@@ -72,7 +72,13 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     }
   };
   const reply = (row: FromClemRow, text: string, decision?: Decision, choiceIndex?: number) =>
-    run(row, async () => { const result = await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex); return { text: outcomeText(result), settled: proactiveReplySettled(result.outcome) }; });
+    run(row, async () => {
+      const result = await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex);
+      return { text: outcomeText(result),
+        settled: proactiveReplySettled(result.outcome, result.outcome === 'started' ? result.itemSettled : undefined),
+        ...(result.outcome === 'started' ? { sessionId: result.sessionId } : {}),
+      };
+    });
 
   const meta = (row: FromClemRow) => (
     <div class="home-row-note">{fromClemSourceName(row)} · {relativeTime(row.at)}</div>
@@ -82,7 +88,10 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     if (!said) return null;
     return said.tone === 'error'
       ? <p class="home-row-error" role="alert">{said.text}</p>
-      : <div class={said.tone === 'success' ? 'home-row-receipt' : 'home-row-note'} role="status">{said.text}</div>;
+      : <div class={said.tone === 'success' ? 'home-row-receipt' : 'home-row-note'} role="status">
+        {said.text}
+        {said.sessionId ? <>{' '}<button type="button" class="home-link-btn" onClick={() => onOpenThread(said.sessionId)}>Open conversation</button></> : null}
+      </div>;
   };
   const replyBox = (row: FromClemRow) => (replying === row.key ? (
     <form class="from-clem-reply" onSubmit={(event) => { event.preventDefault(); if (drafts[row.key]?.trim()) void reply(row, drafts[row.key]!.trim()); }}>

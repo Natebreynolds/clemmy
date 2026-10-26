@@ -394,7 +394,7 @@ export type FromClemReplyOutcome =
   | { outcome: 'gone' }
   | { outcome: 'changed' }
   | { outcome: 'unclear'; decision: 'unclear' }
-  | ({ outcome: 'started'; decision: ClemReplyResult['decision'] } & FromClemTurnRef)
+  | ({ outcome: 'started'; decision: ClemReplyResult['decision']; itemSettled?: false } & FromClemTurnRef)
   | { outcome: 'approved' | 'declined' | 'cleared' | 'later' | 'rule_added'; decision: ClemReplyResult['decision'] }
   | { outcome: 'answered'; questionId: string };
 
@@ -425,7 +425,7 @@ function factsOf(row: FromClemRow): string {
  * Act on the owner's words about one row. A Noticing proposal is answered
  * through its own check-in (Noticing reads it and starts the work). Anything
  * else is read into a decision, and the host takes the path that already
- * settles it: a turn for "do it", the plan decision for a suggestion, read
+ * handles it: a turn for "do it" or a follow-up question, the plan decision for a suggestion, read
  * for "done" or "not now", and a rule in the owner's own words for "never".
  */
 export interface FromClemReplyRequest {
@@ -504,14 +504,15 @@ async function replyOnce(
       : { outcome: 'gone' };
   }
   switch (read.decision) {
+    case 'follow_up':
     case 'do_it': {
-      if (planId && !read.instruction) {
+      if (read.decision === 'do_it' && planId && !read.instruction) {
         return deps.approvePlan(planId) ? { outcome: 'approved', decision: read.decision } : { outcome: 'gone' };
       }
       // A tap on one of the choices this row offered (checked against the
       // choices the host showed, for the version the owner saw) approves
       // exactly that action; typed words are an ordinary reply.
-      const tapped = typeof choiceIndex === 'number' && row.asks
+      const tapped = read.decision === 'do_it' && typeof choiceIndex === 'number' && row.asks
         && Array.isArray(row.choices) && row.choices[choiceIndex] === reply;
       const started = deps.startTurn({
         title: row.text.slice(0, 120),
@@ -529,6 +530,8 @@ async function replyOnce(
           ...(row.ref ? { ref: row.ref } : {}),
         }) } : {}),
       });
+      // Asking about the item does not decide it or authorize an offered action.
+      if (read.decision === 'follow_up') return { outcome: 'started', decision: read.decision, itemSettled: false, ...started };
       if (notificationId) deps.markRead(notificationId);
       if (planId) deps.rejectPlan(planId, `Taken up in conversation: ${reply}`);
       return { outcome: 'started', decision: read.decision, ...started };

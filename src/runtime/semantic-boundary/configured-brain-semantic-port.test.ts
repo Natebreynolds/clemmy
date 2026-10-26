@@ -1,11 +1,47 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  ClemReplyV1Schema,
   configuredBrainSemanticPort,
   semanticModelRoleForPurpose,
   tokensFromAgentRun,
 } from './configured-brain-semantic-port.js';
 import type { TurnSemanticHostViewV1 } from './turn-semantic-proposal.js';
+
+test('Clem reads an informational follow-up through the existing typed reply port without promoting it to an action', async () => {
+  const calls: Array<{ purpose: string; schemaName: string; system: string; user: string }> = [];
+  const port = configuredBrainSemanticPort(async (input) => {
+    calls.push(input);
+    return { raw: { decision: 'follow_up', instruction: null }, modelIdentity: 'controlled-follow-up-brain',
+      inputTokens: 0, outputTokens: 0, latencyMs: 0 };
+  });
+  const request = {
+    purpose: 'clem_reply' as const,
+    said: 'The controlled item is waiting on your decision.',
+    facts: 'Controlled fixture: proposed for Thursday, with no decision recorded.',
+    reply: 'what day is this?',
+    evidenceDigest: 'controlled-follow-up-row-digest',
+  };
+  const result = await port.readClemReply!(request);
+  assert.equal(result.decision, 'follow_up');
+  assert.equal(result.evidenceDigest, request.evidenceDigest);
+  assert.equal(result.modelIdentity, 'controlled-follow-up-brain');
+  assert.equal(calls.length, 1, 'no additional classifier, reviewer, or fallback call');
+  assert.equal(calls[0]!.purpose, 'clem_reply');
+  assert.equal(calls[0]!.schemaName, 'ClemReplyV1');
+  assert.deepEqual(JSON.parse(calls[0]!.user), { said: request.said, facts: request.facts, reply: request.reply });
+  assert.match(calls[0]!.system, /follow_up/, 'the typed disposition is part of the model contract');
+  assert.equal(semanticModelRoleForPurpose('clem_reply'), 'brain');
+});
+
+test('the informational-reply schema keeps instruction required and nullable and rejects extra failed-open claims', () => {
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'done' }).success, false);
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'done', instruction: null }).success, true);
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'follow_up', instruction: null }).success, true);
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'follow_up' }).success, false);
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'follow_up', instruction: 42 }).success, false);
+  assert.equal(ClemReplyV1Schema.safeParse({ decision: 'follow_up', instruction: null, failedOpen: true }).success, false);
+});
 
 test('reading what a message asks is a quick check, write judgment stays on the judge, and Clem\'s own voice stays on the brain', () => {
   assert.equal(semanticModelRoleForPurpose('turn_semantics'), 'quick');

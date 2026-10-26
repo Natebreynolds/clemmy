@@ -415,9 +415,10 @@ export interface ClemReplyCall {
   evidenceDigest: string;
 }
 export interface ClemReplyResult {
-  /** do_it: act (on what she offered, or on what they asked); done: seen or
-   *  handled, nothing to do; not_now: later; never: stop raising this kind. */
-  decision: 'do_it' | 'done' | 'not_now' | 'never' | 'unclear';
+  /** do_it: act (on what she offered, or on what they asked); follow_up: ask
+   *  about the item without deciding it; done: seen or handled, nothing to do;
+   *  not_now: later; never: stop raising this kind. */
+  decision: 'do_it' | 'follow_up' | 'done' | 'not_now' | 'never' | 'unclear';
   instruction?: string;
   evidenceDigest: string;
   modelIdentity: string;

@@ -240,6 +240,165 @@ test('unclear words change nothing, and a row that is gone says so', async () =>
   assert.deepEqual(await replyToFromClem('notif:missing', 'ok', run.all), { outcome: 'gone' });
 });
 
+// An informational reply is a conversation about an unresolved item, not an
+// answer to that item. These fixtures never use a real notification or provider.
+function assertNoFollowUpSettlement(log: readonly string[]): void {
+  assert.deepEqual(log.filter((line) => /^(?:answer:|read-notif:|rule:|approve:|reject:|snooze:|later:)/.test(line)), []);
+}
+
+test('a typed informational follow-up dispatches the ordinary turn with exact context and no approval or notification settlement', async () => {
+  const { bindFromClemRespond, startFromClemTurn, CLEM_THREAD_ID } = await import('./from-clem-runtime.js');
+  const requests: Array<Parameters<NonNullable<Parameters<typeof bindFromClemRespond>[0]>>[0]> = [];
+  let ensured = 0;
+  bindFromClemRespond(async (request) => { requests.push(request); });
+  try {
+    const run = deps({
+      read: async () => stream((key) => key === 'notif:wr'
+        ? { message: 'The controlled standup is waiting on your decision.', choices: ['Accept', 'Decline', 'Suggest another time'] }
+        : undefined),
+      startTurn: (input) => startFromClemTurn(input, { ensure() { ensured += 1; } }),
+    }, { decision: 'follow_up' });
+    const row = (await run.all.read()).rows.find((item) => item.key === 'notif:wr')!;
+    const reply = 'what day is this?';
+    const result = await replyToFromClem(row.key, reply, run.all, {
+      requestId: 'follow-up-notification-ordinary-0001', seenDigest: row.voiceDigest,
+    });
+    assert.equal(result.outcome, 'started');
+    assert.deepEqual(result, {
+      outcome: 'started', decision: 'follow_up', itemSettled: false,
+      sessionId: CLEM_THREAD_ID, runId: requests[0]?.runId,
+    });
+    assert.equal(ensured, 1);
+    assert.equal(requests.length, 1);
+    const request = requests[0]!;
+    assert.equal(request.channel, 'desktop');
+    assert.equal(request.sessionId, CLEM_THREAD_ID);
+    assert.match(request.runId, /^from-clem:[A-Za-z0-9-]+$/);
+    assert.equal(request.displayMessage, reply, 'the accepted owner wording is not replaced by the card or an action');
+    assert.ok(request.message.includes(row.say!));
+    assert.ok(request.message.includes(`${row.text}\n${row.detail}`));
+    assert.ok(request.message.includes('itemKey=k2'), 'the existing item reference reaches the ordinary turn');
+    assert.ok(request.message.includes(`My reply: ${reply}`));
+    assert.equal(Object.hasOwn(request, 'ownerChoiceToken'), false, 'asking for context is not approval of an offered action');
+    assertNoFollowUpSettlement(run.log);
+    assert.equal((await run.all.read()).rows.find((item) => item.key === row.key)?.asks, true);
+  } finally { bindFromClemRespond(null); }
+});
+
+test('a typed informational follow-up about a plan starts a conversation without approving, rejecting, or snoozing the plan', async () => {
+  const starts: Array<Parameters<FromClemReplyDeps['startTurn']>[0]> = [];
+  const run = deps({ startTurn: (input) => {
+    starts.push(input); return { sessionId: 'sess-follow-up-plan', runId: 'from-clem:follow-up-plan' };
+  } }, { decision: 'follow_up', instruction: 'Explain the proposed scope.' });
+  const row = (await run.all.read()).rows.find((item) => item.key === 'plan:plan1')!;
+  const reply = 'What would this include?';
+  assert.deepEqual(await replyToFromClem(row.key, reply, run.all, {
+    requestId: 'follow-up-plan-ordinary-0001', seenDigest: row.voiceDigest,
+  }), {
+    outcome: 'started', decision: 'follow_up', itemSettled: false,
+    sessionId: 'sess-follow-up-plan', runId: 'from-clem:follow-up-plan',
+  });
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0]!.displayMessage, reply);
+  assert.ok(starts[0]!.message.includes(row.text));
+  assert.ok(starts[0]!.message.includes(`My reply: ${reply}`));
+  assert.equal(Object.hasOwn(starts[0]!, 'ownerChoiceToken'), false);
+  assertNoFollowUpSettlement(run.log);
+  assert.equal((await run.all.read()).rows.find((item) => item.key === row.key)?.answer?.kind, 'yes_no');
+});
+
+test('a duplicate informational follow-up request starts one conversation while leaving the item unresolved', async () => {
+  const starts: Array<Parameters<FromClemReplyDeps['startTurn']>[0]> = [];
+  const run = deps({ startTurn: (input) => {
+    starts.push(input); return { sessionId: 'sess-follow-up-repeat', runId: 'from-clem:follow-up-repeat' };
+  } }, { decision: 'follow_up' });
+  const row = (await run.all.read()).rows.find((item) => item.key === 'notif:wr')!;
+  const request = { requestId: 'follow-up-deduplicated-0001', seenDigest: row.voiceDigest };
+  const [first, duplicate] = await Promise.all([
+    replyToFromClem(row.key, 'what day is this?', run.all, request),
+    replyToFromClem(row.key, 'what day is this?', run.all, request),
+  ]);
+  assert.deepEqual(first, {
+    outcome: 'started', decision: 'follow_up', itemSettled: false,
+    sessionId: 'sess-follow-up-repeat', runId: 'from-clem:follow-up-repeat',
+  });
+  assert.deepEqual(duplicate, first);
+  assert.deepEqual(await replyToFromClem(row.key, 'what day is this?', run.all, request), first);
+  assert.equal(starts.length, 1);
+  assert.equal(run.log.filter((line) => line.startsWith('read:')).length, 1);
+  assert.equal(Object.hasOwn(starts[0]!, 'ownerChoiceToken'), false);
+  assertNoFollowUpSettlement(run.log);
+});
+
+test('an informational follow-up to a stale item version does not classify, dispatch, or settle anything', async () => {
+  const run = deps({}, { decision: 'follow_up' });
+  assert.deepEqual(await replyToFromClem('notif:wr', 'what day is this?', run.all, {
+    requestId: 'follow-up-stale-entry-0001', seenDigest: 'a-version-the-owner-no-longer-sees',
+  }), { outcome: 'changed' });
+  assert.deepEqual(run.log, []);
+});
+
+test('an informational follow-up rechecks the item after classification before dispatching or settling', async () => {
+  let reads = 0;
+  const run = deps({ read: async () => {
+    reads += 1;
+    const value = stream();
+    return reads === 1 ? value : { ...value, rows: value.rows.map((row) => row.key === 'notif:wr'
+      ? { ...row, voiceDigest: 'changed-during-informational-classification' } : row) };
+  } }, { decision: 'follow_up' });
+  const seenDigest = stream().rows.find((item) => item.key === 'notif:wr')!.voiceDigest;
+  assert.deepEqual(await replyToFromClem('notif:wr', 'what day is this?', run.all, {
+    requestId: 'follow-up-stale-recheck-0001', seenDigest,
+  }), { outcome: 'changed' });
+  assert.equal(reads, 2);
+  assert.equal(run.log.length, 1, 'classification is the only work that happened');
+  assertNoFollowUpSettlement(run.log);
+});
+
+test('informational wording does not dispatch when its classifier is absent, malformed, or unclear', async () => {
+  const { configuredBrainSemanticPort } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
+  const rawPackets: unknown[] = [
+    { decision: 'unclear', instruction: null },
+    { decision: 'follow_up' }, // instruction remains required, even when null.
+    { decision: 'follow_up', instruction: 42 },
+    { decision: 'follow_up', instruction: null, failedOpen: true },
+    null,
+  ];
+  for (const [index, raw] of rawPackets.entries()) {
+    let classified = 0;
+    const port = configuredBrainSemanticPort(async () => {
+      classified += 1;
+      return { raw, modelIdentity: 'controlled-follow-up-classifier', inputTokens: 0, outputTokens: 0, latencyMs: 0 };
+    });
+    const run = deps({ port: () => port });
+    assert.deepEqual(await replyToFromClem('notif:wr', 'what day is this?', run.all, {
+      requestId: `follow-up-invalid-packet-${index}`,
+    }), { outcome: 'unclear', decision: 'unclear' });
+    assert.equal(classified, 1);
+    assert.deepEqual(run.log, [], 'no dispatch, settlement, or fallback action');
+  }
+  for (const [index, port] of [null, {}].entries()) {
+    const run = deps({ port: () => port as ReturnType<FromClemReplyDeps['port']> });
+    assert.deepEqual(await replyToFromClem('notif:wr', 'what day is this?', run.all, {
+      requestId: `follow-up-missing-classifier-${index}`,
+    }), { outcome: 'unclear', decision: 'unclear' });
+    assert.deepEqual(run.log, []);
+  }
+});
+
+test('an unavailable informational-reply classifier never falls through to a conversation or settlement', async () => {
+  const { configuredBrainSemanticPort } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
+  const failure = new Error('Controlled classifier unavailable');
+  let classified = 0;
+  const port = configuredBrainSemanticPort(async () => { classified += 1; throw failure; });
+  const run = deps({ port: () => port });
+  await assert.rejects(replyToFromClem('notif:wr', 'what day is this?', run.all, {
+    requestId: 'follow-up-classifier-unavailable-0001',
+  }), (error) => error === failure);
+  assert.equal(classified, 1);
+  assert.deepEqual(run.log, []);
+});
+
 // ── durability: crash/retry, stale versions, double replies ──────────────────
 
 test('a message already in her thread is not posted again when the record of posting it was lost', async () => {
