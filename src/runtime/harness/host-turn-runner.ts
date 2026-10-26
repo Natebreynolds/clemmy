@@ -10168,6 +10168,16 @@ const runHostTurnBody = async (
     // survive serialization, including tokens for ordinary siblings that did
     // not themselves prompt. Scan/evaluate the whole frame before any body so
     // a later mismatch cannot leave an earlier sibling partially executed.
+    // Which check sent an approved resumed call back to the model, recorded
+    // once per call so a refused approval can be read from the event log.
+    const noteResumeFrameRepair = (reason: string, pending: PendingHostCall, detail: Record<string, unknown> = {}): void => {
+      try {
+        const identity = exactHostIdentity();
+        appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
+          data: { kind: 'resume_frame_repair', reason, sourceUserSeq: identity.sourceUserSeq,
+            callId: pending.callId, tool: pending.name, decision: pending.decision ?? null, ...detail } });
+      } catch { /* telemetry only */ }
+    };
     for (const pending of pendingFromResume) {
       const tool = toolByName.get(pending.name);
       let argumentsJson = pending.rawItem.arguments;
@@ -10176,6 +10186,7 @@ const runHostTurnBody = async (
         argumentsJson = materializedArgumentsJson(pending.name, argumentsJson);
         args = parsedArgs(argumentsJson);
       } catch {
+        noteResumeFrameRepair('arguments_unreadable', pending);
         resumeFrameRepair = true;
         break;
       }
@@ -10187,6 +10198,7 @@ const runHostTurnBody = async (
       // A rejection is still paired visibly below and never executes a body.
       if (!hostProduction) continue;
       if (!tool || !args) {
+        noteResumeFrameRepair('tool_or_arguments_missing', pending);
         resumeFrameRepair = true;
         break;
       }
@@ -10229,6 +10241,7 @@ const runHostTurnBody = async (
         && pending.decision === 'approved'
         && !exactApprovalId
       ) {
+        noteResumeFrameRepair('approval_not_linked', pending);
         resumeFrameRepair = true;
         break;
       }
@@ -10253,6 +10266,7 @@ const runHostTurnBody = async (
         },
       );
       if (!exactProduction) {
+        noteResumeFrameRepair('exact_call_not_rebuilt', pending);
         resumeFrameRepair = true;
         break;
       }
@@ -10290,6 +10304,7 @@ const runHostTurnBody = async (
           }),
         );
         if (prepared.status !== 'prepared') {
+          noteResumeFrameRepair('preparation_failed', pending);
           resumeFrameRepair = true;
           break;
         }
@@ -10304,6 +10319,7 @@ const runHostTurnBody = async (
         || consent.decision.kind !== 'proceed'
         || (pending.consentSubject && consent.decision.basis !== 'exact_user_grant')
       ) {
+        noteResumeFrameRepair('consent_not_exact_grant', pending, { consentStatus: consent.status, decision: consent.status === 'decided' ? consent.decision.kind : null, basis: consent.status === 'decided' && consent.decision.kind === 'proceed' ? consent.decision.basis : null });
         resumeFrameRepair = true;
         break;
       }
