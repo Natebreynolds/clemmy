@@ -363,6 +363,54 @@ test('tree CLI with a guarded snapshot refuses a changed shell before staging or
   assert.equal(fs.readFileSync(path.join(g.daemonDist, 'index.js'), 'utf8'), 'old daemon');
 });
 
+for (const guarded of [true, false]) test(`tree CLI late running transition ${guarded ? 'refuses guarded automatic quit' : 'preserves unguarded idle quit'}`, async t => {
+  const g = guardedFixture(t);
+  const app = guarded ? g.app : path.join(g.root, 'ordinary-install');
+  const daemon = path.join(app, 'Contents/Resources/daemon');
+  fs.mkdirSync(daemon, { recursive: true });
+  fs.writeFileSync(path.join(daemon, 'package.json'), JSON.stringify({ version: '0.0.0' }));
+  const snapshotFile = path.join(g.root, 'native-before.json');
+  fs.writeFileSync(snapshotFile, JSON.stringify(g.snapshot));
+  const moduleUrl = new URL('./hotpatch-installed-tree.mjs', import.meta.url);
+  // Run the actual CLI body with inert subprocess and idle-database imports.
+  // The guarded case completes its real synthetic proof before the app starts.
+  const body = fs.readFileSync(moduleUrl, 'utf8').replace(/^import[\s\S]*?from ['"][^'"]+['"];\s*$/gm, '')
+    .replaceAll('import.meta.url', JSON.stringify(moduleUrl.href))
+    .replace("await import('better-sqlite3')", 'await importIdleDatabase()');
+  const helpers = await import('./hotpatch-daemon.mjs');
+  const { Script } = await import('node:vm'); const { fileURLToPath } = await import('node:url');
+  let proofFinished = false; let idleReads = 0; let idleQueries = 0; let replacements = 0;
+  const commands = [];
+  const result = new Script(`(async () => { ${body}\n})()`).runInNewContext({
+    ...helpers, fs, path, createHash, fileURLToPath,
+    process: { argv: ['node', moduleUrl.pathname, '--no-relaunch', ...(guarded ? ['--guarded-shell-snapshot', snapshotFile] : [])],
+      env: { HOME: g.home, CLEMENTINE_APP_PATH: app }, exit(code) { throw new Error(`unexpected exit ${code}`); } },
+    console: { log() {}, error() {} },
+    isInstalledAppRunning() { return guarded ? proofFinished : true; },
+    verifyGuardedSealedPatch(options) {
+      const proof = helpers.verifyGuardedSealedPatch({ ...options, isUpdaterRunning: () => false, verifyNativeSignature() {} });
+      proofFinished = true; return proof;
+    },
+    async importIdleDatabase() {
+      return { default: class {
+        constructor() { idleReads++; }
+        prepare() { idleQueries++; return { get() { return { created_at: '2000-01-01T00:00:00.000Z' }; } }; }
+        close() {}
+      } };
+    },
+    execFileSync(command) { commands.push(command); throw new Error('fixture reached legacy quit'); },
+    installDaemonPatch() { replacements++; throw new Error('unexpected replacement'); },
+    installBundledAssetDirectory() { replacements++; throw new Error('unexpected replacement'); },
+  });
+  const error = await result.then(() => null, error => error);
+  assert.equal(replacements, 0);
+  assert.equal(idleReads, guarded ? 0 : 1, 'guarded mode must refuse before opening the idle database');
+  assert.equal(idleQueries, guarded ? 0 : 1);
+  assert.deepEqual(commands, guarded ? [] : ['osascript']);
+  assert.equal(proofFinished, guarded);
+  assert.match(error?.message ?? '', guarded ? /Refusing a guarded patch:.*started/ : /fixture reached legacy quit/);
+});
+
 // Stored synthetic ZIP entries exercise the real parser without an installer,
 // an installed app, ZIP subprocesses, credentials, or the owner's home.
 function nativeZip(g, entries = SEALED_SHELL_PARTS, compressed = false) {

@@ -166,6 +166,7 @@ if (recovery.directory) initializeCurrentStateRecoveryArtifacts({ guarded, direc
 const IDLE_REQUIRED_SECONDS = 90;
 
 if (running()) {
+  if (SHELL_SNAPSHOT) throw new Error('Refusing a guarded patch: application started after verification; quit remains caller-controlled.');
   const idle = await idleSeconds();
   if (!Number.isFinite(idle)) {
     console.error('REFUSED: could not read the event log to confirm Clementine is idle. Quit it yourself, then re-run.');
