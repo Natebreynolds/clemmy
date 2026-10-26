@@ -3143,6 +3143,90 @@ const runHostTurnBody = async (
     unplannedNativeCarries.set(call.callId, carry);
   };
 
+  /** Prepare one call's exact local requirement and schema-completed bytes
+   *  before admission. The pre-approval loop runs it on every call; an
+   *  approval resume runs it again on each paused call, so a resumed call is
+   *  rebuilt under the same requirement its card was raised for instead of
+   *  re-binding as its bare carrier (which held every approved carried write). */
+  const prepareCallBeforeAdmission = async (call: { callId: string; name: string; argumentsJson: string }): Promise<void> => {
+    // Any first-class local change the registry declares safe to plan
+    // (a file, a folder, a Space) takes its requirement from its live
+    // definition here, not only the native authoring tools: a worker's
+    // direct write_file had no requirement and was refused (live 10-02).
+    // An agent with no preparation binding gets none, as before.
+    if ((NATIVE_PRODUCT_AUTHORING_TOOLS.has(call.name) || isRegistryDeclaredLocalPlanningMutation(call.name))
+      && toolByName.has(call.name)) {
+      const identity = exactHostIdentity();
+      const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+      if (args && !actionExpectedWorkRequired(identity)) {
+        const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
+        const requirement = await prepareDirectHostLocalCall(agent, {
+          ...identity, operationId: call.name, args,
+        });
+        // A direct call whose arguments match no definition is refused
+        // for those arguments, not as uncovered work: a coverage refusal
+        // says the arguments are fine and sends the same call back
+        // through another carrier before the schema complaint arrives.
+        if (requirement) directLocalCallRequirements.set(call.callId, requirement);
+        else await noteLocalArgumentMismatch(call, call.name, args);
+      }
+      return;
+    }
+    if (!isPlainOrClementineLocalTool(call.name, 'work_call')) {
+      await prepareUnplannedNativeCarry(call);
+      return;
+    }
+    const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
+    // A requirement id that is just the carried operation's own name, a
+    // free label the model made up ("read.page"), or no id at all is a
+    // label slip, not a different request: run the named operation under
+    // its own exact current definition, exactly as a direct call would.
+    // Live 2026-10-20: a page read's third shell call and a workflow run
+    // each carried an invented label and were refused "not yet published
+    // for this request; call tool_search", two model steps per hoop.
+    const requirementLabel = args && typeof args.requirement_id === 'string' ? args.requirement_id.trim() : '';
+    if (args && typeof args.name === 'string'
+      && (!requirementLabel || requirementLabel === args.name.trim() || !requirementLabel.startsWith('cap:local:'))
+      && !actionExpectedWorkRequired(exactHostIdentity())) {
+      const selfNamed = unwrapRuntimeEffectiveToolIdentity(call.name, args);
+      if (selfNamed.toolName && selfNamed.args && typeof selfNamed.args === 'object' && !Array.isArray(selfNamed.args)) {
+        const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
+        const requirement = await prepareDirectHostLocalCall(agent, {
+          ...exactHostIdentity(), operationId: selfNamed.toolName, args: selfNamed.args,
+        });
+        const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
+        const prepared = requirement ? await materializeLocalRuntimeToolArguments(selfNamed.toolName, selfNamed.args) : null;
+        if (requirement && prepared) {
+          directLocalCallRequirements.set(call.callId, requirement);
+          // The prepared outer contract carries only the carrier's own
+          // fields; a target field the model put beside the carrier has
+          // been folded into the prepared target arguments above.
+          localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
+            JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirement, args_json: JSON.stringify(prepared.args) }));
+        }
+      }
+      return;
+    }
+    if (!args || typeof args.requirement_id !== 'string' || !args.requirement_id.startsWith('cap:local:')) return;
+    const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
+    if (!effective.toolName || args.name !== effective.toolName) return;
+    const identity = exactHostIdentity();
+    const localCall = { ...identity, capabilityRef: args.requirement_id,
+      operationId: effective.toolName, args: effective.args };
+    let requirementId = args.requirement_id;
+    if (!nominateDisclosedLocalPlanningDefinition({ ...localCall, effect: 'local_write' })) {
+      const { resolveHostLocalCallRequirement } = await import('./host-local-call-preparation.js');
+      const resolved = await resolveHostLocalCallRequirement(agent, localCall);
+      if (!resolved) return;
+      requirementId = resolved;
+    }
+    const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
+    const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
+    if (!prepared) return;
+    localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
+      JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirementId, args_json: JSON.stringify(prepared.args) }));
+  };
+
   // Keyed by the call's own name, not its surface object: a call off the
   // surface has no object, and two such calls with the same bytes must not
   // share one preparation.
@@ -10180,6 +10264,11 @@ const runHostTurnBody = async (
             callId: pending.callId, tool: pending.name, decision: pending.decision ?? null, ...detail } });
       } catch { /* telemetry only */ }
     };
+    if (hostProduction) {
+      for (const pending of pendingFromResume) {
+        await prepareCallBeforeAdmission({ callId: pending.callId, name: pending.name, argumentsJson: pending.rawItem.arguments });
+      }
+    }
     for (const pending of pendingFromResume) {
       const tool = toolByName.get(pending.name);
       let argumentsJson = pending.rawItem.arguments;
@@ -10321,7 +10410,7 @@ const runHostTurnBody = async (
         || consent.decision.kind !== 'proceed'
         || (pending.consentSubject && consent.decision.basis !== 'exact_user_grant')
       ) {
-        noteResumeFrameRepair('consent_not_exact_grant', pending, { consentStatus: consent.status, decision: consent.status === 'decided' ? consent.decision.kind : null, basis: consent.status === 'decided' && consent.decision.kind === 'proceed' ? consent.decision.basis : null });
+        noteResumeFrameRepair('consent_not_exact_grant', pending, { consentStatus: consent.status, consentReason: consent.status === 'decided' ? ('reason' in consent.decision ? consent.decision.reason : null) : consent.reason, decision: consent.status === 'decided' ? consent.decision.kind : null, basis: consent.status === 'decided' && consent.decision.kind === 'proceed' ? consent.decision.basis : null });
         resumeFrameRepair = true;
         break;
       }
@@ -11966,84 +12055,7 @@ const runHostTurnBody = async (
 
     const canonicalCalls = admission.frame.calls;
     if (hostProduction) {
-      for (const call of canonicalCalls) {
-        // Any first-class local change the registry declares safe to plan
-        // (a file, a folder, a Space) takes its requirement from its live
-        // definition here, not only the native authoring tools: a worker's
-        // direct write_file had no requirement and was refused (live 10-02).
-        // An agent with no preparation binding gets none, as before.
-        if ((NATIVE_PRODUCT_AUTHORING_TOOLS.has(call.name) || isRegistryDeclaredLocalPlanningMutation(call.name))
-          && toolByName.has(call.name)) {
-          const identity = exactHostIdentity();
-          const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
-          if (args && !actionExpectedWorkRequired(identity)) {
-            const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
-            const requirement = await prepareDirectHostLocalCall(agent, {
-              ...identity, operationId: call.name, args,
-            });
-            // A direct call whose arguments match no definition is refused
-            // for those arguments, not as uncovered work: a coverage refusal
-            // says the arguments are fine and sends the same call back
-            // through another carrier before the schema complaint arrives.
-            if (requirement) directLocalCallRequirements.set(call.callId, requirement);
-            else await noteLocalArgumentMismatch(call, call.name, args);
-          }
-          continue;
-        }
-        if (!isPlainOrClementineLocalTool(call.name, 'work_call')) {
-          await prepareUnplannedNativeCarry(call);
-          continue;
-        }
-        const args = parsedArgs(materializedToolArgumentsJson(toolByName.get(call.name), call.argumentsJson));
-        // A requirement id that is just the carried operation's own name, a
-        // free label the model made up ("read.page"), or no id at all is a
-        // label slip, not a different request: run the named operation under
-        // its own exact current definition, exactly as a direct call would.
-        // Live 2026-10-20: a page read's third shell call and a workflow run
-        // each carried an invented label and were refused "not yet published
-        // for this request; call tool_search", two model steps per hoop.
-        const requirementLabel = args && typeof args.requirement_id === 'string' ? args.requirement_id.trim() : '';
-        if (args && typeof args.name === 'string'
-          && (!requirementLabel || requirementLabel === args.name.trim() || !requirementLabel.startsWith('cap:local:'))
-          && !actionExpectedWorkRequired(exactHostIdentity())) {
-          const selfNamed = unwrapRuntimeEffectiveToolIdentity(call.name, args);
-          if (selfNamed.toolName && selfNamed.args && typeof selfNamed.args === 'object' && !Array.isArray(selfNamed.args)) {
-            const { prepareDirectHostLocalCall } = await import('./host-local-call-preparation.js');
-            const requirement = await prepareDirectHostLocalCall(agent, {
-              ...exactHostIdentity(), operationId: selfNamed.toolName, args: selfNamed.args,
-            });
-            const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
-            const prepared = requirement ? await materializeLocalRuntimeToolArguments(selfNamed.toolName, selfNamed.args) : null;
-            if (requirement && prepared) {
-              directLocalCallRequirements.set(call.callId, requirement);
-              // The prepared outer contract carries only the carrier's own
-              // fields; a target field the model put beside the carrier has
-              // been folded into the prepared target arguments above.
-              localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
-                JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirement, args_json: JSON.stringify(prepared.args) }));
-            }
-          }
-          continue;
-        }
-        if (!args || typeof args.requirement_id !== 'string' || !args.requirement_id.startsWith('cap:local:')) continue;
-        const effective = unwrapRuntimeEffectiveToolIdentity(call.name, args);
-        if (!effective.toolName || args.name !== effective.toolName) continue;
-        const identity = exactHostIdentity();
-        const localCall = { ...identity, capabilityRef: args.requirement_id,
-          operationId: effective.toolName, args: effective.args };
-        let requirementId = args.requirement_id;
-        if (!nominateDisclosedLocalPlanningDefinition({ ...localCall, effect: 'local_write' })) {
-          const { resolveHostLocalCallRequirement } = await import('./host-local-call-preparation.js');
-          const resolved = await resolveHostLocalCallRequirement(agent, localCall);
-          if (!resolved) continue;
-          requirementId = resolved;
-        }
-        const { materializeLocalRuntimeToolArguments } = await import('../../tools/call-tool.js');
-        const prepared = await materializeLocalRuntimeToolArguments(effective.toolName, effective.args);
-        if (!prepared) continue;
-        localArgumentPreparations.set(`${call.name}\0${call.argumentsJson}`,
-          JSON.stringify({ ...carrierOwnFieldsOnly(args), requirement_id: requirementId, args_json: JSON.stringify(prepared.args) }));
-      }
+      for (const call of canonicalCalls) await prepareCallBeforeAdmission(call);
     }
     const repeatsCommittedCallId = canonicalCalls.some((call) => history.some((item) => {
       const row = item as unknown as { type?: unknown; callId?: unknown };
