@@ -1448,8 +1448,12 @@ export async function tryJevCompletionVerdict(
     }
   }
   let verdict: Omit<JevCompletionVerdict, 'judgeModelId'> | null = null;
-  if (taskViewComplete && !evidence.clipped && sure(asksUser)) {
-    verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting', confidence: asksUser! };
+  // A necessary question about one dependent part cannot waive another
+  // requested result. Unfinished work with an explained dependency is not
+  // unaddressed; it may still pause without claiming the whole task delivered.
+  if (taskViewComplete && !evidence.clipped && sure(asksUser) && sureNot(unaddressed)) {
+    verdict = { done: true, awaitingUser: true, reason: COMPLETION_REASONS.awaiting, choice: 'awaiting',
+      confidence: Math.min(asksUser!, 1 - unaddressed!) };
   } else if (taskViewComplete && !evidence.clipped && sure(deadEnd)) {
     // Owner's rule (10-20): an undone part needs a next way or a plain reason.
     // A reply that ends on "it was refused" with neither is not done and not

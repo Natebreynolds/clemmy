@@ -4273,8 +4273,12 @@ test('production host repairs a stale memory correction read and changes the fac
   assert.ok(surfaces[1]?.includes('memory_read'), 'argument repair keeps the already admitted fresh read available');
   assert.ok(granted);
   assert.equal(model.calls(), 4, 'the host accepts refusal, fresh read and one corrected retry without another owner turn');
-  assert.equal(result.terminal, undefined, JSON.stringify(result.terminal));
-  assert.equal(result.finalOutput, 'The report heading is now LILAC GROVE, and the footer convention is unchanged.');
+  // The fresh prewrite grant proves which one correction may execute. This
+  // fixture disables completion review, so it cannot certify the whole memory
+  // objective without an accepted completion assessment (even after the save).
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'memory_correction_unverified');
+  assert.notEqual(result.finalOutput, 'The report heading is now LILAC GROVE, and the footer convention is unchanged.');
   const retained = eventlog.openEventLog().prepare(`SELECT s.logical_tool_call_id, l.tool_name, s.execution_kind,
     s.outcome_kind, s.requires_reconciliation, s.mutating FROM logical_call_settlements s
     JOIN logical_tool_calls l ON l.session_id=s.session_id AND l.source_user_seq=s.source_user_seq
@@ -13847,11 +13851,11 @@ for (const variant of ['unhelpful-first', 'partial-complete', 'after-disclosure'
   });
 }
 
-function ownedQuestionAdmissionFixture(label: string, frames: unknown[][]) {
+function ownedQuestionAdmissionFixture(label: string, frames: unknown[][],
+  objective = 'Prepare the controlled report using my private cutoff and intended audience. Ask for the exact missing owner choices.') {
   const session = eventlog.createSession({ id: `question-admission-owned-${++acceptedSerial}-${label}`,
     kind: 'chat', channel: 'desktop', userId: 'desktop' });
   const attempt = eventlog.beginRunAttempt(session.id, { runId: `question-admission:${session.id}` });
-  const objective = 'Prepare the controlled report using my private cutoff and intended audience. Ask for the exact missing owner choices.';
   const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user',
     data: { text: objective, taskMode: { version: 1, kind: 'normal' } } }, { armRunInFlight: true });
   const model = scriptedRecordingModel(frames);
@@ -13863,6 +13867,156 @@ function ownedQuestionAdmissionFixture(label: string, frames: unknown[][]) {
     makeRunner: () => throwingRunner() as never,
   });
   return { session, attempt, source, objective, model, run };
+}
+
+test('question admission keeps same-frame independent progress in the reviewed and delivered reply', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const progress = 'Measurement A is 17.';
+  const question = 'What private cutoff should I use to classify measurement B?';
+  const options = ['10', '20'];
+  const objective = `Report measurement A as 17, then classify measurement B using my unpublished private cutoff. `
+    + 'Ask for that cutoff only after reporting A.';
+  const ask = toolCall('partial-progress-same-frame-ask', 'ask_user_question',
+    { question, options, purpose: 'clarification' });
+  const fixture = ownedQuestionAdmissionFixture('partial-progress-same-frame', [[textMsg(progress), ask]], objective);
+  const reviews: Array<{ objective: string; reply: string; evidence?: string; postedBefore: number }> = [];
+  // This injected reading isolates presentation assembly; it does not claim
+  // that a semantic reviewer can detect a missing independent answer.
+  host._setHostObjectiveJudgeForTests(async (currentObjective, reply, context) => {
+    reviews.push({ objective: currentObjective, reply, evidence: context?.toolCallSummary,
+      postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+    return { done: true, awaitingUser: true, reason: 'Controlled awaiting reading: only B needs the owner cutoff.' };
+  });
+  const result = await fixture.run();
+  const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] })
+    .filter(row => row.data.sourceUserSeq === fixture.source.seq);
+  const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter(row => row.data.sourceUserSeq === fixture.source.seq);
+  const delivered = result.publicPresentation?.text ?? '';
+  t.diagnostic(JSON.stringify({ shape: 'same-frame', primaryCalls: fixture.model.calls(), reviews: reviews.length,
+    reviewedProgress: reviews.at(-1)?.reply.includes(progress) ?? false,
+    deliveredProgress: delivered.includes(progress), questions: questions.length, terminalCount: terminal.length,
+    visibleStatus: result.publicPresentation?.status }));
+  assert.equal(reviews.length, 1, 'the complete pause uses one existing review');
+  assert.equal(reviews[0]!.postedBefore, 0, 'the question is reviewed before publication');
+  assert.equal(reviews[0]!.objective, objective);
+  assert.ok(reviews[0]!.reply.includes(question));
+  assert.ok((reviews[0]!.evidence ?? '').includes(JSON.stringify({ question, options })),
+    'the exact staged question and choices accompany the complete candidate');
+  assert.equal(questions.length, 1);
+  assert.equal(questions[0]!.data.question, question);
+  assert.deepEqual(questions[0]!.data.options, options);
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.equal(terminal.length, 1, 'the real conversation reducer commits one visible terminal');
+  assert.equal(terminal[0]!.data.awaitingUser, true);
+  assert.equal(fixture.model.calls(), 1, 'no narration model call is added');
+  assert.deepEqual({ reviewed: reviews[0]!.reply.includes(progress), delivered: delivered.includes(progress) },
+    { reviewed: true, delivered: true }, 'independent A must survive into both the reviewed candidate and durable visible reply');
+  assert.equal(delivered.split(progress).length - 1, 1, 'partial progress is delivered exactly once');
+  assert.ok(delivered.indexOf(progress) < delivered.indexOf(question), 'the completed independent result precedes the remaining question');
+});
+
+for (const shape of ['no-prior-frame', 'prior-frame'] as const) {
+  test(`question admission repairs omitted independent progress through actual Jev coverage routing (${shape})`, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    const judge = await import('./objective-judge.js');
+    t.after(() => {
+      host._setHostObjectiveJudgeForTests(null);
+      judge._setCompletionJudgeForTests(null);
+      jevClient._setTypesafeKeyForTests(undefined);
+      jevClient._setSystemOneFetchForTests(undefined);
+    });
+    const progress = 'Measurement A is 17.';
+    const question = 'What private cutoff should I use to classify measurement B?';
+    const options = ['10', '20'];
+    const file = path.join(TMP_HOME, `question-progress-repair-${shape}.txt`);
+    if (shape === 'prior-frame') writeFileSync(file, 'Measurement B is 26. The owner has not supplied the private cutoff.\n', 'utf8');
+    const objective = 'Report measurement A as 17, then classify measurement B using my unpublished private cutoff. Ask for that cutoff only after reporting A.'
+      + (shape === 'prior-frame' ? ` The controlled B record is at ${file}.` : '');
+    const ask = (callId: string) => toolCall(callId, 'ask_user_question', { question, options, purpose: 'clarification' });
+    const fixture = ownedQuestionAdmissionFixture(`partial-progress-jev-repair-${shape}`, [
+      ...(shape === 'prior-frame' ? [[textMsg(progress), toolCall('partial-progress-read-b', 'call_tool',
+        { name: 'read_file', args_json: { path: file, max_chars: null } })]] : []),
+      [ask('partial-progress-omitted')],
+      [textMsg(progress), ask('partial-progress-repaired')],
+    ], objective);
+    const payloads: Array<{ state: Record<string, unknown>; questions: Record<string, unknown> }> = [];
+    let configuredReviews = 0;
+    jevClient._setTypesafeKeyForTests('ts_question_partial_progress_fixture');
+    jevClient._setSystemOneFetchForTests(async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      assert.ok(payload.questions?.asksUser, 'this controlled transport serves only the existing completion screen');
+      payloads.push(payload);
+      const reportedA = String(payload.state.response).includes(progress);
+      // Retained q5 readings found both the legitimate B question and missing
+      // independent A. These injected scores exercise the real routing/repair;
+      // they do not claim that a live model will always identify the omission.
+      const readings = { delivered: 0.15, unaddressed: reportedA ? 0.05 : 0.91,
+        unsupported: 0.10, computed: 0.07, asksUser: 0.86, cannotFinish: 0.03, deadEnd: 0.54 };
+      return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+        answers: Object.fromEntries(Object.entries(readings).map(([id, noul]) => [id, { type: 'noul', noul }])),
+        usage: { input_tokens: 36, output_tokens: 5 } }) };
+    });
+    judge._setCompletionJudgeForTests(async () => {
+      configuredReviews++;
+      return { verdict: null, failure: 'error', unavailableReason: 'Controlled configured reviewer unavailable on the existing read-and-direction-question route.' };
+    });
+    const reviews: Array<{ reply: string; postedBefore: number; verdict: import('./objective-judge.js').ObjectiveJudgeVerdict }> = [];
+    host._setHostObjectiveJudgeForTests(async (currentObjective, reply, context) => {
+      const postedBefore = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length;
+      const verdict = await judge.judgeObjectiveComplete(currentObjective, reply, context);
+      reviews.push({ reply, postedBefore, verdict });
+      return verdict;
+    });
+    const result = await fixture.run();
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] });
+    t.diagnostic(JSON.stringify({ shape, primaryCalls: fixture.model.calls(), jevCalls: payloads.length, configuredReviews,
+      verdicts: reviews.map(row => ({ done: row.verdict.done, awaitingUser: row.verdict.awaitingUser === true,
+        failedOpen: row.verdict.failedOpen === true })), deliveredProgress: result.publicPresentation?.text.includes(progress) ?? false }));
+    assert.equal(reviews.length, 2, 'one negative question uses the existing repair and is reviewed again');
+    assert.equal(payloads.length, 2, 'each candidate gets exactly one Jev screen');
+    assert.equal(configuredReviews, 0, 'both candidates remain on the existing Jev-only no-output question route');
+    assert.ok(reviews.every(row => row.postedBefore === 0), 'the incomplete question is never published while repairing');
+    assert.equal(reviews[0]!.verdict.done, false);
+    assert.notEqual(reviews[0]!.verdict.awaitingUser, true);
+    assert.notEqual(reviews[0]!.verdict.failedOpen, true);
+    assert.equal(reviews[1]!.verdict.awaitingUser, true, 'B may still await its private cutoff after A is reported');
+    assert.ok(payloads.every(payload => payload.state.request === objective));
+    assert.ok(!String(payloads[0]!.state.response).includes(progress));
+    assert.ok(String(payloads[1]!.state.response).includes(progress));
+    assert.ok(payloads.every(payload => String(payload.state.evidence).includes(JSON.stringify({ question, options }))));
+    assert.equal(fixture.model.calls(), shape === 'prior-frame' ? 3 : 2,
+      'one existing repair supplies the complete reply without rerunning settled work or adding a narrator');
+    assert.match(JSON.stringify(fixture.model.requests[shape === 'prior-frame' ? 2 : 1]), /RETAINED COMPLETION REVIEW/);
+    if (shape === 'prior-frame') {
+      const reads = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind, execution_kind
+        FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
+        .all(fixture.session.id, fixture.source.seq, 'partial-progress-read-b') as
+        Array<{ logical_tool_call_id: string; outcome_kind: string; execution_kind: string }>;
+      assert.equal(reads.length, 1, 'the earlier accepted read settles exactly once through repair');
+      assert.equal(reads[0]!.outcome_kind, 'succeeded');
+      assert.equal(reads[0]!.execution_kind, 'local_execution');
+      const results = eventlog.listEvents(fixture.session.id, { types: ['tool_returned'] })
+        .filter(row => row.data.sourceUserSeq === fixture.source.seq && row.data.callId === 'partial-progress-read-b');
+      assert.ok(results.some(row => String(row.data.result).includes('Measurement B is 26.')),
+        'the first frame really completed its read before the omitted-progress candidate');
+    }
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0]!.data.question, question);
+    assert.deepEqual(questions[0]!.data.options, options);
+    assert.equal(result.status, 'awaiting_user_input');
+    assert.equal(result.publicPresentation?.status, 'needs_input');
+    const delivered = result.publicPresentation?.text ?? '';
+    assert.ok(delivered.startsWith(`${progress}\n\n${question}`),
+      'the final durable reply begins with A and the exact remaining B question, before any retained-work footer');
+    assert.equal(delivered.split(progress).length - 1, 1, 'A appears once in the final durable visible reply');
+    assert.equal(delivered.split(question).length - 1, 1, 'the remaining B question appears once');
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0]!.data.awaitingUser, true, 'the repaired pause is still not whole-objective completion');
+  });
 }
 
 for (const shape of ['direct', 'wrapped', 'bundled-spoken'] as const) {
@@ -14011,6 +14165,112 @@ for (const variant of ['ordinary-ask', 'review-unavailable'] as const) {
     } else assert.equal(review.data.awaitingUser, true);
   });
 }
+
+test('question admission preserves a necessary memory clarification when review is unavailable', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const { explicitMemoryInstructionFor } = await import('../../memory/auto-capture.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const objective = 'Correction for later: the report heading is Willow, replacing Birch. '
+    + 'Remember the correction for future chats, but first ask whether I mean report A or report B before changing either saved heading.';
+  assert.ok(explicitMemoryInstructionFor(objective), 'the source is an explicit durable correction');
+  const question = 'Which saved report heading should I correct: report A or report B?';
+  const options = ['Report A', 'Report B'];
+  const fixture = ownedQuestionAdmissionFixture('memory-clarification-unavailable', [[
+    toolCall('question-memory-target', 'ask_user_question', { question, options, purpose: 'clarification' }),
+  ], [textMsg('No additional primary step should run before the owner chooses a report.')]], objective);
+  const reviews: Array<{ memoryRequired: boolean; postedBefore: number }> = [];
+  host._setHostObjectiveJudgeForTests(async (_objective, _reply, context) => {
+    reviews.push({ memoryRequired: Boolean(context?.memoryRequirementContext),
+      postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+    // No negative semantic finding exists: this is the review-unavailable
+    // fallback. The separate memory floor must still prevent a false save,
+    // without converting that unfinished work into a rejected clarification.
+    return { done: true, failedOpen: true, reviewFailure: 'unavailable',
+      reason: 'Controlled reviewer unavailable; no semantic acceptance or rejection was obtained.' };
+  });
+  const result = await fixture.run();
+  const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+  const terminal = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] });
+  const review = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .find(row => row.data.kind === 'completion');
+  t.diagnostic(JSON.stringify({ primaryCalls: fixture.model.calls(), reviews: reviews.length,
+    memoryRequired: reviews[0]?.memoryRequired, questions: questions.length,
+    status: result.status, visibleStatus: result.publicPresentation?.status,
+    memoryStatus: (review?.data.judgedMemoryRequirement as { status?: string } | undefined)?.status,
+    fulfills: review?.data.fulfills, awaitingUser: terminal[0]?.data.awaitingUser }));
+  assert.equal(reviews.length, 1);
+  assert.equal(reviews[0]!.memoryRequired, true, 'this must reach the memory-obligation branch');
+  assert.equal(reviews[0]!.postedBefore, 0);
+  assert.equal(fixture.model.calls(), 1, 'review unavailability does not buy another primary step');
+  assert.ok(review);
+  assert.equal(review.data.fulfills, false, 'no unfinished memory correction is reported complete');
+  assert.equal(review.data.failedOpen, true);
+  assert.equal(review.data.reviewFailure, 'unavailable');
+  assert.equal((review.data.judgedMemoryRequirement as { status?: string } | undefined)?.status, 'unverified');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['tool_called'] })
+    .filter(row => ['memory_remember', 'memory_forget'].includes(String(row.data.tool))).length, 0,
+  'the ambiguous target is not changed before the owner answers');
+  assert.equal(questions.length, 1, 'an unfinished memory obligation is not a semantic rejection of the required question');
+  assert.equal(questions[0]!.data.question, question);
+  assert.deepEqual(questions[0]!.data.options, options);
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.equal(result.publicPresentation?.kind, 'question');
+  assert.ok(result.publicPresentation?.text.includes(question));
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0]!.data.awaitingUser, true);
+  assert.notEqual(terminal[0]!.data.review, 'checked', 'a necessary pause is not provider validation');
+});
+
+test('question admission refuses an exhausted negative finding when the configured reviewer was unavailable', async (t) => {
+  const host = await import('./host-turn-runner.js');
+  const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
+  process.env.HARNESS_TOOL_BRACKETS = 'on';
+  t.after(() => {
+    host._setHostObjectiveJudgeForTests(null);
+    if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
+    else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
+  });
+  const objective = 'Report measurement A as 17, then classify measurement B using my unpublished private cutoff. Ask for the cutoff only after reporting A.';
+  const fixture = freshComputationFixture(eventlog.createSession({
+    id: `question-negative-unavailable-${++acceptedSerial}`, kind: 'chat',
+  }), objective, 'question-negative-unavailable');
+  t.after(() => eventlog.finishRunAttempt(fixture.attempt, 'completed'));
+  host.captureEffectiveCompletionPolicyOnce({ ...fixture.context, enabled: true });
+  const questionTool = brackets.wrapToolForHarness(buildAskUserQuestionTool() as never);
+  const maxRepairs = host.MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS;
+  const model = scriptedRecordingModel(Array.from({ length: maxRepairs + 3 }, (_, index) => [
+    toolCall(`question-negative-unavailable-${index}`, 'ask_user_question', {
+      // Keep a completed-work claim so the existing honest failure stop does
+      // not settle this deliberately unresolved classification instead.
+      question: `I completed the classification. What private cutoff should I use for measurement B (attempt ${index + 1})?`,
+      options: ['10', '20'], purpose: 'clarification',
+    }),
+  ]));
+  const reviews: Array<{ postedBefore: number }> = [];
+  host._setHostObjectiveJudgeForTests(async () => {
+    reviews.push({ postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+    // Actual objective-judge fallback shape: the configured reviewer failed,
+    // while Jev supplied an independent negative finding. failedOpen must
+    // preserve that provenance, not turn done:false into question approval.
+    return { done: false, failedOpen: true, reviewFailure: 'unavailable',
+      reason: 'The fast check found the objective unmet: the independent measurement A was not reported.' };
+  });
+  const agent = { model, tools: [questionTool], toolUseBehavior: userChoiceToolUseBehavior };
+  bindHostCanarySurface(fixture, agent, agent.tools);
+  const result = await runProductionHost(fixture, agent, undefined,
+    { maxTurns: maxRepairs + 3, hostJudgeCompletion: true });
+  const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+  t.diagnostic(JSON.stringify({ primaryCalls: model.calls(), reviews: reviews.length, questions: questions.length,
+    terminalStatus: result.terminal?.status ?? null, terminalReason: result.terminal?.reason ?? null }));
+  assert.equal(reviews.length, maxRepairs + 1, 'only the existing task repairs and final check run');
+  assert.equal(model.calls(), maxRepairs + 1, 'an unavailable reviewer does not add disclosure or repair budget');
+  assert.ok(reviews.every(row => row.postedBefore === 0));
+  assert.equal(questions.length, 0, 'the exhausted negative finding cannot publish an approved question');
+  assert.equal(result.terminal?.status, 'blocked');
+  assert.equal(result.terminal?.reason, 'question_review_unmet');
+  assert.doesNotMatch(String(result.finalOutput), /I completed the classification/);
+});
 
 test('question admission stops bounded repeated rejected questions without posting one', async (t) => {
   const host = await import('./host-turn-runner.js');

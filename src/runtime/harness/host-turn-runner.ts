@@ -5148,6 +5148,10 @@ const runHostTurnBody = async (
     // semantic verdict cannot waive an explicit whole-output contract; the
     // next candidate is repaired and reviewed normally with all evidence.
     verdict = applyWholeResponseFormatFinding(verdict, responseFormatFinding);
+    // An unavailable review may still carry an explicit negative finding.
+    // Keep that distinct from a later memory-evidence hold: unfinished memory
+    // does not itself reject a question asking for the missing information.
+    const reviewRejectedQuestion = decision?.nextAction === 'awaiting_user_input' && !verdict.done;
     let currentMemoryAssessment: ReturnType<typeof retainMemoryRequirementAssessment> | undefined;
     if (memoryRequirementRequired) {
       let memoryAssessmentAccepted = false;
@@ -5504,7 +5508,10 @@ const runHostTurnBody = async (
     if (awaitingInput && !continuation) return 'awaiting_user_input';
     // 'done' also ends a bounded negative review; it is not an admission
     // verdict. Do not let that answer fallback publish a rejected question.
-    if (!continuation && decision?.nextAction === 'awaiting_user_input' && !verdict.done && !verdict.failedOpen) {
+    // An unavailable configured reviewer can retain a negative Jev finding;
+    // failedOpen does not turn that explicit rejection into permission to post.
+    if (!continuation && decision?.nextAction === 'awaiting_user_input' && !verdict.done
+      && (!verdict.failedOpen || reviewRejectedQuestion)) {
       onQuestionRejected?.();
     }
     if (!continuation) return 'done';

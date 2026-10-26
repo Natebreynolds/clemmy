@@ -366,12 +366,46 @@ test('tryJevCompletionVerdict settles only when every yes/no reading is sure', a
   assert.equal(await ask({ delivered: 0.95, unaddressed: 0.05, unsupported: 0.1, computed: 0.9 }), null,
     'an answer resting on a figure Jev finds computed stays with the reviewer');
   assert.equal(await ask({ delivered: 0.7, unaddressed: 0.3, unsupported: 0.3 }), null, 'unsure readings settle nothing');
-  const question = await ask({ asksUser: 0.92 });
+  const question = await ask({ asksUser: 0.92, unaddressed: 0.05 });
   assert.equal(question?.awaitingUser, true);
   const blocked = await ask({ cannotFinish: 0.9, delivered: 0.3 });
   assert.equal(blocked?.blocked, true);
   assert.equal(blocked?.done, false);
 });
+
+for (const coverage of ['reported', 'omitted', 'uncertain', 'missing'] as const) {
+  test(`completion question coverage ${coverage} cannot waive independent requested work`, async () => {
+    _setTypesafeKeyForTests('ts_question_coverage_fixture');
+    let calls = 0;
+    const answers = JSON.parse(completionAnswers({ delivered: 0.15, unaddressed: 0.05,
+      unsupported: 0.1, computed: 0.07, asksUser: 0.86, cannotFinish: 0.03, deadEnd: 0.54 }));
+    if (coverage === 'omitted') answers.answers.unaddressed.noul = 0.91;
+    if (coverage === 'uncertain' || coverage === 'missing') {
+      answers.answers.delivered.noul = 0.5;
+      if (coverage === 'missing') delete answers.answers.unaddressed;
+      else answers.answers.unaddressed.noul = 0.5;
+    }
+    _setSystemOneFetchForTests(async () => {
+      calls++;
+      return { status: 200, ok: true, text: async () => JSON.stringify(answers) };
+    });
+    const question = 'What private cutoff should I use for record B, 10 or 20?';
+    const verdict = await tryJevCompletionVerdict(
+      'Report the supplied value 17 for record A now, then ask for the missing private cutoff for B.',
+      coverage === 'reported' ? `Record A has value 17. ${question}` : question,
+      { coverage: { complete: false, outcomeEvidence: [] } },
+    );
+    assert.equal(calls, 1, 'the existing screen owns the decision without another model call');
+    if (coverage === 'reported') {
+      assert.equal(verdict?.awaitingUser, true, 'explained dependent work may remain unfinished');
+      assert.equal(verdict?.confidence, 0.86);
+    } else if (coverage === 'omitted') {
+      assert.equal(verdict?.done, false, 'the live contradictory reading must preserve the missing independent result');
+      assert.notEqual(verdict?.awaitingUser, true);
+      assert.equal(verdict?.requirementCoverage, 'missing');
+    } else assert.equal(verdict, null, 'coverage uncertainty or absence is not affirmative permission to pause');
+  });
+}
 
 test('tryJevOutputGroundingVerdict returns a typed rollup only when confidence is high', async () => {
   _setTypesafeKeyForTests('ts_test');
@@ -483,7 +517,7 @@ for (const decision of ['done', 'awaiting'] as const) {
     _setSystemOneFetchForTests(async (_url, init) => {
       posted = JSON.parse(String(init.body));
       return { status: 200, ok: true, text: async () => completionAnswers(decision === 'done'
-        ? { delivered: .95, unaddressed: .03, unsupported: .03 } : { asksUser: .95 }) };
+        ? { delivered: .95, unaddressed: .03, unsupported: .03 } : { asksUser: .95, unaddressed: .03 }) };
     });
     const verdict = await tryJevCompletionVerdict('Report the observed result.', 'Should I use the delegated presentation?', {
       requirementContext: requirements, toolCallSummary: evidence,
@@ -503,7 +537,7 @@ test('an over-budget complete requirement context is never sent clipped, includi
   let calls = 0;
   _setSystemOneFetchForTests(async () => {
     calls++;
-    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95 }) };
+    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95, unaddressed: .03 }) };
   });
   for (const requirementContext of [
     'A late applicable instruction. '.repeat(3_000),
@@ -525,7 +559,7 @@ test('a screen with over-budget evidence defers immediately without paying for a
   let calls = 0;
   _setSystemOneFetchForTests(async () => {
     calls++;
-    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95 }) };
+    return { status: 200, ok: true, text: async () => completionAnswers({ asksUser: .95, unaddressed: .03 }) };
   });
   assert.equal(await tryJevCompletionVerdict('Report the result.', 'Which option should I take?', {
     requirementContext: 'The display choice is delegated; preserve every material contrary observation.', screening: true,
@@ -540,7 +574,7 @@ for (const clippedPart of ['request', 'response'] as const) {
     let posted: Record<string, any> = {};
     const answers = completionAnswers(decision === 'done'
       ? { delivered: 0.95, unaddressed: 0.05, unsupported: 0.05 }
-      : { asksUser: 0.95 });
+      : { asksUser: 0.95, unaddressed: 0.03 });
     _setSystemOneFetchForTests(async (_url, init) => {
       posted = JSON.parse(String(init.body));
       return { status: 200, ok: true, text: async () => answers };
@@ -593,7 +627,7 @@ test('completion keeps positive decisions at the full request and response size 
   assert.equal((await tryJevCompletionVerdict(objective, response))?.done, true);
   assert.equal(posted.state.request, objective);
   assert.equal(posted.state.response, response);
-  answers = completionAnswers({ asksUser: 0.95 });
+  answers = completionAnswers({ asksUser: 0.95, unaddressed: 0.03 });
   assert.equal((await tryJevCompletionVerdict(objective, response))?.awaitingUser, true);
 });
 

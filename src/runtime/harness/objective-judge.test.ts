@@ -31,7 +31,7 @@ function jevCompletionReading(kind: 'done' | 'incomplete' | 'awaiting' | 'missin
   const nouls: Record<string, number> = kind === 'done' ? { delivered: 0.93, unaddressed: 0.05, unsupported }
     : kind === 'incomplete' ? { delivered: 0.1, unaddressed: 0.9, unsupported }
       : kind === 'missing' ? { delivered: 0.9, unaddressed: 0.9, unsupported }
-        : { delivered: 0.2, unaddressed: 0.5, unsupported, asksUser: 0.92 };
+        : { delivered: 0.2, unaddressed: 0.05, unsupported, asksUser: 0.92 };
   return {
     model: 'jev-1.13.0',
     answers: Object.fromEntries(Object.entries({ computed: 0.03, asksUser: 0.03, cannotFinish: 0.03, deadEnd: 0.03, ...nouls })
@@ -1769,8 +1769,13 @@ for (const variant of ['known-part-reported', 'known-part-omitted'] as const) {
       payloads.push(JSON.parse(String(init.body)));
       // These controlled readings test the existing route, not Jev's semantic
       // accuracy. B intentionally remains unresolved even on a valid pause.
-      const reading = jevCompletionReading(variant === 'known-part-reported' ? 'awaiting' : 'incomplete');
-      reading.answers.unaddressed.noul = 0.92;
+      // Both readings recognize B's real question. Only the omitted A is
+      // unaddressed: B's explicit missing cutoff is an explained dependency,
+      // not proof that the whole task is already delivered.
+      const reading = jevCompletionReading('awaiting');
+      reading.answers.delivered.noul = 0.15;
+      reading.answers.asksUser.noul = 0.86;
+      reading.answers.unaddressed.noul = variant === 'known-part-reported' ? 0.05 : 0.91;
       return { status: 200, ok: true, text: async () => JSON.stringify(reading) };
     });
     _setCompletionJudgeForTests(async () => {
@@ -1805,6 +1810,34 @@ for (const variant of ['known-part-reported', 'known-part-omitted'] as const) {
       assert.equal(verdict.done, false, 'a negative Jev reading retains the existing repair route');
       assert.notEqual(verdict.awaitingUser, true);
     }
+  });
+}
+
+for (const coverage of ['uncertain', 'missing'] as const) {
+  test(`Jev question coverage ${coverage} preserves the existing unqualified no-output route`, async () => {
+    let screenCalls = 0; let reviewerCalls = 0;
+    _setTypesafeKeyForTests('ts_question_coverage_fixture');
+    _setSystemOneFetchForTests(async () => {
+      screenCalls++;
+      const reading = jevCompletionReading('awaiting');
+      reading.answers.delivered.noul = 0.5;
+      if (coverage === 'missing') delete reading.answers.unaddressed;
+      else reading.answers.unaddressed.noul = 0.5;
+      return { status: 200, ok: true, text: async () => JSON.stringify(reading) };
+    });
+    _setCompletionJudgeForTests(async () => {
+      reviewerCalls++;
+      return { verdict: { done: true, reason: 'No extra reviewer is authorized by this route.' }, failure: null };
+    });
+    const verdict = await judgeObjectiveComplete(
+      'Report the known value for A, then ask for the private cutoff needed by B.',
+      'What private cutoff should I use for B?',
+      { sessionId: `question-coverage-${coverage}`, skills: [], producedNoOutput: true, reviewStakes: 'read' },
+    );
+    assert.equal(screenCalls, 1);
+    assert.equal(reviewerCalls, 0, 'coverage uncertainty does not add another model or review budget');
+    assert.equal(verdict.failedOpen, true, 'an uncertain or absent coverage reading cannot qualify the pause');
+    assert.notEqual(verdict.awaitingUser, true);
   });
 }
 
