@@ -178,6 +178,41 @@ test('retained progress/review/budget validation remains canonical and cannot re
   assert.throws(() => assertSourceBudgetPolicyRef({ eventId: '', digest: '1'.repeat(64) }), /budget reference/);
 });
 
+test('unpublished question repair data survives checkpoints without granting publication or changing old packets', () => {
+  const reply = 'What private cutoff should I use?';
+  const question = reply;
+  const options = ['10', '20'];
+  const feedback = { version: 1 as const, sessionId: ref.sessionId, sourceUserSeq: ref.sourceUserSeq,
+    objective: 'Report A, then ask for the cutoff.', objectiveDigest: hash('Report A, then ask for the cutoff.'),
+    reply, replyDigest: hash(reply), reason: 'A is still missing.',
+    questionProposal: { status: 'unpublished' as const, question, options,
+      presentationDigest: hash(JSON.stringify([reply, question, options])) } };
+  const state = new HostRecoveryState(ref.sessionId, ref.sourceUserSeq, 'continue', history, [], [],
+    undefined, undefined, 'host_v1', undefined, 1, ref, 1, feedback);
+  const wire = JSON.parse(state.toString());
+  const restored = HostRecoveryState.fromString(state.toString());
+  assert.deepEqual(restored.completionReviewFeedback, feedback);
+  assert.equal(restored.objectiveJudgeContinuations, 1, 'question data cannot reset the repair allowance');
+  const old = clone(wire);
+  delete old.completionReviewFeedback.questionProposal;
+  assert.deepEqual(HostRecoveryState.fromString(JSON.stringify(old)).completionReviewFeedback,
+    Object.fromEntries(Object.entries(feedback).filter(([key]) => key !== 'questionProposal')));
+  for (const change of [
+    { question: 'Changed without a new digest' }, { options: ['20', '10'] },
+    { options: [10, 20] }, { options: '10,20' }, { status: 'published' },
+    { presentationDigest: 'invalid' },
+  ]) {
+    const tampered = clone(wire);
+    Object.assign(tampered.completionReviewFeedback.questionProposal, change);
+    assert.throws(() => HostRecoveryState.fromString(JSON.stringify(tampered)), /completion-review feedback/);
+  }
+  const noChoices = clone(wire);
+  noChoices.completionReviewFeedback.questionProposal.options = null;
+  noChoices.completionReviewFeedback.questionProposal.presentationDigest = hash(JSON.stringify([reply, question, null]));
+  assert.equal((HostRecoveryState.fromString(JSON.stringify(noChoices)).completionReviewFeedback as typeof feedback)
+    .questionProposal.options, null);
+});
+
 test('metadata codecs preserve tombstones, exact source paths and foreign identity refusal', () => {
   assert.equal(sourceApprovalCheckpointPath({ sessionId: ref.sessionId, sourceUserSeq: 7 }), '$.__source_approval_checkpoints."7"');
   assert.throws(() => sourceApprovalCheckpointPath({ sessionId: ref.sessionId, sourceUserSeq: 0 }), /exact accepted source/);

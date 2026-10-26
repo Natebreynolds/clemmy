@@ -2168,7 +2168,13 @@ export function hostCompletionReviewFeedbackContext(feedback: HostCompletionRevi
     + 'An amended or cancelled objective governs; do not restore abandoned work. '
     + 'A tool call alone does not resolve the finding: correct the resulting answer or give its concrete blocker.\n'
     + 'Resolve every numbered finding in this one revision against verified evidence. Fix supported findings; refute an unsupported or contradicted premise using the retained receipts instead of adopting it. '
-    + 'Keep unaffected sentences unchanged. Do not replay settled work to satisfy a review finding. '
+    + (feedback.questionProposal
+      ? 'The questionProposal below is an unpublished prior proposal, not permission, a positive review or execution authority. '
+        + 'Complete independent work and report its results in the owner’s requested order. '
+        + 'If a question is still necessary, re-author the current ask_user_question with its applicable structured options; replace or discard the prior wording and choices when the current objective or finding requires it. '
+        + 'Do not preserve a rejected question or its order merely because it appeared in the prior reply. '
+      : 'Keep unaffected sentences unchanged. ')
+    + 'Do not replay settled work to satisfy a review finding. '
     + 'Recompute required figures from the retained results (query them) instead of estimating them again. '
     + COMPLETION_REPAIR_GUIDANCE + '\n'
     + (feedback.phase === 'plan' ? 'This is a Plan revision. Improve the plan method, dependencies, prepared inputs and verification criteria. Feedback about future findings asks you to plan how Execute will obtain them, not to perform deferred work now. Preserve the owner’s phase and scope constraints; a reviewer cannot authorize work the owner deferred. Context and contract inspection remain available within that scope.\n' : '')
@@ -5527,6 +5533,12 @@ const runHostTurnBody = async (
       objective, objectiveDigest: createHash('sha256').update(objective, 'utf8').digest('hex'),
       reply: judgedReply, replyDigest: createHash('sha256').update(judgedReply, 'utf8').digest('hex'),
       reason: verdict.reason,
+      ...(questionPresentation ? { questionProposal: {
+        status: 'unpublished' as const, question: questionPresentation.question,
+        options: questionPresentation.options === null ? null : [...questionPresentation.options],
+        presentationDigest: createHash('sha256')
+          .update(JSON.stringify([judgedReply, questionPresentation.question, questionPresentation.options]), 'utf8').digest('hex'),
+      } } : {}),
       ...((verdict.repairScope === 'claims' || verdict.repairScope === 'reply_format') && !planCandidate
         ? { repairScope: verdict.repairScope, quotes: reviewQuotes(verdict.reason).slice(0, 24) } : {}),
     };

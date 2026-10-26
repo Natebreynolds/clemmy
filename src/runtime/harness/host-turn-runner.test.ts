@@ -12461,7 +12461,8 @@ test('a carried control executes instead of being replanned', async (t) => {
 });
 
 
-test('completion feedback survives an actual native carrier read, checkpoint hold and reopen', async (t) => {
+for (const candidate of ['plain-reply', 'staged-question'] as const) {
+test(`completion feedback survives an actual native carrier read, checkpoint hold and reopen (${candidate})`, async (t) => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const priorBrackets = process.env.HARNESS_TOOL_BRACKETS;
   process.env.HARNESS_TOOL_BRACKETS = 'on';
@@ -12470,24 +12471,36 @@ test('completion feedback survives an actual native carrier read, checkpoint hol
     if (priorBrackets === undefined) delete process.env.HARNESS_TOOL_BRACKETS;
     else process.env.HARNESS_TOOL_BRACKETS = priorBrackets;
   });
-  const fixture = acceptHostCanarySource('completion-feedback-native', 'Read the current harness status and report the available evidence.');
-  const rejected = 'Done. No harness status data was available.';
+  const question = 'What private cutoff should I use?';
+  const options = ['10', '20'];
+  const fixture = acceptHostCanarySource(`completion-feedback-native-${candidate}`,
+    'Read the current harness status and report the available evidence.'
+      + (candidate === 'staged-question' ? ' Then ask which private cutoff to use.' : ''));
+  const attempt = candidate === 'staged-question' ? eventlog.beginRunAttempt(fixture.session.id,
+    { runId: `feedback-recovery-${fixture.source.seq}` }) : undefined;
+  if (attempt) {
+    eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: fixture.source.data },
+      { existingEventSeq: fixture.source.seq, armRunInFlight: true });
+    t.after(() => { eventlog.finishRunAttempt(attempt, 'completed'); });
+  }
+  const rejected = candidate === 'staged-question' ? question : 'Done. No harness status data was available.';
   const reason = 'Read the actual status result and correct the claim of missing evidence.';
   const corrected = 'The harness status was read; its actual current values are reported.';
   const trigger = `feedback_checkpoint_${acceptedSerial}`;
   const db = eventlog.openEventLog();
   const sqlSession = fixture.session.id.replaceAll("'", "''");
   let judges = 0;
-  _setHostObjectiveJudgeForTests(async (_objective, _reply, options) => {
+  const reviewInputs: Array<{ reply: string; evidence?: string }> = [];
+  _setHostObjectiveJudgeForTests(async (_objective, reply, options) => {
     judges += 1;
+    reviewInputs.push({ reply, evidence: options?.toolCallSummary });
     if (judges === 1) {
       db.exec(`CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON accepted_model_batch_checkpoints
         WHEN NEW.session_id = '${sqlSession}' BEGIN SELECT RAISE(ABORT, 'feedback recovery control'); END`);
       return { done: false, reason };
     }
-    assert.ok(options?.toolCallSummary?.includes(rejected));
-    assert.ok(options?.toolCallSummary?.includes(reason));
-    return { done: true, reason: 'The retained finding was resolved.' };
+    return { done: true, ...(candidate === 'staged-question' ? { awaitingUser: true } : {}),
+      reason: 'The retained finding was resolved.' };
   });
   const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
     reachableBuiltinNames: new Set(['harness_status']),
@@ -12496,44 +12509,89 @@ test('completion feedback survives an actual native carrier read, checkpoint hol
     admitBuiltinAcquisition: async (name) => name === 'harness_status' ? { ok: true }
       : { ok: false, kind: 'requires_readmission', outside: [name] },
   }) as never);
-  const read = (id: string) => toolCall(id, 'call_tool', { name: 'harness_status', args_json: '{}' });
-  const model = scriptedRecordingModel([[read('feedback-read-1')], [textMsg(rejected)],
-    [read('feedback-read-2')], [textMsg(corrected)]]);
-  const agent = { model, tools: [carrier] };
-  bindHostCanarySurface(fixture, agent, [carrier]);
-  const run = (state: unknown) => brackets.withHarnessRunContext(fixture.parent, () => productionHostRunRunner(
-    throwingRunner() as never, agent as never, state as never,
-    { maxTurns: 10, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
-  ));
+  const callPrefix = `feedback-${candidate}-`;
+  const read = (id: string) => toolCall(callPrefix + id, 'call_tool', { name: 'harness_status', args_json: '{}' });
+  const ask = (id: string) => toolCall(callPrefix + id, 'ask_user_question', { question, options, purpose: 'clarification' });
+  const model = scriptedRecordingModel([[read('feedback-read-1')],
+    [candidate === 'staged-question' ? ask('feedback-question-rejected') : textMsg(rejected)],
+    [read('feedback-read-2')], [textMsg(corrected), ...(candidate === 'staged-question' ? [ask('feedback-question-current')] : [])]]);
+  const orchestrator = candidate === 'staged-question' ? await buildOrchestratorAgent({ sessionId: fixture.session.id,
+    sourceUserSeq: fixture.source.seq, userInput: fixture.source.data.text as string, allowToolJit: true, model: model as never }) : undefined;
+  const questionTool = orchestrator?.tools.find(entry => entry.name === 'ask_user_question');
+  if (candidate === 'staged-question') assert.ok(questionTool);
+  const tools = [carrier, ...(questionTool ? [questionTool] : [])];
+  const agent = { model, tools, ...(orchestrator ? { toolUseBehavior: orchestrator.toolUseBehavior } : {}) };
+  bindHostCanarySurface(fixture, agent, tools);
+  let activation = 0;
+  const run = async (state: unknown) => {
+    const lease = attempt ? dispatchLeases.activateDispatchLease({ sessionId: fixture.session.id,
+      scopeId: `${fixture.session.id}:activation:${++activation}`, runAttemptId: attempt.attemptId }) : undefined;
+    try { return await brackets.withHarnessRunContext({ ...fixture.parent,
+      ...(attempt ? { runAttemptId: attempt.attemptId, dispatchLease: lease } : {}) }, () => productionHostRunRunner(
+        throwingRunner() as never, agent as never, state as never,
+        { maxTurns: 10, hostTurnEngine: 'host_v1', context: fixture.context, hostJudgeCompletion: true } as never,
+      )); }
+    finally { dispatchLeases.revokeDispatchLease(lease); }
+  };
   let held: Awaited<ReturnType<typeof run>>;
   try { held = await run([{ role: 'user', content: fixture.source.data.text }]); }
   finally { db.exec(`DROP TRIGGER IF EXISTS ${trigger}`); }
+  if (!held.serializedRecoveryState) t.diagnostic(JSON.stringify({ candidate, calls: model.calls(), judges,
+    terminal: held.terminal, finalOutput: held.finalOutput,
+    history: held.history.filter(row => (row as { type?: string }).type === 'function_call_result') }));
   assert.ok(held.serializedRecoveryState, 'the real checkpoint trigger must transfer recovery ownership');
   const state = HostRecoveryState.fromString(held.serializedRecoveryState);
   assert.equal(state.completionReviewFeedback?.reply, rejected);
   assert.equal(state.completionReviewFeedback?.reason, reason);
+  const expectedProposal = candidate === 'staged-question' ? { status: 'unpublished', question, options,
+    presentationDigest: sha256(JSON.stringify([rejected, question, options])) } : undefined;
+  assert.deepEqual(state.completionReviewFeedback?.questionProposal, expectedProposal);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length, 0);
   assert.equal(state.objectiveJudgeContinuations, 1);
-  assert.ok(!JSON.stringify(state.history).includes(rejected), 'rejected prose never changes checkpoint history');
+  if (candidate === 'plain-reply') assert.ok(!JSON.stringify(state.history).includes(rejected),
+    'rejected prose never changes checkpoint history');
   eventlog.closeEventLog();
   let final = await run(state);
   for (let i = 0; final.serializedRecoveryState && i < 3; i += 1) {
     const next = HostRecoveryState.fromString(final.serializedRecoveryState);
     assert.equal(next.completionReviewFeedback?.reply, rejected);
+    assert.deepEqual(next.completionReviewFeedback?.questionProposal, expectedProposal);
     assert.equal(next.objectiveJudgeContinuations, 1);
     final = await run(next);
   }
-  assert.equal(final.finalOutput, corrected, JSON.stringify(final.terminal));
+  if (candidate === 'staged-question') {
+    assert.equal(final.finalOutput, `[clementine:awaiting-user-input:final]\n${corrected}\n\n${question}`);
+    const published = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    assert.equal(published.length, 1);
+    assert.deepEqual(published[0]!.data.options, options);
+    const reviews = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    assert.ok(reviews.at(-1)!.seq < published[0]!.seq, 'recovered proposal still needs a fresh review before publishing');
+  } else assert.equal(final.finalOutput, corrected, JSON.stringify(final.terminal));
   assert.equal(judges, 2);
+  assert.ok(reviewInputs[1]!.evidence?.includes(reason));
+  assert.ok(reviewInputs[1]!.evidence?.includes(sha256(rejected)),
+    'the current reviewer gets the historical finding identity rather than treating the old draft as its current reply');
+  assert.equal(reviewInputs[1]!.reply, candidate === 'staged-question' ? `${corrected}\n\n${question}` : corrected);
+  assert.ok(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .every(event => event.data.failedOpen !== true), 'a fixture assertion cannot silently become a passing failed-open review');
   assert.equal(model.calls(), 4);
   for (const request of model.requests.slice(2)) {
     assert.ok(JSON.stringify(request).includes(rejected));
     assert.ok(JSON.stringify(request).includes(reason));
+    if (candidate === 'staged-question') {
+      const projection = (request as { input?: Array<{ content?: unknown }> }).input
+        ?.map(row => row.content).find((text): text is string => typeof text === 'string'
+          && text.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]'));
+      assert.ok(projection);
+      assert.deepEqual(JSON.parse(projection.slice(projection.lastIndexOf('\n') + 1)).questionProposal, expectedProposal);
+    }
   }
   const settled = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind FROM logical_call_settlements
-    WHERE session_id = ? AND source_user_seq = ? ORDER BY logical_tool_call_id`).all(fixture.session.id, fixture.source.seq);
+    WHERE session_id = ? AND source_user_seq = ? AND logical_tool_call_id LIKE ?
+    ORDER BY logical_tool_call_id`).all(fixture.session.id, fixture.source.seq, `${callPrefix}feedback-read-%`);
   assert.deepEqual(settled, [
-    { logical_tool_call_id: 'feedback-read-1', outcome_kind: 'succeeded' },
-    { logical_tool_call_id: 'feedback-read-2', outcome_kind: 'succeeded' },
+    { logical_tool_call_id: `${callPrefix}feedback-read-1`, outcome_kind: 'succeeded' },
+    { logical_tool_call_id: `${callPrefix}feedback-read-2`, outcome_kind: 'succeeded' },
   ], 'both actual native reads settle exactly once');
   assert.deepEqual(eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
     .map((event) => event.data.continuationsUsed), [0, 1]);
@@ -12546,6 +12604,7 @@ test('completion feedback survives an actual native carrier read, checkpoint hol
     assert.throws(() => HostRecoveryState.fromString(JSON.stringify(corrupt)), /invalid completion-review feedback/);
   }
 });
+}
 
 
 test('retained review feedback rejects foreign sources and yields to actual delivered objective steering', async () => {
@@ -12560,7 +12619,11 @@ test('retained review feedback rejects foreign sources and yields to actual deli
   const reply = 'Rejected original draft.';
   const feedback = { version: 1 as const, sessionId: session.id, sourceUserSeq: source.seq,
     objective, objectiveDigest: sha256(objective), reply, replyDigest: sha256(reply),
-    reason: 'Old finding must not revive an abandoned investigation.' };
+    reason: 'Old finding must not revive an abandoned investigation.',
+    questionProposal: { status: 'unpublished' as const, question: 'Which obsolete status should I inspect?',
+      options: ['Historical choice A', 'Historical choice B'],
+      presentationDigest: sha256(JSON.stringify([reply, 'Which obsolete status should I inspect?',
+        ['Historical choice A', 'Historical choice B']])) } };
   const history = [{ role: 'user', content: objective }] as never;
   const wrongSource = new HostInterruptState(history, [], undefined, 'host_v1', undefined, undefined, 1,
     { ...feedback, sourceUserSeq: source.seq + 1 });
@@ -12592,6 +12655,10 @@ test('retained review feedback rejects foreign sources and yields to actual deli
     'the actual request retains the entire delivered steering block, including its newlines');
   assert.ok(!JSON.stringify(model.requests[0]).includes(feedback.reason));
   assert.ok(!JSON.stringify(model.requests[0]).includes(reply));
+  assert.ok(!JSON.stringify(model.requests[0]).includes(feedback.questionProposal.question));
+  assert.ok(!JSON.stringify(model.requests[0]).includes('Historical choice A'));
+  assert.equal(eventlog.listEvents(session.id, { types: ['awaiting_user_input'] }).length, 0,
+    'an amended objective cannot revive old question controls');
   assert.equal(eventlog.listEvents(session.id, { types: ['goal_alignment_judged'] }).length, 0);
 });
 
@@ -13867,6 +13934,82 @@ function ownedQuestionAdmissionFixture(label: string, frames: unknown[][],
     makeRunner: () => throwingRunner() as never,
   });
   return { session, attempt, source, objective, model, run };
+}
+
+for (const revision of ['same-question', 'changed-question', 'removed-question'] as const) {
+  test(`question repair keeps the unpublished proposal advisory and publishes only the current choice (${revision})`, async (t) => {
+    const host = await import('./host-turn-runner.js');
+    t.after(() => host._setHostObjectiveJudgeForTests(null));
+    const progress = 'Measurement A is 17.';
+    const priorQuestion = 'What private cutoff should I use to classify measurement B?';
+    const priorOptions = ['10', '20'];
+    const currentQuestion = revision === 'changed-question'
+      ? 'Who should receive the measurement B summary?' : priorQuestion;
+    const currentOptions = revision === 'changed-question' ? ['Team', 'Board'] : priorOptions;
+    const finalReply = `${progress} I cannot classify measurement B without its private cutoff.`;
+    const fixture = ownedQuestionAdmissionFixture(`question-repair-${revision}`, [
+      [toolCall('question-repair-prior', 'ask_user_question',
+        { question: priorQuestion, options: priorOptions, purpose: 'clarification' })],
+      revision === 'removed-question' ? [textMsg(finalReply)] : [textMsg(progress),
+        toolCall('question-repair-current', 'ask_user_question',
+          { question: currentQuestion, options: currentOptions, purpose: 'clarification' })],
+    ], 'Report measurement A as 17 before resolving measurement B. Ask only for a genuinely missing owner choice, with the applicable options.');
+    const reviews: Array<{ reply: string; evidence?: string; postedBefore: number }> = [];
+    host._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
+      reviews.push({ reply, evidence: context?.toolCallSummary,
+        postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
+      // These supplied readings isolate the real repair/publication boundary;
+      // semantic correctness of the scripted revision is not under test.
+      return reviews.length === 1
+        ? { done: false, reason: 'Measurement A is missing. Report A before the remaining owner question.' }
+        : { done: true, awaitingUser: true, reason: 'Controlled revision reports A and asks the current missing choice.' };
+    });
+    const result = await fixture.run();
+    const questions = eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] });
+    const reviewEvents = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+      .filter(row => row.data.kind === 'completion');
+    const repairText = (fixture.model.requests[1] as { input?: Array<{ content?: unknown }> }).input
+      ?.map(row => row.content).find((value): value is string => typeof value === 'string'
+        && value.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]'));
+    assert.ok(repairText, 'the actual second model request must carry the retained finding');
+    const feedback = JSON.parse(repairText.slice(repairText.lastIndexOf('\n') + 1));
+    t.diagnostic(JSON.stringify({ revision, primaryCalls: fixture.model.calls(), reviews: reviews.length,
+      questions: questions.length, status: result.status, hasQuestionProposal: Boolean(feedback.questionProposal) }));
+    assert.equal(fixture.model.calls(), 2, 'the existing repair consumes one primary continuation');
+    assert.ok(reviews.every(row => row.postedBefore === 0));
+    assert.equal(reviewEvents[0]!.data.continuation, true);
+    assert.equal(reviewEvents[0]!.data.fulfills, false);
+    if (revision === 'removed-question') {
+      // The existing no-work ordinary-reply path skips another review; its
+      // prior negative finding still blocks completion. Advisory question data
+      // must not restore a question that the current reply did not author.
+      assert.equal(reviews.length, 1);
+      assert.equal(questions.length, 0, 'removing the question does not revive its rejected controls');
+      assert.equal(result.status, 'blocked');
+      assert.equal(result.publicPresentation?.status, 'blocked');
+      assert.equal(result.publicPresentation?.text, finalReply);
+    } else {
+      assert.equal(reviews.length, 2, 'the current question gets its own review');
+      assert.equal(questions.length, 1, 'only the freshly authored question is published');
+      assert.equal(questions[0]!.data.question, currentQuestion);
+      assert.deepEqual(questions[0]!.data.options, currentOptions);
+      assert.ok(reviewEvents[1]!.seq < questions[0]!.seq, 'current review precedes the single public question');
+      assert.ok(reviews[1]!.reply.startsWith(progress));
+      assert.ok(reviews[1]!.evidence?.includes(JSON.stringify({ question: currentQuestion, options: currentOptions })));
+      assert.equal(result.status, 'awaiting_user_input');
+      assert.equal(result.publicPresentation?.text, `${progress}\n\n${currentQuestion}`);
+      assert.equal(reviewEvents[1]!.data.fulfills, false, 'the remaining choice is not whole-objective completion');
+    }
+    assert.deepEqual(feedback.questionProposal, { status: 'unpublished', question: priorQuestion,
+      options: priorOptions, presentationDigest: reviewEvents[0]!.data.questionPresentationDigest },
+    'repair must retain the exact unpublished question and structured options as source-bound advisory data');
+    assert.equal(feedback.questionProposal.presentationDigest,
+      sha256(JSON.stringify([feedback.reply, priorQuestion, priorOptions])));
+    assert.match(repairText, /unpublished prior proposal/);
+    assert.match(repairText, /requested order/);
+    assert.match(repairText, /re-author.*ask_user_question/);
+    assert.match(repairText, /not.*permission|never.*authority/);
+  });
 }
 
 test('question admission keeps same-frame independent progress in the reviewed and delivered reply', async (t) => {

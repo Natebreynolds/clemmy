@@ -127,6 +127,14 @@ export interface HostCompletionReviewFeedback {
    *  a changed reply or permission to omit whole-objective review. */
   repairScope?: 'claims' | 'reply_format';
   quotes?: string[];
+  /** Exact staged controls from the rejected candidate, for revision only.
+   *  Never a publication receipt, positive verdict or execution permission. */
+  questionProposal?: {
+    status: 'unpublished';
+    question: string;
+    options: string[] | null;
+    presentationDigest: string;
+  };
 }
 
 export function parseHostCompletionReviewFeedback(value: unknown): HostCompletionReviewFeedback | undefined {
@@ -147,12 +155,27 @@ export function parseHostCompletionReviewFeedback(value: unknown): HostCompletio
   if (row.quotes !== undefined && (!Array.isArray(row.quotes) || row.quotes.some((quote) => typeof quote !== 'string'))) {
     throw new Error('paused host state has invalid completion-review feedback');
   }
+  let questionProposal: HostCompletionReviewFeedback['questionProposal'];
+  if (row.questionProposal !== undefined) {
+    const proposal = row.questionProposal as Record<string, unknown> | null;
+    if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)
+      || proposal.status !== 'unpublished' || typeof proposal.question !== 'string' || !proposal.question.trim()
+      || !(proposal.options === null || (Array.isArray(proposal.options) && proposal.options.every(option => typeof option === 'string')))
+      || proposal.presentationDigest !== createHash('sha256')
+        .update(JSON.stringify([row.reply, proposal.question, proposal.options]), 'utf8').digest('hex')) {
+      throw new Error('paused host state has invalid completion-review feedback');
+    }
+    questionProposal = { status: 'unpublished', question: proposal.question,
+      options: proposal.options === null ? null : [...proposal.options as string[]],
+      presentationDigest: String(proposal.presentationDigest) };
+  }
   return { version: 1, sessionId: row.sessionId, sourceUserSeq: Number(row.sourceUserSeq),
     objective: row.objective, objectiveDigest: String(row.objectiveDigest),
     reply: row.reply, replyDigest: String(row.replyDigest), reason: row.reason,
     ...(row.phase === 'plan' || row.phase === 'disclose' ? { phase: row.phase as 'plan' | 'disclose' } : {}),
     ...(row.repairScope === 'claims' || row.repairScope === 'reply_format' ? { repairScope: row.repairScope as 'claims' | 'reply_format' } : {}),
-    ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}) };
+    ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}),
+    ...(questionProposal ? { questionProposal } : {}) };
 }
 
 export type HostRecoveryPhase = 'admit' | 'finalize' | 'continue';
