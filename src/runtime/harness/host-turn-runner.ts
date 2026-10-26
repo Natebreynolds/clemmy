@@ -12,6 +12,7 @@ import { intakeReplacementsForSource, readMemoryRequirementSource, readRetainedM
 import { ARGS_JSON_OBJECT_ENCODED, carrierOwnFieldsOnly, liftNestedCarrierFields } from './carrier-field-lift.js';
 import { abbreviatedArgumentNote, abbreviatedArguments } from './abbreviated-argument.js';
 import { PAGING_NOTE_FROM, pagingRunLength, pagingRunNote } from './paging-run.js';
+import { OWNER_DECLINED_SAME_ACTION, ownerDeclinedSameAction } from './declined-action.js';
 import { argumentCorrectionRepairLine, repairWithArgumentCorrections } from './argument-correction-repair.js';
 import { ARGUMENT_CORRECTION_APPLIED, loadArgumentCorrections } from '../../memory/argument-corrections-store.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
@@ -12925,6 +12926,19 @@ const runHostTurnBody = async (
             if (consent.decision.need !== 'approval' || !consent.consentSubject) {
               preApprovalRefused = true;
               break;
+            }
+            {
+              // The owner said no to exactly this action in this request: no
+              // second card for it; Clem answers instead.
+              const identity = exactHostIdentity();
+              const since = listEvents(identity.sessionId, { types: ['user_input_received'] })
+                .find((event) => event.seq === identity.sourceUserSeq)?.createdAt;
+              if (since && ownerDeclinedSameAction({ sessionId: identity.sessionId, sinceIso: since, tool: call.name, args: parsedArguments })) {
+                preApprovalRepairDiagnostics.set(call.callId, { diagnostic: OWNER_DECLINED_SAME_ACTION });
+                preApprovalOwnReasons.set(call.callId, 'consent_refuse_owner_declined_same_action');
+                preApprovalRefused = true;
+                break;
+              }
             }
             needs = true;
             consentSubject = consent.consentSubject;
