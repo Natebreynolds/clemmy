@@ -139,7 +139,18 @@ test('security and reachability failures explain the cause without blocking loca
 });
 
 
-test('healthy loopback HTTP cannot qualify an unreachable phone pairing address', async () => {
+test('healthy loopback HTTP cannot qualify an unreachable phone pairing address', async (t) => {
+  // The TLS failure is the subject here; a LAN address is a controlled precondition.
+  t.mock.method(os, 'networkInterfaces', (): ReturnType<typeof os.networkInterfaces> => ({
+    fixture0: [{
+      address: '192.0.2.50',
+      netmask: '255.255.255.0',
+      family: 'IPv4',
+      mac: '02:00:00:00:00:01',
+      internal: false,
+      cidr: '192.0.2.50/24',
+    }],
+  }));
   const { ensureMobileAccess } = await import('./mobile-setup.js');
   const { setDirectAppRuntime } = await import('../runtime/mobile-ingress.js');
   setDirectAppRuntime({ port: 8421, fingerprint: 'controlled-local-pin' });
@@ -150,6 +161,7 @@ test('healthy loopback HTTP cannot qualify an unreachable phone pairing address'
       probeImpl: async (origin, pin) => {
         checks++;
         assert.match(origin, /^https:\/\//);
+        assert.equal(origin, 'https://192.0.2.50:8421/m/');
         assert.equal(pin, 'controlled-local-pin');
         return { state: 'failed', reason: 'unreachable' };
       },
