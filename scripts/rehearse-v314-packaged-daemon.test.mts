@@ -230,7 +230,7 @@ test('packaged daemon and exercise PATH is the exact empty gate directory', () =
   assert.doesNotMatch(runtime.PATH ?? '', /salesforce|node_modules/);
 });
 
-test('an upgraded home\'s first storage pass is accepted only when it reported and removed nothing', () => {
+test('an upgraded home\'s first storage pass is accepted only when it removed nothing, in either mode', () => {
   const report = {
     version: 1, at: '2026-10-14T00:00:00.000Z', mode: 'report', budgetBytes: 1, scratchDays: 7,
     footprintBefore: 10, footprintAfter: 10, footprintComplete: true,
@@ -240,7 +240,8 @@ test('an upgraded home\'s first storage pass is accepted only when it reported a
   };
   const due = { lastRunMs: 1_792_000_000_000 };
   assert.equal(validReportOnlyStorageRetention(report, due), true);
-  assert.equal(validReportOnlyStorageRetention({ ...report, mode: 'enforce' }, due), false);
+  assert.equal(validReportOnlyStorageRetention({ ...report, mode: 'enforce', toolResults: { removedRows: 0, distilled: true } }, due), true, 'the default enforce pass distils and finds nothing to end on a fresh home');
+  assert.equal(validReportOnlyStorageRetention({ ...report, mode: 'enforce', requestCopies: { ...report.requestCopies, removed: 1, removedBytes: 10 } }, due), false);
   assert.equal(validReportOnlyStorageRetention({ ...report, requestCopies: { ...report.requestCopies, removed: 1, removedBytes: 10 } }, due), false);
   assert.equal(validReportOnlyStorageRetention({ ...report, toolResults: { removedRows: 2, distilled: true } }, due), false);
   assert.equal(validReportOnlyStorageRetention(report, null), false, 'a pass without its clock would repeat on every restart');
