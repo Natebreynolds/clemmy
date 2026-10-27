@@ -706,8 +706,17 @@ export async function resolveSourceAccountRouting(input: {
     proposalDigest,
   }, connectionRevision);
   if (!result) return { kind: 'account_selection_required', choices, labels: accountChoiceLabels(relevant), reason: 'review_unavailable' };
-  if (result.verdict !== (defaultMode ? 'default_compatible' : 'entailed')
-    || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim()) return blocked('not_entailed');
+  // With one live connected identity, "uncertain" is not a conflict: the
+  // owner named no other account, and asking which account to use offers a
+  // list of one (live 2026-10-27: "a hold on my Outlook calendar" with one
+  // Outlook connection — the judge was unsure, every search came back
+  // account_selection_required with that single choice, and the hold was
+  // never created). The write's own card still names the account. A conflict
+  // — wording that names an account that is not this one — still blocks.
+  const soleAccountUnsure = defaultMode && choices.length === 1
+    && result.verdict === 'uncertain' && result.proposalDigest === proposalDigest && result.modelIdentity.trim() !== '';
+  if (!soleAccountUnsure && (result.verdict !== (defaultMode ? 'default_compatible' : 'entailed')
+    || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim())) return blocked('not_entailed');
   if (defaultMode) return { kind: 'resolved', connection, evidence: {
     version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit, identity,
     sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,

@@ -418,6 +418,8 @@ test('production staging checks sole-mailbox writes independently of the availab
   const fixtures = [
     { text: 'Create these drafts using my missing@example.invalid Outlook account.', verdict: 'conflict' },
     { text: 'Create these drafts in my unavailable studio mailbox.', verdict: 'conflict' },
+    // Unsure about the one connected account is not a conflict (live
+    // 2026-10-27: a list of one choice was offered and the write never ran).
     { text: `Create these drafts in ${SCORPION}.`, verdict: 'uncertain' },
     { text: `Do not use ${SCORPION} for these drafts.`, verdict: 'conflict' },
     { text: 'Create these drafts in Alex’s mailbox.', verdict: 'conflict' },
@@ -437,7 +439,7 @@ test('production staging checks sole-mailbox writes independently of the availab
     });
     const staged = await provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates, accountSelection: null });
     const proven = resolution.provenCapabilityEntriesForTurn(identity);
-    if (fixture.verdict === 'default_compatible') {
+    if (fixture.verdict === 'default_compatible' || fixture.verdict === 'uncertain') {
       assertCheckedAccountWithoutLivePublication(staged.blockers);
       assert.equal(proven.length, 2);
       for (const entry of proven) {
