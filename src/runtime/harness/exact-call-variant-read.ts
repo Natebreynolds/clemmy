@@ -32,6 +32,10 @@ export const OPERATION_VARIANT_READ_VERSION = 1 as const;
  * only turns away the clear writes, which it scores far above this; clear
  * reads still score well above zero. The judge's confirmation decides. */
 export const OPERATION_VARIANT_READ_SCREEN_MAX = 0.35;
+/** For a request judged by its endpoint the screen reads only a path, and
+ * scores a lookup near the middle while a write still scores far above; the
+ * judge's confirmation decides. */
+export const REQUEST_VARIANT_READ_SCREEN_MAX = 0.5;
 /** The judge's confidence that it changes nothing, at least. */
 export const OPERATION_VARIANT_READ_CONFIRM_MIN = 0.9;
 
@@ -180,7 +184,7 @@ function parseVerdict(value: unknown): OperationVariantReadVerdictV1 | null {
   const { screen, confirm } = value;
   if (!isRecord(screen) || !boundedText(screen.model, MAX_MODEL_CHARS)
     || typeof screen.changeProbability !== 'number' || !(screen.changeProbability >= 0)
-    || screen.changeProbability > OPERATION_VARIANT_READ_SCREEN_MAX) return null;
+    || screen.changeProbability > REQUEST_VARIANT_READ_SCREEN_MAX) return null;
   if (!isRecord(confirm) || confirm.role !== 'judge' || !boundedText(confirm.model, MAX_MODEL_CHARS)
     || confirm.changesAnything !== 'no' || typeof confirm.confidence !== 'number'
     || confirm.confidence < OPERATION_VARIANT_READ_CONFIRM_MIN || confirm.confidence > 1) return null;
@@ -246,6 +250,7 @@ async function boundedWait<T>(work: Promise<T>, timeoutMs: number): Promise<T | 
 
 interface PreparedVariant {
   key: string;
+  requestTarget: boolean;
   providerKind: OperationVariantProviderKind;
   operationId: string;
   description: string;
@@ -275,7 +280,8 @@ async function judge(prepared: PreparedVariant, sessionId: string): Promise<{ ve
   }).catch(() => null);
   const changes = screened?.ok ? screened.answers.changes : undefined;
   if (!screened?.ok || changes?.type !== 'noul') return { verdict: null, outcome: 'screen_unavailable' };
-  if (!(changes.noul <= OPERATION_VARIANT_READ_SCREEN_MAX)) return { verdict: null, outcome: 'screen_not_confident' };
+  const screenMax = prepared.requestTarget ? REQUEST_VARIANT_READ_SCREEN_MAX : OPERATION_VARIANT_READ_SCREEN_MAX;
+  if (!(changes.noul <= screenMax)) return { verdict: null, outcome: 'screen_not_confident' };
   const port = peekTurnSemanticModelPort();
   if (!port?.judgeOperationVariantRead) return { verdict: null, outcome: 'confirm_unavailable' };
   const confirmed = await boundedWait(port.judgeOperationVariantRead({
@@ -395,7 +401,7 @@ async function read(
   let pending = inFlight.get(definitionDigest);
   if (!pending) {
     pending = judge({
-      key, providerKind: input.providerKind, operationId: input.operationId, description, schemaText,
+      key, requestTarget: input.requestTarget === true, providerKind: input.providerKind, operationId: input.operationId, description, schemaText,
       fixedArguments: fixed, definitionDigest, inputSchemaDigest,
     }, input.sessionId).catch(() => ({ verdict: null, outcome: 'confirm_unavailable' as const }));
     inFlight.set(definitionDigest, pending);
