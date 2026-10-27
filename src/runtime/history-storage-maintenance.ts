@@ -36,3 +36,28 @@ export function runHistoryStorageMaintenance(dbPath: string): Promise<HistorySto
   void task.finally(() => { if (running.get(dbPath) === task) running.delete(dbPath); });
   return task;
 }
+
+export interface HistoryStorageCatchUp {
+  batches: number;
+  converted: number;
+  inlineBytesRemoved: number;
+  last: HistoryStorageWorkerResult['state'];
+}
+
+/** Several bounded conversion batches in a row, stopping at the first that
+ * converts nothing (caught up, deferred to live work, a busy writer, or a
+ * blocked lane). Each batch is its own short-lived worker, so a turn that
+ * starts between batches is never kept waiting. */
+export async function catchUpHistoryStorage(dbPath: string, maxBatches: number): Promise<HistoryStorageCatchUp> {
+  const pass: HistoryStorageCatchUp = { batches: 0, converted: 0, inlineBytesRemoved: 0, last: 'caught_up' };
+  for (let n = 0; n < Math.max(1, Math.floor(maxBatches)); n++) {
+    const result = await runHistoryStorageMaintenance(dbPath);
+    pass.batches += 1;
+    pass.last = result.state;
+    if (result.state !== 'processed') break;
+    pass.converted += result.result.converted;
+    pass.inlineBytesRemoved += result.result.inlineBytesRemoved;
+    if (result.result.converted === 0) break;
+  }
+  return pass;
+}

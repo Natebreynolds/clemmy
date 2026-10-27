@@ -7,7 +7,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { HARNESS_SCHEMA_VERSION } from './harness/schema-version.js';
 import { createAcceptedModelHistorySchema, createAcceptedModelHistoryConversionSchema, registerAcceptedModelHistoryReader } from './harness/accepted-model-history-store.js';
-import { runHistoryStorageMaintenance } from './history-storage-maintenance.js';
+import { catchUpHistoryStorage, runHistoryStorageMaintenance } from './history-storage-maintenance.js';
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'clem-idle-history-'));
@@ -76,5 +76,23 @@ test('maintenance cannot migrate an old or noncontiguous store and never falls b
     assert.equal((f.db.prepare('SELECT COUNT(*) AS n FROM accepted_model_history_objects_v1').get() as { n: number }).n, 0);
     assert.equal(f.db.prepare('SELECT version FROM schema_version WHERE version = 3').get(), undefined);
     assert.deepEqual(await runHistoryStorageMaintenance(path.join(f.root, 'missing.db')), { state: 'unavailable' });
+  } finally { await f.close(); }
+});
+
+test('a catch-up pass runs batches until the lanes are caught up and stops at the batch bound', async () => {
+  const f = await fixture();
+  try {
+    const bounded = await catchUpHistoryStorage(f.filename, 1);
+    assert.equal(bounded.batches, 1);
+    assert.equal(bounded.converted, 1);
+    assert.equal(bounded.last, 'processed');
+    const rest = await catchUpHistoryStorage(f.filename, 10);
+    assert.ok(rest.batches >= 2 && rest.batches <= 10, `batches ${rest.batches}`);
+    assert.equal(rest.last, 'caught_up');
+    assert.equal(rest.converted + bounded.converted, 3);
+    assert.equal((f.db.prepare('SELECT COUNT(*) AS n FROM accepted_model_history_objects_v1').get() as { n: number }).n, 1);
+    assert.equal((f.db.prepare('SELECT history_json FROM accepted_model_batch_checkpoints_readable_v1').get() as { history_json: string }).history_json, f.json);
+    f.db.prepare('INSERT INTO run_attempts VALUES (?, NULL)').run('controlled-active-work');
+    assert.deepEqual(await catchUpHistoryStorage(f.filename, 5), { batches: 1, converted: 0, inlineBytesRemoved: 0, last: 'deferred' });
   } finally { await f.close(); }
 });

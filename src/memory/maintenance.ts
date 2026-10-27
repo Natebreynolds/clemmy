@@ -136,6 +136,8 @@ const TOOLCHOICE_AUDIT_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
 // cheap (single DELETE with index on created_at). Each row is 4KB-200KB
 // so even on a busy day the delete-set is bounded.
 const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
+const HISTORY_STORAGE_EVERY_N_TICKS = 4; // ~1 min with a 15s tick
+const HISTORY_STORAGE_BATCHES_PER_TICK = 8; // 8 x 16 rows: a backlog of 40k rows clears in a few idle hours
 const CONVERSATION_MEMORY_FIRST_TICK = 20; // ~5min after start with a 15s tick
 // Recall stuck-recording reaper. Some captures (notably the
 // desktop-audio fallback, which isn't tied to a meeting window) never
@@ -851,6 +853,21 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       }
     } catch (err) {
       logger.warn({ err }, 'storage retention pass failed');
+    }
+  }
+
+  // A stored model history that a later turn reads through the readable views
+  // moves, unchanged, from its inline column to the shared compressed object
+  // store. Bounded per tick; each batch yields to unfinished work and to a
+  // busy writer, so a conversation never waits on it.
+  if (tickCount % HISTORY_STORAGE_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('history-storage')) {
+    try {
+      const { catchUpHistoryStorage } = await import('../runtime/history-storage-maintenance.js');
+      const { HARNESS_DB_PATH } = await import('../runtime/harness/eventlog.js');
+      const pass = await catchUpHistoryStorage(HARNESS_DB_PATH, HISTORY_STORAGE_BATCHES_PER_TICK);
+      if (pass.converted > 0) logger.info({ ...pass }, 'history storage conversion pass');
+    } catch (err) {
+      logger.warn({ err }, 'history storage conversion failed');
     }
   }
 
