@@ -689,21 +689,34 @@ export async function resolveSourceAccountRouting(input: {
   // 7 days: 634 default-account writes reviewed at ~3.7 s each). Words that
   // say anything about accounts, an answered account question, or an unsure
   // or unavailable screen go to the reviewer exactly as before.
-  if (defaultMode && rememberedSend && !clarification) {
+  // The same holds for a route already established in this conversation
+  // (the owner chose the account earlier): its re-check reads only the
+  // messages since the last check, and when they say nothing about accounts
+  // the route stands (live 2026-10-27: a delete two turns after the create
+  // re-checked the same account on the reviewer for 4.4 s).
+  const screenable = !clarification && ((defaultMode && rememberedSend) || (!defaultMode && established && !nomination));
+  if (screenable) {
     const screened = await screenDefaultAccountWithJev({
       acceptedText: source.text,
       earlierTexts: interveningAcceptedSources.map((prior) => prior.acceptedText),
       toolkit,
       defaultIdentity: identity,
-      defaultLabel: aliasLabelFor(toolkit, emailOf(rememberedSend) || undefined, rememberedSend.connectionId) ?? null,
+      defaultLabel: aliasLabelFor(toolkit, emailOf(connection) || undefined, connection.connectionId) ?? null,
       otherIdentities: [...new Set(relevant.map(identityOf))].filter((candidate) => candidate !== identity),
     }).catch(() => null);
-    if (screened?.kind === 'keep') {
+    if (screened?.kind === 'keep' && defaultMode) {
       return { kind: 'resolved', connection, evidence: {
         version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit, identity,
         sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
         checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
         connectionRevision, judgeModelIdentity: `${screened.model}:default_${screened.choice}`,
+      } };
+    }
+    if (screened?.kind === 'keep' && established) {
+      return { kind: 'resolved', connection, evidence: {
+        ...established,
+        checkedForSourceUserSeq: input.sourceUserSeq, checkedForSourceDigest: source.digest,
+        judgeModelIdentity: `${screened.model}:established_${screened.choice}`,
       } };
     }
   }

@@ -1015,6 +1015,50 @@ test('a remembered send default with words that say nothing about accounts keeps
   }
 });
 
+test('an established route stands on the quick screen when the messages since its check say nothing about accounts; a correction still reaches the reviewer', async () => {
+  // Live 2026-10-27: a delete two turns after the create re-checked the same
+  // account on the slow reviewer (4.4 s, then 6.0 s on the next turn).
+  const jev = await import('../runtime/jev/client.js');
+  const firstText = ORIGINAL;
+  const first = source(firstText);
+  const calls = installJudge(call => ({ verdict: call.acceptedText.includes('missing@example.invalid')
+    || call.interveningAcceptedSources.some(prior => prior.acceptedText.includes('missing@example.invalid'))
+    ? 'conflict' : call.mode === 'current_source_default' ? 'default_compatible' : 'entailed' }));
+  const request = { ...input(first), connections: connections.slice(0, 1) };
+  persist(first, firstText, await routing.resolveSourceAccountRouting(request));
+  assert.equal(calls.length, 1, 'the owner\'s own choice is reviewed once');
+  const screened: string[] = [];
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { state: { request: string; earlierMessages: string[] } };
+    screened.push(body.state.request);
+    const texts = [body.state.request, ...body.state.earlierMessages].join('\n');
+    const choice = texts.includes('missing@example.invalid') ? 'other' : 'silent';
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+      answers: { accounts: { type: 'choice', choice, confidence: 0.95, probabilities: { [choice]: 0.95 } } }, usage: { input_tokens: 10, output_tokens: 2 } }) };
+  });
+  try {
+    const continuation = source('Create another note.', first.sessionId);
+    const kept = await routing.resolveSourceAccountRouting({ ...request, ...continuation, nomination: null });
+    assert.equal(kept.kind, 'resolved', JSON.stringify(kept));
+    if (kept.kind === 'resolved') {
+      assert.equal(kept.connection.connectionId, 'fixture-scorpion');
+      assert.equal(kept.evidence.checkedForSourceUserSeq, continuation.sourceUserSeq, 'the route is checked for this source');
+      assert.equal(kept.evidence.judgeModelIdentity, 'jev-1.13.0:established_silent');
+    }
+    assert.deepEqual(screened, ['Create another note.']);
+    assert.equal(calls.length, 1, 'no reviewer call for words that say nothing about accounts');
+    const correction = source('Actually use missing@example.invalid for these notes.', first.sessionId);
+    const refused = await routing.resolveSourceAccountRouting({ ...request, ...correction, nomination: null });
+    assert.equal(refused.kind, 'account_selection_required', JSON.stringify(refused));
+    assert.equal(calls.length, 2, 'words about another account reach the reviewer, which refuses');
+  } finally {
+    jev._setTypesafeKeyForTests(undefined);
+    jev._setSystemOneFetchForTests(undefined);
+    registry.installTurnSemanticModelPort(null);
+  }
+});
+
 test('a remembered send default is reviewed by the judge instead of asking again, and the judge can still refuse', async () => {
   const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
   const { SEND_DEFAULT_ACCOUNT_LABEL } = routing;
