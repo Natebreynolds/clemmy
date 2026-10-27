@@ -367,6 +367,8 @@ export interface ObjectiveJudgeVerdict {
     coverageComplete: boolean;
       /** Whether the configured reviewer was started (false = the hedge saved it). */
     reviewerStarted?: boolean;
+    /** The screen's own reading that the reply asks the owner something (0–1). */
+    asksUser?: number;
     historicalOnly?: boolean;
     /** Content-free original producer correlation only; never review authority or billing proof. */
     originalReading?: {
@@ -640,6 +642,17 @@ export function reaffirmedQuestionSettles(input: {
  * or content; the prose question was held, seven lookup rounds followed, then
  * a draft to a remembered contact, 147 s). Claims and promises stay judged;
  * a reviewer's own negative verdict still bounces. */
+/** The screen's sure threshold, the same bar the control plane uses for its
+ * own readings. A prose reply the screen is this sure asks the owner
+ * something is question-shaped for the host, exactly as an ask_user_question
+ * call is (live 2026-10-27: a prose "who is it to, and what's the point?"
+ * after two lookups ended as a typed stop with the question inside it). */
+const JEV_ASKS_USER_SURE = 0.85;
+export function jevReadsReplyAsQuestion(verdict: Pick<ObjectiveJudgeVerdict, 'jevAttempt'>): boolean {
+  const reading = verdict.jevAttempt?.asksUser;
+  return typeof reading === 'number' && reading >= JEV_ASKS_USER_SURE;
+}
+
 export function screenHeldConversationalReplySettles(input: {
   verdictDone: boolean;
   verdictFailedOpen: boolean | undefined;
@@ -2743,6 +2756,7 @@ export async function judgeObjectiveComplete(
       reviewerStarted: judgePromise !== null,
       ...(fast.historicalEvidence ? { historicalOnly: true } : {}),
       ...(fast.choice ? { choice: fast.choice } : {}),
+      ...(typeof fast.asksUser === 'number' ? { asksUser: fast.asksUser } : {}),
       ...(fast.requirementCoverage ? { requirementCoverage: fast.requirementCoverage } : {}),
       ...(typeof fast.confidence === 'number' ? { confidence: fast.confidence } : {}),
       ...(typeof fast.replyMatchesReceipts === 'number'

@@ -15318,6 +15318,50 @@ test('a rejected question asked again in other prose words ends as the question 
     .filter(row => row.data.kind === 'completion_review_disclosed').length, 0, 'no disclosure round');
 });
 
+test('a prose question after lookups, asked again after one bounce, ends as the question the screen read it as', async (t) => {
+  // Live 2026-10-27 (r56c16): two memory lookups, then "who is it to, and
+  // what's the point of the note?" in prose, no ask tool. The screen held
+  // it (unaddressed), the brain asked again in prose, and the turn ended as
+  // a typed stop with the question inside it. The screen's own asks-user
+  // reading now makes that prose question-shaped for the host.
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const fixture = acceptJudgedSource('prose-question-after-lookups', 'Can you draft an email for me');
+  const question = "I don't have the recipient or what you want it to say. Who is it to, and what's the point of the note?";
+  const reworded = 'Who should it go to, and what is the one thing to say?';
+  let judged = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judged++;
+    return { done: false, reason: 'Jev found part of the request left without a result.', fast: true,
+      jevAttempt: { accepted: false, coverageComplete: false, reviewerStarted: false, choice: 'incomplete', confidence: 0.95, asksUser: 0.92 } };
+  });
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const carrier = brackets.wrapToolForHarness(callToolTools.buildCallTool({
+    reachableBuiltinNames: new Set(['harness_status']), firstClassNames: new Set(['call_tool']),
+    deniedNames: new Set(), mcpToolScope: null, controlOnlyBuiltins: true,
+    admitBuiltinAcquisition: async () => ({ ok: true }),
+  }) as never);
+  const model = scriptedRecordingModel([
+    [toolCall('prose-question-lookup', 'call_tool', { name: 'harness_status', args_json: '{}' })],
+    [textMsg(question)],
+    [textMsg(reworded)],
+    [textMsg('A fourth round that must never be asked for.')],
+  ]);
+  const agent = { model, tools: [carrier] };
+  bindHostCanarySurface(fixture, agent, [carrier]);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(model.calls(), 3, 'lookup, question, one bounce, the reaffirmed question');
+  assert.equal(judged, 2);
+  assert.equal(result.terminal?.status, 'awaiting_user_input');
+  assert.equal(result.finalOutput, reworded);
+  const rows = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+  assert.deepEqual(rows.map((row) => row.data.continuation), [true, false]);
+  assert.equal(rows[1]?.data.reaffirmedQuestion, true);
+  assert.equal(rows[1]?.data.fulfills, false, 'the finding stays on the row');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
+    .filter((row) => (row.data.turnOutcome as { status?: string } | undefined)?.status === 'blocked').length, 0,
+  'never a stop with the question inside it');
+});
+
 test('a conversation-shaped first reply held by the fast screen alone is delivered, not bounced', async (t) => {
   // Live 2026-10-27: "draft an email for me" named no recipient and no
   // content. The brain answered in prose at second 8 asking for both; the fast

@@ -1387,6 +1387,14 @@ test('a question the model asks again after one bounce settles as the question; 
   assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, verdictDone: true }), false);
 });
 
+test('the screen\'s sure asks-user reading makes a prose reply question-shaped for the host', async () => {
+  const { jevReadsReplyAsQuestion } = await import('./objective-judge.js');
+  assert.equal(jevReadsReplyAsQuestion({ jevAttempt: { accepted: false, coverageComplete: false, asksUser: 0.9 } }), true);
+  assert.equal(jevReadsReplyAsQuestion({ jevAttempt: { accepted: false, coverageComplete: false, asksUser: 0.6 } }), false, 'unsure is not a question');
+  assert.equal(jevReadsReplyAsQuestion({ jevAttempt: { accepted: false, coverageComplete: false } }), false);
+  assert.equal(jevReadsReplyAsQuestion({}), false);
+});
+
 test('a conversation-shaped first reply held by the fast screen alone is delivered; claims, promises, work and reviewers still bounce', async () => {
   const { screenHeldConversationalReplySettles } = await import('./objective-judge.js');
   const question = "Sure. Who should it go to, and what should it say?";

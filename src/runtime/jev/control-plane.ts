@@ -1071,6 +1071,10 @@ export interface JevCompletionVerdict {
   confidence?: number;
   replyMatchesReceipts?: number;
   requirementCoverage?: 'satisfied' | 'missing' | 'uncertain';
+  /** The screen's own reading that the reply asks the owner something (0–1),
+   * kept on a negative verdict too: an incomplete request can still end on a
+   * question the owner has to answer before any more work is possible. */
+  asksUser?: number;
   /** Supports this reply's past-tense observations only, never current work. */
   historicalEvidence?: HistoricalReadClosure;
 }
@@ -1136,7 +1140,7 @@ const COMPLETION_REQUEST_CHARS = 12_000;
 const COMPLETION_RESPONSE_CHARS = 12_000;
 /** Each yes/no answer counts only this sure; Jev settles a review only when
  *  every question it rests on is, except the support question below. */
-const COMPLETION_SURE = 0.85;
+export const COMPLETION_SURE = 0.85;
 /** The support question's bar. A real answer adds inference, framing and an
  *  offer that no result states word for word, so Jev almost never rules out
  *  every unsupported specific with certainty, even on a plain read-back the
@@ -1487,6 +1491,7 @@ export async function tryJevCompletionVerdict(
       confidence: Math.max(unaddressed ?? 0, 1 - (delivered ?? 1)),
       ...(sure(unaddressed) ? { requirementCoverage: 'missing' as const } : {}),
       ...(unsupported !== null ? { replyMatchesReceipts: 1 - unsupported } : {}),
+      ...(asksUser !== null ? { asksUser } : {}),
     };
   }
   noteJevDecisionOutcome(result.decisionId, verdict ? verdict.choice ?? 'read' : 'abstained', {

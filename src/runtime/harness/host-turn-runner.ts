@@ -206,6 +206,7 @@ import {
   honestFailureReportSettles,
   reaffirmedQuestionSettles,
   screenHeldConversationalReplySettles,
+  jevReadsReplyAsQuestion,
   resolveJudgeResponder,
   isPromiseShapedReply,
   judgeObjectiveComplete,
@@ -5279,7 +5280,10 @@ const runHostTurnBody = async (
     // held by the fast screen alone, is delivered as it is. The screen is a
     // read-turn screen, not a reviewer; its bounce here bought lookup rounds
     // and then work the owner never asked for.
-    const questionShaped = Boolean(questionPresentation) || decision?.nextAction === 'awaiting_user_input';
+    // Question-shaped: a staged ask, an ASK marker, or prose the screen itself
+    // is sure asks the owner something.
+    const questionShaped = Boolean(questionPresentation) || decision?.nextAction === 'awaiting_user_input'
+      || jevReadsReplyAsQuestion(verdict);
     const screenHeldConversation = !planCandidate && !deliveredReviewRun
       && !explicitMemoryRequired && !memoryRequirementRequired && !responseFormatRequirement && !formatRepairReviewRequired
       && screenHeldConversationalReplySettles({
@@ -5314,7 +5318,7 @@ const runHostTurnBody = async (
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
     // A proposed owner question is not a failure account. A negative review
     // may still use the existing remaining repair before honest disclosure.
-    const honestStop = !planCandidate && !questionPresentation
+    const honestStop = !planCandidate && !questionPresentation && !questionShaped
       && decision?.nextAction !== 'awaiting_user_input' && honestFailureReportSettles({
       verdictDone: verdict.done,
       continuationsUsed: objectiveJudgeContinuations,
