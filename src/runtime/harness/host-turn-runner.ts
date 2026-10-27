@@ -205,6 +205,7 @@ import {
   completionJudgeComparisonDiagnostic,
   honestFailureReportSettles,
   reaffirmedQuestionSettles,
+  screenHeldConversationalReplySettles,
   resolveJudgeResponder,
   isPromiseShapedReply,
   judgeObjectiveComplete,
@@ -5266,6 +5267,26 @@ const runHostTurnBody = async (
           reason: `${memoryCheck.reason} ${verdict.reason}`.slice(0, 1600) };
       }
     }
+    // A conversation-shaped first reply (a question, an answer; no claim, no
+    // promise) on a turn that called no business tool and settled nothing,
+    // held by the fast screen alone, is delivered as it is. The screen is a
+    // read-turn screen, not a reviewer; its bounce here bought lookup rounds
+    // and then work the owner never asked for.
+    const questionShaped = Boolean(questionPresentation) || decision?.nextAction === 'awaiting_user_input';
+    const screenHeldConversation = !planCandidate && !deliveredReviewRun
+      && !explicitMemoryRequired && !memoryRequirementRequired && !responseFormatRequirement && !formatRepairReviewRequired
+      && screenHeldConversationalReplySettles({
+        verdictDone: verdict.done,
+        verdictFailedOpen: verdict.failedOpen,
+        verdictBlocked: verdict.blocked,
+        verdictFast: verdict.fast,
+        reviewerStarted: verdict.jevAttempt?.reviewerStarted,
+        continuationsUsed: objectiveJudgeContinuations,
+        businessCalls: businessCalls.length,
+        settledWrites: settled.count,
+        reply: judgedReply,
+      });
+    if (screenHeldConversation && questionShaped) verdict = { ...verdict, awaitingUser: true };
     // A question the model asks again after one negative review, on a turn
     // that settled no write, is its reaffirmed reading that nothing else can
     // be done without the answer; it is delivered as a question rather than
@@ -5295,7 +5316,7 @@ const runHostTurnBody = async (
     // reviewer's finding goes to the owner instead of a re-run.
     const blockedByReview = verdict.blocked === true && !verdict.failedOpen;
     // An answer already delivered is corrected in the thread, never re-run.
-    const ordinaryContinuation = !deliveredReviewRun
+    const ordinaryContinuation = !deliveredReviewRun && !screenHeldConversation
       && verdict.reviewDisposition !== 'answered_unqualified' && !honestStop && !blockedByReview
       && !(memoryRequirementRequired && verdict.failedOpen) && ((!verdict.done && !awaitingInput)
       || (awaitingInput && planCandidate?.readiness === 'ready')) && !reviewSignal?.aborted
@@ -5385,6 +5406,7 @@ const runHostTurnBody = async (
           ...(verdict.claimRevision ? { claimRevision: verdict.claimRevision } : {}),
           reason: verdict.reason.slice(0, 1_600),
           ...(reaffirmedQuestion ? { reaffirmedQuestion: true } : {}),
+          ...(screenHeldConversation ? { screenHeld: 'delivered' } : {}),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
           ...(verdict.failedOpen && verdict.reviewFailure ? { reviewFailure: verdict.reviewFailure } : {}),
@@ -5532,6 +5554,7 @@ const runHostTurnBody = async (
     // An unverified memory correction ends on its own stop, which Clem
     // narrates as her question; an account written here would be discarded.
     const disclose = !continuation && !awaitingInput && !verdict.done && !verdict.failedOpen && !planCandidate
+      && !screenHeldConversation
       && !responseFormatRequirement && !formatRepairReviewRequired && !reviewSignal?.aborted && !openApprovalCard
       && currentMemoryReviewCheck?.status !== 'unverified'
       && !deliveredReviewRun && !reviewDisclosureArmed && !hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq);

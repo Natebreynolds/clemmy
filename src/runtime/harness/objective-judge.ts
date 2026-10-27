@@ -631,6 +631,34 @@ export function reaffirmedQuestionSettles(input: {
   return !replyClaimsCompletedWork(input.reply);
 }
 
+/** A conversation-shaped reply — no completed-work claim, no promise — on a
+ * turn that called no business tool and settled nothing, held by the fast
+ * screen alone on its first verdict, is delivered as it is. The screen is a
+ * read-turn screen, not a reviewer; a bounce here buys a round of lookups to
+ * find "a result" for a request that named none, and then work the owner
+ * never asked for (live 2026-10-27: "draft an email for me" with no recipient
+ * or content; the prose question was held, seven lookup rounds followed, then
+ * a draft to a remembered contact, 147 s). Claims and promises stay judged;
+ * a reviewer's own negative verdict still bounces. */
+export function screenHeldConversationalReplySettles(input: {
+  verdictDone: boolean;
+  verdictFailedOpen: boolean | undefined;
+  verdictBlocked: boolean | undefined;
+  verdictFast: boolean | undefined;
+  reviewerStarted: boolean | undefined;
+  continuationsUsed: number;
+  businessCalls: number;
+  settledWrites: number;
+  reply: string | null | undefined;
+}): boolean {
+  if (input.verdictDone || input.verdictFailedOpen === true || input.verdictBlocked === true) return false;
+  if (input.verdictFast !== true || input.reviewerStarted === true) return false;
+  if (input.continuationsUsed !== 0 || input.businessCalls !== 0 || input.settledWrites !== 0) return false;
+  const text = (input.reply ?? '').trim();
+  if (!text) return false;
+  return !replyClaimsCompletedWork(text) && !isPromiseShapedReply(text);
+}
+
 /** The model that actually answered a judge call. The fallover wrapper writes
  * a `turn_model_routed` row (fallover:true, fromModel, model) when it benches
  * the pinned judge mid-call; the verdict must record that responder, not the

@@ -1387,6 +1387,24 @@ test('a question the model asks again after one bounce settles as the question; 
   assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, verdictDone: true }), false);
 });
 
+test('a conversation-shaped first reply held by the fast screen alone is delivered; claims, promises, work and reviewers still bounce', async () => {
+  const { screenHeldConversationalReplySettles } = await import('./objective-judge.js');
+  const question = "Sure. Who should it go to, and what should it say?";
+  const base = { verdictDone: false, verdictFailedOpen: undefined, verdictBlocked: undefined, verdictFast: true,
+    reviewerStarted: false, continuationsUsed: 0, businessCalls: 0, settledWrites: 0, reply: question };
+  assert.equal(screenHeldConversationalReplySettles(base), true);
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: 'Done — the draft is in your Outlook.' }), false, 'a claim is judged');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: "I'll draft it now." }), false, 'a promise is judged');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1 }), false, 'a turn that did work is reviewed on its evidence');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, settledWrites: 1 }), false);
+  assert.equal(screenHeldConversationalReplySettles({ ...base, continuationsUsed: 1 }), false, 'only the first verdict');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, verdictFast: undefined }), false, 'a reviewer verdict stands');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reviewerStarted: true }), false, 'a started reviewer stands');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, verdictBlocked: true }), false);
+  assert.equal(screenHeldConversationalReplySettles({ ...base, verdictFailedOpen: true }), false);
+  assert.equal(screenHeldConversationalReplySettles({ ...base, verdictDone: true }), false);
+});
+
 test('a verdict records the model that answered after a mid-call fallover, keeping the pin as requested', () => {
   const startedAt = Date.parse('2026-09-15T07:59:40.000Z');
   const rows = [

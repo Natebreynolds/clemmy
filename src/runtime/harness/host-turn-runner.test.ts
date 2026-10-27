@@ -14531,6 +14531,30 @@ for (const shape of ['no-prior-frame', 'prior-frame'] as const) {
     t.diagnostic(JSON.stringify({ shape, primaryCalls: fixture.model.calls(), jevCalls: payloads.length, configuredReviews,
       verdicts: reviews.map(row => ({ done: row.verdict.done, awaitingUser: row.verdict.awaitingUser === true,
         failedOpen: row.verdict.failedOpen === true })), deliveredProgress: result.publicPresentation?.text.includes(progress) ?? false }));
+    if (shape === 'no-prior-frame') {
+      // A question asked as the FIRST move of a turn that called no business
+      // tool, held by the Jev screen alone, is delivered (live 2026-10-27: the
+      // screen held four such first replies in a day, each wrongly, and each
+      // bounce bought lookup rounds and work the owner never asked for). The
+      // screen's finding stays on the row; the owner answers in one tap. The
+      // repair of omitted independent progress is pinned by the prior-frame
+      // shape, where a business read preceded the question.
+      assert.equal(reviews.length, 1, 'the screen-held first question is delivered on its first verdict');
+      assert.equal(payloads.length, 1);
+      assert.equal(configuredReviews, 0, 'the candidate remains on the existing Jev-only no-output question route');
+      assert.equal(reviews[0]!.postedBefore, 0);
+      assert.equal(reviews[0]!.verdict.done, false);
+      assert.notEqual(reviews[0]!.verdict.failedOpen, true);
+      assert.equal(fixture.model.calls(), 1, 'no repair round');
+      assert.equal(questions.length, 1);
+      assert.equal(questions[0]!.data.question, question);
+      assert.equal(result.status, 'awaiting_user_input');
+      const row = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+        .filter(item => item.data.kind === 'completion')[0];
+      assert.equal(row?.data.screenHeld, 'delivered');
+      assert.equal(row?.data.fulfills, false, 'the finding stays on the row');
+      return;
+    }
     assert.equal(reviews.length, 2, 'one negative question uses the existing repair and is reviewed again');
     assert.equal(payloads.length, 2, 'each candidate gets exactly one Jev screen');
     assert.equal(configuredReviews, 0, 'both candidates remain on the existing Jev-only no-output question route');
@@ -14543,9 +14567,9 @@ for (const shape of ['no-prior-frame', 'prior-frame'] as const) {
     assert.ok(!String(payloads[0]!.state.response).includes(progress));
     assert.ok(String(payloads[1]!.state.response).includes(progress));
     assert.ok(payloads.every(payload => String(payload.state.evidence).includes(JSON.stringify({ question, options }))));
-    assert.equal(fixture.model.calls(), shape === 'prior-frame' ? 3 : 2,
+    assert.equal(fixture.model.calls(), 3,
       'one existing repair supplies the complete reply without rerunning settled work or adding a narrator');
-    assert.match(JSON.stringify(fixture.model.requests[shape === 'prior-frame' ? 2 : 1]), /RETAINED COMPLETION REVIEW/);
+    assert.match(JSON.stringify(fixture.model.requests[2]), /RETAINED COMPLETION REVIEW/);
     if (shape === 'prior-frame') {
       const reads = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind, execution_kind
         FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
@@ -15227,6 +15251,40 @@ test('a dropped connection reported by the SDK ends in the same continuation que
     if (prior === undefined) delete process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES;
     else process.env.CLEMMY_MODEL_STREAM_STALL_RETRIES = prior;
   }
+});
+
+test('a conversation-shaped first reply held by the fast screen alone is delivered, not bounced', async (t) => {
+  // Live 2026-10-27: "draft an email for me" named no recipient and no
+  // content. The brain answered in prose at second 8 asking for both; the fast
+  // screen alone held it as "part of the request left without a result"; the
+  // bounce bought seven lookup rounds and then a draft to a remembered contact
+  // the owner never named, 147 s. The screen is a read-turn screen, not a
+  // reviewer; a conversation-shaped reply on a turn that did no work is the
+  // answer. Promises still bounce (next test); claims are still judged.
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const fixture = acceptJudgedSource('screen-held-conversation', 'Can you draft an email for me');
+  const question = 'Sure. Who should it go to, and what should it say?';
+  let judged = 0;
+  _setHostObjectiveJudgeForTests(async () => {
+    judged++;
+    return { done: false, reason: 'Jev found part of the request left without a result.', fast: true,
+      jevAttempt: { accepted: false, coverageComplete: false, reviewerStarted: false, choice: 'incomplete', confidence: 0.96 } };
+  });
+  t.after(() => _setHostObjectiveJudgeForTests(null));
+  const model = scriptedRecordingModel([[textMsg(question)], [textMsg('A second round that must never be asked for.')]]);
+  const agent = { model, tools: [] };
+  bindHostCanarySurface(fixture, agent, []);
+  const result = await runJudgedHost(fixture, agent, true);
+  assert.equal(model.calls(), 1, 'the screen-held reply is delivered without a second round');
+  assert.equal(judged, 1);
+  assert.equal(result.finalOutput, question);
+  const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0]?.data.fulfills, false, 'the screen finding stays on the row');
+  assert.equal(verdicts[0]?.data.screenHeld, 'delivered');
+  assert.equal(verdicts[0]?.data.continuation, false);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .filter((row) => row.data.kind === 'completion_review_disclosed').length, 0, 'no disclosure round either');
 });
 
 test('a result completed on the last repair receives a fresh positive verdict', async (t) => {
