@@ -2719,14 +2719,20 @@ test('a verified revision after unavailable reading receives the exact reference
         return next === 'revision' ? fixtureRevision(input) : { status: 'no_revision', reason: 'no_progress' };
       });
       const route = await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: second.seq });
-      assert.equal(route?.route, next === 'revision' ? 'revise' : 'reask');
+      assert.equal(route?.route, next === 'revision' ? 'revise' : 'respond');
       assert.equal(route?.revisionUnavailable, undefined);
       const result = reofferUnresolvedAcceptedSourceClarification({ sessionId, sourceUserSeq: second.seq, turn: second.turn });
-      assert.equal(result?.status, 'awaiting_user_input');
       if (next === 'revision') {
+        assert.equal(result?.status, 'awaiting_user_input');
         assert.ok(result?.publicPresentation?.text.endsWith(RESIDUAL_QUESTION));
         assert.doesNotMatch(result?.publicPresentation?.text ?? '', /couldn’t verify|10 rows/);
-      } else assert.equal(result?.publicPresentation?.text, COMPOUND_QUESTION);
+      } else {
+        // No checked revision and no admitted reading: the words may be an
+        // instruction past the question, so the brain reads them instead of
+        // the host repeating the question verbatim (live 2026-10-27).
+        assert.equal(route?.partialAnswer, true);
+        assert.equal(result, null, 'the brain answers this reply; no verbatim re-ask');
+      }
       assert.equal(continuity.peekTaskContinuityPacket({ sessionId }).status, 'available');
       assert.equal(eventlog.listEvents(sessionId, { types: ['tool_called'] }).length, 0);
     } finally { runtime._setClarificationRevisionProposerForTests(null); }

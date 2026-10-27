@@ -551,8 +551,15 @@ export async function classifyUnsettledOpenQuestionReply(input: {
   // them (owner 2026-10-06: no canned hold). The verbatim re-ask on a
   // no-progress revision stands. An unrunnable completeness check reaches
   // the brain too (above); only an interrupted reading holds.
+  // A reply the quick reading could not admit and the proposer found "no
+  // progress" on is not thereby an answer: the words may be an instruction
+  // past the question (live 2026-10-27: "Now delete the … event" after "the
+  // hold was not created — try again or hold off?" came back as the same
+  // question, verbatim, with no model step). With no checked revision to
+  // offer, the brain reads the person's words and decides what to ask or do.
   const brainReadsReply = completenessRequired || amending || continuing
-    || ((recordedReading.reading === 'answers' || unreadable) && recordedReading.revisionUnavailable === true);
+    || (recordedReading.reading === 'answers' && recordedReading.revisionUnavailable === true)
+    || unreadable;
   if (route === 'reask' && !revision && !skipRevision && brainReadsReply) {
     route = 'respond';
     recordedReading = { ...recordedReading, partialAnswer: true };
