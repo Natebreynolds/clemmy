@@ -13,6 +13,7 @@ const {
   selectAgentForTaskWithJev,
   classifyApprovalReplyWithJev,
   nominateReadCapabilitiesWithJev,
+  screenDefaultAccountWithJev,
   prepareSharedEvidenceDecisionsWithJev,
   decideTurnStartWithJev,
   rerankNamedCandidatesWithJev,
@@ -29,6 +30,34 @@ const { modelUsageAttributionStorage } = await import('../usage-log.js');
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+});
+
+test('the default-account screen keeps the default only on a sure silent or default reading, and reads earlier messages too', async () => {
+  const posted: Array<Record<string, unknown>> = [];
+  let choice = 'silent'; let confidence = 0.95;
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async (_url, init) => { posted.push(JSON.parse(String(init.body))); return { status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: { accounts: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } } },
+      usage: { input_tokens: 12, output_tokens: 2 } }) }; });
+  const input = { acceptedText: 'Send Adam the invite', earlierTexts: ['Draft a note first.'], toolkit: 'outlook',
+    defaultIdentity: 'operator@scorpion.invalid', defaultLabel: 'Scorpion', otherIdentities: ['operator@personal.invalid'] };
+  const kept = await screenDefaultAccountWithJev(input);
+  assert.deepEqual(kept, { kind: 'keep', choice: 'silent', confidence: 0.95, model: 'jev-1.13.0' });
+  const state = posted[0]!.state as Record<string, unknown>;
+  assert.equal(state.request, 'Send Adam the invite');
+  assert.deepEqual(state.earlierMessages, ['Draft a note first.'], 'earlier messages still in force are read too');
+  assert.deepEqual(state.otherConnectedAccounts, ['operator@personal.invalid']);
+  assert.doesNotMatch(JSON.stringify(posted[0]), /ts_test/);
+  choice = 'default';
+  assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'keep', 'naming the default itself keeps it');
+  choice = 'other';
+  assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'review', 'any other account reading goes to the reviewer');
+  choice = 'silent'; confidence = 0.6;
+  assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'review', 'an unsure silent reading goes to the reviewer');
+  choice = 'unsure'; confidence = 0.99;
+  assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'review');
+  _setTypesafeKeyForTests(undefined);
+  assert.equal(await screenDefaultAccountWithJev(input), null, 'no screen without Jev: the reviewer runs as before');
 });
 
 test('original same-invocation abstention remains advisory with exact request and six-score bindings', async () => {

@@ -16,6 +16,7 @@ import {
 import { searchFactsByText } from '../memory/facts.js';
 import { selectToolkitConnection, type listUsableConnectedToolkits } from '../integrations/composio/client.js';
 import { structuralDestinationPosture } from '../runtime/harness/external-capability-risk.js';
+import { screenDefaultAccountWithJev } from '../runtime/jev/control-plane.js';
 import pino from 'pino';
 
 const logger = pino({ name: 'source-account-routing' });
@@ -683,6 +684,29 @@ export async function resolveSourceAccountRouting(input: {
   // answer — "the Scorpion one" or "my default" then entails an identity the
   // bare answer never names. Routing evidence only; the judge still decides.
   const clarification = consumedAccountClarification(input.sessionId, input.sourceUserSeq, source.text);
+  // A remembered default and words that say nothing about accounts: the
+  // quick screen keeps the default without the cross-family reviewer (live
+  // 7 days: 634 default-account writes reviewed at ~3.7 s each). Words that
+  // say anything about accounts, an answered account question, or an unsure
+  // or unavailable screen go to the reviewer exactly as before.
+  if (defaultMode && rememberedSend && !clarification) {
+    const screened = await screenDefaultAccountWithJev({
+      acceptedText: source.text,
+      earlierTexts: interveningAcceptedSources.map((prior) => prior.acceptedText),
+      toolkit,
+      defaultIdentity: identity,
+      defaultLabel: aliasLabelFor(toolkit, emailOf(rememberedSend) || undefined, rememberedSend.connectionId) ?? null,
+      otherIdentities: [...new Set(relevant.map(identityOf))].filter((candidate) => candidate !== identity),
+    }).catch(() => null);
+    if (screened?.kind === 'keep') {
+      return { kind: 'resolved', connection, evidence: {
+        version: 2, selectionKind: 'current_source_default', sessionId: input.sessionId, principalId, toolkit, identity,
+        sourceSessionId: input.sessionId, sourceUserSeq: source.seq, sourceQuote: null, sourceDigest: source.digest,
+        checkedForSourceUserSeq: source.seq, checkedForSourceDigest: source.digest,
+        connectionRevision, judgeModelIdentity: `${screened.model}:default_${screened.choice}`,
+      } };
+    }
+  }
   const result = await judge({
     purpose: 'turn_semantics_account_selection',
     ...(clarification ? { clarification } : {}),

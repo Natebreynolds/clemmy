@@ -968,6 +968,53 @@ test('a write that changes an existing record resolves to the remembered read ac
   resetAccountAliasesForTest();
 });
 
+test('a remembered send default with words that say nothing about accounts keeps the default on the quick screen; words about another account still reach the reviewer', async () => {
+  // Live 7 days: 634 default-account writes went to the cross-family
+  // reviewer at ~3.7 s each to confirm what the owner's words never
+  // mentioned. The quick screen reads the words first; the reviewer runs
+  // only when they say anything about accounts, or when the screen is
+  // unsure or unavailable (the next pin keeps that path).
+  const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  const jev = await import('../runtime/jev/client.js');
+  const { SEND_DEFAULT_ACCOUNT_LABEL } = routing;
+  resetAccountAliasesForTest();
+  rememberAccountAlias({ toolkit: 'outlook', label: SEND_DEFAULT_ACCOUNT_LABEL, email: SCORPION, connectionId: 'fixture-scorpion' });
+  const calls = installJudge();
+  const screened: string[] = [];
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { state: { request: string; defaultAccount: { identity: string }; otherConnectedAccounts: string[] } };
+    screened.push(body.state.request);
+    assert.equal(body.state.defaultAccount.identity, SCORPION);
+    assert.deepEqual(body.state.otherConnectedAccounts, [PERSONAL]);
+    const choice = body.state.request.includes('personal') ? 'other' : 'silent';
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+      answers: { accounts: { type: 'choice', choice, confidence: 0.96, probabilities: { [choice]: 0.96 } } }, usage: { input_tokens: 10, output_tokens: 2 } }) };
+  });
+  const write = { toolkit: 'outlook', operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections, nomination: null, effect: 'write' as const };
+  try {
+    const kept = await routing.resolveSourceAccountRouting({ ...source('Send Adam the invite'), ...write });
+    assert.equal(kept.kind, 'resolved', JSON.stringify(kept));
+    if (kept.kind === 'resolved') {
+      assert.equal(kept.connection.connectionId, 'fixture-scorpion');
+      assert.equal(kept.evidence.version, 2);
+      assert.equal(kept.evidence.judgeModelIdentity, 'jev-1.13.0:default_silent');
+    }
+    assert.deepEqual(screened, ['Send Adam the invite']);
+    assert.equal(calls.length, 0, 'the reviewer never ran for words that say nothing about accounts');
+    const reviewed = await routing.resolveSourceAccountRouting({ ...source('Send it from my personal mailbox this time'), ...write });
+    assert.equal(reviewed.kind, 'resolved', JSON.stringify(reviewed));
+    if (reviewed.kind === 'resolved') assert.equal(reviewed.evidence.judgeModelIdentity, 'fixture-independent-judge');
+    assert.equal(calls.length, 1, 'words about another account reach the reviewer exactly as before');
+    assert.equal(calls[0]?.mode, 'current_source_default');
+  } finally {
+    jev._setTypesafeKeyForTests(undefined);
+    jev._setSystemOneFetchForTests(undefined);
+    registry.installTurnSemanticModelPort(null);
+    resetAccountAliasesForTest();
+  }
+});
+
 test('a remembered send default is reviewed by the judge instead of asking again, and the judge can still refuse', async () => {
   const { rememberAccountAlias, resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
   const { SEND_DEFAULT_ACCOUNT_LABEL } = routing;
