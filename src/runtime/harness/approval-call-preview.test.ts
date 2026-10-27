@@ -163,6 +163,12 @@ test('a file argument is named on the card by name, size and folder, and one tha
     const other = preview!.fields.find((field) => field.name === 'other')!;
     assert.match(other.label ?? '', /^cannot be sent: There is no file at /);
     assert.equal(preview!.fields.find((field) => field.name === 'subject')!.label, undefined);
+    // An API route is not a missing file: its top folder does not exist here.
+    const route = approvalCallPreview({
+      toolName: 'composio_execute_tool',
+      args: { tool_slug: 'ACME_API_REQUEST', arguments: JSON.stringify({ path: '/v3/acme_labs/google/rank_overview/live', method: 'POST' }) },
+    } as never);
+    assert.equal(route!.fields.find((field) => field.name === 'path')!.label, undefined);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

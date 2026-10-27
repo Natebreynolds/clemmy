@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { scanSecrets } from './guardrails.js';
 import { isPlainOrClementineLocalTool, stripMcpTransportPrefix } from './runtime-tool-identity.js';
 import type { InterruptionInfo } from './loop.js';
@@ -34,6 +35,16 @@ export function approvalJsonRecord(value: unknown): Record<string, unknown> | nu
 }
 
 
+/** An absolute path whose top folder does not exist here names nothing on
+ * this computer (an API route such as /v3/…), so a card never calls it a
+ * missing file. */
+function rootedOnThisComputer(value: string): boolean {
+  const text = value.trim();
+  if (!text.startsWith('/') || text.startsWith('//')) return true;
+  const top = text.split('/').find(Boolean);
+  return top ? existsSync(`/${top}`) : true;
+}
+
 /** How a card names the file(s) an argument would send from this computer;
  * undefined when the argument names no local file. A file that cannot be
  * sent says why. */
@@ -41,7 +52,7 @@ export function approvalFileLabel(raw: unknown, attachmentSource?: AttachmentFil
   const paths = typeof raw === 'string' ? [raw]
     : Array.isArray(raw) && raw.length > 0 && raw.every((item) => typeof item === 'string') ? raw as string[]
       : [];
-  const local = paths.filter((item) => looksLikeLocalFilePath(item));
+  const local = paths.filter((item) => looksLikeLocalFilePath(item) && rootedOnThisComputer(item));
   if (local.length === 0 || local.length !== paths.length) return undefined;
   return local.map((item) => {
     try {
