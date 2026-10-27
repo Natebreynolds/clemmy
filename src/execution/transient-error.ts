@@ -25,7 +25,17 @@ const STATUS_IN_MESSAGE_RE = /\b(?:api error|http|status)\s*[:#]?\s*(\d{3})\b/i;
 
 /** True when `err` looks like a transient infrastructure failure worth ONE
  *  retry. Bounded-recurses into `err.cause` (undici wraps the real cause). */
+/** The step's model could not be reached (lost connection, provider not
+ *  answering): the step did no work and is retried like any other blip. */
+export class ModelUnavailableStepError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelUnavailableStepError';
+  }
+}
+
 export function isTransientStepError(err: unknown, depth = 0): boolean {
+  if (err instanceof ModelUnavailableStepError) return true;
   const msg = err instanceof Error ? err.message : String(err ?? '');
   if (NON_RETRYABLE_RE.test(msg)) return false;
   // A model/plan-scoped allowance is recoverable by a DIFFERENT brain, but

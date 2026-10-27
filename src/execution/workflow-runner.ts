@@ -6597,6 +6597,14 @@ async function runStepViaHarness(
       const awaitingEvents = listHarnessEvents(realSessionId, { types: ['awaiting_user_input'] })
         .filter((event) => event.seq > sourceUserEvent.seq);
       const latestQuestion = awaitingEvents[awaitingEvents.length - 1];
+      // The host stops on "would you like me to try continuing?" when it
+      // cannot reach the model. In a chat the owner answers that; a scheduled
+      // run has no one to ask and nothing to decide. The step did no work, so
+      // it is retried like any other outage, never parked on a question.
+      if (latestQuestion?.data?.source === 'model_transport_recovery') {
+        takeStepResult(realSessionId);
+        throw new ModelUnavailableStepError(`workflow step "${step.id}" could not reach its model`);
+      }
       const question = (
         typeof latestQuestion?.data?.question === 'string'
           ? latestQuestion.data.question
@@ -7074,7 +7082,7 @@ const RETRY_BACKOFF_BASE_MS = parseInt(
 // (transient-error.ts) so low-level tool modules (composio-tools) can share it
 // without importing this high-level runner. Imported for internal step-retry
 // use + re-exported for back-compat with existing importers.
-import { isAuthRecoverableError, isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
+import { ModelUnavailableStepError, isAuthRecoverableError, isTransientStepError, isUnparseableToolCallError } from './transient-error.js';
 import { isRegisteredCarrierGateway } from '../runtime/harness/carrier-completion.js';
 import { isPlainOrClementineLocalTool } from '../runtime/harness/runtime-tool-identity.js';
 export { isTransientStepError };
