@@ -4,6 +4,7 @@ import { Suspense } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   adoptOriginSession,
+  sessionProofAccepted,
   finalizeOriginHandoff,
   activateOriginHandoff,
   api,
@@ -444,7 +445,10 @@ export function App() {
               // cold JS reload. A raw fetch would observe the cookie but leave
               // the very next request unable to prove it owns that session.
               const already = await getAuthStatus().catch(() => null);
-              return Boolean(already?.authenticated);
+              if (!already?.authenticated) return false;
+              // A session this phone cannot sign for is not its session: the
+              // stored handoff is what replaces it.
+              return (await sessionProofAccepted()) !== false;
             },
             adopt: async (value) => { await adoptOriginSession(value); },
             finalize: async (id, version) => { await finalizeOriginHandoff(id, version); },

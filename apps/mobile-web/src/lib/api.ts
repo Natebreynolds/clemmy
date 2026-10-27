@@ -237,6 +237,27 @@ export interface AuthStatus {
   sessionFingerprint?: string | null;
 }
 
+/**
+ * Whether this phone can sign for the session its cookie names. A cookie can
+ * outlive the key it was bound to (the phone re-paired and kept the newer
+ * key), and /auth/status, which is unsigned, still calls that session alive.
+ * Only a signed request proves the session is this phone's. Null when the Mac
+ * could not be asked; no recovery side effects, the caller decides.
+ */
+export async function sessionProofAccepted(): Promise<boolean | null> {
+  const path = '/m/api/whoami';
+  try {
+    const headers = requestHeaders(undefined) as Record<string, string>;
+    Object.assign(headers, await proofHeader(path, 'GET'));
+    const res = await fetch(path, { credentials: 'same-origin', cache: 'no-store', headers });
+    if (res.headers.get(LAST_GOOD_HEADER)) return null;
+    if (res.status === 401) return false;
+    return res.ok ? true : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function getAuthStatus(): Promise<AuthStatus> {
   const status = await api<AuthStatus>('/m/auth/status');
   if (status.sessionFingerprint) setSessionFingerprint(status.sessionFingerprint);
