@@ -2158,8 +2158,9 @@ export function hostCompletionReviewFeedbackContext(feedback: HostCompletionRevi
       + 'Your checker still does not accept your answer, and this request has no revisions left. '
       + 'Write your final reply to the owner now, without calling tools. Give the answer you have. '
       + 'Correct or drop anything the finding below shows is wrong rather than repeating it. '
-      + 'Then say plainly, in your own words, what your checker could not confirm and why, '
-      + 'and ask the owner one question: whether to keep working on it, and how. Add no new claims.\n'
+      + 'Then say plainly, in your own words, what is still not confirmed and why, as a fact about the work itself; '
+      + 'do not mention a checker, a review or a second opinion, which mean nothing to the owner. '
+      + 'Ask the owner one question: whether to keep working on it, and how. Add no new claims.\n'
       + JSON.stringify(feedback);
   }
   return '[RETAINED COMPLETION REVIEW — same accepted request]\n'
