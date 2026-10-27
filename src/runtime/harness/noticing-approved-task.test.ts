@@ -262,13 +262,28 @@ test('approved noticing task checked partial-answer chain keeps earlier account 
     usage: { input_tokens: 1, output_tokens: 1 }, decisionId: 'fixture-completeness',
   })));
   try {
-    assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: f.session.id, sourceUserSeq: partial.seq }))?.route, 'revise');
+    // Owner 2026-10-27: the partial reply goes to the brain with the question
+    // beside it and the hold is released; the host proposes and re-asks
+    // nothing. The brain asks for the marker in its own words (modelled as a
+    // fresh clarification from the partial reply), and the final answer
+    // settles that question with the partial reply as its parent.
+    assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: f.session.id, sourceUserSeq: partial.seq }))?.route, 'respond');
     assert.equal(reofferUnresolvedAcceptedSourceClarification({ sessionId: f.session.id, sourceUserSeq: partial.seq,
-      turn: partial.turn })?.status, 'awaiting_user_input');
+      turn: partial.turn }), null, 'the brain reads the partial answer; no host re-ask');
+    const steered = await continuity.enrichAcceptedRequestWithTaskContinuity({ sessionId: f.session.id, message: partialText }, partial.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    assert.equal(steered.taskContinuation, undefined, 'a partial answer never consumes the edge into executing work');
+    assert.ok((steered.semanticTaskInput ?? '').includes(partialText), 'the brain reads the exact amendment');
+    assert.ok((steered.semanticTaskInput ?? '').includes(question), 'beside the whole question');
+    assert.equal(store.peekTaskContinuityPacket({ sessionId: f.session.id }).status, 'none', 'released for the brain');
+    log.appendEvent({ sessionId: f.session.id, turn: 2, role: 'Clem', type: 'awaiting_user_input',
+      data: { sourceUserSeq: partial.seq, question: residual, options: [] } });
+    const reask = { ...f.identity, sourceUserSeq: partial.seq, turn: 2 };
+    commitTurnOutcome({ version: 2, id: outcomes.turnOutcomeId(reask), identity: reask, status: 'needs_input',
+      resumable: true, needs: { kind: 'input' }, presentation: { kind: 'question', text: residual } });
     const pending = store.peekTaskContinuityPacket({ sessionId: f.session.id });
-    assert.equal(pending.status, 'available');
+    assert.equal(pending.status, 'available', 'the brain asked for the marker');
     if (pending.status !== 'available') return;
-    assert.equal(pending.packet.rootSourceUserSeq, f.source.seq);
     const finalText = 'Use the marker FIXTURE-ONLY.';
     const final = log.acceptUserInputForRun({ sessionId: f.session.id, turn: 3, role: 'user', data: { text: finalText } });
     const slot = pending.packet.pause.slot!;
@@ -277,13 +292,10 @@ test('approved noticing task checked partial-answer chain keeps earlier account 
     assert.equal((await continuity.classifyUnsettledOpenQuestionReply({ sessionId: f.session.id, sourceUserSeq: final.seq }))?.route, 'settled');
     const resolved = await continuity.enrichAcceptedRequestWithTaskContinuity({ sessionId: f.session.id, message: finalText }, final.seq,
       { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'provided' } });
-    assert.equal(resolved.taskContinuation?.parentSourceUserSeq, f.source.seq, 'the verified chain jumps straight to A');
-    assert.match(resolved.taskContinuation?.parentInput ?? '', /never switch account or send/);
+    assert.ok(resolved.taskContinuation, 'the fully checked answer consumes the brain\'s question');
+    assert.match(resolved.taskContinuation?.parentInput ?? '', /never switch account or send/, 'the amendment is the question\'s own parent');
     const source = { sessionId: f.session.id, sourceUserSeq: final.seq };
-    const task = approved.readNoticingTaskThroughVerifiedClarifications(source, continuity.rehydrateConsumedClarificationContext);
-    assert.ok(task?.context.includes(partialText), 'earlier literal amendments survive the direct-root jump');
     const objective = host.acceptedObjectiveForSource(source)!;
-    assert.match(objective, /Read both controlled sources and save a draft/);
     assert.match(objective, /existing fixture account and folder A only; never switch account or send/);
     assert.match(objective, /FIXTURE-ONLY/);
     log.closeEventLog();

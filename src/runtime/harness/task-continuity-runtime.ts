@@ -88,8 +88,6 @@ import {
 import { currentInputSuppressesPriorTask } from './current-task-authority.js';
 import { withoutRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import { modelUsageAttributionStorage, withModelUsageAttribution } from '../usage-log.js';
-import { validatedClarificationFailureDiagnostic } from '../semantic-boundary/clarification-failure-diagnostic.js';
-import { validatedClarificationStructuralDiagnostic } from '../semantic-boundary/clarification-structural-diagnostic.js';
 import { parseTaskMode } from './task-mode.js';
 import {
   proposeClarificationRevision,
@@ -507,62 +505,19 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       recordedReading = { ...recordedReading, partialAnswer: true, replyReading: 'affirms' };
     }
   }
-  let revision: ProposedClarificationRevision | undefined;
-  if (route === 'reask' && !skipRevision) {
-    const revisionInput = clarificationRevisionInputFor(current.packet, input.sourceUserSeq);
-    const proposal = revisionInput
-      ? await (clarificationRevisionProposerForTests ?? proposeClarificationRevision)(revisionInput, undefined,
-        // The brain reads an unreadable reply either way; one deadline is enough.
-        { retryOnDeadline: !unreadable })
-        .catch(() => ({ status: 'unavailable' as const, stage: 'proposal', reason: 'proposal_failed' }))
-      : { status: 'unavailable' as const, stage: 'context', reason: 'exact_source_chain_unavailable' };
-    if (proposal.status === 'proposed' && revisionInput) {
-      revision = validatedClarificationRevision(revisionInput, proposal.revision) ?? undefined;
-      if (revision) route = 'revise';
-    }
-    const failureDiagnostic = proposal.status === 'unavailable' && 'diagnostic' in proposal
-      ? validatedClarificationFailureDiagnostic(proposal.diagnostic, input) : null;
-    const structuralDiagnostic = revisionInput && proposal.status === 'unavailable'
-      && proposal.stage === 'proposal' && proposal.reason === 'interpretation_unbound'
-      && 'structuralDiagnostic' in proposal
-      ? validatedClarificationStructuralDiagnostic(proposal.structuralDiagnostic, revisionInput) : null;
-    recordedReading = { ...recordedReading,
-      ...(failureDiagnostic ? { revisionDiagnostic: failureDiagnostic } : {}),
-      ...(structuralDiagnostic ? { revisionStructuralDiagnostic: structuralDiagnostic } : {}),
-      revisionStatus: revision ? 'proposed' : proposal.status,
-      ...(!revision && (proposal.status === 'unavailable' || proposal.status === 'proposed'
-        || proposal.reason === 'not_grounded') ? { revisionUnavailable: true } : {}),
-      ...(!revision && proposal.status !== 'proposed' ? { revisionReason: proposal.reason } : {}),
-    };
-  }
-  // The host read the reply (a partial answer, an amendment, a continuation,
-  // or a sure answer) and no checked revision came out of the quick model.
-  // Holding here with "I couldn't verify how it changes the pending question"
-  // was a dead end: live 2026-10-05, every partial answer to a compound
-  // question stopped on that notice, four different ways; live 2026-10-06,
-  // "change the plan: merge intro and outro" and then "Go." both stopped on
-  // it when the revision call ran past its deadline twice. Clem answers from
-  // the exact question and reply instead (the brain input below carries the
-  // reading). A sure answer the quick model read as no progress is re-asked
-  // verbatim as before; a reply nothing could interpret, or a completeness
-  // check that could not run, keeps the honest hold.
-  // A reply the quick semantic reading could not admit is still the person's
-  // exact words; when the revision check is unavailable too, the brain reads
-  // them (owner 2026-10-06: no canned hold). The verbatim re-ask on a
-  // no-progress revision stands. An unrunnable completeness check reaches
-  // the brain too (above); only an interrupted reading holds.
-  // A reply the quick reading could not admit and the proposer found "no
-  // progress" on is not thereby an answer: the words may be an instruction
-  // past the question (live 2026-10-27: "Now delete the … event" after "the
-  // hold was not created — try again or hold off?" came back as the same
-  // question, verbatim, with no model step). With no checked revision to
-  // offer, the brain reads the person's words and decides what to ask or do.
-  const brainReadsReply = completenessRequired || amending || continuing
-    || (recordedReading.reading === 'answers' && recordedReading.revisionUnavailable === true)
-    || unreadable;
-  if (route === 'reask' && !revision && !skipRevision && brainReadsReply) {
+  // THE BRAIN READS EVERY REPLY TO ITS QUESTION. A partial answer, an
+  // amendment, a question back, words nothing could interpret: the person's
+  // exact words go to the brain with the question beside them, and the brain
+  // decides what to ask or do next. The host no longer proposes a revised
+  // question of its own here: that proposer ran a quick model with a 12-s
+  // deadline, twice, on the reply path. Seven live days: 75 replies, 18 s on
+  // average between the owner's reply and the brain, 100 s at worst, two
+  // usable revisions, and the brain read the reply anyway in the other 73
+  // (owner 2026-10-27: remove it). Only a fully checked answer settles the
+  // question without the brain (above).
+  if (route === 'reask') {
     route = 'respond';
-    recordedReading = { ...recordedReading, partialAnswer: true };
+    recordedReading = { ...recordedReading, partialAnswer: true, revisionStatus: 'not_proposed' };
   }
   const retainedReading = appendEvent({
     sessionId: input.sessionId,
@@ -576,11 +531,9 @@ export async function classifyUnsettledOpenQuestionReply(input: {
       parentSlot: current.packet.pause.slot ?? null,
       route,
       ...recordedReading,
-      ...(revision ? { revision } : {}),
     },
   });
   return { route, parentPacketId: current.packet.packetId,
-    ...(revision ? { revision } : {}),
     ...(recordedReading.revisionUnavailable === true ? { revisionUnavailable: true, unavailableReadingEventId: retainedReading.id } : {}),
     ...(recordedReading.answerCompletenessRequired === true ? { answerCompletenessRequired: true } : {}),
     ...(recordedReading.partialAnswer === true ? { partialAnswer: true } : {}),
