@@ -82,6 +82,9 @@ test('maintenance cannot migrate an old or noncontiguous store and never falls b
 test('a catch-up pass runs batches until the lanes are caught up and stops at the batch bound', async () => {
   const f = await fixture();
   try {
+    // A history below the object store's size floor stays inline, advances the
+    // cursor, and must not end the pass early.
+    f.db.prepare(`INSERT INTO accepted_model_batch_checkpoints VALUES (?, ?, 1, NULL)`).run('[{"content":"short"}]', 'short');
     const bounded = await catchUpHistoryStorage(f.filename, 1);
     assert.equal(bounded.batches, 1);
     assert.equal(bounded.converted, 1);
@@ -93,6 +96,6 @@ test('a catch-up pass runs batches until the lanes are caught up and stops at th
     assert.equal((f.db.prepare('SELECT COUNT(*) AS n FROM accepted_model_history_objects_v1').get() as { n: number }).n, 1);
     assert.equal((f.db.prepare('SELECT history_json FROM accepted_model_batch_checkpoints_readable_v1').get() as { history_json: string }).history_json, f.json);
     f.db.prepare('INSERT INTO run_attempts VALUES (?, NULL)').run('controlled-active-work');
-    assert.deepEqual(await catchUpHistoryStorage(f.filename, 5), { batches: 1, converted: 0, inlineBytesRemoved: 0, last: 'deferred' });
+    assert.deepEqual(await catchUpHistoryStorage(f.filename, 5), { batches: 1, scanned: 0, converted: 0, inlineBytesRemoved: 0, last: 'deferred' });
   } finally { await f.close(); }
 });

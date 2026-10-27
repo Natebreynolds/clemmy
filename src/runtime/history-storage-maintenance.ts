@@ -39,25 +39,28 @@ export function runHistoryStorageMaintenance(dbPath: string): Promise<HistorySto
 
 export interface HistoryStorageCatchUp {
   batches: number;
+  scanned: number;
   converted: number;
   inlineBytesRemoved: number;
   last: HistoryStorageWorkerResult['state'];
 }
 
 /** Several bounded conversion batches in a row, stopping at the first that
- * converts nothing (caught up, deferred to live work, a busy writer, or a
- * blocked lane). Each batch is its own short-lived worker, so a turn that
- * starts between batches is never kept waiting. */
+ * scans nothing (caught up, deferred to live work, a busy writer, or a
+ * blocked lane). A batch of histories too small for the object store still
+ * advances the cursor and counts. Each batch is its own short-lived worker,
+ * so a turn that starts between batches is never kept waiting. */
 export async function catchUpHistoryStorage(dbPath: string, maxBatches: number): Promise<HistoryStorageCatchUp> {
-  const pass: HistoryStorageCatchUp = { batches: 0, converted: 0, inlineBytesRemoved: 0, last: 'caught_up' };
+  const pass: HistoryStorageCatchUp = { batches: 0, scanned: 0, converted: 0, inlineBytesRemoved: 0, last: 'caught_up' };
   for (let n = 0; n < Math.max(1, Math.floor(maxBatches)); n++) {
     const result = await runHistoryStorageMaintenance(dbPath);
     pass.batches += 1;
     pass.last = result.state;
     if (result.state !== 'processed') break;
+    pass.scanned += result.result.scanned;
     pass.converted += result.result.converted;
     pass.inlineBytesRemoved += result.result.inlineBytesRemoved;
-    if (result.result.converted === 0) break;
+    if (result.result.scanned === 0) break;
   }
   return pass;
 }
