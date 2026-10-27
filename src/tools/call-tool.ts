@@ -570,7 +570,7 @@ export type NativeToolArgumentPreparation =
 
 /** The selected host-local instance owns both its parser and its dispatch.
  * A separate registry entry with the same name is not an equivalent schema. */
-function prepareTurnOwnedToolArguments(target: string, args: unknown, configured: unknown): NativeToolArgumentPreparation {
+async function prepareTurnOwnedToolArguments(target: string, args: unknown, configured: unknown): Promise<NativeToolArgumentPreparation> {
   let inputSchema: unknown = null;
   try {
     const selected = configured as { name?: unknown; invoke?: unknown; parameters?: unknown; description?: unknown } | null;
@@ -582,7 +582,18 @@ function prepareTurnOwnedToolArguments(target: string, args: unknown, configured
       || typeof (inputSchema as { properties?: unknown }).properties !== 'object'
       || Array.isArray((inputSchema as { properties?: unknown }).properties)) throw new Error('invalid schema');
     const schema = z.fromJSONSchema(inputSchema as Parameters<typeof z.fromJSONSchema>[0]);
-    const parsed = schema.safeParse(materializeStrictNullableFields(args, inputSchema));
+    const materialized = materializeStrictNullableFields(args, inputSchema);
+    let parsed = schema.safeParse(materialized);
+    if (!parsed.success) {
+      // The advertised parameters are the strict wire projection, which
+      // cannot spell every shape the tool's own schema takes (an open record
+      // such as {"rows": 1} becomes a closed empty object). The registered
+      // schema the handler itself parses is the lossless one; a value it
+      // accepts was never wrong. Only the handler's own name is trusted.
+      const canonical = (await localSchemas()).schemas.get(target);
+      const lossless = canonical?.safeParse(materialized);
+      if (lossless?.success) parsed = lossless;
+    }
     if (!parsed.success) {
       const paths = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
         ? issue.keys.map((key) => [...issue.path, key].join('.'))
@@ -1422,7 +1433,7 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
         });
       }
       const prepared = hasLocalOverride
-        ? prepareTurnOwnedToolArguments(target, resolvedArgs, localToolOverride)
+        ? await prepareTurnOwnedToolArguments(target, resolvedArgs, localToolOverride)
         : await prepareNativeToolArguments(target, resolvedArgs);
       if (prepared.status === 'invalid') {
         const next = missingRequiredNextAction(

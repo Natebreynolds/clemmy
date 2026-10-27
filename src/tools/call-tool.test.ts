@@ -2476,6 +2476,38 @@ test('turn-owned schema owns nullable/default handling, strict validation and th
   assert.deepEqual(JSON.parse(String(openResult)), openArgs);
 });
 
+test('a turn-owned call the strict wire projection cannot spell is read by the tool\'s own schema', async () => {
+  // Live 2026-10-27: workflow_create was first-class on the turn, so its
+  // advertised parameters were the strict projection, in which an open record
+  // (output.min_items) is a closed empty object; {"emails":1} was refused as
+  // "steps.1.output: Invalid input" and the brain re-authored without it.
+  const { tool } = await import('@openai/agents');
+  const sessionId = 'sess-turn-owned-record'; const accepted = acceptedSourceForCallToolFixture(sessionId);
+  const received: unknown[] = [];
+  const closedRecord = { type: 'object', properties: {}, additionalProperties: false };
+  const selected = tool({ name: 'workflow_create', description: 'Strict projection of the real tool.', strict: false,
+    parameters: { type: 'object', additionalProperties: false, required: ['name', 'steps'], properties: {
+      name: { type: 'string' },
+      steps: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id'], properties: {
+        id: { type: 'string' }, prompt: { type: 'string' },
+        output: { anyOf: [{ type: 'object', additionalProperties: false, properties: { min_items: { anyOf: [closedRecord, { type: 'null' }] } } }, { type: 'null' }] },
+      } } },
+    } },
+    execute: async args => { received.push(args); return 'created'; } });
+  const callTool = buildCallTool({ firstClassNames: new Set(['workflow_create']),
+    localToolOverrides: new Map([['workflow_create', selected]]) }) as unknown as ToolLike;
+  const run = (args: unknown) => withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+    callTool.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'workflow_create', args_json: args }), {}));
+  const args = { name: 'FRAMEWORK-TEST record', description: 'A record read by the real schema.',
+    steps: [{ id: 'shape', prompt: 'shape rows', output: { min_items: { emails: 1 } } }] };
+  assert.equal(String(await run(args)), 'created');
+  assert.equal(received.length, 1);
+  assert.deepEqual((received[0] as { steps: Array<{ output?: { min_items?: unknown } }> }).steps[0]?.output?.min_items, { emails: 1 });
+  const refused = JSON.parse(String(await run({ ...args, steps: 'not a list' })));
+  assert.equal(refused.error, 'arg_validation', 'what neither schema accepts keeps its refusal');
+  assert.equal(received.length, 1);
+});
+
 test('malformed turn-owned instance/schema never falls back to a global implementation', async () => {
   const sessionId = 'sess-turn-owned-invalid'; const accepted = acceptedSourceForCallToolFixture(sessionId);
   let globalCalls = 0; let overrideCalls = 0;
