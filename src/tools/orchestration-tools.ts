@@ -125,7 +125,9 @@ import {
 } from '../execution/workflow-certification.js';
 import {
   buildWorkflowResourceBindingReportFromRuntime,
+  completeWorkflowResourceBindingsFromRuntime,
   renderWorkflowResourceBindingReport,
+  workflowResourceBindingGaps,
 } from '../execution/workflow-resource-binding.js';
 import {
   deriveWorkflowTerminalOutcome,
@@ -1425,6 +1427,11 @@ export function registerOrchestrationTools(server: McpServer): void {
         inputs: Object.keys(inputsSchema).length > 0 ? inputsSchema : undefined,
         synthesis: synthesis_prompt ? { prompt: synthesis_prompt } : undefined,
       };
+      // A declared resource that names a connected app and account is bound
+      // now, from the app's own connections, so the save and the first run
+      // agree on what "bound" means.
+      const resourceCompletion = await completeWorkflowResourceBindingsFromRuntime(def);
+      if (resourceCompletion.resources) def.resources = resourceCompletion.resources;
       // Citations first: land every operation an authored step already names in
       // that step's own tool scope, so the binder below never has to infer one
       // and execution never has to rediscover it.
@@ -1467,9 +1474,14 @@ export function registerOrchestrationTools(server: McpServer): void {
         created.savedDef.enabled = false;
         writeWorkflowAndSyncTriggers(dirName, created.savedDef);
       }
-      const createBindReport = [...chatBind.boundNotes, ...created.boundNotes].length > 0
-        ? `\n\n${[...chatBind.boundNotes, ...created.boundNotes].join('\n')}` : '';
+      const createBindNotes = [...chatBind.boundNotes, ...resourceCompletion.notes, ...created.boundNotes];
+      const createBindReport = createBindNotes.length > 0 ? `\n\n${createBindNotes.join('\n')}` : '';
+      // A resource still unbound stops the first run; say so on the save,
+      // not on the run (live: a save reported PASSED/ENABLED, the run then
+      // answered NEEDS RESOURCE BINDING).
+      const bindingGaps = workflowResourceBindingGaps(created.savedDef);
       const advisoryTail = `${renderAuthoringAdvisories([...created.repairs, ...created.warnings, ...created.advisories])}`
+        + (bindingGaps.length ? `\n\nNot runnable until these are bound (workflow_update resources=...):\n- ${bindingGaps.join('\n- ')}` : '')
         + (created.gaps.length ? `\n\nOptional authoring review (does not block this workflow):${renderWorkflowGapQuestions(created.gaps)}` : '');
       if (needsCreationTest) {
         const testInputs = workflowSmokeInputs(created.savedDef, providedSmokeInputs);
@@ -2339,7 +2351,14 @@ export function registerOrchestrationTools(server: McpServer): void {
       const updateBind = steps ? bindStepsToToolChoices(next.steps) : { boundNotes: [], advisories: [] };
       if (inputsProvided) next.inputs = inputsSchema;
       if (clear_resources) delete next.resources;
-      else if (resourcesProvided) next.resources = Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined;
+      else if (resourcesProvided) {
+        next.resources = Object.keys(resourceBindings).length > 0 ? resourceBindings : undefined;
+        if (next.resources) {
+          const completion = await completeWorkflowResourceBindingsFromRuntime(next);
+          if (completion.resources) next.resources = completion.resources;
+          updateBind.boundNotes.push(...completion.notes);
+        }
+      }
       if (synthesis_prompt !== undefined) next.synthesis = { prompt: synthesis_prompt };
       if (allowSends !== undefined) next.allowSends = allowSends;
       if (clear_goal) {

@@ -658,10 +658,16 @@ export function normalizeWorkflowResources(input: unknown): Record<string, Workf
     const kind = WORKFLOW_RESOURCE_KINDS.has(rawKind as WorkflowResourceKind)
       ? rawKind as WorkflowResourceKind
       : 'other';
+    // A kind that is not one of ours names what the author meant ("outlook");
+    // keep the word on the binding so the connected-app match can read it.
+    const label = resourceString(rec.label) ?? (kind === 'other' && rawKind !== 'other' ? rawKind : undefined);
+    // The account an author names by its address or handle is its selector.
+    const name = resourceString(rec.name) ?? resourceString(rec.identity) ?? resourceString(rec.email)
+      ?? resourceString(rec.address) ?? resourceString(rec.handle) ?? resourceString(rec.login);
     out[id] = {
       id,
       kind,
-      ...(resourceString(rec.label) ? { label: resourceString(rec.label) } : {}),
+      ...(label ? { label } : {}),
       ...(resourceString(rec.description) ? { description: resourceString(rec.description) } : {}),
       ...(resourceString(rec.toolkit) ? { toolkit: resourceString(rec.toolkit) } : {}),
       ...(resourceString(rec.tool) ? { tool: resourceString(rec.tool) } : {}),
@@ -671,7 +677,7 @@ export function normalizeWorkflowResources(input: unknown): Record<string, Workf
       ...(resourceString(rec.account) ? { account: resourceString(rec.account) } : {}),
       ...(resourceString(rec.resourceId ?? rec.resource_id) ? { resourceId: resourceString(rec.resourceId ?? rec.resource_id) } : {}),
       ...(resourceString(rec.url) ? { url: resourceString(rec.url) } : {}),
-      ...(resourceString(rec.name) ? { name: resourceString(rec.name) } : {}),
+      ...(name ? { name } : {}),
       ...(resourceObject(rec.scope) ? { scope: resourceObject(rec.scope) } : {}),
       ...(resourceObject(rec.cursor) ? { cursor: resourceObject(rec.cursor) } : {}),
       ...(resourceObject(rec.trigger) ? { trigger: resourceObject(rec.trigger) } : {}),

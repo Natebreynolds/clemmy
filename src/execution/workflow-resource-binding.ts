@@ -125,10 +125,9 @@ const TEXT_CLI_HINTS: Array<{ pattern: RegExp; ids: string[] }> = [
   { pattern: /\bhiggsfield\b/i, ids: ['higgsfield'] },
 ];
 
-export async function buildWorkflowResourceBindingReportFromRuntime(
-  def: WorkflowDefinition,
-  now = new Date(),
-): Promise<WorkflowResourceBindingReport> {
+/** What the app has connected right now: the inventory every binding
+ * proposal and completion reads. */
+export async function loadWorkflowResourceBindingInventory(): Promise<WorkflowResourceBindingInventory> {
   const credentials = getComposioCredentialStatus();
   let connected: ConnectedToolkit[] = [];
   let composioError: string | undefined;
@@ -146,7 +145,7 @@ export async function buildWorkflowResourceBindingReportFromRuntime(
     })),
     ...listCachedToolkits(),
   ]);
-  return buildWorkflowResourceBindingReport(def, {
+  return {
     composio: {
       apiKeyPresent: credentials.apiKeyPresent,
       connected,
@@ -157,7 +156,76 @@ export async function buildWorkflowResourceBindingReportFromRuntime(
       connected: Object.values(readConnectedClis()),
       savedCommands: getSavedClis(),
     },
-  }, now);
+  };
+}
+
+export async function buildWorkflowResourceBindingReportFromRuntime(
+  def: WorkflowDefinition,
+  now = new Date(),
+): Promise<WorkflowResourceBindingReport> {
+  return buildWorkflowResourceBindingReport(def, await loadWorkflowResourceBindingInventory(), now);
+}
+
+/**
+ * Finish a declared binding from what the app already proves. An author who
+ * writes `{"kind":"outlook","identity":"me@firm.com"}` has named the app and
+ * the account; the save used to keep neither, and the first run then stopped
+ * on "choose a connector … bind a concrete account" for a workflow whose
+ * creation test had just run against that very account. Pure over the
+ * inventory: the surface is set only when exactly one connected app fits the
+ * declaration, the account only when exactly one connection of that app
+ * matches the named identity (or is the only one). Nothing the author set is
+ * changed; nothing is invented when the match is not unique.
+ */
+export function completeWorkflowResourceBindings(
+  def: WorkflowDefinition,
+  inventory: WorkflowResourceBindingInventory,
+): { resources: Record<string, WorkflowResourceBinding> | undefined; notes: string[] } {
+  const notes: string[] = [];
+  if (!def.resources) return { resources: def.resources, notes };
+  const resources: Record<string, WorkflowResourceBinding> = {};
+  for (const [key, resource] of Object.entries(def.resources)) {
+    let next: WorkflowResourceBinding = { ...resource };
+    if (resource.required !== false && !resourceHasSurface(resource, def)) {
+      const ready = dedupeCandidates(resourceCandidates(def, resource, inventory)
+        .filter((candidate) => candidate.kind === 'composio' && candidate.status === 'ready' && candidate.toolkit));
+      if (ready.length === 1) {
+        next = { ...next, toolkit: ready[0]!.toolkit };
+        notes.push(`🔗 Bound resource \`${resource.id}\` to ${ready[0]!.label} (connected).`);
+      }
+    }
+    if (resource.required !== false && next.toolkit && !resourceHasSelector(next, def)) {
+      const connections = (inventory.composio?.connected ?? [])
+        .filter((connection) => normalizeKey(connection.slug) === normalizeKey(next.toolkit!));
+      const picked = connections.length === 1 ? connections[0] : undefined;
+      if (picked) {
+        next = { ...next, connectionId: picked.connectionId };
+        const who = picked.accountEmail ?? picked.accountLabel ?? picked.accountName ?? picked.alias;
+        notes.push(`🔗 Resource \`${resource.id}\` uses the one connected ${toolkitDisplayName(next.toolkit!, inventory)} account${who ? ` (${who})` : ''}.`);
+      }
+    } else if (resource.required !== false && next.toolkit && next.name && !next.connectionId && !next.account) {
+      // The author named the account; pin the connection that carries it.
+      const wanted = normalizeKey(next.name);
+      const matches = (inventory.composio?.connected ?? []).filter((connection) => (
+        normalizeKey(connection.slug) === normalizeKey(next.toolkit!)
+        && [connection.accountEmail, connection.accountLabel, connection.accountName, connection.alias]
+          .some((identity) => identity && normalizeKey(identity) === wanted)
+      ));
+      if (matches.length === 1) next = { ...next, connectionId: matches[0]!.connectionId };
+    }
+    resources[key] = next;
+  }
+  return { resources, notes };
+}
+
+export async function completeWorkflowResourceBindingsFromRuntime(
+  def: WorkflowDefinition,
+): Promise<{ resources: Record<string, WorkflowResourceBinding> | undefined; notes: string[] }> {
+  try {
+    return completeWorkflowResourceBindings(def, await loadWorkflowResourceBindingInventory());
+  } catch {
+    return { resources: def.resources, notes: [] };
+  }
 }
 
 export function buildWorkflowResourceBindingReport(

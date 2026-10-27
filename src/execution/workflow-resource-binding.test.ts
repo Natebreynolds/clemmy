@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { WorkflowDefinition } from '../memory/workflow-store.js';
-import { buildWorkflowResourceBindingReport, workflowResourceBindingGaps } from './workflow-resource-binding.js';
+import { buildWorkflowResourceBindingReport, completeWorkflowResourceBindings, workflowResourceBindingGaps } from './workflow-resource-binding.js';
 
 function def(overrides: Partial<WorkflowDefinition>): WorkflowDefinition {
   return {
@@ -36,6 +36,59 @@ const baseInventory = {
     savedCommands: [],
   },
 };
+
+test('a declared binding keeps the app word and the named address an author wrote', async () => {
+  const { normalizeWorkflowResources } = await import('./workflow-authoring.js');
+  const normalized = normalizeWorkflowResources({
+    mailbox: { kind: 'outlook', identity: 'ops@example.com' },
+    sheet: { kind: 'sheet', toolkit: 'googlesheets', resource_id: 'abc', label: 'Leads' },
+  });
+  assert.deepEqual(normalized?.mailbox, { id: 'mailbox', kind: 'other', label: 'outlook', name: 'ops@example.com' });
+  assert.deepEqual(normalized?.sheet, { id: 'sheet', kind: 'sheet', label: 'Leads', toolkit: 'googlesheets', resourceId: 'abc' });
+});
+
+test('a declared app and account are bound from the connected inventory at save time', () => {
+  // Live 2026-10-27: {"kind":"outlook","identity":"<address>"} saved as an
+  // unbound "other" resource; the creation test passed and the first run
+  // then stopped on NEEDS RESOURCE BINDING for that very account.
+  const inventory = {
+    ...baseInventory,
+    composio: {
+      ...baseInventory.composio,
+      connected: [
+        ...baseInventory.composio.connected,
+        { slug: 'outlook', connectionId: 'conn-outlook-a', status: 'ACTIVE', accountEmail: 'ops@example.com' },
+        { slug: 'outlook', connectionId: 'conn-outlook-b', status: 'ACTIVE', accountEmail: 'sales@example.com' },
+      ],
+    },
+  };
+  const named = completeWorkflowResourceBindings(def({
+    resources: { mailbox: { id: 'mailbox', kind: 'other', label: 'outlook', name: 'ops@example.com' } },
+  }), inventory);
+  assert.equal(named.resources?.mailbox?.toolkit, 'outlook');
+  assert.equal(named.resources?.mailbox?.connectionId, 'conn-outlook-a', 'the named identity picks its connection');
+  assert.deepEqual(workflowResourceBindingGaps(def({ resources: named.resources })), []);
+  assert.match(named.notes[0] ?? '', /mailbox.*Outlook/i);
+
+  const unnamed = completeWorkflowResourceBindings(def({
+    resources: { mailbox: { id: 'mailbox', kind: 'other', label: 'outlook' } },
+  }), inventory);
+  assert.equal(unnamed.resources?.mailbox?.toolkit, 'outlook');
+  assert.equal(unnamed.resources?.mailbox?.connectionId, undefined, 'two accounts and no name: the account stays a question');
+  assert.equal(workflowResourceBindingGaps(def({ resources: unnamed.resources })).length, 1);
+
+  const single = completeWorkflowResourceBindings(def({
+    resources: { sheet: { id: 'sheet', kind: 'sheet', label: 'Google Sheets leads' } },
+  }), baseInventory);
+  assert.equal(single.resources?.sheet?.toolkit, 'googlesheets');
+  assert.equal(single.resources?.sheet?.connectionId, 'conn-sheet', 'the only connection of that app is the account');
+
+  const explicit = completeWorkflowResourceBindings(def({
+    resources: { ads: { id: 'ads', kind: 'account', toolkit: 'googleads', account: '123' } },
+  }), baseInventory);
+  assert.deepEqual(explicit.resources?.ads, { id: 'ads', kind: 'account', toolkit: 'googleads', account: '123' }, 'what the author set is untouched');
+  assert.deepEqual(explicit.notes, []);
+});
 
 test('connected sheet surface still needs a concrete selector', () => {
   const report = buildWorkflowResourceBindingReport(def({
