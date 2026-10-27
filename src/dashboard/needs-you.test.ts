@@ -148,6 +148,9 @@ test('a run parked because the model was unreachable stops asking once its workf
   parked('run-outage-still', 'notes-watch-3', 'model_transport_recovery', iso(-2 * 3_600_000));
   assert.equal(listInboxQuestions().filter((row) => row.runId?.startsWith('run-')).length, 3, 'the inbox still lists all three');
 
+  // The notice that carried the superseded question is history with it.
+  notify('outage-carrier', 'workflow', 'Workflow paused — needs your answer', { workflow: 'notes-watch', runId: 'run-outage',
+    status: 'awaiting_input', stepId: 'scan', questionId: 'workflow-input:run-outage:scan:1', needsAttention: true });
   const summary = await summarizeNeedsYou({ nowMs: NOW });
   const asked = summary.keys.filter((key) => key.startsWith('workflow:run-'));
   assert.equal(asked.some((key) => key.startsWith('workflow:run-outage|')), false, 'superseded outage question');

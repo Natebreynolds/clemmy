@@ -203,6 +203,8 @@ export interface NeedsYouReferents extends LiveReferents {
   approvalBySession: ReadonlyMap<string, string>;
   /** workflow key → the open question one of its runs is stopped on. */
   questionByWorkflow?: ReadonlyMap<string, string>;
+  /** Parked-run questions a later completed run of the same workflow answered. */
+  supersededQuestionIds: ReadonlySet<string>;
   runs: RunIndex;
   nowMs: number;
 }
@@ -263,11 +265,14 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs);
   // A run parked on an outage holds no decision once its workflow has run to
   // completion again: the next occurrence did the work the question was about.
-  const questionIds = new Set(listInboxQuestions().filter((row) => {
-    if (row.source !== 'workflow' || !row.runId || !runs.outageParkedRuns.has(row.runId)) return true;
-    const workflow = runs.workflowOfRun.get(row.runId);
-    return !workflow || runs.latestStatus.get(workflow) !== 'completed';
-  }).map((row) => row.id));
+  const questionIds = new Set<string>();
+  const supersededQuestionIds = new Set<string>();
+  for (const row of listInboxQuestions()) {
+    const workflow = row.source === 'workflow' && row.runId && runs.outageParkedRuns.has(row.runId)
+      ? runs.workflowOfRun.get(row.runId) : undefined;
+    if (workflow && runs.latestStatus.get(workflow) === 'completed') supersededQuestionIds.add(row.id);
+    else questionIds.add(row.id);
+  }
   return {
     approvalIds,
     planIds,
@@ -275,6 +280,7 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
     questionIds,
     approvalBySession,
     questionByWorkflow: questionsByWorkflow(questionIds, runs),
+    supersededQuestionIds,
     runs,
     nowMs,
     approvalPending: (id) => approvalIds.has(id),
@@ -389,6 +395,9 @@ export function notificationNeedsYou(
   ref: NeedsYouReferents,
 ): boolean {
   const meta = notification.metadata;
+  // The carrier of a question a later run answered is history with it.
+  const carried = notificationActionItemId(notification);
+  if (carried && ref.supersededQuestionIds.has(carried)) return false;
   if (calendarAskOpen(meta, ref.nowMs)) return true;
   if (heartbeatItemOpen(meta)) return true;
   // A workflow notice is current exactly while its workflow's newest run is
