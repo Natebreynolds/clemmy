@@ -130,7 +130,7 @@ import {
   type HostWorkCallPreparationRequest,
   type HostWorkCallPreparationResult,
 } from './work-call-mode.js';
-import { localSafeModeMismatchFor } from '../runtime/harness/local-planning-capability.js';
+import { localSafeModeMismatchFor, localSafeModeOmittedFieldsFor } from '../runtime/harness/local-planning-capability.js';
 export { isHostPlanRequiredWorkCall } from './work-call-mode.js';
 
 const IdSchema = WorkTopologyIdSchema;
@@ -1272,7 +1272,7 @@ function refusalResult(
   );
 }
 
-export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'propagateInvocationError' | 'resolvedRefusalLane' | 'modelVisibility'> {
+export interface BuildWorkCallOptions extends Omit<BuildCallToolOptions, 'aroundResolvedDispatch' | 'completeResolvedArguments' | 'propagateInvocationError' | 'resolvedRefusalLane' | 'modelVisibility'> {
   /** Adapter attribution only; admission and recovery remain provider-neutral. */
   settlementLane?: SettleToolAttemptInput['lane'];
   /** Host-frozen contract for this exact accepted source, when one exists. */
@@ -1485,6 +1485,19 @@ export function buildWorkCall(options: BuildWorkCallOptions = {}): Tool<RuntimeC
     propagateInvocationError: (error: unknown) => (
       error instanceof ToolGuardrailEscalated || isHostDurableContinuationPendingError(error)
     ),
+    // The requirement the model named already fixes its mode's values; an
+    // omitted one is read from the requirement, not sent back for a retry.
+    completeResolvedArguments: ({ targetName, targetArgs }) => {
+      const frame = workCallStorage.getStore();
+      const ambient = harnessRunContextStorage.getStore();
+      if (!frame || !ambient?.sessionId || !Number.isSafeInteger(ambient.sourceUserSeq) || (ambient.sourceUserSeq ?? 0) <= 0) return undefined;
+      if (!targetArgs || typeof targetArgs !== 'object' || Array.isArray(targetArgs)) return undefined;
+      const fill = localSafeModeOmittedFieldsFor({
+        sessionId: ambient.sessionId, sourceUserSeq: ambient.sourceUserSeq as number,
+        requirementId: frame.input.requirement_id, toolName: targetName, args: targetArgs,
+      });
+      return fill ? { ...(targetArgs as Record<string, unknown>), ...fill } : undefined;
+    },
     aroundResolvedDispatch: async (resolved, dispatch) => {
       const frame = workCallStorage.getStore();
       const refuse = (

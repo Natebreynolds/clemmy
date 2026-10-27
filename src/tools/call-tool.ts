@@ -860,6 +860,14 @@ export interface BuildCallToolOptions {
    * authority boundary; `admitBuiltinAcquisition` owns that contract. A throwing
    * observer must never break an already-admitted dispatch. */
   onBuiltinAcquisition?: (targetName: string) => void;
+  /** Optional carrier-owned completion of schema-valid inner arguments from
+   * what the carrier's own contract already fixes (a published requirement's
+   * declared mode). Return the completed arguments, or undefined to keep the
+   * originals; the result passes the same preparation before it dispatches.
+   * This grants no authority: the completed call still crosses every gate. */
+  completeResolvedArguments?: (
+    input: { targetName: string; targetArgs: unknown },
+  ) => unknown | Promise<unknown>;
   /** Optional carrier-owned authority wrapper around the already-resolved,
    * schema-validated inner dispatch. `work_call` uses this seam to atomically
    * bind semantic expected work before the inner brackets/provider run. */
@@ -1429,7 +1437,18 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
           ...(next ? { next } : {}),
           schema: prepared.schema });
       }
-      const dispatchArgs = prepared.status === 'prepared' ? prepared.args : resolvedArgs;
+      let dispatchArgs = prepared.status === 'prepared' ? prepared.args : resolvedArgs;
+      if (prepared.status === 'prepared' && options.completeResolvedArguments) {
+        // A carrier may finish what its own requirement already fixes; the
+        // completed bytes pass the same preparation or the originals stand.
+        const completed = await options.completeResolvedArguments({ targetName: target, targetArgs: dispatchArgs });
+        if (completed && typeof completed === 'object' && !Array.isArray(completed) && completed !== dispatchArgs) {
+          const again = hasLocalOverride
+            ? await prepareTurnOwnedToolArguments(target, completed, localToolOverride)
+            : await prepareNativeToolArguments(target, completed);
+          if (again.status === 'prepared') dispatchArgs = again.args;
+        }
+      }
       // The canonical deferred schema stays authoritative for local open data;
       // other native tools use the assembled core schema validated above.
       // External MCP/provider carriers keep their existing exact schema owner.

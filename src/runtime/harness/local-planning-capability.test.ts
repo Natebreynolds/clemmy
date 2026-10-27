@@ -1169,6 +1169,27 @@ test('a published local requirement whose arguments miss its mode is told the fi
   assert.equal(describeLocalSafeModeMismatch({ safeMode: null } as never, { anything: 1 }), null);
 });
 
+test('a field the chosen requirement fixes is completed when omitted, never when sent', async () => {
+  // Live 2026-10-27: cap:local:set_timer:local_inbox sent without `delivery`
+  // was refused once and retried; the requirement already said local.
+  const { localSafeModeOmittedFields, localSafeModeFixedArgs } = await import('./local-planning-capability.js');
+  const definition = { safeMode: { id: 'local_inbox', requiredEquals: { delivery: 'local' } } } as never;
+  assert.deepEqual(localSafeModeOmittedFields(definition, { minutes: 2, message: 'up' }), { delivery: 'local' });
+  assert.deepEqual(localSafeModeOmittedFields(definition, { minutes: 2, message: 'up', delivery: null }), { delivery: 'local' },
+    'null is the strict wire spelling of omitted');
+  assert.equal(localSafeModeOmittedFields(definition, { minutes: 2, delivery: 'configured' }), null, 'a sent value is never changed');
+  assert.equal(localSafeModeOmittedFields(definition, { minutes: 2, delivery: 'local' }), null, 'nothing to complete');
+  assert.deepEqual(localSafeModeFixedArgs(definition), { delivery: 'local' }, 'the example carries the fixed value');
+  const alternatives = { safeMode: { id: 'append', requiredEquals: {}, alternatives: [
+    { requiredEquals: { append: true }, allowedValues: { mode: ['create', 'append', null] } },
+    { requiredEquals: { mode: 'append' }, absentOrNull: ['append'] },
+  ] } } as never;
+  assert.equal(localSafeModeOmittedFields(alternatives, {}), null, 'two alternatives fit an empty call; nothing is guessed');
+  assert.deepEqual(localSafeModeOmittedFields(alternatives, { mode: 'create' }), { append: true }, 'only the first alternative fits mode=create');
+  assert.equal(localSafeModeFixedArgs(alternatives), null);
+  assert.equal(localSafeModeOmittedFields({ safeMode: null } as never, {}), null);
+});
+
 test('a workflow delete without confirm is the confirmed delete; the owner\'s card is the confirmation', async () => {
   const deletion = await local.observeCurrentLocalPlanningDefinition({ name: 'workflow_delete', carrier: 'work_call' });
   assert.equal(deletion.ok, true, deletion.ok ? '' : deletion.reason);

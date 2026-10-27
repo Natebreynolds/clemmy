@@ -41,6 +41,7 @@ import {
   AUTHORIZED_LOCAL_REGISTRY_PROVENANCE,
   inspectAuthorizedLocalPlanningDisclosureCandidates,
   issueAuthorizedLocalPlanningDisclosureCandidate,
+  localSafeModeFixedArgs,
   type LocalPlanningRefusalReason,
 } from '../runtime/harness/local-planning-capability.js';
 import {
@@ -2273,10 +2274,16 @@ export function registerToolSearchTool(
           ?? (localEffects.size === 1 ? [...localEffects][0] : undefined);
         const carriedPerCall = Boolean(opts.discloseForPlanning) && !planningRefs[r.name] && !planningBlockers[r.name]
           && localPlanningRowStatus(r.name).dispatchScope === 'reads_and_computation';
+        // A published mode's fixed values ride the example, so the call the
+        // model copies is already whole (a local-inbox reminder names its
+        // delivery) instead of being sent back for the one value the row fixed.
+        const publishedDefinition = localDefinitions?.find((definition) => definition.capabilityRef === planningRefs[r.name])
+          ?? (localDefinitions?.length === 1 ? localDefinitions[0] : undefined);
+        const fixedArgs = publishedDefinition ? localSafeModeFixedArgs(publishedDefinition) : null;
         const invocation = 'invocation' in r && r.invocation
           ? r.invocation
           : localDefinitions?.length || carriedPerCall
-            ? { name: r.name, payloadField: null }
+            ? { name: r.name, payloadField: null, ...(fixedArgs ? { fixedArgs } : {}) }
             : undefined;
         const shownCarrier = ('carrier' in r && r.carrier)
           || opts.dispatchCarrierForName?.(r.name) || opts.dispatchCarrier;

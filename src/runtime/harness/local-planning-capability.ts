@@ -1178,3 +1178,61 @@ export function localSafeModeMismatchFor(input: {
   return `${ref} is published for this request, but these arguments do not fit its declared mode — ${mismatch}. `
     + 'Retry this same work_call with the same requirement_id and those exact values. A different mode is a different requirement, not a search.';
 }
+
+/** The field values a mode fixes outright: its `requiredEquals`, when the
+ * mode has exactly one predicate. A mode with alternatives fixes nothing on
+ * its own. Published with the invocation example so the call is sent whole. */
+export function localSafeModeFixedArgs(
+  definition: Pick<AuthorizedLocalPlanningDefinitionV1, 'safeMode'>,
+): Record<string, unknown> | null {
+  const safeMode = definition.safeMode;
+  if (!safeMode || safeMode.alternatives?.length) return null;
+  const fixed = Object.entries(safeMode.requiredEquals ?? {});
+  return fixed.length > 0 ? Object.fromEntries(fixed) : null;
+}
+
+/** The fields a work_call left out that the requirement it names already
+ * fixes. A model that chose cap:local:set_timer:local_inbox and omitted
+ * `delivery` chose local delivery; the host reads the omission from the
+ * requirement instead of sending the call back for the one value it has.
+ * A value the model did send is never changed: a conflict stays a conflict
+ * (describeLocalSafeModeMismatch), and a mode with alternatives is not
+ * completed unless exactly one alternative fits everything that was sent. */
+export function localSafeModeOmittedFieldsFor(input: {
+  sessionId: string;
+  sourceUserSeq: number;
+  requirementId: string | undefined;
+  toolName: string;
+  args: unknown;
+}): Record<string, unknown> | null {
+  const ref = typeof input.requirementId === 'string' ? input.requirementId.trim() : '';
+  const match = /^cap:local:([a-z0-9][a-z0-9._/-]{0,63}):([a-z0-9][a-z0-9._/-]{0,63})$/.exec(ref);
+  if (!match || match[1] !== safeToken(input.toolName)) return null;
+  const loaded = readDurableAuthorizedLocalPlanningDefinition({
+    sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, capabilityRef: ref,
+  });
+  if (!loaded.ok || loaded.definition.name !== input.toolName) return null;
+  return localSafeModeOmittedFields(loaded.definition, input.args);
+}
+
+/** Pure half of localSafeModeOmittedFieldsFor: the omitted fields one mode
+ * predicate fixes, given the definition. */
+export function localSafeModeOmittedFields(
+  definition: Pick<AuthorizedLocalPlanningDefinitionV1, 'safeMode'>,
+  args: unknown,
+): Record<string, unknown> | null {
+  if (!definition.safeMode || !isRecord(args)) return null;
+  const given = args;
+  const omitted = (field: string) => given[field] === undefined || given[field] === null;
+  const predicates: readonly LocalPlanningSafeModePredicate[] = definition.safeMode.alternatives?.length
+    ? definition.safeMode.alternatives
+    : [definition.safeMode];
+  const fits = predicates.filter((predicate) => (
+    Object.entries(predicate.requiredEquals).every(([field, expected]) => omitted(field) || given[field] === expected)
+    && (predicate.absentOrNull ?? []).every((field) => omitted(field))
+    && Object.entries(predicate.allowedValues ?? {}).every(([field, allowed]) => omitted(field) || allowed.some((value) => given[field] === value))
+  ));
+  if (fits.length !== 1) return null;
+  const fill = Object.entries(fits[0]!.requiredEquals).filter(([field]) => omitted(field));
+  return fill.length > 0 ? Object.fromEntries(fill) : null;
+}
