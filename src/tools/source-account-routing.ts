@@ -694,7 +694,13 @@ export async function resolveSourceAccountRouting(input: {
   // messages since the last check, and when they say nothing about accounts
   // the route stands (live 2026-10-27: a delete two turns after the create
   // re-checked the same account on the reviewer for 4.4 s).
-  const screenable = !clarification && ((defaultMode && rememberedSend) || (!defaultMode && established && !nomination));
+  // A sole connected account is the default too: its reviewer call could only
+  // ever find words that ask for an account that is not connected (live
+  // 2026-10-27: the second Outlook account had lapsed, and every write to
+  // the one that remained still waited 4.6–7.7 s on the reviewer).
+  const screenable = !clarification && (
+    (defaultMode && (rememberedSend || choices.length === 1))
+    || (!defaultMode && established && !nomination));
   if (screenable) {
     const screened = await screenDefaultAccountWithJev({
       acceptedText: source.text,

@@ -1015,6 +1015,43 @@ test('a remembered send default with words that say nothing about accounts keeps
   }
 });
 
+test('a sole connected account stands on the quick screen when the words say nothing about accounts; words asking for an unconnected one still reach the reviewer', async () => {
+  // Live 2026-10-27: the second Outlook account had lapsed; every write to
+  // the remaining one still waited 4.6–7.7 s on the reviewer.
+  const jev = await import('../runtime/jev/client.js');
+  const { resetAccountAliasesForTest } = await import('../memory/account-alias-store.js');
+  resetAccountAliasesForTest();
+  const calls = installJudge(call => ({ verdict: call.acceptedText.includes('missing@example.invalid') ? 'conflict' : 'default_compatible' }));
+  const screened: string[] = [];
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { state: { request: string; otherConnectedAccounts: string[] } };
+    screened.push(body.state.request);
+    assert.deepEqual(body.state.otherConnectedAccounts, [], 'a sole account has no other connected account to name');
+    const choice = body.state.request.includes('missing@example.invalid') ? 'other' : 'silent';
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0',
+      answers: { accounts: { type: 'choice', choice, confidence: 0.9, probabilities: { [choice]: 0.9 } } }, usage: { input_tokens: 10, output_tokens: 2 } }) };
+  });
+  const write = { toolkit: 'outlook', operation: 'OUTLOOK_CALENDAR_CREATE_EVENT', connections: connections.slice(0, 1), nomination: null, effect: 'write' as const };
+  try {
+    const kept = await routing.resolveSourceAccountRouting({ ...source('Put a 15-minute hold on my calendar tomorrow at 7am.'), ...write });
+    assert.equal(kept.kind, 'resolved', JSON.stringify(kept));
+    if (kept.kind === 'resolved') {
+      assert.equal(kept.connection.connectionId, 'fixture-scorpion');
+      assert.equal(kept.evidence.judgeModelIdentity, 'jev-1.13.0:default_silent');
+    }
+    assert.equal(screened.length, 1);
+    assert.equal(calls.length, 0, 'no reviewer call for a sole account and words that say nothing about accounts');
+    const refused = await routing.resolveSourceAccountRouting({ ...source('Create these drafts using my missing@example.invalid Outlook account.'), ...write });
+    assert.equal(refused.kind, 'account_selection_required', JSON.stringify(refused));
+    assert.equal(calls.length, 1, 'words asking for an unconnected account reach the reviewer, which refuses');
+  } finally {
+    jev._setTypesafeKeyForTests(undefined);
+    jev._setSystemOneFetchForTests(undefined);
+    registry.installTurnSemanticModelPort(null);
+  }
+});
+
 test('an established route stands on the quick screen when the messages since its check say nothing about accounts; a correction still reaches the reviewer', async () => {
   // Live 2026-10-27: a delete two turns after the create re-checked the same
   // account on the slow reviewer (4.4 s, then 6.0 s on the next turn).
