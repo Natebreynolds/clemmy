@@ -1092,18 +1092,19 @@ export function registerOrchestrationTools(server: McpServer): void {
     {
       detail: z.enum(['names', 'summary']).optional().describe('names returns only matching names and total; summary (default) includes workflow metadata.'),
       query: z.string().optional().describe('Optional literal case-insensitive substring of the saved name or slug. Leading/trailing whitespace is ignored; omitted or blank lists all workflows. No fuzzy matching.'),
+      limit: z.number().int().min(1).max(500).optional().describe('Return at most this many matching records; total still counts every match.'),
     },
-    async ({ detail, query }) => {
+    async ({ detail, query, limit }) => {
       const filter = query?.trim().toLowerCase();
       const workflows = listWorkflowFiles().filter((entry) => !filter
         || entry.data.name.toLowerCase().includes(filter) || entry.name.toLowerCase().includes(filter));
-      const records = workflows.map(({ data }) => detail === 'names'
+      const records = workflows.slice(0, limit ?? workflows.length).map(({ data }) => detail === 'names'
         ? { name: data.name }
         : { name: data.name, enabled: data.enabled, description: data.description ?? '',
           summary: describeWorkflowOneLine(data), stepCount: data.steps.length, trigger: data.trigger });
       // Keep the result queryable: prose forced models to recall and extract
       // an already-known collection merely to count it or select its names.
-      return textResult(JSON.stringify({ total: records.length, workflows: records }), { maxChars: 40_000 });
+      return textResult(JSON.stringify({ total: workflows.length, workflows: records }), { maxChars: 40_000 });
     },
   );
 

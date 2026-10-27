@@ -2845,6 +2845,10 @@ test('workflow list scoped MCP queries match only literal saved names or slugs w
       assert.equal(value.total, fixtures.length);
       assert.deepEqual(value.workflows.map(entry => entry.name).sort(), fixtures.map(entry => entry.name).sort());
     }
+    // Live 2026-10-27: a brain sent limit=10 and was refused for the key.
+    const limited = await list({ detail: 'names', limit: 1 });
+    assert.equal(limited.value.total, fixtures.length, 'total still counts every match');
+    assert.equal(limited.value.workflows.length, 1);
     const invalid = await client.callTool({ name: 'workflow_list', arguments: { query: 7, detail: 'names' } });
     assert.equal(invalid.isError, true, 'invalid scoped input is refused by the actual MCP schema');
     assert.doesNotMatch(JSON.stringify(invalid), /SCOPE_SENTINEL|Unrelated Private Process/);
