@@ -358,13 +358,20 @@ export function auditMemoryReadiness(
       ));
 
       const v15AppliedAt = (db.prepare('SELECT applied_at FROM schema_version WHERE version = 15').get() as { applied_at: string } | undefined)?.applied_at ?? generatedAt;
+      // Usable evidence is a retained excerpt on an episode that still exists.
+      // An episode whose body aged out under retention keeps its excerpt and
+      // its status row; the fact it backs is aged evidence, disclosed as such,
+      // not evidence lost. Only an episode row that is gone loses the fact
+      // its backing (live 2026-10-27: three facts learned in October, their
+      // episodes expired, read as a post-upgrade evidence loss and held the
+      // whole store at "not ready").
       inventory.evidence.derivedWithUsableEvidence = count(db, `
         SELECT COUNT(DISTINCT cf.id) AS count
         FROM consolidated_facts cf
         JOIN fact_evidence fe ON fe.fact_id = cf.id
         JOIN memory_episodes me ON me.id = fe.episode_id
         WHERE cf.active = 1 AND cf.derived_from_call_id IS NOT NULL
-          AND me.status IN ('available','partial') AND length(trim(fe.excerpt)) > 0
+          AND me.status IN ('available','partial','expired') AND length(trim(fe.excerpt)) > 0
       `);
       inventory.evidence.unreconciledDerived = count(db, `
         SELECT COUNT(*) AS count FROM consolidated_facts cf
@@ -378,7 +385,7 @@ export function auditMemoryReadiness(
           AND NOT EXISTS (
             SELECT 1 FROM fact_evidence fe
             JOIN memory_episodes me ON me.id = fe.episode_id
-            WHERE fe.fact_id = cf.id AND me.status IN ('available','partial')
+            WHERE fe.fact_id = cf.id AND me.status IN ('available','partial','expired')
               AND length(trim(fe.excerpt)) > 0
           )
       `, v15AppliedAt);
@@ -390,7 +397,7 @@ export function auditMemoryReadiness(
           AND NOT EXISTS (
             SELECT 1 FROM fact_evidence fe
             JOIN memory_episodes me ON me.id = fe.episode_id
-            WHERE fe.fact_id = cf.id AND me.status IN ('available','partial')
+            WHERE fe.fact_id = cf.id AND me.status IN ('available','partial','expired')
               AND length(trim(fe.excerpt)) > 0
           )
       `, v15AppliedAt);

@@ -210,6 +210,44 @@ test('healthy current memory passes every blocking release gate', () => {
   }
 });
 
+test('evidence whose episode aged out keeps its excerpt as usable evidence; only a missing episode row is a loss', () => {
+  // Live 2026-10-27: three facts learned in October had their episodes expire
+  // under retention; the excerpt each fact keeps was read as "no usable
+  // evidence" and the whole store stayed "not ready" for a loss that was the
+  // design. The gone episode row (no status, no body) remains the real loss.
+  const root = mkdtempSync(path.join(os.tmpdir(), 'clementine-memory-aged-evidence-'));
+  try {
+    const databasePath = createCurrentFixture(root);
+    const db = new Database(databasePath);
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      INSERT INTO consolidated_facts VALUES
+        (5, 'project', 'Learned in October from a chat that has since aged out.', 1, 0, 'call-aged', '2026-07-15T03:00:00.000Z', 0);
+      INSERT INTO memory_episodes (id, status, metadata_json) VALUES ('episode-aged', 'expired', '{}');
+      INSERT INTO fact_evidence VALUES (5, 'episode-aged', 'The retained excerpt the fact was learned from.');
+    `);
+    db.close();
+    const aged = auditMemoryReadiness(databasePath, { now: NOW, expectedSchemaVersion: 28 });
+    assert.equal(byId(aged, 'derived_evidence').status, 'pass');
+    assert.equal(aged.inventory?.evidence.derivedWithUsableEvidence, 2);
+    assert.equal(aged.inventory?.evidence.postUpgradeDerivedWithoutUsableEvidence, 0);
+
+    const gone = new Database(databasePath);
+    gone.pragma('foreign_keys = OFF');
+    gone.exec(`
+      INSERT INTO consolidated_facts VALUES
+        (6, 'project', 'Learned from an episode whose row is gone.', 1, 0, 'call-gone', '2026-07-15T04:00:00.000Z', 0);
+      INSERT INTO fact_evidence VALUES (6, 'episode-missing', 'An excerpt with no episode behind it.');
+    `);
+    gone.close();
+    const lost = auditMemoryReadiness(databasePath, { now: NOW, expectedSchemaVersion: 28 });
+    assert.equal(byId(lost, 'derived_evidence').status, 'fail');
+    assert.equal(lost.inventory?.evidence.postUpgradeDerivedWithoutUsableEvidence, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('degraded memory withholds release and identifies distinct root causes', () => {
   const root = mkdtempSync(path.join(os.tmpdir(), 'clementine-memory-degraded-'));
   try {
