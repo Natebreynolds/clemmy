@@ -14531,70 +14531,36 @@ for (const shape of ['no-prior-frame', 'prior-frame'] as const) {
     t.diagnostic(JSON.stringify({ shape, primaryCalls: fixture.model.calls(), jevCalls: payloads.length, configuredReviews,
       verdicts: reviews.map(row => ({ done: row.verdict.done, awaitingUser: row.verdict.awaitingUser === true,
         failedOpen: row.verdict.failedOpen === true })), deliveredProgress: result.publicPresentation?.text.includes(progress) ?? false }));
-    if (shape === 'no-prior-frame') {
-      // A question asked as the FIRST move of a turn that called no business
-      // tool, held by the Jev screen alone, is delivered (live 2026-10-27: the
-      // screen held four such first replies in a day, each wrongly, and each
-      // bounce bought lookup rounds and work the owner never asked for). The
-      // screen's finding stays on the row; the owner answers in one tap. The
-      // repair of omitted independent progress is pinned by the prior-frame
-      // shape, where a business read preceded the question.
-      assert.equal(reviews.length, 1, 'the screen-held first question is delivered on its first verdict');
-      assert.equal(payloads.length, 1);
-      assert.equal(configuredReviews, 0, 'the candidate remains on the existing Jev-only no-output question route');
-      assert.equal(reviews[0]!.postedBefore, 0);
-      assert.equal(reviews[0]!.verdict.done, false);
-      assert.notEqual(reviews[0]!.verdict.failedOpen, true);
-      assert.equal(fixture.model.calls(), 1, 'no repair round');
-      assert.equal(questions.length, 1);
-      assert.equal(questions[0]!.data.question, question);
-      assert.equal(result.status, 'awaiting_user_input');
-      const row = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
-        .filter(item => item.data.kind === 'completion')[0];
-      assert.equal(row?.data.screenHeld, 'delivered');
-      assert.equal(row?.data.fulfills, false, 'the finding stays on the row');
-      return;
-    }
-    assert.equal(reviews.length, 2, 'one negative question uses the existing repair and is reviewed again');
-    assert.equal(payloads.length, 2, 'each candidate gets exactly one Jev screen');
-    assert.equal(configuredReviews, 0, 'both candidates remain on the existing Jev-only no-output question route');
-    assert.ok(reviews.every(row => row.postedBefore === 0), 'the incomplete question is never published while repairing');
+    // A question asked as the first move, or after a read, held by the Jev
+    // screen alone, is delivered when the screen itself read it as a question
+    // (live 2026-10-27: the screen held four such first replies in a day,
+    // each wrongly; a bounce after two lookups bought a calendar read, an
+    // inbox read and an unasked-for draft). The screen's finding stays on the
+    // row; the owner answers in one tap. Only a settled write keeps the
+    // repair of omitted independent progress.
+    assert.equal(reviews.length, 1, 'the screen-held question is delivered on its first verdict');
+    assert.equal(payloads.length, 1);
+    assert.equal(configuredReviews, 0, 'the candidate remains on the existing Jev-only no-output question route');
+    assert.equal(reviews[0]!.postedBefore, 0);
     assert.equal(reviews[0]!.verdict.done, false);
-    assert.notEqual(reviews[0]!.verdict.awaitingUser, true);
     assert.notEqual(reviews[0]!.verdict.failedOpen, true);
-    assert.equal(reviews[1]!.verdict.awaitingUser, true, 'B may still await its private cutoff after A is reported');
-    assert.ok(payloads.every(payload => payload.state.request === objective));
-    assert.ok(!String(payloads[0]!.state.response).includes(progress));
-    assert.ok(String(payloads[1]!.state.response).includes(progress));
-    assert.ok(payloads.every(payload => String(payload.state.evidence).includes(JSON.stringify({ question, options }))));
-    assert.equal(fixture.model.calls(), 3,
-      'one existing repair supplies the complete reply without rerunning settled work or adding a narrator');
-    assert.match(JSON.stringify(fixture.model.requests[2]), /RETAINED COMPLETION REVIEW/);
+    assert.equal(fixture.model.calls(), shape === 'prior-frame' ? 2 : 1, 'no repair round');
+    assert.equal(questions.length, 1);
+    assert.equal(questions[0]!.data.question, question);
+    assert.equal(result.status, 'awaiting_user_input');
+    const row = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+      .filter(item => item.data.kind === 'completion')[0];
+    assert.equal(row?.data.screenHeld, 'delivered');
+    assert.equal(row?.data.fulfills, false, 'the finding stays on the row');
     if (shape === 'prior-frame') {
       const reads = eventlog.openEventLog().prepare(`SELECT logical_tool_call_id, outcome_kind, execution_kind
         FROM logical_call_settlements WHERE session_id=? AND source_user_seq=? AND logical_tool_call_id=?`)
         .all(fixture.session.id, fixture.source.seq, 'partial-progress-read-b') as
         Array<{ logical_tool_call_id: string; outcome_kind: string; execution_kind: string }>;
-      assert.equal(reads.length, 1, 'the earlier accepted read settles exactly once through repair');
+      assert.equal(reads.length, 1, 'the earlier accepted read settled exactly once');
       assert.equal(reads[0]!.outcome_kind, 'succeeded');
-      assert.equal(reads[0]!.execution_kind, 'local_execution');
-      const results = eventlog.listEvents(fixture.session.id, { types: ['tool_returned'] })
-        .filter(row => row.data.sourceUserSeq === fixture.source.seq && row.data.callId === 'partial-progress-read-b');
-      assert.ok(results.some(row => String(row.data.result).includes('Measurement B is 26.')),
-        'the first frame really completed its read before the omitted-progress candidate');
     }
-    assert.equal(questions.length, 1);
-    assert.equal(questions[0]!.data.question, question);
-    assert.deepEqual(questions[0]!.data.options, options);
-    assert.equal(result.status, 'awaiting_user_input');
-    assert.equal(result.publicPresentation?.status, 'needs_input');
-    const delivered = result.publicPresentation?.text ?? '';
-    assert.ok(delivered.startsWith(`${progress}\n\n${question}`),
-      'the final durable reply begins with A and the exact remaining B question, before any retained-work footer');
-    assert.equal(delivered.split(progress).length - 1, 1, 'A appears once in the final durable visible reply');
-    assert.equal(delivered.split(question).length - 1, 1, 'the remaining B question appears once');
-    assert.equal(terminal.length, 1);
-    assert.equal(terminal[0]!.data.awaitingUser, true, 'the repaired pause is still not whole-objective completion');
+    void terminal; void progress;
   });
 }
 
@@ -15318,7 +15284,7 @@ test('a rejected question asked again in other prose words ends as the question 
     .filter(row => row.data.kind === 'completion_review_disclosed').length, 0, 'no disclosure round');
 });
 
-test('a prose question after lookups, asked again after one bounce, ends as the question the screen read it as', async (t) => {
+test('a prose question after lookups is delivered on its first verdict when the screen reads it as a question', async (t) => {
   // Live 2026-10-27 (r56c16): two memory lookups, then "who is it to, and
   // what's the point of the note?" in prose, no ask tool. The screen held
   // it (unaddressed), the brain asked again in prose, and the turn ended as
@@ -15349,14 +15315,19 @@ test('a prose question after lookups, asked again after one bounce, ends as the 
   const agent = { model, tools: [carrier] };
   bindHostCanarySurface(fixture, agent, [carrier]);
   const result = await runJudgedHost(fixture, agent, true);
-  assert.equal(model.calls(), 3, 'lookup, question, one bounce, the reaffirmed question');
-  assert.equal(judged, 2);
+  // Live 2026-10-27, later the same day: the one bounce after lookups bought
+  // a calendar read, an inbox read and an unasked-for draft (140 s). The
+  // screen's own sure asks-user reading now delivers the question on the
+  // first verdict even after lookups; only a settled write keeps the review.
+  assert.equal(model.calls(), 2, 'lookup, then the question is delivered on its first verdict');
+  assert.equal(judged, 1);
   assert.equal(result.terminal?.status, 'awaiting_user_input');
-  assert.equal(result.finalOutput, reworded);
+  assert.equal(result.finalOutput, question);
   const rows = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
-  assert.deepEqual(rows.map((row) => row.data.continuation), [true, false]);
-  assert.equal(rows[1]?.data.reaffirmedQuestion, true);
-  assert.equal(rows[1]?.data.fulfills, false, 'the finding stays on the row');
+  assert.deepEqual(rows.map((row) => row.data.continuation), [false]);
+  assert.equal(rows[0]?.data.screenHeld, 'delivered');
+  assert.equal(rows[0]?.data.fulfills, false, 'the finding stays on the row');
+  void reworded;
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] })
     .filter((row) => (row.data.turnOutcome as { status?: string } | undefined)?.status === 'blocked').length, 0,
   'never a stop with the question inside it');

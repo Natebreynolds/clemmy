@@ -661,12 +661,18 @@ export function screenHeldConversationalReplySettles(input: {
   reviewerStarted: boolean | undefined;
   continuationsUsed: number;
   businessCalls: number;
+  /** The screen's own sure reading that the reply asks the owner something:
+   * a question after lookups is still the brain's answer (live 2026-10-27:
+   * two memory lookups, then "who should it go to?", bounced once, and the
+   * bounce bought a calendar read, an inbox read and an unasked-for draft). */
+  jevAsksUser?: boolean;
   settledWrites: number;
   reply: string | null | undefined;
 }): boolean {
   if (input.verdictDone || input.verdictFailedOpen === true || input.verdictBlocked === true) return false;
   if (input.verdictFast !== true || input.reviewerStarted === true) return false;
-  if (input.continuationsUsed !== 0 || input.businessCalls !== 0 || input.settledWrites !== 0) return false;
+  if (input.continuationsUsed !== 0 || input.settledWrites !== 0) return false;
+  if (input.businessCalls !== 0 && input.jevAsksUser !== true) return false;
   const text = (input.reply ?? '').trim();
   if (!text) return false;
   return !replyClaimsCompletedWork(text) && !isPromiseShapedReply(text);

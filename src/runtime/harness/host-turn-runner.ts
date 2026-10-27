@@ -5294,6 +5294,7 @@ const runHostTurnBody = async (
         reviewerStarted: verdict.jevAttempt?.reviewerStarted,
         continuationsUsed: objectiveJudgeContinuations,
         businessCalls: businessCalls.length,
+        jevAsksUser: jevReadsReplyAsQuestion(verdict),
         settledWrites: settled.count,
         reply: judgedReply,
       });

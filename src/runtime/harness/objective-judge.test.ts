@@ -1404,6 +1404,9 @@ test('a conversation-shaped first reply held by the fast screen alone is deliver
   assert.equal(screenHeldConversationalReplySettles({ ...base, reply: 'Done — the draft is in your Outlook.' }), false, 'a claim is judged');
   assert.equal(screenHeldConversationalReplySettles({ ...base, reply: "I'll draft it now." }), false, 'a promise is judged');
   assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1 }), false, 'a turn that did work is reviewed on its evidence');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1, jevAsksUser: true }), true,
+    'unless the screen itself read the reply as a question to the owner: a question after lookups is still the answer');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1, jevAsksUser: true, settledWrites: 1 }), false, 'a settled write still keeps the review');
   assert.equal(screenHeldConversationalReplySettles({ ...base, settledWrites: 1 }), false);
   assert.equal(screenHeldConversationalReplySettles({ ...base, continuationsUsed: 1 }), false, 'only the first verdict');
   assert.equal(screenHeldConversationalReplySettles({ ...base, verdictFast: undefined }), false, 'a reviewer verdict stands');
