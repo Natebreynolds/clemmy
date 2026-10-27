@@ -15,6 +15,11 @@ export function registerAppGuideTools(server: McpServer): void {
     {
       places: z.boolean().optional()
         .describe('Also list every place in the app (default true); false when only what is set up matters.'),
+      // The field a caller reaches for first. The whole guide answers it; the
+      // call is not refused for naming its purpose (live: every connect-app
+      // run sent one and was sent back for it).
+      topic: z.string().optional()
+        .describe('What the owner is trying to set up or find; the whole guide is returned either way.'),
     },
     async ({ places }) => textResult(appGuideText(appAbilitiesFromFacts(await readAppAbilityFacts()), { places: places !== false })),
   );

@@ -2506,8 +2506,11 @@ test('a turn-owned call the strict wire projection cannot spell is read by the t
   const refused = JSON.parse(String(await run({ ...args, steps: 'not a list' })));
   assert.equal(refused.error, 'arg_validation', 'what neither schema accepts keeps its refusal');
   assert.equal(received.length, 1);
-  // A turn-owned READ sent a field it does not take runs without it (live
-  // 2026-10-27: app_guide {"topic": …} refused on every connect-app run).
+  // A turn-owned READ sent a field only the tool's own schema declares runs
+  // with it (live 2026-10-27: app_guide {"topic": …} on every connect-app
+  // run; app_guide now declares it). A field no schema declares is refused
+  // with the schema: a dropped field would read a default target instead and
+  // the model would never learn the shape.
   const guideReceived: unknown[] = [];
   const guide = tool({ name: 'app_guide', description: 'Strict projection of the guide.', strict: false,
     parameters: { type: 'object', additionalProperties: false, properties: { places: { anyOf: [{ type: 'boolean' }, { type: 'null' }] } } },
@@ -2518,7 +2521,13 @@ test('a turn-owned call the strict wire projection cannot spell is read by the t
     guideCarrier.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'app_guide', args_json: { topic: 'connect Notion' } }), {}));
   assert.equal(String(guided), 'guide');
   assert.equal(guideReceived.length, 1);
-  assert.equal((guideReceived[0] as { topic?: unknown }).topic, undefined, 'the unknown field is left out');
+  assert.equal((guideReceived[0] as { topic?: unknown }).topic, 'connect Notion', 'the field the tool declares reaches it');
+  const bogus = await withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+    guideCarrier.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'app_guide', args_json: { bogus: true } }), {}));
+  const guideRefusal = JSON.parse(String(bogus));
+  assert.equal(guideRefusal.error, 'arg_validation');
+  assert.deepEqual(guideRefusal.violations, ['bogus']);
+  assert.equal(guideReceived.length, 1, 'nothing is dispatched on a field no schema declares');
 });
 
 test('malformed turn-owned instance/schema never falls back to a global implementation', async () => {

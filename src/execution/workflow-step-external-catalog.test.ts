@@ -538,7 +538,10 @@ test('exact workflow provisioner binds schema, account, and effect for reads and
     },
   });
 
-  assert.deepEqual(provisioned, { ok: true });
+  assert.equal(provisioned.ok, true);
+  // Each stage reports how long it took; the shape is what the loop publishes.
+  assert.deepEqual(Object.keys((provisioned as { stages?: Record<string, number> }).stages ?? {}).sort(),
+    ['account_routing', 'definitions_and_connections', 'operation_effects', 'proof_publication']);
   assert.deepEqual(resolutionEntries.sort((left, right) => left.identifier.localeCompare(right.identifier)), [
     {
       identifier: 'GOOGLESHEETS_INSERT_DIMENSION',
