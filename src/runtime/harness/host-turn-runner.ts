@@ -9758,12 +9758,18 @@ const runHostTurnBody = async (
         if (isKillRequested(identity.sessionId, { sourceUserSeq: identity.sourceUserSeq,
           ...(active?.runAttemptId ? { attemptId: active.runAttemptId } : {}) })) throw new KillRequested(identity.sessionId);
         assertRecoveryActivationOwned();
-        if (!owner || !publicationLease || JSON.stringify(publicationLease) !== JSON.stringify(active?.dispatchLease)) {
+        // A registered attempt publishes only as its own reply owner, and a
+        // turn that captured under a dispatch lease publishes only under that
+        // same lease. A direct host turn with no attempt has no owner to
+        // change; its steering is still checked.
+        const attempted = Boolean(active?.runAttemptId);
+        if ((attempted && !owner)
+          || JSON.stringify(publicationLease) !== JSON.stringify(active?.dispatchLease)) {
           throw new HostCallAuthorityBoundaryError('question_publication_owner_unavailable');
         }
-        assertDispatchLeaseCurrent(publicationLease);
-        const stillCurrent = Boolean(owner && sameReplyOwner(owner, currentFenceOwner())
-          && !(hostOwnerSteering && hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq)));
+        if (publicationLease) assertDispatchLeaseCurrent(publicationLease);
+        const stillCurrent = (!attempted || Boolean(owner && sameReplyOwner(owner, currentFenceOwner())))
+          && !(hostOwnerSteering && hasUndeliveredSteerNotes(identity.sessionId, identity.sourceUserSeq));
         if (!stillCurrent) reviewedReplacementText = undefined;
         return stillCurrent;
       };
