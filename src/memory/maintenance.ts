@@ -137,6 +137,8 @@ const TOOLCHOICE_AUDIT_EVERY_N_TICKS = 1440; // ~6h with a 15s tick
 // so even on a busy day the delete-set is bounded.
 const EVENTLOG_REAPER_EVERY_N_TICKS = 240; // ~1h with a 15s tick
 const HISTORY_STORAGE_EVERY_N_TICKS = 4; // ~1 min with a 15s tick
+const DIAGNOSTIC_EVENTS_EVERY_N_TICKS = 4; // ~1 min with a 15s tick
+const DIAGNOSTIC_EVENT_ROWS_PER_TICK = 5_000;
 const HISTORY_STORAGE_BATCHES_PER_TICK = 16; // 16 x 16 rows a minute: a backlog of 60k rows clears in a few idle hours
 const CONVERSATION_MEMORY_FIRST_TICK = 20; // ~5min after start with a 15s tick
 // Recall stuck-recording reaper. Some captures (notably the
@@ -868,6 +870,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       if (pass.converted > 0) logger.info({ ...pass }, 'history storage conversion pass');
     } catch (err) {
       logger.warn({ err }, 'history storage conversion failed');
+    }
+  }
+
+  // Diagnostic event rows age out a month after their turn; the transcript
+  // stays. Bounded per tick so the loop never waits on a large backlog.
+  if (tickCount % DIAGNOSTIC_EVENTS_EVERY_N_TICKS === 0 && !shouldDeferDiscretionaryWork('diagnostic-events')) {
+    try {
+      const { reapStaleDiagnosticEvents } = await import('../runtime/harness/diagnostic-event-retention.js');
+      const pass = reapStaleDiagnosticEvents({ maxRows: DIAGNOSTIC_EVENT_ROWS_PER_TICK });
+      if (pass.removed > 0) logger.info({ ...pass }, 'diagnostic events aged out');
+    } catch (err) {
+      logger.warn({ err }, 'diagnostic event retention failed');
     }
   }
 
