@@ -1630,12 +1630,14 @@ export function validReportOnlyStorageRetention(
   const orphans = record(report?.orphanPayloads);
   const toolResults = record(report?.toolResults);
   const cache = record(report?.pythonToolCache);
+  // The pass enforces its budget by default now; on a fresh home it has
+  // nothing to end, and that is the invariant: a first boot deletes nothing.
   return report?.version === 1
-    && report.mode === 'report'
+    && (report.mode === 'report' || report.mode === 'enforce')
     && copies?.removed === 0 && copies.removedBytes === 0
     && orphans?.removed === 0
-    && toolResults?.removedRows === 0 && toolResults.distilled === false
-    && cache?.pruned === false
+    && toolResults?.removedRows === 0 && typeof toolResults.distilled === 'boolean'
+    && typeof cache?.pruned === 'boolean'
     && typeof due?.lastRunMs === 'number' && Number.isFinite(due.lastRunMs) && due.lastRunMs > 0;
 }
 
@@ -2683,7 +2685,7 @@ export async function runPackagedV314DaemonRehearsal(
     ...BUILTIN_SKILL_SEED_IDS.flatMap(builtinSkillSeedFiles),
   ].sort();
   // The storage pass runs on the maintenance clock, so the first snapshot may
-  // or may not hold it; when it does, both files, report-only, unchanged after.
+  // or may not hold it; when it does, both files, nothing deleted, unchanged after.
   const storageReportAdded = firstBootAdded.storage_report.length === 0 || (
     stable(firstBootAdded.storage_report) === stable([...STORAGE_REPORT_FILES])
     && validReportOnlyStorageRetention(
@@ -2710,7 +2712,7 @@ export async function runPackagedV314DaemonRehearsal(
       recovery: expectedRecoveryAddedFiles,
       deterministicSeeds: expectedDeterministicSeedFiles,
       schedulerObservation: ['state/space-schedule-state.json'],
-      storageReport: 'none, or both files from one report-only pass that a restart does not repeat',
+      storageReport: 'none, or both files from one pass that deleted nothing and a restart does not repeat',
       ephemeralProcessOwners: [],
     },
   });
