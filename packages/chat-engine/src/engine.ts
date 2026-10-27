@@ -220,6 +220,9 @@ export class ChatEngine {
   /** Cursor immediately before the current ordinary send. A terminal naming a
    * source at/below this fence is a trailing terminal for earlier work. */
   private activeSourceFloorSeq = 0;
+  /** The bubble awaiting_user_input already drew and settled, until its
+   * canonical conversation_completed row arrives or a new turn starts. */
+  private settledQuestion: { id: string; sourceUserSeq: number | null } | null = null;
   private modelRetryProgressSource: number | null = null;
   private modelRetryProgressSeq = 0;
 
@@ -989,6 +992,17 @@ export class ChatEngine {
         if (!this.terminalOwnsActiveTurn(event)) {
           return;
         }
+        // The canonical row of a question this stream already drew and
+        // settled completes THAT bubble, with its typed terminal, instead of
+        // opening a second one with the same words under it.
+        const settledQuestion = this.settledQuestion;
+        this.settledQuestion = null;
+        if (!this.activeAssistantId && settledQuestion
+          && this.messages.some((message) => message.id === settledQuestion.id)
+          && (sourceUserSeqOf(event) === null || settledQuestion.sourceUserSeq === null
+            || sourceUserSeqOf(event) === settledQuestion.sourceUserSeq)) {
+          this.activeAssistantId = settledQuestion.id;
+        }
         const presentation = terminalCompletionPresentation(d, this.activeText(), this.activeStatus());
         const planProposalId = typeof d.planProposalId === 'string' ? d.planProposalId : undefined;
         const statusRaw = typeof d.planProposalStatus === 'string' ? d.planProposalStatus : 'pending';
@@ -1081,6 +1095,9 @@ export class ChatEngine {
           ),
         }));
         this.busy = false;
+        this.settledQuestion = this.activeAssistantId
+          ? { id: this.activeAssistantId, sourceUserSeq: sourceUserSeqOf(event) }
+          : null;
         this.activeAssistantId = null;
         break;
       }

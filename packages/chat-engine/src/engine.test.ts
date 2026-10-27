@@ -431,6 +431,47 @@ test('awaiting_user_input renders the question and releases mobile immediately',
   engine.dispose();
 });
 
+test('a question already drawn at awaiting_user_input is completed in place by its canonical row, never drawn twice', async () => {
+  // Live 2026-10-27 (phone, stream kept open while idle): the question bubble,
+  // then the same words again under it with the Needs-your-reply line, because
+  // the completion row that followed the question 50 ms later opened a new
+  // assistant bubble once the question had released the active one.
+  const transport = new FakeTransport();
+  const sessionId = 'sess-mob-63a7dc1430be0c3799342d78ae3d2699';
+  const engine = new ChatEngine({
+    transport,
+    sessionId,
+    observeWhileIdle: true,
+    api: {
+      send: async () => ({ sessionId, accepted: true }),
+      loadSession: async () => ({ events: [], latestSeq: 0 }),
+    },
+  });
+  await engine.send('Hey can you draft an email for me');
+  await wait(10);
+  transport.live!.onEvent(ev(787267, 'user_input_received', { text: 'Hey can you draft an email for me' }));
+  const question = 'The draft is not in your Outlook yet. Who should it go to and what should it say?';
+  transport.live!.onEvent(ev(787462, 'awaiting_user_input', {
+    question, sourceUserSeq: 787267, source: 'completion_review', reason: 'completion_review_disclosed',
+  }));
+  assert.equal(engine.snapshot().busy, false);
+  transport.live!.onEvent(ev(787463, 'conversation_completed', {
+    steps: 1, reply: question, summary: question, reason: 'awaiting_user_input', awaitingUser: true, delivered: false,
+    sourceUserSeq: 787267,
+    presentation: { version: 1, id: 'turn:787267:presentation', outcomeId: 'turn:787267', audience: 'user', phase: 'final',
+      identity: { sessionId, turn: 1, sourceUserSeq: 787267 }, status: 'needs_input', kind: 'question', text: question,
+      resumable: true, needs: { kind: 'input' } },
+    turnOutcome: { version: 2, id: 'turn:787267', status: 'needs_input', resumable: true, needs: { kind: 'input' } },
+  }));
+  const replies = engine.snapshot().messages.filter((message) => message.role === 'assistant');
+  assert.equal(replies.length, 1, 'one logical pause is one bubble');
+  assert.equal(replies[0]?.text, question);
+  assert.equal(replies[0]?.status, 'awaiting-reply');
+  assert.equal(replies[0]?.terminal?.status, 'needs_input', 'the canonical row lends the bubble its typed terminal');
+  assert.equal(engine.snapshot().busy, false);
+  engine.dispose();
+});
+
 test('a trailing completion for a prior awaiting source cannot settle the next mobile turn', async () => {
   const transport = new FakeTransport();
   const sessionId = 'sess-mob-3cd5b791c813490fcd61c65095ff87a5';
