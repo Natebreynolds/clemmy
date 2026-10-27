@@ -60,6 +60,10 @@ export interface LiveReferents {
   planPending?: (id: string) => boolean;
   trustPending?: (id: string) => boolean;
   questionOpen?: (id: string) => boolean;
+  /** Is the question a chat run asked (its report-back names the session and
+   *  the request it answered) still the newest word in that chat? A later
+   *  message from the owner, or a later finished turn, means they moved on. */
+  chatQuestionOpen?: (sessionId: string, sourceUserSeq: number) => boolean;
 }
 
 /**
@@ -190,6 +194,17 @@ export function classifyNotification(
     || meta?.needsAttention === false
   ) {
     return 'neither';
+  }
+
+  // A chat question the owner has moved past is no longer theirs to answer:
+  // the next thing they said in that chat, or Clem's later finished turn
+  // there, settled it. Only the caller can see the chat; without it the
+  // record stands.
+  if (meta?.foregroundRun === true && status === 'needs_input' && live.chatQuestionOpen) {
+    const sessionId = str(meta, 'sessionId');
+    const sourceUserSeq = meta?.sourceUserSeq;
+    if (sessionId && typeof sourceUserSeq === 'number' && Number.isSafeInteger(sourceUserSeq)
+      && !live.chatQuestionOpen(sessionId, sourceUserSeq)) return 'neither';
   }
 
   // (1) Clem is stopped and needs an answer — and there is something to answer.

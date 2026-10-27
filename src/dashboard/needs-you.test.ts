@@ -106,6 +106,30 @@ test('a chat run waiting on an answer counts; a past-tense "blocked" report is a
   assert.equal(summary.keys.includes('session:sess-gave-up'), false);
 });
 
+test('a chat question the owner moved past no longer counts; one still waiting does', async () => {
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  const moved = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
+  const waiting = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
+  const ask = (sessionId: string) => appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Which account?' } });
+  const movedAsk = ask(moved.id);
+  const waitingAsk = ask(waiting.id);
+  for (const [session, seq] of [[moved, movedAsk.seq], [waiting, waitingAsk.seq]] as const) {
+    const identity = { sessionId: session.id, turn: 1, sourceUserSeq: seq };
+    commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'needs_input', resumable: true,
+      needs: { kind: 'input' }, presentation: { kind: 'question', text: 'Which one?' } });
+    notify(`foreground-report-back-${session.id}-${seq}`, 'execution', 'Needs your answer: which account',
+      { status: 'needs_input', sessionId: session.id, needsAttention: true, foregroundRun: true, terminalReportBack: true });
+  }
+  // The owner said something else in that chat: the question is history.
+  appendEvent({ sessionId: moved.id, turn: 2, role: 'user', type: 'user_input_received', data: { text: 'Never mind, do the other thing.' } });
+
+  const summary = await summarizeNeedsYou({ nowMs: NOW });
+  assert.equal(summary.keys.includes(`session:${moved.id}`), false, 'moved on');
+  assert.ok(summary.keys.includes(`session:${waiting.id}`), 'still waiting');
+});
+
 test('a notification carrying a pending approval is that approval, counted once', async () => {
   const session = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
   const approval = approvalRegistry.register({

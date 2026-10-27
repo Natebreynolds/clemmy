@@ -37,6 +37,7 @@ import { listPendingRuns, type PendingRun } from '../execution/workflow-events.j
 import { loadNotifications, type NotificationRecord } from '../runtime/notifications.js';
 import { readWorkflow } from '../memory/workflow-store.js';
 import { classifyNotification, type LiveReferents } from '../runtime/notification-intent.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
 
 /** A run in one of these is stopped until a person acts. */
 const STOPPED_RUN_STATUSES: ReadonlySet<string> = new Set([
@@ -200,6 +201,34 @@ export interface NeedsYouReferents extends LiveReferents {
   nowMs: number;
 }
 
+/** Whether the question a chat run asked for request `sourceUserSeq` is still
+ *  that chat's newest word. Unreadable history keeps the question (under-
+ *  counting a question is the direction that loses work). */
+function chatQuestionStillOpen(sessionId: string, sourceUserSeq: number): boolean {
+  try {
+    const later = listEvents(sessionId, { types: ['user_input_received', 'conversation_completed'], sinceSeq: sourceUserSeq });
+    if (later.some((event) => event.type === 'user_input_received')) return false;
+    const terminals = later.filter((event) => event.type === 'conversation_completed'
+      && (event.data as { sourceUserSeq?: unknown }).sourceUserSeq === sourceUserSeq);
+    const newest = terminals.at(-1)?.data as { presentation?: { status?: unknown } } | undefined;
+    return !newest || newest.presentation?.status === 'needs_input';
+  } catch {
+    return true;
+  }
+}
+
+/** The request a foreground report-back answered, from its own id
+ *  (`foreground-report-back-<session>-<seq>`) when the record carries none. */
+function reportBackSourceUserSeq(notification: Pick<NotificationRecord, 'id' | 'metadata'>): number | null {
+  const stamped = notification.metadata?.sourceUserSeq;
+  if (typeof stamped === 'number' && Number.isSafeInteger(stamped)) return stamped;
+  const sessionId = str(notification.metadata, 'sessionId');
+  const prefix = `foreground-report-back-${sessionId}-`;
+  if (!sessionId || !notification.id.startsWith(prefix)) return null;
+  const seq = Number(notification.id.slice(prefix.length));
+  return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+}
+
 export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   const approvals = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => !approvalRegistry.isExpired(row))
@@ -225,6 +254,7 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
     approvalPending: (id) => approvalIds.has(id),
     planPending: (id) => planIds.has(id),
     trustPending: (id) => trustIds.has(id),
+    chatQuestionOpen: chatQuestionStillOpen,
     // No `questionOpen`: the classifier trusts a question id over a lookup
     // table here on purpose (an under-counted question loses work).
   };
@@ -345,7 +375,11 @@ export function notificationNeedsYou(
       return STOPPED_RUN_STATUSES.has(latest);
     }
   }
-  return classifyNotification(notification, ref) === 'awaiting_you';
+  const sourceUserSeq = notification.metadata?.foregroundRun === true ? reportBackSourceUserSeq(notification) : null;
+  const input = sourceUserSeq === null
+    ? notification
+    : { ...notification, metadata: { ...notification.metadata, sourceUserSeq } };
+  return classifyNotification(input, ref) === 'awaiting_you';
 }
 
 // ─── The count ───────────────────────────────────────────────────────────────

@@ -409,6 +409,7 @@ function emitTerminalReportBack(
       reportBackTargetId: 'origin-chat',
       terminalReportBack: true,
       foregroundRun: true,
+      sourceUserSeq: facts.startSeq,
       status: facts.outcome,
       needsAttention: facts.outcome !== 'done',
       // Structured alongside the prose so a surface can offer "open" instead of
