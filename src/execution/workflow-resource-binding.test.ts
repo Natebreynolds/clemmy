@@ -70,6 +70,15 @@ test('a declared app and account are bound from the connected inventory at save 
   assert.deepEqual(workflowResourceBindingGaps(def({ resources: named.resources })), []);
   assert.match(named.notes[0] ?? '', /mailbox.*Outlook/i);
 
+  // Live 2026-10-27 (again): the author wrote the connection's own id as the
+  // resource id under kind "other"; with two accounts connected that id is
+  // the choice, not a question.
+  const byId = completeWorkflowResourceBindings(def({
+    resources: { 'conn-outlook-b': { id: 'conn-outlook-b', kind: 'other', label: 'connected_account', toolkit: 'outlook' } },
+  }), inventory);
+  assert.equal(byId.resources?.['conn-outlook-b']?.connectionId, 'conn-outlook-b', 'a connection id as the resource id binds that connection');
+  assert.deepEqual(workflowResourceBindingGaps(def({ resources: byId.resources })), []);
+
   const unnamed = completeWorkflowResourceBindings(def({
     resources: { mailbox: { id: 'mailbox', kind: 'other', label: 'outlook' } },
   }), inventory);

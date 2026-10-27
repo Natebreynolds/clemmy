@@ -197,7 +197,12 @@ export function completeWorkflowResourceBindings(
     if (resource.required !== false && next.toolkit && !resourceHasSelector(next, def)) {
       const connections = (inventory.composio?.connected ?? [])
         .filter((connection) => normalizeKey(connection.slug) === normalizeKey(next.toolkit!));
-      const picked = connections.length === 1 ? connections[0] : undefined;
+      // An author who wrote the connection's own id as the resource id (or as
+      // resourceId) has already chosen the account, whatever kind word came
+      // with it; with several accounts connected that choice is the binding.
+      const named = [resource.id, resource.resourceId].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+      const byId = connections.find((connection) => named.some((value) => value.trim() === connection.connectionId));
+      const picked = byId ?? (connections.length === 1 ? connections[0] : undefined);
       if (picked) {
         next = { ...next, connectionId: picked.connectionId };
         const who = picked.accountEmail ?? picked.accountLabel ?? picked.accountName ?? picked.alias;
