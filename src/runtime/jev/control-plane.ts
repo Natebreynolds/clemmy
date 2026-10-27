@@ -87,6 +87,12 @@ export async function nominateReadCapabilitiesWithJev(
  * (live 7 days: 634 default-account writes reviewed at ~3.7 s each; the
  * reviewer still runs whenever the words say anything about accounts, or
  * when this screen is unsure or unavailable). */
+/** The screen's bar for keeping the default. Words that do mention another
+ * account flip the CHOICE to `other` (live 2026-10-27 probes: 0.73–0.81 on
+ * `other`), they do not lower a `silent` reading; `silent` on an ordinary ask
+ * ("put a hold on my Outlook calendar") read 0.80–0.84 live, under the
+ * completion screen's 0.85 bar, and the slow reviewer ran anyway. */
+const ACCOUNT_DEFAULT_SURE = 0.75;
 export async function screenDefaultAccountWithJev(input: {
   acceptedText: string;
   earlierTexts: readonly string[];
@@ -118,7 +124,7 @@ export async function screenDefaultAccountWithJev(input: {
   if (!result.ok) return null;
   const answer = result.answers.accounts as ChoiceAnswer | undefined;
   if (!answer || answer.type !== 'choice') { noteJevDecisionOutcome(result.decisionId, 'unreadable'); return null; }
-  const keep = (answer.choice === 'silent' || answer.choice === 'default') && answer.confidence >= COMPLETION_SURE;
+  const keep = (answer.choice === 'silent' || answer.choice === 'default') && answer.confidence >= ACCOUNT_DEFAULT_SURE;
   noteJevDecisionOutcome(result.decisionId, keep ? 'default_kept' : 'reviewed', { choice: answer.choice });
   return { kind: keep ? 'keep' : 'review', choice: answer.choice, confidence: answer.confidence, model: result.model };
 }

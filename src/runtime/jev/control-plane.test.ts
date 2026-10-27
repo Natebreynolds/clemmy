@@ -52,6 +52,8 @@ test('the default-account screen keeps the default only on a sure silent or defa
   assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'keep', 'naming the default itself keeps it');
   choice = 'other';
   assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'review', 'any other account reading goes to the reviewer');
+  choice = 'silent'; confidence = 0.8;
+  assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'keep', 'a silent reading at the live 0.80–0.84 level keeps the default');
   choice = 'silent'; confidence = 0.6;
   assert.equal((await screenDefaultAccountWithJev(input))?.kind, 'review', 'an unsure silent reading goes to the reviewer');
   choice = 'unsure'; confidence = 0.99;
