@@ -9,7 +9,7 @@ exercises the installed product against the same disposable migrated home. The
 only model endpoint is a loopback fixture server. Every path remains below the
 operating system's temporary directory.
 
-## Current candidate: harness schema v99
+## Current candidate: harness schema v100
 
 Target reviewed: 2026-10-15. The migration authority is
 `src/runtime/harness/eventlog-schema.ts`; retained-proof migration details live
@@ -76,7 +76,7 @@ v3.14 graph; any installed dependency drift refuses exact-tag execution.
 
 | Store | v3.14.0 | Current target | Upgrade behavior | Rehearsed |
 |---|---:|---:|---|---|
-| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 99) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
+| `state/harness.db` | migration 20 | exported `HARNESS_SCHEMA_VERSION` (currently 100) | numbered, transactional migrations 21 through current; contiguous ledger required | Yes, using a real v20 database created by tag APIs |
 | `state/memory.db` | migration 32 | exported `MEMORY_SCHEMA_VERSION` | numbered migrations 33 through current; opening an old DB must first make an immutable pre-migration backup | Yes, including backup existence and second-open idempotence |
 | `state/workspaces.db` | `PRAGMA user_version=3` | 5 | v4 adds workflow binding/run projection/partition tables; v5 adds the canonical-entity projection head; Space remains a read model | Yes, with a v3 Space and dataset observation |
 | `state/workflow-triggers.db` | schema contract 4 | 4 | additive shape validation; no release-boundary version change | Yes, with exact cron and event triggers compiled by v3.14 |

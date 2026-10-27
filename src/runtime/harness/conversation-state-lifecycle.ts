@@ -29,6 +29,10 @@ import { getSessionConversationState, getToolOutput, openEventLog } from './even
 
 export const CONVERSATION_COMPACT_IDLE_DAYS = 7;
 export const CONVERSATION_MEMORY_ONLY_IDLE_DAYS = 30;
+/** How long a retired conversation keeps its step records after retiring:
+ * long enough for the retire itself to be noticed, since a resumed chat
+ * reads its memory and tail, never these. */
+export const RETIRED_WORK_RECORD_GRACE_DAYS = 1;
 
 /** A tool result keeps this much of its text, and a call this much of its
  * arguments. */
@@ -375,4 +379,68 @@ export function retireConversationStateToMemory(sessionId: string, input: {
       ? { summary: input.memory.summary, since: session.createdAt, until: session.updatedAt }
       : null),
   });
+}
+
+export interface RetiredWorkRecordDecay {
+  /** Conversations whose step records went. */
+  sessions: number;
+  admissions: number;
+  checkpoints: number;
+  /** Stored histories no record references any more. */
+  objects: number;
+  /** Retired conversations kept whole because something could still pick them up. */
+  held: number;
+}
+
+/** The step records of a conversation retired to its memory: the batch
+ * admissions and checkpoints (with their result receipts) every turn wrote
+ * while it ran. A retired chat resumes from its memory and tail, and a new
+ * turn starts its own batch chain, so these are working copies once the
+ * grace window after retiring has passed. The transcript in events, the
+ * memory, the request provenance and the result handles stay. Nothing goes
+ * while the conversation is held (a pin, a pending approval, an unfinished
+ * run), and the fidelity is rechecked under the writer lock. */
+export function decayRetiredConversationWorkRecords(input: {
+  nowMs?: number;
+  graceDays?: number;
+  limit?: number;
+} = {}): RetiredWorkRecordDecay {
+  const db = openEventLog();
+  const nowMs = input.nowMs ?? Date.now();
+  const retiredBefore = new Date(nowMs - (input.graceDays ?? RETIRED_WORK_RECORD_GRACE_DAYS) * 86_400_000).toISOString();
+  const result: RetiredWorkRecordDecay = { sessions: 0, admissions: 0, checkpoints: 0, objects: 0, held: 0 };
+  const candidates = db.prepare(`
+    SELECT state.session_id AS sessionId
+      FROM session_conversation_state state
+     WHERE state.fidelity = 'memory'
+       AND state.compacted_at IS NOT NULL
+       AND state.compacted_at < ?
+       AND EXISTS (SELECT 1 FROM accepted_model_batch_admissions a WHERE a.session_id = state.session_id)
+     ORDER BY state.compacted_at
+     LIMIT ?
+  `).all(retiredBefore, Math.max(1, input.limit ?? 300)) as Array<{ sessionId: string }>;
+  const fidelityOf = db.prepare('SELECT fidelity FROM session_conversation_state WHERE session_id = ?');
+  const countCheckpoints = db.prepare('SELECT COUNT(*) AS n FROM accepted_model_batch_checkpoints WHERE session_id = ?');
+  const deleteAdmissions = db.prepare('DELETE FROM accepted_model_batch_admissions WHERE session_id = ?');
+  for (const { sessionId } of candidates) {
+    if (conversationLifecycleHold(sessionId) !== null) { result.held += 1; continue; }
+    db.transaction(() => {
+      const row = fidelityOf.get(sessionId) as { fidelity?: string } | undefined;
+      if (row?.fidelity !== 'memory') return;
+      const checkpoints = (countCheckpoints.get(sessionId) as { n: number }).n;
+      const admissions = deleteAdmissions.run(sessionId).changes;
+      result.sessions += 1;
+      result.admissions += admissions;
+      result.checkpoints += checkpoints;
+    }).immediate();
+  }
+  if (result.sessions > 0) {
+    result.objects = db.prepare(`
+      DELETE FROM accepted_model_history_objects_v1
+       WHERE NOT EXISTS (SELECT 1 FROM accepted_model_batch_checkpoints c WHERE c.history_object_digest = accepted_model_history_objects_v1.digest)
+         AND NOT EXISTS (SELECT 1 FROM accepted_model_batch_admissions a WHERE a.pre_history_object_digest = accepted_model_history_objects_v1.digest)
+         AND NOT EXISTS (SELECT 1 FROM accepted_model_batch_admissions a WHERE a.frame_history_object_digest = accepted_model_history_objects_v1.digest)
+    `).run().changes;
+  }
+  return result;
 }

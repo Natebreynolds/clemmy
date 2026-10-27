@@ -11493,6 +11493,40 @@ const MIGRATIONS: EventLogMigration[] = [
     if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_updated_id ON sessions(updated_at DESC, id DESC)');
   } },
+  // A chat that retired to its memory (idle a month, its summary written by
+  // the owner's memory model) keeps its transcript in events and its memory.
+  // The step records a turn needed while it ran — batch admissions, their
+  // checkpoints and result receipts — are working copies: v59, v67 and v69
+  // forbade deleting them while the session row exists, so they outlived the
+  // conversation they served (live 10-27: 1,472 retired chats held 3.6 GB).
+  // Deletion is now refused only while the conversation is not at memory
+  // fidelity. No row changes; a fresh install gets the same guards.
+  { version: 100, sql: '', backfill: (db) => {
+    const tableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?");
+    if (!tableExists.get('session_conversation_state')) return;
+    const guards: Array<[trigger: string, table: string, message: string]> = [
+      ['trg_accepted_model_batch_admission_delete_immutable', 'accepted_model_batch_admissions', 'model batch admissions are append-only'],
+      ['trg_accepted_model_batch_checkpoint_delete_immutable', 'accepted_model_batch_checkpoints', 'model batch checkpoints are append-only'],
+      ['trg_host_model_result_receipt_delete_immutable', 'host_model_result_receipts', 'host model result receipts are immutable'],
+      ['trg_logical_model_result_projection_delete_immutable', 'logical_model_result_projection_receipts', 'logical model result projections are immutable'],
+    ];
+    for (const [trigger, table, message] of guards) {
+      if (!tableExists.get(table)) continue;
+      db.exec(`
+        DROP TRIGGER IF EXISTS ${trigger};
+        CREATE TRIGGER ${trigger}
+        BEFORE DELETE ON ${table}
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM session_conversation_state retired
+            WHERE retired.session_id = OLD.session_id AND retired.fidelity = 'memory'
+         )
+        BEGIN
+          SELECT RAISE(ABORT, '${message}');
+        END;
+      `);
+    }
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
