@@ -1453,8 +1453,12 @@ export function settleToolAttempt(input: SettleToolAttemptInput): SettledToolAtt
   if (workerFailure && ['unknown', 'succeeded', 'empty_result'].includes(outcome.kind)) {
     outcome = { ...classifyAttemptOutcome({ executionFailed: true }), detail: workerFailure };
   }
+  // A contradicted envelope is no success, whether it carried records or
+  // came back empty: a provider whose nested task failed and returned no
+  // result is not "worked and returned nothing", and the result handle
+  // derives the same contradiction, so the settlement must agree with it.
   if (
-    outcome.kind === 'succeeded'
+    (outcome.kind === 'succeeded' || outcome.kind === 'empty_result')
     && inspectProviderEnvelope(input.result).verdict === 'contradicted'
   ) {
     outcome = classifyAttemptOutcome({
