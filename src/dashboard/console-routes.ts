@@ -88,6 +88,7 @@ import { listRecallUses, listSessionRecallRunIds, readRecallRun } from '../memor
 import { latestModelMemoryManifest } from '../runtime/harness/model-memory-evidence.js';
 import { MEMORY_DB_PATH, openMemoryDb, type FocusRow } from '../memory/db.js';
 import { auditMemoryReadiness } from '../memory/readiness.js';
+import { createMemoryReportCache } from '../memory/report-cache.js';
 import { buildMemoryGraph, buildMemoryNeighborhood } from './memory-graph.js';
 import { recallMemory } from '../memory/recall-memory.js';
 import { readRecallShadowSummary, scheduleRecallShadow } from '../memory/recall-shadow.js';
@@ -5092,9 +5093,11 @@ export function registerConsoleRoutes(
    * + freshness, recall hit-rate, and the hidden layers (pinned / episodic /
    * focus) that the fact-centric panel doesn't otherwise surface.
    */
-  app.get('/api/console/memory/health', (req, res) => {
-    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
-    try {
+  // Health and readiness are polled reports computed from dozens of queries
+  // on this thread; they are recomputed only after memory changed (see
+  // report-cache.ts), so an open Memory screen no longer holds the daemon
+  // loop on every poll.
+  const computeMemoryHealth = () => {
       const db = openMemoryDb();
       const one = (sql: string): number => (db.prepare(sql).get() as { c: number } | undefined)?.c ?? 0;
       const facts = one('SELECT COUNT(*) AS c FROM consolidated_facts WHERE active = 1');
@@ -5181,7 +5184,7 @@ export function registerConsoleRoutes(
           return entry ? { at: entry.at, kind: entry.kind, count: entry.ids.length } : null;
         } catch { return null; }
       })();
-      res.json({
+      return ({
         facts: { active: facts, inactive: factsInactive, total: factsTotal, pinned },
         lastHygiene,
         entities,
@@ -5231,6 +5234,12 @@ export function registerConsoleRoutes(
           promptContext,
         },
       });
+  };
+  const memoryHealthCache = createMemoryReportCache({ databasePath: MEMORY_DB_PATH, compute: computeMemoryHealth });
+  app.get('/api/console/memory/health', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      res.json(memoryHealthCache.read());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -5339,10 +5348,12 @@ export function registerConsoleRoutes(
   /** Truthful, non-mutating assurance report for the desktop Memory screen.
    * Uses a separate query-only handle so rendering diagnostics can never run a
    * migration, reconciliation, checkpoint, or repair. */
+  const memoryReadinessCache = createMemoryReportCache({ databasePath: MEMORY_DB_PATH,
+    compute: () => auditMemoryReadiness(MEMORY_DB_PATH) });
   app.get('/api/console/memory/readiness', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      res.json(auditMemoryReadiness(MEMORY_DB_PATH));
+      res.json(memoryReadinessCache.read());
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
