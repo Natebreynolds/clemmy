@@ -1143,8 +1143,12 @@ async function variantReadForExactCall(input: {
   if (input.callSignals.outboundDelivery === true || input.callSignals.recipientsPresent === true
     || (method !== null && method !== 'safe' && method !== 'post')) return null;
   const risk = external.projection.risk;
+  // The definition alone cannot say what the call does: a tool that declares
+  // destruction for every action, one that declares nothing, or one that
+  // sends a request wherever its caller names (the method is the only thing
+  // the host could read, so the consequence stayed unknown).
   const waitsOnTool = external.currentDefinition.behaviorHints.destructive === true
-    || (risk.consequence === 'unknown' && risk.reversibility === 'unknown');
+    || (risk.consequence === 'unknown' && (risk.reversibility === 'unknown' || method !== null));
   if (!waitsOnTool) return null;
   const definition = external.currentDefinition;
   const verdict = await exactCallVariantRead({

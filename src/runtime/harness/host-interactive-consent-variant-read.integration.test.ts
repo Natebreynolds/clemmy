@@ -324,6 +324,15 @@ test('a POST lookup through a generic request tool reads for its endpoint, remem
   assert.equal(judgeRequests.length, 2, 'another endpoint is judged on its own');
 });
 
+test('a request tool that declares itself non-destructive is still judged for its endpoint', async () => {
+  // The live shape: the connector's "make any request" tool carries destructive: false,
+  // so its consequence stays unknown with ordinary reversibility; the read check used to skip it.
+  const call = decided((await acceptedCall({ schema: REQUEST_SCHEMA, operationId: REQUEST_OPERATION, destructive: false,
+    args: { method: 'POST', path: '/v3/labs/history/live', data: [{ target: 'example.com' }] } })).result);
+  assert.equal(call.decision.kind === 'proceed' ? call.decision.basis : null, 'exact_variant_read', JSON.stringify(call.decision));
+  assert.equal(judgeRequests.length, 1);
+});
+
 test('a PUT through the same request tool keeps its card and asks neither model', async () => {
   const put = decided((await acceptedCall({ schema: REQUEST_SCHEMA, operationId: REQUEST_OPERATION,
     args: { method: 'PUT', path: '/v3/labs/rank_overview/live', data: [{ target: 'example.com' }] } })).result);
