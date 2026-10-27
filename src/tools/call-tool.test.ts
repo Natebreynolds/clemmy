@@ -2506,6 +2506,19 @@ test('a turn-owned call the strict wire projection cannot spell is read by the t
   const refused = JSON.parse(String(await run({ ...args, steps: 'not a list' })));
   assert.equal(refused.error, 'arg_validation', 'what neither schema accepts keeps its refusal');
   assert.equal(received.length, 1);
+  // A turn-owned READ sent a field it does not take runs without it (live
+  // 2026-10-27: app_guide {"topic": …} refused on every connect-app run).
+  const guideReceived: unknown[] = [];
+  const guide = tool({ name: 'app_guide', description: 'Strict projection of the guide.', strict: false,
+    parameters: { type: 'object', additionalProperties: false, properties: { places: { anyOf: [{ type: 'boolean' }, { type: 'null' }] } } },
+    execute: async args => { guideReceived.push(args); return 'guide'; } });
+  const guideCarrier = buildCallTool({ firstClassNames: new Set(['app_guide']),
+    localToolOverrides: new Map([['app_guide', guide]]) }) as unknown as ToolLike;
+  const guided = await withHarnessRunContext({ sessionId, ...accepted, counter: new ToolCallsCounter(20) }, () =>
+    guideCarrier.invoke!({ context: { sessionId } }, JSON.stringify({ name: 'app_guide', args_json: { topic: 'connect Notion' } }), {}));
+  assert.equal(String(guided), 'guide');
+  assert.equal(guideReceived.length, 1);
+  assert.equal((guideReceived[0] as { topic?: unknown }).topic, undefined, 'the unknown field is left out');
 });
 
 test('malformed turn-owned instance/schema never falls back to a global implementation', async () => {

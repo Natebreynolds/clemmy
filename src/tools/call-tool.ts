@@ -593,6 +593,17 @@ async function prepareTurnOwnedToolArguments(target: string, args: unknown, conf
       const canonical = (await localSchemas()).schemas.get(target);
       const lossless = canonical?.safeParse(materialized);
       if (lossless?.success) parsed = lossless;
+      // The same exact completions a deferred call gets (a dropped unknown
+      // field on a read, a canonical scalar, one wrapped item), proven by
+      // re-validating against the schema that owns the dispatch.
+      if (!parsed.success) {
+        const owner = canonical ?? schema;
+        const repaired = repairNativeArguments(owner, materialized, { sideEffect: registeredToolSideEffect(target) });
+        if (repaired) {
+          const again = owner.safeParse(repaired.args);
+          if (again.success) parsed = again;
+        }
+      }
     }
     if (!parsed.success) {
       const paths = parsed.error.issues.flatMap((issue) => issue.code === 'unrecognized_keys'
