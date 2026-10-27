@@ -130,6 +130,31 @@ test('a chat question the owner moved past no longer counts; one still waiting d
   assert.ok(summary.keys.includes(`session:${waiting.id}`), 'still waiting');
 });
 
+test('a run parked because the model was unreachable stops asking once its workflow ran again', async () => {
+  const { appendEvent } = await import('../runtime/harness/eventlog.js');
+  const { listInboxQuestions } = await import('../execution/inbox-questions.js');
+  const parked = (runId: string, workflow: string, source: string, createdAt: string) => {
+    const session = createSession({ id: `${runId}-step`, kind: 'workflow' } as never);
+    appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+      data: { question: 'Would you like me to try continuing from here?', source, sourceUserSeq: 1 } });
+    writeRun(runId, workflow, 'awaiting_input', createdAt, { awaitingInput: {
+      question: 'Would you like me to try continuing from here?', questionId: `workflow-input:${runId}:scan:1`,
+      sessionId: session.id, sessionIdSuffix: 'scan', stepId: 'scan', askedAt: createdAt } });
+  };
+  parked('run-outage', 'notes-watch', 'model_transport_recovery', iso(-2 * 3_600_000));
+  writeRun('run-after', 'notes-watch', 'completed', iso(-3_600_000));
+  parked('run-real-ask', 'notes-watch-2', 'completion_review', iso(-2 * 3_600_000));
+  writeRun('run-after-2', 'notes-watch-2', 'completed', iso(-3_600_000));
+  parked('run-outage-still', 'notes-watch-3', 'model_transport_recovery', iso(-2 * 3_600_000));
+  assert.equal(listInboxQuestions().filter((row) => row.runId?.startsWith('run-')).length, 3, 'the inbox still lists all three');
+
+  const summary = await summarizeNeedsYou({ nowMs: NOW });
+  const asked = summary.keys.filter((key) => key.startsWith('workflow:run-'));
+  assert.equal(asked.some((key) => key.startsWith('workflow:run-outage|')), false, 'superseded outage question');
+  assert.ok(asked.some((key) => key.startsWith('workflow:run-real-ask|')), 'a real clarification still counts');
+  assert.ok(asked.some((key) => key.startsWith('workflow:run-outage-still|')), 'an outage question with no later run still counts');
+});
+
 test('a notification carrying a pending approval is that approval, counted once', async () => {
   const session = createSession({ kind: 'chat', channel: 'desktop', userId: 'desktop' });
   const approval = approvalRegistry.register({

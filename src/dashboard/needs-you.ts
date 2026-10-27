@@ -77,6 +77,10 @@ interface RunIndex {
   workflowOfRun: Map<string, string>;
   /** workflow key → the status of its newest run. */
   latestStatus: Map<string, string>;
+  /** Runs parked because the model could not be reached at the time: the
+   *  question they hold is "try again?", which the workflow's next completed
+   *  run has answered. */
+  outageParkedRuns: Set<string>;
 }
 
 const RUN_INDEX_TTL_MS = 15_000;
@@ -102,6 +106,7 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): R
   }
   const workflowOfRun = new Map<string, string>();
   const newest = new Map<string, { at: number; status: string }>();
+  const outageParkedRuns = new Set<string>();
   if (existsSync(runsDir)) {
     for (const file of readdirSync(runsDir)) {
       if (!file.endsWith('.json')) continue;
@@ -124,6 +129,7 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): R
       if (typeof record.workflow === 'string' && record.workflow.trim()) {
         workflowOfRun.set(`name:${record.workflow.trim().toLowerCase()}`, key);
       }
+      if (status === 'awaiting_input' && parkedOnModelOutage(record)) outageParkedRuns.add(id);
       const at = runTime(record);
       if (!Number.isFinite(at)) continue;
       const prior = newest.get(key);
@@ -131,7 +137,7 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): R
     }
   }
   const latestStatus = new Map([...newest].map(([key, value]) => [key, value.status]));
-  const index = { workflowOfRun, latestStatus };
+  const index = { workflowOfRun, latestStatus, outageParkedRuns };
   if (runsDir === WORKFLOW_RUNS_DIR) runIndexCache = { at: nowMs, dirMtimeMs, index };
   return index;
 }
@@ -229,6 +235,20 @@ function reportBackSourceUserSeq(notification: Pick<NotificationRecord, 'id' | '
   return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
 }
 
+/** Whether a parked run's question is the host's own "try continuing?" after
+ *  it could not reach the model, read from the typed stop in the step's chat. */
+function parkedOnModelOutage(record: Record<string, unknown>): boolean {
+  const pending = record.awaitingInput;
+  const sessionId = pending && typeof pending === 'object' ? (pending as { sessionId?: unknown }).sessionId : undefined;
+  if (typeof sessionId !== 'string' || !sessionId) return false;
+  try {
+    const latest = listEvents(sessionId, { types: ['awaiting_user_input'], desc: true, limit: 1 })[0];
+    return (latest?.data as { source?: unknown } | undefined)?.source === 'model_transport_recovery';
+  } catch {
+    return false;
+  }
+}
+
 export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   const approvals = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => !approvalRegistry.isExpired(row))
@@ -240,8 +260,14 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   }
   const planIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
   const trustIds = new Set(listTrustProposals('pending').map((row) => row.id));
-  const questionIds = new Set(listInboxQuestions().map((row) => row.id));
   const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs);
+  // A run parked on an outage holds no decision once its workflow has run to
+  // completion again: the next occurrence did the work the question was about.
+  const questionIds = new Set(listInboxQuestions().filter((row) => {
+    if (row.source !== 'workflow' || !row.runId || !runs.outageParkedRuns.has(row.runId)) return true;
+    const workflow = runs.workflowOfRun.get(row.runId);
+    return !workflow || runs.latestStatus.get(workflow) !== 'completed';
+  }).map((row) => row.id));
   return {
     approvalIds,
     planIds,
