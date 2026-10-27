@@ -31,7 +31,12 @@ test('only trusted exact rejection proof turns a returned mutation failure into 
   for (const status of [200, 400, 401, 403, 404, 405, 422, 501]) {
     assert.equal(classifyAttemptOutcome({ httpStatus: status, envelopeSuccessful: false, mutating: true, acknowledged: false }).kind, 'uncertain_write', `generic ${status} failure may follow a partial commit`);
   }
-  assert.equal(classifyAttemptOutcome({ httpStatus: 404, envelopeSuccessful: false, mutating: false }).kind, 'unsupported_capability', 'read error semantics remain intact');
+  // A read told "there is none" found nothing; it did not find the wrong
+  // carrier (live 2026-10-27: a lookup of a just-deleted event). An unknown
+  // effect keeps the capability reading.
+  assert.equal(classifyAttemptOutcome({ httpStatus: 404, envelopeSuccessful: false, mutating: false }).kind, 'empty_result', 'a read\'s 404 is nothing found');
+  assert.equal(classifyAttemptOutcome({ httpStatus: 404, envelopeSuccessful: false }).kind, 'unsupported_capability', 'an unknown effect keeps the capability reading');
+  assert.equal(classifyAttemptOutcome({ httpStatus: 405, envelopeSuccessful: false, mutating: false }).kind, 'unsupported_capability', 'other read error semantics remain intact');
   assert.equal(classifyAttemptOutcome({ providerRejectedBeforeEffect: true, providerEnvelopeContradicted: true, mutating: true }).kind, 'uncertain_write', 'contradictory evidence outranks rejection');
   // A 2xx that the provider calls successful is still a success.
   assert.equal(classifyAttemptOutcome({ httpStatus: 200, envelopeSuccessful: true, mutating: true }).kind, 'succeeded');

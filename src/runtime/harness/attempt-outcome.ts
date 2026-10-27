@@ -441,6 +441,12 @@ export function classifyAttemptOutcome(signals: AttemptSignals): AttemptOutcome 
       return outcome(status === 403 ? 'policy_denial' : 'auth_failure', 'structured', `http_${status}`, status);
     }
     if (status === 400 || status === 422) return outcome('invalid_arguments', 'structured', `http_${status}`, status);
+    // A read that asked for one thing and was told there is none found
+    // nothing; it did not find the wrong carrier (live 2026-10-27: the lookup
+    // of an event just deleted answered 404 and was settled as a capability
+    // the provider lacks). A mutation's 404 stays what it was: the target or
+    // the endpoint may be missing, and a retry must not assume either.
+    if (status === 404 && signals.mutating === false) return outcome('empty_result', 'structured', `http_${status}`, status);
     if (status === 404 || status === 405 || status === 501) {
       return outcome('unsupported_capability', 'structured', `http_${status}`, status);
     }
