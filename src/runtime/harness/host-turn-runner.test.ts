@@ -14353,17 +14353,25 @@ for (const revision of ['same-question', 'changed-question', 'removed-question']
   });
 }
 
-test('question admission spends the remaining repair on a repeated staged question before honest disclosure', async (t) => {
+test('a question asked again after one negative review is delivered; the review does not buy a third round', async (t) => {
+  // Live 2026-10-27: "draft an email for me" named no recipient and no
+  // content. The model asked for both at once; the review ruled the request
+  // left without a result; the model searched memory, found nothing, and
+  // asked the same question; the review ruled the same; a third round ended
+  // on that question anyway. 92 s and five model rounds for one answer the
+  // model had at second 18. A question the model reaffirms after one bounce,
+  // with nothing settled, is its answer: delivered, the finding kept on the
+  // row. (Earlier this pin spent the remaining repair on a repeated staged
+  // question; the repair it bought here was a third identical ask.)
   const host = await import('./host-turn-runner.js');
   t.after(() => host._setHostObjectiveJudgeForTests(null));
-  const progress = 'Measurement A is 17.';
   const question = 'What private cutoff should I use to classify measurement B?';
   const options = ['10', '20'];
   const ask = (id: string) => toolCall(id, 'ask_user_question', { question, options, purpose: 'clarification' });
   const fixture = ownedQuestionAdmissionFixture('second-question-repair', [
     [ask('second-question-repair-first')],
     [ask('second-question-repair-second')],
-    [textMsg(progress), ask('second-question-repair-current')],
+    [textMsg('Measurement A is 17.'), ask('second-question-repair-current')],
   ], 'Report measurement A as 17, then classify measurement B using my unpublished private cutoff. Ask for that cutoff only after reporting A.');
   const reviews: Array<{ reply: string; evidence?: string; postedBefore: number }> = [];
   host._setHostObjectiveJudgeForTests(async (_objective, reply, context) => {
@@ -14371,9 +14379,7 @@ test('question admission spends the remaining repair on a repeated staged questi
       postedBefore: eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length });
     // Controlled findings exercise the actual host budget and publication
     // boundary; they do not qualify a model's semantic accuracy.
-    return reviews.length < 3
-      ? { done: false, reason: 'Measurement A is missing. Report A before the remaining owner question.' }
-      : { done: true, awaitingUser: true, reason: 'The current candidate reports A and asks only for the missing B cutoff.' };
+    return { done: false, reason: 'Measurement A is missing. Report A before the remaining owner question.' };
   });
   const result = await fixture.run();
   const reviewEvents = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
@@ -14389,35 +14395,33 @@ test('question admission spends the remaining repair on a repeated staged questi
     continuationsUsed: reviewEvents.map(row => row.data.continuationsUsed),
     feedbackPhases: feedbackByRequest.map(rows => rows.map(text => JSON.parse(text.slice(text.lastIndexOf('\n') + 1)).phase)),
     questions: questions.length, status: result.status }));
-  assert.equal(fixture.model.calls(), 3, 'only the two existing primary repairs are used');
-  assert.equal(reviews.length, 3, 'each proposed question gets its own current review');
-  assert.deepEqual(reviewEvents.map(row => row.data.continuation), [true, true, false],
-    'a repeated rejected question is not an honest failure report while the second repair remains');
-  assert.deepEqual(reviewEvents.map(row => row.data.continuationsUsed), [0, 1, 2]);
+  assert.equal(fixture.model.calls(), 2, 'one bounce, then the reaffirmed question is delivered');
+  assert.equal(reviews.length, 2, 'each proposed question gets its own current review');
+  assert.deepEqual(reviewEvents.map(row => row.data.continuation), [true, false],
+    'the first negative verdict bounces once; the reaffirmed question is not bounced again');
+  assert.deepEqual(reviewEvents.map(row => row.data.continuationsUsed), [0, 1]);
   assert.ok(feedbackByRequest.every(rows => rows.length === 1
     && rows[0]!.startsWith('[RETAINED COMPLETION REVIEW — same accepted request]')),
-  'both actual repair requests retain the finding instead of prematurely asking for failure disclosure');
-  assert.ok(reviews.every(row => row.postedBefore === 0), 'no earlier proposal is published during repair');
-  assert.ok(reviews.slice(0, 2).every(row => !row.reply.includes(progress)));
-  assert.equal(reviews[2]!.reply, `${progress}\n\n${question}`);
-  assert.ok(reviews[2]!.evidence?.includes(JSON.stringify({ question, options })));
-  assert.equal(questions.length, 1, 'only the freshly reviewed complete question is published');
+  'the one repair request retains the finding instead of asking for failure disclosure');
+  assert.ok(reviews.every(row => row.postedBefore === 0), 'no proposal is published during the bounce');
+  assert.ok(reviews[1]!.evidence?.includes(JSON.stringify({ question, options })));
+  assert.equal(questions.length, 1, 'the reaffirmed question is published once');
   assert.equal(questions[0]!.data.question, question);
   assert.deepEqual(questions[0]!.data.options, options);
   assert.equal(questions[0]!.data.sourceUserSeq, fixture.source.seq);
-  assert.ok(reviewEvents[2]!.seq < questions[0]!.seq);
-  assert.equal(reviewEvents[2]!.data.questionPresentationDigest,
+  assert.ok(reviewEvents[1]!.seq < questions[0]!.seq);
+  assert.equal(reviewEvents[1]!.data.questionPresentationDigest,
     sha256(JSON.stringify([result.publicPresentation?.text, questions[0]!.data.question, questions[0]!.data.options])),
     'the exact delivered reply and public choices match the final current review');
-  assert.equal(reviewEvents[2]!.data.fulfills, false, 'B remains unresolved rather than falsely completed');
-  assert.equal(reviewEvents[2]!.data.awaitingUser, true);
-  assert.notEqual(reviewEvents[2]!.data.failedOpen, true);
+  assert.equal(reviewEvents[1]!.data.fulfills, false, 'the finding stays on the row');
+  assert.equal(reviewEvents[1]!.data.reaffirmedQuestion, true);
+  assert.equal(reviewEvents[1]!.data.awaitingUser, true);
+  assert.notEqual(reviewEvents[1]!.data.failedOpen, true);
   assert.equal(eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
     .filter(row => row.data.kind === 'completion_review_disclosed').length, 0);
   assert.equal(result.status, 'awaiting_user_input');
   assert.equal(result.publicPresentation?.status, 'needs_input');
-  assert.equal(result.publicPresentation?.text, `${progress}\n\n${question}`);
-  assert.equal(result.publicPresentation!.text.split(progress).length - 1, 1);
+  assert.equal(result.publicPresentation?.text, question);
 });
 
 test('question admission keeps same-frame independent progress in the reviewed and delivered reply', async (t) => {

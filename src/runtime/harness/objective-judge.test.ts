@@ -1372,6 +1372,21 @@ test('an honest failure report settles after one bounce; claims and promises sti
   assert.equal(honestFailureReportSettles({ verdictDone: true, continuationsUsed: 1, reply: honest, settledWrites: 0 }), false);
 });
 
+test('a question the model asks again after one bounce settles as the question; the first ask still bounces once', async () => {
+  const { reaffirmedQuestionSettles } = await import('./objective-judge.js');
+  const reply = "I don't have a recipient or what the email should say. Who should it go to and what should it say?";
+  const base = { verdictDone: false, verdictAwaitingUser: undefined, verdictFailedOpen: undefined, settledWrites: 0, reply };
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1 }), true);
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1,
+    reply: 'I completed the classification. Would you like me to continue with the report?' }), false,
+  'a question that claims the work was done is a claim under review');
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 0 }), false, 'the first negative verdict still bounces once');
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, settledWrites: 1 }), false, 'a settled write keeps the full review');
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, verdictAwaitingUser: true }), false, 'an accepted question needs no settling');
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, verdictFailedOpen: true }), false, 'a review that failed open is not a bounce');
+  assert.equal(reaffirmedQuestionSettles({ ...base, continuationsUsed: 1, verdictDone: true }), false);
+});
+
 test('a verdict records the model that answered after a mid-call fallover, keeping the pin as requested', () => {
   const startedAt = Date.parse('2026-09-15T07:59:40.000Z');
   const rows = [

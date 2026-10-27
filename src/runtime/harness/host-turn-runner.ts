@@ -204,6 +204,7 @@ import {
   completionJudgeContextAdmission,
   completionJudgeComparisonDiagnostic,
   honestFailureReportSettles,
+  reaffirmedQuestionSettles,
   resolveJudgeResponder,
   isPromiseShapedReply,
   judgeObjectiveComplete,
@@ -5265,6 +5266,21 @@ const runHostTurnBody = async (
           reason: `${memoryCheck.reason} ${verdict.reason}`.slice(0, 1600) };
       }
     }
+    // A question the model asks again after one negative review, on a turn
+    // that settled no write, is its reaffirmed reading that nothing else can
+    // be done without the answer; it is delivered as a question rather than
+    // bounced into one more lookup round that ends on the same question.
+    const reaffirmedQuestion = !planCandidate
+      && (Boolean(questionPresentation) || decision?.nextAction === 'awaiting_user_input')
+      && reaffirmedQuestionSettles({
+        verdictDone: verdict.done,
+        verdictAwaitingUser: verdict.awaitingUser,
+        verdictFailedOpen: verdict.failedOpen,
+        continuationsUsed: objectiveJudgeContinuations,
+        reply: judgedReply,
+        settledWrites: settled.count,
+      });
+    if (reaffirmedQuestion) verdict = { ...verdict, awaitingUser: true };
     const awaitingInput = verdict.awaitingUser === true && !verdict.failedOpen;
     // A proposed owner question is not a failure account. A negative review
     // may still use the existing remaining repair before honest disclosure.
@@ -5368,6 +5384,7 @@ const runHostTurnBody = async (
           ...(verdict.repairScope ? { repairScope: verdict.repairScope } : {}),
           ...(verdict.claimRevision ? { claimRevision: verdict.claimRevision } : {}),
           reason: verdict.reason.slice(0, 1_600),
+          ...(reaffirmedQuestion ? { reaffirmedQuestion: true } : {}),
           ...(blockedByReview ? { blocked: true } : {}),
           ...(verdict.failedOpen ? { failedOpen: true } : {}),
           ...(verdict.failedOpen && verdict.reviewFailure ? { reviewFailure: verdict.reviewFailure } : {}),

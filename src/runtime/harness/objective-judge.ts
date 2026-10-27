@@ -609,6 +609,28 @@ export function honestFailureReportSettles(input: {
   return !replyClaimsCompletedWork(text) && !isPromiseShapedReply(text);
 }
 
+/** After one negative verdict and one bounce, a question the model asks the
+ * owner AGAIN, with no settled write anywhere in the turn, is the model's
+ * reaffirmed reading that nothing else can be done without that answer. A
+ * second rejection buys only another lookup round and the same question later
+ * (live 2026-10-27: "who should it go to and what should it say?" asked three
+ * times over 92 s, every review negative, the question delivered anyway). The
+ * reaffirmed question is delivered; the review's finding stays on its row.
+ * A question that claims the work was done ("I completed it, continue?") is
+ * a claim under review, not a reaffirmed ask; it keeps the full review. */
+export function reaffirmedQuestionSettles(input: {
+  verdictDone: boolean;
+  verdictAwaitingUser: boolean | undefined;
+  verdictFailedOpen: boolean | undefined;
+  continuationsUsed: number;
+  reply: string | null | undefined;
+  settledWrites: number;
+}): boolean {
+  if (input.verdictDone || input.verdictAwaitingUser === true || input.verdictFailedOpen === true) return false;
+  if (input.continuationsUsed < 1 || input.settledWrites > 0) return false;
+  return !replyClaimsCompletedWork(input.reply);
+}
+
 /** The model that actually answered a judge call. The fallover wrapper writes
  * a `turn_model_routed` row (fallover:true, fromModel, model) when it benches
  * the pinned judge mid-call; the verdict must record that responder, not the
