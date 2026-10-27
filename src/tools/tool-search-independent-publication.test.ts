@@ -224,7 +224,8 @@ test('a scheduled READ with one connected account provisions without the account
     registerProof: async () => { published += 1; return { registered: [`cap:resolved:${TARGET.toLowerCase()}`] }; },
   };
   const result = await sources.provisionExactWorkflowProviderOperations({ ...identity, acceptedInput: text, operationIds: [TARGET] }, deps);
-  assert.deepEqual(result, { ok: true }, JSON.stringify(result));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.ok(result.ok && result.stages && 'proof_publication' in result.stages, 'the provisioning records where its time went, stage by stage');
   assert.equal(published, 1);
   const proof = resolution.provenCapabilityEntriesForTurn(identity).find(entry => entry.identifier === TARGET);
   assert.equal(proof?.sourceAccountRouting?.judgeModelIdentity, 'host:read_single_account');
@@ -264,7 +265,7 @@ test('a scheduled step\'s own deadline governs its account review, not the chat 
   const scheduled = source(text);
   const ok = await sources.provisionExactWorkflowProviderOperations(
     { ...scheduled, acceptedInput: text, operationIds: [writeSlug], deadlineAt: Date.now() + 5_000 }, deps);
-  assert.deepEqual(ok, { ok: true }, JSON.stringify(ok));
+  assert.equal(ok.ok, true, JSON.stringify(ok));
   // With no caller deadline the search budget still bounds the whole pass.
   const bare = source(text);
   const expired = await sources.provisionExactWorkflowProviderOperations(
@@ -294,7 +295,7 @@ test('exact JIT read provisioning uses checked conversation account continuity w
     registerProof: async () => { published += 1; return { registered: [`cap:resolved:${TARGET.toLowerCase()}`] }; },
   };
   const result = await sources.provisionExactWorkflowProviderOperations({ ...retry, acceptedInput: text, operationIds: [TARGET] }, deps);
-  assert.deepEqual(result, { ok: true });
+  assert.equal(result.ok, true, JSON.stringify(result));
   const proof = resolution.provenCapabilityEntriesForTurn(retry).find(entry => entry.identifier === TARGET);
   assert.equal(proof?.accountIdentity, ACCOUNT);
   assert.equal(proof?.sourceAccountRouting?.sourceUserSeq, original.sourceUserSeq);
@@ -345,7 +346,7 @@ test('workflow re-provisioning keeps its selected account when another active ac
     materializeExact: async () => [{ toolkit: 'outlook', slug: TARGET, name: TARGET, score: 1, inputParameters: INPUT }],
     freshConnections: async () => connections,
   });
-  assert.deepEqual(result, { ok: true });
+  assert.equal(result.ok, true, JSON.stringify(result));
   const proof = resolution.provenCapabilityEntriesForTurn(turn).find(entry => entry.identifier === TARGET);
   assert.equal(proof?.accountIdentity, ACCOUNT, 'refresh must not substitute the remembered default');
   const store = manifests.peekCapabilityManifestStore()!;

@@ -109,6 +109,8 @@ export interface ProvenOperationPreparation {
   /** Existing Date.now elapsed around the decision, when asked. Wall-clock
    *  diagnostic only; not the whole preparation span or a timing guarantee. */
   decisionWaitMs?: number;
+  /** Where exact-operation provisioning spent its time this turn, by stage, when it ran. */
+  provisioning?: { stages: Record<string, number> };
 }
 
 export interface ProvenOperationDependencies {
@@ -932,6 +934,7 @@ async function prepareProvenOperationInScope(
   let descriptors: HostCapabilityDescriptorV1[] = [];
   let invocations: unknown[] = [];
   let boundAccounts: ProvenBoundAccount[] = [];
+  let provisioningStages: Record<string, number> | undefined;
   const composioSlugs = composioSlugsFromStrategy(ruleBesideRun ? [...strategy.toolsUsed, ruleBesideRun] : strategy.toolsUsed);
   // A strategy that does not cover the request must not spend the request's
   // time provisioning its operations. Coverage is either the request restating the run
@@ -969,6 +972,7 @@ async function prepareProvenOperationInScope(
           deadlineAt: Date.now() + PROVEN_PROVISION_BUDGET_MS,
         });
         if (provisioned.ok) published = publishedProvenOperations(composioSlugs);
+        if (provisioned.ok && provisioned.stages) provisioningStages = provisioned.stages;
       }
       const bound = bindPublishedSkip(published);
       // A strategy that covers only a sliver of the request may still be
@@ -1100,5 +1104,6 @@ async function prepareProvenOperationInScope(
     ...(routed && ownerRuleFor.has(strategy.toolsUsed[0] ?? '') ? { ownerRule: ownerRuleFor.get(strategy.toolsUsed[0]!)! } : {}),
     ...(ruleBesideRun ? { ownerRule: { ...ownerRuleFor.get(ruleBesideRun)!, operation: ruleBesideRun } } : {}),
     ...(decisionWaitMs !== undefined ? { decisionWaitMs } : {}),
+    ...(provisioningStages ? { provisioning: { stages: provisioningStages } } : {}),
   };
 }

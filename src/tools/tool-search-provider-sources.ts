@@ -1717,7 +1717,7 @@ async function freshConnectionsWithin(input: {
 }
 
 export type ExactWorkflowProviderProvisionResult =
-  | { ok: true }
+  | { ok: true; stages?: Record<string, number> }
   | {
       ok: false;
       code:
@@ -1852,6 +1852,16 @@ export async function provisionExactWorkflowProviderOperations(input: {
   // when one is given (a scheduled step's wall clock), and publication after
   // it gets a fresh search budget, still capped by the caller.
   const reviewGuard = { signal: input.signal, deadlineAt: input.deadlineAt ?? ownDeadlineAt };
+  // Where a turn's provisioning spends its time, stage by stage, for the
+  // turn's own timing row (live 2026-10-27: 7–9 s before the brain on every
+  // ask that resolved to an Outlook operation, with no breakdown to act on).
+  const stages: Record<string, number> = {};
+  let stageMark = Date.now();
+  const stage = (name: string): void => {
+    const now = Date.now();
+    stages[name] = now - stageMark;
+    stageMark = now;
+  };
   if (!discoveryStillActive(guard)) {
     return {
       ok: false,
@@ -1864,6 +1874,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
     (dependencies.materializeExact ?? materializeExactProviderBatch)({ requests, ...guard }),
     (dependencies.freshConnections ?? freshConnectionsWithin)(guard),
   ]);
+  stage('definitions_and_connections');
   if (!discoveryStillActive(guard)) {
     return {
       ok: false,
@@ -1897,6 +1908,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
       { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, deadlineAt: Date.now() + Math.max(2_000, Math.min(totalDeadlineMs, 8_000)) },
     );
   } catch { /* the conservative default stands */ }
+  stage('operation_effects');
   // Background only: whether a send-shaped operation delivers anything is
   // learned from the definitions already in hand, off this path.
   try {
@@ -2007,6 +2019,7 @@ export async function provisionExactWorkflowProviderOperations(input: {
       materializedBySlug.get(identifier)!.inputParameters as Record<string, unknown>,
     ),
   }));
+  stage('account_routing');
   const publication = await awaitBounded({
     start: () => (dependencies.registerProof ?? registerProofProvisionedCapabilities)(
       { sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq },
@@ -2060,7 +2073,8 @@ export async function provisionExactWorkflowProviderOperations(input: {
       detail: 'not_registered',
     };
   }
-  return { ok: true };
+  stage('proof_publication');
+  return { ok: true, stages };
 }
 
 /** A current 30-minute provider-observation lease. Hydrates disk into the
