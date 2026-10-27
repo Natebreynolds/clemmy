@@ -13,6 +13,7 @@
  */
 
 import pino from 'pino';
+import { createHash } from 'node:crypto';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 
@@ -99,6 +100,27 @@ export interface LiveVoiceStatus {
   reason?: string;
 }
 
+/** What the voice service last said about the saved key, so availability
+ *  tells the truth before the device starts a session that cannot work. Live
+ *  2026-10-27: the saved key had been refused (401) for speech and for live
+ *  voice, and the status still said available; the mic would start and fail.
+ *  Remembered by the key's digest, never the key; a different saved key, or a
+ *  later success with the same key, clears it. */
+let savedKeyRefusal: { digest: string; reason: string } | null = null;
+function keyDigest(key: string): string {
+  return createHash('sha256').update(key, 'utf8').digest('hex');
+}
+export function noteSavedOpenAiKeyOutcome(key: string, refusal: { reason: string } | null): void {
+  if (!key) return;
+  savedKeyRefusal = refusal ? { digest: keyDigest(key), reason: refusal.reason } : null;
+}
+function savedKeyRefusedReason(key: string): string | null {
+  return savedKeyRefusal && savedKeyRefusal.digest === keyDigest(key) ? savedKeyRefusal.reason : null;
+}
+export function _resetSavedOpenAiKeyMemoryForTests(): void {
+  savedKeyRefusal = null;
+}
+
 /** The key and settings the session needs. Reading saved credentials can be
  *  refused (on Windows when their privacy cannot be verified); that is an
  *  answer for the device, never an exception that reaches the daemon. */
@@ -124,9 +146,9 @@ function liveVoiceSettings(config: LiveVoiceConfigReader = savedConfig): { ok: t
 export function liveVoiceStatus(config: LiveVoiceConfigReader = savedConfig): LiveVoiceStatus {
   const settings = liveVoiceSettings(config);
   if (!settings.ok) return { available: false, reason: 'The saved OpenAI key could not be read safely.' };
-  return settings.key
-    ? { available: true }
-    : { available: false, reason: 'Live voice needs an OpenAI key.' };
+  if (!settings.key) return { available: false, reason: 'Live voice needs an OpenAI key.' };
+  const refused = savedKeyRefusedReason(settings.key);
+  return refused ? { available: false, reason: refused } : { available: true };
 }
 
 export type LiveVoiceSessionResult =
@@ -187,15 +209,22 @@ export async function createLiveVoiceSession(
     if (response.status === 429) {
       // The service answers 429 both for an account with no credit left and
       // for a momentary rate limit; the error type tells them apart.
-      return openAiOutOfCredit(raw)
-        ? { ok: false, status: 409, code: 'LIVE_VOICE_NO_CREDIT', error: 'The OpenAI account is out of credit. Add credit in the OpenAI billing settings to use live voice.' }
-        : { ok: false, status: 503, code: 'LIVE_VOICE_BUSY', error: 'The voice service is busy right now. Try again in a moment.' };
+      if (openAiOutOfCredit(raw)) {
+        const error = 'The OpenAI account is out of credit. Add credit in the OpenAI billing settings to use live voice.';
+        noteSavedOpenAiKeyOutcome(key, { reason: error });
+        return { ok: false, status: 409, code: 'LIVE_VOICE_NO_CREDIT', error };
+      }
+      return { ok: false, status: 503, code: 'LIVE_VOICE_BUSY', error: 'The voice service is busy right now. Try again in a moment.' };
     }
     if (response.status === 401) {
-      return { ok: false, status: 409, code: 'LIVE_VOICE_KEY_REFUSED', error: 'The saved OpenAI key was refused for live voice.' };
+      const error = 'The saved OpenAI key was refused for live voice. Save a working key in Settings.';
+      noteSavedOpenAiKeyOutcome(key, { reason: error });
+      return { ok: false, status: 409, code: 'LIVE_VOICE_KEY_REFUSED', error };
     }
     if (response.status === 403 || response.status === 404) {
-      return { ok: false, status: 409, code: 'LIVE_VOICE_UNAVAILABLE', error: 'This OpenAI key does not have live voice yet.' };
+      const error = 'This OpenAI key does not have live voice yet.';
+      noteSavedOpenAiKeyOutcome(key, { reason: error });
+      return { ok: false, status: 409, code: 'LIVE_VOICE_UNAVAILABLE', error };
     }
     return { ok: false, status: 502, code: 'LIVE_VOICE_FAILED', error: `The voice service answered HTTP ${response.status}.` };
   }
@@ -207,5 +236,6 @@ export async function createLiveVoiceSession(
     return { ok: false, status: 502, code: 'LIVE_VOICE_FAILED', error: 'The voice service did not return a session.' };
   }
   logger.info({ sessionId, history: history.length }, 'live voice session started');
+  noteSavedOpenAiKeyOutcome(key, null);
   return { ok: true, sessionId, sdp: answer };
 }

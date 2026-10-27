@@ -14,7 +14,7 @@ import pino from 'pino';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { toSpokenSentences } from './spoken-text.js';
-import { openAiOutOfCredit } from './live-voice.js';
+import { noteSavedOpenAiKeyOutcome, openAiOutOfCredit } from './live-voice.js';
 
 /** The most a single spoken reply says aloud; the rest stays on screen. */
 export const SPOKEN_REPLY_MAX_CHARS = 900;
@@ -87,6 +87,9 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
   }
   if (response.status === 401 || response.status === 403) {
     logger.warn({ status: response.status }, 'voice speech key refused; the computer voice speaks instead');
+    // The same saved key serves live voice: its availability now says so
+    // before the device starts a session that cannot work.
+    noteSavedOpenAiKeyOutcome(key, { reason: 'The saved OpenAI key was refused for speech. Save a working key in Settings.' });
     return { ok: false, status: 409, error: 'The saved OpenAI key was refused for speech; using this computer’s voice.', fallback: 'system' };
   }
   if (!response.ok || !response.body) {
@@ -97,5 +100,6 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     }
     return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.` };
   }
+  noteSavedOpenAiKeyOutcome(key, null);
   return { ok: true, response, contentType: response.headers.get('content-type') || 'audio/mpeg' };
 }

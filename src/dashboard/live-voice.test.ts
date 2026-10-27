@@ -120,6 +120,27 @@ test('a saved key that cannot be read safely is an answer, never an exception', 
   assert.deepEqual(live.liveVoiceStatus(refused), { available: false, reason: 'The saved OpenAI key could not be read safely.' });
 });
 
+test('a refused saved key makes live voice unavailable, with the reason, until the key changes or works again', async () => {
+  // Live 2026-10-27: the saved key had been refused (401) for speech and for
+  // live voice, and the status still said available; the mic would start and
+  // then fail.
+  live._resetSavedOpenAiKeyMemoryForTests();
+  const key = { openAiKey: () => 'sk-synthetic-live', env: (_k: string, f: string) => f };
+  const other = { openAiKey: () => 'sk-synthetic-other', env: (_k: string, f: string) => f };
+  assert.deepEqual(live.liveVoiceStatus(key), { available: true });
+  const answering = (status: number) => (async () => new Response('{"error":{"message":"nope"}}', { status })) as unknown as typeof fetch;
+  const refused = await live.createLiveVoiceSession({ sdp: offer }, undefined, answering(401), key);
+  assert.ok(!refused.ok && refused.code === 'LIVE_VOICE_KEY_REFUSED');
+  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  assert.deepEqual(live.liveVoiceStatus(other), { available: true }, 'a different saved key is judged on its own');
+  const ok = (async () => new Response(JSON.stringify({ session: { id: 'live_ok' }, transport: { type: 'webrtc', sdp: 'answer' } }), { status: 201 })) as unknown as typeof fetch;
+  assert.equal((await live.createLiveVoiceSession({ sdp: offer }, undefined, ok, key)).ok, true);
+  assert.deepEqual(live.liveVoiceStatus(key), { available: true }, 'a later success with the same key clears the refusal');
+  live.noteSavedOpenAiKeyOutcome('sk-synthetic-live', { reason: 'The saved OpenAI key was refused for speech. Save a working key in Settings.' });
+  assert.equal(live.liveVoiceStatus(key).available, false, 'a speech refusal of the same key counts too');
+  live._resetSavedOpenAiKeyMemoryForTests();
+});
+
 test('a session that throws answers 500 and the server keeps serving', async () => {
   const app = express();
   registerConsoleRoutes(app, req => req.get('authorization') === bearer, {} as never, {
