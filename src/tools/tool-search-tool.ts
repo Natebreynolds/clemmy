@@ -400,8 +400,8 @@ class ToolSearchContinuationStore {
 
 const DESCRIPTION = [
   'Search the built-in tool catalog by intent: names + one-line summaries for the top matches, plus the complete JSON input schema for the closest few.',
-  'Use it when the tool you need is not on your surface — say what you want to do (e.g. "schedule a recurring workflow", "spawn workers for N items") and follow the returned invocation hint.',
-  'A tool whose exact name you already know needs no search first: call it directly, and if the arguments are the wrong shape the refusal names the exact failing paths and the required shape.',
+  'Use it when the tool you need is not on your surface — say what you want to do and follow the returned invocation hint.',
+  'A known exact name needs no search: call it directly; a wrong shape is refused with its exact failing paths.',
   'Read-only.',
 ].join(' ');
 
