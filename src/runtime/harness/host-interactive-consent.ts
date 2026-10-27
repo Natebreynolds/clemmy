@@ -1137,8 +1137,11 @@ async function variantReadForExactCall(input: {
   const providerKind = external.manifest.providerKind;
   if (providerKind !== 'composio' && providerKind !== 'native_mcp') return null;
   if (prepared.sourceUserSeq === null || external.projection.effect !== 'external_write') return null;
+  // A request that only fetches (GET, or the POST many APIs read with) is
+  // judged for its endpoint; PUT, PATCH and DELETE keep their card.
+  const method = input.callSignals.requestMethod;
   if (input.callSignals.outboundDelivery === true || input.callSignals.recipientsPresent === true
-    || input.callSignals.requestMethod !== null) return null;
+    || (method !== null && method !== 'safe' && method !== 'post')) return null;
   const risk = external.projection.risk;
   const waitsOnTool = external.currentDefinition.behaviorHints.destructive === true
     || (risk.consequence === 'unknown' && risk.reversibility === 'unknown');
@@ -1158,6 +1161,7 @@ async function variantReadForExactCall(input: {
     sourceUserSeq: prepared.sourceUserSeq,
     acceptedTaskId: prepared.acceptedTaskId,
     logicalToolCallId: prepared.logicalToolCallId,
+    ...(method !== null ? { requestTarget: true } : {}),
   });
   return verdict ? { verdictDigest: digest({ version: 1, kind: 'operation_variant_read', verdict }), verdict } : null;
 }

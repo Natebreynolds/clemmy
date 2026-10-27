@@ -112,12 +112,15 @@ async function acceptedCall(options: {
   args: Record<string, unknown>;
   destructive?: boolean | null;
   learningPolicy?: unknown;
+  schema?: Record<string, unknown>;
+  operationId?: string;
 }) {
   const sessionId = `variant-read-${randomUUID()}`;
-  const operationId = OPERATION;
-  const schemaDigest = canonicalExternalInputSchemaDigestV1(SCHEMA)!;
+  const operationId = options.operationId ?? OPERATION;
+  const schema = options.schema ?? SCHEMA;
+  const schemaDigest = canonicalExternalInputSchemaDigestV1(schema)!;
   const effect = 'external_write' as const;
-  const capabilityId = `cap:variant-read:manage:${String(options.destructive ?? true)}`;
+  const capabilityId = `cap:variant-read:${operationId}:${String(options.destructive ?? true)}`;
   const accountId = 'account:variant-read:owner';
   const fingerprint = sha(`${operationId}:${schemaDigest}`);
   const manifest = manifests.attachSemanticContract({
@@ -185,7 +188,7 @@ async function acceptedCall(options: {
       toolName: logical.toolName, argumentDigest: logical.argumentDigest, effect });
     assert.equal(bound.status, 'bound', JSON.stringify(bound));
   });
-  const request = { attestation, args: options.args, inputSchema: SCHEMA };
+  const request = { attestation, args: options.args, inputSchema: schema };
   const result = await consent.evaluateUncoveredHostMutationConsent(request);
   return { result, request, sessionId };
 }
@@ -285,4 +288,53 @@ test('a call admitted as a variant read is booked as a read', () => {
   const write = hostInvocation.hostCallAccounting({ identity, effect: 'external_write', boundary: 'host_owned_external',
     consentBasis: 'exact_user_grant' } as Parameters<typeof hostInvocation.hostCallAccounting>[0]);
   assert.equal(write.mutating, true);
+});
+
+// A tool that sends one request wherever its caller names: what a call does
+// lives in its method and endpoint, so a lookup (GET, or the POST many APIs
+// read with) is judged for that endpoint and remembered per endpoint.
+const REQUEST_OPERATION = 'EXAMPLE_API_REQUEST';
+const REQUEST_SCHEMA = {
+  type: 'object',
+  description: 'Make a request to any endpoint of the Example data API. Data endpoints under /v3/labs return results for the target; task endpoints create paid tasks.',
+  properties: {
+    method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] },
+    path: { type: 'string', description: 'The endpoint path, for example /v3/labs/rank_overview/live.' },
+    data: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['method', 'path'],
+  additionalProperties: false,
+};
+
+test('a POST lookup through a generic request tool reads for its endpoint, remembered per endpoint', async () => {
+  const call = (path: string, target: string) => acceptedCall({ schema: REQUEST_SCHEMA, operationId: REQUEST_OPERATION,
+    args: { method: 'POST', path, data: [{ target }] } });
+  const first = decided((await call('/v3/labs/rank_overview/live', 'example.com')).result);
+  assert.equal(first.decision.kind === 'proceed' ? first.decision.basis : null, 'exact_variant_read', JSON.stringify(first.decision));
+  assert.equal(first.consentSubject, undefined, 'no card');
+  const judged = JSON.parse(judgeRequests[0]!.user) as Record<string, unknown>;
+  assert.deepEqual(judged.fixedArguments, { method: 'POST', path: '/v3/labs/rank_overview/live' }, 'the method and endpoint are fixed; the body is not');
+
+  const same = decided((await call('/v3/labs/rank_overview/live', 'other.example')).result);
+  assert.equal(same.decision.kind === 'proceed' ? same.decision.basis : null, 'exact_variant_read');
+  assert.equal(judgeRequests.length, 1, 'the same endpoint is remembered');
+
+  const other = decided((await call('/v3/labs/traffic_overview/live', 'example.com')).result);
+  assert.equal(other.decision.kind === 'proceed' ? other.decision.basis : null, 'exact_variant_read');
+  assert.equal(judgeRequests.length, 2, 'another endpoint is judged on its own');
+});
+
+test('a PUT through the same request tool keeps its card and asks neither model', async () => {
+  const put = decided((await acceptedCall({ schema: REQUEST_SCHEMA, operationId: REQUEST_OPERATION,
+    args: { method: 'PUT', path: '/v3/labs/rank_overview/live', data: [{ target: 'example.com' }] } })).result);
+  assert.equal(put.decision.kind, 'needs_user', JSON.stringify(put.decision));
+  assert.equal(jevRequests.length, 0);
+  assert.equal(judgeRequests.length, 0);
+});
+
+test('a POST the judge does not confirm as a lookup keeps its card', async () => {
+  judgeAnswer = { changesAnything: 'yes', confidence: 0.95 };
+  const task = decided((await acceptedCall({ schema: REQUEST_SCHEMA, operationId: REQUEST_OPERATION,
+    args: { method: 'POST', path: '/v3/labs/task_post', data: [{ target: 'example.com' }] } })).result);
+  assert.equal(task.decision.kind, 'needs_user', JSON.stringify(task.decision));
 });
