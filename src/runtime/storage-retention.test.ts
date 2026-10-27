@@ -15,9 +15,11 @@ import {
 const NOW = Date.parse('2026-10-14T12:00:00Z');
 const daysAgo = (days: number) => new Date(NOW - days * 86_400_000).toISOString();
 
-test('the default policy keeps Clem inside 10 GB with a one-week window, and reports before it deletes', () => {
+test('the default policy keeps Clem inside 10 GB with a one-week window, and enforces it', () => {
   const policy = storageRetentionPolicy({});
-  assert.equal(policy.mode, 'report');
+  assert.equal(policy.mode, 'enforce');
+  assert.equal(storageRetentionPolicy({ CLEMMY_STORAGE_RETENTION: 'report' }).mode, 'report');
+  assert.equal(storageRetentionPolicy({ CLEMMY_STORAGE_RETENTION: 'off' }).mode, 'off');
   assert.equal(policy.budgetBytes, 10 * 1024 ** 3);
   assert.equal(policy.scratchDays, 7);
   assert.equal(storageRetentionPolicy({ CLEMMY_STORAGE_RETENTION: 'enforce' }).mode, 'enforce');

@@ -14,6 +14,10 @@
  * running task or a recent conversation still reads, and records what it did.
  * When the footprint is still over budget after the ordinary window, the window
  * for working copies tightens; memory is never a candidate.
+ *
+ * Enforcing is the default: an install bounds itself the way a production one
+ * must. An operator may set `CLEMMY_STORAGE_RETENTION=report` to measure only,
+ * or `off`.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -48,7 +52,7 @@ function boundedNumber(raw: string | undefined, fallback: number, min: number, m
 export function storageRetentionPolicy(env: NodeJS.ProcessEnv = process.env): StorageRetentionPolicy {
   const mode = (env.CLEMMY_STORAGE_RETENTION ?? '').trim().toLowerCase();
   return {
-    mode: mode === 'enforce' || mode === 'off' ? mode : 'report',
+    mode: mode === 'report' || mode === 'off' ? mode : 'enforce',
     budgetBytes: Math.round(boundedNumber(env.CLEMMY_STORAGE_BUDGET_GB, 10, 1, 1_000) * GB),
     scratchDays: Math.floor(boundedNumber(env.CLEMMY_STORAGE_SCRATCH_DAYS, 7, 1, 90)),
     recentConversationDays: 30,
