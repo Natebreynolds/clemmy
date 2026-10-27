@@ -37,22 +37,6 @@ test('other invalid calls are left for the ordinary refusal', () => {
   assert.equal(repairNativeArguments(read, { slug: 'my-day', source_id: null }, { sideEffect: 'read' }), null, 'a valid call needs nothing');
 });
 
-test('a read sent with fields the tool does not take runs without them; a write keeps the refusal', () => {
-  // Live 2026-10-27: app_guide {"topic":"connect Notion"} and tool_output_query
-  // {"call_id", "query", "limit"} were refused for the key and called again.
-  const guide = z.strictObject({ places: z.boolean().optional() });
-  const repaired = repairNativeArguments(guide, { topic: 'connect Notion' }, { sideEffect: 'read' });
-  assert.deepEqual(repaired?.args, {});
-  assert.equal(repaired?.repair, 'dropped_unknown_fields');
-  assert.match(repaired?.detail ?? '', /"topic" is not an argument/);
-  const several = repairNativeArguments(z.strictObject({ call_id: z.string() }), { call_id: 'c1', query: 'x', limit: 20 }, { sideEffect: 'read' });
-  assert.deepEqual(several?.args, { call_id: 'c1' });
-  assert.match(several?.detail ?? '', /"query", "limit" are not arguments/);
-  assert.equal(repairNativeArguments(guide, { topic: 'connect Notion' }, { sideEffect: 'write' }), null, 'a write never drops a field');
-  assert.equal(repairNativeArguments(read, { space_id: 'my-day', source_id: null }, { sideEffect: 'read' })?.repair, 'renamed_field',
-    'a missing required field is still a rename, never a drop');
-});
-
 test('a number or boolean sent as its exact canonical text is read as that value', () => {
   const preview = z.strictObject({
     slug: z.string().min(2),
@@ -70,11 +54,7 @@ test('a number or boolean sent as its exact canonical text is read as that value
   }
   assert.equal(repairNativeArguments(preview, { slug: 'my-day', width: '1440.5' }, { sideEffect: 'read' }), null, 'the value must still validate');
   assert.equal(repairNativeArguments(preview, { slug: 'my-day', width: '1440' }, { sideEffect: 'send' }), null);
-  // A read's unknown field is left out and named (DROP), after the scalar read.
-  const dropped = repairNativeArguments(preview, { slug: 'my-day', text: 'x', width: '1440' }, { sideEffect: 'read' });
-  assert.deepEqual(dropped?.args, { slug: 'my-day', width: 1440 });
-  assert.match(dropped?.detail ?? '', /"width" read as its value; "text" is not an argument/);
-  assert.equal(repairNativeArguments(preview, { slug: 'my-day', text: 'x', width: '1440' }, { sideEffect: 'write' }), null, 'a write with a remaining unknown field keeps the refusal');
+  assert.equal(repairNativeArguments(preview, { slug: 'my-day', text: 'x', width: '1440' }, { sideEffect: 'read' }), null, 'a remaining unknown field keeps the refusal');
 });
 
 test('a nullable number compiled from JSON Schema takes the same canonical text', () => {

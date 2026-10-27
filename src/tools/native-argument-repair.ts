@@ -29,7 +29,7 @@ import type { ToolSideEffect } from './tool-registry.js';
 
 export type NativeArgumentRepair = {
   args: Record<string, unknown>;
-  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar' | 'json_text_sibling' | 'carrier_unwrapped' | 'dropped_unknown_fields';
+  repair: 'wrapped_single_item' | 'renamed_field' | 'canonical_scalar' | 'json_text_sibling' | 'carrier_unwrapped';
   detail: string;
 };
 
@@ -244,22 +244,6 @@ export function repairNativeArguments(
       if (schema.safeParse(unwrapped).success) {
         return { args: unwrapped, repair: 'carrier_unwrapped', detail: withScalarDetail('the arguments in "args_json" were read as the call\'s own') };
       }
-    }
-  }
-  // DROP (reads only): fields the schema does not declare, when the call is
-  // whole without them. A read sent with an extra "topic" or "query" the
-  // tool never takes returns what the tool does return, and the result names
-  // what was left out; the model reads it and refines if it matters. A write
-  // keeps the refusal: a dropped field could change what is written.
-  if (options.sideEffect === 'read' && missing.length === 0 && unrecognized.length > 0) {
-    const kept: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(args)) if (!unrecognized.includes(key)) kept[key] = value;
-    if (schema.safeParse(kept).success) {
-      return {
-        args: kept,
-        repair: 'dropped_unknown_fields',
-        detail: withScalarDetail(`${unrecognized.map((key) => `"${key}"`).join(', ')} ${unrecognized.length === 1 ? 'is not an argument of this tool and was left out' : 'are not arguments of this tool and were left out'}`),
-      };
     }
   }
   if (missing.length !== 1 || unrecognized.length === 0) return null;
