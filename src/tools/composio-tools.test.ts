@@ -711,25 +711,32 @@ test('buildComposioStatusPayload puts usable connections first and does not expo
   assert.ok(hidden.every((connection) => connection.connectionId === undefined));
 });
 
-test('buildComposioStatusPayload can expose suppressed ids only for explicit diagnostics', () => {
+test('buildComposioStatusPayload can expose suppressed ids only for explicit diagnostics, and names each account by its address', () => {
+  // Live 2026-10-27: asked whether their second Outlook account still
+  // worked, Clem could only say "a third connection is expired" because the
+  // status carried no address. The owner's own address names it.
   const payload = buildComposioStatusPayload(
     { enabled: true },
-    [],
+    [{ slug: 'outlook', connectionId: 'ca_live', status: 'ACTIVE', accountEmail: 'owner@work.invalid' } as never],
     [{
       slug: 'outlook',
       connectionId: 'ca_stale_entity',
       status: 'ACTIVE',
+      accountEmail: 'owner@home.invalid',
       suppression: {
         reason: 'entity-mismatch',
         suppressUntil: '2026-07-03T03:16:03.194Z',
         lastErrorAt: '2026-07-02T15:16:03.194Z',
         failures: 1,
       },
-    }],
+    } as never],
     true,
   );
-  const suppressed = payload.suppressedConnections as Array<{ connectionId?: string }>;
+  const suppressed = payload.suppressedConnections as Array<{ connectionId?: string; email?: string | null }>;
   assert.equal(suppressed[0]?.connectionId, 'ca_stale_entity');
+  assert.equal(suppressed[0]?.email, 'owner@home.invalid', 'a suppressed connection still says whose mailbox it is');
+  const usable = payload.usableConnections as Array<{ connectionId: string; email?: string | null }>;
+  assert.equal(usable[0]?.email, 'owner@work.invalid');
 });
 
 // ── composio-thrash fix: loud, self-correcting failure output ──────────

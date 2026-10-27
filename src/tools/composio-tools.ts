@@ -2059,12 +2059,17 @@ export function buildComposioStatusPayload(
   suppressedConnections: SuppressedConnectedToolkit[],
   exposeSuppressedIds = ['1', 'true', 'yes'].includes((process.env.CLEMMY_COMPOSIO_STATUS_EXPOSE_SUPPRESSED_IDS ?? '').toLowerCase()),
 ): Record<string, unknown> {
+  // The owner's own address on each connection, so an expired or duplicate
+  // account can be named to them (live 2026-10-27: asked whether their
+  // second Outlook account still worked, Clem could say only that "a third
+  // connection is expired" and could not tell them which mailbox it was).
   const connectionList = connections.map((connection) => ({
     toolkit: connection.slug,
     slug: connection.slug,
     connectionId: connection.connectionId,
     status: connection.status,
     account: connection.accountLabel ?? connection.alias ?? null,
+    email: connection.accountEmail ?? null,
   }));
   const usableConnections = connectionList.filter((connection) => isActiveConnectionStatus(connection.status));
   const suppressedConnectionList = suppressedConnections.map((connection) => {
@@ -2073,6 +2078,7 @@ export function buildComposioStatusPayload(
       slug: connection.slug,
       status: connection.status,
       account: connection.accountLabel ?? connection.alias ?? null,
+      email: connection.accountEmail ?? null,
       reason: connection.suppression.reason ?? 'suppressed',
       suppressUntil: connection.suppression.suppressUntil,
     };
