@@ -4833,6 +4833,12 @@ const runHostTurnBody = async (
             // No reviewer answered this row: it carries the last verdict onto
             // an honest continuation that added no evidence to judge.
             carriedVerdict: true,
+            // The same words again after the review rejected them as a
+            // question: the brain reaffirmed its ask, now in prose. It ends
+            // as the question, never as a stop with the question inside it
+            // (live 2026-10-27: a "blocked" turn whose text was "who should
+            // this go to, and what should it say?").
+            ...(carried.questionProposal ? { reaffirmedQuestion: true, awaitingUser: true } : {}),
             sourceUserSeq: identity.sourceUserSeq,
             settledEffectCount: settled.count,
             settledEvidenceAvailable: settled.evidenceAvailable && readEvidence.evidenceAvailable,
@@ -4852,6 +4858,7 @@ const runHostTurnBody = async (
         continuation: false,
         reason: carried.reason.slice(0, 200),
       }, 'host completion judge');
+      if (carried.questionProposal) return 'awaiting_user_input';
       return 'done';
     }
     let memoryConsolidation = verifiedMemoryConsolidationEvidence(identity);
@@ -5291,8 +5298,10 @@ const runHostTurnBody = async (
     // that settled no write, is its reaffirmed reading that nothing else can
     // be done without the answer; it is delivered as a question rather than
     // bounced into one more lookup round that ends on the same question.
+    // Asked again in prose, in other words, after the review rejected it as
+    // a question (its questionProposal), it is the same reaffirmed ask.
     const reaffirmedQuestion = !planCandidate
-      && (Boolean(questionPresentation) || decision?.nextAction === 'awaiting_user_input')
+      && (questionShaped || Boolean(completionReviewFeedback?.questionProposal))
       && reaffirmedQuestionSettles({
         verdictDone: verdict.done,
         verdictAwaitingUser: verdict.awaitingUser,

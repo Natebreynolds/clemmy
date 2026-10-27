@@ -15253,6 +15253,71 @@ test('a dropped connection reported by the SDK ends in the same continuation que
   }
 });
 
+test('a rejected question asked again in prose ends as the question, not as a stop with the question inside', async (t) => {
+  // Live 2026-10-27 (r56c15): two lookups, a question, the review held it,
+  // the brain repeated the same question as plain text, and the carried
+  // rejection settled the turn as a typed "blocked" stop whose text was
+  // "who should this go to, and what should it say?". The owner saw a
+  // stopped turn, not a question to answer.
+  const host = await import('./host-turn-runner.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const question = 'Who should this draft go to, and what should it say?';
+  const fixture = ownedQuestionAdmissionFixture('prose-reaffirmed-question', [
+    [toolCall('prose-reaffirmed-ask', 'ask_user_question', { question, options: [], purpose: 'clarification' })],
+    [textMsg(question)],
+  ], 'Draft an email for me and leave it unsent.');
+  let reviews = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    reviews++;
+    return { done: false, reason: 'The request was left without a result.' };
+  });
+  const result = await fixture.run();
+  assert.equal(fixture.model.calls(), 2);
+  assert.equal(reviews, 1, 'the same words carry the verdict; no second review');
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.status, 'needs_input');
+  assert.equal(result.publicPresentation?.text, question);
+  const rows = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1]!.data.carriedVerdict, true);
+  assert.equal(rows[1]!.data.reaffirmedQuestion, true);
+  assert.equal(rows[1]!.data.fulfills, false, 'the finding stays on the row');
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['awaiting_user_input'] }).length, 1);
+});
+
+test('a rejected question asked again in other prose words ends as the question without a disclosure round', async (t) => {
+  // Same family as the pin above: the brain reworded its question instead of
+  // repeating it. Without this the reworded ask was judged once more, held,
+  // and the brain was sent a disclosure directive for a third round that
+  // ended on the same question anyway.
+  const host = await import('./host-turn-runner.js');
+  t.after(() => host._setHostObjectiveJudgeForTests(null));
+  const question = 'Who should this draft go to, and what should it say?';
+  const reworded = "I don't have a recipient or a point yet. Who is it for, and what is the one thing to say?";
+  const fixture = ownedQuestionAdmissionFixture('prose-reworded-question', [
+    [toolCall('prose-reworded-ask', 'ask_user_question', { question, options: [], purpose: 'clarification' })],
+    [textMsg(reworded)],
+    [textMsg('A third round that must never be asked for.')],
+  ], 'Draft an email for me and leave it unsent.');
+  let reviews = 0;
+  host._setHostObjectiveJudgeForTests(async () => {
+    reviews++;
+    return { done: false, reason: 'The request was left without a result.' };
+  });
+  const result = await fixture.run();
+  assert.equal(fixture.model.calls(), 2, 'one bounce, then the reworded ask is the question');
+  assert.equal(reviews, 2);
+  assert.equal(result.status, 'awaiting_user_input');
+  assert.equal(result.publicPresentation?.text, reworded);
+  const rows = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] })
+    .filter(row => row.data.kind === 'completion');
+  assert.deepEqual(rows.map(row => row.data.continuation), [true, false]);
+  assert.equal(rows[1]!.data.reaffirmedQuestion, true);
+  assert.equal(eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] })
+    .filter(row => row.data.kind === 'completion_review_disclosed').length, 0, 'no disclosure round');
+});
+
 test('a conversation-shaped first reply held by the fast screen alone is delivered, not bounced', async (t) => {
   // Live 2026-10-27: "draft an email for me" named no recipient and no
   // content. The brain answered in prose at second 8 asking for both; the fast
