@@ -10,6 +10,7 @@ process.env.CLEMENTINE_HOME = TEST_HOME;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 const eventlog = await import('../runtime/harness/eventlog.js');
 const lifecycle = await import('../runtime/harness/conversation-state-lifecycle.js');
+const tiers = await import('../runtime/harness/conversation-state-tiers.js');
 const { inspectConversationProtocol } = await import('../runtime/harness/conversation-protocol.js');
 const { HarnessSession } = await import('../runtime/harness/session.js');
 const conversationMemory = await import('./conversation-memory.js');
@@ -45,6 +46,8 @@ function chat(tag: string, idleDays: number, options: { kind?: 'chat' | 'workflo
 }
 
 const state = (sessionId: string) => eventlog.getSessionConversationState(sessionId)!;
+/** The storage decay worker's compaction, run here on the test's own log. */
+const compactIdle = (now = NOW) => tiers.compactIdleConversations(eventlog.openEventLog(), { nowMs: now.getTime() });
 const summaries: string[] = [];
 
 beforeEach(() => {
@@ -80,7 +83,7 @@ test('the memory form is what memory kept and the last few messages as text', ()
   assert.equal(inspectConversationProtocol(items).status, 'valid');
 });
 
-test('a pass remembers idle chats, compacts a week-idle state, retires a month-idle one to its memory, and resuming still works', async () => {
+test('a pass remembers idle chats and retires a month-idle one to its memory, the worker compacts a week-idle state, and resuming still works', async () => {
   const fresh = chat('fresh', 2);
   const weekIdle = chat('week', 9);
   const monthIdle = chat('month', 40);
@@ -89,6 +92,9 @@ test('a pass remembers idle chats, compacts a week-idle state, retires a month-i
   const first = await conversationMemory.consolidateIdleConversations({ now: NOW });
   assert.equal(first.waiting, false);
   assert.equal(first.remembered, 2, 'both idle chats with a transcript are remembered');
+  const compaction = compactIdle();
+  assert.equal(compaction.compacted, 1, 'the week-idle state still at full fidelity is compacted');
+  assert.equal(compaction.caughtUp, true);
   assert.equal(state(fresh).fidelity, 'full', 'a recent conversation is untouched');
   assert.equal(state(weekIdle).fidelity, 'compacted');
   assert.equal(state(weekIdle).state.lastResponseId, undefined, 'a rewritten history never continues the provider chain');
@@ -103,7 +109,7 @@ test('a pass remembers idle chats, compacts a week-idle state, retires a month-i
   assert.deepEqual(HarnessSession.load(monthIdle)!.toInputItems().map((item) => (item as { role?: string }).role), ['user', 'user', 'assistant']);
 
   const second = await conversationMemory.consolidateIdleConversations({ now: NOW });
-  assert.equal(second.remembered + second.compacted + second.retired, 0, 'a second pass has nothing left to do');
+  assert.equal(second.remembered + second.retired + compactIdle().compacted, 0, 'a second pass has nothing left to do');
 
   HarnessSession.load(monthIdle)!.updateConversationSnapshot([...HarnessSession.load(monthIdle)!.toInputItems(), { role: 'user', content: 'and the next one?' }] as never);
   assert.equal(state(monthIdle).fidelity, 'full', 'a new turn makes the state current again');
@@ -120,19 +126,25 @@ test('nothing is lowered while the conversation can still be picked up where it 
   eventlog.openEventLog().prepare(`INSERT INTO run_attempts (attempt_id, session_id, run_id, started_at, status)
     VALUES ('attempt-fixture', ?, 'run-fixture', ?, 'active')`).run(running, daysAgo(40));
   const result = await conversationMemory.consolidateIdleConversations({ now: NOW });
+  const compaction = compactIdle();
   for (const sessionId of [pinned, parked, awaiting, running]) assert.equal(state(sessionId).fidelity, 'full', sessionId);
   assert.ok(result.held >= 4);
+  assert.equal(compaction.held, 4);
+  assert.equal(compaction.compacted, 0);
+  assert.deepEqual(compaction.heldBy, { pinned: 1, __interrupt_state: 1, pending_approval: 1, unfinished_run: 1 });
   assert.equal(lifecycle.conversationLifecycleHold(pinned), 'pinned');
   assert.equal(lifecycle.conversationLifecycleHold(awaiting), 'pending_approval');
   assert.equal(lifecycle.conversationLifecycleHold(running), 'unfinished_run');
 });
 
-test('without a memory model the pass waits to remember and still compacts', async () => {
+test('without a memory model the pass waits to remember, and the worker still compacts', async () => {
   conversationMemory._setConversationMemorySummarizerForTests(null, null);
   const idle = chat('nomodel', 40);
   const result = await conversationMemory.consolidateIdleConversations({ now: NOW });
   assert.equal(result.waiting, true);
-  assert.equal(state(idle).fidelity, 'compacted', 'a chat is never retired without its memory');
+  assert.equal(state(idle).fidelity, 'full', 'a chat is never retired without its memory');
+  compactIdle();
+  assert.equal(state(idle).fidelity, 'compacted', 'its working state still shrinks');
 });
 
 test('a call whose result is provenance-bound keeps its call and result whole, and a shortened one is restored byte for byte', () => {
@@ -230,6 +242,7 @@ test('a resumed chat with an unusable summary retains working state instead of r
   const tag = 'retire-current-marker';
   const sessionId = chat(tag, 8);
   await conversationMemory.consolidateIdleConversations({ now: NOW });
+  compactIdle();
   const oldMemory = conversationMemory.conversationMemoryFor(sessionId)!;
   assert.ok(oldMemory);
   assert.equal(state(sessionId).memoryEpisodeId, oldMemory.episodeId);
@@ -244,6 +257,7 @@ test('a resumed chat with an unusable summary retains working state instead of r
   eventlog.openEventLog().prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(daysAgo(40), sessionId);
   conversationMemory._setConversationMemorySummarizerForTests(async () => null, 'fixture-memory-model');
   await conversationMemory.consolidateIdleConversations({ now: NOW });
+  compactIdle();
   assert.equal(state(sessionId).fidelity, 'compacted', 'new work is retained when no current usable summary exists');
   assert.match(String(state(sessionId).memoryEpisodeId), /^none:unusable-summary:/);
   assert.match(JSON.stringify(state(sessionId).state), /NEW-RETIRE-WORK-9321/);

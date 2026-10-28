@@ -2,7 +2,8 @@
  * Run: node scripts/run-tests-isolated.mjs src/runtime/storage-decay.test.ts
  *
  * The storage decay worker sheds a retired conversation's working records
- * and the event log's old diagnostic rows on its own connection.
+ * and the event log's old diagnostic rows, and compacts a week-idle
+ * conversation's stored state, on its own connection.
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -58,4 +59,42 @@ test('a pass sheds a retired chat\'s provenance and outputs and the old diagnost
   const again = await decay.runStorageDecayPass(log.HARNESS_DB_PATH, { budgetMs: 10_000 });
   assert.equal(again.state, 'processed');
   if (again.state === 'processed') { assert.equal(again.decay.sessions, 0); assert.equal(again.diagnostics.removed, 0); }
+});
+
+
+test('a pass compacts a conversation idle a week on the worker, and leaves a fresh or a held one whole', async () => {
+  const db = log.openEventLog();
+  const stored = JSON.stringify({ items: [
+    { role: 'user', content: 'Find the report' },
+    { type: 'reasoning', id: 'rs_1', content: [{ type: 'input_text', text: 'thinking '.repeat(500) }] },
+    { type: 'function_call', callId: 'call_1', name: 'search_files', arguments: JSON.stringify({ q: 'report', padding: 'x'.repeat(3_000) }) },
+    { type: 'function_call_result', callId: 'call_1', name: 'search_files', status: 'completed', output: { type: 'text', text: `found rh_abcdef01 ${'row,'.repeat(2_000)}` } },
+    { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The report is in /reports/a.pdf.' }] },
+  ], lastResponseId: 'resp_1', updatedAt: daysAgo(9) });
+  const conversation = (id: string, idleDays: number, metadata = '{}') => {
+    db.prepare(`INSERT INTO sessions (id, kind, created_at, updated_at, status, metadata_json) VALUES (?, 'chat', ?, ?, 'active', ?)`).run(id, daysAgo(idleDays + 1), daysAgo(idleDays), metadata);
+    db.prepare(`INSERT INTO session_conversation_state (session_id, state_json, fidelity, memory_episode_id, updated_at) VALUES (?, ?, 'full', NULL, ?)`).run(id, stored, daysAgo(idleDays));
+  };
+  conversation('week-idle', 9);
+  conversation('fresh', 2);
+  conversation('pinned', 9, '{"pinned":true}');
+
+  const pass = await decay.runStorageDecayPass(log.HARNESS_DB_PATH, { budgetMs: 10_000 });
+  assert.equal(pass.state, 'processed', JSON.stringify(pass));
+  if (pass.state !== 'processed') return;
+  assert.equal(pass.compaction.compacted, 1);
+  assert.equal(pass.compaction.held, 1);
+  assert.deepEqual(pass.compaction.heldBy, { pinned: 1 });
+  assert.equal(pass.compaction.caughtUp, true);
+  const row = (id: string) => db.prepare('SELECT fidelity, state_json AS stateJson FROM session_conversation_state WHERE session_id = ?').get(id) as { fidelity: string; stateJson: string };
+  assert.equal(row('week-idle').fidelity, 'compacted');
+  const compacted = JSON.parse(row('week-idle').stateJson) as { items: Array<{ type?: string; role?: string }>; lastResponseId?: string };
+  assert.equal(compacted.lastResponseId, undefined, 'a rewritten history never continues the provider chain');
+  assert.equal(compacted.items.some((item) => item.type === 'reasoning'), false);
+  assert.deepEqual(compacted.items.filter((item) => item.role).length, 2, 'messages stay');
+  assert.ok(row('week-idle').stateJson.length < stored.length / 4, 'the stored state shrank');
+  assert.equal(row('fresh').fidelity, 'full');
+  assert.equal(row('fresh').stateJson, stored);
+  assert.equal(row('pinned').fidelity, 'full');
+  assert.equal(row('pinned').stateJson, stored);
 });

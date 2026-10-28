@@ -1,7 +1,7 @@
 /** Off-main-thread storage decay: a retired turn's working records and the
- * event log's diagnostic rows age out in a short-lived worker with its own
- * connection. Single-flight per store; it never falls back to blocking the
- * main loop. */
+ * event log's diagnostic rows age out, and a week-idle conversation's stored
+ * state is compacted, in a short-lived worker with its own connection.
+ * Single-flight per store; it never falls back to blocking the main loop. */
 import { Worker } from 'node:worker_threads';
 import type { StorageDecayWorkerData, StorageDecayWorkerResult } from './storage-decay.worker.js';
 
@@ -10,15 +10,17 @@ import type { StorageDecayWorkerData, StorageDecayWorkerResult } from './storage
 export const STORAGE_DECAY_PASS_BUDGET_MS = 2_000;
 /** Diagnostic rows one pass removes at most. */
 export const STORAGE_DECAY_DIAGNOSTIC_ROWS = 2_000;
+/** Idle conversations one pass compacts at most. */
+export const STORAGE_DECAY_COMPACTION_LIMIT = 25;
 const WORKER_TIMEOUT_MS = 20_000;
 
 const running = new Map<string, Promise<StorageDecayWorkerResult>>();
-export function runStorageDecayPass(dbPath: string, options: { budgetMs?: number; diagnosticRows?: number } = {}): Promise<StorageDecayWorkerResult> {
+export function runStorageDecayPass(dbPath: string, options: { budgetMs?: number; diagnosticRows?: number; compactionLimit?: number } = {}): Promise<StorageDecayWorkerResult> {
   const existing = running.get(dbPath);
   if (existing) return existing;
   const task = new Promise<StorageDecayWorkerResult>(resolve => {
     const data: StorageDecayWorkerData = { dbPath, budgetMs: options.budgetMs ?? STORAGE_DECAY_PASS_BUDGET_MS,
-      diagnosticRows: options.diagnosticRows ?? STORAGE_DECAY_DIAGNOSTIC_ROWS };
+      diagnosticRows: options.diagnosticRows ?? STORAGE_DECAY_DIAGNOSTIC_ROWS, compactionLimit: options.compactionLimit ?? STORAGE_DECAY_COMPACTION_LIMIT };
     let worker: Worker;
     try {
       if (import.meta.url.endsWith('.ts')) {

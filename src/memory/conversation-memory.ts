@@ -5,10 +5,10 @@
  * and found, what was decided, what was left open and what is worth finding
  * again, written by the owner's memory model from the transcript alone (the
  * `learn` job). Recall finds it like any other memory. Its stored working
- * state is compacted at the same age, and after a month idle it is retired to
- * that memory plus its last few messages (conversation-state-lifecycle.ts). A
- * chat retires only once its memory exists. The transcript the owner reads is
- * never touched.
+ * state is compacted at the same age (the storage decay worker's pass), and
+ * after a month idle it is retired to that memory plus its last few messages
+ * (conversation-state-lifecycle.ts). A chat retires only once its memory
+ * exists. The transcript the owner reads is never touched.
  *
  * Memories decay too: a year after the conversation ended, its memory keeps
  * only its first line.
@@ -20,7 +20,6 @@ import { z } from 'zod';
 import { listEvents, openEventLog } from '../runtime/harness/eventlog.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import {
-  compactConversationState,
   captureConversationMemorySnapshot,
   CONVERSATION_COMPACT_IDLE_DAYS,
   CONVERSATION_MEMORY_ONLY_IDLE_DAYS,
@@ -185,7 +184,6 @@ function memoryText(memory: ConversationMemory): string {
 }
 
 export interface ConversationConsolidation {
-  compacted: number;
   remembered: number;
   retired: number;
   held: number;
@@ -247,9 +245,8 @@ export function fadeConversationMemories(nowIso = new Date().toISOString()): num
 }
 
 /**
- * One pass: compact what has been idle a week, remember idle chats, retire
- * what has been idle a month, fade year-old memories. Bounded per pass; the
- * next pass picks up the rest.
+ * One pass: remember idle chats, retire what has been idle a month, fade
+ * year-old memories. Bounded per pass; the next pass picks up the rest.
  */
 let lastUnlearnDay = '';
 
@@ -298,13 +295,12 @@ export function expireLearningExcludedMemories(now: Date = new Date(), force = f
 
 export async function consolidateIdleConversations(input: {
   now?: Date;
-  compactLimit?: number;
   rememberLimit?: number;
   retireLimit?: number;
 } = {}): Promise<ConversationConsolidation> {
   const now = input.now ?? new Date();
   const nowMs = now.getTime();
-  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, unlearned: 0, waiting: false };
+  const result: ConversationConsolidation = { remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, unlearned: 0, waiting: false };
   const weekAgo = new Date(nowMs - CONVERSATION_COMPACT_IDLE_DAYS * 86_400_000).toISOString();
   const monthAgo = new Date(nowMs - CONVERSATION_MEMORY_ONLY_IDLE_DAYS * 86_400_000).toISOString();
 
@@ -340,15 +336,11 @@ export async function consolidateIdleConversations(input: {
       ? memoryJobFailed(note)
       : result.remembered > 0 ? { outcome: 'ok', produced: { learned: result.remembered }, record: true } : { outcome: 'nothing_new' });
 
-  // Compacting and retiring stored state is upkeep (`tidy`): no model.
+  // Retiring stored state is upkeep (`tidy`): no model. Compacting it is the
+  // storage decay worker's pass, off the daemon's loop.
   await runMemoryModelJob('tidy', { source: { kind: 'schedule' } }, async () => {
     for (const sessionId of listCompactedSessionsNeedingRepair(200)) {
       result.repaired += repairCompactedProvenanceResults(sessionId).restored;
-    }
-    for (const candidate of listConversationLifecycleCandidates({ idleBefore: weekAgo, fidelity: ['full'], limit: input.compactLimit ?? 150 })) {
-      const step = compactConversationState(candidate.sessionId, nowMs);
-      if (step === 'changed') result.compacted += 1;
-      else if (step === 'held') result.held += 1;
     }
     for (const candidate of listConversationLifecycleCandidates({ idleBefore: monthAgo, fidelity: ['full', 'compacted'], limit: input.retireLimit ?? 150 })) {
       // A chat retires only to its memory; a workflow or execution step's
@@ -366,6 +358,6 @@ export async function consolidateIdleConversations(input: {
     }
     result.faded = fadeConversationMemories(now.toISOString());
     result.unlearned = expireLearningExcludedMemories(now);
-  }, () => memoryTidyOutcome([], result.compacted + result.retired + result.faded + result.unlearned));
+  }, () => memoryTidyOutcome([], result.retired + result.faded + result.unlearned));
   return result;
 }

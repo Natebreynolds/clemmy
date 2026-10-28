@@ -783,16 +783,17 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     logger.warn({ err }, 'memory work retention tick failed');
   }
 
-  // Idle conversations fold into memory and their stored working state
-  // shrinks (conversation-memory.ts): first a few minutes after start, since
-  // an app quit often may never reach the hour, then hourly. Bounded per
-  // pass; never while the machine is busy.
+  // Idle conversations fold into memory and the month-idle retire to it
+  // (conversation-memory.ts): first a few minutes after start, since an app
+  // quit often may never reach the hour, then hourly. Bounded per pass; never
+  // while the machine is busy. A week-idle state's compaction is the storage
+  // decay worker's, below, off this loop.
   if ((tickCount === CONVERSATION_MEMORY_FIRST_TICK || tickCount % EVENTLOG_REAPER_EVERY_N_TICKS === 0)
     && !shouldDeferDiscretionaryWork('conversation-memory')) {
     try {
       const { consolidateIdleConversations } = await import('./conversation-memory.js');
       const folded = await consolidateIdleConversations();
-      if (folded.compacted + folded.remembered + folded.retired + folded.faded + folded.repaired > 0) logger.info({ folded }, 'conversation memory tick');
+      if (folded.remembered + folded.retired + folded.faded + folded.repaired > 0) logger.info({ folded }, 'conversation memory tick');
     } catch (err) {
       logger.warn({ err }, 'conversation memory tick failed');
     }
@@ -872,8 +873,9 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
   }
 
   // A retired turn's working records and the event log's diagnostic rows age
-  // out in a worker with its own connection, a bounded pass a minute, so a
-  // chat never waits behind a delete.
+  // out, and a week-idle conversation's stored state is compacted, in a
+  // worker with its own connection, a bounded pass a minute, so a chat never
+  // waits behind a delete or a rewrite.
   if (tickCount % HISTORY_STORAGE_EVERY_N_TICKS === 2 && !shouldDeferDiscretionaryWork('storage-decay')) {
     try {
       const { runStorageDecayPass } = await import('../runtime/storage-decay.js');
@@ -881,7 +883,15 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
       const pass = await runStorageDecayPass(HARNESS_DB_PATH);
       if (pass.state === 'processed') {
         const shed = Object.entries(pass.decay).some(([key, value]) => key !== 'held' && key !== 'heldBy' && (value as number) > 0);
-        if (shed || pass.diagnostics.removed > 0) logger.info({ ...pass.decay, diagnostics: pass.diagnostics }, 'storage decay pass');
+        if (shed || pass.compaction.compacted > 0 || pass.diagnostics.removed > 0) {
+          logger.info({ ...pass.decay, compaction: pass.compaction, diagnostics: pass.diagnostics }, 'storage decay pass');
+        }
+        // A compacted conversation is tidy work the Memory tab shows.
+        if (pass.compaction.compacted > 0) {
+          const { memoryTidyOutcome, runMemoryModelJob } = await import('./memory-job-context.js');
+          await runMemoryModelJob('tidy', { source: { kind: 'schedule' } }, async () => pass.compaction.compacted,
+            (compacted) => memoryTidyOutcome([], compacted));
+        }
       } else if (pass.state === 'unavailable') logger.warn({ error: pass.error }, 'storage decay pass unavailable');
     } catch (err) {
       logger.warn({ err }, 'storage decay pass failed');
