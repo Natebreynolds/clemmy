@@ -1,4 +1,5 @@
 import { inlineCreationTestReturnedMetadata, notifyInlineCreationTestReturned } from '../../execution/inline-creation-test-delivery.js';
+import { storeToolMedia } from '../chat-media.js';
 import type { Runner } from '@openai/agents';
 import { randomUUID } from 'node:crypto';
 import { appendEvent, writeToolOutput, withEventPublicationTransaction, type EventRow } from './eventlog.js';
@@ -540,6 +541,11 @@ export function attachEventLogHooks(
     // The SDK lifecycle sees the model-facing result, which can carry harness
     // steering appended after the provider settled. Never persist or learn
     // that control-plane prose as provider authority.
+    // What the tool saw, kept for the chat under this call; never blocks the return.
+    let returnedMedia: Array<{ id: string; path: string; mimeType: string }> = [];
+    try {
+      if (callId) returnedMedia = storeToolMedia(sessionId, callId, result).map(({ id, path: mediaPath, mimeType }) => ({ id, path: mediaPath, mimeType }));
+    } catch { returnedMedia = []; }
     const authorityResultStr = resultStr === null
       || effectiveToolTail(tool?.name ?? '') !== 'composio_execute_tool'
       ? resultStr
@@ -634,6 +640,7 @@ export function attachEventLogHooks(
               tool: tool?.name ?? null,
               callId: callId ?? null,
               canonicalCallId: callId ?? null,
+              ...(returnedMedia.length ? { media: returnedMedia } : {}),
               ...(lease ? { dispatchLeaseId: lease.leaseId } : {}),
               accounting: 'top_level',
               topologyRole,
