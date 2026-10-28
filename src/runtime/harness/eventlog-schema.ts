@@ -11599,6 +11599,58 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     }
   } },
+  { version: 102, sql: '', backfill: (db) => {
+    const tableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?");
+    // Every column that references an event row, indexed where it is set:
+    // deleting an event checks each of these, and an unindexed one is read
+    // row by row. Live, one unindexed delete pinned the daemon for minutes.
+    const references: Array<[table: string, column: string]> = [
+      ['accepted_model_batch_admissions', 'graph_event_id'],
+      ['accepted_model_batch_checkpoints', 'graph_event_id'],
+      ['accepted_source_usage_v1', 'source_user_seq'],
+      ['accepted_task_authority', 'host_completion_event_id'],
+      ['accepted_task_authority', 'backstop_event_id'],
+      ['accepted_task_authority', 'terminal_event_id'],
+      ['accepted_task_authority', 'graph_event_id'],
+      ['accepted_task_operations', 'operation_event_id'],
+      ['accepted_task_resolutions', 'finalize_event_id'],
+      ['accepted_task_resolutions', 'graph_event_id'],
+      ['accepted_task_work_contracts', 'graph_event_id'],
+      ['accepted_turn_call_authorities', 'graph_event_id'],
+      ['accepted_turn_call_authorities', 'source_event_id'],
+      ['expected_work_universe_amendments', 'amendment_event_id'],
+      ['host_call_capability_bindings', 'source_event_id'],
+      ['host_call_capability_bindings', 'root_graph_event_id'],
+      ['host_model_result_receipts', 'source_event_id'],
+      ['logical_model_result_projection_receipts', 'settlement_event_id'],
+      ['logical_model_result_projection_receipts', 'source_event_id'],
+      ['model_request_provenance', 'source_event_id'],
+      ['physical_dispatches', 'settle_event_id'],
+      ['physical_dispatches', 'start_event_id'],
+      ['plan_task_activation_receipts', 'preamble_event_id'],
+      ['plan_task_binding_seal_intents', 'graph_event_id'],
+      ['plan_task_preparation_checkpoints', 'graph_event_id'],
+      ['reviewed_plan_execution_claims_v1', 'event_id'],
+      ['reviewed_plan_execution_claims_v1', 'source_user_seq'],
+      ['reviewed_plan_execution_observers_v1', 'source_user_seq'],
+      ['reviewed_plan_preparation_drafts_v1', 'source_user_seq'],
+      ['reviewed_plan_revisions_v1', 'event_id'],
+      ['reviewed_plan_revisions_v1', 'source_user_seq'],
+      ['reviewed_plan_step_results_v1', 'source_user_seq'],
+      ['run_attempts', 'source_user_seq'],
+      ['session_history_documents_v1', 'source_user_seq'],
+      ['session_history_documents_v1', 'event_seq'],
+      ['session_history_search_receipts_v1', 'source_user_seq'],
+      ['source_session_contexts_v1', 'source_user_seq'],
+      ['task_continuity_packets', 'consumed_by_source_event_id'],
+      ['task_continuity_packets', 'originating_source_event_id'],
+      ['write_evidence_dispatch_outcomes', 'settlement_event_id']
+    ];
+    for (const [table, column] of references) {
+      if (!tableExists.get(table)) continue;
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_${column}_event ON ${table} (${column}) WHERE ${column} IS NOT NULL`);
+    }
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {
