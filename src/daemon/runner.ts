@@ -3640,6 +3640,17 @@ export async function startDaemon(
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Coding run executor failed to start');
   }
 
+  // App events: what happens in a connected app reaches the workflows that
+  // subscribe to it, over Composio's push subscription (no public URL).
+  try {
+    const { startAppEventListener } = await import('../integrations/composio/trigger-listener.js');
+    void startAppEventListener().catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'App event listener failed to start');
+    });
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'App event listener could not load');
+  }
+
   bootStep('heartbeats');
   // Calendar watch heartbeat: a minute-level check that ticks on the policy
   // cadence, reads every connected calendar through the prepared read path,
