@@ -2108,4 +2108,31 @@ export function registerSpaceTools(server: McpServer): void {
       );
     },
   );
+
+  server.tool(
+    'space_archive',
+    [
+      'Archive a Workspace the user no longer wants on their Spaces list, or restore one they archived. Archiving is reversible: every file, dataset and schedule record is kept, nothing refreshes while it is archived, and it leaves the list.',
+      'Use this for "delete / remove / get rid of / archive this Space"; there is no harder delete to look for. Name the Space by its slug (space_list shows slugs).',
+      'Say plainly what happened in your own words: which Space, that it can be restored, or that it is back.',
+    ].join('\n'),
+    {
+      slug: z.string().min(2).max(63).describe('The workspace slug to archive or restore.'),
+      restore: z.boolean().optional().describe('true brings an archived Space back to the list as active.'),
+    },
+    async ({ slug, restore }) => {
+      if (!isValidSpaceSlug(slug)) return invalidArgumentsTextResult(`Error: "${slug}" is not a valid workspace slug.`);
+      const existing = spaceStore.get(slug);
+      if (!existing) return invalidArgumentsTextResult(`Error: no workspace "${slug}" exists. space_list shows the slugs that do.`);
+      if (restore) {
+        if (existing.status !== 'archived') return textResult(`"${existing.title}" (${slug}) is not archived; it is ${existing.status} and on the list already.`);
+        const restored = spaceStore.update(slug, { status: 'active' });
+        return textResult(`Restored "${restored?.title ?? existing.title}" (${slug}): it is active and back on the Spaces list; scheduled sources refresh again on their schedule.`);
+      }
+      if (existing.status === 'archived') return textResult(`"${existing.title}" (${slug}) is already archived. Pass restore=true to bring it back.`);
+      const archived = spaceStore.archive(slug);
+      if (!archived) return textResult(`Could not archive "${slug}": its manifest could not be updated.`);
+      return textResult(`Archived "${archived.title}" (${slug}): it is off the Spaces list and nothing refreshes while it is archived. Its files and data are kept; space_archive with restore=true brings it back.`);
+    },
+  );
 }

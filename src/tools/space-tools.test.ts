@@ -1536,3 +1536,23 @@ test('a Space document may be passed as the object itself, not only as JSON text
   } as never));
   assert.match(bad, /initial_data_json is not valid JSON/);
 });
+
+test('space_archive takes a Space off the list reversibly, and restore brings it back', async () => {
+  // Live 2026-10-27: asked to delete a Space, Clem invented a space_delete
+  // tool and settled effect-unknown; there was no door for the ask.
+  const created = await tools.space_save({ slug: 'archive-me', title: 'Archive me', view_html: '<html><body>x</body></html>' });
+  assert.doesNotMatch(text(created), /Error/);
+  assert.equal(isInvalidArgumentsTextResult(await tools.space_archive({ slug: 'Bad Slug' })), true);
+  assert.equal(isInvalidArgumentsTextResult(await tools.space_archive({ slug: 'never-made' })), true);
+  const archived = await tools.space_archive({ slug: 'archive-me' });
+  assert.match(text(archived), /Archived "Archive me"/);
+  assert.match(text(archived), /restore=true/);
+  assert.equal(store.spaceStore.get('archive-me')?.status, 'archived');
+  assert.equal(store.spaceStore.list().some((space) => space.id === 'archive-me'), false, 'off the list');
+  assert.equal(store.spaceStore.list(true).some((space) => space.id === 'archive-me'), true, 'kept for restore');
+  assert.match(text(await tools.space_archive({ slug: 'archive-me' })), /already archived/);
+  const restored = await tools.space_archive({ slug: 'archive-me', restore: true });
+  assert.match(text(restored), /Restored "Archive me"/);
+  assert.equal(store.spaceStore.get('archive-me')?.status, 'active');
+  assert.match(text(await tools.space_archive({ slug: 'archive-me', restore: true })), /not archived/);
+});
