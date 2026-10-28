@@ -19,6 +19,12 @@ const daysAgo = (days: number) => new Date(NOW - days * 86_400_000).toISOString(
 
 after(() => { log.closeEventLog(); rmSync(TMP_HOME, { recursive: true, force: true }); });
 
+test('an event a call or dispatch record names is not a diagnostic', () => {
+  for (const type of ['provider_dispatch_started', 'provider_dispatch_settled', 'tool_attempt_settled', 'tool_called', 'tool_returned', 'user_input_received', 'conversation_completed']) {
+    assert.ok(!(retention.DIAGNOSTIC_EVENT_TYPES as readonly string[]).includes(type), `${type} stays with its record`);
+  }
+});
+
 test('diagnostic rows older than the window go, the transcript and referenced rows stay, and the bound holds', () => {
   const db = log.openEventLog();
   db.pragma('foreign_keys = ON');

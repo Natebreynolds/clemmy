@@ -16,16 +16,16 @@
  */
 import type Database from 'better-sqlite3';
 
-/** Observational event types: read within their own turn, never as history. */
+/** Observational event types: read within their own turn, never as history.
+ * A dispatch's start and settle events and the attempt a call settled on are
+ * not here: a dispatch or call record names them, and they live and go with
+ * it. */
 export const DIAGNOSTIC_EVENT_TYPES = [
   'model_transport_observed',
   'model_resilience_observed',
   'model_stream_diagnostic',
-  'provider_dispatch_started',
-  'provider_dispatch_settled',
   'prompt_composition',
   'turn_phase_timings',
-  'tool_attempt_settled',
   'guardrail_tripped',
   'discovery_governor_decision',
   'discovery_governor_outcome',
