@@ -64,7 +64,9 @@ export function ComputerDriver() {
             </div>
           )}
           {step === 'install' && s?.install.viaPassword && (
-            <p className="mt-2 text-small text-muted">{s.install.reason}</p>
+            <p className="mt-2 text-small text-muted">
+              {s.install.reason} The window is your Mac’s own security prompt: it says a script started by Clementine wants administrator access and that Apple could not verify the script. That is Apple’s standard wording for any admin step. Clem never sees what you type there.
+            </p>
           )}
           {step === 'needs-admin' && s && (
             <div className="mt-3">
