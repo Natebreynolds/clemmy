@@ -77,6 +77,7 @@ export function ComputerDriver() {
           {step === 'ready' && s && (
             <div className="mt-2">
               <p className="inline-flex items-center gap-1 text-small text-fg"><Check className="h-4 w-4 text-success" aria-hidden /> Clem can use the apps on this computer. Ask her to do something in one.</p>
+              <p className="mt-1 text-small text-muted">This is also Clem’s browser now. The Chrome harness and any cloud browser below stay idle while it is on.</p>
               {s.platformSupport === 'supported' && (
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <Button variant="ghost" size="sm" disabled={busy === 'permissions'} onClick={() => run('permissions', async () => { const r = await grantComputerDriverPermissions(); setHint(r.output); })}>

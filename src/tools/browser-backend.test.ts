@@ -15,7 +15,7 @@ const home = mkdtempSync(path.join(os.tmpdir(), 'clem-browser-backend-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { browserBackendOffered } = await import('./browser-backend.js');
+const { browserBackendOffered, browserNotOfferedText } = await import('./browser-backend.js');
 const { browserbaseStoreFile, browserbaseProjectSetUp } = await import('../integrations/browserbase-setup.js');
 const { catalogEntries } = await import('../agents/tool-catalog.js');
 const { TOOL_REGISTRY } = await import('./tool-registry.js');
@@ -88,5 +88,19 @@ test('a store without a valid project leaves local Chrome as the browser', () =>
     assert.equal(browserBackendOffered('local'), true);
   } finally {
     rmSync(file, { force: true });
+  }
+});
+
+test('with Clem\'s computer driver connected, neither browser is offered: the computer is the browser', () => {
+  process.env.CLEMMY_COMPUTER_IS_THE_BROWSER = '1';
+  try {
+    assert.equal(browserBackendOffered('cloud'), false);
+    assert.equal(browserBackendOffered('local'), false);
+    assert.equal(browserBackendOffered(undefined), true, 'tools without a browser backend are unaffected');
+    const offered = names();
+    for (const name of [...backendTools('cloud'), ...backendTools('local')]) assert.ok(!offered.has(name), `${name} hidden`);
+    assert.match(browserNotOfferedText('local'), /Your computer is the browser/);
+  } finally {
+    delete process.env.CLEMMY_COMPUTER_IS_THE_BROWSER;
   }
 });

@@ -112,6 +112,9 @@ export function describeExternalWrite(
  *  `publicSlug` is the runtime-validated dispatch identity the public event
  *  plane attaches (raw args are private there) — it wins when present, so the
  *  live strip says "outlook send email" instead of "composio execute tool". */
+/** Servers Clem herself set up read by what they are to the owner. */
+const SERVER_WORDS: Record<string, string> = { 'cua-driver': 'Your computer' };
+
 export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unknown, innerTool?: unknown): string {
   if (typeof publicSlug === 'string' && publicSlug) {
     return publicSlug.replace(/_/g, ' ').toLowerCase();
@@ -130,5 +133,5 @@ export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unk
   // `server__tool` names render as "server · tool"; `mcp__server__tool` drops
   // the mcp prefix first. Single underscores become spaces.
   const stripped = tool.replace(/^mcp__/, '');
-  return stripped.split('__').map((part) => part.replace(/_/g, ' ')).filter(Boolean).join(' · ');
+  return stripped.split('__').map((part, index) => (index === 0 && SERVER_WORDS[part]) || part.replace(/_/g, ' ')).filter(Boolean).join(' · ');
 }

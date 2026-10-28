@@ -178,6 +178,14 @@ export async function computerDriverStatus(servers: ReadonlyArray<Pick<ManagedMc
   return readComputerDriverStatus({ path: binary, embedded, host: computerDriverHostState(), statusText: null, permissionsText, servers });
 }
 
+/** True when Clem's own driver is registered and enabled: it is then the
+ *  browser on this machine as well as the desktop. Reads the server list
+ *  the caller already holds, so the switch costs nothing on the hot path. */
+export function computerDriverIsTheBrowser(servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>, binary: string | null = computerDriverPath()): boolean {
+  if (!binary || !isOwnComputerDriver(binary)) return false;
+  return readComputerDriverStatus({ path: binary, statusText: null, permissionsText: null, servers }).connected;
+}
+
 // ─── The private daemon ──────────────────────────────────────────────────
 let host: { child: ChildProcess; generation: number } | null = null;
 let hostStopped = true;

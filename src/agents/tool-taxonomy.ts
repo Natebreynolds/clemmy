@@ -486,6 +486,24 @@ function classifyComposioSlug(slug: string): ToolKind {
 }
 
 /** Public — used by every tool family's `needsApproval` factory. */
+
+/**
+ * The computer driver (Connect → Your computer) serves its tools over MCP
+ * under one server name. Observation is a read: looking at windows, the
+ * screen, the clipboard, its own health. Everything else acts in an app on
+ * this machine, a write at the local boundary, so Auto runs it and Ask asks.
+ */
+const COMPUTER_DRIVER_PREFIX = 'cua-driver__';
+const COMPUTER_DRIVER_READ_PREFIXES = ['get_', 'list_', 'check_', 'verify_', 'parse_', 'debug_'];
+const COMPUTER_DRIVER_READ_NAMES = new Set(['zoom', 'screenshot', 'clipboard_read', 'health_report', 'page']);
+export function computerDriverToolKind(rawLower: string): ToolKind | null {
+  const bare = rawLower.startsWith('mcp__') ? rawLower.slice('mcp__'.length) : rawLower;
+  if (!bare.startsWith(COMPUTER_DRIVER_PREFIX)) return null;
+  const tool = bare.slice(COMPUTER_DRIVER_PREFIX.length);
+  if (COMPUTER_DRIVER_READ_NAMES.has(tool) || COMPUTER_DRIVER_READ_PREFIXES.some((prefix) => tool.startsWith(prefix))) return 'read';
+  return 'write';
+}
+
 export function classifyTool(name: string, options: ClassifyOptions = {}): ToolKind {
   if (options.kindHint) return options.kindHint;
   // Fixed Chrome observation is a read; arbitrary scripts keep their own effect.
@@ -514,6 +532,8 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
   // Treating every `dataforseo__*` call as "write" caused SEO audits to
   // stop for approval on every lookup.
   const rawLower = name.toLowerCase();
+  const computerDriverKind = computerDriverToolKind(rawLower);
+  if (computerDriverKind) return computerDriverKind;
   if (rawLower.startsWith('dataforseo__') || rawLower.startsWith('dataforseo-mcp-server__')) {
     return 'read';
   }
@@ -580,6 +600,7 @@ export function classifyTool(name: string, options: ClassifyOptions = {}): ToolK
 function hasKnownToolClassification(name: string, args: unknown): boolean {
   if (ALWAYS_READ.has(name) || ALWAYS_ADMIN.has(name) || NEVER_GATE_LOCAL_MEMORY.has(name)) return true;
   const rawLower = name.toLowerCase();
+  if (computerDriverToolKind(rawLower)) return true;
   if (rawLower.startsWith('dataforseo__') || rawLower.startsWith('dataforseo-mcp-server__')) return true;
   if (name === 'memory_self_heal' || name.endsWith('__memory_self_heal')) return true;
   if (isComposioMultiplexerName(name)) return Boolean(extractComposioSlug(args));

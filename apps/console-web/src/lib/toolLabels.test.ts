@@ -17,6 +17,7 @@ test('humanToolLabel unwraps a composio slug and strips mcp prefixes', () => {
     'outlook send email',
   );
   assert.equal(humanToolLabel('mcp__some_server__list_items'), 'some server · list items');
+  assert.equal(humanToolLabel('mcp__cua-driver__get_window_state'), 'Your computer · get window state');
   assert.equal(humanToolLabel('read_file'), 'read file');
   // No args is fine — the composio branch just doesn't fire.
   assert.equal(humanToolLabel('composio_execute_tool'), 'composio execute tool');

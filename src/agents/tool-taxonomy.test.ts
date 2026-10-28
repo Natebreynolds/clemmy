@@ -800,3 +800,13 @@ test('foreign shell and Composio multiplexers never auto-run under yolo', () => 
   });
   assert.equal(local.needsApproval, false, 'exact local shell keeps yolo semantics');
 });
+
+test('the computer driver\'s tools: looking is a read, acting in an app is a write at the local boundary', () => {
+  for (const name of ['mcp__cua-driver__get_window_state', 'cua-driver__list_apps', 'cua-driver__check_permissions', 'cua-driver__verify_state', 'cua-driver__zoom', 'cua-driver__screenshot', 'cua-driver__clipboard_read', 'cua-driver__health_report', 'cua-driver__get_browser_state']) {
+    assert.equal(classifyTool(name), 'read', name);
+  }
+  for (const name of ['mcp__cua-driver__click', 'cua-driver__type_text', 'cua-driver__press_key', 'cua-driver__launch_app', 'cua-driver__kill_app', 'cua-driver__run_steps', 'cua-driver__run_script', 'cua-driver__browser_navigate', 'cua-driver__browser_click', 'cua-driver__clipboard_write', 'cua-driver__set_value']) {
+    assert.equal(classifyTool(name), 'write', name);
+  }
+  assert.equal(classifyTool('other-server__click'), 'write', 'another server\'s click keeps the conservative default');
+});
