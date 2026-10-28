@@ -4,16 +4,16 @@ import type { InstallJob } from './connect';
 export interface ComputerDriverStatus {
   installed: boolean;
   path: string | null;
+  embedded: boolean;
+  version: string;
   daemon: 'running' | 'stopped' | 'unknown';
   statusText: string | null;
   permissions: 'granted' | 'missing' | 'unknown';
   permissionsText: string | null;
   connected: boolean;
   serverName: string;
-  installCommand: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
-  install: { blocked: boolean; viaPassword: boolean; reason: string | null; adminCommand: string | null };
 }
 
 export const getComputerDriver = () => apiGet<ComputerDriverStatus>('/api/console/computer-driver');
@@ -22,11 +22,10 @@ export const getComputerDriverInstallJob = (id: string) => apiGet<{ job: Install
 export const grantComputerDriverPermissions = () => apiPost<{ output: string; status: ComputerDriverStatus }>('/api/console/computer-driver/permissions', {});
 export const connectComputerDriver = () => apiPost<{ status: ComputerDriverStatus }>('/api/console/computer-driver/connect', {});
 
-/** The one next step the card offers, in order: install, permissions, connect, done. */
-export function computerDriverNextStep(status: ComputerDriverStatus): 'install' | 'needs-admin' | 'permissions' | 'connect' | 'ready' | 'unsupported' {
+/** The one next step the card offers: turn on, connect (an older copy), then ready. */
+export function computerDriverNextStep(status: ComputerDriverStatus): 'install' | 'connect' | 'ready' | 'unsupported' {
   if (status.platformSupport === 'unsupported') return 'unsupported';
-  if (!status.installed) return status.install?.blocked ? 'needs-admin' : 'install';
-  if (status.permissions === 'missing') return 'permissions';
+  if (!status.installed) return 'install';
   if (!status.connected) return 'connect';
   return 'ready';
 }

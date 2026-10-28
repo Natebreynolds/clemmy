@@ -3640,6 +3640,17 @@ export async function startDaemon(
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Coding run executor failed to start');
   }
 
+  // Clem's computer: her own copy of the driver runs as a private daemon
+  // under the app's identity whenever it is installed and connected.
+  try {
+    const { startComputerDriverHost } = await import('../integrations/computer-driver.js');
+    const { discoverMcpServers } = await import('../runtime/mcp-config.js');
+    const started = startComputerDriverHost({ servers: discoverMcpServers() });
+    if (started !== 'idle') logger.info({ started }, 'Computer driver host');
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Computer driver host could not start');
+  }
+
   // App events: what happens in a connected app reaches the workflows that
   // subscribe to it, over Composio's push subscription (no public URL).
   try {

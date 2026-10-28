@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Monitor, Check, Download, ShieldCheck, Plug, Loader2, ExternalLink, Copy } from 'lucide-react';
+import { Monitor, Check, Download, ShieldCheck, Plug, Loader2, ExternalLink } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -10,14 +10,17 @@ import {
 } from '@/lib/computer-driver';
 
 // Your computer: Cua Driver (open source) lets Clem click, type and read in
-// the apps on this machine, in windows behind yours, with a cursor of its
-// own. Three moves, one at a time: install, grant permissions, connect.
+// the apps on this machine with a cursor of its own. One tap turns it on:
+// Clem downloads her own copy, verifies it, and runs it under the app's
+// identity, so no administrator, system folder or terminal is involved. The
+// system's own permission pages are offered beside the ready line.
 export function ComputerDriver() {
   const qc = useQueryClient();
   const status = usePoll(['computer-driver'], getComputerDriver, 20_000);
   const [jobId, setJobId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [hint, setHint] = useState('');
   const jobQ = useQuery({
     queryKey: ['computer-driver-install', jobId],
     queryFn: () => getComputerDriverInstallJob(jobId!),
@@ -42,9 +45,9 @@ export function ComputerDriver() {
             <h3 className="text-h3 text-fg">Your computer</h3>
             {s && (
               <>
-                <StatusPill tone={s.installed ? 'success' : step === 'needs-admin' ? 'warning' : 'neutral'}>{s.installed ? 'Installed' : step === 'needs-admin' ? 'Needs an admin' : 'Not installed'}</StatusPill>
-                {s.installed && <StatusPill tone={s.daemon === 'running' ? 'success' : s.daemon === 'stopped' ? 'warning' : 'neutral'}>{s.daemon === 'running' ? 'Running' : s.daemon === 'stopped' ? 'Stopped' : 'Status unknown'}</StatusPill>}
-                {s.installed && s.permissions !== 'unknown' && <StatusPill tone={s.permissions === 'granted' ? 'success' : 'warning'}>{s.permissions === 'granted' ? 'Permissions granted' : 'Needs permissions'}</StatusPill>}
+                <StatusPill tone={s.installed ? 'success' : 'neutral'}>{s.installed ? 'On' : 'Off'}</StatusPill>
+                {s.installed && <StatusPill tone={s.daemon === 'running' ? 'success' : s.daemon === 'stopped' ? 'warning' : 'neutral'}>{s.daemon === 'running' ? 'Running' : s.daemon === 'stopped' ? 'Stopped' : 'Starting'}</StatusPill>}
+                {s.installed && s.permissions !== 'unknown' && <StatusPill tone={s.permissions === 'granted' ? 'success' : 'warning'}>{s.permissions === 'granted' ? 'Allowed by macOS' : 'Needs your permission'}</StatusPill>}
                 <StatusPill tone={s.connected ? 'success' : 'neutral'}>{s.connected ? 'Connected to Clem' : 'Not connected'}</StatusPill>
               </>
             )}
@@ -57,30 +60,10 @@ export function ComputerDriver() {
           {step === 'install' && s && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <Button size="sm" disabled={busy === 'install' || job?.status === 'running'} onClick={() => run('install', async () => { const r = await installComputerDriver(); setJobId(r.job.id); })}>
-                {busy === 'install' || job?.status === 'running' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Download className="h-4 w-4" aria-hidden />} Install Cua Driver
+                {busy === 'install' || job?.status === 'running' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Download className="h-4 w-4" aria-hidden />} Turn on
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => { void navigator.clipboard?.writeText(s.installCommand); }} aria-label="Copy the install command"><Copy className="h-4 w-4" aria-hidden /> Copy the command</Button>
-              <a className="inline-flex items-center gap-1 text-small text-primary hover:underline" href={s.docsUrl} target="_blank" rel="noreferrer">What it installs <ExternalLink className="h-3.5 w-3.5" aria-hidden /></a>
-            </div>
-          )}
-          {step === 'install' && s?.install.viaPassword && (
-            <p className="mt-2 text-small text-muted">
-              {s.install.reason} The window is your Mac’s own security prompt: it says a script started by Clementine wants administrator access and that Apple could not verify the script. That is Apple’s standard wording for any admin step. Clem never sees what you type there.
-            </p>
-          )}
-          {step === 'needs-admin' && s && (
-            <div className="mt-3">
-              <p className="text-small text-fg">{s.install.reason}</p>
-              <pre className="mt-2 overflow-auto rounded-md bg-subtle p-2 text-xs text-muted">{s.install.adminCommand}</pre>
-              <Button variant="ghost" size="sm" onClick={() => { void navigator.clipboard?.writeText(s.install.adminCommand ?? ''); }} aria-label="Copy the command for the administrator"><Copy className="h-4 w-4" aria-hidden /> Copy the command</Button>
-            </div>
-          )}
-          {step === 'permissions' && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <Button size="sm" disabled={busy === 'permissions'} onClick={() => run('permissions', grantComputerDriverPermissions)}>
-                {busy === 'permissions' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />} Grant Accessibility & Screen Recording
-              </Button>
-              <span className="text-small text-muted">macOS asks you; nothing is granted from here.</span>
+              <span className="text-small text-muted">Downloads Clem’s own copy (about 50 MB, checked against the maker’s checksums) and connects it. No administrator needed.</span>
+              <a className="inline-flex items-center gap-1 text-small text-primary hover:underline" href={s.docsUrl} target="_blank" rel="noreferrer">What it is <ExternalLink className="h-3.5 w-3.5" aria-hidden /></a>
             </div>
           )}
           {step === 'connect' && (
@@ -91,10 +74,22 @@ export function ComputerDriver() {
               <span className="text-small text-muted">Registers the driver as Clem’s own tool server.</span>
             </div>
           )}
-          {step === 'ready' && <p className="mt-2 inline-flex items-center gap-1 text-small text-fg"><Check className="h-4 w-4 text-success" aria-hidden /> Clem can use the apps on this computer. Ask her to do something in one.</p>}
+          {step === 'ready' && s && (
+            <div className="mt-2">
+              <p className="inline-flex items-center gap-1 text-small text-fg"><Check className="h-4 w-4 text-success" aria-hidden /> Clem can use the apps on this computer. Ask her to do something in one.</p>
+              {s.platformSupport === 'supported' && (
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <Button variant="ghost" size="sm" disabled={busy === 'permissions'} onClick={() => run('permissions', async () => { const r = await grantComputerDriverPermissions(); setHint(r.output); })}>
+                    {busy === 'permissions' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />} Allow in System Settings
+                  </Button>
+                  <span className="text-small text-muted">{hint || 'If Clem cannot see or use your screen, switch Clementine on under Accessibility and Screen Recording.'}</span>
+                </div>
+              )}
+            </div>
+          )}
           {step === 'unsupported' && <p className="mt-2 text-small text-muted">Cua Driver does not support this platform yet.</p>}
-          {job && step !== 'needs-admin' && (
-            <pre className="mt-3 max-h-40 overflow-auto rounded-md bg-subtle p-2 text-xs text-muted">{job.status === 'running' ? 'Installing…\n' : job.status === 'succeeded' ? 'Installed.\n' : 'The install did not finish.\n'}{job.output}</pre>
+          {job && (
+            <pre className="mt-3 max-h-40 overflow-auto rounded-md bg-subtle p-2 text-xs text-muted">{job.status === 'running' ? 'Turning on…\n' : job.status === 'succeeded' ? 'On.\n' : 'That did not finish.\n'}{job.output}</pre>
           )}
           {error && <p className="mt-2 text-small text-danger">{error}</p>}
         </div>

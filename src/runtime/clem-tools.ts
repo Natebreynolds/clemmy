@@ -68,6 +68,8 @@ export interface ToolDownloadRecipe {
   archive?: 'tar' | 'zip' | 'binary';
   /** Names linked into Clem's bin; the executable's own name when omitted. */
   links?: string[];
+  /** The version a fixed-URL recipe pins, for the folder it unpacks into. */
+  version?: string;
 }
 
 export interface ResolvedToolDownload { url: string; assetName: string; checksumsUrl: string | null; version: string; archive: 'tar' | 'zip' | 'binary' }
@@ -82,7 +84,7 @@ export function resolveToolDownload(recipe: ToolDownloadRecipe, input: { platfor
   const asset = key ? recipe.assets[key] : undefined;
   if (!asset) return null;
   const tag = input.tag ?? '';
-  const version = tag.replace(/^v/, '');
+  const version = tag.replace(/^v/, '') || recipe.version || '';
   const name = fill(asset, version, tag);
   const base = recipe.githubRepo ? `https://github.com/${recipe.githubRepo}/releases/download/${tag}/` : '';
   const url = /^https?:\/\//.test(name) ? name : `${base}${name}`;

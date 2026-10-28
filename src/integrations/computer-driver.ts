@@ -1,58 +1,86 @@
 /**
  * Clem's computer: Cua Driver (cua.ai/cua-driver, MIT), a local computer-use
  * daemon that clicks, types and reads in the apps on this machine through
- * the accessibility tree and its own browser window, driven over MCP. Clem
- * registers it as an MCP server of her own, so every action it takes rides
- * her existing contract: consent at the write boundary, settlement of every
- * attempt, and the record of what was done.
+ * the accessibility tree, driven over MCP. Clem owns it: the driver binary
+ * downloads into her tools folder, verified against the vendor's checksums,
+ * and runs embedded under the desktop app's own identity, so the operating
+ * system's Accessibility and Screen Recording grants attach to Clementine
+ * and no system folder, app bundle or administrator is involved. Clem
+ * registers the driver as an MCP server of her own, so every action it
+ * takes rides her existing contract: consent at the write boundary,
+ * settlement of every attempt, and the record of what was done.
  *
- * This module knows where the driver lives, what it reports, and how it is
- * installed and granted its permissions; the Connect card and the routes
- * read and call it. Nothing here runs an action on the computer.
+ * This module knows where the driver lives, how it is fetched, how its
+ * private daemon is kept alive, and what the Connect card reads. Nothing
+ * here runs an action on the computer.
  */
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import pino from 'pino';
 import type { ManagedMcpServer } from '../types.js';
-import { installPreflight, type InstallPlace } from '../runtime/install-locations.js';
+import { clementineHomeDir, clemToolsBin, type ToolDownloadRecipe } from '../runtime/clem-tools.js';
+
+const logger = pino({ name: 'clementine.computer-driver' });
 
 export const COMPUTER_DRIVER_SERVER_NAME = 'cua-driver';
-/** The installer's documented one-liner, from the vendor's quickstart. */
-export const COMPUTER_DRIVER_INSTALL_COMMAND = process.platform === 'win32'
-  ? 'powershell -NoProfile -Command "irm https://cua.ai/driver/install.ps1 | iex"'
-  : '/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"';
+export const COMPUTER_DRIVER_VERSION = '0.37.0';
+/** The desktop app's bundle identity; the driver's permissions attach to it. */
+export const COMPUTER_DRIVER_HOST_BUNDLE_ID = 'com.clemmy.desktop';
 export const COMPUTER_DRIVER_DOCS_URL = 'https://cua.ai/docs/cua-driver/quickstart';
-/** On macOS the installer places an app bundle in the system Applications
- *  folder so the permissions the OS grants attach to it; nothing else works. */
-export const COMPUTER_DRIVER_INSTALL_NEEDS: InstallPlace[] = process.platform === 'darwin' ? ['applications'] : [];
-const MAC_APP_BINARY = '/Applications/CuaDriver.app/Contents/MacOS/cua-driver';
+const RELEASE_BASE = `https://github.com/trycua/cua/releases/download/cua-driver-rs-v${COMPUTER_DRIVER_VERSION}/`;
+
+/** The vendor's binary-only release for this machine, with the vendor's checksum file. */
+export const COMPUTER_DRIVER_DOWNLOAD: ToolDownloadRecipe = {
+  version: COMPUTER_DRIVER_VERSION,
+  assets: {
+    'darwin-arm64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-darwin-universal-binary.tar.gz`,
+    'darwin-x64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-darwin-universal-binary.tar.gz`,
+    'linux-x64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-linux-x86_64-binary.tar.gz`,
+  },
+  checksums: `${RELEASE_BASE}SHA256SUMS`,
+  bin: 'cua-driver',
+};
 
 export interface ComputerDriverStatus {
   installed: boolean;
   path: string | null;
-  /** What `cua-driver status` said, trimmed; null when it could not be asked. */
+  /** Clem's own copy, run embedded under the app's identity. */
+  embedded: boolean;
+  version: string;
+  /** The private daemon Clem keeps for the driver. */
   daemon: 'running' | 'stopped' | 'unknown';
   statusText: string | null;
-  /** macOS: Accessibility and Screen Recording, from `permissions status`. */
+  /** macOS: Accessibility and Screen Recording, when the driver can say. */
   permissions: 'granted' | 'missing' | 'unknown';
   permissionsText: string | null;
   /** Registered as Clem's MCP server, and enabled. */
   connected: boolean;
   serverName: string;
-  installCommand: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
-  /** Whether this account can run the install itself; when not, the words
-   *  and the command an administrator runs once. */
-  install: { blocked: boolean; viaPassword: boolean; reason: string | null; adminCommand: string | null };
 }
 
-export function computerDriverPath(home: string = os.homedir(), platform: NodeJS.Platform = process.platform): string | null {
+/** Clem's own copy first; an older standalone install still counts. */
+export function computerDriverPath(home: string = os.homedir(), platform: NodeJS.Platform = process.platform, toolsBin: string = clemToolsBin()): string | null {
+  const own = path.join(toolsBin, platform === 'win32' ? 'cua-driver.exe' : 'cua-driver');
   const candidates = platform === 'win32'
-    ? [path.join(home, '.local', 'bin', 'cua-driver.exe'), path.join(home, 'AppData', 'Local', 'cua', 'bin', 'cua-driver.exe')]
-    : [path.join(home, '.local', 'bin', 'cua-driver'), '/usr/local/bin/cua-driver', '/opt/homebrew/bin/cua-driver', ...(platform === 'darwin' ? [MAC_APP_BINARY] : [])];
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+    ? [own, path.join(home, '.local', 'bin', 'cua-driver.exe'), path.join(home, 'AppData', 'Local', 'cua', 'bin', 'cua-driver.exe')]
+    : [own, path.join(home, '.local', 'bin', 'cua-driver'), '/usr/local/bin/cua-driver', '/opt/homebrew/bin/cua-driver', '/Applications/CuaDriver.app/Contents/MacOS/cua-driver'];
+  const found = candidates.find((candidate) => existsSync(candidate)) ?? null;
+  // Clem's link is handed out as the link, so ownership stays readable; the
+  // daemon and proxy resolve it at spawn time (see realComputerDriverPath).
+  return found;
+}
+
+/** The executable behind Clem's link, so libraries beside it resolve. */
+export function realComputerDriverPath(binary: string): string {
+  try { return realpathSync(binary); } catch { return binary; }
+}
+
+export function isOwnComputerDriver(binary: string | null, toolsBin: string = clemToolsBin()): boolean {
+  return Boolean(binary && path.dirname(binary) === toolsBin);
 }
 
 function platformSupport(platform: NodeJS.Platform = process.platform): ComputerDriverStatus['platformSupport'] {
@@ -61,11 +89,39 @@ function platformSupport(platform: NodeJS.Platform = process.platform): Computer
   return 'unsupported';
 }
 
+/** The private endpoint Clem's driver daemon listens on. */
+export function computerDriverSocketPath(home: string = clementineHomeDir()): string {
+  return path.join(home, 'state', 'cua-driver.sock');
+}
+
+export function computerDriverEnv(bundleId: string = COMPUTER_DRIVER_HOST_BUNDLE_ID): Record<string, string> {
+  return { CUA_DRIVER_EMBEDDED: '1', CUA_DRIVER_HOST_BUNDLE_ID: bundleId };
+}
+
+/** The daemon Clem supervises: the driver serving on her private socket. */
+export function computerDriverServeCommand(binary: string, socket: string = computerDriverSocketPath(), bundleId: string = COMPUTER_DRIVER_HOST_BUNDLE_ID): { command: string; args: string[]; env: Record<string, string> } {
+  return { command: realComputerDriverPath(binary), args: ['serve', '--socket', socket], env: computerDriverEnv(bundleId) };
+}
+
+/** The MCP server record Clem keeps for the driver: a proxy onto her private daemon. */
+export function computerDriverServer(binary: string, socket: string = computerDriverSocketPath(), bundleId: string = COMPUTER_DRIVER_HOST_BUNDLE_ID): ManagedMcpServer {
+  return {
+    name: COMPUTER_DRIVER_SERVER_NAME,
+    type: 'stdio',
+    command: realComputerDriverPath(binary),
+    args: ['mcp', '--embedded', '--socket', socket, '--host-bundle-id', bundleId],
+    env: computerDriverEnv(bundleId),
+    description: 'Your computer: Cua Driver clicks, types and reads in the apps on this machine for Clem.',
+    enabled: true,
+    source: 'user',
+  };
+}
+
 /** Ask the driver one question, bounded; null when it cannot answer. */
-export function askDriver(binary: string, args: string[], timeoutMs = 8_000): Promise<string | null> {
+export function askDriver(binary: string, args: string[], timeoutMs = 8_000, env: Record<string, string> = {}): Promise<string | null> {
   return new Promise((resolve) => {
     try {
-      execFile(binary, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 256_000 }, (error, stdout, stderr) => {
+      execFile(binary, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 256_000, env: { ...process.env, ...env } }, (error, stdout, stderr) => {
         const text = `${stdout ?? ''}${stderr ?? ''}`.trim();
         if (error && !text) { resolve(null); return; }
         resolve(text || '');
@@ -77,17 +133,20 @@ export function askDriver(binary: string, args: string[], timeoutMs = 8_000): Pr
 /** The readings as the Connect card shows them. Pure, so the words are pinned. */
 export function readComputerDriverStatus(input: {
   path: string | null;
+  embedded?: boolean;
+  host?: 'running' | 'stopped' | 'not_started';
   statusText: string | null;
   permissionsText: string | null;
   servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>;
   platform?: NodeJS.Platform;
-  install?: ComputerDriverStatus['install'];
 }): ComputerDriverStatus {
   const status = input.statusText?.toLowerCase() ?? null;
-  const daemon: ComputerDriverStatus['daemon'] = status === null ? 'unknown'
-    : /\b(not running|stopped|offline|unavailable)\b/.test(status) ? 'stopped'
-      : /\b(running|ready|ok|healthy|serving)\b/.test(status) ? 'running'
-        : 'unknown';
+  const daemon: ComputerDriverStatus['daemon'] = input.host === 'running' ? 'running'
+    : input.host === 'stopped' ? 'stopped'
+      : status === null ? 'unknown'
+        : /\b(not running|stopped|offline|unavailable)\b/.test(status) ? 'stopped'
+          : /\b(running|ready|ok|healthy|serving)\b/.test(status) ? 'running'
+            : 'unknown';
   const perms = input.permissionsText?.toLowerCase() ?? null;
   const permissions: ComputerDriverStatus['permissions'] = perms === null ? 'unknown'
     : /\b(denied|missing|not granted|needs|required)\b/.test(perms) ? 'missing'
@@ -99,43 +158,93 @@ export function readComputerDriverStatus(input: {
   return {
     installed: input.path !== null,
     path: input.path,
+    embedded: input.embedded ?? false,
+    version: COMPUTER_DRIVER_VERSION,
     daemon,
     statusText: input.statusText,
     permissions,
     permissionsText: input.permissionsText,
     connected,
     serverName: COMPUTER_DRIVER_SERVER_NAME,
-    installCommand: COMPUTER_DRIVER_INSTALL_COMMAND,
     docsUrl: COMPUTER_DRIVER_DOCS_URL,
     platformSupport: platformSupport(input.platform),
-    install: input.install ?? { blocked: false, viaPassword: false, reason: null, adminCommand: null },
   };
-}
-
-/** Can this account place the driver itself? Read live, never cached. */
-export function computerDriverInstallability(): ComputerDriverStatus['install'] {
-  const verdict = installPreflight({ command: COMPUTER_DRIVER_INSTALL_COMMAND, needs: COMPUTER_DRIVER_INSTALL_NEEDS });
-  if (verdict.ok) return { blocked: false, viaPassword: false, reason: null, adminCommand: null };
-  return { blocked: verdict.elevated === null, viaPassword: verdict.elevated !== null, reason: verdict.reason, adminCommand: verdict.adminCommand };
 }
 
 export async function computerDriverStatus(servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>): Promise<ComputerDriverStatus> {
   const binary = computerDriverPath();
-  const [statusText, permissionsText] = binary
-    ? await Promise.all([askDriver(binary, ['status']), process.platform === 'darwin' ? askDriver(binary, ['permissions', 'status']) : Promise.resolve(null)])
-    : [null, null];
-  return readComputerDriverStatus({ path: binary, statusText, permissionsText, servers, install: binary ? undefined : computerDriverInstallability() });
+  const embedded = isOwnComputerDriver(binary);
+  const permissionsText = binary && process.platform === 'darwin' ? await askDriver(binary, ['permissions', 'status'], 8_000, embedded ? computerDriverEnv() : {}) : null;
+  return readComputerDriverStatus({ path: binary, embedded, host: computerDriverHostState(), statusText: null, permissionsText, servers });
 }
 
-/** The MCP server record Clem keeps for the driver. */
-export function computerDriverServer(binary: string): ManagedMcpServer {
-  return {
-    name: COMPUTER_DRIVER_SERVER_NAME,
-    type: 'stdio',
-    command: binary,
-    args: ['mcp'],
-    description: 'Your computer: Cua Driver clicks, types and reads in the apps on this machine for Clem.',
-    enabled: true,
-    source: 'user',
-  };
+// ─── The private daemon ──────────────────────────────────────────────────
+let host: { child: ChildProcess; generation: number } | null = null;
+let hostStopped = true;
+let restartTimer: NodeJS.Timeout | null = null;
+let backoffMs = 2_000;
+
+export function computerDriverHostState(): 'running' | 'stopped' | 'not_started' {
+  if (host?.child && host.child.exitCode === null && !host.child.killed) return 'running';
+  return hostStopped ? 'not_started' : 'stopped';
+}
+
+/**
+ * Keep Clem's driver daemon alive while the driver is hers and connected.
+ * Starts nothing when the driver is absent or not registered; restarts with
+ * backoff when it exits on its own. Idempotent.
+ */
+export function startComputerDriverHost(input: { binary?: string | null; servers?: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>> } = {}): 'started' | 'already' | 'idle' {
+  const binary = input.binary === undefined ? computerDriverPath() : input.binary;
+  if (!binary || !isOwnComputerDriver(binary)) return 'idle';
+  if (input.servers && !readComputerDriverStatus({ path: binary, statusText: null, permissionsText: null, servers: input.servers }).connected) return 'idle';
+  if (computerDriverHostState() === 'running') return 'already';
+  hostStopped = false;
+  spawnHost(binary);
+  return 'started';
+}
+
+function spawnHost(binary: string): void {
+  const socket = computerDriverSocketPath();
+  try { mkdirSync(path.dirname(socket), { recursive: true }); rmSync(socket, { force: true }); } catch { /* the daemon reports it */ }
+  const plan = computerDriverServeCommand(binary, socket);
+  const generation = (host?.generation ?? 0) + 1;
+  let child: ChildProcess;
+  try {
+    child = spawn(plan.command, plan.args, { env: { ...process.env, ...plan.env }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  } catch (error) {
+    logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'computer driver could not start');
+    scheduleRestart(binary);
+    return;
+  }
+  host = { child, generation };
+  child.stdout?.on('data', (chunk) => logger.info({ generation }, `driver: ${String(chunk).trim().slice(0, 300)}`));
+  child.stderr?.on('data', (chunk) => logger.info({ generation }, `driver: ${String(chunk).trim().slice(0, 300)}`));
+  child.on('error', (error) => logger.warn({ generation, err: error.message }, 'computer driver errored'));
+  child.on('exit', (code, signal) => {
+    logger.info({ generation, code, signal }, 'computer driver daemon exited');
+    if (!hostStopped) scheduleRestart(binary);
+  });
+  logger.info({ generation, socket }, 'computer driver daemon started under the app\'s identity');
+}
+
+function scheduleRestart(binary: string): void {
+  if (hostStopped || restartTimer) return;
+  restartTimer = setTimeout(() => { restartTimer = null; if (!hostStopped) spawnHost(binary); }, backoffMs);
+  restartTimer.unref?.();
+  backoffMs = Math.min(60_000, backoffMs * 2);
+}
+
+export async function stopComputerDriverHost(): Promise<void> {
+  hostStopped = true;
+  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+  backoffMs = 2_000;
+  const child = host?.child;
+  host = null;
+  if (!child || child.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } resolve(); }, 5_000);
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+    try { child.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
+  });
 }
