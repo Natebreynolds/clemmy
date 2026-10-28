@@ -11527,6 +11527,78 @@ const MIGRATIONS: EventLogMigration[] = [
       `);
     }
   } },
+  { version: 101, sql: '', backfill: (db) => {
+    const tableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?");
+    if (!tableExists.get('sessions')) return;
+    // A turn whose working records may go is written here first, by the
+    // lifecycle pass that judged it retired; every append-only delete guard
+    // below reads this table and nothing else. The transcript in events is
+    // never a working record.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS retired_turn_work_records (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_user_seq INTEGER NOT NULL CHECK (source_user_seq > 0),
+        retired_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, source_user_seq)
+      ) WITHOUT ROWID;
+    `);
+    // Every key a working-record delete looks up in a child table, indexed:
+    // a delete must never scan a child table row by row.
+    const indexes: Array<[name: string, table: string, columns: string]> = [
+      ['idx_evidence_receipts_result_handle', 'evidence_receipts', 'result_handle_id'],
+      ['idx_evidence_receipts_settlement', 'evidence_receipts', 'session_id, source_user_seq, logical_tool_call_id'],
+      ['idx_async_read_refinement_intent_source_handle', 'async_read_refinement_intents', 'source_result_handle_id'],
+      ['idx_async_read_refinement_start_receipt_handle', 'async_read_refinement_start_receipts', 'start_result_handle_id'],
+      ['idx_async_read_refinement_completion_receipt_handle', 'async_read_refinement_completion_receipts', 'getter_result_handle_id'],
+      ['idx_async_read_refinement_terminal_receipt_handle', 'async_read_refinement_terminal_receipts', 'getter_result_handle_id'],
+      ['idx_workflow_paginated_read_page_result_handle', 'workflow_paginated_read_pages', 'result_handle_id'],
+      ['idx_write_evidence_derivation_source_result_handle', 'write_evidence_derivation_sources', 'result_handle_id'],
+      ['idx_write_evidence_derivation_source_settlement', 'write_evidence_derivation_sources', 'session_id, source_user_seq, logical_tool_call_id'],
+      ['idx_write_evidence_dispatch_outcome_result_handle', 'write_evidence_dispatch_outcomes', 'result_handle_id'],
+      ['idx_write_evidence_dispatch_outcome_settlement', 'write_evidence_dispatch_outcomes', 'session_id, source_user_seq, logical_tool_call_id'],
+    ];
+    for (const [name, table, columns] of indexes) {
+      if (!tableExists.get(table)) continue;
+      db.exec(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})`);
+    }
+    const guards: Array<[trigger: string, table: string, message: string]> = [
+      ['trg_accepted_model_batch_admission_delete_immutable', 'accepted_model_batch_admissions', 'model batch admissions are append-only'],
+      ['trg_accepted_model_batch_checkpoint_delete_immutable', 'accepted_model_batch_checkpoints', 'model batch checkpoints are append-only'],
+      ['trg_host_model_result_receipt_delete_immutable', 'host_model_result_receipts', 'host model result receipts are immutable'],
+      ['trg_logical_model_result_projection_delete_immutable', 'logical_model_result_projection_receipts', 'logical model result projections are immutable'],
+      ['trg_logical_call_settlement_delete_immutable', 'logical_call_settlements', 'logical call settlements are immutable'],
+      ['trg_logical_settlement_crossing_delete_immutable', 'logical_call_settlement_crossings', 'logical settlement crossings are immutable'],
+      ['trg_model_request_provenance_delete_immutable', 'model_request_provenance', 'model request provenance is immutable'],
+      ['trg_write_evidence_bindings_delete_immutable', 'write_evidence_bindings', 'write evidence bindings are immutable'],
+      ['trg_write_evidence_reservations_delete_immutable', 'write_evidence_dispatch_reservations', 'write evidence reservations are immutable'],
+      ['trg_write_evidence_outcomes_delete_immutable', 'write_evidence_dispatch_outcomes', 'write evidence outcomes are immutable'],
+      ['trg_write_evidence_readbacks_delete_immutable', 'write_evidence_readback_bindings', 'write evidence readback bindings are immutable'],
+      ['trg_write_evidence_derivations_delete_immutable', 'write_evidence_derivations', 'write evidence derivations are immutable'],
+      ['trg_write_evidence_derivation_sources_delete_immutable', 'write_evidence_derivation_sources', 'write evidence derivation sources are immutable'],
+      ['trg_write_evidence_execution_snapshots_delete_immutable', 'write_evidence_execution_snapshots', 'write evidence execution snapshots are immutable'],
+      ['trg_write_evidence_proofs_delete_immutable', 'write_evidence_proofs', 'write evidence proofs are immutable'],
+      ['trg_async_read_refinement_intent_delete_immutable', 'async_read_refinement_intents', 'async read refinement intents are immutable'],
+      ['trg_async_read_refinement_start_receipt_delete_immutable', 'async_read_refinement_start_receipts', 'async read refinement start receipts are immutable'],
+      ['trg_async_read_refinement_completion_receipt_delete_immutable', 'async_read_refinement_completion_receipts', 'async read refinement completion receipts are immutable'],
+      ['trg_async_read_refinement_terminal_receipt_delete_immutable', 'async_read_refinement_terminal_receipts', 'async read refinement terminal receipts are immutable'],
+    ];
+    for (const [trigger, table, message] of guards) {
+      if (!tableExists.get(table)) continue;
+      db.exec(`
+        DROP TRIGGER IF EXISTS ${trigger};
+        CREATE TRIGGER ${trigger}
+        BEFORE DELETE ON ${table}
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM retired_turn_work_records retired
+            WHERE retired.session_id = OLD.session_id AND retired.source_user_seq = OLD.source_user_seq
+         )
+        BEGIN
+          SELECT RAISE(ABORT, '${message}');
+        END;
+      `);
+    }
+  } },
 ];
 
 function ensureAuthorityPrivacySchema(db: Database.Database): void {

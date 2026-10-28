@@ -381,60 +381,113 @@ export function retireConversationStateToMemory(sessionId: string, input: {
   });
 }
 
+/** A finished turn of a long-lived session keeps its working records this
+ * many days: the same bar a chat meets when it retires to its memory. */
+export const RETIRED_TURN_IDLE_DAYS = CONVERSATION_MEMORY_ONLY_IDLE_DAYS;
+
+/** Tables whose rows are a turn's working records, keyed by session and turn. */
+const TURN_WORKING_RECORD_TABLES = ['accepted_model_batch_admissions', 'durable_result_handles', 'model_request_provenance', 'logical_call_settlements'] as const;
+/** The same, plus the retained outputs a conversation keys by session alone. */
+const CONVERSATION_WORKING_RECORD_TABLES = [...TURN_WORKING_RECORD_TABLES, 'tool_outputs', 'tool_output_invocations'] as const;
+/** Where a conversation's turns are named. */
+const TURN_SOURCES = ['accepted_turn_call_authorities', ...TURN_WORKING_RECORD_TABLES, 'write_evidence_bindings', 'evidence_receipts', 'async_read_refinement_intents'] as const;
+
 export interface RetiredWorkRecordDecay {
-  /** Conversations whose step records went. */
+  /** Conversations retired to memory whose working records went. */
   sessions: number;
+  /** Finished turns of long-lived sessions (a watch, a workflow, a workspace) whose working records went. */
+  turns: number;
   admissions: number;
   checkpoints: number;
   /** Stored histories no record references any more. */
   objects: number;
-  /** Retired conversations kept whole because something could still pick them up. */
+  handles: number;
+  settlements: number;
+  provenance: number;
+  toolOutputs: number;
+  /** Retired conversations and turns kept whole because something could still pick them up. */
   held: number;
 }
 
-/** The step records of a conversation retired to its memory: the batch
- * admissions and checkpoints (with their result receipts) every turn wrote
- * while it ran. A retired chat resumes from its memory and tail, and a new
- * turn starts its own batch chain, so these are working copies once the
- * grace window after retiring has passed. The transcript in events, the
- * memory, the request provenance and the result handles stay. Nothing goes
- * while the conversation is held (a pin, a pending approval, an unfinished
- * run), and the fidelity is rechecked under the writer lock. */
+/** The working records of a conversation retired to its memory, and of a
+ * finished turn of a long-lived session: the batch admissions and checkpoints
+ * (with their result receipts), the call settlements with their evidence, the
+ * result handles, the request provenance, and the retained tool outputs every
+ * turn wrote while it ran. A retired chat resumes from its memory and tail,
+ * and a new turn starts its own records, so these are working copies once the
+ * grace window after retiring has passed. A watch, a workflow or a workspace
+ * never retires as a whole: it runs turn after turn, and a turn whose call
+ * authority closed thirty days ago with no run still open is done. The
+ * transcript in events, the calls and dispatches themselves, and the memory
+ * stay. Nothing goes while the session is held (a pin, a pending approval, an
+ * unfinished run); the retirement is recorded first, under the writer lock,
+ * and every append-only guard reads that record. */
 export function decayRetiredConversationWorkRecords(input: {
   nowMs?: number;
   graceDays?: number;
   limit?: number;
+  turnLimit?: number;
 } = {}): RetiredWorkRecordDecay {
   const db = openEventLog();
   const nowMs = input.nowMs ?? Date.now();
-  const retiredBefore = new Date(nowMs - (input.graceDays ?? RETIRED_WORK_RECORD_GRACE_DAYS) * 86_400_000).toISOString();
-  const result: RetiredWorkRecordDecay = { sessions: 0, admissions: 0, checkpoints: 0, objects: 0, held: 0 };
-  const candidates = db.prepare(`
+  const graceDays = input.graceDays ?? RETIRED_WORK_RECORD_GRACE_DAYS;
+  const retiredBefore = new Date(nowMs - graceDays * 86_400_000).toISOString();
+  const turnsOpenedBefore = new Date(nowMs - (RETIRED_TURN_IDLE_DAYS + graceDays) * 86_400_000).toISOString();
+  const result: RetiredWorkRecordDecay = { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 0 };
+  const shed = turnWorkRecordShedder(db, new Date(nowMs).toISOString(), result);
+
+  const conversations = db.prepare(`
     SELECT state.session_id AS sessionId
       FROM session_conversation_state state
      WHERE state.fidelity = 'memory'
        AND state.compacted_at IS NOT NULL
        AND state.compacted_at < ?
-       AND EXISTS (SELECT 1 FROM accepted_model_batch_admissions a WHERE a.session_id = state.session_id)
+       AND (${CONVERSATION_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE w.session_id = state.session_id)`).join(' OR ')})
      ORDER BY state.compacted_at
      LIMIT ?
   `).all(retiredBefore, Math.max(1, input.limit ?? 300)) as Array<{ sessionId: string }>;
   const fidelityOf = db.prepare('SELECT fidelity FROM session_conversation_state WHERE session_id = ?');
-  const countCheckpoints = db.prepare('SELECT COUNT(*) AS n FROM accepted_model_batch_checkpoints WHERE session_id = ?');
-  const deleteAdmissions = db.prepare('DELETE FROM accepted_model_batch_admissions WHERE session_id = ?');
-  for (const { sessionId } of candidates) {
+  const turnsOf = db.prepare(`SELECT DISTINCT source_user_seq AS seq FROM (${TURN_SOURCES.map((table) => `SELECT source_user_seq FROM ${table} WHERE session_id = ? AND source_user_seq IS NOT NULL`).join(' UNION ALL ')}) ORDER BY seq`);
+  const deleteConversationOutputs = ['tool_outputs', 'tool_output_invocations'].map((table) => db.prepare(`DELETE FROM ${table} WHERE session_id = ?`));
+  for (const { sessionId } of conversations) {
     if (conversationLifecycleHold(sessionId) !== null) { result.held += 1; continue; }
     db.transaction(() => {
       const row = fidelityOf.get(sessionId) as { fidelity?: string } | undefined;
       if (row?.fidelity !== 'memory') return;
-      const checkpoints = (countCheckpoints.get(sessionId) as { n: number }).n;
-      const admissions = deleteAdmissions.run(sessionId).changes;
+      for (const { seq } of turnsOf.all(...TURN_SOURCES.map(() => sessionId)) as Array<{ seq: number }>) shed(sessionId, seq);
+      // An output whose call left no record goes with its conversation.
+      for (const statement of deleteConversationOutputs) result.toolOutputs += statement.run(sessionId).changes;
       result.sessions += 1;
-      result.admissions += admissions;
-      result.checkpoints += checkpoints;
     }).immediate();
   }
-  if (result.sessions > 0) {
+
+  const turns = db.prepare(`
+    SELECT a.session_id AS sessionId, a.source_user_seq AS seq
+      FROM accepted_turn_call_authorities a
+     WHERE a.state IN ('closed', 'conflict')
+       AND a.opened_at < ?
+       AND NOT EXISTS (SELECT 1 FROM session_conversation_state c WHERE c.session_id = a.session_id)
+       AND NOT EXISTS (SELECT 1 FROM retired_turn_work_records r WHERE r.session_id = a.session_id AND r.source_user_seq = a.source_user_seq)
+       AND NOT EXISTS (SELECT 1 FROM run_attempts ra WHERE ra.session_id = a.session_id AND ra.source_user_seq = a.source_user_seq AND ra.finished_at IS NULL)
+       AND (${TURN_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE w.session_id = a.session_id AND w.source_user_seq = a.source_user_seq)`).join(' OR ')})
+     ORDER BY a.opened_at
+     LIMIT ?
+  `).all(turnsOpenedBefore, Math.max(1, input.turnLimit ?? 300)) as Array<{ sessionId: string; seq: number }>;
+  const openRun = db.prepare('SELECT 1 FROM run_attempts WHERE session_id = ? AND source_user_seq = ? AND finished_at IS NULL LIMIT 1');
+  const holds = new Map<string, boolean>();
+  for (const { sessionId, seq } of turns) {
+    let held = holds.get(sessionId);
+    if (held === undefined) { held = conversationLifecycleHold(sessionId) !== null; holds.set(sessionId, held); }
+    if (held) { result.held += 1; continue; }
+    db.transaction(() => {
+      // Rechecked under the writer lock: a run may have started since.
+      if (openRun.get(sessionId, seq)) return;
+      shed(sessionId, seq);
+      result.turns += 1;
+    }).immediate();
+  }
+
+  if (result.sessions > 0 || result.turns > 0) {
     result.objects = db.prepare(`
       DELETE FROM accepted_model_history_objects_v1
        WHERE NOT EXISTS (SELECT 1 FROM accepted_model_batch_checkpoints c WHERE c.history_object_digest = accepted_model_history_objects_v1.digest)
@@ -443,4 +496,34 @@ export function decayRetiredConversationWorkRecords(input: {
     `).run().changes;
   }
   return result;
+}
+
+/** Deletes one turn's working records, children before the rows they
+ * reference, after recording the turn as retired. */
+function turnWorkRecordShedder(db: ReturnType<typeof openEventLog>, retiredAt: string, counts: RetiredWorkRecordDecay): (sessionId: string, seq: number) => void {
+  const record = db.prepare('INSERT OR IGNORE INTO retired_turn_work_records (session_id, source_user_seq, retired_at) VALUES (?, ?, ?)');
+  const evidence = [
+    'DELETE FROM write_evidence_proofs WHERE session_id = ? AND source_user_seq = ?',
+    'DELETE FROM write_evidence_bindings WHERE session_id = ? AND source_user_seq = ?',
+    'DELETE FROM evidence_receipts WHERE session_id = ? AND source_user_seq = ?',
+    'DELETE FROM async_read_refinement_intents WHERE session_id = ? AND source_user_seq = ?',
+    'DELETE FROM workflow_paginated_read_pages WHERE result_handle_id IN (SELECT handle_id FROM durable_result_handles WHERE session_id = ? AND source_user_seq = ?)',
+  ].map((sql) => db.prepare(sql));
+  const settlements = db.prepare('DELETE FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?');
+  const handles = db.prepare('DELETE FROM durable_result_handles WHERE session_id = ? AND source_user_seq = ?');
+  const provenance = db.prepare('DELETE FROM model_request_provenance WHERE session_id = ? AND source_user_seq = ?');
+  const outputs = ['tool_outputs', 'tool_output_invocations'].map((table) => db.prepare(
+    `DELETE FROM ${table} WHERE session_id = ? AND call_id IN (SELECT logical_tool_call_id FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?)`));
+  const checkpoints = db.prepare('SELECT COUNT(*) AS n FROM accepted_model_batch_checkpoints WHERE session_id = ? AND source_user_seq = ?');
+  const admissions = db.prepare('DELETE FROM accepted_model_batch_admissions WHERE session_id = ? AND source_user_seq = ?');
+  return (sessionId, seq) => {
+    record.run(sessionId, seq, retiredAt);
+    for (const statement of evidence) statement.run(sessionId, seq);
+    counts.settlements += settlements.run(sessionId, seq).changes;
+    counts.handles += handles.run(sessionId, seq).changes;
+    counts.provenance += provenance.run(sessionId, seq).changes;
+    for (const statement of outputs) counts.toolOutputs += statement.run(sessionId, sessionId, seq).changes;
+    counts.checkpoints += (checkpoints.get(sessionId, seq) as { n: number }).n;
+    counts.admissions += admissions.run(sessionId, seq).changes;
+  };
 }
