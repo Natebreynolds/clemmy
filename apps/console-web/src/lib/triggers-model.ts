@@ -79,3 +79,8 @@ export function whenLabel(iso: string, now: number = Date.now()): string {
   const dayLabel = hours < 48 ? 'tomorrow' : date.toLocaleDateString(undefined, { weekday: 'short' });
   return `${dayLabel} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}`;
 }
+
+/** The address a service holds: it starts this one workflow and nothing else. */
+export function webhookAddress(view: Pick<TriggersView, 'webhookBase'>, row: Pick<TriggerWorkflowRow, 'webhookPath' | 'webhookKey'>): string {
+  return `${view.webhookBase}${row.webhookPath ?? ''}${row.webhookKey ? `?key=${row.webhookKey}` : ''}`;
+}

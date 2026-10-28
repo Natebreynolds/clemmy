@@ -22,7 +22,7 @@ import { humanizeCron } from '@/lib/cron';
 import { runWorkflow, setWorkflowEnabled } from '@/lib/automate';
 import { cancelReminder, getTriggers, type TriggerWorkflowRow } from '@/lib/triggers';
 import {
-  activeWatches, eventWorkflows, nextUp, pendingReminders, scheduledWorkflows, webhookWorkflows, whenLabel, type TriggerKind,
+  activeWatches, eventWorkflows, nextUp, pendingReminders, scheduledWorkflows, webhookAddress, webhookWorkflows, whenLabel, type TriggerKind,
 } from '@/lib/triggers-model';
 import { useState } from 'react';
 
@@ -129,7 +129,7 @@ export function Triggers() {
             {webhookWorkflows(view).length === 0
               ? <EmptyState title="No webhooks yet" description="Tell Clem: “when my form tool posts a new lead, start the intake workflow.”" />
               : webhookWorkflows(view).map((row) => {
-                const url = `${view.webhookBase}${row.webhookPath}`;
+                const url = webhookAddress(view, row);
                 return (
                   <Card key={row.name} className="mb-2">
                     <div className="flex items-center gap-3">
@@ -137,7 +137,7 @@ export function Triggers() {
                       <div className="min-w-0 flex-1">
                         <Link to={`/automate/${encodeURIComponent(row.name)}`} className="block truncate font-medium text-fg hover:underline">{row.name}</Link>
                         <div className="truncate text-small text-muted" title={url}>POST {url}{!row.enabled && ' · paused'}</div>
-                        <div className="text-small text-muted">Send it with your Clementine token (Connect → Your phone & tools).</div>
+                        <div className="text-small text-muted">Paste this address into the service that should call it. It starts this one workflow and nothing else, so keep it between you and that service.</div>
                       </div>
                       <StatusPill tone={outcomeTone(row)}>{lastRunWords(row)}</StatusPill>
                       <Button variant="ghost" size="sm" onClick={() => copy(url)} aria-label={`Copy the address for ${row.name}`}><Copy className="h-4 w-4" aria-hidden /></Button>

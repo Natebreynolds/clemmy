@@ -5,6 +5,7 @@ import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import pino from 'pino';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { presentedHookKey, workflowHookKeyMatches } from '../execution/workflow-hook-key.js';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1543,8 +1544,14 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   // whose trigger.webhookPath matches :hookPath is queued through the standard
   // run queue — dedupe-key-once via the trigger registry, same-inputs dedupe
   // via queueWorkflowRun. 404 when nothing subscribes to the path.
-  app.post('/api/hooks/workflows/:hookPath', requireAuth, (req, res) => {
+  app.post('/api/hooks/workflows/:hookPath', (req, res) => {
     const hookPath = String(req.params.hookPath ?? '');
+    // The admin credential or this hook's own key; a service holding the
+    // address can start this one workflow and nothing else.
+    if (!isAuthorized(req) && !workflowHookKeyMatches(WEBHOOK_SECRET, hookPath, presentedHookKey(req))) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
     // No daemon-liveness gate: fireWorkflowWebhook persists a durable receipt
     // and queues the run file even with the daemon down (standalone `clementine
     // webhook` mode runs this server with no daemon by design). Recovery on the

@@ -12,6 +12,7 @@ export interface TriggerWorkflowRow {
   onceAt: string | null;
   interval: unknown | null;
   webhookPath: string | null;
+  webhookKey: string | null;
   events: string[];
   manual: boolean;
   lastRun: { runId: string; at: string | null; status: string | null; outcome: string | null } | null;

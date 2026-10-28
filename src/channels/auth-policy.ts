@@ -189,6 +189,14 @@ export const AUTH_POLICY: readonly AuthPolicyRule[] = [
       + 'the native shell deletes the durable Keychain lease.',
   },
 
+  // ---- Workflow webhooks: each hook has a key of its own ---------------------
+  {
+    method: 'POST',
+    pattern: '/api/hooks/workflows/:hookPath',
+    realm: 'signed-webhook',
+    reason: 'The route accepts the admin credential or the hook\'s own derived key (?key= / x-clementine-hook-key), so a third-party service never holds the console token.',
+  },
+
   // ---- Mobile: admin-only within the mobile router -------------------------
   // Listed explicitly rather than left to the default so the privilege boundary
   // is visible here: a mobile session must never be able to rotate its own PIN

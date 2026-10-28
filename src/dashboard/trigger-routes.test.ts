@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 process.env.CLEMENTINE_HOME = mkdtempSync(path.join(os.tmpdir(), 'clem-trigger-routes-'));
 const { triggerWorkflowViews } = await import('./trigger-routes.js');
+const { workflowHookKey } = await import('../execution/workflow-hook-key.js');
+const { WEBHOOK_SECRET } = await import('../config.js');
 type Entry = Parameters<typeof triggerWorkflowViews>[0][number];
 
 function entry(name: string, trigger: Record<string, unknown>, extra: Record<string, unknown> = {}): Entry {
@@ -32,4 +34,12 @@ test('every workflow that fires on its own is listed with its kinds and last run
   const lead = views.find((view) => view.name === 'Lead intake')!;
   assert.equal(lead.webhookPath, 'lead-intake'); assert.deepEqual(lead.events, ['composio.gmail.new_message']); assert.equal(lead.lastRun, null);
   assert.equal(views.find((view) => view.name === 'Board sync')!.enabled, false);
+});
+
+test('a webhook workflow\'s view carries the hook\'s own key, derived from the installation secret', () => {
+  const [row] = triggerWorkflowViews([entry('Lead intake', { webhookPath: 'lead-intake' })], []);
+  assert.equal(row.webhookPath, 'lead-intake');
+  assert.equal(row.webhookKey, workflowHookKey(WEBHOOK_SECRET, 'lead-intake'));
+  const [plain] = triggerWorkflowViews([entry('Daily', { schedule: '0 8 * * *' })], []);
+  assert.equal(plain.webhookKey, null);
 });

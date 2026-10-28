@@ -7,6 +7,8 @@
  * plus one for a reminder, which had no door outside chat.
  */
 import type { Express, Request, Response } from 'express';
+import { WEBHOOK_SECRET } from '../config.js';
+import { workflowHookKey } from '../execution/workflow-hook-key.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { listWatchViews } from '../agents/watches.js';
 import { cancelTimers, listPendingTimers } from '../runtime/timers.js';
@@ -23,6 +25,8 @@ export interface TriggerWorkflowView {
   onceAt: string | null;
   interval: unknown | null;
   webhookPath: string | null;
+  /** The hook's own key, for the address a service holds. */
+  webhookKey: string | null;
   events: string[];
   manual: boolean;
   lastRun: { runId: string; at: string | null; status: string | null; outcome: string | null } | null;
@@ -70,6 +74,7 @@ export function triggerWorkflowViews(
       onceAt: trigger.onceAt ?? null,
       interval: trigger.interval ?? null,
       webhookPath: trigger.webhookPath ?? null,
+      webhookKey: trigger.webhookPath ? workflowHookKey(WEBHOOK_SECRET, trigger.webhookPath) : null,
       events,
       manual: trigger.manual === true,
       lastRun: run ? {

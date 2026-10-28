@@ -1,13 +1,13 @@
 /** Run with scripts/run-tests-isolated.mjs; no daemon, providers, or home needed. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { nextUp, scheduledWorkflows, webhookWorkflows, eventWorkflows, workflowKinds, whenLabel } from './triggers-model';
+import { nextUp, scheduledWorkflows, webhookWorkflows, webhookAddress, eventWorkflows, workflowKinds, whenLabel } from './triggers-model';
 import type { TriggersView, TriggerWorkflowRow } from './triggers';
 
 const NOW = Date.parse('2026-10-28T18:00:00.000Z');
 const workflow = (overrides: Partial<TriggerWorkflowRow>): TriggerWorkflowRow => ({
   name: 'Daily brief', slug: 'daily-brief', enabled: true, description: null, schedule: null, timezone: null, onceAt: null,
-  interval: null, webhookPath: null, events: [], manual: false, lastRun: null, ...overrides,
+  interval: null, webhookPath: null, webhookKey: null, events: [], manual: false, lastRun: null, ...overrides,
 });
 const view = (overrides: Partial<TriggersView> = {}): TriggersView => ({
   generatedAt: new Date(NOW).toISOString(), workflows: [], upcoming: [], watches: [], reminders: [], webhookBase: 'http://127.0.0.1:8520/api/hooks/workflows/', ...overrides,
@@ -44,4 +44,10 @@ test('when labels read as a person says them', () => {
   assert.equal(whenLabel(new Date(NOW + 3 * 3_600_000).toISOString(), NOW), 'in 3 h');
   assert.match(whenLabel(new Date(NOW + 30 * 3_600_000).toISOString(), NOW), /^tomorrow /);
   assert.equal(whenLabel('not a date', NOW), '');
+});
+
+test('a webhook\'s address carries the hook\'s own key, never the console token', () => {
+  const view = { webhookBase: 'https://clem.local/api/hooks/workflows/' };
+  assert.equal(webhookAddress(view, { webhookPath: 'lead-intake', webhookKey: 'k_abc' }), 'https://clem.local/api/hooks/workflows/lead-intake?key=k_abc');
+  assert.equal(webhookAddress(view, { webhookPath: 'lead-intake', webhookKey: null }), 'https://clem.local/api/hooks/workflows/lead-intake');
 });
