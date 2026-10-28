@@ -8834,16 +8834,16 @@ export function registerConsoleRoutes(
     }
   });
 
-  app.post('/api/console/cli-catalog/install', (req, res) => {
+  app.post('/api/console/cli-catalog/install', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const id = typeof req.body?.id === 'string' ? req.body.id : '';
     const entry = findCatalogEntry(id);
     if (!entry) { res.status(404).json({ error: 'unknown catalog id: ' + id }); return; }
     try {
-      const recipe = catalogInstallForPlatform(entry);
-      if (!recipe.supported) { res.status(400).json({ error: recipe.reason, status: 'manual_install_required', docsUrl: recipe.docsUrl }); return; }
-      const job = startApprovedInstallCommand(recipe.command, `Install ${entry.name}`, { cliCatalogId: entry.id });
-      res.json({ job, entry });
+      const { startCatalogInstall } = await import('../integrations/cli-catalog/platform-install.js');
+      const started = await startCatalogInstall(entry);
+      if (!started.ok) { res.status(400).json({ error: started.reason, status: 'manual_install_required', docsUrl: started.docsUrl }); return; }
+      res.json({ job: started.job, entry });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }

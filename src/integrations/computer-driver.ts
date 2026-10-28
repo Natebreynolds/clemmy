@@ -45,7 +45,7 @@ export interface ComputerDriverStatus {
   platformSupport: 'supported' | 'preview' | 'unsupported';
   /** Whether this account can run the install itself; when not, the words
    *  and the command an administrator runs once. */
-  install: { blocked: boolean; reason: string | null; adminCommand: string | null };
+  install: { blocked: boolean; viaPassword: boolean; reason: string | null; adminCommand: string | null };
 }
 
 export function computerDriverPath(home: string = os.homedir(), platform: NodeJS.Platform = process.platform): string | null {
@@ -108,14 +108,15 @@ export function readComputerDriverStatus(input: {
     installCommand: COMPUTER_DRIVER_INSTALL_COMMAND,
     docsUrl: COMPUTER_DRIVER_DOCS_URL,
     platformSupport: platformSupport(input.platform),
-    install: input.install ?? { blocked: false, reason: null, adminCommand: null },
+    install: input.install ?? { blocked: false, viaPassword: false, reason: null, adminCommand: null },
   };
 }
 
 /** Can this account place the driver itself? Read live, never cached. */
 export function computerDriverInstallability(): ComputerDriverStatus['install'] {
   const verdict = installPreflight({ command: COMPUTER_DRIVER_INSTALL_COMMAND, needs: COMPUTER_DRIVER_INSTALL_NEEDS });
-  return verdict.ok ? { blocked: false, reason: null, adminCommand: null } : { blocked: true, reason: verdict.reason, adminCommand: verdict.adminCommand };
+  if (verdict.ok) return { blocked: false, viaPassword: false, reason: null, adminCommand: null };
+  return { blocked: verdict.elevated === null, viaPassword: verdict.elevated !== null, reason: verdict.reason, adminCommand: verdict.adminCommand };
 }
 
 export async function computerDriverStatus(servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>): Promise<ComputerDriverStatus> {

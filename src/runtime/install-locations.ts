@@ -55,7 +55,33 @@ export function readInstallPlaces(input: { env?: NodeJS.ProcessEnv; platform?: N
 
 export type InstallPreflight =
   | { ok: true; env: Record<string, string>; note: string | null }
-  | { ok: false; place: InstallPlace; reason: string; adminCommand: string };
+  | { ok: false; place: InstallPlace; reason: string; adminCommand: string; elevated: ElevatedCommand | null };
+
+export interface ElevatedCommand { command: string; args: string[]; prompt: string }
+
+/**
+ * The same install, run through the operating system's own administrator
+ * prompt: the OS asks for an administrator's name and password in its own
+ * dialog, and the daemon never sees them. The owner's home stays the home,
+ * so the tool's own files land in the owner's folders.
+ */
+export function elevatedInstallCommand(command: string, input: { platform?: NodeJS.Platform; home?: string } = {}): ElevatedCommand | null {
+  const platform = input.platform ?? process.platform;
+  const home = input.home ?? os.homedir();
+  const inner = `env HOME=${shellQuote(home)} ${command}`;
+  if (platform === 'darwin') {
+    const script = inner.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    return { command: 'osascript', args: ['-e', `do shell script "${script}" with administrator privileges`], prompt: 'macOS is asking for an administrator\'s name and password in its own window. Clem never sees them.' };
+  }
+  if (platform === 'linux') {
+    return { command: 'pkexec', args: ['/bin/sh', '-c', inner], prompt: 'Your system is asking for an administrator\'s password in its own window. Clem never sees it.' };
+  }
+  return null;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 const PLACE_WORDS: Record<InstallPlace, string> = {
   applications: 'the Applications folder',
@@ -101,7 +127,7 @@ export function installPreflight(input: {
         notes.push('This account cannot write to the Applications folder, so the app goes into your own Applications folder.');
         continue;
       }
-      return blocked(place, input.command);
+      return blocked(place, input.command, platform);
     }
     if (place === 'npm_prefix' && !places.npmPrefix.writable) {
       env.npm_config_prefix = path.join(places.home, '.local');
@@ -109,20 +135,25 @@ export function installPreflight(input: {
       continue;
     }
     if (place === 'homebrew' && (!places.homebrew || !places.homebrew.writable)) {
-      if (!places.homebrew) return { ok: false, place, reason: 'Homebrew is not installed on this computer, and installing it needs an administrator.', adminCommand: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' };
-      return blocked(place, input.command);
+      if (!places.homebrew) return { ok: false, place, reason: 'Homebrew is not installed on this computer, and installing it needs an administrator.', adminCommand: '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', elevated: null };
+      return blocked(place, input.command, platform);
     }
-    if (place === 'usr_local_bin' && !places.usrLocalBin) return blocked(place, input.command);
+    if (place === 'usr_local_bin' && !places.usrLocalBin) return blocked(place, input.command, platform);
   }
   return { ok: true, env, note: notes.length ? notes.join(' ') : null };
 }
 
-function blocked(place: InstallPlace, command: string): InstallPreflight {
+function blocked(place: InstallPlace, command: string, platform: NodeJS.Platform = process.platform): InstallPreflight {
+  // The package manager's own tree refuses to be touched as an administrator; only system places can be.
+  const elevated = place === 'homebrew' ? null : elevatedInstallCommand(command, { platform });
   return {
     ok: false,
     place,
-    reason: `This install needs to write to ${PLACE_WORDS[place]}, and this account cannot (this computer looks managed). An administrator needs to run it once in Terminal; after that, come back here and the rest finishes on its own.`,
+    reason: elevated
+      ? `This install needs to write to ${PLACE_WORDS[place]}, and this account cannot on its own (this computer looks managed). Your computer will ask for an administrator's name and password.`
+      : `This install needs to write to ${PLACE_WORDS[place]}, and this account cannot (this computer looks managed). An administrator needs to run it once in Terminal; after that, come back here and the rest finishes on its own.`,
     adminCommand: command,
+    elevated,
   };
 }
 

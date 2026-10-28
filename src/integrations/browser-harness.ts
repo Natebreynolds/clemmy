@@ -5,7 +5,8 @@ import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
 import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 import { augmentPath } from '../runtime/spawn-env.js';
-import { blockedInstallText, installPreflight, type InstallPlace } from '../runtime/install-locations.js';
+import { blockedInstallText, installPreflight, type ElevatedCommand, type InstallPlace } from '../runtime/install-locations.js';
+import { bundledNpmCli, clementineHomeDir, clemToolsDir, installToolDownload, npmInstallPlan, type ToolDownloadRecipe } from '../runtime/clem-tools.js';
 import { observeBrowserConnection, type BrowserConnectionObservation } from './browser-operation.js';
 import { findBrowserHarnessPython } from './browser-python.js';
 import { windowsEnvValue } from './windows-browser-paths.js';
@@ -426,11 +427,36 @@ async function rememberFinishedInstall(job: InstallJob): Promise<void> {
 /** A job that never ran because this account cannot write where the
  *  install needs to; the words name the place and the administrator's command. */
 function blockedInstallJob(job: InstallJob, verdict: Extract<ReturnType<typeof installPreflight>, { ok: false }>): InstallJob {
+  if (verdict.elevated) return runElevatedInstall(job, verdict.elevated);
   job.status = 'failed';
   job.exitCode = -1;
   job.completedAt = new Date().toISOString();
   job.output = blockedInstallText(verdict);
   job.metadata = { ...(job.metadata ?? {}), needsAdmin: '1', adminCommand: verdict.adminCommand, blockedPlace: verdict.place };
+  return job;
+}
+
+/** The same install through the operating system's administrator prompt. */
+function runElevatedInstall(job: InstallJob, elevated: ElevatedCommand): InstallJob {
+  job.metadata = { ...(job.metadata ?? {}), elevated: '1' };
+  job.output = `${elevated.prompt}\n`;
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(elevated.command, elevated.args, { cwd: os.homedir(), env: installCommandEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(job.output + String(error));
+    return job;
+  }
+  child.stdout?.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
+  child.stderr?.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
+  child.on('error', (error) => {
+    job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(job.output + String(error));
+  });
+  child.on('close', (code) => {
+    job.status = code === 0 ? 'succeeded' : 'failed'; job.exitCode = code; job.completedAt = new Date().toISOString();
+    if (code !== 0 && /User cancell?ed|-128/.test(job.output)) job.output = truncate(job.output + '\nThe password prompt was closed, so nothing was installed. Tap Install again when ready.\n');
+    if (code === 0) { invalidateCliScan(); void rememberFinishedInstall(job); }
+  });
   return job;
 }
 
@@ -470,9 +496,61 @@ export function startRecipeInstallJob(input: { title: string; command: string; m
   return job;
 }
 
+/** A job whose body is Clem's own code, narrated into the same output the
+ *  dashboard streams; nothing here goes through a shell. */
+export function startAsyncInstallJob(input: { title: string; command: string; metadata?: Record<string, string>; run: (log: (line: string) => void) => Promise<void> }): InstallJob {
+  const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const job: InstallJob = {
+    id, recipeId: 'custom-install', title: input.title, status: 'running', command: input.command, output: '', startedAt: new Date().toISOString(),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  };
+  jobs.set(id, job);
+  const log = (line: string): void => { job.output = truncate(`${job.output}${line}\n`); };
+  void input.run(log).then(() => {
+    job.status = 'succeeded'; job.exitCode = 0; job.completedAt = new Date().toISOString();
+    invalidateCliScan();
+    void rememberFinishedInstall(job);
+  }, (error: unknown) => {
+    job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString();
+    log(error instanceof Error ? error.message : String(error));
+  });
+  return job;
+}
+
+/** A vendor's release, into Clem's tools folder. */
+export function startToolDownloadJob(input: { id: string; title: string; recipe: ToolDownloadRecipe; metadata?: Record<string, string> }): InstallJob {
+  return startAsyncInstallJob({
+    title: input.title,
+    command: `download ${input.id}`,
+    metadata: input.metadata,
+    run: async (log) => { await installToolDownload({ id: input.id, recipe: input.recipe, log }); },
+  });
+}
+
+/** An npm package, on Clem's own runtime into Clem's tools folder; npm on
+ *  PATH only when this tree does not bundle it. */
+export function startNpmToolJob(spec: string, title: string, metadata?: Record<string, string>): InstallJob {
+  const plan = npmInstallPlan({ spec, npmCli: bundledNpmCli(), toolsDir: clemToolsDir(), cacheDir: path.join(clementineHomeDir(), 'cache', 'npm') });
+  return startAsyncInstallJob({
+    title,
+    command: `npm install -g ${spec}`,
+    metadata,
+    run: (log) => new Promise<void>((resolve, reject) => {
+      log(`Installing ${spec} into Clem's tools…`);
+      const child = spawn(plan.command, plan.args, { cwd: os.homedir(), env: { ...installCommandEnv(), ...plan.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout?.on('data', (chunk) => log(String(chunk).trimEnd()));
+      child.stderr?.on('data', (chunk) => log(String(chunk).trimEnd()));
+      child.on('error', reject);
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`npm exited ${code}`))));
+    }),
+  });
+}
+
 export function startApprovedInstallCommand(command: string, title = 'Install capability', metadata?: Record<string, string>): InstallJob {
   const checked = validateInstallCommand(command);
   if (!checked.ok) throw new Error(checked.error);
+  const npmForm = /^npm (?:install|i) (?:-g|--global) ([@a-z0-9._/-]+)$/i.exec(checked.normalized);
+  if (npmForm && process.platform !== 'win32') return startNpmToolJob(npmForm[1], title, metadata);
   const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const job: InstallJob = {
     id,

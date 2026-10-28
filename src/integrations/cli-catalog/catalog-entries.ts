@@ -1,3 +1,4 @@
+import type { ToolDownloadRecipe } from '../../runtime/clem-tools.js';
 /** The curated CLI catalog as plain data: entry types, declared reviewed reads
  * and repairs, and the entries themselves. Storage-free so a physical
  * transport artifact can read it without reaching the connected-CLI state or
@@ -27,6 +28,8 @@
  */
 
 export type CliInstallSource = 'npm' | 'brew' | 'uv' | 'pipx';
+export type { ToolDownloadRecipe };
+
 
 /**
  * Read-only auth-state probe for a catalog CLI. By contract the probe
@@ -71,6 +74,9 @@ export interface CliCatalogEntry {
   /** Install command, must match the install allowlist. */
   installCommand: string;
   installSource: CliInstallSource;
+  /** The vendor's own release download, preferred over any package manager:
+   *  Clem installs it into her tools folder with nothing on the machine. */
+  download?: ToolDownloadRecipe;
   /** Docs URL the "Configure" button opens. Required. */
   authDocsUrl: string;
   /** Optional auth-bootstrap command shown post-install. */
@@ -366,6 +372,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['supabase', 'postgres', 'database', 'edge functions'],
     installCommand: 'brew install supabase/tap/supabase',
     installSource: 'brew',
+    download: { githubRepo: 'supabase/cli', assets: { 'darwin-arm64': 'supabase_darwin_arm64.tar.gz', 'darwin-x64': 'supabase_darwin_amd64.tar.gz', 'linux-x64': 'supabase_linux_amd64.tar.gz', 'linux-arm64': 'supabase_linux_arm64.tar.gz' }, checksums: 'checksums.txt', bin: 'supabase' },
     authDocsUrl: 'https://supabase.com/docs/guides/local-development/cli/getting-started',
     authCommand: 'supabase login',
     homepage: 'https://supabase.com',
@@ -379,6 +386,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['github', 'gh', 'git', 'pr', 'pull request'],
     installCommand: 'brew install gh',
     installSource: 'brew',
+    download: { githubRepo: 'cli/cli', assets: { 'darwin-arm64': 'gh_{version}_macOS_arm64.zip', 'darwin-x64': 'gh_{version}_macOS_amd64.zip', 'linux-x64': 'gh_{version}_linux_amd64.tar.gz', 'linux-arm64': 'gh_{version}_linux_arm64.tar.gz' }, checksums: 'gh_{version}_checksums.txt', bin: 'bin/gh' },
     authDocsUrl: 'https://docs.github.com/en/github-cli/github-cli/quickstart',
     authCommand: 'gh auth login',
     homepage: 'https://cli.github.com',
@@ -405,6 +413,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['gcloud', 'gcp', 'google cloud', 'firebase'],
     installCommand: 'brew install --cask google-cloud-sdk',
     installSource: 'brew',
+    download: { assets: { 'darwin-arm64': 'https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-arm.tar.gz', 'darwin-x64': 'https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-x86_64.tar.gz', 'linux-x64': 'https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz', 'linux-arm64': 'https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-arm.tar.gz' }, bin: 'google-cloud-sdk/bin/gcloud' },
     authDocsUrl: 'https://cloud.google.com/sdk/docs/initializing',
     authCommand: 'gcloud init',
     // Verified live: active account as a JSON array; with NO active
@@ -427,6 +436,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['heroku', 'paas', 'deploy'],
     installCommand: 'brew install heroku',
     installSource: 'brew',
+    download: { assets: { 'darwin-arm64': 'https://cli-assets.heroku.com/channels/stable/heroku-darwin-arm64.tar.xz', 'darwin-x64': 'https://cli-assets.heroku.com/channels/stable/heroku-darwin-x64.tar.xz', 'linux-x64': 'https://cli-assets.heroku.com/channels/stable/heroku-linux-x64.tar.xz', 'linux-arm64': 'https://cli-assets.heroku.com/channels/stable/heroku-linux-arm.tar.xz' }, bin: 'heroku/bin/heroku' },
     authDocsUrl: 'https://devcenter.heroku.com/articles/heroku-cli',
     authCommand: 'heroku login',
     homepage: 'https://devcenter.heroku.com/articles/heroku-cli',
@@ -440,6 +450,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['stripe', 'payments', 'webhooks'],
     installCommand: 'brew install stripe/stripe-cli/stripe',
     installSource: 'brew',
+    download: { githubRepo: 'stripe/stripe-cli', assets: { 'darwin-arm64': 'stripe_{version}_mac-os_arm64.tar.gz', 'darwin-x64': 'stripe_{version}_mac-os_x86_64.tar.gz', 'linux-x64': 'stripe_{version}_linux_x86_64.tar.gz', 'linux-arm64': 'stripe_{version}_linux_arm64.tar.gz' }, checksums: { 'darwin-arm64': 'stripe-mac-checksums.txt', 'darwin-x64': 'stripe-mac-checksums.txt', 'linux-x64': 'stripe-linux-checksums.txt', 'linux-arm64': 'stripe-linux-checksums.txt' }, bin: 'stripe' },
     authDocsUrl: 'https://docs.stripe.com/stripe-cli',
     authCommand: 'stripe login',
     homepage: 'https://stripe.com/docs/stripe-cli',
@@ -466,6 +477,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['fly', 'flyio', 'fly.io', 'flyctl', 'deploy'],
     installCommand: 'brew install flyctl',
     installSource: 'brew',
+    download: { githubRepo: 'superfly/flyctl', assets: { 'darwin-arm64': 'flyctl_{version}_macOS_arm64.tar.gz', 'darwin-x64': 'flyctl_{version}_macOS_x86_64.tar.gz', 'linux-x64': 'flyctl_{version}_Linux_x86_64.tar.gz', 'linux-arm64': 'flyctl_{version}_Linux_arm64.tar.gz' }, checksums: 'flyctl_{version}_checksums.txt', bin: 'flyctl', links: ['flyctl', 'fly'] },
     authDocsUrl: 'https://fly.io/docs/flyctl/auth-login/',
     authCommand: 'flyctl auth login',
     homepage: 'https://fly.io',
@@ -497,6 +509,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['doppler', 'secrets', 'env'],
     installCommand: 'brew install dopplerhq/cli/doppler',
     installSource: 'brew',
+    download: { githubRepo: 'DopplerHQ/cli', assets: { 'darwin-arm64': 'doppler_{version}_macOS_arm64.tar.gz', 'darwin-x64': 'doppler_{version}_macOS_amd64.tar.gz', 'linux-x64': 'doppler_{version}_linux_amd64.tar.gz', 'linux-arm64': 'doppler_{version}_linux_arm64.tar.gz' }, checksums: 'checksums.txt', bin: 'doppler' },
     authDocsUrl: 'https://docs.doppler.com/docs/install-cli',
     authCommand: 'doppler login',
     homepage: 'https://www.doppler.com',
@@ -510,6 +523,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['ngrok', 'tunnel', 'webhook'],
     installCommand: 'brew install ngrok/ngrok/ngrok',
     installSource: 'brew',
+    download: { assets: { 'darwin-arm64': 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-arm64.zip', 'darwin-x64': 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-amd64.zip', 'linux-x64': 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz', 'linux-arm64': 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.tgz' }, bin: 'ngrok' },
     authDocsUrl: 'https://ngrok.com/docs/getting-started/',
     authCommand: 'ngrok config add-authtoken <your-token>',
     homepage: 'https://ngrok.com',
@@ -523,6 +537,7 @@ export const CLI_CATALOG: readonly CliCatalogEntry[] = [
     tags: ['digitalocean', 'doctl', 'do'],
     installCommand: 'brew install doctl',
     installSource: 'brew',
+    download: { githubRepo: 'digitalocean/doctl', assets: { 'darwin-arm64': 'doctl-{version}-darwin-arm64.tar.gz', 'darwin-x64': 'doctl-{version}-darwin-amd64.tar.gz', 'linux-x64': 'doctl-{version}-linux-amd64.tar.gz', 'linux-arm64': 'doctl-{version}-linux-arm64.tar.gz' }, checksums: 'doctl-{version}-checksums.sha256', bin: 'doctl' },
     authDocsUrl: 'https://docs.digitalocean.com/reference/doctl/how-to/install/',
     authCommand: 'doctl auth init',
     homepage: 'https://www.digitalocean.com/products/tools',

@@ -63,6 +63,9 @@ export function ComputerDriver() {
               <a className="inline-flex items-center gap-1 text-small text-primary hover:underline" href={s.docsUrl} target="_blank" rel="noreferrer">What it installs <ExternalLink className="h-3.5 w-3.5" aria-hidden /></a>
             </div>
           )}
+          {step === 'install' && s?.install.viaPassword && (
+            <p className="mt-2 text-small text-muted">{s.install.reason}</p>
+          )}
           {step === 'needs-admin' && s && (
             <div className="mt-3">
               <p className="text-small text-fg">{s.install.reason}</p>

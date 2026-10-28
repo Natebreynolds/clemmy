@@ -18,6 +18,19 @@ test('Windows catalog never dispatches a Homebrew recipe; native and npm recipes
     } else {
       assert.deepEqual(recipe, { supported: true, command: entry.installCommand }, entry.id);
     }
-    assert.deepEqual(catalogInstallForPlatform(entry, 'darwin'), { supported: true, command: entry.installCommand });
+    const mac = catalogInstallForPlatform(entry, 'darwin', 'arm64');
+    if (entry.download) {
+      assert.ok(mac.supported && mac.download === entry.download, `${entry.id}: the vendor's own download wins on a Mac`);
+    } else {
+      assert.deepEqual(mac, { supported: true, command: entry.installCommand });
+    }
+  }
+});
+
+test('every Homebrew recipe except the one vendor without a release archive has a download for both Mac chips and Linux', () => {
+  for (const entry of CLI_CATALOG) {
+    if (!/^brew\s/.test(entry.installCommand) || entry.id === 'aws') continue;
+    assert.ok(entry.download, `${entry.id} still needs Homebrew`);
+    for (const key of ['darwin-arm64', 'darwin-x64', 'linux-x64'] as const) assert.ok(entry.download.assets[key], `${entry.id}: ${key}`);
   }
 });

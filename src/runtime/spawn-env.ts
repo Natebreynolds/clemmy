@@ -117,6 +117,13 @@ function isolatedNpmCache(env: Record<string, string>, platform: NodeJS.Platform
  */
 export function augmentPath(existing: string | undefined): string {
   const candidates: string[] = [];
+  // Clem's own tools first: what Clem installed is what Clem runs.
+  try {
+    const base = process.env.CLEMENTINE_HOME?.trim() || path.join(os.homedir(), '.clementine-next');
+    candidates.push(path.join(base, 'tools', 'bin'));
+  } catch {
+    /* home unavailable is fine */
+  }
   try {
     const dir = path.dirname(process.execPath);
     if (dir) candidates.push(dir);

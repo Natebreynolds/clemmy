@@ -13,7 +13,7 @@ export interface ComputerDriverStatus {
   installCommand: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
-  install: { blocked: boolean; reason: string | null; adminCommand: string | null };
+  install: { blocked: boolean; viaPassword: boolean; reason: string | null; adminCommand: string | null };
 }
 
 export const getComputerDriver = () => apiGet<ComputerDriverStatus>('/api/console/computer-driver');
