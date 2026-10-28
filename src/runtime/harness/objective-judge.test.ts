@@ -1407,6 +1407,13 @@ test('a conversation-shaped first reply held by the fast screen alone is deliver
   assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1, jevAsksUser: true }), true,
     'unless the screen itself read the reply as a question to the owner: a question after lookups is still the answer');
   assert.equal(screenHeldConversationalReplySettles({ ...base, businessCalls: 1, jevAsksUser: true, settledWrites: 1 }), false, 'a settled write still keeps the review');
+  const askWithPromise = "Who should this draft go to, and what should it say? I'll save it in your Outlook Drafts.";
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: askWithPromise, businessCalls: 3 }), false, 'in prose after lookups, a promise is judged');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: askWithPromise, businessCalls: 3, stagedAsk: true }), true,
+    'asked through the question tool, it is a question by construction: the words after the question mark do not bounce it');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: askWithPromise, stagedAsk: true, settledWrites: 1 }), false, 'a staged ask after a settled write is still reviewed');
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: askWithPromise, stagedAsk: true, continuationsUsed: 1 }), false);
+  assert.equal(screenHeldConversationalReplySettles({ ...base, reply: '', stagedAsk: true }), false, 'an empty ask is nothing to deliver');
   assert.equal(screenHeldConversationalReplySettles({ ...base, settledWrites: 1 }), false);
   assert.equal(screenHeldConversationalReplySettles({ ...base, continuationsUsed: 1 }), false, 'only the first verdict');
   assert.equal(screenHeldConversationalReplySettles({ ...base, verdictFast: undefined }), false, 'a reviewer verdict stands');

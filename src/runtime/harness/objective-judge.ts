@@ -666,15 +666,23 @@ export function screenHeldConversationalReplySettles(input: {
    * two memory lookups, then "who should it go to?", bounced once, and the
    * bounce bought a calendar read, an inbox read and an unasked-for draft). */
   jevAsksUser?: boolean;
+  /** The brain asked through the question tool, or its decision awaits the
+   * owner: a question by construction, whatever else the words say. Live
+   * 2026-10-28: "Who should this go to, and what should it say? I'll save it
+   * in your Drafts" read as a promise, the screen's reading fell one point
+   * short of sure, and the bounce bought five identical lookups and a draft
+   * to a guessed recipient. */
+  stagedAsk?: boolean;
   settledWrites: number;
   reply: string | null | undefined;
 }): boolean {
   if (input.verdictDone || input.verdictFailedOpen === true || input.verdictBlocked === true) return false;
   if (input.verdictFast !== true || input.reviewerStarted === true) return false;
   if (input.continuationsUsed !== 0 || input.settledWrites !== 0) return false;
-  if (input.businessCalls !== 0 && input.jevAsksUser !== true) return false;
   const text = (input.reply ?? '').trim();
   if (!text) return false;
+  if (input.stagedAsk === true) return true;
+  if (input.businessCalls !== 0 && input.jevAsksUser !== true) return false;
   return !replyClaimsCompletedWork(text) && !isPromiseShapedReply(text);
 }
 
