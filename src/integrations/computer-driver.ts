@@ -15,6 +15,7 @@ import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ManagedMcpServer } from '../types.js';
+import { installPreflight, type InstallPlace } from '../runtime/install-locations.js';
 
 export const COMPUTER_DRIVER_SERVER_NAME = 'cua-driver';
 /** The installer's documented one-liner, from the vendor's quickstart. */
@@ -22,6 +23,10 @@ export const COMPUTER_DRIVER_INSTALL_COMMAND = process.platform === 'win32'
   ? 'powershell -NoProfile -Command "irm https://cua.ai/driver/install.ps1 | iex"'
   : '/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"';
 export const COMPUTER_DRIVER_DOCS_URL = 'https://cua.ai/docs/cua-driver/quickstart';
+/** On macOS the installer places an app bundle in the system Applications
+ *  folder so the permissions the OS grants attach to it; nothing else works. */
+export const COMPUTER_DRIVER_INSTALL_NEEDS: InstallPlace[] = process.platform === 'darwin' ? ['applications'] : [];
+const MAC_APP_BINARY = '/Applications/CuaDriver.app/Contents/MacOS/cua-driver';
 
 export interface ComputerDriverStatus {
   installed: boolean;
@@ -38,12 +43,15 @@ export interface ComputerDriverStatus {
   installCommand: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
+  /** Whether this account can run the install itself; when not, the words
+   *  and the command an administrator runs once. */
+  install: { blocked: boolean; reason: string | null; adminCommand: string | null };
 }
 
 export function computerDriverPath(home: string = os.homedir(), platform: NodeJS.Platform = process.platform): string | null {
   const candidates = platform === 'win32'
     ? [path.join(home, '.local', 'bin', 'cua-driver.exe'), path.join(home, 'AppData', 'Local', 'cua', 'bin', 'cua-driver.exe')]
-    : [path.join(home, '.local', 'bin', 'cua-driver'), '/usr/local/bin/cua-driver', '/opt/homebrew/bin/cua-driver'];
+    : [path.join(home, '.local', 'bin', 'cua-driver'), '/usr/local/bin/cua-driver', '/opt/homebrew/bin/cua-driver', ...(platform === 'darwin' ? [MAC_APP_BINARY] : [])];
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
@@ -73,6 +81,7 @@ export function readComputerDriverStatus(input: {
   permissionsText: string | null;
   servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>;
   platform?: NodeJS.Platform;
+  install?: ComputerDriverStatus['install'];
 }): ComputerDriverStatus {
   const status = input.statusText?.toLowerCase() ?? null;
   const daemon: ComputerDriverStatus['daemon'] = status === null ? 'unknown'
@@ -99,7 +108,14 @@ export function readComputerDriverStatus(input: {
     installCommand: COMPUTER_DRIVER_INSTALL_COMMAND,
     docsUrl: COMPUTER_DRIVER_DOCS_URL,
     platformSupport: platformSupport(input.platform),
+    install: input.install ?? { blocked: false, reason: null, adminCommand: null },
   };
+}
+
+/** Can this account place the driver itself? Read live, never cached. */
+export function computerDriverInstallability(): ComputerDriverStatus['install'] {
+  const verdict = installPreflight({ command: COMPUTER_DRIVER_INSTALL_COMMAND, needs: COMPUTER_DRIVER_INSTALL_NEEDS });
+  return verdict.ok ? { blocked: false, reason: null, adminCommand: null } : { blocked: true, reason: verdict.reason, adminCommand: verdict.adminCommand };
 }
 
 export async function computerDriverStatus(servers: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>>): Promise<ComputerDriverStatus> {
@@ -107,7 +123,7 @@ export async function computerDriverStatus(servers: ReadonlyArray<Pick<ManagedMc
   const [statusText, permissionsText] = binary
     ? await Promise.all([askDriver(binary, ['status']), process.platform === 'darwin' ? askDriver(binary, ['permissions', 'status']) : Promise.resolve(null)])
     : [null, null];
-  return readComputerDriverStatus({ path: binary, statusText, permissionsText, servers });
+  return readComputerDriverStatus({ path: binary, statusText, permissionsText, servers, install: binary ? undefined : computerDriverInstallability() });
 }
 
 /** The MCP server record Clem keeps for the driver. */

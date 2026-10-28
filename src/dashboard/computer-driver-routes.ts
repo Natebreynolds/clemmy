@@ -8,7 +8,7 @@ import type { Express, Request, Response } from 'express';
 import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { getInstallJob, startRecipeInstallJob } from '../integrations/browser-harness.js';
 import {
-  COMPUTER_DRIVER_INSTALL_COMMAND, askDriver, computerDriverPath, computerDriverServer, computerDriverStatus,
+  COMPUTER_DRIVER_INSTALL_NEEDS, COMPUTER_DRIVER_INSTALL_COMMAND, askDriver, computerDriverPath, computerDriverServer, computerDriverStatus,
 } from '../integrations/computer-driver.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
@@ -25,7 +25,7 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
   app.post('/api/console/computer-driver/install', (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      res.json({ job: startRecipeInstallJob({ title: 'Install Cua Driver', command: COMPUTER_DRIVER_INSTALL_COMMAND, metadata: { capability: 'computer-driver' } }) });
+      res.json({ job: startRecipeInstallJob({ title: 'Install Cua Driver', command: COMPUTER_DRIVER_INSTALL_COMMAND, needs: COMPUTER_DRIVER_INSTALL_NEEDS, metadata: { capability: 'computer-driver' } }) });
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }

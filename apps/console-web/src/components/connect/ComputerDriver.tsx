@@ -42,7 +42,7 @@ export function ComputerDriver() {
             <h3 className="text-h3 text-fg">Your computer</h3>
             {s && (
               <>
-                <StatusPill tone={s.installed ? 'success' : 'neutral'}>{s.installed ? 'Installed' : 'Not installed'}</StatusPill>
+                <StatusPill tone={s.installed ? 'success' : step === 'needs-admin' ? 'warning' : 'neutral'}>{s.installed ? 'Installed' : step === 'needs-admin' ? 'Needs an admin' : 'Not installed'}</StatusPill>
                 {s.installed && <StatusPill tone={s.daemon === 'running' ? 'success' : s.daemon === 'stopped' ? 'warning' : 'neutral'}>{s.daemon === 'running' ? 'Running' : s.daemon === 'stopped' ? 'Stopped' : 'Status unknown'}</StatusPill>}
                 {s.installed && s.permissions !== 'unknown' && <StatusPill tone={s.permissions === 'granted' ? 'success' : 'warning'}>{s.permissions === 'granted' ? 'Permissions granted' : 'Needs permissions'}</StatusPill>}
                 <StatusPill tone={s.connected ? 'success' : 'neutral'}>{s.connected ? 'Connected to Clem' : 'Not connected'}</StatusPill>
@@ -63,6 +63,13 @@ export function ComputerDriver() {
               <a className="inline-flex items-center gap-1 text-small text-primary hover:underline" href={s.docsUrl} target="_blank" rel="noreferrer">What it installs <ExternalLink className="h-3.5 w-3.5" aria-hidden /></a>
             </div>
           )}
+          {step === 'needs-admin' && s && (
+            <div className="mt-3">
+              <p className="text-small text-fg">{s.install.reason}</p>
+              <pre className="mt-2 overflow-auto rounded-md bg-subtle p-2 text-xs text-muted">{s.install.adminCommand}</pre>
+              <Button variant="ghost" size="sm" onClick={() => { void navigator.clipboard?.writeText(s.install.adminCommand ?? ''); }} aria-label="Copy the command for the administrator"><Copy className="h-4 w-4" aria-hidden /> Copy the command</Button>
+            </div>
+          )}
           {step === 'permissions' && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <Button size="sm" disabled={busy === 'permissions'} onClick={() => run('permissions', grantComputerDriverPermissions)}>
@@ -81,7 +88,7 @@ export function ComputerDriver() {
           )}
           {step === 'ready' && <p className="mt-2 inline-flex items-center gap-1 text-small text-fg"><Check className="h-4 w-4 text-success" aria-hidden /> Clem can use the apps on this computer. Ask her to do something in one.</p>}
           {step === 'unsupported' && <p className="mt-2 text-small text-muted">Cua Driver does not support this platform yet.</p>}
-          {job && (
+          {job && step !== 'needs-admin' && (
             <pre className="mt-3 max-h-40 overflow-auto rounded-md bg-subtle p-2 text-xs text-muted">{job.status === 'running' ? 'Installing…\n' : job.status === 'succeeded' ? 'Installed.\n' : 'The install did not finish.\n'}{job.output}</pre>
           )}
           {error && <p className="mt-2 text-small text-danger">{error}</p>}

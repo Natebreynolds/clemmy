@@ -13,6 +13,7 @@ export interface ComputerDriverStatus {
   installCommand: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
+  install: { blocked: boolean; reason: string | null; adminCommand: string | null };
 }
 
 export const getComputerDriver = () => apiGet<ComputerDriverStatus>('/api/console/computer-driver');
@@ -22,9 +23,9 @@ export const grantComputerDriverPermissions = () => apiPost<{ output: string; st
 export const connectComputerDriver = () => apiPost<{ status: ComputerDriverStatus }>('/api/console/computer-driver/connect', {});
 
 /** The one next step the card offers, in order: install, permissions, connect, done. */
-export function computerDriverNextStep(status: ComputerDriverStatus): 'install' | 'permissions' | 'connect' | 'ready' | 'unsupported' {
+export function computerDriverNextStep(status: ComputerDriverStatus): 'install' | 'needs-admin' | 'permissions' | 'connect' | 'ready' | 'unsupported' {
   if (status.platformSupport === 'unsupported') return 'unsupported';
-  if (!status.installed) return 'install';
+  if (!status.installed) return status.install?.blocked ? 'needs-admin' : 'install';
   if (status.permissions === 'missing') return 'permissions';
   if (!status.connected) return 'connect';
   return 'ready';

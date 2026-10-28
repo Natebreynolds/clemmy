@@ -465,7 +465,7 @@ export interface CatalogResp {
   query: string; results: CatalogEntry[]; connected: Record<string, ConnectedCli>; autoPromoted: string[];
   health?: Record<string, CliHealth>;
 }
-export interface InstallJob { id: string; title: string; status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null }
+export interface InstallJob { id: string; title: string; status: 'running' | 'succeeded' | 'failed'; output: string; exitCode?: number | null; metadata?: Record<string, string> }
 
 export const getCliCatalog = (q?: string) =>
   apiGet<CatalogResp>(`/api/console/cli-catalog${q ? `?q=${encodeURIComponent(q)}` : ''}`);

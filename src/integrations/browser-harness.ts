@@ -5,6 +5,7 @@ import path from 'node:path';
 import { getSecretStore } from '../runtime/secrets/index.js';
 import { invalidateCachedScan as invalidateCliScan, resolveSafeCliProbe } from '../runtime/cli-discovery.js';
 import { augmentPath } from '../runtime/spawn-env.js';
+import { blockedInstallText, installPreflight, type InstallPlace } from '../runtime/install-locations.js';
 import { observeBrowserConnection, type BrowserConnectionObservation } from './browser-operation.js';
 import { findBrowserHarnessPython } from './browser-python.js';
 import { windowsEnvValue } from './windows-browser-paths.js';
@@ -422,7 +423,18 @@ async function rememberFinishedInstall(job: InstallJob): Promise<void> {
  * model or a request. The approved-command path above keeps its allow-list
  * for everything else.
  */
-export function startRecipeInstallJob(input: { title: string; command: string; metadata?: Record<string, string> }): InstallJob {
+/** A job that never ran because this account cannot write where the
+ *  install needs to; the words name the place and the administrator's command. */
+function blockedInstallJob(job: InstallJob, verdict: Extract<ReturnType<typeof installPreflight>, { ok: false }>): InstallJob {
+  job.status = 'failed';
+  job.exitCode = -1;
+  job.completedAt = new Date().toISOString();
+  job.output = blockedInstallText(verdict);
+  job.metadata = { ...(job.metadata ?? {}), needsAdmin: '1', adminCommand: verdict.adminCommand, blockedPlace: verdict.place };
+  return job;
+}
+
+export function startRecipeInstallJob(input: { title: string; command: string; metadata?: Record<string, string>; needs?: InstallPlace[] }): InstallJob {
   const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const job: InstallJob = {
     id,
@@ -435,10 +447,13 @@ export function startRecipeInstallJob(input: { title: string; command: string; m
     ...(input.metadata ? { metadata: input.metadata } : {}),
   };
   jobs.set(id, job);
+  const preflight = installPreflight({ command: input.command, needs: input.needs });
+  if (!preflight.ok) return blockedInstallJob(job, preflight);
+  if (preflight.note) job.output = `${preflight.note}\n`;
   const shell = shellCommand(input.command);
   let child: ReturnType<typeof spawn>;
   try {
-    child = spawn(shell.command, shell.args, { cwd: os.homedir(), env: browserHarnessEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    child = spawn(shell.command, shell.args, { cwd: os.homedir(), env: browserHarnessEnv(preflight.env), stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (error) {
     job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(String(error));
     return job;
@@ -471,10 +486,13 @@ export function startApprovedInstallCommand(command: string, title = 'Install ca
   };
   jobs.set(id, job);
 
+  const preflight = installPreflight({ command: checked.normalized });
+  if (!preflight.ok) return blockedInstallJob(job, preflight);
+  if (preflight.note) job.output = `${preflight.note}\n`;
   const shell = installShellCommand(checked.normalized);
   const child = spawn(shell.command, shell.args, {
     cwd: os.homedir(),
-    env: installCommandEnv(),
+    env: { ...installCommandEnv(), ...preflight.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
