@@ -877,7 +877,7 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     try {
       const { decayRetiredConversationWorkRecords } = await import('../runtime/harness/conversation-state-lifecycle.js');
       const decayed = decayRetiredConversationWorkRecords();
-      if (decayed.sessions > 0 || decayed.turns > 0) logger.info({ ...decayed }, 'retired work records decayed');
+      if (Object.entries(decayed).some(([key, value]) => key !== 'held' && value > 0)) logger.info({ ...decayed }, 'retired work records decayed');
     } catch (err) {
       logger.warn({ err }, 'retired work record decay failed');
     }

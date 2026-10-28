@@ -394,6 +394,10 @@ const TURN_WORKING_RECORD_TABLES = ['accepted_model_batch_admissions', 'durable_
 const CONVERSATION_WORKING_RECORD_TABLES = [...TURN_WORKING_RECORD_TABLES, 'tool_outputs', 'tool_output_invocations'] as const;
 /** Where a conversation's turns are named. */
 const TURN_SOURCES = ['accepted_turn_call_authorities', ...TURN_WORKING_RECORD_TABLES, 'write_evidence_bindings', 'evidence_receipts', 'async_read_refinement_intents'] as const;
+/** The result handle index covers authoritative handles only, and every
+ * session-bound handle is one: a lookup says so, or it scans the table. */
+const HANDLE_SCOPE = "scope_kind = 'authoritative' AND ";
+const turnScope = (table: string, alias: string) => (table === 'durable_result_handles' ? `${alias}.${HANDLE_SCOPE}` : '');
 
 export interface RetiredWorkRecordDecay {
   /** Conversations retired to memory whose working records went. */
@@ -449,12 +453,12 @@ export function decayRetiredConversationWorkRecords(input: {
      WHERE state.fidelity = 'memory'
        AND state.compacted_at IS NOT NULL
        AND state.compacted_at < ?
-       AND (${CONVERSATION_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE w.session_id = state.session_id)`).join(' OR ')})
+       AND (${CONVERSATION_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE ${turnScope(table, 'w')}w.session_id = state.session_id)`).join(' OR ')})
      ORDER BY state.compacted_at
      LIMIT ?
   `).all(retiredBefore, Math.max(1, input.limit ?? 300)) as Array<{ sessionId: string }>;
   const fidelityOf = db.prepare('SELECT fidelity FROM session_conversation_state WHERE session_id = ?');
-  const turnsOf = db.prepare(`SELECT DISTINCT source_user_seq AS seq FROM (${TURN_SOURCES.map((table) => `SELECT source_user_seq FROM ${table} WHERE session_id = ? AND source_user_seq IS NOT NULL`).join(' UNION ALL ')}) ORDER BY seq`);
+  const turnsOf = db.prepare(`SELECT DISTINCT source_user_seq AS seq FROM (${TURN_SOURCES.map((table) => `SELECT source_user_seq FROM ${table} WHERE ${turnScope(table, table)}session_id = ? AND source_user_seq IS NOT NULL`).join(' UNION ALL ')}) ORDER BY seq`);
   const deleteConversationOutputs = ['tool_outputs', 'tool_output_invocations'].map((table) => db.prepare(`DELETE FROM ${table} WHERE session_id = ?`));
   // Each turn goes in its own transaction, the fidelity rechecked under the
   // writer lock every time; a pass that runs out of time leaves the rest of a
@@ -485,7 +489,7 @@ export function decayRetiredConversationWorkRecords(input: {
        AND NOT EXISTS (SELECT 1 FROM session_conversation_state c WHERE c.session_id = a.session_id)
        AND NOT EXISTS (SELECT 1 FROM retired_turn_work_records r WHERE r.session_id = a.session_id AND r.source_user_seq = a.source_user_seq)
        AND NOT EXISTS (SELECT 1 FROM run_attempts ra WHERE ra.session_id = a.session_id AND ra.source_user_seq = a.source_user_seq AND ra.finished_at IS NULL)
-       AND (${TURN_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE w.session_id = a.session_id AND w.source_user_seq = a.source_user_seq)`).join(' OR ')})
+       AND (${TURN_WORKING_RECORD_TABLES.map((table) => `EXISTS (SELECT 1 FROM ${table} w WHERE ${turnScope(table, 'w')}w.session_id = a.session_id AND w.source_user_seq = a.source_user_seq)`).join(' OR ')})
      ORDER BY a.opened_at
      LIMIT ?
   `).all(turnsOpenedBefore, Math.max(1, input.turnLimit ?? 300)) as Array<{ sessionId: string; seq: number }>;
@@ -524,10 +528,10 @@ function turnWorkRecordShedder(db: ReturnType<typeof openEventLog>, retiredAt: s
     'DELETE FROM write_evidence_bindings WHERE session_id = ? AND source_user_seq = ?',
     'DELETE FROM evidence_receipts WHERE session_id = ? AND source_user_seq = ?',
     'DELETE FROM async_read_refinement_intents WHERE session_id = ? AND source_user_seq = ?',
-    'DELETE FROM workflow_paginated_read_pages WHERE result_handle_id IN (SELECT handle_id FROM durable_result_handles WHERE session_id = ? AND source_user_seq = ?)',
+    `DELETE FROM workflow_paginated_read_pages WHERE result_handle_id IN (SELECT handle_id FROM durable_result_handles WHERE ${HANDLE_SCOPE}session_id = ? AND source_user_seq = ?)`,
   ].map((sql) => db.prepare(sql));
   const settlements = db.prepare('DELETE FROM logical_call_settlements WHERE session_id = ? AND source_user_seq = ?');
-  const handles = db.prepare('DELETE FROM durable_result_handles WHERE session_id = ? AND source_user_seq = ?');
+  const handles = db.prepare(`DELETE FROM durable_result_handles WHERE ${HANDLE_SCOPE}session_id = ? AND source_user_seq = ?`);
   const provenance = db.prepare('DELETE FROM model_request_provenance WHERE session_id = ? AND source_user_seq = ?');
   const outputs = ['tool_outputs', 'tool_output_invocations'].map((table) => db.prepare(
     `DELETE FROM ${table} WHERE session_id = ? AND call_id IN (SELECT logical_tool_call_id FROM logical_tool_calls WHERE session_id = ? AND source_user_seq = ?)`));
