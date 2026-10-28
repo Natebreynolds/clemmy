@@ -5,7 +5,8 @@ import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowUpRight, Check, Send, X } from 'lucide-react';
+import { ArrowUpRight, Check, Send, Square, Volume2, X } from 'lucide-react';
+import { replySpeaker } from '@/lib/reply-speaker';
 import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate, isIdentifierLike, normalizePendingActionResultRecord, retainPendingActionPresentation } from '@clem/chat-engine';
 import type { ApprovalConfirm, ApprovalResolution, TerminalNoticeLine } from '@clem/chat-engine';
 import { DogMark } from '@/components/DogMark';
@@ -141,6 +142,24 @@ function DraftFrame({ draft, live, children }: { draft: ChatMessage['answerDraft
 
 /** Who is speaking, and when. The avatar lives here now rather than in a
  *  gutter beside every reply, so the answer can use the full column. */
+/** Read this reply aloud, in the voice voice mode uses; press again to stop. */
+function SpeakReplyButton({ replyKey, text }: { replyKey: string; text: string }) {
+  const [speaking, setSpeaking] = useState(() => replySpeaker().current === replyKey);
+  useEffect(() => replySpeaker().subscribe((key) => setSpeaking(key === replyKey)), [replyKey]);
+  return (
+    <button
+      type="button"
+      onClick={() => { replySpeaker().toggle(replyKey, text); }}
+      aria-label={speaking ? 'Stop reading this reply' : 'Read this reply aloud'}
+      aria-pressed={speaking}
+      className={cn('inline-flex h-7 w-7 items-center justify-center self-start rounded-md text-muted transition-opacity hover:bg-surface-2 hover:text-fg',
+        speaking ? 'opacity-100 text-primary' : 'opacity-0 group-hover/turn:opacity-100 focus-visible:opacity-100')}
+    >
+      {speaking ? <Square className="h-3.5 w-3.5" aria-hidden /> : <Volume2 className="h-3.5 w-3.5" aria-hidden />}
+    </button>
+  );
+}
+
 function TurnHeader({ at, quiet, speaker, project }: { at?: number; quiet?: boolean; speaker?: string; project?: string }) {
   const time = at ? new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
   return (
@@ -745,6 +764,9 @@ export function ChatBubble({
                 failed={message.status === 'failed'}
               />
             </DraftFrame>
+          )}
+          {hasReplyText && !thinking && message.status !== 'failed' && (
+            <SpeakReplyButton replyKey={message.id} text={message.text} />
           )}
 
         {((message.status === 'awaiting-approval' && message.approval) || message.status === 'awaiting-plan') && (
