@@ -261,7 +261,13 @@ test('an unreachable built-in is told it is off the surface, never to call it di
     'a tool the guard just proved unreachable must not be described as first-class');
   assert.ok(!/Call background_task_status DIRECTLY/.test(detail),
     'the refusal must not send the model at a door that is closed this turn');
-  assert.match(detail, /tool_search/, 'the refusal names the door that exists');
+  // Live 2026-10-28: a task-recovery control's door is the hand-off that
+  // makes a task, not another search; told to search, the model searched
+  // again and polled a task id it made up.
+  assert.match(detail, /has none to act on yet/);
+  assert.match(detail, /dispatch_background_task/, 'the refusal names the door that exists');
+  assert.match(detail, /Never guess a task id/);
+  assert.doesNotMatch(detail, /Call tool_search DIRECTLY/);
 });
 
 test('turn-scoped reachability refuses a built-in that was not advertised as deferred', async () => {

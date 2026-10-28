@@ -58,7 +58,7 @@ import {
   dispatchBatchItemTool,
   isMcpNamespacedTool,
 } from './inner-dispatch.js';
-import { deriveOrchestratorDiscoveryNames, isEffectDecidedPerCall, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
+import { actionControlContextFor, deriveOrchestratorDiscoveryNames, isEffectDecidedPerCall, isRegisteredActionControl, isRegistryDeclaredRead, isRegistryDeclaredTool, registeredToolSideEffect } from './tool-registry.js';
 import { forgetToolHit, recordToolHit } from '../agents/tool-hotset.js';
 import { HostLocalExecutionFailureResult, HostLocalNonWriteResult } from '../runtime/harness/attempt-settlement.js';
 import { deriveResultHandleFactsFromRaw } from '../runtime/harness/result-facts.js';
@@ -1341,6 +1341,14 @@ export function buildCallTool(options: BuildCallToolOptions = {}): Tool<RuntimeC
                 + ` Call work_call DIRECTLY as its own tool call, with name "${target}", args_json holding its arguments,`
                 + ` and "${target}" as requirement_id. A call that only reads or computes runs at once.`
                 + ' A call that changes files or leaves this machine is a different effect and answers for itself there.'
+              // A task-recovery control is reachable once this conversation
+              // has a background task; told "not on this turn's surface" the
+              // model searched for it again and polled a task id it made up.
+              // Live 2026-10-28. The true correction is the order of moves.
+              : isRegistryDeclaredTool(target) && actionControlContextFor(target) === 'task_recovery'
+              ? `"${requestedTarget}" inspects or steers a background task, and this conversation has none to act on yet.`
+                + ' Hand the work off first with dispatch_background_task; its receipt names the task id,'
+                + ` and "${target}" is reachable with that id from then on. Never guess a task id.`
               : isRegistryDeclaredTool(target)
               ? `"${requestedTarget}" is a Clementine built-in, but it is NOT on this turn's surface:`
                 + ' this turn\'s tool policy does not reach it, so neither this carrier nor a direct call can invoke it here.'
