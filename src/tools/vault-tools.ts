@@ -203,7 +203,7 @@ export function registerVaultTools(server: McpServer): void {
       if (hasReminderIntent || hasExactDueTime) {
         return textResult(
           'task_add refused: this looks like a reminder, but task_add would create only a passive TODO and would not notify the user. '
-          + 'For a one-time reminder within 24 hours, call set_timer with fire_at (an ISO timestamp with an explicit offset). '
+          + 'For a one-time reminder within the next 30 days, call set_timer with fire_at (an ISO timestamp with an explicit offset). '
           + 'For later or recurring work, use workflow_create + workflow_schedule.',
         );
       }

@@ -11,7 +11,7 @@ import {
   listWorkspaceProjects,
   textResult,
 } from './shared.js';
-import { appendTimer, cancelTimers, listPendingTimers, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
+import { appendTimer, cancelTimers, listPendingTimers, MAX_TIMER_MINUTES, resolveTimerFireAt, type TimerEntry } from '../runtime/timers.js';
 import { timerProspectiveDefinition } from '../runtime/prospective-adapters.js';
 import { upsertProspectiveIntention } from '../runtime/prospective-intentions.js';
 import { getToolOutputContext } from '../runtime/harness/tool-output-context.js';
@@ -155,12 +155,12 @@ export function registerAdminTools(server: McpServer): void {
 
   server.tool(
     'set_timer',
-    'Set a one-time reminder notification within the next 24 hours. Use minutes for a relative reminder, or fire_at for an exact wall-clock time such as "10 PM tonight". This tool actually fires; task_add only creates a passive TODO.',
+    'Set a one-time reminder notification, from minutes ahead to 30 days out. Use minutes for a relative reminder, or fire_at for an exact wall-clock time such as "10 PM tonight" or "Thursday at 9am". This tool actually fires; task_add only creates a passive TODO.',
     {
-      minutes: z.number().min(1).max(1440).optional()
+      minutes: z.number().min(1).max(MAX_TIMER_MINUTES).optional()
         .describe('Relative delay in minutes. Provide this OR fire_at, never both.'),
       fire_at: z.string().optional()
-        .describe('Exact ISO 8601 timestamp with an explicit UTC offset, within 24 hours. Example: 2026-07-30T22:00:00-07:00. Provide this OR minutes.'),
+        .describe('Exact ISO 8601 timestamp with an explicit UTC offset, within the next 30 days. Example: 2026-07-30T22:00:00-07:00. Provide this OR minutes.'),
       message: z.string().min(1),
       delivery: z.enum(['configured', 'local']).optional()
         .describe('Use local when the user requests in-app/local-only delivery: inbox only, never external channels or push. Omitted/configured uses the user’s notification destinations.'),

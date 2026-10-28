@@ -48,7 +48,15 @@ export interface TimerEntry {
 
 /** A fire more than this late gets the honest "delayed" annotation. */
 const LATE_ANNOTATION_MS = 2 * 60_000;
-const MAX_TIMER_AHEAD_MS = 24 * 60 * 60_000;
+/** A one-time reminder reaches this far ahead. The store is durable (a timer
+ * fires late but never lost across restarts and sleep), so the horizon is a
+ * product bound, not a reliability one: further out than this, a scheduled
+ * workflow is the honest tool. Live 2026-10-28: a 24-hour horizon sent a
+ * "tomorrow at 9" reminder hunting through three tool searches for a
+ * longer-range path that does not exist. */
+export const MAX_TIMER_AHEAD_DAYS = 30;
+const MAX_TIMER_AHEAD_MS = MAX_TIMER_AHEAD_DAYS * 24 * 60 * 60_000;
+export const MAX_TIMER_MINUTES = MAX_TIMER_AHEAD_DAYS * 24 * 60;
 
 export type TimerFireAtInput = {
   minutes?: number | null;
@@ -82,8 +90,8 @@ export function resolveTimerFireAt(
 
   if (hasMinutes) {
     const minutes = input.minutes!;
-    if (minutes < 1 || minutes > 1440) {
-      return { ok: false, error: 'minutes must be between 1 and 1440.' };
+    if (minutes < 1 || minutes > MAX_TIMER_MINUTES) {
+      return { ok: false, error: `minutes must be between 1 and ${MAX_TIMER_MINUTES} (${MAX_TIMER_AHEAD_DAYS} days).` };
     }
     return {
       ok: true,
@@ -111,7 +119,7 @@ export function resolveTimerFireAt(
   if (fireAt - now > MAX_TIMER_AHEAD_MS) {
     return {
       ok: false,
-      error: 'fire_at must be within the next 24 hours; use a scheduled workflow for a later reminder.',
+      error: `fire_at must be within the next ${MAX_TIMER_AHEAD_DAYS} days; use a scheduled workflow for a later reminder.`,
     };
   }
   return { ok: true, fireAt, confirmationTarget: exact };

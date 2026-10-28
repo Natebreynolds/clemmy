@@ -905,3 +905,19 @@ test('a limit over the 200 rows the query returns is clamped, not refused (a cou
   assert.equal(schema.safeParse({ call_id: 'call_x', limit: 1000, aggregate: 'count' }).success, true);
   assert.equal(schema.safeParse({ call_id: 'call_x', limit: 0 }).success, false, 'a non-positive limit is still refused');
 });
+
+test('a recall of an id this session never retained is a repairable argument, not a failed execution', async () => {
+  // Live 2026-10-28: the model misquoted a call id; the reader answered with
+  // the real ids, but the attempt settled as execution_failed and counted as
+  // a tool failure against the turn.
+  const { isInvalidArgumentsTextResult } = await import('./shared.js');
+  resetEventLog();
+  const session = createSession({ kind: 'chat' });
+  writeToolOutput({ sessionId: session.id, callId: 'call-real-9', tool: 'work_call', output: JSON.stringify({ items: [1, 2] }) });
+  const recall = captureRecallHandler();
+  const result = await withHarnessRunContext({ sessionId: session.id, counter: new ToolCallsCounter(10), recallBudget: new RecallBudget(3, 60_000) },
+    () => recall({ call_id: 'call_made_up_by_the_model' }));
+  assert.equal(isInvalidArgumentsTextResult(result), true, 'the miss carries the repairable-argument proof');
+  assert.match(result.content[0].text, /No tool output found for call_id "call_made_up_by_the_model"/);
+  assert.match(result.content[0].text, /call-real-9 \(work_call/);
+});

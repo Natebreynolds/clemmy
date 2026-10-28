@@ -184,7 +184,7 @@ test('set_timer rejects ambiguous, stale, timezone-less, and over-horizon exact 
       },
       { message: 'past schedule', fire_at: '2026-07-30T19:59:00-07:00' },
       { message: 'ambiguous local time', fire_at: '2026-07-30T22:00:00' },
-      { message: 'too far away', fire_at: '2026-08-01T20:00:01-07:00' },
+      { message: 'too far away', fire_at: '2026-08-30T20:00:01-07:00' },
     ];
     for (const input of invalidInputs) {
       const result = await handler(input);
@@ -355,4 +355,20 @@ test('cancel_timer removes the chosen pending reminder and nothing else', async 
   assert.deepEqual(cancelTimers({}, now).map((t) => t.id), ['timer-aaaa0002'], 'one pending and no selector: that one');
   assert.deepEqual(readTimers(), []);
   assert.deepEqual(cancelTimers({ all: true }, now), [], 'nothing pending cancels nothing');
+});
+
+test('a one-time reminder reaches 30 days out; further out is refused toward a scheduled workflow', async () => {
+  const { resolveTimerFireAt, MAX_TIMER_AHEAD_DAYS, MAX_TIMER_MINUTES } = await import('./timers.js');
+  const now = Date.parse('2026-10-28T16:00:00.000Z');
+  const inDays = (days: number) => new Date(now + days * 86_400_000).toISOString().replace('.000Z', '+00:00');
+  // Live 2026-10-28: "tomorrow at 9" sat 23 hours out, and a 24-hour horizon
+  // sent the reminder hunting for a longer-range path that does not exist.
+  assert.equal(resolveTimerFireAt({ fireAt: inDays(1) }, now).ok, true, 'tomorrow');
+  assert.equal(resolveTimerFireAt({ fireAt: inDays(7) }, now).ok, true, 'next week');
+  assert.equal(resolveTimerFireAt({ fireAt: inDays(MAX_TIMER_AHEAD_DAYS - 0.5) }, now).ok, true, 'inside the horizon');
+  const tooFar = resolveTimerFireAt({ fireAt: inDays(MAX_TIMER_AHEAD_DAYS + 1) }, now);
+  assert.equal(tooFar.ok, false);
+  assert.match((tooFar as { error: string }).error, /scheduled workflow/);
+  assert.equal(resolveTimerFireAt({ minutes: MAX_TIMER_MINUTES }, now).ok, true, 'minutes reach the same horizon');
+  assert.equal(resolveTimerFireAt({ minutes: MAX_TIMER_MINUTES + 1 }, now).ok, false);
 });

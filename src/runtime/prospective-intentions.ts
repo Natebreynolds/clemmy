@@ -1076,7 +1076,7 @@ export function prospectiveCaptureDirective(input: string): string | null {
   if (!explicitReminder && !standingWatch && !eventAction && !scheduledAction) return null;
   return (
     'Prospective-intention signal: this request contains a future cue. Do not rely on chat memory or merely promise it. '
-    + 'Persist it through the matching existing capability (set_timer for a one-time notification within 24 hours, a self-driving goal, or a scheduled/event workflow). '
+    + 'Persist it through the matching existing capability (set_timer for a one-time notification within the next 30 days, a self-driving goal, or a scheduled/event workflow). '
     + 'A passive task_add TODO does not fire and is not evidence that a reminder was scheduled; report success only from the timer/workflow receipt. '
     + 'An update or cancellation must revise the existing commitment, not create a competing duplicate.'
   );

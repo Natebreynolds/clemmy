@@ -9,7 +9,7 @@ import {
   inlineResultBudgetForModel,
   retainedReaderMaxChars,
 } from '../runtime/harness/tool-output-format.js';
-import { textResult } from './shared.js';
+import { invalidArgumentsTextResult, textResult } from './shared.js';
 import { parseShellToolOutput } from './inner-dispatch.js';
 import { parseStoredToolOutputJson } from '../runtime/harness/json-repair.js';
 import { listToolOutputCallIds } from '../runtime/harness/eventlog.js';
@@ -544,12 +544,16 @@ export function registerRecallTools(server: McpServer): void {
         // A capability reference is not a result handle, and "not found" is
         // not "empty": name what the id is, how to invoke it, and what this
         // turn has actually retained.
-        return textResult(describeMissingRetainedOutputForSession({
+        // The id was the model's mistake: a repairable argument, told with
+        // the ids that do exist, never an execution that failed. Live
+        // 2026-10-28: a misquoted id settled as execution_failed and counted
+        // against the turn as a tool failure.
+        return invalidArgumentsTextResult(describeMissingRetainedOutputForSession({
           sessionId: ctx.sessionId,
           sourceUserSeq: ctx.sourceUserSeq,
           requestedId: callId,
           readerTool: 'recall_tool_result',
-        }), { isError: true });
+        }));
       }
       if (read.status === 'incomplete') {
         return textResult(
@@ -612,12 +616,12 @@ export function registerRecallTools(server: McpServer): void {
         // Not a typo of a real id. Say what the id IS (a capability reference
         // that was never invoked, or an unknown id), the exact carrier call
         // that produces a result, and which results this turn has retained.
-        return textResult(describeMissingRetainedOutputForSession({
+        return invalidArgumentsTextResult(describeMissingRetainedOutputForSession({
           sessionId: ctx.sessionId,
           sourceUserSeq: ctx.sourceUserSeq,
           requestedId: callId,
           readerTool: 'tool_output_query',
-        }), { isError: true });
+        }));
       }
       if (row.truncatedAtWrite) {
         return textResult(
