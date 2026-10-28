@@ -871,6 +871,18 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
+  // A retired turn's working records go a little at a time: each pass works
+  // for its budget on this loop and stops, so a chat never waits behind it.
+  if (tickCount % HISTORY_STORAGE_EVERY_N_TICKS === 2 && !shouldDeferDiscretionaryWork('retired-work-records')) {
+    try {
+      const { decayRetiredConversationWorkRecords } = await import('../runtime/harness/conversation-state-lifecycle.js');
+      const decayed = decayRetiredConversationWorkRecords();
+      if (decayed.sessions > 0 || decayed.turns > 0) logger.info({ ...decayed }, 'retired work records decayed');
+    } catch (err) {
+      logger.warn({ err }, 'retired work record decay failed');
+    }
+  }
+
 
 
   // Procedural-memory self-heal (Wave 2 ever-learning robustness). Sweeps the

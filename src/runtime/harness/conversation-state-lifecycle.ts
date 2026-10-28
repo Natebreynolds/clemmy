@@ -384,6 +384,9 @@ export function retireConversationStateToMemory(sessionId: string, input: {
 /** A finished turn of a long-lived session keeps its working records this
  * many days: the same bar a chat meets when it retires to its memory. */
 export const RETIRED_TURN_IDLE_DAYS = CONVERSATION_MEMORY_ONLY_IDLE_DAYS;
+/** A decay pass runs on the daemon's own loop, so it works this long and
+ * stops; the backlog clears over the passes that follow, never in one. */
+export const RETIRED_WORK_RECORD_PASS_BUDGET_MS = 250;
 
 /** Tables whose rows are a turn's working records, keyed by session and turn. */
 const TURN_WORKING_RECORD_TABLES = ['accepted_model_batch_admissions', 'durable_result_handles', 'model_request_provenance', 'logical_call_settlements'] as const;
@@ -427,10 +430,14 @@ export function decayRetiredConversationWorkRecords(input: {
   graceDays?: number;
   limit?: number;
   turnLimit?: number;
+  /** Wall-clock work per pass; what is left waits for the next pass. */
+  budgetMs?: number;
 } = {}): RetiredWorkRecordDecay {
   const db = openEventLog();
   const nowMs = input.nowMs ?? Date.now();
   const graceDays = input.graceDays ?? RETIRED_WORK_RECORD_GRACE_DAYS;
+  const deadline = performance.now() + (input.budgetMs ?? RETIRED_WORK_RECORD_PASS_BUDGET_MS);
+  const outOfTime = () => performance.now() > deadline;
   const retiredBefore = new Date(nowMs - graceDays * 86_400_000).toISOString();
   const turnsOpenedBefore = new Date(nowMs - (RETIRED_TURN_IDLE_DAYS + graceDays) * 86_400_000).toISOString();
   const result: RetiredWorkRecordDecay = { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 0 };
@@ -449,12 +456,21 @@ export function decayRetiredConversationWorkRecords(input: {
   const fidelityOf = db.prepare('SELECT fidelity FROM session_conversation_state WHERE session_id = ?');
   const turnsOf = db.prepare(`SELECT DISTINCT source_user_seq AS seq FROM (${TURN_SOURCES.map((table) => `SELECT source_user_seq FROM ${table} WHERE session_id = ? AND source_user_seq IS NOT NULL`).join(' UNION ALL ')}) ORDER BY seq`);
   const deleteConversationOutputs = ['tool_outputs', 'tool_output_invocations'].map((table) => db.prepare(`DELETE FROM ${table} WHERE session_id = ?`));
-  for (const { sessionId } of conversations) {
+  // Each turn goes in its own transaction, the fidelity rechecked under the
+  // writer lock every time; a pass that runs out of time leaves the rest of a
+  // conversation for the next one, which finds it still a candidate.
+  const stillRetired = () => (fidelityOf.get(sessionId) as { fidelity?: string } | undefined)?.fidelity === 'memory';
+  let sessionId = '';
+  conversations: for (const candidate of conversations) {
+    sessionId = candidate.sessionId;
     if (conversationLifecycleHold(sessionId) !== null) { result.held += 1; continue; }
+    for (const { seq } of turnsOf.all(...TURN_SOURCES.map(() => sessionId)) as Array<{ seq: number }>) {
+      if (outOfTime()) break conversations;
+      db.transaction(() => { if (stillRetired()) shed(sessionId, seq); }).immediate();
+    }
+    if (outOfTime()) break;
     db.transaction(() => {
-      const row = fidelityOf.get(sessionId) as { fidelity?: string } | undefined;
-      if (row?.fidelity !== 'memory') return;
-      for (const { seq } of turnsOf.all(...TURN_SOURCES.map(() => sessionId)) as Array<{ seq: number }>) shed(sessionId, seq);
+      if (!stillRetired()) return;
       // An output whose call left no record goes with its conversation.
       for (const statement of deleteConversationOutputs) result.toolOutputs += statement.run(sessionId).changes;
       result.sessions += 1;
@@ -475,14 +491,15 @@ export function decayRetiredConversationWorkRecords(input: {
   `).all(turnsOpenedBefore, Math.max(1, input.turnLimit ?? 300)) as Array<{ sessionId: string; seq: number }>;
   const openRun = db.prepare('SELECT 1 FROM run_attempts WHERE session_id = ? AND source_user_seq = ? AND finished_at IS NULL LIMIT 1');
   const holds = new Map<string, boolean>();
-  for (const { sessionId, seq } of turns) {
-    let held = holds.get(sessionId);
-    if (held === undefined) { held = conversationLifecycleHold(sessionId) !== null; holds.set(sessionId, held); }
+  for (const turn of outOfTime() ? [] : turns) {
+    if (outOfTime()) break;
+    let held = holds.get(turn.sessionId);
+    if (held === undefined) { held = conversationLifecycleHold(turn.sessionId) !== null; holds.set(turn.sessionId, held); }
     if (held) { result.held += 1; continue; }
     db.transaction(() => {
       // Rechecked under the writer lock: a run may have started since.
-      if (openRun.get(sessionId, seq)) return;
-      shed(sessionId, seq);
+      if (openRun.get(turn.sessionId, turn.seq)) return;
+      shed(turn.sessionId, turn.seq);
       result.turns += 1;
     }).immediate();
   }

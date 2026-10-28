@@ -217,7 +217,7 @@ test('a retired chat sheds every turn; a long-lived session sheds a finished tur
   // A turn still open: never a candidate.
   seedTurn(db, 'workflow:open', 1, { kind: 'workflow', authorityState: 'open', openedAt: daysAgo(42) });
 
-  const decayed = lifecycle.decayRetiredConversationWorkRecords({ nowMs });
+  const decayed = lifecycle.decayRetiredConversationWorkRecords({ nowMs, budgetMs: 60_000 });
   assert.deepEqual(decayed, { sessions: 1, turns: 1, admissions: 3, checkpoints: 3, objects: 0, handles: 3, settlements: 3, provenance: 3, toolOutputs: 6, held: 1 });
 
   for (const table of WORKING) assert.equal(count(db, table, 'retired-chat'), 0, `retired-chat sheds ${table}`);
@@ -237,5 +237,5 @@ test('a retired chat sheds every turn; a long-lived session sheds a finished tur
   assert.equal(count(db, 'durable_result_handles', 'workflow:nightly', running.seq), 1);
 
   // The same pass again finds nothing to do.
-  assert.deepEqual(lifecycle.decayRetiredConversationWorkRecords({ nowMs }), { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1 });
+  assert.deepEqual(lifecycle.decayRetiredConversationWorkRecords({ nowMs, budgetMs: 60_000 }), { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1 });
 });
