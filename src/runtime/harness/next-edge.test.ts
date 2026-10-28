@@ -21,8 +21,18 @@ import test from 'node:test';
 
 const {
   nextEdge, renderNextEdge, isRecoverableWithoutEdge, defaultDispositionEdge,
-  edgeToolName,
+  edgeToolName, consentRefusalRecoveryToolNames,
 } = await import('./next-edge.js');
+
+test('a consent refusal admits on its recovery surface the move its own edge names', () => {
+  assert.deepEqual(consentRefusalRecoveryToolNames('coverage_missing', 'call_tool'), ['call_tool', 'work_call', 'tool_search'],
+    'the edge says work_call; work_call may then ask for one tool_search');
+  assert.deepEqual(consentRefusalRecoveryToolNames('coverage_missing', 'work_call'), ['work_call', 'tool_search']);
+  assert.deepEqual(consentRefusalRecoveryToolNames('schema_stale', 'call_tool'), ['call_tool', 'tool_search']);
+  assert.deepEqual(consentRefusalRecoveryToolNames('risk_unknown', 'work_call'), ['work_call', 'tool_search']);
+  assert.deepEqual(consentRefusalRecoveryToolNames('scope_mismatch', 'work_call'), ['work_call'], 'no retry can fix scope; the carrier alone');
+  assert.deepEqual(consentRefusalRecoveryToolNames(null, 'opaque_refused_carrier'), ['opaque_refused_carrier']);
+});
 
 test('an edge names a tool and a typed move — prose is never the only carrier', () => {
   const edge = nextEdge({ tool: 'publish_plan', change: 'publish_partial' });

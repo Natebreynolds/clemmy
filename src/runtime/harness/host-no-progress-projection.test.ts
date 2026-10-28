@@ -1969,6 +1969,30 @@ test('a zero-crossing policy refusal remains retryable on its refused carrier', 
   assert.deepEqual(projected.consequence?.recoveryToolNames, ['opaque_refused_carrier']);
 });
 
+test('a coverage refusal of a built-in change admits work_call and tool_search, the moves its edge names', () => {
+  const identity = accepted('coverage-missing-built-in');
+  const db = settlementDb([{
+    callId: 'timer-call',
+    executionKind: 'refused_pre_dispatch',
+    outcomeKind: 'policy_denial',
+    outcomeDetail: 'coverage_missing',
+    recoveryAction: 'stop_and_explain',
+    businessCall: 1,
+    physicalCrossingCount: 0,
+    hostCrossingCount: 0,
+  }], identity);
+  const projected = projectHostNoProgressAttempt({
+    ...identity,
+    historyDelta: [call('timer-call', 'call_tool'), result('timer-call', 'call_tool')],
+  }, db);
+  db.close();
+  assert.equal(projected.status, 'ok');
+  if (projected.status !== 'ok') return;
+  assert.equal(projected.consequence?.stage, 'execution:policy_denial');
+  assert.equal(projected.consequence?.recovery, 'repair_model');
+  assert.deepEqual([...(projected.consequence?.recoveryToolNames ?? [])].sort(), ['call_tool', 'tool_search', 'work_call']);
+});
+
 test('crossed and host-executed policy denials remain factual stops', () => {
   const identity = accepted('genuine-policy-denials');
   const db = settlementDb([

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { consentRefusalRecoveryToolNames } from './next-edge.js';
 import type Database from 'better-sqlite3';
 import {
   listEvents,
@@ -1379,7 +1380,8 @@ function settlementConsequence(input: {
         stage: `execution:${settlement.outcome_kind}`,
         recovery: notStarted ? 'repair_model' : 'stop_factual',
         effectState,
-        recoveryToolNames: notStarted ? [call.name] : [],
+        // The surface must admit the move the refusal's own edge names.
+        recoveryToolNames: notStarted ? consentRefusalRecoveryToolNames(settlement.outcome_detail, call.name) : [],
       });
     case 'unknown':
       // A READ THAT FAILED CHANGED NOTHING.

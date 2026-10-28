@@ -162,6 +162,28 @@ export function planScopeRefusalEdge(diagnostic: string | undefined, toolName: s
 /** The code a host consent refusal writes: `before dispatch (<code>).` */
 const CONSENT_REFUSAL_CODE = /before dispatch \((coverage_missing|scope_mismatch|risk_unknown|schema_stale|authority_conflict|cardinality_spent|consent_preparation_unavailable)\)/;
 
+/** The tools a consent refusal's own edge names, so the recovery surface
+ *  admits the move the refusal asks for. Live 2026-10-28: a built-in timer
+ *  sent through call_tool was refused coverage_missing, the edge said "send
+ *  it through work_call", and the recovery surface held only call_tool, so
+ *  the work_call the host asked for was refused as off-surface; the model
+ *  then needed a search and two more calls to set a two-minute timer. */
+export function consentRefusalRecoveryToolNames(detail: string | null | undefined, callName: string): string[] {
+  const code = (detail ?? '').trim();
+  switch (code) {
+    case 'coverage_missing':
+      // The edge: work_call binds the change to this request's work; when the
+      // operation is not yet published for it, work_call's own refusal asks
+      // for one tool_search. Both must be reachable or the advice dead-ends.
+      return callName === 'work_call' ? [callName, 'tool_search'] : [callName, 'work_call', 'tool_search'];
+    case 'schema_stale':
+    case 'risk_unknown':
+      return [callName, 'tool_search'];
+    default:
+      return [callName];
+  }
+}
+
 /** A host refusal before dispatch, said as what it is: the real cause and the
  *  move that can succeed. The host writes every code read here; a refusal it
  *  does not recognise keeps the default edge, which claims no cause.
