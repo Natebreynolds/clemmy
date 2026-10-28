@@ -15301,3 +15301,20 @@ test('her own plain-text answer to a decline is what the owner reads; the fixed 
     assert.equal(completed.data.reply ?? (completed.data as { summary?: unknown }).summary, expected);
   }
 });
+
+test('an ordinary reply that prepared no workflow leaves no origin group directory behind', async () => {
+  resetEventLog();
+  const { finalizePreparedWorkflowDispatchForSource } = await import('./loop.js');
+  const { workflowOriginSourceGroupId } = await import('../../execution/workflow-origin-group.js');
+  const session = createSession({ kind: 'chat' });
+  const source = appendEvent({
+    sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'just a question' },
+  });
+  const dispatched = finalizePreparedWorkflowDispatchForSource(session.id, source.seq);
+  assert.ok(dispatched === null || (Array.isArray(dispatched) && dispatched.length === 0), 'nothing to dispatch');
+  const groupDir = path.join(WORKFLOW_RUNS_DIR, '.origin-groups',
+    createHash('sha256').update(workflowOriginSourceGroupId({ sessionId: session.id, sourceUserSeq: source.seq })).digest('hex'));
+  // Live 2026-10-28: the close lock lived in the group directory, so every
+  // turn created one; 7,227 empty groups sat in front of every reconcile.
+  assert.equal(existsSync(groupDir), false, 'no group is manufactured for a turn that dispatched nothing');
+});

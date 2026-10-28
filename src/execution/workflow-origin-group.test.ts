@@ -760,3 +760,29 @@ test('unknown run-origin marker versions fail closed instead of disappearing', (
     /unknown origin observer marker version/,
   );
 });
+
+test('a day-old empty group directory is removed; a fresh one and one with evidence stay', async () => {
+  const { reapEmptyWorkflowOriginGroupDirectories, EMPTY_ORIGIN_GROUP_DIRECTORY_MIN_AGE_MS } = await import('./workflow-origin-group.js');
+  const { utimesSync } = await import('node:fs');
+  const root = path.join(TMP_HOME, 'workflows', 'runs', '.origin-groups');
+  mkdirSync(root, { recursive: true });
+  const name = (seed: string) => createHash('sha256').update(seed).digest('hex');
+  const old = path.join(root, name('old-empty'));
+  const fresh = path.join(root, name('fresh-empty'));
+  const written = path.join(root, name('written'));
+  for (const dir of [old, fresh, written]) mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(written, 'tombstone.json'), '{}');
+  const dayAgo = new Date(Date.now() - EMPTY_ORIGIN_GROUP_DIRECTORY_MIN_AGE_MS - 60_000);
+  utimesSync(old, dayAgo, dayAgo);
+  utimesSync(written, dayAgo, dayAgo);
+  mkdirSync(path.join(root, 'not-a-group'), { recursive: true });
+  utimesSync(path.join(root, 'not-a-group'), dayAgo, dayAgo);
+
+  const pass = reapEmptyWorkflowOriginGroupDirectories();
+  assert.equal(pass.removed, 1);
+  assert.equal(existsSync(old), false, 'the day-old empty group is gone');
+  assert.equal(existsSync(fresh), true, 'a fresh empty group may be an admission in flight');
+  assert.equal(existsSync(written), true, 'a group with evidence stays');
+  assert.equal(existsSync(path.join(root, 'not-a-group')), true, 'unknown entries are never touched');
+  assert.equal(reapEmptyWorkflowOriginGroupDirectories().removed, 0);
+});

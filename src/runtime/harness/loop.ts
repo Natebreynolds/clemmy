@@ -5092,6 +5092,14 @@ function closePreparedWorkflowDispatchBatch(
     .find((event) => event.seq === sourceUserSeq);
   if (!source || source.role !== 'user' || source.data.synthetic === true) return null;
   const sourceGroupId = workflowOriginSourceGroupId({ sessionId, sourceUserSeq });
+  // The group lock lives in the group's directory, so taking it creates the
+  // group. A reply that prepared nothing and closed nothing is decided from
+  // the event log alone, before the lock: an ordinary turn leaves no group
+  // behind. Live 2026-10-28: 7,227 empty group directories, one per turn,
+  // listed by every 15-second reconcile. The lock re-reads both below.
+  const closedBefore = listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] })
+    .some((event) => event.data.sourceUserSeq === sourceUserSeq);
+  if (!closedBefore && preparedWorkflowDispatchReceipts({ sessionId, sourceUserSeq }).length === 0) return null;
   return withWorkflowOriginGroupAuthorityLock(sourceGroupId, () => {
     const existing = listEvents(sessionId, { types: ['async_work_dispatch_batch_closed'] })
       .filter((event) => event.data.sourceUserSeq === sourceUserSeq);

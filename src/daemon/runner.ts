@@ -4075,6 +4075,9 @@ export async function startDaemon(
           if (reaped.deleted > 0) {
             logger.info(reaped, 'Reaped stale workflow run records');
           }
+          const { reapEmptyWorkflowOriginGroupDirectories } = await import('../execution/workflow-origin-group.js');
+          const groups = reapEmptyWorkflowOriginGroupDirectories();
+          if (groups.removed > 0) logger.info(groups, 'Removed empty workflow origin group directories');
         } catch (err) {
           logger.warn(
             { err: err instanceof Error ? err.message : String(err) },

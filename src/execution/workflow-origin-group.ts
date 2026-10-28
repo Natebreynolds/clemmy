@@ -193,6 +193,39 @@ function groupDir(groupId: string): string {
   return path.join(WORKFLOW_ORIGIN_GROUPS_DIR, createHash('sha256').update(groupId).digest('hex'));
 }
 
+/** An empty group directory a day old is a group nothing ever wrote: a lock
+ * taken and released with no admission behind it. An admission creates its
+ * parent moments before it publishes, so a day is well past any live one.
+ * Removed oldest-listed first, a bounded number a pass; a directory that
+ * gains an entry or vanishes meanwhile is left alone. */
+export const EMPTY_ORIGIN_GROUP_DIRECTORY_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+export function reapEmptyWorkflowOriginGroupDirectories(input: { nowMs?: number; limit?: number } = {}): { scanned: number; removed: number } {
+  if (!existsSync(WORKFLOW_ORIGIN_GROUPS_DIR)) return { scanned: 0, removed: 0 };
+  const nowMs = input.nowMs ?? Date.now();
+  const limit = Math.max(1, input.limit ?? 2_000);
+  let entries: string[];
+  try { entries = readdirSync(WORKFLOW_ORIGIN_GROUPS_DIR).sort(); } catch { return { scanned: 0, removed: 0 }; }
+  let removed = 0;
+  for (const entry of entries) {
+    if (removed >= limit) break;
+    if (!/^[a-f0-9]{64}$/.test(entry)) continue;
+    const dir = path.join(WORKFLOW_ORIGIN_GROUPS_DIR, entry);
+    try {
+      const stat = lstatSync(dir);
+      if (!stat.isDirectory() || nowMs - stat.mtimeMs < EMPTY_ORIGIN_GROUP_DIRECTORY_MIN_AGE_MS) continue;
+      if (readdirSync(dir).length > 0) continue;
+      rmdirSync(dir);
+      removed += 1;
+    } catch { /* gone, or written to, since it was listed */ }
+  }
+  if (removed > 0 && process.platform !== 'win32') {
+    const fd = openSync(WORKFLOW_ORIGIN_GROUPS_DIR, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
+  forgetCloseIntentWalk();
+  return { scanned: entries.length, removed };
+}
+
 /** Metadata observation only, never group authority. Current admissions create
  * this parent before publishing a canonical held run under its group lock.
  * Compaction retains it and its tombstone. Unknown access is not absence. */
