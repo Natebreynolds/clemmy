@@ -871,15 +871,20 @@ export async function processMemoryMaintenance(tickCount: number): Promise<void>
     }
   }
 
-  // A retired turn's working records go a little at a time: each pass works
-  // for its budget on this loop and stops, so a chat never waits behind it.
-  if (tickCount % HISTORY_STORAGE_EVERY_N_TICKS === 2 && !shouldDeferDiscretionaryWork('retired-work-records')) {
+  // A retired turn's working records and the event log's diagnostic rows age
+  // out in a worker with its own connection, a bounded pass a minute, so a
+  // chat never waits behind a delete.
+  if (tickCount % HISTORY_STORAGE_EVERY_N_TICKS === 2 && !shouldDeferDiscretionaryWork('storage-decay')) {
     try {
-      const { decayRetiredConversationWorkRecords } = await import('../runtime/harness/conversation-state-lifecycle.js');
-      const decayed = decayRetiredConversationWorkRecords();
-      if (Object.entries(decayed).some(([key, value]) => key !== 'held' && value > 0)) logger.info({ ...decayed }, 'retired work records decayed');
+      const { runStorageDecayPass } = await import('../runtime/storage-decay.js');
+      const { HARNESS_DB_PATH } = await import('../runtime/harness/eventlog.js');
+      const pass = await runStorageDecayPass(HARNESS_DB_PATH);
+      if (pass.state === 'processed') {
+        const shed = Object.entries(pass.decay).some(([key, value]) => key !== 'held' && key !== 'heldBy' && (value as number) > 0);
+        if (shed || pass.diagnostics.removed > 0) logger.info({ ...pass.decay, diagnostics: pass.diagnostics }, 'storage decay pass');
+      } else if (pass.state === 'unavailable') logger.warn({ error: pass.error }, 'storage decay pass unavailable');
     } catch (err) {
-      logger.warn({ err }, 'retired work record decay failed');
+      logger.warn({ err }, 'storage decay pass failed');
     }
   }
 

@@ -40,12 +40,12 @@ test('diagnostic rows older than the window go, the transcript and referenced ro
   const count = (type: string) => (db.prepare('SELECT COUNT(*) AS n FROM events WHERE type = ?').get(type) as { n: number }).n;
 
   // A bound smaller than the backlog removes oldest rows first and reports that it is not caught up.
-  const bounded = retention.reapStaleDiagnosticEvents({ nowMs: NOW, maxRows: 5 });
+  const bounded = retention.reapStaleDiagnosticEvents(db, { nowMs: NOW, maxRows: 5 });
   assert.deepEqual(bounded, { removed: 5, pinned: 0, caughtUp: false });
   assert.equal(count('model_transport_observed'), 8);
   assert.equal(db.prepare("SELECT 1 FROM events WHERE id = 'transport-0'").get(), undefined, 'the oldest row went first');
 
-  const rest = retention.reapStaleDiagnosticEvents({ nowMs: NOW });
+  const rest = retention.reapStaleDiagnosticEvents(db, { nowMs: NOW });
   assert.deepEqual(rest, { removed: 13, pinned: 1, caughtUp: true });
   assert.equal(count('model_transport_observed'), 1, 'only the fresh transport row stays');
   assert.equal(count('guardrail_tripped'), 1, 'only the fresh guardrail row stays');
@@ -54,5 +54,5 @@ test('diagnostic rows older than the window go, the transcript and referenced ro
     assert.ok(db.prepare('SELECT 1 FROM events WHERE id = ?').get(kept), `${kept} stays`);
   }
   // Nothing left to do: the pinned row is reported, not retried forever.
-  assert.deepEqual(retention.reapStaleDiagnosticEvents({ nowMs: NOW }), { removed: 0, pinned: 1, caughtUp: true });
+  assert.deepEqual(retention.reapStaleDiagnosticEvents(db, { nowMs: NOW }), { removed: 0, pinned: 1, caughtUp: true });
 });

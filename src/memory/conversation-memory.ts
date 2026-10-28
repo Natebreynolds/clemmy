@@ -27,7 +27,6 @@ import {
   listCompactedSessionsNeedingRepair,
   listConversationLifecycleCandidates,
   noteConversationMemory,
-  decayRetiredConversationWorkRecords,
   repairCompactedProvenanceResults,
   retireConversationStateToMemory,
   type ConversationMemorySnapshot,
@@ -195,8 +194,6 @@ export interface ConversationConsolidation {
   repaired: number;
   /** Memories expired because their turn was marked not to learn from. */
   unlearned: number;
-  /** Retired conversations whose step records went after the grace window. */
-  decayed: number;
   waiting: boolean;
 }
 
@@ -307,7 +304,7 @@ export async function consolidateIdleConversations(input: {
 } = {}): Promise<ConversationConsolidation> {
   const now = input.now ?? new Date();
   const nowMs = now.getTime();
-  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, unlearned: 0, decayed: 0, waiting: false };
+  const result: ConversationConsolidation = { compacted: 0, remembered: 0, retired: 0, held: 0, faded: 0, repaired: 0, unlearned: 0, waiting: false };
   const weekAgo = new Date(nowMs - CONVERSATION_COMPACT_IDLE_DAYS * 86_400_000).toISOString();
   const monthAgo = new Date(nowMs - CONVERSATION_MEMORY_ONLY_IDLE_DAYS * 86_400_000).toISOString();
 
@@ -369,10 +366,6 @@ export async function consolidateIdleConversations(input: {
     }
     result.faded = fadeConversationMemories(now.toISOString());
     result.unlearned = expireLearningExcludedMemories(now);
-    // A week after retiring, a chat's step records are working copies.
-    const decayed = decayRetiredConversationWorkRecords({ nowMs });
-    result.decayed = decayed.sessions;
-    if (decayed.sessions > 0 || decayed.held > 0) logger.info({ ...decayed }, 'retired conversation step records decayed');
-  }, () => memoryTidyOutcome([], result.compacted + result.retired + result.faded + result.unlearned + result.decayed));
+  }, () => memoryTidyOutcome([], result.compacted + result.retired + result.faded + result.unlearned));
   return result;
 }

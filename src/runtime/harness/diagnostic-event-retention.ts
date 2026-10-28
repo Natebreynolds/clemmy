@@ -14,7 +14,7 @@
  * a receipt's source) is kept: the delete yields to the foreign key and moves
  * on. Rows go oldest first through the (type, seq) index in bounded batches.
  */
-import { openEventLog } from './eventlog.js';
+import type Database from 'better-sqlite3';
 
 /** Observational event types: read within their own turn, never as history. */
 export const DIAGNOSTIC_EVENT_TYPES = [
@@ -53,12 +53,11 @@ function refusedByForeignKey(error: unknown): boolean {
 }
 
 /** Remove diagnostic rows older than the window, at most `maxRows` per call. */
-export function reapStaleDiagnosticEvents(input: {
+export function reapStaleDiagnosticEvents(db: Database.Database, input: {
   nowMs?: number;
   maxAgeDays?: number;
   maxRows?: number;
 } = {}): DiagnosticEventRetentionResult {
-  const db = openEventLog();
   const cutoff = new Date((input.nowMs ?? Date.now()) - (input.maxAgeDays ?? DIAGNOSTIC_EVENT_TTL_DAYS) * 86_400_000).toISOString();
   const bound = Math.max(1, Math.floor(input.maxRows ?? 5_000));
   const result: DiagnosticEventRetentionResult = { removed: 0, pinned: 0, caughtUp: true };
