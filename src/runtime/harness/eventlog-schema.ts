@@ -11646,8 +11646,11 @@ const MIGRATIONS: EventLogMigration[] = [
       ['task_continuity_packets', 'originating_source_event_id'],
       ['write_evidence_dispatch_outcomes', 'settlement_event_id']
     ];
+    // A store upgraded from an older shape may carry a table without the
+    // column a later version added; the index waits for the column.
+    const columnExists = db.prepare("SELECT 1 FROM pragma_table_info(?) WHERE name = ?");
     for (const [table, column] of references) {
-      if (!tableExists.get(table)) continue;
+      if (!tableExists.get(table) || !columnExists.get(table, column)) continue;
       db.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_${column}_event ON ${table} (${column}) WHERE ${column} IS NOT NULL`);
     }
   } },
