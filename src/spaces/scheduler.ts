@@ -18,6 +18,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
+import { withDaemonRuntimePhase, withDaemonRuntimePhaseSync } from '../daemon/phase.js';
 import { cronMatches, scheduleCatchupWindow } from '../execution/workflow-scheduler.js';
 import { peekConnectedToolkits } from '../integrations/composio/client.js';
 import { addNotification } from '../runtime/notifications.js';
@@ -209,6 +210,10 @@ function connectionSnapshot() {
   }
 }
 
+/** The tick's parts as the loop-hold journal names them: each tick's cost is
+ *  charged to the listing, the feed index, a refresh or the save. */
+const PHASE = 'daemon.loop.space_schedules';
+
 /**
  * Evaluate every active Workspace's scheduled data sources against the wall
  * clock (with catch-up) and refresh any that are due. Idempotent per minute.
@@ -271,7 +276,8 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
     && Math.floor(state.lastEvaluatedAtMs / 60_000) === Math.floor(now.getTime() / 60_000);
   const signature = spaceManifestSignature();
   if (minuteAlreadyEvaluated && signature === lastFullyEvaluatedSignature
-    && Object.keys(state.pendingSourceNotices).length === 0 && streaksQuietSinceLastEvaluation(streaks)) {
+    && Object.keys(state.pendingSourceNotices).length === 0
+    && withDaemonRuntimePhaseSync(`${PHASE}.quiet_check`, {}, () => streaksQuietSinceLastEvaluation(streaks))) {
     return { evaluated: 0, fired: 0, errors: 0, awaitingApproval: 0, heldBack: 0, told: 0 };
   }
   lastFullyEvaluatedSignature = signature;
@@ -312,11 +318,14 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   let fedOnSchedule = new Map<string, Set<string>>();
   try {
     const { scheduledFeedCollectionsBySpace } = await import('./workflow-feeds.js');
-    fedOnSchedule = await scheduledFeedCollectionsBySpace();
+    fedOnSchedule = await withDaemonRuntimePhase(`${PHASE}.feeds`, {}, () => scheduledFeedCollectionsBySpace());
   } catch { /* the feed index is unreadable: every source keeps its own timer */ }
 
-  const scheduledSpaces = spaceStore.listWhere((space) => space.status === 'active'
-    && space.dataSources.some((ds) => Boolean(ds.schedule)));
+  // The schedule is decided from each committed manifest; the refresh reads
+  // the current record under its own lock. Live 2026-10-28 (101 Spaces, 17
+  // scheduled): the locked listing cost ~100 ms a minute, the view ~10 ms.
+  const scheduledSpaces = withDaemonRuntimePhaseSync(`${PHASE}.list`, {}, () => spaceStore.listWhereForView((space) => space.status === 'active'
+    && space.dataSources.some((ds) => Boolean(ds.schedule))));
   for (const space of scheduledSpaces) {
     if (space.status !== 'active') continue;
     for (const ds of space.dataSources) {
@@ -389,7 +398,7 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
 
       let results: RefreshResult[];
       try {
-        results = await refreshSpaceData(space.id, ds.id, { cause: 'scheduled', refreshId, batchId });
+        results = await withDaemonRuntimePhase(`${PHASE}.refresh`, {}, () => refreshSpaceData(space.id, ds.id, { cause: 'scheduled', refreshId, batchId }));
       } catch (error) {
         errors += 1;
         recordFailure(space, ds, key, {
@@ -448,7 +457,7 @@ async function processSpaceSchedulesOwned(now: Date): Promise<SpaceFireResult> {
   // notification admission. A failed write is retried next tick, even if no
   // source is due or its backoff is holding it. Stable ids also repair a crash
   // after notifications.json was written but before its delivery queue was.
-  saveState(state);
+  withDaemonRuntimePhaseSync(`${PHASE}.save`, {}, () => saveState(state));
   for (const notice of Object.values(state.pendingSourceNotices)) {
     try {
       addNotification({ ...notice, kind: 'system', read: false });
@@ -490,7 +499,7 @@ async function retryPausedSpacesOwned(now: Date): Promise<PausedRetryResult> {
 
   // Only a build-paused Space with sources, or an active one still holding a
   // retry budget, has anything for this pass to do.
-  const candidates = spaceStore.listWhere((space) => (space.status === 'paused' && space.pausedBy === 'build_check'
+  const candidates = spaceStore.listWhereForView((space) => (space.status === 'paused' && space.pausedBy === 'build_check'
     && space.dataSources.length > 0) || (space.status === 'active' && Boolean(retries[space.id])));
   for (const space of candidates) {
     if (space.status !== 'paused' || space.pausedBy !== 'build_check' || space.dataSources.length === 0) {

@@ -68,9 +68,9 @@ test('a due approved local source is contained and still dedupes within the minu
 test('a second tick inside an evaluated minute reads no Space manifests; the next minute does', async () => {
   // Live 2026-10-20: with 89 Spaces and a 15 s tick, listing every Space on
   // ticks where no schedule could fire was the largest steady-state daemon hold.
-  const original = store.spaceStore.listWhere;
+  const original = store.spaceStore.listWhereForView;
   let listings = 0;
-  store.spaceStore.listWhere = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
+  store.spaceStore.listWhereForView = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
     listings += 1;
     return original.apply(this, args);
   } as typeof original;
@@ -91,7 +91,7 @@ test('a second tick inside an evaluated minute reads no Space manifests; the nex
     await sched.processSpaceSchedules(new Date(minute.getTime() + 90_000));
     assert.equal(listings, 3, 'unchanged manifests skip again');
   } finally {
-    store.spaceStore.listWhere = original;
+    store.spaceStore.listWhereForView = original;
     store.spaceStore.archive('sched-saved-mid-minute');
   }
 });
@@ -205,9 +205,9 @@ test('a quiet failing source keeps the in-minute skip; one the last pass did not
     writeFileSync(stateFile, JSON.stringify(state));
   };
   const streaks = () => JSON.parse(readFileSync(stateFile, 'utf8')).sourceStreakByKey as Record<string, unknown>;
-  const original = store.spaceStore.listWhere;
+  const original = store.spaceStore.listWhereForView;
   let listings = 0;
-  store.spaceStore.listWhere = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
+  store.spaceStore.listWhereForView = function (this: typeof store.spaceStore, ...args: Parameters<typeof original>) {
     listings += 1;
     return original.apply(this, args);
   } as typeof original;
@@ -231,7 +231,7 @@ test('a quiet failing source keeps the in-minute skip; one the last pass did not
     await sched.processSpaceSchedules(new Date(minute.getTime() + 45_000));
     assert.equal(listings, 2, 'after which the skip holds again');
   } finally {
-    store.spaceStore.listWhere = original;
+    store.spaceStore.listWhereForView = original;
     store.spaceStore.archive('sched-quiet-streak');
   }
 });

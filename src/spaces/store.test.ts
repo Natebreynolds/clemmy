@@ -1057,6 +1057,8 @@ test('a screen read is the locked read: re-read under the lock when a file chang
   const rows = (spaces: Array<{ id: string; title: string; version: number }>) => spaces.map(({ id, title, version }) => [id, title, version]);
   assert.deepEqual(rows(store.spaceStore.listForView()), rows(store.spaceStore.list()));
   assert.deepEqual(rows(store.spaceStore.listForView(true)), rows(store.spaceStore.list(true)));
+  const plain = (space: { id: string }) => space.id === 'lv-plain';
+  assert.deepEqual(rows(store.spaceStore.listWhereForView(plain)), rows(store.spaceStore.listWhere(plain)), 'a matched view listing is the matched locked listing');
 
   const manifest = store.resolveInSpace('lv-plain', 'space.json');
   let reads = 0;

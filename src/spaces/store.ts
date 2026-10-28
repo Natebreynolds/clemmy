@@ -1432,6 +1432,17 @@ export class SpaceStore {
     return this.listMatching(includeArchived, matches);
   }
 
+  /**
+   * The matching Spaces as listForView reads them: the committed manifest,
+   * without the per-Space lock unless an update is pending or lands during
+   * the read. For a caller that only decides from the manifest and then acts
+   * through get() or a refresh, which read the current record under the lock
+   * themselves; a timer that lists every minute never takes a lock per Space.
+   */
+  listWhereForView(matches: (space: SpaceRecord) => boolean, includeArchived = false): SpaceRecord[] {
+    return this.listMatching(includeArchived, matches, true);
+  }
+
   private listMatching(includeArchived: boolean, matches: ((space: SpaceRecord) => boolean) | null, view = false): SpaceRecord[] {
     try {
       recoverWorkspaceDeletionQuarantine();
