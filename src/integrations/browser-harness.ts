@@ -416,6 +416,45 @@ async function rememberFinishedInstall(job: InstallJob): Promise<void> {
   } catch { /* the Connect screen's poll records it on its next read */ }
 }
 
+/**
+ * Run one of Clem's OWN install recipes as a job: a command this codebase
+ * wrote (an official installer's documented one-liner), never text from the
+ * model or a request. The approved-command path above keeps its allow-list
+ * for everything else.
+ */
+export function startRecipeInstallJob(input: { title: string; command: string; metadata?: Record<string, string> }): InstallJob {
+  const id = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const job: InstallJob = {
+    id,
+    recipeId: 'custom-install',
+    title: input.title,
+    status: 'running',
+    command: input.command,
+    output: '',
+    startedAt: new Date().toISOString(),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  };
+  jobs.set(id, job);
+  const shell = shellCommand(input.command);
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(shell.command, shell.args, { cwd: os.homedir(), env: browserHarnessEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(String(error));
+    return job;
+  }
+  child.stdout?.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
+  child.stderr?.on('data', (chunk) => { job.output = truncate(job.output + String(chunk)); });
+  child.on('error', (error) => {
+    job.status = 'failed'; job.exitCode = -1; job.completedAt = new Date().toISOString(); job.output = truncate(job.output + String(error));
+  });
+  child.on('close', (code) => {
+    job.status = code === 0 ? 'succeeded' : 'failed'; job.exitCode = code; job.completedAt = new Date().toISOString();
+    if (code === 0) invalidateCliScan();
+  });
+  return job;
+}
+
 export function startApprovedInstallCommand(command: string, title = 'Install capability', metadata?: Record<string, string>): InstallJob {
   const checked = validateInstallCommand(command);
   if (!checked.ok) throw new Error(checked.error);

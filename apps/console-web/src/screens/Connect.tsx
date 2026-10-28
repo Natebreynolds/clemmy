@@ -17,6 +17,7 @@ import { SlackConnect } from '@/components/connect/SlackConnect';
 import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
 import { BrowserHarness } from '@/components/connect/BrowserHarness';
+import { ComputerDriver } from '@/components/connect/ComputerDriver';
 import { BrowserConnection } from '@/components/connect/BrowserConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
 import { usePoll } from '@/lib/poll';
@@ -355,6 +356,7 @@ export function Connect() {
       <CliTools />
 
       {/* Browser harness — drive the user's real Chrome */}
+      <ComputerDriver />
       <BrowserHarness />
       <BrowserConnection />
 
