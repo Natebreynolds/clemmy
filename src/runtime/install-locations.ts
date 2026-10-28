@@ -57,7 +57,15 @@ export type InstallPreflight =
   | { ok: true; env: Record<string, string>; note: string | null }
   | { ok: false; place: InstallPlace; reason: string; adminCommand: string; elevated: ElevatedCommand | null };
 
-export interface ElevatedCommand { command: string; args: string[]; prompt: string }
+export interface ElevatedCommand {
+  command: string;
+  args: string[];
+  prompt: string;
+  /** A file the caller touches right before running; anything the
+   *  administrator's run leaves root-owned in the owner's home and newer
+   *  than it is handed back to the owner at the end of the same run. */
+  marker: string | null;
+}
 
 /**
  * The same install, run through the operating system's own administrator
@@ -65,18 +73,33 @@ export interface ElevatedCommand { command: string; args: string[]; prompt: stri
  * dialog, and the daemon never sees them. The owner's home stays the home,
  * so the tool's own files land in the owner's folders.
  */
-export function elevatedInstallCommand(command: string, input: { platform?: NodeJS.Platform; home?: string } = {}): ElevatedCommand | null {
+export function elevatedInstallCommand(command: string, input: { platform?: NodeJS.Platform; home?: string; owner?: { uid: number; gid: number }; marker?: string } = {}): ElevatedCommand | null {
   const platform = input.platform ?? process.platform;
   const home = input.home ?? os.homedir();
-  const inner = `env HOME=${shellQuote(home)} ${command}`;
+  const owner = input.owner ?? currentOwner();
+  const marker = input.marker ?? null;
+  const reown = owner && marker
+    ? `; __s=$?; find ${shellQuote(home)} -xdev -user 0 -newer ${shellQuote(marker)} -exec chown -h ${owner.uid}:${owner.gid} {} + 2>/dev/null; exit $__s`
+    : '';
+  const inner = `env HOME=${shellQuote(home)} ${command}${reown}`;
   if (platform === 'darwin') {
     const script = inner.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    return { command: 'osascript', args: ['-e', `do shell script "${script}" with administrator privileges`], prompt: 'macOS is asking for an administrator\'s name and password in its own window. Clem never sees them.' };
+    return { command: 'osascript', args: ['-e', `do shell script "${script}" with administrator privileges`], prompt: 'macOS is asking for an administrator\'s name and password in its own window. Clem never sees them.', marker };
   }
   if (platform === 'linux') {
-    return { command: 'pkexec', args: ['/bin/sh', '-c', inner], prompt: 'Your system is asking for an administrator\'s password in its own window. Clem never sees it.' };
+    return { command: 'pkexec', args: ['/bin/sh', '-c', inner], prompt: 'Your system is asking for an administrator\'s password in its own window. Clem never sees it.', marker };
   }
   return null;
+}
+
+function currentOwner(): { uid: number; gid: number } | null {
+  try { const info = os.userInfo(); return info.uid >= 0 ? { uid: info.uid, gid: info.gid } : null; } catch { return null; }
+}
+
+/** Where the marker for an elevated run lives: Clem's own state folder. */
+export function elevatedInstallMarkerPath(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+  const base = env.CLEMENTINE_HOME?.trim() || path.join(home, '.clementine-next');
+  return path.join(base, 'state', 'elevated-install.marker');
 }
 
 function shellQuote(value: string): string {
@@ -145,7 +168,7 @@ export function installPreflight(input: {
 
 function blocked(place: InstallPlace, command: string, platform: NodeJS.Platform = process.platform): InstallPreflight {
   // The package manager's own tree refuses to be touched as an administrator; only system places can be.
-  const elevated = place === 'homebrew' ? null : elevatedInstallCommand(command, { platform });
+  const elevated = place === 'homebrew' ? null : elevatedInstallCommand(command, { platform, marker: elevatedInstallMarkerPath() });
   return {
     ok: false,
     place,

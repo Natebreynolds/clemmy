@@ -42,12 +42,18 @@ test('an install that only an administrator can place is blocked up front with t
   assert.ok(installPreflight({ command, needs: ['applications'], places: managed, platform: 'win32' }).ok, 'Windows places are not read here');
 });
 
-test('the elevated form keeps the owner\'s home and escapes the command for the OS prompt; the password is the OS\'s, never Clem\'s', () => {
-  const mac = elevatedInstallCommand('/bin/bash -c "$(curl -fsSL https://example.test/install.sh)"', { platform: 'darwin', home: "/Users/o'wner" });
+test('the elevated form keeps the owner\'s home, hands root-owned leftovers back, and the password is the OS\'s, never Clem\'s', () => {
+  const mac = elevatedInstallCommand('/bin/bash -c "$(curl -fsSL https://example.test/install.sh)"', { platform: 'darwin', home: "/Users/o'wner", owner: { uid: 501, gid: 20 }, marker: '/Users/o/.clementine-next/state/elevated-install.marker' });
   assert.equal(mac?.command, 'osascript');
-  const expected = 'do shell script "env HOME=\'/Users/o\'\\\\\'\'wner\' /bin/bash -c \\"$(curl -fsSL https://example.test/install.sh)\\"" with administrator privileges';
-  assert.equal(mac?.args[1], expected);
+  const script = mac?.args[1] ?? '';
+  assert.ok(script.startsWith('do shell script "env HOME=\'/Users/o\'\\\\\'\'wner\' /bin/bash -c \\"$(curl -fsSL https://example.test/install.sh)\\"'), script);
+  assert.ok(script.endsWith('" with administrator privileges'), script);
+  assert.match(script, /find '\/Users\/o'\\\\''wner' -xdev -user 0 -newer '\/Users\/o\/\.clementine-next\/state\/elevated-install\.marker' -exec chown -h 501:20 \{\} \+/);
+  assert.match(script, /exit \$__s/, 'the install\'s own exit code is what the job sees');
+  assert.equal(mac?.marker, '/Users/o/.clementine-next/state/elevated-install.marker');
   assert.match(mac?.prompt ?? '', /Clem never sees them/);
-  assert.equal(elevatedInstallCommand('x', { platform: 'linux', home: '/home/o' })?.command, 'pkexec');
+  const bare = elevatedInstallCommand('x', { platform: 'linux', home: '/home/o', owner: { uid: 1000, gid: 1000 } });
+  assert.equal(bare?.command, 'pkexec');
+  assert.doesNotMatch(bare?.args[2] ?? '', /chown/, 'without a marker nothing is re-owned');
   assert.equal(elevatedInstallCommand('x', { platform: 'win32' }), null);
 });

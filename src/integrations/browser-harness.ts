@@ -440,6 +440,9 @@ function blockedInstallJob(job: InstallJob, verdict: Extract<ReturnType<typeof i
 function runElevatedInstall(job: InstallJob, elevated: ElevatedCommand): InstallJob {
   job.metadata = { ...(job.metadata ?? {}), elevated: '1' };
   job.output = `${elevated.prompt}\n`;
+  if (elevated.marker) {
+    try { mkdirSync(path.dirname(elevated.marker), { recursive: true }); writeFileSync(elevated.marker, new Date().toISOString()); } catch { /* re-owning is best effort */ }
+  }
   let child: ReturnType<typeof spawn>;
   try {
     child = spawn(elevated.command, elevated.args, { cwd: os.homedir(), env: installCommandEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
