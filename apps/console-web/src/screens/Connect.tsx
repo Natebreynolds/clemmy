@@ -13,6 +13,7 @@ import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { cn } from '@/lib/cn';
 import { MobilePanel } from '@/components/connect/MobilePanel';
 import { McpManager } from '@/components/connect/McpManager';
+import { ShareCartridge } from '@/components/connect/ShareCartridge';
 import { SlackConnect } from '@/components/connect/SlackConnect';
 import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
@@ -351,6 +352,7 @@ export function Connect() {
 
       {/* MCP */}
       <McpManager />
+      <ShareCartridge />
 
       {/* CLIs — save-to-confirm, not a PATH dump */}
       <CliTools />
