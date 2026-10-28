@@ -36,6 +36,9 @@ export interface StorageRetentionPolicy {
   recentConversationDays: number;
   /** Request copies a recent conversation keeps (later turns read the newest few). */
   keepRequestCopiesPerConversation: number;
+  /** Past this age a request copy goes whatever the conversation is doing: a
+   *  restart projector is not going to reopen a month-old request. */
+  maxRequestCopyDays: number;
 }
 
 const GB = 1024 ** 3;
@@ -57,6 +60,7 @@ export function storageRetentionPolicy(env: NodeJS.ProcessEnv = process.env): St
     scratchDays: Math.floor(boundedNumber(env.CLEMMY_STORAGE_SCRATCH_DAYS, 7, 1, 90)),
     recentConversationDays: 30,
     keepRequestCopiesPerConversation: 3,
+    maxRequestCopyDays: 30,
   };
 }
 
@@ -79,11 +83,13 @@ export function selectExpiredRequestCopies(rows: readonly RequestCopyRow[], inpu
   scratchDays: number;
   recentConversationDays: number;
   keepPerConversation: number;
+  maxDays?: number;
   conversationUpdatedAt: ReadonlyMap<string, string>;
   liveConversations: ReadonlySet<string>;
 }): string[] {
   const cutoff = new Date(input.nowMs - input.scratchDays * DAY_MS).toISOString();
   const recent = new Date(input.nowMs - input.recentConversationDays * DAY_MS).toISOString();
+  const hardCutoff = input.maxDays === undefined ? null : new Date(input.nowMs - input.maxDays * DAY_MS).toISOString();
   const newestFirst = [...rows].sort((left, right) => left.sessionId.localeCompare(right.sessionId)
     || right.sourceUserSeq - left.sourceUserSeq || right.requestOrdinal - left.requestOrdinal);
   const seen = new Map<string, number>();
@@ -92,6 +98,7 @@ export function selectExpiredRequestCopies(rows: readonly RequestCopyRow[], inpu
     const rank = seen.get(row.sessionId) ?? 0;
     seen.set(row.sessionId, rank + 1);
     if (!row.payloadId || row.createdAt >= cutoff) continue;
+    if (hardCutoff !== null && row.createdAt < hardCutoff) { expired.push(row.payloadId); continue; }
     if (input.liveConversations.has(row.sessionId)) continue;
     const touched = input.conversationUpdatedAt.get(row.sessionId);
     if (touched !== undefined && touched >= recent && rank < input.keepPerConversation) continue;
@@ -224,6 +231,7 @@ export async function runStorageRetention(policy: StorageRetentionPolicy, deps: 
     const expired = selectExpiredRequestCopies(readRequestCopyRows(db), {
       nowMs: deps.now(), scratchDays, recentConversationDays: policy.recentConversationDays,
       keepPerConversation: policy.keepRequestCopiesPerConversation,
+      maxDays: policy.maxRequestCopyDays,
       conversationUpdatedAt: facts.updatedAt, liveConversations: facts.live,
     });
     const pass = emptyClass();

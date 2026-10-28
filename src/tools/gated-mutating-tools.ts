@@ -1,4 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { storeToolMedia } from '../runtime/chat-media.js';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import type { Tool } from '@openai/agents';
@@ -299,6 +300,9 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
                 toolSlug: accounting.toolSlug,
               })
             : null;
+          // What the tool saw, kept for the chat; a missing picture never blocks the result.
+          let returnedMedia: Array<{ id: string; path: string; mimeType: string }> = [];
+          try { returnedMedia = storeToolMedia(sessionId, innerCallId, out).map(({ id, path: mediaPath, mimeType }) => ({ id, path: mediaPath, mimeType })); } catch { returnedMedia = []; }
           try {
             // The mirror row reports what the OUTPUT says, not "the call
             // returned" — a resolved harness refusal must never read ok:true.
@@ -312,6 +316,7 @@ export function registerGatedMutatingTools(server: McpServer, opts: RegisterGate
                 ...(runScopeId ? { runScopeId } : {}),
                 tool: name,
                 callId: innerCallId,
+                ...(returnedMedia.length ? { media: returnedMedia } : {}),
                 ...(canonicalClaim ? {
                   canonicalCallId: canonicalClaim.providerCallId,
                   canonicalCalledEventId: canonicalClaim.calledEventId,

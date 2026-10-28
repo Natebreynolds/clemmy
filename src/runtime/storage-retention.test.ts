@@ -32,17 +32,17 @@ test('request copies expire after the window, except a running task\'s and the n
   const rows = [
     row('recent', 1, 1, daysAgo(40)), row('recent', 2, 1, daysAgo(20)), row('recent', 3, 1, daysAgo(10)), row('recent', 4, 1, daysAgo(9)), row('recent', 5, 1, daysAgo(1)),
     row('stale', 1, 1, daysAgo(60)), row('stale', 2, 1, daysAgo(50)),
-    row('running', 1, 1, daysAgo(30)),
+    row('running', 1, 1, daysAgo(30)), row('running', 2, 1, daysAgo(45)),
   ];
   const expired = selectExpiredRequestCopies(rows, {
-    nowMs: NOW, scratchDays: 7, recentConversationDays: 30, keepPerConversation: 3,
+    nowMs: NOW, scratchDays: 7, recentConversationDays: 30, keepPerConversation: 3, maxDays: 30,
     conversationUpdatedAt: new Map([['recent', daysAgo(1)], ['stale', daysAgo(45)], ['running', daysAgo(0)]]),
     liveConversations: new Set(['running']),
   });
   assert.deepEqual(expired.sort(), [
     'authority-payload:recent-1-1', 'authority-payload:recent-2-1',
-    'authority-payload:stale-1-1', 'authority-payload:stale-2-1',
-  ].sort(), 'inside the window: kept; newest three of a recent conversation: kept; a running task: kept; an old conversation: all past the window go');
+    'authority-payload:stale-1-1', 'authority-payload:stale-2-1', 'authority-payload:running-2-1',
+  ].sort(), 'inside the window: kept; newest three of a recent conversation: kept; a running task: kept, except a copy past the hard cap; an old conversation: all past the window go');
 });
 
 function harness(input: { footprint: number[]; files: Array<{ id: string; createdAt: string; bytes: number }>; distillFails?: boolean }) {
