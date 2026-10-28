@@ -63,6 +63,7 @@ const WorkflowCanvas = lazyNamed(() => import('./screens/WorkflowCanvas'), 'Work
 const WorkflowPage = lazyNamed(() => import('./screens/WorkflowPage'), 'WorkflowPage');
 const Heartbeats = lazyNamed(() => import('./screens/Heartbeats'), 'Heartbeats');
 const Watches = lazyNamed(() => import('./screens/Watches'), 'Watches');
+const Triggers = lazyNamed(() => import('./screens/Triggers'), 'Triggers');
 const Connect = lazyNamed(() => import('./screens/Connect'), 'Connect');
 const Memory = lazyNamed(() => import('./screens/Memory'), 'Memory');
 const Meetings = lazyNamed(() => import('./screens/Meetings'), 'Meetings');
@@ -257,6 +258,7 @@ export function App() {
             <Route path="/automate/:name" element={deferred(<WorkflowPage />)} />
             <Route path="/heartbeats" element={deferred(<Heartbeats />)} />
             <Route path="/watching" element={deferred(<Watches />)} />
+            <Route path="/triggers" element={deferred(<Triggers />)} />
             <Route path="/automate/:name/canvas" element={deferred(<WorkflowCanvas />)} />
             <Route path="/advanced/canvas" element={deferred(<WorkflowCanvas />)} />
             <Route path="/connect" element={deferred(<Connect />)} />
