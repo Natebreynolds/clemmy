@@ -30,6 +30,7 @@ import {
   resolveWorkflowRunDefinitionSnapshot,
 } from './workflow-run-definition.js';
 import { validateCronExpression } from '../shared/cron.js';
+import { isTerminalWorkflowRunStatus } from './workflow-run-terminal-status.js';
 import { parseWorkflowOnceAt } from '../shared/workflow-once.js';
 import { recordOperationalEvent } from '../runtime/operational-telemetry.js';
 import {
@@ -1863,16 +1864,12 @@ function enqueueScheduledRun(
  * pending-report records are never touched.
  */
 const RUN_RETENTION_DAYS = 7;
+/** Deletions one hourly pass makes at most. Each takes the record lock and
+ * removes sidecars under fsync (~90 ms live), and the pass runs on the
+ * daemon's loop: a backlog clears over the passes that follow, never in one. */
+const RUN_REAP_DELETIONS_PER_PASS = 25;
 // creation_test / dry_run retain the same status from admission through finish,
 // so finishedAt (checked below) is their terminal discriminator.
-const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
-  'completed',
-  'completed_with_errors',
-  'error',
-  'failed',
-  'cancelled',
-]);
-
 interface ReapableWorkflowRunRecord extends WorkflowRunReportBackRecord {
   status?: string;
   finishedAt?: string;
@@ -1907,11 +1904,16 @@ export function _setWorkflowRunReaperAfterCanonicalUnlinkForTests(
   afterCanonicalRunUnlinkForTests = hook;
 }
 
+/** The one terminal-status definition every run reader shares: a blocked run
+ * is as finished as a completed one and ages out the same way. Live
+ * 2026-10-28: the reaper's own list once left out `blocked`, and 141 finished
+ * runs older than a week stayed in the directory every scan reads. A test run
+ * counts only once it has finished. */
 function isTerminalWorkflowRunRecord(record: ReapableWorkflowRunRecord): boolean {
   if (record.status === 'dry_run' || record.status === 'creation_test') {
     return typeof record.finishedAt === 'string';
   }
-  return typeof record.status === 'string' && TERMINAL_STATUSES.has(record.status);
+  return isTerminalWorkflowRunStatus(record.status);
 }
 
 function hasOutstandingWorkflowRunReportBack(record: ReapableWorkflowRunRecord): boolean {
@@ -2055,6 +2057,7 @@ export function reapStaleWorkflowRuns(): { scanned: number; deleted: number } {
   const cutoffMs = Date.now() - RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000;
   let deleted = 0;
   for (const file of files) {
+    if (deleted >= RUN_REAP_DELETIONS_PER_PASS) break;
     const full = path.join(WORKFLOW_RUNS_DIR, file);
     try {
       // A record that is still running or too young to reap is kept on a plain

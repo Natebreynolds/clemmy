@@ -446,6 +446,47 @@ test('reaper preserves a run when its admitted canonical owner evidence is corru
   assert.equal(existsSync(file), true, 'the sole ownership record remains available for repair');
 });
 
+test('reaper removes an old blocked run like any other finished run', () => {
+  // A run that finished blocked (a step it could not run) is terminal: it has
+  // its finish time and its outcome was told. Every scan of the runs
+  // directory pays for a file kept past retention.
+  const file = writeRun('blocked-old', {
+    status: 'blocked',
+    notifiedAt: OLD_FINISHED_AT,
+    reportBack: {
+      version: 1,
+      workflowName: 'Retention Workflow',
+      outcome: 'blocked',
+      detail: 'A step could not run',
+      acknowledgedOriginSessionIds: [],
+    },
+  });
+  const young = writeRun('blocked-young', {
+    status: 'blocked',
+    finishedAt: new Date().toISOString(),
+    notifiedAt: new Date().toISOString(),
+    reportBack: {
+      version: 1,
+      workflowName: 'Retention Workflow',
+      outcome: 'blocked',
+      detail: 'A step could not run',
+      acknowledgedOriginSessionIds: [],
+    },
+  });
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 2, deleted: 1 });
+  assert.equal(existsSync(file), false, 'the old blocked run is gone');
+  assert.equal(existsSync(young), true, 'a blocked run inside retention stays');
+  rmSync(young);
+});
+
+test('reaper deletes a bounded number of runs a pass and the next pass takes the rest', () => {
+  const files = Array.from({ length: 27 }, (_, index) => writeRun(`bounded-${index}`, { notifiedAt: OLD_FINISHED_AT }));
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 27, deleted: 25 });
+  assert.equal(files.filter((file) => existsSync(file)).length, 2, 'two wait for the next pass');
+  assert.deepEqual(reapStaleWorkflowRuns(), { scanned: 2, deleted: 2 });
+  assert.equal(files.some((file) => existsSync(file)), false);
+});
+
 test('reaper still removes an old terminal record whose report-back is fully acknowledged', () => {
   const file = writeRun('acknowledged-report-back', {
     originSessionId: 'origin-done',
