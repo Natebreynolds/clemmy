@@ -139,7 +139,7 @@ test('a day after retiring, a chat sheds its step records; held, younger and liv
   setConversationState(db, 'compacted-only', 'compacted', daysAgo(40));
 
   const decayed = lifecycle.decayRetiredConversationWorkRecords({ nowMs: Date.parse(NOW), budgetMs: 60_000 });
-  assert.deepEqual(decayed, { sessions: 1, turns: 0, admissions: 1, checkpoints: 1, objects: 1, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1 });
+  assert.deepEqual(decayed, { sessions: 1, turns: 0, admissions: 1, checkpoints: 1, objects: 1, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1, heldBy: { unfinished_run: 1 } });
   assert.equal(count(db, 'accepted_model_batch_admissions', 'retired-old'), 0);
   assert.equal(count(db, 'accepted_model_batch_checkpoints', 'retired-old'), 0);
   assert.equal(count(db, 'events', 'retired-old'), 1, 'the transcript stays');
@@ -151,5 +151,5 @@ test('a day after retiring, a chat sheds its step records; held, younger and liv
   assert.ok(db.prepare("SELECT 1 FROM session_conversation_state WHERE session_id = 'retired-old' AND fidelity = 'memory'").get(), 'the retired state itself stays');
 
   // The same pass again finds nothing to do.
-  assert.deepEqual(lifecycle.decayRetiredConversationWorkRecords({ nowMs: Date.parse(NOW), budgetMs: 60_000 }), { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1 });
+  assert.deepEqual(lifecycle.decayRetiredConversationWorkRecords({ nowMs: Date.parse(NOW), budgetMs: 60_000 }), { sessions: 0, turns: 0, admissions: 0, checkpoints: 0, objects: 0, handles: 0, settlements: 0, provenance: 0, toolOutputs: 0, held: 1, heldBy: { unfinished_run: 1 } });
 });
