@@ -33,21 +33,32 @@ const { resolveRoleModel, defaultForRole, modelRolesRegistryEnabled, judgeDefaul
 const { resolveProvider } = await import('./model-wire-registry.js');
 
 /** Set env keys for a permutation, run fn, restore. */
-function withEnv(over: Record<string, string | undefined>, fn: () => void): void {
+function withEnv(over: Record<string, string | undefined>, fn: () => void): void;
+function withEnv(over: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void>;
+function withEnv(over: Record<string, string | undefined>, fn: () => void | Promise<void>): void | Promise<void> {
   const prev: Record<string, string | undefined> = {};
   for (const k of Object.keys(over)) {
     prev[k] = process.env[k];
     if (over[k] === undefined) delete process.env[k];
     else process.env[k] = over[k];
   }
-  try {
-    fn();
-  } finally {
+  const restore = () => {
     for (const k of Object.keys(over)) {
       if (prev[k] === undefined) delete process.env[k];
       else process.env[k] = prev[k];
     }
+  };
+  let result: void | Promise<void>;
+  try {
+    result = fn();
+  } catch (error) {
+    restore();
+    throw error;
   }
+  // An async body keeps its environment until it settles.
+  if (result && typeof (result as Promise<void>).then === 'function') return (result as Promise<void>).finally(restore);
+  restore();
+  return result;
 }
 
 // The legacy brain id for the non-all_in permutations (all_in needs byo setup,
@@ -489,13 +500,13 @@ test('route policy: a measured winner overrides the default with source=policy; 
     expiresAt: Date.now() + 60 * 60 * 1000,
     scopes: ['user:inference'],
   }), 'utf-8');
-  withEnv({ CLEMMY_MODEL_ROLES: undefined, CLEMMY_ROUTE_POLICY: 'on', AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+  await withEnv({ CLEMMY_MODEL_ROLES: undefined, CLEMMY_ROUTE_POLICY: 'on', AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, async () => {
     const staticDefault = defaultForRole('worker');
     // The default is measured WEAK; a validated alternative is measured STRONG.
     // Use a real Claude model id so validateRoleModelBinding accepts it.
     seed(staticDefault, 12, 0.4);
     seed('claude-sonnet-5', 12, 1);
-    runRoutePolicyJob({ now: NOW });
+    await runRoutePolicyJob({ now: NOW });
     clearRoutePolicyCache();
 
     const r = resolveRoleModel('worker');
@@ -522,7 +533,7 @@ test('route policy reports declared gpt-shaped all_in winners as BYO', async () 
   clearRoutePolicyCache();
   setRoutePolicySamplerForTest((a, b) => a / (a + b));
   const now = new Date('2026-07-02T12:00:00.000Z');
-  withEnv({
+  await withEnv({
     AUTH_MODE: 'api_key',
     MODEL_ROUTING_MODE: 'all_in',
     CLEMMY_ROUTE_POLICY: 'on',
@@ -534,14 +545,14 @@ test('route policy reports declared gpt-shaped all_in winners as BYO', async () 
       { id: 'together', label: 'Together', baseURL: 'https://api.together.test/v1', modelIds: ['gpt-4o'] },
     ]),
     BYO_PROVIDER_TOGETHER_API_KEY: 'together-key',
-  }, () => {
+  }, async () => {
     for (const [model, successCount] of [['glm-5.2', 4], ['gpt-4o', 12]] as const) {
       for (let i = 0; i < 12; i++) {
         const id = recordModelRouteDecision({ role: 'worker', resolvedModel: model, provider: 'byo', source: 'default', now });
         recordModelRouteOutcome({ decisionId: id, status: i < successCount ? 'success' : 'failed', latencyMs: 1000, now });
       }
     }
-    runRoutePolicyJob({ now });
+    await runRoutePolicyJob({ now });
     clearRoutePolicyCache();
     const resolved = resolveRoleModel('worker');
     assert.equal(resolved.source, 'policy');
@@ -560,7 +571,7 @@ test('route policy: an explicit user binding ALWAYS beats the learned policy', a
   clearRoutePolicyCache();
 
   const NOW = new Date('2026-07-01T12:00:00.000Z');
-  withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, () => {
+  await withEnv({ AUTH_MODE: 'claude_oauth', CLAUDE_MODEL: 'claude-opus-4-8' }, async () => {
     const staticDefault = defaultForRole('worker');
     for (const [model, rate] of [[staticDefault, 0.4], ['claude-sonnet-5', 1]] as const) {
       for (let i = 0; i < 12; i++) {
@@ -568,7 +579,7 @@ test('route policy: an explicit user binding ALWAYS beats the learned policy', a
         recordModelRouteOutcome({ decisionId: id, status: i < Math.round(12 * rate) ? 'success' : 'failed', now: NOW });
       }
     }
-    runRoutePolicyJob({ now: NOW });
+    await runRoutePolicyJob({ now: NOW });
     clearRoutePolicyCache();
 
     const binding = JSON.stringify([{ role: 'worker', modelId: 'claude-opus-4-8', scope: 'durable', source: 'settings' }]);

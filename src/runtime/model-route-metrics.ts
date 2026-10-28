@@ -6,6 +6,18 @@ import { providerReportedModel } from './harness/traceless-step-model.js';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import {
+  DEFAULT_ROUTE_SCORE_WEIGHTS, scoreModelRouteCandidate,
+  type ModelRouteOutcomeSample, type ModelRouteOutcomeStatus, type ModelRouteRole, type ModelRouteSummary, type RouteScoreWeights,
+} from './model-route-scoring.js';
+
+// The outcome types, the weights and the scorer live with the policy rebuild
+// in model-route-scoring.ts, which the route policy worker loads; they are
+// re-exported here for every reader that learned them from this module.
+export {
+  DEFAULT_ROUTE_SCORE_WEIGHTS, scoreModelRouteCandidate, summarizeRouteOutcomes,
+  type ModelRouteOutcomeSample, type ModelRouteOutcomeStatus, type ModelRouteRole, type ModelRouteSummary, type RouteScoreWeights,
+} from './model-route-scoring.js';
 import type { Model, ModelRequest, ModelResponse } from '@openai/agents-core';
 import type { StreamEvent } from '@openai/agents-core/types';
 import { BASE_DIR } from '../config.js';
@@ -36,49 +48,13 @@ export const MODEL_ROUTE_METRICS_TABLES = [
 
 export type ModelRouteMetricsTableName = (typeof MODEL_ROUTE_METRICS_TABLES)[number];
 
-export type ModelRouteRole = 'brain' | 'worker' | 'judge' | 'writer' | 'memory' | 'quick';
 
 /** Every route role the decision and policy tables admit. A role missing here
  *  is dropped silently by `INSERT OR IGNORE` (the writer never had a row). */
 export const MODEL_ROUTE_ROLES: readonly ModelRouteRole[] = ['brain', 'worker', 'judge', 'writer', 'memory', 'quick'];
 const ROUTE_ROLE_CHECK = `CHECK (role IN (${MODEL_ROUTE_ROLES.map((role) => `'${role}'`).join(',')}))`;
-export type ModelRouteOutcomeStatus = 'success' | 'failed' | 'fallback' | 'cancelled';
 export type ModelRouteDecisionSource = 'default' | 'binding' | 'intent_binding' | 'explicit' | 'fallback' | 'policy';
 export type ModelRouteProvider = 'codex' | 'claude' | 'byo' | 'openai' | 'unknown';
-
-export interface ModelRouteOutcomeSample {
-  status: ModelRouteOutcomeStatus;
-  latencyMs?: number;
-  totalTokens?: number;
-  costUsd?: number;
-  objectiveMet?: boolean;
-  toolSuccess?: boolean;
-}
-
-export interface ModelRouteSummary {
-  sampleCount: number;
-  successCount: number;
-  failureCount: number;
-  fallbackCount: number;
-  objectiveMetCount: number;
-  toolSuccessCount: number;
-  avgLatencyMs: number | null;
-  avgTokens: number | null;
-  avgCostUsd: number | null;
-  successRate: number;
-  objectiveRate: number;
-  toolSuccessRate: number;
-}
-
-export interface RouteScoreWeights {
-  success: number;
-  objective: number;
-  toolSuccess: number;
-  latency: number;
-  cost: number;
-  token: number;
-  fallbackPenalty: number;
-}
 
 export interface ModelRouteCandidate {
   role: ModelRouteRole;
@@ -92,16 +68,6 @@ export interface ModelRouteCandidate {
 export interface ScoredModelRouteCandidate extends ModelRouteCandidate {
   score: number;
 }
-
-export const DEFAULT_ROUTE_SCORE_WEIGHTS: RouteScoreWeights = {
-  success: 0.45,
-  objective: 0.25,
-  toolSuccess: 0.15,
-  latency: 0.06,
-  cost: 0.05,
-  token: 0.02,
-  fallbackPenalty: 0.02,
-};
 
 function decisionsTableSql(name: string): string {
   return `CREATE TABLE IF NOT EXISTS ${name} (
@@ -1146,58 +1112,6 @@ class ModelRouteMetricsModel implements Model {
   }
 }
 
-export function summarizeRouteOutcomes(samples: ModelRouteOutcomeSample[]): ModelRouteSummary {
-  const sampleCount = samples.length;
-  const successCount = samples.filter((sample) => sample.status === 'success').length;
-  const failureCount = samples.filter((sample) => sample.status === 'failed').length;
-  const fallbackCount = samples.filter((sample) => sample.status === 'fallback').length;
-  const objectiveMetCount = samples.filter((sample) => sample.objectiveMet === true).length;
-  const toolSuccessCount = samples.filter((sample) => sample.toolSuccess === true).length;
-  // A turn's verdict lands on the one request that wrote its reply, and only
-  // when something reviewed it; every other request carries no verdict. The
-  // rates are over the samples that carry the signal, so "not reviewed" never
-  // reads as "failed review".
-  const objectiveSamples = samples.filter((sample) => sample.objectiveMet !== undefined).length;
-  const toolSamples = samples.filter((sample) => sample.toolSuccess !== undefined).length;
-
-  return {
-    sampleCount,
-    successCount,
-    failureCount,
-    fallbackCount,
-    objectiveMetCount,
-    toolSuccessCount,
-    avgLatencyMs: average(samples.map((sample) => sample.latencyMs)),
-    avgTokens: average(samples.map((sample) => sample.totalTokens)),
-    avgCostUsd: average(samples.map((sample) => sample.costUsd)),
-    successRate: ratio(successCount, sampleCount),
-    objectiveRate: ratio(objectiveMetCount, objectiveSamples),
-    toolSuccessRate: ratio(toolSuccessCount, toolSamples),
-  };
-}
-
-export function scoreModelRouteCandidate(
-  summary: ModelRouteSummary,
-  weights: RouteScoreWeights = DEFAULT_ROUTE_SCORE_WEIGHTS,
-): number {
-  if (summary.sampleCount === 0) return 0;
-  const latencyPenalty = normalizePenalty(summary.avgLatencyMs, 30_000);
-  const costPenalty = normalizePenalty(summary.avgCostUsd, 0.25);
-  const tokenPenalty = normalizePenalty(summary.avgTokens, 64_000);
-  const fallbackRate = ratio(summary.fallbackCount, summary.sampleCount);
-
-  const raw =
-    weights.success * summary.successRate
-    + weights.objective * summary.objectiveRate
-    + weights.toolSuccess * summary.toolSuccessRate
-    - weights.latency * latencyPenalty
-    - weights.cost * costPenalty
-    - weights.token * tokenPenalty
-    - weights.fallbackPenalty * fallbackRate;
-
-  return roundScore(clamp(raw, 0, 1));
-}
-
 export function selectBestRouteCandidate(
   candidates: ModelRouteCandidate[],
   weights: RouteScoreWeights = DEFAULT_ROUTE_SCORE_WEIGHTS,
@@ -1214,29 +1128,6 @@ export function selectBestRouteCandidate(
       return a.model.localeCompare(b.model);
     });
   return scored[0] ?? null;
-}
-
-function average(values: Array<number | undefined>): number | null {
-  const nums = values.filter((value): value is number => Number.isFinite(value));
-  if (nums.length === 0) return null;
-  return nums.reduce((sum, value) => sum + value, 0) / nums.length;
-}
-
-function ratio(numerator: number, denominator: number): number {
-  return denominator <= 0 ? 0 : numerator / denominator;
-}
-
-function normalizePenalty(value: number | null, highWater: number): number {
-  if (value == null || !Number.isFinite(value) || highWater <= 0) return 0;
-  return clamp(value / highWater, 0, 1);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function roundScore(value: number): number {
-  return Math.round(value * 1_000_000) / 1_000_000;
 }
 
 function ensureStateDir(): void {

@@ -3296,7 +3296,7 @@ export async function startDaemon(
   bootStep('lanes_watchdogs');
   const tickRoutePolicy = () => {
     void withDaemonRuntimePhase('daemon.timer.route_policy', {}, async () => {
-      const result = runRoutePolicyJob();
+      const result = await runRoutePolicyJob();
       if (result) {
         logger.info(
           { policyVersion: result.policyVersion, rows: result.rowsWritten, windowDays: result.windowDays },

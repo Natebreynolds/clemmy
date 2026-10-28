@@ -42,41 +42,13 @@
  * With an empty policy table (or the flag off) resolution is byte-identical
  * to the static behavior — characterization-tested.
  */
-import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import { getRuntimeEnv } from '../../config.js';
 import { recordOperationalEvent } from '../operational-telemetry.js';
-import {
-  openModelRouteMetricsDb,
-  summarizeRouteOutcomes,
-  scoreModelRouteCandidate,
-  DEFAULT_ROUTE_SCORE_WEIGHTS,
-  type RouteScoreWeights,
-  type ModelRouteRole,
-  type ModelRouteOutcomeSample,
-  type ModelRouteOutcomeStatus,
-} from '../model-route-metrics.js';
+import { MODEL_ROUTE_METRICS_DB_PATH, openModelRouteMetricsDb, type ModelRouteRole } from '../model-route-metrics.js';
+import type { RoutePolicyWorkerData, RoutePolicyWorkerResult } from './route-policy.worker.js';
 
-/**
- * Weights adapted to the signals a group ACTUALLY carries. Not every capture
- * seam can attribute every signal (judge passes have no toolSuccess/objective;
- * some lanes omit objectiveMet) — scoring an ABSENT signal as zero would
- * permanently pin those groups below the quality floor ("no data" is not
- * "objective never met"). Redistribute missing positive weights onto the
- * success rate so a signal-poor group competes on the evidence it has, and a
- * signal-rich group is scored exactly as before.
- */
-export function weightsForSamples(samples: ModelRouteOutcomeSample[]): RouteScoreWeights {
-  const w = { ...DEFAULT_ROUTE_SCORE_WEIGHTS };
-  if (samples.every((s) => s.objectiveMet === undefined)) {
-    w.success += w.objective;
-    w.objective = 0;
-  }
-  if (samples.every((s) => s.toolSuccess === undefined)) {
-    w.success += w.toolSuccess;
-    w.toolSuccess = 0;
-  }
-  return w;
-}
+export { weightsForSamples } from '../model-route-scoring.js';
 
 export interface RoutePolicyRow {
   role: ModelRouteRole;
@@ -160,19 +132,6 @@ function routePolicyWindowDays(): number {
 
 // ─── The offline policy job ────────────────────────────────────────────────
 
-interface OutcomeJoinRow {
-  role: ModelRouteRole;
-  intent: string | null;
-  provider: string;
-  resolved_model: string;
-  status: ModelRouteOutcomeStatus;
-  latency_ms: number | null;
-  total_tokens: number | null;
-  cost_usd: number | null;
-  objective_met: number | null;
-  tool_success: number | null;
-}
-
 export interface RoutePolicyJobResult {
   policyVersion: number;
   rowsWritten: number;
@@ -180,100 +139,42 @@ export interface RoutePolicyJobResult {
   windowDays: number;
 }
 
+const WORKER_TIMEOUT_MS = 120_000;
+let jobInFlight: Promise<RoutePolicyJobResult | null> | null = null;
+
 /**
- * Rebuild model_route_policy from the recent outcome window. Full rewrite in a
- * transaction — the table is derived data; a rebuild is always consistent with
- * the evidence. Never throws (returns null on failure); must be safe to call
- * from a daemon tick.
+ * Rebuild model_route_policy from the recent outcome window, in a worker on
+ * its own connection: the window's rows are read, grouped and scored off the
+ * daemon's loop (live 2026-10-28: 39k rows, 1.2 s on the loop each hour).
+ * Full rewrite in one transaction — the table is derived data; a rebuild is
+ * always consistent with the evidence. Single-flight; never throws (null on
+ * failure), so it is safe to call from a daemon tick.
  */
-export function runRoutePolicyJob(opts: { now?: Date } = {}): RoutePolicyJobResult | null {
+export function runRoutePolicyJob(opts: { now?: Date } = {}): Promise<RoutePolicyJobResult | null> {
+  if (jobInFlight) return jobInFlight;
+  const job = rebuildRoutePolicyInWorker(opts).finally(() => { if (jobInFlight === job) jobInFlight = null; });
+  jobInFlight = job;
+  return job;
+}
+
+async function rebuildRoutePolicyInWorker(opts: { now?: Date }): Promise<RoutePolicyJobResult | null> {
   try {
-    const db = openModelRouteMetricsDb();
+    // The schema is made by the main connection; the worker only opens the file.
+    openModelRouteMetricsDb();
     const now = opts.now ?? new Date();
     const windowDays = routePolicyWindowDays();
-    const cutoff = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000).toISOString();
-
-    const rows = db.prepare(`
-      SELECT d.role, d.intent, d.provider, d.resolved_model,
-             o.status, o.latency_ms, o.total_tokens, o.cost_usd,
-             o.objective_met, o.tool_success
-      FROM model_route_outcomes o
-      JOIN model_route_decisions d ON d.id = o.decision_id
-      WHERE o.completed_at >= ?
-    `).all(cutoff) as OutcomeJoinRow[];
-
-    const groups = new Map<string, { role: ModelRouteRole; intent: string | null; provider: string; model: string; samples: ModelRouteOutcomeSample[] }>();
-    for (const row of rows) {
-      const key = `${row.role}\u0000${row.intent ?? ''}\u0000${row.provider}\u0000${row.resolved_model}`;
-      let group = groups.get(key);
-      if (!group) {
-        group = { role: row.role, intent: row.intent, provider: row.provider, model: row.resolved_model, samples: [] };
-        groups.set(key, group);
-      }
-      group.samples.push({
-        status: row.status,
-        latencyMs: row.latency_ms ?? undefined,
-        totalTokens: row.total_tokens ?? undefined,
-        costUsd: row.cost_usd ?? undefined,
-        objectiveMet: row.objective_met === null ? undefined : row.objective_met === 1,
-        toolSuccess: row.tool_success === null ? undefined : row.tool_success === 1,
-      });
-    }
-
-    const prevVersion = (db.prepare(`SELECT MAX(policy_version) AS v FROM model_route_policy`).get() as { v: number | null }).v ?? 0;
-    const policyVersion = prevVersion + 1;
     const minSamples = routePolicyMinSamples();
     const floor = routePolicyFloor();
-    const updatedAt = now.toISOString();
-
-    const insert = db.prepare(`
-      INSERT INTO model_route_policy (
-        id, role, intent, provider, model, score, sample_count, success_count,
-        objective_met_count, avg_latency_ms, avg_cost_usd, disabled_reason,
-        policy_version, updated_at
-      ) VALUES (
-        @id, @role, @intent, @provider, @model, @score, @sampleCount, @successCount,
-        @objectiveMetCount, @avgLatencyMs, @avgCostUsd, @disabledReason,
-        @policyVersion, @updatedAt
-      )
-    `);
-    const rebuild = db.transaction(() => {
-      db.prepare(`DELETE FROM model_route_policy`).run();
-      for (const group of groups.values()) {
-        const summary = summarizeRouteOutcomes(group.samples);
-        const score = scoreModelRouteCandidate(summary, weightsForSamples(group.samples));
-        const disabledReason = summary.sampleCount < minSamples
-          ? 'insufficient_samples'
-          : score < floor
-            ? 'below_floor'
-            : null;
-        insert.run({
-          id: randomUUID(),
-          role: group.role,
-          intent: group.intent,
-          provider: group.provider,
-          model: group.model,
-          score,
-          sampleCount: summary.sampleCount,
-          successCount: summary.successCount,
-          objectiveMetCount: summary.objectiveMetCount,
-          avgLatencyMs: summary.avgLatencyMs,
-          avgCostUsd: summary.avgCostUsd,
-          disabledReason,
-          policyVersion,
-          updatedAt,
-        });
-      }
+    const outcome = await runRoutePolicyWorker({
+      dbPath: MODEL_ROUTE_METRICS_DB_PATH,
+      cutoff: new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000).toISOString(),
+      minSamples,
+      floor,
+      updatedAt: now.toISOString(),
     });
-    rebuild();
+    if (outcome.state !== 'processed') return null;
     clearRoutePolicyCache();
-
-    const result: RoutePolicyJobResult = {
-      policyVersion,
-      rowsWritten: groups.size,
-      groupsScored: groups.size,
-      windowDays,
-    };
+    const result: RoutePolicyJobResult = { ...outcome.rebuild, windowDays };
     try {
       recordOperationalEvent({
         source: 'model',
@@ -288,6 +189,28 @@ export function runRoutePolicyJob(opts: { now?: Date } = {}): RoutePolicyJobResu
   } catch {
     return null; // the policy job must never take down a daemon tick
   }
+}
+
+function runRoutePolicyWorker(data: RoutePolicyWorkerData): Promise<RoutePolicyWorkerResult> {
+  return new Promise<RoutePolicyWorkerResult>((resolve) => {
+    let worker: Worker;
+    try {
+      if (import.meta.url.endsWith('.ts')) {
+        worker = new Worker(`const { workerData } = require('node:worker_threads');
+          import(workerData.tsxApi).then(({ register }) => { register(); return import(workerData.entry); });`, {
+          eval: true, workerData: { ...data, tsxApi: import.meta.resolve('tsx/esm/api'),
+            entry: new URL('./route-policy.worker.ts', import.meta.url).href },
+        });
+      } else worker = new Worker(new URL('./route-policy.worker.js', import.meta.url), { workerData: data });
+    } catch (error) { resolve({ state: 'unavailable', error: error instanceof Error ? error.message : String(error) }); return; }
+    let result: RoutePolicyWorkerResult = { state: 'unavailable' };
+    let expired = false;
+    const timer = setTimeout(() => { expired = true; void worker.terminate().catch(() => {}); }, WORKER_TIMEOUT_MS);
+    timer.unref();
+    worker.on('message', (message: RoutePolicyWorkerResult) => { result = message; });
+    worker.on('error', (error) => { result = { state: 'unavailable', error: error.message }; });
+    worker.once('exit', (code) => { clearTimeout(timer); resolve(expired || code !== 0 ? { state: 'unavailable' } : result); });
+  });
 }
 
 // ─── The bounded hot-path read ─────────────────────────────────────────────

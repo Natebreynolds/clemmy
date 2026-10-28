@@ -83,19 +83,19 @@ after(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-test('adaptive routing is opt-in: default off, explicit on', () => {
+test('adaptive routing is opt-in: default off, explicit on', async () => {
   delete process.env.CLEMMY_ROUTE_POLICY;
   assert.equal(routePolicyEnabled(), false);
   process.env.CLEMMY_ROUTE_POLICY = 'on';
   assert.equal(routePolicyEnabled(), true);
 });
 
-test('job: groups outcomes, scores them, marks thin/weak candidates disabled', () => {
+test('job: groups outcomes, scores them, marks thin/weak candidates disabled', async () => {
   seed({ role: 'worker', model: 'model-strong', n: 12, successRate: 1 });
   seed({ role: 'worker', model: 'model-weak', n: 12, successRate: 0.25 });
   seed({ role: 'worker', model: 'model-thin', n: 3, successRate: 1 });
 
-  const result = runRoutePolicyJob({ now: NOW });
+  const result = await runRoutePolicyJob({ now: NOW });
   assert.ok(result, 'job ran');
   assert.equal(result!.rowsWritten, 3);
   assert.equal(result!.policyVersion, 1);
@@ -110,10 +110,10 @@ test('job: groups outcomes, scores them, marks thin/weak candidates disabled', (
   assert.ok(byModel.get('model-strong')!.score > byModel.get('model-weak')!.score);
 });
 
-test('job: reruns bump the policy version and fully rebuild', () => {
+test('job: reruns bump the policy version and fully rebuild', async () => {
   seed({ role: 'worker', model: 'm1', n: 10, successRate: 1 });
-  assert.equal(runRoutePolicyJob({ now: NOW })!.policyVersion, 1);
-  assert.equal(runRoutePolicyJob({ now: NOW })!.policyVersion, 2);
+  assert.equal((await runRoutePolicyJob({ now: NOW }))!.policyVersion, 1);
+  assert.equal((await runRoutePolicyJob({ now: NOW }))!.policyVersion, 2);
   const count = (openModelRouteMetricsDb().prepare(`SELECT COUNT(*) AS c FROM model_route_policy`).get() as { c: number }).c;
   assert.equal(count, 1, 'rebuild, not append');
 });
@@ -121,7 +121,7 @@ test('job: reruns bump the policy version and fully rebuild', () => {
 // Writer and memory decisions persist now (the route role CHECK admits them).
 // Their groups must not break the one-transaction rebuild: the first build's
 // policy CHECK would have rolled back every brain/worker/judge row with them.
-test('job: writer and memory evidence never stops the brain, worker and judge policy rebuilding', () => {
+test('job: writer and memory evidence never stops the brain, worker and judge policy rebuilding', async () => {
   seed({ role: 'judge', model: 'judge-model', n: 10, successRate: 1 });
   seed({ role: 'worker', model: 'worker-model', n: 10, successRate: 1 });
   seed({ role: 'writer', model: 'writer-model', n: 10, successRate: 1 });
@@ -131,7 +131,7 @@ test('job: writer and memory evidence never stops the brain, worker and judge po
     .map((row) => row.role);
   assert.deepEqual(decisionRoles, ['judge', 'memory', 'worker', 'writer'], 'every route role is recorded');
 
-  const result = runRoutePolicyJob({ now: NOW });
+  const result = await runRoutePolicyJob({ now: NOW });
   assert.ok(result, 'the rebuild committed');
   const policyRoles = (openModelRouteMetricsDb()
     .prepare(`SELECT role FROM model_route_policy ORDER BY role`).all() as Array<{ role: string }>)
@@ -139,38 +139,38 @@ test('job: writer and memory evidence never stops the brain, worker and judge po
   assert.ok(policyRoles.includes('judge') && policyRoles.includes('worker'), 'checker and worker policy rows are written');
 });
 
-test('pick: the memory role is never moved by the learned policy', () => {
+test('pick: the memory role is never moved by the learned policy', async () => {
   seed({ role: 'memory', model: 'memory-default', n: 12, successRate: 0.6 });
   seed({ role: 'memory', model: 'memory-better', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   assert.equal(pickRoutePolicyModel('memory', undefined, 'memory-default', acceptAll), null);
 });
 
-test('pick: empty table ⇒ null (byte-identical static behavior)', () => {
-  runRoutePolicyJob({ now: NOW });
+test('pick: empty table ⇒ null (byte-identical static behavior)', async () => {
+  await runRoutePolicyJob({ now: NOW });
   assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null);
 });
 
-test('pick: kill-switch off ⇒ null even with a winning candidate', () => {
+test('pick: kill-switch off ⇒ null even with a winning candidate', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.6 });
   seed({ role: 'worker', model: 'better-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   process.env.CLEMMY_ROUTE_POLICY = 'off';
   assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null);
 });
 
-test('pick: an UNMEASURED default is never switched away from', () => {
+test('pick: an UNMEASURED default is never switched away from', async () => {
   seed({ role: 'worker', model: 'better-model', n: 20, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   // default-model has no rows at all → no anchor → no switch.
   assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null);
 });
 
-test('pick: candidate must beat the measured default by the hysteresis margin', () => {
+test('pick: candidate must beat the measured default by the hysteresis margin', async () => {
   // Both healthy; the gap is real (0.6 vs 1.0 success) → switch fires.
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.6 });
   seed({ role: 'worker', model: 'better-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   const pick = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
   assert.ok(pick, 'clear winner picked');
   assert.equal(pick!.modelId, 'better-model');
@@ -181,26 +181,26 @@ test('pick: candidate must beat the measured default by the hysteresis margin', 
   clearRoutePolicyCache();
   seed({ role: 'worker', model: 'default-model', n: 20, successRate: 0.95 });
   seed({ role: 'worker', model: 'better-model', n: 20, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null);
 });
 
-test('pick: disabled and thin candidates never win; validator rejection skips', () => {
+test('pick: disabled and thin candidates never win; validator rejection skips', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'weak-model', n: 12, successRate: 0.3 });   // below floor
   seed({ role: 'worker', model: 'thin-model', n: 3, successRate: 1 });      // insufficient samples
   seed({ role: 'worker', model: 'gone-model', n: 12, successRate: 1 });     // validator rejects
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   const pick = pickRoutePolicyModel('worker', undefined, 'default-model', (m) => m !== 'gone-model');
   assert.equal(pick, null, 'no guard-passing candidate ⇒ static default');
 });
 
-test('pick: intent scope wins over role-wide scope; scopes never mix anchors', () => {
+test('pick: intent scope wins over role-wide scope; scopes never mix anchors', async () => {
   // Role-wide: default is fine. Design intent: default measured weak, alt strong.
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 1 });
   seed({ role: 'worker', intent: 'design', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', intent: 'design', model: 'design-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
 
   const designPick = pickRoutePolicyModel('worker', 'design', 'default-model', acceptAll);
   assert.ok(designPick, 'intent-scoped winner found');
@@ -210,10 +210,10 @@ test('pick: intent scope wins over role-wide scope; scopes never mix anchors', (
   assert.equal(plainPick, null, 'role-wide default is healthy — no switch');
 });
 
-test('pick: sampleCount from the winning row rides out for the routing trace', () => {
+test('pick: sampleCount from the winning row rides out for the routing trace', async () => {
   seed({ role: 'judge', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'judge', model: 'sharp-judge', n: 15, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   const pick = pickRoutePolicyModel('judge', undefined, 'default-model', acceptAll);
   assert.ok(pick);
   assert.equal(pick!.sampleCount, 15);
@@ -236,7 +236,7 @@ test('weightsForSamples: absent signals redistribute onto success; present signa
   assert.equal(mixed.toolSuccess, DEFAULT_ROUTE_SCORE_WEIGHTS.toolSuccess);
 });
 
-test('job: of two models that answer equally, the one whose turns pass review scores higher', () => {
+test('job: of two models that answer equally, the one whose turns pass review scores higher', async () => {
   // A turn's verdict lands on the one request that wrote its reply; the
   // turn's other requests carry none. Three requests per turn, all answered.
   const turns = (model: string, passed: number, turnCount: number) => {
@@ -257,7 +257,7 @@ test('job: of two models that answer equally, the one whose turns pass review sc
     const id = recordModelRouteDecision({ role: 'brain', resolvedModel: 'model-dense', provider: 'claude', source: 'default', now: NOW });
     recordModelRouteOutcome({ decisionId: id, status: 'success', latencyMs: 2_000, objectiveMet: true, toolSuccess: true, now: NOW });
   }
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   const score = new Map((openModelRouteMetricsDb()
     .prepare(`SELECT model, score FROM model_route_policy WHERE role = 'brain'`)
     .all() as Array<{ model: string; score: number }>).map((row) => [row.model, row.score]));
@@ -281,17 +281,17 @@ function withThompson(sampler: (a: number, b: number) => number, fn: () => void)
   }
 }
 
-test('thompson: kill-switch defaults ON; off restores the greedy branch', () => {
+test('thompson: kill-switch defaults ON; off restores the greedy branch', async () => {
   delete process.env.CLEMMY_ROUTE_POLICY_THOMPSON;
   assert.equal(routePolicyThompsonEnabled(), true, 'validated behavior is the default');
   process.env.CLEMMY_ROUTE_POLICY_THOMPSON = 'off';
   assert.equal(routePolicyThompsonEnabled(), false);
 });
 
-test('thompson: clear winner picked deterministically under the mean sampler', () => {
+test('thompson: clear winner picked deterministically under the mean sampler', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'better-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     const pick = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
     assert.ok(pick);
@@ -301,11 +301,11 @@ test('thompson: clear winner picked deterministically under the mean sampler', (
   });
 });
 
-test('thompson: a near-tie the greedy margin refused is now explorable', () => {
+test('thompson: a near-tie the greedy margin refused is now explorable', async () => {
   // Same seeding as the greedy near-tie test above, which pins null.
   seed({ role: 'worker', model: 'default-model', n: 20, successRate: 0.95 });
   seed({ role: 'worker', model: 'better-model', n: 20, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     const pick = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
     assert.ok(pick, 'posterior mean 21/22 beats 20/22 — no hysteresis wall');
@@ -313,10 +313,10 @@ test('thompson: a near-tie the greedy margin refused is now explorable', () => {
   });
 });
 
-test('thompson: an under-sampled candidate stays eligible (wide posterior IS the exploration)', () => {
+test('thompson: an under-sampled candidate stays eligible (wide posterior IS the exploration)', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'thin-model', n: 3, successRate: 1 }); // disabled: insufficient_samples
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     const pick = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
     assert.ok(pick, 'Beta(4,1) mean 0.8 beats the default posterior 0.5');
@@ -324,10 +324,10 @@ test('thompson: an under-sampled candidate stays eligible (wide posterior IS the
   });
 });
 
-test('thompson: a MEASURED below-floor candidate is excluded before any draw', () => {
+test('thompson: a MEASURED below-floor candidate is excluded before any draw', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'weak-model', n: 12, successRate: 0.25 }); // measured, below floor
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   // First draw is the default's: give it 0 so ANY sampled candidate would win.
   let calls = 0;
   withThompson(() => (calls++ === 0 ? 0 : 1), () => {
@@ -336,20 +336,20 @@ test('thompson: a MEASURED below-floor candidate is excluded before any draw', (
   });
 });
 
-test('thompson: validator rejection excludes a candidate before any draw', () => {
+test('thompson: validator rejection excludes a candidate before any draw', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'gone-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   let calls = 0;
   withThompson(() => (calls++ === 0 ? 0 : 1), () => {
     assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', (m) => m !== 'gone-model'), null);
   });
 });
 
-test('thompson: the draw is memoized for the cache window (no mid-turn flips)', () => {
+test('thompson: the draw is memoized for the cache window (no mid-turn flips)', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'better-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   let draws = 0;
   withThompson((a, b) => { draws++; return a / (a + b); }, () => {
     const first = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
@@ -360,14 +360,14 @@ test('thompson: the draw is memoized for the cache window (no mid-turn flips)', 
   });
 });
 
-test('thompson: fallback outcomes count against the posterior', () => {
+test('thompson: fallback outcomes count against the posterior', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 }); // posterior mean 7/14 = 0.5
   seed({ role: 'worker', model: 'flaky-model', n: 12, successRate: 1 });
   for (let i = 0; i < 12; i++) {
     const id = recordModelRouteDecision({ role: 'worker', resolvedModel: 'flaky-model', provider: 'claude', source: 'default', now: NOW });
     recordModelRouteOutcome({ decisionId: id, status: 'fallback', latencyMs: 2_000, now: NOW });
   }
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     // 12 successes / 24 samples ⇒ posterior mean 13/26 = 0.5 — ties the
     // default, and ties go to the default.
@@ -375,10 +375,10 @@ test('thompson: fallback outcomes count against the posterior', () => {
   });
 });
 
-test('thompson: a denied model never enters the draw (id and prefix)', () => {
+test('thompson: a denied model never enters the draw (id and prefix)', async () => {
   seed({ role: 'worker', model: 'default-model', n: 12, successRate: 0.5 });
   seed({ role: 'worker', model: 'pricey-model', n: 12, successRate: 1 });
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   for (const deny of ['pricey-model', 'pricey']) {
     process.env.CLEMMY_ROUTE_POLICY_DENY = deny;
     clearRoutePolicyCache();
@@ -389,7 +389,7 @@ test('thompson: a denied model never enters the draw (id and prefix)', () => {
   delete process.env.CLEMMY_ROUTE_POLICY_DENY;
 });
 
-test('thompson: cost guard — the bandit never routes UP in measured cost', () => {
+test('thompson: cost guard — the bandit never routes UP in measured cost', async () => {
   const seedWithCost = (model: string, n: number, successRate: number, costUsd: number): void => {
     for (let i = 0; i < n; i++) {
       const id = recordModelRouteDecision({ role: 'worker', resolvedModel: model, provider: 'claude', source: 'default', now: NOW });
@@ -399,7 +399,7 @@ test('thompson: cost guard — the bandit never routes UP in measured cost', () 
   // Pricier winner: excluded despite a perfect record.
   seedWithCost('default-model', 12, 0.5, 0.02);
   seedWithCost('premium-model', 12, 1, 0.1);
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null, '5× the cost is not the bandit\'s call');
   });
@@ -409,7 +409,7 @@ test('thompson: cost guard — the bandit never routes UP in measured cost', () 
   clearRoutePolicyCache();
   seedWithCost('default-model', 12, 0.5, 0.02);
   seed({ role: 'worker', model: 'mystery-model', n: 12, successRate: 1 }); // no cost evidence
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     assert.equal(pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll), null);
   });
@@ -419,7 +419,7 @@ test('thompson: cost guard — the bandit never routes UP in measured cost', () 
   clearRoutePolicyCache();
   seedWithCost('default-model', 12, 0.5, 0.02);
   seedWithCost('frugal-model', 12, 1, 0.02);
-  runRoutePolicyJob({ now: NOW });
+  await runRoutePolicyJob({ now: NOW });
   withThompson(meanSampler, () => {
     const pick = pickRoutePolicyModel('worker', undefined, 'default-model', acceptAll);
     assert.ok(pick);
@@ -427,7 +427,7 @@ test('thompson: cost guard — the bandit never routes UP in measured cost', () 
   });
 });
 
-test('sampleBeta: deterministic under a seeded rng and statistically sane', () => {
+test('sampleBeta: deterministic under a seeded rng and statistically sane', async () => {
   // mulberry32 — tiny seeded PRNG, good enough for a distribution sanity check.
   const mulberry32 = (s: number) => () => {
     s |= 0; s = (s + 0x6d2b79f5) | 0;
