@@ -93,6 +93,8 @@ Usage: clementine <command> [options]
 
 Core
   chat                Start interactive CLI chat
+  run "<task>"        One task through the running app; prints the reply, exit code says how it ended
+                      [--chat <id>] continue a conversation  [--json] one JSON object  [--timeout <s>]
   service             Start all services (daemon + webhook + discord)
 
 Daemon (background agent)
@@ -461,6 +463,13 @@ async function main(): Promise<void> {
   // --- Setup commands (no auth needed) ---
   if (command === 'setup') {
     process.exitCode = await runSetupWizard();
+    return;
+  }
+  // One task through the running app, for scripts and CI. No runtime boots
+  // here: the app's daemon owns the home and runs the turn.
+  if (command === 'run') {
+    const { runRunCli } = await import('./cli/run.js');
+    process.exitCode = await runRunCli(process.argv.slice(3));
     return;
   }
   if (command === 'doctor') {
