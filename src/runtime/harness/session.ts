@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { withDaemonRuntimePhaseSync } from '../../daemon/phase.js';
 import { recoveryActivationOwner, type RecoveryActivationOwner } from './recovery-activation.js';
 import type { AgentInputItem } from '@openai/agents';
 import type { McpToolScope } from '../mcp-tool-scope.js';
@@ -205,13 +206,18 @@ export class HarnessSession {
   private persistConversationSnapshot(snapshot: PersistedConversation): void {
     const active = workflowParentActivation(this.row.id);
     if (active) { active.conversation = snapshot; return; }
-    openEventLog().transaction(() => {
-      const merged = this.preserveUnobservedSyntheticTurns(snapshot);
-      const db = openEventLog();
-      const written = db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(snapshot.updatedAt, this.row.id);
-      if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
-      putSessionConversationState(db, this.row.id, persistedState(merged), snapshot.updatedAt);
-    }).immediate();
+    // Serializing and validating a long history is the turn's largest
+    // synchronous write; named, so a hold here is charged to it rather than
+    // to whatever the loop was waiting on (live 2026-10-28: 7 s, "sleep").
+    withDaemonRuntimePhaseSync('daemon.turn.persist_conversation', { items: snapshot.items.length }, () => {
+      openEventLog().transaction(() => {
+        const merged = this.preserveUnobservedSyntheticTurns(snapshot);
+        const db = openEventLog();
+        const written = db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(snapshot.updatedAt, this.row.id);
+        if (written.changes !== 1) throw new Error(`session not found: ${this.row.id}`);
+        putSessionConversationState(db, this.row.id, persistedState(merged), snapshot.updatedAt);
+      }).immediate();
+    });
     this.refresh();
   }
 

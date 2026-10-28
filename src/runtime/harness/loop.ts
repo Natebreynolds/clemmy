@@ -1,5 +1,6 @@
 import { observeHeldStopPublicationOwner, sealHeldStopPublication, drainHeldStopPublication, drainHeldStopPublications, heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_TEXT, HeldStopPublicationSupersededError, type HeldStopPublicationTicket } from './held-stop-publication.js';
 import { isPermanentActivationError } from './permanent-activation-error.js';
+import { withDaemonRuntimePhase, withDaemonRuntimePhaseSync } from '../../daemon/phase.js';
 import { parseRetainedWorkCheckpoint } from './retained-work-checkpoint.js';
 import { replyEndsOnQuestion } from './review-after-delivery.js';
 import { committedMutationVerificationHoldsForSource, type CommittedMutationVerificationHold } from './mutation-verification-executor.js';
@@ -12191,12 +12192,14 @@ async function runTurnWithSessionContext(options: RunTurnOptions): Promise<RunTu
   // Layer 1 clips old results IN PLACE, so the conversation the continuation's
   // exact history begins with is captured before compaction runs.
   const preCompactionContinuationItems = options.hostOwnedContinuation === true || adoptedCheckpointContinuation
-    ? JSON.parse(JSON.stringify(sessionItems)) as AgentInputItem[]
+    ? withDaemonRuntimePhaseSync('daemon.turn.history_copy', { items: sessionItems.length }, () => JSON.parse(JSON.stringify(sessionItems)) as AgentInputItem[])
     : undefined;
   try {
+    // Compaction counts tokens over the whole history on the loop; named so
+    // a long history's cost is charged to it, never read as loop idle time.
     const { result, nextItems, forkRequest } = workflowReplay
       ? { result: { modified: false }, nextItems: sessionItems, forkRequest: undefined }
-      : await compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens, layer1BudgetTokens: turnLayer1BudgetTokens });
+      : await withDaemonRuntimePhase('daemon.turn.compaction', { items: sessionItems.length }, () => compactSessionIfNeeded(session, sessionItems, { idleMs, inputBudgetTokens: turnInputBudgetTokens, layer1BudgetTokens: turnLayer1BudgetTokens }));
     compactedItems = nextItems;
     markTurnClock(options.sessionId, 'compaction_done');
     if (result.modified) {
