@@ -9,6 +9,7 @@
  * deterministic same-shape work goes through `run_batch`; both reuse this one
  * inner gate chain instead of owning a second dispatcher.
  */
+import { storeToolMedia } from '../runtime/chat-media.js';
 import { randomUUID } from 'node:crypto';
 import {
   wrapToolForHarness,
@@ -563,7 +564,9 @@ export async function dispatchBatchItemTool(
         )
       : await dispatchInnerLocalTool(method, args, sessionId, callId, counter, certifiedBatch, batchItem, localToolOverride, pendingActionExecution);
     const ok = toolOutputLooksSuccessful(out);
-    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
+    let media: ReturnType<typeof storeToolMedia> = [];
+    try { media = storeToolMedia(sessionId, callId, out); } catch { /* a missing picture never blocks the result */ }
+    try { appendEvent({ sessionId, turn: 0, role: 'tool', type: 'tool_returned', data: { tool: method, callId, ok, batchMode: batchItem, ...telemetryData, ...(media.length ? { media: media.map(({ id, path: mediaPath, mimeType }) => ({ id, path: mediaPath, mimeType })) } : {}), preview: (typeof out === 'string' ? out : JSON.stringify(out ?? '')).slice(0, 400) } }); } catch { /* best-effort */ }
     if (typeof out !== 'string') return out ?? null;
     try { return JSON.parse(out); } catch { return out; }
   } catch (err) {

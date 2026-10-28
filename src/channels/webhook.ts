@@ -72,6 +72,7 @@ import { registerSpaceRoutes } from '../dashboard/space-routes.js';
 import { registerWatchRoutes } from '../dashboard/watch-routes.js';
 import { registerTriggerRoutes } from '../dashboard/trigger-routes.js';
 import { registerComputerDriverRoutes } from '../dashboard/computer-driver-routes.js';
+import { registerChatMediaRoutes } from '../dashboard/chat-media-routes.js';
 import { registerPluginExportRoutes } from '../dashboard/plugin-export-routes.js';
 import { createMobileRouter } from './mobile-routes.js';
 import { defaultDenyAuthGate } from './auth-policy.js';
@@ -2057,6 +2058,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
   registerWatchRoutes(app, isAuthorized);
   registerTriggerRoutes(app, isAuthorized);
   registerComputerDriverRoutes(app, isAuthorized);
+  registerChatMediaRoutes(app, isAuthorized);
   registerPluginExportRoutes(app, isAuthorized);
   const consoleSpaServed = consoleNext && registerConsoleSpaRoutes(app, isAuthorized);
   registerConsoleRoutes(app, isAuthorized, assistant, { serveLegacyAtRoot: !consoleSpaServed });

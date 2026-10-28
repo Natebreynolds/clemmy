@@ -167,6 +167,15 @@ export function ActivityRow({ a, now, live, showDetails = false, brainName }: {
           {a.excerpt}
         </pre>
       )}
+      {a.media && a.media.length > 0 && (
+        <div className="ml-5 flex flex-wrap gap-2">
+          {a.media.map((m) => (
+            <a key={m.url} href={m.url} target="_blank" rel="noreferrer" aria-label="Open what the tool saw">
+              <img src={m.url} alt="What the tool saw" loading="lazy" className="max-h-40 rounded-md border border-border/60 bg-subtle" />
+            </a>
+          ))}
+        </div>
+      )}
     </li>
   );
 }

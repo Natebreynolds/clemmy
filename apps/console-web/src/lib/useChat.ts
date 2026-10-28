@@ -28,6 +28,7 @@ import { rememberLastChatSession, unifiedChatSessionId } from './last-session';
 import { apiGet, apiPost, type ApiError } from './api';
 import { chatPendingStorageKey } from './chat-pending-scope';
 import { getPendingActionStatus } from './pendingActions';
+import { withToken } from './api';
 import { humanToolLabel, salientArgDetail } from './toolLabels';
 import { applyWriteEvent, writeRowKey, writeRowLabel, writeRowStatus, writeRowTone, type WriteLedgerRow } from '@clem/chat-engine';
 import { isWorkPlanRow, workPlanActivityItem, workPlanStepLabel } from './work-plan-presentation';
@@ -42,10 +43,26 @@ export type MessageStatus =
 
 /** One live step in a turn's activity strip — a tool call, a spawned agent, a
  *  batch meter, or a trust check (judge verdict / watcher steer). */
+
+/** The chat's view of a tool's pictures: the served path, with this viewer's token. */
+export function mediaFromToolReturn(raw: unknown): Array<{ url: string; mimeType: string }> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ url: string; mimeType: string }> = [];
+  for (const item of raw) {
+    const path = item && typeof item === 'object' ? (item as { path?: unknown }).path : undefined;
+    if (typeof path !== 'string' || !path.startsWith('/api/console/chat-media/')) continue;
+    const mimeType = typeof (item as { mimeType?: unknown }).mimeType === 'string' ? (item as { mimeType: string }).mimeType : 'image/png';
+    out.push({ url: withToken(path), mimeType });
+  }
+  return out;
+}
+
 export interface ActivityItem {
   id: string;
   kind: 'tool' | 'agent' | 'batch' | 'check' | 'event';
   label: string;
+  /** What the tool saw: pictures kept for this chat, shown under the row. */
+  media?: Array<{ url: string; mimeType: string }>;
   /** The host refused this call before it ran; nothing happened. */
   refusedBeforeDispatch?: true;
   detail?: string;
@@ -1087,6 +1104,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
             typeof g.sample === 'string' && g.sample ? `“${g.sample}”` : '',
           ].filter(Boolean).join(' · ')
         : '';
+      const media = mediaFromToolReturn(d.media);
       const settle = (a: ActivityItem): ActivityItem => {
         const reusedDetail = a.label === REUSED_RESULT_LABEL
           ? (a.detail || toolLabel)
@@ -1095,6 +1113,7 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
           ...a,
           status,
           finishedAt: at,
+          ...(media.length ? { media } : {}),
           ...(refused ? { refusedBeforeDispatch: true as const } : {}),
           ...(reused ? { label: REUSED_RESULT_LABEL } : {}),
           ...(glimpseDetail
