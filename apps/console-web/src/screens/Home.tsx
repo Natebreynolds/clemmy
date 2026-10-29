@@ -52,6 +52,7 @@ import { ModelStatusChips } from '@/components/ModelStatusChips';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { QuickActions } from '@/components/home/QuickActions';
 import { NeedsYouPane } from '@/components/home/NeedsYouPane';
+import { MissedRunsCard } from '@/components/home/MissedRunsCard';
 import { WhileAwayPane } from '@/components/home/WhileAwayPane';
 import { ProjectsPane } from '@/components/home/ProjectsPane';
 import { MadePane } from '@/components/home/MadePane';
@@ -335,8 +336,11 @@ function LiveHome() {
       onRetry={retryCommandCenter}
       layout={layoutKind}
       maxRows={maxRows}
-      lead={<FromClemPane section="waiting" headingId="home-from-clem-waiting" data={fromClem.data} loading={fromClem.isLoading}
-        error={fromClem.isError} onRetry={() => { void fromClem.refetch(); }} />}
+      lead={<>
+        <MissedRunsCard />
+        <FromClemPane section="waiting" headingId="home-from-clem-waiting" data={fromClem.data} loading={fromClem.isLoading}
+          error={fromClem.isError} onRetry={() => { void fromClem.refetch(); }} />
+      </>}
       leadCount={clemWaiting > 0 ? 1 : 0}
     />
   );

@@ -1826,6 +1826,8 @@ function emitMissedWhileClosedNotice(missed: MissedWhileClosed[], now: Date): vo
         itemKey: `missed-while-closed:${minute}`,
         errorCategory: 'workflow_missed_while_closed',
         workflows: missed.map((entry) => entry.workflowName),
+        // What the Today card lists and offers: each workflow, when it was due.
+        missed: missed.map((entry) => ({ workflow: entry.workflowName, dueAt: new Date(entry.dueAtMs).toISOString(), times: entry.times })),
       },
     });
   } catch (err) {

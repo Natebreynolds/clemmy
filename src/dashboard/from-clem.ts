@@ -222,6 +222,11 @@ export function buildFromClem(input: FromClemInput): FromClem {
       covers.notificationIds.push(notification.id);
       continue;
     }
+    // Runs missed while Clementine was closed have their own card on Today.
+    if (notification.metadata?.errorCategory === 'workflow_missed_while_closed') {
+      covers.notificationIds.push(notification.id);
+      continue;
+    }
     // A report a workflow run sent the owner with no chat of its own to report
     // into (a silent one went to its chat): her words, posted as written.
     if (isWorkflowReport(notification.metadata)) {

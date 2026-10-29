@@ -15015,6 +15015,37 @@ export function registerConsoleRoutes(
     }
   });
 
+  // Scheduled runs that came due while Clementine was closed: run now or skip,
+  // each one, then what the runs it started are doing (Today's own card).
+  app.get('/api/console/home/missed-runs', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { readMissedWhileClosed } = await import('../execution/missed-while-closed.js');
+      res.json({ notices: readMissedWhileClosed() });
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+  app.post('/api/console/home/missed-runs/:id/decide', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = req.body ?? {};
+    const action = body.action === 'run' || body.action === 'skip' ? body.action : null;
+    if (!action || typeof body.workflow !== 'string') { res.status(400).json({ error: 'workflow and action (run or skip) are required' }); return; }
+    try {
+      const { decideMissedRun } = await import('../execution/missed-while-closed.js');
+      const done = decideMissedRun({ noticeId: req.params.id, workflow: body.workflow, action,
+        ...(typeof body.runId === 'string' ? { runId: body.runId } : {}) });
+      if (!done.ok) { res.status(409).json({ error: done.reason }); return; }
+      res.json(done);
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+  app.post('/api/console/home/missed-runs/:id/dismiss', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const { dismissMissedNotice } = await import('../execution/missed-while-closed.js');
+      dismissMissedNotice(req.params.id);
+      res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+
   // What the owner recently asked Clem from her items, each with what she is
   // doing about it, so the item itself carries the record (desktop and phone).
   app.get('/api/console/home/from-clem/replies', async (req, res) => {
