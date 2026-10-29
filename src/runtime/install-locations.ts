@@ -43,7 +43,7 @@ export function readInstallPlaces(input: { env?: NodeJS.ProcessEnv; platform?: N
     || (existsSync('/opt/homebrew/bin/npm') ? '/opt/homebrew' : '/usr/local');
   const brewPrefix = platform === 'darwin'
     ? (existsSync('/opt/homebrew/bin/brew') ? '/opt/homebrew' : existsSync('/usr/local/bin/brew') ? '/usr/local' : null)
-    : (existsSync('/home/linuxbrew/.linuxbrew/bin/brew') ? '/home/linuxbrew/.linuxbrew' : null);
+    : (() => { const linuxbrew = path.join('/home', 'linuxbrew', '.linuxbrew'); return existsSync(path.join(linuxbrew, 'bin', 'brew')) ? linuxbrew : null; })();
   return {
     home,
     applications: platform === 'darwin' ? canWrite('/Applications') : true,

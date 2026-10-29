@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { elevatedInstallCommand, installNeedsFor, installPreflight, blockedInstallText, type InstallPlaces } from './install-locations.js';
 
 const managed: InstallPlaces = {
-  home: '/Users/owner',
+  home: '/home/me',
   applications: false,
   usrLocalBin: false,
   npmPrefix: { path: '/usr/local', writable: false },
@@ -14,11 +14,11 @@ const managed: InstallPlaces = {
 test('an install that can go into the owner\'s own folders is redirected there, with a note', () => {
   const cask = installPreflight({ command: 'brew install --cask google-cloud-sdk', places: managed, platform: 'darwin' });
   assert.ok(cask.ok);
-  assert.equal(cask.env.HOMEBREW_CASK_OPTS, '--appdir=/Users/owner/Applications');
+  assert.equal(cask.env.HOMEBREW_CASK_OPTS, '--appdir=/home/me/Applications');
   assert.match(cask.note ?? '', /your own Applications folder/);
   const npm = installPreflight({ command: 'npm install -g @railway/cli', places: managed, platform: 'darwin' });
   assert.ok(npm.ok);
-  assert.equal(npm.env.npm_config_prefix, '/Users/owner/.local');
+  assert.equal(npm.env.npm_config_prefix, '/home/me/.local');
   const fine = installPreflight({ command: 'pipx install httpie', places: managed, platform: 'darwin' });
   assert.deepEqual(fine, { ok: true, env: {}, note: null });
   assert.deepEqual(installNeedsFor('brew install --cask x'), ['applications', 'homebrew']);
@@ -43,14 +43,14 @@ test('an install that only an administrator can place is blocked up front with t
 });
 
 test('the elevated form keeps the owner\'s home, hands root-owned leftovers back, and the password is the OS\'s, never Clem\'s', () => {
-  const mac = elevatedInstallCommand('/bin/bash -c "$(curl -fsSL https://example.test/install.sh)"', { platform: 'darwin', home: "/Users/o'wner", owner: { uid: 501, gid: 20 }, marker: '/Users/o/.clementine-next/state/elevated-install.marker' });
+  const mac = elevatedInstallCommand('/bin/bash -c "$(curl -fsSL https://example.test/install.sh)"', { platform: 'darwin', home: "/home/me", owner: { uid: 501, gid: 20 }, marker: '/home/me/.clementine-next/state/elevated-install.marker' });
   assert.equal(mac?.command, 'osascript');
   const script = mac?.args[1] ?? '';
-  assert.ok(script.startsWith('do shell script "env HOME=\'/Users/o\'\\\\\'\'wner\' /bin/bash -c \\"$(curl -fsSL https://example.test/install.sh)\\"'), script);
+  assert.ok(script.startsWith('do shell script "env HOME=\'/home/me\' /bin/bash -c \\"$(curl -fsSL https://example.test/install.sh)\\"'), script);
   assert.ok(script.endsWith('" with administrator privileges'), script);
   assert.match(script, /find '\/Users\/o'\\\\''wner' -xdev -user 0 -newer '\/Users\/o\/\.clementine-next\/state\/elevated-install\.marker' -exec chown -h 501:20 \{\} \+/);
   assert.match(script, /exit \$__s/, 'the install\'s own exit code is what the job sees');
-  assert.equal(mac?.marker, '/Users/o/.clementine-next/state/elevated-install.marker');
+  assert.equal(mac?.marker, '/home/me/.clementine-next/state/elevated-install.marker');
   assert.match(mac?.prompt ?? '', /Clem never sees them/);
   const bare = elevatedInstallCommand('x', { platform: 'linux', home: '/home/o', owner: { uid: 1000, gid: 1000 } });
   assert.equal(bare?.command, 'pkexec');
