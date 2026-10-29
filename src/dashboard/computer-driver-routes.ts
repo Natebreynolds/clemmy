@@ -95,7 +95,9 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
     let target: { pid: number; windowId: number } | null = null;
     if (session) { try { target = lastActedWindow(listEvents(session, { types: ['tool_called'] })); } catch { target = null; } }
     const call = target
-      ? ['call', 'get_window_state', JSON.stringify({ pid: target.pid, window_id: target.windowId }), '--socket', computerDriverSocketPath(), '--screenshot-out-file', file]
+      // The view wants the picture, not the accessibility tree: the smallest
+      // read the driver allows answers in about a second instead of twenty.
+      ? ['call', 'get_window_state', JSON.stringify({ pid: target.pid, window_id: target.windowId, max_elements: 1, timeout_ms: 500 }), '--socket', computerDriverSocketPath(), '--screenshot-out-file', file]
       : ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file];
     try {
       // A window capture answers in a few seconds; the whole display takes the
@@ -105,7 +107,11 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
         // The window is gone; fall back to the display rather than show nothing.
         answer = await askDriver(realComputerDriverPath(status.path), ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file], 45_000, computerDriverEnv());
       }
-      if (!existsSync(file)) { res.status(503).json({ error: answer?.slice(0, 300) || 'The driver answered without a picture. If macOS has not allowed Screen Recording for Clementine yet, allow it in System Settings.' }); return; }
+      if (!existsSync(file)) {
+        const said = (answer ?? '').trim().slice(0, 300);
+        res.status(503).json({ error: said ? `The driver answered without a picture: ${said}` : 'The driver did not answer in time. If macOS has not allowed Screen Recording for Clementine yet, allow it in System Settings.' });
+        return;
+      }
       res.setHeader('Cache-Control', 'no-store');
       res.type('png').send(readFileSync(file));
     } catch (error) {

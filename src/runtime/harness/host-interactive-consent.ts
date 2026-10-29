@@ -1,6 +1,7 @@
 import { hostInteractiveConsentApprovalResumeKey, parseHostInteractiveConsentSubjectV1, type HostInteractiveConsentSubjectV1 } from './host-interactive-consent-subject.js';
 export { hostInteractiveConsentApprovalResumeKey, parseHostInteractiveConsentSubjectV1 } from './host-interactive-consent-subject.js';
 export type { HostInteractiveConsentSubjectV1 } from './host-interactive-consent-subject.js';
+import pino from 'pino';
 import { exactCallDeliveryProof } from './exact-call-delivery.js';
 import { exactCallVariantRead, type OperationVariantReadVerdictV1 } from './exact-call-variant-read.js';
 import { gateApprovedStepWriteCoverage } from './workflow-gate-write-coverage.js';
@@ -81,6 +82,8 @@ import { hasApprovedWriteKind, recordApprovedWriteKind, approvedWriteKindsForTes
 import { ownerRunsInAutoMode } from './worker-lead-authority.js';
 import { answeredRefusalsInTurn } from './turn-answered-refusals.js';
 import {
+
+const consentLogger = pino({ name: 'clementine.consent' });
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
 } from './host-call-capability-binding.js';
@@ -1379,7 +1382,17 @@ function reduceHostConsentEvidence(input: {
   ) {
     try {
       recordApprovedWriteKind({ operationId: call.operationId, accountId: call.accountId, approvalId: input.durableApproval.approvalId });
+      consentLogger.info({ operationId: call.operationId, approvalId: input.durableApproval.approvalId }, 'approval taught a write kind');
     } catch { /* the grant stands; learning is best effort */ }
+  } else if (input.durableApproval) {
+    // Why an approval taught nothing, for the live log: the kind of
+    // decision, its basis, and what the ungranted reading would have asked.
+    consentLogger.info({
+      operationId: call.operationId, approvalId: input.durableApproval.approvalId, decision: decision.kind,
+      basis: decision.kind === 'proceed' ? decision.basis : null, ungranted: ungrantedDecision.kind,
+      teaches: ungrantedDecision.kind === 'needs_user' ? ungrantedDecision.teaches ?? null : null,
+      reason: ungrantedDecision.kind === 'needs_user' ? ungrantedDecision.reason?.slice(0, 120) : null,
+    }, 'approval taught nothing');
   }
   return { decision, consentSubject, userGrant, consentMode, ungrantedDecision };
 }
