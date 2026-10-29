@@ -81,4 +81,7 @@ test('the chat\'s live view follows the window Clem last acted in, read from the
     { type: 'tool_called', data: { tool: 'cua-driver__run_steps', args: '{"steps":[{"tool":"hotkey","args":{"keys":["cmd","n"]}}],"observe":true,"session":"x","target":{"kind":"window","pi' } },
     { type: 'tool_returned', data: { tool: 'cua-driver__run_steps', preview: 'run_steps: 2/2 steps ok\\nwindow_id=273 pid=19529 elements=66 snapshot_id=s0000000a' } },
   ]), { pid: 19529, windowId: 273 }, 'a batch whose arguments were stored short still names its window in the answer');
+  assert.deepEqual(driver.lastActedWindow([
+    { type: 'tool_returned', data: { tool: 'work_call', effectiveTool: 'cua-driver__run_steps', result: '{"content":[{"type":"text","text":"run_steps: 1/1 steps ok"},{"type":"text","text":"window_id=273 pid=19529 elements=256"}]}' } },
+  ]), { pid: 19529, windowId: 273 }, 'a call carried by work_call is read by the driver tool it ran');
 });

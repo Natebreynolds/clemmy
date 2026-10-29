@@ -208,7 +208,8 @@ export function firstImageBlock(content: unknown): { data: string; mimeType: str
 export function lastActedWindow(rows: ReadonlyArray<{ type: string; data: Record<string, unknown> }>): { pid: number; windowId: number } | null {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i];
-    const tool = typeof row.data.tool === 'string' ? row.data.tool : typeof row.data.effectiveTool === 'string' ? row.data.effectiveTool : '';
+    // A carried call is recorded under its carrier; the driver tool it ran is the effective one.
+    const tool = typeof row.data.effectiveTool === 'string' ? row.data.effectiveTool : typeof row.data.tool === 'string' ? row.data.tool : '';
     if (!tool.startsWith(`${COMPUTER_DRIVER_SERVER_NAME}__`) && !tool.startsWith(`mcp__${COMPUTER_DRIVER_SERVER_NAME}__`)) continue;
     if (row.type === 'tool_called') {
       // A call that named the window in its arguments (a click, typed text, a batch of steps).
