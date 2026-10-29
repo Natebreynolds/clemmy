@@ -392,3 +392,13 @@ test('a carrier that declares an unnamed operation non-destructive bounds it to 
   (malformed.callSignals as { requestMethod: unknown }).requestMethod = 'CONNECT';
   assert.deepEqual(projectExternalCapabilityRiskV1(malformed), { ok: false, reason: 'malformed_input' });
 });
+
+test('a carrier\'s non-destructive claim bounds an execution as it bounds an unnamed consequence; an absent hint does not', () => {
+  const claimed = projected(riskInput({ semanticName: 'RUN_STEPS', effect: 'external_write', destructive: false })).risk;
+  assert.equal(claimed.consequence, 'execute');
+  assert.equal(claimed.reversibility, 'ordinary_non_destructive');
+  assert.equal(claimed.destructive, false);
+  const unclaimed = projected(riskInput({ semanticName: 'RUN_STEPS', effect: 'external_write' })).risk;
+  assert.equal(unclaimed.consequence, 'execute');
+  assert.equal(unclaimed.reversibility, 'unknown');
+});

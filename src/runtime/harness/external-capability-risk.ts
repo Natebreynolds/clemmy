@@ -571,9 +571,14 @@ function structuralClassification(
     };
   }
   if (primaryConsequence === 'execute') {
+    // A carrier's explicit non-destructive claim bounds an execution the
+    // same way it bounds an unnamed consequence below: with no outbound
+    // delivery and no DELETE in the arguments (both returned above), the run
+    // is ordinary work that asks once and teaches, not an unclassifiable
+    // action carded forever. An absent hint is not a claim.
     return {
       consequence: 'execute',
-      reversibility: 'unknown',
+      reversibility: hints.destructive === false ? 'ordinary_non_destructive' : 'unknown',
       destructive: false,
       affirmativeMutation: false,
     };
