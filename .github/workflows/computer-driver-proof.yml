@@ -1,0 +1,53 @@
+name: Computer driver proof
+
+# Proves Clem's computer driver on each desktop platform through the same
+# code the Connect "Your computer" tap uses: the verified vendor download into
+# Clem's tools folder, the server record she registers, her supervised daemon
+# (macOS and Linux), and an MCP handshake that lists the driver's tools, each
+# classified by Clem's own taxonomy. Nothing is published; the report is the
+# job log. Windows is the vendor's preview build.
+on:
+  workflow_dispatch:
+  # Also runs when its own files change, so a branch can prove it before it
+  # reaches the default branch (manual dispatch needs it there first).
+  push:
+    paths:
+      - '.github/workflows/computer-driver-proof.yml'
+      - 'scripts/prove-computer-driver.mts'
+      - 'src/integrations/computer-driver.ts'
+      - 'src/integrations/computer-driver-presence.ts'
+      - 'src/runtime/clem-tools.ts'
+
+jobs:
+  prove:
+    name: Prove the driver on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Prove the driver (Linux, virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node --import tsx scripts/prove-computer-driver.mts
+
+      - name: Prove the driver
+        if: runner.os != 'Linux'
+        run: node --import tsx scripts/prove-computer-driver.mts
