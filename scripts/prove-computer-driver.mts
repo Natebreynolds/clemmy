@@ -98,9 +98,13 @@ try {
   report.error = error instanceof Error ? error.message : String(error);
 } finally {
   if (process.platform !== 'win32') await driver.stopComputerDriverHost().catch(() => undefined);
-  rmSync(home, { recursive: true, force: true });
 }
 report.ok = ok;
 if (json) console.log(JSON.stringify(report));
 else console.log(`COMPUTER_DRIVER_PROOF ${JSON.stringify(report)}`);
+// Windows keeps a just-exited program's file locked for a moment; the
+// disposable home is best-effort cleanup and never the verdict.
+for (let attempt = 0; attempt < 5; attempt += 1) {
+  try { rmSync(home, { recursive: true, force: true }); break; } catch { await new Promise((resolve) => setTimeout(resolve, 1_000)); }
+}
 process.exit(ok ? 0 : 1);
