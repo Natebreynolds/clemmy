@@ -24,7 +24,8 @@
     "package:dist": "npm run build && npm run build:daemon && npm run build:mobile-web && npm run build:console-web && npm run vendor:recall-native && npm run vendor:whisper && npm run rebuild-daemon-natives && electron-builder && npm run restore-node-natives",
     "release": "./scripts/release-mac-dual-arch.sh",
     "build:credential-policy": "node scripts/build-credential-policy.mjs",
-    "build:windows-private-filesystem": "node scripts/build-windows-private-filesystem-probe.mjs"
+    "build:windows-private-filesystem": "node scripts/build-windows-private-filesystem-probe.mjs",
+    "package:linux": "node scripts/release-linux.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

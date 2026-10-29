@@ -1,0 +1,70 @@
+name: Linux AppImage (unpublished)
+
+# Builds the Linux desktop app as an AppImage on demand and keeps it as a
+# workflow artifact. Nothing is published or tagged; this is the proof that
+# the daemon, both web apps and the desktop shell package on Linux.
+on:
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    name: Package Linux x64 AppImage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Linux packaging prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libfuse2 rpm
+
+      - name: Install daemon dependencies
+        run: npm ci
+
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Install mobile-web dependencies
+        working-directory: apps/mobile-web
+        run: npm ci
+
+      - name: Install console-web dependencies
+        working-directory: apps/console-web
+        run: npm ci
+
+      - name: Build daemon
+        run: npm run build
+
+      - name: Build mobile-web
+        working-directory: apps/mobile-web
+        run: npm run build
+
+      - name: Build console-web
+        working-directory: apps/console-web
+        run: npm run build
+
+      - name: Build desktop shell
+        working-directory: apps/desktop
+        run: npm run build
+
+      - name: Rebuild daemon natives for Electron
+        working-directory: apps/desktop
+        run: npm run rebuild-daemon-natives
+
+      - name: Package AppImage
+        working-directory: apps/desktop
+        run: npm run package:linux
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: clementine-linux-appimage-${{ github.run_id }}
+          path: apps/desktop/release/*.AppImage
+          if-no-files-found: error
