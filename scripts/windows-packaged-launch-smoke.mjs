@@ -473,9 +473,9 @@ async function findPage(port, predicate) {
 
 async function skipSetup(app) {
   // First run starts the daemon and opens onboarding in the main window
-  // (09dde2b0b, v3.18.43); there is no separate setup window any more. Its
-  // own skips lead to "Explore without a model", which writes the same
-  // skipped setup marker the old wizard's Skip did, then opens chat.
+  // (09dde2b0b, v3.18.43); there is no separate setup window any more.
+  // "Continue without a model" writes the same skipped setup marker the old
+  // wizard's Skip did, then opens chat.
   const target = await waitFor(() => findPage(app.port, isOnboardingTarget), 'first_launch_setup_missing');
   const page = new CDP(assertCDPUrl(target.webSocketDebuggerUrl, app.port, 'page'));
   try {
@@ -488,10 +488,9 @@ async function skipSetup(app) {
       button.click();
       return true;
     })()`), code, 60_000);
-    await press('Connect a model later', 'setup_preload_or_button_missing');
-    await press('Skip Jev for now', 'onboarding_jev_skip_missing');
-    await press('Skip voice for now', 'onboarding_voice_skip_missing');
-    await press('Explore without a model', 'onboarding_explore_missing');
+    // Onboarding's first page offers "Continue without a model" (the 3.18.59
+    // redesign), which writes the same skipped setup marker in one step.
+    await press('Continue without a model', 'setup_preload_or_button_missing');
     await waitFor(async () => {
       const marker = path.join(app.env.CLEMENTINE_HOME, 'state', 'setup-complete.json');
       if (!existsSync(marker)) return null;
