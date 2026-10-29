@@ -71,6 +71,28 @@ jobs:
         working-directory: apps/desktop
         run: npm run package:linux
 
+      - name: Smoke-launch the AppImage on a virtual display
+        working-directory: apps/desktop
+        run: |
+          sudo apt-get install -y xvfb
+          IMAGE=$(ls release/*.AppImage | head -1)
+          chmod +x "$IMAGE"
+          # The shell starts its daemon on first launch; the daemon answering
+          # its own health route is the proof the Linux build runs end to end.
+          xvfb-run -a bash -c "\"$IMAGE\" --appimage-extract-and-run --no-sandbox > release/smoke.log 2>&1 & APP=\$!; \
+            for i in \$(seq 1 60); do sleep 3; \
+              SECRET=\$(grep -E '^WEBHOOK_SECRET=' \$HOME/.clementine-next/.env 2>/dev/null | cut -d= -f2-); \
+              if [ -n \"\$SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$SECRET\" http://127.0.0.1:8520/api/console/health; then echo \"daemon answered after \$((i*3))s\"; kill \$APP; exit 0; fi; \
+            done; echo 'the daemon never answered'; tail -40 release/smoke.log; kill \$APP; exit 1"
+
+      - name: Upload smoke log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-log-${{ github.run_id }}
+          path: apps/desktop/release/smoke.log
+          if-no-files-found: ignore
+
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
