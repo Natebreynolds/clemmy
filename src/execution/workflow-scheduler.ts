@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readableWorkflowName } from './workflow-diagnosis.js';
 import {
   closeSync,
@@ -99,6 +99,11 @@ import { WORKFLOW_RAW_SUBPROCESS_REFUSAL_CODE } from './workflow-raw-subprocess-
 
 const logger = pino({ name: 'clementine-next.workflow-scheduler' });
 
+/** This running Clementine, as the scheduler's tick mark names it. */
+let schedulerProcessId: string = randomUUID();
+/** Pins stand in for a reopened Clementine with a new id. */
+export function _testOnly_setSchedulerProcessId(id: string): void { schedulerProcessId = id; }
+
 // Keep schedule state next to the cron daemon state so backup/clean-up
 // happens uniformly. Format mirrors the cron path but with a `wf:`
 // prefix to namespace the keys.
@@ -118,6 +123,10 @@ interface ScheduleState {
   // canonical laptop case) used to silently drop that run because cron was only
   // matched against `now`. We now backfill the missed window on the next tick.
   lastEvaluatedAtMs?: number;
+  /** Which running Clementine made that tick. A first tick that finds another
+   *  one's mark is the first since she reopened: what fell due in between
+   *  happened while she was closed. */
+  lastEvaluatedBy?: string;
 }
 
 interface PendingScheduleOccurrence {
@@ -185,6 +194,7 @@ function loadScheduleState(): ScheduleState {
       ...(Number.isFinite(parsed.lastEvaluatedAtMs)
         ? { lastEvaluatedAtMs: parsed.lastEvaluatedAtMs }
         : {}),
+      ...(typeof parsed.lastEvaluatedBy === 'string' ? { lastEvaluatedBy: parsed.lastEvaluatedBy } : {}),
     };
   } catch (err) {
     const preserved = `${SCHEDULE_STATE_FILE}.corrupt-${Date.now()}`;
@@ -264,6 +274,7 @@ function pruneScheduleState(state: ScheduleState): ScheduleState {
     lastRunAtMs: nextEpoch,
     pendingByWorkflow: state.pendingByWorkflow,
     lastEvaluatedAtMs: state.lastEvaluatedAtMs,
+    ...(state.lastEvaluatedBy ? { lastEvaluatedBy: state.lastEvaluatedBy } : {}),
   };
 }
 
@@ -411,6 +422,9 @@ interface ScheduledFireResult {
   deferred: string[];
   /** Names that matched but were skipped because we already fired this minute. */
   deduped: string[];
+  /** Names whose occurrence fell due while Clementine was closed: not run, but
+   *  offered to the owner in one notice, to run now if they choose. */
+  offered?: string[];
 }
 
 interface ScheduledReadinessBlockerEvidence {
@@ -1089,8 +1103,14 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
   for (const dedupeKey of Object.keys(state.pendingByWorkflow)) {
     if (!configured.has(dedupeKey)) delete state.pendingByWorkflow[dedupeKey];
   }
+  // The last tick an earlier Clementine made, on this one's first tick: a
+  // scheduled run that fell due between the two came due while she was closed.
+  const closedSinceMs = state.lastEvaluatedAtMs !== undefined && state.lastEvaluatedBy !== schedulerProcessId
+    ? state.lastEvaluatedAtMs : null;
   state.lastEvaluatedAtMs = nowMinuteMs;
+  state.lastEvaluatedBy = schedulerProcessId;
   saveScheduleState(state);
+  const missedWhileClosed: MissedWhileClosed[] = [];
 
   const candidates = Array.from(configured.entries())
     .map(([dedupeKey, config]) => {
@@ -1127,6 +1147,24 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
         now,
       );
     } catch { /* the workflow schedule store remains authoritative */ }
+
+    // A run that came due while Clementine was closed is the owner's to start:
+    // she asks which to run now (a run started now counts from now) instead of
+    // firing every one of them into one queue as she reopens.
+    if (isCatchupFire && closedSinceMs !== null && occurrence.firstDueAtMs > closedSinceMs) {
+      markWorkflowOccurrenceHandled(state, dedupeKey, occurrence);
+      saveScheduleState(state);
+      (result.offered ??= []).push(workflowName);
+      missedWhileClosed.push({ workflowName, dueAtMs: occurrence.atMs, times: occurrence.missed + 1 });
+      recordOperationalEvent({
+        source: 'workflow',
+        type: 'workflow_trigger_deduped',
+        severity: 'info',
+        actor: 'workflow-scheduler',
+        payload: { workflowName, schedule, reason: 'missed_while_closed_offered', occurrenceAtMs: occurrence.atMs, closedSinceMs },
+      });
+      continue;
+    }
 
     // Each durable run snapshot costs file creation + fsync, and the runner
     // admits catch-up lineages one at a time anyway. Bound the per-tick burst
@@ -1430,6 +1468,7 @@ export async function processWorkflowSchedules(now: Date = new Date()): Promise<
       } catch { /* best-effort control-plane receipt */ }
     }
   }
+  if (missedWhileClosed.length > 0) emitMissedWhileClosedNotice(missedWhileClosed, now);
   try {
     const intervalResult = await processWorkflowIntervalSchedules(workflows, now);
     result.fired.push(...intervalResult.fired);
@@ -1752,6 +1791,48 @@ function emitEnqueueFailureNotice(workflowName: string, err: unknown): void {
 
 /** A skipped occurrence is a missed post; the person must hear it once a
  *  day, not discover it from an empty channel. */
+interface MissedWhileClosed { workflowName: string; dueAtMs: number; times: number }
+
+function dueWords(atMs: number, now: Date): string {
+  const at = new Date(atMs);
+  const time = at.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return at.toDateString() === now.toDateString() ? time : `${at.toLocaleDateString('en-US', { weekday: 'long' })} ${time}`;
+}
+
+/** One notice for what came due while Clementine was closed. Its facts only:
+ *  Clem says it and offers the runs in her own words on the item. */
+function emitMissedWhileClosedNotice(missed: MissedWhileClosed[], now: Date): void {
+  try {
+    const minute = minuteFloor(now.getTime());
+    const id = `system-workflows-missed-while-closed-${minute}`;
+    if (getNotification(id)) return;
+    const names = missed.map((entry) => readableWorkflowName(entry.workflowName));
+    addNotification({
+      id,
+      kind: 'workflow',
+      title: missed.length === 1
+        ? `${names[0]} didn't run while Clementine was closed`
+        : `${missed.length} scheduled workflows didn't run while Clementine was closed`,
+      body: [
+        ...missed.map((entry, index) => `${names[index]}: due ${dueWords(entry.dueAtMs, now)}${entry.times > 1 ? ` (${entry.times} times)` : ''}`),
+        'None of these ran. A run started now counts from now.',
+      ].join('\n'),
+      createdAt: now.toISOString(),
+      read: false,
+      metadata: {
+        needsAttention: true,
+        heartbeatId: 'schedules',
+        sourceTitle: 'Schedules',
+        itemKey: `missed-while-closed:${minute}`,
+        errorCategory: 'workflow_missed_while_closed',
+        workflows: missed.map((entry) => entry.workflowName),
+      },
+    });
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Failed to emit missed-while-closed notice (best-effort, ignored)');
+  }
+}
+
 function emitParkedSkipNotice(workflowName: string, parked: number): void {
   try {
     const dayKey = new Date().toISOString().slice(0, 10);
