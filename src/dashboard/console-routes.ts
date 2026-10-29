@@ -50,6 +50,7 @@ import { registerConsoleMemoryWorkRoutes } from './console-memory-work-routes.js
 import { registerConsoleMemoryFactDetailRoutes } from './console-memory-fact-detail-routes.js';
 import { runGuardedMemoryFactMutation } from './memory-fact-mutation-guard.js';
 import { registerConsoleTaskHandlingRoutes } from './console-task-handling-routes.js';
+import { registerConsoleOtherAppsRoutes } from './console-other-apps-routes.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
   BASE_DIR,
@@ -4079,6 +4080,7 @@ export function registerConsoleRoutes(
   registerConsoleMemoryWorkRoutes(app, { isAuthorized });
   registerConsoleMemoryFactDetailRoutes(app, { isAuthorized });
   registerConsoleTaskHandlingRoutes(app, { isAuthorized });
+  registerConsoleOtherAppsRoutes(app, { isAuthorized });
   armWorkflowListMemoWarm();
 
   /**

@@ -159,33 +159,38 @@ export async function answerCard(decide: { decision: 'approve' | 'reject'; appro
   }
 }
 
-export async function runCliTask(options: RunCliOptions, io: { fetch?: typeof fetch; stdout: (text: string) => void } = { stdout: (text) => process.stdout.write(`${text}\n`) }): Promise<number> {
-  if (options.decide) return answerCard(options.decide, io, options.json);
-  const doFetch = io.fetch ?? fetch;
-  const sessionId = options.chat ?? `console:run-${randomUUID().slice(0, 12)}`;
+/** Send one task (or a follow-up) to the running app's chat route and read
+ *  how the turn ended. A wait that runs out leaves the turn running there. */
+export async function sendTaskToApp(input: { task: string; sessionId: string; timeoutSeconds: number; requestPrefix?: string },
+  doFetch: typeof fetch = fetch): Promise<RunOutcome> {
+  const { sessionId, timeoutSeconds } = input;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutSeconds * 1000);
-  let outcome: RunOutcome;
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
   try {
     const response = await doFetch(`http://127.0.0.1:${WEBHOOK_PORT}/api/console/home/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WEBHOOK_SECRET}` },
-      body: JSON.stringify({ message: options.task, sessionId, clientRequestId: `cli:${randomUUID()}` }),
+      body: JSON.stringify({ message: input.task, sessionId, clientRequestId: `${input.requestPrefix ?? 'cli'}:${randomUUID()}` }),
       signal: controller.signal,
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
-      outcome = { status: 'unreachable', exitCode: RUN_EXIT_UNREACHABLE, sessionId, text: '', stoppedReason: null, pendingApprovalId: null,
+      return { status: 'unreachable', exitCode: RUN_EXIT_UNREACHABLE, sessionId, text: '', stoppedReason: null, pendingApprovalId: null,
         error: response.status === 401 ? 'The app refused the connection: run this as the user the app runs as.' : `The app answered HTTP ${response.status}${detail ? `: ${detail.slice(0, 200)}` : ''}` };
-    } else {
-      outcome = runOutcomeFromFrames(parseChatStreamFrames(await response.text()), sessionId);
     }
+    return runOutcomeFromFrames(parseChatStreamFrames(await response.text()), sessionId);
   } catch (error) {
     const aborted = controller.signal.aborted;
-    outcome = { status: aborted ? 'failed' : 'unreachable', exitCode: aborted ? RUN_EXIT_FAILED : RUN_EXIT_UNREACHABLE, sessionId, text: '',
+    return { status: aborted ? 'failed' : 'unreachable', exitCode: aborted ? RUN_EXIT_FAILED : RUN_EXIT_UNREACHABLE, sessionId, text: '',
       stoppedReason: aborted ? 'timeout' : null, pendingApprovalId: null,
-      error: aborted ? `no reply within ${options.timeoutSeconds} s; the turn may still be running in the app` : `Clementine is not running on port ${WEBHOOK_PORT} (${error instanceof Error ? error.message : String(error)}).` };
+      error: aborted ? `no reply within ${timeoutSeconds} s; the turn may still be running in the app` : `Clementine is not running on port ${WEBHOOK_PORT} (${error instanceof Error ? error.message : String(error)}).` };
   } finally { clearTimeout(timer); }
+}
+
+export async function runCliTask(options: RunCliOptions, io: { fetch?: typeof fetch; stdout: (text: string) => void } = { stdout: (text) => process.stdout.write(`${text}\n`) }): Promise<number> {
+  if (options.decide) return answerCard(options.decide, io, options.json);
+  const sessionId = options.chat ?? `console:run-${randomUUID().slice(0, 12)}`;
+  const outcome = await sendTaskToApp({ task: options.task, sessionId, timeoutSeconds: options.timeoutSeconds }, io.fetch ?? fetch);
   io.stdout(formatRunOutcome(outcome, options.json));
   return outcome.exitCode;
 }
