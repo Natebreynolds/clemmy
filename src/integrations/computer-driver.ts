@@ -24,7 +24,8 @@ import { clementineHomeDir, clemToolsBin, type ToolDownloadRecipe } from '../run
 
 const logger = pino({ name: 'clementine.computer-driver' });
 
-export const COMPUTER_DRIVER_SERVER_NAME = 'cua-driver';
+import { COMPUTER_DRIVER_SERVER_NAME, computerDriverRecordConnected } from './computer-driver-presence.js';
+export { COMPUTER_DRIVER_SERVER_NAME } from './computer-driver-presence.js';
 export const COMPUTER_DRIVER_VERSION = '0.37.0';
 /** The desktop app's bundle identity; the driver's permissions attach to it. */
 export const COMPUTER_DRIVER_HOST_BUNDLE_ID = 'com.clemmy.desktop';
@@ -157,9 +158,7 @@ export function readComputerDriverStatus(input: {
     : /\b(denied|missing|not granted|needs|required)\b/.test(perms) ? 'missing'
       : /\b(granted|ok|allowed|enabled)\b/.test(perms) ? 'granted'
         : 'unknown';
-  const connected = input.servers.some((server) => server.enabled !== false
-    && typeof server.command === 'string' && /cua-driver(\.exe)?$/.test(server.command)
-    && Array.isArray(server.args) && server.args.includes('mcp'));
+  const connected = computerDriverRecordConnected(input.servers);
   return {
     installed: input.path !== null,
     path: input.path,

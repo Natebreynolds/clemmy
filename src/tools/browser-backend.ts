@@ -6,15 +6,12 @@
  * it, or while no cloud provider is set up. A tool declares which backend it
  * drives (`browserBackend` in the registry); every other tool is unaffected. */
 import { cloudBrowserSelection } from '../integrations/browserbase-setup.js';
-import { computerDriverIsTheBrowser } from '../integrations/computer-driver.js';
-import { discoverMcpServers } from '../runtime/mcp-config.js';
+import { computerDriverIsTheBrowserNow } from '../integrations/computer-driver-presence.js';
 import { TOOL_REGISTRY, type BrowserBackend } from './tool-registry.js';
 
 /** Whether Clem's computer driver is the browser now. Overridable for pins. */
 export function computerIsTheBrowser(): boolean {
-  if (process.env.CLEMMY_COMPUTER_IS_THE_BROWSER === '1') return true;
-  if (process.env.CLEMMY_COMPUTER_IS_THE_BROWSER === '0') return false;
-  try { return computerDriverIsTheBrowser(discoverMcpServers()); } catch { return false; }
+  try { return computerDriverIsTheBrowserNow(); } catch { return false; }
 }
 
 export function browserBackendOffered(backend: BrowserBackend | undefined): boolean {
