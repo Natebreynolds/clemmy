@@ -19,6 +19,7 @@ import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
 import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { ComputerDriver } from '@/components/connect/ComputerDriver';
+import { getComputerDriver } from '@/lib/computer-driver';
 import { BrowserConnection } from '@/components/connect/BrowserConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
 import { usePoll } from '@/lib/poll';
@@ -103,6 +104,9 @@ export function Connect() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  const computerDriver = usePoll(['computer-driver'], getComputerDriver, 20_000);
+  const computerIsOn = Boolean(computerDriver.data?.installed && computerDriver.data?.connected);
+  const [showBrowsersAnyway, setShowBrowsersAnyway] = useState(false);
   const [setupForm, setSetupForm] = useState<AppSetupForm | null>(null);
 
   /** Open a sign-in link in the browser; the words go back to the card. */
@@ -357,10 +361,21 @@ export function Connect() {
       {/* CLIs — save-to-confirm, not a PATH dump */}
       <CliTools />
 
-      {/* Browser harness — drive the user's real Chrome */}
+      {/* Your computer first; while Clem's driver is on, it is the browser too */}
       <ComputerDriver />
-      <BrowserHarness />
-      <BrowserConnection />
+      {computerIsOn && !showBrowsersAnyway ? (
+        <Card>
+          <p className="text-small text-muted">
+            Your computer is Clem’s browser while it is on. The Chrome harness and any cloud browser stay idle.
+            {' '}<button type="button" className="text-primary hover:underline" onClick={() => setShowBrowsersAnyway(true)}>Show them anyway</button>
+          </p>
+        </Card>
+      ) : (
+        <>
+          <BrowserHarness />
+          <BrowserConnection />
+        </>
+      )}
 
       {/* Code folders (local code, not the Projects screen) */}
       <ProjectsPanel />

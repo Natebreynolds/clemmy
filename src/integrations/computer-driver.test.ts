@@ -55,3 +55,10 @@ test('the driver runs embedded under the app\'s identity: a private daemon on Cl
   assert.equal(driver.startComputerDriverHost({ binary: '/u/.local/bin/cua-driver' }), 'idle', 'a standalone copy is not Clem\'s to run');
   assert.equal(driver.computerDriverHostState(), 'not_started');
 });
+
+test('the chat\'s live view takes the first picture in the driver\'s answer, bare or wrapped, and nothing else', () => {
+  assert.deepEqual(driver.firstImageBlock([{ type: 'text', text: 'desktop' }, { type: 'image', data: 'QUJD', mimeType: 'image/png' }]), { data: 'QUJD', mimeType: 'image/png' });
+  assert.deepEqual(driver.firstImageBlock({ content: [{ type: 'image', data: 'QUJD', mimeType: 'image/jpeg' }] }), { data: 'QUJD', mimeType: 'image/jpeg' });
+  assert.equal(driver.firstImageBlock([{ type: 'text', text: 'no picture' }]), null);
+  assert.equal(driver.firstImageBlock('text'), null);
+});

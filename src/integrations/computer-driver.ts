@@ -186,6 +186,18 @@ export function computerDriverIsTheBrowser(servers: ReadonlyArray<Pick<ManagedMc
   return readComputerDriverStatus({ path: binary, statusText: null, permissionsText: null, servers }).connected;
 }
 
+/** The first picture in a driver tool's result: what the screen looks like now. */
+export function firstImageBlock(content: unknown): { data: string; mimeType: string } | null {
+  const blocks = Array.isArray(content) ? content : (content && typeof content === 'object' && Array.isArray((content as { content?: unknown }).content)) ? (content as { content: unknown[] }).content : [];
+  for (const block of blocks) {
+    if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'image'
+      && typeof (block as { data?: unknown }).data === 'string' && typeof (block as { mimeType?: unknown }).mimeType === 'string') {
+      return { data: (block as { data: string }).data, mimeType: (block as { mimeType: string }).mimeType };
+    }
+  }
+  return null;
+}
+
 // ─── The private daemon ──────────────────────────────────────────────────
 let host: { child: ChildProcess; generation: number } | null = null;
 let hostStopped = true;

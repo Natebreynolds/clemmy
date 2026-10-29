@@ -2,6 +2,7 @@ import { handoffComposerDraft, newComposerDraftKey } from '@/lib/composer-drafts
 import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
+import { ComputerDock } from '@/components/chat/ComputerDock';
 import { FileDockWorkspace } from '@/components/chat/FileDock';
 import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -209,6 +210,7 @@ export function Chat() {
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <FileDockWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <div className="flex h-full min-h-0 flex-col">
+      <ComputerDock />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           {chat.messages.map((m, index) => (

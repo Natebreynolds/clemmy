@@ -10,8 +10,9 @@ import type { Express, Request, Response } from 'express';
 import { clearAutonomyAgentCache } from '../agents/autonomy-v2.js';
 import { getInstallJob, startAsyncInstallJob } from '../integrations/browser-harness.js';
 import {
-  COMPUTER_DRIVER_DOWNLOAD, computerDriverPath, computerDriverServer, computerDriverStatus, startComputerDriverHost,
+  COMPUTER_DRIVER_DOWNLOAD, COMPUTER_DRIVER_SERVER_NAME, computerDriverPath, computerDriverServer, computerDriverStatus, firstImageBlock, startComputerDriverHost,
 } from '../integrations/computer-driver.js';
+import { getOrCreateExternalMcpServerForTool } from '../runtime/mcp-servers.js';
 import { installToolDownload } from '../runtime/clem-tools.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
@@ -75,6 +76,27 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
       }
     }
     res.json({ output: 'Find Clementine in Accessibility and in Screen & System Audio Recording and switch it on.', status: await computerDriverStatus(discoverMcpServers()) });
+  });
+  // What the screen looks like now, through the driver's own capture: the
+  // chat's live view of the computer. A read; nothing on the screen changes.
+  app.get('/api/console/computer-driver/screen', async (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const status = await computerDriverStatus(discoverMcpServers());
+    if (!status.installed || !status.connected) { res.status(409).json({ error: 'Your computer is not turned on for Clem.' }); return; }
+    const toolName = `${COMPUTER_DRIVER_SERVER_NAME}__get_desktop_state`;
+    try {
+      const server = getOrCreateExternalMcpServerForTool(toolName);
+      const content = await Promise.race([
+        server.callTool(toolName, {}),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the driver did not answer in time')), 15_000)),
+      ]);
+      const image = firstImageBlock(content);
+      if (!image) { res.status(503).json({ error: 'The driver answered without a picture. If macOS has not allowed Screen Recording for Clementine yet, allow it in System Settings.' }); return; }
+      res.setHeader('Cache-Control', 'no-store');
+      res.type(image.mimeType).send(Buffer.from(image.data, 'base64'));
+    } catch (error) {
+      res.status(503).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
   app.post('/api/console/computer-driver/connect', async (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }

@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from './api';
+import { apiGet, apiPost, withToken } from './api';
 import type { InstallJob } from './connect';
 
 export interface ComputerDriverStatus {
@@ -28,4 +28,9 @@ export function computerDriverNextStep(status: ComputerDriverStatus): 'install' 
   if (!status.installed) return 'install';
   if (!status.connected) return 'connect';
   return 'ready';
+}
+
+/** A fresh capture of the screen each time it is asked for. */
+export function computerScreenUrl(nowMs: number = Date.now()): string {
+  return `${withToken('/api/console/computer-driver/screen')}&t=${nowMs}`;
 }
