@@ -19,6 +19,7 @@
 import { STALLED_WORK_REAP_MS } from '../dashboard/working-now-policy.js';
 import { readableWorkflowName } from '../execution/workflow-diagnosis.js';
 import type { NotificationRecord } from '../runtime/notifications.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusal } from '../shared/provider-capacity.js';
 
 export interface WorkRunObservation {
   runId: string;
@@ -66,9 +67,15 @@ export interface WorkReviewCandidate {
   detail: string;
   /** What the item points at, so it can retire when that resolves. Several
    *  runs or conversations about one thing are one item with several refs. */
-  ref: { type: 'workflow_run' | 'chat_run' | 'draft'; id: string };
+  ref: { type: 'workflow_run' | 'chat_run' | 'draft' | 'account_cause'; id: string };
   refs: string[];
   count: number;
+  /** For failures that share one cause in an account they use: the
+   *  workflows it has stopped right now (their latest real run failed on it). */
+  workflows?: string[];
+  /** A cause still stopping workflows with no new failure since the last look:
+   *  it keeps an open item current and raises none. */
+  keepsOnly?: boolean;
   /** Where Clementine could help, in one line. Model voice comes later; this is the fact. */
   offer: string;
   observedAt: string;
@@ -234,6 +241,40 @@ function short(text: string, max = 140): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+export type AccountFailureCause = 'out_of_credit' | 'usage_used_up';
+
+const ACCOUNT_FAILURE_WORDS: Record<AccountFailureCause, { subject: string; why: string; offer: string }> = {
+  out_of_credit: {
+    subject: 'An account is out of credit',
+    why: 'an account they use is out of credit',
+    offer: 'Add credit on that account and run them again; if it is the model they run on, a backup model in Settings lets them switch on their own.',
+  },
+  usage_used_up: {
+    subject: 'An account used up its usage',
+    why: 'an account they use has used up its usage',
+    offer: 'Wait for the limit to reset or add usage, then run them again; if it is the model they run on, a backup model in Settings lets them switch on their own.',
+  },
+};
+
+/** A run's failure whose cause sits outside the workflow, in an account it
+ *  uses, read from the provider's own refusal words. A bare status number or a
+ *  sign-in error is not enough: a run's error text carries tool output too,
+ *  and a tool's sign-in is not the account every workflow shares. */
+export function accountFailureCause(error: string | undefined): AccountFailureCause | null {
+  if (!error) return null;
+  if (isProviderCreditRefusal(undefined, error)) return 'out_of_credit';
+  if (isProviderCapacityExhausted(error)) return 'usage_used_up';
+  return null;
+}
+
+export function accountCauseKey(cause: AccountFailureCause): string {
+  return `run_failed:cause:${cause}`;
+}
+
+function isAccountCauseKey(key: string): boolean {
+  return key.startsWith('run_failed:cause:');
+}
+
 /**
  * The candidates this observation supports. Pure: the same observation at the
  * same time always yields the same keys, so the diff against state is exact.
@@ -255,6 +296,7 @@ export function deriveWorkReviewCandidates(
     const finished = ms(run.finishedAt) ?? ms(run.createdAt);
     if (FAILED_RUN_STATUSES.has(run.status)) {
       if (finished === null || finished < failureSince) continue;
+      if (accountFailureCause(run.error)) continue; // one item per cause, below
       out.push({
         key: `run_failed:${run.runId}`,
         kind: 'run_failed',
@@ -267,6 +309,45 @@ export function deriveWorkReviewCandidates(
         observedAt,
       });
     }
+  }
+
+  // Workflows stopped on one cause in an account they use (out of credit,
+  // usage used up) are one thing for the owner to fix: one item per cause,
+  // naming every workflow whose latest real run failed on it.
+  const latestByWorkflow = new Map<string, { run: WorkRunObservation; finished: number }>();
+  for (const run of observation.runs) {
+    if (run.targetStepId || (run.status !== 'completed' && !FAILED_RUN_STATUSES.has(run.status))) continue;
+    const finished = ms(run.finishedAt) ?? ms(run.createdAt);
+    if (finished === null) continue;
+    const seen = latestByWorkflow.get(run.workflow);
+    if (!seen || finished > seen.finished) latestByWorkflow.set(run.workflow, { run, finished });
+  }
+  const byCause = new Map<AccountFailureCause, Array<{ run: WorkRunObservation; finished: number }>>();
+  for (const latest of latestByWorkflow.values()) {
+    if (!FAILED_RUN_STATUSES.has(latest.run.status) || latest.finished < tooOld) continue;
+    const cause = accountFailureCause(latest.run.error);
+    if (cause) byCause.set(cause, [...(byCause.get(cause) ?? []), latest]);
+  }
+  for (const [cause, group] of byCause) {
+    group.sort((a, b) => b.finished - a.finished);
+    const words = ACCOUNT_FAILURE_WORDS[cause];
+    const workflows = group.map(({ run }) => run.workflow);
+    const names = workflows.map((workflow) => readableWorkflowName(workflow));
+    const latest = group[0]!;
+    out.push({
+      key: accountCauseKey(cause),
+      kind: 'run_failed',
+      subject: words.subject,
+      detail: `${names.length === 1 ? `${names[0]} stopped` : `${names.length} workflows stopped`} because ${words.why}`
+        + `${names.length === 1 ? '' : `: ${names.join(', ')}`}. Latest ${formatWhen(latest.finished, nowMs, 'at')}: ${short(latest.run.error ?? '', 160)}`,
+      ref: { type: 'account_cause', id: cause },
+      refs: group.map(({ run }) => run.runId).slice(0, 20),
+      count: group.length,
+      offer: words.offer,
+      observedAt,
+      workflows,
+      ...(group.some(({ finished }) => finished >= failureSince) ? {} : { keepsOnly: true }),
+    });
   }
 
   for (const draft of observation.drafts) {
@@ -291,7 +372,7 @@ export function deriveWorkReviewCandidates(
 /** Open items whose referent no longer needs anything. */
 export function retirableItems(items: WorkReviewItem[], candidates: WorkReviewCandidate[]): WorkReviewItem[] {
   const live = new Set(candidates.map((c) => c.key));
-  return items.filter((item) => !item.retiredAt && !live.has(item.key) && item.kind !== 'run_failed');
+  return items.filter((item) => !item.retiredAt && !live.has(item.key) && (item.kind !== 'run_failed' || isAccountCauseKey(item.key)));
 }
 
 /** Failures a later completed run of the same workflow has superseded.
@@ -303,6 +384,8 @@ export function supersededFailures(items: WorkReviewItem[], observation: WorkObs
     if (item.retiredAt || item.kind !== 'run_failed') return false;
     const raised = ms(item.createdAt);
     if (raised === null) return false;
+    // A cause's item leaves when nothing is stopped on it (retirableItems).
+    if (isAccountCauseKey(item.key)) return false;
     return observation.runs.some((run) => run.workflow === item.subject && run.status === 'completed' && !run.targetStepId
       && (ms(run.finishedAt) ?? -Infinity) > raised);
   });
@@ -318,7 +401,9 @@ export function buildWorkReviewNotification(
   notify: 'quiet' | 'push',
 ): NotificationRecord {
   // A workflow's subject is its slug; the owner reads its name (2026-10-18).
-  const title = candidate.kind === 'run_failed' ? `Something went wrong: ${short(readableWorkflowName(candidate.subject), 60)}`
+  const title = candidate.kind === 'run_failed' && candidate.workflows?.length
+    ? `${candidate.workflows.length === 1 ? `${short(readableWorkflowName(candidate.workflows[0]!), 50)} stopped` : `${candidate.workflows.length} workflows stopped`}: ${short(candidate.subject, 60)}`
+    : candidate.kind === 'run_failed' ? `Something went wrong: ${short(readableWorkflowName(candidate.subject), 60)}`
     : candidate.kind === 'run_waiting' ? `Still waiting on you: ${short(readableWorkflowName(candidate.subject), 60)}`
       : candidate.kind === 'chat_waiting' ? `Still waiting: ${short(candidate.subject, 60)}`
         : `Unsent draft: ${short(candidate.subject, 60)}`;
@@ -399,8 +484,45 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     }
   }
 
-  // 3. New candidates only; an item raised before is not raised again.
-  const fresh = candidates.filter((c) => !state.items[c.key]);
+  // Cards raised one per run for a failure whose cause is now read as one
+  // in an account fold into that cause's card.
+  const runsById = new Map(observation.runs.map((run) => [run.runId, run]));
+  const folding: Array<{ item: WorkReviewItem; causeKey: string }> = [];
+  for (const c of candidates) {
+    if (!c.workflows) continue;
+    for (const item of Object.values(state.items)) {
+      if (item.retiredAt || item.kind !== 'run_failed' || item.ref.type !== 'workflow_run') continue;
+      const run = runsById.get(item.ref.id);
+      if (run && c.workflows.includes(run.workflow) && accountFailureCause(run.error) === c.ref.id) folding.push({ item, causeKey: c.key });
+    }
+  }
+  const takesOver = new Set(folding.map(({ causeKey }) => causeKey));
+
+  // 3. New candidates only; an item raised before is not raised again. A
+  //    cause that stops workflows again after its item left is raised again.
+  const fresh = candidates.filter((c) => {
+    const raises = !c.keepsOnly || takesOver.has(c.key);
+    const earlier = state.items[c.key];
+    if (!earlier) return raises;
+    return isAccountCauseKey(c.key) && Boolean(earlier.retiredAt) && earlier.retiredReason !== 'jev_skip' && raises;
+  });
+  // An open cause item follows what the cause stops now. A workflow newly
+  // stopped on it replaces the card, quietly, so one cause stays one card.
+  const refreshed: WorkReviewItem[] = [];
+  for (const c of candidates) {
+    const item = state.items[c.key];
+    if (!item || item.retiredAt || !c.workflows) continue;
+    const joined = c.workflows.filter((workflow) => !item.workflows?.includes(workflow));
+    const now = { subject: c.subject, detail: c.detail, refs: c.refs, count: c.count, workflows: c.workflows, observedAt: c.observedAt };
+    if (joined.length === 0) { Object.assign(item, now); continue; }
+    const notification = buildWorkReviewNotification({ ...item, ...now }, at, 'quiet');
+    try { deps.publish(notification); } catch { continue; } // the next tick tries again
+    if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the new card stands */ } }
+    Object.assign(item, now);
+    item.notificationId = notification.id;
+    delete item.acknowledgedAt;
+    refreshed.push(item);
+  }
   const duplicates = candidates.length - fresh.length;
   state.metrics.duplicatesSuppressed += duplicates;
 
@@ -494,11 +616,21 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     state.metrics.itemsProduced += 1;
   }
   held += Math.max(0, surfaced.length - cfg.maxItemsPerTick);
+  // The per-run cards leave once their cause holds them (or the owner's rules skip it).
+  for (const { item, causeKey } of folding) {
+    const cause = state.items[causeKey];
+    if (!cause || (cause.retiredAt && cause.retiredReason !== 'jev_skip') || item.retiredAt) continue;
+    item.retiredAt = at;
+    item.retiredReason = 'superseded';
+    state.metrics.itemsRetired += 1;
+    if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the state still says folded */ } }
+    retired.push(item);
+  }
   produced.push(...reopened);
   retired.push(...quieted);
 
   // 6. Record the tick.
-  const quiet = produced.length === 0 && retired.length === 0;
+  const quiet = produced.length === 0 && retired.length === 0 && refreshed.length === 0;
   if (quiet) state.metrics.quietTicks += 1; else state.metrics.changedTicks += 1;
   const observed = { runs: observation.runs.length, chats: observation.chats.length, drafts: observation.drafts.length };
   const resolved = retired.length - quieted.length;
@@ -508,6 +640,7 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     vetoed - quieted.length ? `${vetoed - quieted.length} judged routine` : '',
     quieted.length ? `${quieted.length} now skipped by your rules` : '',
     reopened.length ? `${reopened.length} back after a rule change` : '',
+    refreshed.length ? `${refreshed.length} updated with newly stopped workflows` : '',
     held ? `${held} held` : '',
     resolved ? `${resolved} resolved` : '',
   ].filter(Boolean);
