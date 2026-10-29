@@ -51,3 +51,22 @@ test('a task reaches the running app through its chat route and nothing else', a
   const unreachable = await run.runCliTask({ task: 'x', json: true, timeoutSeconds: 5 }, { fetch: down, stdout: (text) => out.push(text) });
   assert.equal(unreachable, 4);
 });
+
+test('a card is answered through the app\'s own button route, never as chat text', async () => {
+  const { parseRunArgs, runCliTask } = await import('./run.js');
+  const parsed = parseRunArgs(['--approve', 'APR-i6br', '--json']);
+  assert.ok(!('error' in parsed) && parsed.decide?.decision === 'approve' && parsed.decide.approvalId === 'apr-i6br');
+  assert.ok('error' in parseRunArgs(['--approve', 'nope']));
+  const calls: Array<{ url: string; method: string }> = [];
+  const out: string[] = [];
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), method: init?.method ?? 'GET' });
+    return new Response(JSON.stringify({ ok: true, status: 'resuming', approval: { sessionId: 'console:run-abc', subject: 'cua-driver__launch_app' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+  const code = await runCliTask(parsed as Parameters<typeof runCliTask>[0], { fetch: fetchImpl, stdout: (t) => out.push(t) });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/api\/console\/harness-approvals\/apr-i6br\/approve$/);
+  assert.equal(calls[0].method, 'POST');
+  assert.equal(JSON.parse(out[0]).sessionId, 'console:run-abc');
+});

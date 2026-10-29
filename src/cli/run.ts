@@ -3,6 +3,7 @@
  * and CI.
  *
  *   clementine run "<task>" [--chat <id>] [--json] [--timeout <seconds>]
+ *   clementine run --approve <approval id> | --reject <approval id>   (answer a card Clem asked)
  *
  * The task goes through the installed daemon's own chat route, so it is the
  * same accepted turn the desktop sends: same brain, consent, memory and
@@ -12,7 +13,8 @@
  *
  *   0  answered
  *   2  Clem needs the owner (a question, or a card to approve) — the reply
- *      says what; answer in the app or with `clementine run --chat <id> "<answer>"`
+ *      says what; a card is answered with `clementine run --approve <id>` (or --reject),
+ *      a question with `clementine run --chat <id> "<your answer>"`
  *   1  the turn failed, or hit its turn or token budget
  *   4  the app is not running, or refused the connection
  */
@@ -20,6 +22,8 @@ import { randomUUID } from 'node:crypto';
 import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 
 export interface RunCliOptions {
+  /** Answer a card Clem asked instead of sending a task. */
+  decide?: { decision: 'approve' | 'reject'; approvalId: string };
   task: string;
   chat?: string;
   json: boolean;
@@ -58,6 +62,11 @@ export function parseRunArgs(args: readonly string[]): RunCliOptions | { error: 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === '--json') { options.json = true; continue; }
+    if (arg === '--approve' || arg === '--reject') {
+      const value = args[index + 1];
+      if (!value || !/^apr-[a-z0-9]{4}$/i.test(value)) return { error: `${arg} needs the card's approval id (apr-xxxx)` };
+      options.decide = { decision: arg === '--approve' ? 'approve' : 'reject', approvalId: value.toLowerCase() }; index += 1; continue;
+    }
     if (arg === '--chat') {
       const value = args[index + 1];
       if (!value || value.startsWith('--')) return { error: '--chat needs a conversation id' };
@@ -72,6 +81,7 @@ export function parseRunArgs(args: readonly string[]): RunCliOptions | { error: 
     words.push(arg);
   }
   options.task = words.join(' ').trim();
+  if (options.decide) return options;
   if (!options.task) return { error: 'run needs the task to do, in quotes' };
   return options;
 }
@@ -117,7 +127,7 @@ export function formatRunOutcome(outcome: RunOutcome, json: boolean): string {
   if (outcome.text) lines.push(outcome.text);
   if (outcome.status === 'needs_you') {
     lines.push('', outcome.pendingApprovalId
-      ? `Clem needs your OK (approval ${outcome.pendingApprovalId}); open the app, or answer with: clementine run --chat ${outcome.sessionId ?? '<id>'} "<your answer>"`
+      ? `Clem needs your OK (card ${outcome.pendingApprovalId}); tap it in the app, or answer with: clementine run --approve ${outcome.pendingApprovalId}`
       : `Clem asked a question; answer with: clementine run --chat ${outcome.sessionId ?? '<id>'} "<your answer>"`);
   } else if (outcome.status === 'failed') {
     lines.push('', `The turn did not finish${outcome.stoppedReason ? ` (${outcome.stoppedReason})` : ''}${outcome.error ? `: ${outcome.error}` : '.'}`);
@@ -128,7 +138,29 @@ export function formatRunOutcome(outcome: RunOutcome, json: boolean): string {
   return lines.join('\n');
 }
 
+/** Answer a card the way the app's own button does: the decision lands on the
+ *  card's conversation and the approved call runs there. */
+export async function answerCard(decide: { decision: 'approve' | 'reject'; approvalId: string }, io: { fetch?: typeof fetch; stdout: (text: string) => void }, json: boolean): Promise<number> {
+  const doFetch = io.fetch ?? fetch;
+  try {
+    const response = await doFetch(`http://127.0.0.1:${WEBHOOK_PORT}/api/console/harness-approvals/${encodeURIComponent(decide.approvalId)}/${decide.decision}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WEBHOOK_SECRET}` }, body: '{}',
+    });
+    const body = await response.json().catch(() => ({})) as { ok?: boolean; status?: string; error?: string; approval?: { sessionId?: string; subject?: string } };
+    const ok = response.ok && body.ok !== false;
+    if (json) { io.stdout(JSON.stringify({ status: ok ? 'answered' : 'failed', exitCode: ok ? RUN_EXIT_ANSWERED : RUN_EXIT_FAILED, approvalId: decide.approvalId, decision: decide.decision, sessionId: body.approval?.sessionId ?? null, detail: body.status ?? body.error ?? null })); }
+    else io.stdout(ok
+      ? `${decide.decision === 'approve' ? 'Approved' : 'Declined'} ${decide.approvalId}${body.approval?.subject ? ` (${body.approval.subject})` : ''}. Clem carries on in the app${body.approval?.sessionId ? `; conversation ${body.approval.sessionId}` : ''}.`
+      : `That card could not be answered${body.error ? `: ${body.error}` : response.status === 404 ? ': it is not waiting any more' : ''}.`);
+    return ok ? RUN_EXIT_ANSWERED : RUN_EXIT_FAILED;
+  } catch {
+    io.stdout(json ? JSON.stringify({ status: 'unreachable', exitCode: RUN_EXIT_UNREACHABLE }) : `Clementine is not running on port ${WEBHOOK_PORT}.`);
+    return RUN_EXIT_UNREACHABLE;
+  }
+}
+
 export async function runCliTask(options: RunCliOptions, io: { fetch?: typeof fetch; stdout: (text: string) => void } = { stdout: (text) => process.stdout.write(`${text}\n`) }): Promise<number> {
+  if (options.decide) return answerCard(options.decide, io, options.json);
   const doFetch = io.fetch ?? fetch;
   const sessionId = options.chat ?? `console:run-${randomUUID().slice(0, 12)}`;
   const controller = new AbortController();
