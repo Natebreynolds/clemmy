@@ -21,7 +21,17 @@ for (const entry of build.extraResources ?? []) {
   if (existsSync(path.resolve(desktopDir, from))) kept.push(entry); else dropped.push(from);
 }
 build.extraResources = kept;
-build.linux = { ...(build.linux ?? {}), target: ['AppImage'], category: 'Utility', artifactName: '${productName}-${version}-${arch}.${ext}' };
+// The package is scoped (@…/desktop), which is not a file name; the binary
+// and the desktop entry get the product's own plain name.
+build.linux = {
+  ...(build.linux ?? {}),
+  target: ['AppImage'],
+  category: 'Utility',
+  executableName: 'clementine',
+  desktop: { entry: { Name: 'Clementine', StartupWMClass: 'clementine' } },
+  maintainer: 'Clementine',
+  artifactName: '${productName}-${version}-${arch}.${ext}',
+};
 mkdirSync(releaseDir, { recursive: true });
 const configFile = path.join(releaseDir, 'linux-builder.json');
 writeFileSync(configFile, JSON.stringify(build, null, 2));
