@@ -1311,7 +1311,7 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
           {/* Plain first (owner 2026-10-18: novice-first): a bare id says
               nothing to the owner and stays in Technical details; a long block
               (a script, a page of text) folds behind its label. */}
-          {details.filter((line) => line.long || !(isIdentifierLike(String(line.value ?? '')) || /\bids?$/i.test(String(line.label ?? '').trim()))).map((line) => (
+          {details.filter((line) => !(isIdentifierLike(String(line.value ?? '')) || /\bids?$/i.test(String(line.label ?? '').trim()))).map((line) => (
             line.long
               ? String(line.value ?? '').length > 280
                 ? (

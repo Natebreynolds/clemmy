@@ -125,7 +125,15 @@ export function detailLinesFor(args: unknown): ApprovalDetailLine[] {
   }
   const lines: ApprovalDetailLine[] = [];
   let fingerprinted = false;
-  for (const [key, raw] of Object.entries(record)) {
+  // A field that is itself a small record of plain values (a message body as
+  // {contentType, content}) reads as its own lines, never as JSON.
+  const entries = Object.entries(record).flatMap(([key, raw]): Array<[string, unknown]> => {
+    const nested = asRecord(raw);
+    return nested && Object.values(nested).every((value) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+      ? Object.entries(nested).map(([inner, value]): [string, unknown] => [`${key} ${inner}`, value])
+      : [[key, raw]];
+  });
+  for (const [key, raw] of entries) {
     if (lines.length >= MAX_LINES) break;
     if (isContentFingerprint(raw)) { fingerprinted = true; continue; }
     const text = valueText(raw);

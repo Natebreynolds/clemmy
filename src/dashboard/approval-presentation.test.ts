@@ -50,3 +50,20 @@ test('a content fingerprint is left out of the card; one plain line says the ver
   assert.equal(lines.at(-1)?.value, 'Locked to this exact version');
   assert.equal(detailLinesFor({ message: 'Hello' }).some((line) => line.label === 'Version check'), false, 'only when something was left out');
 });
+
+test('a field that is a small record of plain values reads as its own lines, never as JSON', async () => {
+  const { detailLinesFor } = await import('./approval-presentation.js');
+  // Live 2026-10-29: a calendar change showed its note as {"contentType": "Text", "content": "..."}.
+  const lines = detailLinesFor({
+    subject: 'EOM Check-in',
+    body: { contentType: 'Text', content: 'Moved from 9:00 AM so it no longer conflicts with the other meeting.' },
+  });
+  assert.equal(lines.some((line) => /[{}"]/.test(line.value)), false, 'no JSON on the card');
+  assert.deepEqual(lines.map((line) => [line.label, line.value]), [
+    ['Subject', 'EOM Check-in'],
+    ['Body content type', 'Text'],
+    ['Body content', 'Moved from 9:00 AM so it no longer conflicts with the other meeting.'],
+  ]);
+  // A deeper structure still shows as it is: nothing is guessed away.
+  assert.match(detailLinesFor({ attendees: { required: ['a', 'b'], optional: [] } })[0]!.value, /required/);
+});
