@@ -446,12 +446,18 @@ function effectOf(tool: McpToolDefinition): {
     const value = annotations[key];
     return typeof value === 'boolean' ? value : null;
   };
-  // A family Clem herself set up may carry no annotations; her own knowledge
-  // of it stands in only where the definition says nothing.
+  // The computer driver marks every action destructive as a blanket default,
+  // which would card each click forever and teach nothing. Clem's own
+  // knowledge of that family decides for the ordinary actions she names
+  // (looking, acting in an app, the batch runner, launching, a session); the
+  // vendor's word stands for everything else in the family (killing an app,
+  // scripts, the clipboard, configuration, the browser tools) and for every
+  // other server. The read that checks a learned call against what the
+  // owner asked for still guards every learned call.
   const family = computerDriverBehaviorHints(tool.name);
   const behaviorHints = {
-    readOnly: declared('readOnlyHint') ?? family?.readOnly ?? null,
-    destructive: declared('destructiveHint') ?? family?.destructive ?? null,
+    readOnly: family?.readOnly ?? declared('readOnlyHint'),
+    destructive: family?.destructive ?? declared('destructiveHint'),
     idempotent: declared('idempotentHint'),
     openWorld: declared('openWorldHint'),
   };
