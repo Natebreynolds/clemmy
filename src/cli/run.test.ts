@@ -32,6 +32,58 @@ test('the exit code says how the turn ended: answered, needs you, failed, unreac
   assert.equal(JSON.parse(run.formatRunOutcome(card, true)).exitCode, 2);
 });
 
+test('a retained or ownership-lost turn is unfinished, not an answered task', () => {
+  for (const sessionId of ['console:run-held', 'console:run-owner-changed']) {
+    const text = 'The run is still in progress in this conversation.';
+    const outcome = run.runOutcomeFromFrames([
+      { type: 'done', sessionId, text, stoppedReason: 'in-progress', pendingApprovalId: null },
+    ]);
+    assert.deepEqual(outcome, {
+      status: 'failed', exitCode: 1, sessionId, text,
+      stoppedReason: 'in-progress', pendingApprovalId: null, error: null,
+    });
+    assert.deepEqual(JSON.parse(run.formatRunOutcome(outcome, true)), outcome);
+    const plain = run.formatRunOutcome(outcome, false);
+    assert.match(plain, /The turn did not finish \(in-progress\)/);
+    assert.ok(plain.includes(`conversation ${sessionId}`));
+    assert.doesNotMatch(plain, /Clem asked a question|Clem needs your OK|run --approve/);
+  }
+});
+
+test('a held headless request keeps its conversation and is never resubmitted', async () => {
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const out: string[] = [];
+  const fake = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return new Response(JSON.stringify({ type: 'done', sessionId: 'console:run-held',
+      text: 'The run is still in progress.', stoppedReason: 'in-progress', pendingApprovalId: null }) + '\n');
+  }) as typeof fetch;
+  const code = await run.runCliTask({ task: 'Finish the controlled brief', chat: 'console:run-held',
+    json: true, timeoutSeconds: 5 }, { fetch: fake, stdout: (text) => out.push(text) });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.url, /\/api\/console\/home\/chat\/stream$/);
+  assert.equal(calls[0]!.body.sessionId, 'console:run-held');
+  assert.equal(code, 1);
+  const outcome = JSON.parse(out[0]!);
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.sessionId, 'console:run-held');
+  assert.equal(outcome.stoppedReason, 'in-progress');
+});
+
+test('legacy replies and explicit approval cards keep their existing outcomes', () => {
+  for (const stoppedReason of [undefined, null, 'success']) {
+    const frame = { type: 'done', sessionId: 'console:run-legacy', text: 'Done.', stoppedReason };
+    const outcome = run.runOutcomeFromFrames(run.parseChatStreamFrames(JSON.stringify(frame)));
+    assert.equal(outcome.status, 'answered');
+    assert.equal(outcome.exitCode, 0);
+  }
+  const card = run.runOutcomeFromFrames([{ type: 'done', sessionId: 'console:run-card',
+    stoppedReason: 'in-progress', pendingApprovalId: 'apr-ab12' }]);
+  assert.equal(card.status, 'needs_you');
+  assert.equal(card.exitCode, 2);
+  assert.equal(card.pendingApprovalId, 'apr-ab12');
+});
+
 test('a task reaches the running app through its chat route and nothing else', async () => {
   const calls: Array<{ url: string; body: Record<string, unknown>; auth: string }> = [];
   const fake = (async (url: string | URL, init?: RequestInit) => {

@@ -15,7 +15,7 @@
  *   2  Clem needs the owner (a question, or a card to approve) — the reply
  *      says what; a card is answered with `clementine run --approve <id>` (or --reject),
  *      a question with `clementine run --chat <id> "<your answer>"`
- *   1  the turn failed, or hit its turn or token budget
+ *   1  the turn did not finish, failed, or hit its turn or token budget
  *   4  the app is not running, or refused the connection
  */
 import { randomUUID } from 'node:crypto';
@@ -115,7 +115,9 @@ export function runOutcomeFromFrames(frames: readonly ChatStreamFrame[], fallbac
   if (pendingApprovalId || stoppedReason === 'pending-approval' || stoppedReason === 'awaiting-input') {
     return { status: 'needs_you', exitCode: RUN_EXIT_NEEDS_YOU, sessionId, text, stoppedReason, pendingApprovalId, error: null };
   }
-  if (stoppedReason === null || stoppedReason === 'success' || stoppedReason === 'in-progress') {
+  // A held turn still has an owner, not a completed answer. Preserve its
+  // conversation through the existing unfinished-turn result below.
+  if (stoppedReason === null || stoppedReason === 'success') {
     return { status: 'answered', exitCode: RUN_EXIT_ANSWERED, sessionId, text, stoppedReason, pendingApprovalId: null, error: null };
   }
   return { status: 'failed', exitCode: RUN_EXIT_FAILED, sessionId, text, stoppedReason, pendingApprovalId: null, error: error?.error ?? null };
