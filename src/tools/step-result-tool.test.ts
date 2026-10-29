@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { recordStepResult, takeStepResult, peekStepResult, clearStepResult, recordStepResultFromTranscript, registerStepResultTool } from './step-result-tool.js';
+import { recordStepResult, takeStepResult, peekStepResult, clearStepResult, recordStepResultFromTranscript, registerStepResultTool, stepQuestionFromArgs, takeStepQuestion } from './step-result-tool.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
 
 test('recordStepResult / takeStepResult: take returns once then clears', () => {
@@ -238,4 +238,19 @@ test('a step write check runs once however often it is asked, and a slow one nev
     authority._setWorkflowMutationReviewerForTests(null);
     authority._resetStepWriteChecksForTests();
   }
+});
+
+test('a step that needs the owner asks through ask_owner: the question is held for the runner, not recorded as a result', async () => {
+  const captured = captureTool() as unknown as { handler: (a: { data: string; ask_owner?: string }) => Promise<unknown> };
+  clearStepResult('sess-ask');
+  const reply = await withToolOutputContext({ sessionId: 'sess-ask', toolName: 'workflow_step_result' }, () =>
+    captured.handler({ data: '{"draft":"so far"}', ask_owner: '  Red or blue for the new header?  ' }),
+  ) as { content?: Array<{ text?: string }> };
+  assert.match(reply.content?.[0]?.text ?? '', /waits for their answer/);
+  assert.equal(takeStepResult('sess-ask').found, false, 'an asked question is not the step result');
+  assert.equal(takeStepQuestion('sess-ask'), 'Red or blue for the new header?');
+  assert.equal(takeStepQuestion('sess-ask'), undefined, 'taken once');
+  assert.equal(stepQuestionFromArgs({ ask_owner: '   ' }), undefined, 'an empty question asks nothing');
+  assert.equal(stepQuestionFromArgs({ data: 'x' }), undefined);
+  assert.equal(stepQuestionFromArgs({ ask_owner: 'q'.repeat(900) })?.length, 600, 'a question is bounded');
 });

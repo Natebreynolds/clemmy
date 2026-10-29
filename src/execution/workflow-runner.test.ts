@@ -94,6 +94,7 @@ const {
   isWorkflowStepBrainFalloverEligible,
   workflowFallbackCause,
   workflowFallbackNote,
+  stepQuestionFromStepCalls,
   _setWorkflowHarnessLoopImplsForTests,
   _setWorkflowVoiceRewriteForTests,
   _setWorkflowCallNodeForTests,
@@ -6220,6 +6221,20 @@ test('a run that switched models says which step, to what, why, and the one thin
   assert.equal(note.split('\n- ').length - 1, 2, 'one line per model, account and reason');
   assert.equal(workflowFallbackNote([{ kind: 'step_advisory', stepId: 's', meta: { reason: 'brain_fallover', to: 'claude' } }]), '',
     'an older advisory without the models says nothing rather than guessing');
+});
+
+test('the runner reads a step\'s question for the owner from its own durable call record, latest call after its source only', async () => {
+  const eventlog = await import('../runtime/harness/eventlog.js');
+  const sid = `workflow:ask-durable-${Date.now()}:ask`;
+  eventlog.createSession({ id: sid, kind: 'workflow' });
+  const before = eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'stale question before the source' } } });
+  const source = eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'step prompt' } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'a call before the accepted source does not count');
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'Which list should I use?' } } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), 'Which list should I use?');
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{"done":true}' } } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'a later plain result supersedes the question');
+  void before;
 });
 
 // ── G5: scheduled enabled workflow auto-approves its declarative gate ──────────

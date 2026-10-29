@@ -158,7 +158,8 @@ export const WORKFLOW_STEP_BLOCKED_TOOL_NAMES = new Set<string>([
   'surface_plan',
   'propose_plan',
   // conversational question: cannot be answered inside a background run
-  // (would hang the run) — block cleanly via workflow_step_result instead
+  // (would hang the run) — a step asks the owner through
+  // workflow_step_result's ask_owner instead: the run parks, never hangs
   'ask_user_question',
 ]);
 
@@ -360,7 +361,8 @@ export function workflowStepExternalMcpScopeForLock(
 
 const STEP_INSTRUCTIONS = [
   'You are executing ONE step of a workflow — a deterministic pipeline, not a chat.',
-  'Do exactly the work the step prompt describes, using the smallest set of tool calls. Do not branch into other tasks, do not re-plan, do not ask the user questions.',
+  'Do exactly the work the step prompt describes, using the smallest set of tool calls. Do not branch into other tasks, do not re-plan, and do not ask the user questions except through ask_owner below.',
+  'If the step needs the owner\'s own answer or decision (the prompt asks you to ask them, or only they can choose), call `workflow_step_result` with `ask_owner` set to that one question in plain words and `data` set to what you have so far, then stop: the run waits for their answer and resumes this step with it. Never guess an answer only the owner can give.',
   'If a "=== STEP CONTEXT ===" block appears below, it is your bound inputs as authoritative structured DATA — trust it over the prose, and use those values directly. If a value you need is empty or absent there, call `workflow_step_result({"blocked":true,"reason":"<what is missing>"})` rather than guessing or inventing one.',
   'When you have the result, you MUST call `workflow_step_result(data)` EXACTLY ONCE as your final action, passing the COMPLETE structured payload the next step needs (e.g. the full array of records as JSON) — not a summary. The next step reads exactly what you pass here; a prose summary will starve it.',
   'If you genuinely cannot produce the result (missing required input, a tool failed), call `workflow_step_result(data)` with `{ "blocked": true, "reason": "<concrete blocker>" }` and stop. Do NOT try to re-run the workflow or work around it — blocking cleanly is correct.',

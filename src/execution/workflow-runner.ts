@@ -258,7 +258,7 @@ import {
   recordWorkflowOutcome,
   shouldStopAutoHeal,
 } from './workflow-failure-ledger.js';
-import { clearStepContract, isStepResultAckEcho, peekStepResult, registerStepContract, takeStepResult } from '../tools/step-result-tool.js';
+import { clearStepContract, isStepResultAckEcho, peekStepResult, registerStepContract, stepQuestionFromArgs, takeStepQuestion, takeStepResult } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { buildWorkflowMemoryPrimerQuery } from './workflow-memory-primer.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
@@ -2464,6 +2464,19 @@ export class WorkflowHarnessBlockedSignal extends Error {
     this.stepId = input.stepId;
     this.sessionId = input.sessionId;
     this.reason = input.reason;
+  }
+}
+
+/** The question a step's last result call asked the owner, read from the
+ *  step session's durable call record after its accepted source. */
+export function stepQuestionFromStepCalls(sessionId: string, afterSeq: number): string | undefined {
+  try {
+    const calls = listHarnessEvents(sessionId, { types: ['tool_called'] })
+      .filter((event) => event.seq > afterSeq && event.data?.tool === 'workflow_step_result');
+    const last = calls[calls.length - 1];
+    return last ? stepQuestionFromArgs(last.data?.args) : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -6623,6 +6636,25 @@ async function runStepViaHarness(
         question,
         questionId: `workflow-input:${workflowRunId}:${step.id}:${sourceUserEvent.seq}`,
         askedAt: latestQuestion?.createdAt,
+      }));
+    }
+
+    // A step that cannot finish without the owner's own answer asks through
+    // workflow_step_result's ask_owner. The run parks on that question (the
+    // Inbox carries it) and this step resumes with the answer; nothing hangs.
+    // Read live first, then from the step's own call record so a restart
+    // between the ask and this read loses nothing.
+    const askedOwner = takeStepQuestion(realSessionId)
+      ?? stepQuestionFromStepCalls(realSessionId, sourceUserEvent.seq);
+    if (askedOwner) {
+      takeStepResult(realSessionId);
+      throw new WorkflowAwaitingInputSignal(workflowInputState({
+        runId: workflowRunId,
+        stepId: step.id,
+        sessionId: realSessionId,
+        sessionIdSuffix,
+        question: askedOwner,
+        questionId: `workflow-input:${workflowRunId}:${step.id}:${sourceUserEvent.seq}`,
       }));
     }
 

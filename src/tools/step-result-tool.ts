@@ -25,6 +25,26 @@ import { coerceOutputForContract, isBlockedStepOutput, verifyStepOutput } from '
 import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
 const stepResults = new Map<string, unknown>();
+/** A step's question for the owner, asked through `ask_owner`: the run parks
+ *  on it and the step resumes with the answer. Keyed by step session. */
+const stepQuestions = new Map<string, string>();
+const ASK_OWNER_MAX_CHARS = 600;
+
+/** Runner-side: read AND clear the question a step asked the owner. */
+export function takeStepQuestion(sessionId: string): string | undefined {
+  if (!sessionId || !stepQuestions.has(sessionId)) return undefined;
+  const question = stepQuestions.get(sessionId);
+  stepQuestions.delete(sessionId);
+  return question;
+}
+
+/** The one shape of an asked question, shared by the live handler and the
+ *  runner's durable read of the step's own call record. */
+export function stepQuestionFromArgs(args: unknown): string | undefined {
+  const raw = args && typeof args === 'object' ? (args as { ask_owner?: unknown }).ask_owner : undefined;
+  const question = typeof raw === 'string' ? raw.trim() : '';
+  return question ? question.slice(0, ASK_OWNER_MAX_CHARS) : undefined;
+}
 
 /** The submission acknowledgement returned to the MODEL inside the turn. It is
  *  transport chrome, never the deliverable: nothing outside this module may
@@ -262,11 +282,22 @@ export function registerStepResultTool(server: McpServer): void {
         .string()
         .min(1)
         .describe('The step result. Prefer a JSON object/array as a string; plain text is accepted for narrative steps.'),
+      ask_owner: z
+        .string()
+        .max(ASK_OWNER_MAX_CHARS)
+        .optional()
+        .describe('Only when this step cannot finish without the owner\'s own answer or decision: the one question, in plain words. '
+          + 'The run then waits for their answer and resumes this step with it; pass what you have so far as data. Never guess an answer only the owner can give.'),
     },
-    async ({ data }: { data: string }) => {
+    async ({ data, ask_owner }: { data: string; ask_owner?: string }) => {
       const ctx = getToolOutputContext();
       const sessionId = ctx?.sessionId;
       const value = coerceStepData(data);
+      const question = stepQuestionFromArgs({ ask_owner });
+      if (sessionId && question) {
+        stepQuestions.set(sessionId, question);
+        return textResult('Your question is with the owner. This run waits for their answer and resumes this step with it. End your turn now.');
+      }
       if (sessionId) {
         const gate = contractRefusal(sessionId, value);
         if ('refusal' in gate) return textResult(gate.refusal);
