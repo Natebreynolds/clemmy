@@ -498,15 +498,19 @@ const COMPUTER_DRIVER_READ_PREFIXES = ['get_', 'list_', 'check_', 'verify_', 'pa
 const COMPUTER_DRIVER_READ_NAMES = new Set(['zoom', 'screenshot', 'clipboard_read', 'health_report', 'page']);
 /** The driver's own tool definitions carry no behaviour annotations, so the
  *  host would card every action forever as unclassifiable. Clem knows the
- *  family: looking is read-only; acting in an app (input primitives, the
- *  batch runner, launching, a lifecycle session) is ordinary non-destructive
- *  work that asks once and teaches its kind; killing an app, a script, the
- *  clipboard, configuration and the browser tools stay unhinted, so they keep
- *  their own card every time. */
+ *  family: looking is read-only; acting in an app or on a web page (input
+ *  primitives, the batch runner, launching, a lifecycle session, opening,
+ *  navigating, clicking and typing in the driver's browser) is ordinary
+ *  non-destructive work that asks once and teaches its kind, and an action
+ *  that sends, submits or deletes is read for that and asks every time;
+ *  killing an app, a script, the clipboard, configuration, uploads,
+ *  downloads and extensions stay unhinted, so they keep their own card every
+ *  time. */
 const COMPUTER_DRIVER_ORDINARY_ACTIONS = new Set([
   'click', 'double_click', 'right_click', 'drag', 'scroll', 'move_cursor', 'type_text', 'press_key', 'hotkey', 'set_value',
   'invoke_menu', 'bring_to_front', 'set_window_frame', 'mouse_button_down', 'mouse_button_up', 'mouse_drag', 'parallel_mouse_drag',
   'run_steps', 'launch_app', 'start_session', 'end_session', 'set_agent_cursor_enabled', 'set_agent_cursor_motion', 'set_agent_cursor_theme',
+  'browser_prepare', 'browser_navigate', 'browser_click', 'browser_type', 'browser_select', 'browser_pointer', 'browser_dialog',
 ]);
 export function computerDriverBehaviorHints(toolName: string): { readOnly: boolean | null; destructive: boolean | null } | null {
   const rawLower = toolName.trim().toLowerCase();

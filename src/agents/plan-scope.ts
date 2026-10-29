@@ -913,7 +913,11 @@ export function writeKindOperation(operationId: string): string {
   const driver = /^(?:mcp__)?cua-driver__(.+)$/.exec(exact);
   if (!driver) return exact;
   const INPUT = new Set(['click', 'double_click', 'right_click', 'drag', 'scroll', 'move_cursor', 'type_text', 'press_key', 'hotkey', 'set_value', 'invoke_menu', 'bring_to_front', 'set_window_frame', 'mouse_button_down', 'mouse_button_up', 'mouse_drag']);
-  return INPUT.has(driver[1]) ? exact.replace(/__[a-z_]+$/, '__input') : exact;
+  if (INPUT.has(driver[1])) return exact.replace(/__[a-z_]+$/, '__input');
+  // Acting on a web page in the driver's browser is one kind of its own, so
+  // an approval there teaches the web, not the desktop, and the reverse.
+  const BROWSER = new Set(['browser_prepare', 'browser_navigate', 'browser_click', 'browser_type', 'browser_select', 'browser_pointer', 'browser_dialog']);
+  return BROWSER.has(driver[1]) ? exact.replace(/__[a-z_]+$/, '__browser') : exact;
 }
 
 function sameWriteKind(kind: ApprovedWriteKind, operationId: string, accountId: string | null): boolean {

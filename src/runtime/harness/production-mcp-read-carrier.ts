@@ -451,7 +451,7 @@ function effectOf(tool: McpToolDefinition): {
   // knowledge of that family decides for the ordinary actions she names
   // (looking, acting in an app, the batch runner, launching, a session); the
   // vendor's word stands for everything else in the family (killing an app,
-  // scripts, the clipboard, configuration, the browser tools) and for every
+  // scripts, the clipboard, configuration, uploads, downloads, extensions) and for every
   // other server. The read that checks a learned call against what the
   // owner asked for still guards every learned call.
   const family = computerDriverBehaviorHints(tool.name);

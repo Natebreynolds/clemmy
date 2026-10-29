@@ -820,6 +820,11 @@ test('the computer driver\'s family hints: looking is read-only, acting in an ap
   assert.equal(computerDriverBehaviorHints('cua-driver__kill_app'), null);
   assert.equal(computerDriverBehaviorHints('cua-driver__run_script'), null);
   assert.equal(computerDriverBehaviorHints('cua-driver__clipboard_write'), null);
-  assert.equal(computerDriverBehaviorHints('cua-driver__browser_navigate'), null);
+  for (const name of ['cua-driver__browser_navigate', 'cua-driver__browser_click', 'cua-driver__browser_type', 'cua-driver__browser_prepare']) {
+    assert.deepEqual(computerDriverBehaviorHints(name), { readOnly: false, destructive: false }, `${name}: acting on a web page is ordinary work`);
+  }
+  for (const name of ['cua-driver__browser_set_input_files', 'cua-driver__browser_download', 'cua-driver__install_extension']) {
+    assert.equal(computerDriverBehaviorHints(name), null, `${name}: an upload, a download or an extension keeps the vendor's word`);
+  }
   assert.equal(computerDriverBehaviorHints('other__click'), null);
 });

@@ -771,6 +771,10 @@ test('the computer driver\'s input primitives are one learned write kind per app
   }
   assert.equal(writeKindOperation('cua-driver__launch_app'), 'cua-driver__launch_app');
   assert.equal(writeKindOperation('cua-driver__run_script'), 'cua-driver__run_script');
-  assert.equal(writeKindOperation('cua-driver__browser_navigate'), 'cua-driver__browser_navigate');
+  for (const op of ['cua-driver__browser_navigate', 'cua-driver__browser_click', 'mcp__cua-driver__browser_type']) {
+    assert.equal(writeKindOperation(op), op.replace(/__[a-z_]+$/, '__browser'), `${op}: the web is its own learned kind`);
+  }
+  assert.notEqual(writeKindOperation('cua-driver__browser_click'), writeKindOperation('cua-driver__click'), 'a desktop approval does not teach the web');
+  assert.equal(writeKindOperation('cua-driver__browser_set_input_files'), 'cua-driver__browser_set_input_files');
   assert.equal(writeKindOperation('OUTLOOK_SEND_EMAIL'), 'OUTLOOK_SEND_EMAIL');
 });
