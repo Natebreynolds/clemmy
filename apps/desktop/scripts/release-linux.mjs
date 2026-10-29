@@ -23,11 +23,12 @@ for (const entry of build.extraResources ?? []) {
 // Other platforms' prebuilt inference binaries and the browser build of the
 // inference runtime never run inside a Linux package; the Linux smoke proves
 // embeddings still load without them.
+// Patterns are relative to the entry's own `from` (the node_modules folder).
 const LINUX_NODE_MODULE_EXCLUSIONS = [
-  '!node_modules/onnxruntime-node/bin/napi-v*/darwin/**',
-  '!node_modules/onnxruntime-node/bin/napi-v*/win32/**',
-  '!node_modules/onnxruntime-node/bin/napi-v*/linux/arm64/**',
-  '!node_modules/onnxruntime-web/dist/**',
+  '!onnxruntime-node/bin/napi-v*/darwin/**',
+  '!onnxruntime-node/bin/napi-v*/win32/**',
+  '!onnxruntime-node/bin/napi-v*/linux/arm64/**',
+  '!onnxruntime-web/dist/**',
 ];
 build.extraResources = kept.map((entry) => (typeof entry !== 'string' && entry.to === 'daemon/node_modules'
   ? { ...entry, filter: [...(entry.filter ?? ['**/*']), ...LINUX_NODE_MODULE_EXCLUSIONS] }
