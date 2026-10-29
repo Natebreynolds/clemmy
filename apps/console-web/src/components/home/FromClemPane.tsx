@@ -1,17 +1,27 @@
 import { useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { attentionReportCount, attentionWorkTitle, groupAttentionReports, oneLine, appPlaceHref, fromClemSourceName, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { markNotificationRead, presentInboxQuestion } from '@/lib/inbox';
-import { fromClemDisposition, fromClemReceiptVersion, fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
+import { cardReplyInMotion, fromClemDisposition, fromClemReceiptVersion, fromClemRunHref, getCardReplies, recentPulses, replyFromClem, replyOutcomeText, type CardReplyRecord, type FromClem, type FromClemRow } from '@/lib/from-clem';
 import { presentAttentionItem } from '@/lib/attention-presentation';
 import { cn } from '@/lib/cn';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
 import { AnswerRow } from './NeedsYouPane';
 import { LoadFailedLine, PaneCard, PaneRow, RowSkeleton, SectionHeader } from './HomeSection';
-import { TapOutcomes, type RecentTap } from './TapOutcome';
+import { CardRecord } from './CardRecord';
+
+const HIDDEN_RECORDS_KEY = 'clem.home.hiddenCardRecords';
+
+function readHiddenRecords(): ReadonlySet<string> {
+  try { return new Set(JSON.parse(localStorage.getItem(HIDDEN_RECORDS_KEY) ?? '[]') as string[]); } catch { return new Set(); }
+}
+
+function writeHiddenRecords(runs: ReadonlySet<string>): void {
+  try { localStorage.setItem(HIDDEN_RECORDS_KEY, JSON.stringify([...runs].slice(-50))); } catch { /* hiding is a convenience */ }
+}
 
 interface RowState {
   voiceDigest: string;
@@ -66,10 +76,22 @@ export function FromClemPane({
   const [openKey, setOpenKey] = useState<string | null>(null);
   const [readingKey, setReadingKey] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  // Taps that started work: what came of each shows here, where the owner
-  // tapped, instead of only "Started a conversation."
-  const [taps, setTaps] = useState<RecentTap[]>([]);
-  const dismissTap = (tap: RecentTap) => setTaps((all) => all.filter((each) => each !== tap));
+  // What the owner asked Clem from an item, and what she is doing about it,
+  // kept by the daemon: shown on that item while it is listed, and under
+  // Just now once it is not. Watched closely only while Clem is working.
+  const cardReplies = useQuery({
+    queryKey: ['from-clem-replies'],
+    queryFn: getCardReplies,
+    refetchInterval: (query) => (query.state.data?.replies.some(cardReplyInMotion) ? 3_000 : 20_000),
+  });
+  const [hiddenRuns, setHiddenRuns] = useState<ReadonlySet<string>>(() => readHiddenRecords());
+  const hideRecord = (record: CardReplyRecord) => setHiddenRuns((all) => {
+    const next = new Set(all).add(record.runId);
+    writeHiddenRecords(next);
+    return next;
+  });
+  const records = (cardReplies.data?.replies ?? []).filter((record) => !hiddenRuns.has(record.runId));
+  const recordFor = (row: FromClemRow) => records.find((record) => record.rowKey === row.key);
   const [showAll, setShowAll] = useState<{ waiting: boolean; updates: boolean }>({ waiting: false, updates: false });
   const rows = data?.rows ?? [];
   const latestRows = useRef(rows);
@@ -77,6 +99,16 @@ export function FromClemPane({
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
+  const listedKeys = new Set(rows.map((row) => row.key));
+  const justNow = records.filter((record) => !listedKeys.has(record.rowKey));
+  const justNowList = justNow.length > 0 && (
+    <div className="flex flex-col gap-1.5">
+      <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">Just now</h3>
+      <div className="flex flex-col gap-2">
+        {justNow.map((record) => <CardRecord key={record.runId} record={record} showTitle onDismiss={() => hideRecord(record)} />)}
+      </div>
+    </div>
+  );
   const pulses = recentPulses(data?.pulses ?? []);
   const visiblePulses = pulses.filter(pulseNeedsVisibility);
   const quietPulses = pulses.filter(pulse => !pulseNeedsVisibility(pulse));
@@ -141,11 +173,11 @@ export function FromClemPane({
   };
 
   const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => {
-    const since = new Date().toISOString();
     return act(row, 'answer', () => replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex), (result) => {
       const outcome = result as Awaited<ReturnType<typeof replyFromClem>>;
       if (outcome.outcome === 'started') {
-        setTaps((all) => [{ key: row.key, runId: outcome.runId, title: row.say ?? row.text, reply: text, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+        // The daemon keeps the record; look again now so the item shows it at once.
+        void qc.invalidateQueries({ queryKey: ['from-clem-replies'] });
         const settled = proactiveReplySettled(outcome.outcome, outcome.itemSettled);
         return { settled, sessionId: outcome.sessionId,
           text: settled ? 'Clem is on it — see Just now.' : 'Started a conversation — see Just now.' };
@@ -220,6 +252,7 @@ export function FromClemPane({
         <p className={cn('text-body text-fg', !open && !reading && 'line-clamp-3')}>{row.say || row.text}</p>
         {(open || reading) && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
         {state.notice && notice(state)}
+        {recordFor(row) && <CardRecord record={recordFor(row)!} />}
         {!state.notice?.settled && (
           <>
             <div className="flex flex-wrap items-center gap-2">
@@ -282,6 +315,7 @@ export function FromClemPane({
           <Link to={row.handoff.sessionId ? `/chat/${encodeURIComponent(unifiedChatSessionId(row.handoff.sessionId))}` : `/chat/${encodeURIComponent(unifiedChatSessionId('clem'))}`} className="font-semibold text-primary hover:underline">{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</Link>
         </div>}
         {state.notice && notice(state)}
+        {recordFor(row) && <CardRecord record={recordFor(row)!} />}
         {!row.handoff && !state.notice?.settled && (
           <div className="flex flex-wrap items-center gap-2">
             {runHref && (
@@ -325,6 +359,7 @@ export function FromClemPane({
         <p className="text-body text-fg">{row.say || row.text}</p>
         {!row.say && row.detail && <p className="text-small text-muted">{row.detail}</p>}
         {state.notice && notice(state)}
+        {recordFor(row) && <CardRecord record={recordFor(row)!} />}
         {!state.notice?.settled && (
           <div className="flex flex-wrap items-center gap-2">
             {href && row.setup && (
@@ -391,7 +426,7 @@ export function FromClemPane({
     if (!data) return null;
     return section === 'waiting'
       ? <>
-          <TapOutcomes taps={taps} onDismiss={dismissTap} />
+          {justNowList}
           {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
           {offers.length > 0 && <details className="rounded-xl border border-border bg-surface px-4 text-small text-muted">
             <summary className="cursor-pointer py-3 font-medium">Ways Clem can help · {offers.length}</summary>
@@ -419,7 +454,7 @@ export function FromClemPane({
         Couldn’t refresh what Clem noticed. Showing the last saved reading.{' '}
         <button type="button" onClick={onRetry} className="rounded-sm font-semibold underline underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Try again</button>
       </p>}
-      <TapOutcomes taps={taps} onDismiss={dismissTap} />
+      {justNowList}
       {error && !data ? (
         <PaneCard><LoadFailedLine what="what Clem noticed" onRetry={onRetry} /></PaneCard>
       ) : loading && !data ? (

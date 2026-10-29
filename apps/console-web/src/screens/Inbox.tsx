@@ -16,7 +16,7 @@ import { ProjectLabelTag } from '@/components/projects/ProjectLabelTag';
 import { useProjectLabels, type SessionProjectLabel } from '@/lib/project-labels';
 import { applyTidy, describeTidy } from '@/lib/tidy';
 import { replyFromClem, replyOutcomeNotice, useFromClem, type FromClemRow } from '@/lib/from-clem';
-import { TapOutcomes, type RecentTap } from '@/components/home/TapOutcome';
+import { RecentCardRecords } from '@/components/home/CardRecord';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
@@ -107,17 +107,15 @@ export function Inbox() {
     }
     return byId;
   }, [fromClem.data]);
-  const [taps, setTaps] = useState<RecentTap[]>([]);
   const [clemBusy, setClemBusy] = useState<string | null>(null);
   const onClemChoice = async (row: FromClemRow, choice: string, index: number) => {
     if (clemBusy) return;
     setClemBusy(row.key);
     setDecisionNotice(null);
-    const since = new Date().toISOString();
     try {
       const outcome = await replyFromClem(row.key, choice, row.voiceDigest, undefined, index);
       if (outcome.outcome === 'started') {
-        setTaps((all) => [{ key: row.key, runId: outcome.runId, title: row.say ?? row.text, reply: choice, since }, ...all.filter((tap) => tap.key !== row.key)].slice(0, 5));
+        void qc.invalidateQueries({ queryKey: ['from-clem-replies'] });
       } else {
         setDecisionNotice(replyOutcomeNotice(outcome, row.heartbeatTitle));
       }
@@ -727,7 +725,7 @@ export function Inbox() {
               />
             )}
 
-            {tab === 'needs' && <TapOutcomes taps={taps} onDismiss={(tap) => setTaps((all) => all.filter((each) => each !== tap))} />}
+            {tab === 'needs' && <RecentCardRecords />}
 
             {!loading && partiallyUnavailable && (
               <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-border bg-subtle px-3.5 py-2 text-body text-fg">

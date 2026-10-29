@@ -131,18 +131,38 @@ export const useFromClem = (enabled = true) => usePoll(['home-from-clem'], getFr
 
 /** What came of a "do it" given on one of Clem's items. */
 export type FromClemTurnOutcome =
-  | { state: 'working' }
+  | { state: 'working'; steps?: FromClemTurnStep[] }
   | { state: 'not_found' }
-  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string };
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer' };
+
+/** One thing Clem did for a reply, by the operation it ran. */
+export interface FromClemTurnStep { tool: string; effect?: string; done: boolean }
 
 export const getFromClemOutcome = (runId: string, since: string) =>
   apiGet<FromClemTurnOutcome>(`/api/console/home/from-clem/outcome?runId=${encodeURIComponent(runId)}&since=${encodeURIComponent(since)}`);
+
+/** What the owner asked Clem from one of her items, with what she is doing about it. */
+export interface CardReplyRecord {
+  rowKey: string;
+  title: string;
+  reply: string;
+  runId: string;
+  since: string;
+  outcome: FromClemTurnOutcome;
+}
+
+export const getCardReplies = () => apiGet<{ replies: CardReplyRecord[] }>('/api/console/home/from-clem/replies');
+
+/** Whether a record is still moving, so the item keeps watching it. */
+export function cardReplyInMotion(record: Pick<CardReplyRecord, 'outcome'>): boolean {
+  return record.outcome.state === 'working';
+}
 
 /** How an outcome reads beside the item it came from. */
 export function tapOutcomeHeadline(outcome: FromClemTurnOutcome | undefined): { tone: 'info' | 'success' | 'warning' | 'error'; text: string } {
   switch (outcome?.state) {
     case 'done': return { tone: 'success', text: 'Done' };
-    case 'needs_you': return { tone: 'warning', text: 'Clem needs one more thing' };
+    case 'needs_you': return { tone: 'warning', text: outcome.asks === 'approval' ? 'Clem needs your OK' : 'Clem needs one more thing' };
     case 'stopped': return { tone: 'error', text: 'This didn’t finish' };
     case 'not_found': return { tone: 'error', text: 'Couldn’t confirm this turn — check the conversation before trying again' };
     default: return { tone: 'info', text: 'Clem is working on it…' };

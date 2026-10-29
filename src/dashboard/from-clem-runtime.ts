@@ -23,6 +23,7 @@ import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type Turn
 import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
 import { mintOwnerCardReplyToken, mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
+import { recordCardReply } from './card-replies.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
@@ -419,7 +420,7 @@ export interface FromClemReplyDeps {
   /** Hide the row until the next morning, or for good; the item itself is
    *  untouched. */
   later: (key: string, forever?: boolean) => void;
-  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }) => FromClemTurnRef;
+  startTurn: (input: { title: string; message: string; displayMessage: string; rowKey?: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }) => FromClemTurnRef;
   /** The owner's answer to "switch back?" after a brain outage. */
   resolveBrainOutage?: (outageId: string, choice: 'switch_back' | 'stay') => Promise<boolean>;
 }
@@ -544,6 +545,7 @@ async function replyOnce(
         && Array.isArray(row.choices) && row.choices[choiceIndex] === reply;
       const started = deps.startTurn({
         title: row.text.slice(0, 120),
+        rowKey: row.key,
         message: [
           `You told me: ${said}`,
           `What it was about: ${factsOf(row)}`,
@@ -590,9 +592,35 @@ async function replyOnce(
 /** Read only the accepted source bound to the host-generated dispatch ID.
  * The display words, item key and clock never select a different turn. */
 export type FromClemTurnOutcome =
-  | { state: 'working' }
+  | { state: 'working'; steps?: FromClemTurnStep[] }
   | { state: 'not_found' }
-  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string };
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer' };
+
+/** One thing Clem did for the reply, named by the operation it ran (the
+ *  surface words it in plain language). Never its arguments. */
+export interface FromClemTurnStep {
+  tool: string;
+  effect?: string;
+  done: boolean;
+}
+
+const STEPS_SHOWN = 8;
+
+function turnSteps(sourceSeq: number): FromClemTurnStep[] {
+  const steps = new Map<string, FromClemTurnStep>();
+  try {
+    for (const event of listEvents(CLEM_THREAD_ID, { types: ['tool_called', 'tool_returned'], sinceSeq: sourceSeq })) {
+      if (event.data.sourceUserSeq !== sourceSeq) continue;
+      const callId = typeof event.data.callId === 'string' ? event.data.callId : `seq:${event.seq}`;
+      if (event.type === 'tool_returned') { const step = steps.get(callId); if (step) step.done = true; continue; }
+      const tool = typeof event.data.effectiveTool === 'string' && event.data.effectiveTool ? event.data.effectiveTool
+        : typeof event.data.tool === 'string' ? event.data.tool : '';
+      if (!tool) continue;
+      steps.set(callId, { tool, ...(typeof event.data.effect === 'string' ? { effect: event.data.effect } : {}), done: false });
+    }
+  } catch { /* no steps is a quieter record, not a failed one */ }
+  return [...steps.values()].slice(-STEPS_SHOWN);
+}
 
 const OUTCOME_TEXT_MAX = 600;
 
@@ -603,25 +631,35 @@ export function fromClemTurnOutcome(input: { runId: string; since: string }, now
   const source = attempt ? getRunAttemptSourceUserEvent(attempt) : null;
   // The asynchronous dispatch may not yet have accepted its input. Missing
   // evidence is unconfirmed, never proof that the owner can safely repeat it.
-  if (!source) return nowMs - sinceMs > 120_000 ? { state: 'not_found' } : { state: 'working' };
+  if (!source) return nowMs - sinceMs > 120_000 ? { state: 'not_found' } : { state: 'working', steps: [] };
   if (source.role !== 'user' || source.data.synthetic === true || source.data.runId !== input.runId) return { state: 'not_found' };
+  const steps = turnSteps(source.seq);
   const terminal = exactTerminalForAcceptedSource(source);
-  if (!terminal) return { state: 'working' };
+  if (!terminal) return { state: 'working', steps };
   const { status, text } = terminal.presentation;
+  const needs = (terminal.presentation as { needs?: { kind?: string } }).needs;
   return {
     state: status === 'done' ? 'done' : status === 'needs_input' ? 'needs_you' : 'stopped',
     text: text.length > OUTCOME_TEXT_MAX ? `${text.slice(0, OUTCOME_TEXT_MAX - 1).trimEnd()}…` : text,
     sessionId: CLEM_THREAD_ID,
+    steps,
+    ...(status === 'needs_input' ? { asks: needs?.kind === 'approval' ? 'approval' as const : 'answer' as const } : {}),
   };
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */
-export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): FromClemTurnRef {
+export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; rowKey?: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): FromClemTurnRef {
   if (!respondImpl) throw new Error('no turn runner is bound');
   thread.ensure();
   const sessionId = CLEM_THREAD_ID;
   const respond = respondImpl;
   const runId = `from-clem:${randomUUID()}`;
+  // The item keeps a record of what was asked of Clem, so it can show what
+  // she is doing about it.
+  if (input.rowKey) {
+    try { recordCardReply({ rowKey: input.rowKey, title: input.title, reply: input.displayMessage, runId, since: new Date().toISOString() }); }
+    catch (error) { logger.warn({ err: error instanceof Error ? error.message : String(error) }, 'from clem: the reply record was not saved'); }
+  }
   void respond({
     sessionId, runId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage,
     ...(input.ownerChoiceToken ? { ownerChoiceToken: input.ownerChoiceToken } : {}),

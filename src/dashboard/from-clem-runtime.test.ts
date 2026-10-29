@@ -809,15 +809,65 @@ test('tap outcomes bind the exact dispatched run, never identical words or a new
   const second = accept('from-clem:fixture-second', 'notif:second');
   finish(second, 'Second controlled result.');
   assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-first', since }),
-    { state: 'done', text: 'First controlled result.', sessionId: CLEM_THREAD_ID });
+    { state: 'done', text: 'First controlled result.', sessionId: CLEM_THREAD_ID, steps: [] });
   const earlier = accept('from-clem:fixture-choice-1', 'notif:repeat', 'Accept');
   finish(earlier, 'Earlier controlled choice.');
   const later = accept('from-clem:fixture-choice-2', 'notif:repeat', 'Decline');
   finish(later, 'Later controlled choice.');
   assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-choice-1', since }),
-    { state: 'done', text: 'Earlier controlled choice.', sessionId: CLEM_THREAD_ID });
-  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-never-accepted', since }), { state: 'working' });
+    { state: 'done', text: 'Earlier controlled choice.', sessionId: CLEM_THREAD_ID, steps: [] });
+  assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-never-accepted', since }), { state: 'working', steps: [] });
   assert.deepEqual(fromClemTurnOutcome({ runId: 'from-clem:fixture-never-accepted', since: new Date(Date.now() - 180_000).toISOString() }), { state: 'not_found' });
+});
+
+test('a reply\'s record shows what Clem does as she does it, then her answer, or what she needs from the owner', async () => {
+  const { fromClemTurnOutcome, CLEM_THREAD_ID } = await import('./from-clem-runtime.js');
+  const eventlog = await import('../runtime/harness/eventlog.js');
+  const { commitTurnOutcome } = await import('../runtime/harness/delivery-committer.js');
+  const { turnOutcomeId } = await import('../runtime/harness/turn-outcome.js');
+  if (!eventlog.getSession(CLEM_THREAD_ID)) eventlog.createSession({ id: CLEM_THREAD_ID, kind: 'chat', channel: 'desktop' });
+  const since = new Date(Date.now() - 1_000).toISOString();
+  const runId = 'from-clem:fixture-steps';
+  const attempt = eventlog.beginRunAttempt(CLEM_THREAD_ID, { runId });
+  const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Move it to 1 PM', displayText: 'Move it to 1 PM', runId } });
+  const call = (callId: string, effectiveTool: string, effect: string) => eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { sourceUserSeq: source.seq, tool: 'work_call', effectiveTool, effect, callId, arguments: '{"private":"never shown"}' } });
+  call('c1', 'FIXTURE_CALENDAR_FIND_EVENT', 'read');
+  eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'work_call', callId: 'c1' } });
+  call('c2', 'FIXTURE_CALENDAR_UPDATE_EVENT', 'external_write');
+  const working = fromClemTurnOutcome({ runId, since });
+  assert.deepEqual(working, { state: 'working', steps: [
+    { tool: 'FIXTURE_CALENDAR_FIND_EVENT', effect: 'read', done: true },
+    { tool: 'FIXTURE_CALENDAR_UPDATE_EVENT', effect: 'external_write', done: false },
+  ] });
+  assert.doesNotMatch(JSON.stringify(working), /never shown/, 'a step never carries its arguments');
+  const identity = { sessionId: CLEM_THREAD_ID, turn: source.turn, sourceUserSeq: source.seq };
+  commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'needs_input', resumable: true,
+    needs: { kind: 'approval' }, presentation: { kind: 'approval', text: 'Ready to move the meeting to 1 PM and tell the team. OK?', approvalId: 'apr-fx01' } });
+  const asks = fromClemTurnOutcome({ runId, since });
+  assert.equal(asks.state, 'needs_you');
+  assert.equal((asks as { asks?: string }).asks, 'approval');
+  assert.equal((asks as { steps?: unknown[] }).steps?.length, 2);
+});
+
+test('a started reply is kept for its item: newest first, one per item, and only recent ones', async () => {
+  const { bindFromClemRespond, startFromClemTurn } = await import('./from-clem-runtime.js');
+  const { listCardReplies, recordCardReply } = await import('./card-replies.js');
+  bindFromClemRespond(async () => {});
+  try {
+    const first = startFromClemTurn({ title: 'Two meetings overlap Friday', message: 'context', displayMessage: 'Move the second to 1 PM', rowKey: 'notif:fixture-overlap' }, { ensure() {} });
+    const again = startFromClemTurn({ title: 'Two meetings overlap Friday', message: 'context', displayMessage: 'Actually make it 2 PM', rowKey: 'notif:fixture-overlap' }, { ensure() {} });
+    startFromClemTurn({ title: 'No item', message: 'context', displayMessage: 'Do it' }, { ensure() {} });
+    const listed = listCardReplies().filter((entry) => entry.rowKey === 'notif:fixture-overlap');
+    assert.equal(listed.length, 1, 'one record per item: the latest reply');
+    assert.equal(listed[0]!.runId, again.runId);
+    assert.equal(listed[0]!.reply, 'Actually make it 2 PM');
+    assert.ok(first.runId !== again.runId);
+    recordCardReply({ rowKey: 'notif:fixture-old', title: 'Old', reply: 'x', runId: 'from-clem:fixture-old', since: new Date(Date.now() - 3 * 24 * 3600_000).toISOString() });
+    assert.equal(listCardReplies().some((entry) => entry.rowKey === 'notif:fixture-old'), false, 'an old record is not shown');
+  } finally {
+    bindFromClemRespond(null as never);
+  }
 });
 
 test('a From Clem start returns the same host run identity passed into dispatch', async () => {
