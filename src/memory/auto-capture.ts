@@ -737,7 +737,7 @@ function memoryProcedureOwnsTail(clauses: ReturnType<typeof memoryClauses>, end:
 
 /** Only remove a contiguous task-only suffix, never splice neighboring claims
  * together. Bare "Confirm both" and substantive procedures remain untouched. */
-function boundedMemoryTaskTail(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): number | null {
+function boundedMemoryTaskTail(text: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): number | null {
   const clauses = memoryClauses(text);
   const acknowledgement = (clause: typeof clauses[number]) => clause.text === clause.unquoted
     && MEMORY_ACKNOWLEDGEMENT_CLAUSE_RE.test(clause.text);
@@ -750,7 +750,7 @@ function boundedMemoryTaskTail(text: string, edition: MemoryCaptureEdition = 'sa
     const ack = acknowledgement(first);
     const receipt = first.text === first.unquoted && MEMORY_SAVE_RECEIPT_RE.test(first.text);
     const preservation = first.text === first.unquoted && MEMORY_PRESERVATION_CLAUSE_RE.test(first.text);
-    if (edition === 'save_operation_v2' && (ack || receipt || preservation)) {
+    if ((edition === 'save_operation_v2' || edition === 'tool_owned_v3') && (ack || receipt || preservation)) {
       if (memoryProcedureOwnsTail(clauses, i)) return null;
       const tail = clauses.slice(i);
       let hasReceipt = false;
@@ -776,7 +776,7 @@ function boundedMemoryTaskTail(text: string, edition: MemoryCaptureEdition = 'sa
   return null;
 }
 
-function isolateMemoryFromSecondaryWork(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): MemoryClauseIsolation {
+function isolateMemoryFromSecondaryWork(text: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): MemoryClauseIsolation {
   const mask = memoryLiteralMask(text);
   const matches = [
     SECONDARY_MEMORY_SENTENCE_RE,
@@ -801,7 +801,7 @@ function isolateMemoryFromSecondaryWork(text: string, edition: MemoryCaptureEdit
   };
 }
 
-function parseRememberInstruction(text: string, edition: MemoryCaptureEdition = 'save_operation_v2'): MemoryClauseIsolation | null {
+function parseRememberInstruction(text: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): MemoryClauseIsolation | null {
   const commandStart = explicitRememberCommandStart(text);
   if (commandStart === null) return null;
   const command = text.slice(commandStart);
@@ -886,7 +886,7 @@ export interface ExplicitMemoryInstructionParse {
  * candidate; callers must keep the original message for transcript, provider,
  * and episode evidence. This module-level seam lets every brain share the same
  * memory/action boundary without importing runtime code into memory. */
-export function parseExplicitMemoryInstruction(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): ExplicitMemoryInstructionParse | null {
+export function parseExplicitMemoryInstruction(message: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): ExplicitMemoryInstructionParse | null {
   const text = clean(message, Infinity);
   if (!text) return null;
   if (isExplicitDurableCorrectionRequest(text)) {
@@ -918,7 +918,7 @@ export function parseExplicitMemoryInstruction(message: string, edition: MemoryC
  *  retired), never the host's storage evidence alone. */
 export const EXPLICIT_CORRECTION_REASON = 'explicit durable correction';
 
-export function explicitMemoryInstructionFor(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): ExplicitMemoryInstructionParse | null {
+export function explicitMemoryInstructionFor(message: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): ExplicitMemoryInstructionParse | null {
   const text = clean(message, Infinity);
   if (!text) return null;
   const parsed = parseExplicitMemoryInstruction(text, edition);
@@ -928,7 +928,7 @@ export function explicitMemoryInstructionFor(message: string, edition: MemoryCap
 /** Automatic intake cannot turn a referential storage directive into a claim.
  * Reuse the ordinary clause boundary as well as the unstripped command so a
  * separate task after it does not make the reference self-contained. */
-export function unresolvedAutomaticMemoryReference(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): boolean {
+export function unresolvedAutomaticMemoryReference(message: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): boolean {
   const text = clean(message, Infinity);
   const instruction = parseExplicitMemoryInstruction(text, edition);
   const commandStart = explicitRememberCommandStart(text);
@@ -939,6 +939,24 @@ export function unresolvedAutomaticMemoryReference(message: string, edition: Mem
     && (hasUnresolvedExplicitMemoryReference(text)
       || hasUnresolvedExplicitMemoryReference(isolatedCommand)
       || isUnresolvedMemoryReferencePayload(instruction.memoryContent));
+}
+
+// A plural store-command container is not itself a complete remembered claim.
+// Ordinary memory tools already interpret its members and requested separation.
+// Inspect the unstripped command: "remember that/this/exactly" and quoted
+// literals remain actual claims, even when their data uses these same words.
+const MEMORY_COMMAND_CONTAINER_RE = new RegExp(
+  '^(?:please\\s+)?remember\\s+'
+  + '(?:(?:all\\s+)?(?:(?:these|those)\\s+)?(?:two|three|four|five|six|seven|eight|nine|ten|several|multiple|[1-9]\\d+|[2-9])(?:\\s+of\\s+(?:these|those))?'
+  + '|(?:the\\s+)?following|these|those|both|all)\\s+'
+  + '(?:(?:separate|distinct|standing|durable|new|project|user|synthetic)\\s+){0,4}'
+  + '(?:facts|preferences|memories|conventions|rules|details|records)\\b', 'i',
+);
+function memoryCommandContainerRequiresTools(text: string, edition: MemoryCaptureEdition): boolean {
+  if (edition !== 'tool_owned_v3') return false;
+  const start = explicitRememberCommandStart(text);
+  return start !== null && !memoryLiteralMask(text)[start]
+    && MEMORY_COMMAND_CONTAINER_RE.test(text.slice(start));
 }
 
 function explicitRememberKind(content: string): ConsolidatedFactKind {
@@ -1050,7 +1068,7 @@ export function extractProfilePatchFromMessage(message: string): Record<string, 
  * explicitly declined. That is why this predicate exists rather than a second
  * copy of the conditions.
  */
-export function durableCaptureRefused(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): boolean {
+export function durableCaptureRefused(message: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): boolean {
   const text = clean(message, Infinity);
   if (!text) return false;
   if (autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(text)) return true;
@@ -1070,7 +1088,7 @@ export function durableCaptureRefused(message: string, edition: MemoryCaptureEdi
   return isOneOffValidationOrToolProbe(text) || EXPLICIT_EPHEMERAL_SCOPE_RE.test(text);
 }
 
-function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
+function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'tool_owned_v3'): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   if (!text || LOW_SIGNAL.test(text)) return [];
   // Don't fold a pasted workflow definition into facts (it pollutes the store
@@ -1087,6 +1105,12 @@ function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 
   // authoritative.
   const explicitMemoryInstruction = explicitMemoryInstructionFor(text, edition);
   const explicitAuthority = explicitMemoryInstruction ? explicitMemoryAuthority(text, explicitMemoryInstruction) : null;
+
+  // Defer this command block before task restrictions can become ordinary
+  // facts. Preserve already-recognized standing safety/routing authority;
+  // plural framing cannot disable an existing enforced constraint or pin.
+  if (explicitMemoryInstruction?.kind === 'remember' && memoryCommandContainerRequiresTools(text, edition)
+    && !explicitAuthority?.constraint && !explicitAuthority?.prohibition) return [];
 
   const candidates: AutoMemoryCandidate[] = [];
   const prohibition = explicitAuthority?.prohibition ?? isSafetyProhibition(text);
@@ -1270,7 +1294,7 @@ function extractNormalizedAutoMemoryCandidates(message: string, maxCandidates = 
 
 /** Retain the original extraction interval before wrappers, normalization or
  * candidate previews can discard it. Repeated literal text is never searched. */
-export function extractAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
+export function extractAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'tool_owned_v3'): AutoMemoryCandidate[] {
   const text = clean(message, Infinity);
   // Split only separate, unquoted, command-shaped memory clauses. Each match
   // supplies its original interval; identical claims in different commands
@@ -1369,11 +1393,13 @@ const MAX_REVIEWABLE_OWNER_CHARS = 2000;
  * model should look at it. If the reviewer says `task`, the drain rejects it and
  * the outcome is identical to the drop that happens today.
  */
-function unjudgedOwnerStatement(message: string, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
+function unjudgedOwnerStatement(message: string, edition: MemoryCaptureEdition = 'tool_owned_v3'): AutoMemoryCandidate[] {
   const text = message.trim();
   // An explicit decline outranks the reviewer. Re-judging is for phrasing the
   // patterns did not recognize, never for something the owner refused.
   if (durableCaptureRefused(text, edition)) return [];
+  // Deferral is not unfamiliar phrasing for the reviewer to auto-promote.
+  if (memoryCommandContainerRequiresTools(text, edition)) return [];
   if (text.length < MIN_REVIEWABLE_OWNER_CHARS) return [];
   if (text.length > MAX_REVIEWABLE_OWNER_CHARS) return [];
   return [{ kind: 'user', content: text, reason: UNJUDGED_OWNER_STATEMENT_REASON }];
@@ -1381,7 +1407,7 @@ function unjudgedOwnerStatement(message: string, edition: MemoryCaptureEdition =
 
 /** Deterministic producer selection, also replayed by exact-source receipt
  * verification. It carries no completed-save authority. */
-export function selectAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'save_operation_v2'): AutoMemoryCandidate[] {
+export function selectAutoMemoryCandidates(message: string, maxCandidates = 3, edition: MemoryCaptureEdition = 'tool_owned_v3'): AutoMemoryCandidate[] {
   if ((autoCaptureHarnessSkipEnabled() && isHarnessInjectedInput(message)) || isSelfContainedComputation(message)) return [];
   const matched = extractAutoMemoryCandidates(message, maxCandidates, edition);
   if (matched.length > 0) {
@@ -1417,7 +1443,7 @@ export function captureInteractionSignals(input: {
   })) {
     return emptyAutoCaptureResult();
   }
-  let captureEdition: MemoryCaptureEdition = 'save_operation_v2';
+  let captureEdition: MemoryCaptureEdition = 'tool_owned_v3';
   if (input.sourceProvenance.authority === 'accepted_user_input') {
     // A steer inherits the exact active execution, never the most recent
     // source in this reusable session. The retained origin rechecks it again

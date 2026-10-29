@@ -300,23 +300,23 @@ function retainedMemoryCaptureSibling<T extends SourceFixtureRef>(template: T, e
   return { input, stored: { identity_json: json, identity_digest: digest } };
 }
 
-test('memory capture edition: fresh source chooses save operation v2 and reopens the exact stored identity', () => {
+test('memory capture edition: fresh source chooses tool owned v3 and reopens the exact stored identity', () => {
   const task = fixture();
   const forgedCallerFields = { ...task, memoryCaptureEdition: 'legacy_v1', digest: 'f'.repeat(64) };
   const context = captureFresh(forgedCallerFields);
-  assert.equal(binding.sourceMemoryCaptureEdition(context), 'save_operation_v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(context), 'tool_owned_v3');
   const stored = storedSourceIdentity(task);
   assert.equal(JSON.parse(stored.identity_json).version, 1, 'the existing identity protocol is retained');
-  assert.equal(JSON.parse(stored.identity_json).memoryCaptureEdition, 'save_operation_v2');
+  assert.equal(JSON.parse(stored.identity_json).memoryCaptureEdition, 'tool_owned_v3');
   assert.equal(stored.identity_digest, context.digest);
   assert.equal(createHash('sha256').update(stored.identity_json).digest('hex'), context.digest);
   log.closeEventLog();
   const reopened = contexts.readSourceSessionContext(task, context.digest)!;
-  assert.equal(binding.sourceMemoryCaptureEdition(reopened), 'save_operation_v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(reopened), 'tool_owned_v3');
   assert.deepEqual(storedSourceIdentity(task), stored, 'recovery must not rewrite the retained edition or bytes');
 });
 
-test('memory capture edition: missing retained field stays legacy after restart while a new source gets v2', () => {
+test('memory capture edition: missing retained field stays legacy after restart while a new source gets v3', () => {
   const template = fixture();
   captureFresh(template);
   const { input: task, stored: legacyBytes } = retainedMemoryCaptureSibling(template, undefined, true);
@@ -329,7 +329,7 @@ test('memory capture edition: missing retained field stays legacy after restart 
   const next = log.appendEvent({ sessionId: task.sessionId, turn: 2, role: 'user', type: 'user_input_received',
     data: { text: 'Remember a separate controlled fact for this new request.' } });
   const fresh = captureFresh({ sessionId: task.sessionId, sourceUserSeq: next.seq });
-  assert.equal(binding.sourceMemoryCaptureEdition(fresh), 'save_operation_v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(fresh), 'tool_owned_v3');
   assert.equal(binding.sourceMemoryCaptureEdition(contexts.readSourceSessionContext(task, legacyBytes.identity_digest)!), 'legacy_v1');
   assert.deepEqual(storedSourceIdentity(task), legacyBytes, 'fresh acceptance must not upgrade the earlier source');
 });
@@ -355,15 +355,15 @@ for (const edition of ['future_v99', null, '', 7] as const) {
   });
 }
 
-test('memory capture edition: plain fields and cloned contexts cannot claim checked v2 provenance', () => {
+test('memory capture edition: plain fields and cloned contexts cannot claim checked v3 provenance', () => {
   const context = captureFresh(fixture());
-  assert.equal(binding.sourceMemoryCaptureEdition(context), 'save_operation_v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(context), 'tool_owned_v3');
   assert.throws(() => binding.sourceMemoryCaptureEdition({ ...context }), /not validated/i);
   assert.throws(() => binding.sourceMemoryCaptureEdition({ ...context, memoryCaptureEdition: 'legacy_v1' }), /not validated/i);
   const { memoryCaptureEdition: _edition, ...legacyUnbound } = context;
-  assert.equal(binding.sourceMemoryCaptureEdition(legacyUnbound), 'legacy_v1', 'an unbound older context cannot opt into v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(legacyUnbound), 'legacy_v1', 'an unbound older context cannot opt into v3');
   assert.throws(() => Object.defineProperty(context, 'memoryCaptureEdition', { value: 'legacy_v1' }), TypeError);
-  assert.equal(binding.sourceMemoryCaptureEdition(context), 'save_operation_v2');
+  assert.equal(binding.sourceMemoryCaptureEdition(context), 'tool_owned_v3');
 });
 
 for (const field of ['sessionId', 'sourceUserSeq', 'digest'] as const) {
@@ -373,15 +373,15 @@ for (const field of ['sessionId', 'sourceUserSeq', 'digest'] as const) {
     Object.assign(context, { [field]: field === 'sourceUserSeq' ? context.sourceUserSeq + 1 : String(original) + '-changed' });
     try { assert.throws(() => binding.sourceMemoryCaptureEdition(context), /changed its accepted source/i); }
     finally { Object.assign(context, { [field]: original }); }
-    assert.equal(binding.sourceMemoryCaptureEdition(context), 'save_operation_v2');
+    assert.equal(binding.sourceMemoryCaptureEdition(context), 'tool_owned_v3');
   });
 }
 
-for (const edition of ['legacy_v1', 'save_operation_v2'] as const) {
+for (const edition of ['legacy_v1', 'save_operation_v2', 'tool_owned_v3'] as const) {
   test(`memory capture edition: helper inherits exact ${edition} parent across restart and rejects edition drift`, () => {
     let parent = fixture();
     captureFresh(parent);
-    if (edition === 'legacy_v1') parent = retainedMemoryCaptureSibling(parent, undefined, true).input;
+    if (edition !== 'tool_owned_v3') parent = retainedMemoryCaptureSibling(parent, edition, edition === 'legacy_v1').input;
     const parentContext = contexts.readSourceSessionContext(parent)!;
     assert.equal(binding.sourceMemoryCaptureEdition(parentContext), edition);
     const child = log.createSession({ id: `source-memory-edition-worker-${parent.id}`, kind: 'agent', metadata: {

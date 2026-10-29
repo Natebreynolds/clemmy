@@ -1,9 +1,11 @@
 /** Memory-operation instructions stay in the source episode, outside the durable claim. */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import type { MemoryCaptureEdition } from '../runtime/harness/source-session-context-scope.js';
 
 const fixtureHome = mkdtempSync(path.join(os.tmpdir(), 'clem-memory-operation-tail-'));
 Object.assign(process.env, { CLEMENTINE_HOME: fixtureHome, CLEMMY_TEST_ISOLATED_HOME: '1',
@@ -28,8 +30,8 @@ const q11Tail = 'Preserve every existing memory. Confirm what you actually saved
   + 'Do not change settings, run workflows, write files, contact external services, edit another project, or reset or clean up memory. '
   + 'This is a normal controlled framework memory-retention check.';
 const naturalClaim = 'the Orchard report cutoff is Friday and the review owner is Morgan.';
-const examples = [
-  { name: 'retained q11 source', leader: 'Remember ', claim: q11Claim, tail: q11Tail },
+const examples: Array<{ name: string; leader: string; claim: string; tail: string; edition?: MemoryCaptureEdition }> = [
+  { name: 'retained q11 source under v2', leader: 'Remember ', claim: q11Claim, tail: q11Tail, edition: 'save_operation_v2' },
   { name: 'ordinary save confirmation and preservation', leader: 'Remember that ', claim: naturalClaim,
     tail: 'Preserve existing memories. Please confirm what you have saved and tell me if anything remains unverified. Do not modify settings, run workflows, or contact external services. This is a memory check.' },
   { name: 'ordinary save outcome disclosure', leader: 'Remember for future reference: ', claim: naturalClaim,
@@ -38,10 +40,10 @@ const examples = [
 
 for (const example of examples) test(`memory-operation suffix: ${example.name} preserves every fact without banking the task`, () => {
   const message = `${example.leader}${example.claim} ${example.tail}`;
-  const parsed = capture.parseExplicitMemoryInstruction(message);
+  const parsed = capture.parseExplicitMemoryInstruction(message, example.edition);
   assert.equal(parsed?.memoryContent, example.claim);
   assert.equal(parsed?.hasSecondaryWork, true);
-  const selected = capture.selectAutoMemoryCandidates(message);
+  const selected = capture.selectAutoMemoryCandidates(message, 3, example.edition);
   assert.equal(selected.length, 1);
   assert.equal(selected[0]!.content, example.claim);
   assert.equal(selected[0]!.reason, 'explicit remember request');
@@ -107,10 +109,21 @@ for (const [name, claim] of [
   const created = projects.createProject({ name: `Memory operation tail fixture ${name}`, context: 'Controlled disposable project.' });
   assert.ok(created.ok); if (!created.ok) throw new Error('fixture project');
   assert.ok(setSessionProject(sessionId, created.project.id, { by: 'owner' }).ok);
+  // Insert a new explicit v2 source identity for this historical producer
+  // regression; never rewrite a source captured under the current edition.
+  const template = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Establish the controlled historical operation-tail context.' } });
+  assert.ok(contexts.captureFreshSourceSessionContext({ sessionId, sourceUserSeq: template.seq }));
+  const templateIdentity = events.openEventLog().prepare('SELECT identity_json FROM source_session_contexts_v1 WHERE session_id=? AND source_user_seq=?')
+    .get(sessionId, template.seq) as { identity_json: string };
   const message = `Remember ${claim} ${q11Tail}`;
-  const accepted = events.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received', data: { text: message } });
-  const context = contexts.captureFreshSourceSessionContext({ sessionId, sourceUserSeq: accepted.seq }); assert.ok(context);
-  const selected = capture.selectAutoMemoryCandidates(message);
+  const accepted = events.appendEvent({ sessionId, turn: 2, role: 'user', type: 'user_input_received', data: { text: message } });
+  const identityJson = JSON.stringify({ ...JSON.parse(templateIdentity.identity_json), sourceUserSeq: accepted.seq, memoryCaptureEdition: 'save_operation_v2' });
+  const identityDigest = createHash('sha256').update(identityJson).digest('hex');
+  events.openEventLog().prepare('INSERT INTO source_session_contexts_v1 (session_id,source_user_seq,identity_json,identity_digest) VALUES (?,?,?,?)')
+    .run(sessionId, accepted.seq, identityJson, identityDigest);
+  const context = contexts.readSourceSessionContext({ sessionId, sourceUserSeq: accepted.seq }, identityDigest); assert.ok(context);
+  const selected = capture.selectAutoMemoryCandidates(message, 3, 'save_operation_v2');
   const input = { message, sessionId, sourceEventId: `user-source:${accepted.seq}`,
     sourceProvenance: capture.autoCaptureProvenanceFromAcceptedEvent(accepted) };
   const origins = capture.automaticMemoryOriginsForCapture(input, selected);

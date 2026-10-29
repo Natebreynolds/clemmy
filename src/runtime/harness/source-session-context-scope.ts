@@ -4,9 +4,9 @@ import type { SessionMount } from './session-composition.js';
 import type { MemoryScope } from '../../memory/memory-scope.js';
 import { parseQuestionToolWireEdition, type QuestionToolWireEdition } from '../../agents/question-tools.js';
 
-export type MemoryCaptureEdition = 'legacy_v1' | 'save_operation_v2';
+export type MemoryCaptureEdition = 'legacy_v1' | 'save_operation_v2' | 'tool_owned_v3';
 export function parseMemoryCaptureEdition(value: unknown): MemoryCaptureEdition | null {
-  return value === 'legacy_v1' || value === 'save_operation_v2' ? value : null;
+  return value === 'legacy_v1' || value === 'save_operation_v2' || value === 'tool_owned_v3' ? value : null;
 }
 
 export interface SourceSessionContextRef {

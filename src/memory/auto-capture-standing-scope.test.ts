@@ -23,8 +23,8 @@ function retainsBoth(text: string) {
   assert.ok(text.includes('the status-report heading is COPPER HORIZON'), 'retain complete first assertion');
   assert.ok(text.includes('the report footnote label is CHARTER LAMP.'), 'retain complete independent second assertion');
 }
-function ordinaryFact(message: string) {
-  const candidates = extractAutoMemoryCandidates(message);
+function ordinaryFact(message: string, edition?: 'save_operation_v2') {
+  const candidates = extractAutoMemoryCandidates(message, 3, edition);
   assert.equal(candidates.length, 1, 'one explicit source-backed candidate, no invented fact splitting');
   const candidate = candidates[0]!; retainsBoth(candidate.content);
   assert.equal(candidate.reason, 'explicit remember request', 'one-turn prohibition cannot classify the durable fact');
@@ -39,7 +39,7 @@ test('actual MEMORY-01 source: parser isolates task confirmation and prohibition
   assert.equal(parsed.hasSecondaryWork, true);
   assert.doesNotMatch(parsed.memoryContent, /Confirm what you saved|Do not create files/);
 });
-test('actual MEMORY-01 source: explicit facts do not become a pinned standing prohibition', () => ordinaryFact(historical));
+test('actual MEMORY-01 source under retained v2: explicit facts do not become a pinned standing prohibition', () => ordinaryFact(historical, 'save_operation_v2'));
 
 test('natural mixed durable facts plus current confirmation are not a standing prohibition', () => {
   ordinaryFact(`Remember for future reference: ${facts} Confirm what you saved. Do not create files.`);
@@ -74,7 +74,7 @@ test('facts-only control retains two assertions and ordinary explicit-memory cla
   }
 });
 test('the historical facts-only framing does not itself create a safety prohibition', () => {
-  const candidate = ordinaryFact(`For this synthetic project Orchard, remember these two standing project conventions for future chats in this project only: ${facts} Keep both as project memory here, not everywhere.`);
+  const candidate = ordinaryFact(`For this synthetic project Orchard, remember these two standing project conventions for future chats in this project only: ${facts} Keep both as project memory here, not everywhere.`, 'save_operation_v2');
   assert.ok(candidate.content.includes('Keep both as project memory here, not everywhere.'));
 });
 test('genuinely standing prohibition control retains full assertion and pinned safety classification', () => {
@@ -154,7 +154,7 @@ test('production enqueue and reopen retain complete source/scope but must not ba
   const source = { authority: 'accepted_user_input' as const, sessionId, eventId: 'source-standing-scope', seq: sourceSeq,
     role: 'user', type: 'user_input_received', data: { text: historical } };
   assert.equal(isEligibleAutoCaptureSourceProvenance(source, { sessionId, sourceEventId: `user-source:${sourceSeq}` }), true);
-  const candidates = extractAutoMemoryCandidates(historical);
+  const candidates = extractAutoMemoryCandidates(historical, 3, 'save_operation_v2');
   const scope = { projectId: 'project-standing-scope-disposable', agentKey: 'agent-standing-scope@disposable' };
   const input = { message: historical, sessionId, sourceEventId: `user-source:${sourceSeq}`, candidates };
   const queued = withMemorySettledFor(scope, () => enqueueAutoCaptureCandidates(input));

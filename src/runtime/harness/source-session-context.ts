@@ -153,7 +153,7 @@ export function captureFreshSourceSessionContext(input: Pick<SourceSessionContex
     const memoryScope: MemoryScope = parent?.memoryScope ?? {
       projectId: mount.project?.project.id ?? null, agentKey: mount.agent ? agentScopeKey(mount.agent.agent) : null };
     const edition = parent ? sourceQuestionToolWireEdition(parent) : 'clarification_v3';
-    const memoryEdition = parent ? sourceMemoryCaptureEdition(parent) : 'save_operation_v2';
+    const memoryEdition = parent ? sourceMemoryCaptureEdition(parent) : 'tool_owned_v3';
     const identity: SourceSessionIdentity = { version: 1, questionToolWireEdition: edition, memoryCaptureEdition: memoryEdition,
       sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq, sessionKind: row.kind,
       mountKind: mount.kind, workspaceSlug: mount.workspaceSlug, workflow: mount.workflow,
