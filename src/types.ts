@@ -342,6 +342,9 @@ export interface AssistantRequest {
    * From Clem reply path and redeemed once by the bridge into the accepted
    * source's own event. Any other value is nothing. */
   ownerChoiceToken?: string;
+  /** A one-time token binding words the owner typed on one of Clem's Home
+   * items to that item, minted by the From Clem reply path. Approves nothing. */
+  ownerCardReplyToken?: string;
   /** Facts the harness knows about this turn that the model should read
    * (a card the owner just declined, nothing pending). Transient system
    * context: never the owner's words, never a reply the harness authored. */

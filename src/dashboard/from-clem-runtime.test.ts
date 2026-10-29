@@ -303,6 +303,12 @@ test('a typed informational follow-up about a plan starts a conversation without
   assert.ok(starts[0]!.message.includes(row.text));
   assert.ok(starts[0]!.message.includes(`My reply: ${reply}`));
   assert.equal(Object.hasOwn(starts[0]!, 'ownerChoiceToken'), false);
+  // Typed words are bound to the item they answer, so a question open in
+  // Clem's thread cannot claim them; the binding approves nothing.
+  const { redeemOwnerCardReplyToken } = await import('../runtime/harness/owner-choice.js');
+  const bound = redeemOwnerCardReplyToken(starts[0]!.ownerCardReplyToken);
+  assert.equal(bound?.rowKey, row.key);
+  assert.equal(bound?.voiceDigest, row.voiceDigest);
   assertNoFollowUpSettlement(run.log);
   assert.equal((await run.all.read()).rows.find((item) => item.key === row.key)?.answer?.kind, 'yes_no');
 });

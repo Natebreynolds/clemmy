@@ -609,6 +609,16 @@ test('a tapped choice from outside the chat is not held by a question still open
   const tapped = tap(true, 3);
   const primed = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: tapped.seq });
   assert.notDeepEqual(primed, { ok: false, stage: 'accepted_source_continuation', reason: 'durable accepted-source continuation is unresolved' }, JSON.stringify(primed));
+  // Words the owner typed on one of those items are bound to that item the
+  // same way (live 2026-10-29: "move the team meeting to 1pm" typed on a
+  // double-booking card was refused in 40 ms and Clem never answered).
+  const attempt = eventlog.beginRunAttempt(session.id, { runId: 'owner-card-reply-4' });
+  const typedOnCard = eventlog.recordRunAttemptUserInput(attempt, { turn: 4, role: 'user', data: {
+    text: 'You told me: two fixture meetings overlap.\n\nMy reply: Move the second one to 1 PM', displayText: 'Move the second one to 1 PM',
+    ownerCardReply: { version: 1, rowKey: 'notif:fixture-double-book', voiceDigest: 'fixture-digest-2', repliedAt: '2026-10-29T21:46:32.000Z' },
+  } });
+  const primedReply = await primePrimaryModelPlanningCatalog({ sessionId: session.id, sourceUserSeq: typedOnCard.seq });
+  assert.notDeepEqual(primedReply, { ok: false, stage: 'accepted_source_continuation', reason: 'durable accepted-source continuation is unresolved' }, JSON.stringify(primedReply));
 });
 
 test('a legitimately new goal with open slots never clones the prior clarification', async () => {
