@@ -556,7 +556,7 @@ test('a catalog line carries the call signature of one of her own tools once its
   try {
     const text = buildCompactToolCatalog();
     assert.match(text, /space_refresh\(slug, source_id\?\)/, 'the primed signature rides the catalog line');
-    assert.match(text, /(^|, )space_diff(,|$)/m, 'an unprimed name stays bare');
+    assert.match(text, /(^- |, )space_diff(,|$)/m, 'an unprimed name stays bare');
   } finally {
     _setToolSignaturesForTest(null);
   }

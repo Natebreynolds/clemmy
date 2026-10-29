@@ -1,9 +1,11 @@
 /**
  * Run: node scripts/run-tests-isolated.mjs src/tools/browser-backend.test.ts
  *
- * One browser per machine: a set-up cloud browser is the browser, and local
- * Chrome is the fallback only while none is set up. Discovery, the local tool
- * lookup and the local browser itself all follow the same rule.
+ * One browser per machine. On macOS and Linux it is Clem's computer driver
+ * and the older browsers are retired. On Windows a set-up cloud browser is the
+ * browser, and local Chrome is the fallback only while none is set up.
+ * Discovery, the local tool lookup and the local browser itself all follow
+ * the same rule.
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,7 +17,9 @@ const home = mkdtempSync(path.join(os.tmpdir(), 'clem-browser-backend-'));
 process.env.CLEMENTINE_HOME = home;
 process.env.CLEMMY_TEST_ISOLATED_HOME = '1';
 
-const { browserBackendOffered, browserNotOfferedText } = await import('./browser-backend.js');
+const { browserBackendOffered, browserNotOfferedText, browserDoor, olderBrowsersRetired, COMPUTER_NOT_ON, _testOnly_setBrowserPlatform } = await import('./browser-backend.js');
+// The pins below the retirement pin are the Windows rule, where the older browsers still stand.
+_testOnly_setBrowserPlatform('win32');
 const { browserbaseStoreFile, browserbaseProjectSetUp } = await import('../integrations/browserbase-setup.js');
 const { catalogEntries } = await import('../agents/tool-catalog.js');
 const { TOOL_REGISTRY } = await import('./tool-registry.js');
@@ -33,6 +37,33 @@ function setUpCloud(projectId = '00000000-0000-4000-8000-000000000001'): void {
 const names = () => new Set(catalogEntries().map((entry) => entry.name));
 const backendTools = (backend: 'local' | 'cloud') => TOOL_REGISTRY
   .filter((tool) => tool.browserBackend === backend).map((tool) => tool.name);
+
+test('on macOS and Linux the cloud browser and the Chrome harness are retired, set up or not, and Clem offers to turn on the computer', () => {
+  assert.equal(olderBrowsersRetired('darwin'), true);
+  assert.equal(olderBrowsersRetired('linux'), true);
+  assert.equal(olderBrowsersRetired('win32'), false, 'Windows keeps them until the driver is proven there');
+  for (const platform of ['darwin', 'linux'] as const) {
+    _testOnly_setBrowserPlatform(platform);
+    try {
+      for (const cloud of [false, true]) {
+        if (cloud) setUpCloud(); else rmSync(file, { force: true });
+        assert.equal(browserBackendOffered('cloud'), false);
+        assert.equal(browserBackendOffered('local'), false);
+        assert.equal(browserBackendOffered(undefined), true, 'every other tool is unaffected');
+        const offered = names();
+        for (const name of [...backendTools('local'), ...backendTools('cloud')]) assert.ok(!offered.has(name), `${name} hidden on ${platform}`);
+        assert.equal(observeReviewedLocalTool('browser_open'), null);
+        assert.equal(observeReviewedLocalTool('cloud_browser_start'), null);
+      }
+      assert.equal(browserDoor(), 'computer_off');
+      assert.equal(browserNotOfferedText('local'), COMPUTER_NOT_ON);
+      assert.match(COMPUTER_NOT_ON, /ask the owner in your own words whether to turn it on: one tap at Connect → Your computer/);
+    } finally {
+      rmSync(file, { force: true });
+      _testOnly_setBrowserPlatform('win32');
+    }
+  }
+});
 
 test('every browser-driving tool declares its backend', () => {
   assert.ok(backendTools('local').includes('browser_open'));

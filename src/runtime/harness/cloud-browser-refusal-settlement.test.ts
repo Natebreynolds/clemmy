@@ -40,6 +40,9 @@ const reviewed = await import('./reviewed-local-tool-transport.js');
 const { createReviewedCloudBrowserStorageAdapter } = await import('./reviewed-local-storage-carrier.js');
 const { capabilityManifestDigest } = await import('./capability-manifest.js');
 const { withToolOutputContext } = await import('./tool-output-context.js');
+// The cloud browser and the Chrome harness stand only on Windows now; these pins drive them there.
+const { _testOnly_setBrowserPlatform } = await import('../../tools/browser-backend.js');
+_testOnly_setBrowserPlatform('win32');
 const singleton = getBrowserbaseService();
 const adapter = getLocalDeferredDispatchTools().find(tool => tool.type === 'function' && tool.name === 'cloud_browser_start');
 assert.ok(adapter, 'the real deferred adapter exposes the registered cloud_browser_start');

@@ -51,6 +51,7 @@ import { registerConsoleMemoryFactDetailRoutes } from './console-memory-fact-det
 import { runGuardedMemoryFactMutation } from './memory-fact-mutation-guard.js';
 import { registerConsoleTaskHandlingRoutes } from './console-task-handling-routes.js';
 import { registerConsoleOtherAppsRoutes } from './console-other-apps-routes.js';
+import { OLDER_BROWSER_SETUP_RETIRED, olderBrowsersRetired } from '../tools/browser-backend.js';
 import { resolveAgentBinding } from '../agents/agent-binding.js';
 import {
   BASE_DIR,
@@ -8651,6 +8652,7 @@ export function registerConsoleRoutes(
 
   app.post('/api/console/browser-harness/install', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (olderBrowsersRetired()) { res.status(409).json({ error: OLDER_BROWSER_SETUP_RETIRED, code: 'browser_retired' }); return; }
     try {
       res.json({ job: startBrowserHarnessInstall() });
     } catch (err) {

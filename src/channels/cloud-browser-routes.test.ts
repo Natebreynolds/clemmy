@@ -101,3 +101,28 @@ test('a detached viewer acknowledgment names the exact owned lease even after it
     assert.equal((await response.json()).resource.id, 'owned');
   });
 });
+
+test('on macOS and Linux the cloud browser is not set up or chosen, and its status says it is retired; Windows sets it up as before', async () => {
+  const { _testOnly_setBrowserPlatform } = await import('../tools/browser-backend.js');
+  try {
+    for (const platform of ['darwin', 'linux'] as const) {
+      _testOnly_setBrowserPlatform(platform);
+      await fixture(async (request, calls) => {
+        const configured = await request('POST', '/configuration', { provider: 'kernel', apiKey: 'private-fixture' });
+        assert.equal(configured.status, 409);
+        const body = await configured.json() as { error: string; code: string };
+        assert.equal(body.code, 'browser_retired');
+        assert.match(body.error, /Clem's browser is your computer \(Connect → Your computer\).*nothing was set up/);
+        assert.equal((await request('POST', '/selection', { browser: 'local' })).status, 409);
+        assert.equal(calls.length, 0, 'nothing reached the provider');
+        assert.equal((await (await request('GET', '/status')).json() as { retired: boolean }).retired, true);
+      });
+    }
+    _testOnly_setBrowserPlatform('win32');
+    await fixture(async (request, calls) => {
+      assert.equal((await request('POST', '/configuration', { provider: 'browserbase', apiKey: 'private-fixture', projectId: 'p' })).status, 200);
+      assert.equal(calls.length, 1);
+      assert.equal((await (await request('GET', '/status')).json() as { retired: boolean }).retired, false);
+    });
+  } finally { _testOnly_setBrowserPlatform(null); }
+});

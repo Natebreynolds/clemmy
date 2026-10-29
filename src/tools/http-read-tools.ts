@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { boundedHttpRead } from './bounded-http-read.js';
-import { browserBackendOffered } from './browser-backend.js';
+import { browserBackendOffered, browserDoor } from './browser-backend.js';
 import { assessUnreadablePage } from './page-read-doors.js';
 import { textResult } from './shared.js';
 
@@ -23,7 +23,8 @@ export function registerHttpReadTools(server: McpServer): void {
         // on this machine; its visible text, when any, is quoted so the
         // model never has to read the bytes to find out.
         const unreadable = assessUnreadablePage(result, {
-          browserOffered: browserBackendOffered('local') || browserBackendOffered('cloud'),
+          browser: browserDoor() !== 'older' ? browserDoor()
+            : browserBackendOffered('local') || browserBackendOffered('cloud') ? 'older' : 'none',
         });
         return textResult(JSON.stringify(unreadable ? { ...result, unreadable } : result), { isError: !result.ok });
       } catch (error) {

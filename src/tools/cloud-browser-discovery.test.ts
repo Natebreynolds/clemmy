@@ -21,6 +21,9 @@ const { withToolOutputContext } = await import('../runtime/harness/tool-output-c
 const { isHostPreDispatchRefusal } = await import('../runtime/harness/host-pre-dispatch-refusal.js');
 const { registerToolSearchTool } = await import('./tool-search-tool.js');
 const { deriveOrchestratorDiscoveryNames, actionTopologyRoleFor } = await import('./tool-registry.js');
+// The cloud browser and the Chrome harness stand only on Windows now; these pins drive them there.
+const { _testOnly_setBrowserPlatform } = await import('./browser-backend.js');
+_testOnly_setBrowserPlatform('win32');
 
 function cloudSearch() {
   let search!: (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;

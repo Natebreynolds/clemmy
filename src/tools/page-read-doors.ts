@@ -54,8 +54,9 @@ export function visibleTextOfHtml(html: string): string {
 }
 
 export interface PageReadDoorsOptions {
-  /** A browser is offered on this machine (local Chrome or the chosen cloud browser). */
-  browserOffered: boolean;
+  /** The browser a page can be opened in: the computer's (on, or once the
+   *  owner turns it on), the older choice where it stands, or none. */
+  browser: 'computer' | 'computer_off' | 'older' | 'none';
   /** The read happened inside a workflow step over several items, where one item's failure is that item's result. */
   inBatch?: boolean;
 }
@@ -68,16 +69,21 @@ export function pageReadDoors(reason: UnreadablePageReason, options: PageReadDoo
       ? 'The page builds its text with scripts, so a plain fetch returns only the shell; the content is not in these bytes.'
       : 'The response is not text.';
   const doors = [
-    options.browserOffered
-      ? 'open the page in the browser and read it there (browser_open, browser_navigate to this URL, then browser_read)'
-      : null,
+    options.browser === 'computer'
+      ? 'open the page in your computer\'s browser and read it there (the computer driver\'s browser_prepare, browser_navigate to this URL, then read the page)'
+      : options.browser === 'older'
+        ? 'open the page in the browser and read it there (browser_open, browser_navigate to this URL, then browser_read)'
+        : null,
     'a connected page-reading app, if one is connected: tool_search "read a web page as text" and call the reader it returns',
   ].filter((door): door is string => door !== null);
   const batch = options.inBatch
     ? ' In a batch, when every door fails for one item, record that item as skipped with this reason and continue with the others; one unreadable page never ends the batch.'
     : '';
+  const turnOn = options.browser === 'computer_off'
+    ? ' If those fail too, the page needs a browser: ask the owner in your own words whether to turn on your computer (one tap at Connect → Your computer), and open it there once they have.'
+    : '';
   return `${why} Do not treat this page as empty or the task as finished. Try the next door: ${doors.join('; or ')}. `
-    + 'If none works, tell the owner which doors failed and ask them for the page text.' + batch;
+    + 'If none works, tell the owner which doors failed and ask them for the page text.' + turnOn + batch;
 }
 
 /**

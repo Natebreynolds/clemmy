@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { BrowserbaseServiceError, getBrowserbaseService } from '../integrations/browserbase.js';
 import { getSession } from '../runtime/harness/eventlog.js';
 import { registerKernelMcpServer, type KernelMcpRegistration } from '../integrations/kernel-mcp.js';
+import { OLDER_BROWSER_SETUP_RETIRED, olderBrowsersRetired } from '../tools/browser-backend.js';
 
 const conversation = z.string().min(1).max(256);
 const resourceId = z.string().min(1).max(128);
@@ -46,10 +47,12 @@ export function registerCloudBrowserRoutes(
     }
   };
   const path = `${prefix}/cloud-browser`;
-  router.get(`${path}/status`, guard, noStore, handler(async (_req, res) => { res.json(await service().status()); }));
+  // `retired`: on this system the computer driver is the only browser, and the cloud browser is not set up here.
+  router.get(`${path}/status`, guard, noStore, handler(async (_req, res) => { res.json({ ...await service().status(), retired: olderBrowsersRetired() }); }));
   router.post(`${path}/configuration`, guard, noStore, handler(async (req, res) => {
     const input = z.strictObject({ provider: z.enum(['browserbase', 'kernel']).optional(), apiKey: z.string().min(1).max(4096).optional(), projectId: z.string().min(1).max(128).optional(),
       idleSeconds: z.number().int().min(60).max(21600).optional(), sessionTimeoutSeconds: z.number().int().min(60).max(21600).optional() }).parse(req.body);
+    if (olderBrowsersRetired()) { res.status(409).json({ error: OLDER_BROWSER_SETUP_RETIRED, code: 'browser_retired' }); return; }
     const status = await service().configure(input);
     // Kernel's own MCP server rides along with the key, so its wider toolset
     // (computer actions, Playwright, profiles, replays) is on the catalog too.
@@ -63,6 +66,7 @@ export function registerCloudBrowserRoutes(
   // The owner's pick among the connected cloud providers, or this computer's Chrome.
   router.post(`${path}/selection`, guard, noStore, handler(async (req, res) => {
     const input = z.strictObject({ browser: z.enum(['browserbase', 'kernel', 'local']) }).parse(req.body);
+    if (olderBrowsersRetired()) { res.status(409).json({ error: OLDER_BROWSER_SETUP_RETIRED, code: 'browser_retired' }); return; }
     res.json(await service().select(input.browser));
   }));
   router.get(`${path}/resources`, guard, noStore, handler(async (req, res) => {

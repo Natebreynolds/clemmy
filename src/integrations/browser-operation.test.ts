@@ -7,6 +7,10 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { browserOperationScript, browserOperationProvesNoMutation, executeBrowserOperation, runBrowserOperationProcess, type BrowserOperationRunner } from './browser-operation.js';
 import { parseBrowserOperationArguments } from '../tools/browser-operation-contract.js';
+import { _testOnly_setBrowserPlatform } from '../tools/browser-backend.js';
+
+// The cloud browser and the Chrome harness stand only on Windows now; these pins drive them there.
+_testOnly_setBrowserPlatform('win32');
 
 const browserId = 'a'.repeat(64);
 const marker = 'CLEM_BROWSER_OPERATION_V1:';

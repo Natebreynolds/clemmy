@@ -28,6 +28,9 @@ const { acceptedTaskIdFor } = await import('./attempt-identity.js');
 const { recordTurnGraphShadow } = await import('../graph/turn-graph-shadow.js');
 const dispatch = await import('./dispatch-ledger.js');
 const { browserbaseStoreFile } = await import('../../integrations/browserbase-setup.js');
+// The cloud browser and the Chrome harness stand only on Windows now; these pins drive them there.
+const { _testOnly_setBrowserPlatform } = await import('../../tools/browser-backend.js');
+_testOnly_setBrowserPlatform('win32');
 
 after(() => { events.closeEventLog(); rmSync(home, { recursive: true, force: true }); });
 let serial = 0;

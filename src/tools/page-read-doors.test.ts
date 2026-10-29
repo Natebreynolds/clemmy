@@ -16,7 +16,7 @@ const shell = `<!DOCTYPE html><html lang="en"><head><script nonce="x">${'var a =
 test('a script shell with no visible text names the browser and a connected reader as the next doors', () => {
   const page = assessUnreadablePage(
     { ok: true, status: 200, contentType: 'text/html;charset=UTF-8', bytes: shell.length, body: shell },
-    { browserOffered: true },
+    { browser: 'older' },
   );
   assert.ok(page);
   assert.equal(page!.reason, 'script_rendered');
@@ -31,7 +31,7 @@ test('a script shell with no visible text names the browser and a connected read
 test('a site that refuses the plain fetch is blocked_by_site whatever the body says', () => {
   const page = assessUnreadablePage(
     { ok: false, status: 403, contentType: 'text/html', bytes: 1_200, body: '<html><body><h1>Just a moment...</h1><p>Checking your browser</p></body></html>' },
-    { browserOffered: false, inBatch: true },
+    { browser: 'none', inBatch: true },
   );
   assert.ok(page);
   assert.equal(page!.reason, 'blocked_by_site');
@@ -46,16 +46,16 @@ test('a page that reads fine carries nothing extra, and visible text drops scrip
     + `<p>${'A fine paragraph of real text. '.repeat(40)}</p><script>track()</script></body></html>`;
   assert.equal(assessUnreadablePage(
     { ok: true, status: 200, contentType: 'text/html', bytes: 20_000, body: html },
-    { browserOffered: true },
+    { browser: 'older' },
   ), null);
   assert.equal(visibleTextOfHtml('<p>Books &amp; prices</p><script>x</script>'), 'Books & prices');
   assert.equal(assessUnreadablePage(
     { ok: true, status: 200, contentType: 'application/json', bytes: 20, body: '{"ok":true}' },
-    { browserOffered: true },
+    { browser: 'older' },
   ), null, 'JSON is not a page');
   assert.equal(assessUnreadablePage(
     { ok: true, status: 200, contentType: 'text/html', bytes: 300, body: '<html><body>tiny</body></html>' },
-    { browserOffered: true },
+    { browser: 'older' },
   ), null, 'a small page with little text is just a small page');
 });
 
@@ -69,3 +69,15 @@ test('a refused browser debugging connection is explained and the other doors ar
   const other = browserUnavailableDoors('Page URL exceeds the exact identity limit', { localChrome: true });
   assert.match(other, /^The browser on this machine did not answer/);
 });
+
+test('the computer\'s browser is the next door when it is on, and turning it on is the owner\'s one tap when it is not', () => {
+  const blocked = { ok: false, status: 403, contentType: 'text/html', bytes: 900, body: '<html><body>Access denied</body></html>' };
+  const on = assessUnreadablePage(blocked, { browser: 'computer' })!;
+  assert.match(on.next, /your computer's browser .*browser_prepare, browser_navigate/);
+  assert.doesNotMatch(on.next, /browser_open|turn on your computer/);
+  const off = assessUnreadablePage(blocked, { browser: 'computer_off' })!;
+  assert.doesNotMatch(off.next, /browser_open|browser_prepare/, 'no browser tool is named while none is on');
+  assert.match(off.next, /ask the owner in your own words whether to turn on your computer \(one tap at Connect → Your computer\)/);
+  assert.match(off.next, /tool_search "read a web page as text"/, 'the other doors come first');
+});
+

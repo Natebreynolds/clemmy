@@ -14,6 +14,9 @@ const { capabilityManifestDigest } = await import('../runtime/harness/capability
 const { rankCatalogEntriesLexically } = await import('../agents/tool-catalog.js');
 const workflowReceipts = await import('../execution/workflow-call-receipts.js');
 const hostRefusals = await import('../runtime/harness/host-pre-dispatch-refusal.js');
+// The cloud browser and the Chrome harness stand only on Windows now; these pins drive them there.
+const { _testOnly_setBrowserPlatform } = await import('./browser-backend.js');
+_testOnly_setBrowserPlatform('win32');
 
 async function search(query: string) {
   let handler!: (args: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>;

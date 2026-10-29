@@ -138,11 +138,19 @@ test('looking at a local page finds the page preview with a reference a turn can
   // The words of the live turn that went looking for a browser (2026-09-29):
   // arbitrary Python still has no typed door. New browser operations must not
   // crowd the existing screenshot renderer off the same discovery page.
-  const live = await search('browser screenshot page render open url playwright');
-  const rows = live.results as Array<{ name: string; capabilityRef?: string; planningRefStatus?: string }>;
-  assert.equal(rows.find((row) => row.name === 'browser_harness_run')?.planningRefStatus, 'unsupported_unmaterialized');
-  assert.equal(rows.find((row) => row.name === 'page_preview')?.capabilityRef, 'cap:local:page_preview:read', JSON.stringify(rows));
-  assert.ok(live.schemas.page_preview, 'the page carries the preview\'s argument schema');
+  // The Chrome harness stands only on Windows now; on macOS and Linux it is not listed at all.
+  const { _testOnly_setBrowserPlatform } = await import('./browser-backend.js');
+  for (const platform of ['win32', 'darwin'] as const) {
+    _testOnly_setBrowserPlatform(platform);
+    try {
+      const live = await search('browser screenshot page render open url playwright');
+      const rows = live.results as Array<{ name: string; capabilityRef?: string; planningRefStatus?: string }>;
+      assert.equal(rows.find((row) => row.name === 'browser_harness_run')?.planningRefStatus,
+        platform === 'win32' ? 'unsupported_unmaterialized' : undefined, `${platform}: ${JSON.stringify(rows.map((row) => row.name))}`);
+      assert.equal(rows.find((row) => row.name === 'page_preview')?.capabilityRef, 'cap:local:page_preview:read', JSON.stringify(rows));
+      assert.ok(live.schemas.page_preview, 'the page carries the preview\'s argument schema');
+    } finally { _testOnly_setBrowserPlatform(null); }
+  }
   // A Workspace is still looked at with its own preview.
   const workspace = await search('preview my workspace screenshot');
   assert.equal(workspace.results[0].name, 'space_preview');
