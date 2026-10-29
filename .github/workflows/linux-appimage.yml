@@ -87,7 +87,7 @@ jobs:
           if kill -0 $APP 2>/dev/null; then echo "shell alive after 30s"; kill $APP; else echo "the shell exited early"; tail -40 release/smoke.log; exit 1; fi
           # 2. The packaged daemon runs on the bundled runtime: natives,
           #    schema and the console route all answer on a fresh home.
-          export CLEMENTINE_HOME="$RUNNER_TEMP/clem-home" WEBHOOK_SECRET="smoke-$(openssl rand -hex 16)" WEBHOOK_PORT=8420 ELECTRON_RUN_AS_NODE=1
+          export CLEMENTINE_HOME="$RUNNER_TEMP/clem-home" WEBHOOK_ENABLED=true WEBHOOK_SECRET="smoke-$(openssl rand -hex 16)" WEBHOOK_PORT=8420 ELECTRON_RUN_AS_NODE=1
           mkdir -p "$CLEMENTINE_HOME"
           ./squashfs-root/clementine ./squashfs-root/resources/daemon/dist/index.js service > release/daemon-smoke.log 2>&1 &
           DAEMON=$!
