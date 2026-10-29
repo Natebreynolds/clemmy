@@ -66,3 +66,15 @@ test('the chat\'s live view takes the first picture in the driver\'s answer, bar
   assert.equal(driver.firstImageBlock([{ type: 'text', text: 'no picture' }]), null);
   assert.equal(driver.firstImageBlock('text'), null);
 });
+
+test('the chat\'s live view follows the window Clem last acted in, read from the conversation\'s driver calls', () => {
+  const rows = [
+    { type: 'tool_called', data: { tool: 'cua-driver__list_apps', args: '{}' } },
+    { type: 'tool_called', data: { tool: 'cua-driver__click', args: '{"pid":19529,"window_id":273,"x":100,"y":200}' } },
+    { type: 'tool_returned', data: { tool: 'cua-driver__click' } },
+    { type: 'tool_called', data: { tool: 'read_file', args: '{"pid":1,"window_id":2}' } },
+  ];
+  assert.deepEqual(driver.lastActedWindow(rows), { pid: 19529, windowId: 273 }, 'the newest driver call that named a window; other tools do not count');
+  assert.equal(driver.lastActedWindow(rows.slice(0, 1)), null);
+  assert.deepEqual(driver.lastActedWindow([{ type: 'tool_called', data: { tool: 'mcp__cua-driver__type_text', args: { pid: 7, window_id: 9, text: 'hi' } } }]), { pid: 7, windowId: 9 });
+});

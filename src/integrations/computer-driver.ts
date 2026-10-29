@@ -203,6 +203,22 @@ export function firstImageBlock(content: unknown): { data: string; mimeType: str
   return null;
 }
 
+/** The window Clem last acted in, read from a conversation's tool calls: the
+ *  newest driver call that named a window. Pure over the rows, so it is pinned. */
+export function lastActedWindow(rows: ReadonlyArray<{ type: string; data: Record<string, unknown> }>): { pid: number; windowId: number } | null {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row.type !== 'tool_called') continue;
+    const tool = typeof row.data.tool === 'string' ? row.data.tool : '';
+    if (!tool.startsWith(`${COMPUTER_DRIVER_SERVER_NAME}__`) && !tool.startsWith(`mcp__${COMPUTER_DRIVER_SERVER_NAME}__`)) continue;
+    const args = typeof row.data.args === 'string' ? row.data.args : JSON.stringify(row.data.args ?? '');
+    const pid = /"pid"\s*:\s*(\d+)/.exec(args);
+    const windowId = /"window_id"\s*:\s*(\d+)/.exec(args);
+    if (pid && windowId) return { pid: Number(pid[1]), windowId: Number(windowId[1]) };
+  }
+  return null;
+}
+
 // ─── The private daemon ──────────────────────────────────────────────────
 let host: { child: ChildProcess; generation: number } | null = null;
 let hostStopped = true;

@@ -210,7 +210,7 @@ export function Chat() {
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <FileDockWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <div className="flex h-full min-h-0 flex-col">
-      <ComputerDock />
+      <ComputerDock conversationId={chat.sessionId.current ?? undefined} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           {chat.messages.map((m, index) => (

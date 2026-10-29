@@ -13,8 +13,9 @@ import { existsSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  COMPUTER_DRIVER_DOWNLOAD, askDriver, computerDriverEnv, computerDriverPath, computerDriverServer, computerDriverSocketPath, computerDriverStatus, realComputerDriverPath, startComputerDriverHost,
+  COMPUTER_DRIVER_DOWNLOAD, askDriver, computerDriverEnv, computerDriverPath, computerDriverServer, computerDriverSocketPath, computerDriverStatus, lastActedWindow, realComputerDriverPath, startComputerDriverHost,
 } from '../integrations/computer-driver.js';
+import { listEvents } from '../runtime/harness/eventlog.js';
 import { installToolDownload } from '../runtime/clem-tools.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
@@ -88,8 +89,20 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
     const status = await computerDriverStatus(discoverMcpServers());
     if (!status.installed || !status.connected || !status.path) { res.status(409).json({ error: 'Your computer is not turned on for Clem.' }); return; }
     const file = path.join(os.tmpdir(), `clem-screen-${process.pid}-${Date.now()}.png`);
+    // The chat's view follows the window Clem last acted in, since the
+    // driver works in windows behind the owner's; the whole display otherwise.
+    const session = typeof req.query.session === 'string' ? req.query.session.slice(0, 120) : '';
+    let target: { pid: number; windowId: number } | null = null;
+    if (session) { try { target = lastActedWindow(listEvents(session, { types: ['tool_called'] })); } catch { target = null; } }
+    const call = target
+      ? ['call', 'get_window_state', JSON.stringify({ pid: target.pid, window_id: target.windowId }), '--socket', computerDriverSocketPath(), '--screenshot-out-file', file]
+      : ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file];
     try {
-      const answer = await askDriver(realComputerDriverPath(status.path), ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file], 20_000, computerDriverEnv());
+      let answer = await askDriver(realComputerDriverPath(status.path), call, 20_000, computerDriverEnv());
+      if (target && !existsSync(file)) {
+        // The window is gone; fall back to the display rather than show nothing.
+        answer = await askDriver(realComputerDriverPath(status.path), ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file], 20_000, computerDriverEnv());
+      }
       if (!existsSync(file)) { res.status(503).json({ error: answer?.slice(0, 300) || 'The driver answered without a picture. If macOS has not allowed Screen Recording for Clementine yet, allow it in System Settings.' }); return; }
       res.setHeader('Cache-Control', 'no-store');
       res.type('png').send(readFileSync(file));

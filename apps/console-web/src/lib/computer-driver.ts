@@ -31,6 +31,7 @@ export function computerDriverNextStep(status: ComputerDriverStatus): 'install' 
 }
 
 /** A fresh capture of the screen each time it is asked for. */
-export function computerScreenUrl(nowMs: number = Date.now()): string {
-  return `${withToken('/api/console/computer-driver/screen')}&t=${nowMs}`;
+export function computerScreenUrl(conversationId?: string, nowMs: number = Date.now()): string {
+  const base = withToken('/api/console/computer-driver/screen');
+  return `${base}${conversationId ? `&session=${encodeURIComponent(conversationId)}` : ''}&t=${nowMs}`;
 }
