@@ -68,6 +68,7 @@ test('canonicalPickerId strips date stamps + [1m]-style context annotations to t
 test('labelForModelId prettifies ids; API display_name wins', () => {
   assert.equal(labelForModelId('claude-fable-5'), 'Claude Fable 5');
   assert.equal(labelForModelId('gpt-6'), 'GPT 6');
+  assert.equal(labelForModelId('deepseek-ai/DeepSeek-V4.1-Flash'), 'DeepSeek V4.1 Flash', 'a hosted id reads without its organization');
   assert.equal(labelForModelId('claude-sonnet-5-20260601', 'Claude Sonnet 5'), 'Claude Sonnet 5');
   assert.equal(labelForModelId('claude-omega-7-20270101'), 'Claude Omega 7');
 });

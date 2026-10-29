@@ -124,6 +124,7 @@ export function canonicalPickerId(id: string): string | null {
 export function labelForModelId(id: string, displayName?: string | null): string {
   if (displayName && displayName.trim()) return displayName.trim();
   return id
+    .slice(id.lastIndexOf('/') + 1) // a hosted id's organization prefix is not part of the model's name
     .replace(/-(\d{8})$/, '') // date-stamped snapshots read cleaner without the stamp
     .split('-')
     .map((part) => (/^\d/.test(part) ? part.replace(/_/g, '.') : part.charAt(0).toUpperCase() + part.slice(1)))

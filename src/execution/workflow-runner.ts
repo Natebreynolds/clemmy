@@ -3,8 +3,7 @@ import { workerStandingInstructions } from './workflow-worker-standing-instructi
 import type { InlineCreationTestDeliveryIntent } from './inline-creation-test-delivery.js';
 import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
-import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
-import { labelForModelId } from '../runtime/harness/model-discovery.js';
+import { brainBackupsConfigured, brainModelLabel } from '../runtime/harness/brain-backups.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
@@ -7628,7 +7627,7 @@ export function workflowFallbackNote(events: ReadonlyArray<{ kind: string; stepI
     const words = FALLBACK_CAUSE_WORDS[group.because];
     const steps = group.steps.length > 1 ? `Steps ${group.steps.join(', ')}`
       : group.steps[0] === 'the summary' ? 'The summary' : `Step ${group.steps[0]}`;
-    return `${steps} ran on ${labelForModelId(group.to)} because the account behind ${labelForModelId(group.from)} ${words.why}.${words.next ? ` ${words.next}` : ''}`;
+    return `${steps} ran on ${brainModelLabel(group.to)} because the account behind ${brainModelLabel(group.from)} ${words.why}.${words.next ? ` ${words.next}` : ''}`;
   });
   return `\n\nRan on a backup model:\n${lines.map((line) => `- ${line}`).join('\n')}`;
 }

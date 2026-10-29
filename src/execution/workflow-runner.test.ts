@@ -6216,8 +6216,8 @@ test('a run that switched models says which step, to what, why, and the one thin
     { kind: 'step_advisory', stepId: 'x', meta: { reason: 'write_check_verified' } },
   ]);
   assert.match(note, /^\n\nRan on a backup model:/);
-  assert.match(note, /Steps "find_official_page", "summarize" ran on Backup Model A because the account behind Vendor\/pinned Model is out of credit\. Add credit on that account, or change this workflow's model, to stop the switch\./);
-  assert.match(note, /- The summary ran on Backup Model B because the account behind Vendor\/pinned Model was not answering\.$/m);
+  assert.match(note, /Steps "find_official_page", "summarize" ran on Backup Model A because the account behind Pinned Model is out of credit\. Add credit on that account, or change this workflow's model, to stop the switch\./);
+  assert.match(note, /- The summary ran on Backup Model B because the account behind Pinned Model was not answering\.$/m);
   assert.equal(note.split('\n- ').length - 1, 2, 'one line per model, account and reason');
   assert.equal(workflowFallbackNote([{ kind: 'step_advisory', stepId: 's', meta: { reason: 'brain_fallover', to: 'claude' } }]), '',
     'an older advisory without the models says nothing rather than guessing');
