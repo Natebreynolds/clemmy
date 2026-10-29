@@ -153,3 +153,15 @@ test('a chain that is not the brain\'s never opens an outage', async () => {
   assert.equal(backups.currentBrainOutage(), null);
   assert.equal(memory.calls(), 3, 'a job on the same model keeps waiting for it');
 });
+
+test('a model is named the way an owner reads it: the picker\'s name, or the model\'s own name when the picker only repeats its id', () => {
+  backups.__brainBackupsTest__.setOptions(() => [
+    { id: 'api_key' as const, value: 'api_key:grok-4.7', label: 'xAI (Grok) — grok-4.7', available: true, modelId: 'grok-4.7' },
+    { id: 'api_key' as const, value: 'api_key:vendor/Pinned-Model-V4.1-Flash', label: 'Hosted — vendor/Pinned-Model-V4.1-Flash', available: true, modelId: 'vendor/Pinned-Model-V4.1-Flash' },
+    { id: 'claude_oauth' as const, value: 'claude_oauth:model-x', label: 'Claude account — Fable 5.1', available: true, modelId: 'model-x' },
+  ]);
+  assert.equal(backups.brainModelLabel('grok-4.7'), 'Grok 4.7');
+  assert.equal(backups.brainModelLabel('vendor/Pinned-Model-V4.1-Flash'), 'Pinned Model V4.1 Flash');
+  assert.equal(backups.brainModelLabel('model-x'), 'Fable 5.1', 'a picker name that is a name wins');
+  assert.equal(backups.brainModelLabel('not-listed-model'), 'Not Listed Model');
+});
