@@ -92,6 +92,8 @@ const {
   WorkflowStepStructuralResultError,
   isWorkflowStepStructuralResultError,
   isWorkflowStepBrainFalloverEligible,
+  workflowFallbackCause,
+  workflowFallbackNote,
   _setWorkflowHarnessLoopImplsForTests,
   _setWorkflowVoiceRewriteForTests,
   _setWorkflowCallNodeForTests,
@@ -6191,6 +6193,33 @@ test('step-boundary brain fallover is eligible for an EXPIRED brain, not just tr
   // A real deterministic error still fails fast (no brain-chain burn).
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('missing required input "url"')), false);
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('API Error: 400 Bad Request: invalid schema')), false);
+});
+
+test('a run that switched models says which step, to what, why, and the one thing that stops it (switch, then tell)', () => {
+  assert.equal(workflowFallbackCause(new Error('failed via harness: 402 Credit limit exceeded, please add credits')), 'out_of_credit');
+  assert.equal(workflowFallbackCause(new Error("You're out of extra usage. Add more at the usage page.")), 'usage_used_up');
+  assert.equal(workflowFallbackCause(new Error('API Error: 401 Unauthorized — OAuth token has expired')), 'sign_in');
+  assert.equal(workflowFallbackCause(new Error('API Error: 529 Overloaded')), 'not_answering');
+  assert.equal(workflowFallbackCause(new Error('tool call could not be parsed (retry also failed)')), 'stumbled');
+
+  assert.equal(workflowFallbackNote([]), '', 'no switch, no note');
+  const advisory = (stepId: string, because: string, toModel = 'backup-model-a') => ({
+    kind: 'step_advisory', stepId,
+    meta: { reason: 'brain_fallover', from: 'byo', to: 'claude', toModel, fromModel: 'vendor/pinned-model', because },
+  });
+  const note = workflowFallbackNote([
+    advisory('find_official_page', 'out_of_credit'),
+    advisory('summarize', 'out_of_credit'),
+    advisory('__synthesis__', 'not_answering', 'backup-model-b'),
+    { kind: 'step_completed', stepId: 'find_official_page' },
+    { kind: 'step_advisory', stepId: 'x', meta: { reason: 'write_check_verified' } },
+  ]);
+  assert.match(note, /^\n\nRan on a backup model:/);
+  assert.match(note, /Steps "find_official_page", "summarize" ran on Backup Model A because the account behind Vendor\/pinned Model is out of credit\. Add credit on that account, or change this workflow's model, to stop the switch\./);
+  assert.match(note, /- The summary ran on Backup Model B because the account behind Vendor\/pinned Model was not answering\.$/m);
+  assert.equal(note.split('\n- ').length - 1, 2, 'one line per model, account and reason');
+  assert.equal(workflowFallbackNote([{ kind: 'step_advisory', stepId: 's', meta: { reason: 'brain_fallover', to: 'claude' } }]), '',
+    'an older advisory without the models says nothing rather than guessing');
 });
 
 // ── G5: scheduled enabled workflow auto-approves its declarative gate ──────────

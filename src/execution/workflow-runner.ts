@@ -4,6 +4,7 @@ import type { InlineCreationTestDeliveryIntent } from './inline-creation-test-de
 import { createWorkflowStepEffectPreparation, ensureWorkflowStepEffectsRead, withWorkflowStepEffectExecutionContext, WorkflowStepEffectUnavailableError } from './workflow-step-effect-reading.js';
 import { forEachSourcePath, forEachSourceStepId } from './workflow-foreach-source.js';
 import { brainBackupsConfigured } from '../runtime/harness/brain-backups.js';
+import { labelForModelId } from '../runtime/harness/model-discovery.js';
 import { workflowVerificationDependencyState } from '../tools/workflow-verification-state.js';
 import { withWorkflowCommit as activationWorkflowCommit } from './workflow-commit.js';
 import { parseHostLocalWriteCommitFacts as activationCommitFacts } from '../runtime/harness/host-local-write-commit.js';
@@ -7551,6 +7552,55 @@ async function executeStepVerified(
  *  step hard-failed instead of switching to the connected Codex/BYO brain the user
  *  configured — the exact "why didn't my fallback fire" bug. Named + exported so
  *  the decision is unit-tested, mirroring the chat lane's isChatBrainFalloverEligible. */
+/** Why a step left its model for a backup, in the closed words its report uses. */
+export type WorkflowFallbackCause = 'out_of_credit' | 'usage_used_up' | 'sign_in' | 'not_answering' | 'stumbled';
+
+export function workflowFallbackCause(err: unknown): WorkflowFallbackCause {
+  if (isProviderCreditRefusalError(err)) return 'out_of_credit';
+  if (isProviderCapacityExhausted(err)) return 'usage_used_up';
+  if (isAuthRecoverableError(err)) return 'sign_in';
+  if (isTransientStepError(err)) return 'not_answering';
+  return 'stumbled';
+}
+
+const FALLBACK_CAUSE_WORDS: Record<WorkflowFallbackCause, { why: string; next: string }> = {
+  out_of_credit: { why: 'is out of credit', next: 'Add credit on that account, or change this workflow\'s model, to stop the switch.' },
+  usage_used_up: { why: 'has used up its usage', next: 'The next run tries it first again; change this workflow\'s model if this keeps happening.' },
+  sign_in: { why: 'needs signing in again', next: 'Sign in to it again under Settings, or change this workflow\'s model.' },
+  not_answering: { why: 'was not answering', next: '' },
+  stumbled: { why: 'could not finish the step', next: '' },
+};
+
+/**
+ * Switch, then tell (owner 2026-10-15): a run that finished on a backup model
+ * says which step switched, to what, and why, with the one thing that stops
+ * it. Read from the run's own fallover advisories; nothing when none.
+ */
+export function workflowFallbackNote(events: ReadonlyArray<{ kind: string; stepId?: string; meta?: Record<string, unknown> }>): string {
+  const groups = new Map<string, { steps: string[]; from: string; to: string; because: WorkflowFallbackCause }>();
+  for (const event of events) {
+    if (event.kind !== 'step_advisory' || event.meta?.reason !== 'brain_fallover') continue;
+    const from = typeof event.meta.fromModel === 'string' ? event.meta.fromModel : '';
+    const to = typeof event.meta.toModel === 'string' ? event.meta.toModel : '';
+    const because = (typeof event.meta.because === 'string' && event.meta.because in FALLBACK_CAUSE_WORDS
+      ? event.meta.because : 'stumbled') as WorkflowFallbackCause;
+    if (!from || !to) continue;
+    const key = `${from}\u0000${to}\u0000${because}`;
+    const group = groups.get(key) ?? { steps: [], from, to, because };
+    const step = event.stepId === '__synthesis__' ? 'the summary' : event.stepId ? `"${event.stepId}"` : 'a step';
+    if (!group.steps.includes(step)) group.steps.push(step);
+    groups.set(key, group);
+  }
+  if (groups.size === 0) return '';
+  const lines = [...groups.values()].map((group) => {
+    const words = FALLBACK_CAUSE_WORDS[group.because];
+    const steps = group.steps.length > 1 ? `Steps ${group.steps.join(', ')}`
+      : group.steps[0] === 'the summary' ? 'The summary' : `Step ${group.steps[0]}`;
+    return `${steps} ran on ${labelForModelId(group.to)} because the account behind ${labelForModelId(group.from)} ${words.why}.${words.next ? ` ${words.next}` : ''}`;
+  });
+  return `\n\nRan on a backup model:\n${lines.map((line) => `- ${line}`).join('\n')}`;
+}
+
 export function isWorkflowStepBrainFalloverEligible(err: unknown): boolean {
   return isTransientStepError(err)
     || isProviderCapacityExhausted(err)
@@ -7587,7 +7637,8 @@ async function executeStepVerifiedInner(
       appendWorkflowEvent(ctx.workflowSlug, ctx.runId, {
         kind: 'step_advisory',
         stepId: step.id,
-        meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId },
+        meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId,
+          fromModel: currentModel, because: workflowFallbackCause(lastErr) },
       });
       logger.warn({ stepId: step.id, from: currentProvider, to: target.provider, model: target.modelId }, 'workflow step provider failing — switching brain at step boundary');
     }
@@ -12379,14 +12430,15 @@ async function executeWorkflow(
       let lastErr: unknown = err;
       // Step-boundary brain fallover, mirroring executeStepVerified. Synthesis
       // is read-only, so there is no external-write guard to respect.
-      if (workflowBrainFalloverEnabled() && (isTransientStepError(err) || isUnparseableToolCallError(err) || isWorkflowStepStructuralResultError(err))) {
+      if (workflowBrainFalloverEnabled() && isWorkflowStepBrainFalloverEligible(err)) {
         const currentModel = synthesisStep.model ?? defaultForRole('brain');
         const currentProvider = resolveEffectiveProviderForModel(currentModel) as BrainProviderClass;
         for (const target of falloverBrainModelIds(currentProvider, currentModel)) {
           appendWorkflowEvent(workflowSlug, runId, {
             kind: 'step_advisory',
             stepId: '__synthesis__',
-            meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId },
+            meta: { reason: 'brain_fallover', from: currentProvider, to: target.provider, toModel: target.modelId,
+              fromModel: currentModel, because: workflowFallbackCause(lastErr) },
           });
           try {
             synthesisOutput = (await synthesisAttempt({ ...synthesisStep, model: target.modelId })).output;
@@ -12399,7 +12451,7 @@ async function executeWorkflow(
               || nextErr instanceof WorkflowRunCancelledError
             ) throw nextErr;
             lastErr = nextErr;
-            if (!isTransientStepError(nextErr) && !isUnparseableToolCallError(nextErr)) break;
+            if (!isWorkflowStepBrainFalloverEligible(nextErr)) break;
           }
         }
       }
@@ -18125,6 +18177,11 @@ async function processOneRunFile(
             .map((a) => `- ${a.note}`)
             .join('\n')}${publicQualityAdvisories.length > 5 ? `\n(+${publicQualityAdvisories.length - 5} more)` : ''}`
         : '';
+      // Switch, then tell: which step ran on a backup model and why.
+      let fallbackNote = '';
+      if (!isCompiledProjectRun) {
+        try { fallbackNote = workflowFallbackNote(readWorkflowEvents(workflow.name, run.id)); } catch { fallbackNote = ''; }
+      }
       const outcome = renderLegibleOutcome({
         workflowName: workflow.data.name,
         blockedSteps,
@@ -18160,7 +18217,7 @@ async function processOneRunFile(
       const unblockedAttentionNote = workflowAttentionNote({ needsAttention, blockedSteps, attentionReason });
       let reportBody = isCompiledProjectRun && !needsAttention
         ? finalOutput
-        : `${escalationBanner}${needsAttention ? outcome.body : successBody}${unblockedAttentionNote}${advisorySummary}`;
+        : `${escalationBanner}${needsAttention ? outcome.body : successBody}${unblockedAttentionNote}${advisorySummary}${fallbackNote}`;
       reportBody = scrubWorkflowTerminalPresentation(reportBody);
       // Warm the tone into Clementine's voice + let her flag a routine no-op.
       // Best-effort/fail-open: any hiccup returns the original text. We skip the
