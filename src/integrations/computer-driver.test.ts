@@ -85,3 +85,16 @@ test('the chat\'s live view follows the window Clem last acted in, read from the
     { type: 'tool_returned', data: { tool: 'work_call', effectiveTool: 'cua-driver__run_steps', result: '{"content":[{"type":"text","text":"run_steps: 1/1 steps ok"},{"type":"text","text":"window_id=273 pid=19529 elements=256"}]}' } },
   ]), { pid: 19529, windowId: 273 }, 'a call carried by work_call is read by the driver tool it ran');
 });
+
+test('a driver left serving Clem\'s socket by a gone app session is found; the live one and strangers are not', () => {
+  const socket = '/home/me/.clementine-next/state/cua-driver.sock';
+  const listing = [
+    '  101     1 /home/me/.clementine-next/tools/cua-driver/0.37.0/cua-driver serve --socket /home/me/.clementine-next/state/cua-driver.sock',
+    '  102  7000 /home/me/.clementine-next/tools/cua-driver/0.37.0/cua-driver serve --socket /home/me/.clementine-next/state/cua-driver.sock',
+    '  103     1 /usr/local/bin/cua-driver serve --socket /tmp/someone-else.sock',
+    '  104     1 /home/me/.clementine-next/tools/cua-driver/0.37.0/cua-driver mcp --embedded --socket /home/me/.clementine-next/state/cua-driver.sock',
+    '  105     1 /bin/zsh -c grep cua-driver serve --socket /home/me/.clementine-next/state/cua-driver.sock.bak',
+    '',
+  ].join('\n');
+  assert.deepEqual(driver.orphanedComputerDriverPids(listing, socket), [101]);
+});

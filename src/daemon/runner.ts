@@ -3643,10 +3643,15 @@ export async function startDaemon(
   // Clem's computer: her own copy of the driver runs as a private daemon
   // under the app's identity whenever it is installed and connected.
   try {
-    const { startComputerDriverHost } = await import('../integrations/computer-driver.js');
+    const { startComputerDriverHost, stopComputerDriverHost } = await import('../integrations/computer-driver.js');
     const { discoverMcpServers } = await import('../runtime/mcp-config.js');
     const started = startComputerDriverHost({ servers: discoverMcpServers() });
-    if (started !== 'idle') logger.info({ started }, 'Computer driver host');
+    if (started !== 'idle') {
+      logger.info({ started }, 'Computer driver host');
+      const stopDriver = (): void => { void stopComputerDriverHost(); };
+      process.prependOnceListener('SIGTERM', stopDriver);
+      process.prependOnceListener('SIGINT', stopDriver);
+    }
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'Computer driver host could not start');
   }

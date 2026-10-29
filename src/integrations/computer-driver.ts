@@ -14,7 +14,7 @@
  * private daemon is kept alive, and what the Connect card reads. Nothing
  * here runs an action on the computer.
  */
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -259,8 +259,51 @@ export function startComputerDriverHost(input: { binary?: string | null; servers
   return 'started';
 }
 
+/**
+ * Driver daemons left serving Clem's private socket by an app session that
+ * is gone: their parent is the system (pid 1), so nothing will ever stop
+ * them, and once a newer daemon recreates the socket they serve nothing.
+ * Pure over a `ps -Ao pid=,ppid=,command=` listing, so it is pinned.
+ */
+export function orphanedComputerDriverPids(listing: string, socket: string): number[] {
+  const needle = `cua-driver serve --socket ${socket}`;
+  const pids: number[] = [];
+  for (const line of listing.split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const command = match[3].trimEnd();
+    if (Number(match[2]) !== 1) continue;
+    if (!(command.endsWith(needle) || command.includes(`${needle} `))) continue;
+    pids.push(Number(match[1]));
+  }
+  return pids;
+}
+
+function stopOrphanedComputerDrivers(socket: string): void {
+  if (process.platform === 'win32') return;
+  let listing = '';
+  try { listing = execFileSync('ps', ['-Ao', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 5_000, maxBuffer: 8 * 1024 * 1024 }); } catch { return; }
+  for (const pid of orphanedComputerDriverPids(listing, socket)) {
+    try { process.kill(pid, 'SIGTERM'); logger.info({ pid }, 'stopped a computer driver left by an earlier app session'); } catch { /* already gone */ }
+  }
+}
+
+let exitHookInstalled = false;
+/** The driver is the app's child: when the daemon exits, so does its driver. */
+function installHostExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.once('exit', () => {
+    hostStopped = true;
+    const child = host?.child;
+    if (child && child.exitCode === null) { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+  });
+}
+
 function spawnHost(binary: string): void {
   const socket = computerDriverSocketPath();
+  installHostExitHook();
+  stopOrphanedComputerDrivers(socket);
   try { mkdirSync(path.dirname(socket), { recursive: true }); rmSync(socket, { force: true }); } catch { /* the daemon reports it */ }
   const plan = computerDriverServeCommand(binary, socket);
   const generation = (host?.generation ?? 0) + 1;
