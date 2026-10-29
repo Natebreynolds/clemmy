@@ -496,6 +496,28 @@ function classifyComposioSlug(slug: string): ToolKind {
 const COMPUTER_DRIVER_PREFIX = 'cua-driver__';
 const COMPUTER_DRIVER_READ_PREFIXES = ['get_', 'list_', 'check_', 'verify_', 'parse_', 'debug_'];
 const COMPUTER_DRIVER_READ_NAMES = new Set(['zoom', 'screenshot', 'clipboard_read', 'health_report', 'page']);
+/** The driver's own tool definitions carry no behaviour annotations, so the
+ *  host would card every action forever as unclassifiable. Clem knows the
+ *  family: looking is read-only; acting in an app (input primitives, the
+ *  batch runner, launching, a lifecycle session) is ordinary non-destructive
+ *  work that asks once and teaches its kind; killing an app, a script, the
+ *  clipboard, configuration and the browser tools stay unhinted, so they keep
+ *  their own card every time. */
+const COMPUTER_DRIVER_ORDINARY_ACTIONS = new Set([
+  'click', 'double_click', 'right_click', 'drag', 'scroll', 'move_cursor', 'type_text', 'press_key', 'hotkey', 'set_value',
+  'invoke_menu', 'bring_to_front', 'set_window_frame', 'mouse_button_down', 'mouse_button_up', 'mouse_drag', 'parallel_mouse_drag',
+  'run_steps', 'launch_app', 'start_session', 'end_session', 'set_agent_cursor_enabled', 'set_agent_cursor_motion', 'set_agent_cursor_theme',
+]);
+export function computerDriverBehaviorHints(toolName: string): { readOnly: boolean | null; destructive: boolean | null } | null {
+  const rawLower = toolName.trim().toLowerCase();
+  const bare = rawLower.startsWith('mcp__') ? rawLower.slice('mcp__'.length) : rawLower;
+  if (!bare.startsWith(COMPUTER_DRIVER_PREFIX)) return null;
+  const tool = bare.slice(COMPUTER_DRIVER_PREFIX.length);
+  if (COMPUTER_DRIVER_READ_NAMES.has(tool) || COMPUTER_DRIVER_READ_PREFIXES.some((prefix) => tool.startsWith(prefix))) return { readOnly: true, destructive: false };
+  if (COMPUTER_DRIVER_ORDINARY_ACTIONS.has(tool)) return { readOnly: false, destructive: false };
+  return null;
+}
+
 export function computerDriverToolKind(rawLower: string): ToolKind | null {
   const bare = rawLower.startsWith('mcp__') ? rawLower.slice('mcp__'.length) : rawLower;
   if (!bare.startsWith(COMPUTER_DRIVER_PREFIX)) return null;

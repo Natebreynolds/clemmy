@@ -810,3 +810,16 @@ test('the computer driver\'s tools: looking is a read, acting in an app is a wri
   }
   assert.equal(classifyTool('other-server__click'), 'write', 'another server\'s click keeps the conservative default');
 });
+
+test('the computer driver\'s family hints: looking is read-only, acting in an app is ordinary, the dangerous few stay unhinted', async () => {
+  const { computerDriverBehaviorHints } = await import('./tool-taxonomy.js');
+  assert.deepEqual(computerDriverBehaviorHints('cua-driver__get_window_state'), { readOnly: true, destructive: false });
+  assert.deepEqual(computerDriverBehaviorHints('mcp__cua-driver__click'), { readOnly: false, destructive: false });
+  assert.deepEqual(computerDriverBehaviorHints('cua-driver__run_steps'), { readOnly: false, destructive: false });
+  assert.deepEqual(computerDriverBehaviorHints('cua-driver__launch_app'), { readOnly: false, destructive: false });
+  assert.equal(computerDriverBehaviorHints('cua-driver__kill_app'), null);
+  assert.equal(computerDriverBehaviorHints('cua-driver__run_script'), null);
+  assert.equal(computerDriverBehaviorHints('cua-driver__clipboard_write'), null);
+  assert.equal(computerDriverBehaviorHints('cua-driver__browser_navigate'), null);
+  assert.equal(computerDriverBehaviorHints('other__click'), null);
+});

@@ -10,6 +10,7 @@
  * immutable port invocation, so stale catalog or memory rows can never dispatch
  * and metadata I/O is never hidden inside the business crossing.
  */
+import { computerDriverBehaviorHints } from '../../agents/tool-taxonomy.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { MCPServer } from '@openai/agents';
@@ -445,9 +446,12 @@ function effectOf(tool: McpToolDefinition): {
     const value = annotations[key];
     return typeof value === 'boolean' ? value : null;
   };
+  // A family Clem herself set up may carry no annotations; her own knowledge
+  // of it stands in only where the definition says nothing.
+  const family = computerDriverBehaviorHints(tool.name);
   const behaviorHints = {
-    readOnly: declared('readOnlyHint'),
-    destructive: declared('destructiveHint'),
+    readOnly: declared('readOnlyHint') ?? family?.readOnly ?? null,
+    destructive: declared('destructiveHint') ?? family?.destructive ?? null,
     idempotent: declared('idempotentHint'),
     openWorld: declared('openWorldHint'),
   };
