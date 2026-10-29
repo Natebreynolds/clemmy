@@ -1,11 +1,10 @@
 /**
  * Share what Clem built as one cartridge: the owner picks workflows, skills,
  * MCP servers and Spaces, and gets a .clemplug another Clementine installs
- * through the same preview-and-consent door. The export carries definitions,
- * never the owner's data: a Space ships its manifest and view, not its
- * dataset, notes, audit or history; an MCP server ships its command and the
- * NAMES of its environment keys, never their values; a workflow ships its
- * definition, scripts and references, never its runs.
+ * through the same preview-and-consent door. Selected definitions travel;
+ * known Space data files and workflow runs are excluded. MCP environment
+ * values are omitted, and launch fields pass the same credential-reference
+ * checks as project tool setup. This is not a scrub of arbitrary file text.
  */
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -15,6 +14,7 @@ import { BASE_DIR } from '../config.js';
 import { SKILLS_DIR, isSafeSkillName } from '../memory/skill-store.js';
 import { listWorkflows } from '../memory/workflow-store.js';
 import { loadUserMcpServers } from '../runtime/mcp-config.js';
+import { prepareMcpLaunchPrivacy } from '../runtime/mcp-server-setup.js';
 import { spaceStore, isValidSpaceSlug, resolveSpaceDir } from '../spaces/store.js';
 import { validateManifest, type PluginManifest } from './plugin-manifest.js';
 
@@ -68,6 +68,29 @@ export function stageCartridge(request: PluginExportRequest): { dir: string; man
   });
   const errors = issues.filter((issue) => issue.level === 'error').map((issue) => issue.message);
   if (!manifest || errors.length > 0) throw new Error(errors.join('; ') || 'invalid manifest');
+  // Prepare every MCP definition before allocating or copying the cartridge.
+  // A refusal leaves no partially staged copy and never rewrites the owner's
+  // saved endpoint, arguments or credential values.
+  const servers = loadUserMcpServers();
+  const serverNames = uniqueStrings(request.mcpServers);
+  const fragment: Record<string, Record<string, unknown>> = {};
+  for (const name of serverNames) {
+    const server = servers[name];
+    if (!server) throw new Error(`MCP server "${name}" is not one of yours`);
+    const prepared = prepareMcpLaunchPrivacy(server);
+    if (!prepared.ok) throw new Error(`This MCP definition cannot be shared: ${prepared.error}`);
+    fragment[name] = {
+      ...(server.type ? { type: server.type } : {}),
+      ...(server.command ? { command: server.command } : {}),
+      ...(server.args ? { args: server.args } : {}),
+      ...(server.url ? { url: server.url } : {}),
+      ...(prepared.headers ? { headers: prepared.headers } : {}),
+      ...(server.description ? { description: server.description } : {}),
+      // Names only: the installer asks the next owner for each value.
+      ...(prepared.requiredEnvKeys.length ? { env: Object.fromEntries(prepared.requiredEnvKeys.map((key) => [key, ''])) } : {}),
+      enabled: true,
+    };
+  }
   const dir = mkdtempSync(path.join(os.tmpdir(), 'clem-cartridge-'));
   const leftOut: string[] = [];
   const contents: PluginExportResult['contents'] = { workflows: [], skills: [], mcpServers: [], workspaces: [] };
@@ -91,28 +114,11 @@ export function stageCartridge(request: PluginExportRequest): { dir: string; man
     contents.skills.push(name);
   }
 
-  const servers = loadUserMcpServers();
-  const fragment: Record<string, Record<string, unknown>> = {};
-  for (const name of uniqueStrings(request.mcpServers)) {
-    const server = servers[name];
-    if (!server) throw new Error(`MCP server "${name}" is not one of yours`);
-    const envKeys = server.env ? Object.keys(server.env) : [];
-    fragment[name] = {
-      ...(server.type ? { type: server.type } : {}),
-      ...(server.command ? { command: server.command } : {}),
-      ...(server.args ? { args: server.args } : {}),
-      ...(server.url ? { url: server.url } : {}),
-      ...(server.description ? { description: server.description } : {}),
-      // Names only: the installer asks the next owner for each value.
-      ...(envKeys.length ? { env: Object.fromEntries(envKeys.map((key) => [key, ''])) } : {}),
-      enabled: true,
-    };
-    contents.mcpServers.push(name);
-  }
+  contents.mcpServers.push(...serverNames);
   if (contents.mcpServers.length) {
     mkdirSync(path.join(dir, 'mcp'), { recursive: true });
     writeFileSync(path.join(dir, 'mcp', 'servers.json'), JSON.stringify(fragment, null, 2));
-    leftOut.push('MCP server keys and secrets (names kept, values left blank)');
+    leftOut.push('MCP environment secrets (names kept, values left blank; credential-bearing launch fields refused)');
   }
 
   for (const slug of uniqueStrings(request.workspaces)) {

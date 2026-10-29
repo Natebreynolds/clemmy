@@ -9,7 +9,7 @@ import { localProjects } from './local-projects.js';
 import { findSafeCliCommand } from '../runtime/cli-discovery.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { prepareMcpServerCreateRequest, validateMcpWorkingDirectory, type McpServerCreateConfig } from '../runtime/mcp-server-request.js';
-import { prepareAgentMcpHeaderTemplates } from '../runtime/mcp-server-setup.js';
+import { prepareMcpLaunchPrivacy } from '../runtime/mcp-server-setup.js';
 import { invalidateConfiguredMcpServers, observeConfiguredMcpServerSetup } from '../runtime/mcp-servers.js';
 import { slugifyServerName } from '../runtime/mcp-namespace-shim.js';
 import type { SourceSessionContextRef } from '../runtime/harness/source-session-context-scope.js';
@@ -105,7 +105,6 @@ function declaration(root: string) {
   }
 }
 
-const credentialArgument = /(?:--?(?:api[-_]?key|access[-_]?token|token|password|secret|authorization|header)(?:=|$)|\bBearer\s+|\b(?:sk|ghp|xoxb|xoxp)-[A-Za-z0-9])/i;
 function preparedDefinition(name: string, raw: unknown, root: string): McpServerCreateConfig {
   if (!record(raw)) return refuse('unsupported_declaration', 'This server needs an object containing its launch or endpoint settings.');
   if (Object.keys(raw).some(key => !['type', 'command', 'args', 'cwd', 'url', 'headers', 'env', 'description', 'enabled'].includes(key))) {
@@ -113,25 +112,10 @@ function preparedDefinition(name: string, raw: unknown, root: string): McpServer
   }
   const type = raw.type ?? (raw.url ? 'http' : 'stdio');
   if (type !== 'stdio' && raw.cwd !== undefined) return refuse('invalid_project_path', 'Only a local server uses a working folder.');
-  const keys = new Set<string>();
-  const privateValues: string[] = [];
-  if (raw.env !== undefined) {
-    if (!record(raw.env) || Object.entries(raw.env).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== 'string')) {
-      return refuse('unsupported_environment', 'Use named environment keys for this server. Enter private values in Connect.');
-    }
-    // The declaration may contain private values. They are deliberately not
-    // copied: the normal human-only credential path supplies declared keys.
-    for (const [key, value] of Object.entries(raw.env)) {
-      keys.add(key);
-      if (typeof value === 'string' && value && !/\$\{/.test(value)) privateValues.push(value);
-    }
-  }
-  const launchTexts = [raw.command, raw.url, ...(Array.isArray(raw.args) ? raw.args : []), ...Object.values(record(raw.headers) ? raw.headers : {})];
-  if (privateValues.some(value => launchTexts.some(text => typeof text === 'string'
-    && (text.includes(value) || text.includes(encodeURIComponent(value)))))) {
-    return refuse('private_launch_value', 'A launch setting repeats a private environment value. Use a named environment reference and enter its value in Connect.');
-  }
-  const refs = (text: string) => { for (const match of text.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) keys.add(match[1]!); };
+  const templates = prepareMcpLaunchPrivacy({ ...raw,
+    ...(type === 'stdio' ? { expandArgument: (arg: string) => arg.replace(/\$\{(?:workspaceFolder|PROJECT_ROOT|CLEMENTINE_PROJECT_ROOT)\}/g, root) } : {}),
+  });
+  if (!templates.ok) return refuse(templates.code, templates.error);
   let command = raw.command;
   let cwd: string | undefined;
   let args = raw.args;
@@ -146,21 +130,8 @@ function preparedDefinition(name: string, raw: unknown, root: string): McpServer
     if (path.isAbsolute(command)) {
       if (validateMcpWorkingDirectory(command, 'stdio')) return refuse('invalid_command', 'Choose a full executable path for this computer.');
     } else if (/[\\/]/.test(command) || /\$\{/.test(command)) command = resolveProjectMcpPath(root, command, process.platform, cwd);
-    if (args !== undefined && (!Array.isArray(args) || args.length > 128 || args.some(arg => typeof arg !== 'string' || arg.length > 8192 || /[\u0000-\u001f\u007f]/.test(arg)))) {
-      return refuse('invalid_arguments', 'This server has invalid launch arguments. Review its setup.');
-    }
-    let previousCredentialFlag = false;
-    args = (args as string[] | undefined ?? []).map((arg, index, all) => {
+    args = (args as string[] | undefined ?? []).map((arg) => {
       const expanded = arg.replace(/\$\{(?:workspaceFolder|PROJECT_ROOT|CLEMENTINE_PROJECT_ROOT)\}/g, root);
-      const reference = /\$\{[A-Za-z_][A-Za-z0-9_]*\}/.test(expanded);
-      const flagWithReferencedValue = /^--?[A-Za-z_-]+$/.test(expanded)
-        && /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(all[index + 1] ?? '');
-      const privateTemplate = /^(?:--?[A-Za-z_-]+=)?(?:Bearer )?\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(expanded);
-      if ((credentialArgument.test(expanded) || previousCredentialFlag) && (!reference || !privateTemplate) && !flagWithReferencedValue) {
-        return refuse('private_argument', 'A tool argument may contain a private value. Use a named environment reference and enter its value in Connect.');
-      }
-      previousCredentialFlag = credentialArgument.test(expanded) && !expanded.includes('=');
-      refs(expanded);
       const equal = expanded.indexOf('=');
       const prefix = equal > 0 && expanded.startsWith('-') ? expanded.slice(0, equal + 1) : '';
       const value = prefix ? expanded.slice(equal + 1) : expanded;
@@ -176,29 +147,8 @@ function preparedDefinition(name: string, raw: unknown, root: string): McpServer
         || (process.platform !== 'win32' && /^[A-Za-z]:[\\/]/.test(value))) {
         return refuse('path_for_another_system', 'A tool argument uses a path for another operating system. Choose its location on this computer.');
       }
-      if (/^https?:\/\//i.test(value)) {
-        const url = new URL(value);
-        if (url.username || url.password || url.search || url.hash) return refuse('private_argument', 'Use a public endpoint without embedded credentials in tool arguments.');
-      }
       return expanded;
     });
-  }
-  if (raw.headers !== undefined && (!record(raw.headers) || Object.values(raw.headers).some(value => typeof value !== 'string'))) {
-    return refuse('invalid_headers', 'Use named environment references for server credentials.');
-  }
-  for (const [name, value] of Object.entries(raw.headers as Record<string, string> | undefined ?? {})) {
-    if (/\$\{/.test(value)) continue;
-    const protocol = name.toLowerCase();
-    const publicMetadata = protocol === 'accept' ? value.split(',').every(part => ['application/json', 'text/event-stream'].includes(part.trim().toLowerCase()))
-      : protocol === 'content-type' ? value.trim().toLowerCase() === 'application/json'
-        : protocol === 'mcp-protocol-version' && /^\d{4}-\d{2}-\d{2}$/.test(value);
-    if (!publicMetadata) return refuse('private_header', 'A server header needs a named environment reference. Enter its private value in Connect.');
-  }
-  const templates = prepareAgentMcpHeaderTemplates(raw.headers as Record<string, string> | undefined, [...keys]);
-  if (!templates.ok) return refuse('private_header', 'A server header needs a named environment reference. Enter its private value in Connect.');
-  if (typeof raw.url === 'string') {
-    try { const url = new URL(raw.url); if (url.username || url.password || url.search || url.hash) throw new Error(); }
-    catch { return refuse('private_endpoint', 'Use a valid server endpoint without embedded credentials or query values.'); }
   }
   const prepared = prepareMcpServerCreateRequest({ name, type, command, args, cwd, url: raw.url,
     headers: templates.headers, env: Object.fromEntries(templates.requiredEnvKeys.map(key => [key, ''])),
