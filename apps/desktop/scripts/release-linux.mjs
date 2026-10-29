@@ -20,7 +20,18 @@ for (const entry of build.extraResources ?? []) {
   const from = typeof entry === 'string' ? entry : entry.from;
   if (existsSync(path.resolve(desktopDir, from))) kept.push(entry); else dropped.push(from);
 }
-build.extraResources = kept;
+// Other platforms' prebuilt inference binaries and the browser build of the
+// inference runtime never run inside a Linux package; the Linux smoke proves
+// embeddings still load without them.
+const LINUX_NODE_MODULE_EXCLUSIONS = [
+  '!node_modules/onnxruntime-node/bin/napi-v*/darwin/**',
+  '!node_modules/onnxruntime-node/bin/napi-v*/win32/**',
+  '!node_modules/onnxruntime-node/bin/napi-v*/linux/arm64/**',
+  '!node_modules/onnxruntime-web/dist/**',
+];
+build.extraResources = kept.map((entry) => (typeof entry !== 'string' && entry.to === 'daemon/node_modules'
+  ? { ...entry, filter: [...(entry.filter ?? ['**/*']), ...LINUX_NODE_MODULE_EXCLUSIONS] }
+  : entry));
 // The package is scoped (@…/desktop), which is not a file name; the binary
 // and the desktop entry get the product's own plain name.
 build.linux = {
