@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle, ChevronRight } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Page } from '@/components/Page';
@@ -19,6 +19,8 @@ import { ProjectsPanel } from '@/components/connect/ProjectsPanel';
 import { CliTools } from '@/components/connect/CliTools';
 import { BrowserHarness } from '@/components/connect/BrowserHarness';
 import { ComputerDriver } from '@/components/connect/ComputerDriver';
+import { OtherApps } from '@/components/connect/OtherApps';
+import { apiGet } from '@/lib/api';
 import { getComputerDriver } from '@/lib/computer-driver';
 import { BrowserConnection } from '@/components/connect/BrowserConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
@@ -107,6 +109,11 @@ export function Connect() {
   const computerDriver = usePoll(['computer-driver'], getComputerDriver, 20_000);
   const computerIsOn = Boolean(computerDriver.data?.installed && computerDriver.data?.connected);
   const [showBrowsersAnyway, setShowBrowsersAnyway] = useState(false);
+  // Where the computer driver is the only browser (macOS, Linux), the cloud
+  // browser and the Chrome harness are retired and not offered at all.
+  const olderBrowsers = useQuery({ queryKey: ['cloud-browser-retired'], staleTime: 300_000,
+    queryFn: () => apiGet<{ retired?: boolean }>('/api/console/cloud-browser/status') });
+  const olderBrowsersRetired = olderBrowsers.data?.retired === true;
   const [setupForm, setSetupForm] = useState<AppSetupForm | null>(null);
 
   /** Open a sign-in link in the browser; the words go back to the card. */
@@ -363,7 +370,8 @@ export function Connect() {
 
       {/* Your computer first; while Clem's driver is on, it is the browser too */}
       <ComputerDriver />
-      {computerIsOn && !showBrowsersAnyway ? (
+      <OtherApps />
+      {olderBrowsersRetired ? null : computerIsOn && !showBrowsersAnyway ? (
         <Card>
           <p className="text-small text-muted">
             Your computer is Clem’s browser while it is on. The Chrome harness and any cloud browser stay idle.
