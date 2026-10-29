@@ -24,6 +24,8 @@ import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttempt
 import { mintOwnerCardReplyToken, mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
 import { listCardReplies, recordCardReply, type CardReply } from './card-replies.js';
+import { actionTopologyRoleFor } from '../tools/tool-registry.js';
+import { withoutRetainedWorkCheckpoint } from '../runtime/harness/retained-work-checkpoint.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
@@ -606,6 +608,17 @@ export interface FromClemTurnStep {
 
 const STEPS_SHOWN = 8;
 
+/** The operation a call ran: the host's resolved tool, else the slug the call
+ *  itself names, else the tool called. */
+function stepOperation(data: Record<string, unknown>): string {
+  if (typeof data.effectiveTool === 'string' && data.effectiveTool) return data.effectiveTool;
+  try {
+    const args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) as Record<string, unknown> : data.arguments as Record<string, unknown> | undefined;
+    if (args && typeof args.tool_slug === 'string' && args.tool_slug) return args.tool_slug;
+  } catch { /* the tool's own name stands */ }
+  return typeof data.tool === 'string' ? data.tool : '';
+}
+
 function turnSteps(sourceSeq: number): FromClemTurnStep[] {
   const steps = new Map<string, FromClemTurnStep>();
   try {
@@ -613,9 +626,12 @@ function turnSteps(sourceSeq: number): FromClemTurnStep[] {
       if (event.data.sourceUserSeq !== sourceSeq) continue;
       const callId = typeof event.data.callId === 'string' ? event.data.callId : `seq:${event.seq}`;
       if (event.type === 'tool_returned') { const step = steps.get(callId); if (step) step.done = true; continue; }
-      const tool = typeof event.data.effectiveTool === 'string' && event.data.effectiveTool ? event.data.effectiveTool
-        : typeof event.data.tool === 'string' ? event.data.tool : '';
+      const tool = stepOperation(event.data);
       if (!tool) continue;
+      // Clem's own housekeeping (looking up tools, recalling memory, reading
+      // a skill) is how she works, not something she did for the owner.
+      const role = typeof event.data.topologyRole === 'string' ? event.data.topologyRole : actionTopologyRoleFor(tool);
+      if (role === 'control') continue;
       steps.set(callId, { tool, ...(typeof event.data.effect === 'string' ? { effect: event.data.effect } : {}), done: false });
     }
   } catch { /* no steps is a quieter record, not a failed one */ }
@@ -636,7 +652,10 @@ export function fromClemTurnOutcome(input: { runId: string; since: string }, now
   const steps = turnSteps(source.seq);
   const terminal = exactTerminalForAcceptedSource(source);
   if (!terminal) return { state: 'working', steps };
-  const { status, text } = terminal.presentation;
+  const { status } = terminal.presentation;
+  // The retained-work checkpoint rides on the terminal for the model; the
+  // owner reads only what Clem wrote.
+  const text = withoutRetainedWorkCheckpoint(terminal.presentation.text).trim();
   const needs = (terminal.presentation as { needs?: { kind?: string } }).needs;
   return {
     state: status === 'done' ? 'done' : status === 'needs_input' ? 'needs_you' : 'stopped',

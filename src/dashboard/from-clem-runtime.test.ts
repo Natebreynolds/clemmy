@@ -832,6 +832,10 @@ test('a reply\'s record shows what Clem does as she does it, then her answer, or
   const source = eventlog.recordRunAttemptUserInput(attempt, { turn: 1, role: 'user', data: { text: 'Move it to 1 PM', displayText: 'Move it to 1 PM', runId } });
   const call = (callId: string, effectiveTool: string, effect: string) => eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
     data: { sourceUserSeq: source.seq, tool: 'work_call', effectiveTool, effect, callId, arguments: '{"private":"never shown"}' } });
+  eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { sourceUserSeq: source.seq, tool: 'call_tool', effectiveTool: 'tool_search', effect: 'read', topologyRole: 'control', callId: 'c0' } });
+  eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { sourceUserSeq: source.seq, tool: 'memory_recall_all', callId: 'c00' } });
   call('c1', 'FIXTURE_CALENDAR_FIND_EVENT', 'read');
   eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'work_call', callId: 'c1' } });
   call('c2', 'FIXTURE_CALENDAR_UPDATE_EVENT', 'external_write');
@@ -841,12 +845,14 @@ test('a reply\'s record shows what Clem does as she does it, then her answer, or
     { tool: 'FIXTURE_CALENDAR_UPDATE_EVENT', effect: 'external_write', done: false },
   ] });
   assert.doesNotMatch(JSON.stringify(working), /never shown/, 'a step never carries its arguments');
+  assert.doesNotMatch(JSON.stringify(working), /tool_search|memory_recall_all/, 'her own housekeeping is not a step she took for the owner');
   const identity = { sessionId: CLEM_THREAD_ID, turn: source.turn, sourceUserSeq: source.seq };
   commitTurnOutcome({ version: 2, id: turnOutcomeId(identity), identity, status: 'needs_input', resumable: true,
-    needs: { kind: 'approval' }, presentation: { kind: 'approval', text: 'Ready to move the meeting to 1 PM and tell the team. OK?', approvalId: 'apr-fx01' } });
+    needs: { kind: 'approval' }, presentation: { kind: 'approval', text: 'Ready to move the meeting to 1 PM and tell the team. OK?\n\nRetained work (durable checkpoint):\n- Source/tool fixture_calendar_view: 7 records (complete) retained as rh_fixture.\nExternal write state: no settled external-write attempt is recorded.', approvalId: 'apr-fx01' } });
   const asks = fromClemTurnOutcome({ runId, since });
   assert.equal(asks.state, 'needs_you');
   assert.equal((asks as { asks?: string }).asks, 'approval');
+  assert.equal((asks as { text?: string }).text, 'Ready to move the meeting to 1 PM and tell the team. OK?', 'the owner reads only what Clem wrote');
   assert.equal((asks as { steps?: unknown[] }).steps?.length, 2);
 });
 
