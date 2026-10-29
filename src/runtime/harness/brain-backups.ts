@@ -112,12 +112,14 @@ function availableBrainModelIds(): Set<string> {
   return ids;
 }
 
-/** A model as the picker names it, without its provider prefix. */
+/** A model as the picker names it, without its provider prefix. A picker
+ *  entry that only repeats the raw model id reads as the model's name. */
 export function brainModelLabel(modelId: string): string {
   try {
     const option = currentBrainOptions().find((o) => o.modelId === modelId);
-    if (option?.label) return option.label.replace(/^[^—]+—\s*/, '').trim() || option.label;
-  } catch { /* the id reads well enough on its own */ }
+    const named = option?.label ? option.label.replace(/^[^—]+—\s*/, '').trim() : '';
+    if (named && named !== modelId) return named;
+  } catch { /* the id is named from itself */ }
   return labelForModelId(modelId);
 }
 
