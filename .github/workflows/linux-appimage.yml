@@ -64,6 +64,9 @@ jobs:
         working-directory: apps/desktop
         run: npm run rebuild-daemon-natives
 
+      - name: Drop the daemon's build-only dependencies before packaging
+        run: npm prune --omit=dev
+
       - name: Package AppImage
         working-directory: apps/desktop
         run: npm run package:linux
