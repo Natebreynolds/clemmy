@@ -451,7 +451,7 @@ import { retractAnswerDraft } from './answer-stream.js';
 import { judgeAmbiguousStallReply, stallIsJudgeAmbiguous } from './stall-judge.js';
 export type { StallSignal, StallInfo } from './turn-decision.js';
 import {
-  peekStepResult,
+  peekStepCapture,
   recordStepResultFromTranscript,
 } from '../../tools/step-result-tool.js';
 import {
@@ -5718,9 +5718,9 @@ function isCompletedWithoutUserFacingReply(decision: OrchestratorDecisionShape |
   return Boolean(decision.done) && decision.nextAction === 'abandoned';
 }
 
-function hasCapturedWorkflowStepResult(sessionId: string): boolean {
+function hasCapturedWorkflowStepResult(sessionId: string, sourceUserSeq?: number): boolean {
   try {
-    return peekStepResult(sessionId).found;
+    return peekStepCapture(sessionId, new Set(sourceUserSeq === undefined ? [] : [sourceUserSeq])).found;
   } catch {
     return false;
   }
@@ -5728,12 +5728,13 @@ function hasCapturedWorkflowStepResult(sessionId: string): boolean {
 
 function captureWorkflowStepResultTranscript(opts: {
   sessionId: string;
+  sourceUserSeq?: number;
   turn: number;
   output: unknown;
 }): boolean {
   if (typeof opts.output !== 'string') return false;
   try {
-    const captured = recordStepResultFromTranscript(opts.sessionId, opts.output);
+    const captured = recordStepResultFromTranscript(opts.sessionId, opts.output, opts.sourceUserSeq);
     if (captured) {
       safeAppend({
         sessionId: opts.sessionId,
@@ -5764,7 +5765,7 @@ function completeCapturedWorkflowStepResult(opts: {
   // from this event instead of losing it (live 2026-08-23, runs
   // 1787745601613-p49r2/-trnr2: the stranded payload's ack echo became the
   // run's blocked reason).
-  const captured = peekStepResult(opts.sessionId);
+  const captured = peekStepCapture(opts.sessionId, new Set(opts.sourceUserSeq === undefined ? [] : [opts.sourceUserSeq]));
   if (captured.found) {
     safeAppend({
       sessionId: opts.sessionId,
@@ -5776,6 +5777,7 @@ function completeCapturedWorkflowStepResult(opts: {
           ? { sourceUserSeq: Number(opts.sourceUserSeq) }
           : {}),
         value: captured.value === undefined ? null : captured.value,
+        ...(captured.control ? { control: captured.control } : {}),
       },
     });
   }
@@ -7704,6 +7706,22 @@ async function runConversationWithinRuntimeConfig(
       const hostQueuedCard = zeroToolTurnAuthority
         ? null
         : materializeHostQueuedApprovals(options.sessionId, turnResult.turn, sourceUserSeq, result);
+      // Fresh host turns bypass runConversationCore, so use the same capture
+      // carrier here before its terminal is committed. Held/dispatch owners
+      // and a queued approval retain their stronger control-flow walls.
+      if (!hostQueuedCard && result.status === 'completed'
+        && hasCapturedWorkflowStepResult(options.sessionId, sourceUserSeq)) {
+        const captured = completeCapturedWorkflowStepResult({
+          sessionId: options.sessionId,
+          sourceUserSeq,
+          turn: turnResult.turn,
+          steps: 1,
+          decision: toOrchestratorDecision(turnResult.finalOutput),
+        });
+        if (captured.publicPresentation) emitRuntimeTerminalEvent(options.sessionId, captured);
+        foregroundRelease = captured.publicPresentation ? 'terminal' : null;
+        return captured;
+      }
       const reduced = reduceStandardConversationTerminal({
         result: hostQueuedCard?.result ?? result,
         sourceUserSeq,
@@ -8783,10 +8801,11 @@ async function runConversationCore(
 
     captureWorkflowStepResultTranscript({
       sessionId: options.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
       turn: turnResult.turn,
       output: turnResult.finalOutput,
     });
-    if (hasCapturedWorkflowStepResult(options.sessionId)) {
+    if (hasCapturedWorkflowStepResult(options.sessionId, activeSourceUserSeq)) {
       return completeCapturedWorkflowStepResult({
         sessionId: options.sessionId,
         sourceUserSeq: activeSourceUserSeq,
@@ -15265,10 +15284,11 @@ async function runConversationFromResumeCore(opts: {
 
   captureWorkflowStepResultTranscript({
     sessionId: opts.sessionId,
+    sourceUserSeq: activeSourceUserSeq,
     turn: lastTurn,
     output: firstResult.finalOutput,
   });
-  if (hasCapturedWorkflowStepResult(opts.sessionId)) {
+  if (hasCapturedWorkflowStepResult(opts.sessionId, activeSourceUserSeq)) {
     return completeCapturedWorkflowStepResult({
       sessionId: opts.sessionId,
       sourceUserSeq: activeSourceUserSeq,
@@ -15903,10 +15923,11 @@ async function runConversationFromResumeCore(opts: {
 
     captureWorkflowStepResultTranscript({
       sessionId: opts.sessionId,
+      sourceUserSeq: activeSourceUserSeq,
       turn: turnResult.turn,
       output: turnResult.finalOutput,
     });
-    if (hasCapturedWorkflowStepResult(opts.sessionId)) {
+    if (hasCapturedWorkflowStepResult(opts.sessionId, activeSourceUserSeq)) {
       return completeCapturedWorkflowStepResult({
         sessionId: opts.sessionId,
         sourceUserSeq: activeSourceUserSeq,

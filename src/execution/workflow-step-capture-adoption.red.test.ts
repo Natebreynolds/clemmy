@@ -51,6 +51,7 @@ const { writeWorkflow } = await import('../memory/workflow-store.js');
 const { WORKFLOW_RUNS_DIR } = await import('../tools/shared.js');
 const eventlog = await import('../runtime/harness/eventlog.js');
 const { recordStepResult, clearStepResult } = await import('../tools/step-result-tool.js');
+const { withToolOutputContext } = await import('../runtime/harness/tool-output-context.js');
 
 // The exact ack the tool returns to the MODEL — transport chrome, never a
 // deliverable. Byte-identical to the live run records' error field.
@@ -136,8 +137,10 @@ test('a demoted blocked terminal adopts the settled capture: the payload, not it
     configureRuntime: (async () => ({ ok: true })) as never,
     runConversation: (async (request: { sessionId?: string }) => {
       const sessionId = String(request.sessionId ?? '');
-      // The capture settled succeeded inside the turn (tool_returned ok) …
-      recordStepResult(sessionId, payload);
+      // The capture settled succeeded inside this exact accepted source …
+      const task = stepSource(sessionId);
+      withToolOutputContext({ sessionId, sourceUserSeq: task.sourceUserSeq, toolName: 'workflow_step_result' }, () =>
+        recordStepResult(sessionId, payload));
       // … and the delivery committer demoted the captured-result completion to
       // a blocked terminal whose only authored text is the tool's ack echo —
       // the exact live shape of run 1787745601613-p49r2 (seq 81163).
@@ -338,7 +341,8 @@ test('an uncertain irreversible write still blocks the step — with the settlem
           irreversible: true,
         },
       });
-      recordStepResult(sessionId, payload);
+      withToolOutputContext({ sessionId, sourceUserSeq: task.sourceUserSeq, toolName: 'workflow_step_result' }, () =>
+        recordStepResult(sessionId, payload));
       return {
         sessionId,
         status: 'blocked',

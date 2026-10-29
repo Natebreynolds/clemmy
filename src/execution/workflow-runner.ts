@@ -257,7 +257,8 @@ import {
   recordWorkflowOutcome,
   shouldStopAutoHeal,
 } from './workflow-failure-ledger.js';
-import { clearStepContract, isStepResultAckEcho, peekStepResult, registerStepContract, stepQuestionFromArgs, takeStepQuestion, takeStepResult } from '../tools/step-result-tool.js';
+import { clearStepContract, clearStepResult, isStepResultAckEcho, peekStepCapture, registerStepContract,
+  stepQuestionFromArgs, takeStepResult, type StepCapture } from '../tools/step-result-tool.js';
 import { markItemsSeen, readSeenItemKeys } from './workflow-watermark-store.js';
 import { buildWorkflowMemoryPrimerQuery } from './workflow-memory-primer.js';
 import { fixSignature, recordPendingFix, confirmPendingFix, discardPendingFix, recallConfirmedFix } from './workflow-fix-memory-store.js';
@@ -2466,17 +2467,10 @@ export class WorkflowHarnessBlockedSignal extends Error {
   }
 }
 
-/** The question a step's last result call asked the owner, read from the
- *  step session's durable call record after its accepted source. */
+/** @deprecated Diagnostic tool-call arguments are not accepted submissions.
+ * Retained for callers of the old export, with exact-source carrier authority. */
 export function stepQuestionFromStepCalls(sessionId: string, afterSeq: number): string | undefined {
-  try {
-    const calls = listHarnessEvents(sessionId, { types: ['tool_called'] })
-      .filter((event) => event.seq > afterSeq && event.data?.tool === 'workflow_step_result');
-    const last = calls[calls.length - 1];
-    return last ? stepQuestionFromArgs(last.data?.args) : undefined;
-  } catch {
-    return undefined;
-  }
+  return durableCapturedStepResult(sessionId, new Set([afterSeq])).control?.question;
 }
 
 function workflowInputState(input: {
@@ -6558,7 +6552,7 @@ async function runStepViaHarness(
         // 2026-08-25 with a new thrower).
         const blockedOutcome = workflowStepBlockedOutcome({
           stepId: step.id,
-          capturedFound: peekStepResult(realSessionId).found
+          capturedFound: peekStepCapture(realSessionId, stepExecutionSourceUserSeqs).found
             || durableCapturedStepResult(realSessionId, stepExecutionSourceUserSeqs).found,
           error: result.error,
           durableBlockedDetail: durableTerminalBlockedDetail(realSessionId),
@@ -6615,7 +6609,7 @@ async function runStepViaHarness(
       // run has no one to ask and nothing to decide. The step did no work, so
       // it is retried like any other outage, never parked on a question.
       if (latestQuestion?.data?.source === 'model_transport_recovery') {
-        takeStepResult(realSessionId);
+        clearStepResult(realSessionId, stepExecutionSourceUserSeqs);
         throw new ModelUnavailableStepError(`workflow step "${step.id}" could not reach its model`);
       }
       const question = (
@@ -6626,7 +6620,7 @@ async function runStepViaHarness(
       // Clear any process-local partial so a later resumed call cannot consume
       // it as the answer's completed result. Durable conversation/tool history
       // remains attached to the stable child session.
-      takeStepResult(realSessionId);
+      clearStepResult(realSessionId, stepExecutionSourceUserSeqs);
       throw new WorkflowAwaitingInputSignal(workflowInputState({
         runId: workflowRunId,
         stepId: step.id,
@@ -6641,12 +6635,15 @@ async function runStepViaHarness(
     // A step that cannot finish without the owner's own answer asks through
     // workflow_step_result's ask_owner. The run parks on that question (the
     // Inbox carries it) and this step resumes with the answer; nothing hangs.
-    // Read live first, then from the step's own call record so a restart
-    // between the ask and this read loses nothing.
-    const askedOwner = takeStepQuestion(realSessionId)
-      ?? stepQuestionFromStepCalls(realSessionId, sourceUserEvent.seq);
+    // Read only an accepted submission from this execution: the full local
+    // capture, or its source-attested durable carrier after a restart. A clipped
+    // tool_called preview can never grant question control.
+    const localSubmission = peekStepCapture(realSessionId, stepExecutionSourceUserSeqs);
+    const submission = localSubmission.found
+      ? localSubmission : durableCapturedStepResult(realSessionId, stepExecutionSourceUserSeqs);
+    const askedOwner = submission.control?.question;
     if (askedOwner) {
-      takeStepResult(realSessionId);
+      clearStepResult(realSessionId, stepExecutionSourceUserSeqs);
       throw new WorkflowAwaitingInputSignal(workflowInputState({
         runId: workflowRunId,
         stepId: step.id,
@@ -10109,21 +10106,36 @@ export function isPhantomStepCompletion(step: WorkflowStepInput, toolUses: strin
 export function durableCapturedStepResult(
   sessionId: string,
   allowedSourceUserSeqs: ReadonlySet<number>,
-): { found: boolean; value: unknown } {
+): StepCapture {
   try {
-    const attestedSources = new Set(
-      listHarnessEvents(sessionId, { types: ['conversation_completed'] })
-        .filter((event) => event.data?.reason === 'workflow_step_result_captured'
-          && Number.isSafeInteger(event.data?.sourceUserSeq))
-        .map((event) => Number(event.data.sourceUserSeq)),
-    );
+    // Select the newest submission first. A malformed or unattested successor
+    // must not revive an older success (or borrow its earlier terminal).
     const carriers = listHarnessEvents(sessionId, { types: ['workflow_step_result_captured'] })
       .filter((event) => Number.isSafeInteger(event.data?.sourceUserSeq)
-        && allowedSourceUserSeqs.has(Number(event.data.sourceUserSeq))
-        && attestedSources.has(Number(event.data.sourceUserSeq)));
+        && allowedSourceUserSeqs.has(Number(event.data.sourceUserSeq)));
     const last = carriers[carriers.length - 1];
     if (!last) return { found: false, value: undefined };
-    return { found: true, value: (last.data as { value?: unknown }).value };
+    const attested = listHarnessEvents(sessionId, { types: ['conversation_completed'] })
+      .some((event) => event.seq > last.seq
+        && event.data?.reason === 'workflow_step_result_captured'
+        && event.data.sourceUserSeq === last.data.sourceUserSeq);
+    if (!attested) return { found: false, value: undefined };
+    const value = (last.data as { value?: unknown }).value;
+    if (!Object.hasOwn(last.data, 'control')) return { found: true, value };
+    const raw = last.data.control;
+    if (last.role !== 'system' || !raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { found: false, value: undefined };
+    }
+    const control = raw as Record<string, unknown>;
+    const question = stepQuestionFromArgs({ ask_owner: control.question });
+    if (control.kind !== 'ask_owner' || !question || control.question !== question
+      || Object.keys(control).length !== 3 || !Object.hasOwn(control, 'partialData')
+      || !value || typeof value !== 'object' || Array.isArray(value)) return { found: false, value: undefined };
+    const blocked = value as Record<string, unknown>;
+    if (blocked.blocked !== true || blocked.reason !== question || Object.keys(blocked).length !== 2) {
+      return { found: false, value: undefined };
+    }
+    return { found: true, value, control: { kind: 'ask_owner', question, partialData: control.partialData } };
   } catch {
     return { found: false, value: undefined };
   }
@@ -10134,11 +10146,11 @@ export function durableCapturedStepResult(
 export function adoptCapturedStepResult(
   sessionId: string,
   allowedSourceUserSeqs: ReadonlySet<number>,
-): { found: boolean; value: unknown } {
+): StepCapture {
   void import('../runtime/harness/authored-workflow-write-authority.js')
     .then(({ settleUncheckedStepWrites }) => settleUncheckedStepWrites(sessionId))
     .catch(() => { /* the step's result stands; its write check is observability */ });
-  const local = takeStepResult(sessionId);
+  const local = takeStepResult(sessionId, allowedSourceUserSeqs);
   if (local.found) return local;
   return durableCapturedStepResult(sessionId, allowedSourceUserSeqs);
 }

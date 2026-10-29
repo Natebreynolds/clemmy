@@ -235,6 +235,17 @@ const {
   getLatestRunAttempt,
   isKillRequested,
 } = await import('../runtime/harness/eventlog.js');
+const { withToolOutputContext: withFixtureStepOutputContext } = await import('../runtime/harness/tool-output-context.js');
+const { recordStepResult: recordFixtureStepResult } = await import('../tools/step-result-tool.js');
+function recordSourceBoundFixtureResult(request: { sessionId: string; sourceUserSeq?: number }, value: unknown): void {
+  assert.ok(Number.isSafeInteger(request.sourceUserSeq) && (request.sourceUserSeq ?? 0) > 0,
+    'the actual runner request must identify the accepted source of its result');
+  const source = listEvents(request.sessionId, { types: ['user_input_received'] })
+    .find(event => event.seq === request.sourceUserSeq);
+  assert.ok(source && source.role === 'user', 'bind to the request source, never the latest row in a reused session');
+  withFixtureStepOutputContext({ sessionId: request.sessionId, sourceUserSeq: source.seq, toolName: 'workflow_step_result' }, () =>
+    recordFixtureStepResult(request.sessionId, value));
+}
 const workflowSettlementIdentities = await import('../runtime/harness/attempt-identity.js');
 const workflowSettlementDispatch = await import('../runtime/harness/dispatch-ledger.js');
 const workflowSettlementOutcomes = await import('../runtime/harness/attempt-outcome.js');
@@ -758,7 +769,6 @@ test('compiled V3 execution rejects a preexisting additive graph overlay before 
 });
 
 test('compiled project winner drains its catalogless V3 model node once and reports back across a restart-style rescan', async () => {
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { getPlanScope } = await import('../agents/plan-scope.js');
 
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -876,7 +886,7 @@ test('compiled project winner drains its catalogless V3 model node once and repo
         { length: 6 },
         (_, index) => `https://example.test/receipt-${index}-${'a'.repeat(80)}`,
       );
-      recordStepResult(options.sessionId, {
+      recordSourceBoundFixtureResult(options, {
         sent: true,
         messageId: `receipt-${stamp}`,
         // Keep this structured value below the workspace-offload threshold so
@@ -999,7 +1009,6 @@ test('compiled project winner drains its catalogless V3 model node once and repo
 });
 
 test('compiled specialists fan out as workers while only the exact brain sink is published', async () => {
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { loadNotifications } = await import('../runtime/notifications.js');
   const { writeWorkflow } = await import('../memory/workflow-store.js');
   const { registerAutonomyActionTools } = await import('../tools/autonomy-action-tools.js');
@@ -1168,14 +1177,14 @@ test('compiled specialists fan out as workers while only the exact brain sink is
   }) as never);
   _setWorkflowHarnessLoopImplsForTests({
     configureRuntime: (async () => ({ ok: true })) as never,
-    runConversation: (async (options: { sessionId: string; input?: string }) => {
+    runConversation: (async (options: { sessionId: string; sourceUserSeq?: number; input?: string }) => {
       const stepId = options.sessionId.split(':').at(-1) ?? '';
       if (specialistIds.includes(stepId)) {
         activeSpecialists += 1;
         maxActiveSpecialists = Math.max(maxActiveSpecialists, activeSpecialists);
         if (activeSpecialists === specialistIds.length) releaseSpecialists();
         await allSpecialistsEntered;
-        recordStepResult(options.sessionId, {
+        recordSourceBoundFixtureResult(options, {
           branch: stepId,
           value: stepId === 'probe_north' ? 12 : stepId === 'probe_east' ? 10 : 15,
           secret: `PRIVATE-${stepId}`,
@@ -1183,20 +1192,21 @@ test('compiled specialists fan out as workers while only the exact brain sink is
         activeSpecialists -= 1;
       } else if (stepId === 'reduce_sales') {
         reducerContexts.push(options.input ?? '');
-        recordStepResult(options.sessionId, {
+        recordSourceBoundFixtureResult(options, {
           total: 37,
           reducerSecret: 'PRIVATE-reducer-only',
         });
       } else if (stepId === 'brain') {
-        recordStepResult(options.sessionId, exactTerminalValue);
+        recordSourceBoundFixtureResult(options, exactTerminalValue);
       } else if (stepId === 'ordinary_step') {
-        recordStepResult(options.sessionId, 'ordinary catalog result');
+        recordSourceBoundFixtureResult(options, 'ordinary catalog result');
       } else if (stepId === 'notify_step') {
         const workflowRunId = options.sessionId.split(':')[1];
         if (!workflowRunId) throw new Error('notify acceptance fixture could not resolve its workflow run id');
         const result = await withToolOutputContext({
           workflowRunId,
           sessionId: options.sessionId,
+          sourceUserSeq: options.sourceUserSeq,
           stepId,
         }, () => notifyUser!({
           title: 'Platform 49 review complete',
@@ -1207,7 +1217,7 @@ test('compiled specialists fan out as workers while only the exact brain sink is
         if (!receipt) throw new Error('notify_user acceptance fixture returned no receipt');
         // Deliberately persist only the local queue receipt as the step result.
         // The authored body exists solely in notify_user's durable record.
-        recordStepResult(options.sessionId, receipt);
+        recordSourceBoundFixtureResult(options, receipt);
       } else if (stepId === 'fail_node') {
         throw new Error('EXACT-COMPILED-FAILURE-73');
       } else {
@@ -2271,7 +2281,6 @@ test('a corrupt project execution ledger cannot starve an independently admitted
 
 test('fresh workflow run records a sanitized graph snapshot event', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const slug = 'graph-snapshot-runner';
   const workflowName = 'Graph Snapshot Runner';
   const runId = `graph-snapshot-${Date.now()}`;
@@ -2309,7 +2318,7 @@ test('fresh workflow run records a sanitized graph snapshot event', async () => 
     configureRuntime: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
     runConversation: (async (options: { sessionId: string }) => {
-      recordStepResult(options.sessionId, { ok: true });
+      recordSourceBoundFixtureResult(options, { ok: true });
       return {
         sessionId: options.sessionId,
         status: 'completed',
@@ -2343,7 +2352,6 @@ test('a run whose target review does not rule records why, never a verdict', asy
   // Live 2026-10-18: a four-branch run passed with an advisory, made no review
   // call, and left no record of why its review did not run.
   const { writeWorkflow } = await import('../memory/workflow-store.js');
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const slug = 'target-review-skip-runner';
   const workflowName = 'Target Review Skip Runner';
   const runId = `target-review-skip-${Date.now()}`;
@@ -2362,7 +2370,7 @@ test('a run whose target review does not rule records why, never a verdict', asy
     configureRuntime: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
     runConversation: (async (options: { sessionId: string }) => {
-      recordStepResult(options.sessionId, { ok: true });
+      recordSourceBoundFixtureResult(options, { ok: true });
       return {
         sessionId: options.sessionId, status: 'completed', steps: 1, lastTurn: 1,
         lastDecision: { summary: 'done', reply: 'done', done: true, nextAction: 'completed' },
@@ -2386,7 +2394,6 @@ test('a run whose target review does not rule records why, never a verdict', asy
 
 test('fresh workflow run records ready batch metadata for parallel scheduler lanes', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const slug = 'parallel-ready-runner';
   const workflowName = 'Parallel Ready Runner';
   const runId = `parallel-ready-${Date.now()}`;
@@ -2415,7 +2422,7 @@ test('fresh workflow run records ready batch metadata for parallel scheduler lan
     configureRuntime: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
     runConversation: (async (options: { sessionId: string }) => {
-      recordStepResult(options.sessionId, { ok: true });
+      recordSourceBoundFixtureResult(options, { ok: true });
       return {
         sessionId: options.sessionId,
         status: 'completed',
@@ -6223,18 +6230,22 @@ test('a run that switched models says which step, to what, why, and the one thin
     'an older advisory without the models says nothing rather than guessing');
 });
 
-test('the runner reads a step\'s question for the owner from its own durable call record, latest call after its source only', async () => {
+test('diagnostic step call previews never grant owner-question recovery authority', async () => {
   const eventlog = await import('../runtime/harness/eventlog.js');
   const sid = `workflow:ask-durable-${Date.now()}:ask`;
   eventlog.createSession({ id: sid, kind: 'workflow' });
-  const before = eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'stale question before the source' } } });
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'stale question before the source' } } });
   const source = eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'step prompt' } });
-  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'a call before the accepted source does not count');
-  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'Which list should I use?' } } });
-  assert.equal(stepQuestionFromStepCalls(sid, source.seq), 'Which list should I use?');
-  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { tool: 'workflow_step_result', args: { data: '{"done":true}' } } });
-  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'a later plain result supersedes the question');
-  void before;
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'a diagnostic before the accepted source earns nothing');
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { sourceUserSeq: source.seq,
+    tool: 'workflow_step_result', arguments: JSON.stringify({ data: '{}', ask_owner: 'An actual argument preview is diagnostic only.' }) } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'production argument previews are not accepted submissions');
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { sourceUserSeq: source.seq,
+    tool: 'workflow_step_result', args: { data: '{}', ask_owner: 'A forged object shape is still not a carrier.' } } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'old synthetic object args cannot be promoted to question authority');
+  eventlog.appendEvent({ sessionId: sid, turn: 1, role: 'assistant', type: 'tool_called', data: { sourceUserSeq: source.seq,
+    tool: 'workflow_step_result', args: JSON.stringify({ data: '{}', ask_owner: 'An inner-dispatch string preview is not authority.' }).slice(0, 300) } });
+  assert.equal(stepQuestionFromStepCalls(sid, source.seq), undefined, 'string previews cannot replace a real source-attested carrier');
 });
 
 // ── G5: scheduled enabled workflow auto-approves its declarative gate ──────────
@@ -7431,7 +7442,6 @@ test('WorkflowWatcherMailbox never waits for the judge and exposes a late verdic
 
 test('workflow watcher: drift at a step boundary records a steer advisory with the right cadence and digest', async () => {
   const { writeWorkflow } = await import('../memory/workflow-store.js');
-  const { recordStepResult } = await import('../tools/step-result-tool.js');
   const { _setWorkflowWatcherForTests: setWatcher } = await import('./workflow-runner.js');
   const slug = 'watcher-steer-runner';
   const workflowName = 'Watcher Steer Runner';
@@ -7459,7 +7469,7 @@ test('workflow watcher: drift at a step boundary records a steer advisory with t
     configureRuntime: (async () => ({ ok: true })) as never,
     buildAgent: (async () => ({})) as never,
     runConversation: (async (options: { sessionId: string }) => {
-      recordStepResult(options.sessionId, { ok: true });
+      recordSourceBoundFixtureResult(options, { ok: true });
       return {
         sessionId: options.sessionId,
         status: 'completed',

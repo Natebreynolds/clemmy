@@ -1,6 +1,6 @@
 import {
   hasRegisteredStepContract,
-  peekStepResult,
+  peekStepCapture,
 } from '../../tools/step-result-tool.js';
 import { auditAcceptedSourceSettlementTruth } from './accepted-source-settlement-audit.js';
 
@@ -43,7 +43,7 @@ export function missingWorkflowStepResultContinuation(input: {
 }): { directive: string; auditStatus: string; auditReason: string } | null {
   if (
     !hasRegisteredStepContract(input.sessionId)
-    || peekStepResult(input.sessionId).found
+    || peekStepCapture(input.sessionId, new Set(input.sourceUserSeq === undefined ? [] : [input.sourceUserSeq])).found
     || !input.endedWithoutResult
     || input.used >= MAX_WORKFLOW_STEP_RESULT_CONTINUATIONS
     || input.stepIndex >= input.maxSteps

@@ -24,22 +24,93 @@ import { textResult } from './shared.js';
 import { coerceOutputForContract, isBlockedStepOutput, verifyStepOutput } from '../execution/step-output-verify.js';
 import type { WorkflowStepOutputContract } from '../memory/workflow-store.js';
 
-const stepResults = new Map<string, unknown>();
-/** A step's question for the owner, asked through `ask_owner`: the run parks
- *  on it and the step resumes with the answer. Keyed by step session. */
-const stepQuestions = new Map<string, string>();
-const ASK_OWNER_MAX_CHARS = 600;
-
-/** Runner-side: read AND clear the question a step asked the owner. */
-export function takeStepQuestion(sessionId: string): string | undefined {
-  if (!sessionId || !stepQuestions.has(sessionId)) return undefined;
-  const question = stepQuestions.get(sessionId);
-  stepQuestions.delete(sessionId);
-  return question;
+export interface StepQuestionControl {
+  kind: 'ask_owner';
+  question: string;
+  partialData: unknown;
 }
 
-/** The one shape of an asked question, shared by the live handler and the
- *  runner's durable read of the step's own call record. */
+export interface StepCapture {
+  found: boolean;
+  value: unknown;
+  control?: StepQuestionControl;
+}
+
+type StepSubmission = { sourceUserSeq?: number } & (
+  | { kind: 'result'; value: unknown }
+  | { kind: 'question'; control: StepQuestionControl }
+);
+
+interface StepSubmissionSlot {
+  submission?: StepSubmission;
+  sourceFence?: number;
+  inFlight: number;
+}
+
+// A question and a final result are competing submissions, never independent
+// stores. The latest accepted submission from the current source owns the slot.
+const stepSubmissions = new Map<string, StepSubmissionSlot>();
+const ASK_OWNER_MAX_CHARS = 600;
+
+function submissionSlot(sessionId: string): StepSubmissionSlot {
+  let slot = stepSubmissions.get(sessionId);
+  if (!slot) {
+    slot = { inFlight: 0 };
+    stepSubmissions.set(sessionId, slot);
+  }
+  return slot;
+}
+
+function dropEmptySubmissionSlot(sessionId: string, slot: StepSubmissionSlot): void {
+  if (!slot.submission && slot.inFlight === 0 && stepSubmissions.get(sessionId) === slot) {
+    stepSubmissions.delete(sessionId);
+  }
+}
+
+function clearVisibleSubmission(sessionId: string): void {
+  const slot = stepSubmissions.get(sessionId);
+  if (!slot) return;
+  delete slot.submission;
+  // A take hides the payload immediately, but an older handler awaiting its
+  // write check must not regain authority just because the newer value was read.
+  // This fence exists only while such handlers are still pending.
+  dropEmptySubmissionSlot(sessionId, slot);
+}
+
+function contextSourceUserSeq(sessionId: string): number | undefined {
+  const ctx = getToolOutputContext();
+  return ctx?.sessionId === sessionId && Number.isSafeInteger(ctx.sourceUserSeq) && (ctx.sourceUserSeq ?? 0) > 0
+    ? ctx.sourceUserSeq : undefined;
+}
+
+function commitStepSubmission(sessionId: string, submission: StepSubmission): boolean {
+  if (!sessionId) return false;
+  const slot = submissionSlot(sessionId);
+  // A handler may finish its write check after a newer accepted source has
+  // submitted. Its old/unknown owner cannot overwrite that newer submission.
+  if (slot.sourceFence !== undefined
+    && (submission.sourceUserSeq === undefined || submission.sourceUserSeq < slot.sourceFence)) return false;
+  slot.submission = submission;
+  slot.sourceFence = submission.sourceUserSeq;
+  return true;
+}
+
+function submissionForSource(sessionId: string, allowedSourceUserSeqs?: ReadonlySet<number>): StepSubmission | undefined {
+  const submission = stepSubmissions.get(sessionId)?.submission;
+  if (!submission || (allowedSourceUserSeqs !== undefined
+    && (submission.sourceUserSeq === undefined || !allowedSourceUserSeqs.has(submission.sourceUserSeq)))) return undefined;
+  return submission;
+}
+
+/** Runner-side: read AND clear the question a step asked the owner. */
+export function takeStepQuestion(sessionId: string, allowedSourceUserSeqs?: ReadonlySet<number>): string | undefined {
+  const submission = submissionForSource(sessionId, allowedSourceUserSeqs);
+  if (submission?.kind !== 'question') return undefined;
+  clearVisibleSubmission(sessionId);
+  return submission.control.question;
+}
+
+/** The normalized shape of a question supplied to the actual handler. */
 export function stepQuestionFromArgs(args: unknown): string | undefined {
   const raw = args && typeof args === 'object' ? (args as { ask_owner?: unknown }).ask_owner : undefined;
   const question = typeof raw === 'string' ? raw.trim() : '';
@@ -116,30 +187,42 @@ function contractRefusal(sessionId: string, value: unknown): { refusal: string }
 
 /** Handler-side: record a step's structured result for `sessionId`. */
 export function recordStepResult(sessionId: string, value: unknown): void {
-  if (!sessionId) return;
-  stepResults.set(sessionId, value);
+  commitStepSubmission(sessionId, { kind: 'result', value, sourceUserSeq: contextSourceUserSeq(sessionId) });
 }
 
 /** Runner-side: read AND clear the recorded result for `sessionId`.
  *  Returns `{ found, value }` so an explicit `null`/empty result is
  *  distinguishable from "the step never called the tool". */
-export function takeStepResult(sessionId: string): { found: boolean; value: unknown } {
-  if (!sessionId || !stepResults.has(sessionId)) return { found: false, value: undefined };
-  const value = stepResults.get(sessionId);
-  stepResults.delete(sessionId);
-  return { found: true, value };
+export function takeStepResult(sessionId: string, allowedSourceUserSeqs?: ReadonlySet<number>): { found: boolean; value: unknown } {
+  const submission = submissionForSource(sessionId, allowedSourceUserSeqs);
+  if (submission?.kind !== 'result') return { found: false, value: undefined };
+  clearVisibleSubmission(sessionId);
+  return { found: true, value: submission.value };
 }
 
 /** Loop-side: check whether a step result exists without consuming it.
  *  The workflow runner remains the only owner that takes/clears the payload. */
 export function peekStepResult(sessionId: string): { found: boolean; value: unknown } {
-  if (!sessionId || !stepResults.has(sessionId)) return { found: false, value: undefined };
-  return { found: true, value: stepResults.get(sessionId) };
+  const submission = submissionForSource(sessionId);
+  return submission?.kind === 'result'
+    ? { found: true, value: submission.value }
+    : { found: false, value: undefined };
+}
+
+/** Full host capture, separate from the legacy completed-result reader. A
+ * question remains honestly blocked to old readers; its complete partial data
+ * belongs only to outer host control metadata, never a completed step output. */
+export function peekStepCapture(sessionId: string, allowedSourceUserSeqs?: ReadonlySet<number>): StepCapture {
+  const submission = submissionForSource(sessionId, allowedSourceUserSeqs);
+  if (!submission) return { found: false, value: undefined };
+  return submission.kind === 'result'
+    ? { found: true, value: submission.value }
+    : { found: true, value: { blocked: true, reason: submission.control.question }, control: submission.control };
 }
 
 /** Test/maintenance: drop a session's pending result without reading. */
-export function clearStepResult(sessionId: string): void {
-  stepResults.delete(sessionId);
+export function clearStepResult(sessionId: string, allowedSourceUserSeqs?: ReadonlySet<number>): void {
+  if (submissionForSource(sessionId, allowedSourceUserSeqs)) clearVisibleSubmission(sessionId);
 }
 
 /**
@@ -252,8 +335,8 @@ function extractXmlCall(text: string): unknown | undefined {
 
 /** Best-effort repair for models that write the inert structural result call
  *  as text instead of invoking the tool. Never executes arbitrary tools. */
-export function recordStepResultFromTranscript(sessionId: string, text: string): boolean {
-  if (!sessionId || !text || stepResults.has(sessionId)) return false;
+export function recordStepResultFromTranscript(sessionId: string, text: string, sourceUserSeq?: number): boolean {
+  if (!sessionId || !text || stepSubmissions.get(sessionId)?.submission) return false;
   const value = extractBalancedJsonCall(text) ?? extractXmlCall(text);
   if (value === undefined) return false;
   // A salvaged transcript call gets the same submission gate as a real one —
@@ -262,8 +345,9 @@ export function recordStepResultFromTranscript(sessionId: string, text: string):
   const contract = stepContracts.get(sessionId);
   const bound = contract ? coerceOutputForContract(value, contract) : value;
   if (contract && !isBlockedStepOutput(bound) && !verifyStepOutput(contract, bound).ok) return false;
-  recordStepResult(sessionId, bound);
-  return true;
+  const source = Number.isSafeInteger(sourceUserSeq) && (sourceUserSeq ?? 0) > 0
+    ? sourceUserSeq : contextSourceUserSeq(sessionId);
+  return commitStepSubmission(sessionId, { kind: 'result', value: bound, sourceUserSeq: source });
 }
 
 /** How long the result call waits on its step's write check, well inside
@@ -292,13 +376,27 @@ export function registerStepResultTool(server: McpServer): void {
     async ({ data, ask_owner }: { data: string; ask_owner?: string }) => {
       const ctx = getToolOutputContext();
       const sessionId = ctx?.sessionId;
+      // Snapshot before awaiting the write check. The eventual commit and ACK
+      // must still belong to the source that actually called this handler.
+      const sourceUserSeq = sessionId ? contextSourceUserSeq(sessionId) : undefined;
       const value = coerceStepData(data);
       const question = stepQuestionFromArgs({ ask_owner });
-      if (sessionId && question) {
-        stepQuestions.set(sessionId, question);
-        return textResult('Your question is with the owner. This run waits for their answer and resumes this step with it. End your turn now.');
+      if (!sessionId) {
+        return textResult('Step result received (no step context to bind it to).');
       }
-      if (sessionId) {
+      if (sourceUserSeq === undefined) {
+        return textResult('Not recorded. This submission has no accepted source to bind it to.');
+      }
+      const slot = submissionSlot(sessionId);
+      slot.inFlight += 1;
+      try {
+        if (question) {
+          if (!commitStepSubmission(sessionId, { kind: 'question', sourceUserSeq,
+            control: { kind: 'ask_owner', question, partialData: value } })) {
+            return textResult('Not recorded. A newer accepted source owns this step submission.');
+          }
+          return textResult('Your question is with the owner. This run waits for their answer and resumes this step with it. End your turn now.');
+        }
         const gate = contractRefusal(sessionId, value);
         if ('refusal' in gate) return textResult(gate.refusal);
         // This step's recoverable writes ran when proposed; they are checked
@@ -309,12 +407,14 @@ export function registerStepResultTool(server: McpServer): void {
           return textResult(`Not recorded yet. A check of the writes this step made found: ${check.reason} `
             + 'Correct those writes now (they can be changed), then call workflow_step_result again with the result.');
         }
-        recordStepResult(sessionId, gate.accept);
+        if (!commitStepSubmission(sessionId, { kind: 'result', value: gate.accept, sourceUserSeq })) {
+          return textResult('Not recorded. A newer accepted source owns this step submission.');
+        }
         return textResult(stepResultAckText(data.length));
+      } finally {
+        slot.inFlight -= 1;
+        dropEmptySubmissionSlot(sessionId, slot);
       }
-      // No session context — can't correlate to a step. Don't throw;
-      // the runner's prose fallback will cover it.
-      return textResult('Step result received (no step context to bind it to).');
     },
   );
 }

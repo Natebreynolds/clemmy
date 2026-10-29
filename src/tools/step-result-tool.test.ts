@@ -1,15 +1,24 @@
 /**
- * Run: npx tsx --test src/tools/step-result-tool.test.ts
+ * Run: node scripts/run-tests-isolated.mjs src/tools/step-result-tool.test.ts
  *
  * The workflow_step_result store: record/take semantics, JSON coercion,
  * and the registered tool's capture behavior under a session context.
  */
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { recordStepResult, takeStepResult, peekStepResult, clearStepResult, recordStepResultFromTranscript, registerStepResultTool, stepQuestionFromArgs, takeStepQuestion } from './step-result-tool.js';
 import { withToolOutputContext } from '../runtime/harness/tool-output-context.js';
+
+assert.equal(process.env.CLEMMY_TEST_ISOLATED_HOME, '1', 'registered-handler fixtures require the canonical isolated launcher');
+const eventlog = await import('../runtime/harness/eventlog.js');
+after(() => eventlog.closeEventLog());
+function fixtureAcceptedSource(sessionId: string): number {
+  eventlog.createSession({ id: sessionId, kind: 'workflow' });
+  return eventlog.appendEvent({ sessionId, turn: 1, role: 'user', type: 'user_input_received',
+    data: { text: 'Complete the controlled registered result-tool fixture.' } }).seq;
+}
 
 test('recordStepResult / takeStepResult: take returns once then clears', () => {
   recordStepResult('sess-A', { accounts: [1, 2, 3] });
@@ -98,7 +107,8 @@ function captureTool() {
 test('tool coerces a JSON-string payload into a structured object', async () => {
   const { handler } = captureTool();
   clearStepResult('sess-json');
-  await withToolOutputContext({ sessionId: 'sess-json', toolName: 'workflow_step_result' }, () =>
+  const sourceUserSeq = fixtureAcceptedSource('sess-json');
+  await withToolOutputContext({ sessionId: 'sess-json', sourceUserSeq, toolName: 'workflow_step_result' }, () =>
     handler({ data: JSON.stringify({ rows: [{ id: 1 }], total: 1 }) }),
   );
   const r = takeStepResult('sess-json');
@@ -109,7 +119,8 @@ test('tool coerces a JSON-string payload into a structured object', async () => 
 test('tool keeps a plain-text payload as a string (narrative steps)', async () => {
   const { handler } = captureTool();
   clearStepResult('sess-text');
-  await withToolOutputContext({ sessionId: 'sess-text', toolName: 'workflow_step_result' }, () =>
+  const sourceUserSeq = fixtureAcceptedSource('sess-text');
+  await withToolOutputContext({ sessionId: 'sess-text', sourceUserSeq, toolName: 'workflow_step_result' }, () =>
     handler({ data: 'Drafted 10 emails; all held for review.' }),
   );
   const r = takeStepResult('sess-text');
@@ -186,8 +197,9 @@ test('workflow_step_result is held once for a conflict the step\'s write check f
   const handlers = new Map<string, (args: { data: string }) => Promise<{ content: Array<{ text: string }> }>>();
   registerStepResultTool({ tool: (name: string, _d: string, _s: unknown, handler: never) => { handlers.set(name, handler); } } as unknown as McpServer);
   const sessionId = 'sess-step-write-check';
+  const sourceUserSeq = fixtureAcceptedSource(sessionId);
   authority._queueStepWriteForTests({ receipt: { workflowName: 'fixture', workflowRunId: 'fixture-run', stepId: 'main' },
-    stepPrompt: 'Append the row with status Open.', sessionId, sourceUserSeq: 1, tool: 'fixture_sheet_append',
+    stepPrompt: 'Append the row with status Open.', sessionId, sourceUserSeq, tool: 'fixture_sheet_append',
     args: { status: 'Closed' } });
   let reviews = 0;
   authority._setWorkflowMutationReviewerForTests(async () => {
@@ -195,7 +207,7 @@ test('workflow_step_result is held once for a conflict the step\'s write check f
     return { verdict: 'conflict', reason: 'The row says Closed; the instructions say Open.', proposalDigest: 'fixture' };
   });
   try {
-    const call = () => withToolOutputContext({ sessionId, toolName: 'workflow_step_result' }, () =>
+    const call = () => withToolOutputContext({ sessionId, sourceUserSeq, toolName: 'workflow_step_result' }, () =>
       handlers.get('workflow_step_result')!({ data: '{"rows":1}' }));
     const held = await call();
     assert.match(held.content[0]!.text, /^Not recorded yet\. A check of the writes this step made found: The row says Closed/);
@@ -243,7 +255,8 @@ test('a step write check runs once however often it is asked, and a slow one nev
 test('a step that needs the owner asks through ask_owner: the question is held for the runner, not recorded as a result', async () => {
   const captured = captureTool() as unknown as { handler: (a: { data: string; ask_owner?: string }) => Promise<unknown> };
   clearStepResult('sess-ask');
-  const reply = await withToolOutputContext({ sessionId: 'sess-ask', toolName: 'workflow_step_result' }, () =>
+  const sourceUserSeq = fixtureAcceptedSource('sess-ask');
+  const reply = await withToolOutputContext({ sessionId: 'sess-ask', sourceUserSeq, toolName: 'workflow_step_result' }, () =>
     captured.handler({ data: '{"draft":"so far"}', ask_owner: '  Red or blue for the new header?  ' }),
   ) as { content?: Array<{ text?: string }> };
   assert.match(reply.content?.[0]?.text ?? '', /waits for their answer/);

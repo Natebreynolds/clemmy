@@ -22,6 +22,7 @@ const { runConversation } = await import('./loop.js');
 const { HarnessSession } = await import('./session.js');
 const eventlog = await import('./eventlog.js');
 const stepResults = await import('../../tools/step-result-tool.js');
+const { withToolOutputContext } = await import('./tool-output-context.js');
 const { auditAcceptedSourceSettlementTruth } = await import('./accepted-source-settlement-audit.js');
 
 after(() => {
@@ -76,10 +77,13 @@ test('host_v1 keeps one accepted workflow source alive until its contracted resu
       requests.push(request);
       calls += 1;
       if (calls === 2) {
-        stepResults.recordStepResult(session.id, {
-          url: 'https://example.test/platform-49',
-          leads: [{ id: 'new-platform-item' }],
-        });
+        const accepted = eventlog.listEvents(session.id, { types: ['user_input_received'] });
+        assert.equal(accepted.length, 1, 'the same unique accepted source owns the structural result');
+        withToolOutputContext({ sessionId: session.id, sourceUserSeq: accepted[0]!.seq, toolName: 'workflow_step_result' }, () =>
+          stepResults.recordStepResult(session.id, {
+            url: 'https://example.test/platform-49',
+            leads: [{ id: 'new-platform-item' }],
+          }));
       }
       return {
         usage: {
