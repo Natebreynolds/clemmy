@@ -596,7 +596,9 @@ async function replyOnce(
 export type FromClemTurnOutcome =
   | { state: 'working'; steps?: FromClemTurnStep[] }
   | { state: 'not_found' }
-  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer' };
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer';
+      /** The card the owner approves or declines, with the exact content. */
+      approvalId?: string };
 
 /** One thing Clem did for the reply, named by the operation it ran (the
  *  surface words it in plain language). Never its arguments. */
@@ -663,6 +665,8 @@ export function fromClemTurnOutcome(input: { runId: string; since: string }, now
     sessionId: CLEM_THREAD_ID,
     steps,
     ...(status === 'needs_input' ? { asks: needs?.kind === 'approval' ? 'approval' as const : 'answer' as const } : {}),
+    ...(needs?.kind === 'approval' && typeof (terminal.presentation as { approvalId?: unknown }).approvalId === 'string'
+      ? { approvalId: (terminal.presentation as { approvalId: string }).approvalId } : {}),
   };
 }
 

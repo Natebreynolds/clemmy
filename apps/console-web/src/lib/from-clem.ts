@@ -133,7 +133,7 @@ export const useFromClem = (enabled = true) => usePoll(['home-from-clem'], getFr
 export type FromClemTurnOutcome =
   | { state: 'working'; steps?: FromClemTurnStep[] }
   | { state: 'not_found' }
-  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer' };
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: FromClemTurnStep[]; asks?: 'approval' | 'answer'; approvalId?: string };
 
 /** One thing Clem did for a reply, by the operation it ran. */
 export interface FromClemTurnStep { tool: string; effect?: string; done: boolean }

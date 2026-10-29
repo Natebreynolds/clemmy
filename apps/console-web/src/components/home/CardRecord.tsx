@@ -60,7 +60,13 @@ export function CardRecord({ record, onDismiss, showTitle = false }: { record: C
         {headline.text}
       </p>
       {words && <p className="mt-0.5 line-clamp-6 whitespace-pre-wrap text-body text-fg [overflow-wrap:anywhere]">{words}</p>}
-      {sessionId && outcome.state !== 'done' && (
+      {outcome.state === 'needs_you' && outcome.approvalId ? (
+        // The approval card shows exactly what Clem will change; it is where the tap is the approval.
+        <Link to={`/inbox?tab=needs&select=${encodeURIComponent(outcome.approvalId)}`}
+          className="mt-1 inline-block text-small font-semibold text-primary hover:underline">
+          Review and approve
+        </Link>
+      ) : sessionId && outcome.state !== 'done' && (
         <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(sessionId))}`}
           className="mt-1 inline-block text-small font-semibold text-primary hover:underline">
           {outcome.state === 'needs_you' ? (outcome.asks === 'approval' ? 'Review and approve' : 'Answer Clem') : 'Open the conversation'}

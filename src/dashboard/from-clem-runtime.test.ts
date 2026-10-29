@@ -852,6 +852,7 @@ test('a reply\'s record shows what Clem does as she does it, then her answer, or
   const asks = fromClemTurnOutcome({ runId, since });
   assert.equal(asks.state, 'needs_you');
   assert.equal((asks as { asks?: string }).asks, 'approval');
+  assert.equal((asks as { approvalId?: string }).approvalId, 'apr-fx01', 'the record opens the approval card itself');
   assert.equal((asks as { text?: string }).text, 'Ready to move the meeting to 1 PM and tell the team. OK?', 'the owner reads only what Clem wrote');
   assert.equal((asks as { steps?: unknown[] }).steps?.length, 2);
 });

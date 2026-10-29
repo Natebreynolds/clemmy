@@ -177,7 +177,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
         <div class="home-row-title">{row.say || row.text}</div>
         {!presentation && row.detail ? <p class="from-clem-report">{row.detail}</p> : null}
         {notice(row)}
-        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} onOpenInbox={onOpenInbox} /> : null}
         {!done ? (
           <div class="home-row-actions">
             {(row.answer?.kind === 'yes_no' ? [] : row.choices ?? []).map((choice, index) => (
@@ -225,7 +225,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
           <button type="button" class="home-btn" onClick={() => onOpenThread(row.handoff?.sessionId)}>{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</button>
         </div> : null}
         {notice(row)}
-        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} onOpenInbox={onOpenInbox} /> : null}
         {!row.handoff && !done ? (
           <div class="home-row-actions">
             {notificationId ? (
@@ -250,7 +250,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
         {!row.say && row.detail ? <div class="home-row-note">{row.detail}</div> : null}
         {!href ? <div class="home-row-note">{setup.placeName} is on your computer.</div> : null}
         {notice(row)}
-        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} onOpenInbox={onOpenInbox} /> : null}
         {!done ? (
           <div class="home-row-actions">
             {href ? <a class="home-btn home-btn-primary" href={href} data-app-place={setup.place}>Open {setup.placeName}</a> : null}
@@ -302,7 +302,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
       </div>
       {justNow.length > 0 ? <div class="card-record-just-now">
         <h3 class="section-head">Just now</h3>
-        {justNow.map((record) => <CardRecord key={record.runId} record={record} showTitle onOpenThread={onOpenThread} />)}
+        {justNow.map((record) => <CardRecord key={record.runId} record={record} showTitle onOpenThread={onOpenThread} onOpenInbox={onOpenInbox} />)}
       </div> : null}
       {group('from-clem-waiting', 'Waiting on you', waiting, waitingRow)}
       {group('from-clem-updates', 'Updates', updates, updateRow)}

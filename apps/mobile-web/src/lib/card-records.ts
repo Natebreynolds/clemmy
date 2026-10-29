@@ -6,7 +6,7 @@ export interface CardStep { tool: string; effect?: string; done: boolean }
 export type CardOutcome =
   | { state: 'working'; steps?: CardStep[] }
   | { state: 'not_found' }
-  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: CardStep[]; asks?: 'approval' | 'answer' };
+  | { state: 'done' | 'needs_you' | 'stopped'; text: string; sessionId: string; steps?: CardStep[]; asks?: 'approval' | 'answer'; approvalId?: string };
 
 /** What the owner asked Clem from one of her items, with what she is doing about it. */
 export interface CardRecord {

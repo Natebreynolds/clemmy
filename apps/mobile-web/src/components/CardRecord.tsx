@@ -4,10 +4,12 @@ import { cardRecordHeadline, cardStepLabel, type CardRecord as Record } from '..
 /** What Clem is doing about what the owner asked on this item: their words,
  *  her steps as they happen, then her answer, or what she still needs. Shown
  *  on the item itself, the same record the desktop shows. */
-export function CardRecord({ record, showTitle = false, onOpenThread }: {
+export function CardRecord({ record, showTitle = false, onOpenThread, onOpenInbox }: {
   record: Record;
   showTitle?: boolean;
   onOpenThread: (sessionId?: string) => void;
+  /** Opens one decision in Inbox: the approval card with the exact content. */
+  onOpenInbox?: (decisionKey?: string) => void;
 }) {
   const outcome = record.outcome;
   const headline = cardRecordHeadline(outcome);
@@ -30,7 +32,9 @@ export function CardRecord({ record, showTitle = false, onOpenThread }: {
       )}
       <p class={`card-record-headline tone-${headline.tone}`}>{headline.text}</p>
       {words && <p class="card-record-words">{words}</p>}
-      {sessionId && outcome.state !== 'done' && (
+      {outcome.state === 'needs_you' && outcome.approvalId && onOpenInbox ? (
+        <button type="button" class="home-link-btn" onClick={() => onOpenInbox(`approval:${outcome.approvalId}`)}>Review and approve</button>
+      ) : sessionId && outcome.state !== 'done' && (
         <button type="button" class="home-link-btn" onClick={() => onOpenThread(sessionId)}>
           {outcome.state === 'needs_you' ? (outcome.asks === 'approval' ? 'Review and approve' : 'Answer Clem') : 'Open the conversation'}
         </button>
