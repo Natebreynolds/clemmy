@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { workflowDisplayName } from '@clem/chat-engine';
 import { useBackGesture, withDepthTransition } from '../lib/back-gesture';
 import { isActiveRunStatus, listRecentRuns, listWorkingNow, type ActivityEntry, type RunSummary } from '../lib/api';
@@ -11,6 +11,7 @@ import { RunControl } from '../components/RunControl';
 import { ScreenNotice } from '../components/ScreenNotice';
 import { useScreenData } from '../lib/use-screen-data';
 import { Run } from './Run';
+import { loadActivitySources, type ActivitySources } from '../lib/activity-sources';
 
 interface Props {
   /** A run addressed by the URL — a push tap, a reload, or any surface that
@@ -19,10 +20,12 @@ interface Props {
   /** Keeps the URL in step with what is open, so reload and the swipe-back
    *  gesture both land where the user actually is. */
   onRunChange?: (sessionId: string | null) => void;
+  onOpenNeedsYou?: (decisionKey?: string) => void;
 }
 
-export function Activity({ initialRunId, onRunChange }: Props = {}) {
+export function Activity({ initialRunId, onRunChange, onOpenNeedsYou }: Props = {}) {
   const [openRun, setOpenRun] = useState<string | null>(initialRunId ?? null);
+  const lastSources = useRef<ActivitySources | null>(null);
   // The swipe-back closes the run AND drops it from the URL, so a reload after
   // leaving does not reopen the run the user just walked out of. (No transition
   // here: back-gesture already wraps the pop it is servicing.)
@@ -48,28 +51,23 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
   // non-terminal row, which is how six runs blocked two days earlier came to
   // sit under the words "Happening now" — each of them still printing the live
   // phase text it had been showing when it died.
-  const { data, loading, error, offline, refresh } = useScreenData(
+  const { data, loading, error, offline, stale, refresh } = useScreenData(
     async () => {
-      const [runsResult, workingNow] = await Promise.all([
-        listRecentRuns().then((v) => ({ v }), (e) => ({ e })),
-        listWorkingNow().then((v) => ({ v }), (e) => ({ e })),
-      ]);
-      if ('e' in runsResult && 'e' in workingNow) throw (runsResult as { e: unknown }).e;
-      return {
-        runs: 'v' in runsResult ? runsResult.v.runs : [],
-        working: 'v' in workingNow ? workingNow.v : { entries: [], observedAt: new Date().toISOString() },
-      };
+      const next = await loadActivitySources({ history: listRecentRuns, working: listWorkingNow }, lastSources.current);
+      lastSources.current = next;
+      return next;
     },
     { intervalMs: 8000, disabled: openRun !== null },
   );
   const runs = data?.runs ?? [];
-  const working = data?.working ?? { entries: [], observedAt: new Date().toISOString() };
+  const working = data?.working;
+  const workingStale = Boolean(data?.workingUnavailable || stale || error || offline || lastGoodAt('/m/api/activity/v2?workingNow=1'));
   // Same certificate as Home: pulse and elapsed come from the ONE shared
   // presenter — a stale or waiting row must not look alive here either.
-  const workingView = presentWorkingNow(working.entries, working.observedAt);
+  const workingView = presentWorkingNow(working?.entries ?? [], working?.observedAt ?? '');
 
   if (openRun) {
-    return <Run key={openRun} sessionId={openRun} onBack={() => { showRun(null); void refresh(); }} />;
+    return <Run key={openRun} sessionId={openRun} onOpenNeedsYou={onOpenNeedsYou} onBack={() => { showRun(null); void refresh(); }} />;
   }
 
   if (loading && runs.length === 0) {
@@ -89,7 +87,12 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
     />
   );
 
-  if (runs.length === 0 && workingView.total === 0 && (error || offline)) return <div class="home">{notice}</div>;
+  const sourceNotices = <>
+    {data?.workingUnavailable ? <ScreenNotice error={working ? 'Current work couldn’t refresh. Showing the last loaded work.' : 'Current work couldn’t be loaded.'} offline={false} hasData={Boolean(working)} onRetry={() => void refresh()} /> : null}
+    {data?.historyUnavailable ? <ScreenNotice error={data.runs ? 'Earlier work couldn’t refresh. Showing the last loaded history.' : 'Earlier work couldn’t be loaded.'} offline={false} hasData={Boolean(data.runs)} onRetry={() => void refresh()} /> : null}
+  </>;
+  const unavailable = Boolean(error || offline || data?.workingUnavailable || data?.historyUnavailable || lastGoodAt('/m/api/runs'));
+  if (runs.length === 0 && workingView.total === 0 && unavailable) return <div class="home">{notice}{sourceNotices}</div>;
 
   if (runs.length === 0 && workingView.total === 0) {
     return (
@@ -106,15 +109,16 @@ export function Activity({ initialRunId, onRunChange }: Props = {}) {
   return (
     <div class="home">
       {notice}
+      {sourceNotices}
       {LIVE_SECTIONS.map(({ membership, head }) => {
         const rows = workingView.entries.filter((p) => p.membership === membership);
         if (rows.length === 0) return null;
         return (
           <section class="home-section" key={membership}>
-            <h2 class="section-head">{head}</h2>
+            <h2 class="section-head">{workingStale ? `Last loaded · ${head.toLocaleLowerCase()}` : head}</h2>
             <div class="stack">
               {rows.map((p, i) => (
-                <LiveCard key={p.entry.runKey} presented={p} index={i} onChanged={() => void refresh()} onOpen={showRun} />
+                <LiveCard key={p.entry.runKey} presented={p} current={!workingStale} index={i} onChanged={() => void refresh()} onOpen={showRun} />
               ))}
             </div>
           </section>
@@ -141,20 +145,21 @@ const LIVE_SECTIONS: ReadonlyArray<{ membership: 'needs_you' | 'running' | 'stal
   { membership: 'stalled', head: 'Stalled' },
 ];
 
-function LiveCard({ presented, index, onChanged, onOpen }: {
+function LiveCard({ presented, current, index, onChanged, onOpen }: {
   presented: PresentedWorkingNowEntry<ActivityEntry>;
+  current: boolean;
   index: number;
   onChanged: () => void;
   onOpen: (sessionId: string) => void;
 }) {
   const entry = presented.entry;
   const { pulse, elapsed } = presented;
-  const control = mobileRunControl(entry);
+  const control = current ? mobileRunControl(entry) : null;
   const body = (
     <>
       {/* The pulse is a certificate: it animates only when the server said
           liveness === 'live'; anything else gets a quiet dot. */}
-      {pulse
+      {pulse && current
         ? <span class="pulse-dot" aria-hidden="true" />
         : <span class="running-task-state" style={{ background: 'var(--line-strong)' }} aria-hidden="true" />}
       <div class="min-w-0">

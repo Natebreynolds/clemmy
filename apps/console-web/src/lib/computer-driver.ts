@@ -14,6 +14,9 @@ export interface ComputerDriverStatus {
   serverName: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
+  /** Older daemons omit capabilities; no unsupported action is inferred. */
+  permissionSettingsAvailable?: boolean;
+  screenViewAvailable?: boolean;
 }
 
 export const getComputerDriver = () => apiGet<ComputerDriverStatus>('/api/console/computer-driver');
@@ -21,6 +24,11 @@ export const installComputerDriver = () => apiPost<{ job: InstallJob }>('/api/co
 export const getComputerDriverInstallJob = (id: string) => apiGet<{ job: InstallJob }>(`/api/console/computer-driver/install/${encodeURIComponent(id)}`);
 export const grantComputerDriverPermissions = () => apiPost<{ output: string; status: ComputerDriverStatus }>('/api/console/computer-driver/permissions', {});
 export const connectComputerDriver = () => apiPost<{ status: ComputerDriverStatus }>('/api/console/computer-driver/connect', {});
+
+/** An installed driver alone does not mean this computer is connected. */
+export function computerDriverIsConnected(status?: Pick<ComputerDriverStatus, 'installed' | 'connected'>): boolean {
+  return Boolean(status?.installed && status.connected);
+}
 
 /** The one next step the card offers: turn on, connect (an older copy), then ready. */
 export function computerDriverNextStep(status: ComputerDriverStatus): 'install' | 'connect' | 'ready' | 'unsupported' {
@@ -32,6 +40,8 @@ export function computerDriverNextStep(status: ComputerDriverStatus): 'install' 
 
 /** A fresh capture of the screen each time it is asked for. */
 export function computerScreenUrl(conversationId?: string, nowMs: number = Date.now()): string {
-  const base = withToken('/api/console/computer-driver/screen');
-  return `${base}${conversationId ? `&session=${encodeURIComponent(conversationId)}` : ''}&t=${nowMs}`;
+  const query = new URLSearchParams();
+  if (conversationId) query.set('session', conversationId);
+  query.set('t', String(nowMs));
+  return withToken(`/api/console/computer-driver/screen?${query}`);
 }

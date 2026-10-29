@@ -20,6 +20,13 @@ const output = await build({
     import { MemoryRouter } from 'react-router-dom';
     import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
     import { FromClemPane } from './src/components/home/FromClemPane';
+    import { NeedsYouPane } from './src/components/home/NeedsYouPane';
+    export function renderNeeds(props) {
+      const client = new QueryClient();
+      try { return renderToStaticMarkup(<MemoryRouter><QueryClientProvider client={client}>
+        <NeedsYouPane headingId="controlled-needs" loading={false} error={false} onRetry={() => { throw new Error('No reads'); }} {...props} />
+      </QueryClientProvider></MemoryRouter>); } finally { client.clear(); }
+    }
     export function render(props) {
       const client = new QueryClient();
       const originalFetch = globalThis.fetch;
@@ -36,7 +43,8 @@ const output = await build({
 });
 const fixtureFile = path.join(temporary, 'render.cjs');
 writeFileSync(fixtureFile, output.outputFiles[0].contents);
-const { render } = createRequire(import.meta.url)(fixtureFile) as {
+const { render, renderNeeds } = createRequire(import.meta.url)(fixtureFile) as {
+  renderNeeds: (props: {items: Array<Record<string, unknown>>;total?:number}) => string;
   render: (props: { data?: FromClem; loading: boolean; error: boolean }) => string;
 };
 
@@ -126,8 +134,58 @@ test('fresh decision controls keep their existing choices and quiet history rema
     presentation: { state: 'scheduled', lastCheck: { state: 'recorded' } } });
   const html = render({ data, error: false, loading: false });
   assert.match(html, /Controlled owner decision/);
-  assert.match(html, /<button[^>]*>Yes<\/button>/);
-  assert.match(html, /<button[^>]*>No<\/button>/);
+  assert.match(html, /href="\/inbox\?tab=needs&amp;select=controlled-plan"[^>]*>Review plan<\/a>/);
+  assert.doesNotMatch(html, /<button[^>]*>Yes<\/button>/, 'Today must not approve from a short preview');
+  assert.match(html, /Decline/);
   assert.match(historyIn(html), /Quiet retained check/);
   assert.doesNotMatch(html, /Showing the last saved reading/);
+});
+
+
+test('generic asks offer recoverable hide controls only with a rendered server generation', () => {
+  const data=snapshot();
+  const lifecycle={canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'exact-rendered-generation'};
+  const row={key:'controlled-generic',heartbeat:'controlled',heartbeatTitle:'Controlled check',at:'2026-10-29T12:00:00Z',asks:true,
+    text:'Controlled generic request',voiceDigest:'controlled-digest',attentionKey:'calendar:controlled',done:{notificationId:'notice'},lifecycle};
+  data.rows.push(row);
+  const html=render({data,error:false,loading:false});
+  assert.match(html,/>Tomorrow<\/button>/);assert.match(html,/>Dismiss<\/button>/);
+  assert.doesNotMatch(html,/>Done<\/button>|>Mark as read</);
+  data.rows[0]={...row,lifecycle:{...lifecycle,generation:undefined}};
+  const unversioned=render({data,error:false,loading:false});
+  assert.doesNotMatch(unversioned,/>Tomorrow<\/button>|>Dismiss<\/button>/);
+});
+
+
+test('Today shows one work parent with every cause and counts equivalent reports without changing choices', () => {
+  const data = snapshot();
+  const lifecycle = {canDismiss:true as const,canDefer:true as const,effect:'hide_only' as const,dismissLabel:'Dismiss' as const,deferLabel:'Tomorrow' as const,generation:'a'.repeat(64)};
+  data.rows = [
+    {key:'credit',attentionKey:'flow:controlled-review',lifecycle,heartbeat:'work-review',heartbeatTitle:'Work review',at:'2026-10-29T00:00:00Z',asks:true,text:'Credit limit',detail:'Add credit before trying again',voiceDigest:'credit-version',relatedNotificationIds:['credit-new','credit-old'],choices:['Review exact account']},
+    {key:'permission',attentionKey:'flow:controlled-review',lifecycle,heartbeat:'work-review',heartbeatTitle:'Work review',at:'2026-10-29T00:00:00Z',asks:true,text:'Permission refused',detail:'Pick the exact source',voiceDigest:'permission-version',relatedNotificationIds:['permission'],choices:['Review exact source']},
+  ];
+  const html = render({data,loading:false,error:false});
+  assert.equal((html.match(/data-attention-group="flow:controlled-review"/g)??[]).length,1);
+  assert.match(html,/3 reports/);
+  assert.match(html,/Add credit before trying again/);
+  assert.match(html,/Pick the exact source/);
+  assert.match(html,/Reported 2 times/);
+  assert.match(html,/Review exact account/);
+  assert.match(html,/Review exact source/);
+  const summary=html.match(/<summary[^>]*>[\s\S]*?<\/summary>/)?.[0]??'';
+  assert.doesNotMatch(summary,/<button|Reply|Do it/);
+});
+
+
+test('Today uses the canonical total while repeated reports occupy one visible work parent', () => {
+  const lifecycle = {canDismiss:true,canDefer:true,effect:'hide_only',dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'a'.repeat(64),explanation:'Hide only'};
+  const items = ['Credit needed','Permission refused','A retained repeat'].map((title,index) => ({title,meta:title,kind:'workflow',notifId:`report-${index}`,attentionKey:'flow:controlled-home',lifecycle}));
+  const html = renderNeeds({items,total:6});
+  assert.equal((html.match(/data-attention-group="flow:controlled-home"/g)??[]).length,1);
+  assert.match(html,/3 reports/);
+  const heading=html.slice(html.indexOf('id="controlled-needs"'),html.indexOf('Open Inbox'));
+  assert.match(heading,/>6</,'the canonical total wins over both the three reports and one preview parent');
+  const fallback=renderNeeds({items});
+  const fallbackHeading=fallback.slice(fallback.indexOf('id="controlled-needs"'),fallback.indexOf('Open Inbox'));
+  assert.match(fallbackHeading,/>1</,'the unavailable-summary fallback counts distinct work items');
 });

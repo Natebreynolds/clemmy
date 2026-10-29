@@ -5,8 +5,9 @@
  * supplies the rows it already polls. Order and membership follow the feeds
  * exactly — this only decides how a row reads, never what counts.
  */
-import { decisionPreview, oneLine } from '@clem/chat-engine';
+import { attentionReportSummary, attentionWorkTitle, decisionPreview, oneLine } from '@clem/chat-engine';
 import type { Tone } from '@/components/ui/StatusPill';
+import type { AttentionItem } from './attention-presentation';
 import {
   attentionPill,
   type ApprovalRow,
@@ -33,8 +34,9 @@ export type NeedsYouItem =
   | { kind: 'plan'; id: string; row: PlanProposalRow }
   | { kind: 'approval'; id: string; row: ApprovalRow; aged: boolean }
   | { kind: 'trust'; id: string; row: TrustProposalRow }
-  | { kind: 'attention'; id: string; row: CollapsedAttentionRow['row']; collapsedCount: number; groupIds?: string[] }
-  | { kind: 'unlisted'; id: string; row: NeedsYouSummary['unlisted'][number] };
+  | { kind: 'attention'; id: string; row: CollapsedAttentionRow['row']; collapsedCount: number; groupIds?: string[]; reports?: CollapsedAttentionRow['row'][] }
+  | { kind: 'unlisted'; id: string; row: NeedsYouSummary['unlisted'][number] }
+  | { kind: 'generic'; id: string; row: AttentionItem };
 
 export interface NeedsYouRowView {
   id: string;
@@ -74,6 +76,7 @@ export function needsYouSection(item: NeedsYouItem): NeedsYouSection {
     case 'workspace': case 'plan': case 'approval': return 'ok';
     case 'question': return 'questions';
     case 'trust': return 'suggestions';
+    case 'generic': return item.row.kind === 'workflow' ? 'stopped' : 'questions';
     case 'unlisted': return item.row.kind === 'check_in_proposal' ? 'suggestions' : 'stopped';
     case 'attention': {
       // A stopped workflow that needs an account picked is a choice to make.
@@ -114,6 +117,13 @@ function questionContext(row: InboxQuestionRow): string {
 export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
   const base = { id: item.id, kind: item.kind, checkable: false, aged: false, section: needsYouSection(item) } as const;
   switch (item.kind) {
+    case 'generic': {
+      const title = oneLine(item.row.title, TITLE_MAX) || 'Needs your attention';
+      return { ...base, title, preview: previewFor(title, [item.row.detail]), at: item.row.createdAt,
+        context: item.row.kind === 'workflow' && item.row.workflow ? `${workflowDisplayName(item.row.workflow)} workflow`
+          : item.row.kind === 'calendar' ? 'Calendar' : item.row.kind === 'conversation' ? 'Conversation' : 'From Clem',
+        state: item.row.kind === 'workflow' ? { tone: 'warning', label: 'Stopped' } : { tone: 'info', label: 'Reply' } };
+    }
     case 'workspace': {
       const title = 'Where should these records live?';
       return { ...base, title, preview: 'Choose a Workspace for the records Clem is preparing.',
@@ -153,16 +163,18 @@ export function needsYouRowView(item: NeedsYouItem): NeedsYouRowView {
     }
     case 'attention': {
       const capability = item.row.workflowCapability;
-      const title = oneLine(item.row.title || item.row.body, TITLE_MAX) || 'Needs your attention';
+      const grouped = (item.reports?.length ?? 0) > 1;
+      const title = grouped ? attentionWorkTitle(item.row.needsYouKey, oneLine(item.row.title || item.row.body, TITLE_MAX))
+        : oneLine(item.row.title || item.row.body, TITLE_MAX) || 'Needs your attention';
       const pill = attentionPill(item.row);
-      return { ...base, title, preview: previewFor(title, [item.row.body]),
+      return { ...base, title, preview: grouped ? attentionReportSummary(item.reports!, report => report).map(report => oneLine(report.title || report.body, 100)).join(' · ') : previewFor(title, [item.row.body]),
         context: capability ? `${capability.workflow} workflow` : undefined, at: item.row.createdAt,
         state: capability ? { tone: 'warning', label: 'Stopped' }
           : pill.label === 'Stopped' ? { tone: 'warning', label: 'Stopped' }
           : pill.label === 'Reply' ? { tone: 'info', label: 'Reply' }
           // "Needs you" inside Needs you says nothing; the row is an update to read.
           : { tone: 'neutral', label: pill.label === 'Needs you' ? 'Update' : pill.label },
-        ...(item.collapsedCount > 0 ? { context: `${capability ? `${capability.workflow} workflow · ` : ''}+${item.collapsedCount} earlier` } : {}) };
+        ...(item.collapsedCount > 0 ? { context: `${capability ? `${capability.workflow} workflow · ` : ''}${item.collapsedCount + 1} reports` } : {}) };
     }
     case 'unlisted': {
       const title = oneLine(item.row.title, TITLE_MAX) || 'Needs your attention';
@@ -187,15 +199,59 @@ export function buildNeedsYouItems(input: {
   trust: readonly TrustProposalRow[];
   attention: readonly CollapsedAttentionRow[];
   unlisted: NeedsYouSummary['unlisted'];
+  attentionItems?: readonly AttentionItem[];
 }): NeedsYouItem[] {
+  const notificationKeys = new Set(input.attention.map(({ row }) => row.needsYouKey).filter(Boolean));
+  // A workflow summary can accompany its notification. Keep the rich carrier
+  // once, without merging unrelated requests or replacing proposal decisions.
+  const unlisted = input.unlisted.filter(row => row.kind === 'check_in_proposal' || !notificationKeys.has(row.key));
+  const represented = new Set([
+    ...notificationKeys,
+    ...unlisted.map(row => row.key),
+  ]);
   return [
     ...input.workspaceChoosers.map((row): NeedsYouItem => ({ kind: 'workspace', id: row.chooserId, row })),
     ...input.questions.map((row): NeedsYouItem => ({ kind: 'question', id: row.id, row })),
     ...input.plans.map((row): NeedsYouItem => ({ kind: 'plan', id: row.id, row })),
     ...input.approvals.filter((row) => !row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: false })),
     ...input.trust.map((row): NeedsYouItem => ({ kind: 'trust', id: row.id, row })),
-    ...input.attention.map(({ row, collapsedCount, groupIds }): NeedsYouItem => ({ kind: 'attention', id: row.id, row, collapsedCount, ...(groupIds ? { groupIds } : {}) })),
-    ...input.unlisted.map((row): NeedsYouItem => ({ kind: 'unlisted', id: row.key, row })),
+    ...input.attention.map(({ row, collapsedCount, groupIds, reports }): NeedsYouItem => ({ kind: 'attention', id: row.id, row, collapsedCount, ...(groupIds ? { groupIds } : {}), ...(reports ? { reports } : {}) })),
+    ...unlisted.map((row): NeedsYouItem => ({ kind: 'unlisted', id: row.key, row })),
+    ...(input.attentionItems ?? []).filter(row => !represented.has(row.key))
+      .map((row): NeedsYouItem => ({ kind: 'generic', id: row.key, row })),
     ...input.approvals.filter((row) => row.stale).map((row): NeedsYouItem => ({ kind: 'approval', id: row.approvalId, row, aged: true })),
   ];
+}
+
+/** The canonical grouping key, never a guessed title or selected-list id. */
+export function needsYouAttentionKey(item: NeedsYouItem): string | undefined {
+  return item.kind === 'generic' ? item.row.key : item.kind === 'attention' ? item.row.needsYouKey
+    : item.kind === 'unlisted' && item.row.kind !== 'check_in_proposal' ? item.row.key : undefined;
+}
+
+/** A link to an older child remains that child after its work is grouped. */
+export function needsYouReport(item: NeedsYouItem, selection: string | null): CollapsedAttentionRow['row'] | undefined {
+  if (item.kind !== 'attention') return undefined;
+  const reports = item.reports ?? [item.row];
+  return reports.find(row => row.id === selection)
+    ?? (selection === item.id || selection === item.row.needsYouKey ? item.row : undefined);
+}
+
+/** A lifecycle is actionable only with the server generation that rendered it. */
+export function needsYouAttentionItem(item: NeedsYouItem, canonical: readonly AttentionItem[]): AttentionItem | undefined {
+  const key = needsYouAttentionKey(item);
+  if (!key) return undefined;
+  const exact = canonical.find(row => row.key === key);
+  const visibleGeneration = item.kind === 'attention' || item.kind === 'unlisted' ? item.row.lifecycle?.generation : undefined;
+  if (exact && (!visibleGeneration || exact.lifecycle.generation === visibleGeneration)) return exact;
+  if (item.kind === 'generic') return item.row;
+  if (item.kind === 'attention' && item.row.lifecycle?.generation) return {
+    key, kind: 'notification', title: item.row.title || 'Request from Clem', detail: item.row.body || '',
+    createdAt: item.row.createdAt || '', notificationId: item.row.id, lifecycle: item.row.lifecycle,
+  };
+  if (item.kind === 'unlisted' && item.row.lifecycle?.generation) return {
+    key, kind: 'workflow', title: item.row.title, detail: item.row.detail || '', createdAt: '',
+    workflow: item.row.workflow, workflowSlug: item.row.workflowSlug, lifecycle: item.row.lifecycle,
+  };
+  return undefined;
 }

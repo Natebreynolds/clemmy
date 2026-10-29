@@ -15,6 +15,8 @@ import { createHash } from 'node:crypto';
 import type { NotificationRecord } from '../runtime/notifications.js';
 import type { HeartbeatPresentation, HeartbeatUnavailable } from '../agents/heartbeats.js';
 import { isWorkflowReport } from '../runtime/notification-intent.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusal } from '../shared/provider-capacity.js';
+import type { AttentionLifecycle } from './attention-presentation.js';
 
 /** notify_user's own limit on what a report says. */
 export const REPORT_MAX_CHARS = 2_000;
@@ -29,6 +31,14 @@ export interface FromClemRow {
   at: string;
   /** Waiting on the owner's answer (vs. telling them something). */
   asks: boolean;
+  /** The same underlying decision counted by Needs you. Never count rows. */
+  attentionKey?: string;
+  /** Every notification represented by a grouped review, newest first. */
+  relatedNotificationIds?: string[];
+  /** Exact diagnostic and review kind equivalence; workflow alone is not a cause. */
+  reviewGroup?: string;
+  blocker?: { kind: 'provider_credit' | 'provider_quota'; retryAvailable: false };
+  lifecycle?: { canDismiss: true; canDefer: true; effect: 'hide_only'; dismissLabel: 'Dismiss'; deferLabel: 'Tomorrow'; generation?: string };
   /** Clem's own words about it, once she has written them. */
   say?: string;
   /** Short answers she offers for an item waiting on the owner. */
@@ -97,6 +107,13 @@ export interface FromClemInput {
   planProposals: ReadonlyArray<{ id: string; proposedAt: string; proposedByAgent: string; status: string; title: string; context?: string }>;
   /** Heartbeat items that are still waiting on the owner (the Needs you rule). */
   asksOwner: (notification: NotificationRecord) => boolean;
+  attentionKey?: (notification: NotificationRecord) => string;
+  attentionLifecycle?: (key: string) => AttentionLifecycle | undefined;
+  questionVisible?: (questionId: string) => boolean;
+  questionGeneration?: (questionId: string) => string | undefined;
+  /** Exact question rows own their answers; review carriers add no second ask. */
+  questionIds?: ReadonlySet<string>;
+  notificationVisible?: (notification: NotificationRecord) => boolean;
   /** Clem's words already written for this row, if any. */
   voiced?: (key: string, voiceDigest: string) => { message: string; choices?: string[] } | undefined;
   /** Rows the owner moved to later: hidden until then, still covered, so they
@@ -114,11 +131,16 @@ export interface FromClemInput {
 /** Bumped when what she is asked to say changes, so every item is said again. */
 const VOICE_RUBRIC = 3;
 
-type VoicedItem = Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at' | 'handoff'>;
+type VoicedItem = Pick<FromClemRow, 'heartbeat' | 'text' | 'detail' | 'asks' | 'at' | 'handoff' | 'attentionKey' | 'lifecycle'>;
 
 function itemDigestFields(row: VoicedItem): unknown[] {
   const fields: unknown[] = [row.heartbeat, row.text, row.detail ?? '', row.asks, row.at];
   if (row.handoff) fields.push(row.handoff);
+  // An unchanged label can conceal a newer workflow run or calendar request.
+  // Replies must name the source generation the owner actually saw.
+  if (row.attentionKey && /^(flow|session|calendar|notification|heartbeat):/.test(row.attentionKey) && row.lifecycle?.generation) {
+    fields.push(row.attentionKey, row.lifecycle.generation);
+  }
   return fields;
 }
 
@@ -174,9 +196,17 @@ export function buildFromClem(input: FromClemInput): FromClem {
     }
     if (proposal.status !== 'open' || !proposal.checkInId) continue;
     const questionId = `checkin:${proposal.checkInId}`;
+    if (input.questionVisible && !input.questionVisible(questionId)) {
+      covers.questionIds.push(questionId);
+      if (proposal.notificationId) covers.notificationIds.push(proposal.notificationId);
+      continue;
+    }
+    const generation = input.questionGeneration?.(questionId);
     rows.push({
       key: `noticing:${proposal.id}`, heartbeat: 'noticing', heartbeatTitle: title('noticing'),
-      at: proposal.createdAt, asks: true, text: proposal.title,
+      at: proposal.createdAt, asks: true, attentionKey: questionId, text: proposal.title,
+      lifecycle: { canDismiss: true, canDefer: true, effect: 'hide_only', dismissLabel: 'Dismiss', deferLabel: 'Tomorrow',
+        ...(generation ? { generation } : {}) },
       ...(proposal.why || proposal.action
         ? { detail: [proposal.why, proposal.action ? `What I would do: ${proposal.action}` : ''].filter(Boolean).join('\n') }
         : {}),
@@ -188,6 +218,10 @@ export function buildFromClem(input: FromClemInput): FromClem {
 
   for (const notification of input.notifications) {
     if (notification.read) continue;
+    if (input.notificationVisible && !input.notificationVisible(notification)) {
+      covers.notificationIds.push(notification.id);
+      continue;
+    }
     // A report a workflow run sent the owner with no chat of its own to report
     // into (a silent one went to its chat): her words, posted as written.
     if (isWorkflowReport(notification.metadata)) {
@@ -210,12 +244,31 @@ export function buildFromClem(input: FromClemInput): FromClem {
     const ref = refOf(notification.metadata as Record<string, unknown> | undefined);
     const meta = notification.metadata ?? {};
     const asks = input.asksOwner(notification);
+    const attentionKey = asks ? input.attentionKey?.(notification) : undefined;
+    if (attentionKey && (input.questionIds?.has(attentionKey) || covers.questionIds.includes(attentionKey))) {
+      covers.notificationIds.push(notification.id);
+      continue;
+    }
+    const credit = heartbeat === 'work-review' && isProviderCreditRefusal(undefined, notification.body);
+    const capacity = credit || (heartbeat === 'work-review' && isProviderCapacityExhausted(notification.body));
     const outageId = str(meta.brainOutageId).trim();
     rows.push({
       key: `notif:${notification.id}`, heartbeat,
       heartbeatTitle: titleOf.get(heartbeat) ?? (str(meta.sourceTitle).trim() || heartbeat),
       at: notification.createdAt, asks, text: notification.title,
-      ...(notification.body.trim() ? { detail: notification.body.trim() } : {}),
+      ...(attentionKey ? { attentionKey } : {}),
+      ...(attentionKey && input.attentionLifecycle?.(attentionKey) ? { lifecycle: input.attentionLifecycle(attentionKey) } : {}),
+      ...(heartbeat === 'work-review' && attentionKey ? { reviewGroup: createHash('sha256').update(JSON.stringify([
+        attentionKey, str(meta.changeKind), notification.body.trim(),
+      ])).digest('hex').slice(0, 24) } : {}),
+      ...(capacity ? {
+        blocker: { kind: credit ? 'provider_credit' as const : 'provider_quota' as const, retryAvailable: false as const },
+        say: credit
+          ? 'The model account for this work is out of credit. Add credit or choose an available model before trying again.'
+          : 'The model account for this work has reached its usage limit. Check the account or wait for its limit to reset before trying again.',
+        choices: ['Review model account'], authored: true,
+      } : {}),
+      ...(!capacity && notification.body.trim() ? { detail: notification.body.trim() } : {}),
       done: { notificationId: notification.id },
       ...(asks && outageId ? { answer: { kind: 'brain_outage' as const, outageId } } : {}),
       ...(ref ? { ref } : {}),
@@ -227,7 +280,7 @@ export function buildFromClem(input: FromClemInput): FromClem {
     if (plan.status !== 'pending' || plan.proposedByAgent !== 'workflow-suggestions') continue;
     rows.push({
       key: `plan:${plan.id}`, heartbeat: 'workflow-suggestions', heartbeatTitle: title('workflow-suggestions'),
-      at: plan.proposedAt, asks: true, text: plan.title,
+      at: plan.proposedAt, asks: true, attentionKey: `plan:${plan.id}`, text: plan.title,
       ...(plan.context ? { detail: plan.context } : {}),
       answer: { kind: 'yes_no', planProposalId: plan.id },
     });
@@ -249,7 +302,22 @@ export function buildFromClem(input: FromClemInput): FromClem {
   // she is only telling them, newest first; then what she offers to set up.
   rows.sort((a, b) => Number(Boolean(a.setup)) - Number(Boolean(b.setup))
     || Number(b.asks) - Number(a.asks) || b.at.localeCompare(a.at));
-  const voicedRows: FromClemRow[] = rows.map((row) => {
+  // Only equivalent reports are duplicates. Different causes of failure on
+  // one workflow keep separate cards and separate acknowledgement authority.
+  const reviewGroups = new Map<string, typeof rows[number]>();
+  const groupedRows = rows.filter((row) => {
+    if (row.heartbeat !== 'work-review' || !row.asks || !row.attentionKey || !row.reviewGroup || !row.done) return true;
+    const prior = reviewGroups.get(row.reviewGroup);
+    if (prior) {
+      prior.relatedNotificationIds!.push(row.done.notificationId);
+      return false;
+    }
+    row.key = `review:${row.attentionKey}:${row.reviewGroup}`;
+    row.relatedNotificationIds = [row.done.notificationId];
+    reviewGroups.set(row.reviewGroup, row);
+    return true;
+  });
+  const voicedRows: FromClemRow[] = groupedRows.map((row) => {
     const voiceDigest = fromClemVoiceDigest(row);
     // Progress is shown from its retained state, never as another voiced
     // proposal that might invite the owner to authorize the same work again.
@@ -258,7 +326,7 @@ export function buildFromClem(input: FromClemInput): FromClem {
       ...(said && !row.authored ? { say: said.message } : {}),
       // A brain-outage ask keeps its yes/no: two outcomes the host carries
       // out exactly, never read back from her wording.
-      ...(said?.choices?.length && row.asks && row.answer?.kind !== 'brain_outage' ? { choices: said.choices } : {}) };
+      ...(said?.choices?.length && !row.blocker && row.asks && row.answer?.kind !== 'brain_outage' ? { choices: said.choices } : {}) };
   });
   // Attempt time and coverage remain distinct. A failed or partial read is
   // not promoted to a successful "look", and raw failure text stays on the

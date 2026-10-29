@@ -15,6 +15,7 @@ import { useFileDock } from '@/components/chat/FileDock';
 import { seedProjectToolsComposerDraft } from '@/lib/project-tools-draft';
 import { seedConnectionSetupComposerDraft } from '@/lib/connection-setup-draft';
 import { COMPOSER_EXAMPLES, seedComposerExample } from '@/lib/composer-examples';
+import { explorationDraftStamp } from '@/lib/onboarding-entry';
 import './composer.css';
 
 const MAX_BYTES = 30 * 1024 * 1024;
@@ -98,7 +99,7 @@ export function Composer({
   const location = useLocation();
   const dock = useFileDock();
   const newChat = (location.state as { newChat?: number } | null)?.newChat;
-  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, newChat);
+  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, explorationDraftStamp(location.pathname, location.state) ?? newChat);
   const draftKey = composerDraftKey(routeDraftKey, sessionId, draftSessionId);
   const activeScope = useRef(draftKey);
   activeScope.current = draftKey;

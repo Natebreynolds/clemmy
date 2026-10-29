@@ -48,7 +48,7 @@ test('every kind is one row, in screen order, keyed like its card and deep link'
   assert.equal(byKey('checkin:q1').preview, undefined, 'a reference id is never the preview');
   assert.equal(byKey('approval:a1').preview, 'Weekly update: three deals moved forward.', 'an approval previews the draft');
   assert.deepEqual(rows.map((row) => row.urgent), [false, false, false, true, true], 'only a stopped workflow is urgent');
-  assert.match(byKey('notification:n1').context ?? '', /\+2 earlier/);
+  assert.match(byKey('notification:n1').context ?? '', /3 reports/);
 });
 
 test('a project name, when the Mac says so, leads the context', () => {

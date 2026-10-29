@@ -7,7 +7,7 @@
  * one the desktop reads. Every control calls the project's own route and the
  * screen settles to the overview that route answers with.
  */
-import { useCallback, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   delegatedTaskFollowsLine,
   PROJECT_LOCAL_PROJECTS_HINT,
@@ -67,6 +67,7 @@ import {
   inWords,
   projectDraftChanges,
   projectDraftFrom,
+  projectEditBaseline,
   refusalIsStale,
   refusalWords,
   type ProjectDraft,
@@ -74,6 +75,7 @@ import {
 import { useScreenData } from '../lib/use-screen-data';
 import type { ChatHandoff } from './Chats';
 import { ProjectResume } from '../components/ProjectResume';
+import { PROJECT_PANELS, projectPanelFromSearch, projectPanelSearch, type ProjectPanel } from '../lib/project-panel';
 
 interface Props {
   projectId: string;
@@ -134,7 +136,21 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
   const [linking, setLinking] = useState(false);
   const [viewing, setViewing] = useState<ProjectPageView | null>(null);
   const [endedOpen, setEndedOpen] = useState(false);
-  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [panel, setPanel] = useState<ProjectPanel>(() => projectPanelFromSearch(window.location.search, projectId));
+  useEffect(() => {
+    const sync = () => setPanel(projectPanelFromSearch(window.location.search, projectId));
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, [projectId]);
+  const selectPanel = (next: ProjectPanel, focus = true) => {
+    haptic('light'); setPanel(next);
+    const search = projectPanelSearch(projectId, next);
+    if (window.location.search !== search) window.history.pushState(window.history.state, '', `${window.location.pathname}${search}`);
+    if (focus) requestAnimationFrame(() => {
+      const tab = document.getElementById(`project-tab-${next}`);
+      tab?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); tab?.focus({ preventScroll: true });
+    });
+  };
 
   /** A decision settled here settles it everywhere: read the project and the count again. */
   const decided = (text?: string) => {
@@ -171,7 +187,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
         <ChatBackButton onClick={onBack} />
         <h2 class="chat-title">{project?.name ?? 'Project'}</h2>
         {project && !editing ? (
-          <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setDetailsOpen(true); requestAnimationFrame(() => document.getElementById('project-details')?.scrollIntoView({ block: 'start' })); }}>Details</button>
+          <button type="button" class="btn-quiet" onClick={() => { selectPanel('context', false); setNote(null); setEditing(true); }}>Edit project</button>
         ) : null}
       </div>
 
@@ -181,8 +197,15 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
       {overview && project && layout ? (
         <div class="project-sections">
           {project.purpose ? <p class="project-resume-purpose">{project.purpose}</p> : null}
-          {archived ? <p class="project-flag" role="note">Archived. Restore this project in Details to start new work.</p> : null}
+          {archived ? <p class="project-flag" role="note">Archived. Restore this project in Context & apps to start new work.</p> : null}
 
+          <div class="project-tabs" role="tablist" aria-label="Project views">
+            {PROJECT_PANELS.map((item, index) => <button key={item.id} id={`project-tab-${item.id}`} type="button" role="tab" aria-label={item.id === 'agents' ? `Agents, ${overview.agents.length} assigned ${overview.agents.length === 1 ? 'agent' : 'agents'}` : undefined} aria-controls={`project-panel-${item.id}`} aria-selected={panel === item.id} tabIndex={panel === item.id ? 0 : -1} onClick={() => selectPanel(item.id)} onKeyDown={event => {
+              if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); selectPanel(PROJECT_PANELS[(index + (event.key === 'ArrowRight' ? 1 : PROJECT_PANELS.length - 1)) % PROJECT_PANELS.length]!.id); }
+              else if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); selectPanel(event.key === 'Home' ? 'overview' : 'conversations'); }
+            }}>{item.label}{item.id === 'agents' && overview.agents.length > 0 ? <> <span aria-hidden="true">{overview.agents.length}</span></> : null}</button>)}
+          </div>
+          <div id="project-panel-overview" class="project-panel" role="tabpanel" aria-labelledby="project-tab-overview" hidden={panel !== 'overview'}>
           {!archived && layout.waiting > 0 ? (
             <section aria-labelledby="project-needs">
               <h2 id="project-needs" class="section-head">
@@ -273,15 +296,8 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             ) : null}
           </section>
 
-          <details id="project-details" class="project-details-fold" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
-            <summary>Project details</summary>
-            <div class="project-sections project-details-body">
-              {editing ? <ProjectEditor overview={overview} onCancel={() => setEditing(false)} onSaved={(next, text) => { setEditing(false); setNote({ tone: 'success', text }); settle(next); }} /> : <section class="project-about" aria-label="What this project is">
-                <div class="project-details-title"><h2 class="section-head">What it is</h2><button type="button" class="btn-quiet" onClick={() => { haptic('light'); setNote(null); setEditing(true); }}>{archived ? 'Restore or edit' : 'Edit'}</button></div>
-                <p class={`project-purpose${project.purpose ? '' : ' is-empty'}`}>{project.purpose || 'No purpose written yet. Tap Edit to say what this project is for.'}</p>
-                {project.goals.length > 0 ? <><h3 class="project-sub">Goals</h3><ul class="project-goals">{project.goals.map(goal => <li key={goal}>{goal}</li>)}</ul></> : null}
-                {project.context ? <><h3 class="project-sub">Always keep in mind</h3><p class="project-context">{project.context}</p></> : null}
-              </section>}
+          </div>
+          <div id="project-panel-agents" class="project-panel" role="tabpanel" aria-labelledby="project-tab-agents" hidden={panel !== 'agents'}>
           <section aria-labelledby="project-agents">
             <h2 id="project-agents" class="section-head">Agents</h2>
             {overview.agents.length === 0 ? (
@@ -314,6 +330,14 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             ) : null}
           </section>
 
+          </div>
+          <div id="project-panel-context" class="project-panel" role="tabpanel" aria-labelledby="project-tab-context" hidden={panel !== 'context'}>
+              {editing ? <ProjectEditor overview={overview} onCancel={() => setEditing(false)} onSaved={(next, text) => { setEditing(false); setNote({ tone: 'success', text }); settle(next); }} /> : <section class="project-about" aria-label="What this project is">
+                <div class="project-details-title"><h2 class="section-head">What it is</h2><button type="button" class="btn-quiet" onClick={() => { haptic('light'); setNote(null); setEditing(true); }}>{archived ? 'Restore or edit' : 'Edit'}</button></div>
+                <p class={`project-purpose${project.purpose ? '' : ' is-empty'}`}>{project.purpose || 'No purpose written yet. Tap Edit to say what this project is for.'}</p>
+                {project.goals.length > 0 ? <><h3 class="project-sub">Goals</h3><ul class="project-goals">{project.goals.map(goal => <li key={goal}>{goal}</li>)}</ul></> : null}
+                {project.context ? <><h3 class="project-sub">Always keep in mind</h3><p class="project-context">{project.context}</p></> : null}
+              </section>}
           <section aria-labelledby="project-resources">
             <h2 id="project-resources" class="section-head">Accounts and resources</h2>
             <div class="project-group">
@@ -382,6 +406,8 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
             </section>
           ) : null}
 
+          </div>
+          <div id="project-panel-conversations" class="project-panel" role="tabpanel" aria-labelledby="project-tab-conversations" hidden={panel !== 'conversations'}>
           <section aria-labelledby="project-chats">
             <h2 id="project-chats" class="section-head">Conversations</h2>
             {overview.conversations.length === 0 ? (
@@ -423,8 +449,7 @@ export function Project({ projectId, onBack, onOpenChat, onOpenRun, onOpenAgent,
               </button>
             ) : null}
           </section>
-            </div>
-          </details>
+          </div>
         </div>
       ) : null}
 
@@ -489,7 +514,8 @@ function ProjectEditor({ overview, onCancel, onSaved }: {
   onSaved: (overview: ProjectOverview, receipt: string) => void;
 }) {
   const project = overview.project;
-  const [draft, setDraft] = useState<ProjectDraft>(() => projectDraftFrom(project));
+  const [baseline] = useState(() => projectEditBaseline(project));
+  const [draft, setDraft] = useState<ProjectDraft>(() => projectDraftFrom(baseline));
   const [busy, setBusy] = useState<'save' | 'archive' | null>(null);
   const [confirmArchive, setConfirmArchive] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
@@ -515,7 +541,7 @@ function ProjectEditor({ overview, onCancel, onSaved }: {
   };
 
   const save = () => {
-    const patch = projectDraftChanges(project, draft);
+    const patch = projectDraftChanges(baseline, draft);
     if (!patch) { onCancel(); return; }
     void run('save', () => changeProject(project.id, patch), 'Saved.');
   };

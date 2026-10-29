@@ -1,0 +1,16 @@
+.attention-work-group { min-width: 0; padding: 0 14px; border-bottom: 1px solid var(--line); }
+.attention-work-group:last-child { border-bottom: 0; }
+.attention-work-group > summary { min-height: 44px; padding: 12px 0; cursor: pointer; color: var(--fg); overflow-wrap: anywhere; }
+.attention-work-group > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.attention-report-count { margin-left: 8px; color: var(--fg-2); font-size: 13px; white-space: nowrap; }
+.attention-report-cause { display: block; margin-top: 6px; color: var(--fg-2); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.attention-work-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0; border-top: 1px solid var(--line); }
+.attention-work-actions > span { flex-basis: 100%; color: var(--fg-2); font-size: 13px; line-height: 1.5; }
+.attention-work-reports > .home-row { padding-left: 0; padding-right: 0; }
+.attention-report-selector { margin: 0 0 16px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.attention-report-selector > summary { min-height: 44px; cursor: pointer; font-weight: 600; line-height: 1.5; }
+.attention-report-selector ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.attention-report-selector li + li { border-top: 1px solid var(--line); }
+.attention-report-selector button { display: block; width: 100%; min-height: 44px; padding: 10px 0; border: 0; background: transparent; color: var(--fg); text-align: left; font: inherit; overflow-wrap: anywhere; }
+.attention-report-selector button[aria-current="true"] { color: var(--accent); font-weight: 600; }
+.attention-report-selector button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

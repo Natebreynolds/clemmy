@@ -23,11 +23,15 @@ export interface CloudBrowserProviderStatus {
   credentialStatus?: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId?: string | null;
 }
 export interface CloudBrowserStatus {
-  /** The chosen cloud provider is set up: a cloud browser is the browser here. */
+  /** The selected cloud account is available. Computer control may take precedence. */
   configured: boolean;
+  /** Actual browser tool selection, including computer-driver precedence.
+   * Selection does not establish driver health or screen/control permissions.
+   * Optional for compatibility with older installed backends. */
+  effectiveBackend?: 'computer' | 'cloud' | 'local';
   /** What the owner chose: a provider, or this computer's Chrome. */
   choice?: CloudBrowserChoice;
-  /** The cloud provider in use when `configured`, else null. */
+  /** The selected available cloud account, retained when computer control is selected. */
   provider?: CloudBrowserProvider | null;
   providers?: Partial<Record<CloudBrowserProvider, CloudBrowserProviderStatus>>;
   projectId?: string; idleSeconds?: number; sessionTimeoutSeconds?: number;

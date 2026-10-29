@@ -16,12 +16,13 @@ import { Link } from 'react-router-dom';
 import { ArrowUpRight, ChevronRight, CornerDownRight, Play, Square } from 'lucide-react';
 import {
   delegatedTaskCard, delegatedTaskChosenBy, delegatedTaskCorrections, delegatedTaskFollowUps, delegatedTaskFollowsLine,
-  renderMarkdown, type DelegatedTaskTone,
+  delegatedTaskReport, renderMarkdown, type DelegatedTaskTone,
 } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
 import { Input, Textarea } from '@/components/ui/Field';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { cn } from '@/lib/cn';
+import { TaskResultFiles } from './TaskResultFiles';
 import { relativeTime } from '@/lib/inbox';
 import {
   answerTask, refusalText, resumeTask, steerTask, stopTask, taskFromRefusal, taskRunPath, type DelegatedTask,
@@ -85,6 +86,7 @@ export function DelegatedTaskCard({
   const [answered, setAnswered] = useState<DelegatedTask | null>(null);
   const shown = answered && answered.taskId === task.taskId && answered.updatedAt >= task.updatedAt ? answered : task;
   const card = delegatedTaskCard(shown);
+  const report = delegatedTaskReport(shown);
   // A dismissed or stale question can briefly leave needs_you without a
   // current approval. Do not present that gap as consent waiting to happen.
   const next = card.next?.action === 'approve' && !card.approvalId ? null : card.next;
@@ -253,7 +255,7 @@ export function DelegatedTaskCard({
               </Button>
             )}
             {next.action === 'approve' && card.approvalId && (
-              <Link to={`/inbox?tab=needs&select=${encodeURIComponent(card.approvalId)}`} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">Review</Link>
+              <Link to={`/inbox?tab=needs&select=${encodeURIComponent(`approval:${card.approvalId}`)}`} className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover active:bg-primary-press">Review</Link>
             )}
             {card.controls.steer && (
               <Button
@@ -269,7 +271,7 @@ export function DelegatedTaskCard({
       )}
       {card.now && <p className="mt-2.5 text-small text-fg">{card.now}</p>}
       {card.latest && (
-        <div className="mt-2.5 border-l-2 border-border pl-3 text-small">
+        <div className="mt-2.5 border-l border-border pl-3 text-small">
           <p className="whitespace-pre-wrap break-words text-fg">{card.latest.note}</p>
           <p className="mt-0.5 text-caption text-faint">{card.owner} · {moment(card.latest.at)}</p>
           {card.latest.earlier > 0 && (
@@ -330,10 +332,10 @@ export function DelegatedTaskCard({
         </div>
       )}
 
-      {card.approvalId && !card.question && !hideQuestion && (
+      {card.approvalId && !card.question && !hideQuestion && next?.action !== 'approve' && (
         <p className="mt-2.5 rounded-md bg-warning-tint px-3 py-2 text-small text-fg">
           Waiting on your approval before it goes on.{' '}
-          <Link to={`/inbox?tab=needs&select=${encodeURIComponent(card.approvalId)}`} className="font-semibold text-primary hover:underline">
+          <Link to={`/inbox?tab=needs&select=${encodeURIComponent(`approval:${card.approvalId}`)}`} className="font-semibold text-primary hover:underline">
             Review it
           </Link>
         </p>
@@ -353,19 +355,17 @@ export function DelegatedTaskCard({
           {card.progress.items.length > 8 && <li className="px-3 py-2 text-caption text-muted">and {card.progress.items.length - 8} more</li>}
         </ul>
       )}
-      {card.report && !hideResult && (
-        <div
-          className="chat-prose mt-2.5 min-w-0 text-small"
-          // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(card.report, { workspaceLinks: false }) }}
-        />
-      )}
+      {report && !hideResult && <div className="mt-3 min-w-0">
+        <h5 className="text-small font-semibold text-fg">{report.label}</h5>
+        <div className="chat-prose mt-1 min-w-0 text-small" dangerouslySetInnerHTML={{ __html: renderMarkdown(report.summary, { workspaceLinks: false }) }} />
+        {report.hasDetails ? <details className="mt-2">
+          <summary className="cursor-pointer text-small font-semibold text-muted hover:text-fg">Report details</summary>
+          <div className="chat-prose mt-2 min-w-0 text-small" dangerouslySetInnerHTML={{ __html: renderMarkdown(report.detail, { workspaceLinks: false }) }} />
+          <Link to={taskRunPath(shown.taskId)} className="mt-2 inline-flex min-h-9 items-center text-small font-semibold text-primary hover:underline">Open the full run</Link>
+        </details> : null}
+      </div>}
       {card.files.length > 0 && (
-        <div className="mt-2.5 flex flex-wrap gap-1.5" aria-label="Files it saved">
-          {card.files.map((file) => (
-            <span key={`${file.dir ?? ''}/${file.name}`} title={file.dir ?? undefined} className="inline-flex h-7 items-center rounded-full border border-border bg-subtle px-2.5 text-caption text-fg">{file.name}</span>
-          ))}
-        </div>
+        <TaskResultFiles taskId={shown.taskId} sessionId={shown.runSessionId} savedKey={JSON.stringify(card.files)} />
       )}
 
       {((card.controls.steer && !next) || card.controls.stop || (card.controls.resume && next?.action !== 'resume') || hasDetails) && (

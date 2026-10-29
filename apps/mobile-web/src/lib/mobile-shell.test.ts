@@ -42,15 +42,15 @@ test('index.html status bar and theme-color match the light chrome', () => {
  * bar; More opens the left menu with everything else. A screen with its own
  * back button stays full screen, and the bar steps aside for the keyboard.
  */
-test('a phone gets four places and More in a tab bar that leaves detail screens and the keyboard alone', () => {
+test('a phone gets five everyday places with More in the header and preserves detail and keyboard space', () => {
   const app = read('../app.tsx');
-  assert.match(app, /const TAB_BAR_PLACES: ReadonlyArray<Tab> = \['home', 'chats', 'inbox', 'spaces'\];/);
-  assert.match(app, /const MENU_PLACES: ReadonlyArray<Tab> = PRIMARY_TABS\.filter\(\(id\) => !TAB_BAR_PLACES\.includes\(id\)\);/);
+  assert.match(app, /const TAB_BAR_PLACES: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows'\];/);
+  assert.match(app, /const MENU_PLACES: ReadonlyArray<Tab> = \['chats', 'memory'\];/);
   assert.match(app, /\{detailHeaderOwned \? null : \(\s*<TabBar/, 'a detail screen owns the full height');
-  assert.match(app, /onMenu=\{openDrawer\}/, 'More opens the one menu');
+  assert.match(read('../components/NavigationMenuButton.tsx'), /navigation\.openNavigation\(event\.currentTarget\)/, 'header More opens the one menu');
   const bar = read('../components/TabBar.tsx');
   assert.match(bar, /aria-current=\{here \? 'page' : undefined\}/);
-  assert.match(bar, /aria-haspopup="dialog"[\s\S]*?aria-expanded=\{menuOpen\}/);
+  assert.doesNotMatch(bar, />More<\//, 'More does not crowd a sixth tab into the bar');
   const css = read('../adaptive-layout.css');
   assert.match(css, /@media \(max-width: 879\.98px\) \{[\s\S]*?:root\[data-keyboard-up\] \.tab-bar \{ display: none; \}/);
   assert.match(css, /:root:not\(\[data-keyboard-up\]\) #app:has\(> \.tab-bar\) \{\s*--mobile-dock-gap: calc\(var\(--tab-bar-clearance\) \+ 10px\);/,
@@ -62,6 +62,33 @@ test('a phone gets four places and More in a tab bar that leaves detail screens 
   assert.match(styles, /\.app-main \{[\s\S]*?env\(safe-area-inset-bottom\)/);
 });
 
+test('320px and 393px navigation keep whole labels, separate counts and readable targets', () => {
+  const app = read('../app.tsx');
+  const inbox = read('../screens/Inbox.tsx');
+  const project = read('../screens/Project.tsx');
+  const styles = read('../styles.css');
+  const adaptive = read('../adaptive-layout.css');
+  const bar = read('../components/TabBar.tsx');
+  assert.match(app, /id: 'workflows',\s*label: 'Automations',\s*shortLabel: 'Automate'/);
+  assert.match(app, /workflows: 'Automations'/, 'the actual screen title remains the full destination');
+  assert.match(bar, /aria-label=\{count \? `\$\{place\.label\}, \$\{count\.label\}` : place\.label\}/,
+    'the compact label retains the full accessible destination, with badge meaning when present');
+  assert.match(bar, /\{place\.shortLabel \?\? place\.label\}/);
+  assert.match(inbox, /class="inbox-tab-label">Needs you<\/span><span class="inbox-tab-count"/);
+  assert.match(inbox, /class="inbox-tab-label">Updates<\/span><span class="inbox-tab-count"/);
+  const rules = styles.slice(styles.indexOf('.inbox-tabs button {'), styles.indexOf('.inbox-tabs button.active'));
+  assert.match(rules, /flex-direction: column/);
+  assert.match(rules, /white-space: nowrap/);
+  assert.doesNotMatch(rules, /overflow-wrap: anywhere/);
+  assert.match(rules, /min-height: 60px/);
+  assert.match(styles, /\.inbox-tab-label \{[^}]*white-space: nowrap/);
+  assert.match(styles, /\.inbox-tab-count \{[^}]*font-size: 11px/);
+  assert.match(adaptive, /\.tab-bar-item \{ min-height: 48px/);
+  assert.match(adaptive, /\.tab-bar-label \{ font-size: 11px/);
+  assert.match(project, /`Agents, \$\{overview\.agents\.length\} assigned/,
+    'assigned-agent counts have a readable accessible name rather than concatenated text');
+});
+
 test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
   const app = read('../app.tsx');
   // ONE menu (owner 2026-08-25, 2026-09-26): the Clemmy mark opens the drawer
@@ -69,7 +96,7 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   // header opens it too, and the title is words. The title-tap sheet is gone.
   assert.match(app, /<NavigationMenuButton\s*\/>/);
   const menuButton = read('../components/NavigationMenuButton.tsx');
-  assert.match(menuButton, /aria-label="Open navigation"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/);
+  assert.match(menuButton, /aria-label="More places and settings"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/);
   assert.match(app, /clientX - sw\.x > 48 && !drawerOpen\) openDrawer\(\)/);
   assert.match(app, /<span class="title-text">\{TAB_TITLES\[tab\]\}<\/span>/);
   assert.doesNotMatch(app, /TitleSwitcher|switcherOpen|title-switch/);
@@ -91,8 +118,8 @@ test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the cu
   const css = read('../styles.css');
   assert.match(css, /\.menu-mark \{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 44px/);
   // Chats has a direct section door as well as its recent-thread shortcuts.
-  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'chats', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'\];/);
-  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['activity'\];/);
+  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows'\];/);
+  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['settings'\];/);
   assert.match(app, /class="drawer-quiet"/);
   assert.match(css, /\.drawer \{[\s\S]*?width: min\(calc\(100vw - 40px\), 340px\)/);
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);
@@ -241,7 +268,7 @@ test('one working-now poll feeds the header chip and Home', () => {
  */
 test('Projects is a primary place, deep-linkable, and settles the shared Needs-you count', () => {
   const app = read('../app.tsx');
-  assert.match(app, /projects: 'Projects',/, 'the screen is titled in the product\'s own word');
+  assert.match(app, /projects: 'Work',/, 'Projects is grouped under Work with tasks and agents');
   assert.match(app, /useState<string \| null>\(\(\) => projectFromSearch\(window\.location\.search\)\)/,
     'a cold open on a project link lands on that project');
   assert.match(app, /setProjectId\(projectFromSearch\(window\.location\.search\)\)/,
@@ -277,4 +304,61 @@ test('the phone\'s approval card reads like a question card and Needs you is tit
   assert.match(chat, /APPROVAL_ANSWER_WORDS\.approve/);
   assert.match(read('../screens/Home.tsx'), /title = row\.presentation\?\.ask \?\? approvalQuestion\(row\.subject\)/);
   assert.match(read('../components/Approvals.tsx'), /row\.presentation\?\.ask \?\? approvalQuestion\(row\.subject\)/);
+});
+
+
+test('legacy chat plans navigate to exact full review and preserve rejection without approving a clipped preview', () => {
+  const chat = read('../screens/Chat.tsx');
+  const start = chat.indexOf("message.planProposalId && planStatus === 'pending' && !message.planProposalNeedsUserInput");
+  const end = chat.indexOf("message.planProposalId && planStatus === 'pending' && message.planProposalNeedsUserInput", start);
+  assert.ok(start >= 0 && end > start);
+  const legacy = chat.slice(start, end);
+  assert.match(legacy, /Review full plan/);
+  assert.match(legacy, /destinationSearch\(\{ tab: 'inbox', decisionKey: `plan:\$\{message\.planProposalId!\}` \}\)/);
+  assert.match(legacy, /window\.dispatchEvent\(new PopStateEvent\('popstate'\)\)/);
+  assert.doesNotMatch(legacy, /onPlanAction\([^)]*'approve'/, 'a clipped chat preview cannot approve the underlying proposal');
+  assert.match(legacy, /onPlanAction\(message\.planProposalId!, 'reject'\)/);
+  assert.match(chat, /<PlanReview planRef=/, 'modern revision-bound review is preserved');
+});
+
+test('Inbox history applies an empty item selection when browser Back returns to the list URL', () => {
+  const inbox = read('../screens/Inbox.tsx');
+  assert.match(inbox, /const key = inboxDecisionFromSearch\(window\.location\.search\); setOpenKey\(key\); setTab\(key \? 'needs' : inboxViewFromSearch\(window\.location\.search\)\)/,
+    'null from a list URL must be applied, not ignored behind a truthy-key guard');
+  assert.match(inbox, /handledDeepLink\.current = null;\s*setLocationRevision\(value => value \+ 1\)/,
+    'Back to an already-presented notification is a new navigation, not suppressed by its old one-time receipt');
+  assert.match(inbox, /\[approvalIds, data, initialNotificationId, locationRevision,/,
+    'an unchanged notification id and retained data still re-run the exact-row selection after Back');
+  assert.match(inbox, /navigateInboxView\(next\)/, 'local tabs use the navigation path that also synchronizes the shell');
+  assert.match(inbox, /!inboxNotificationIsCurrent\(window\.location\.search, initialNotificationId\)/,
+    'a pending presentation first verifies that the notification still owns the current URL');
+});
+
+test('the mounted project editor compares its draft with the record captured when editing began', () => {
+  const project = read('../screens/Project.tsx');
+  assert.match(project, /const \[baseline\] = useState\(\(\) => projectEditBaseline\(project\)\)/);
+  assert.match(project, /projectDraftFrom\(baseline\)/);
+  assert.match(project, /projectDraftChanges\(baseline, draft\)/);
+  assert.doesNotMatch(project, /projectDraftChanges\(project, draft\)/, 'a polled overview cannot redefine which fields the owner edited');
+});
+
+
+test('chat tools are contextual while conversation files retain an explicit lazy, focus-safe door', () => {
+  const chat = read('../screens/Chat.tsx');
+  const files = read('../components/CompletedFiles.tsx');
+  const browser = read('../components/CloudBrowserDock.tsx');
+  const composer = read('../components/Composer.tsx');
+  assert.doesNotMatch(chat, /browserOpenRequest|Open browser tools|Browser tools are available after your first message/);
+  assert.match(chat, /Conversation files/);
+  assert.match(chat, /<CompletedFiles[^>]*openRequest=\{filesOpenRequest\}[^>]*onReturn=\{\(\) => optionsTrigger\.current\?\.focus\(\)\}/);
+  assert.doesNotMatch(files, /class="chat-files-bar"|class="chat-files-trigger"/, 'no empty Files strip competes with the transcript');
+  assert.match(files, /if \(!open\) return;[\s\S]*listSessionFiles\(sessionId/, 'saved files still load only on explicit open');
+  assert.match(files, /FilePreview/);
+  assert.match(files, /onDiscuss\(context\)/, 'saved files can still become revision-bound conversation context');
+  assert.doesNotMatch(browser, /openRequest/);
+  assert.match(browser, /const inUse = conversationBrowsersInUse\(resources\)/);
+  assert.match(browser, /Take control/);
+  assert.match(browser, /Watch/);
+  assert.match(browser, /cloudBrowser\.stop\(/, 'real session controls remain reachable');
+  assert.match(composer, /ref=\{filesRef\} type="file" multiple/, 'phone file attachments are retained');
 });

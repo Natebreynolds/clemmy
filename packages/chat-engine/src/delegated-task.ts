@@ -112,6 +112,26 @@ function opening(text: string | null | undefined, max: number): string {
   return `${(stop > max * 0.6 ? cut.slice(0, stop) : cut).trimEnd()}…`;
 }
 
+/** A readable opening of the recorded report. The phase, rather than the
+ * report's wording, determines whether this is presented as a result. */
+export function delegatedTaskReport(
+  task: Pick<DelegatedTask, 'phase' | 'resultPreview' | 'error'>,
+  options: { summaryChars?: number } = {},
+): { label: 'Result' | 'What happened' | 'Latest report'; summary: string; detail: string; hasDetails: boolean } | null {
+  const endedShort = task.phase === 'failed' || task.phase === 'paused' || task.phase === 'stopped';
+  const detail = (task.resultPreview?.trim() || (endedShort ? task.error?.trim() : '') || '').replace(/\r\n/g, '\n');
+  if (!detail) return null;
+  const paragraphs = detail.split(/\n\s*\n/).filter(Boolean);
+  const first = paragraphs.find(paragraph => !/^#{1,6}\s+[^\n]+$/.test(paragraph.trim())) ?? detail;
+  const requested = options.summaryChars ?? 220;
+  const limit = Number.isFinite(requested) ? Math.max(80, Math.floor(requested)) : 220;
+  const summary = opening(first, limit);
+  return {
+    label: task.phase === 'finished' ? 'Result' : endedShort ? 'What happened' : 'Latest report',
+    summary, detail, hasDetails: summary !== detail,
+  };
+}
+
 export interface DelegatedTaskCardView {
   taskId: string;
   title: string;

@@ -73,6 +73,7 @@ export function Workspaces({
   if (spaces.length === 0) {
     return (
       <EmptyState
+        guide="create-space"
         title="No Spaces yet"
         body="A Space is a live page Clem keeps up to date for you, like a tracker or a dashboard."
         action={{ label: 'Ask Clem to build one', onClick: () => onAsk('Build me a Space that ') }}
@@ -95,6 +96,7 @@ export function Workspaces({
           Nothing here has data yet. Open one below and ask Clem to set it up.
         </p>
       ) : null}
+      <div class="section-intro"><p>Live pages Clem keeps up to date for you.</p><button type="button" class="home-btn" data-clem-guide="create-space" onClick={() => onAsk('Build me a Space that ')}>Create a Space</button></div>
       {renderRows(live, 0)}
       {empty.length > 0 ? (
         <EmptyWorkspaces spaces={empty} onOpen={selectWorkspace} startIndex={live.length} />

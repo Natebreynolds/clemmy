@@ -6,7 +6,8 @@ import { textResult } from './shared.js';
 export const APP_GUIDE_TOOL_DESCRIPTION =
   'What is set up in Clementine now, what each part gives the owner, and every place in the app. Use when they ask '
   + 'how to set something up or where something is, or when a request needs something not set up. Link places as '
-  + '[Open <name>](app:<id>), and one Space or workflow as (app:space:<id>) or (app:workflow:<name>).';
+  + '[Open <name>](app:<id>), and one Space or workflow as (app:space:<id>) or (app:workflow:<name>). '
+  + 'For a contextual interface walkthrough, use [Show me](app:guide:<id>) for a supported place listed in the guide.';
 
 export function registerAppGuideTools(server: McpServer): void {
   server.tool(

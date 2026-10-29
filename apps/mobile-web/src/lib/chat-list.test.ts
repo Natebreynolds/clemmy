@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { arrangeChatList, cleanChatTitle } from './chat-list.js';
+import { arrangeChatList, chatListEmpty, cleanChatTitle } from './chat-list.js';
 
 const rows = [
   { id: 'a', title: 'Quick SEO audit', updatedAt: 3, pinned: false },
@@ -21,4 +21,11 @@ test('pinned first, then newest first; search narrows by title or agent', () => 
 test('a rename is one line and never empty', () => {
   assert.equal(cleanChatTitle('  Mesa   firms\n  '), 'Mesa firms');
   assert.equal(cleanChatTitle('   '), null);
+});
+
+test('an empty archive does not claim this is the owner’s first conversation', () => {
+  assert.equal(chatListEmpty(true).title, 'No archived conversations');
+  assert.equal(chatListEmpty(true).starterDraft, null);
+  assert.match(chatListEmpty(false).body, /outcome/);
+  assert.match(chatListEmpty(false).starterDraft!, /Ask me what I want to achieve/);
 });

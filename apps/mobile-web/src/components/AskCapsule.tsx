@@ -8,13 +8,24 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ChatAttachment } from '@clem/chat-engine';
 import { Composer } from './Composer';
 import { uploadChatAttachment } from '../lib/api';
+import { mobileDrafts } from '../lib/file-context';
+
+// This window's floating draft is independent of every conversation draft.
+const CAPSULE_DRAFT_SCOPE = 'capsule:ask';
 
 interface Props {
   onAsk: (text: string, attachments?: ChatAttachment[]) => void;
 }
 
 export function AskCapsule({ onAsk }: Props) {
-  const [draft, setDraft] = useState('');
+  const generation = useRef(mobileDrafts.generation);
+  const [draft, setDraftState] = useState(() => mobileDrafts.read(CAPSULE_DRAFT_SCOPE).text);
+  useEffect(() => {
+    const sync = () => setDraftState(generation.current === mobileDrafts.generation ? mobileDrafts.read(CAPSULE_DRAFT_SCOPE).text : '');
+    sync();
+    return mobileDrafts.subscribe(sync);
+  }, []);
+  const setDraft = (text: string) => { mobileDrafts.patchInGeneration(CAPSULE_DRAFT_SCOPE, generation.current, { text }); };
   // The page reserves exactly the capsule's height below its content, so the
   // last row is never hidden behind the card (live 09-26: Needs you's first
   // card sat under the composer on Home).
@@ -35,6 +46,7 @@ export function AskCapsule({ onAsk }: Props) {
         <Composer
           compact
           value={draft}
+          attachmentScope={CAPSULE_DRAFT_SCOPE}
           onChange={setDraft}
           placeholder="Ask Clem…"
           ariaLabel="Ask Clem"

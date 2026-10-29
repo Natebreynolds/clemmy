@@ -1,13 +1,14 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { MessageCircle, Keyboard, RefreshCw, LifeBuoy, Map as MapIcon, Sparkles } from 'lucide-react';
-import { APP_PLACES } from '@clem/chat-engine';
+import { APP_PLACES, appGuidanceHref } from '@clem/chat-engine';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import { getBuildInfo } from '@/lib/advanced';
 import { clemmy, isDesktop } from '@/lib/clemmy';
+import { updateCheckFeedback } from '@/lib/update-check-feedback';
 
 const modKey = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl';
 
@@ -42,15 +43,7 @@ export function Help() {
     setCheckNote(null);
     try {
       const result = await bridge.updaterCheck();
-      const state = result && typeof result === 'object' && 'state' in result
-        ? String((result as { state?: unknown }).state)
-        : undefined;
-      if (state === 'available' || state === 'downloading' || state === 'ready-to-install') {
-        setCheckNote('An update is available — see the prompt at the bottom-left.');
-      } else {
-        const v = build.data?.version ? ` (v${build.data.version})` : '';
-        setCheckNote(`You're on the latest version${v}.`);
-      }
+      setCheckNote(updateCheckFeedback(result, build.data?.version));
     } catch {
       setCheckNote("Couldn't check for updates right now — try again in a moment.");
     } finally {
@@ -108,11 +101,14 @@ export function Help() {
           <div className="mb-3 flex items-center gap-2"><MapIcon className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Where things are</h3></div>
           <ul className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
             {APP_PLACES.filter((place) => place.id !== 'help').map((place) => (
-              <li key={place.id}>
-                <Link to={place.desktop} className="group block rounded-md px-2 py-1.5 hover:bg-subtle">
+              <li key={place.id} className="flex items-start gap-2">
+                <Link to={place.desktop} className="group block min-w-0 flex-1 rounded-md px-2 py-1.5 hover:bg-subtle">
                   <span className="block text-body font-semibold text-fg group-hover:text-primary-ink">{place.name}</span>
                   <span className="block text-small text-muted">{place.purpose}</span>
                 </Link>
+                {appGuidanceHref(place.id, 'desktop') ? <Link to={appGuidanceHref(place.id, 'desktop')!} state={{ clemGuidanceOrigin: '/help' }}
+                  className="inline-flex min-h-11 shrink-0 items-center rounded-md px-2 text-small font-semibold text-primary hover:underline"
+                  aria-label={`Show me ${place.name}`}>Show me</Link> : null}
               </li>
             ))}
           </ul>

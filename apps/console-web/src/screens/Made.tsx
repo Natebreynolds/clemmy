@@ -113,12 +113,12 @@ function MadeArchiveContent() {
   return (
     <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 py-6 animate-fade-in sm:px-10">
       <div>
-        <h1 className="text-h1 text-fg">Made</h1>
+        <h1 className="text-h2 font-semibold text-fg">Files & results</h1>
         <p className="mt-1 text-body text-muted">Pick up a finished file, or open a folder to see everything from that work.</p>
       </div>
       <label className="flex min-h-10 items-center gap-2 rounded-md border border-border bg-surface px-3 text-muted">
         <Search className="h-4 w-4 shrink-0" aria-hidden />
-        <input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label="Search Made by title or filename" placeholder="Search titles and filenames" className="min-w-0 flex-1 bg-transparent py-2 text-body text-fg placeholder:text-muted" />
+        <input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label="Search files and results by title or filename" placeholder="Search titles and filenames" className="min-w-0 flex-1 bg-transparent py-2 text-body text-fg placeholder:text-muted" />
       </label>
       <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter made work">
         {FILTERS.map((f) => (
@@ -140,7 +140,7 @@ function MadeArchiveContent() {
         <div className="flex flex-col gap-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12" />)}</div>
       ) : delivered.isError && !delivered.data ? (
         <QueryUnavailable
-          title="Made is unavailable"
+          title="Files & results are unavailable"
           description="Clementine couldn’t load the archive, so this is not an empty one. Nothing you made has been lost."
           onRetry={() => { void delivered.refetch(); }}
         />
@@ -151,7 +151,7 @@ function MadeArchiveContent() {
         {recent.length > 0 ? <section className="flex flex-col gap-2"><h2 className="text-body font-semibold text-fg">Recent work</h2><div className="overflow-hidden rounded-lg border border-border bg-surface">{recent.map(group => <FolderRow key={group.id} group={group} />)}</div></section> : null}
         {sections.map(([heading, rows]) => (
           <section key={heading} className="flex flex-col gap-2">
-            <h2 className="text-caption font-semibold uppercase tracking-wide text-faint">{heading}</h2>
+            <h2 className="text-small font-semibold text-muted">{heading}</h2>
             <div className="overflow-hidden rounded-lg border border-border bg-surface">
               {rows.map((group) => <FolderRow key={group.id} group={group} query={search} />)}
             </div>

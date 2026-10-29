@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { desktopAppLinkNavigation } from '@/lib/app-link-navigation';
 import {
   ApprovalResultUpdateGate, approvalResultUpdateLookup, approvalResultUpdateMatchesRecord, type ApprovalResultUpdatedEvent,
   approvalResultRelationKey, sameApprovalResultRelation, mergeApprovalResultBinding, mergeApprovalResultRecord, normalizeApprovalResultResponse,
@@ -16,6 +17,7 @@ interface ReadState { key: string; record?: PendingActionResultRecord; binding: 
  * card cannot approve, resume or dispatch the action. */
 export function ApprovalResult({ approval, observed }: { approval: NonNullable<ChatMessage['approval']>; observed?: PendingActionExecutionPresentation }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const fromRecord = normalizePendingActionResultRecord(approval.pendingAction);
   const retained = normalizePendingActionResultRecord(approval.resultRecord);
   const candidate = retained && fromRecord ? mergeApprovalResultRecord(retained, fromRecord) ?? retained : retained ?? fromRecord;
@@ -126,9 +128,10 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
       {presentation?.mode === 'durable' && <div className="mt-2 min-w-0" role="status">
         <p className="text-caption font-semibold text-muted">{phases[presentation.phase]}</p>
         {copy.note && <div className="chat-prose mt-1 min-w-0 text-body text-fg" onClick={event => {
-          const link = (event.target as Element).closest?.('a[data-app-place]');
-          const href = link?.getAttribute('href');
-          if (href) { event.preventDefault(); navigate(href); }
+          const link = (event.target as Element).closest?.('a[data-app-place],a[data-app-item]');
+          if (!link) return;
+          const destination = desktopAppLinkNavigation({ href: link.getAttribute('href'), place: link.getAttribute('data-app-place'), item: link.getAttribute('data-app-item'), target: link.getAttribute('target'), download: link.hasAttribute('download') }, event, location.pathname);
+          if (destination) { event.preventDefault(); navigate(destination.href, { state: destination.state }); }
         }} dangerouslySetInnerHTML={{ __html: renderMarkdown(copy.note, { workspaceLinks: false, appPlaceLinks: 'desktop' }) }} />}
         {copy.details && <details className="mt-2 min-w-0 text-caption text-muted">
           <summary className="cursor-pointer">Execution details</summary>

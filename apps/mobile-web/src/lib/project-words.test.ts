@@ -14,6 +14,7 @@ import {
   inWords,
   projectDraftChanges,
   projectDraftFrom,
+  projectEditBaseline,
   refusalIsStale,
   refusalWords,
 } from './project-words';
@@ -38,6 +39,21 @@ test('saving sends only the fields the owner changed', () => {
   assert.deepEqual(projectDraftChanges(project, { ...draft, context: '' }), { context: '' });
   assert.deepEqual(projectDraftChanges(project, { ...draft, name: '   ' }), null, 'a project is never renamed to nothing');
   assert.deepEqual(projectDraftChanges(project, { ...draft, name: 'Sales', context: 'New' }), { name: 'Sales', context: 'New' });
+});
+
+test('a context-only mobile edit preserves a concurrent desktop rename and goals change', () => {
+  const opening = { name: 'Weekly Sales', purpose: 'Run the weekly numbers', goals: ['Close Q4'], context: 'Use the pipeline sheet' };
+  const baseline = projectEditBaseline(opening);
+  const draft = { ...projectDraftFrom(baseline), context: 'Use the approved October forecast' };
+  // The overview can refresh while the form remains mounted in another panel.
+  const current = { ...opening, name: 'Revenue Planning', goals: ['Close Q4', 'Renew Acme'] };
+  const patch = projectDraftChanges(baseline, draft);
+  assert.deepEqual(patch, { context: 'Use the approved October forecast' });
+  assert.deepEqual({ ...current, ...patch }, { ...current, context: 'Use the approved October forecast' });
+  assert.equal(projectDraftChanges(baseline, projectDraftFrom(baseline)), null, 'polling alone must not produce a write');
+  opening.name = 'Another live name'; opening.goals.push('Another live goal');
+  assert.equal(baseline.name, 'Weekly Sales');
+  assert.deepEqual(baseline.goals, ['Close Q4'], 'the baseline owns a copy of array fields');
 });
 
 test('a refusal is said in words; its code never reaches the screen', () => {

@@ -17,7 +17,7 @@ const CYCLE_MS = 4_200;
  * shared working-now presenter (the board's own counts) and the calendar
  * watch's schedule; it adds no call of its own.
  */
-export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, onOpen }: {
+export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, onOpen, needsYouCount }: {
   entries: readonly PresentedWorkingNowEntry<ActivityEntry>[];
   mode: HomeLiveStatus;
   /** When Clem next checks something on a schedule, if known. */
@@ -29,6 +29,8 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
    *  glance belongs). */
   compact?: boolean;
   onOpen?: () => void;
+  /** The canonical Inbox count; working-now membership never substitutes for it. */
+  needsYouCount?: number;
 }) {
   const running = entries.filter((p) => p.membership === 'running');
   const [index, setIndex] = useState(0);
@@ -43,6 +45,8 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
 
   if (mode === 'off') return null;
   const summary = liveWorkSummary(entries.map(entry => entry.membership), unavailable);
+  const quietLabel = unavailable ? summary.label : needsYouCount === undefined ? summary.label
+    : needsYouCount > 0 ? `${needsYouCount} ${needsYouCount === 1 ? 'item needs' : 'items need'} you` : 'Ready when you are';
   const working = !unavailable && running.length > 0;
   const current = working ? running[index % running.length]! : null;
   const step = current ? runningMeta(current.entry) : '';
@@ -70,7 +74,7 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
         <span className={cn('live-dot h-2 w-2 shrink-0 rounded-full', working ? 'bg-primary' : summary.attention ? 'bg-warning' : 'bg-faint')} aria-hidden />
         <span className="flex min-w-0 flex-col leading-tight">
           <span key={current?.entry.runKey ?? 'quiet'} className="truncate text-small font-semibold text-fg animate-fade-in">
-            {current ? (current.entry.headline || 'Working') : summary.label}
+            {current ? (current.entry.headline || 'Working') : quietLabel}
           </span>
           {second && <span className="truncate text-caption text-muted">{second}</span>}
         </span>
@@ -111,7 +115,7 @@ export function LiveStatus({ entries, mode, nextCheckAt, unavailable, compact, o
           </>
         ) : (
           <>
-            <span className="text-body font-semibold text-fg">{summary.label}</span>
+            <span className="text-body font-semibold text-fg">{quietLabel}</span>
             {next && <span className="text-small text-muted">Next calendar check at {next}</span>}
           </>
         )}

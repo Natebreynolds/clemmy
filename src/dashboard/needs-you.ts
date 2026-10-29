@@ -31,6 +31,9 @@ import { listPlanProposals } from '../agents/plan-proposals.js';
 import { listProposals as listCheckInProposals } from '../agents/check-in-proposals.js';
 import { listTrustProposals } from '../agents/trust-graduation.js';
 import { listInboxQuestions } from '../execution/inbox-questions.js';
+import { projectInboxQuestion, visibleInboxQuestions } from './question-presentation.js';
+import { attentionGeneration, attentionItemHidden, attentionLifecycle, isAttentionPresentationKey, mutateAttentionPreference,
+  readAttentionPreferences, type AttentionAction, type AttentionItem, type AttentionLifecycle, type AttentionPresentationItem } from './attention-presentation.js';
 import { listBackgroundTasks } from '../execution/background-tasks.js';
 import { listWorkflowBindingStops } from '../execution/workflow-binding-stops.js';
 import { listPendingRuns, type PendingRun } from '../execution/workflow-events.js';
@@ -81,6 +84,8 @@ interface RunIndex {
    *  question they hold is "try again?", which the workflow's next completed
    *  run has answered. */
   outageParkedRuns: Set<string>;
+  /** Current run facts fence a new stop even when it has no new carrier yet. */
+  latestGeneration?: ReadonlyMap<string, string>;
 }
 
 const RUN_INDEX_TTL_MS = 15_000;
@@ -97,15 +102,15 @@ function runTime(record: Record<string, unknown>): number {
   return Number.NaN;
 }
 
-export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): RunIndex {
+export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now(), fresh = false): RunIndex {
   let dirMtimeMs = 0;
   try { dirMtimeMs = statSync(runsDir).mtimeMs; } catch { /* no runs yet */ }
-  if (runsDir === WORKFLOW_RUNS_DIR && runIndexCache && nowMs - runIndexCache.at < RUN_INDEX_TTL_MS
+  if (!fresh && runsDir === WORKFLOW_RUNS_DIR && runIndexCache && nowMs - runIndexCache.at < RUN_INDEX_TTL_MS
     && runIndexCache.dirMtimeMs === dirMtimeMs) {
     return runIndexCache.index;
   }
   const workflowOfRun = new Map<string, string>();
-  const newest = new Map<string, { at: number; status: string }>();
+  const newest = new Map<string, { at: number; status: string; generation: string }>();
   const outageParkedRuns = new Set<string>();
   if (existsSync(runsDir)) {
     for (const file of readdirSync(runsDir)) {
@@ -133,11 +138,15 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now()): R
       const at = runTime(record);
       if (!Number.isFinite(at)) continue;
       const prior = newest.get(key);
-      if (!prior || at > prior.at) newest.set(key, { at, status });
+      if (!prior || at > prior.at) newest.set(key, { at, status, generation: attentionGeneration([
+        id, status, record.createdAt, record.awaitingInput, record.parked,
+        record.error, record.failureDetail, record.blockedReason, record.stoppedReason, record.bootResumeParkedAt,
+      ]) });
     }
   }
   const latestStatus = new Map([...newest].map(([key, value]) => [key, value.status]));
-  const index = { workflowOfRun, latestStatus, outageParkedRuns };
+  const latestGeneration = new Map([...newest].map(([key, value]) => [key, value.generation]));
+  const index = { workflowOfRun, latestStatus, outageParkedRuns, latestGeneration };
   if (runsDir === WORKFLOW_RUNS_DIR) runIndexCache = { at: nowMs, dirMtimeMs, index };
   return index;
 }
@@ -205,6 +214,12 @@ export interface NeedsYouReferents extends LiveReferents {
   questionByWorkflow?: ReadonlyMap<string, string>;
   /** Parked-run questions a later completed run of the same workflow answered. */
   supersededQuestionIds: ReadonlySet<string>;
+  /** Exact questions the owner dismissed or deferred. Paused work is intact. */
+  hiddenQuestionIds?: ReadonlySet<string>;
+  questionGenerationById?: ReadonlyMap<string, string>;
+  /** All current generic asks, including the ones set aside. */
+  attentionItems?: ReadonlyMap<string, AttentionItem>;
+  hiddenAttentionKeys?: ReadonlySet<string>;
   runs: RunIndex;
   nowMs: number;
 }
@@ -251,7 +266,7 @@ function parkedOnModelOutage(record: Record<string, unknown>): boolean {
   }
 }
 
-export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
+export function needsYouReferents(nowMs = Date.now(), options: { freshRuns?: boolean; pendingRuns?: readonly PendingRun[] } = {}): NeedsYouReferents {
   const approvals = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => !approvalRegistry.isExpired(row))
     .filter((row) => approvalRegistry.isFormalApprovalSurface(row));
@@ -262,25 +277,30 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
   }
   const planIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
   const trustIds = new Set(listTrustProposals('pending').map((row) => row.id));
-  const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs);
+  const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs, options.freshRuns);
   // A run parked on an outage holds no decision once its workflow has run to
   // completion again: the next occurrence did the work the question was about.
   const questionIds = new Set<string>();
   const supersededQuestionIds = new Set<string>();
-  for (const row of listInboxQuestions()) {
+  const questions = listInboxQuestions();
+  const visibleIds = new Set(visibleInboxQuestions(questions, nowMs).map((row) => row.id));
+  const hiddenQuestionIds = new Set(questions.filter((row) => !visibleIds.has(row.id)).map((row) => row.id));
+  for (const row of questions) {
     const workflow = row.source === 'workflow' && row.runId && runs.outageParkedRuns.has(row.runId)
       ? runs.workflowOfRun.get(row.runId) : undefined;
     if (workflow && runs.latestStatus.get(workflow) === 'completed') supersededQuestionIds.add(row.id);
-    else questionIds.add(row.id);
+    else if (visibleIds.has(row.id)) questionIds.add(row.id);
   }
-  return {
+  const ref: NeedsYouReferents = {
     approvalIds,
     planIds,
     trustIds,
     questionIds,
     approvalBySession,
-    questionByWorkflow: questionsByWorkflow(questionIds, runs),
+    questionByWorkflow: questionsByWorkflow(questions.filter((row) => !supersededQuestionIds.has(row.id)).map((row) => row.id), runs),
     supersededQuestionIds,
+    hiddenQuestionIds,
+    questionGenerationById: new Map(questions.map((row) => [row.id, projectInboxQuestion(row).lifecycle.generation])),
     runs,
     nowMs,
     approvalPending: (id) => approvalIds.has(id),
@@ -290,6 +310,96 @@ export function needsYouReferents(nowMs = Date.now()): NeedsYouReferents {
     // No `questionOpen`: the classifier trusts a question id over a lookup
     // table here on purpose (an under-counted question loses work).
   };
+  const items = rawAttentionItems(ref, options.pendingRuns);
+  const preferences = readAttentionPreferences();
+  ref.attentionItems = new Map(items.map(item => [item.key, item]));
+  ref.hiddenAttentionKeys = new Set(items.filter(item => attentionItemHidden(item, preferences, nowMs)).map(item => item.key));
+  return ref;
+}
+
+/** Build attention items from the live asks before applying their preferences.
+ * A receipt can only be restored while these same source facts still exist. */
+function rawAttentionItems(ref: NeedsYouReferents, pendingRuns?: readonly PendingRun[]): AttentionItem[] {
+  interface Group {
+    notices: NotificationRecord[];
+    binding?: ReturnType<typeof listWorkflowBindingStops>[number];
+    paused?: BootParkedWorkflow;
+  }
+  const groups = new Map<string, Group>();
+  const group = (key: string) => {
+    const value = groups.get(key) ?? { notices: [] };
+    groups.set(key, value);
+    return value;
+  };
+  for (const notice of loadNotifications()) {
+    if (notice.read || notice.silent || notice.metadata?.heartbeat === true || !notificationRequiresAttention(notice, ref)) continue;
+    const key = needsYouKey(notice, ref);
+    if (isAttentionPresentationKey(key)) group(key).notices.push(notice);
+  }
+  try {
+    for (const stop of listWorkflowBindingStops()) if (stop.scheduled) group(workflowKey(stop.slug || stop.workflow)).binding = stop;
+  } catch { /* Preserve the same bounded read semantics as the canonical count. */ }
+  try {
+    for (const paused of bootParkedWorkflows(pendingRuns)) group(paused.key).paused = paused;
+  } catch { /* No pending workflow event store. */ }
+  const factKeys = ['source', 'status', 'runId', 'workflowRunId', 'workflow', 'workflowSlug', 'stepId', 'questionId',
+    'sourceUserSeq', 'foregroundRun', 'itemKey', 'changeKind', 'eventId', 'accountId', 'connectionId', 'startsAt', 'endsAt',
+    'heartbeatId', 'refType', 'refId', 'needsAttention', 'questionResolvedAt', 'capabilitySettledAt',
+    'sessionId', 'targetSessionId', 'runSessionId', 'backgroundTaskId', 'projectId', 'watch', 'provider', 'brainOutageId'];
+  return [...groups].map(([key, value]) => {
+    value.notices.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
+    const latest = value.notices[0];
+    const meta = latest?.metadata;
+    const prefix = key.slice(0, key.indexOf(':'));
+    const kind = prefix === 'flow' ? 'workflow' : prefix === 'session' ? 'conversation' : prefix === 'calendar' ? 'calendar' : 'notification';
+    const workflow = value.binding?.workflow ?? value.paused?.workflowName ?? str(meta, 'workflow');
+    const candidateSlug = value.binding?.slug ?? value.paused?.workflowName ?? (prefix === 'flow' ? key.slice(5) : '');
+    const workflowSlug = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidateSlug) ? candidateSlug : '';
+    const pausedCount = value.paused?.runIds.length ?? 0;
+    const title = latest?.title || (value.binding ? `${workflow} can't run on its schedule`
+      : pausedCount === 1 ? `${workflow} stopped after restarting several times`
+        : `${pausedCount} runs of ${workflow} stopped after restarting several times`);
+    const detail = latest?.body || (value.binding ? 'Pick the account or source it should use.'
+      : pausedCount === 1 ? 'Open it to resume the run or skip it.' : 'Open it to resume the runs or skip them.');
+    const generation = attentionGeneration({ key,
+      notices: [...value.notices].sort((a, b) => a.id.localeCompare(b.id)).map(notice => ({ id: notice.id,
+        createdAt: notice.createdAt, title: notice.title, body: notice.body,
+        facts: Object.fromEntries(factKeys.filter(field => notice.metadata?.[field] !== undefined).map(field => [field, notice.metadata![field]])),
+      })),
+      currentRun: prefix === 'flow' ? ref.runs.latestGeneration?.get(key) ?? ref.runs.latestStatus.get(key) : undefined,
+      binding: value.binding ? { ...value.binding, gaps: [...value.binding.gaps].sort() } : undefined,
+      paused: value.paused ? { ...value.paused, runIds: [...value.paused.runIds].sort() } : undefined,
+    });
+    const sessionId = str(meta, 'sessionId', 'targetSessionId');
+    const runId = str(meta, 'runId', 'workflowRunId', 'backgroundTaskId') || value.paused?.runIds[0];
+    const projectId = str(meta, 'projectId');
+    return { key, kind, title, detail, createdAt: latest?.createdAt || value.paused?.oldest || '',
+      ...(latest ? { notificationId: latest.id } : {}), ...(sessionId ? { sessionId } : {}), ...(runId ? { runId } : {}),
+      ...(workflow ? { workflow } : {}), ...(workflowSlug ? { workflowSlug } : {}), ...(projectId ? { projectId } : {}),
+      lifecycle: attentionLifecycle(generation) } as AttentionItem;
+  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.key.localeCompare(b.key));
+}
+
+export function attentionLifecycleForKey(key: string, ref: NeedsYouReferents): AttentionLifecycle | undefined {
+  return ref.attentionItems?.get(key)?.lifecycle;
+}
+export function notificationAttentionHidden(notification: Pick<NotificationRecord, 'id' | 'kind' | 'title' | 'metadata'>, ref: NeedsYouReferents): boolean {
+  const key = needsYouKey(notification, ref);
+  return ref.hiddenQuestionIds?.has(key) === true
+    || ref.hiddenAttentionKeys?.has(key) === true && notificationRequiresAttention(notification, ref);
+}
+export function listAttentionPresentations(nowMs = Date.now()): AttentionPresentationItem[] {
+  const entries = readAttentionPreferences(true);
+  const current = needsYouReferents(nowMs, { freshRuns: true }).attentionItems;
+  return [...(current?.values() ?? [])].flatMap((item): AttentionPresentationItem[] => {
+    const saved = entries[item.key];
+    return saved && attentionItemHidden(item, entries, nowMs) && (saved.action === 'dismiss' || saved.action === 'defer')
+      ? [{ ...item, ...saved, action: saved.action }] : [];
+  });
+}
+export function presentAttentionItem(key: string, action: AttentionAction, generation?: string, mutationToken?: string, nowMs = Date.now()) {
+  return mutateAttentionPreference({ key, action, generation, mutationToken, nowMs }, () =>
+    [...(needsYouReferents(nowMs, { freshRuns: true }).attentionItems?.values() ?? [])]);
 }
 
 // ─── One notification ────────────────────────────────────────────────────────
@@ -394,10 +504,19 @@ export function notificationNeedsYou(
   notification: Pick<NotificationRecord, 'id' | 'kind' | 'title' | 'metadata'>,
   ref: NeedsYouReferents,
 ): boolean {
+  return !notificationAttentionHidden(notification, ref) && notificationRequiresAttention(notification, ref);
+}
+
+/** Classify the owning ask without applying generic attention preferences. */
+function notificationRequiresAttention(
+  notification: Pick<NotificationRecord, 'id' | 'kind' | 'title' | 'metadata'>,
+  ref: NeedsYouReferents,
+): boolean {
   const meta = notification.metadata;
   // The carrier of a question a later run answered is history with it.
   const carried = notificationActionItemId(notification);
   if (carried && ref.supersededQuestionIds.has(carried)) return false;
+  if (ref.hiddenQuestionIds?.has(needsYouKey(notification, ref))) return false;
   if (calendarAskOpen(meta, ref.nowMs)) return true;
   if (heartbeatItemOpen(meta)) return true;
   // A workflow notice is current exactly while its workflow's newest run is
@@ -442,6 +561,8 @@ export interface NeedsYouSummary {
    * these, so a list and its badge cannot disagree by construction.
    */
   unlisted: NeedsYouUnlistedItem[];
+  /** Visible generic asks, with the exact attention generation every surface uses. */
+  attentionItems: AttentionItem[];
 }
 
 export interface NeedsYouUnlistedItem {
@@ -453,15 +574,16 @@ export interface NeedsYouUnlistedItem {
   workflow?: string;
   /** Its saved name, which its page is opened by. */
   workflowSlug?: string;
+  lifecycle?: AttentionLifecycle;
 }
 
 export async function summarizeNeedsYou(
   input: { runtimeApprovalIds?: readonly string[]; nowMs?: number; pendingRuns?: readonly PendingRun[] } = {},
 ): Promise<NeedsYouSummary> {
   const nowMs = input.nowMs ?? Date.now();
-  const ref = needsYouReferents(nowMs);
+  const ref = needsYouReferents(nowMs, { pendingRuns: input.pendingRuns });
   const keys = new Set<string>();
-  const add = (key: string) => { if (key) keys.add(key); };
+  const add = (key: string) => { if (key && !ref.hiddenAttentionKeys?.has(key)) keys.add(key); };
 
   for (const id of ref.approvalIds) add(`approval:${id}`);
   const runtimeApprovalIds = decidableRuntimeApprovalIds(input.runtimeApprovalIds ?? []);
@@ -508,6 +630,8 @@ export async function summarizeNeedsYou(
   const noticedWorkflows = new Set<string>();
   for (const notification of loadNotifications()) {
     if (notification.read || notification.silent || notification.metadata?.heartbeat === true) continue;
+    // A hidden ask is still an ask, not newly unread news or completed work.
+    if (notificationAttentionHidden(notification, ref)) continue;
     if (!notificationNeedsYou(notification, ref)) {
       unreadUpdates += 1;
       continue;
@@ -551,6 +675,7 @@ export async function summarizeNeedsYou(
       workflowSlug: group.workflowName,
     });
   }
+  for (const key of ref.hiddenAttentionKeys ?? []) workflowKeys.delete(key);
   for (const key of workflowKeys) add(key);
   const beforeNotifications = keys.size;
   for (const key of notificationKeys) add(key);
@@ -567,6 +692,8 @@ export async function summarizeNeedsYou(
     notificationNeedsYou: keys.size - beforeNotifications,
     unreadUpdates,
     keys: [...keys],
-    unlisted,
+    unlisted: unlisted.filter(row => !ref.hiddenAttentionKeys?.has(row.key)).map(row => ({ ...row,
+      ...(attentionLifecycleForKey(row.key, ref) ? { lifecycle: attentionLifecycleForKey(row.key, ref) } : {}) })),
+    attentionItems: [...(ref.attentionItems?.values() ?? [])].filter(item => !ref.hiddenAttentionKeys?.has(item.key)),
   };
 }

@@ -3,7 +3,7 @@ import { flushSync } from 'react-dom';
 import { Link } from 'react-router-dom';
 import { Globe, PanelRightClose, RefreshCw, Square, Hand, ArrowRight } from 'lucide-react';
 import { browserClosesText, cloudBrowserProviderLabel, browserElapsed, browserFocusPage, browserViewTarget, browserCloseResultMessage, startBrowserViewLifecycle, browserResourceKey, browserStopMessage, browsersChipLabel, canApplyBrowserResponse, canApplyBrowserControlResponse, createBrowserViewerLeases, canStartBrowserInTask, isBrowserDisconnected, type CloudBrowserOpenBrowser, type CloudBrowserOverview, type CloudBrowserResource, type CloudBrowserStatus, type CloudBrowserUnlinkedSession, type BrowserViewLifecycle, type CloudBrowserView } from '@clem/chat-engine';
-import { cloudBrowser } from '@/lib/cloud-browser';
+import { cloudBrowser, hasCloudBrowserSession } from '@/lib/cloud-browser';
 import { embedsBrowserViewer } from '@/lib/clemmy';
 import './cloud-browser.css';
 
@@ -52,7 +52,7 @@ function BrowserWorkspace({ conversationId, children, inHeader = false }: { conv
       if (mounted.current && context.current === conversationId && version === generation.current) { setStatus(nextStatus); setStatusFailed(false); setResources(list.resources.map((item) => fresh?.id === item.id ? fresh : item)); }
     } catch { if (mounted.current && version === generation.current) { setStatusFailed(true); setNotice('Browser status is unavailable. Refresh to reconnect.'); } }
   }, [conversationId]);
-  // Every open browser on this Mac, for the chip count and the other-browsers list.
+  // Every open cloud browser, for the chip count and the other-browsers list.
   const loadOverview = useCallback(async () => {
     try { const next = await cloudBrowser.overview(); if (mounted.current) setOverview(next); } catch { /* keep the last list */ }
   }, []);
@@ -210,10 +210,11 @@ function BrowserWorkspace({ conversationId, children, inHeader = false }: { conv
   };
   const toggleBrowser = () => { if (open) void lifecycle.current?.stop(); setOpen(!open); };
   const browserStatus = resource ? (resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state) : null;
-  const control: BrowserControl | null = conversationId && inHeader ? { label: browsersChipLabel(openCount), status: browserStatus, open, toggle: toggleBrowser } : null;
+  const hasSession = hasCloudBrowserSession(scopedResources, openCount, open);
+  const control: BrowserControl | null = conversationId && inHeader && hasSession ? { label: browsersChipLabel(openCount), status: browserStatus, open, toggle: toggleBrowser } : null;
   return <BrowserControlContext.Provider value={control}><div className={`cloud-browser-workspace${open ? ' is-open' : ''}`}>
     <div className="cloud-browser-conversation">
-      {conversationId && !inHeader ? <div className="cloud-browser-strip">
+      {conversationId && !inHeader && hasSession ? <div className="cloud-browser-strip">
         <button type="button" onClick={() => { if (open) void lifecycle.current?.stop(); setOpen(!open); }} aria-expanded={open}><Globe size={16} aria-hidden />{browsersChipLabel(openCount)}{resource ? <span>{resource.returnPending ? 'Waiting for open views' : active ? resource.controller === 'human' ? 'Your control' : 'Clem has control' : resource.state}</span> : null}</button>
         <span className="cloud-browser-strip-note">{open ? 'Chat and approvals stay here' : resource ? browserElapsed(resource.elapsedSeconds) : 'A browser for this conversation'}</span>
       </div> : null}

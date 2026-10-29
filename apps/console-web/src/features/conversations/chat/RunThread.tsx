@@ -6,6 +6,9 @@ import { RunHeader } from '@/components/run/RunHeader';
 import { RunSection } from '@/components/run/RunSection';
 import { RunTimeline } from '@/components/run/RunTimeline';
 import { RunWriteLedger } from '@/components/run/RunWriteLedger';
+import { FileDockWorkspace } from '@/components/chat/FileDock';
+import { TaskResultFiles } from '@/components/projects/TaskResultFiles';
+import { rawId } from '../lib/ids';
 import { linkify } from '@/lib/linkify';
 import { usePoll } from '@/lib/poll';
 import {
@@ -54,6 +57,7 @@ const TICK_MS = 1_000;
 const STOP_CONTROLS_POLL_MS = 5_000;
 
 export function RunThread({ session }: { session: Session }) {
+  const filesSessionId = session.executionSessionId ?? rawId(session.id);
   const qc = useQueryClient();
   const mutations = useSessionMutations();
   const { events, liveness, loading, error, coverage } = useRunEvents(session);
@@ -124,6 +128,7 @@ export function RunThread({ session }: { session: Session }) {
   };
 
   return (
+    <FileDockWorkspace conversationId={filesSessionId}>
     <div className="flex min-h-0 flex-1 flex-col">
       <RunHeader
         title={session.title || 'Run'}
@@ -156,7 +161,8 @@ export function RunThread({ session }: { session: Session }) {
 
           {deliverables.length > 0 && (
             <RunSection title="What it produced" meta={`${deliverables.length} file${deliverables.length === 1 ? '' : 's'}`}>
-              <ul className="space-y-3">
+              <TaskResultFiles taskId={session.id} sessionId={filesSessionId} savedKey={JSON.stringify(deliverables)} />
+              <details className="mt-3"><summary className="cursor-pointer text-small text-muted">Recorded output details</summary><ul className="mt-3 space-y-3">
                 {deliverables.map((file) => (
                   <li key={file.key}>
                     <p className="text-body text-fg">{file.name}</p>
@@ -168,7 +174,7 @@ export function RunThread({ session }: { session: Session }) {
                     )}
                   </li>
                 ))}
-              </ul>
+              </ul></details>
             </RunSection>
           )}
 
@@ -188,6 +194,7 @@ export function RunThread({ session }: { session: Session }) {
       </div>
       <RunFooter session={session} />
     </div>
+    </FileDockWorkspace>
   );
 }
 

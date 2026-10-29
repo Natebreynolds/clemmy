@@ -23,16 +23,12 @@ import type { JSX } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   answerInboxQuestion,
-  approveApproval,
-  approvePlanProposal,
   getReminders,
   listApprovals,
   listInboxNotifications,
   listInboxQuestions,
   listPlanProposals,
   listWorkspaceDestinationChoosers,
-  rejectApproval,
-  rejectPlanProposal,
   resolveWorkspaceDestinationChooser,
   runWorkflow,
   type ApprovalRow,
@@ -65,8 +61,8 @@ import { FromClem } from '../components/FromClem';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
-const MAX_TODAY_ROWS = 6;
-const MAX_RECENT_ROWS = 4;
+const MAX_TODAY_ROWS = 3;
+const MAX_RECENT_ROWS = 2;
 const DIGEST_SHOWN_KEY = 'clem.today.digestShownAt';
 const LAST_OPEN_KEY = 'clem.today.lastOpenAt';
 // Every other pane on this screen is capped. This one was not, which is why
@@ -80,7 +76,7 @@ interface Props {
   onOpenChat: (session: ChatSession) => void;
   /** Open a conversation by id: Clem's own thread, from From Clem. */
   onOpenThread: (sessionId: string, title: string) => void;
-  onOpenInbox: () => void;
+  onOpenInbox: (notificationId?: string, decisionKey?: string) => void;
   onOpenWorkspace: (id: string) => void;
   /** Open a run's own screen. Every surface that shows running work must be
    *  able to reach it — a row with a pulse and a progress bar that cannot be
@@ -126,7 +122,7 @@ const EMPTY: HomeData = {
 
 
 export function Home({
-  name, onAsk, onOpenChat, onOpenThread, onOpenInbox, onOpenWorkspace, onOpenActivity, onCustomize,
+  name, onAsk, onOpenChat, onOpenThread, onOpenInbox, onOpenWorkspace, onOpenActivity, onOpenRun, onCustomize,
   needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
 }: Props) {
   const { prefs } = useHomePreferences();
@@ -170,6 +166,11 @@ export function Home({
   // What Clem's heartbeats brought, in her words. Home's other lists leave out
   // what she already shows, so nothing appears twice.
   const fromClem = useScreenData(() => getFromClem(), { intervalMs: 20_000, resourceKey: 'home-from-clem', disabled: !paneSet.has('needs_you') && !paneSet.has('while_away') });
+  useEffect(() => {
+    const changed = () => { void refresh(); void fromClem.refresh(); };
+    window.addEventListener('clem:needs-you-changed', changed);
+    return () => window.removeEventListener('clem:needs-you-changed', changed);
+  }, [refresh, fromClem.refresh]);
   const clemDecisions = (fromClem.data?.rows ?? []).filter(row => row.asks && !row.setup);
   const clemUpdates = (fromClem.data?.rows ?? []).filter(row => !row.asks || row.setup);
   const covers = fromClem.data?.covers;
@@ -252,7 +253,8 @@ export function Home({
     ...plans.map((row): NeedsItem => ({ key: `plan:${row.id}`, kind: 'plan', row })),
     ...approvals.map((row): NeedsItem => ({ key: `approval:${row.approvalId}`, kind: 'approval', row })),
   ] : [];
-  const needsShown = needsItems.slice(0, MAX_NEEDS_ROWS);
+  const clemShown = Math.min(MAX_NEEDS_ROWS, clemDecisions.length);
+  const needsShown = needsItems.slice(0, Math.max(0, MAX_NEEDS_ROWS - clemShown));
   const needsPane = homeNeedsYouPane({
     rendered: needsShown.length,
     counted: needsYouCount,
@@ -262,7 +264,7 @@ export function Home({
   const greeting = timeGreeting(new Date().getHours(), greetingName(name));
   const lead = homeLead({
     loading,
-    answerableShown: needsShown.length + (paneSet.has('needs_you') ? clemDecisions.length : 0),
+    answerableShown: 0, // The authoritative summary owns the total; these are previews.
     needsYouCount,
     needsYouCountKnown,
     countLive: needsYouCountLive,
@@ -277,7 +279,10 @@ export function Home({
   });
   // Narrowed here, not in the callback: TypeScript drops a property narrowing
   // the moment it crosses into a closure.
-  const leadAction = lead.action;
+  const hasAttention = needsYouCountKnown && needsYouCount > 0;
+  const leadHeadline = hasAttention ? `${needsYouCount === 1 ? 'One thing needs' : `${needsYouCount} things need`} your attention` : lead.headline;
+  const leadAction = hasAttention ? { label: 'Review Inbox', target: 'inbox' as const } : lead.action;
+  const activeWork = workingView.entries.filter(row => row.membership === 'running');
 
   const sections: Record<HomePaneId, () => JSX.Element | null> = {
     // No actions saved means no row: the door to adding one is the Customize
@@ -285,8 +290,8 @@ export function Home({
     quick_actions: () => (prefs.quickActions.length > 0 ? (
       <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
     ) : null),
-    needs_you: () => (needsPane.show || clemDecisions.length > 0) ? <>
-      <FromClem data={fromClem.data ?? null} mode="decisions" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'clem', 'Clem')} />
+    needs_you: () => <>
+      <FromClem data={fromClem.data ?? null} mode="decisions" maxRows={MAX_NEEDS_ROWS} onOpenInbox={(key) => onOpenInbox(undefined, key)} onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'harness:clem', 'Clem')} />
       {needsPane.show ? (
         <NeedsYou
           pane={needsPane}
@@ -294,19 +299,19 @@ export function Home({
           onOpenInbox={onOpenInbox}
           onChanged={refresh}
         />
-      ) : null}</> : null,
+      ) : null}</>,
     // Current work lives in Activity; the headline and the header chip lead there.
     running: () => null,
     // Delivered work is a row in Today now; this pane is folded in.
     made: () => null,
     while_away: () => (dayRows.length > 0 || clemUpdates.length > 0) ? <>
-      <FromClem data={fromClem.data ?? null} mode="updates" onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'clem', 'Clem')} />
+      <FromClem data={fromClem.data ?? null} mode="updates" maxRows={3} onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'harness:clem', 'Clem')} />
       {dayRows.length > 0 ? (
         <section class="home-section" aria-labelledby="home-today">
-          <h2 id="home-today" class="section-head pane-head">Today</h2>
+          <h2 id="home-today" class="section-head pane-head">Your day</h2>
           <div class="home-card" id="home-today-rows">
             {dayRows.map((row) => (
-              <TodayLine key={row.key} row={row} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
+              <TodayLine key={row.key} row={row} onOpen={() => row.notificationId ? onOpenInbox(row.notificationId) : onAsk(`Tell me about “${row.title}” scheduled for ${row.at}.`)} onDone={async () => { if (row.notificationId) { await markInboxNotificationRead(row.notificationId); void refresh(); } }} />
             ))}
           </div>
           {moreDayRows > 0 ? <button type="button" class="home-pinned-more" aria-expanded={todayExpanded} aria-controls="home-today-rows"
@@ -317,7 +322,7 @@ export function Home({
       ) : null}</> : null,
     projects: () => (recent.length > 0 ? (
       <section class="home-section" aria-labelledby="home-recent">
-        <h2 id="home-recent" class="section-head pane-head">Recent</h2>
+        <h2 id="home-recent" class="section-head pane-head">Pick up a conversation</h2>
         <div class="home-card">
           {recent.map((session) => (
             <button key={session.id} type="button" class="home-row home-row-tap" onClick={() => { haptic('light'); onOpenChat(session); }}>
@@ -340,20 +345,20 @@ export function Home({
   return (
     <div class="home">
       {/* Current state leads; the greeting stays a quiet personal detail. */}
-      <header class={`home-lead home-lead-${lead.tone} rise`} style={{ '--i': 0 }}>
+      <header class={`home-lead home-lead-${lead.tone}`}><p class="home-greeting">{greeting}</p>
         {/* The answer rewrites itself as polls land — from "Catching up…" to
             whatever is true — so it is announced. One live region for the
             whole sentence, its qualifier and its provenance, or a screen
             reader hears the count change and never hears how old it is. */}
         <div class="home-lead-say" aria-live="polite">
-          <h2 class="home-lead-head">{lead.headline}</h2>
+          <h2 class="home-lead-head">{leadHeadline}</h2>
           {lead.detail ? <p class="home-lead-detail">{lead.detail}</p> : null}
           {/* Never render the confident version of an unknown: when the shell's
               count came off the service-worker shelf, the number is still
               given — with how old it is. */}
           {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
         </div>
-        <p class="home-greeting">{greeting}</p>
+
         {digest ? (
           <p class="today-digest" role="status">
             <span>{digest}</span>
@@ -385,6 +390,12 @@ export function Home({
         hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
 
+      {!prefs.panes.hidden.includes('running') && activeWork.length > 0 ? <section class="home-section" aria-labelledby="home-active-work">
+        <div class="home-section-heading"><h2 id="home-active-work" class="section-head pane-head">Clem is working</h2><button type="button" class="home-link-btn" onClick={onOpenActivity}>View Work</button></div>
+        <div class="home-card">{activeWork.slice(0, 2).map(({ entry, pulse, elapsed }) => <button type="button" key={entry.runKey} class="home-row home-row-tap home-active-row" onClick={() => entry.sessionId ? onOpenRun(entry.sessionId) : onOpenActivity()}>
+          <span class={pulse ? 'home-work-state home-work-state-live' : 'home-work-state'} aria-hidden="true" /><span class="min-w-0"><span class="home-row-title">{entry.headline || 'Work in progress'}</span><span class="home-row-note">{entry.activity?.text || 'In progress'}{elapsed ? ` · ${elapsed}` : ''}</span></span>
+        </button>)}</div>
+      </section> : null}
       {panes.map((id) => {
         const rendered = sections[id]();
         return rendered ? <div key={id} class="home-pane rise" style={{ '--i': 1 }}>{rendered}</div> : null;
@@ -514,7 +525,7 @@ function NeedsYou({ pane, items, onOpenInbox, onChanged }: {
    *  remainder is named. The pane is only mounted when it has rows. */
   pane: NeedsYouPane;
   items: NeedsItem[];
-  onOpenInbox: () => void;
+  onOpenInbox: (notificationId?: string, decisionKey?: string) => void;
   onChanged: () => void | Promise<void>;
 }) {
   return (
@@ -540,7 +551,7 @@ function NeedsYou({ pane, items, onOpenInbox, onChanged }: {
 
 function NeedsRow({ item, onOpenInbox, onChanged }: {
   item: NeedsItem;
-  onOpenInbox: () => void;
+  onOpenInbox: (notificationId?: string, decisionKey?: string) => void;
   onChanged: () => void | Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
@@ -576,7 +587,7 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
   };
 
   const openInInbox = (
-    <button type="button" class="home-btn" onClick={() => { haptic('light'); onOpenInbox(); }}>Answer in Needs you</button>
+    <button type="button" class="home-btn" onClick={() => { haptic('light'); onOpenInbox(); }}>Open in Inbox</button>
   );
 
   let title = '';
@@ -588,16 +599,7 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
     // Clem's own question when her checker wrote one.
     title = row.presentation?.ask ?? approvalQuestion(row.subject);
     note = `${approvalKindLabel(row.tool)} · ${relativeTime(row.requestedAt)}${row.resourceFingerprint?.warning ? ` · ${row.resourceFingerprint.warning}` : ''}`;
-    actions = (
-      <>
-        <button type="button" class="home-btn home-btn-primary" disabled={busy !== null} onClick={() => void act('approve', () => approveApproval(row.approvalId), 'Approved')}>
-          {busy === 'approve' ? 'Approving…' : 'Approve'}
-        </button>
-        <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void act('reject', () => rejectApproval(row.approvalId), 'Declined')}>
-          {busy === 'reject' ? 'Saving…' : 'Decline'}
-        </button>
-      </>
-    );
+    actions = <button type="button" class="home-btn home-btn-primary" onClick={() => onOpenInbox(undefined, `approval:${row.approvalId}`)}>Review action</button>;
   } else if (item.kind === 'question') {
     const row = item.row;
     title = row.question;
@@ -621,16 +623,7 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
     const row = item.row;
     title = `I made a plan for “${row.objective}.”`;
     note = `${row.steps.length} ${row.steps.length === 1 ? 'step' : 'steps'} · ${relativeTime(row.proposedAt)}`;
-    actions = row.needsUserInput.length > 0 ? openInInbox : (
-      <>
-        <button type="button" class="home-btn home-btn-primary" disabled={busy !== null} onClick={() => void act('approve', () => approvePlanProposal(row.id), 'Plan started')}>
-          {busy === 'approve' ? 'Starting…' : 'Start this plan'}
-        </button>
-        <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void act('reject', () => rejectPlanProposal(row.id), 'Plan rejected')}>
-          {busy === 'reject' ? 'Saving…' : 'Reject'}
-        </button>
-      </>
-    );
+    actions = <button type="button" class="home-btn home-btn-primary" onClick={() => onOpenInbox(undefined, `plan:${row.id}`)}>Review plan</button>;
   } else {
     const row = item.row;
     title = 'Where should these records live?';
@@ -696,22 +689,24 @@ function NeedsRow({ item, onOpenInbox, onChanged }: {
 
 // ─── today ─────────────────────────────────────────────────────────────────
 
-function TodayLine({ row, onDone }: { row: TodayRow; onDone: () => Promise<void> }) {
+function TodayLine({ row, onDone, onOpen }: { row: TodayRow; onDone: () => Promise<void>; onOpen: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const when = row.kind === 'calendar' ? formatUpcoming(row.at) : clockOrDay(row.at);
   return (
     <div class="home-row today-row">
-      <div class="today-row-body">
+      <button type="button" class="today-row-body today-row-open" onClick={onOpen} aria-label={`${row.kind === 'calendar' ? 'Ask Clem about' : 'Open update'}: ${row.title}`}>
         <span class={`today-row-eyebrow${row.kind === 'heartbeat' ? ' heartbeat' : ''}`}>{row.eyebrow}</span>
         <span class="home-row-title">{row.title}</span>
-      </div>
+      </button>
       {row.kind === 'heartbeat' ? (
-        <button type="button" class="today-row-done" disabled={busy} onClick={async () => { haptic('light'); setBusy(true); try { await onDone(); } finally { setBusy(false); } }}>
-          {busy ? '…' : 'Done'}
+        <button type="button" class="today-row-done" disabled={busy} onClick={async () => { haptic('light'); setBusy(true); try { await onDone(); setError(null); } catch (err) { setError(err instanceof Error ? err.message : 'Could not dismiss this update. Try again.'); } finally { setBusy(false); } }}>
+          {busy ? 'Saving…' : 'Dismiss'}
         </button>
       ) : (
         <time class="today-row-when" dateTime={row.at}>{when}</time>
       )}
+      {error ? <p class="home-row-error" role="alert">{error}</p> : null}
     </div>
   );
 }

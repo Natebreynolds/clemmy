@@ -11,6 +11,42 @@ const { BrowserbaseService, BrowserbaseServiceError } = await import('./browserb
 const { BrowserbaseClientError } = await import('./browserbase-client.js');
 const { BrowserbaseCdpError } = await import('./browserbase-cdp.js');
 const project = '10000000-0000-4000-8000-000000000001', sessionId = '20000000-0000-4000-8000-000000000002';
+
+test('browser status reflects registered computer precedence without changing saved selection or claiming health', async () => {
+  const t = setup();
+  const beforeOverride = process.env.CLEMMY_COMPUTER_IS_THE_BROWSER;
+  delete process.env.CLEMMY_COMPUTER_IS_THE_BROWSER;
+  try {
+    assert.equal((await t.service.status()).effectiveBackend, 'local');
+    await t.service.configure({ projectId: project });
+    assert.equal((await t.service.status()).effectiveBackend, 'cloud');
+    const binary = path.join(t.baseDir, 'tools', 'bin', process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver');
+    fs.mkdirSync(path.dirname(binary), { recursive: true }); writeFileSync(binary, 'controlled non-executable fixture');
+    assert.equal((await t.service.status()).effectiveBackend, 'cloud', 'installation alone is not selection');
+    fs.mkdirSync(path.join(t.baseDir, 'mcp'), { recursive: true });
+    const record = { command: binary, args: ['mcp', '--embedded'], enabled: true };
+    const servers = path.join(t.baseDir, 'mcp', 'servers.json');
+    writeFileSync(servers, JSON.stringify({ 'cua-driver': record }));
+    const before = readFileSync(path.join(t.baseDir, 'state/browserbase/resources.json'), 'utf8');
+    const status = await t.service.status();
+    assert.equal(status.effectiveBackend, 'computer');
+    assert.equal(status.choice, 'browserbase');
+    assert.equal(status.provider, 'browserbase');
+    assert.equal(status.configured, true, 'saved cloud account status remains available');
+    assert.equal('ready' in status, false, 'presence never claims permission/daemon readiness');
+    assert.equal(readFileSync(path.join(t.baseDir, 'state/browserbase/resources.json'), 'utf8'), before, 'status does not mutate browser policy');
+    assert.equal(t.counts().creates, 0);
+    writeFileSync(servers, JSON.stringify({ 'cua-driver': { ...record, enabled: false } }));
+    assert.equal((await t.service.status()).effectiveBackend, 'cloud');
+    await t.service.select('local');
+    assert.equal((await t.service.status()).effectiveBackend, 'local');
+  } finally {
+    if (beforeOverride === undefined) delete process.env.CLEMMY_COMPUTER_IS_THE_BROWSER;
+    else process.env.CLEMMY_COMPUTER_IS_THE_BROWSER = beforeOverride;
+    t.close();
+  }
+});
+
 function setup() {
   const baseDir = mkdtempSync(path.join(os.tmpdir(), 'clem-browserbase-service-'));
   let clock = Date.parse('2026-10-02T00:00:00Z'), status: 'RUNNING'|'COMPLETED'|'TIMED_OUT'|'ERROR' = 'RUNNING', key = 'private-test-key';

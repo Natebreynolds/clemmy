@@ -199,6 +199,7 @@ export function needsYouTarget(item: HomeFeedItem): string {
   if (item.approvalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.approvalId)}`;
   if (item.planProposalId) return `/inbox?tab=needs&select=${encodeURIComponent(item.planProposalId)}`;
   if (item.questionId) return `/inbox?tab=needs&select=${encodeURIComponent(item.questionId)}`;
+  if (item.attentionKey) return `/inbox?tab=needs&select=${encodeURIComponent(item.attentionKey)}`;
   if (item.kind === 'background') return '/tasks';
   return '/inbox';
 }
@@ -229,6 +230,7 @@ export function needsYouKey(item: HomeFeedItem, index: number): string {
     ?? item.planProposalId
     ?? item.questionId
     ?? item.notifId
+    ?? item.attentionKey
     ?? (item.dismissId ? `${item.dismissKind}:${item.dismissId}` : `row:${index}:${item.title ?? ''}`);
 }
 

@@ -1,10 +1,11 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { appPlaceHref, fromClemSourceName, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
+import { attentionReportCount, attentionWorkTitle, groupAttentionReports, oneLine, appPlaceHref, fromClemSourceName, heartbeatLastCheckWords, heartbeatStateWords, currentProactiveReceipt, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { Button } from '@/components/ui/Button';
-import { decidePlanProposal, markNotificationRead } from '@/lib/inbox';
-import { fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
+import { markNotificationRead, presentInboxQuestion } from '@/lib/inbox';
+import { fromClemDisposition, fromClemReceiptVersion, fromClemRunHref, recentPulses, replyFromClem, replyOutcomeText, type FromClem, type FromClemRow } from '@/lib/from-clem';
+import { presentAttentionItem } from '@/lib/attention-presentation';
 import { cn } from '@/lib/cn';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
@@ -19,7 +20,7 @@ interface RowState {
 }
 
 /** How many rows each group shows before "Show more" opens the rest in place. */
-const WAITING_SHOWN = 5;
+const WAITING_SHOWN = 3;
 const UPDATES_SHOWN = 3;
 
 function pulseNeedsVisibility(pulse: FromClem['pulses'][number]): boolean {
@@ -101,21 +102,42 @@ export function FromClemPane({
     run: () => Promise<unknown>,
     success: string | ((result: unknown) => { text: string; sessionId?: string; settled?: boolean }),
   ) => {
-    if (inFlight.current.has(row.key)) return;
-    inFlight.current.add(row.key);
-    setStates((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, busy } }));
+    const version = fromClemReceiptVersion(row);
+    const lockKey = `${row.key}:${version}`;
+    if (inFlight.current.has(lockKey)) return;
+    inFlight.current.add(lockKey);
+    setStates((all) => ({ ...all, [row.key]: { voiceDigest: version, busy } }));
     run().then(
       (result) => {
         const said = typeof success === 'string' ? { text: success } : success(result);
-        setStates((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, notice: { tone: said.settled === false ? 'info' : 'success', settled: said.settled !== false, voiceDigest: row.voiceDigest, ...said } } }));
-        if (said.settled !== false && latestRows.current.some(current => current.key === row.key && current.voiceDigest === row.voiceDigest)) setOpenKey((key) => (key === row.key ? null : key));
-        void qc.invalidateQueries({ queryKey: ['home-from-clem'] });
-        void qc.invalidateQueries({ queryKey: ['command-center'] });
+        setStates((all) => all[row.key]?.voiceDigest !== version ? all : ({ ...all, [row.key]: { voiceDigest: version, notice: { tone: said.settled === false ? 'info' : 'success', settled: said.settled !== false, voiceDigest: version, ...said } } }));
+        if (said.settled !== false && latestRows.current.some(current => current.key === row.key && fromClemReceiptVersion(current) === version)) setOpenKey((key) => (key === row.key ? null : key));
       },
-    ).catch((err: unknown) => setStates((all) => ({
+    ).catch((err: unknown) => setStates((all) => all[row.key]?.voiceDigest !== version ? all : ({
         ...all,
-        [row.key]: { voiceDigest: row.voiceDigest, notice: { voiceDigest: row.voiceDigest, settled: false, tone: 'error', text: err instanceof Error ? err.message : 'That didn’t reach Clem. Your reply is kept; check the item before trying again.' } },
-      }))).finally(() => { inFlight.current.delete(row.key); });
+        [row.key]: { voiceDigest: version, notice: { voiceDigest: version, settled: false, tone: 'error', text: err instanceof Error ? err.message : 'That didn’t reach Clem. Your reply is kept; check the item before trying again.' } },
+      }))).finally(() => {
+        inFlight.current.delete(lockKey);
+        for (const key of ['home-from-clem', 'command-center', 'needs-you-summary', 'inbox-questions', 'inbox-question-presentations', 'inbox-attention-presentations', 'notifications', 'working-now-badge']) {
+          void qc.invalidateQueries({ queryKey: [key] });
+        }
+      });
+  };
+
+  const setAside = (row: FromClemRow, action: 'dismiss' | 'defer') => {
+    const disposition = fromClemDisposition(row, action);
+    if (!disposition) return;
+    if (disposition.kind === 'question') {
+      act(row, 'done', () => presentInboxQuestion(disposition.questionId, disposition.action, row.lifecycle?.generation),
+        '');
+      return;
+    }
+    if (disposition.kind === 'attention') {
+      act(row, 'done', () => presentAttentionItem(disposition.key, disposition.action, disposition.generation),
+        '');
+      return;
+    }
+    reply(row, disposition.text, disposition.decision);
   };
 
   const reply = (row: FromClemRow, text: string, decision?: 'do_it' | 'done' | 'not_now' | 'never', choiceIndex?: number) => {
@@ -136,6 +158,14 @@ export function FromClemPane({
    *  record's own (yes/no for a suggestion). */
   const answers = (row: FromClemRow, state: RowState) => {
     const busy = Boolean(state.busy);
+    // Consent belongs beside the full proposed steps, never a clamped preview.
+    if (row.answer?.kind === 'yes_no') {
+      const id = row.answer.planProposalId;
+      return [<Link key="review" to={`/inbox?tab=needs&select=${encodeURIComponent(id)}`}
+        className="inline-flex min-h-9 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover">Review plan</Link>];
+    }
+    if (row.blocker) return [<Link key="account" to="/settings?guide=model-accounts#accounts"
+      className="inline-flex min-h-9 items-center rounded-md bg-primary px-3 text-small font-semibold text-primary-fg hover:bg-primary-hover">Review model account</Link>];
     if (row.choices?.length) {
       return row.choices.map((choice, index) => (
         <Button key={choice} size="sm" variant={index === 0 ? 'primary' : 'secondary'} className="h-8 px-3 text-small"
@@ -154,23 +184,10 @@ export function FromClemPane({
         </Button>,
       ];
     }
-    if (row.answer?.kind === 'yes_no') {
-      const id = row.answer.planProposalId;
-      return [
-        <Button key="yes" size="sm" className="h-8 px-3 text-small" disabled={busy}
-          onClick={() => act(row, 'yes', () => decidePlanProposal(id, 'approve'), 'Approved.')}>
-          {state.busy === 'yes' ? 'Sending…' : 'Yes'}
-        </Button>,
-        <Button key="no" size="sm" variant="secondary" className="h-8 px-3 text-small" disabled={busy}
-          onClick={() => act(row, 'no', () => decidePlanProposal(id, 'reject'), 'Declined.')}>
-          No
-        </Button>,
-      ];
-    }
     return [];
   };
 
-  const notice = (state: RowState) => state.notice && (
+  const notice = (state: RowState) => state.notice?.text && (
     <p role="status" className={cn('text-small', state.notice.tone === 'error' ? 'text-warning' : 'text-muted')}>
       {state.notice.text}
       {state.notice.sessionId && (
@@ -184,6 +201,7 @@ export function FromClemPane({
       <span className="font-semibold text-muted">{fromClemSourceName(row)}</span>
       <span aria-hidden>·</span>
       <span>{agoLabel(row.at)}</span>
+      {(row.relatedNotificationIds?.length ?? 0) > 1 && <span>Reported {row.relatedNotificationIds!.length} times</span>}
       {drafts[row.key]?.trim() && openKey !== row.key && <span className="ml-auto text-muted">Draft saved</span>}
     </span>
   );
@@ -191,24 +209,36 @@ export function FromClemPane({
   // What the message is about: the record behind it, shown on request.
   const source = (row: FromClemRow) => (row.say ? [row.text, row.detail] : [row.detail]).filter(Boolean).join(' · ');
 
-  const waitingRow = (row: FromClemRow) => {
-    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
+  const waitingRow = (row: FromClemRow, presentation = true) => {
+    const state = currentProactiveReceipt(states[row.key], fromClemReceiptVersion(row)) ?? { voiceDigest: row.voiceDigest };
     const open = openKey === row.key;
+    const reading = readingKey === row.key;
     const offered = answers(row, state);
     return (
       <PaneRow key={row.key} className="flex-col items-stretch gap-2 py-3.5">
         {meta(row)}
-        <p className="text-body text-fg">{row.say || row.text}</p>
-        {open && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
+        <p className={cn('text-body text-fg', !open && !reading && 'line-clamp-3')}>{row.say || row.text}</p>
+        {(open || reading) && source(row) && <p className="whitespace-pre-line text-small text-muted">{source(row)}</p>}
         {state.notice && notice(state)}
         {!state.notice?.settled && (
           <>
             <div className="flex flex-wrap items-center gap-2">
               {offered}
+              <button type="button" aria-expanded={reading} onClick={() => setReadingKey(reading ? null : row.key)}
+                className="rounded-sm px-1 text-small font-medium text-muted hover:underline">{reading ? 'Less detail' : 'Details'}</button>
               <button type="button" aria-expanded={open} onClick={() => setOpenKey(open ? null : row.key)}
                 className="rounded-sm px-1 text-small font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
                 {open ? 'Close' : offered.length > 0 ? 'Reply in your words' : 'Reply'}
               </button>
+              {presentation && (row.answer?.kind === 'words' ? row.lifecycle?.canDefer : Boolean(fromClemDisposition(row, 'defer'))) && <button type="button" disabled={Boolean(state.busy)} onClick={() => setAside(row, 'defer')}
+                className="ml-auto rounded-md px-2 py-1 text-small font-medium text-muted hover:bg-hover hover:text-fg disabled:opacity-50">
+                Tomorrow
+              </button>}
+              {presentation && (row.answer?.kind === 'words' ? row.lifecycle?.canDismiss : Boolean(fromClemDisposition(row, 'dismiss'))) &&
+                <button type="button" disabled={Boolean(state.busy)} onClick={() => setAside(row, 'dismiss')}
+                  className="rounded-md px-2 py-1 text-small font-medium text-muted hover:bg-hover hover:text-fg disabled:opacity-50">
+                  {row.answer?.kind === 'yes_no' ? 'Decline' : 'Dismiss'}
+                </button>}
             </div>
             {open && (
               <AnswerRow
@@ -227,7 +257,7 @@ export function FromClemPane({
   };
 
   const updateRow = (row: FromClemRow) => {
-    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
+    const state = currentProactiveReceipt(states[row.key], fromClemReceiptVersion(row)) ?? { voiceDigest: row.voiceDigest };
     const open = readingKey === row.key;
     const replying = openKey === row.key;
     const done = row.done;
@@ -287,7 +317,7 @@ export function FromClemPane({
   // An offer to help set something up: go there, have Clem walk you through
   // it, or move it out of the way.
   const offerRow = (row: FromClemRow) => {
-    const state = currentProactiveReceipt(states[row.key], row.voiceDigest) ?? { voiceDigest: row.voiceDigest };
+    const state = currentProactiveReceipt(states[row.key], fromClemReceiptVersion(row)) ?? { voiceDigest: row.voiceDigest };
     const href = row.setup ? appPlaceHref(row.setup.place, 'desktop') : null;
     const busy = Boolean(state.busy);
     return (
@@ -320,28 +350,39 @@ export function FromClemPane({
     );
   };
 
-  const group = (label: string, list: FromClemRow[], shown: number, which: 'waiting' | 'updates', render: (row: FromClemRow) => React.ReactElement) => {
+  const group = (label: string, list: FromClemRow[], shown: number, which: 'waiting' | 'updates', render: (row: FromClemRow) => ReactNode) => {
     if (list.length === 0) return null;
+    const grouped = groupAttentionReports(list, row => ({ id: row.key, attentionKey: row.attentionKey,
+      generation: row.lifecycle?.generation, protected: !row.asks || Boolean(row.answer) || Boolean(row.setup) }));
     const all = showAll[which];
-    const visible = all ? list : list.slice(0, shown);
-    return (
-      <div className="flex flex-col gap-1.5">
-        {section === 'all' && <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">
-          {label}{list.length > 1 ? ` · ${list.length}` : ''}
-        </h3>}
-        <PaneCard className={which === 'updates' ? 'rounded-none border-0 bg-transparent' : undefined}>
-          {visible.map(render)}
-          {list.length > shown && (
-            <PaneRow className="justify-center text-small">
-              <button type="button" onClick={() => setShowAll((now) => ({ ...now, [which]: !all }))}
-                className="rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
-                {all ? 'Show fewer' : `Show ${list.length - shown} more`}
-              </button>
-            </PaneRow>
-          )}
-        </PaneCard>
-      </div>
-    );
+    const visible = all ? grouped : grouped.slice(0, shown);
+    const count = new Set(grouped.map(item => item.attentionKey ?? item.id)).size;
+    return <div className="flex flex-col gap-1.5">
+      {section === 'all' && <h3 className="text-small font-semibold text-muted">{label}{count > 1 ? ` · ${count}` : ''}</h3>}
+      <PaneCard className={which === 'updates' ? 'rounded-none border-0 bg-transparent' : undefined}>
+        {visible.map(item => {
+          if (item.reports.length === 1) return render(item.reports[0]);
+          const first = item.reports[0];
+          const reportCount = attentionReportCount(item.reports, row => row.relatedNotificationIds ?? [row.done?.notificationId ?? row.key]);
+          const busy = item.reports.some(row => Boolean(currentProactiveReceipt(states[row.key], fromClemReceiptVersion(row))?.busy));
+          return <details key={item.id} data-attention-group={item.attentionKey} className="px-4 py-3">
+            <summary className="min-h-11 cursor-pointer rounded-sm py-1 text-body focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              <span className="font-semibold text-fg">{attentionWorkTitle(item.attentionKey, fromClemSourceName(first))}</span>
+              <span className="ml-2 text-small text-muted">{reportCount} reports</span>
+              {item.reports.map(row => <span key={row.key} className="mt-1 block text-small font-normal text-muted [overflow-wrap:anywhere]">{oneLine(row.say || row.detail || row.text, 140)}</span>)}
+            </summary>
+            <div className="flex flex-wrap items-center gap-2 border-t border-border pt-2 text-small">
+              <span className="mr-auto text-muted">Setting this aside leaves every report and the work unchanged.</span>
+              {fromClemDisposition(first, 'defer')?.kind === 'attention' && <Button size="sm" variant="secondary" disabled={busy} onClick={() => setAside(first, 'defer')}>Tomorrow</Button>}
+              {fromClemDisposition(first, 'dismiss')?.kind === 'attention' && <Button size="sm" variant="secondary" disabled={busy} onClick={() => setAside(first, 'dismiss')}>Dismiss</Button>}
+            </div>
+            <div className="divide-y divide-border">{item.reports.map(row => waitingRow(row, false))}</div>
+          </details>;
+        })}
+        {grouped.length > shown && <PaneRow className="justify-center text-small"><button type="button" onClick={() => setShowAll(now => ({ ...now, [which]: !all }))}
+          className="min-h-11 rounded-sm font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{all ? 'Show fewer' : `Show ${grouped.length - shown} more items`}</button></PaneRow>}
+      </PaneCard>
+    </div>;
   };
 
   if (section !== 'all') {
@@ -352,7 +393,10 @@ export function FromClemPane({
       ? <>
           <TapOutcomes taps={taps} onDismiss={dismissTap} />
           {group('Waiting on you', waiting, WAITING_SHOWN, 'waiting', waitingRow)}
-          {offers.length > 0 && <PaneCard>{offers.map(offerRow)}</PaneCard>}
+          {offers.length > 0 && <details className="rounded-xl border border-border bg-surface px-4 text-small text-muted">
+            <summary className="cursor-pointer py-3 font-medium">Ways Clem can help · {offers.length}</summary>
+            <div className="border-t border-border">{offers.map(offerRow)}</div>
+          </details>}
         </>
       : group('Updates', updates, UPDATES_SHOWN, 'updates', updateRow);
   }

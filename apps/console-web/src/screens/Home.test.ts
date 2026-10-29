@@ -68,9 +68,19 @@ test('the live band names running work from the shared presenter and leads to th
   assert.match(LIVE, /liveWorkSummary\(entries\.map\(entry => entry\.membership\), unavailable\)/, 'unknown and unfinished work keep their own status');
   assert.doesNotMatch(LIVE, /Caught up|Clem is caught up/, 'no running turn is not proof that every task is finished');
   assert.match(LIVE, /prefers-reduced-motion: reduce/);
+  const SHELL = readFileSync(new URL('../components/AppShell.tsx', import.meta.url), 'utf8');
+  assert.match(SHELL, /onOpenTasks=\{\(\) => navigate\('\/tasks'\)\}/, 'an explicit active-work tap must bypass the preference-driven landing redirect');
+  assert.doesNotMatch(SHELL, /navigate\('\/\?focus=running'\)/);
   const CSS = readFileSync(new URL('../styles.css', import.meta.url), 'utf8');
   assert.match(CSS, /\.live-band\.is-working:not\(\.live-band-still\)::after/);
   assert.match(CSS, /\.live-band\.is-working::after, \.live-band\.is-working \.live-dot::after \{ animation: none; display: none; \}/);
+});
+
+test('Today states the canonical total without inventing a remainder from mixed preview sources', () => {
+  const PANE = readFileSync(new URL('../components/home/NeedsYouPane.tsx', import.meta.url), 'utf8');
+  assert.match(PANE, /typeof total === 'number' \? Math\.max\(0, total\)/);
+  assert.match(PANE, /See all requests in Inbox/);
+  assert.doesNotMatch(PANE, /\{overflow\} more/, 'From Clem previews and ordinary previews overlap; their raw lengths cannot establish a unique remainder');
 });
 
 test('Build home is a tracked journey, not a chat hand-off', () => {

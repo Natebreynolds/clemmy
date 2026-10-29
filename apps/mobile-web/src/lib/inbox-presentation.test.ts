@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import {
   applyLocalReads,
   approvalDetails,
+  approvalCardReview,
   approvalKindLabel,
   approvalQuestion,
   clearReceipt,
   collapseAttentionNotifications,
   notificationIsRepresentedByApprovals,
   notificationRunTarget,
+  notificationWorkflowHref,
   trustScopeSummary,
   updatesClearScope,
   workspaceChoiceLayout,
@@ -16,6 +18,126 @@ import {
 } from './inbox-presentation';
 import type { InboxNotification } from './api';
 import { readFileSync } from 'node:fs';
+import { approvalReview } from '../../../../packages/chat-engine/src/approval-review';
+import type { ApprovalPreview } from '../../../../packages/chat-engine/src/types';
+
+test('a recorded single-action review preserves the whole message, destination and scope without its carrier', () => {
+  const body = `Opening line\n${'Exact message. '.repeat(700)}\nFinal line`;
+  const prepared: ApprovalPreview = { operation: 'Send the reviewed email', fields: [
+    { name: 'to', value: 'renewals@example.test' },
+    { name: 'body', value: body },
+    { name: 'scope', value: 'Only this email; no future sends' },
+  ] };
+  const input = { args: { name: 'provider-envelope', connection_id: 'private-record', args_json: '{}' },
+    contentPreview: { body: body.slice(0, 1499) + '…' }, preview: prepared };
+  const content = approvalCardReview(input);
+  assert.equal(content.complete, true);
+  const displayed = approvalReview(content.preview!)!;
+  assert.equal(displayed.items[0]?.exact.find(field => field.name === 'body')?.value, body);
+  assert.equal(displayed.items[0]?.exact.find(field => field.name === 'to')?.value, 'renewals@example.test');
+  assert.equal(displayed.items[0]?.exact.find(field => field.name === 'scope')?.value, 'Only this email; no future sends');
+  assert.equal(content.preview?.items?.[0], prepared, 'the host-recorded fields keep their identity');
+  assert.deepEqual(content.details, [], 'the carrier is not a second owner-facing review');
+  assert.equal(content.draft, '', 'the full recorded message does not get a second clipped draft beneath it');
+  assert.equal(approvalCardReview({ ...input, contentPreview: { body: 'A distinct note outside the recorded message' } }).draft,
+    'A distinct note outside the recorded message', 'a different recorded preview is not silently discarded');
+  assert.equal(input.args.connection_id, 'private-record', 'presentation never changes approved arguments');
+});
+
+test('a prepared batch keeps every distinct recipient and one approval covers only those recorded actions', () => {
+  const items = ['a@example.test', 'b@example.test', 'c@example.test'].map(to => ({
+    operation: 'Send the reviewed message', fields: [{ name: 'to', value: to }, { name: 'body', value: 'Exact draft' }],
+  }));
+  const content = approvalCardReview({ args: { opaque: true }, preview: { operation: 'Send three messages', fields: [], items } });
+  assert.equal(content.complete, true);
+  assert.equal(content.preview?.items?.length, 3);
+  assert.deepEqual(approvalReview(content.preview!)?.items.map(item => item.exact.find(field => field.name === 'to')?.value),
+    ['a@example.test', 'b@example.test', 'c@example.test']);
+});
+
+test('a complete legacy flat action remains reviewable in words, while hidden or clipped scope cannot be approved on phone', () => {
+  const complete = approvalCardReview({ args: { to: ['a@example.test', 'b@example.test'], body: '[Update] Exact draft', mark_as_read: false } });
+  assert.equal(complete.complete, true);
+  assert.equal(complete.details.find(field => field.label === 'To')?.value, 'a@example.test\nb@example.test');
+  assert.equal(complete.details.find(field => field.label === 'Message')?.value, '[Update] Exact draft');
+  for (const args of [
+    { body: 'x'.repeat(4_001), to: 'a@example.test' },
+    { recipients: Array.from({ length: 21 }, (_, index) => `person${index}@example.test`) },
+    { recipient: { address: 'a@example.test' } },
+    { args_json: '{"to":"a@example.test","body":"Exact draft"}' },
+    { body: 'a'.repeat(64) },
+    {}, null,
+  ]) {
+    assert.equal(approvalCardReview({ args, contentPreview: { body: 'A short summary' } }).complete, false);
+  }
+  assert.equal(approvalCardReview({ args: { to: 'a@example.test' }, presentation: { action: 'Send', details: [], unwrapped: true } }).complete, false,
+    'an opaque provider carrier is not established by a clipped human summary');
+  assert.equal(approvalCardReview({ args: {}, preview: { operation: 'Action', fields: [{ name: 'Prepared actions', value: '3' }] } }).complete, false);
+});
+
+test('an opaque legacy action cannot leak its raw carrier through fallback details', () => {
+  const raw = '{"name":"composio_execute_tool","connection_id":"private-record","arguments":{"to":"a@example.test"}}';
+  const noSummary = approvalCardReview({ args: { args_json: raw }, contentPreview: { body: raw } });
+  assert.equal(noSummary.complete, false);
+  assert.deepEqual(noSummary.details, []);
+  assert.equal(noSummary.draft, '');
+  const withSummary = approvalCardReview({ args: { arguments: { to: 'a@example.test' } }, presentation: {
+    action: 'Send the older draft', unwrapped: true, details: [
+      { label: 'To', value: 'a@example.test', long: false },
+      { label: 'Scope', value: 'Only this message', long: false },
+      { label: 'Arguments', value: raw, long: true },
+      { label: 'Details', value: raw, long: true },
+      { label: 'Connection id', value: 'private-record', long: false },
+      { label: 'Name', value: 'composio_execute_tool', long: false },
+      { label: 'Record', value: 'long_opaque_record_identifier_12345', long: false },
+    ],
+  } });
+  assert.equal(withSummary.complete, false);
+  assert.deepEqual(withSummary.details.map(line => [line.label, line.value]), [
+    ['To', 'a@example.test'], ['Scope', 'Only this message'],
+  ]);
+});
+
+test('fingerprints, withheld values and opaque carrier previews do not establish reviewable material', () => {
+  for (const fields of [
+    [{ name: 'Content hash', value: 'a'.repeat(64) }],
+    [{ name: 'To', value: 'a@example.test' }, { name: 'Body', value: 'a'.repeat(64) }],
+    [{ name: 'Body', value: '[withheld: looks like a secret]' }],
+    [{ name: 'Arguments', value: '{"connection_id":"private-record","payload":"unknown"}' }],
+    [{ name: 'Record', value: 'long_opaque_record_identifier_12345', detail: true as const }],
+    [{ name: 'To', value: 'a@example.test' }, { name: 'Body', value: '[withheld: looks like a secret]' }],
+    [{ name: 'Summary', value: 'A short action summary' }, { name: 'Arguments', value: '{"to":"unknown@example.test"}' }],
+    [{ name: 'Name', value: 'composio_execute_tool' }, { name: 'Arguments', value: '{"body":"unknown"}' }],
+    [{ name: 'To', value: 'a@example.test' }, { name: 'Body', value: 'A clipped message… (1200 more characters)' }],
+  ]) {
+    const prepared: ApprovalPreview = { operation: 'Action', fields };
+    const review = approvalCardReview({ args: {}, preview: prepared });
+    assert.equal(review.complete, false);
+    assert.equal(review.preview, null, 'incomplete canonical fields never enter the phone renderer');
+  }
+  assert.equal(approvalCardReview({ args: {}, preview: { operation: 'Two actions', fields: [], items: [
+    { operation: 'Send', fields: [{ name: 'To', value: 'a@example.test' }] },
+    { operation: 'Unknown', fields: [{ name: 'Content hash', value: 'b'.repeat(64) }] },
+  ] } }).complete, false, 'one incomplete action keeps the whole batch unapprovable on phone');
+});
+
+test('an opaque canonical preview returns only a readable server summary, without its serialized carrier', () => {
+  const raw = '{"connection_id":"private-record","arguments":{"to":"hidden@example.test"}}';
+  const preview: ApprovalPreview = { operation: 'Review old prepared action', fields: [
+    { name: 'Summary', value: 'The old draft is waiting' }, { name: 'Arguments', value: raw },
+  ] };
+  const content = approvalCardReview({ args: { args_json: raw }, preview, presentation: {
+    action: 'Review the old draft', unwrapped: true, details: [
+      { label: 'To', value: 'visible@example.test', long: false },
+      { label: 'Arguments', value: raw, long: true },
+    ],
+  } });
+  assert.equal(content.complete, false);
+  assert.equal(content.preview, null);
+  assert.deepEqual(content.details, [{ label: 'To', value: 'visible@example.test', long: false }]);
+  assert.doesNotMatch(JSON.stringify(content), /private-record|connection_id|hidden@example/);
+  assert.equal(preview.fields[1]?.value, raw, 'display refusal never changes recorded approval material');
+});
 
 test('approval presentation turns provider plumbing into assistant language', () => {
   assert.equal(approvalKindLabel('OUTLOOK_SEND_EMAIL'), 'Email');
@@ -298,4 +420,16 @@ test('a workspace choice is buttons up to three Workspaces and a picker beyond; 
   assert.equal(workspaceChoiceLayout([...existing(10), { kind: 'create_new' }]), 'picker');
   assert.equal(workspaceChoiceTitle({ label: 'Scorpion Inbox Triage (and-inpox-triage)', workspaceId: 'and-inpox-triage' }), 'Scorpion Inbox Triage');
   assert.equal(workspaceChoiceTitle({ label: 'Prepare a new Workspace', workspaceId: '' }), 'Prepare a new Workspace');
+});
+
+
+test('workflow reports without chat sessions open only their existing canonical review route',()=>{
+  const lifecycle={canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'a'.repeat(64),explanation:'Hide only'};
+  assert.equal(notificationWorkflowHref({needsYouKey:'flow:controlled-workflow',lifecycle}),'/m/?tab=workflows&workflow=controlled-workflow');
+  assert.equal(notificationWorkflowHref({needsYouKey:'session:controlled',lifecycle}),null);
+  assert.equal(notificationWorkflowHref({needsYouKey:'flow:../outside',lifecycle}),null);
+  const row={needsYouKey:'flow:controlled alias',lifecycle};
+  const canonical={key:row.needsYouKey,workflowSlug:'controlled-saved',lifecycle};
+  assert.equal(notificationWorkflowHref(row,canonical),'/m/?tab=workflows&workflow=controlled-saved');
+  assert.equal(notificationWorkflowHref(row,{...canonical,lifecycle:{...lifecycle,generation:'b'.repeat(64)}}),null,'an old report cannot borrow a newer alias mapping');
 });

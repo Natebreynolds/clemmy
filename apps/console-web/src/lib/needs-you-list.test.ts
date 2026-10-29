@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { attentionDestination, buildNeedsYouItems, needsYouRowView } from './needs-you-list.js';
+import { attentionDestination, buildNeedsYouItems, needsYouRowView, needsYouAttentionItem, needsYouReport } from './needs-you-list.js';
 import type { ApprovalRow, InboxQuestionRow, PlanProposalRow } from './inbox.js';
 
 const longText = 'Clem found that the research steps you ran three times this week share the same inputs. '.repeat(12);
@@ -56,7 +56,7 @@ test('order and membership follow the feeds; older approvals sit last; only appr
   assert.equal(views.at(-1)!.aged, true);
   const stopped = views.find((v) => v.id === 'n1')!;
   assert.equal(stopped.state.tone, 'warning', 'a stopped workflow is a real problem');
-  assert.match(stopped.context ?? '', /\+2 earlier/);
+  assert.match(stopped.context ?? '', /3 reports/);
   assert.equal(views.find((v) => v.id === 'u1')!.href, '/automate?workflow=weekly-report');
 });
 
@@ -113,4 +113,65 @@ test('a missing summary leaves summary-only decisions unqualified even when the 
     suggestions: false, plans: false, questions: false, summary: true });
   assert.equal(result.unavailable, false);
   assert.deepEqual(result.failed, ['check-in suggestions and stopped workflows']);
+});
+
+
+test('canonical generic asks fill missing carriers once while preserving rich notification actions', () => {
+  const lifecycle = { canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'rendered-generation',explanation:'Hide only' };
+  const calendar = {key:'calendar:one',kind:'calendar' as const,title:'Review invitation',detail:'Pick an option',createdAt:'',lifecycle};
+  const heartbeat = {...calendar,key:'heartbeat:controlled',kind:'notification' as const,title:'Review retained finding'};
+  const notification = {id:'notice',title:'Original invitation',needsYouKey:calendar.key,lifecycle};
+  const items = buildNeedsYouItems({workspaceChoosers:[],questions:[],plans:[],approvals:[],trust:[],unlisted:[],
+    attention:[{row:notification,collapsedCount:0,groupIds:[notification.id]}],attentionItems:[calendar,heartbeat]});
+  assert.deepEqual(items.map(item=>[item.kind,item.id]),[['attention','notice'],['generic','heartbeat:controlled']]);
+  assert.deepEqual(needsYouAttentionItem(items[0],[calendar,heartbeat]),calendar,'canonical lifecycle and grouping win over the carrier');
+  assert.equal(needsYouAttentionItem(items[1],[])?.key,heartbeat.key,'summary-only asks remain actionable');
+  assert.equal(needsYouRowView(items[1]).href,undefined,'selecting opens full details before a decision');
+  assert.equal(needsYouRowView(items[1]).at,'','missing canonical dates stay absent');
+  assert.equal(needsYouAttentionItem({kind:'question',id:'q',row:question()},[calendar]),undefined,'question authority is never replaced');
+});
+
+test('a carrier lifecycle remains usable during a failed summary refresh without guessing a generation', () => {
+  const lifecycle = { canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'exact-carrier-generation',explanation:'Hide only' };
+  const item = {kind:'attention' as const,id:'notice',collapsedCount:0,row:{id:'notice',title:'Exact request',needsYouKey:'notification:notice',lifecycle}};
+  assert.equal(needsYouAttentionItem(item,[])?.lifecycle.generation,'exact-carrier-generation');
+  assert.equal(needsYouAttentionItem({...item,row:{...item.row,lifecycle:undefined}},[]),undefined);
+});
+
+
+test('a workflow notification and its exact summary key render once without merging distinct asks or replacing typed actions',()=>{
+  const gate={workflowName:'controlled-flow',displayName:'Controlled flow',reason:'Review before enabling'};
+  const row={id:'controlled-notice',title:'Controlled workflow needs a review',needsYouKey:'flow:controlled',workflowEnableGate:gate};
+  const common={workspaceChoosers:[],questions:[],plans:[],approvals:[],trust:[],attention:[{row,collapsedCount:0,groupIds:[row.id]}]};
+  const items=buildNeedsYouItems({...common,unlisted:[
+    {key:'flow:controlled',kind:'workflow_paused',title:row.title,detail:'Paused',workflowSlug:'controlled-flow'},
+    {key:'flow:distinct',kind:'workflow_paused',title:row.title,detail:'Paused',workflowSlug:'distinct-flow'},
+    {key:'proposal:controlled',kind:'check_in_proposal',title:'Keep this check-in?',detail:'Exact owning decision'},
+  ]});
+  assert.deepEqual(items.map(item=>[item.kind,item.id]),[['attention',row.id],['unlisted','flow:distinct'],['unlisted','proposal:controlled']]);
+  assert.equal(items[0].row,row,'the rich notification retains its owning enable action');
+});
+
+
+test('an old notification link selects its exact retained report and cannot borrow a newer generation', () => {
+  const lifecycle = { canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'a'.repeat(64),explanation:'Hide only' };
+  const latest = {id:'latest',title:'Credit limit',body:'Newest exact source',needsYouKey:'flow:controlled',lifecycle};
+  const older = {...latest,id:'older',title:'Permission refused',body:'Older exact source',metadata:{runId:'old-run'}};
+  const item = {kind:'attention' as const,id:latest.id,row:latest,reports:[latest,older],collapsedCount:1,groupIds:[latest.id,older.id]};
+  assert.equal(needsYouReport(item,'older'),older);
+  assert.equal(needsYouReport(item,'missing'),undefined,'an absent child is never replaced with the newest');
+  assert.equal(needsYouReport(item,'flow:controlled'),latest,'explicit work navigation can open its leading report');
+  const current = {key:'flow:controlled',kind:'workflow' as const,title:'New source',detail:'Changed',createdAt:'',lifecycle:{...lifecycle,generation:'b'.repeat(64)}};
+  assert.equal(needsYouAttentionItem(item,[current])?.lifecycle.generation,lifecycle.generation);
+});
+
+
+test('work overview names distinct causes once while preserving all exact report members',()=>{
+  const reports=[{id:'credit-new',title:'Review model account',body:'Full credit explanation',needsYouKey:'flow:controlled'},
+    {id:'credit-old',title:'Review model account',body:'Full credit explanation',needsYouKey:'flow:controlled'},
+    {id:'permission',title:'Review computer access',body:'Full permission explanation',needsYouKey:'flow:controlled'}];
+  const item={kind:'attention' as const,id:'credit-new',row:reports[0],reports,collapsedCount:2,groupIds:reports.map(row=>row.id)};
+  assert.equal(needsYouRowView(item).preview,'Review model account · Review computer access');
+  assert.match(needsYouRowView(item).context??'',/3 reports/);
+  assert.equal(needsYouReport(item,'credit-old'),reports[1]);
 });

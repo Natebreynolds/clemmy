@@ -131,11 +131,12 @@ export function MobilePanel() {
   const phase = setup.phase;
 
   return (
-    <Card className="space-y-5 p-5">
+    <Card data-clem-guide="phone" className="space-y-5 p-5">
       <header className="flex items-start gap-3">
         <Smartphone className="mt-0.5 h-5 w-5 text-primary" aria-hidden />
         <div className="min-w-0 flex-1">
-          <h3 className="text-body font-semibold text-fg">{setup.headline}</h3>
+          <h3 className="text-body font-semibold text-fg">Pair your phone</h3>
+          <p className="mt-1 text-small font-medium text-fg">{setup.headline}</p>
           {setup.detail ? <p className="mt-1 text-small text-muted">{setup.detail}</p> : null}
         </div>
         {setup.qrReady ? <StatusPill tone={setup.devices.length > 0 ? 'success' : 'neutral'}>{setup.devices.length > 0 ? 'Paired' : 'Ready to pair'}</StatusPill> : null}

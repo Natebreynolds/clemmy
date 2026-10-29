@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   delegatedTaskCard, delegatedTaskChosenBy, delegatedTaskCorrection, delegatedTaskCorrections, delegatedTaskFollowUps,
-  delegatedTaskFollowsLine, delegatedTaskOpen, delegatedTaskOwner, orderDelegatedTasks, type DelegatedTask,
+  delegatedTaskFollowsLine, delegatedTaskOpen, delegatedTaskOwner, delegatedTaskReport, orderDelegatedTasks, type DelegatedTask,
 } from './delegated-task.js';
 
 function task(patch: Partial<DelegatedTask> = {}): DelegatedTask {
@@ -36,6 +36,26 @@ function task(patch: Partial<DelegatedTask> = {}): DelegatedTask {
     ...patch,
   };
 }
+
+test('report openings stay concise while recorded detail and incomplete phase remain intact', () => {
+  const detail = `# Update\n\nThe first document is saved, but the second still needs your review. ${'More context. '.repeat(25)}\n\nNothing was sent.`;
+  const report = delegatedTaskReport(task({ phase: 'paused', resultPreview: detail }))!;
+  assert.equal(report.label, 'What happened');
+  assert.match(report.summary, /^The first document is saved, but the second still needs your review\./);
+  assert.ok(report.summary.length <= 221);
+  assert.equal(report.detail, detail);
+  assert.equal(report.hasDetails, true);
+  assert.equal(delegatedTaskReport(task({ phase: 'failed', resultPreview: 'Everything is complete.' }))?.label, 'What happened');
+});
+
+test('reports use only recorded text and never create an outcome from a phase or filename', () => {
+  assert.equal(delegatedTaskReport(task({ phase: 'finished', files: [{ name: 'summary.pdf', dir: 'Saved' }] })), null);
+  assert.equal(delegatedTaskReport(task({ phase: 'working', error: 'An old error' })), null);
+  assert.deepEqual(delegatedTaskReport(task({ phase: 'finished', resultPreview: 'Draft saved.' })), {
+    label: 'Result', summary: 'Draft saved.', detail: 'Draft saved.', hasDetails: false,
+  });
+  assert.equal(delegatedTaskReport(task({ phase: 'failed', error: 'Account needs attention.' }))?.summary, 'Account needs attention.');
+});
 
 test('the card names the owner and the project, never always Clem', () => {
   const card = delegatedTaskCard(task());

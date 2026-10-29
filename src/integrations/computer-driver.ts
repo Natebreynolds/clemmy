@@ -63,6 +63,10 @@ export interface ComputerDriverStatus {
   serverName: string;
   docsUrl: string;
   platformSupport: 'supported' | 'preview' | 'unsupported';
+  /** Whether this host can open the OS permission pages offered by setup. */
+  permissionSettingsAvailable: boolean;
+  /** Manual screen viewing uses Clem's own running embedded host. */
+  screenViewAvailable: boolean;
 }
 
 /** Clem's own copy first; an older standalone install still counts. */
@@ -159,6 +163,7 @@ export function readComputerDriverStatus(input: {
       : /\b(granted|ok|allowed|enabled)\b/.test(perms) ? 'granted'
         : 'unknown';
   const connected = computerDriverRecordConnected(input.servers);
+  const platform = input.platform ?? process.platform;
   return {
     installed: input.path !== null,
     path: input.path,
@@ -172,6 +177,9 @@ export function readComputerDriverStatus(input: {
     serverName: COMPUTER_DRIVER_SERVER_NAME,
     docsUrl: COMPUTER_DRIVER_DOCS_URL,
     platformSupport: platformSupport(input.platform),
+    permissionSettingsAvailable: platform === 'darwin',
+    screenViewAvailable: Boolean(input.path && connected && input.embedded && input.host === 'running'
+      && (platform === 'darwin' || platform === 'linux')),
   };
 }
 

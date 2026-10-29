@@ -46,6 +46,24 @@ test('Clem\'s own copy comes first, from the vendor\'s binary release for this m
   assert.equal(resolveToolDownload(driver.COMPUTER_DRIVER_DOWNLOAD, { platform: 'win32', arch: 'x64' })?.archive, 'zip');
 });
 
+test('setup and manual screen controls reflect the host capability, separately from the registered tools', () => {
+  const connected = { path: '/h/tools/bin/cua-driver', statusText: null, permissionsText: null,
+    servers: [{ name: 'cua-driver', command: '/h/tools/bin/cua-driver', args: ['mcp'], enabled: true }] };
+  const cases = [
+    { platform: 'darwin' as const, embedded: true, host: 'running' as const, permissionSettings: true, screenView: true },
+    { platform: 'darwin' as const, embedded: true, host: 'stopped' as const, permissionSettings: true, screenView: false },
+    { platform: 'darwin' as const, embedded: false, host: 'not_started' as const, permissionSettings: true, screenView: false },
+    { platform: 'linux' as const, embedded: true, host: 'running' as const, permissionSettings: false, screenView: true },
+    { platform: 'win32' as const, embedded: false, host: 'not_started' as const, permissionSettings: false, screenView: false },
+  ];
+  for (const scenario of cases) {
+    const status = driver.readComputerDriverStatus({ ...connected, ...scenario });
+    assert.equal(status.connected, true, 'tool registration remains available without a manual screen view');
+    assert.equal(status.permissionSettingsAvailable, scenario.permissionSettings, scenario.platform);
+    assert.equal(status.screenViewAvailable, scenario.screenView, `${scenario.platform}/${scenario.embedded}/${scenario.host}`);
+  }
+});
+
 test('the driver runs embedded under the app\'s identity: a private daemon on Clem\'s socket and an MCP proxy onto it', () => {
   const serve = driver.computerDriverServeCommand('/h/tools/bin/cua-driver', '/h/state/cua-driver.sock', 'com.example.app');
   assert.deepEqual(serve, { command: '/h/tools/bin/cua-driver', args: ['serve', '--socket', '/h/state/cua-driver.sock'], env: { CUA_DRIVER_EMBEDDED: '1', CUA_DRIVER_HOST_BUNDLE_ID: 'com.example.app' } });

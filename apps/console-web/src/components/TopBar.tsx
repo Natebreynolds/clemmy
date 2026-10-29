@@ -17,6 +17,7 @@ export function TopBar({
   runningCount,
   needsYouCount,
   onOpenTasks,
+  onOpenInbox,
   liveEntries,
   liveMode,
   nextCheckAt,
@@ -25,11 +26,11 @@ export function TopBar({
   title: string;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
-  /** Both counts come from the ONE shared presenter (presentWorkingNow) via
-   *  AppShell. TopBar renders them verbatim and derives nothing. */
+  /** Running comes from working-now; needs-you is the canonical Inbox count. */
   runningCount: number;
   needsYouCount: number;
   onOpenTasks: () => void;
+  onOpenInbox: () => void;
   /** Clem at work, said in the header: the presented working-now entries, the
    *  owner's live-status style, and the next scheduled check. Off or unknown
    *  falls back to the plain Running button; unknown is never "caught up". */
@@ -84,7 +85,8 @@ export function TopBar({
             mode={liveMode}
             nextCheckAt={nextCheckAt}
             unavailable={liveUnavailable}
-            onOpen={onOpenTasks}
+            needsYouCount={needsYouCount}
+            onOpen={runningCount > 0 ? onOpenTasks : needsYouCount > 0 ? onOpenInbox : onOpenTasks}
           />
         ) : (
           <Button

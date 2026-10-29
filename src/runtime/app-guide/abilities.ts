@@ -230,5 +230,6 @@ export function appGuideText(abilities: readonly AppAbility[], options: { places
     for (const place of APP_PLACES) lines.push(`- ${place.id}: ${place.name}, ${place.purpose}${place.phone ? '' : ' (on the computer, not the phone)'}`);
   }
   lines.push('', 'To send the owner to a place, link it in your reply as [Open <name>](app:<id>); they tap it to go there. Say what to do once they are there. To open one Space or workflow itself, link it as [Open <title>](app:space:<id>) or [Open <name>](app:workflow:<name>) with its exact id.');
+  lines.push('When the owner asks how to use the interface, offer [Show me](app:guide:<id>) for inbox, needs-you, work, projects, agents, spaces, automate, connect, phone, memory, models, model-accounts, or notifications. This opens the actual page with a short instruction and highlights its named control when available. Explain one step at a time. The guide does not click controls, change settings, grant access, or prove a task was completed; wait for the owner’s response or an actual resulting state. On the phone, a place without a phone route remains a computer-only instruction.');
   return lines.join('\n');
 }

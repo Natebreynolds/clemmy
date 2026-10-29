@@ -17,7 +17,7 @@ import pino from 'pino';
 import { BASE_DIR } from '../tools/shared.js';
 import { buildFromClem, fromClemItemDigest, fromClemSaidUnderEarlierRubric, type FromClem, type FromClemRow } from './from-clem.js';
 import type { FromClemSetup } from './from-clem-setup.js';
-import { needsYouReferents, notificationNeedsYou } from './needs-you.js';
+import { attentionLifecycleForKey, needsYouKey, needsYouReferents, notificationAttentionHidden, notificationNeedsYou } from './needs-you.js';
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
@@ -168,6 +168,12 @@ export async function readFromClem(options: {
       ...(proposal.context ? { context: proposal.context } : {}),
     })),
     asksOwner: (notification) => notificationNeedsYou(notification, needsYouRef),
+    attentionKey: (notification) => needsYouKey(notification, needsYouRef),
+    attentionLifecycle: (key) => attentionLifecycleForKey(key, needsYouRef),
+    questionVisible: (id) => needsYouRef.questionIds.has(id),
+    questionGeneration: (id) => needsYouRef.questionGenerationById?.get(id),
+    questionIds: needsYouRef.questionIds,
+    notificationVisible: (notification) => !notificationAttentionHidden(notification, needsYouRef),
     voiced: voiced(loadVoices()),
     later,
     setup,
@@ -403,6 +409,8 @@ export interface FromClemReplyDeps {
   port: () => Pick<TurnSemanticModelPort, 'readClemReply'> | null;
   /** `requestId` is the owner's one reply, so a retried send is the same answer. */
   answerQuestion: (questionId: string, text: string, requestId?: string) => boolean;
+  presentQuestion?: (questionId: string, action: 'dismiss' | 'defer', generation?: string) => boolean;
+  presentAttention?: (key: string, action: 'dismiss' | 'defer', generation: string) => boolean;
   markRead: (notificationId: string) => void;
   addRule: (heartbeat: string, text: string) => void;
   approvePlan: (planProposalId: string) => boolean;
@@ -475,6 +483,14 @@ async function replyOnce(
   // The owner answered the version they saw; a changed item is shown again first.
   if (seenDigest && seenDigest !== row.voiceDigest) return { outcome: 'changed' };
   if (row.answer?.kind === 'words') {
+    if (decided === 'done' || decided === 'not_now' || decided === 'never') {
+      // Typed presentation controls are never natural-language answers. This
+      // also protects older clients that post them through the reply route.
+      if (!deps.presentQuestion) return { outcome: 'unclear', decision: 'unclear' };
+      const action = decided === 'not_now' ? 'defer' : 'dismiss';
+      if (!deps.presentQuestion(row.answer.questionId, action, row.lifecycle?.generation)) return { outcome: 'gone' };
+      return { outcome: action === 'defer' ? 'later' : 'cleared', decision: decided };
+    }
     return deps.answerQuestion(row.answer.questionId, reply, requestId) ? { outcome: 'answered', questionId: row.answer.questionId } : { outcome: 'gone' };
   }
   const said = row.say ?? row.text;
@@ -495,6 +511,9 @@ async function replyOnce(
   if (current.voiceDigest !== row.voiceDigest) return { outcome: 'changed' };
   const planId = row.answer?.kind === 'yes_no' ? row.answer.planProposalId : null;
   const notificationId = row.done?.notificationId ?? null;
+  const markRead = () => {
+    for (const id of row.relatedNotificationIds ?? (notificationId ? [notificationId] : [])) deps.markRead(id);
+  };
   const outageId = row.answer?.kind === 'brain_outage' ? row.answer.outageId : null;
   if (outageId && deps.resolveBrainOutage && !read.instruction
     && (read.decision === 'do_it' || read.decision === 'done' || read.decision === 'never')) {
@@ -502,6 +521,15 @@ async function replyOnce(
     return await deps.resolveBrainOutage(outageId, yes ? 'switch_back' : 'stay')
       ? { outcome: yes ? 'approved' : 'declined', decision: read.decision }
       : { outcome: 'gone' };
+  }
+  const genericAttention = row.attentionKey && /^(flow|session|calendar|notification|heartbeat):/.test(row.attentionKey)
+    && row.lifecycle?.generation ? { key: row.attentionKey, generation: row.lifecycle.generation } : null;
+  if (genericAttention && (read.decision === 'done' || read.decision === 'not_now' || read.decision === 'never')) {
+    if (!deps.presentAttention) return { outcome: 'unclear', decision: 'unclear' };
+    const action = read.decision === 'not_now' ? 'defer' : 'dismiss';
+    if (!deps.presentAttention(genericAttention.key, action, genericAttention.generation)) return { outcome: 'changed' };
+    if (read.decision === 'never') deps.addRule(row.heartbeat, reply);
+    return { outcome: action === 'defer' ? 'later' : read.decision === 'never' ? 'rule_added' : 'cleared', decision: read.decision };
   }
   switch (read.decision) {
     case 'follow_up':
@@ -532,13 +560,13 @@ async function replyOnce(
       });
       // Asking about the item does not decide it or authorize an offered action.
       if (read.decision === 'follow_up') return { outcome: 'started', decision: read.decision, itemSettled: false, ...started };
-      if (notificationId) deps.markRead(notificationId);
+      if (notificationId && !genericAttention) markRead();
       if (planId) deps.rejectPlan(planId, `Taken up in conversation: ${reply}`);
       return { outcome: 'started', decision: read.decision, ...started };
     }
     case 'done':
       if (planId) return deps.rejectPlan(planId, reply) ? { outcome: 'declined', decision: read.decision } : { outcome: 'gone' };
-      if (notificationId) deps.markRead(notificationId);
+      if (notificationId) markRead();
       // An offer with no record behind it leaves until tomorrow; done for real
       // means the part is set up, and it stops being offered.
       if (!notificationId && row.setup) deps.later(row.key);
@@ -551,7 +579,7 @@ async function replyOnce(
     case 'never':
       if (row.setup) { deps.later(row.key, true); return { outcome: 'cleared', decision: read.decision }; }
       if (planId) deps.rejectPlan(planId, reply);
-      if (notificationId) deps.markRead(notificationId);
+      if (notificationId) markRead();
       deps.addRule(row.heartbeat, reply);
       return { outcome: 'rule_added', decision: read.decision };
     default:

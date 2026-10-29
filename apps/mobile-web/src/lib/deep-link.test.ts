@@ -4,9 +4,11 @@ import {
   agentFromSearch,
   destinationSearch,
   inboxNotificationFromSearch,
+  inboxDecisionFromSearch,
   projectFromSearch,
   runFromSearch,
   searchHasDestination,
+  sessionFromSearch,
   tabFromSearch,
 } from './deep-link';
 
@@ -73,4 +75,23 @@ test('an agent link opens an agent only on the Agents tab', () => {
   assert.equal(agentFromSearch('?tab=agents'), null);
   assert.equal(destinationSearch({ tab: 'agents', agentId: 'agt_1', projectId: 'prj_1' }), '?tab=agents&agent=agt_1');
   assert.equal(destinationSearch({ tab: 'projects', agentId: 'agt_1' }), '?tab=projects');
+});
+
+test('chat links select only an exact valid session on Chats', () => {
+  assert.equal(sessionFromSearch('?tab=chats&session=harness%3Aclem'), 'harness:clem');
+  assert.equal(sessionFromSearch('?tab=chats&session=sess-desktop_123'), 'sess-desktop_123');
+  assert.equal(sessionFromSearch('?tab=home&session=harness%3Aclem'), null);
+  assert.equal(sessionFromSearch('?tab=chats&session=../../other'), null);
+  assert.equal(sessionFromSearch('?tab=chats&session='), null);
+  assert.equal(searchHasDestination('?tab=chats&session=harness%3Aclem'), true);
+  assert.equal(searchHasDestination('?guide=work'), true);
+});
+
+test('a compact plan opens its exact complete decision review without approving', () => {
+  const link = destinationSearch({ tab: 'inbox', decisionKey: 'plan:plan_123' });
+  assert.equal(inboxDecisionFromSearch(link), 'plan:plan_123');
+  assert.equal(inboxDecisionFromSearch('?tab=chats&item=plan:plan_123'), null);
+  assert.equal(inboxDecisionFromSearch('?tab=inbox&item=not-a-decision'), null);
+  assert.equal(inboxDecisionFromSearch('?tab=inbox&item=plan:'), null);
+  assert.equal(destinationSearch({ tab: 'home', decisionKey: 'plan:plan_123' }), '');
 });

@@ -1,4 +1,5 @@
 import type { JSX, ComponentChildren } from 'preact';
+import { getAppGuidance } from '@clem/chat-engine';
 import { Component } from 'preact';
 import { Suspense } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
@@ -30,6 +31,7 @@ import {
 import { originHandoffMintCoordinator } from './lib/origin-handoff-mint';
 import { runOriginHandoffAdoption } from './lib/origin-handoff-adoption';
 import { authBootstrapMode } from './lib/auth-bootstrap';
+import { canRetryPairing, pairingRecovery } from './lib/pairing-recovery';
 import {
   mobileWorkspacePath,
   workspaceColdOpenNeedsParent,
@@ -43,6 +45,7 @@ import {
   projectFromSearch,
   runFromSearch,
   searchHasDestination,
+  sessionFromSearch,
   tabFromSearch,
   type TabId as Tab,
 } from './lib/deep-link';
@@ -59,6 +62,7 @@ import { Chats } from './screens/Chats';
 import { deferredScreen } from './lib/lazy-screen';
 import { describeThisDevice } from './lib/device-name';
 import { Inbox } from './screens/Inbox';
+import { AppGuidance } from './components/AppGuidance';
 import type { ChatHandoff } from './screens/Chats';
 import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
@@ -73,6 +77,7 @@ import { MobileNavigationProvider } from './lib/mobile-navigation';
 import { NavigationMenuButton } from './components/NavigationMenuButton';
 import { useMobileViewportVariables } from './lib/use-keyboard-inset';
 import { mobileChatLocation } from './lib/chat-location';
+import { appLinkClickIsPlain, guidanceOrigin, guidanceReturnFromHistory, guidanceReturnSearch, mobileAppLinkDestination } from './lib/app-link-navigation';
 import { installNativeVoiceBridge } from './lib/native-voice-bridge';
 import { composeModeFromSearch, consumeComposeSearch } from './lib/compose-route';
 import { saveWidgetSpace, saveWidgetWorkflow, widgetAvailable, widgetWorkflowAvailable, widgetNavigationFromSearch, WIDGET_ROUTE_EVENT } from './lib/widget-bridge';
@@ -101,7 +106,13 @@ export function App() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [pairing, setPairing] = useState(false);
   const [pairError, setPairError] = useState<string | null>(null);
+  const [pairRetryable, setPairRetryable] = useState(false);
+  const [pairRetryAt, setPairRetryAt] = useState<number | null>(null);
+  const pairingAttemptToken = useRef<string | null>(null);
   const [tab, setTab] = useState<Tab>(() => tabFromSearch(window.location.search));
+  const [guideId, setGuideId] = useState(() => new URLSearchParams(window.location.search).get('guide'));
+  const guideReturn = useRef(guidanceReturnFromHistory(window.history.state));
+  const guidance = guideId ? getAppGuidance(guideId, 'phone') : null;
   const [inboxNotification, setInboxNotification] = useState<string | null>(
     () => inboxNotificationFromSearch(window.location.search),
   );
@@ -152,7 +163,8 @@ export function App() {
   /** Set when Home hands a question to Chats — consumed once on arrival. */
   const [handoff, setHandoff] = useState<ChatHandoff | null>(() => {
     const composeMode = composeModeFromSearch(window.location.search);
-    return composeMode ? { composeMode } : null;
+    const sessionId = sessionFromSearch(window.location.search);
+    return composeMode ? { composeMode } : sessionId ? { sessionId } : null;
   });
   /** The Chats LIST is a capsule surface; an open thread has its own composer. */
   const [chatsListVisible, setChatsListVisible] = useState(false);
@@ -285,6 +297,9 @@ export function App() {
   useEffect(() => {
     const syncLocation = () => {
       setTab(tabFromSearch(window.location.search));
+      const nextGuide = new URLSearchParams(window.location.search).get('guide');
+      setGuideId(nextGuide);
+      guideReturn.current = nextGuide ? guidanceReturnFromHistory(window.history.state) : null;
       setInboxNotification(inboxNotificationFromSearch(window.location.search));
       setWorkspaceId(workspaceFromSearch(window.location.search));
       setRunId(runFromSearch(window.location.search));
@@ -292,6 +307,10 @@ export function App() {
       setAgentId(agentFromSearch(window.location.search));
       const composeMode = composeModeFromSearch(window.location.search);
       if (composeMode) setHandoff({ composeMode });
+      else {
+        const sessionId = sessionFromSearch(window.location.search);
+        if (sessionId) setHandoff({ sessionId });
+      }
     };
     window.addEventListener('popstate', syncLocation);
     const widgetRoute = (event: Event) => {
@@ -325,12 +344,16 @@ export function App() {
   // the same sync above moves the shell, with no page load.
   useEffect(() => {
     const openPlace = (event: MouseEvent) => {
-      const link = (event.target as Element | null)?.closest?.('a[data-app-place]');
+      const link = (event.target as Element | null)?.closest?.('a[data-app-place],a[data-app-item]');
       const href = link?.getAttribute('href');
-      if (!href) return;
+      if (!href || !link || !appLinkClickIsPlain(event, link.getAttribute('target'), link.hasAttribute('download'))) return;
+      const destination = mobileAppLinkDestination(href, { place: link.getAttribute('data-app-place'), item: link.getAttribute('data-app-item') }, window.location.href);
+      if (!destination) return;
       event.preventDefault();
       userNavigated.current = true;
-      window.history.pushState(null, '', href);
+      const origin = destination.searchParams.has('guide')
+        ? guidanceOrigin(window.location.search, mobileChatLocation.resume(), guidanceReturnFromHistory(window.history.state)) : null;
+      window.history.pushState(origin ? { clemGuidanceReturn: origin } : null, '', `${destination.pathname}${destination.search}${destination.hash}`);
       window.dispatchEvent(new PopStateEvent('popstate'));
     };
     document.addEventListener('click', openPlace);
@@ -375,6 +398,7 @@ export function App() {
     const onWake = () => { if (document.visibilityState === 'visible') void refreshCount(); };
     document.addEventListener('visibilitychange', onWake);
     window.addEventListener('online', onWake);
+    window.addEventListener('clem:needs-you-changed', onWake);
     const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refreshCount(); }, 8_000);
     return () => {
       cancelled = true;
@@ -382,17 +406,12 @@ export function App() {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('online', onWake);
+      window.removeEventListener('clem:needs-you-changed', onWake);
     };
   }, [authenticated]);
 
-  const setAuthoritativeDecisionCount = useCallback((count: number) => {
-    setDecisions(count);
-    setDecisionsKnown(true);
-    // The Inbox's own sources are never served from the shelf, so a complete
-    // count it publishes was read live. The 8-second poll above corrects this
-    // the moment the daemon stops answering.
-    setDecisionsAsOf(new Date().toISOString());
-    setDecisionsLive(true);
+  const setAuthoritativeDecisionCount = useCallback((_count: number) => {
+    recountNeedsYou.current();
   }, []);
 
   // The greeting name, resolved at runtime from the profile — never hardcoded,
@@ -518,6 +537,9 @@ export function App() {
     let cancelled = false;
     setPairing(true);
     setPairError(null);
+    setPairRetryable(false);
+    setPairRetryAt(null);
+    pairingAttemptToken.current = token;
     const cleanPairTokenFromUrl = () => {
       const clean = `${window.location.pathname}${window.location.hash || ''}`;
       window.history.replaceState(null, '', clean || '/m/');
@@ -527,19 +549,18 @@ export function App() {
         await pairDevice(token, describeThisDevice(navigator.userAgent, inNativeShell()));
         if (cancelled) return;
         cleanPairTokenFromUrl();
+        pairingAttemptToken.current = null;
         await refreshAuth();
       } catch (err) {
         if (cancelled) return;
-        const apiErr = err as { status?: number; body?: unknown; message?: string };
-        const body = apiErr.body as { error?: string } | null;
-        if (apiErr.status === 401 && body?.error === 'INVALID_PAIRING_CODE') {
+        const recovery = pairingRecovery(err);
+        if (!recovery.retryable) {
           cleanPairTokenFromUrl();
-          setPairError('That QR code expired or was already used. Open Mobile on the desktop app and scan a fresh QR.');
-        } else {
-          // A transport failure does not spend the one-time token. Keep it in
-          // the URL so reloading can retry the same pairing attempt.
-          setPairError(apiErr.message || 'QR pairing failed. Check the connection and try the same QR again.');
+          pairingAttemptToken.current = null;
         }
+        setPairError(recovery.message);
+        setPairRetryable(recovery.retryable);
+        setPairRetryAt(recovery.retryAt ?? null);
         // Leave the bootstrap state even after a failed pair. Without this,
         // authStatus stayed null and the app rendered “Waking up…” forever.
         await refreshAuth();
@@ -552,10 +573,12 @@ export function App() {
 
   const navigateTo = useCallback((
     next: Tab,
-    target?: { notificationId?: string | null; runId?: string | null; projectId?: string | null; agentId?: string | null },
+    target?: { decisionKey?: string | null; notificationId?: string | null; runId?: string | null; projectId?: string | null; agentId?: string | null },
   ) => {
     userNavigated.current = true;
     setTab(next);
+    setGuideId(null);
+    guideReturn.current = null;
     setWorkspaceId(null);
     // A selection only survives onto the tab that can act on it; destinationSearch
     // owns that rule so the URL and this state cannot disagree.
@@ -570,6 +593,7 @@ export function App() {
     const search = destinationSearch({
       tab: next,
       notificationId: selectedNotification,
+      decisionKey: next === 'inbox' ? target?.decisionKey : null,
       runId: selectedRun,
       projectId: selectedProject,
       agentId: selectedAgent,
@@ -636,7 +660,12 @@ export function App() {
   }
 
   if (!authStatus.authenticated) {
-    return <Login pairError={pairError} />;
+    return <Login pairError={pairError} onRetryPair={canRetryPairing(window.location.search, pairingAttemptToken.current, pairRetryable) ? () => {
+      if (!canRetryPairing(window.location.search, pairingAttemptToken.current, pairRetryable, pairRetryAt)) return;
+      // Re-enter the existing credential bootstrap rather than starting a
+      // parallel status or pairing request from the error screen.
+      window.location.reload();
+    } : undefined} retryAt={pairRetryAt} />;
   }
 
   const selectWorkspace = (slug: string | null) => {
@@ -661,6 +690,13 @@ export function App() {
 
   const goToChat = (payload: ChatHandoff) => {
     setHandoff(payload);
+    navigateTo('chats');
+  };
+
+  const openChatsList = () => {
+    haptic('light');
+    mobileChatLocation.showList();
+    setHandoff({ showList: true });
     navigateTo('chats');
   };
 
@@ -713,6 +749,27 @@ export function App() {
   // fought for it — mark, title, a "6·42" chip, a "Needs you · 86" pill and
   // the connection state — and the title was crushed to a sliver.)
   const headerChrome = phoneHeaderChrome({ tab, needsYouSignal: needsYou.show });
+  const workSection = tab === 'projects' || tab === 'activity' || tab === 'agents';
+  const selectedPlace: Tab = workSection ? 'projects' : tab;
+  const dismissGuidance = () => {
+    setGuideId(null);
+    guideReturn.current = null;
+    const url = new URL(window.location.href);
+    url.searchParams.delete('guide');
+    const state = { ...(window.history.state ?? {}) };
+    delete state.clemGuidanceReturn;
+    window.history.replaceState(state, '', `${url.pathname}${url.search}`);
+    document.querySelectorAll('.clem-guide-target').forEach(node => node.classList.remove('clem-guide-target'));
+  };
+  const returnFromGuidance = () => {
+    const origin = guideReturn.current;
+    // Restoring navigation identity reuses the existing scoped draft store;
+    // initial handoff instructions and auto-send are deliberately absent.
+    if (origin) { mobileChatLocation.save(origin); mobileChatLocation.showConversation(); }
+    setHandoff(null);
+    navigateTo('chats');
+    window.history.replaceState(null, '', `${window.location.pathname}${guidanceReturnSearch(origin)}`);
+  };
 
   // The capsule is the one persistent control — on Home, Needs you, and the
   // Chats list. An open thread has its own composer; other screens have
@@ -720,7 +777,7 @@ export function App() {
   const capsuleShown = tab === 'home' || tab === 'inbox' || (tab === 'chats' && chatsListVisible);
 
   return (
-    <MobileNavigationProvider openNavigation={openDrawer} navigationOpen={drawerOpen} onDetailHeaderChange={setDetailHeaderOwned}>
+    <MobileNavigationProvider openNavigation={openDrawer} navigationOpen={drawerOpen} openChats={openChatsList} onDetailHeaderChange={setDetailHeaderOwned}>
       {/* The same destinations stay mounted across a fold/rotation. Only CSS
           changes their placement; the open screen and draft keep their identity. */}
       <nav class="adaptive-navigation" aria-label="Sections" inert={drawerOpen ? true : undefined}>
@@ -733,7 +790,7 @@ export function App() {
           New chat
         </button>
         <div class="adaptive-navigation-sections">
-          {[...PRIMARY_TABS, ...QUIET_TABS].map(id => (
+          {[...PRIMARY_TABS, ...MENU_PLACES].map(id => (
             <button key={id} type="button" aria-current={tab === id ? 'page' : undefined}
               onClick={() => { if (tab !== id) haptic('light'); navigateTo(id); }}>
               {TABS.find(section => section.id === id)!.label}
@@ -749,7 +806,7 @@ export function App() {
           />
         ) : null}
         <button type="button" class="adaptive-settings" aria-current={tab === 'settings' ? 'page' : undefined}
-          onClick={() => { haptic('light'); navigateTo('settings'); }}>Settings</button>
+          onClick={() => { haptic('light'); navigateTo('settings'); }}>Apps &amp; devices</button>
       </nav>
       <header
         class="app-header"
@@ -789,7 +846,7 @@ export function App() {
               float at the bottom now that the dock is gone. Absent at zero
               (presenter contract: the pill disappears when total is 0), and
               absent on the screens that already list the work themselves. */}
-          {headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} compact={headerChrome.needsPill} /> : null}
+          {tab !== 'home' && headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} compact /> : null}
           {/* The pill has no room for a banner, so it discloses the age in the
               space it has: "Needs you · 3 · 6h ago" when the number came off
               the worker's shelf or a poll stopped answering. It is the standing
@@ -819,19 +876,21 @@ export function App() {
               type="button"
               class="header-round"
               aria-label={tab === 'projects' ? 'New project' : 'New agent'}
+              data-clem-guide={tab === 'projects' ? 'create-project' : 'create-agent'}
               onClick={() => { haptic('light'); setCreateRequest((n) => n + 1); }}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
             </button>
           ) : null}
-          {tab === 'chats' && chatsListVisible ? (
+          {tab !== 'chats' || chatsListVisible ? (
             <button
               type="button"
-              class="header-round"
-              aria-label="New chat"
-              onClick={() => { haptic('light'); goToChat({}); }}
+              class="header-round header-chat-button"
+              aria-label={tab === 'chats' ? 'New chat' : 'Open chats'}
+              onClick={() => { if (tab === 'chats') { haptic('light'); goToChat({}); } else openChatsList(); }}
             >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></svg>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{tab === 'chats' ? <><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></> : <><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-3 3V4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" /><path d="M6 7h10M6 11h7" /></>}</svg>
+              <span>{tab === 'chats' ? 'New' : 'Chats'}</span>
             </button>
           ) : null}
           {door === 'direct' ? (
@@ -914,7 +973,7 @@ export function App() {
             </div>
             <nav class="drawer-nav" aria-label="Sections">
               {/* Detail screens hide the tab bar, so their menu must include its destinations. */}
-              {(detailHeaderOwned ? PRIMARY_TABS : MENU_PLACES).map((id) => TABS.find((t) => t.id === id)!).map((t) => (
+              {(detailHeaderOwned ? [...PRIMARY_TABS, ...MENU_PLACES] : MENU_PLACES).map((id) => TABS.find((t) => t.id === id)!).map((t) => (
                 <button
                   key={t.id}
                   class="drawer-item"
@@ -992,7 +1051,12 @@ export function App() {
         </div>
       ) : null}
 
-      <main class={`app-main${capsuleShown ? ' app-main-capsule' : ''}`} key={tab}>
+      <main class={`app-main${capsuleShown ? ' app-main-capsule' : ''}`} tabIndex={-1} data-clem-guide={tab === 'inbox' ? 'inbox' : tab === 'memory' ? 'memory' : workSection ? 'work' : undefined} key={tab}>
+        {guidance ? <AppGuidance guidance={guidance} onBack={returnFromGuidance} onClose={dismissGuidance}
+          returnLabel={guideReturn.current?.kind === 'new' ? 'Return to draft' : guideReturn.current ? 'Back to our conversation' : 'Open chats'} /> : null}
+        {workSection && !detailHeaderOwned ? <nav class="work-section-nav" aria-label="Work views">
+          {([{ id: 'projects', label: 'Projects' }, { id: 'activity', label: 'Tasks & results' }, { id: 'agents', label: 'Agents' }] as const).map(place => <button key={place.id} type="button" aria-current={tab === place.id ? 'page' : undefined} onClick={() => navigateTo(place.id)}>{place.label}</button>)}
+        </nav> : null}
         <ScreenBoundary tab={tab} onRetry={() => {
           if (tab in deferredScreens) deferredScreens[tab as keyof typeof deferredScreens].retry();
         }}>
@@ -1004,7 +1068,7 @@ export function App() {
               onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })}
               onOpenChat={(session) => goToChat({ session, sessionId: session.id, title: session.title })}
               onOpenThread={(sessionId, title) => goToChat({ sessionId, title })}
-              onOpenInbox={() => navigateTo('inbox')}
+              onOpenInbox={(notificationId, decisionKey) => navigateTo('inbox', { notificationId, decisionKey })}
               onOpenWorkspace={openWorkspace}
               onOpenActivity={() => navigateTo('activity')}
               onCustomize={() => setCustomizeOpen(true)}
@@ -1020,6 +1084,7 @@ export function App() {
           ) : tab === 'inbox' ? (
             <Inbox
               initialNotificationId={inboxNotification}
+              canonicalNeedsCount={decisionsKnown ? decisions : null}
               onCount={setAuthoritativeDecisionCount}
               onReply={(sessionId, draft) => goToChat({ sessionId: sessionId ?? undefined, draft })}
               onOpenSettings={() => navigateTo('settings')}
@@ -1100,6 +1165,7 @@ export function App() {
               <Activity
                 initialRunId={runId}
                 onRunChange={(sessionId) => navigateTo('activity', { runId: sessionId })}
+                onOpenNeedsYou={(decisionKey) => navigateTo('inbox', { decisionKey })}
               />
             )}
           </Suspense>
@@ -1113,13 +1179,12 @@ export function App() {
       {detailHeaderOwned ? null : (
         <TabBar
           places={TAB_BAR_PLACES.map((id) => TABS.find((t) => t.id === id)!)}
-          current={tab}
-          currentInMenu={!TAB_BAR_PLACES.includes(tab)}
+          current={selectedPlace}
+          currentInMenu={!TAB_BAR_PLACES.includes(selectedPlace)}
           menuOpen={drawerOpen}
           badge={needsYou.show ? { place: 'inbox', text: needsYou.badgeText, label: needsYou.badgeAriaLabel, stale: needsYou.stale } : null}
           onSelect={(id) => navigateTo(id)}
           onReselect={() => document.querySelector<HTMLElement>('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' })}
-          onMenu={openDrawer}
         />
       )}
     </MobileNavigationProvider>
@@ -1167,29 +1232,29 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 };
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
-const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'chats', 'inbox', 'projects', 'spaces', 'workflows', 'agents', 'memory'];
+const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows'];
 /** On a phone the four used most sit in the tab bar (owner 10-23); More opens the menu with the rest. */
-const TAB_BAR_PLACES: ReadonlyArray<Tab> = ['home', 'chats', 'inbox', 'spaces'];
-const MENU_PLACES: ReadonlyArray<Tab> = PRIMARY_TABS.filter((id) => !TAB_BAR_PLACES.includes(id));
+const TAB_BAR_PLACES: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows'];
+const MENU_PLACES: ReadonlyArray<Tab> = ['chats', 'memory'];
 // Recents remain shortcuts; Chats is also a first-class section.
-const QUIET_TABS: ReadonlyArray<Tab> = ['activity'];
+const QUIET_TABS: ReadonlyArray<Tab> = ['settings'];
 
 const TAB_TITLES: Record<Tab, string> = {
   home: 'Today',
-  inbox: 'Needs you',
+  inbox: 'Inbox',
   chats: 'Chats',
-  projects: 'Projects',
+  projects: 'Work',
   agents: 'Agents',
   spaces: 'Spaces',
   workflows: 'Automations',
   memory: 'Memory',
-  activity: 'Activity',
-  settings: 'Settings',
+  activity: 'Work',
+  settings: 'Apps & devices',
 };
 
 const stroke = { fill: 'none', stroke: 'currentColor', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' } as const;
 
-const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
+const TABS: Array<{ id: Tab; label: string; shortLabel?: string; icon: JSX.Element }> = [
   {
     id: 'home',
     label: 'Today',
@@ -1201,7 +1266,7 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   },
   {
     id: 'inbox',
-    label: 'Needs you',
+    label: 'Inbox',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="M4 5h16v14H4z" /><path d="M4 14h4l2 3h4l2-3h4" />
@@ -1219,7 +1284,7 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   },
   {
     id: 'projects',
-    label: 'Projects',
+    label: 'Work',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
@@ -1250,6 +1315,7 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
   {
     id: 'workflows',
     label: 'Automations',
+    shortLabel: 'Automate',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
@@ -1266,8 +1332,13 @@ const TABS: Array<{ id: Tab; label: string; icon: JSX.Element }> = [
     ),
   },
   {
+    id: 'settings',
+    label: 'Apps & devices',
+    icon: <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true"><path d="M9 7V3M15 7V3M6 7h12v4a6 6 0 0 1-12 0zM12 17v4" /></svg>,
+  },
+  {
     id: 'activity',
-    label: 'Activity',
+    label: 'Tasks & results',
     icon: (
       <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
         <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />

@@ -1,4 +1,4 @@
-import type { HeartbeatPresentation, PendingActionResultLookup } from '@clem/chat-engine';
+import type { ApprovalPreview, HeartbeatPresentation, PendingActionResultLookup } from '@clem/chat-engine';
 import { readChatStopReceipt, readCompletionReviewResponse, type CheckerFacts, type DelegatedTask, type MemoryModelProblem, type MemoryScope, type TaskMode, type ReplayPayload, type UsageStatusLike, type WorkflowStopQualification } from '@clem/chat-engine';
 import { recoverFromUnauthorized, type LiveAuthStatus } from './proof-recovery.js';
 /**
@@ -445,6 +445,7 @@ export interface ApprovalRow {
   resolution: 'approved' | 'rejected' | 'expired' | 'cancelled_by_user' | 'cancelled_by_system' | null;
   kind?: 'harness' | 'runtime';
   resourceFingerprint?: { warning?: string };
+  preview?: ApprovalPreview;
   /** The project this approval belongs to, when the Mac says so. */
   projectId?: string | null;
   projectName?: string | null;
@@ -511,6 +512,7 @@ export interface InboxNotification {
   /** Server-owned grouping identity (dashboard/needs-you.ts). Older daemons
    *  omit it; the row then stands alone. */
   needsYouKey?: string;
+  lifecycle?: AttentionLifecycle;
   deliveredAt: string | null;
   deliveryError: string | null;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
@@ -575,18 +577,63 @@ export interface InboxSummary {
   checkInProposals?: number;
   /** Items in `needsYou` no Inbox feed has a row for; the Inbox renders them. */
   unlisted?: InboxUnlistedItem[];
+  attentionItems?: AttentionItem[];
 }
 
 export interface InboxUnlistedItem {
   key: string;
-  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
+  kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal' | 'attention';
   title: string;
   detail: string;
   workflow?: string;
+  lifecycle?: AttentionLifecycle;
+  sessionId?: string;
+  runId?: string;
+}
+
+export interface AttentionLifecycle {
+  canDismiss: boolean;
+  canDefer: boolean;
+  dismissLabel: string;
+  deferLabel: string;
+  effect: 'hide_only';
+  generation: string;
+  explanation: string;
+}
+export interface AttentionItem {
+  key: string;
+  kind: 'workflow' | 'conversation' | 'calendar' | 'notification';
+  title: string;
+  detail: string;
+  createdAt: string;
+  notificationId?: string;
+  sessionId?: string;
+  runId?: string;
+  workflow?: string;
+  workflowSlug?: string;
+  projectId?: string;
+  projectName?: string;
+  lifecycle: AttentionLifecycle;
+}
+export interface AttentionPresentationReceipt {
+  ok: true;
+  key: string;
+  action: 'dismiss' | 'defer' | 'restore';
+  generation: string;
+  mutationToken: string;
+  until?: string;
+}
+export interface AttentionPresentationItem extends AttentionItem {
+  action: 'dismiss' | 'defer';
+  generation: string;
+  mutationToken: string;
+  until?: string;
 }
 
 export interface InboxQuestion {
   id: string;
+  attentionKey?: string;
+  lifecycle?: { canDismiss: boolean; canDefer: boolean; dismissLabel: string; deferLabel: string; effect: 'hide_only'; generation?: string };
   source: 'check_in' | 'background_task' | 'workflow';
   question: string;
   options: string[];
@@ -710,6 +757,40 @@ export async function getInboxSummary(): Promise<InboxSummary> {
 
 export async function listInboxQuestions(): Promise<{ questions: InboxQuestion[]; count: number }> {
   return api('/m/api/inbox/questions');
+}
+
+/** Only still-pending, exact-generation questions hidden by the owner. */
+export interface QuestionPresentationItem extends InboxQuestion {
+  action: 'dismiss' | 'defer';
+  generation: string;
+  mutationToken: string;
+  until?: string;
+}
+export async function listQuestionPresentations(): Promise<{ questions: QuestionPresentationItem[]; count: number }> {
+  return api('/m/api/inbox/questions/presentation', { cache: 'no-store' });
+}
+
+export async function listAttentionPresentations(): Promise<{ items: AttentionPresentationItem[]; count: number }> {
+  return api('/m/api/inbox/attention/presentation', { cache: 'no-store' });
+}
+export async function presentInboxAttention(key: string, action: 'dismiss' | 'defer' | 'restore', generation: string, mutationToken?: string): Promise<AttentionPresentationReceipt> {
+  if (!generation || action === 'restore' && !mutationToken) throw new Error('Refresh Inbox before changing this saved attention setting.');
+  const result = await api<AttentionPresentationReceipt>('/m/api/inbox/attention/presentation', {
+    method: 'POST', body: JSON.stringify({ key, action, generation, ...(mutationToken ? { mutationToken } : {}) }),
+  });
+  if (result.ok !== true || result.key !== key || result.action !== action || result.generation !== generation || !result.mutationToken
+    || action === 'restore' && result.mutationToken !== mutationToken) {
+    throw new Error('Clem could not confirm that attention change. Refresh Inbox before trying again.');
+  }
+  window.dispatchEvent(new Event('clem:needs-you-changed'));
+  return result;
+}
+
+export async function presentInboxQuestion(id: string, action: 'dismiss' | 'defer' | 'restore', generation?: string, mutationToken?: string): Promise<{ ok: boolean; id: string; action: 'dismiss' | 'defer' | 'restore'; generation?: string; mutationToken?: string; until?: string }> {
+  if (action === 'restore' && (!generation || !mutationToken)) throw new Error('This Undo is missing its exact receipt. Refresh Inbox to check the question.');
+  const result = await api<{ ok: boolean; id: string; action: 'dismiss' | 'defer' | 'restore'; generation?: string; mutationToken?: string; until?: string }>(`/m/api/inbox/questions/${encodeURIComponent(id)}/presentation`, { method: 'POST', body: JSON.stringify({ action, ...(generation ? { generation } : {}), ...(mutationToken ? { mutationToken } : {}) }) });
+  window.dispatchEvent(new Event('clem:needs-you-changed'));
+  return result;
 }
 
 export async function listInboxTrustProposals(): Promise<{ proposals: InboxTrustProposal[]; count: number }> {
@@ -2263,6 +2344,10 @@ export async function setHeartbeatNotify(id: string, notify: 'quiet' | 'push'): 
 
 export interface FromClemRow {
   key: string;
+  attentionKey?: string;
+  /** Exact source IDs retained by a server-grouped equivalent report. */
+  relatedNotificationIds?: string[];
+  lifecycle?: { canDismiss: boolean; canDefer: boolean; dismissLabel: string; deferLabel: string; effect: 'hide_only'; generation?: string };
   heartbeat: string;
   heartbeatTitle: string;
   at: string;

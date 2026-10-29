@@ -17,6 +17,10 @@ export interface FromClemRow {
   text: string;
   detail?: string;
   voiceDigest: string;
+  attentionKey?: string;
+  relatedNotificationIds?: string[];
+  lifecycle?: { canDismiss: boolean; canDefer: boolean; dismissLabel: string; deferLabel: string; effect: 'hide_only'; generation?: string };
+  blocker?: { kind: 'provider_credit' | 'provider_quota'; retryAvailable: false };
   answer?: { kind: 'words'; questionId: string } | { kind: 'yes_no'; planProposalId: string } | { kind: 'brain_outage'; outageId: string };
   done?: { notificationId: string };
   /** A part of Clementine Clem offers to help set up, and where it lives. */
@@ -26,6 +30,12 @@ export interface FromClemRow {
   /** A report she already wrote: `say` is the report itself. */
   authored?: boolean;
   handoff?: {state:'not_started'|'dispatched'|'needs_attention'|'settled';sessionId?:string;reason?:string};
+}
+
+/** Local feedback follows the exact generic ask, even if its wording stays the same. */
+export function fromClemReceiptVersion(row: FromClemRow): string {
+  return row.attentionKey && row.lifecycle?.generation && !row.answer
+    ? JSON.stringify([row.voiceDigest, row.attentionKey, row.lifecycle.generation]) : row.voiceDigest;
 }
 
 /** Where a report's run opens, when its workflow is known. */
@@ -52,6 +62,26 @@ export interface FromClem {
 }
 
 export const getFromClem = () => apiGet<FromClem>('/api/console/home/from-clem');
+
+/** A question can leave the Inbox without turning a dismissal into an answer. */
+export function fromClemDisposition(row: FromClemRow, action: 'dismiss' | 'defer'):
+  | { kind: 'question'; questionId: string; action: 'dismiss' | 'defer' }
+  | { kind: 'attention'; key: string; action: 'dismiss' | 'defer'; generation: string }
+  | { kind: 'reply'; text: string; decision: 'done' | 'not_now' }
+  | null {
+  if (row.answer?.kind === 'words') return { kind: 'question', questionId: row.answer.questionId, action };
+  // Plan and model-switch choices keep their owning decision path.
+  if (row.answer?.kind === 'yes_no') return action === 'defer'
+    ? { kind: 'reply', text: 'Not now', decision: 'not_now' }
+    : { kind: 'reply', text: 'Decline this proposal', decision: 'done' };
+  if (row.answer?.kind === 'brain_outage') return action === 'defer'
+    ? { kind: 'reply', text: 'Not now', decision: 'not_now' } : null;
+  const allowed = action === 'defer' ? row.lifecycle?.canDefer : row.lifecycle?.canDismiss;
+  if (row.attentionKey && row.lifecycle?.generation && allowed) return {
+    kind: 'attention', key: row.attentionKey, action, generation: row.lifecycle.generation,
+  };
+  return null;
+}
 
 export type FromClemReplyOutcome =
   | { outcome: 'gone' }

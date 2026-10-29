@@ -131,11 +131,11 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
 
   if (section) {
     return (
-      <div class="stack settings settings-page">
+      <div class="stack settings settings-page" data-clem-guide={section === 'devices' ? 'phone' : section} tabIndex={-1}>
         <header class="settings-subhead">
           <button type="button" class="settings-back" onClick={backToIndex}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
-            Settings
+            Apps & devices
           </button>
           <h1 class="settings-page-title">{SECTION_TITLES[section]}</h1>
         </header>
@@ -210,6 +210,7 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
       <IndexGroup label="You">
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></svg>}
+          guide="notifications"
           title="Notifications"
           note={notificationsSummary({ registered: thisDevice ? Boolean(thisDevice.pushRegistered) : undefined, heartbeats: heartbeats.data?.heartbeats })}
           onOpen={() => openSection('notifications')}
@@ -241,12 +242,14 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         />
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-3 3.9A4 4 0 0 0 7 19h1a4 4 0 0 0 8 0h1a4 4 0 0 0 2-7.1V11a4 4 0 0 0-3-3.9V7a4 4 0 0 0-4-4z" /><path d="M12 3v18" /></svg>}
+          guide="models"
           title="Models"
           note={models.data ? `${brainSummary(models.data)} does the work` : ''}
           onOpen={() => openSection('models')}
         />
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M3 10h18" /><path d="M7 14h3" /></svg>}
+          guide="accounts"
           title="Model accounts"
           note={accountsNote}
           tone={outOfCredit ? 'warn' : undefined}
@@ -254,7 +257,8 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
         />
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7V3M15 7V3" /><path d="M6 7h12v4a6 6 0 0 1-12 0z" /><path d="M12 17v4" /></svg>}
-          title="Connections"
+          guide="connections"
+          title="Connected apps"
           note={connections.error || connections.offline ? 'Status unavailable · open to retry' : connectionsSummary(connections.data?.connections)}
           onOpen={() => openSection('connections')}
         />
@@ -272,13 +276,14 @@ export function Settings({ door, doorCopy, onSignOut, onCustomize }: {
       <IndexGroup label="This phone">
         <IndexRow
           icon={<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M11 18h2" /></svg>}
+          guide="phone"
           title="Devices & security"
           note={devicesSummary(devices.data?.devices)}
           onOpen={() => openSection('devices')}
         />
       </IndexGroup>
 
-      <p class="settings-foot">Sign-ins, keys and clean-up live on your computer, in Settings.</p>
+      <p class="settings-foot">For sign-ins and pairing, open Apps & devices on your computer.</p>
     </div>
   );
 }
@@ -377,15 +382,16 @@ function IndexGroup({ label, children }: { label: string; children: preact.Compo
   );
 }
 
-function IndexRow({ icon, title, note, tone, onOpen }: {
+function IndexRow({ icon, title, note, tone, guide, onOpen }: {
   icon: preact.ComponentChildren;
   title: string;
   note: string;
   tone?: 'warn';
+  guide?: string;
   onOpen: () => void;
 }) {
   return (
-    <button type="button" class="settings-index-row" onClick={onOpen}>
+    <button type="button" class="settings-index-row" data-clem-guide={guide} onClick={onOpen}>
       <span class="settings-index-icon" aria-hidden="true">{icon}</span>
       <span class="settings-row-main">
         <span class="settings-row-label">{title}</span>

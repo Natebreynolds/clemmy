@@ -71,8 +71,8 @@ export function Heartbeats() {
   const list = q.data?.heartbeats ?? [];
   return (
     <Page
-      title="Heartbeats"
-      subtitle="Choose what Clem keeps an eye on. Useful suggestions and questions appear in From Clem; you decide what happens next."
+      title="Check-ins"
+      subtitle="Choose what Clem checks on her own and how often. Decisions arrive in your Inbox."
     >
       {q.isLoading && list.length === 0 ? (
         <Skeleton className="h-64" />

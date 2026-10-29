@@ -2,6 +2,7 @@
  * Reusable response cards for the durable Needs-you inbox.
  */
 import { decisionHeading } from '@clem/chat-engine';
+import { ApprovalReview } from './ApprovalReview';
 import { useRef, useState } from 'preact/hooks';
 import {
   approveApproval,
@@ -14,7 +15,7 @@ import {
   type WorkspaceDestinationChooser,
 } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
-import { approvalDetails, approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceChoiceTitle } from '../lib/inbox-presentation';
+import { approvalCardReview, approvalKindLabel, approvalQuestion, workspaceChoiceLayout, workspaceChoiceTitle } from '../lib/inbox-presentation';
 
 export function relativeTime(iso: string | number): string {
   const then = typeof iso === 'number' ? iso : Date.parse(iso);
@@ -219,7 +220,7 @@ function PlanCard({ row, index, acting, disabled, onAct, onReply }: {
   onReply?: DecisionsProps['onReply'];
 }) {
   const needsInput = row.needsUserInput.length > 0;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const steps = open ? row.steps : row.steps.slice(0, 3);
   const { heading, body: headingBody } = decisionHeading(row.objective || 'Proposed plan');
   return (
@@ -296,16 +297,16 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
   onAct: Act;
   onReply?: DecisionsProps['onReply'];
 }) {
-  const [open, setOpen] = useState(false);
-  // The server already unwrapped the carrier into the provider's own fields.
-  const details = row.presentation && row.presentation.details.length > 0 ? row.presentation.details : approvalDetails(row);
+  const [open, setOpen] = useState(true);
+  const review = approvalCardReview(row);
+  const details = review.details;
   const isWorkflowGate = row.tool === 'workflow_approval_gate';
   const [changing, setChanging] = useState(false);
   const [changeNote, setChangeNote] = useState('');
   // The words being approved, before the buttons: the first lines always,
   // the rest one tap away.
-  const draft = row.contentPreview?.body?.trim() ?? '';
-  const [draftOpen, setDraftOpen] = useState(false);
+  const draft = review.draft;
+  const [draftOpen, setDraftOpen] = useState(true);
   const draftIsLong = draft.length > 320;
   const shownDraft = draftIsLong && !draftOpen ? `${draft.slice(0, 319)}…` : draft;
   return (
@@ -325,6 +326,7 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
       {row.resourceFingerprint?.warning ? (
         <p class="card-warn">{row.resourceFingerprint.warning}</p>
       ) : null}
+      {review.preview ? <ApprovalReview preview={review.preview} /> : null}
       {draft ? (
         <figure class="approval-draft" aria-label="What you are approving">
           <figcaption>Draft</figcaption>
@@ -359,7 +361,14 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
           ) : null}
         </>
       ) : null}
-      <p class="approval-response-hint">Approve it, reject it, or tell me what you want changed.</p>
+      {!review.complete ? <p class="card-warn" role="note">I can’t show this whole action on the phone. Open this approval in Inbox on your computer to review and approve it.</p> : null}
+      <p class="approval-response-hint">{review.complete
+        ? onReply || isWorkflowGate
+          ? 'Approve it, reject it, or tell me what you want changed. I’ll only act on the version you approve.'
+          : 'Review who this goes to, what it says and what will change. I’ll only perform the action you approve.'
+        : onReply || isWorkflowGate
+          ? 'You can reject it here, or tell me what you want changed.'
+          : 'You can reject it here. I’ll wait for your review before doing anything.'}</p>
       {isWorkflowGate && changing ? (
         <form
           class="inbox-answer"
@@ -390,10 +399,10 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
           type="button"
           class="btn-approve"
           aria-label={`Approve ${approvalKindLabel(row.tool)}: ${row.subject}`}
-          disabled={disabled}
+          disabled={disabled || !review.complete}
           onClick={() => onAct('approve')}
         >
-          {acting ? 'Continuing…' : 'Yes, do it'}
+          {acting ? 'Continuing…' : row.preview?.items && row.preview.items.length > 1 ? `Approve ${row.preview.items.length} actions` : 'Yes, do it'}
         </button>
         {isWorkflowGate ? (
           <button
@@ -420,11 +429,11 @@ function ApprovalCard({ row, index, acting, disabled, onAct, onReply, project }:
           <button
             class="btn-reply"
             type="button"
-            aria-label={`Tell Clem about: ${row.subject}`}
+            aria-label={`Tell me what to change about: ${row.subject}`}
             disabled={disabled}
             onClick={() => onReply(row.sessionId, `About “${row.subject}”: `)}
           >
-            Tell Clem
+            Tell me what to change
           </button>
         ) : null}
       </footer>

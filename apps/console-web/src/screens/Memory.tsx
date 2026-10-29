@@ -185,7 +185,7 @@ function MemoryOverview() {
   ];
   const current = tabs.find((item) => item.key === tab)!;
   return (
-    <section className="memory-workspace" aria-label="Memory workspace">
+    <section data-clem-guide="memory" className="memory-workspace" aria-label="Memory workspace">
       <header className="memory-toolbar">
         <div className="memory-search">
           <Search size={18} aria-hidden />

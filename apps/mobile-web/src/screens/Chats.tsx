@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useBackGesture } from '../lib/back-gesture';
 import { listChatSessions, patchChatSession, type ChatSession } from '../lib/api';
-import { arrangeChatList, cleanChatTitle } from '../lib/chat-list';
+import { arrangeChatList, chatListEmpty, cleanChatTitle } from '../lib/chat-list';
 import { chatHasNews, chatSeenBaseline, markChatSeen } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { SWIPE_ACTIONS_WIDTH, swipeIntent, swipeOffset, swipeSettles } from '../lib/chat-swipe';
@@ -17,6 +17,8 @@ import { mobileChatLocation } from '../lib/chat-location';
 import type { ComposeMode } from '../lib/compose-route';
 
 export interface ChatHandoff {
+  /** Open the list while keeping the current conversation or draft recoverable. */
+  showList?: boolean;
   composeMode?: ComposeMode;
   draft?: string;
   fileContext?: SelectedFileContext;
@@ -53,7 +55,8 @@ interface Props {
 }
 
 export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou, onOpenSettings }: Props) {
-  const resume = useRef(handoff ? null : mobileChatLocation.resume());
+  const resume = useRef(handoff && !handoff.showList ? null : mobileChatLocation.resume());
+  const [showList, setShowList] = useState(Boolean(handoff?.showList || (!handoff && mobileChatLocation.showingList)));
   const [selectedId, setSelectedId] = useState<string | null>(resume.current?.kind === 'chat' ? resume.current.sessionId : null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>(resume.current?.kind === 'chat' ? resume.current.title : undefined);
@@ -68,7 +71,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     setSelectedTitle(undefined);
     setSelectedContext(undefined);
   };
-  useBackGesture(selectedId !== null, closeSelected);
+  useBackGesture(!showList && selectedId !== null, closeSelected);
   const [composing, setComposing] = useState<{ scope: string; composeMode?: ComposeMode; draft?: string; fileContext?: SelectedFileContext; attachments?: ChatAttachment[]; autoSend?: boolean; agentId?: string; agentName?: string; projectId?: string; projectName?: string } | null>(resume.current?.kind === 'new' ? resume.current : null);
   useLayoutEffect(() => {
     mobileChatLocation.save(composing ? { kind: 'new', ...composing }
@@ -86,7 +89,20 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   const [swipedId, setSwipedId] = useState<string | null>(null);
   // The list keeps polling and wake-refreshing only while it is the visible
   // surface — an open thread owns its own stream.
-  const listVisible = !composing && !selectedId;
+  const listVisible = showList || (!composing && !selectedId);
+  const showConversation = () => { mobileChatLocation.showConversation(); setShowList(false); };
+  const returnToCurrent = () => {
+    const saved = mobileChatLocation.resume();
+    if (!saved) return;
+    setSelectedDraft(undefined); setSelectedContext(undefined);
+    if (saved.kind === 'new') { setSelectedId(null); setComposing({ ...saved }); }
+    else { setComposing(null); setSelectedId(saved.sessionId); setSelectedTitle(saved.title); }
+    showConversation();
+  };
+  const openSession = (session: ChatSession) => {
+    setSwipedId(null); setComposing(null); setSelectedDraft(undefined); setSelectedContext(undefined);
+    setSelectedId(session.id); setSelectedTitle(session.title); showConversation();
+  };
   const { data, loading, error, offline, refresh } = useScreenData(
     () => listChatSessions({ archived: showArchived }),
     { intervalMs: 8000, disabled: !listVisible, resourceKey: `chats:${showArchived ? 'archived' : 'live'}` },
@@ -143,6 +159,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     setPendingLatest(false);
     const latest = data.sessions[0];
     if (!latest) return;
+    showConversation();
     setSelectedId(latest.id);
     setSelectedTitle(latest.title);
   }, [pendingLatest, data]);
@@ -151,6 +168,12 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
   // already in the composer; a tapped thread opens that thread.
   useEffect(() => {
     if (!handoff) return;
+    if (handoff.showList) {
+      mobileChatLocation.showList(); setShowList(true);
+      onHandoffConsumed?.();
+      return;
+    }
+    showConversation();
     if (handoff.composeMode && composing) {
       // A widget may wake an unfinished new conversation. Keep its scope,
       // text, and uploaded files reachable instead of replacing the draft.
@@ -176,7 +199,10 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     onHandoffConsumed?.();
   }, [handoff, onHandoffConsumed]);
 
-  if (composing) {
+  const currentReturn = showList ? mobileChatLocation.resume() : null;
+  const empty = chatListEmpty(showArchived);
+
+  if (composing && !showList) {
     return (
       <Chat
         key={composing.scope}
@@ -199,7 +225,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
     );
   }
 
-  if (selectedId) {
+  if (selectedId && !showList) {
     const session = sessions.find((s) => s.id === selectedId);
     return (
       <Chat
@@ -222,6 +248,10 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
 
   return (
     <div>
+      {currentReturn ? <button type="button" class="chats-return-current" onClick={returnToCurrent}>
+        <span>{currentReturn.kind === 'new' ? 'Resume draft' : 'Return to conversation'}</span>
+        {currentReturn.kind === 'chat' && currentReturn.title ? <span>{currentReturn.title}</span> : null}
+      </button> : null}
       <label class="chats-search">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
         <input type="search" value={query} onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)} placeholder={showArchived ? 'Search archived' : 'Search conversations'} aria-label="Search conversations" autocomplete="off" />
@@ -236,18 +266,22 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       {!loading && !error && !offline && sessions.length === 0 ? (
         <div class="empty">
           <img class="empty-mark" src="/m/clemmy.png" alt="" width="72" height="72" />
-          <p class="empty-title">No conversations yet</p>
-          <p class="empty-body">Ask below — she picks up all the context from your computer.</p>
+          <p class="empty-title">{empty.title}</p>
+          <p class="empty-body">{empty.body}</p>
+          {empty.starterDraft ? <button type="button" class="login-repair" onClick={() => {
+            haptic('light'); setSelectedId(null); setSelectedContext(undefined);
+            setComposing({ scope: newMobileDraftScope(), draft: empty.starterDraft!, autoSend: false }); showConversation();
+          }}>Start with a plan</button> : null}
         </div>
       ) : null}
 
       {arranged.pinned.length > 0 ? <h2 class="chat-list-head">Pinned</h2> : null}
       <div class="chat-list">
-        {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSwipedId(null); setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
+        {arranged.pinned.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => openSession(session)} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
       </div>
       {arranged.pinned.length > 0 && arranged.rest.length > 0 ? <h2 class="chat-list-head">{showArchived ? 'Archived' : 'Recent'}</h2> : null}
       <div class="chat-list">
-        {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => { setSwipedId(null); setSelectedId(session.id); setSelectedTitle(session.title); }} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
+        {arranged.rest.map((session) => <ChatRow key={session.id} session={session} news={chatHasNews(session, seen)} onOpen={() => openSession(session)} onMenu={() => { haptic('light'); setMenuFor(session); }} swipeOpen={swipedId === session.id} onSwipe={(open) => setSwipedId(open ? session.id : null)} onPin={() => { setSwipedId(null); void change(session, { pinned: !session.pinned }); }} onArchive={() => { setSwipedId(null); void change(session, { archived: !session.archived }); }} />)}
       </div>
       {!loading && sessions.length > 0 && arranged.pinned.length + arranged.rest.length === 0 ? (
         <p class="chats-none">Nothing matches “{query.trim()}”.</p>

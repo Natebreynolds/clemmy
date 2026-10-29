@@ -13,6 +13,12 @@ export type ChatLocation = NewChatLocation | { kind: 'chat'; sessionId: string; 
 export class MobileChatLocationStore {
   private location: ChatLocation = null;
   private created = new Map<string, string>();
+  private listVisible = false;
+
+  /** Looking through chats does not discard the conversation or draft beneath. */
+  get showingList(): boolean { return this.listVisible; }
+  showList(): void { this.listVisible = true; }
+  showConversation(): void { this.listVisible = false; }
 
   save(location: ChatLocation): void {
     this.location = !location ? null : location.kind === 'chat'
@@ -29,7 +35,7 @@ export class MobileChatLocationStore {
   promote(scope: string, sessionId: string): void {
     if (scope && sessionId) this.created.set(scope, sessionId);
   }
-  clear(): void { this.location = null; this.created.clear(); }
+  clear(): void { this.location = null; this.created.clear(); this.listVisible = false; }
 }
 
 export const mobileChatLocation = new MobileChatLocationStore();

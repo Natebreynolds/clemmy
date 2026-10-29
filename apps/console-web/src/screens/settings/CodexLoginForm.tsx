@@ -18,7 +18,9 @@ import { createSignInAttemptOwner, deviceSignInDeadline, deviceSignInPollDelay }
  */
 const isDesktop = () => clemmy() !== null;
 
-export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: () => void }) {
+export function CodexReauth({ signedIn, onDone, onBusyChange, allowCancel = false }: {
+  signedIn: boolean; onDone: () => void; onBusyChange?: (busy: boolean) => void; allowCancel?: boolean;
+}) {
   const [localState, setLocalState] = useState<'idle' | 'opening' | 'done'>('idle');
   const [localErr, setLocalErr] = useState('');
   const [device, setDevice] = useState<{ uri: string; code: string } | null>(null);
@@ -26,6 +28,13 @@ export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: (
   const [deviceBusy, setDeviceBusy] = useState(false);
   const attempts = useRef(createSignInAttemptOwner());
   useEffect(() => () => attempts.current.stop(), []);
+  const pending = localState === 'opening' || deviceBusy;
+  useEffect(() => { onBusyChange?.(pending); }, [pending, onBusyChange]);
+  const stopWaiting = () => {
+    attempts.current.stop(); setLocalState('idle'); setDeviceBusy(false); setDevice(null); setLocalErr('');
+    setDeviceStatus('Stopped waiting here. If you finished in the browser, refresh your sign-in status.');
+    onDone();
+  };
 
   const runLocal = async () => {
     const attempt = attempts.current.begin();
@@ -102,6 +111,7 @@ export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: (
         <Button variant={isDesktop() ? 'ghost' : 'primary'} size="sm" onClick={runRemote} disabled={deviceBusy}>
           <RotateCw className="h-4 w-4" aria-hidden /> Sign in on another device
         </Button>
+        {allowCancel && pending ? <Button variant="ghost" size="sm" onClick={stopWaiting}>Stop waiting</Button> : null}
       </div>
       {localErr && <p className="mt-2 text-caption text-danger">{localErr}</p>}
       {device && (
@@ -119,7 +129,9 @@ export function CodexReauth({ signedIn, onDone }: { signedIn: boolean; onDone: (
  * Fetches its own signed-in status from the credentials snapshot so it can stand
  * alone in Models & routing next to the Claude login.
  */
-export function CodexLoginForm({ embedded = false }: { embedded?: boolean } = {}) {
+export function CodexLoginForm({ embedded = false, onboarding = false, onBusyChange }: {
+  embedded?: boolean; onboarding?: boolean; onBusyChange?: (busy: boolean) => void;
+} = {}) {
   const qc = useQueryClient();
   const creds = usePoll(['credentials'], getCredentials, 0);
   const signedIn = Boolean(creds.data?.auth?.codexOauthPresent);
@@ -132,11 +144,13 @@ export function CodexLoginForm({ embedded = false }: { embedded?: boolean } = {}
         <h4 className="text-label text-fg">Codex (OpenAI) sign-in</h4>
       </div>
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
-        {signedIn
+        {creds.isLoading ? <span role="status" className="text-muted">Checking your Codex sign-in…</span>
+          : creds.isError || typeof creds.data?.auth?.codexOauthPresent !== 'boolean' ? <span role="status" className="text-muted">Could not confirm your Codex sign-in. <Button variant="link" size="sm" onClick={() => void creds.refetch()}>Try again</Button></span>
+          : signedIn
           ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Signed in · subscription billing</span>
           : <span className="text-muted">Not signed in. Connect your Codex/OpenAI subscription below.</span>}
       </div>
-      <CodexReauth signedIn={signedIn} onDone={refetch} />
+      <CodexReauth signedIn={signedIn} onDone={refetch} onBusyChange={onBusyChange} allowCancel={onboarding} />
     </>
   );
 

@@ -12,11 +12,11 @@ const FileIcon = () => <svg viewBox="0 0 24 24" width="20" height="20" fill="non
 
 /** Finished files are read when the owner opens them. The conversation stays
  * mounted underneath, retaining its draft and place; no creation feed or polling. */
-export function CompletedFiles({ conversationId, onDiscuss }: { conversationId?: string; onDiscuss?: (context: SelectedFileContext) => void }) {
-  return conversationId ? <ConversationFiles key={conversationId} sessionId={conversationId} onDiscuss={onDiscuss} /> : null;
+export function CompletedFiles({ conversationId, onDiscuss, openRequest = 0, onReturn }: { conversationId?: string; onDiscuss?: (context: SelectedFileContext) => void; openRequest?: number; onReturn?: () => void }) {
+  return conversationId ? <ConversationFiles key={conversationId} sessionId={conversationId} onDiscuss={onDiscuss} openRequest={openRequest} onReturn={onReturn} /> : null;
 }
 
-function ConversationFiles({ sessionId, onDiscuss }: { sessionId: string; onDiscuss?: (context: SelectedFileContext) => void }) {
+function ConversationFiles({ sessionId, onDiscuss, openRequest, onReturn }: { sessionId: string; onDiscuss?: (context: SelectedFileContext) => void; openRequest: number; onReturn?: () => void }) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<SessionFile[] | null>(null);
   const [problem, setProblem] = useState('');
@@ -24,7 +24,16 @@ function ConversationFiles({ sessionId, onDiscuss }: { sessionId: string; onDisc
   const [selected, setSelected] = useState<SessionFile | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
   const selectedFileId = useRef('');
-  const close = () => { setOpen(false); setSelected(null); };
+  const lastOpenRequest = useRef(0);
+  useEffect(() => {
+    if (!openRequest || openRequest === lastOpenRequest.current) return;
+    lastOpenRequest.current = openRequest;
+    setOpen(true);
+  }, [openRequest]);
+  const close = () => {
+    setOpen(false); setSelected(null);
+    window.requestAnimationFrame(() => onReturn?.());
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -50,22 +59,16 @@ function ConversationFiles({ sessionId, onDiscuss }: { sessionId: string; onDisc
 
   return (
     <>
-      <div class="chat-files-bar">
-        <button class="chat-files-trigger" type="button" aria-haspopup="dialog" onClick={() => setOpen(true)}>
-          <FileIcon /><span>Files</span>
-          {files && files.length > 0 ? <span class="chat-files-count">{files.length}</span> : null}
-        </button>
-      </div>
       <Sheet
         open={open}
         onClose={close}
-        title="Files"
+        title="Conversation files"
         backGesture
         class="chat-files-sheet sheet-tall"
         aside={<button type="button" class="chat-file-action" onClick={close} aria-label="Close files and return to conversation">Done</button>}
       >
         {selected ? (
-          <FilePreview key={selected.fileId} sessionId={sessionId} initialFile={selected} onBack={backToFiles} onDiscuss={onDiscuss ? context => { close(); onDiscuss(context); } : undefined} />
+          <FilePreview key={selected.fileId} sessionId={sessionId} initialFile={selected} onBack={backToFiles} onDiscuss={onDiscuss ? context => { setOpen(false); setSelected(null); onDiscuss(context); } : undefined} />
         ) : (
           <>
             <div class="chat-files-intro">

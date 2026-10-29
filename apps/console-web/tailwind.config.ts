@@ -10,7 +10,7 @@ import type { Config } from 'tailwindcss';
  * hero; the old electric lime/cyan and CRT scanlines are gone.
  */
 const config: Config = {
-  content: ['./index.html', './src/**/*.{ts,tsx}'],
+  content: { relative: true, files: ['./index.html', './src/**/*.{ts,tsx}'] },
   darkMode: 'class',
   theme: {
     extend: {

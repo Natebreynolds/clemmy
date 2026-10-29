@@ -68,8 +68,8 @@ export function Triggers() {
 
   return (
     <Page
-      title="Triggers"
-      subtitle="Everything that makes Clem act without you typing: schedules, webhooks, things that happen in your apps, what she watches, and reminders. Set one up in chat; steer it here."
+      title="Schedule & events"
+      subtitle="See what happens next. Pause a schedule, run it now, or ask Clem to set up something new."
     >
       {q.isError && <QueryUnavailable title="Triggers are unavailable" description={q.error instanceof Error ? q.error.message : undefined} onRetry={() => { void q.refetch(); }} />}
       {!view && !q.isError && <Skeleton className="h-40" />}

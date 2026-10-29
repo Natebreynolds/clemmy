@@ -1,4 +1,6 @@
-import type { ApprovalRow, InboxNotification } from './api';
+import { groupAttentionReports } from '@clem/chat-engine';
+import { mobileWorkflowPath, WORKFLOW_WIDGET_SLUG } from './workflow-widget';
+import type { ApprovalRow, AttentionItem, InboxNotification } from './api';
 
 export interface ApprovalDetailRow {
   label: string;
@@ -86,6 +88,9 @@ function displayValue(value: unknown): string {
   if (value === null || value === undefined) return '—';
   if (typeof value === 'string') return truncateDetail(value.trim()) || '—';
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value) && value.every(item => typeof item === 'string')) {
+    return truncateDetail(value.join('\n')) || '—';
+  }
   try {
     return truncateDetail(JSON.stringify(boundedJsonValue(value, 0, new WeakSet()), null, 2));
   } catch {
@@ -160,6 +165,73 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
   return rows;
 }
 
+/** A preview is the host's recorded review, not a summary inferred from args.
+ * Legacy flat actions can still be reviewed on the phone when every value fits
+ * the readable presenter. An opaque carrier or clipped value needs the full
+ * desktop review; a short content preview cannot establish its whole scope. */
+export function approvalCardReview(row: Pick<ApprovalRow, 'args' | 'preview' | 'presentation' | 'contentPreview'>): {
+  preview: ApprovalRow['preview'] | null;
+  details: ApprovalDetailRow[];
+  draft: string;
+  complete: boolean;
+} {
+  const recorded = row.preview;
+  const preview = recorded?.items?.length ? recorded : recorded?.fields?.some(field => field.name !== 'Prepared actions')
+    ? { operation: recorded.operation, fields: [], items: [recorded] }
+    : null;
+  const args = row.args;
+  const values = args && typeof args === 'object' && !Array.isArray(args)
+    ? Object.entries(args as Record<string, unknown>) : null;
+  const structuredText = (value: string) => {
+    if (!/^\s*[\[{]/.test(value)) return false;
+    try { return typeof JSON.parse(value) === 'object'; } catch { return false; }
+  };
+  const scalar = (value: unknown) => value === null || typeof value === 'boolean'
+    || typeof value === 'number' && Number.isFinite(value)
+    || typeof value === 'string' && value.length <= MAX_DETAIL_VALUE_CHARS
+      && !structuredText(value);
+  const carrierField = (name: string) => /^(?:args(?:[ _-]?json)?|arguments|payload|request|call|tool(?:[ _-]?(?:name|slug))?|requirement(?:[ _-]?id)?)$/i.test(name.trim());
+  const placeholder = (value: string) => /^\s*\[(?:withheld|redacted|omitted|more detail)/i.test(value);
+  const materialField = (field: NonNullable<ApprovalRow['preview']>['fields'][number]) => {
+    const value = field.value.trim();
+    return field.name !== 'Prepared actions' && Boolean(value) && !isContentFingerprint(value) && !placeholder(value)
+      && Boolean(field.label?.trim() || field.display?.trim() || !field.detail && !(carrierField(field.name) && structuredText(value)));
+  };
+  const opaquePreparedField = (field: NonNullable<ApprovalRow['preview']>['fields'][number]) => {
+    const value = field.value.trim();
+    return isContentFingerprint(value) || placeholder(value) || /…\s*\(\d+ more characters\)$/.test(value)
+      || carrierField(field.name) && structuredText(value)
+      || /^(?:name|tool(?:[ _-]?(?:name|slug))?)$/i.test(field.name) && /^(?:work_call|composio_execute_tool)$/.test(value);
+  };
+  const preparedComplete = preview?.items?.every(item => item.fields.some(materialField)
+    && !item.fields.some(opaquePreparedField)) === true;
+  const complete = preparedComplete || Boolean(!preview && values && !row.presentation?.unwrapped
+    && values.length > 0 && values.length <= MAX_DETAIL_FIELDS
+    && values.every(([, value]) => !isContentFingerprint(value) && (scalar(value)
+      || Array.isArray(value) && value.length <= MAX_COLLECTION_ITEMS
+        && value.every(item => typeof item === 'string' && scalar(item))
+        && value.join('\n').length <= MAX_DETAIL_VALUE_CHARS)));
+  const readableDetail = (line: ApprovalDetailRow) => {
+    const value = line.value.trim();
+    const opaque = value.length >= 20 && !/\s/.test(value) && !/[@/\\]/.test(value)
+      && !/\.[A-Za-z0-9]{1,6}$/.test(value) && /^[A-Za-z0-9+=_\-.:]+$/.test(value);
+    return Boolean(value) && !carrierField(line.label) && !/\bids?$/i.test(line.label)
+      && !structuredText(value) && !isContentFingerprint(value) && !placeholder(value) && !opaque
+      && !/\b(?:work_call|composio_execute_tool|args_json|tool_slug|requirement_id|connection_id)\b|cap:resolved/i.test(value);
+  };
+  // An incomplete review may show a readable server summary, never the carrier
+  // arguments that could not be represented. The computer owns its full review.
+  const shownPreview = complete ? preview : null;
+  const details = shownPreview ? [] : complete ? approvalDetails(row)
+    : (row.presentation?.details ?? []).filter(readableDetail);
+  const draft = row.contentPreview?.body?.trim() ?? '';
+  const draftPrefix = draft.replace(/(?:…|\.{3})$/, '').trimEnd();
+  const draftAlreadyRecorded = Boolean(shownPreview && draftPrefix && shownPreview.items?.some(item => item.fields.some(field =>
+    /(?:body|message|content|description|text)/i.test(field.name) && field.value.trim().startsWith(draftPrefix))));
+  return { preview: shownPreview, details,
+    draft: draftAlreadyRecorded || !complete && structuredText(draft) ? '' : draft, complete };
+}
+
 /** A notification title as the card shows it: a leading emoji is a status
  *  icon ("📅 Reply needed", "⚠️ Workflow …") and the card already says what
  *  kind of row it is. */
@@ -212,6 +284,20 @@ export function notificationRunTarget(
   return null;
 }
 
+/** Workflow reports need not have a chat session. Review their existing saved
+ * definition; a run ID alone never invents a chat destination or grants work. */
+export function notificationWorkflowHref(
+  row: Pick<InboxNotification, 'needsYouKey' | 'lifecycle'>,
+  canonical?: Pick<AttentionItem, 'key' | 'workflowSlug' | 'lifecycle'>,
+): string | null {
+  const key = row.needsYouKey;
+  if (!key?.startsWith('flow:')) return null;
+  const exact = canonical?.key === key && canonical.lifecycle.generation === row.lifecycle?.generation
+    ? canonical.workflowSlug : undefined;
+  const slug = exact ?? key.slice('flow:'.length);
+  return WORKFLOW_WIDGET_SLUG.test(slug) ? mobileWorkflowPath(slug) : null;
+}
+
 export function notificationDedupeKey(row: InboxNotification): string {
   // A title or workflow name is presentation, not identity: one workflow can
   // have two unrelated blockers with the same generic title. The server now
@@ -248,15 +334,10 @@ export function notificationIsRepresentedByApprovals(
 export function collapseAttentionNotifications(rows: InboxNotification[]): Array<{
   row: InboxNotification;
   earlier: number;
+  reports: InboxNotification[];
 }> {
-  const seen = new Map<string, { row: InboxNotification; earlier: number }>();
-  for (const row of rows) {
-    const key = notificationDedupeKey(row);
-    const existing = seen.get(key);
-    if (existing) existing.earlier += 1;
-    else seen.set(key, { row, earlier: 0 });
-  }
-  return [...seen.values()];
+  return groupAttentionReports(rows, row => ({ id: row.id, attentionKey: row.needsYouKey,
+    generation: row.lifecycle?.generation })).map(group => ({ row: group.reports[0], earlier: group.reports.length - 1, reports: group.reports }));
 }
 
 // ─── clearing ──────────────────────────────────────────────────────────────

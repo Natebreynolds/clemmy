@@ -43,6 +43,13 @@ test('a reopened conversation keeps every control the new-chat surface has', () 
   }
 });
 
+test('reopened chats keep the opt-in computer view in their existing header', () => {
+  assert.match(thread, /<ComputerWorkspace conversationId=/);
+  assert.match(thread, /const computer = useComputerControl\(\)/);
+  assert.match(thread, /aria-expanded=\{computer.open\} onClick=\{computer.toggle\}/);
+  assert.match(thread, /<Header session=\{session\} \/>\s*<ComputerView \/>/);
+});
+
 test('the read-only transcript renders no decision handlers at all', () => {
   assert.ok(!/onApprove=\{\(\) => \{\}\}/.test(thread),
     'A no-op onApprove is back: the replay thread draws buttons that do nothing.');

@@ -48,3 +48,11 @@ test('opaque artifact IDs disambiguate equal filenames without trusting paths', 
   assert.equal(sameSessionFile(ref, { ...ref, fileId: 'file-two' }), false);
   assert.match(DOCK, /sandbox=""/);
 });
+
+test('native file opening keeps the server authorization and exact file identity', () => {
+  assert.match(DOCK, /file\?\.openable \? <button[^>]*onClick=\{\(\) => void openInApp\(\)\}/);
+  assert.match(DOCK, /await openSessionFile\(fileRef\)/);
+  assert.match(DOCK, /onComputer \? 'Open on computer' : 'Open in app'/);
+  assert.match(DOCK, /Download/);
+  assert.match(DOCK, /onDiscuss\(file, fileRef, conversationSessionId\)/);
+});

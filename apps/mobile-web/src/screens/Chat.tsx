@@ -128,6 +128,7 @@ import { ChatBackButton } from '../components/ChatBackButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { Sheet } from '../components/Sheet';
 import { PlanReview } from '../components/PlanReview';
+import { destinationSearch } from '../lib/deep-link';
 import { RunControl, delegatedRunControlForExpandedWork } from '../components/RunControl';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
 import { CompletedFiles } from '../components/CompletedFiles';
@@ -199,7 +200,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   // instead of leaving two modal focus traps mounted over the conversation.
   const [conversationPanel, setConversationPanel] = useState<'options' | 'agent' | 'project' | 'model' | null>(null);
   const optionsTrigger = useRef<HTMLButtonElement | null>(null);
-  const [browserOpenRequest, setBrowserOpenRequest] = useState(0);
+  const [filesOpenRequest, setFilesOpenRequest] = useState(0);
   const closeConversationPanel = () => {
     setConversationPanel(null);
     window.requestAnimationFrame(() => optionsTrigger.current?.focus());
@@ -853,7 +854,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       style={{ '--chat-dock-h': `${dockH}px` }}
     >
       <div class="chat-header chat-header-compact">
-        <ChatBackButton onClick={onBack} />
+        <ChatBackButton onClick={onBack} showChats={false} opensChats />
         <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
         <button ref={optionsTrigger} type="button" class="chat-options-trigger" aria-label="Conversation options" aria-haspopup="dialog" aria-expanded={conversationPanel !== null} onClick={() => { haptic('light'); setConversationPanel('options'); }}>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
@@ -875,9 +876,9 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           <p class="chat-options-note">Plan investigates first and asks before execution.{takesAgent ? ' Changing the agent or project applies to your next message.' : ''}</p>
           {snapshot?.sessionId || initialSessionId ? <button type="button" class="chat-option" onClick={() => {
             setConversationPanel(null);
-            // Let the options sheet release focus before opening the browser.
-            window.requestAnimationFrame(() => setBrowserOpenRequest(value => value + 1));
-          }}><span>Browser</span><strong>Open browser tools</strong></button> : <p class="chat-options-note">Browser tools are available after your first message.</p>}
+            // Let the options sheet release focus before opening saved files.
+            window.requestAnimationFrame(() => setFilesOpenRequest(value => value + 1));
+          }}><span>Conversation files</span><strong>Documents and saved results</strong></button> : null}
         </div>
       </Sheet>
         <Sheet open={projectPickOpen} onClose={closeConversationPanel} title="Project" class="sheet-compact" aside={<button type="button" class="btn-quiet" onClick={closeConversationPanel}>Done</button>}>
@@ -941,8 +942,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
           beforeChange={() => applyAgentChoice(snapshot?.sessionId ?? initialSessionId ?? undefined)}
         />
       {snapshot?.sessionId || initialSessionId ? <div class="chat-tools" aria-label="Conversation tools">
-        <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} onDiscuss={discussFile} />
-        <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} openRequest={browserOpenRequest} onReturn={() => optionsTrigger.current?.focus()} />
+        <CompletedFiles conversationId={snapshot?.sessionId ?? initialSessionId} openRequest={filesOpenRequest} onReturn={() => optionsTrigger.current?.focus()} onDiscuss={discussFile} />
+        <CloudBrowserDock conversationId={snapshot?.sessionId ?? initialSessionId} onReturn={() => optionsTrigger.current?.focus()} />
       </div> : null}
       <div
         class="chat-transcript"
@@ -1493,9 +1494,13 @@ function MessageRow({
           <button
             class="approve"
             disabled={planActing !== null}
-            onClick={() => onPlanAction(message.planProposalId!, 'approve')}
+            onClick={() => {
+              const search = destinationSearch({ tab: 'inbox', decisionKey: `plan:${message.planProposalId!}` });
+              window.history.pushState(null, '', `${window.location.pathname}${search}`);
+              window.dispatchEvent(new PopStateEvent('popstate'));
+            }}
           >
-            {planActing === message.planProposalId ? '…' : 'Approve & Proceed'}
+            Review full plan
           </button>
           <button
             class="reject"

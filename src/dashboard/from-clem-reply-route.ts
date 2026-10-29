@@ -6,6 +6,8 @@
  * queued task is started differ, so those are the caller's.
  */
 import { randomBytes } from 'node:crypto';
+import { presentInboxQuestion } from './question-presentation.js';
+import { presentAttentionItem } from './needs-you.js';
 
 export interface FromClemReplyRouteOptions {
   surface: 'desktop' | 'mobile';
@@ -55,6 +57,8 @@ export async function handleFromClemReply(
       });
       return answered.status === 'answered' || answered.status === 'resuming';
     },
+    presentQuestion: (questionId, action, generation) => presentInboxQuestion(questionId, action, Date.now(), generation).ok,
+    presentAttention: (key, action, generation) => presentAttentionItem(key, action, generation).ok,
     markRead: (notificationId) => { markNotificationRead(notificationId); },
     addRule: (heartbeat, rule) => {
       if ((HEARTBEAT_IDS as readonly string[]).includes(heartbeat)) addRule(heartbeat as (typeof HEARTBEAT_IDS)[number], rule, 'owner');

@@ -221,7 +221,7 @@ export function Automate() {
     <Page
       title="Automations"
       subtitle="Work Clem does for you, on a schedule or with one tap"
-      actions={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>}
+      actions={<Button data-clem-guide="create-automation" onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> New automation</Button>}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
         {tabs.map((t) => {

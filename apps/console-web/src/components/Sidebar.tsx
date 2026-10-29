@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, Ellipsis, MessageSquare, Plus, Search } from 'lucide-react';
-import { resolveSidebarNav, type NavDest } from '@/lib/nav';
+import { experienceSection, resolveSidebarNav, type NavDest } from '@/lib/nav';
 import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
 import { usePoll } from '@/lib/poll';
 import { getSettings } from '@/lib/settings';
@@ -49,6 +49,10 @@ function NavRow({
   badgeLabel?: string;
 }) {
   const Icon = dest.icon;
+  const { pathname } = useLocation();
+  const section = experienceSection(pathname);
+  const parentActive = dest.path === '/projects' && section === 'work'
+    || dest.path === '/automate' && section === 'automations';
   const showBadge = typeof badge === 'number' && badge > 0;
   const badgeClass = badgeTone === 'primary' ? 'bg-primary text-primary-fg' : 'bg-subtle text-muted';
   return (
@@ -57,7 +61,9 @@ function NavRow({
       end={dest.path === '/chat'}
       title={collapsed ? `${dest.label} — ${dest.hint}` : dest.hint}
       aria-label={showBadge && badgeLabel ? `${dest.label}, ${badgeLabel}` : undefined}
-      className={({ isActive }) =>
+      className={({ isActive: routeActive }) => {
+        const isActive = routeActive || parentActive;
+        return (
         cn(
           // Navigation recedes so the page leads: a quiet fill and full-strength
           // text mark where you are, inactive rows stay muted, icons are small.
@@ -66,10 +72,12 @@ function NavRow({
           isActive
             ? 'bg-subtle text-fg'
             : 'text-muted hover:bg-hover hover:text-fg',
-        )
-      }
+        ));
+      }}
     >
-      {({ isActive }) => (
+      {({ isActive: routeActive }) => {
+        const isActive = routeActive || parentActive;
+        return (
         <>
           <Icon className={cn('h-4 w-4 shrink-0', isActive ? 'text-primary' : 'text-faint group-hover:text-muted')} strokeWidth={1.75} aria-hidden />
           {!collapsed && <span className="truncate">{dest.label}</span>}
@@ -93,7 +101,7 @@ function NavRow({
             </span>
           )}
         </>
-      )}
+      );}}
     </NavLink>
   );
 }
@@ -105,10 +113,10 @@ export function Sidebar({
   onExpand,
 }: {
   collapsed: boolean;
-  /** The ONE needs-you count, from AppShell's presentWorkingNow view. The
+  /** The canonical Needs-you summary count from AppShell. The
    *  sidebar renders it verbatim and never derives its own. */
   needsYouCount: number;
-  /** Same source; shown muted on Running as a plain count, not a summons. */
+  /** Actual running work; shown muted on an explicitly pinned Activity door. */
   runningCount?: number;
   onExpand?: () => void;
 }) {
@@ -170,13 +178,13 @@ export function Sidebar({
     <nav
       aria-label="Primary"
       className={cn(
-        'flex h-full shrink-0 flex-col border-r border-border bg-surface transition-[width] duration-base motion-reduce:transition-none',
-        collapsed ? 'w-[72px]' : 'w-[248px]',
+        'clem-sidebar flex h-full shrink-0 flex-col border-r border-border bg-surface transition-[width] duration-base motion-reduce:transition-none',
+        collapsed ? 'w-[72px]' : 'w-[232px]',
       )}
     >
       <div className={cn('sidebar-brand app-drag flex items-center gap-2.5 px-4 py-4', collapsed && 'justify-center px-0')}>
         <DogMark size={collapsed ? 28 : 32} />
-        {!collapsed && <span className="text-h3 font-bold text-fg">Clementine</span>}
+        {!collapsed && <span className="text-h3 font-bold tracking-[-0.02em] text-fg">Clementine</span>}
       </div>
 
       <div className={cn('flex shrink-0 flex-col gap-1 px-3 pb-3', collapsed && 'items-center px-0')}>
@@ -184,7 +192,7 @@ export function Sidebar({
           <Plus className="h-4 w-4 shrink-0" aria-hidden />{!collapsed && 'New chat'}
         </button>
         <button type="button" onClick={() => window.dispatchEvent(new Event('clem:command-palette'))} title="Search work and chats" aria-label="Search work and chats" className={cn('flex h-10 items-center gap-2.5 rounded-md px-3 text-body text-muted transition-colors hover:bg-hover hover:text-fg', collapsed ? 'w-11 justify-center px-0' : 'w-full')}>
-          <Search className="h-4 w-4 shrink-0" aria-hidden />{!collapsed && 'Search work and chats'}
+          <Search className="h-4 w-4 shrink-0" aria-hidden />{!collapsed && <span className="truncate">Search anything</span>}
         </button>
         {collapsed && <button type="button" onClick={showChats} title="Chat history" aria-label="Chat history" className="grid h-10 w-11 place-items-center rounded-md text-muted hover:bg-hover hover:text-fg"><MessageSquare className="h-4 w-4" aria-hidden /></button>}
       </div>

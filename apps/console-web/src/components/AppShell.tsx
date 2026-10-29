@@ -5,26 +5,32 @@ import { Sidebar } from './Sidebar';
 import { sidebarCollapsedFor, writeSidebarCollapsed } from '@/lib/sidebar-collapsed';
 import { TopBar } from './TopBar';
 import { CommandPalette } from './CommandPalette';
-import { CustomizePanel } from './home/CustomizePanel';
+import { CustomizeLauncher } from './home/CustomizeLauncher';
 import { UpdaterBanner } from './UpdaterBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { LocalRecordingBanner } from './LocalRecordingBanner';
 import { ALL_NAV, DEVELOPER_NAV } from '@/lib/nav';
 import { ShellTitleContext } from '@/lib/shell-title';
 import { usePoll } from '@/lib/poll';
-import { apiGet } from '@/lib/api';
-import type { CommandCenter } from '@/lib/types';
 import { listWorkingNowSnapshot } from '@/lib/activity';
 import { presentWorkingNow } from '@/lib/activity-presentation';
 import { pollIntervalForStream, useConsoleActionStream } from '@/lib/action-stream';
 import { DEFAULT_HOME_PREFERENCES, useHomePreferences } from '@/lib/home-prefs';
 import { useHomeToday } from '@/lib/home-data';
+import { getNeedsYouSummary } from '@/lib/inbox';
+import { experienceSection } from '@/lib/nav';
+import { SectionNavigation } from './SectionNavigation';
+import { AppGuidance } from './AppGuidance';
+import { QuestionPresentationUndo } from './inbox/QuestionPresentationUndo';
 
 const NARROW_QUERY = '(max-width: 720px)';
 
 function titleForPath(pathname: string): string {
   // Today lives at /chat; a conversation under it is a conversation, not Today.
   if (pathname.startsWith('/chat/')) return 'Chat';
+  const section = experienceSection(pathname);
+  if (section === 'work') return 'Work';
+  if (section === 'automations') return 'Automations';
   // Longest matching prefix wins (so /advanced/usage beats /advanced).
   const match = [...ALL_NAV, DEVELOPER_NAV]
     .sort((a, b) => b.path.length - a.path.length)
@@ -60,17 +66,10 @@ export function AppShell() {
   // entries. The conversation the user is currently watching is omitted in
   // the presenter call: its bubble already narrates itself.
   const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, pollIntervalForStream(stream, 12_000));
-  // ONE needs-you number for every badge: the command center's decision-shaped
-  // list (the same query Home and Chat render), never the presenter's broader
-  // 'needs attention' bucket — two denominators on one screen was the clutter.
-  const commandCenter = usePoll(
-    ['command-center'],
-    () => apiGet<CommandCenter>('/api/console/home/command-center'),
-    pollIntervalForStream(stream, 6_000),
-  );
-  // `waiting` counts a decision set aside with "Not now" too: it left Home,
-  // not Needs you.
-  const needsYouCount = commandCenter.data?.counts?.waiting ?? commandCenter.data?.needsYou?.length ?? 0;
+  // One canonical attention projection feeds every badge and Today. A live
+  // work entry and a From Clem message may describe the same decision.
+  const attention = usePoll(['needs-you-summary'], getNeedsYouSummary, pollIntervalForStream(stream, 8_000));
+  const needsYouCount = attention.data?.total ?? 0;
   const currentChatMatch = /^\/chat\/([^/]+)/.exec(location.pathname);
   const currentChatSession = currentChatMatch ? decodeURIComponent(currentChatMatch[1]) : null;
   const workingView = presentWorkingNow(
@@ -130,15 +129,19 @@ export function AppShell() {
           onToggleSidebar={toggleSidebar}
           runningCount={workingView.running}
           needsYouCount={needsYouCount}
-          // The pill opens the work itself: Home's Working now cards, not
-          // the board (owner 2026-10-21: "I should be able to click this").
-          onOpenTasks={() => navigate('/?focus=running')}
+          // Go straight to all active work; saved landing preferences must
+          // never redirect this explicit navigation to a different place.
+          onOpenTasks={() => navigate('/tasks')}
+          onOpenInbox={() => navigate('/inbox')}
           liveEntries={workingView.entries}
           liveMode={liveMode}
           nextCheckAt={today.data?.nextCheckAt ?? null}
-          liveUnavailable={workingNow.isError || !workingNow.data}
+          liveUnavailable={workingNow.isError || !workingNow.data || !attention.data}
         />
+        <SectionNavigation />
+        <AppGuidance />
         <LocalRecordingBanner />
+        <QuestionPresentationUndo />
         {needsLogin && (
           <div
             role="alert"
@@ -172,7 +175,7 @@ export function AppShell() {
       </div>
 
       <CommandPalette />
-      <CustomizePanel />
+      <CustomizeLauncher />
       <UpdaterBanner />
     </div>
   );

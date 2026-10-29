@@ -10,7 +10,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeft, Plus, Loader2, PanelRightClose, PanelRightOpen, Pencil, Trash2,
-  Check, X, Hourglass, ChevronRight, type LucideIcon,
+  Check, X, Hourglass, ChevronRight, Files, Monitor, Globe, MessagesSquare, type LucideIcon,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
@@ -21,7 +21,11 @@ import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
 import { ConversationTasks } from '@/components/chat/ConversationTasks';
-import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS } from '@clem/chat-engine';
+import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/CloudBrowserDock';
+import { ComputerWorkspace, ComputerView, useComputerControl } from '@/components/chat/ComputerDock';
+import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
+import { agentWorkspaceLayout } from '@/lib/agent-workspace-layout';
+import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS, sameTerminalContinuation } from '@clem/chat-engine';
 import { useConversationAgent } from '@/lib/conversation-agent';
 import { useConversationProject } from '@/lib/conversation-project';
 import { reportOwner, useConversationTasks } from '@/lib/conversation-tasks';
@@ -46,7 +50,7 @@ import { useSession } from '@/features/conversations/hooks/useSession';
 import { sessionKeys } from '@/features/conversations/hooks/keys';
 import { groupSessions } from '@/features/conversations/lib/groupSessions';
 import { rawId } from '@/features/conversations/lib/ids';
-import { historyToMessages } from '@/features/conversations/chat/conversation-history';
+import { historyHandlingSources, historyToMessages } from '@/features/conversations/chat/conversation-history';
 import { CHAT_COMPOSER_WRAP, CHAT_THREAD } from '@/features/conversations/lib/chatColumn';
 import type { Session, Turn } from '@/features/conversations/types';
 
@@ -83,7 +87,6 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
   const navigate = useNavigate();
   const agentQ = usePoll(['agents', 'one', id], () => getAgent(id), 15_000, { enabled: !!id });
   const catalogQ = usePoll(['agents', 'catalog'], getAgentCatalog, 30_000);
-  const [panelOpen, setPanelOpen] = useState(true);
   const [editing, setEditing] = useState(false);
 
   const agent = agentQ.data;
@@ -112,34 +115,17 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
   }
 
   return (
-    <div className="flex h-full min-h-0">
-      <ThreadRail agent={agent} activeSessionId={sessionId} />
-
-      <section className="flex min-w-0 flex-1 flex-col" aria-label={`Conversation with ${agent.name}`}>
-        <div className="flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
-          <h2 className="min-w-0 flex-1 truncate text-h3 text-fg">{agent.name}</h2>
-          {!panelOpen && (
-            <Button variant="ghost" size="icon" aria-label="Show the agent's details" onClick={() => setPanelOpen(true)}>
-              <PanelRightOpen className="h-4 w-4" aria-hidden />
-            </Button>
-          )}
-        </div>
-        <AgentThread key={sessionId ?? 'new'} agent={agent} sessionId={sessionId} />
-      </section>
-
-      {panelOpen && (
-        <AgentPanel
-          agent={agent}
-          catalog={catalogQ.data}
-          onCollapse={() => setPanelOpen(false)}
-          onEdit={() => setEditing(true)}
-          onDeleted={() => {
-            void qc.invalidateQueries({ queryKey: ['agents'] });
-            navigate('/agents', { replace: true });
-          }}
-        />
-      )}
-
+    <>
+      <CloudBrowserWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
+        <ComputerWorkspace conversationId={sessionId ? rawId(sessionId) : undefined}>
+          <FileDockWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
+            <AgentWorkspacePanes agent={agent} sessionId={sessionId} catalog={catalogQ.data}
+              onEdit={() => setEditing(true)} onDeleted={() => {
+                void qc.invalidateQueries({ queryKey: ['agents'] }); navigate('/agents', { replace: true });
+              }} />
+          </FileDockWorkspace>
+        </ComputerWorkspace>
+      </CloudBrowserWorkspace>
       {editing && (
         <AgentForm
           mode="edit"
@@ -152,25 +138,84 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
           }}
         />
       )}
-    </div>
+    </>
   );
+}
+
+function AgentWorkspacePanes({ agent, sessionId, catalog, onEdit, onDeleted }: {
+  agent: AgentRecord; sessionId?: string; catalog?: AgentCatalog; onEdit: () => void; onDeleted: () => void;
+}) {
+  const container = useRef<HTMLDivElement>(null);
+  const auxiliary = useRef<HTMLDivElement>(null);
+  const opener = useRef<HTMLElement | null>(null);
+  const [width, setWidth] = useState(0);
+  const [threadsOpen, setThreadsOpen] = useState(true);
+  const [aboutOpen, setAboutOpen] = useState(true);
+  const [activePane, setActivePane] = useState<'threads' | 'about' | null>(null);
+  const layout = agentWorkspaceLayout(width, threadsOpen, aboutOpen);
+  const files = useFileDock()?.filesControl;
+  const computer = useComputerControl();
+  const browser = useBrowserControl();
+  useEffect(() => {
+    const element = container.current;
+    if (!element) return;
+    const observer = new ResizeObserver(entries => setWidth(entries[0]?.contentRect.width ?? 0));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => { if (activePane) auxiliary.current?.focus({ preventScroll: true }); }, [activePane]);
+  useEffect(() => { setActivePane(null); }, [sessionId]);
+  const closePane = () => {
+    setActivePane(null);
+    requestAnimationFrame(() => opener.current?.focus({ preventScroll: true }));
+  };
+  const toggle = (pane: 'threads' | 'about') => {
+    opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (activePane) { if (activePane === pane) closePane(); else setActivePane(pane); return; }
+    if (pane === 'threads' && (layout.inlineThreads || agentWorkspaceLayout(width, true, aboutOpen).inlineThreads)) setThreadsOpen(!threadsOpen);
+    else if (pane === 'about' && (layout.inlineAbout || agentWorkspaceLayout(width, threadsOpen, true).inlineAbout)) setAboutOpen(!aboutOpen);
+    else setActivePane(pane);
+  };
+  return <div ref={container} className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+    <header className="flex flex-wrap items-center gap-1 border-b border-border bg-surface px-3 py-2.5">
+      {activePane ? <Button size="sm" variant="ghost" onClick={closePane}><ArrowLeft className="h-4 w-4" aria-hidden /> Conversation</Button>
+        : <h2 className="min-w-0 flex-1 truncate px-1 text-h3 text-fg">{agent.name}</h2>}
+      <div className="ml-auto flex flex-wrap items-center gap-1">
+        <Button size="sm" variant="ghost" onClick={() => toggle('threads')} aria-controls="agent-threads" aria-expanded={activePane === 'threads' || (!activePane && layout.inlineThreads)}><MessagesSquare className="h-4 w-4" aria-hidden /> Threads</Button>
+        <Button size="sm" variant="ghost" onClick={() => toggle('about')} aria-controls="agent-about" aria-expanded={activePane === 'about' || (!activePane && layout.inlineAbout)}><PanelRightOpen className="h-4 w-4" aria-hidden /> About</Button>
+        {files ? <Button size="sm" variant="ghost" onClick={files.toggle} aria-expanded={files.open} aria-label={files.open ? 'Close files from this chat' : 'Open files from this chat'}><Files className="h-4 w-4" aria-hidden /> Files{files.count > 0 ? <span className="text-faint">{files.count}</span> : null}</Button> : null}
+        {computer ? <Button size="sm" variant="ghost" onClick={computer.toggle} aria-expanded={computer.open} aria-label={computer.open ? 'Close computer view' : 'Watch your connected computer'}><Monitor className="h-4 w-4" aria-hidden /> Computer</Button> : null}
+        {browser ? <Button size="sm" variant="ghost" onClick={browser.toggle} aria-expanded={browser.open}><Globe className="h-4 w-4" aria-hidden /> {browser.label}{browser.status ? <span className="text-faint">· {browser.status}</span> : null}</Button> : null}
+      </div>
+    </header>
+    <ComputerView />
+    {activePane ? <div ref={auxiliary} tabIndex={-1} className="flex min-h-0 flex-1 outline-none" aria-label={activePane === 'threads' ? `${agent.name} threads` : `About ${agent.name}`} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); closePane(); } }}>
+      {activePane === 'threads' ? <ThreadRail agent={agent} activeSessionId={sessionId} fullWidth onChoose={closePane} /> : <AgentPanel agent={agent} catalog={catalog} fullWidth onCollapse={closePane} onEdit={onEdit} onDeleted={onDeleted} />}
+    </div> : null}
+    {/* Secondary views never unmount the thread, its stream, or its draft. */}
+    <div className={activePane ? 'hidden' : 'flex min-h-0 min-w-0 flex-1'}>
+      {!activePane && layout.inlineThreads ? <ThreadRail agent={agent} activeSessionId={sessionId} /> : null}
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label={`Conversation with ${agent.name}`}><AgentThread key={sessionId ?? 'new'} agent={agent} sessionId={sessionId} /></section>
+      {!activePane && layout.inlineAbout ? <AgentPanel agent={agent} catalog={catalog} onCollapse={() => setAboutOpen(false)} onEdit={onEdit} onDeleted={onDeleted} /> : null}
+    </div>
+  </div>;
 }
 
 // ─── Left rail: this agent's threads ───
 
-function ThreadRail({ agent, activeSessionId }: { agent: AgentRecord; activeSessionId?: string }) {
+function ThreadRail({ agent, activeSessionId, fullWidth = false, onChoose }: { agent: AgentRecord; activeSessionId?: string; fullWidth?: boolean; onChoose?: () => void }) {
   const navigate = useNavigate();
   const threads = useSessions({ agent: agent.id, limit: THREAD_PAGE_SIZE }, 'chats');
   const sessions = threads.data?.sessions ?? [];
   const groups = useMemo(() => groupSessions(sessions, Date.now()), [sessions]);
 
   return (
-    <aside aria-label={`${agent.name} threads`} className="flex w-[260px] shrink-0 flex-col border-r border-border bg-surface">
+    <aside id="agent-threads" aria-label={`${agent.name} threads`} className={cn('flex min-h-0 shrink-0 flex-col border-r border-border bg-surface', fullWidth ? 'w-full' : 'w-[260px]')}>
       <div className="space-y-2 border-b border-border p-3">
         <Link to="/agents" className="inline-flex items-center gap-1 text-caption font-semibold text-muted hover:text-fg">
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden /> Agents
         </Link>
-        <Button className="w-full" onClick={() => navigate(agentPath(agent.id), { state: { newThread: Date.now() } })}>
+        <Button className="w-full" onClick={() => { onChoose?.(); navigate(agentPath(agent.id), { state: { newThread: Date.now() } }); }}>
           <Plus className="h-4 w-4" /> New thread
         </Button>
       </div>
@@ -192,6 +237,7 @@ function ThreadRail({ agent, activeSessionId }: { agent: AgentRecord; activeSess
                   <li key={s.id}>
                     <NavLink
                       to={threadPath(agent.id, s.id)}
+                      onClick={onChoose}
                       className={cn(
                         'block rounded-md px-2.5 py-2 transition-colors',
                         s.id === activeSessionId ? 'bg-primary-tint' : 'hover:bg-hover',
@@ -244,8 +290,10 @@ function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessionId: s
 
 /** A reopened thread: hydrated from history, reattached if a turn is running. */
 function BoundThread({ agent, session, history }: { agent: AgentRecord; session: Session; history: Turn[] }) {
+  const retainedHistorySources = useMemo(() => historyHandlingSources(history), [history]);
   const chat = useChat({
-    initialSessionId: rawId(session.id),
+    initialSessionId: session.executionSessionId ?? rawId(session.id),
+    conversationSessionId: rawId(session.id),
     initialMessages: historyToMessages(history),
     reattachActiveRun: true,
   });
@@ -254,6 +302,7 @@ function BoundThread({ agent, session, history }: { agent: AgentRecord; session:
       agent={agent}
       chat={chat}
       sessionId={session.id}
+      retainedHistorySources={retainedHistorySources}
       project={session.projectId && session.projectName ? { id: session.projectId, name: session.projectName } : null}
     />
   );
@@ -268,12 +317,13 @@ function FreshThread({ agent }: { agent: AgentRecord }) {
 
 type ChatHandle = ReturnType<typeof useChat>;
 
-function ThreadBody({ agent, chat, sessionId, project = null }: {
+function ThreadBody({ agent, chat, sessionId, project = null, retainedHistorySources }: {
   agent: AgentRecord;
   chat: ChatHandle;
   sessionId?: string;
   /** The project the thread works in when it was opened. */
   project?: { id: string; name: string } | null;
+  retainedHistorySources?: ReturnType<typeof historyHandlingSources>;
 }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
@@ -317,13 +367,28 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
     }
   }, [location.state, fresh, resetChat]);
 
-  const send = async (input: ComposerSendInput) => {
+  const continuationState = useRef({ busy: chat.busy, latest: chat.messages.at(-1), pending: chat.pendingPost });
+  continuationState.current = { busy: chat.busy, latest: chat.messages.at(-1), pending: chat.pendingPost };
+  const renderedSessionId = chat.sessionId.current;
+  const continuePaused = (message: ChatMessage) => {
+    const assertCurrent = () => {
+      const current = continuationState.current;
+      if (!renderedSessionId || chat.sessionId.current !== renderedSessionId || current.busy || current.pending
+        || !sameTerminalContinuation(message, current.latest)) {
+        throw new Error('This pause has changed. Check the latest reply before continuing.');
+      }
+    };
+    return send({ text: 'continue', attachmentIds: [], attachmentNames: [], taskMode: message.taskMode, onAccepted: () => {} }, assertCurrent);
+  };
+  const send = async (input: ComposerSendInput, assertCurrent: () => void = () => {}) => {
+    assertCurrent();
     const scope = captureSendScope();
     const [addressed, placed] = await Promise.all([
       agentChoice.prepare(chat.sessionId.current, chat.busy),
       projectChoice.prepare(chat.sessionId.current, chat.busy),
     ]);
     scope.assertCurrent();
+    assertCurrent();
     await chat.send({ ...input, ...addressed, ...placed });
     qc.invalidateQueries({ queryKey: sessionKeys.lists() });
     // The server minted the session on that first send; from here the thread
@@ -372,20 +437,23 @@ function ThreadBody({ agent, chat, sessionId, project = null }: {
               project={projectMarks[index]?.project ?? undefined}
               ownedTaskIds={delegated.ownedIds}
               sessionId={chat.sessionId.current ?? undefined}
+              retainedHistorySources={retainedHistorySources}
               executionBusy={chat.busy}
               onExecutePlan={chat.executePlan}
               onPreparePlan={chat.preparePlan}
               onRevisePlan={() => { chat.setComposerMode('plan'); composerRef.current?.focus(); }}
               onApprove={() => resolveDecision(m, 'approve')}
+              onApproveWithEdits={(fields) => chat.approveWithEdits(m, fields)}
               onReject={() => resolveDecision(m, 'reject')}
               onBackground={chat.background}
               onSendHeld={chat.sendHeld}
               onAnswer={index === chat.messages.length - 1 ? (text, connectionResume) => connectionResume ? chat.send({ text, connectionResume }) : send(chatAnswerInput(m, text)) : undefined}
+              onContinue={index === chat.messages.length - 1 && !chat.busy && !chat.pendingPost ? () => continuePaused(m) : undefined}
               traceHref={traceHref}
             />
             </Fragment>
           ))}
-          <ConversationTasks cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
+          <ConversationTasks conversationId={chat.sessionId.current ?? undefined} cards={delegated.cards} tasks={delegated.tasks} messages={chat.messages} onChanged={delegated.refresh} />
           <div ref={bottomRef} />
         </div>
       </div>
@@ -422,12 +490,14 @@ function AgentPanel({
   onCollapse,
   onEdit,
   onDeleted,
+  fullWidth = false,
 }: {
   agent: AgentRecord;
   catalog?: AgentCatalog;
   onCollapse: () => void;
   onEdit: () => void;
   onDeleted: () => void;
+  fullWidth?: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -450,7 +520,7 @@ function AgentPanel({
   };
 
   return (
-    <aside aria-label={`About ${agent.name}`} className="flex w-[320px] shrink-0 flex-col border-l border-border bg-subtle">
+    <aside id="agent-about" aria-label={`About ${agent.name}`} className={cn('flex min-h-0 shrink-0 flex-col border-l border-border bg-subtle', fullWidth ? 'w-full' : 'w-[320px]')}>
       <div className="flex items-center gap-1 border-b border-border px-3 py-2">
         <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">About</span>
         <Button variant="ghost" size="sm" onClick={onEdit}>

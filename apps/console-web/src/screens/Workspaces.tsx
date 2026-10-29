@@ -159,7 +159,7 @@ export function Workspaces() {
       title="Spaces"
       subtitle="Live, interactive surfaces Clementine builds for you — reports, trackers, planners"
       actions={
-        <Button onClick={() => setModalOpen(true)}>
+        <Button data-clem-guide="create-space" onClick={() => setModalOpen(true)}>
           <Plus className="h-4 w-4" aria-hidden /> New Space
         </Button>
       }

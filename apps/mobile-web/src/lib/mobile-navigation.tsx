@@ -4,15 +4,17 @@ import { useCallback, useContext, useLayoutEffect, useMemo, useRef } from 'preac
 interface MobileNavigation {
   openNavigation: (opener?: HTMLElement) => void;
   navigationOpen: boolean;
+  openChats: () => void;
   ownDetailHeader: () => () => void;
 }
 
 const NavigationContext = createContext<MobileNavigation | null>(null);
 
 /** One drawer belongs to the shell; inner screens supply only its trigger. */
-export function MobileNavigationProvider({ openNavigation, navigationOpen, onDetailHeaderChange, children }: {
+export function MobileNavigationProvider({ openNavigation, navigationOpen, openChats, onDetailHeaderChange, children }: {
   openNavigation: MobileNavigation['openNavigation'];
   navigationOpen: boolean;
+  openChats: MobileNavigation['openChats'];
   onDetailHeaderChange: (owned: boolean) => void;
   children: ComponentChildren;
 }) {
@@ -28,7 +30,7 @@ export function MobileNavigationProvider({ openNavigation, navigationOpen, onDet
       changed.current(owners.current.size > 0);
     };
   }, []);
-  const value = useMemo(() => ({ openNavigation, navigationOpen, ownDetailHeader }), [openNavigation, navigationOpen, ownDetailHeader]);
+  const value = useMemo(() => ({ openNavigation, navigationOpen, openChats, ownDetailHeader }), [openNavigation, navigationOpen, openChats, ownDetailHeader]);
   return <NavigationContext.Provider value={value}>{children}</NavigationContext.Provider>;
 }
 

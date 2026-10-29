@@ -89,7 +89,7 @@ export function todayDigest(input: {
     if (row.kind === 'workflow' || row.kind === 'execution' || row.kind === 'cron') finished += 1;
   }
   const parts = [
-    finished ? `${finished} finished` : '',
+    finished ? `${finished} ${finished === 1 ? 'update' : 'updates'}` : '',
     raised ? `${raised} ${raised === 1 ? 'thing' : 'things'} Clementine noticed` : '',
   ].filter(Boolean);
   return parts.length ? `Since you last looked: ${parts.join(' · ')}` : '';

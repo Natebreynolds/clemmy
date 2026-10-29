@@ -8,7 +8,7 @@ import { Pencil } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Textarea } from '@/components/ui/Field';
 import {
-  goalsFromText, goalsToText, refusalText, updateProject, type ProjectInput, type ProjectOverview,
+  goalsToText, projectIdentityChanges, refusalText, updateProject, type ProjectOverview,
 } from '@/lib/projects';
 import { ProjectSection } from './ProjectSection';
 
@@ -26,10 +26,12 @@ export function ProjectIdentity({ overview, onSaved }: {
   const [purpose, setPurpose] = useState(project.purpose);
   const [goals, setGoals] = useState(goalsToText(project.goals));
   const [context, setContext] = useState(project.context);
+  const [baseline, setBaseline] = useState(() => ({ ...project, goals: [...project.goals] }));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
   const open = () => {
+    setBaseline({ ...project, goals: [...project.goals] });
     setName(project.name);
     setPurpose(project.purpose);
     setGoals(goalsToText(project.goals));
@@ -42,13 +44,7 @@ export function ProjectIdentity({ overview, onSaved }: {
     if (!name.trim()) { setError('Give the project a name.'); return; }
     // Only what changed is sent, so an edit made elsewhere to another field
     // is not written over by what this form happened to be showing.
-    const goalList = goalsFromText(goals);
-    const patch: ProjectInput = {
-      ...(name.trim() !== project.name ? { name: name.trim() } : {}),
-      ...(purpose.trim() !== project.purpose ? { purpose: purpose.trim() } : {}),
-      ...(goalList.join('\n') !== project.goals.join('\n') ? { goals: goalList } : {}),
-      ...(context.trim() !== project.context ? { context: context.trim() } : {}),
-    };
+    const patch = projectIdentityChanges(baseline, { name, purpose, goals, context });
     if (Object.keys(patch).length === 0) { setEditing(false); return; }
     setSaving(true);
     setError('');

@@ -9,19 +9,23 @@ import { chatAnswerInput, type ChatMessage } from '../lib/useChat';
 import { historyToMessages } from '../features/conversations/chat/conversation-history';
 
 type Element = { type: unknown; props: Record<string, any> };
-function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'normal') {
+function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'normal', overrides: Record<string, any> = {}) {
   let release!: () => void;
   const prepared = new Promise<void>(resolve => { release = resolve; });
-  const calls = { sends: [] as any[], agent: 0, project: 0, scope: 0, execute: [] as any[] };
+  const calls = { sends: [] as any[], agent: 0, project: 0, scope: 0, execute: [] as any[], edits: [] as any[] };
   const chat = { messages, busy: false, composerMode, delegatedTaskTick: 0,
     sessionId: { current: 'controlled-agent-option' }, conversationSessionId: { current: 'controlled-agent-option' },
     send: async (input: any) => { calls.sends.push(JSON.parse(JSON.stringify(input))); },
     executePlan: (ref: any) => { calls.execute.push(ref); }, reset() {}, setComposerMode() {},
     preparePlan() {}, background() {}, sendHeld() {}, stop() {}, retryPending() {}, cancelPending() {},
+    approveWithEdits: async (message: any, fields: any) => { calls.edits.push({ message, fields }); },
+    ...overrides,
   };
+  const refs: Array<{ current: any }> = [];
+  let hook = 0;
   const element = (type: unknown, props: Record<string, any>, key?: string): Element => ({ type, props: { ...props, key } });
   const dependencies: Record<string, any> = {
-    react: { Fragment: 'fragment', useRef: (value: any) => ({ current: value }), useEffect() {} },
+    react: { Fragment: 'fragment', useRef: (value: any) => refs[hook++] ?? (refs[hook - 1] = { current: value }), useEffect() {} },
     'react/jsx-runtime': { jsx: element, jsxs: element },
     '@tanstack/react-query': { useQueryClient: () => ({ invalidateQueries() {} }) },
     'react-router-dom': { useNavigate: () => () => {}, useLocation: () => ({ key: 'controlled-agent-route' }) },
@@ -44,6 +48,8 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
     '@/features/conversations/hooks/useSessions': {}, '@/features/conversations/hooks/useSession': {},
     '@/features/conversations/lib/groupSessions': {}, '@/features/conversations/lib/ids': {},
     '@/features/conversations/chat/conversation-history': { historyToMessages },
+    '@/components/chat/CloudBrowserDock': {}, '@/components/chat/ComputerDock': {}, '@/components/chat/FileDock': {},
+    '@/lib/agent-workspace-layout': {},
   };
   for (const [path, name] of [
     ['ui/Button', 'Button'], ['ui/QueryUnavailable', 'QueryUnavailable'], ['ui/Skeleton', 'Skeleton'],
@@ -63,17 +69,21 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
   runInNewContext(`${code}\nexports.__threadBody = ThreadBody;`, { exports,
     require(name: string) { assert.ok(name in dependencies, `Unexpected production dependency: ${name}`); return dependencies[name]; },
   });
-  const tree = exports.__threadBody({ agent: { id: 'controlled-agent', name: 'Controlled agent' }, chat,
-    sessionId: 'desktop:controlled-agent-option' });
-  const nodes: Element[] = [];
-  const visit = (node: any) => {
-    if (Array.isArray(node)) node.forEach(visit);
-    else if (node && typeof node === 'object' && node.props) { nodes.push(node); visit(node.props.children); }
+  const render = () => {
+    hook = 0;
+    const tree = exports.__threadBody({ agent: { id: 'controlled-agent', name: 'Controlled agent' }, chat,
+      sessionId: 'desktop:controlled-agent-option' });
+    const nodes: Element[] = [];
+    const visit = (node: any) => {
+      if (Array.isArray(node)) node.forEach(visit);
+      else if (node && typeof node === 'object' && node.props) { nodes.push(node); visit(node.props.children); }
+    };
+    visit(tree);
+    return nodes.filter(node => node.type === 'ChatBubble');
   };
-  visit(tree);
-  const bubbles = nodes.filter(node => node.type === 'ChatBubble');
+  const bubbles = render();
   assert.equal(bubbles.length, messages.length);
-  return { calls, chat, bubbles, release };
+  return { calls, chat, bubbles, release, render };
 }
 const question = (taskMode?: ChatMessage['taskMode']): ChatMessage => ({ id: 'controlled-question',
   role: 'assistant', text: 'Choose Amber or Violet.', status: 'awaiting-reply', ...(taskMode ? { taskMode } : {}) });
@@ -110,5 +120,43 @@ test('AgentWorkspace connection continuation bypasses generic answer preparation
   const connectionResume = { connectionRequestId: 'controlled-connection', clientRequestId: 'controlled-request' };
   await view.bubbles[1].props.onAnswer('Continue', connectionResume);
   assert.deepEqual(view.calls.sends, [{ text: 'Continue', connectionResume }]);
+  assert.deepEqual([view.calls.agent, view.calls.project, view.calls.scope], [0, 0, 0]);
+});
+
+const pause = (): ChatMessage => ({ id: 'paused-exact', role: 'assistant', text: 'I can keep going.', status: 'awaiting-reply',
+  terminal: { version: 1, status: 'needs_input', kind: 'continue', needs: 'continue', resumable: true,
+    retained: { results: 1, outsideChange: 'none' } }, taskMode: { version: 1, kind: 'normal' } } as ChatMessage);
+
+test('agent Continue preserves its mode and chosen agent/project through preparation', async () => {
+  const view = mount([pause()], 'plan');
+  const sent = view.bubbles[0].props.onContinue();
+  assert.equal(view.calls.sends.length, 0);
+  view.release(); await sent;
+  assert.deepEqual(view.calls.sends, [{ text: 'continue', attachmentIds: [], attachmentNames: [],
+    taskMode: { version: 1, kind: 'normal' }, agentId: 'controlled-agent', projectId: 'controlled-project' }]);
+});
+
+test('agent Continue rejects replacement replies and changed sessions during async preparation', async () => {
+  for (const changed of ['reply', 'session']) {
+    const view = mount([pause()]);
+    const sent = view.bubbles[0].props.onContinue();
+    if (changed === 'reply') { view.chat.messages = [{ ...pause(), id: 'replacement' }]; view.render(); }
+    else view.chat.sessionId.current = 'another-session';
+    view.release();
+    await assert.rejects(sent, /pause has changed/);
+    assert.equal(view.calls.sends.length, 0);
+  }
+});
+
+test('agent Continue is absent on earlier, busy and pending replies; edited approval keeps exact card authority', async () => {
+  const view = mount([pause(), { ...pause(), id: 'newer' }]);
+  assert.equal(view.bubbles[0].props.onContinue, undefined);
+  for (const overrides of [{ busy: true }, { pendingPost: { requestId: 'pending-exact' } }]) {
+    assert.equal(mount([pause()], 'normal', overrides).bubbles[0].props.onContinue, undefined);
+  }
+  const fields = { subject: 'Edited subject' };
+  await view.bubbles[1].props.onApproveWithEdits(fields);
+  assert.equal(view.calls.edits[0].message, view.chat.messages[1]);
+  assert.equal(view.calls.edits[0].fields, fields);
   assert.deepEqual([view.calls.agent, view.calls.project, view.calls.scope], [0, 0, 0]);
 });

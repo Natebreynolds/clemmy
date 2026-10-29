@@ -70,6 +70,7 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
   });
   app.post('/api/console/computer-driver/permissions', async (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    if (process.platform !== 'darwin') { res.status(501).json({ error: 'Permission settings do not open from Clem on this computer.' }); return; }
     if (!computerDriverPath()) { res.status(409).json({ error: 'Your computer is not turned on for Clem yet.' }); return; }
     // The grants belong to the desktop app; the system's own pages are where
     // the owner gives them. Nothing is granted from here.
@@ -87,7 +88,7 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
   app.get('/api/console/computer-driver/screen', async (req: Request, res: Response) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     const status = await computerDriverStatus(discoverMcpServers());
-    if (!status.installed || !status.connected || !status.path) { res.status(409).json({ error: 'Your computer is not turned on for Clem.' }); return; }
+    if (!status.screenViewAvailable || !status.path) { res.status(409).json({ error: 'The computer view is not available. Check the computer connection in Apps & devices.' }); return; }
     const file = path.join(os.tmpdir(), `clem-screen-${process.pid}-${Date.now()}.png`);
     // The chat's view follows the window Clem last acted in, since the
     // driver works in windows behind the owner's; the whole display otherwise.

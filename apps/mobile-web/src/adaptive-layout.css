@@ -253,7 +253,7 @@
   :root[data-rail='right'] .tab-bar { left: auto; right: calc((env(safe-area-inset-right) - var(--rail-pill-w)) / 2); }
   :root[data-rail='left'] .tab-bar { right: auto; left: calc((env(safe-area-inset-left) - var(--rail-pill-w)) / 2); }
   :root[data-rail] .tab-bar-item { border-radius: 18px; }
-  :root[data-rail] .tab-bar-label { font-size: 10px; letter-spacing: 0; white-space: normal; text-align: center; line-height: 1.1; }
+  :root[data-rail] .tab-bar-label { font-size: 11px; letter-spacing: 0; white-space: normal; text-align: center; line-height: 1.1; }
 }
 
 /* A phone on its side has little height to spare: a slimmer bar with the
@@ -268,3 +268,24 @@
 
 /* No animated relayout while the keyboard, hinge, or window changes size. */
 .chat-dock, .ask-capsule { transition-property: border-color; }
+
+/* Five stable destinations; chat and More retain their own header doors. */
+@media (max-width: 879.98px) {
+  #app:has(> .tab-bar) {
+    --tab-bar-h: calc(64px + env(safe-area-inset-bottom));
+    --tab-bar-bottom: 0px;
+  }
+  .tab-bar {
+    left: 0; right: 0; bottom: 0; max-width: none;
+    padding: 4px max(6px, env(safe-area-inset-right)) max(4px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+    border: 0; border-top: 1px solid var(--line); border-radius: 0;
+    background: var(--bg-1); box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+  }
+  .tab-bar-item { min-height: 48px; border-radius: 10px; padding-inline: 0; }
+  .tab-bar-label { font-size: 11px; letter-spacing: 0; font-weight: 600; text-overflow: clip; }
+  .tab-bar-badge { box-shadow: 0 0 0 2px var(--bg-1); }
+}
+@media (max-height: 520px) and (orientation: landscape) {
+  #app:has(> .tab-bar) { --tab-bar-h: calc(52px + env(safe-area-inset-bottom)); }
+  .tab-bar-item { min-height: 44px; }
+}

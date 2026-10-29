@@ -14,7 +14,7 @@ import { DogMark } from '@/components/DogMark';
 import { Plus, SlidersHorizontal } from 'lucide-react';
 import { HomeBuilder } from '@/components/home/HomeBuilder';
 import { SpaceTile } from '@/components/home/SpaceTile';
-import { openCustomizeHome } from '@/components/home/CustomizePanel';
+import { openCustomizeHome } from '@/lib/customize-home';
 import { changeHomeLayout, HOME_LAYOUT_KEY, useHomeLayout, type HomeTile } from '@/lib/home-layout';
 import { useHomeBuilds } from '@/lib/home-builds';
 import { BuildCard } from '@/components/home/BuildCard';
@@ -60,11 +60,16 @@ import { FromClemPane } from '@/components/home/FromClemPane';
 import { HomeWatchLine } from '@/components/home/HomeWatchOverview';
 import { buildWatchOverview } from '@/components/home/watch-overview-model';
 import { buildHomeContentLayout } from '@/components/home/home-content-layout';
+import { isDefaultExploration, quietExplorationIntroductions } from '@/components/home/exploration-home';
 import { listWatches } from '@/lib/watches';
 import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
 import { DelegatedTaskCard } from '@/components/projects/DelegatedTaskCard';
+import { ExplorationNotice } from '@/components/onboarding/ExplorationNotice';
+import { explorationDraftStamp } from '@/lib/onboarding-entry';
 import { listOpenTasks } from '@/lib/projects';
+import { listDelivered } from '@/lib/delivered';
+import { getNeedsYouSummary } from '@/lib/inbox';
 import { awayCounts, presenceLine, silentImmediatePanes, staleSuffix, type HomeFeedItem } from '@/components/home/home-model';
 import '@/components/home/home-presence.css';
 
@@ -88,6 +93,7 @@ export function Home() {
 
 function LiveHome() {
   const navigate = useNavigate();
+  const location = useLocation();
   const qc = useQueryClient();
   const layout = useHomeLayout();
   const [building, setBuilding] = useState(false);
@@ -96,6 +102,7 @@ function LiveHome() {
   const savePrefs = useSaveHomePreferences();
 
   const cc = usePoll(['command-center'], () => apiGet<CommandCenter>('/api/console/home/command-center'), 6000);
+  const attention = usePoll(['needs-you-summary'], getNeedsYouSummary, 8_000);
   // Shared with the shell's badge; Home reads it for the live band only (the
   // board owns the detail).
   const workingNow = usePoll(['working-now-badge'], listWorkingNowSnapshot, 12_000);
@@ -114,6 +121,12 @@ function LiveHome() {
 
   const panes = visiblePanes(prefs);
   const shown = (id: HomePaneId) => panes.includes(id);
+  const defaultExploration = isDefaultExploration(location.pathname, location.state, prefsQuery.data,
+    !prefsQuery.isLoading && !prefsQuery.isError && !prefsQuery.isPlaceholderData && !savePrefs.isPending);
+  // Share Made's query so verified empty first-use content can yield without
+  // adding a second endpoint or fetching it for a returning hidden pane.
+  const explorationResults = usePoll(['delivered'], () => listDelivered(24), 30_000,
+    { enabled: defaultExploration && shown('made') });
   const today = useHomeToday(shown('today'));
   // What the heartbeats brought the owner leads Home, once; the other lists
   // leave those items out so nothing shows twice.
@@ -144,8 +157,8 @@ function LiveHome() {
   };
 
   const chat = useChat({ rememberAsLastSession: true });
-  const location = useLocation();
-  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, (location.state as { newChat?: number } | null)?.newChat);
+  const routeDraftKey = newComposerDraftKey(location.pathname, location.key, explorationDraftStamp(location.pathname, location.state)
+    ?? (location.state as { newChat?: number } | null)?.newChat);
   const captureSendScope = useConversationSendScope(routeDraftKey, chat.sessionId);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   // The composer stays in reach while the owner scrolls Today (owner
@@ -212,21 +225,18 @@ function LiveHome() {
   const daemonUnreachable = ccError && workingNow.isError && !workingNow.data;
   const retryCommandCenter = () => { void cc.refetch(); };
 
-  const immediateSettled = !cc.isLoading && !cc.isError
+  const immediateSettled = !cc.isLoading && !cc.isError && Boolean(attention.data)
     && !workingNow.isLoading && !(workingNow.isError && !workingNow.data);
   // The one needs-you number (the sidebar's, the phone's); a list may show
   // fewer rows than it counts, never a different number.
-  const needsYouTotal = typeof cc.data?.counts?.waiting === 'number'
-    ? Math.max(cc.data.counts.waiting, needsYou.length)
-    : needsYou.length;
+  const needsYouTotal = attention.data?.total ?? 0;
   // Today's lists lead with what Clem brought (owner 2026-10-18: one Needs
   // you, one While you were away). Their numbers: the inbox's, less what
   // Clem's rows already stand for, plus her own.
   const clemRows = fromClem.data?.rows ?? [];
-  const clemWaiting = clemRows.filter((row) => row.asks || row.setup).length;
+  const clemWaiting = clemRows.filter((row) => row.asks && !row.setup).length;
   const clemUpdates = clemRows.filter((row) => !row.asks && !row.setup).length;
-  const coveredNeeds = Math.max(0, (cc.data?.needsYou?.length ?? 0) - needsYou.length);
-  const todayNeedsTotal = Math.max(0, needsYouTotal - coveredNeeds) + clemWaiting;
+  const todayNeedsTotal = needsYouTotal;
   const silent = new Set(silentImmediatePanes({
     needsYou: needsYouTotal,
     running: workingView.running,
@@ -237,7 +247,8 @@ function LiveHome() {
   }));
   const showNeeds = !daemonUnreachable && shown('needs_you') && (!silent.has('needs_you') || clemWaiting > 0);
   const showRecent = !daemonUnreachable && shown('while_away') && (!silent.has('while_away') || clemUpdates > 0);
-  const openTaskRows = openTasks.data ?? [];
+  const allOpenTaskRows = openTasks.data ?? [];
+  const openTaskRows = allOpenTaskRows.filter(task => task.phase === 'working');
   const showRunning = !daemonUnreachable && shown('running') && openTaskRows.length > 0;
   // The header pill lands on the cards it summarises.
   const focusRunning = new URLSearchParams(location.search).get('focus') === 'running';
@@ -248,9 +259,22 @@ function LiveHome() {
   // Today appears once a calendar is connected (or while its read is loading);
   // Tune lists it either way.
   const showToday = !daemonUnreachable && shown('today') && (today.isLoading || today.isError || Boolean(today.data?.connected));
-  const lowerPanes = panes.filter((id) => id === 'made' || id === 'projects' || id === 'workstate');
   const liveBuilds = builds.builds;
   const onHome = (spaceId: string) => Boolean(layout.data?.tiles.some((t) => t.spaceId === spaceId));
+  const freshLayout = !layout.isLoading && !layout.isError && Boolean(layout.data);
+  const untouchedLayout = freshLayout && layout.data?.revision === 0 && layout.data?.updatedAt === null;
+  const quietIntroductions = quietExplorationIntroductions({
+    eligible: defaultExploration, nowMs: Date.now(),
+    made: { state: explorationResults.isError ? 'error' : explorationResults.isLoading ? 'loading' : 'loaded',
+      count: explorationResults.data?.length, updatedAt: explorationResults.dataUpdatedAt },
+    projects: { state: spaces.isError ? 'error' : spaces.isLoading ? 'loading' : untouchedLayout ? 'loaded' : 'unconfirmed',
+      count: spaces.data?.filter(s => !onHome(s.id)).length, updatedAt: Math.min(spaces.dataUpdatedAt, layout.dataUpdatedAt) },
+    spaces: { state: untouchedLayout ? 'loaded' : 'unconfirmed', count: tiles.length + liveBuilds.length, updatedAt: layout.dataUpdatedAt },
+    watching: { state: watchOverview.status === 'loaded' ? 'loaded' : 'unconfirmed',
+      count: watchOverview.currentCounts?.total, updatedAt: watches.dataUpdatedAt },
+  });
+  const lowerPanes = panes.filter((id) => id === 'made' && !quietIntroductions.made
+    || id === 'projects' && !quietIntroductions.projects || id === 'workstate');
   const addToHome = (spaceId: string) => {
     if (!layout.data) return;
     void changeHomeLayout({ operation: 'pin', space_id: spaceId, expected_revision: layout.data.revision })
@@ -259,14 +283,14 @@ function LiveHome() {
   };
 
   // Nothing placed, building, waiting or chosen — and we actually KNOW that.
-  const homeIsBare = immediateSettled && !daemonUnreachable && !layout.isLoading && Boolean(layout.data)
+  const homeIsBare = !quietIntroductions.spaces && immediateSettled && !daemonUnreachable && !layout.isLoading && Boolean(layout.data)
     && tiles.length === 0 && liveBuilds.length === 0 && !showNeeds && !showRecent && !showToday && !showRunning && lowerPanes.length === 0
     && !(shown('quick_actions') && prefs.quickActions.length > 0);
 
   const greeting = timeGreeting(new Date().getHours(), greetingName(userContext.data?.profile));
   const servingCached = (cc.isError && Boolean(cc.data)) || (workingNow.isError && Boolean(workingNow.data));
   const oldestReading = Math.min(cc.dataUpdatedAt || Number.POSITIVE_INFINITY, workingNow.dataUpdatedAt || Number.POSITIVE_INFINITY);
-  const presence = ccError || (workingNow.isError && !workingNow.data)
+  const presence = ccError || (workingNow.isError && !workingNow.data) || attention.isError && !attention.data
     ? 'Live work status is unavailable.'
     : !immediateSettled && !servingCached
     ? null
@@ -305,7 +329,7 @@ function LiveHome() {
     <NeedsYouPane
       headingId="home-needs-you"
       items={needsYou}
-      total={Math.max(0, needsYouTotal - coveredNeeds)}
+      total={needsYouTotal}
       loading={ccLoading}
       error={ccError}
       onRetry={retryCommandCenter}
@@ -313,7 +337,7 @@ function LiveHome() {
       maxRows={maxRows}
       lead={<FromClemPane section="waiting" headingId="home-from-clem-waiting" data={fromClem.data} loading={fromClem.isLoading}
         error={fromClem.isError} onRetry={() => { void fromClem.refetch(); }} />}
-      leadCount={clemWaiting}
+      leadCount={clemWaiting > 0 ? 1 : 0}
     />
   );
   const todayPane = (
@@ -321,13 +345,15 @@ function LiveHome() {
   );
   const runningPane = (
     <section aria-labelledby="home-running" className="flex min-w-0 flex-col gap-2.5">
-      <SectionHeader id="home-running" label="Working now" count={openTaskRows.length} countTone="muted" />
+      <SectionHeader id="home-running" label="Working now" count={openTaskRows.length} countTone="muted"
+        aside={<Link to="/tasks" className="font-semibold text-primary hover:underline">All work</Link>} />
       <div className="flex flex-col gap-2">
-        {openTaskRows.map((task) => (
+        {openTaskRows.slice(0, 3).map((task) => (
           <DelegatedTaskCard key={task.taskId} task={task} beside={openTaskRows} compact
             onChanged={() => { void openTasks.refetch(); }} />
         ))}
       </div>
+      {openTaskRows.length > 3 && <Link to="/tasks" className="self-start text-small font-semibold text-primary hover:underline">See {openTaskRows.length - 3} more active jobs</Link>}
     </section>
   );
   const recentPane = (variant: 'list' | 'timeline') => (
@@ -377,7 +403,7 @@ function LiveHome() {
     ? 'col-span-12'
     : t.width === 'small' ? 'col-span-12 md:col-span-6 xl:col-span-4' : 'col-span-12 md:col-span-6';
 
-  const spacesPane = <section aria-labelledby="home-spaces" className="flex min-w-0 flex-col gap-3">
+  const spacesPane = quietIntroductions.spaces ? null : <section aria-labelledby="home-spaces" className="flex min-w-0 flex-col gap-3">
     {spacesHeader}
     {buildCards}
     {layout.isLoading ? <Skeleton className="h-40 w-full" />
@@ -402,7 +428,8 @@ function LiveHome() {
 
   return (
     // A reading width: Clem's sentences ran 150 characters a line at 1240px.
-    <div className="clem-home mx-auto flex w-full max-w-[960px] flex-col gap-8 px-5 py-6 sm:px-10 sm:py-8">
+    <div className="clem-home mx-auto flex w-full max-w-[960px] flex-col gap-7 px-5 py-6 sm:px-9 sm:py-8">
+      <ExplorationNotice />
       <section aria-label="Today" className="flex flex-col">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div className="clem-home-greeting">
@@ -417,6 +444,10 @@ function LiveHome() {
         {/* When this passes out of view the composer below has pinned. */}
         <div ref={composerSentinel} aria-hidden className="h-0" />
       </section>
+      {allOpenTaskRows.length > openTaskRows.length && <Link to="/tasks" className="home-work-resume flex items-center justify-between gap-3 rounded-xl border border-border px-4 py-3 text-small text-muted transition-colors hover:bg-hover hover:text-fg">
+        <span>{allOpenTaskRows.length - openTaskRows.length} paused or waiting {allOpenTaskRows.length - openTaskRows.length === 1 ? 'job' : 'jobs'} saved in Work</span>
+        <span className="shrink-0 font-semibold text-primary">Review work</span>
+      </Link>}
       {/* A direct child of the page column: a sticky element pins only within
           its parent, and this one stays in reach the whole way down. */}
       <section aria-label="Ask Clementine" className={cn('sticky top-0 z-20 -mx-5 -mt-4 bg-canvas px-5 pb-3 pt-3 transition-shadow sm:-mx-10 sm:px-10',
@@ -473,7 +504,7 @@ function LiveHome() {
         // One reading column (owner 2026-10-18): Needs you and While you were
         // away now carry Clem's own cards, which side by side were cramped.
         : <div key={block.panes.join(':') + index} className="flex min-w-0 flex-col gap-7">{block.panes.map(id => <Fragment key={id}>{paneContent.get(id)}</Fragment>)}</div>)}
-      {!daemonUnreachable && <HomeWatchLine overview={watchOverview} refreshing={watches.isFetching} onRetry={() => { void watches.refetch(); }} />}
+      {!daemonUnreachable && !quietIntroductions.watching && <HomeWatchLine overview={watchOverview} refreshing={watches.isFetching} onRetry={() => { void watches.refetch(); }} />}
       {building && layout.data && (
         <HomeBuilder
           layout={layout.data}

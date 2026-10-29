@@ -42,6 +42,52 @@ const input = (over: Partial<FromClemInput> = {}): FromClemInput => ({
   ...over,
 });
 
+test('a revised generic attention source invalidates old reply words even when its display text is unchanged', () => {
+  const make = (generation: string) => buildFromClem(input({ attentionKey: () => 'calendar:FRAMEWORK-TEST-generation',
+    attentionLifecycle: () => ({ canDismiss: true, canDefer: true, effect: 'hide_only', dismissLabel: 'Dismiss', deferLabel: 'Tomorrow',
+      generation, explanation: 'Controlled hide-only fixture.' }) })).rows.find(row => row.key === 'notif:cal-ask')!;
+  const before = make('a'.repeat(64));
+  const after = make('b'.repeat(64));
+  assert.equal(before.text, after.text);
+  assert.notEqual(before.voiceDigest, after.voiceDigest);
+});
+
+test('repeated reviews share one attention identity, retain provenance and replace impossible retry offers', () => {
+  const out = buildFromClem(input({
+    noticingProposals: [], planProposals: [],
+    notifications: ['old', 'new'].map((id, index) => notification(id, {
+      heartbeatId: 'work-review', itemKey: `run_failed:${id}`,
+    }, { createdAt: `2026-10-01T${index ? '20' : '19'}:00:00.000Z`,
+      body: '402 Credit limit exceeded. PRIVATE_PROVIDER_DETAIL' })),
+    asksOwner: () => true, attentionKey: () => 'flow:controlled-workflow',
+    voiced: () => ({ message: 'Old retry offer', choices: ['Look into it', 'Run it again'] }),
+  }));
+  assert.equal(out.rows.length, 1);
+  assert.match(out.rows[0].key, /^review:flow:controlled-workflow:[a-f0-9]{24}$/);
+  assert.deepEqual(out.rows[0].relatedNotificationIds, ['new', 'old']);
+  assert.deepEqual(out.rows[0].choices, ['Review model account']);
+  assert.equal(out.rows[0].blocker?.retryAvailable, false);
+  assert.match(out.rows[0].say!, /out of credit/);
+  assert.doesNotMatch(JSON.stringify(out.rows), /PRIVATE_PROVIDER_DETAIL|Run it again/);
+  assert.deepEqual(out.covers.notificationIds.sort(), ['new', 'old']);
+});
+
+test('a hidden proposal question and carrier stay covered without resurfacing', () => {
+  const out = buildFromClem(input({ questionVisible: () => false }));
+  assert.equal(out.rows.some((row) => row.key === 'noticing:p-open'), false);
+  assert.ok(out.covers.questionIds.includes('checkin:ci-1'));
+  assert.ok(out.covers.notificationIds.includes('carrier-1'));
+});
+
+test('a review carrying an exact open question leaves the question as the only actionable ask', () => {
+  const out = buildFromClem(input({ noticingProposals: [], planProposals: [],
+    notifications: [notification('question-carrier', { heartbeatId: 'work-review', itemKey: 'waiting:fixture' })],
+    asksOwner: () => true, attentionKey: () => 'workflow:fixture|q1', questionIds: new Set(['workflow:fixture|q1']) }));
+  assert.deepEqual(out.rows, []);
+  assert.deepEqual(out.covers.notificationIds, ['question-carrier']);
+  assert.deepEqual(out.covers.questionIds, [], 'the independent question feed still owns the answer');
+});
+
 test('one stream of what the heartbeats said, what waits on the owner first, each with its own way to answer', () => {
   const out = buildFromClem(input());
   assert.deepEqual(out.rows.map((row) => row.key), [

@@ -165,6 +165,72 @@ test('a Noticing reply is the check-in answer; the brain is not asked twice', as
   assert.deepEqual(log, ['answer:checkin:ci1:do it']);
 });
 
+test('typed clear and later controls on a words question never become an answer or resume', async () => {
+  for (const decision of ['done', 'not_now', 'never'] as const) {
+    const actions: string[] = [];
+    const { all, log } = deps({ presentQuestion: (id, action) => { actions.push(`${id}:${action}`); return true; } });
+    const result = await replyToFromClem('noticing:p1', 'Done', all, { decision });
+    assert.equal(result.outcome, decision === 'not_now' ? 'later' : 'cleared');
+    assert.deepEqual(log, []);
+    assert.deepEqual(actions, [`checkin:ci1:${decision === 'not_now' ? 'defer' : 'dismiss'}`]);
+  }
+});
+
+test('acknowledging one grouped review clears all represented notices and never starts work', async () => {
+  const row = { ...stream().rows.find((item) => item.key === 'notif:wr')!,
+    key: 'review:flow:controlled', relatedNotificationIds: ['new-notice', 'old-notice'] };
+  const { all, log } = deps({ read: async () => ({ ...stream(), rows: [row] }) });
+  const result = await replyToFromClem(row.key, 'Dismiss', all, { decision: 'done' });
+  assert.equal(result.outcome, 'cleared');
+  assert.deepEqual(log, ['read-notif:new-notice', 'read-notif:old-notice']);
+});
+
+test('generic attention replies use the canonical exact preference and never acknowledge or change source work', async () => {
+  const row = { ...stream().rows.find((item) => item.key === 'notif:wr')!, attentionKey: 'flow:FRAMEWORK-TEST-reply',
+    lifecycle: { canDismiss: true as const, canDefer: true as const, effect: 'hide_only' as const,
+      dismissLabel: 'Dismiss' as const, deferLabel: 'Tomorrow' as const, generation: 'a'.repeat(64) } };
+  for (const decision of ['done', 'not_now', 'never', 'do_it'] as const) {
+    const actions: string[] = [];
+    const { all, log } = deps({ read: async () => ({ ...stream(), rows: [row] }),
+      presentAttention: (key, action, generation) => { actions.push(`${key}:${action}:${generation}`); return true; } });
+    const result = await replyToFromClem(row.key, 'Controlled owner preference', all, { decision, seenDigest: row.voiceDigest });
+    if (decision === 'do_it') {
+      assert.equal(result.outcome, 'started');
+      assert.deepEqual(actions, []);
+    } else {
+      assert.equal(result.outcome, decision === 'not_now' ? 'later' : decision === 'never' ? 'rule_added' : 'cleared');
+      assert.deepEqual(actions, [`${row.attentionKey}:${decision === 'not_now' ? 'defer' : 'dismiss'}:${row.lifecycle.generation}`]);
+    }
+    assert.equal(log.some(line => /^(read-notif|later|approve|reject|snooze|answer):/.test(line)), false);
+  }
+  const missing = deps({ read: async () => ({ ...stream(), rows: [row] }) });
+  assert.equal((await replyToFromClem(row.key, 'Done', missing.all, { decision: 'done' })).outcome, 'unclear');
+  assert.deepEqual(missing.log, [], 'a missing preference writer cannot fall back to acknowledging source notifications');
+  const stale = deps({ read: async () => ({ ...stream(), rows: [row] }), presentAttention: () => false });
+  assert.equal((await replyToFromClem(row.key, 'Done', stale.all, { decision: 'done' })).outcome, 'changed');
+  assert.deepEqual(stale.log, []);
+});
+
+test('different failures on one workflow retain separate acknowledgement authority', async () => {
+  const notifications = [
+    { id: 'credit-a', body: '402 Credit limit exceeded.' },
+    { id: 'credit-b', body: '402 Credit limit exceeded.' },
+    { id: 'permission', body: 'Permission denied for the requested source.' },
+  ].map((item) => ({ ...item, kind: 'execution' as const, title: 'Controlled workflow failed',
+    createdAt: '2026-10-01T12:00:00.000Z', read: false,
+    metadata: { heartbeatId: 'work-review', changeKind: 'run_failed', itemKey: `run_failed:${item.id}` } }));
+  const grouped = buildFromClem({ heartbeats: [], noticingProposals: [], planProposals: [], notifications,
+    asksOwner: () => true, attentionKey: () => 'flow:controlled-failures' });
+  assert.equal(grouped.rows.length, 2);
+  const credit = grouped.rows.find((row) => row.blocker?.kind === 'provider_credit')!;
+  const permission = grouped.rows.find((row) => !row.blocker)!;
+  assert.deepEqual(credit.relatedNotificationIds, ['credit-a', 'credit-b']);
+  assert.deepEqual(permission.relatedNotificationIds, ['permission']);
+  const { all, log } = deps({ read: async () => grouped });
+  assert.equal((await replyToFromClem(credit.key, 'Dismiss', all, { decision: 'done' })).outcome, 'cleared');
+  assert.deepEqual(log, ['read-notif:credit-a', 'read-notif:credit-b']);
+});
+
 test('a finding: done clears it, never becomes a rule in the owner\'s words, do it starts a turn with what she said', async () => {
   let run = deps({}, { decision: 'done' });
   assert.equal((await replyToFromClem('notif:cal', 'got it', run.all)).outcome, 'cleared');

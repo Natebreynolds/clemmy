@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, ExternalLink, AlertTriangle, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -16,7 +16,9 @@ import { getSettings, beginClaudeLogin, completeClaudeLogin } from '@/lib/settin
  * dropdown above (Models & routing) — there is no separate "run on Claude"
  * toggle here. Mirrors CodexLoginForm so the two subscription logins read alike.
  */
-export function ClaudeLoginForm({ embedded = false, onboarding = false }: { embedded?: boolean; onboarding?: boolean } = {}) {
+export function ClaudeLoginForm({ embedded = false, onboarding = false, onBusyChange }: {
+  embedded?: boolean; onboarding?: boolean; onBusyChange?: (busy: boolean) => void;
+} = {}) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 0);
   const claude = settings.data?.claudeAuth;
@@ -26,6 +28,8 @@ export function ClaudeLoginForm({ embedded = false, onboarding = false }: { embe
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const pending = busy || flowId !== null;
+  useEffect(() => { onBusyChange?.(pending); }, [pending, onBusyChange]);
 
   const start = async () => {
     setBusy(true); setError(null); setDone(false);
@@ -57,7 +61,9 @@ export function ClaudeLoginForm({ embedded = false, onboarding = false }: { embe
         <h4 className="text-label text-fg">Claude (Anthropic) sign-in</h4>
       </div>
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
-        {claude?.configured
+        {settings.isLoading ? <span role="status" className="text-muted">Checking your Claude sign-in…</span>
+          : settings.isError || typeof claude?.configured !== 'boolean' ? <span role="status" className="text-muted">Could not confirm your Claude sign-in. <Button variant="link" size="sm" onClick={() => void settings.refetch()}>Try again</Button></span>
+          : claude.configured
           ? <span className="inline-flex items-center gap-1 text-success">
               <Check className="h-4 w-4" aria-hidden /> Signed in{claude.plan ? ` (${claude.plan})` : ''} · subscription billing{claude.expiresAt ? ` · valid until ${new Date(claude.expiresAt).toLocaleString()}` : ''}
             </span>

@@ -10,10 +10,7 @@ const PROVIDERS: Array<{ provider: CloudBrowserProvider; label: string; keyHint:
   { provider: 'kernel', label: 'Kernel', keyHint: 'Kernel dashboard → API keys', projectHint: 'Project (optional; the key\'s default project otherwise)', projectRequired: false },
 ];
 
-/** The browser Clem uses on this computer: the one chosen here. A cloud
- * provider must be connected before it can be chosen; this computer's own
- * Chrome needs nothing. The side-by-side window, the tools and every
- * workflow step follow the choice. */
+/** Saved browser preferences stay available when computer control is selected. */
 export function BrowserConnection() {
   const [status, setStatus] = useState<CloudBrowserStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
@@ -34,13 +31,20 @@ export function BrowserConnection() {
     try {
       const next = await cloudBrowser.configure(editing, apiKey.trim(), projectId.trim() || undefined);
       setStatus(next); setApiKey(''); setProjectId(''); setEditing(null);
-      setNotice(next.providers?.[editing]?.configured ? `${label(editing)} connected. Choose it below to make it the browser, then open Browser in a conversation to verify it.` : 'The connection was not saved. Check the project and key.');
+      setNotice(next.providers?.[editing]?.configured
+        ? next.effectiveBackend === 'computer' ? `${label(editing)} connected as a fallback. Clem is still set to use your computer.`
+          : `${label(editing)} connected. Choose it below to use it for browsing. You can watch from the chat when a browser session opens.`
+        : 'The connection was not saved. Check the project and key.');
     } catch { setApiKey(''); setNotice('The connection was not confirmed. Check the project and key, then try again.'); }
     finally { setBusy(false); }
   };
   const choose = async (choice: CloudBrowserChoice) => {
     if (busy) return; setBusy(true); setNotice('');
-    try { const next = await cloudBrowser.select(choice); setStatus(next); setNotice(choice === 'local' ? 'This computer\'s Chrome is the browser now.' : `${label(choice)} is the browser now.`); }
+    try {
+      const next = await cloudBrowser.select(choice); setStatus(next);
+      const name = choice === 'local' ? "This computer’s Chrome" : label(choice);
+      setNotice(next.effectiveBackend === 'computer' ? `${name} saved as the fallback. Clem is still set to use your computer.` : `${name} selected for browsing.`);
+    }
     catch { setNotice('The choice was not saved. Retry.'); }
     finally { setBusy(false); }
   };
@@ -53,13 +57,14 @@ export function BrowserConnection() {
     return 'Not connected';
   };
   const choice = status?.choice ?? 'local';
+  const computerSelected = status?.effectiveBackend === 'computer';
   return <section className="mb-8" aria-labelledby="browser-connection-title">
-    <div className="mb-3 flex items-center gap-2.5"><Globe className="h-5 w-5 text-primary" aria-hidden /><div><h3 id="browser-connection-title" className="text-h3 text-fg">Browser</h3><p className="text-small text-muted">Which browser Clem uses here: watch her browse, take over, and return control from desktop or phone.</p></div></div>
+    <div className="mb-3 flex items-center gap-2.5"><Globe className="h-5 w-5 text-primary" aria-hidden /><div><h3 id="browser-connection-title" className="text-h3 text-fg">{computerSelected ? 'Browser fallbacks' : 'Browser'}</h3><p className="text-small text-muted">{computerSelected ? 'Clem is set to use your computer. These are saved browser fallbacks; check the computer connection and permissions above.' : 'Choose a browser for Clem. Open sessions can be watched and managed from the chat.'}</p></div></div>
     <div className="rounded-xl border border-border bg-surface p-4 space-y-4">
-      <fieldset className="space-y-2" aria-label="Browser to use">
+      <fieldset className="space-y-2" aria-label={computerSelected ? 'Saved browser fallback' : 'Browser to use'}>
         <label className="flex items-start gap-3 text-small text-fg">
           <input type="radio" name="browser-choice" className="mt-1" checked={choice === 'local'} disabled={busy} onChange={() => void choose('local')} />
-          <span><span className="font-medium">This computer's Chrome</span><span className="block text-muted">Clem drives the Chrome on this machine. No account needed.</span></span>
+          <span><span className="font-medium">This computer's Chrome</span><span className="block text-muted">{computerSelected ? 'Use local Chrome as the saved fallback. No account needed.' : 'Clem drives the Chrome on this machine. No account needed.'}</span></span>
         </label>
         {PROVIDERS.map((entry) => {
           const configured = Boolean(status?.providers?.[entry.provider]?.configured);

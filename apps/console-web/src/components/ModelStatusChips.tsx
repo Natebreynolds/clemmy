@@ -38,10 +38,12 @@ function meterTooltip(meter: UsageMeter, now: number): string {
   return lines.join('\n');
 }
 
-export function useUsageMeters(): { meters: UsageMeter[]; now: number; ready: boolean } {
+export function useUsageMeters(): { meters: UsageMeter[]; now: number; ready: boolean; loading: boolean; unavailable: boolean; refreshing: boolean; retry: () => void } {
   const q = usePoll(['model-status'], () => getModelStatus(), 15_000);
   const data = q.data as ModelStatus | undefined;
-  return { meters: presentUsageMeters(data), now: Date.now(), ready: Boolean(data) };
+  return { meters: presentUsageMeters(data), now: Date.now(), ready: Boolean(data),
+    loading: q.isLoading, unavailable: q.isError, refreshing: q.isFetching,
+    retry: () => { void q.refetch(); } };
 }
 
 const CHIP = 'app-no-drag inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-1 text-caption';

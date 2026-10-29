@@ -79,6 +79,8 @@ export interface CommandCenterItem {
   /** Exact global Inbox question coordinate (`checkin:`, `task:`, or
    * `workflow:<run>|<question>`). */
   questionId?: string;
+  attentionKey?: string;
+  lifecycle?: import('./attention-presentation').AttentionLifecycle;
   targetSessionId?: string;
   /** Backing notification id for needs-attention cards — deep-links to the
    *  Inbox Notifications tab. */

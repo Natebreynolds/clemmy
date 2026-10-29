@@ -53,7 +53,7 @@ export function ComputerDriver() {
             )}
           </div>
           <p className="mt-1 text-small text-muted">
-            Cua Driver (open source) lets Clem click, type and read in the apps on this Mac, in windows behind yours, with a cursor of its own.
+            Cua Driver (open source) lets Clem click, type and read in the apps on this computer, in windows behind yours, with a cursor of its own.
             Every action still asks you first when it changes something, and is recorded like any other.
             {s?.platformSupport === 'preview' && ' On Windows this is a preview.'}
           </p>
@@ -78,7 +78,7 @@ export function ComputerDriver() {
             <div className="mt-2">
               <p className="inline-flex items-center gap-1 text-small text-fg"><Check className="h-4 w-4 text-success" aria-hidden /> Clem can use the apps on this computer. Ask her to do something in one.</p>
               <p className="mt-1 text-small text-muted">This is also Clem’s browser now. The Chrome harness and any cloud browser below stay idle while it is on.</p>
-              {s.platformSupport === 'supported' && (
+              {s.permissionSettingsAvailable === true && (
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <Button variant="ghost" size="sm" disabled={busy === 'permissions'} onClick={() => run('permissions', async () => { const r = await grantComputerDriverPermissions(); setHint(r.output); })}>
                     {busy === 'permissions' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <ShieldCheck className="h-4 w-4" aria-hidden />} Allow in System Settings

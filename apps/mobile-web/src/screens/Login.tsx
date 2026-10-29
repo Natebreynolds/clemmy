@@ -18,25 +18,42 @@
  * ends while travelling, you re-pair when you get home. That is the trade a
  * security-first product should make.
  */
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { inNativeShell, requestNativeRepair } from '../lib/native-bridge';
 
 interface Props {
   pairError?: string | null;
+  onRetryPair?: () => void;
+  retryAt?: number | null;
 }
 
-export function Login({ pairError }: Props) {
+export function Login({ pairError, onRetryPair, retryAt }: Props) {
   const [repairUnavailable, setRepairUnavailable] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    if (!retryAt || retryAt <= Date.now()) return;
+    const timer = window.setInterval(() => {
+      const tick = Date.now(); setNow(tick);
+      if (tick >= retryAt) window.clearInterval(timer);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [retryAt]);
+  const waitSeconds = Math.max(0, Math.ceil(((retryAt ?? 0) - now) / 1000));
   const showRepair = inNativeShell() && !repairUnavailable;
   return (
     <div class="login-shell">
       <img class="login-mark" src="/m/clemmy.png" alt="" width="88" height="88" />
       <h1>Pair with your computer</h1>
       <p>
-        Open Clementine on your computer, go to <strong>Mobile</strong>, and scan the QR code
-        from inside this app.
+        Open Clementine on your computer, open <strong>Apps &amp; devices</strong>, then find <strong>Pair your phone</strong>.
+        Scan the QR code to bring your conversations and work with you.
       </p>
+      <ol class="login-steps"><li>Keep Clem open on your computer.</li><li>Connect both devices to the same Wi-Fi.</li><li>Scan the pairing code and allow Local Network access if asked.</li></ol>
       {pairError ? <div class="global-error">{pairError}</div> : null}
+      {onRetryPair ? <button class="login-repair" type="button" disabled={waitSeconds > 0} onClick={onRetryPair}>
+        {waitSeconds > 0 ? `Try again in ${waitSeconds >= 60 ? `${Math.ceil(waitSeconds / 60)} min` : `${waitSeconds}s`}` : 'Try pairing again'}
+      </button> : null}
       {showRepair ? (
         // The shell holds a pairing, so it will never show its scanner on its
         // own — this button asks it to clear the pairing and open the camera.
@@ -57,8 +74,7 @@ export function Login({ pairError }: Props) {
         </p>
       ) : null}
       <p class="login-fineprint">
-        Pairing happens on your own network and never leaves it. After that, Face ID keeps
-        this app locked to you.
+        Pair once on your own network. Your phone then uses its device security to keep Clem private.
       </p>
     </div>
   );

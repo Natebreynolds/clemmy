@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/Button';
 import { Input, Select } from '@/components/ui/Field';
 import { WorkflowRunDetail } from '@/components/board/WorkflowRunDetail';
 import { RunAgentsPanel } from '@/components/board/RunAgentsPanel';
+import { TaskResultFiles } from '@/components/projects/TaskResultFiles';
 import {
   answerBackgroundTaskQuestion,
   boardTraceSinceSeq,
@@ -743,6 +744,11 @@ export function LiveTraceDrawer({
             <X className="h-4 w-4" />
           </button>
         </header>
+
+        {traceSessionId && card.column === 'done' ? <div className="border-b border-border px-5 py-3">
+          <h4 className="text-small font-semibold text-fg">Saved results</h4>
+          <TaskResultFiles taskId={card.id} sessionId={traceSessionId} savedKey={taskDetail?.task.updatedAt ?? card.id} />
+        </div> : null}
 
         {card.pendingAction && (
           <PendingActionReview

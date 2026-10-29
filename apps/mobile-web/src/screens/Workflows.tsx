@@ -91,6 +91,7 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
   if (workflows.length === 0) {
     return (
       <EmptyState
+        guide="create-automation"
         title="No automations yet"
         body="An automation is work Clem does for you on a schedule or with one tap."
         action={{ label: 'Ask Clem to set one up', onClick: () => onAsk('Set up an automation that ') }}
@@ -101,6 +102,7 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
   return (
     <div>
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
+      <div class="section-intro"><p>Work Clem handles on a schedule or whenever you need it.</p><button type="button" class="home-btn" data-clem-guide="create-automation" onClick={() => onAsk('Set up an automation that ')}>Create with Clem</button></div>
       {workflows.map((wf) => (
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">

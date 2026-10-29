@@ -24,6 +24,7 @@ import {
   narrateActivity,
   renderMarkdown,
   delegatedTaskCard,
+  delegatedTaskReport,
   reduceActivity,
   writeReversibilityLabel,
   writeRowIsChange,
@@ -33,6 +34,7 @@ import {
 } from '@clem/chat-engine';
 import { getRun, runDetailPath } from '../lib/api';
 import { DelegatedTaskCard } from '../components/DelegatedTaskCard';
+import { TaskResultFiles } from '../components/TaskResultFiles';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
 import { RunControl } from '../components/RunControl';
@@ -45,9 +47,10 @@ import { useScreenData } from '../lib/use-screen-data';
 interface Props {
   sessionId: string;
   onBack: () => void;
+  onOpenNeedsYou?: (decisionKey?: string) => void;
 }
 
-export function Run({ sessionId, onBack }: Props) {
+export function Run({ sessionId, onBack, onOpenNeedsYou }: Props) {
   useMobileDetailHeader();
   const { data, loading, error, offline, stale, refresh } = useScreenData(
     () => getRun(sessionId),
@@ -106,6 +109,9 @@ export function Run({ sessionId, onBack }: Props) {
     return '';
   }, [run]);
 
+  const taskReport = run?.delegatedTask ? delegatedTaskReport(run.delegatedTask) : null;
+  const separateReport = reply && reply.replace(/\r\n/g, '\n') !== taskReport?.detail;
+
   return (
     <div class="workflow-detail">
       <div class="chat-header">
@@ -143,7 +149,7 @@ export function Run({ sessionId, onBack }: Props) {
 
             {/* A job is its card: where it stands, what moves it on, what it
                 made and what it reported, the same card the chat shows. */}
-            {run.delegatedTask ? <DelegatedTaskCard task={run.delegatedTask} onChanged={() => void refresh()} /> : null}
+            {run.delegatedTask ? <DelegatedTaskCard task={run.delegatedTask} onOpenNeedsYou={onOpenNeedsYou} onChanged={() => void refresh()} /> : null}
 
             {/* What it changed in the world. First, because it is the thing a
                 person most needs to know and the hardest to take back. */}
@@ -166,6 +172,8 @@ export function Run({ sessionId, onBack }: Props) {
             {!run.delegatedTask && run.deliverables.length > 0 ? (
               <section class="home-section">
                 <h2 class="section-head">What it produced</h2>
+                <TaskResultFiles sessionId={run.id} savedKey={JSON.stringify(run.deliverables)} />
+                <details class="wf-raw-log"><summary class="wf-steps-summary">Recorded output details</summary>
                 {run.deliverables.map((file, i) => (
                   <div key={i} class="run-receipt">
                     <div class="run-receipt-what">{file.name}</div>
@@ -173,6 +181,7 @@ export function Run({ sessionId, onBack }: Props) {
                     {file.excerpt ? <pre class="run-excerpt">{file.excerpt}</pre> : null}
                   </div>
                 ))}
+                </details>
               </section>
             ) : null}
 
@@ -184,7 +193,7 @@ export function Run({ sessionId, onBack }: Props) {
               </section>
             ) : null}
 
-            {run.delegatedTask && reply ? (
+            {run.delegatedTask && separateReport ? (
               <details class="wf-raw-log">
                 <summary class="wf-steps-summary">Full report</summary>
                 <div class="run-reply bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(reply) }} />

@@ -363,13 +363,15 @@ test('the header carries a signal only for what the screen cannot show itself', 
 
 const read = (relative: string): string => readFileSync(new URL(relative, import.meta.url), 'utf8');
 
-test('Home leads with the presenter and prints no count it did not render', () => {
+test('Home leads with the canonical summary and labels its bounded request preview', () => {
   const home = read('../screens/Home.tsx');
   assert.match(home, /const lead = homeLead\(\{/, 'the lead is computed, not written inline');
-  assert.match(home, /class="home-lead-head">\{lead\.headline\}/, 'and it is the headline');
+  assert.match(home, /class="home-lead-head">\{leadHeadline\}/, 'the summary headline is rendered');
+  assert.match(home, /const hasAttention = needsYouCountKnown && needsYouCount > 0;/);
+  assert.match(home, /const leadAction = hasAttention \? \{ label: 'Review Inbox'/, 'the total names its complete destination');
   assert.match(home, /<p class="home-greeting">\{greeting\}<\/p>/,
     'the greeting remains a quiet personal detail');
-  assert.ok(home.indexOf('class="home-lead-head"') < home.indexOf('class="home-greeting"'), 'the current state precedes the greeting');
+  assert.match(home, /const needsShown = needsItems\.slice\(0, Math\.max\(0, MAX_NEEDS_ROWS - clemShown\)\)/, 'From Clem and other decisions share one bounded preview');
 
   assert.match(home, /const needsPane = homeNeedsYouPane\(\{/);
   assert.match(home, /\{needsPane\.show \? \(/,
@@ -395,11 +397,13 @@ test('there is ONE definition of running in the app, and Home reads it', () => {
     'unfinished is a class the presenter names, not a subtraction');
 });
 
-test('Home draws no work pane: Activity owns the rows, the lead and the header chip lead there', () => {
+test('Home previews only running work, capped at two, with the complete Work destination', () => {
   const home = read('../screens/Home.tsx');
   assert.match(home, /running: \(\) => null,/, 'a stored running pane renders nothing');
   assert.doesNotMatch(home, /RunningRow|workRows|homeWorkPane\(/);
-  assert.doesNotMatch(home, /\{workingView\.entries\.map\(/, 'no run rows on Home at all');
+  assert.match(home, /const activeWork = workingView\.entries\.filter\(row => row\.membership === 'running'\)/);
+  assert.match(home, /activeWork\.slice\(0, 2\)/, 'paused and waiting work cannot fill Today');
+  assert.match(home, /onClick=\{onOpenActivity\}>View Work/, 'the full list remains one tap away');
 });
 
 test('the lead is fed the demand the Inbox count cannot see, and how old that count is', () => {
@@ -421,7 +425,7 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
 test('the header row is fed by the chrome rule, and Home is handed the age the pill used to carry', () => {
   const app = read('../app.tsx');
   assert.match(app, /const headerChrome = phoneHeaderChrome\(\{ tab, needsYouSignal: needsYou\.show \}\)/);
-  assert.match(app, /\{headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\} compact=\{headerChrome\.needsPill\} \/> : null\}/);
+  assert.match(app, /\{tab !== 'home' && headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\} compact \/> : null\}/);
   assert.match(app, /\{headerChrome\.needsPill \? \(/);
   assert.doesNotMatch(app, /tab === 'home' && needsYou\.show/,
     'the pill no longer appears only on the one screen that already says it');

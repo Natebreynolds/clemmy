@@ -40,14 +40,10 @@ import { CustomizeSortableRow } from './CustomizeSortableRow';
 import { CustomizeQuickActionForm } from './CustomizeQuickActionForm';
 import { useCustomizeSaver, type CustomizeSaveStatus } from './CustomizeSave';
 import { useCustomizeFocusTrap } from './CustomizeFocusTrap';
+import { CUSTOMIZE_HOME_EVENT } from '@/lib/customize-home';
+export { openCustomizeHome } from '@/lib/customize-home';
 
 /** Window event that opens the sheet from anywhere (Home header, Settings). */
-export const CUSTOMIZE_HOME_EVENT = 'clem:customize-home';
-
-export function openCustomizeHome() {
-  window.dispatchEvent(new Event(CUSTOMIZE_HOME_EVENT));
-}
-
 // ── Panes ──────────────────────────────────────────────────────────────────
 
 const PANE_LABELS: Record<HomePaneId, string> = {
@@ -205,8 +201,8 @@ function newQuickActionId(): string {
  * record (HomePreferences) saved to the account, so it applies on the phone.
  * Opens on the `clem:customize-home` window event; Esc or the scrim closes.
  */
-export function CustomizePanel() {
-  const [open, setOpen] = useState(false);
+export function CustomizePanel({ initialOpen = false }: { initialOpen?: boolean }) {
+  const [open, setOpen] = useState(initialOpen);
 
   useEffect(() => {
     const onOpen = () => setOpen(true);

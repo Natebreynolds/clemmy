@@ -4,23 +4,17 @@ import { browserClosesText, cloudBrowserProviderLabel, browserElapsed, browserFo
 import { cloudBrowser } from '../lib/cloud-browser';
 import { conversationBrowsersInUse } from '../lib/chat-browser-visibility';
 const Globe = () => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" /></svg>;
-export function CloudBrowserDock({ conversationId, openRequest = 0, onReturn }: { conversationId?: string; openRequest?: number; onReturn?: () => void }) {
+export function CloudBrowserDock({ conversationId, onReturn }: { conversationId?: string; onReturn?: () => void }) {
   if (!conversationId) return null;
-  return <TaskBrowser key={conversationId} conversationId={conversationId} openRequest={openRequest} onReturn={onReturn} />;
+  return <TaskBrowser key={conversationId} conversationId={conversationId} onReturn={onReturn} />;
 }
-function TaskBrowser({ conversationId, openRequest, onReturn }: { conversationId: string; openRequest: number; onReturn?: () => void }) {
+function TaskBrowser({ conversationId, onReturn }: { conversationId: string; onReturn?: () => void }) {
   const [status, setStatus] = useState<CloudBrowserStatus | null>(null);
   const [statusFailed, setStatusFailed] = useState(false);
   const [visible, setVisible] = useState(!document.hidden);
   const [resources, setResources] = useState<CloudBrowserResource[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [open, setOpen] = useState(false); const [busy, setBusy] = useState<string | null>(null);
-  const lastOpenRequest = useRef(0);
-  useEffect(() => {
-    if (!openRequest || openRequest === lastOpenRequest.current) return;
-    lastOpenRequest.current = openRequest;
-    setOpen(true);
-  }, [openRequest]);
   const [notice, setNotice] = useState(''); const [recording, setRecording] = useState(false);
   const [recoveryId, setRecoveryId] = useState('');
   const [view, setView] = useState<(CloudBrowserView & { key: string }) | null>(null);

@@ -96,18 +96,23 @@ export function Projects() {
   });
 
   const newProject = (
-    <Button size="sm" onClick={() => setCreating(true)}>
+    <Button size="sm" data-clem-guide="create-project" onClick={() => setCreating(true)}>
       <Plus className="h-4 w-4" aria-hidden /> New project
     </Button>
   );
 
   return (
     <Page
-      title="Projects"
-      subtitle="What you are working on, who is on it, and what it needs from you."
+      title="Projects & agents"
+      subtitle="Projects keep the goal, context and results together. Agents bring the instructions and skills to do the work."
       actions={newProject}
       width="reading"
     >
+      <div className="mb-6 flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-border pb-4 text-small">
+        <span className="font-semibold text-fg">Your projects</span>
+        <Link to="/agents" className="inline-flex min-h-9 items-center gap-1 font-semibold text-primary hover:underline">Meet your agents <ChevronRight size={15} aria-hidden /></Link>
+        <Link to="/tasks" className="inline-flex min-h-9 items-center font-medium text-muted hover:text-fg hover:underline">See active work</Link>
+      </div>
       {loading ? (
         <div className="space-y-3" role="status">
           <span className="sr-only">Loading your projects</span>

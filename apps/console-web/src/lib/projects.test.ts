@@ -10,13 +10,24 @@ import { projectPageRefusal } from '@clem/chat-engine';
 import {
   accountBindingFromRefusal, apiErrorCode, conversationPath, goalsFromText, goalsToText, localProjectLinkFromRefusal,
   checkPageDocument, findSessionPage, isPageName, pageDocumentUrl, pageRefusalText, pageViewerPath, projectKeys, refusalText,
-  taskFromRefusal, taskRunPath,
+  projectIdentityChanges, taskFromRefusal, taskRunPath,
 } from './projects.js';
 
 function refused(status: number, body: unknown): Error {
   const code = body && typeof body === 'object' ? (body as { error?: unknown }).error : undefined;
   return Object.assign(new Error(typeof code === 'string' ? code : `HTTP ${status}`), { status, body });
 }
+
+test('editing one project field preserves newer untouched fields from another device', () => {
+  const baseline = { name: 'Original name', purpose: 'A weekly briefing', goals: ['Review the draft'], context: 'Original context' };
+  const draft = { name: baseline.name, purpose: baseline.purpose, goals: baseline.goals.join('\n'), context: 'New context' };
+  const incoming = { ...baseline, name: 'Renamed on phone', purpose: 'Updated on phone' };
+  const patch = projectIdentityChanges(baseline, draft);
+  assert.deepEqual(patch, { context: 'New context' });
+  assert.deepEqual({ ...incoming, ...patch }, { ...incoming, context: 'New context' });
+  assert.deepEqual(projectIdentityChanges(baseline, { ...draft, context: baseline.context }), {});
+  assert.deepEqual(projectIdentityChanges(baseline, { ...draft, name: 'My revised name' }), { name: 'My revised name', context: 'New context' });
+});
 
 test('a refusal is read by its code, and said in words', () => {
   assert.equal(apiErrorCode(refused(409, { error: 'NAME_TAKEN' })), 'NAME_TAKEN');

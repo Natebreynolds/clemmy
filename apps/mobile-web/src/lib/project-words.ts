@@ -37,6 +37,12 @@ export interface ProjectDraft {
   context: string;
 }
 
+type ProjectEditBaseline = { name: string; purpose: string; goals: string[]; context: string };
+/** An editor owns the opening values. Later polling must not redefine what it changed. */
+export function projectEditBaseline(project: { name: string; purpose: string; goals: readonly string[]; context: string }): ProjectEditBaseline {
+  return { name: project.name, purpose: project.purpose, goals: [...project.goals], context: project.context };
+}
+
 export function projectDraftFrom(project: { name: string; purpose: string; goals: readonly string[]; context: string }): ProjectDraft {
   return { name: project.name, purpose: project.purpose, goals: goalsToText(project.goals), context: project.context };
 }

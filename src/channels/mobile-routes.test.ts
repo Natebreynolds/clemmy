@@ -311,6 +311,89 @@ test('mobile notification paging filters before limit and dismissal reads only t
   }
 });
 
+test('mobile question dismissal and exact Undo preserve the paused question and canonical count', async () => {
+  const checkIn = createCheckIn({ agentSlug: 'clementine', question: 'Controlled mobile attention fixture', urgency: 'normal' });
+  const id = `checkin:${checkIn.id}`;
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Question presentation phone');
+    const endpoint = `${h.url}/m/api/inbox/questions/${encodeURIComponent(id)}/presentation`;
+    const post = (body: unknown) => fetch(endpoint, { method: 'POST', headers: { cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const dismissed = await post({ action: 'dismiss' });
+    assert.equal(dismissed.status, 200);
+    const receipt = await dismissed.json() as { generation: string; mutationToken: string };
+    assert.match(receipt.generation, /^[a-f0-9]{64}$/);
+    assert.equal(getCheckIn(checkIn.id)?.status, 'open');
+    const recovery = await (await fetch(`${h.url}/m/api/inbox/questions/presentation`, { headers: { cookie } })).json() as {
+      questions: Array<{ id: string; action: string; generation: string; mutationToken: string }>;
+    };
+    assert.deepEqual(recovery.questions.find((row) => row.id === id)?.mutationToken, receipt.mutationToken);
+    const deniedRecovery = await fetch(`${h.url}/m/api/inbox/questions/presentation`);
+    assert.equal(deniedRecovery.status, 401);
+    const listed = await (await fetch(`${h.url}/m/api/inbox/questions`, { headers: { cookie } })).json() as { questions: Array<{ id: string }> };
+    assert.equal(listed.questions.some((question) => question.id === id), false);
+    const summary = await (await fetch(`${h.url}/m/api/inbox/summary`, { headers: { cookie } })).json() as { needsYou: number; total: number; keys: string[] };
+    assert.equal(summary.needsYou, summary.total);
+    assert.equal(summary.keys.includes(id), false);
+    assert.equal((await post({ action: 'restore', generation: '0'.repeat(64) })).status, 409);
+    assert.equal((await post({ action: 'restore', generation: receipt.generation })).status, 409, 'Undo also requires its exact mutation');
+    assert.equal((await post({ action: 'restore', generation: receipt.generation, mutationToken: receipt.mutationToken })).status, 200);
+    const restored = await (await fetch(`${h.url}/m/api/inbox/questions`, { headers: { cookie } })).json() as { questions: Array<{ id: string }> };
+    assert.ok(restored.questions.some((question) => question.id === id));
+    assert.equal(getCheckIn(checkIn.id)?.status, 'open');
+  } finally { await h.close(); closeCheckIn(checkIn.id, 'Controlled fixture cleanup.'); }
+});
+
+test('mobile generic attention shares hide-only recovery receipts, counts and notification visibility', async () => {
+  const prefix = 'FRAMEWORK-TEST-mobile-attention';
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  const file = path.join(WORKFLOW_RUNS_DIR, `${prefix}.json`);
+  const bytes = JSON.stringify({ id: prefix, workflow: prefix, workflowSlug: prefix, status: 'blocked', createdAt: new Date().toISOString() });
+  writeFileSync(file, bytes);
+  const fixtures = [
+    { id: `${prefix}-flow`, key: `flow:${prefix.toLowerCase()}`, metadata: { workflow: prefix, runId: prefix, heartbeatId: 'work-review', itemKey: `run_failed:${prefix}`, refType: 'workflow_run', refId: prefix, needsAttention: true } },
+    { id: `${prefix}-session`, key: `session:${prefix}`, metadata: { sessionId: prefix, status: 'needs_input', needsAttention: true } },
+    { id: `${prefix}-calendar`, key: `calendar:${prefix}|invite_unanswered|event`, metadata: { watch: 'calendar', itemKey: `${prefix}|invite_unanswered|event`, changeKind: 'invite_unanswered', startsAt: new Date(Date.now() + 86_400_000).toISOString(), needsAttention: true } },
+  ];
+  for (const fixture of fixtures) addNotification({ id: fixture.id, kind: fixture.key.startsWith('flow:') ? 'workflow' : 'execution', title: fixture.id, body: 'Controlled phone attention fixture.',
+    createdAt: new Date().toISOString(), read: false, metadata: fixture.metadata });
+  const h = await startHarness();
+  try {
+    const cookie = await loginMobile(h, 'Generic attention fixture phone');
+    const endpoint = `${h.url}/m/api/inbox/attention/presentation`;
+    assert.equal((await fetch(endpoint)).status, 401);
+    assert.equal((await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: fixtures[0]!.key, action: 'dismiss' }) })).status, 401);
+    const post = (body: unknown) => fetch(endpoint, { method: 'POST', headers: { cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const summary = async () => (await (await fetch(`${h.url}/m/api/inbox/summary`, { headers: { cookie } })).json()) as {
+      total: number; keys: string[]; unreadUpdates: number; attentionItems: Array<{ key: string; lifecycle: { generation: string } }> };
+    const before = await summary();
+    for (const fixture of fixtures) {
+      const item = before.attentionItems.find(row => row.key === fixture.key)!;
+      assert.ok(item, fixture.key);
+      const visible = await (await fetch(`${h.url}/m/api/inbox/notifications`, { headers: { cookie } })).json() as {
+        notifications: Array<{ id: string; lifecycle?: { generation?: string } }> };
+      assert.equal(visible.notifications.find(row => row.id === fixture.id)?.lifecycle?.generation, item.lifecycle.generation);
+      const response = await post({ key: fixture.key, action: 'defer', generation: item.lifecycle.generation });
+      assert.equal(response.status, 200);
+      const receipt = await response.json() as { generation: string; mutationToken: string; until: string };
+      assert.ok(receipt.until);
+      const recovery = await (await fetch(endpoint, { headers: { cookie } })).json() as { items: Array<{ key: string; mutationToken: string }> };
+      assert.equal(recovery.items.find(row => row.key === fixture.key)?.mutationToken, receipt.mutationToken);
+      const after = await summary();
+      assert.equal(after.total, before.total - 1);
+      assert.equal(after.keys.includes(fixture.key), false);
+      assert.equal(after.unreadUpdates, before.unreadUpdates);
+      const hidden = await (await fetch(`${h.url}/m/api/inbox/notifications`, { headers: { cookie } })).json() as { notifications: Array<{ id: string }> };
+      assert.equal(hidden.notifications.some(row => row.id === fixture.id), false);
+      assert.equal(getNotification(fixture.id)?.read, false);
+      assert.equal(readFileSync(file, 'utf8'), bytes);
+      assert.equal((await post({ key: fixture.key, action: 'restore', generation: receipt.generation })).status, 409);
+      assert.equal((await post({ key: fixture.key, action: 'restore', generation: receipt.generation, mutationToken: receipt.mutationToken })).status, 200);
+      assert.equal((await summary()).keys.includes(fixture.key), true);
+    }
+  } finally { await h.close(); for (const fixture of fixtures) markNotificationRead(fixture.id); }
+});
+
 test('mobile check-in answer is single-winner and late answers return 409 without overwriting', async () => {
   const checkIn = createCheckIn({
     agentSlug: 'mobile-check-in-race',

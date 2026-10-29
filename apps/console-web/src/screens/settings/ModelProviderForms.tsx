@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, ExternalLink, Trash2 } from 'lucide-react';
 import type { ModelProvider } from '@/lib/settings';
@@ -102,8 +102,9 @@ function useCatalogPicker(initial: string) {
 }
 
 /** Add an API-key provider, then offer the new model a job. */
-export function AddModelForm({ onClose, presentation = 'settings' }: {
+export function AddModelForm({ onClose, presentation = 'settings', onBusyChange, onDirtyChange, discardRequest = 0 }: {
   onClose: () => void; presentation?: 'settings' | 'onboarding';
+  onBusyChange?: (busy: boolean) => void; onDirtyChange?: (dirty: boolean) => void; discardRequest?: number;
 }) {
   const qc = useQueryClient();
   const first = PROVIDER_PRESETS[0];
@@ -116,6 +117,17 @@ export function AddModelForm({ onClose, presentation = 'settings' }: {
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState<{ label: string; modelIds: string[] } | null>(null);
   const picker = useCatalogPicker(onboarding ? '' : first.workerModel);
+  const discardSeen = useRef(discardRequest);
+  const pending = busy || picker.fetching;
+  const dirty = onboarding && !connected && Boolean(presetId || label || baseURL || apiKey || picker.models);
+  useEffect(() => { onBusyChange?.(pending); }, [pending, onBusyChange]);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => {
+    if (!onboarding || pending || discardSeen.current === discardRequest) return;
+    discardSeen.current = discardRequest;
+    setPresetId(''); setLabel(''); setBaseURL(''); setApiKey(''); picker.setModels(''); picker.reset(); setError(null);
+    // Only unsaved fields are discarded. A connected provider stays connected.
+  }, [discardRequest, onboarding, pending]);
 
   const applyPreset = (id: string) => {
     const p = PROVIDER_PRESETS.find((x) => x.id === id);
@@ -157,7 +169,7 @@ export function AddModelForm({ onClose, presentation = 'settings' }: {
 
   const preset = PROVIDER_PRESETS.find((p) => p.id === presetId);
   return (
-    <div className={onboarding ? '' : 'rounded-lg border border-border bg-canvas p-4'}>
+    <fieldset disabled={pending} className={onboarding ? 'min-w-0' : 'min-w-0 rounded-lg border border-border bg-canvas p-4'}>
       {!onboarding && <div className="mb-2 text-label text-fg">Add a model</div>}
       <div className="grid gap-x-4 sm:grid-cols-2">
         <Field label="Provider" hint="Pre-fills the endpoint + a default model.">{(id) => (
@@ -192,11 +204,11 @@ export function AddModelForm({ onClose, presentation = 'settings' }: {
       </div>
       {picker.checklist()}
       <div className="mt-3 flex items-center gap-2">
-        <Button onClick={() => void onAdd()} disabled={busy}>{busy ? 'Connecting…' : 'Connect'}</Button>
-        <Button variant="secondary" size="sm" onClick={onClose}>{onboarding ? 'Close' : 'Cancel'}</Button>
+        <Button onClick={() => void onAdd()} disabled={pending}>{busy ? 'Connecting…' : 'Connect'}</Button>
+        <Button variant="secondary" size="sm" onClick={onClose} disabled={pending}>{onboarding ? 'Close' : 'Cancel'}</Button>
         {error && <span className="text-small text-danger">{error}</span>}
       </div>
-    </div>
+    </fieldset>
   );
 }
 

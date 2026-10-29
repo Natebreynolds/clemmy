@@ -30,6 +30,6 @@ test('a switch the saved settings do not confirm says so', () => {
 });
 
 test('an API account added without a usable key stays listed under Not connected with the reason', () => {
-  assert.match(ACCOUNTS, /providers\.filter\(\(p\) => !p\.configured && !byId\.has\(p\.id\)/);
+  assert.match(ACCOUNTS, /providers\.filter\(\(p\) => \(statusUnknown \|\| !p\.configured\) && !byId\.has\(p\.id\)/);
   assert.match(ACCOUNTS, /no API key is saved, so \$\{models\} can't be used/);
 });

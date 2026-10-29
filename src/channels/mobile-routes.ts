@@ -16,7 +16,8 @@ import { registerConnectionSetupRoutes } from './connection-setup-routes.js';
 import { registerWorkspaceSourceControlRoutes } from '../dashboard/workspace-source-control-routes.js';
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
-import { needsYouKey, needsYouReferents, notificationActionItemId, notificationNeedsYou, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
+import { attentionLifecycleForKey, listAttentionPresentations, needsYouKey, needsYouReferents, notificationActionItemId,
+  notificationAttentionHidden, notificationNeedsYou, presentAttentionItem, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { approvalDecisionAckMetadata } from '../runtime/harness/approval-decision-ack.js';
@@ -144,6 +145,7 @@ import {
   sameConversationAncestorSessionIds,
 } from '../runtime/harness/accepted-source-session-branch.js';
 import {
+  approvalPreviewProjection,
   projectHarnessEventsForPublic,
   publicPresentationText,
   publicUserInputText,
@@ -208,9 +210,9 @@ import {
 } from '../execution/background-tasks.js';
 import {
   answerInboxQuestion as answerUnifiedInboxQuestion,
-  listInboxQuestions as listUnifiedInboxQuestions,
   type InboxQuestionItem,
 } from '../execution/inbox-questions.js';
+import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion, visibleInboxQuestions as listUnifiedInboxQuestions } from '../dashboard/question-presentation.js';
 import {
   projectWorkflowCapabilityInboxGate,
   type WorkflowCapabilityInboxGate,
@@ -576,6 +578,7 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
   /** The draft being approved (message body, post copy), so the phone shows
    *  the words before "Yes, do it" — the same preview the desktop card shows. */
   contentPreview?: ApprovalContentPreview;
+  preview?: NonNullable<ReturnType<typeof approvalPreviewProjection>>['preview'];
   status: approvalRegistry.PendingApprovalStatus;
   resolution: approvalRegistry.ApprovalResolution | null;
 } {
@@ -584,6 +587,7 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
     presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject,
       ...cardVoiceFields(approvalCardVoice(row.sessionId, row.approvalId)) }),
     contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
+    ...(approvalPreviewProjection(row.args?.preview) ?? {}),
     approvalId: row.approvalId,
     sessionId: row.sessionId,
     channel: row.channel,
@@ -608,6 +612,7 @@ interface MobileInboxNotification {
   needsAttention: boolean;
   /** Server-owned grouping identity (dashboard/needs-you.ts `needsYouKey`). */
   needsYouKey: string;
+  lifecycle?: ReturnType<typeof attentionLifecycleForKey>;
   deliveredAt: string | null;
   deliveryError: string | null;
   workflowCapability: WorkflowCapabilityInboxGate | null;
@@ -671,6 +676,7 @@ function serializeInboxNotificationForMobile(row: NotificationRecord, ref: Needs
     // and the identity to group by — a workflow blocked five times is one row.
     needsAttention: notificationNeedsYou(row, ref),
     needsYouKey: needsYouKey(row, ref),
+    lifecycle: notificationNeedsYou(row, ref) ? attentionLifecycleForKey(needsYouKey(row, ref), ref) : undefined,
     deliveredAt: row.deliveredAt ?? null,
     deliveryError: row.deliveryError ?? null,
     workflowCapability: projectWorkflowCapabilityInboxGate(row),
@@ -705,6 +711,7 @@ function mobileInboxNotifications(limit = 200, ref: NeedsYouReferents = needsYou
   // the front can crowd real Inbox rows out and make list/summary disagree.
   const rows = loadNotifications()
     .filter((row) => !row.silent && row.metadata?.heartbeat !== true)
+    .filter((row) => !notificationAttentionHidden(row, ref))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const actionable = rows.filter((row) => !row.read && notificationNeedsYou(row, ref));
   const actionableIds = new Set(actionable.map((row) => row.id));
@@ -2628,10 +2635,51 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
 
   router.get('/api/inbox/questions', requireMobileSession, (_req, res) => {
     try {
-      const questions = mobileInboxQuestions();
+      const questions = mobileInboxQuestions().map(projectInboxQuestion);
       res.json({ questions, count: questions.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  router.get('/api/inbox/questions/presentation', requireMobileSession, (_req, res) => {
+    try {
+      const questions = listQuestionPresentations();
+      res.json({ questions, count: questions.length });
+    } catch { res.status(503).json({ error: 'Set-aside questions are unavailable. Please try again.' }); }
+  });
+
+  router.get('/api/inbox/attention/presentation', requireMobileSession, (_req, res) => {
+    try {
+      const items = listAttentionPresentations();
+      res.json({ items, count: items.length });
+    } catch { res.status(503).json({ error: 'Set-aside items are unavailable. Please try again.' }); }
+  });
+  router.post('/api/inbox/attention/presentation', requireMobileSession, (req, res) => {
+    const action = req.body?.action;
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!key || key.length > 4096 || (action !== 'dismiss' && action !== 'defer' && action !== 'restore')) {
+      res.status(400).json({ error: 'An item key and dismiss, defer or restore action are required.' }); return;
+    }
+    try {
+      const generation = typeof req.body?.generation === 'string' ? req.body.generation : undefined;
+      const mutationToken = typeof req.body?.mutationToken === 'string' ? req.body.mutationToken : undefined;
+      const result = presentAttentionItem(key, action, generation, mutationToken);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch { res.status(503).json({ error: 'The item could not be moved. Please try again; its work has not changed.' }); }
+  });
+
+  router.post('/api/inbox/questions/:id/presentation', requireMobileSession, (req, res) => {
+    const action = req.body?.action;
+    if (action !== 'dismiss' && action !== 'defer' && action !== 'restore') { res.status(400).json({ error: 'action must be dismiss, defer or restore' }); return; }
+    try {
+      const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const generation = typeof req.body?.generation === 'string' ? req.body.generation : undefined;
+      const mutationToken = typeof req.body?.mutationToken === 'string' ? req.body.mutationToken : undefined;
+      const result = presentInboxQuestion(id, action, Date.now(), generation, mutationToken);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch {
+      res.status(503).json({ error: 'The question could not be moved. Please try again.' });
     }
   });
 
@@ -2946,6 +2994,9 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       const summary = await summarizeNeedsYou();
       res.json({
         needsYou: summary.total,
+        total: summary.total,
+        keys: summary.keys,
+        attentionItems: summary.attentionItems,
         questions: summary.questions,
         approvals: summary.approvals,
         plans: summary.plans,

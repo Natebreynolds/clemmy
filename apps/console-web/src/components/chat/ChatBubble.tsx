@@ -4,7 +4,8 @@ import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { desktopAppLinkNavigation } from '@/lib/app-link-navigation';
 import { ArrowUpRight, Check, Send, Square, Volume2, X } from 'lucide-react';
 import { replySpeaker } from '@/lib/reply-speaker';
 import { steerReceiptLabel, answerDraftStatus, canContinueTerminal, hiddenCardDecision, liveTurnText, renderMarkdown, retainedOutsideChange, terminalNoticeLine, terminalStatusPill, TerminalContinueGate, APPROVAL_ANSWER_WORDS, NOTICE_ACTION_LABEL, editableApprovalField, ApprovalDecisionGate, isIdentifierLike, normalizePendingActionResultRecord, retainPendingActionPresentation } from '@clem/chat-engine';
@@ -100,17 +101,19 @@ function approvalFieldLabel(name: string): string {
  */
 function ReplyProse({ text, streaming, failed }: { text: string; streaming?: boolean; failed?: boolean }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const html = useMemo(() => renderMarkdown(text, { workspaceLinks: false, appPlaceLinks: 'desktop' }), [text]);
   return (
     <div
       className={cn('chat-prose min-w-0', streaming && 'is-streaming', failed && 'text-danger')}
       // A place Clem links opens inside the app, never as a page load.
       onClick={(event) => {
-        const link = (event.target as Element).closest?.('a[data-app-place]');
-        const href = link?.getAttribute('href');
-        if (!href) return;
+        const link = (event.target as Element).closest?.('a[data-app-place],a[data-app-item]');
+        if (!link) return;
+        const destination = desktopAppLinkNavigation({ href: link.getAttribute('href'), place: link.getAttribute('data-app-place'), item: link.getAttribute('data-app-item'), target: link.getAttribute('target'), download: link.hasAttribute('download') }, event, location.pathname);
+        if (!destination) return;
         event.preventDefault();
-        navigate(href);
+        navigate(destination.href, { state: destination.state });
       }}
       // eslint-disable-next-line react/no-danger -- renderMarkdown escapes all input first
       dangerouslySetInnerHTML={{ __html: html }}

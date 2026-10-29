@@ -5,7 +5,7 @@ import { cn } from '@/lib/cn';
 import { awayMeta, awayOutcome, awayTarget, clockLabel, plainText, type HomeFeedItem } from './home-model';
 import { LoadFailedLine, PaneCard, PaneRow, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
-const MAX_ROWS = 5;
+const MAX_ROWS = 3;
 
 /**
  * WHAT CAME BACK — durable updates, including informational notices, as a

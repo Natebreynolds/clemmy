@@ -137,6 +137,23 @@
     outline-offset: var(--clem-focus-offset);
   }
   ::placeholder { color: var(--text-subtle); }
+  ::selection { background: var(--primary-tint); color: var(--text); }
+  input, textarea { caret-color: var(--primary-ink); }
+}
+
+/* The same restrained hierarchy on every first-party page. */
+.section-navigation { scrollbar-width: thin; scroll-padding-inline: 20px; }
+.section-navigation a { text-decoration: none; }
+.clem-page h2, .clem-page h3 { text-wrap: balance; }
+.clem-guide-target {
+  outline: 2px solid var(--clem-focus);
+  outline-offset: 5px;
+  scroll-margin-block: 24px;
+}
+.clem-guidance { color: var(--text); }
+.clem-home .home-work-resume { background: var(--bg-subtle); }
+@media (max-width: 900px) {
+  .section-navigation > div { gap: 20px; }
 }
 
 @layer utilities {
@@ -276,7 +293,7 @@
 .chat-prose code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86em; background: var(--bg-subtle); border-radius: 6px; padding: 0.1em 0.35em; }
 .chat-prose pre { background: var(--bg-subtle); border-radius: 12px; padding: 12px 14px; overflow-x: auto; font-size: 0.86rem; line-height: 1.55; }
 .chat-prose pre code { background: none; padding: 0; font-size: inherit; }
-.chat-prose blockquote { border-left: 2px solid var(--border-strong); padding-left: 14px; color: var(--text-muted); }
+.chat-prose blockquote { border-left: 1px solid var(--border-strong); padding-left: 14px; color: var(--text-muted); }
 .chat-prose .md-table { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-surface); }
 /* Sizes to its content and scrolls inside its frame; words never break letter by letter (same rule as the phone). */
 .chat-prose table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.9375rem; line-height: 1.45; font-variant-numeric: tabular-nums; }
@@ -312,14 +329,8 @@
   animation: live-ring 1.9s var(--clem-ease) infinite;
 }
 .work-shimmer {
-  background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 38%, var(--text) 50%, var(--text-muted) 62%, var(--text-muted) 100%);
-  background-size: 260% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: work-shimmer 2s linear infinite;
+  color: var(--text-muted);
 }
-@keyframes work-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 .work-reveal { animation: work-reveal var(--clem-dur-base) var(--clem-ease) both; }
 @keyframes work-reveal { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
 /* The beat she is on: up to two lines, never a truncated clause. */
@@ -328,7 +339,7 @@
 /* The progress rail: one segment per phase. Done is filled, current sweeps
    (or fills to a declared fraction), pending waits, skipped is a dashed gap. */
 .rail-seg { position: relative; display: block; height: 3px; overflow: hidden; border-radius: 9999px; background: var(--border); }
-.rail-fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--primary); transition: width var(--clem-dur-base) var(--clem-ease); }
+.rail-fill { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--primary); }
 .rail-seg.is-done .rail-fill { width: 100%; opacity: 0.55; }
 .rail-seg.is-current .rail-fill {
   width: 100%;
@@ -343,7 +354,7 @@
 /* A step's place in the turn: a hairline under the label whose offset and
    length are its share of the time. Running reaches the right edge. */
 .step-track { position: relative; display: block; height: 2px; margin-top: 5px; overflow: hidden; border-radius: 9999px; background: var(--border); }
-.step-fill { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: inherit; background: var(--text-subtle); opacity: 0.7; transition: left 1s linear, width 1s linear; }
+.step-fill { position: absolute; top: 0; bottom: 0; min-width: 3px; border-radius: inherit; background: var(--text-subtle); opacity: 0.7; }
 .step-fill.is-running { background: var(--primary); opacity: 1; }
 .step-fill.is-failed { background: var(--danger); opacity: 1; }
 .step-fill.is-interrupted { background: var(--warning); opacity: 1; }

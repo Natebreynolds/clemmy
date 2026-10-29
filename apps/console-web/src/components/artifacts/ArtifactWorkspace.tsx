@@ -12,6 +12,9 @@ import { artifactReadingKey, readArtifactReadingState, rememberArtifactReadingSt
 import { useArtifactScroll } from '@/lib/use-artifact-scroll';
 import { readArtifactDiscussion, type ArtifactDiscussion } from '@/lib/artifact-discussion';
 import { newComposerDraftKey, writeComposerDraft } from '@/lib/composer-drafts';
+import { usePoll } from '@/lib/poll';
+import { computerDriverIsConnected, getComputerDriver } from '@/lib/computer-driver';
+import { readSavedFileNavigation } from '@/lib/saved-file-navigation';
 import '../chat/file-dock.css';
 
 const PdfPreview = lazy(() => import('../chat/PdfPreview'));
@@ -19,7 +22,7 @@ const PdfPreview = lazy(() => import('../chat/PdfPreview'));
 export type DockedItem = { kind: 'file'; ref: SessionFileRef; conversationSessionId?: string } | { kind: 'page'; projectId: string; page: ProjectPageView };
 /** The chat header's Files button, when the toolbar lives in the header. */
 export interface FilesControl { count: number; open: boolean; toggle: () => void }
-interface FileDock { item: DockedItem | null; open: (item: DockedItem) => void; close: () => void; showFiles: () => void; filesControl?: FilesControl }
+interface FileDock { item: DockedItem | null; open: (item: DockedItem) => void; close: () => void; showFiles: () => void; hasFilesList: boolean; filesControl?: FilesControl }
 const FileDockContext = createContext<FileDock | null>(null);
 export function useFileDock(): FileDock | null { return useContext(FileDockContext); }
 interface DockState { visible: boolean; item: DockedItem | null; expanded: boolean }
@@ -47,6 +50,10 @@ function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = t
   const navigate = useNavigate();
   const location = useLocation();
   const [state, setState] = useState<DockState>(() => {
+    const navigation = location.state as { openSavedFile?: unknown; showSavedFiles?: unknown } | null;
+    const file = showFilesBar ? readSavedFileNavigation(navigation?.openSavedFile, filesSessionId) : null;
+    if (file) return { visible: true, item: { kind: 'file', ref: file }, expanded: false };
+    if (showFilesBar && navigation?.showSavedFiles === true) return { visible: true, item: null, expanded: false };
     const selection = showFilesBar ? readArtifactDiscussion((location.state as { artifactDiscussion?: unknown } | null)?.artifactDiscussion) : null;
     return selection ? { visible: !window.matchMedia('(max-width: 949px)').matches, item: { kind: 'file', ref: selection.ref }, expanded: false } : remembered.get(scopeKey) ?? INITIAL;
   });
@@ -114,7 +121,7 @@ function Workspace({ scopeKey, children, returnLabel = 'work', scrollContent = t
   }, [filesSessionId, state.visible, refresh]);
   useEffect(() => { if (state.visible) panel.current?.focus({ preventScroll: true }); }, [state.visible, state.item]);
   const filesCount = files.length;
-  const dock = useMemo<FileDock>(() => ({ item: state.visible ? state.item : null, open, close, showFiles,
+  const dock = useMemo<FileDock>(() => ({ item: state.visible ? state.item : null, open, close, showFiles, hasFilesList: showFilesBar,
     ...(showFilesBar && filesInHeader ? { filesControl: { count: filesCount, open: state.visible, toggle: state.visible ? close : showFiles } } : {}) }),
   [state.visible, state.item, open, close, showFiles, showFilesBar, filesInHeader, filesCount]);
   return <FileDockContext.Provider value={dock}>
@@ -160,6 +167,8 @@ function PageBody({ projectId, page }: { projectId: string; page: ProjectPageVie
   return <><PanelHeader title={projectPageTitle(page)} place={projectPagePlace(page)} actions={<Link to={pageViewerPath(projectId, page.id)} className={ACTION}><ExternalLink className="h-4 w-4" aria-hidden /> Open page</Link>} /><div {...scroll} className="flex min-h-0 flex-1 flex-col overflow-auto px-4 py-3"><ProjectPagePreview projectId={projectId} page={page} /></div></>;
 }
 function FileBody({ fileRef, conversationSessionId, newConversation, onDiscuss }: { fileRef: SessionFileRef; conversationSessionId?: string; newConversation: boolean; onDiscuss: (file: SessionFile, ref: SessionFileRef, sourceSessionId?: string) => void }) {
+  const computer = usePoll(['computer-driver'], getComputerDriver, 20_000);
+  const onComputer = computerDriverIsConnected(computer.data);
   const [file, setFile] = useState<SessionFile | null>(null);
   const readingKey = artifactReadingKey({ ...fileRef, fileId: file?.fileId ?? fileRef.fileId });
   const [media, setMedia] = useState('');
@@ -201,9 +210,11 @@ function FileBody({ fileRef, conversationSessionId, newConversation, onDiscuss }
   };
   return <>
     <PanelHeader title={fileRef.name} place={file ? `${file.place} · ${fileSizeWords(file.bytes)}` : fileRef.folder} actions={<>
+      {file?.openable ? <button type="button" onClick={() => void openInApp()} disabled={action !== null}
+        className={onComputer ? 'inline-flex min-h-9 shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 text-small font-semibold text-primary-fg transition-colors hover:bg-primary-hover disabled:opacity-60' : ACTION}
+        title={onComputer ? 'Open in its app to keep working with Clem.' : undefined}><ExternalLink className="h-4 w-4" aria-hidden /> {action === 'open' ? 'Opening…' : onComputer ? 'Open on computer' : 'Open in app'}</button> : null}
       {conversationSessionId ? <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(conversationSessionId))}`} className={ACTION}>Conversation</Link> : null}
       <button type="button" onClick={() => setAttempt(n => n + 1)} disabled={action !== null} className={ACTION} aria-label="Reload file" title="Reload the current version"><RefreshCw className="h-4 w-4" aria-hidden /></button>
-      {file?.openable ? <button type="button" onClick={() => void openInApp()} disabled={action !== null} className={ACTION}><ExternalLink className="h-4 w-4" aria-hidden /> Open in app</button> : null}
       {file ? <button type="button" onClick={() => void download()} disabled={action !== null} className={ACTION}><Download className="h-4 w-4" aria-hidden /> {action === 'download' ? 'Downloading…' : 'Download'}</button> : null}
     </>} />
     {file?.kind === 'html' ? <div className="flex gap-1 border-b border-border px-4 py-2" aria-label="HTML view"><button type="button" className={ACTION} aria-pressed={!source} onClick={() => changeSource(false)}>Preview</button><button type="button" className={ACTION} aria-pressed={source} onClick={() => changeSource(true)}>Source</button></div> : null}

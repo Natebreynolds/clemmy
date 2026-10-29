@@ -1,7 +1,11 @@
+import { AttentionReportSelector } from '../components/AttentionReportSelector';
+import '../components/attention-report-groups.css';
 import { renderMarkdown } from '@clem/chat-engine';
+import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   answerInboxQuestion,
+  presentInboxQuestion,
   cancelWorkflowRunById,
   decideCheckInProposal,
   getInboxNotification,
@@ -18,6 +22,8 @@ import {
   resolveInboxTrustProposal,
   resolveInboxWorkflowCapability,
   type ApprovalRow,
+  type AttentionItem,
+  type AttentionPresentationReceipt,
   type InboxNotification,
   type InboxQuestion,
   type InboxTrustProposal,
@@ -37,6 +43,7 @@ import {
   notificationIsRepresentedByApprovals,
   notificationLabel,
   notificationRunTarget,
+  notificationWorkflowHref,
   trustScopeSummary,
   updatesClearScope, notificationTitle, needsYouCardLabel } from '../lib/inbox-presentation';
 import { inboxNeedsCountKnown, mergeInboxLastGood, type InboxLastGood } from '../lib/inbox-last-good';
@@ -53,9 +60,15 @@ import {
 import { listProjectLabels } from '../lib/project-api';
 import { useScreenData } from '../lib/use-screen-data';
 import { buildNeedsRows, NEEDS_SECTIONS, type NeedsRow, type NeedsRowKind } from '../lib/needs-you-rows';
-import { decisionHeading, isIdentifierLike, checkInProposalDecisionFeedback } from '@clem/chat-engine';
+import { attentionWorkTitle, decisionHeading, isIdentifierLike, checkInProposalDecisionFeedback } from '@clem/chat-engine';
 
-type InboxTab = 'needs' | 'updates';
+import { inboxDecisionFromSearch } from '../lib/deep-link';
+import { inboxNotificationIsCurrent, inboxViewFromSearch, navigateInboxView, type InboxView } from '../lib/set-aside-questions';
+import { SetAsideQuestions } from '../components/SetAsideQuestions';
+import { AttentionActions } from '../components/AttentionActions';
+import { attentionFallbackRows, notificationAttentionKey, restoreSavedAttention, sameAttentionReceipt, type SavedAttentionReceipt } from '../lib/attention-presentation';
+
+type InboxTab = InboxView;
 
 interface InboxData {
   approvals: ApprovalRow[];
@@ -69,6 +82,8 @@ interface InboxData {
   requestedNotificationPending: boolean;
   /** True only after every Needs-you source has returned at least once. */
   needsCountKnown: boolean;
+  /** A badge may change only after all contributing sources refresh together. */
+  needsCountFresh: boolean;
   /** The Updates feed has its own truth boundary; other source failures do
    * not make a successful empty notification response unknown. */
   updatesKnown: boolean;
@@ -83,6 +98,7 @@ interface InboxData {
   /** Needs-you items no feed has a row for (dashboard/needs-you.ts), so this
    *  list and the header's number are the same set. */
   unlisted: InboxUnlistedItem[];
+  attentionItems: AttentionItem[];
   /** Which project each row's session works in. Empty when none does, or
    *  when the Mac could not say: a row then reads as it always did. */
   projectLabels: ProjectLabel[];
@@ -117,6 +133,7 @@ interface DecidedEntry {
 
 interface Props {
   initialNotificationId?: string | null;
+  canonicalNeedsCount: number | null;
   onCount: (count: number) => void;
   onReply: (sessionId: string | null, draft: string) => void;
   onOpenSettings: () => void;
@@ -126,7 +143,7 @@ interface Props {
   onOpenRun: (sessionId: string) => void;
 }
 
-export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings, onOpenWorkflows, onOpenRun }: Props) {
+export function Inbox({ initialNotificationId, canonicalNeedsCount, onCount, onReply, onOpenSettings, onOpenWorkflows, onOpenRun }: Props) {
   // Partial endpoint failures keep the last successful value for that exact
   // source. `undefined` means “never known”; an empty array means a successful
   // authoritative zero. This distinction prevents a transport miss from
@@ -136,7 +153,6 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // one fact where a remembered value would be the defect. It keeps its own
   // slot so a stale snapshot can never leak into the decision sets above.
   const lastStoppableRunIds = useRef<string[] | null>(null);
-  const lastUnlisted = useRef<InboxUnlistedItem[]>([]);
   // Labels are presentation, so they never hold up or fail the Inbox: asked
   // once for the rows on screen, and again only when those rows change.
   const lastLabels = useRef<{ key: string; at: number; labels: ProjectLabel[] }>({ key: '', at: 0, labels: [] });
@@ -159,7 +175,6 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       loadInboxPart(listWorkingNow()),
       loadInboxPart(getInboxSummary()),
     ]);
-    if (summary.ok) lastUnlisted.current = summary.value.unlisted ?? [];
     if (workingNow.ok) {
       lastStoppableRunIds.current = [...stoppableWorkflowRunIds(workingNow.value.entries)];
     }
@@ -174,6 +189,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       ...(questions.ok ? { questions: questions.value.questions } : {}),
       ...(trusts.ok ? { trustProposals: trusts.value.proposals } : {}),
       ...(notifications.ok ? { notifications: [...notifications.value.notifications] } : {}),
+      ...(summary.ok ? { attentionItems: summary.value.attentionItems ?? [], unlisted: summary.value.unlisted ?? [] } : {}),
     });
 
     let notificationRows = [...(lastGood.current.notifications ?? [])];
@@ -223,22 +239,27 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         !questions.ok ? 'questions' : '',
         !trusts.ok ? 'trust requests' : '',
         !notifications.ok ? 'updates' : '',
-        // Say it out loud the first time, because the consequence is a missing
-        // control: with no liveness the phone will not offer to end a run.
-        !workingNow.ok && lastStoppableRunIds.current === null ? 'run controls' : '',
+        !summary.ok ? 'request status' : '',
+        // Cached run liveness cannot authorize a fresh stop control.
+        !workingNow.ok ? 'run controls' : '',
         requestedNotificationPending ? 'selected update' : '',
       ].filter(Boolean),
       requestedNotificationMissing,
       requestedNotificationPending,
       needsCountKnown: inboxNeedsCountKnown(lastGood.current),
+      needsCountFresh: parts.every((part) => part.ok) && summary.ok,
       updatesKnown: lastGood.current.notifications !== undefined,
-      stoppableRunIds: lastStoppableRunIds.current,
-      unlisted: lastUnlisted.current,
+      stoppableRunIds: workingNow.ok ? lastStoppableRunIds.current : null,
+      unlisted: lastGood.current.unlisted ?? [],
+      attentionItems: lastGood.current.attentionItems ?? [],
       projectLabels: lastLabels.current.labels,
     };
   }, [initialNotificationId]);
   const { data, loading, refreshing, error, offline, refresh } = useScreenData(load, { intervalMs: 6_000, resourceKey: initialNotificationId ?? 'inbox' });
-  const [tab, setTab] = useState<InboxTab>('needs');
+  const [tab, setTab] = useState<InboxTab>(() => inboxViewFromSearch(window.location.search));
+  const [presentationUndo, setPresentationUndo] = useState<SavedAttentionReceipt | null>(null);
+  const [undoBusy, setUndoBusy] = useState(false);
+  const undoLock = useRef(false);
   const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
   // A SET, not one id: per-row clearing is concurrent now that it no longer
   // freezes the screen, and a single slot would let the last tap take the
@@ -254,11 +275,28 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const [confirmClear, setConfirmClear] = useState(false);
   // Needs you is a list; one item opens on its own with Back. The list's
   // scroll position is kept so Back lands where the person was.
-  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [openKey, setOpenKey] = useState<string | null>(() => inboxDecisionFromSearch(window.location.search));
   const listScroll = useRef(0);
   const screenRef = useRef<HTMLDivElement>(null);
   const handledDeepLink = useRef<string | null>(null);
+  const [locationRevision, setLocationRevision] = useState(0);
   const clearingLock = useRef(false);
+  useEffect(() => {
+    const sync = () => {
+      const key = inboxDecisionFromSearch(window.location.search); setOpenKey(key); setTab(key ? 'needs' : inboxViewFromSearch(window.location.search));
+      // Browser Back can address the same notification again. It is a new
+      // navigation even when its id and the retained Inbox data are unchanged.
+      handledDeepLink.current = null;
+      setLocationRevision(value => value + 1);
+    };
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, []);
+  useEffect(() => {
+    const changed = () => { void refresh(); };
+    window.addEventListener('clem:needs-you-changed', changed);
+    return () => window.removeEventListener('clem:needs-you-changed', changed);
+  }, [refresh]);
 
   const forgetLocalReads = useCallback((ids: readonly string[]) => {
     setLocallyRead((current) => {
@@ -311,8 +349,15 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // The count ON THIS SCREEN counts the rows on this screen — including the
   // ones this phone just dismissed, which are gone from the list. A tab badge
   // that outran its own rows would be a count exceeding what its screen shows.
-  const unlisted = data?.unlisted ?? [];
-  const needsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + notificationNeeds.length + unlisted.length;
+  const attentionItems = data?.attentionItems ?? [];
+  const attentionByKey = useMemo(() => new Map((data?.attentionItems ?? []).map(item => [item.key, item])), [data?.attentionItems]);
+  const attentionForReport = (row: InboxNotification) => row.lifecycle?.generation ? {
+    key: notificationAttentionKey(row), lifecycle: { ...row.lifecycle, generation: row.lifecycle.generation },
+  } : undefined;
+  const unlisted = useMemo(() => attentionFallbackRows(attentionItems, notificationNeeds.map(item => item.row), data?.unlisted ?? []),
+    [data?.attentionItems, notificationNeeds, data?.unlisted]);
+  const notificationWorkCount = new Set(notificationNeeds.map(item => item.row.needsYouKey ?? `notification:${item.row.id}`)).size;
+  const needsCount = questions.length + approvals.length + plans.length + workspaceChoosers.length + trustProposals.length + notificationWorkCount + unlisted.length;
 
   // The count PUBLISHED TO THE SHELL is a different claim, so it is a different
   // number: the shell keeps it as its last authoritative summary and shows it
@@ -321,7 +366,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // the daemon has confirmed — no local guess reaches the icon. It catches up
   // on the very next poll, and a refused clear never has to walk it back.
   const confirmedNotificationNeeds = useMemo(
-    () => collapseAttentionNotifications((data?.notifications ?? []).filter(stillNeedsUser)).length,
+    () => new Set(collapseAttentionNotifications((data?.notifications ?? []).filter(stillNeedsUser)).map(item => item.row.needsYouKey ?? `notification:${item.row.id}`)).size,
     [data?.notifications, stillNeedsUser],
   );
   const needsRows = useMemo(() => buildNeedsRows({
@@ -376,8 +421,8 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   useEffect(() => {
     // The app shell independently retains its last authoritative summary.
     // Publish only a complete count; a guessed zero would erase that truth.
-    if (data?.needsCountKnown) onCount(confirmedNeedsCount);
-  }, [confirmedNeedsCount, data?.needsCountKnown, onCount]);
+    if (data?.needsCountFresh) onCount(confirmedNeedsCount);
+  }, [confirmedNeedsCount, data?.needsCountFresh, onCount]);
 
   // A pending "are you sure" belongs to the scope it was asked about. Leave
   // the tab, or clear the scope, and the question is gone — it must never
@@ -401,7 +446,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   // a typed question/approval, focus the richer response card instead of its
   // generic delivery copy. Otherwise open the update itself.
   useEffect(() => {
-    if (!initialNotificationId || !data || handledDeepLink.current === initialNotificationId) return;
+    if (!initialNotificationId || !inboxNotificationIsCurrent(window.location.search, initialNotificationId) || !data || handledDeepLink.current === initialNotificationId) return;
     if (data.requestedNotificationMissing) {
       handledDeepLink.current = initialNotificationId;
       setTab('updates');
@@ -427,14 +472,14 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
       ),
     );
     const fallbackNotification = updates.find((row) => row.id === initialNotificationId)
-      ?? notificationNeeds.find(({ row }) => row.id === initialNotificationId)?.row
+      ?? notificationNeeds.flatMap(group => group.reports).find(row => row.id === initialNotificationId)
       ?? (actionTarget ? updates.find((row) => row.context.actionItemId === actionTarget) : undefined)
-      ?? (actionTarget ? notificationNeeds.find(({ row }) => row.context.actionItemId === actionTarget)?.row : undefined);
+      ?? (actionTarget ? notificationNeeds.flatMap(group => group.reports).find(row => row.context.actionItemId === actionTarget) : undefined);
     const target = targetIsOpen && actionTarget
       ? actionTarget
       : `notification:${fallbackNotification?.id ?? initialNotificationId}`;
     const belongsInNeeds = targetIsOpen || Boolean(
-      fallbackNotification && notificationNeeds.some(({ row }) => row.id === fallbackNotification.id),
+      fallbackNotification && notificationNeeds.some(group => group.reports.some(row => row.id === fallbackNotification.id)),
     );
     setTab(belongsInNeeds ? 'needs' : 'updates');
     if (belongsInNeeds) setOpenKey(target);
@@ -449,7 +494,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         reportNativeNotificationHandled(initialNotificationId, 'presented');
       });
     });
-  }, [approvalIds, data, initialNotificationId, notificationNeeds, notifications, planIds, questionIds, trustIds, updates]);
+  }, [approvalIds, data, initialNotificationId, locationRevision, notificationNeeds, notifications, planIds, questionIds, trustIds, updates]);
 
   const scroller = () => screenRef.current?.closest<HTMLElement>('.app-main') ?? null;
   const openRow = (key: string) => {
@@ -465,6 +510,9 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   const returnToList = (focusId?: string) => {
     const key = openKey;
     setOpenKey(null);
+    const location = new URL(window.location.href);
+    location.searchParams.delete('item');
+    window.history.replaceState(window.history.state, '', `${location.pathname}${location.search}`);
     window.requestAnimationFrame(() => {
       scroller()?.scrollTo({ top: listScroll.current });
       (document.getElementById(focusId ?? `needs-row-${key}`) ?? document.getElementById('inbox-tab-needs'))?.focus({ preventScroll: true });
@@ -472,8 +520,8 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   };
   // An opened item that settled elsewhere (or here) leaves the detail view.
   useEffect(() => {
-    if (openKey && data && !needsRows.some((row) => row.key === openKey)) setOpenKey(null);
-  }, [data, needsRows, openKey]);
+    if (openKey && data && !needsRows.some(row => row.key === openKey) && !notificationNeeds.some(group => group.reports.some(row => `notification:${row.id}` === openKey || row.needsYouKey === openKey))) setOpenKey(null);
+  }, [data, needsRows, notificationNeeds, openKey]);
   useEffect(() => {
     if (tab !== 'needs') setOpenKey(null);
   }, [tab]);
@@ -485,12 +533,25 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
     ].slice(0, 12));
   };
 
-  const resolved = (text: string, tone: 'success' | 'error' = 'success') => {
+  const resolved = (text: string, tone: 'success' | 'error' = 'success', decision = true) => {
     setNotice({ tone, text });
-    if (tone === 'success') recordDecision(`decision-${Date.now().toString(36)}`, text);
+    if (tone === 'success' && decision) recordDecision(`decision-${Date.now().toString(36)}`, text);
     if (tone === 'success' && openKey) returnToList('inbox-action-receipt');
     void refresh();
     window.requestAnimationFrame(() => document.getElementById('inbox-action-receipt')?.focus());
+  };
+  const presented = (receipt: SavedAttentionReceipt) => {
+    setPresentationUndo(receipt);
+    setNotice(null);
+    if (openKey) returnToList('inbox-presentation-receipt');
+    void refresh();
+    window.requestAnimationFrame(() => {
+      scroller()?.scrollTo({ top: 0 });
+      document.getElementById('inbox-presentation-receipt')?.focus({ preventScroll: true });
+    });
+  };
+  const attentionPresented = (receipt: AttentionPresentationReceipt) => {
+    presented({ source: 'attention', id: receipt.key, generation: receipt.generation, mutationToken: receipt.mutationToken });
   };
 
   const answered = (question: InboxQuestion, receipt: Omit<AnswerReceipt, 'id'>) => {
@@ -518,7 +579,18 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
 
   const selectTab = (next: InboxTab) => {
     setTab(next);
+    navigateInboxView(next);
     window.requestAnimationFrame(() => document.getElementById(`inbox-tab-${next}`)?.focus());
+  };
+  const tabKey = (event: KeyboardEvent, current: InboxTab) => {
+    const order: InboxTab[] = ['needs', 'updates', 'set-aside'];
+    const index = order.indexOf(current);
+    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+      event.preventDefault();
+      selectTab(order[(index + (event.key === 'ArrowRight' ? 1 : order.length - 1)) % order.length]!);
+    } else if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault(); selectTab(event.key === 'Home' ? 'needs' : 'set-aside');
+    }
   };
 
   // Clear ONE row, from the row, without leaving the screen. The row leaves
@@ -593,44 +665,37 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
   };
 
   return (
-    <div class="inbox-screen" aria-busy={refreshing} ref={screenRef}>
+    <div class="inbox-screen" data-clem-guide="inbox" aria-busy={refreshing} ref={screenRef}>
       <div class="inbox-tabs" role="tablist" aria-label="Inbox views">
         <button
           id="inbox-tab-needs"
           type="button"
           role="tab"
+          aria-label={canonicalNeedsCount !== null && canonicalNeedsCount > 0 ? `Needs you, ${canonicalNeedsCount} ${canonicalNeedsCount === 1 ? 'request' : 'requests'}` : 'Needs you'}
           aria-controls="inbox-panel-needs"
           aria-selected={tab === 'needs'}
           tabIndex={tab === 'needs' ? 0 : -1}
           class={tab === 'needs' ? 'active' : ''}
-          onClick={() => setTab('needs')}
-          onKeyDown={(event) => {
-            if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-              event.preventDefault();
-              selectTab('updates');
-            }
-          }}
+          onClick={() => selectTab('needs')}
+          onKeyDown={(event) => tabKey(event, 'needs')}
         >
-          Needs you {needsCount > 0 ? <span>{needsCount > 99 ? '99+' : needsCount}</span> : null}
+          <span class="inbox-tab-label">Needs you</span><span class="inbox-tab-count" aria-hidden="true">{canonicalNeedsCount !== null && canonicalNeedsCount > 0 ? canonicalNeedsCount > 99 ? '99+' : canonicalNeedsCount : null}</span>
         </button>
         <button
           id="inbox-tab-updates"
           type="button"
           role="tab"
+          aria-label={unreadUpdates > 0 ? `Updates, ${unreadUpdates} unread` : 'Updates'}
           aria-controls="inbox-panel-updates"
           aria-selected={tab === 'updates'}
           tabIndex={tab === 'updates' ? 0 : -1}
           class={tab === 'updates' ? 'active' : ''}
-          onClick={() => setTab('updates')}
-          onKeyDown={(event) => {
-            if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-              event.preventDefault();
-              selectTab('needs');
-            }
-          }}
+          onClick={() => selectTab('updates')}
+          onKeyDown={(event) => tabKey(event, 'updates')}
         >
-          Updates {unreadUpdates > 0 ? <span>{unreadUpdates > 99 ? '99+' : unreadUpdates}</span> : null}
+          <span class="inbox-tab-label">Updates</span><span class="inbox-tab-count" aria-hidden="true">{unreadUpdates > 0 ? unreadUpdates > 99 ? '99+' : unreadUpdates : null}</span>
         </button>
+        <button id="inbox-tab-set-aside" type="button" role="tab" aria-controls="inbox-panel-set-aside" aria-selected={tab === 'set-aside'} tabIndex={tab === 'set-aside' ? 0 : -1} class={tab === 'set-aside' ? 'active' : ''} onClick={() => selectTab('set-aside')} onKeyDown={event => tabKey(event, 'set-aside')}><span class="inbox-tab-label">Set aside</span><span class="inbox-tab-count" aria-hidden="true" /></button>
       </div>
 
       <ScreenNotice
@@ -641,15 +706,23 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
         note={note}
       />
 
-      {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
+      {presentationUndo ? <div id="inbox-presentation-receipt" class="presentation-undo" role="status" tabIndex={-1}><span>Set aside. The work is unchanged.</span><button type="button" disabled={undoBusy} onClick={async () => {
+        if (undoLock.current) return; undoLock.current = true; setUndoBusy(true);
+        const receipt = presentationUndo;
+        try { await restoreSavedAttention(receipt); setPresentationUndo(current => sameAttentionReceipt(current, receipt) ? null : current); resolved('Restored to Needs you. The work is unchanged.', 'success', false); }
+        catch (err) { setNotice({ tone: 'error', text: err instanceof Error ? err.message : 'Could not restore this item. Refresh to check its status.' }); }
+        finally { undoLock.current = false; setUndoBusy(false); }
+      }}>{undoBusy ? 'Restoring…' : 'Undo'}</button></div> : null}
+      {loading && tab !== 'set-aside' ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
+      {tab === 'set-aside' ? <div id="inbox-panel-set-aside" role="tabpanel" aria-labelledby="inbox-tab-set-aside"><SetAsideQuestions onReply={onReply} onRestored={receipt => { setPresentationUndo(current => sameAttentionReceipt(current, receipt) ? null : current); void refresh(); }} /></div> : null}
 
       {!loading && tab === 'needs' ? (
         <div id="inbox-panel-needs" class="inbox-stack" role="tabpanel" aria-labelledby="inbox-tab-needs">
-          {data?.needsCountKnown && needsCount === 0 ? (
+          {data?.needsCountFresh && needsCount === 0 && canonicalNeedsCount === 0 ? (
             <div class="inbox-clear">
               <span aria-hidden="true"><CheckGlyph /></span>
               <h2>Nothing is waiting on you</h2>
-              <p>New questions will stay here until you answer them.</p>
+              <p>You’re up to date. New requests arrive here, ready to review.</p>
             </div>
           ) : null}
 
@@ -694,12 +767,14 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
             </button>
           ) : null}
 
+          {openKey && data?.needsCountFresh && !needsRows.some(row => row.key === openKey) ? <div class="inbox-clear"><h2>This request is no longer waiting</h2><p>Return to the list, or check Updates &amp; history for what happened.</p><button type="button" class="home-btn" onClick={() => returnToList()}>Back to Inbox</button></div> : null}
           {questions.filter((question) => question.id === openKey).map((question) => (
             <QuestionCard
               key={question.id}
               question={question}
               project={projectNameFor(question, questionSessions(question), projectLabels)}
               onAnswered={(receipt) => answered(question, receipt)}
+              onPresented={(_action, generation, mutationToken) => { if (generation && mutationToken) presented({ source: 'question', id: question.id, generation, mutationToken }); }}
               onReply={onReply}
             />
           ))}
@@ -728,22 +803,40 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 <div class="inbox-card-actions">
                   <button type="button" class="btn-reply" onClick={onOpenWorkflows}>Open Automations</button>
                 </div>
-              ) : null}
+              ) : item.sessionId ? <div class="inbox-card-actions"><button type="button" class="btn-reply" onClick={() => onReply(item.sessionId!, '')}>Open conversation</button></div> : null}
+              <AttentionActions item={attentionByKey.get(item.key)} onPresented={attentionPresented} onChanged={() => void refresh()} />
             </article>
           ))}
 
-          {notificationNeeds.filter(({ row }) => `notification:${row.id}` === openKey).map(({ row, earlier }) => {
+          {notificationNeeds.filter(group => group.reports.some(row => `notification:${row.id}` === openKey) || group.row.needsYouKey === openKey).map(({ row: first, earlier, reports }) => {
+            const row = reports.find(report => `notification:${report.id}` === openKey)
+              ?? (first.needsYouKey === openKey ? first : undefined);
+            if (!row) return null;
+            const groupedReports = reports.length > 1;
+            const parentActions = attentionForReport(first);
+            const selector = groupedReports ? <div data-attention-group={first.needsYouKey}>
+              <h2 class="pane-head">{attentionWorkTitle(first.needsYouKey, first.title)}</h2>
+              <AttentionReportSelector reports={reports} attentionKey={first.needsYouKey} selectedId={row.id} onSelect={id => {
+                setOpenKey(`notification:${id}`);
+                window.requestAnimationFrame(() => document.getElementById(`inbox-notification:${id}`)?.scrollIntoView({ block: 'start' }));
+              }} />
+              <AttentionActions item={parentActions} onPresented={attentionPresented} onChanged={() => void refresh()} />
+            </div> : null;
             // The run this row is ABOUT (see notificationRunTarget) — the same
             // destination the push for this same notification lands on.
             const runTarget = notificationRunTarget(row);
-            return row.workflowCapability ? (
+            const workflowHref = notificationWorkflowHref(row, attentionByKey.get(notificationAttentionKey(row)));
+            return <section key={first.id} class="attention-work-detail">
+              {selector}
+              {row.workflowCapability ? (
               <WorkflowCapabilityCard
-                key={row.id}
+                key={`${row.id}:${row.lifecycle?.generation ?? ''}`}
                 row={row}
                 gate={row.workflowCapability}
                 onResolved={resolved}
                 onOpenSettings={onOpenSettings}
                 onOpenWorkflows={onOpenWorkflows}
+                attentionActions={!groupedReports ? <AttentionActions item={attentionForReport(row)} onPresented={attentionPresented} onChanged={() => void refresh()} /> : undefined}
               />
             ) : (
               <article
@@ -756,7 +849,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                 <ProjectChip name={projectNameFor({}, notificationSessions(row), projectLabels)} />
                 <h2>{notificationTitle(row.title) || 'I need your attention'}</h2>
                 {row.body ? <p class="inbox-card-body">{row.body}</p> : null}
-                {earlier > 0 ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
+                {earlier > 0 && !groupedReports ? <p class="inbox-card-fine">+{earlier} earlier update{earlier === 1 ? '' : 's'} like this</p> : null}
                 <div class="inbox-card-actions">
                   {row.context.sessionId ? (
                     <button
@@ -780,6 +873,7 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                       Open run
                     </button>
                   ) : null}
+                  {!runTarget && workflowHref ? <a class="btn-reply" data-app-item="workflow" href={workflowHref}>Open workflow</a> : null}
                   {/* Dismissing the MESSAGE leaves the run exactly where it
                       is — which is how a run reaches eleven hours of
                       "Running" with nobody able to stop it from the phone.
@@ -800,12 +894,13 @@ export function Inbox({ initialNotificationId, onCount, onReply, onOpenSettings,
                       onResolved={resolved}
                     />
                   ) : null}
-                  <button type="button" class="btn-reject" disabled={reading.has(row.id)} onClick={() => void markRead(row)}>
+                  {!row.needsAttention ? <button type="button" class="btn-reject" disabled={reading.has(row.id)} onClick={() => void markRead(row)}>
                     {reading.has(row.id) ? 'Saving…' : 'Dismiss update'}
-                  </button>
+                  </button> : null}
                 </div>
+                {!groupedReports ? <AttentionActions item={attentionForReport(row)} onPresented={attentionPresented} onChanged={() => void refresh()} /> : null}
               </article>
-            );
+            )}</section>;
           })}
 
           {openKey === null && decidedToday.length > 0 ? (
@@ -1034,12 +1129,13 @@ function EndRunButton({ runId, workflow, onResolved }: {
   );
 }
 
-function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenWorkflows }: {
+function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenWorkflows, attentionActions }: {
   row: InboxNotification;
   gate: WorkflowCapabilityInboxGate;
   onResolved: (message: string, tone?: 'success' | 'error') => void;
   onOpenSettings: () => void;
   onOpenWorkflows: () => void;
+  attentionActions?: ComponentChildren;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1121,6 +1217,7 @@ function WorkflowCapabilityCard({ row, gate, onResolved, onOpenSettings, onOpenW
         </div>
       )}
       {error ? <p class="inbox-inline-error" role="alert">{error}</p> : null}
+      {attentionActions}
     </article>
   );
 }
@@ -1212,11 +1309,12 @@ function ProjectChip({ name }: { name: string | null }) {
   return name ? <span class="chip chip-project inbox-project">{name}</span> : null;
 }
 
-function QuestionCard({ question, project, onAnswered, onReply }: {
+function QuestionCard({ question, project, onAnswered, onPresented, onReply }: {
   question: InboxQuestion;
   /** The project this question belongs to; null when it belongs to none. */
   project: string | null;
   onAnswered: (receipt: Omit<AnswerReceipt, 'id'>) => void;
+  onPresented: (action: 'dismiss' | 'defer', generation?: string, mutationToken?: string) => void;
   onReply: Props['onReply'];
 }) {
   const draftKey = `clem-inbox-draft:${question.id}`;
@@ -1270,6 +1368,18 @@ function QuestionCard({ question, project, onAnswered, onReply }: {
       actionLock.current = false;
       setBusy(false);
     }
+  };
+
+  const present = async (action: 'dismiss' | 'defer') => {
+    if (actionLock.current) return;
+    actionLock.current = true; setBusy(true); setError(null);
+    try {
+      if (!question.lifecycle?.generation) throw new Error('Refresh this question before setting it aside.');
+      const result = await presentInboxQuestion(question.id, action, question.lifecycle.generation);
+      haptic('light');
+      onPresented(action, result.generation, result.mutationToken);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Could not update this request. Try again.'); }
+    finally { actionLock.current = false; setBusy(false); }
   };
 
   return (
@@ -1347,6 +1457,13 @@ function QuestionCard({ question, project, onAnswered, onReply }: {
             ?? 'This question has no safe reply context on the phone yet. Open its run on the desktop to answer without risking the wrong work.'}
         </p>
       )}
+      {question.lifecycle?.effect === 'hide_only' && question.lifecycle.generation ? <div class="question-presentation">
+        <div class="inbox-card-actions">
+          {question.lifecycle.canDefer ? <button type="button" class="btn-reply" disabled={busy} onClick={() => void present('defer')}>Later</button> : null}
+          {question.lifecycle.canDismiss ? <button type="button" class="btn-reply" disabled={busy} onClick={() => void present('dismiss')}>Dismiss</button> : null}
+        </div>
+        <p class="card-note">This hides the question. Clem’s work stays paused until you respond.</p>
+      </div> : null}
       {error ? <p id={errorId} class="inbox-inline-error" role="alert">{error}</p> : null}
     </article>
   );

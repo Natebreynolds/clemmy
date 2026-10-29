@@ -9,7 +9,7 @@ export function ApprovalReview({ preview }: { preview: ApprovalPreview }) {
     <dt>{label(field.name)}</dt><dd>{approvalFieldText(field)}</dd>
   </div>)}</dl>;
   return <section class="approval-review" aria-label="Prepared actions">
-    <p class="approval-review-scope">Approve all {review.items.length} listed actions. Check the dates, times and recipients. Reply with changes before approving.</p>
+    <p class="approval-review-scope">{review.items.length === 1 ? 'Review this action.' : `Review all ${review.items.length} listed actions.`} Check the dates, times and recipients. Tell me what you want changed before approving.</p>
     {fields(review.common.filter(field => !(review.items.every(item => item.when) && field.name === 'is_all_day')))}
     <ol class="approval-review-list">{review.items.map((item, index) => <li key={index}>
       <p class="approval-review-title">{item.title}</p>
@@ -21,6 +21,6 @@ export function ApprovalReview({ preview }: { preview: ApprovalPreview }) {
         : 'Standing-rule check unavailable.'}</p>}
       <details><summary>{item.when ? 'Description & exact details' : 'Exact details'}</summary>{fields(item.exact)}</details>
     </li>)}</ol>
-    {review.items.every(item => item.check?.status === 'clear') && <p class="approval-review-scope">Standing rules checked for all {review.items.length} actions — no conflicts found.</p>}
+    {review.items.every(item => item.check?.status === 'clear') && <p class="approval-review-scope">{review.items.length === 1 ? 'Standing rules checked for this action' : `Standing rules checked for all ${review.items.length} actions`} — no conflicts found.</p>}
   </section>;
 }

@@ -20,7 +20,7 @@ export const TAB_IDS: ReadonlySet<TabId> = new Set<TabId>([
 
 /** Every parameter that names a destination. A cold launch carrying any of
  *  them is an explicit request and outranks the "open on launch" preference. */
-const DESTINATION_KEYS = ['tab', 'notification', 'workspace', 'run', 'project', 'agent', 'pair', 'adopt'] as const;
+const DESTINATION_KEYS = ['tab', 'notification', 'item', 'workspace', 'run', 'project', 'agent', 'session', 'guide', 'pair', 'adopt'] as const;
 
 export function tabFromSearch(search: string): TabId {
   const value = new URLSearchParams(search).get('tab');
@@ -74,6 +74,7 @@ export function searchHasDestination(search: string): boolean {
 export function destinationSearch(input: {
   tab: TabId;
   notificationId?: string | null;
+  decisionKey?: string | null;
   runId?: string | null;
   projectId?: string | null;
   agentId?: string | null;
@@ -81,9 +82,26 @@ export function destinationSearch(input: {
   const params = new URLSearchParams();
   if (input.tab !== 'home') params.set('tab', input.tab);
   if (input.tab === 'inbox' && input.notificationId) params.set('notification', input.notificationId);
+  if (input.tab === 'inbox' && input.decisionKey && /^(plan|approval|trust|chooser):[^\s]{1,240}$/.test(input.decisionKey)) params.set('item', input.decisionKey);
   if (input.tab === 'activity' && input.runId) params.set('run', input.runId);
   if (input.tab === 'projects' && input.projectId) params.set('project', input.projectId);
   if (input.tab === 'agents' && input.agentId) params.set('agent', input.agentId);
   const query = params.toString();
   return query ? `?${query}` : '';
+}
+
+/** Exact chat destinations are read-only navigation, scoped to Chats. */
+export function sessionFromSearch(search: string): string | null {
+  const params = new URLSearchParams(search);
+  if (params.get('tab') !== 'chats') return null;
+  const value = params.get('session');
+  return value && /^[a-zA-Z0-9:_-]{1,200}$/.test(value) ? value : null;
+}
+
+/** A full decision review, never a consent action. */
+export function inboxDecisionFromSearch(search: string): string | null {
+  const params = new URLSearchParams(search);
+  if (params.get('tab') !== 'inbox') return null;
+  const value = params.get('item');
+  return value && /^(plan|approval|trust|chooser):[^\s]{1,240}$/.test(value) ? value : null;
 }

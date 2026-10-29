@@ -1,6 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fromClemRunHref, recentPulses, withoutFromClem } from './from-clem';
+import { fromClemDisposition, fromClemReceiptVersion, fromClemRunHref, recentPulses, withoutFromClem, type FromClemRow } from './from-clem';
+
+const decisionRow: FromClemRow = { key: 'controlled', heartbeat: 'work', heartbeatTitle: 'Work review', at: '2026-10-29T12:00:00Z',
+  asks: true, text: 'Controlled question', voiceDigest: 'controlled-version' };
+
+test('question dismissal and tomorrow never become a submitted answer or resume decision', () => {
+  const row = { ...decisionRow, answer: { kind: 'words' as const, questionId: 'task:controlled' } };
+  assert.deepEqual(fromClemDisposition(row, 'dismiss'), { kind: 'question', questionId: 'task:controlled', action: 'dismiss' });
+  assert.deepEqual(fromClemDisposition(row, 'defer'), { kind: 'question', questionId: 'task:controlled', action: 'defer' });
+});
+
+test('generic dispositions hide the exact ask without submitting a reply or acknowledging its notification', () => {
+  const row = { ...decisionRow, done: { notificationId: 'controlled-notice' }, attentionKey: 'calendar:controlled',
+    lifecycle: {canDismiss:true,canDefer:true,dismissLabel:'Dismiss',deferLabel:'Tomorrow',effect:'hide_only' as const,generation:'rendered-generation'} };
+  for (const action of ['dismiss','defer'] as const) {
+    assert.deepEqual(fromClemDisposition(row, action), { kind:'attention',key:'calendar:controlled',action,generation:'rendered-generation' });
+    assert.equal(fromClemDisposition({ ...row, lifecycle: {...row.lifecycle,generation:undefined} },action),null);
+  }
+  assert.equal(fromClemDisposition({ ...decisionRow, done: {notificationId:'legacy'} }, 'dismiss'), null);
+  assert.equal(fromClemDisposition({ ...decisionRow, answer: { kind: 'brain_outage', outageId: 'controlled-outage' } }, 'dismiss'), null);
+  assert.deepEqual(fromClemDisposition({...row,answer:{kind:'yes_no',planProposalId:'plan'}},'dismiss'),
+    {kind:'reply',text:'Decline this proposal',decision:'done'},'plans retain their owning decline decision');
+});
 
 test('Home lists leave out exactly what From Clem shows', () => {
   const items = [
@@ -62,4 +84,11 @@ test('a follow-up conversation has an informational receipt without claiming the
     'an older started receipt keeps its existing settled presentation');
   assert.deepEqual(replyOutcomeNotice({ ...conversation, itemSettled: true }, 'Controlled check'),
     { tone: 'success', text: 'Started a conversation.' });
+});
+
+
+test('a newer generic generation cannot inherit an older local success receipt with identical wording',()=>{
+  const row={...decisionRow,attentionKey:'heartbeat:controlled',lifecycle:{canDismiss:true,canDefer:true,dismissLabel:'Dismiss',deferLabel:'Tomorrow',effect:'hide_only' as const,generation:'one'}};
+  assert.notEqual(fromClemReceiptVersion(row),fromClemReceiptVersion({...row,lifecycle:{...row.lifecycle,generation:'two'}}));
+  assert.equal(fromClemReceiptVersion({...row,answer:{kind:'yes_no',planProposalId:'plan'}}),row.voiceDigest,'owning decisions retain their existing receipt identity');
 });

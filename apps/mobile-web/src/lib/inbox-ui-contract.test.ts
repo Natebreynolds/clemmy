@@ -6,13 +6,14 @@ const read = (relative: string): string => readFileSync(new URL(relative, import
 
 test('Inbox never publishes an unknown zero or claims caught-up from a partial snapshot', () => {
   const source = read('../screens/Inbox.tsx');
-  assert.match(source, /if \(data\?\.needsCountKnown\) onCount\(confirmedNeedsCount\)/);
+  assert.match(source, /if \(data\?\.needsCountFresh\) onCount\(confirmedNeedsCount\)/);
   assert.doesNotMatch(source, /onCount\(0\)/);
-  assert.match(source, /data\?\.needsCountKnown && needsCount === 0/);
+  assert.match(source, /data\?\.needsCountFresh && needsCount === 0/);
+  assert.match(source, /needsCountFresh: parts\.every\(\(part\) => part\.ok\) && summary\.ok/);
   assert.match(source, /mergeInboxLastGood/);
 });
 
-test('the shell badge is published from daemon-confirmed rows, the tab count from the screen', () => {
+test('the shell badge is published from daemon-confirmed rows and reused by the Inbox tab', () => {
   const source = read('../screens/Inbox.tsx');
   // The shell keeps this as its last authoritative summary and paints it on
   // the app icon. An optimistic dismissal is a local, unconfirmed fact, so it
@@ -21,10 +22,10 @@ test('the shell badge is published from daemon-confirmed rows, the tab count fro
   assert.match(source, /confirmedNotificationNeeds = useMemo\(/);
   assert.match(source, /\(data\?\.notifications \?\? \[\]\)\.filter\(stillNeedsUser\)/);
   assert.match(source, /onCount\(confirmedNeedsCount\)/);
-  // The on-screen tab count still counts the on-screen rows, so a badge can
-  // never exceed the rows its own screen is showing.
+  // Rows can change optimistically, while both navigation badges keep the
+  // same last confirmed count until a complete refresh succeeds.
   assert.match(source, /notifications\.filter\(stillNeedsUser\)/);
-  assert.match(source, /Needs you \{needsCount > 0/);
+  assert.match(source, /aria-label=\{canonicalNeedsCount !== null && canonicalNeedsCount > 0/);
 });
 
 test('"End this run" is offered only for a run the daemon says is still going', () => {
@@ -45,6 +46,7 @@ test('"End this run" is offered only for a run the daemon says is still going', 
   // a live one; hiding the control asserts nothing.
   assert.match(source, /stoppableRunIds: string\[\] \| null/);
   assert.match(source, /data\?\.stoppableRunIds \? new Set\(data\.stoppableRunIds\) : null/);
+  assert.match(source, /stoppableRunIds: workingNow\.ok \? lastStoppableRunIds\.current : null/);
 });
 
 test('question decisions are one-shot, answerability-gated, and receipt the exact answer', () => {

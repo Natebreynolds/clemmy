@@ -1,8 +1,9 @@
-import { APPROVAL_ANSWER_WORDS, checkInProposalDecisionFeedback } from '@clem/chat-engine';
+import { AttentionReportSelector } from '../components/inbox/AttentionReportSelector';
+import { attentionWorkTitle, APPROVAL_ANSWER_WORDS, checkInProposalDecisionFeedback } from '@clem/chat-engine';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, X, RefreshCw, Mail, BellRing, Send, MoreHorizontal, ChevronDown } from 'lucide-react';
+import { Check, X, RefreshCw, Mail, BellRing, Clock3, Send, MoreHorizontal, ChevronDown } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
@@ -20,15 +21,17 @@ import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
 import { useMediaQuery } from '@/lib/use-media-query';
-import { attentionDestination, buildNeedsYouItems, isIdentifierLike, needsYouRowView, needsYouFeedAvailability, type NeedsYouItem, type NeedsYouRowView, NEEDS_YOU_SECTIONS } from '@/lib/needs-you-list';
+import { attentionDestination, buildNeedsYouItems, needsYouReport, needsYouAttentionItem, needsYouAttentionKey, isIdentifierLike, needsYouRowView, needsYouFeedAvailability, type NeedsYouItem, type NeedsYouRowView, NEEDS_YOU_SECTIONS } from '@/lib/needs-you-list';
 import { DecisionFrame, DecisionRow, Disclosure } from '@/components/inbox/DecisionList';
+import { attentionItemContext, presentAttentionItem, ATTENTION_PRESENTATION_INVALIDATE, type AttentionItem } from '@/lib/attention-presentation';
+import { SetAsideQuestions } from '@/components/inbox/SetAsideQuestions';
 import {
   listApprovals, decideApproval, cancelStaleApprovals,
   listWorkspaceDestinationChoosers, resolveWorkspaceDestinationChooser,
   listNotifications, markNotificationRead, retryNotification,
   listTrustProposals, decideTrustProposal,
   listPlanProposals, decidePlanProposal,
-  listInboxQuestions, answerInboxQuestion,
+  listInboxQuestions, answerInboxQuestion, presentInboxQuestion,
   resolveWorkflowCapability,
   relativeTime,
   approvalDecisionSuccessText, collapseAttentionRows, decideCheckInProposal, getNeedsYouSummary, notifTone, notifFailed, notificationRunHref,
@@ -45,7 +48,7 @@ function needsAttentionNotif(n: NotificationRow): boolean {
   return n.needsAttention === true;
 }
 
-type Tab = 'needs' | 'notifications';
+type Tab = 'needs' | 'notifications' | 'set-aside';
 type DecisionNotice = { tone: 'success' | 'error' | 'info'; text: string };
 type RowDecisionState = {
   busy: boolean;
@@ -62,11 +65,10 @@ export function Inbox() {
   // Deep-link support: /inbox?tab=notifications&select=<id> (used by the
   // Home "Needs you" cards, which are notification-backed — landing them on
   // the default approvals tab showed an empty "all caught up" page).
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get('tab');
   // 'activity' is gone (it duplicated the Tasks board) — legacy links map to notifications.
-  const initialTab: Tab = tabParam === 'notifications' || tabParam === 'activity' ? 'notifications' : 'needs';
-  const [tab, setTab] = useState<Tab>(initialTab);
+  const tab: Tab = tabParam === 'notifications' || tabParam === 'activity' ? 'notifications' : tabParam === 'set-aside' ? 'set-aside' : 'needs';
   const [selected, setSelected] = useState<string | null>(searchParams.get('select'));
   const userPicked = useRef(false);
   // Wide: list beside one detail. Narrow: the list, or one decision with Back.
@@ -86,6 +88,8 @@ export function Inbox() {
   const [chooserBusy, setChooserBusy] = useState<string | null>(null);
   const [planBusy, setPlanBusy] = useState<string | null>(null);
   const [questionBusy, setQuestionBusy] = useState<string | null>(null);
+  const [attentionBusy, setAttentionBusy] = useState<string | null>(null);
+  const attentionLockRef = useRef<string | null>(null);
   const [capabilityBusy, setCapabilityBusy] = useState<string | null>(null);
   const questionLockRef = useRef<string | null>(null);
   const capabilityLockRef = useRef<string | null>(null);
@@ -98,6 +102,8 @@ export function Inbox() {
     const byId = new Map<string, FromClemRow>();
     for (const row of fromClem.data?.rows ?? []) {
       if (row.key.startsWith('notif:')) byId.set(row.key.slice('notif:'.length), row);
+      if (row.done?.notificationId) byId.set(row.done.notificationId, row);
+      for (const id of row.relatedNotificationIds ?? []) byId.set(id, row);
     }
     return byId;
   }, [fromClem.data]);
@@ -128,10 +134,8 @@ export function Inbox() {
   // Re-apply when the deep link changes while the screen stays mounted
   // (e.g. Home card → Inbox already open in the router tree).
   useEffect(() => {
-    if (tabParam === 'notifications' || tabParam === 'activity') setTab('notifications');
-    else if (tabParam === 'needs') setTab('needs');
     const select = searchParams.get('select');
-    if (select) setSelected(select);
+    setSelected(select); setOpened(Boolean(select)); userPicked.current = Boolean(select);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
@@ -154,7 +158,6 @@ export function Inbox() {
   const workspaceChooserRows = workspaceChoosers.data?.choosers ?? [];
   // Server sorts urgent-first; aged cards (48h+ unanswered, nothing parked on
   // them) render below a divider and stop counting toward "needs you".
-  const urgentApprovalRows = approvalRows.filter((a) => !a.stale);
   // Silent records are history (lifecycle steps, reports delivered into their
   // own chat); the Notifications tab is what was meant for the owner.
   const notifRows = (notifications.data?.notifications ?? []).filter((n) => !n.silent);
@@ -169,7 +172,7 @@ export function Inbox() {
   // On a wide screen the detail opens the first decision of any kind, so it
   // is never an empty pane beside the list. A narrow screen waits for a tap.
   useEffect(() => {
-    if (!wide || userPicked.current) return;
+    if (!wide || userPicked.current || tab === 'set-aside') return;
     const ids = tab === 'needs' ? needsViewsRef.current.filter((view) => !view.href).map((view) => view.id) : plainNotifIdsRef.current;
     if (selected && ids.includes(selected)) return;
     const first = ids[0] ?? null;
@@ -190,12 +193,13 @@ export function Inbox() {
     && needsAttentionNotif(n)
     && !(n.needsYouKey && listedDecisionKeys.has(n.needsYouKey)));
   const attentionIds = new Set(attentionRows.map((n) => n.id));
-  const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id));
+  const plainNotifRows = notifRows.filter((n) => !attentionIds.has(n.id) && !needsAttentionNotif(n));
   plainNotifIdsRef.current = plainNotifRows.map((n) => n.id);
   // A burst of blocked runs from one workflow is ONE decision, not ten rows —
   // collapse duplicates to the newest and badge the earlier ones.
   const collapsedAttention = collapseAttentionRows(attentionRows);
   const unlistedRows = needsSummary.data?.unlisted ?? [];
+  const genericAttention = needsSummary.data?.attentionItems ?? [];
   // One list for every kind of decision; how each row reads is decided once.
   const needsItems = useMemo(() => buildNeedsYouItems({
     workspaceChoosers: workspaceChooserRows,
@@ -205,22 +209,26 @@ export function Inbox() {
     trust: trustRows,
     attention: collapsedAttention,
     unlisted: unlistedRows,
-  }), [workspaceChooserRows, questionRows, planRows, approvalRows, trustRows, collapsedAttention, unlistedRows]);
+    attentionItems: genericAttention,
+  }), [workspaceChooserRows, questionRows, planRows, approvalRows, trustRows, collapsedAttention, unlistedRows, genericAttention]);
   // Grouped by what each asks of the owner, in the one section order; within
   // a section, the feeds' own order (live decisions first) is kept.
   const needsViews = useMemo(() => {
     const rank = new Map(NEEDS_YOU_SECTIONS.map((section, index) => [section.id, index]));
-    return needsItems.map(needsYouRowView)
+    return needsItems.map(item => {
+      const view = needsYouRowView(item);
+      // Open the full request before its workflow context, so set-aside is reachable.
+      return needsYouAttentionItem(item, genericAttention) ? { ...view, href: undefined } : view;
+    })
       .map((view, index) => ({ view, index }))
       .sort((a, b) => (rank.get(a.view.section) ?? 0) - (rank.get(b.view.section) ?? 0) || a.index - b.index)
       .map(({ view }) => view);
-  }, [needsItems]);
+  }, [needsItems, genericAttention]);
   needsViewsRef.current = needsViews;
   // The badge is the server's total whenever it has answered: the sidebar and
   // the phone show that same number. The local sum is only the fallback.
-  const needsCount = needsSummary.data?.total
-    ?? (workspaceChooserRows.length + urgentApprovalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length);
-  const anyDecisionRows = workspaceChooserRows.length + approvalRows.length + collapsedAttention.length + trustRows.length + planRows.length + questionRows.length + unlistedRows.length;
+  const needsCount = needsSummary.data?.total ?? needsItems.filter(item => item.kind !== 'approval' || !item.aged).length;
+  const anyDecisionRows = needsItems.length;
   // Count only checked IDs that still exist in the live list — resolved cards
   // drop out on the next poll and must not keep inflating the bulk-action count.
   const checkedCount = approvalRows.reduce((n, a) => (checked.has(a.approvalId) ? n + 1 : n), 0);
@@ -233,7 +241,8 @@ export function Inbox() {
     summary: needsSummary.isError,
   });
   const failedNeedsFeeds = availability.failed;
-  const queryUnavailable = tab === 'needs' ? availability.unavailable : notifications.isError;
+  const anyNeedsData = [approvals.data, workspaceChoosers.data, notifications.data, trustProposals.data, planProposals.data, questions.data, needsSummary.data].some(Boolean);
+  const queryUnavailable = tab === 'needs' ? availability.unavailable && !anyNeedsData : tab === 'notifications' && notifications.isError && !notifications.data;
   const partiallyUnavailable = tab === 'needs' && !queryUnavailable && failedNeedsFeeds.length > 0;
   // Gate the reading pane on the SAME denominator the list renders from.
   // `needsCount` excludes stale approvals; `anyDecisionRows` does not — so with
@@ -241,7 +250,7 @@ export function Inbox() {
   // while the pane that shows tool, session, requested-at and the full args
   // never mounted. The click went nowhere, on the one screen whose whole job
   // is to let a decision land.
-  const hasRows = !queryUnavailable && (tab === 'needs' ? anyDecisionRows : plainNotifRows.length) > 0;
+  const hasRows = tab !== 'set-aside' && !queryUnavailable && (tab === 'needs' ? anyDecisionRows : plainNotifRows.length) > 0;
   const unread = plainNotifRows.filter((n) => !n.read).length;
 
   // Every decision moves the one count too, so the badge never lags the list.
@@ -466,6 +475,40 @@ export function Inbox() {
       invalidate('plan-proposals', 'approvals-count', 'working-now-badge', 'command-center', 'command-center');
     }
   };
+  const onPresentQuestion = async (row: InboxQuestionRow, action: 'dismiss' | 'defer') => {
+    if (questionLockRef.current) return;
+    questionLockRef.current = row.id;
+    setQuestionBusy(row.id);
+    setDecisionNotice(null);
+    try {
+      await presentInboxQuestion(row.id, action, row.lifecycle?.generation);
+      setSelected(null);
+      setOpened(false);
+      userPicked.current = false;
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Could not update that question. Try again.') });
+    } finally {
+      questionLockRef.current = null;
+      setQuestionBusy(null);
+      invalidate('inbox-questions', 'inbox-question-presentations', 'notifications', 'home-from-clem', 'command-center', 'working-now-badge');
+    }
+  };
+
+  const onPresentAttention = async (row: AttentionItem, action: 'dismiss' | 'defer') => {
+    if (attentionLockRef.current || !row.lifecycle.generation) return;
+    attentionLockRef.current = row.key;
+    setAttentionBusy(row.key); setDecisionNotice(null);
+    try {
+      await presentAttentionItem(row.key, action, row.lifecycle.generation);
+      setSelected(null); setOpened(false); userPicked.current = false;
+    } catch (error) {
+      setDecisionNotice({ tone: 'error', text: actionError(error, 'Couldn’t confirm that change. Refresh the item before trying again.') });
+    } finally {
+      attentionLockRef.current = null; setAttentionBusy(null);
+      invalidate(...ATTENTION_PRESENTATION_INVALIDATE);
+    }
+  };
+
   const onAnswerQuestion = async (row: InboxQuestionRow, option?: string) => {
     if (questionLockRef.current || !row.answerable) return;
     const answer = (option ?? questionAnswers[row.id] ?? '').trim();
@@ -549,10 +592,11 @@ export function Inbox() {
   const tabs: { key: Tab; label: string; icon: typeof Mail; count: number }[] = [
     { key: 'needs', label: 'Needs you', icon: Mail, count: needsCount },
     { key: 'notifications', label: 'Updates', icon: BellRing, count: unread },
+    { key: 'set-aside', label: 'Set aside', icon: Clock3, count: 0 },
   ];
 
   const loading =
-    (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading || planProposals.isLoading || questions.isLoading)) ||
+    (tab === 'needs' && (approvals.isLoading || workspaceChoosers.isLoading || notifications.isLoading || trustProposals.isLoading || planProposals.isLoading || questions.isLoading || needsSummary.isLoading)) ||
     (tab === 'notifications' && notifications.isLoading);
   const retryCurrentTab = () => {
     if (tab === 'needs') {
@@ -561,12 +605,22 @@ export function Inbox() {
       void trustProposals.refetch();
       void planProposals.refetch();
       void questions.refetch();
+      void needsSummary.refetch();
     }
     void notifications.refetch();
   };
 
-  const selItem = tab === 'needs' ? needsItems.find((item) => item.id === selected) : undefined;
+  const selItem = tab === 'needs' ? needsItems.find((item) => item.id === selected || Boolean(needsYouReport(item, selected)) || needsYouAttentionKey(item) === selected
+    || (item.kind === 'approval' && `approval:${item.row.approvalId}` === selected)) : undefined;
+  const selectedAttentionNotification = selItem?.kind === 'attention' ? needsYouReport(selItem, selected) : selItem?.kind === 'generic'
+    ? notifRows.find(row => row.id === selItem.row.notificationId) : undefined;
   const selView = selItem ? needsViews.find((view) => view.id === selItem.id) : undefined;
+  const reportMembers = selItem?.kind === 'attention' ? selItem.reports ?? [selItem.row] : [];
+  const groupedReports = reportMembers.length > 1;
+  const detailItem = selItem?.kind === 'attention' && selectedAttentionNotification
+    ? { ...selItem, row: selectedAttentionNotification, collapsedCount: 0, reports: undefined } : selItem;
+  const detailView = detailItem ? needsYouRowView(detailItem) : selView;
+  const groupPresentation = selItem ? needsYouAttentionItem(selItem, genericAttention) : undefined;
   const selNotif = tab === 'notifications' ? plainNotifRows.find((n) => n.id === selected) : undefined;
   // Narrow screens show one surface at a time: the list, or the opened decision.
   const showList = wide || !opened || (!selItem && !selNotif);
@@ -610,11 +664,11 @@ export function Inbox() {
 
   return (
     <Page
-      title="Needs you"
-      subtitle="Decisions waiting on you, and updates from finished work"
+      title="Inbox"
+      subtitle="What needs your decision, and what Clem has brought back."
       actions={cleanupMenu}
     >
-      <div className="mb-4 flex gap-1 overflow-x-auto border-b border-border">
+      <div data-clem-guide="inbox" className="mb-4 flex gap-1 overflow-x-auto border-b border-border">
         {tabs.map((t) => {
           const Icon = t.icon;
           const active = tab === t.key;
@@ -622,7 +676,10 @@ export function Inbox() {
             <button
               key={t.key}
               type="button"
-              onClick={() => { setTab(t.key); userPicked.current = false; setSelected(null); setOpened(false); }}
+              onClick={() => {
+                const next = new URLSearchParams(searchParams); next.set('tab', t.key); next.delete('select'); next.delete('view');
+                setSearchParams(next); userPicked.current = false; setSelected(null); setOpened(false); setDecisionNotice(null);
+              }}
               className={cn(
                 'inline-flex shrink-0 items-center gap-2 whitespace-nowrap border-b-2 px-3 py-2.5 text-body font-medium cursor-pointer -mb-px',
                 active ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg',
@@ -656,7 +713,7 @@ export function Inbox() {
         </div>
       )}
 
-      <div className={cn('grid gap-4', hasRows && wide && 'grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)]')}>
+      {tab === 'set-aside' ? <SetAsideQuestions /> : <div className={cn('grid gap-4', hasRows && wide && 'grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)]')}>
         {showList && (
           <div className="min-w-0 space-y-2">
             {loading && [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)}
@@ -715,7 +772,7 @@ export function Inbox() {
                             <li key={view.id}>
                               <DecisionRow
                                 view={view}
-                                selected={selected === view.id}
+                                selected={selItem?.id === view.id}
                                 checked={checked.has(view.id)}
                                 disabled={bulkBusy || decisionStates[view.id]?.busy === true}
                                 onToggleCheck={() => toggleChecked(view.id)}
@@ -740,7 +797,7 @@ export function Inbox() {
                             <li key={view.id}>
                               <DecisionRow
                                 view={view}
-                                selected={selected === view.id}
+                                selected={selItem?.id === view.id}
                                 checked={checked.has(view.id)}
                                 disabled={bulkBusy || decisionStates[view.id]?.busy === true}
                                 onToggleCheck={() => toggleChecked(view.id)}
@@ -778,18 +835,29 @@ export function Inbox() {
             'flex min-w-0 flex-col self-start rounded-lg border border-border-raised bg-raised p-5',
             wide && 'sticky top-4 max-h-[calc(100vh-8rem)]',
           )}>
-            {selItem && selView ? (
+            {selItem && selView ? (<>
+              {groupedReports && <div data-attention-group={needsYouAttentionKey(selItem)} className="mb-4 border-b border-border pb-4">
+                <h2 className="text-body font-semibold text-fg">{attentionWorkTitle(needsYouAttentionKey(selItem), selView.title)}</h2>
+                <AttentionReportSelector reports={reportMembers} attentionKey={needsYouAttentionKey(selItem)} selectedId={selectedAttentionNotification?.id} onSelect={pick} />
+                {groupPresentation && <AttentionActions item={groupPresentation} busy={attentionBusy !== null} onPresentation={action => { void onPresentAttention(groupPresentation, action); }} />}
+              </div>}
               <NeedsYouDetail
-                key={selItem.id}
-                item={selItem}
-                view={selView}
+                key={selectedAttentionNotification ? `${selectedAttentionNotification.id}:${selectedAttentionNotification.lifecycle?.generation ?? ''}` : selItem.id}
+                item={detailItem ?? selItem}
+                view={detailView ?? selView}
                 project={'row' in selItem && (selItem.kind === 'question' || selItem.kind === 'plan' || selItem.kind === 'approval') ? projectOf(selItem.row) : undefined}
                 onBack={back}
+                attention={(() => {
+                  if (groupedReports) return undefined;
+                  const row = needsYouAttentionItem(selItem, genericAttention);
+                  return row ? { item: row, busy: attentionBusy !== null, onPresentation: (action: 'dismiss' | 'defer') => { void onPresentAttention(row, action); } } : undefined;
+                })()}
                 approval={{ decisionState: selItem.kind === 'approval' ? decisionStates[selItem.id] : undefined, disabled: bulkBusy,
                   onApprove: () => onDecide(selItem.id, 'approve'), onReject: (note?: string) => onDecide(selItem.id, 'reject', note) }}
                 plan={{ busy: planBusy === selItem.id, onApprove: () => onDecidePlan(selItem.id, 'approve'), onReject: () => onDecidePlan(selItem.id, 'reject') }}
                 question={{ answer: questionAnswers[selItem.id] ?? '', busy: questionBusy === selItem.id, globallyBusy: questionBusy !== null,
                   onAnswerChange: (answer: string) => setQuestionAnswers((previous) => ({ ...previous, [selItem.id]: answer })),
+                  onPresentation: (action: 'dismiss' | 'defer') => { if (selItem.kind === 'question') void onPresentQuestion(selItem.row, action); },
                   onSubmit: (option?: string) => { if (selItem.kind === 'question') void onAnswerQuestion(selItem.row, option); } }}
                 workspace={{ busy: selItem.kind === 'workspace' && chooserBusy === selItem.id,
                   onChoose: (choiceId: string) => { if (selItem.kind === 'workspace') void onChooseWorkspace(selItem.row, choiceId); } }}
@@ -799,17 +867,17 @@ export function Inbox() {
                 proposal={{ busy: proposalBusy === selItem.id, globallyBusy: proposalBusy !== null,
                   onKeep: () => { if (selItem.kind === 'unlisted') void onDecideProposal(selItem.row.key, selItem.row.title, 'keep'); },
                   onDecline: () => { if (selItem.kind === 'unlisted') void onDecideProposal(selItem.row.key, selItem.row.title, 'decline'); } }}
-                capability={{ busy: capabilityBusy === selItem.id, globallyBusy: capabilityBusy !== null,
+                capability={{ busy: capabilityBusy === (selectedAttentionNotification?.id ?? selItem.id), globallyBusy: capabilityBusy !== null,
                   onResolve: (choice?: WorkflowCapabilityAccountChoice) => {
-                    if (selItem.kind === 'attention' && selItem.row.workflowCapability) void onResolveCapability(selItem.row.workflowCapability, choice);
+                    if (selectedAttentionNotification?.workflowCapability) void onResolveCapability(selectedAttentionNotification.workflowCapability, choice);
                   } }}
-                notification={{ onRead: () => onRead(selItem.id, selItem.kind === 'attention' ? selItem.groupIds : undefined), onRetry: () => onRetry(selItem.id),
+                notification={{ row: selectedAttentionNotification, onRead: () => onRead(selectedAttentionNotification?.id ?? selItem.id), onRetry: () => onRetry(selectedAttentionNotification?.id ?? selItem.id),
                   ...(() => {
-                    const clemRow = selItem.kind === 'attention' ? clemRowByNotification.get(selItem.row.id) : undefined;
+                    const clemRow = selectedAttentionNotification ? clemRowByNotification.get(selectedAttentionNotification.id) : undefined;
                     return clemRow ? { clemRow, clemBusy: clemBusy !== null, onClemChoice: (choice: string, index: number) => { void onClemChoice(clemRow, choice, index); } } : {};
                   })() }}
               />
-            ) : selNotif ? (
+            </>) : selNotif ? (
               <NotifDetail key={selNotif.id} row={selNotif} onRead={() => onRead(selNotif.id)} onRetry={() => onRetry(selNotif.id)} onBack={back} />
             ) : (
               <div className="flex min-h-40 flex-col items-center justify-center gap-1 text-center">
@@ -819,7 +887,7 @@ export function Inbox() {
             )}
           </div>
         )}
-      </div>
+      </div>}
     </Page>
   );
 }
@@ -842,16 +910,28 @@ function ListRow({ title, meta, tone, selected, onSelect, dim }: {
 
 type ApprovalHandlers = { decisionState?: RowDecisionState; disabled: boolean; onApprove: () => void; onReject: (note?: string) => void };
 type PlanHandlers = { busy: boolean; onApprove: () => void; onReject: () => void };
-type QuestionHandlers = { answer: string; busy: boolean; globallyBusy: boolean; onAnswerChange: (answer: string) => void; onSubmit: (option?: string) => void };
+type QuestionHandlers = { answer: string; busy: boolean; globallyBusy: boolean; onAnswerChange: (answer: string) => void; onSubmit: (option?: string) => void; onPresentation: (action: 'dismiss' | 'defer') => void };
 type WorkspaceHandlers = { busy: boolean; onChoose: (choiceId: string) => void };
 type TrustHandlers = { busy: boolean; globallyBusy: boolean; onApprove: () => void; onDecline: () => void };
 type CapabilityHandlers = { busy: boolean; globallyBusy: boolean; onResolve: (choice?: WorkflowCapabilityAccountChoice) => void };
-type NotificationHandlers = { onRead: () => void; onRetry: () => void; clemRow?: FromClemRow; onClemChoice?: (choice: string, index: number) => void; clemBusy?: boolean };
+type AttentionHandlers = { item: AttentionItem; busy: boolean; onPresentation: (action: 'dismiss' | 'defer') => void };
+
+function AttentionActions({ item, busy, onPresentation }: AttentionHandlers) {
+  const lifecycle = item.lifecycle;
+  if (!lifecycle.generation) return null;
+  return <div className="flex basis-full flex-wrap items-center gap-2 border-t border-border pt-3">
+    {lifecycle.canDefer && <Button size="sm" variant="secondary" disabled={busy} onClick={() => onPresentation('defer')}>Tomorrow</Button>}
+    {lifecycle.canDismiss && <Button size="sm" variant="ghost" disabled={busy} onClick={() => onPresentation('dismiss')}>Dismiss</Button>}
+    <span className="text-caption text-muted">Nothing is answered or resolved.</span>
+  </div>;
+}
+
+type NotificationHandlers = { row?: NotificationRow; onRead: () => void; onRetry: () => void; clemRow?: FromClemRow; onClemChoice?: (choice: string, index: number) => void; clemBusy?: boolean };
 
 /** The selected decision, whatever its kind, in the one detail shape. */
 type ProposalHandlers = { busy: boolean; globallyBusy: boolean; onKeep: () => void; onDecline: () => void };
 
-function NeedsYouDetail({ item, view, project, onBack, approval, plan, question, workspace, trust, capability, notification, proposal }: {
+function NeedsYouDetail({ item, view, project, onBack, approval, plan, question, workspace, trust, capability, notification, proposal, attention }: {
   item: NeedsYouItem;
   view: NeedsYouRowView;
   project?: SessionProjectLabel;
@@ -864,6 +944,7 @@ function NeedsYouDetail({ item, view, project, onBack, approval, plan, question,
   capability: CapabilityHandlers;
   notification: NotificationHandlers;
   proposal: ProposalHandlers;
+  attention?: AttentionHandlers;
 }) {
   switch (item.kind) {
     case 'approval': return <ApprovalDetail row={item.row} view={view} project={project} onBack={onBack} {...approval} />;
@@ -872,8 +953,19 @@ function NeedsYouDetail({ item, view, project, onBack, approval, plan, question,
     case 'workspace': return <WorkspaceDetail chooser={item.row} view={view} onBack={onBack} {...workspace} />;
     case 'trust': return <TrustDetail row={item.row} view={view} onBack={onBack} {...trust} />;
     case 'attention': return item.row.workflowCapability
-      ? <CapabilityDetail gate={item.row.workflowCapability} row={item.row} view={view} onBack={onBack} {...capability} />
-      : <NotifDetail row={item.row} view={view} onBack={onBack} destination={attentionDestination(item.row.needsYouKey)} {...notification} />;
+      ? <CapabilityDetail gate={item.row.workflowCapability} row={item.row} view={view} onBack={onBack} attention={attention} {...capability} />
+      : <NotifDetail row={item.row} view={view} onBack={onBack} destination={attentionDestination(item.row.needsYouKey)} attention={attention} {...notification} />;
+    case 'generic': {
+      if (notification.row?.workflowCapability) return <CapabilityDetail {...capability} gate={notification.row.workflowCapability} row={notification.row} view={view} onBack={onBack} attention={attention} />;
+      if (notification.row) return <NotifDetail {...notification} row={notification.row} view={view} onBack={onBack} attention={attention} destination={attentionItemContext(item.row) ?? undefined} />;
+      const context = attentionItemContext(item.row);
+      return <DecisionFrame view={view} title={item.row.title} onBack={onBack} actions={<>
+        {context && <Link to={context.href} className="text-small font-medium text-primary hover:underline">{context.label}</Link>}
+        {attention && <AttentionActions {...attention} />}
+      </>}>
+        {item.row.detail && <p className="whitespace-pre-wrap">{linkify(item.row.detail)}</p>}
+      </DecisionFrame>;
+    }
     case 'unlisted': return (
       <DecisionFrame view={view} title={item.row.title} onBack={onBack}
         actions={item.row.kind === 'check_in_proposal' ? (
@@ -881,7 +973,10 @@ function NeedsYouDetail({ item, view, project, onBack, approval, plan, question,
             <Button disabled={proposal.globallyBusy} onClick={proposal.onKeep}><Check className="h-4 w-4" aria-hidden /> {proposal.busy ? 'Saving…' : 'Keep it'}</Button>
             <Button variant="secondary" disabled={proposal.globallyBusy} onClick={proposal.onDecline}><X className="h-4 w-4" aria-hidden /> {proposal.busy ? 'Saving…' : 'No thanks'}</Button>
           </>
-        ) : view.href ? <Link to={view.href} className="text-small font-medium text-primary hover:underline">Open the workflow</Link> : undefined}>
+        ) : <>
+          {(attention ? attentionItemContext(attention.item)?.href : view.href) && <Link to={(attention ? attentionItemContext(attention.item)?.href : view.href)!} className="text-small font-medium text-primary hover:underline">Open the workflow</Link>}
+          {attention && <AttentionActions {...attention} />}
+        </>}>
         {item.row.detail && <p className="whitespace-pre-wrap">{item.row.detail}</p>}
       </DecisionFrame>
     );
@@ -964,7 +1059,7 @@ function WorkspaceDetail({ chooser, view, busy, onChoose, onBack }: WorkspaceHan
   );
 }
 
-function QuestionDetail({ row, view, project, answer, busy, globallyBusy, onAnswerChange, onSubmit, onBack }: QuestionHandlers & {
+function QuestionDetail({ row, view, project, answer, busy, globallyBusy, onAnswerChange, onSubmit, onPresentation, onBack }: QuestionHandlers & {
   row: InboxQuestionRow; view: NeedsYouRowView; project?: SessionProjectLabel; onBack?: () => void;
 }) {
   const disabled = globallyBusy || !row.answerable;
@@ -990,6 +1085,11 @@ function QuestionDetail({ row, view, project, answer, busy, globallyBusy, onAnsw
             </label>
             <Button type="submit" disabled={disabled || !answer.trim()}>{busy ? 'Sending…' : 'Answer'}</Button>
           </form>
+          {row.lifecycle && <div className="flex basis-full flex-wrap items-center gap-2 border-t border-border pt-3">
+            {row.lifecycle.canDefer && <Button size="sm" variant="secondary" disabled={globallyBusy} onClick={() => onPresentation('defer')}>Tomorrow</Button>}
+            {row.lifecycle.canDismiss && <Button size="sm" variant="ghost" disabled={globallyBusy} onClick={() => onPresentation('dismiss')}>Dismiss</Button>}
+            <span className="text-caption text-muted">The work stays paused in Work.</span>
+          </div>}
         </>
       )}>
       {row.context && (isIdentifierLike(row.context)
@@ -1046,8 +1146,8 @@ function PlanDetail({ row, view, project, busy, onApprove, onReject, onBack }: P
   );
 }
 
-function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBack }: CapabilityHandlers & {
-  gate: WorkflowCapabilityInboxGate; row: NotificationRow; view: NeedsYouRowView; onBack?: () => void;
+function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBack, attention }: CapabilityHandlers & {
+  gate: WorkflowCapabilityInboxGate; row: NotificationRow; view: NeedsYouRowView; onBack?: () => void; attention?: AttentionHandlers;
 }) {
   const resolution = gate.resolution;
   const [picked, setPicked] = useState(0);
@@ -1055,7 +1155,7 @@ function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBa
   const choice = candidates[picked] ?? candidates[0];
   return (
     <DecisionFrame view={view} title={row.title || `${gate.workflow} needs you`} onBack={onBack}
-      actions={resolution.kind === 'choose_account' ? (
+      actions={<>{resolution.kind === 'choose_account' ? (
         <Button disabled={globallyBusy || !choice} onClick={() => { if (choice) onResolve(choice); }}>
           {busy ? 'Saving…' : `Use ${choice?.label ?? 'this account'} and resume`}
         </Button>
@@ -1068,7 +1168,7 @@ function CapabilityDetail({ gate, row, view, busy, globallyBusy, onResolve, onBa
         <Button disabled={globallyBusy} onClick={() => onResolve()}>{busy ? 'Retrying…' : 'Retry now'}</Button>
       ) : (
         <Link to="/automate" className="text-small font-medium text-primary hover:underline">Review the run</Link>
-      )}>
+      )}{attention && <AttentionActions {...attention} />}</>}>
       {row.body && <p className="whitespace-pre-wrap">{linkify(row.body)}</p>}
       <p className="text-small text-muted">Nothing was sent through {gate.tool}. Steps that finished are kept, and the run resumes once.</p>
       {resolution.kind === 'choose_account' && (
@@ -1262,10 +1362,11 @@ function PendingActionDetail({ action }: { action: NonNullable<ApprovalRow['pend
   );
 }
 
-function NotifDetail({ row, view, destination, onRead, onRetry, onBack, clemRow, onClemChoice, clemBusy }: NotificationHandlers & {
+function NotifDetail({ row, view, destination, onRead, onRetry, onBack, clemRow, onClemChoice, clemBusy, attention }: NotificationHandlers & {
   row: NotificationRow; view?: Pick<NeedsYouRowView, 'state' | 'context' | 'at'>; onBack?: () => void;
   /** Where the item is resolved, when the server's key names a place. */
   destination?: { href: string; label: string };
+  attention?: AttentionHandlers;
   /** The same item as Clem offers it on Home, with her own choices (a
    *  meeting to accept or decline): tapping one does it, as on Home. */
   clemRow?: FromClemRow;
@@ -1298,7 +1399,7 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack, clemRow,
   const frameView = view ?? { state: notifTone(row), at: row.createdAt };
   const runHref = notificationRunHref(row);
   const clemChoices = clemRow?.choices?.length && onClemChoice ? clemRow.choices : null;
-  const actions = clemChoices || enableGate || !row.read || failed || destination || runHref ? (
+  const actions = attention || clemChoices || enableGate || (!row.read && !row.needsAttention) || failed || destination || runHref ? (
     <>
       {clemChoices && clemChoices.map((choice, index) => (
         <Button key={choice} variant={index === 0 ? 'primary' : 'secondary'} disabled={clemBusy} onClick={() => onClemChoice!(choice, index)}>
@@ -1321,7 +1422,8 @@ function NotifDetail({ row, view, destination, onRead, onRetry, onBack, clemRow,
           Open run
         </Link>
       )}
-      {!row.read && <Button variant="secondary" onClick={onRead}>Mark as read</Button>}
+      {!row.read && !row.needsAttention && <Button variant="secondary" onClick={onRead}>Mark as read</Button>}
+      {attention && <AttentionActions {...attention} />}
     </>
   ) : undefined;
   return (

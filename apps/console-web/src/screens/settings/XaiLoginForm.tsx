@@ -17,14 +17,26 @@ import { createSignInAttemptOwner, deviceSignInDeadline, deviceSignInPollDelay }
  * tunnel, and from a phone. A second button would be a distinction without a
  * difference.
  */
-export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: () => void }) {
+export function XaiSignIn({ connected, onDone, onBusyChange, allowCancel = false }: {
+  connected: boolean; onDone: () => void; onBusyChange?: (busy: boolean) => void; allowCancel?: boolean;
+}) {
   const [device, setDevice] = useState<{ uri: string; code: string } | null>(null);
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
   const attempts = useRef(createSignInAttemptOwner());
+  const signInActive = useRef(false);
   useEffect(() => () => attempts.current.stop(), []);
+  useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  const stopWaiting = () => {
+    if (!signInActive.current) return;
+    signInActive.current = false;
+    attempts.current.stop(); setBusy(false); setDevice(null);
+    setStatus('Stopped waiting here. If you finished in the browser, refresh your sign-in status.');
+    onDone();
+  };
 
   const run = async () => {
+    signInActive.current = true;
     const attempt = attempts.current.begin();
     setBusy(true); setStatus('Requesting a sign-in code…'); setDevice(null);
     const cancelBeginTimeout = attempt.later(() => {
@@ -89,12 +101,14 @@ export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: (
   };
 
   const disconnect = async () => {
+    signInActive.current = false;
     setBusy(true); setStatus('Disconnecting…');
     try { await xaiDisconnect(); onDone(); setStatus(''); } catch (e) { setStatus((e as Error).message); }
     setBusy(false);
   };
 
   const refreshModels = async () => {
+    signInActive.current = false;
     setBusy(true); setStatus('Refreshing Grok models…');
     try {
       const { models } = await listProviderModels({ providerId: 'xai' });
@@ -125,6 +139,7 @@ export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: (
           {busy && !device ? <><Loader2 className="h-4 w-4 animate-spin" aria-hidden /> Starting…</>
             : <><RotateCw className="h-4 w-4" aria-hidden /> {connected ? 'Reconnect' : 'Connect xAI (Grok)'}</>}
         </Button>
+        {allowCancel && busy && device && signInActive.current ? <Button variant="ghost" size="sm" onClick={stopWaiting}>Stop waiting</Button> : null}
         {connected && (
           <>
             <Button variant="secondary" size="sm" onClick={refreshModels} disabled={busy}>
@@ -147,7 +162,9 @@ export function XaiSignIn({ connected, onDone }: { connected: boolean; onDone: (
 }
 
 /** Self-contained xAI sign-in for Settings, mirroring the Codex/Claude cards. */
-export function XaiLoginForm({ embedded = false }: { embedded?: boolean } = {}) {
+export function XaiLoginForm({ embedded = false, onboarding = false, onBusyChange }: {
+  embedded?: boolean; onboarding?: boolean; onBusyChange?: (busy: boolean) => void;
+} = {}) {
   const qc = useQueryClient();
   const auth = usePoll(['xai-auth'], xaiAuthStatus, 0);
   const connected = Boolean(auth.data?.connected);
@@ -164,11 +181,13 @@ export function XaiLoginForm({ embedded = false }: { embedded?: boolean } = {}) 
         <h4 className="text-label text-fg">xAI (Grok) sign-in</h4>
       </div>
       <div className="rounded-lg border border-border bg-canvas p-3 text-small">
-        {connected
+        {auth.isLoading ? <span role="status" className="text-muted">Checking your xAI sign-in…</span>
+          : auth.isError || typeof auth.data?.connected !== 'boolean' ? <span role="status" className="text-muted">Could not confirm your xAI sign-in. <Button variant="link" size="sm" onClick={() => void auth.refetch()}>Try again</Button></span>
+          : connected
           ? <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Connected · subscription billing</span>
           : <span className="text-muted">Not connected. Sign in with your xAI account to use Grok as a brain, worker, or judge.</span>}
       </div>
-      <XaiSignIn connected={connected} onDone={refetch} />
+      <XaiSignIn connected={connected} onDone={refetch} onBusyChange={onBusyChange} allowCancel={onboarding} />
     </>
   );
 

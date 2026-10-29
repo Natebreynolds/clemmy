@@ -44,7 +44,7 @@ export function PaneCard({ className, ...props }: HTMLAttributes<HTMLDivElement>
   return (
     <div
       // Elevation = a hairline plus a lighter surface than the canvas.
-      className={cn('flex flex-col overflow-hidden rounded-md border border-border bg-surface', className)}
+      className={cn('flex flex-col overflow-hidden rounded-xl border border-border bg-surface', className)}
       {...props}
     />
   );

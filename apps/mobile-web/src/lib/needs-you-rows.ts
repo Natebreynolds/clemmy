@@ -6,7 +6,7 @@
  * unchanged — this only decides how a row reads. The reading rules are the
  * shared ones the desktop list uses.
  */
-import { decisionPreview, oneLine, workflowDisplayName } from '@clem/chat-engine';
+import { attentionReportSummary, attentionWorkTitle, decisionPreview, oneLine, workflowDisplayName } from '@clem/chat-engine';
 import type {
   ApprovalRow,
   InboxNotification,
@@ -78,7 +78,7 @@ export function buildNeedsRows(input: {
   plans: readonly PlanProposalRow[];
   approvals: readonly ApprovalRow[];
   unlisted: readonly InboxUnlistedItem[];
-  attention: ReadonlyArray<{ row: InboxNotification; earlier: number }>;
+  attention: ReadonlyArray<{ row: InboxNotification; earlier: number; reports?: InboxNotification[] }>;
   /** The project a row's session works in, when it works in one. */
   projectOf?: (kind: NeedsRowKind, row: unknown) => string | null;
 }): NeedsRow[] {
@@ -141,16 +141,16 @@ export function buildNeedsRows(input: {
       section: stopped ? 'stopped' : 'suggestions',
     });
   }
-  for (const { row, earlier } of input.attention) {
+  for (const { row, earlier, reports } of input.attention) {
     const gate = row.workflowCapability;
-    const title = oneLine(namedWorkflows(notificationTitle(row.title), gate?.workflow), TITLE_MAX) || 'I need your attention';
+    const title = reports && reports.length > 1 ? attentionWorkTitle(row.needsYouKey, notificationTitle(row.title)) : oneLine(namedWorkflows(notificationTitle(row.title), gate?.workflow), TITLE_MAX) || 'I need your attention';
     const cardLabel = needsYouCardLabel(row);
     // "Needs you" inside Needs you says nothing; the row is an update to read.
     const label = gate ? 'Stopped' : cardLabel === 'Update · needs you' ? 'Update' : cardLabel;
     rows.push({
       key: `notification:${row.id}`, kind: 'attention', title,
-      preview: decisionPreview(title, [row.body]),
-      context: joinContext(project('attention', row), gate?.workflow && !title.includes(workflowDisplayName(gate.workflow)) ? workflowDisplayName(gate.workflow) : null, earlier > 0 ? `+${earlier} earlier` : null),
+      preview: reports && reports.length > 1 ? attentionReportSummary(reports, report => report).map(report => oneLine(report.title || report.body, 100)).join(' · ') : decisionPreview(title, [row.body]),
+      context: joinContext(project('attention', row), gate?.workflow && !title.includes(workflowDisplayName(gate.workflow)) ? workflowDisplayName(gate.workflow) : null, earlier > 0 ? `${earlier + 1} reports` : null),
       at: row.createdAt, label,
       urgent: Boolean(gate) || label === 'Flow · stopped',
       // A stopped workflow that needs an account picked is a choice to make.

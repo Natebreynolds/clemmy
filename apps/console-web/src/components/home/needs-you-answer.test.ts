@@ -52,3 +52,10 @@ test('the answer path costs nothing when nothing is asking', () => {
   assert.match(pane, /enabled: questionIds\.length > 0/,
     'The questions poll is no longer conditional; a Home with no open questions pays for it anyway.');
 });
+
+test('Today hides the exact rendered question generation and shows its matching question text', () => {
+  for (const action of ['defer', 'dismiss']) {
+    assert.ok(pane.includes(`presentInboxQuestion(item.questionId, '${action}', questionFor(item.questionId)?.lifecycle?.generation)`));
+  }
+  assert.match(pane, /plainText\(question\?\.question \?\? item.title\)/);
+});

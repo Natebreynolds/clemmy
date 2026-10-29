@@ -1,7 +1,9 @@
+import './attention-report-groups.css';
 import type { JSX } from 'preact';
 import { useRef, useState } from 'preact/hooks';
-import { appPlaceHref, currentProactiveReceipt, fromClemSourceName, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
-import { markInboxNotificationRead, replyFromClem, type FromClem as FromClemData, type FromClemReplyOutcome, type FromClemRow } from '../lib/api';
+import { attentionReportCount, attentionWorkTitle, groupAttentionReports, oneLine, appPlaceHref, currentProactiveReceipt, fromClemSourceName, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
+import { markInboxNotificationRead, presentInboxAttention, presentInboxQuestion, replyFromClem, type FromClem as FromClemData, type FromClemReplyOutcome, type FromClemRow } from '../lib/api';
+import { restoreSavedAttention, sameAttentionReceipt, type SavedAttentionReceipt } from '../lib/attention-presentation';
 import { relativeTime } from './Approvals';
 import { haptic } from '../lib/native-bridge';
 
@@ -29,24 +31,33 @@ function outcomeText(outcome: FromClemReplyOutcome): string {
  * away; then updates, each cleared with Done; then the one part she offers to
  * help set up. A place that lives only on the Mac says so instead of linking.
  */
-export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
+export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows, onOpenInbox }: {
   data: FromClemData | null;
+  maxRows?: number;
+  onOpenInbox?: (decisionKey?: string) => void;
   /** Home places current decisions in its configurable Needs you pane. */
   mode?: 'all' | 'decisions' | 'updates';
   onChanged: () => void;
   onOpenThread: (sessionId?: string) => void;
 }) {
   const inFlight = useRef(false);
+  const undoElement = useRef<HTMLDivElement | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, ProactiveReplyReceipt>>({});
   const [replying, setReplying] = useState<string | null>(null);
   const [reading, setReading] = useState<string | null>(null);
+  const [undo, setUndo] = useState<{ rowKey: string; receipt: SavedAttentionReceipt } | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const rows = (data?.rows ?? []).filter(row => mode === 'all' || (mode === 'decisions' ? row.asks && !row.setup : !row.asks || Boolean(row.setup)));
+  const allRows = (data?.rows ?? []).filter(row => mode === 'all' || (mode === 'decisions' ? row.asks && !row.setup : !row.asks || Boolean(row.setup)));
+  const allGroups = groupAttentionReports(allRows, row => ({ id: row.key, attentionKey: row.attentionKey,
+    generation: row.lifecycle?.generation, protected: !row.asks || Boolean(row.answer) || Boolean(row.setup) }));
+  const visibleGroups = maxRows === undefined ? allGroups : allGroups.slice(0, maxRows);
+  const rows = visibleGroups.flatMap(group => group.reports);
   const latestRows = useRef(rows);
   latestRows.current = rows;
   const sectionId = `home-from-clem-${mode}`;
-  if (rows.length === 0) return null;
+  if (rows.length === 0 && !undo) return null;
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
@@ -66,6 +77,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
       onChanged();
     } catch (error) {
       setNotices((all) => ({ ...all, [row.key]: { voiceDigest: row.voiceDigest, settled: false, tone: 'error', text: error instanceof Error ? error.message : 'That didn’t reach Clem. Your reply is kept; check the item before trying again.' } }));
+      if ((error as { status?: number }).status === 409) onChanged();
     } finally {
       inFlight.current = false;
       setBusy(null);
@@ -80,8 +92,37 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
       };
     });
 
+  const hideQuestion = (row: FromClemRow, action: 'dismiss' | 'defer') => run(row, async () => {
+    if (row.lifecycle?.effect !== 'hide_only' || !row.lifecycle.generation) throw new Error('Refresh this item before setting it aside.');
+    const question = row.answer?.kind === 'words' ? row.answer.questionId : null;
+    if (!question && (!row.attentionKey || row.answer?.kind === 'yes_no')) throw new Error('This decision must be reviewed in Inbox.');
+    const result = question ? await presentInboxQuestion(question, action, row.lifecycle.generation)
+      : await presentInboxAttention(row.attentionKey!, action, row.lifecycle.generation);
+    setUndo(result.generation && result.mutationToken ? { rowKey: row.key, receipt: { source: question ? 'question' : 'attention',
+      id: question ?? row.attentionKey!, generation: result.generation, mutationToken: result.mutationToken } } : null);
+    setUndoError(null);
+    // Only an explicit presentation action moves focus. Polls never do. Wait
+    // for the receipt and the collapsing report list to reach the DOM first.
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      undoElement.current?.scrollIntoView({ block: 'center', behavior: 'auto' });
+      undoElement.current?.focus({ preventScroll: true });
+    }));
+    return { text: action === 'defer' ? 'Set aside until tomorrow. The work is unchanged.' : 'Set aside. The work is unchanged.', settled: true };
+  });
+  const restoreQuestion = async () => {
+    if (!undo || inFlight.current) return;
+    const held = undo;
+    inFlight.current = true; setBusy(held.rowKey); setUndoError(null);
+    try {
+      await restoreSavedAttention(held.receipt);
+      setNotices(all => { const next = { ...all }; delete next[held.rowKey]; return next; });
+      setUndo(current => current && sameAttentionReceipt(current.receipt, held.receipt) ? null : current); onChanged();
+    } catch (err) { setUndoError(err instanceof Error ? err.message : 'Could not restore this item. Refresh to check its status.'); }
+    finally { inFlight.current = false; setBusy(null); }
+  };
+
   const meta = (row: FromClemRow) => (
-    <div class="home-row-note">{fromClemSourceName(row)} · {relativeTime(row.at)}</div>
+    <div class="home-row-note">{fromClemSourceName(row)} · {relativeTime(row.at)}{(row.relatedNotificationIds?.length ?? 0) > 1 ? ` · Reported ${row.relatedNotificationIds!.length} times` : ''}</div>
   );
   const notice = (row: FromClemRow) => {
     const said = currentProactiveReceipt(notices[row.key], row.voiceDigest);
@@ -109,29 +150,35 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     </button>
   );
 
-  const waitingRow = (row: FromClemRow) => {
+  const waitingRow = (row: FromClemRow, presentation = true) => {
     const done = Boolean(currentProactiveReceipt(notices[row.key], row.voiceDigest)?.settled);
     return (
       <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
         {meta(row)}
         <div class="home-row-title">{row.say || row.text}</div>
+        {!presentation && row.detail ? <p class="from-clem-report">{row.detail}</p> : null}
         {notice(row)}
         {!done ? (
           <div class="home-row-actions">
-            {(row.choices ?? []).map((choice, index) => (
+            {(row.answer?.kind === 'yes_no' ? [] : row.choices ?? []).map((choice, index) => (
               <button key={choice} type="button" class={index === 0 ? 'home-btn home-btn-primary' : 'home-btn'} disabled={busy !== null}
                 onClick={() => void reply(row, choice, undefined, index)}>{choice}</button>
             ))}
-            {!row.choices?.length && (row.answer?.kind === 'yes_no' || row.answer?.kind === 'brain_outage') ? (
+            {row.answer?.kind === 'yes_no' && onOpenInbox ? <button type="button" class="home-btn home-btn-primary" onClick={() => { if (row.answer?.kind === 'yes_no') onOpenInbox(`plan:${row.answer.planProposalId}`); }}>Review plan</button> : null}
+            {!row.choices?.length && row.answer?.kind === 'brain_outage' ? (
               <>
                 <button type="button" class="home-btn home-btn-primary" disabled={busy !== null} onClick={() => void reply(row, 'Yes, do it', 'do_it')}>Yes</button>
                 <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void reply(row, 'No', 'done')}>No</button>
               </>
             ) : null}
-            {openReply(row, row.choices?.length ? 'Reply in your words' : 'Reply')}
+            {row.answer?.kind !== 'yes_no' ? openReply(row, row.choices?.length ? 'Reply in your words' : 'Reply') : null}
+            {presentation && (row.answer?.kind === 'words' || row.attentionKey && row.answer?.kind !== 'yes_no') && row.lifecycle?.effect === 'hide_only' && row.lifecycle.generation ? <>
+              {row.lifecycle.canDefer ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(row, 'defer')}>Later</button> : null}
+              {row.lifecycle.canDismiss ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(row, 'dismiss')}>Dismiss</button> : null}
+            </> : null}
           </div>
         ) : null}
-        {replyBox(row)}
+        {row.answer?.kind !== 'yes_no' ? replyBox(row) : null}
       </div>
     );
   };
@@ -152,7 +199,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
         {report ? <div class={open ? 'from-clem-report' : 'from-clem-report from-clem-report-clamped'}>{row.say}</div> : null}
         {open && detail ? <div class="from-clem-report">{detail}</div> : null}
         <button type="button" class="home-link-btn from-clem-read" aria-expanded={open}
-          onClick={() => setReading(open ? null : row.key)}>{open ? 'Show less' : 'Read more'}</button>
+          onClick={() => setReading(open ? null : row.key)}>{open ? 'Show less' : 'Read update'}</button>
         {row.handoff ? <div class="home-row-note">
           <p>{row.handoff.reason || (row.handoff.state === 'dispatched' ? 'The approved task is in its conversation.' : 'This suggestion needs another look before work continues.')}</p>
           <button type="button" class="home-btn" onClick={() => onOpenThread(row.handoff?.sessionId)}>{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</button>
@@ -162,7 +209,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
           <div class="home-row-actions">
             {notificationId ? (
               <button type="button" class="home-btn" disabled={busy !== null}
-                onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return {text: 'Cleared.', settled: true}; })}>Done</button>
+                onClick={() => void run(row, async () => { await markInboxNotificationRead(notificationId); return {text: 'Cleared.', settled: true}; })}>Dismiss update</button>
             ) : null}
             {openReply(row, 'Tell Clem')}
           </div>
@@ -197,22 +244,44 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all' }: {
     );
   };
 
-  const group = (id: string, label: string, list: FromClemRow[], render: (row: FromClemRow) => JSX.Element) => (list.length > 0 ? (
-    <div class={`from-clem-group ${id}`}>
-      {showGroupHeading ? <h3 id={`${sectionId}-${id}`} class="from-clem-group-head">{label}{list.length > 1 ? ` · ${list.length}` : ''}</h3> : null}
-      <div class="home-card" aria-labelledby={showGroupHeading ? `${sectionId}-${id}` : sectionId}>{list.map(render)}</div>
-    </div>
-  ) : null);
+  const group = (id: string, label: string, list: FromClemRow[], render: (row: FromClemRow) => JSX.Element) => {
+    if (list.length === 0) return null;
+    const grouped = groupAttentionReports(list, row => ({ id: row.key, attentionKey: row.attentionKey,
+      generation: row.lifecycle?.generation, protected: !row.asks || Boolean(row.answer) || Boolean(row.setup) }));
+    return <div class={`from-clem-group ${id}`}>
+      {showGroupHeading ? <h3 id={`${sectionId}-${id}`} class="from-clem-group-head">{label}</h3> : null}
+      <div class="home-card" aria-labelledby={showGroupHeading ? `${sectionId}-${id}` : sectionId}>
+        {grouped.map(item => {
+          if (item.reports.length === 1) return render(item.reports[0]);
+          const first = item.reports[0];
+          const count = attentionReportCount(item.reports, row => row.relatedNotificationIds ?? [row.done?.notificationId ?? row.key]);
+          return <details key={item.id} data-attention-group={item.attentionKey} class="attention-work-group">
+            <summary><strong>{attentionWorkTitle(item.attentionKey, fromClemSourceName(first))}</strong><span class="attention-report-count">{count} reports</span>
+              {item.reports.map(row => <span key={row.key} class="attention-report-cause">{oneLine(row.say || row.detail || row.text, 140)}</span>)}
+            </summary>
+            <div class="attention-work-actions"><span>Setting this aside leaves every report and the work unchanged.</span>
+              {first.lifecycle?.canDefer ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(first, 'defer')}>Later</button> : null}
+              {first.lifecycle?.canDismiss ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(first, 'dismiss')}>Dismiss</button> : null}
+            </div>
+            <div class="attention-work-reports">{item.reports.map(row => waitingRow(row, false))}</div>
+          </details>;
+        })}
+      </div>
+    </div>;
+  };
 
   return (
     <section class="home-section" aria-labelledby={sectionId}>
+      {undo ? <div ref={undoElement} class="presentation-undo" role="status" tabIndex={-1}><span>Set aside. The work is unchanged.</span><button type="button" disabled={busy !== null} onClick={() => void restoreQuestion()}>Undo</button></div> : null}
+      {undoError ? <p class="home-row-error" role="alert">{undoError}</p> : null}
       <div class="from-clem-head">
         <h2 id={sectionId} class="section-head pane-head">{heading}</h2>
-        {mode !== 'decisions' ? <button type="button" class="from-clem-thread" onClick={() => { haptic('light'); onOpenThread(); }}>Her thread</button> : null}
+        {mode !== 'decisions' ? <button type="button" class="from-clem-thread" onClick={() => { haptic('light'); onOpenThread(); }}>Chat with Clem</button> : null}
       </div>
       {group('from-clem-waiting', 'Waiting on you', waiting, waitingRow)}
       {group('from-clem-updates', 'Updates', updates, updateRow)}
       {group('from-clem-setup', 'Set up next', offers, offerRow)}
+      {allGroups.length > visibleGroups.length ? <button type="button" class="home-pinned-more" onClick={() => onOpenInbox ? onOpenInbox() : onOpenThread()}>View all {new Set(allGroups.map(group => group.attentionKey ?? group.id)).size} {mode === 'decisions' ? 'requests' : 'updates'}</button> : null}
     </section>
   );
 }

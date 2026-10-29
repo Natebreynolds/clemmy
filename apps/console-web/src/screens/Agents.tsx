@@ -151,7 +151,7 @@ export function Agents() {
 
   const loading = agentsQ.isLoading && agents.length === 0;
   const newAgent = (
-    <Button size="sm" onClick={() => setCreating(true)}>
+    <Button size="sm" data-clem-guide="create-agent" onClick={() => setCreating(true)}>
       <Plus className="h-4 w-4" /> New agent
     </Button>
   );
@@ -159,9 +159,10 @@ export function Agents() {
   return (
     <Page
       title="Agents"
-      subtitle="Specialized places to work: each one starts every thread with its own instructions and the skills, workflows and tools it reaches for first."
+      subtitle="Your team for the work. Each agent carries its own instructions, skills and tools, and can be assigned to a project."
       actions={newAgent}
     >
+      <p className="mb-5 text-small text-muted">Open an agent to work together, or <Link to="/projects" className="font-semibold text-primary hover:underline">choose a project</Link> to keep the whole job together.</p>
       <Drafts
         proposals={proposals}
         busyId={proposalBusyId}

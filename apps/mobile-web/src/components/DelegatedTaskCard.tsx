@@ -9,12 +9,13 @@
  * own route, and settles to the task the Mac answers with.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { delegatedTaskCard, delegatedTaskCorrection, delegatedTaskFollowsLine, renderMarkdown, type DelegatedTask } from '@clem/chat-engine';
+import { delegatedTaskCard, delegatedTaskCorrection, delegatedTaskFollowsLine, delegatedTaskReport, renderMarkdown, type DelegatedTask } from '@clem/chat-engine';
 import { answerDelegatedTask, refusedTask, steerDelegatedTask } from '../lib/project-api';
 import { refusalIsStale, refusalWords } from '../lib/project-words';
 import { haptic } from '../lib/native-bridge';
 import { relativeTime } from './Approvals';
 import { RunControl } from './RunControl';
+import { TaskResultFiles } from './TaskResultFiles';
 
 interface Props {
   task: DelegatedTask;
@@ -23,7 +24,7 @@ interface Props {
   /** Opens the run view that already exists for the task's work. */
   onOpenRun?: (runSessionId: string) => void;
   /** Where an approval is decided, when the task waits on one. */
-  onOpenNeedsYou?: () => void;
+  onOpenNeedsYou?: (decisionKey?: string) => void;
   /** A project's own screen already says which project this is. */
   hideProject?: boolean;
   /** An agent's own screen already says who owns it. */
@@ -66,6 +67,7 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
 
   const task = newest(given, settled);
   const view = delegatedTaskCard(task, { resultChars: 280 });
+  const report = hideReport ? null : delegatedTaskReport(task);
   // The words are the shared engine's, so the desktop card says the same.
   const request = view.request;
   const who = [hideOwner ? '' : view.owner, hideProject ? '' : view.project ?? ''].filter(Boolean).join(' · ');
@@ -179,7 +181,7 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
               <RunControl target={{ kind: 'delegated-task', taskId: task.taskId }} resumable onChanged={onChanged} />
             ) : null}
             {view.next.action === 'approve' && onOpenNeedsYou ? (
-              <button type="button" class="btn-approve task-send" onClick={() => { haptic('light'); onOpenNeedsYou(); }}>Review</button>
+              <button type="button" class="btn-approve task-send" onClick={() => { haptic('light'); onOpenNeedsYou(view.approvalId ? `approval:${view.approvalId}` : undefined); }}>Review</button>
             ) : null}
             {view.controls.steer && mode !== 'steer' ? (
               <button type="button" class={view.next.action === 'correct' ? 'btn-approve task-send' : 'btn-quiet'} onClick={() => { haptic('light'); setError(null); setMode('steer'); }}>
@@ -219,18 +221,30 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
             </>
           ) : null}
         </div>
-      ) : view.approvalId ? (
+      ) : view.approvalId && view.next?.action !== 'approve' ? (
         <div class="task-question">
           <p class="task-question-text">{view.owner} is waiting for your approval before going on.</p>
           {onOpenNeedsYou ? (
-            <button type="button" class="link-btn" onClick={() => { haptic('light'); onOpenNeedsYou(); }}>Review in Needs you</button>
+            <button type="button" class="link-btn" onClick={() => { haptic('light'); onOpenNeedsYou(`approval:${view.approvalId}`); }}>Review in Needs you</button>
           ) : null}
         </div>
       ) : null}
 
       {view.now ? <p class="task-now">{view.now}</p> : null}
 
-      {view.latest ? (
+      {report ? (
+        <div class="task-report">
+          <h4 class="task-report-label">{report.label}</h4>
+          <div class="bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(report.summary) }} />
+          {report.hasDetails ? <details class="task-detail"><summary>Recorded report</summary><div class="bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(report.detail) }} /></details> : null}
+        </div>
+      ) : null}
+
+      {view.phase.settled && view.latest ? <details class="task-detail"><summary>Agent updates ({task.checkIns?.length ?? 0})</summary><ol class="task-checkins">{(task.checkIns ?? []).slice().reverse().map(entry => <li key={`${entry.at}-${entry.note.slice(0, 24)}`}><time class="task-checkin-when" dateTime={entry.at}>{relativeTime(entry.at)}</time><p class="task-checkin-note">{entry.note}</p></li>)}</ol></details> : null}
+
+      {view.files.length > 0 && task.runSessionId ? <TaskResultFiles sessionId={task.runSessionId} savedKey={JSON.stringify(task.files ?? [])} onOpenRun={onOpenRun} /> : null}
+
+      {view.latest && !view.phase.settled ? (
         <div class="task-latest">
           <p class="task-checkin-note">{view.latest.note}</p>
           <span class="task-checkin-when">{view.owner} · <time dateTime={view.latest.at}>{relativeTime(view.latest.at)}</time></span>
@@ -251,34 +265,15 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
       ) : null}
 
       {view.progress && view.progress.items.length > 0 ? (
-        <ul class="task-items" aria-label={view.progress.label}>
-          {view.progress.items.slice(0, 6).map((item) => (
+        <details class="task-detail"><summary>Work details ({view.progress.items.length})</summary><ul class="task-items" aria-label={view.progress.label}>
+          {view.progress.items.map((item) => (
             <li key={item.id} class={`task-item task-item-${item.state}`}>
               <i class="task-item-mark" aria-hidden="true" />
               <span class="task-item-label">{item.label}</span>
               <span class="task-item-state">{ITEM_WORDS[item.state]}{item.note ? ` · ${item.note}` : ''}</span>
             </li>
           ))}
-          {view.progress.items.length > 6 ? (
-            <li class="task-item task-item-more">and {view.progress.items.length - 6} more</li>
-          ) : null}
-        </ul>
-      ) : null}
-
-      {view.report && !hideReport ? (
-        <div class="task-report">
-          {/* The report is markdown, like a chat reply. */}
-          <div class="bubble-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(view.report) }} />
-          {onOpenRun ? (
-            <button type="button" class="link-btn" onClick={() => { haptic('light'); onOpenRun(task.runSessionId); }}>Full report</button>
-          ) : null}
-        </div>
-      ) : null}
-
-      {view.files.length > 0 ? (
-        <div class="task-files" aria-label="Files it saved">
-          {view.files.map((file) => <span key={`${file.dir ?? ''}/${file.name}`} class="task-file" title={file.dir ?? undefined}>{file.name}</span>)}
-        </div>
+        </ul></details>
       ) : null}
 
       {mode === 'steer' ? (
@@ -305,7 +300,7 @@ export function DelegatedTaskCard({ task: given, onChanged, onOpenRun, onOpenNee
       ) : hasControls ? (
         <div class="task-actions">
           {onOpenRun ? (
-            <button type="button" class="btn-quiet" onClick={() => { haptic('light'); onOpenRun(task.runSessionId); }}>Open</button>
+            <button type="button" class="btn-quiet" onClick={() => { haptic('light'); onOpenRun(task.runSessionId); }}>Open run</button>
           ) : null}
           {steerInRow ? (
             <button type="button" class="btn-quiet" onClick={() => { haptic('light'); setError(null); setMode('steer'); }}>

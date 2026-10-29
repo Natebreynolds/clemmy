@@ -1,8 +1,10 @@
 import type {
   ApprovalRow,
+  AttentionItem,
   InboxNotification,
   InboxQuestion,
   InboxTrustProposal,
+  InboxUnlistedItem,
   PlanProposalRow,
   WorkspaceDestinationChooser,
 } from './api';
@@ -14,6 +16,8 @@ export interface InboxCollections {
   questions: InboxQuestion[];
   trustProposals: InboxTrustProposal[];
   notifications: InboxNotification[];
+  attentionItems: AttentionItem[];
+  unlisted: InboxUnlistedItem[];
 }
 
 /** Missing means “never successfully observed”; [] means authoritative zero. */
@@ -32,5 +36,7 @@ export function inboxNeedsCountKnown(value: InboxLastGood): value is InboxCollec
     && value.workspaceChoosers !== undefined
     && value.questions !== undefined
     && value.trustProposals !== undefined
-    && value.notifications !== undefined;
+    && value.notifications !== undefined
+    && value.attentionItems !== undefined
+    && value.unlisted !== undefined;
 }

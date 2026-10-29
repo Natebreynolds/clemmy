@@ -115,6 +115,21 @@ export const getProjectOverview = (projectId: string) =>
 
 export interface ProjectInput { name?: string; purpose?: string; goals?: string[]; context?: string }
 
+/** Compare with the record editing began from, so a fresh poll cannot turn
+ * an untouched stale field into a change that overwrites another device. */
+export function projectIdentityChanges(
+  baseline: Pick<ProjectOverview['project'], 'name' | 'purpose' | 'goals' | 'context'>,
+  draft: { name: string; purpose: string; goals: string; context: string },
+): ProjectInput {
+  const goals = goalsFromText(draft.goals);
+  return {
+    ...(draft.name.trim() !== baseline.name ? { name: draft.name.trim() } : {}),
+    ...(draft.purpose.trim() !== baseline.purpose ? { purpose: draft.purpose.trim() } : {}),
+    ...(goals.join('\n') !== baseline.goals.join('\n') ? { goals } : {}),
+    ...(draft.context.trim() !== baseline.context ? { context: draft.context.trim() } : {}),
+  };
+}
+
 const overviewOf = (r: { overview: ProjectOverview }) => r.overview;
 
 export const createProject = (input: ProjectInput & { name: string }) =>

@@ -3,13 +3,14 @@ import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkS
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
-import { browserbaseStoreFile } from './browserbase-setup.js';
+import { browserbaseStoreFile, cloudBrowserSelection } from './browserbase-setup.js';
 import { readSecret, writeSecret } from '../runtime/secrets/index.js';
 import { syncDirectoryMetadata } from '../runtime/sync-directory.js';
 import { BrowserbaseApiClient, BrowserbaseClientError, type BrowserbaseSession, type BrowserbaseRunningSession } from './browserbase-client.js';
 import { BrowserbaseCdpClient, BrowserbaseCdpError, parseBrowserbaseOperation, type BrowserbaseOperation, type BrowserbasePage, type BrowserbaseCdpResult } from './browserbase-cdp.js';
 import { CLOUD_BROWSER_PROVIDER_INFO, isBrowserChoice, isCloudBrowserProvider, type BrowserChoice, type CloudBrowserProvider } from './cloud-browser-provider.js';
 import { KernelApiClient, KERNEL_DEFAULT_PROJECT } from './kernel-client.js';
+import { computerDriverIsTheBrowserNow } from './computer-driver-presence.js';
 
 export interface BrowserbaseResource {
   id: string; conversationId: string; provider: CloudBrowserProvider; providerSessionId: string | null; projectId: string;
@@ -348,6 +349,7 @@ export class BrowserbaseService {
   }
   async status(): Promise<{
     configured: boolean; choice: BrowserChoice; provider: CloudBrowserProvider | null;
+    effectiveBackend: 'computer' | 'cloud' | 'local';
     providers: Partial<Record<CloudBrowserProvider, { configured: boolean; credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null }>>;
     credentialConfigured: boolean; credentialStatus: 'available' | 'missing' | 'unavailable' | 'not_checked'; projectId: string | null; idleSeconds: number; sessionTimeoutSeconds: number; activeResources: number; privacy: { logSession: boolean; recordSession: boolean };
   }> {
@@ -365,6 +367,10 @@ export class BrowserbaseService {
     const activeStatus = active ? providers[active.provider] : undefined;
     return {
       configured: Boolean(active && activeStatus?.configured), choice, provider: active && activeStatus?.configured ? active.provider : null, providers,
+      // Match browser-backend's existing selection authority. This is passive
+      // status only: no driver start, permissions request or routing change.
+      effectiveBackend: computerDriverIsTheBrowserNow({ home: this.dependencies.baseDir ?? BASE_DIR })
+        ? 'computer' : cloudBrowserSelection(this.dependencies.baseDir ?? BASE_DIR).provider ? 'cloud' : 'local',
       credentialConfigured: activeStatus?.credentialConfigured ?? false, credentialStatus: activeStatus?.credentialStatus ?? 'not_checked',
       projectId: active?.projectId ?? null, idleSeconds: active?.idleSeconds ?? DEFAULT_IDLE_SECONDS, sessionTimeoutSeconds: active?.sessionTimeoutSeconds ?? DEFAULT_SESSION_TIMEOUT_SECONDS,
       activeResources: this.store.resources.filter(nonterminal).length, privacy: { logSession: false, recordSession: false } };

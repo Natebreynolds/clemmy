@@ -1,12 +1,13 @@
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/CloudBrowserDock';
+import { ComputerView, ComputerWorkspace, useComputerControl } from '@/components/chat/ComputerDock';
 import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
 import { Fragment, useEffect, useMemo, useRef } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { FolderKanban, Pin, Loader2, Files, Globe } from 'lucide-react';
+import { FolderKanban, Pin, Loader2, Files, Globe, Monitor } from 'lucide-react';
 import { Composer, type ComposerSendInput } from '@/components/chat/Composer';
 import { AgentPicker } from '@/components/chat/AgentPicker';
 import { ProjectPicker } from '@/components/chat/ProjectPicker';
@@ -42,6 +43,7 @@ function Header({ session }: { session: Session }) {
   const mutations = useSessionMutations();
   const files = useFileDock()?.filesControl;
   const browser = useBrowserControl();
+  const computer = useComputerControl();
   const meta = originMeta(session.origin);
   return (
     <div className="flex items-center gap-3 border-b border-border bg-surface px-5 py-3">
@@ -65,7 +67,7 @@ function Header({ session }: { session: Session }) {
           )}
         </div>
       </div>
-      {/* Files and the browser sit here, one header row (owner 2026-10-18:
+      {/* Files and computer views sit here, one header row (owner 2026-10-18:
           three stacked bars above every chat read as clutter). */}
       {files && (
         <Button size="sm" variant="ghost" aria-expanded={files.open} onClick={files.toggle}
@@ -73,8 +75,14 @@ function Header({ session }: { session: Session }) {
           <Files className="h-4 w-4" aria-hidden /> Files{files.count > 0 ? <span className="text-faint">{files.count}</span> : null}
         </Button>
       )}
+      {computer && (
+        <Button size="sm" variant="ghost" aria-expanded={computer.open} onClick={computer.toggle}
+          aria-label={computer.open ? 'Close computer view' : 'Watch your connected computer'}>
+          <Monitor className="h-4 w-4" aria-hidden /> Computer
+        </Button>
+      )}
       {browser && (
-        <Button size="sm" variant="ghost" aria-expanded={browser.open} onClick={browser.toggle} title="A browser Clem can use for this conversation">
+        <Button size="sm" variant="ghost" aria-expanded={browser.open} onClick={browser.toggle} title="Manage an open cloud browser session">
           <Globe className="h-4 w-4" aria-hidden /> {browser.label}{browser.status ? <span className="text-faint">· {browser.status}</span> : null}
         </Button>
       )}
@@ -192,9 +200,11 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 
   return (
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
+    <ComputerWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
     <FileDockWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
+      <ComputerView />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} sessionId={rawId(session.id)} compact />
@@ -235,6 +245,7 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
       </div>
     </div>
     </FileDockWorkspace>
+    </ComputerWorkspace>
     </CloudBrowserWorkspace>
   );
 }
@@ -246,6 +257,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
   const marks = agentThreadMarks(messages, session.agentName ?? null);
   const projectMarks = projectThreadMarks(messages, session.projectName ?? null);
   return (
+    <FileDockWorkspace conversationId={rawId(session.id)} inHeader>
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -264,6 +276,7 @@ function ReadOnlyThread({ session, history }: { session: Session; history: Turn[
       </div>
       <ReadOnlyNotice kind={session.kind} />
     </div>
+    </FileDockWorkspace>
   );
 }
 

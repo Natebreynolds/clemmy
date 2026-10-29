@@ -4,7 +4,7 @@ import { usePoll } from '@/lib/poll';
 import { artifactCountLabel, dayHeading, folderHref, groupKinds, listDelivered, type DeliveredGroup } from '@/lib/delivered';
 import { LoadFailedLine, PaneCard, QuietLine, RowSkeleton, SectionHeader } from './HomeSection';
 
-const MAX_ROWS = 6;
+const MAX_ROWS = 3;
 
 function FolderGlyph({ group }: { group: DeliveredGroup }) {
   const kinds = groupKinds(group);
@@ -31,10 +31,10 @@ export function MadePane({ headingId }: { headingId: string }) {
     <section aria-labelledby={headingId} className="flex flex-col gap-2.5">
       <SectionHeader
         id={headingId}
-        label="Made"
+        label="Files & results"
         aside={
           <Link to="/made" className="rounded-sm font-semibold text-primary hover:underline">
-            All made
+            All results
           </Link>
         }
       />

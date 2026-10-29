@@ -9,7 +9,7 @@ import { Sun, Moon, Monitor, Sliders, ChevronRight } from 'lucide-react';
 import { useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
-import { openCustomizeHome } from '@/components/home/CustomizePanel';
+import { openCustomizeHome } from '@/lib/customize-home';
 import { useTheme, type ThemeChoice } from '@/lib/theme';
 import { ProfileForm } from './settings/ProfileForm';
 import { NotificationsEditor } from './settings/NotificationsEditor';
@@ -21,6 +21,7 @@ import { CleanupCard } from './settings/CleanupCard';
 import { StorageCard } from './settings/StorageCard';
 import { cn } from '@/lib/cn';
 import { isMac } from '@/lib/platform';
+import { OnboardingModelReturn } from '@/components/onboarding/ExplorationNotice';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
   { key: 'light', label: 'Light', icon: Sun },
@@ -88,6 +89,7 @@ export function Settings() {
       </nav>
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-8">
+          <OnboardingModelReturn />
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Clementine</p>
           <ModelsSection />
           <section id="computer-access" className="scroll-mt-16">

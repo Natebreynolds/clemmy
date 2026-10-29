@@ -179,7 +179,9 @@ import { extractYouTubeUrls, foldAttachmentsIntoMessage, ingestAttachment, loadI
 import { acceptedAttachmentFiles, type AttachmentFileReference } from '../runtime/attachment-file-reference.js';
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
-import { bootParkedWorkflows, needsYouKey, needsYouReferents, notificationNeedsYou, summarizeNeedsYou } from './needs-you.js';
+import { attentionLifecycleForKey, bootParkedWorkflows, listAttentionPresentations, needsYouKey, needsYouReferents,
+  notificationAttentionHidden, notificationNeedsYou, presentAttentionItem, summarizeNeedsYou } from './needs-you.js';
+import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion, visibleInboxQuestions } from './question-presentation.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -353,7 +355,6 @@ import { approvePlanAndQueueBackgroundTask } from '../execution/approved-plan-ta
 import {
   answerInboxQuestion,
   listActionableCheckIns,
-  listInboxQuestions,
 } from '../execution/inbox-questions.js';
 import {
   parseGoalCommand,
@@ -11442,11 +11443,41 @@ export function registerConsoleRoutes(
   app.get('/api/console/inbox/questions', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const questions = listInboxQuestions();
+      const questions = visibleInboxQuestions().map(projectInboxQuestion);
       res.json({ questions, count: questions.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
+  });
+
+  app.get('/api/console/inbox/questions/presentation', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const questions = listQuestionPresentations();
+      res.json({ questions, count: questions.length });
+    } catch { res.status(503).json({ error: 'Set-aside questions are unavailable. Please try again.' }); }
+  });
+
+  app.get('/api/console/inbox/attention/presentation', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    try {
+      const items = listAttentionPresentations();
+      res.json({ items, count: items.length });
+    } catch { res.status(503).json({ error: 'Set-aside items are unavailable. Please try again.' }); }
+  });
+  app.post('/api/console/inbox/attention/presentation', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const action = req.body?.action;
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!key || key.length > 4096 || (action !== 'dismiss' && action !== 'defer' && action !== 'restore')) {
+      res.status(400).json({ error: 'An item key and dismiss, defer or restore action are required.' }); return;
+    }
+    try {
+      const generation = typeof req.body?.generation === 'string' ? req.body.generation : undefined;
+      const mutationToken = typeof req.body?.mutationToken === 'string' ? req.body.mutationToken : undefined;
+      const result = presentAttentionItem(key, action, generation, mutationToken);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch { res.status(503).json({ error: 'The item could not be moved. Please try again; its work has not changed.' }); }
   });
 
   app.post('/api/console/inbox/questions/:id/answer', (req, res) => {
@@ -11467,6 +11498,20 @@ export function registerConsoleRoutes(
     }
     if (result.status === 'storage_error') { res.status(503).json({ error: result.reason, ...result }); return; }
     res.status(409).json({ error: 'question already answered or superseded', ...result });
+  });
+
+  app.post('/api/console/inbox/questions/:id/presentation', (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const action = req.body?.action;
+    if (action !== 'dismiss' && action !== 'defer' && action !== 'restore') { res.status(400).json({ error: 'action must be dismiss, defer or restore' }); return; }
+    try {
+      const generation = typeof req.body?.generation === 'string' ? req.body.generation : undefined;
+      const mutationToken = typeof req.body?.mutationToken === 'string' ? req.body.mutationToken : undefined;
+      const result = presentInboxQuestion(req.params.id, action, Date.now(), generation, mutationToken);
+      res.status(result.ok ? 200 : 409).json(result);
+    } catch {
+      res.status(503).json({ error: 'The question could not be moved. Please try again.' });
+    }
   });
 
   app.post('/api/console/inbox/workflow-capabilities/:runId/resolve', (req, res) => {
@@ -14801,6 +14846,7 @@ export function registerConsoleRoutes(
       const ref = needsYouReferents();
       const items = listNotifications(50)
         .filter((n) => !n.silent && !n.read)
+        .filter((n) => !notificationAttentionHidden(n, ref))
         .filter((n) => !Number.isFinite(since) || Date.parse(n.createdAt) > since)
         .slice(0, 5)
         .map((n) => {
@@ -14852,8 +14898,13 @@ export function registerConsoleRoutes(
     if (!id) { res.status(400).json({ error: 'id required' }); return; }
     try {
       if (kind === 'checkin') {
-        const closed = closeCheckIn(id, 'Dismissed by user from the inbox.');
-        res.json({ ok: Boolean(closed), kind, id });
+        const result = presentInboxQuestion(`checkin:${id}`, 'dismiss');
+        res.status(result.ok ? 200 : 409).json({ ...result, kind, id });
+        return;
+      }
+      if (kind === 'question') {
+        const result = presentInboxQuestion(id, 'dismiss');
+        res.status(result.ok ? 200 : 409).json({ ...result, kind, id });
         return;
       }
       if (kind === 'plan') {
@@ -14867,11 +14918,17 @@ export function registerConsoleRoutes(
         return;
       }
       if (kind === 'notif') {
-        // "Needs you" cards backed by a needs-attention notification dismiss
-        // by marking the notification read — the command-center feed only
-        // surfaces unread ones, so the card disappears everywhere at once.
+        const notification = getNotification(id);
+        const ref = needsYouReferents(Date.now(), { freshRuns: true });
+        const attentionKey = notification ? needsYouKey(notification, ref) : '';
+        if (attentionKey && attentionLifecycleForKey(attentionKey, ref)) {
+          const generation = typeof req.body?.generation === 'string' ? req.body.generation : undefined;
+          const result = presentAttentionItem(attentionKey, 'dismiss', generation);
+          res.status(result.ok ? 200 : 409).json({ ...result, kind, id });
+          return;
+        }
         // Group-read: the feed dedupes by title/workflow, so the twins
-        // behind the surfaced card must clear too or they pop right back.
+        // behind an ordinary update must clear too or they pop right back.
         const marked = markNotificationGroupRead(id);
         res.json({ ok: marked.length > 0, kind, id, cleared: marked.length });
         return;
@@ -15015,7 +15072,7 @@ export function registerConsoleRoutes(
         .filter(approvalRegistry.isFormalApprovalSurface);
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
-      const inboxQuestions = withDaemonRuntimePhaseSync('daemon.http.command_center.inbox_questions', {}, () => listInboxQuestions());
+      const inboxQuestions = withDaemonRuntimePhaseSync('daemon.http.command_center.inbox_questions', {}, () => visibleInboxQuestions());
       const openCheckIns = listActionableCheckIns();
       // For WORKING NOW we only want executions the daemon is RUNNING
       // right now. Blocked/paused are stalled — they show in Activity.
@@ -15188,9 +15245,10 @@ export function registerConsoleRoutes(
           panel: 'settings',
           urgency: question.urgency === 'high' ? 'high' : 'normal',
           questionId: question.id,
-          ...(question.source === 'check_in'
-            ? { dismissKind: 'checkin' as const, dismissId: question.id.slice('checkin:'.length) }
-            : {}),
+          attentionKey: question.id,
+          lifecycle: projectInboxQuestion(question).lifecycle,
+          dismissKind: 'question' as const,
+          dismissId: question.id,
         })),
         ...activeBackgroundTasks.filter((task) => task.status === 'awaiting_approval' && !task.pendingApprovalId).map((task) => ({
           kind: 'background',
@@ -15454,6 +15512,8 @@ export function registerConsoleRoutes(
         panel: 'activity',
         urgency: 'high',
         notifId: notification.id,
+        attentionKey: needsYouKey(notification, needsYouRef),
+        lifecycle: attentionLifecycleForKey(needsYouKey(notification, needsYouRef), needsYouRef),
         body: (notification.body || '').slice(0, 4000),
         createdAt: notification.createdAt,
         runId: String(notification.metadata?.workflowRunId || notification.metadata?.runId || ''),
@@ -15462,7 +15522,8 @@ export function registerConsoleRoutes(
         dismissId: notification.id,
       }));
       const notifRecent = dedupeByWorkflow(
-        inboxNotifs.filter((notification) => !notificationNeedsYou(notification, needsYouRef) && !isGenericWorkflowEcho(notification)),
+        inboxNotifs.filter((notification) => !notificationAttentionHidden(notification, needsYouRef)
+          && !notificationNeedsYou(notification, needsYouRef) && !isGenericWorkflowEcho(notification)),
         12,
       ).map((notification) => {
         const undelivered = !notification.deliveredAt && (Boolean(notification.deliveryError) || (notification.deliveryAttempts || 0) > 0);

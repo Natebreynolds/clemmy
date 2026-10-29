@@ -28,3 +28,15 @@ export function cleanChatTitle(raw: string): string | null {
   const title = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
   return title ? title : null;
 }
+
+export function chatListEmpty(archived: boolean): { title: string; body: string; starterDraft: string | null } {
+  return archived ? {
+    title: 'No archived conversations',
+    body: 'Conversations you archive stay here. Go back to your recent conversations to continue.',
+    starterDraft: null,
+  } : {
+    title: 'What would you like to get done?',
+    body: 'Tell Clem the outcome you want. Start with a plan, a draft or a question.',
+    starterDraft: 'Help me plan a task. Ask me what I want to achieve, then suggest a clear next step.',
+  };
+}

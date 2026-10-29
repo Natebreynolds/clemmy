@@ -1,4 +1,5 @@
 export * from './app-places.js';
+export * from './app-guidance.js';
 export * from './chat-seen.js';
 export * from './types.js';
 export type { TaskHandlingDetails, TaskHandlingUsageTotals, TaskMemoryState, TaskMemoryStatus } from './task-handling.js';
@@ -58,3 +59,4 @@ export * from './proactive-status.js';
 export * from './pending-action-result.js';
 
 export * from './approval-result-update.js';
+export * from './attention-report-groups.js';

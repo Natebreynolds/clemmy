@@ -220,7 +220,7 @@ function providerCapacityRefusal(error: unknown): { credit: boolean; providerSai
   return { credit, ...(quotable ? { providerSaid: raw } : {}) };
 }
 
-function providerCapacityLine(refusal: { credit: boolean; providerSaid?: string }): string {
+function providerCapacityLine(refusal: { credit: boolean; providerSaid?: string }, retainedWorkKnown = true): string {
   return [
     refusal.credit
       ? 'The model account this work runs on is out of credit, so this run stopped.'
@@ -229,7 +229,7 @@ function providerCapacityLine(refusal: { credit: boolean; providerSaid?: string 
     refusal.credit
       ? 'Add credit on that account or choose a different model for this work, then resume or ask again.'
       : 'Add usage on that account (or wait for its limit to reset) or choose a different model for this work, then resume or ask again.',
-    'The work done so far is saved.',
+    retainedWorkKnown ? 'The work done so far is saved.' : '',
   ].filter(Boolean).join(' ');
 }
 
@@ -275,6 +275,23 @@ export function publicRunFailureTerminal(input: {
     };
   }
   return { text: PUBLIC_RUN_FAILURE_TEXT, notice: { code: 'run_failed' } };
+}
+
+/** Earlier terminals retained the cause privately but published the generic
+ * unknown-cause line. Project only a closed capacity classification from that
+ * exact failed terminal; never quote its diagnostic or rewrite its ledger. */
+function retainedCapacityFailure(data: Record<string, unknown>): { text: string; notice: TerminalNotice } | null {
+  if (data.reason !== 'failed' || typeof data.failureDetail !== 'string') return null;
+  const presentation = presentationEventFromCompletionData(data);
+  if (presentation && presentation.status !== 'failed') return null;
+  const reply = presentation ? publicPresentationText(presentation) : publicReplyText(data.reply, '');
+  if (!isPublicRunFailureText(reply)) return null;
+  const refusal = providerCapacityRefusal(data.failureDetail);
+  if (!refusal) return null;
+  return {
+    text: providerCapacityLine({ credit: refusal.credit }, false),
+    notice: { code: refusal.credit ? 'provider_out_of_credit' : 'provider_quota' },
+  };
 }
 export const PUBLIC_MODEL_RUNTIME_UNAVAILABLE_TEXT =
   'No model runtime is connected, so this turn could not start. Open Settings > Models, connect a model, and try again.';
@@ -789,6 +806,8 @@ export function publicCompletionText(
 ): string {
   try {
     const typedPresentation = presentationEventFromCompletionData(data);
+    const retainedFailure = retainedCapacityFailure(data);
+    if (retainedFailure) return retainedFailure.text;
     const missingReply = data.reply === undefined || data.reply === null
       || (typeof data.reply === 'string' && !data.reply.trim());
     if (typedPresentation) return publicPresentationText(typedPresentation);
@@ -879,6 +898,8 @@ function publicTerminalRetained(
 /** An app status the clients render as chrome instead of a Clem bubble. Only
  * a known code passes; every string beside it is bounded again here. */
 function publicTerminalNotice(data: Record<string, unknown>): { notice?: TerminalNotice } {
+  const retainedFailure = retainedCapacityFailure(data);
+  if (retainedFailure) return { notice: retainedFailure.notice };
   const notice = normalizeTerminalNotice(data.hostNotice);
   // A card-only receipt needs an exact retained decision, not a copied notice.
   return notice && notice.code !== 'card_decision' ? { notice } : {};
@@ -1064,7 +1085,7 @@ function terminalData(data: Record<string, unknown>, eventSessionId: string): Re
     summary: reply,
     ...(typedOutcome ? { turnOutcome: typedOutcome } : {}),
     presentation: typedPresentation
-      ? { ...typedPresentation, text: publicPresentationText(typedPresentation) }
+      ? { ...typedPresentation, text: reply }
       : {
           version: 1,
           audience: 'user',

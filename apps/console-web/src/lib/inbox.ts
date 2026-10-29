@@ -1,3 +1,4 @@
+import { groupAttentionReports } from '@clem/chat-engine';
 import { apiGet, apiPost } from './api';
 import type { PendingActionApprovalView } from './types';
 
@@ -79,6 +80,7 @@ export interface NotificationRow {
   /** Server-owned grouping identity (dashboard/needs-you.ts): a workflow
    *  blocked five times is one row; a carrier for an approval is that approval. */
   needsYouKey?: string;
+  lifecycle?: import('./attention-presentation').AttentionLifecycle;
   workflowCapability?: WorkflowCapabilityInboxGate | null;
   /** A workflow the system switched off that only a person can switch back on. */
   workflowEnableGate?: WorkflowEnableInboxGate | null;
@@ -132,42 +134,26 @@ export interface WorkflowCapabilityInboxGate {
     | { kind: 'review_run'; reason: string };
 }
 
-/** One visible needs-attention row per underlying subject. A flaky morning
- *  produced ten "Workflow needs attention: morning-…" rows — one per blocked
- *  run — burying the two decisions that actually differed. Group by the
- *  workflow (or exact title), keep the NEWEST row, and surface how many
- *  earlier duplicates it stands for. */
+/** One visible work parent per exact canonical key and compatible generation.
+ * Every source report stays available for reading, navigation and typed actions. */
 export interface CollapsedAttentionRow {
   row: NotificationRow;
-  /** Older rows this one stands for (0 = unique). */
+  /** Other reports inside this work parent (0 = one report). */
   collapsedCount: number;
-  /** Ids of every row in the group (newest first) — dismissing dismisses all. */
+  /** Retained exact source IDs; these never authorize group mark-read. */
   groupIds: string[];
+  /** Every exact report remains available inside its work parent. */
+  reports?: NotificationRow[];
 }
 
 export function collapseAttentionRows(rows: NotificationRow[]): CollapsedAttentionRow[] {
-  const keyFor = (row: NotificationRow): string => {
-    if (row.workflowCapability) return `capability:${row.workflowCapability.notificationId}`;
-    if (row.needsYouKey) return row.needsYouKey;
-    const title = (row.title || row.body || '').trim();
-    const workflow = /workflow needs attention:\s*(.+)$/i.exec(title)?.[1]?.trim();
-    return workflow ? `wf:${workflow.toLowerCase()}` : `title:${title.toLowerCase()}`;
-  };
-  const groups = new Map<string, NotificationRow[]>();
-  for (const row of rows) {
-    const key = keyFor(row);
-    const bucket = groups.get(key);
-    if (bucket) bucket.push(row);
-    else groups.set(key, [row]);
-  }
   const newestFirst = (a: NotificationRow, b: NotificationRow) =>
     Date.parse(b.createdAt ?? '') - Date.parse(a.createdAt ?? '') || a.id.localeCompare(b.id);
-  return [...groups.values()]
-    .map((bucket) => {
-      const sorted = [...bucket].sort(newestFirst);
-      return { row: sorted[0], collapsedCount: sorted.length - 1, groupIds: sorted.map((r) => r.id) };
-    })
-    .sort((a, b) => newestFirst(a.row, b.row));
+  return groupAttentionReports([...rows].sort(newestFirst), row => ({ id: row.id,
+    attentionKey: row.needsYouKey, generation: row.lifecycle?.generation })).map(group => ({
+      row: group.reports[0], collapsedCount: group.reports.length - 1,
+      groupIds: group.reports.map(row => row.id), reports: group.reports,
+    }));
 }
 
 export const listApprovals = () =>
@@ -364,16 +350,47 @@ export interface InboxQuestionRow {
   stepId: string | null;
   answerable: boolean;
   unavailableReason: string | null;
+  attentionKey?: string;
+  lifecycle?: { canDismiss: boolean; canDefer: boolean; dismissLabel: string; deferLabel: string; effect: 'hide_only'; generation: string };
 }
 
 export const listInboxQuestions = () =>
   apiGet<{ questions: InboxQuestionRow[]; count: number }>('/api/console/inbox/questions');
+
+/** Only still-pending questions hidden by their exact presentation generation. */
+export interface QuestionPresentationItem extends InboxQuestionRow {
+  action: 'dismiss' | 'defer';
+  generation: string;
+  mutationToken: string;
+  until?: string;
+}
+export interface QuestionPresentationList { questions: QuestionPresentationItem[]; count: number }
+export const listQuestionPresentations = () =>
+  apiGet<QuestionPresentationList>('/api/console/inbox/questions/presentation');
 
 export const answerInboxQuestion = (id: string, answer: string) =>
   apiPost<{ status: 'answered' | 'resuming'; questionId: string; taskId?: string; runId?: string }>(
     `/api/console/inbox/questions/${encodeURIComponent(id)}/answer`,
     { answer },
   );
+
+/** Presentation only: this never submits an answer or resumes the work. */
+export interface QuestionPresentationReceipt { ok: boolean; id: string; action: 'dismiss' | 'defer' | 'restore'; until?: string; generation: string; mutationToken: string }
+export const QUESTION_PRESENTATION_EVENT = 'clem:question-presentation';
+export function sameQuestionPresentation(a: Pick<QuestionPresentationReceipt, 'id' | 'generation' | 'mutationToken'> | null, b: Pick<QuestionPresentationReceipt, 'id' | 'generation' | 'mutationToken'>): boolean {
+  return Boolean(a && a.id === b.id && a.generation === b.generation && a.mutationToken === b.mutationToken);
+}
+export async function presentInboxQuestion(id: string, action: 'dismiss' | 'defer' | 'restore', generation?: string, mutationToken?: string) {
+  const receipt = await apiPost<QuestionPresentationReceipt>(
+    `/api/console/inbox/questions/${encodeURIComponent(id)}/presentation`, {
+      action, ...(generation ? { generation } : {}), ...(mutationToken ? { mutationToken } : {}),
+    },
+  );
+  if (receipt.generation && receipt.mutationToken && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(QUESTION_PRESENTATION_EVENT, { detail: receipt }));
+  }
+  return receipt;
+}
 
 export const listRuns = (limit = 40) => apiGet<{ runs: RunRow[] }>(`/api/runs?limit=${limit}`);
 
@@ -480,6 +497,7 @@ export function notifFailed(n: NotificationRow): boolean {
 export interface NeedsYouSummary {
   total: number;
   keys: string[];
+  attentionItems?: import('./attention-presentation').AttentionItem[];
   unlisted: Array<{
     key: string;
     kind: 'workflow_binding' | 'workflow_paused' | 'check_in_proposal';
@@ -487,6 +505,7 @@ export interface NeedsYouSummary {
     detail: string;
     workflow?: string;
     workflowSlug?: string;
+    lifecycle?: import('./attention-presentation').AttentionLifecycle;
   }>;
 }
 

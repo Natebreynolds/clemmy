@@ -30,7 +30,7 @@ test('the day reads: soon calendar first, then what Clementine noticed, then wha
 
 test('the digest counts since you last looked and says nothing when nothing happened', () => {
   const rows = [n({ id: 'a' }), n({ id: 'b', createdAt: new Date(NOW - 26 * 3_600_000).toISOString() }), n({ id: 'h', needsAttention: true, needsYouKey: 'heartbeat:work-review:x' })];
-  assert.equal(todayDigest({ notifications: rows, sinceMs: NOW - 12 * 3_600_000 }), 'Since you last looked: 1 finished · 1 thing Clementine noticed');
+  assert.equal(todayDigest({ notifications: rows, sinceMs: NOW - 12 * 3_600_000 }), 'Since you last looked: 1 update · 1 thing Clementine noticed');
   assert.equal(todayDigest({ notifications: [], sinceMs: NOW - 12 * 3_600_000 }), '', 'the lead already says who needs you');
 });
 

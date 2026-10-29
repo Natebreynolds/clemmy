@@ -5,7 +5,6 @@ import { accountCaption, accountHeadline, creditRefusalSentence, meterTone, rese
 import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Field';
-import { Skeleton } from '@/components/ui/Skeleton';
 import { PROVIDER_DOT } from '@/components/chat/ActivityFeed';
 import { useUsageMeters } from '@/components/ModelStatusChips';
 import { useModelRoles } from '@/lib/model-roles';
@@ -118,7 +117,7 @@ function captionFor(meter: UsageMeter | undefined, kind: string, notConnectedNot
   return `${kind} · ${accountCaption(meter, now)}`;
 }
 
-function OpenAiKeyForm({ connected, onSaved }: { connected: boolean; onSaved: () => void }) {
+function OpenAiKeyForm({ connected, onSaved }: { connected: boolean | undefined; onSaved: () => void }) {
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -149,7 +148,7 @@ function OpenAiKeyForm({ connected, onSaved }: { connected: boolean; onSaved: ()
   );
 }
 
-function ManagePanel({ id, connected, providers, onChanged }: { id: string; connected: boolean; providers: ModelProvider[]; onChanged: () => void }) {
+function ManagePanel({ id, connected, providers, onChanged }: { id: string; connected: boolean | undefined; providers: ModelProvider[]; onChanged: () => void }) {
   const r = useModelRoles();
   if (id === 'claude') return <ClaudeLoginForm embedded />;
   if (id === 'codex') return <CodexLoginForm embedded />;
@@ -160,7 +159,7 @@ function ManagePanel({ id, connected, providers, onChanged }: { id: string; conn
   return provider ? <ProviderManagePanel provider={provider} /> : <p className="text-small text-muted">This account has no settings here.</p>;
 }
 
-function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, onChanged, notConnectedNote }: {
+function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, onChanged, notConnectedNote, statusUnknown = false }: {
   id: string;
   label: string;
   kind: string;
@@ -171,25 +170,26 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
   providers: ModelProvider[];
   onChanged: () => void;
   notConnectedNote?: string;
+  statusUnknown?: boolean;
 }) {
-  const connected = Boolean(meter);
+  const connected = statusUnknown ? undefined : Boolean(meter);
   const out = Boolean(meter?.outOfCredit);
   const tone = meter ? meterTone(meter) : 'ok';
   const summary = meter ? accountHeadline(meter, now) : null;
   return (
     <li id={`account-${id}`} className="scroll-mt-16 rounded-lg border border-border bg-surface px-4 py-3">
       <div className="flex items-center gap-3">
-        <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: dotColor(id), opacity: connected ? 1 : 0.35 }} aria-hidden />
+        <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: dotColor(id), opacity: connected || statusUnknown ? 1 : 0.35 }} aria-hidden />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2">
-            <span className={cn('font-semibold', connected ? 'text-fg' : 'text-muted')}>{label}</span>
+            <span className={cn('font-semibold', connected || statusUnknown ? 'text-fg' : 'text-muted')}>{label}</span>
             {summary && <span className={cn('text-small tabular-nums', out || tone !== 'ok' ? TONE_TEXT[tone] : 'text-muted')}>{summary}</span>}
           </div>
           <div className="truncate text-caption text-muted" title={captionFor(meter, kind, notConnectedNote, now)}>{captionFor(meter, kind, notConnectedNote, now)}</div>
         </div>
         {meter && <BillingLink meter={meter} emphasis={out} />}
-        <Button size="sm" variant={connected ? 'ghost' : 'secondary'} onClick={onToggle} aria-expanded={open} aria-controls={`account-${id}-panel`}>
-          {connected ? 'Manage' : 'Connect'}
+        <Button size="sm" variant={connected || statusUnknown ? 'ghost' : 'secondary'} onClick={onToggle} aria-expanded={open} aria-controls={`account-${id}-panel`}>
+          {statusUnknown ? 'Manage connection' : connected ? 'Manage' : 'Connect'}
           <ChevronDown className={cn('h-4 w-4 transition-transform', open && 'rotate-180')} aria-hidden />
         </Button>
       </div>
@@ -205,7 +205,7 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
 
 export function ModelAccountsCard() {
   const qc = useQueryClient();
-  const { meters, now, ready } = useUsageMeters();
+  const { meters: loadedMeters, now, ready, loading, unavailable, refreshing, retry } = useUsageMeters();
   const r = useModelRoles();
   const providers = r.settings?.modelProviders ?? [];
   const [open, setOpen] = useState<string | null>(null);
@@ -218,8 +218,10 @@ export function ModelAccountsCard() {
   };
   const toggle = (id: string) => setOpen((cur) => (cur === id ? null : id));
 
-  if (!ready) return <Skeleton className="h-40 w-full" />;
-
+  // Usage is a read, not the authority to reach the account's own sign-in or
+  // key form. Failed/unfinished reads must never turn absence into disconnected.
+  const statusUnknown = !ready || unavailable;
+  const meters = statusUnknown ? [] : loadedMeters;
   const byId = new Map(meters.map((m) => [m.id, m]));
   // An API account added without a working key keeps its place here, saying
   // why its models are greyed out in the pickers, instead of vanishing.
@@ -230,13 +232,14 @@ export function ModelAccountsCard() {
   };
   const notConnected = [
     ...SIGN_IN_ACCOUNTS.filter((a) => !byId.has(a.id)).map((a) => {
+      if (statusUnknown) return a;
       const added = providers.find((p) => p.id === a.id && !p.configured && p.modelIds.length > 0);
       if (!added) return a;
       const models = added.modelIds.length === 1 ? added.modelIds[0] : `its ${added.modelIds.length} models`;
       return { ...a, what: `${a.what} · added, but not signed in and no key saved, so ${models} can't be used` };
     }),
-    ...providers.filter((p) => !p.configured && !byId.has(p.id) && !SIGN_IN_ACCOUNTS.some((a) => a.id === p.id))
-      .map((p) => ({ id: p.id, label: p.label || 'API account', what: unusable(p) })),
+    ...providers.filter((p) => (statusUnknown || !p.configured) && !byId.has(p.id) && !SIGN_IN_ACCOUNTS.some((a) => a.id === p.id))
+      .map((p) => ({ id: p.id, label: p.label || 'API account', what: statusUnknown ? 'Saved API account' : unusable(p) })),
   ];
   // The alarm is for an account doing a job for Clem; an idle one out of
   // credit says so in its own row (2026-10-18: the same rule as the header dot).
@@ -245,6 +248,13 @@ export function ModelAccountsCard() {
 
   return (
     <div>
+      {statusUnknown && <div role="status" className="mb-3 flex flex-wrap items-center gap-3 rounded-md border border-border px-3 py-2 text-small text-muted">
+        <span className="min-w-0 flex-1">{unavailable
+          ? 'Account usage couldn’t be loaded. Your connections have not changed.'
+          : loading ? 'Checking account usage. You can still manage connections below.'
+            : 'Account status is not confirmed. You can still manage connections below.'}</span>
+        {unavailable && <Button size="sm" variant="secondary" disabled={refreshing} onClick={retry}>{refreshing ? 'Retrying…' : 'Retry'}</Button>}
+      </div>}
       {/* One alarm for one problem: it names the account and jumps to its
           row; the row itself says "Refusing requests" and offers Add credit. */}
       {outCount > 0 && (
@@ -281,12 +291,13 @@ export function ModelAccountsCard() {
       {notConnected.length > 0 && (
         <>
           <p className="mb-2 mt-5 inline-flex items-center gap-1.5 text-caption font-semibold uppercase tracking-widest text-faint">
-            <KeyRound className="h-3.5 w-3.5" aria-hidden /> Not connected
+            <KeyRound className="h-3.5 w-3.5" aria-hidden /> {statusUnknown ? 'Model connections' : 'Not connected'}
           </p>
-          <ul className="space-y-2" aria-label="Accounts not connected">
+          <ul className="space-y-2" aria-label={statusUnknown ? 'Model connections with unconfirmed status' : 'Accounts not connected'}>
             {notConnected.map((a) => (
               <AccountRow key={a.id} id={a.id} label={a.label} kind="" now={now} open={open === a.id}
-                onToggle={() => toggle(a.id)} providers={providers} onChanged={onChanged} notConnectedNote={a.what} />
+                onToggle={() => toggle(a.id)} providers={providers} onChanged={onChanged} statusUnknown={statusUnknown}
+                notConnectedNote={statusUnknown ? `${a.what} · status not confirmed` : a.what} />
             ))}
           </ul>
         </>

@@ -99,7 +99,8 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
   const [newIntentModel, setNewIntentModel] = useState('');
   // The Memory tab's "Change" lands on the memory row. The row exists only once
   // the settings read lands, after the page's own hash scroll has run.
-  const { hash } = useLocation();
+  const location = useLocation();
+  const { hash } = location;
   const memoryRowReady = Boolean(mr?.roles.memory);
   const [memoryLanded, setMemoryLanded] = useState(false);
   useEffect(() => {
@@ -204,7 +205,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
       return (
         <div className="mt-1 flex items-start gap-1.5 text-caption text-danger" role="alert">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span className="min-w-0">That change didn’t take: Clem is still on {roleLabel(mr, 'brain')}. Try again, or check the account under Connected.</span>
+          <span className="min-w-0">That change didn’t take: Clem is still on {roleLabel(mr, 'brain')}. Try again, or check <Link to={{ pathname: '/settings', hash: '#accounts' }} state={location.state} className="font-semibold underline underline-offset-2">Model accounts</Link>.</span>
         </div>
       );
     }
@@ -432,7 +433,7 @@ export function ModelRolesCard({ sessionId }: { sessionId?: string } = {}) {
       <div className="mt-3 flex flex-wrap items-center gap-3 text-small">
         {r.saved && !INLINE_FEEDBACK.has(r.saved) && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies on the next message</span>}
         {r.error && !INLINE_FEEDBACK.has(r.errorKey ?? '') && <span className="text-danger" role="alert">{r.error}</span>}
-        {mr.available.length === 0 && <span className="text-muted">No models connected yet — sign in or add a key under Connected.</span>}
+        {mr.available.length === 0 && <span className="text-muted">No models listed yet — sign in or add a key in <Link to={{ pathname: '/settings', hash: '#accounts' }} state={location.state} className="font-semibold text-primary underline-offset-2 hover:underline">Model accounts</Link>.</span>}
       </div>
       {r.claudeSignInFor && <div className="mt-3"><ClaudeLoginForm embedded /></div>}
     </div>

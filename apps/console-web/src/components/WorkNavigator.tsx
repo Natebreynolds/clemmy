@@ -63,7 +63,7 @@ export function WorkCollection({ kind, path }: { kind: Exclude<WorkKind, 'chat'>
 
 export function RecentWork({ onHistory }: { onHistory: () => void }) {
   const catalog = useWorkCatalog(true, 'chat');
-  const items = searchWorkItems(catalog.items, '', 5);
+  const items = searchWorkItems(catalog.items, '', 3);
   return (
     <section className="border-t border-border pt-3" aria-labelledby="work-recent-heading">
       <div className="flex items-center justify-between gap-2 px-2 pb-1">

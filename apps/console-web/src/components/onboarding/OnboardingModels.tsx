@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/Button';
 import { Field, Select } from '@/components/ui/Field';
@@ -13,9 +13,13 @@ import { AddModelForm } from '@/screens/settings/ModelProviderForms';
 
 type Connection = '' | 'codex' | 'claude' | 'xai' | 'api-key';
 
-export interface OnboardingModelsProps { onBusyChange?: (busy: boolean) => void }
+export interface OnboardingModelsProps {
+  onBusyChange?: (busy: boolean) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  discardRequest?: number;
+}
 
-export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
+export function OnboardingModels({ onBusyChange, onDirtyChange, discardRequest = 0 }: OnboardingModelsProps) {
   const qc = useQueryClient();
   const settings = usePoll(['settings'], getSettings, 5_000);
   const snapshot = settings.data;
@@ -27,14 +31,33 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
   const [primaryDraft, setPrimaryDraft] = useState<string | null>(null);
   const [backupDraft, setBackupDraft] = useState<string[] | null>(null);
   const [busy, setBusy] = useState<'primary' | 'backups' | null>(null);
+  const [connectionBusy, setConnectionBusy] = useState({ codex: false, claude: false, xai: false, api: false });
+  const [providerDirty, setProviderDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const saving = useRef(false);
   const primaryValue = primaryDraft ?? saved?.value ?? '';
   const backups = backupDraft ?? retainedBackups?.modelIds ?? [];
   const choicesUnavailable = settings.isLoading || Boolean(settings.error) || !snapshot?.modelRoles;
+  const pendingConnection = Object.values(connectionBusy).some(Boolean);
+  const blocked = busy !== null || pendingConnection;
+  const dirty = providerDirty || primaryDraft !== null && primaryDraft !== (saved?.value ?? '')
+    || backupDraft !== null && JSON.stringify(backupDraft) !== JSON.stringify(retainedBackups?.modelIds ?? []);
+  const discardSeen = useRef(discardRequest);
+  const connectionCallbacks = useMemo(() => {
+    const report = (kind: keyof typeof connectionBusy) => (pending: boolean) =>
+      setConnectionBusy(current => current[kind] === pending ? current : { ...current, [kind]: pending });
+    return { codex: report('codex'), claude: report('claude'), xai: report('xai'), api: report('api') };
+  }, []);
+  const reportProviderDirty = useCallback((value: boolean) => setProviderDirty(value), []);
 
-  useEffect(() => { onBusyChange?.(busy !== null); }, [busy, onBusyChange]);
+  useEffect(() => { onBusyChange?.(blocked); }, [blocked, onBusyChange]);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => {
+    if (blocked || discardSeen.current === discardRequest) return;
+    discardSeen.current = discardRequest;
+    setPrimaryDraft(null); setBackupDraft(null);
+  }, [discardRequest, blocked]);
 
   const refresh = async () => {
     await qc.invalidateQueries({ queryKey: ['settings'] });
@@ -42,7 +65,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
   };
   const savePrimary = async () => {
     const selection = onboardingPrimarySelection(snapshot, primaryValue);
-    if (!selection || choicesUnavailable || saving.current) return;
+    if (!selection || choicesUnavailable || blocked || saving.current) return;
     saving.current = true; setBusy('primary'); setError(null); setMessage(null);
     try {
       await setActiveBrain(selection.brain, selection.modelId);
@@ -58,7 +81,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
   };
   const saveBackups = async () => {
     const selection = onboardingBackupSelection(snapshot, backups);
-    if (!selection || choicesUnavailable || saving.current) return;
+    if (!selection || choicesUnavailable || blocked || saving.current) return;
     saving.current = true; setBusy('backups'); setError(null); setMessage(null);
     try {
       await patchBrainBackups(selection);
@@ -75,7 +98,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
       <h2 id="onboarding-connect-model" className="text-h3 text-fg">Connect a model</h2>
       <p className="mt-2 max-w-prose text-body text-muted">Start with one account you already use. Different models bring different strengths; a second connection also gives Clem a backup. You can add it later.</p>
       <div className="mt-5">
-        <Field label="How would you like to connect?">{(id) => <Select id={id} value={connection}
+        <Field label="How would you like to connect?">{(id) => <Select id={id} value={connection} disabled={blocked}
           onChange={(event) => setConnection(event.target.value as Connection)}>
           <option value="">Choose a sign-in or API key</option>
           <option value="codex">ChatGPT / Codex subscription</option>
@@ -85,10 +108,13 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
         </Select>}</Field>
         {/* Keep the forms mounted: switching methods or wizard steps must not
             discard a code, key draft, or in-flight sign-in. */}
-        <div hidden={connection !== 'codex'}><CodexLoginForm embedded /></div>
-        <div hidden={connection !== 'claude'}><ClaudeLoginForm embedded onboarding /></div>
-        <div hidden={connection !== 'xai'}><XaiLoginForm embedded /></div>
-        <div hidden={connection !== 'api-key'}><AddModelForm presentation="onboarding" onClose={() => setConnection('')} /></div>
+        <fieldset disabled={busy !== null} className="min-w-0">
+          <div hidden={connection !== 'codex'}><CodexLoginForm embedded onboarding onBusyChange={connectionCallbacks.codex} /></div>
+          <div hidden={connection !== 'claude'}><ClaudeLoginForm embedded onboarding onBusyChange={connectionCallbacks.claude} /></div>
+          <div hidden={connection !== 'xai'}><XaiLoginForm embedded onboarding onBusyChange={connectionCallbacks.xai} /></div>
+          <div hidden={connection !== 'api-key'}><AddModelForm presentation="onboarding" onClose={() => setConnection('')}
+            onBusyChange={connectionCallbacks.api} onDirtyChange={reportProviderDirty} discardRequest={discardRequest} /></div>
+        </fieldset>
       </div>
     </section>
 
@@ -103,7 +129,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
               <p className="mt-4 text-small text-fg">{saved ? <>Saved main model: <strong>{saved.label}</strong>.</> : 'Choose a connected model to get started.'}</p>
               {choices.some((choice) => choice.available) ? <div className="mt-4 flex flex-col items-start gap-2 sm:flex-row sm:items-end">
                 <div className="w-full min-w-0 flex-1"><Field label="Main model">{(id) => <Select id={id} value={primaryValue}
-                  disabled={busy !== null} onChange={(event) => { setPrimaryDraft(event.target.value); setMessage(null); setError(null); }}>
+                  disabled={blocked} onChange={(event) => { setPrimaryDraft(event.target.value); setMessage(null); setError(null); }}>
                   <option value="">Choose a connected model</option>
                   {primaryValue && !choices.some((choice) => choice.value === primaryValue)
                     && <option value={primaryValue} disabled>Previous choice is no longer available</option>}
@@ -111,12 +137,12 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
                     {choice.label}{!choice.available ? ' (not connected)' : ''}
                   </option>)}
                 </Select>}</Field></div>
-                <Button className="mb-4" disabled={busy !== null || !onboardingPrimarySelection(snapshot, primaryValue) || primaryValue === saved?.value}
+                <Button className="mb-4" disabled={blocked || !onboardingPrimarySelection(snapshot, primaryValue) || primaryValue === saved?.value}
                   onClick={() => void savePrimary()}>{busy === 'primary' ? 'Saving…' : 'Use this model'}</Button>
               </div> : <p className="mt-3 text-small text-muted">Once you connect an account above, its available models appear here. If they haven’t appeared yet, reload the list.</p>}
               {primaryDraft !== null && primaryDraft !== saved?.value && <p className="text-caption text-muted">Your selection is not saved until you choose “Use this model”.</p>}
               {snapshot.modelRoles.discovery?.refreshing && <p className="mt-2 text-caption text-muted" role="status">Refreshing the available models…</p>}
-              <Button variant="link" size="sm" disabled={busy !== null || settings.isFetching} onClick={() => void settings.refetch()}>Reload model list</Button>
+              <Button variant="link" size="sm" disabled={blocked || settings.isFetching} onClick={() => void settings.refetch()}>Reload model list</Button>
             </>}
     </section>
 
@@ -130,7 +156,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
       <p className="mt-2 max-w-prose text-small text-muted">If your main model stops answering, Clem can try these models in order. Connect another account above, then choose it here. You decide which accounts may be used.</p>
       <div className="mt-4 space-y-3">
         {Array.from({ length: Math.min(3, backups.length + 1) }, (_, slot) => <Field key={slot} label={`Backup ${slot + 1}`}>{(id) => <Select id={id}
-          value={backups[slot] ?? ''} disabled={busy !== null || choicesUnavailable || !saved} onChange={(event) => {
+          value={backups[slot] ?? ''} disabled={blocked || choicesUnavailable || !saved} onChange={(event) => {
             const value = event.target.value;
             setBackupDraft(value ? [...backups.slice(0, slot), value, ...backups.slice(slot + 1)] : backups.slice(0, slot));
             setMessage(null); setError(null);
@@ -145,7 +171,7 @@ export function OnboardingModels({ onBusyChange }: OnboardingModelsProps) {
       {!saved && <p className="text-caption text-muted">Save your main model before choosing backups.</p>}
       {backupDraft !== null && <>
         <p className="mb-3 text-caption text-muted">Save this order before continuing. Removing a backup here does not disconnect its account.</p>
-        <Button disabled={busy !== null || choicesUnavailable || !onboardingBackupSelection(snapshot, backups)} onClick={() => void saveBackups()}>
+        <Button disabled={blocked || choicesUnavailable || !onboardingBackupSelection(snapshot, backups)} onClick={() => void saveBackups()}>
           {busy === 'backups' ? 'Saving…' : 'Save backups'}
         </Button>
       </>}

@@ -36,14 +36,14 @@ export const PRIMARY_NAV: NavDest[] = [
   // conversation the moment you send (owner 09-26). Running folded into it;
   // the board stays one click away from Today's status line.
   { path: '/chat', label: 'Today', icon: Sun, hint: 'Your day, and a conversation with Clementine' },
-  { path: '/inbox', label: 'Needs you', icon: Inbox, hint: 'Approvals, questions & anything waiting on you' },
-  { path: '/projects', label: 'Projects', icon: FolderKanban, hint: 'What you are working on, who is on it and what it needs from you' },
+  { path: '/inbox', label: 'Inbox', icon: Inbox, hint: 'Decisions, questions and updates from Clem' },
+  { path: '/projects', label: 'Work', icon: FolderKanban, hint: 'Projects, active work, agents and finished results' },
   { path: '/workspaces', label: 'Spaces', icon: LayoutDashboard, hint: 'Live spaces Clementine built for you' },
   { path: '/automate', label: 'Automations', icon: Zap, hint: 'Work Clem runs for you on a schedule or with one tap, and her skills' },
-  { path: '/triggers', label: 'Triggers', icon: CalendarClock, hint: 'What fires on its own: schedules, webhooks, app events, watches & reminders' },
+  { path: '/triggers', label: 'Schedule & events', icon: CalendarClock, hint: 'What fires on its own: schedules, webhooks, app events, watches & reminders' },
   { path: '/watching', label: 'Watching', icon: Eye, hint: 'What Clem can see: the sources you handed her to keep an eye on' },
-  { path: '/heartbeats', label: 'Heartbeats', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
-  { path: '/connect', label: 'Connect', icon: Plug, hint: 'Apps, tools, CLIs & your phone' },
+  { path: '/heartbeats', label: 'Check-ins', icon: HeartPulse, hint: 'What Clementine checks on her own, and how often' },
+  { path: '/connect', label: 'Apps & devices', icon: Plug, hint: 'Connected apps, your computer and your phone' },
   { path: '/memory', label: 'Memory', icon: Brain, hint: 'What Clementine knows about you' },
   { path: '/meetings', label: 'Meetings', icon: Video, hint: 'Recorded meetings & summaries' },
   { path: '/goals', label: 'Goals', icon: Goal, hint: 'Long-running outcomes and self-drive' },
@@ -55,7 +55,7 @@ export const PRIMARY_NAV: NavDest[] = [
  * Developer link, shown when developer mode is on) and the command palette.
  */
 export const ADVANCED_NAV: NavDest[] = [
-  { path: '/tasks', label: 'Running', icon: Activity, hint: 'Everything Clementine is working on right now', tier: 'everyday' },
+  { path: '/tasks', label: 'Activity', icon: Activity, hint: 'Active work, saved pauses and finished runs', tier: 'everyday' },
   { path: '/advanced/usage', label: 'Usage', icon: BarChart3, hint: 'Token spend & activity', tier: 'everyday' },
   { path: '/advanced/tools', label: 'Tools', icon: Wrench, hint: 'Registered tool catalog', tier: 'everyday' },
   { path: '/advanced/canvas', label: 'Canvas', icon: Workflow, hint: 'See a workflow as a graph & rewire its steps', tier: 'everyday' },
@@ -86,7 +86,7 @@ export const FOOTER_NAV: NavDest[] = [
 
 /** Reachable from Home, not a sidebar pin. Command palette and titles still resolve. */
 export const MADE_NAV: NavDest = {
-  path: '/made', label: 'Made', icon: FolderOpen, hint: 'Finished work — drafts, files, sheets',
+  path: '/made', label: 'Files & results', icon: FolderOpen, hint: 'Finished work — drafts, files, sheets',
 };
 
 /** Every destination the command palette can jump to and titles resolve from. */
@@ -101,6 +101,30 @@ export interface SidebarNav {
   more: NavDest[];
   /** Settings & Help, at the bottom. */
   footer: NavDest[];
+}
+
+/** Stable routes remain usable; these groups give each object one front door. */
+export const EXPERIENCE_PATHS = ['/chat', '/inbox', '/projects', '/workspaces', '/automate'] as const;
+export const WORK_DESTINATIONS = [
+  { path: '/projects', label: 'Projects' },
+  { path: '/agents', label: 'Agents' },
+  { path: '/tasks', label: 'Activity' },
+  { path: '/goals', label: 'Goals' },
+  { path: '/made', label: 'Files & results' },
+  { path: '/meetings', label: 'Meetings' },
+] as const;
+export const AUTOMATION_DESTINATIONS = [
+  { path: '/automate', label: 'Workflows' },
+  { path: '/triggers', label: 'Schedule & events' },
+  { path: '/watching', label: 'Watching' },
+  { path: '/heartbeats', label: 'Check-ins' },
+] as const;
+
+export function experienceSection(pathname: string): 'work' | 'automations' | null {
+  const matches = (path: string) => pathname === path || pathname.startsWith(path + '/');
+  if (WORK_DESTINATIONS.some(d => matches(d.path))) return 'work';
+  if (AUTOMATION_DESTINATIONS.some(d => matches(d.path))) return 'automations';
+  return null;
 }
 
 /**
@@ -147,5 +171,23 @@ export function resolveSidebarNav(
     }
   }
 
-  return { pinned, shown, more, footer: FOOTER_NAV };
+  // The five main doors are always discoverable. Their relative saved order
+  // and any additional explicit pins survive; secondary objects have their
+  // own contextual tabs rather than accumulating in a second primary menu.
+  const main = new Set<string>(EXPERIENCE_PATHS);
+  const ordered = [...pinned, ...shown, ...more];
+  const core = ordered.filter(d => main.has(d.path));
+  const extraPins = pinned.filter(d => !main.has(d.path));
+  const secondary = ['/memory', '/connect'].flatMap(path => {
+    if (extraPins.some(d => d.path === path)) return [];
+    const dest = known.get(path);
+    return dest ? [dest] : [];
+  });
+  // Custom shown destinations remain available in More. The old shipped
+  // Agents row is now a Work tab; explicitly pinning it still keeps its door.
+  const contextual = new Set<string>([...WORK_DESTINATIONS, ...AUTOMATION_DESTINATIONS].map(d => d.path));
+  const secondaryPaths = new Set(secondary.map(d => d.path));
+  const extras = [...shown, ...more].filter(d => !main.has(d.path) && !secondaryPaths.has(d.path)
+    && !extraPins.some(p => p.path === d.path) && !contextual.has(d.path));
+  return { pinned: [...core, ...extraPins], shown: secondary, more: extras, footer: FOOTER_NAV };
 }

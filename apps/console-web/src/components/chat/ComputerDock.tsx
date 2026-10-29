@@ -1,37 +1,83 @@
-import { useEffect, useState } from 'react';
-import { Monitor } from 'lucide-react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Link } from 'react-router-dom';
+import { Monitor, RefreshCw, X } from 'lucide-react';
+import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
-import { computerScreenUrl, getComputerDriver } from '@/lib/computer-driver';
+import { computerDriverIsConnected, computerScreenUrl, getComputerDriver } from '@/lib/computer-driver';
+import { startComputerScreenCycle, type ComputerScreenCycle } from '@/lib/computer-screen-cycle';
 
-// Your computer, live, in the conversation: once the driver is on, a strip
-// under the header opens a view that refreshes from the driver's own screen
-// capture every two seconds. Watching only; Clem's cursor is its own.
-export function ComputerDock({ conversationId }: { conversationId?: string } = {}) {
+interface ComputerControl {
+  open: boolean;
+  toggle: () => void;
+  close: () => void;
+  src: string | null;
+  failed: boolean;
+  loaded: (source: string) => void;
+  fail: (source: string) => void;
+  retry: () => void;
+}
+const ComputerContext = createContext<ComputerControl | null>(null);
+export function useComputerControl(): ComputerControl | null { return useContext(ComputerContext); }
+
+/** Watching is opt-in and belongs to this chat. Changing chats closes the view. */
+export function ComputerWorkspace({ conversationId, children }: { conversationId?: string; children: ReactNode }) {
   const status = usePoll(['computer-driver'], getComputerDriver, 20_000);
-  const [open, setOpen] = useState(false);
+  const [watching, setWatching] = useState<{ conversationId?: string; open: boolean }>({ conversationId, open: false });
+  const open = watching.conversationId === conversationId && watching.open;
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-  const on = Boolean(status.data?.installed && status.data?.connected);
+  const [attempt, setAttempt] = useState(0);
+  const cycle = useRef<ComputerScreenCycle | null>(null);
+  const connected = computerDriverIsConnected(status.data) && status.data?.screenViewAvailable === true;
   useEffect(() => {
-    if (!open || !on) { setSrc(null); return; }
-    let cancelled = false;
-    const tick = () => { if (!cancelled) setSrc(computerScreenUrl(conversationId)); };
-    tick();
-    const timer = setInterval(tick, 2_000);
-    return () => { cancelled = true; clearInterval(timer); };
-  }, [open, on, conversationId]);
-  if (!on) return null;
-  return (
-    <div className="cloud-browser-strip" data-computer-dock>
-      <button type="button" onClick={() => setOpen(!open)} aria-expanded={open}><Monitor size={16} aria-hidden /> Your computer</button>
-      <span className="cloud-browser-strip-note">{open ? 'The window Clem is working in, even behind yours. Watching only.' : 'See what Clem sees on this Mac'}</span>
-      {open && (
-        <div className="mt-2 w-full">
-          {src && !failed
-            ? <img src={src} alt="Your screen as Clem sees it" className="max-h-72 w-full rounded-md border border-border/60 bg-subtle object-contain" onError={() => setFailed(true)} />
-            : <p className="text-small text-muted">{failed ? 'No picture yet. If macOS has not allowed Screen Recording for Clementine, allow it in System Settings, then open this again.' : 'Asking the driver for the screen…'}</p>}
-        </div>
-      )}
+    if (!open || !connected || failed) { setSrc(null); return; }
+    const active = startComputerScreenCycle({
+      source: () => new URL(computerScreenUrl(conversationId), window.location.href).href,
+      show: setSrc,
+      fail: () => setFailed(true),
+      schedule: (run, delayMs) => { const timer = window.setTimeout(run, delayMs); return () => window.clearTimeout(timer); },
+    });
+    cycle.current = active;
+    return () => { active.stop(); if (cycle.current === active) cycle.current = null; };
+  }, [open, connected, failed, conversationId, attempt]);
+  useEffect(() => { setWatching({ conversationId, open: false }); setFailed(false); setSrc(null); }, [conversationId]);
+  useEffect(() => { if (!connected) { setWatching({ conversationId, open: false }); setFailed(false); } }, [connected, conversationId]);
+  const retry = () => { setFailed(false); setSrc(null); setAttempt(value => value + 1); };
+  const toggle = () => { setFailed(false); setSrc(null); setWatching({ conversationId, open: !open }); };
+  return <ComputerContext.Provider value={connected ? { open, toggle, close: () => setWatching({ conversationId, open: false }), src, failed, loaded: source => cycle.current?.loaded(source), fail: source => cycle.current?.failed(source), retry } : null}>{children}</ComputerContext.Provider>;
+}
+
+/** A compact view below the existing header; capture starts only after opening. */
+export function ComputerView() {
+  const computer = useComputerControl();
+  if (!computer?.open) return null;
+  return <section className="shrink-0 border-b border-border bg-subtle px-5 py-3" aria-label="Your computer" data-computer-dock>
+    <div className="mb-2 flex items-center gap-3">
+      <p className="min-w-0 flex-1 text-small text-muted">A view of your connected computer. Watching only.</p>
+      <Button size="icon" variant="ghost" onClick={computer.close} aria-label="Close computer view"><X className="h-4 w-4" aria-hidden /></Button>
     </div>
-  );
+    {computer.src && !computer.failed
+      ? <img src={computer.src} alt="Screen from your connected computer" className="max-h-72 w-full rounded-md border border-border bg-surface object-contain" onLoad={event => computer.loaded(event.currentTarget.currentSrc || event.currentTarget.src)} onError={event => computer.fail(event.currentTarget.src)} />
+      : computer.failed ? <div className="flex flex-wrap items-center gap-3" role="status">
+        <p className="min-w-0 flex-1 text-small text-muted">The screen couldn’t be shown. Check the computer connection and permissions in Apps & devices.</p>
+        <Button size="sm" variant="secondary" onClick={computer.retry}><RefreshCw className="h-4 w-4" aria-hidden /> Try again</Button>
+        <Link to="/connect" className="text-small font-semibold text-primary hover:underline">Apps & devices</Link>
+      </div> : <p className="text-small text-muted" role="status">Opening the computer view…</p>}
+  </section>;
+}
+
+function StandaloneDock() {
+  const computer = useComputerControl();
+  if (!computer) return null;
+  return <>
+    <div className="cloud-browser-strip">
+      <button type="button" onClick={computer.toggle} aria-expanded={computer.open}><Monitor size={16} aria-hidden /> Computer</button>
+      <span className="cloud-browser-strip-note">Watch your connected computer</span>
+    </div>
+    <ComputerView />
+  </>;
+}
+
+export function ComputerDock({ conversationId }: { conversationId?: string } = {}) {
+  return <ComputerWorkspace conversationId={conversationId}><StandaloneDock /></ComputerWorkspace>;
 }

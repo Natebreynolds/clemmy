@@ -21,6 +21,21 @@ import {
 import { BoundaryError } from '../boundary-error.js';
 import { __setToolkitCatalogForTests } from '../../integrations/composio/toolkit-identity.js';
 
+test('retained capacity failures replace only generic failed copy with a closed actionable notice', () => {
+  const data = { reason: 'failed', delivered: false, reply: PUBLIC_RUN_FAILURE_TEXT, summary: PUBLIC_RUN_FAILURE_TEXT,
+    hostNotice: { code: 'run_failed' }, failureDetail: '402 Credit limit exceeded. SECRET_PROVIDER_TOKEN=do-not-publish' };
+  const before = structuredClone(data);
+  const projected = projectHarnessEventForPublic(event('conversation_completed', data))!;
+  assert.match(projected.data.reply as string, /out of credit/);
+  assert.deepEqual(projected.data.notice, { code: 'provider_out_of_credit' });
+  assert.equal((projected.data.presentation as { text: string }).text, projected.data.reply);
+  assert.doesNotMatch(JSON.stringify(projected), /SECRET_PROVIDER_TOKEN|failureDetail/);
+  assert.deepEqual(data, before, 'durable evidence is unchanged');
+  assert.equal(publicCompletionText({ ...data, reason: 'success' }), PUBLIC_RUN_FAILURE_TEXT);
+  assert.equal(publicCompletionText({ ...data, reply: 'An authored explanation.' }), 'An authored explanation.');
+  assert.equal(publicCompletionText({ ...data, failureDetail: 'PRIVATE_UNKNOWN_FAILURE' }), PUBLIC_RUN_FAILURE_TEXT);
+});
+
 test('private meeting research shows the question without changing its accepted objective or evidence', () => {
   const hash = (input: string) => createHash('sha256').update(input).digest('hex');
   const meetingId = 'controlled-meeting'; const question = 'What is the approved fixture launch date?';

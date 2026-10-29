@@ -183,8 +183,8 @@ export function Connect() {
   };
 
   return (
-    <Page title="Connect" subtitle="Give Clementine access to your apps, tools, and phone">
-      <section className="mb-8 max-w-3xl" aria-labelledby="connection-setup-heading">
+    <Page title="Apps & devices" subtitle="Connect what Clem needs for your work, and pair your phone.">
+      <section data-clem-guide="connections" className="mb-8 max-w-3xl" aria-labelledby="connection-setup-heading">
         <h2 id="connection-setup-heading" className="text-h2 text-fg">What would you like to connect?</h2>
         <p id="connection-setup-help" className="mt-2 max-w-prose text-body text-muted">Tell Clem what you need. She’ll check the setup and guide you through any sign-in.</p>
         <form className="mt-4 flex flex-col gap-3 sm:flex-row" onSubmit={event => {
