@@ -23,6 +23,9 @@ test('a tool\'s pictures are kept for the chat under the tool\'s call, bounded, 
   assert.equal(chatMediaFile('../etc', 'passwd', root), null, 'unsafe names never resolve');
   assert.equal(chatMediaFile('sess-1', '.hidden', root), null);
   assert.deepEqual(storeToolMedia('sess-1', 'c8', 'no pictures here', { root }), []);
+  const [colon] = storeToolMedia('console:run-4c3b60f2-f61', 'call-1', [{ type: 'image', data: png, mimeType: 'image/png' }], { root });
+  assert.equal(colon.path, '/api/console/chat-media/console-run-4c3b60f2-f61/call-1-1.png', 'a chat id with a colon still gets a folder, and the served path finds it');
+  assert.ok(chatMediaFile('console-run-4c3b60f2-f61', 'call-1-1.png', root));
 });
 
 test('pictures older than a week are swept, and an emptied chat folder goes with them', () => {

@@ -28,6 +28,10 @@ const SAFE = /^[A-Za-z0-9._-]{1,120}$/;
 export function safeSegment(value: string): string | null {
   return SAFE.test(value) && !value.startsWith('.') ? value : null;
 }
+/** A chat's folder name: its id with anything a path could misread replaced. Deterministic, so the served path finds it again. */
+export function chatFolderName(sessionId: string): string | null {
+  return safeSegment(sessionId.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^\.+/, '').slice(0, 120));
+}
 
 /** The image blocks a tool's output carries, whether bare or under `content`. */
 export function imageBlocksOf(output: unknown): ToolMediaImageBlock[] {
@@ -51,7 +55,7 @@ function extensionFor(mimeType: string): string {
  * row shows; empty when the output carries no picture or the names are unsafe.
  */
 export function storeToolMedia(sessionId: string, callId: string, output: unknown, options: { root?: string; nowMs?: number } = {}): ChatMediaRef[] {
-  const session = safeSegment(sessionId);
+  const session = chatFolderName(sessionId);
   const call = safeSegment(callId.replace(/[^A-Za-z0-9._-]/g, '-'));
   if (!session || !call) return [];
   const blocks = imageBlocksOf(output).slice(0, MAX_IMAGES_PER_CALL);
