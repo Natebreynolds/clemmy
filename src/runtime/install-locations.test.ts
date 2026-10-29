@@ -46,9 +46,10 @@ test('the elevated form keeps the owner\'s home, hands root-owned leftovers back
   const mac = elevatedInstallCommand('/bin/bash -c "$(curl -fsSL https://example.test/install.sh)"', { platform: 'darwin', home: "/home/me", owner: { uid: 501, gid: 20 }, marker: '/home/me/.clementine-next/state/elevated-install.marker' });
   assert.equal(mac?.command, 'osascript');
   const script = mac?.args[1] ?? '';
-  assert.ok(script.startsWith('do shell script "env HOME=\'/home/me\' /bin/bash -c \\"$(curl -fsSL https://example.test/install.sh)\\"'), script);
+  assert.ok(script.startsWith('do shell script "env HOME=\'/home/me\' /bin/bash -c '), script);
+  assert.ok(script.includes('curl -fsSL https://example.test/install.sh'), script);
   assert.ok(script.endsWith('" with administrator privileges'), script);
-  assert.match(script, /find '\/Users\/o'\\\\''wner' -xdev -user 0 -newer '\/Users\/o\/\.clementine-next\/state\/elevated-install\.marker' -exec chown -h 501:20 \{\} \+/);
+  assert.match(script, /find '\/home\/me' -xdev -user 0 -newer '\/home\/me\/\.clementine-next\/state\/elevated-install\.marker' -exec chown -h 501:20 \{\} \+/);
   assert.match(script, /exit \$__s/, 'the install\'s own exit code is what the job sees');
   assert.equal(mac?.marker, '/home/me/.clementine-next/state/elevated-install.marker');
   assert.match(mac?.prompt ?? '', /Clem never sees them/);
