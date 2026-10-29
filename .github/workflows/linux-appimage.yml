@@ -77,20 +77,37 @@ jobs:
           sudo apt-get install -y xvfb
           IMAGE=$(ls release/*.AppImage | head -1)
           chmod +x "$IMAGE"
-          # The shell starts its daemon on first launch; the daemon answering
-          # its own health route is the proof the Linux build runs end to end.
-          xvfb-run -a bash -c "\"$IMAGE\" --appimage-extract-and-run --no-sandbox > release/smoke.log 2>&1 & APP=\$!; \
-            for i in \$(seq 1 60); do sleep 3; \
-              SECRET=\$(grep -E '^WEBHOOK_SECRET=' \$HOME/.clementine-next/.env 2>/dev/null | cut -d= -f2-); \
-              if [ -n \"\$SECRET\" ] && curl -sf -o /dev/null -H \"Authorization: Bearer \$SECRET\" http://127.0.0.1:8520/api/console/health; then echo \"daemon answered after \$((i*3))s\"; kill \$APP; exit 0; fi; \
-            done; echo 'the daemon never answered'; tail -40 release/smoke.log; kill \$APP; exit 1"
+          "$IMAGE" --appimage-extract > /dev/null
+          # 1. The shell starts and stays up on a virtual display. Its first
+          #    run opens the setup wizard, which gates the daemon, so the
+          #    daemon's own proof follows separately.
+          xvfb-run -a ./squashfs-root/clementine --no-sandbox > release/smoke.log 2>&1 &
+          APP=$!
+          sleep 30
+          if kill -0 $APP 2>/dev/null; then echo "shell alive after 30s"; kill $APP; else echo "the shell exited early"; tail -40 release/smoke.log; exit 1; fi
+          # 2. The packaged daemon runs on the bundled runtime: natives,
+          #    schema and the console route all answer on a fresh home.
+          export CLEMENTINE_HOME="$RUNNER_TEMP/clem-home" WEBHOOK_SECRET="smoke-$(openssl rand -hex 16)" WEBHOOK_PORT=8420 ELECTRON_RUN_AS_NODE=1
+          mkdir -p "$CLEMENTINE_HOME"
+          ./squashfs-root/clementine ./squashfs-root/resources/daemon/dist/index.js service > release/daemon-smoke.log 2>&1 &
+          DAEMON=$!
+          for i in $(seq 1 60); do
+            sleep 3
+            if curl -sf -o /dev/null -H "Authorization: Bearer $WEBHOOK_SECRET" "http://127.0.0.1:$WEBHOOK_PORT/api/console/health"; then
+              echo "daemon answered after $((i*3))s"; kill $DAEMON; exit 0
+            fi
+            kill -0 $DAEMON 2>/dev/null || { echo "the daemon exited"; break; }
+          done
+          echo "the daemon never answered"; tail -60 release/daemon-smoke.log; kill $DAEMON 2>/dev/null; exit 1
 
       - name: Upload smoke log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-smoke-log-${{ github.run_id }}
-          path: apps/desktop/release/smoke.log
+          path: |
+            apps/desktop/release/smoke.log
+            apps/desktop/release/daemon-smoke.log
           if-no-files-found: ignore
 
       - name: Upload AppImage
