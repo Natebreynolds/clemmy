@@ -4,7 +4,7 @@ import { recordDeclaredMcpToolEffect } from './mcp-declared-effects.js';
 import { mcpToolEffectLabelStamp, withApprovedMcpToolEffect } from './mcp-tool-effect-labels.js';
 import type { MCPServer } from '@openai/agents';
 import pino from 'pino';
-import { decideToolApproval } from '../agents/tool-taxonomy.js';
+import { computerDriverToolNote, decideToolApproval } from '../agents/tool-taxonomy.js';
 import { beginToolEvent } from '../agents/tool-observability.js';
 import { BoundaryError } from './boundary-error.js';
 import { rateLimitedAlert } from './rate-limited-alert.js';
@@ -1286,12 +1286,15 @@ export function createMcpNamespaceShim(options: MCPNamespaceShimOptions): McpNam
         // Re-emit the MCPTool with the namespaced name. Description and
         // inputSchema are preserved verbatim — the SDK passes those
         // straight to the model, which is exactly what we want.
+        // Clem's own note rides with a tool whose vendor text would steer
+        // her wrong (the computer driver's browser tools); none elsewhere.
+        const clemNote = computerDriverToolNote(namespaced);
         tools.push({
           ...tool,
           name: namespaced,
-          description: tool.description
+          description: (tool.description
             ? `[${slug}] ${tool.description}`
-            : `[${slug}] tool from ${server.name}`,
+            : `[${slug}] tool from ${server.name}`) + (clemNote ? `\n\n${clemNote}` : ''),
         });
         // A server's own readOnly/destructive/idempotent hints are the only
         // non-guessed effect evidence a third-party tool ever carries. They

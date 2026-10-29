@@ -828,3 +828,11 @@ test('the computer driver\'s family hints: looking is read-only, acting in an ap
   }
   assert.equal(computerDriverBehaviorHints('other__click'), null);
 });
+
+test('Clem carries her own note on the driver\'s browser tools: launch her own browser, never take over the owner\'s tab', async () => {
+  const { computerDriverToolNote } = await import('./tool-taxonomy.js');
+  assert.match(computerDriverToolNote('cua-driver__browser_prepare') ?? '', /launch a browser of your own[\s\S]*allow_launch true[\s\S]*isolated profile/);
+  assert.match(computerDriverToolNote('mcp__cua-driver__browser_navigate') ?? '', /never a tab the owner already had open[\s\S]*new tab first/);
+  assert.equal(computerDriverToolNote('cua-driver__click'), null, 'only the browser tools carry the note');
+  assert.equal(computerDriverToolNote('other__browser_navigate'), null, 'another server keeps its own words');
+});

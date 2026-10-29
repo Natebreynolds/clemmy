@@ -522,6 +522,23 @@ export function computerDriverBehaviorHints(toolName: string): { readOnly: boole
   return null;
 }
 
+/** Clem's own note on the driver's browser tools, carried with their
+ *  description. The vendor's text steers toward the owner's running browser;
+ *  acting there takes over a tab the owner was using. A page that needs no
+ *  sign-in belongs in a browser the driver launches for Clem, and a page that
+ *  needs the owner's session gets a new tab, never one the owner had open. */
+const COMPUTER_DRIVER_BROWSER_NOTES: Record<string, string> = {
+  browser_prepare: "Clem's note: when the page does not need the owner's sign-ins, launch a browser of your own (allow_launch true with an isolated profile), so none of the owner's windows or tabs change. Attach to the owner's running browser only when the task needs their signed-in session.",
+  browser_navigate: "Clem's note: navigate only a tab you opened or a browser you launched, never a tab the owner already had open. In the owner's browser, open a new tab first (the browser's new-tab shortcut) and navigate that one.",
+};
+
+export function computerDriverToolNote(toolName: string): string | null {
+  const rawLower = toolName.trim().toLowerCase();
+  const bare = rawLower.startsWith('mcp__') ? rawLower.slice('mcp__'.length) : rawLower;
+  if (!bare.startsWith(COMPUTER_DRIVER_PREFIX)) return null;
+  return COMPUTER_DRIVER_BROWSER_NOTES[bare.slice(COMPUTER_DRIVER_PREFIX.length)] ?? null;
+}
+
 export function computerDriverToolKind(rawLower: string): ToolKind | null {
   const bare = rawLower.startsWith('mcp__') ? rawLower.slice('mcp__'.length) : rawLower;
   if (!bare.startsWith(COMPUTER_DRIVER_PREFIX)) return null;
