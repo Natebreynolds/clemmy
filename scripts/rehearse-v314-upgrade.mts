@@ -302,6 +302,22 @@ function isolatedChildEnv(home: string): NodeJS.ProcessEnv {
  * dependency is allowed only when the exact package was already present in
  * the v3.14 installation graph.
  */
+/**
+ * The npm that ships beside the running Node, never one linked under this
+ * repository's node_modules/.bin. A script run through npm puts that bin
+ * folder first on PATH, so a bundled npm dependency would otherwise install
+ * the archived lock under its own install-script policy and leave native
+ * modules unbuilt.
+ */
+export function runtimeNpmCommand(
+  execPath: string = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const name = platform === 'win32' ? 'npm.cmd' : 'npm';
+  const beside = path.join(path.dirname(execPath), name);
+  return existsSync(beside) ? beside : name;
+}
+
 export function normalizedInstalledPackageGraph(lock: unknown): unknown {
   const copy = structuredClone(lock) as {
     name?: unknown;
@@ -382,7 +398,7 @@ function verifyReleaseCheckout(checkout: string): {
     // checkout instead; npm ci verifies tarball integrity and preserves the lock.
     assertDisposablePath(checkout, 'exact-tag dependency checkout');
     const lockBefore = sha256File(tagLockPath);
-    run(process.platform === 'win32' ? 'npm.cmd' : 'npm', [
+    run(runtimeNpmCommand(), [
       'ci', '--no-audit', '--no-fund', '--cache', path.join(tempRoot, 'clem-upgrade-npm-cache'),
     ], { cwd: checkout });
     if (sha256File(tagLockPath) !== lockBefore) {

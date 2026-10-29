@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { test } from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import {
   V314_RELEASE,
   installedPackageGraphCoversTag,
   normalizedInstalledPackageGraph,
+  runtimeNpmCommand,
   runV314UpgradeRehearsal,
 } from './rehearse-v314-upgrade.mts';
 
@@ -42,6 +43,20 @@ function discoveredMcpServerNames(home: string): string[] {
   assert.equal(child.status, 0, child.stderr || child.stdout);
   return JSON.parse(child.stdout) as string[];
 }
+
+test('the exact-tag dependency install runs the npm beside the runtime, never a bundled one under node_modules', () => {
+  const bin = mkdtempSync(path.join(os.tmpdir(), 'clem-runtime-npm-'));
+  try {
+    const node = path.join(bin, 'node');
+    assert.equal(runtimeNpmCommand(node, 'linux'), 'npm', 'no npm beside the runtime falls back to the name');
+    writeFileSync(path.join(bin, 'npm'), '', 'utf8');
+    assert.equal(runtimeNpmCommand(node, 'linux'), path.join(bin, 'npm'));
+    assert.equal(runtimeNpmCommand(path.join(bin, 'node.exe'), 'win32'), 'npm.cmd');
+    assert.doesNotMatch(runtimeNpmCommand(), /node_modules/, 'the real resolution never points into the repository');
+  } finally {
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
 
 test('dependency proof ignores only root request metadata, never installed package drift', () => {
   const tag = {

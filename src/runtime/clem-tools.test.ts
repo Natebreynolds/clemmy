@@ -1,7 +1,8 @@
 /** Run: node scripts/run-tests-isolated.mjs src/runtime/clem-tools.test.ts */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readlinkSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -70,4 +71,10 @@ test('a download is verified, unpacked, and linked into Clem\'s bin', async () =
   }) as unknown as typeof fetch;
   await assert.rejects(installToolDownload({ id: 'tool', toolsDir, platform: 'darwin', arch: 'arm64', fetchImpl: tampered, log: () => undefined, recipe: { githubRepo: 'acme/tool', assets: { 'darwin-arm64': 'tool_{version}_darwin_arm64.tar.gz' }, checksums: 'checksums.txt', bin: 'bin/tool' } }), /did not match/);
   assert.equal(path.basename(linkTool(path.join(toolsDir, 'bin'), 'again', result.executable)), 'again');
+});
+
+test('the bundled npm is a line that runs dependencies\' install scripts, so a tool with a native module builds', () => {
+  const version = String((JSON.parse(readFileSync(createRequire(import.meta.url).resolve('npm/package.json'), 'utf8')) as { version: string }).version);
+  const major = Number(version.split('.')[0]);
+  assert.ok(major >= 10 && major < 12, `bundled npm ${version}: the 12 line blocks dependencies' install scripts unless each is listed, which leaves native modules unbuilt`);
 });
