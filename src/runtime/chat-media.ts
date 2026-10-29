@@ -35,6 +35,12 @@ export function chatFolderName(sessionId: string): string | null {
 
 /** The image blocks a tool's output carries, whether bare or under `content`. */
 export function imageBlocksOf(output: unknown): ToolMediaImageBlock[] {
+  // A tool adapter hands non-text results on as JSON text; a picture inside
+  // it is still a picture. Only text that can hold an image block is parsed.
+  if (typeof output === 'string') {
+    if (!/^\s*[[{]/.test(output) || !output.includes('"image"')) return [];
+    try { return imageBlocksOf(JSON.parse(output)); } catch { return []; }
+  }
   if (Array.isArray(output)) return toolMediaImageBlocks(output);
   if (output && typeof output === 'object' && Array.isArray((output as { content?: unknown }).content)) {
     return toolMediaImageBlocks((output as { content: unknown[] }).content);

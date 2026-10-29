@@ -14,6 +14,9 @@ test('a tool\'s pictures are kept for the chat under the tool\'s call, bounded, 
   assert.equal(imageBlocksOf(content).length, 3);
   assert.equal(imageBlocksOf({ content }).length, 3);
   assert.equal(imageBlocksOf('just text').length, 0);
+  assert.equal(imageBlocksOf(JSON.stringify(content)).length, 3, 'a picture inside JSON text the tool adapter produced still counts');
+  assert.equal(imageBlocksOf(JSON.stringify({ content })).length, 3);
+  assert.equal(imageBlocksOf('[not json "image"').length, 0);
   const refs = storeToolMedia('sess-1', 'call:7', { content }, { root });
   assert.deepEqual(refs.map((r) => [r.id, r.path, r.mimeType]), [
     ['call-7-1.png', '/api/console/chat-media/sess-1/call-7-1.png', 'image/png'],
