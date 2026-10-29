@@ -5,6 +5,12 @@ name: Linux AppImage (unpublished)
 # the daemon, both web apps and the desktop shell package on Linux.
 on:
   workflow_dispatch:
+  # Also runs when its own files change, so a branch can prove the job before
+  # it ever reaches the default branch (manual dispatch needs it there first).
+  push:
+    paths:
+      - '.github/workflows/linux-appimage.yml'
+      - 'apps/desktop/scripts/release-linux.mjs'
 
 jobs:
   appimage:
