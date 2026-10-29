@@ -15020,8 +15020,8 @@ export function registerConsoleRoutes(
   app.get('/api/console/home/from-clem/replies', async (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const [{ listCardReplies }, { fromClemTurnOutcome }] = await Promise.all([import('./card-replies.js'), import('./from-clem-runtime.js')]);
-      res.json({ replies: listCardReplies().map((reply) => ({ ...reply, outcome: fromClemTurnOutcome({ runId: reply.runId, since: reply.since }) })) });
+      const { readCardRecords } = await import('./from-clem-runtime.js');
+      res.json({ replies: readCardRecords() });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -23,7 +23,7 @@ import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type Turn
 import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
 import { mintOwnerCardReplyToken, mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
-import { recordCardReply } from './card-replies.js';
+import { listCardReplies, recordCardReply, type CardReply } from './card-replies.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
 
@@ -645,6 +645,12 @@ export function fromClemTurnOutcome(input: { runId: string; since: string }, now
     steps,
     ...(status === 'needs_input' ? { asks: needs?.kind === 'approval' ? 'approval' as const : 'answer' as const } : {}),
   };
+}
+
+/** What the owner recently asked Clem from her items, each with what she is
+ *  doing about it: the one reading every surface shows. */
+export function readCardRecords(nowMs = Date.now()): Array<CardReply & { outcome: FromClemTurnOutcome }> {
+  return listCardReplies(nowMs).map((reply) => ({ ...reply, outcome: fromClemTurnOutcome({ runId: reply.runId, since: reply.since }, nowMs) }));
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */

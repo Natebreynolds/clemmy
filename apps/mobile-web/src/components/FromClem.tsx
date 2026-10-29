@@ -1,11 +1,13 @@
 import './attention-report-groups.css';
 import type { JSX } from 'preact';
-import { useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { attentionReportCount, attentionWorkTitle, groupAttentionReports, oneLine, appPlaceHref, currentProactiveReceipt, fromClemSourceName, proactiveReplySettled, type ProactiveReplyReceipt } from '@clem/chat-engine';
 import { markInboxNotificationRead, presentInboxAttention, presentInboxQuestion, replyFromClem, type FromClem as FromClemData, type FromClemReplyOutcome, type FromClemRow } from '../lib/api';
 import { restoreSavedAttention, sameAttentionReceipt, type SavedAttentionReceipt } from '../lib/attention-presentation';
 import { relativeTime } from './Approvals';
 import { haptic } from '../lib/native-bridge';
+import { cardRecordInMotion, getCardRecords, type CardRecord as CardRecordData } from '../lib/card-records';
+import { CardRecord } from './CardRecord';
 
 type Decision = 'do_it' | 'done' | 'not_now' | 'never';
 
@@ -49,6 +51,18 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
   const [undo, setUndo] = useState<{ rowKey: string; receipt: SavedAttentionReceipt } | null>(null);
   const [undoError, setUndoError] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // What the owner asked Clem from an item, and what she is doing about it,
+  // kept by the daemon: on the item while it is listed, under Just now after.
+  const [records, setRecords] = useState<CardRecordData[]>([]);
+  const [recordsTick, setRecordsTick] = useState(0);
+  const recordsMoving = records.some(cardRecordInMotion);
+  useEffect(() => {
+    let live = true;
+    const read = () => { getCardRecords().then((result) => { if (live) setRecords(result.replies); }).catch(() => { /* the last reading stands */ }); };
+    read();
+    const timer = window.setInterval(read, recordsMoving ? 3_000 : 20_000);
+    return () => { live = false; window.clearInterval(timer); };
+  }, [recordsMoving, recordsTick]);
   const allRows = (data?.rows ?? []).filter(row => mode === 'all' || (mode === 'decisions' ? row.asks && !row.setup : !row.asks || Boolean(row.setup)));
   const allGroups = groupAttentionReports(allRows, row => ({ id: row.key, attentionKey: row.attentionKey,
     generation: row.lifecycle?.generation, protected: !row.asks || Boolean(row.answer) || Boolean(row.setup) }));
@@ -57,7 +71,11 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
   const latestRows = useRef(rows);
   latestRows.current = rows;
   const sectionId = `home-from-clem-${mode}`;
-  if (rows.length === 0 && !undo) return null;
+  const recordFor = (row: FromClemRow) => records.find((record) => record.rowKey === row.key);
+  const listedKeys = new Set((data?.rows ?? []).map((row) => row.key));
+  const justNow = mode === 'updates' ? [] : records.filter((record) => !listedKeys.has(record.rowKey)).slice(0, 3);
+
+  if (rows.length === 0 && !undo && justNow.length === 0) return null;
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
@@ -86,6 +104,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
   const reply = (row: FromClemRow, text: string, decision?: Decision, choiceIndex?: number) =>
     run(row, async () => {
       const result = await replyFromClem(row.key, text, row.voiceDigest, decision, choiceIndex);
+      if (result.outcome === 'started') setRecordsTick((tick) => tick + 1);
       return { text: outcomeText(result),
         settled: proactiveReplySettled(result.outcome, result.outcome === 'started' ? result.itemSettled : undefined),
         ...(result.outcome === 'started' ? { sessionId: result.sessionId } : {}),
@@ -158,6 +177,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
         <div class="home-row-title">{row.say || row.text}</div>
         {!presentation && row.detail ? <p class="from-clem-report">{row.detail}</p> : null}
         {notice(row)}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
         {!done ? (
           <div class="home-row-actions">
             {(row.answer?.kind === 'yes_no' ? [] : row.choices ?? []).map((choice, index) => (
@@ -205,6 +225,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
           <button type="button" class="home-btn" onClick={() => onOpenThread(row.handoff?.sessionId)}>{row.handoff.sessionId ? 'Open conversation' : 'Ask Clem in chat'}</button>
         </div> : null}
         {notice(row)}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
         {!row.handoff && !done ? (
           <div class="home-row-actions">
             {notificationId ? (
@@ -229,6 +250,7 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
         {!row.say && row.detail ? <div class="home-row-note">{row.detail}</div> : null}
         {!href ? <div class="home-row-note">{setup.placeName} is on your computer.</div> : null}
         {notice(row)}
+        {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} /> : null}
         {!done ? (
           <div class="home-row-actions">
             {href ? <a class="home-btn home-btn-primary" href={href} data-app-place={setup.place}>Open {setup.placeName}</a> : null}
@@ -278,6 +300,10 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
         <h2 id={sectionId} class="section-head pane-head">{heading}</h2>
         {mode !== 'decisions' ? <button type="button" class="from-clem-thread" onClick={() => { haptic('light'); onOpenThread(); }}>Chat with Clem</button> : null}
       </div>
+      {justNow.length > 0 ? <div class="card-record-just-now">
+        <h3 class="section-head">Just now</h3>
+        {justNow.map((record) => <CardRecord key={record.runId} record={record} showTitle onOpenThread={onOpenThread} />)}
+      </div> : null}
       {group('from-clem-waiting', 'Waiting on you', waiting, waitingRow)}
       {group('from-clem-updates', 'Updates', updates, updateRow)}
       {group('from-clem-setup', 'Set up next', offers, offerRow)}

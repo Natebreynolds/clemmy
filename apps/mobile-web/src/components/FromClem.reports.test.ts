@@ -22,7 +22,7 @@ function render(data: FromClemData, maxRows = 3) {
   const calls: { replies: unknown[][]; presentations: unknown[][] } = { replies: [], presentations: [] };
   const dependencies: Record<string, unknown> = {
     './attention-report-groups.css': {},
-    'preact/hooks': { useState: (value: unknown) => [value, () => {}], useRef: (current: unknown) => { const ref={current}; refs.push(ref); return ref; } },
+    'preact/hooks': { useState: (value: unknown) => [typeof value === 'function' ? (value as () => unknown)() : value, () => {}], useRef: (current: unknown) => { const ref={current}; refs.push(ref); return ref; }, useEffect: () => {} },
     'preact/jsx-runtime': { jsx: element, jsxs: element, Fragment: 'fragment' },
     '@clem/chat-engine': engine,
     '../lib/api': {
@@ -32,6 +32,7 @@ function render(data: FromClemData, maxRows = 3) {
       presentInboxQuestion: () => assert.fail('Generic grouping must not answer or set aside a question'),
     },
     '../lib/attention-presentation': {}, './Approvals': { relativeTime: () => 'now' }, '../lib/native-bridge': { haptic() {} },
+    '../lib/card-records': { cardRecordInMotion: () => false, getCardRecords: async () => ({ replies: [] }) }, './CardRecord': { CardRecord: () => null },
   };
   const code = ts.transpileModule(readFileSync(new URL('./FromClem.tsx', import.meta.url), 'utf8'), { compilerOptions: {
     module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, jsxImportSource: 'preact',

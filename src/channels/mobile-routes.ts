@@ -2968,6 +2968,15 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+  // What the owner asked Clem from her items, with what she is doing about it.
+  router.get('/api/home/from-clem/replies', requireMobileSession, async (_req, res) => {
+    try {
+      const { readCardRecords } = await import('../dashboard/from-clem-runtime.js');
+      res.json({ replies: readCardRecords() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
   router.post('/api/home/from-clem/reply', requireMobileSession, async (req, res) => {
     try {
       const { handleFromClemReply } = await import('../dashboard/from-clem-reply-route.js');

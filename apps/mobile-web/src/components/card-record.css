@@ -1,0 +1,15 @@
+.card-record { margin-top: var(--sp-2); padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); overflow-wrap: anywhere; }
+.card-record-title { margin: 0 0 4px; color: var(--fg-3); font-size: var(--t-xs); line-height: 1.4; }
+.card-record-you { margin: 0; color: var(--fg); font-size: var(--t-sm); line-height: 1.5; }
+.card-record-steps { list-style: none; margin: 6px 0 0; padding: 0; }
+.card-record-steps li { display: flex; gap: 6px; align-items: baseline; color: var(--fg-2); font-size: var(--t-xs); line-height: 1.6; }
+.card-record-steps li.is-done .card-record-mark { color: var(--accent-2); }
+.card-record-steps li.is-running .card-record-mark { color: var(--accent); animation: card-record-pulse 1.2s var(--ease-out) infinite; }
+.card-record-headline { margin: 6px 0 0; font-size: var(--t-sm); font-weight: 700; }
+.card-record-headline.tone-info { color: var(--fg-2); }
+.card-record-headline.tone-done { color: var(--accent-2); }
+.card-record-headline.tone-ask { color: var(--accent-warn); }
+.card-record-headline.tone-fail { color: var(--accent-fail); }
+.card-record-words { margin: 2px 0 0; color: var(--fg); font-size: var(--t-sm); line-height: 1.5; white-space: pre-wrap; }
+@keyframes card-record-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .card-record-steps li.is-running .card-record-mark { animation: none; } }
