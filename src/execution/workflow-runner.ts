@@ -29,7 +29,7 @@ import { actionBus } from '../runtime/action-bus.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import type { ClementineAssistant } from '../assistant/core.js';
 import { MODELS, getRuntimeEnv, getWorkerModel, getActiveAuthMode, getClaudeBrainModel, DEFAULT_CODEX_MODEL } from '../config.js';
-import { isProviderCapacityExhausted } from '../shared/provider-capacity.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusalError } from '../shared/provider-capacity.js';
 import { resolveRoleModel, defaultForRole, readDurableBindings } from '../runtime/harness/model-roles.js';
 import { falloverBrainModelIds, type BrainProviderClass } from '../runtime/harness/model-role-options.js';
 import { resolveProvider } from '../runtime/harness/model-wire-registry.js';
@@ -7543,7 +7543,8 @@ async function executeStepVerified(
  *  brain? Yes for a transient provider failure (overload/5xx/timeout), an
  *  unparseable-tool-call (a flaky model stumble a different brain won't
  *  reproduce), a structural-result error, OR an AUTH-expired brain — all
- *  recoverable by switching. A real deterministic error (bad input, contract,
+ *  recoverable by switching, as is an account that refuses for lack of credit:
+ *  a listed backup on another account answers. A real deterministic error (bad input, contract,
  *  non-auth 4xx) repeats identically on any model, so it fails fast. Auth-expiry
  *  is the case that reached this gate blind before 2026-07-20: an expired Claude
  *  token is a 401 that isTransientStepError classifies deterministic, so the whole
@@ -7553,6 +7554,7 @@ async function executeStepVerified(
 export function isWorkflowStepBrainFalloverEligible(err: unknown): boolean {
   return isTransientStepError(err)
     || isProviderCapacityExhausted(err)
+    || isProviderCreditRefusalError(err)
     || isUnparseableToolCallError(err)
     || isWorkflowStepStructuralResultError(err)
     || isAuthRecoverableError(err);

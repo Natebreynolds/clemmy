@@ -6179,6 +6179,15 @@ test('step-boundary brain fallover is eligible for an EXPIRED brain, not just tr
     'model-scoped capacity switches brains without retrying the exhausted model',
   );
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error("tool call could not be parsed (retry also failed)")), true);
+  // An account out of credit is an account condition: the step's own model never
+  // answers again until its owner pays, while a listed backup on another account does.
+  assert.equal(
+    isWorkflowStepBrainFalloverEligible(new Error('workflow step "find_page" failed via harness: 402 Credit limit exceeded, please add credits.')),
+    true,
+    'a credit refusal switches to a listed backup instead of failing the run',
+  );
+  assert.equal(isWorkflowStepBrainFalloverEligible(Object.assign(new Error('Payment Required'), { status: 402 })), true);
+  assert.equal(isWorkflowStepBrainFalloverEligible(new Error('fetch failed', { cause: Object.assign(new Error('insufficient_quota'), { status: 429 }) })), true);
   // A real deterministic error still fails fast (no brain-chain burn).
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('missing required input "url"')), false);
   assert.equal(isWorkflowStepBrainFalloverEligible(new Error('API Error: 400 Bad Request: invalid schema')), false);

@@ -68,7 +68,7 @@ export function isProviderExtraUsageUnavailable(value: unknown): boolean {
  * not reset on its own.
  */
 const PROVIDER_CREDIT_REFUSED_RE =
-  /insufficient[_ ]?(?:quota|balance|credits?|funds)|credit_balance_exhausted|no credits? (?:remaining|left)|out of credits?|credit balance is too low|exceeded your current quota|exceeded_current_quota|check your plan and billing|used all (?:of your |its )?(?:available )?credits|balance (?:is )?(?:insufficient|too low|exhausted|not enough)|"code"\s*:\s*"?1113\b/i;
+  /insufficient[_ ]?(?:quota|balance|credits?|funds)|credit_balance_exhausted|credit (?:limit|line) (?:exceeded|reached)|no credits? (?:remaining|left)|out of credits?|credit balance is too low|exceeded your current quota|exceeded_current_quota|check your plan and billing|used all (?:of your |its )?(?:available )?credits|balance (?:is )?(?:insufficient|too low|exhausted|not enough)|"code"\s*:\s*"?1113\b/i;
 
 const CREDIT_REFUSAL_TEXT_STATUSES = new Set([400, 403, 429]);
 
@@ -76,4 +76,28 @@ export function isProviderCreditRefusal(status: number | undefined, value: unkno
   if (status === 402) return true;
   if (status !== undefined && !CREDIT_REFUSAL_TEXT_STATUSES.has(status)) return false;
   return PROVIDER_CREDIT_REFUSED_RE.test(providerCapacityErrorText(value));
+}
+
+const STATUS_IN_TEXT_RE = /\b(?:api error|http|status)?\s*[:#]?\s*(402)\b/i;
+
+/**
+ * A thrown error that carries a provider's credit refusal: a 402 on the error
+ * or its cause, a 402 named in its text, or the refusal words themselves. An
+ * account out of credit is an account condition, not a model condition, so a
+ * lane that holds a backup on another account can answer where a retry of the
+ * same account never will.
+ */
+export function isProviderCreditRefusalError(err: unknown, depth = 0): boolean {
+  if (err == null) return false;
+  const record = err as { status?: unknown; statusCode?: unknown; cause?: unknown };
+  const status = typeof record.status === 'number' ? record.status
+    : typeof record.statusCode === 'number' ? record.statusCode : undefined;
+  if (status === 402) return true;
+  const text = providerCapacityErrorText(err);
+  if (STATUS_IN_TEXT_RE.test(text)) return true;
+  if (isProviderCreditRefusal(status ?? undefined, err)) return true;
+  if (depth < 3 && typeof err === 'object' && record.cause && record.cause !== err) {
+    return isProviderCreditRefusalError(record.cause, depth + 1);
+  }
+  return false;
 }

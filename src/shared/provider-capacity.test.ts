@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isProviderCapacityExhausted, providerCapacityErrorText, isProviderExtraUsageUnavailable } from './provider-capacity.js';
+import { isProviderCapacityExhausted, providerCapacityErrorText, isProviderExtraUsageUnavailable, isProviderCreditRefusalError } from './provider-capacity.js';
 
 test('recognizes Anthropic model-scoped extra-usage exhaustion carried by HTTP 400', () => {
   const live = {
@@ -31,4 +31,14 @@ test('recognizes established plan/quota spellings without treating ordinary 400s
   for (const value of ['429 Too Many Requests', 'Weekly limit reached.', 'invalid schema']) {
     assert.equal(isProviderExtraUsageUnavailable(value), false, 'do not invent an extra-usage scope');
   }
+});
+
+test('a thrown credit refusal is read from the status, the status in its text, the words, or the cause', () => {
+  assert.equal(isProviderCreditRefusalError(Object.assign(new Error('Payment Required'), { status: 402 })), true);
+  assert.equal(isProviderCreditRefusalError(new Error('step failed via harness: 402 Credit limit exceeded, please add credits')), true);
+  assert.equal(isProviderCreditRefusalError(new Error('credit line reached for this account')), true);
+  assert.equal(isProviderCreditRefusalError(new Error('fetch failed', { cause: Object.assign(new Error('insufficient_quota'), { status: 429 }) })), true);
+  assert.equal(isProviderCreditRefusalError(new Error('API Error: 429 rate limit, slow down')), false, 'a burst limit is not a refusal for credit');
+  assert.equal(isProviderCreditRefusalError(new Error('API Error: 400 Bad Request: invalid schema')), false);
+  assert.equal(isProviderCreditRefusalError(null), false);
 });
