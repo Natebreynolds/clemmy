@@ -83,10 +83,11 @@ import { ownerRunsInAutoMode } from './worker-lead-authority.js';
 import { answeredRefusalsInTurn } from './turn-answered-refusals.js';
 import {
 
-const consentLogger = pino({ name: 'clementine.consent' });
   loadHostCallCapabilityBinding,
   hostCallCapabilityBindingMatchesAttestation,
 } from './host-call-capability-binding.js';
+
+const consentLogger = pino({ name: 'clementine.consent' });
 
 export interface HostNativeConsentAdmissionExpectationV1 {
   sessionId: string;
