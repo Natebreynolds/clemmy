@@ -77,4 +77,8 @@ test('the chat\'s live view follows the window Clem last acted in, read from the
   assert.deepEqual(driver.lastActedWindow(rows), { pid: 19529, windowId: 273 }, 'the newest driver call that named a window; other tools do not count');
   assert.equal(driver.lastActedWindow(rows.slice(0, 1)), null);
   assert.deepEqual(driver.lastActedWindow([{ type: 'tool_called', data: { tool: 'mcp__cua-driver__type_text', args: { pid: 7, window_id: 9, text: 'hi' } } }]), { pid: 7, windowId: 9 });
+  assert.deepEqual(driver.lastActedWindow([
+    { type: 'tool_called', data: { tool: 'cua-driver__run_steps', args: '{"steps":[{"tool":"hotkey","args":{"keys":["cmd","n"]}}],"observe":true,"session":"x","target":{"kind":"window","pi' } },
+    { type: 'tool_returned', data: { tool: 'cua-driver__run_steps', preview: 'run_steps: 2/2 steps ok\\nwindow_id=273 pid=19529 elements=66 snapshot_id=s0000000a' } },
+  ]), { pid: 19529, windowId: 273 }, 'a batch whose arguments were stored short still names its window in the answer');
 });

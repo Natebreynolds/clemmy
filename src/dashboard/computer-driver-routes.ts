@@ -93,7 +93,7 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
     // driver works in windows behind the owner's; the whole display otherwise.
     const session = typeof req.query.session === 'string' ? req.query.session.slice(0, 120) : '';
     let target: { pid: number; windowId: number } | null = null;
-    if (session) { try { target = lastActedWindow(listEvents(session, { types: ['tool_called'] })); } catch { target = null; } }
+    if (session) { try { target = lastActedWindow(listEvents(session, { types: ['tool_called', 'tool_returned'] })); } catch { target = null; } }
     const call = target
       // The view wants the picture, not the accessibility tree: the smallest
       // read the driver allows answers in about a second instead of twenty.

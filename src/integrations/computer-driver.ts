@@ -208,13 +208,26 @@ export function firstImageBlock(content: unknown): { data: string; mimeType: str
 export function lastActedWindow(rows: ReadonlyArray<{ type: string; data: Record<string, unknown> }>): { pid: number; windowId: number } | null {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const row = rows[i];
-    if (row.type !== 'tool_called') continue;
-    const tool = typeof row.data.tool === 'string' ? row.data.tool : '';
+    const tool = typeof row.data.tool === 'string' ? row.data.tool : typeof row.data.effectiveTool === 'string' ? row.data.effectiveTool : '';
     if (!tool.startsWith(`${COMPUTER_DRIVER_SERVER_NAME}__`) && !tool.startsWith(`mcp__${COMPUTER_DRIVER_SERVER_NAME}__`)) continue;
-    const args = typeof row.data.args === 'string' ? row.data.args : JSON.stringify(row.data.args ?? '');
-    const pid = /"pid"\s*:\s*(\d+)/.exec(args);
-    const windowId = /"window_id"\s*:\s*(\d+)/.exec(args);
-    if (pid && windowId) return { pid: Number(pid[1]), windowId: Number(windowId[1]) };
+    if (row.type === 'tool_called') {
+      // A call that named the window in its arguments (a click, typed text, a batch of steps).
+      const args = typeof row.data.args === 'string' ? row.data.args : JSON.stringify(row.data.args ?? '');
+      const pid = /"pid"\s*:\s*(\d+)/.exec(args);
+      const windowId = /"window_id"\s*:\s*(\d+)/.exec(args);
+      if (pid && windowId) return { pid: Number(pid[1]), windowId: Number(windowId[1]) };
+      continue;
+    }
+    if (row.type === 'tool_returned') {
+      // A read or a batch whose answer names the window it looked at
+      // ("window_id=273 pid=19529"); the call's own arguments are stored short.
+      const text = typeof row.data.preview === 'string' ? row.data.preview : typeof row.data.result === 'string' ? row.data.result : '';
+      const named = /window_id=(\d+)\s+pid=(\d+)/.exec(text) ?? /pid=(\d+)\s+window_id=(\d+)/.exec(text);
+      if (named) {
+        const byOrder = text.indexOf('window_id=') < text.indexOf('pid=') ? { windowId: Number(named[1]), pid: Number(named[2]) } : { pid: Number(named[1]), windowId: Number(named[2]) };
+        return byOrder;
+      }
+    }
   }
   return null;
 }
