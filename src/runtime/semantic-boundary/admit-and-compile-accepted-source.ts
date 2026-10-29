@@ -77,7 +77,7 @@ import {
   rehydrateConsumedClarificationContext,
   verifyDurableClarificationContext,
 } from '../harness/task-continuity-runtime.js';
-import { ownerChoiceForSource } from '../harness/owner-choice.js';
+import { ownerCardReplyForSource, ownerChoiceForSource } from '../harness/owner-choice.js';
 import { classifyMessageIntent, isBareDeicticFollowUp, selfContainedConversation } from '../../assistant/message-intent.js';
 import {
   markAdmissionCapabilityResolutionSuperseded,
@@ -2163,8 +2163,11 @@ export async function primePrimaryModelPlanningCatalog(input: {
       // A tapped choice on one of Clem's items outside the chat approves that
       // exact action: it is a new instruction, never an answer to a question
       // still open in the thread it runs in, so that question cannot hold it.
+      // Words typed on one of those items are bound to that item the same way
+      // (they approve nothing), so the open question cannot claim them either.
       if (pending.status !== 'none' && !acceptedSourceIsVerifiedMetaChoice(input)
-        && !ownerChoiceForSource(input.sessionId, input.sourceUserSeq)) {
+        && !ownerChoiceForSource(input.sessionId, input.sourceUserSeq)
+        && !ownerCardReplyForSource(input.sessionId, input.sourceUserSeq)) {
         return refuse('accepted_source_continuation', 'durable accepted-source continuation is unresolved');
       }
     }

@@ -1,5 +1,5 @@
 import { heldStopPublicationOwnsSource, HELD_STOP_PUBLICATION_PENDING_TEXT } from './held-stop-publication.js';
-import { redeemOwnerChoiceToken } from './owner-choice.js';
+import { redeemOwnerCardReplyToken, redeemOwnerChoiceToken } from './owner-choice.js';
 import './memory-scope-binding.js';
 import { providerCapacityErrorText } from '../../shared/provider-capacity.js';
 import { redactSensitiveText } from '../security.js';
@@ -1695,12 +1695,14 @@ export async function respondViaHarness(
   // A choice the owner tapped on Home rides on the accepted source's own
   // event, from a token only the From Clem reply path can mint.
   const ownerChoice = redeemOwnerChoiceToken(request.ownerChoiceToken);
+  const ownerCardReply = ownerChoice ? null : redeemOwnerCardReplyToken(request.ownerCardReplyToken);
   const sourceUserEvent = connection?.source ?? reviewedAdmission?.source ?? recordRunAttemptUserInput(requestAttempt, {
     turn: 1,
     role: 'user',
     data: {
       text: displayMessage,
       ...(ownerChoice ? { ownerChoice } : {}),
+      ...(ownerCardReply ? { ownerCardReply } : {}),
       ...taskModeFields(request.taskMode),
       ...turnLearningPolicyFields(request.learningPolicy),
       ...(request.learningPolicySource ? { learningPolicySource: request.learningPolicySource } : {}),

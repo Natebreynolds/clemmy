@@ -21,7 +21,7 @@ import { attentionLifecycleForKey, needsYouKey, needsYouReferents, notificationA
 import { peekTurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-port-registry.js';
 import { CLEM_REPLY_PURPOSE, CLEM_VOICE_PURPOSE, type ClemReplyResult, type TurnSemanticModelPort } from '../runtime/semantic-boundary/turn-semantic-model-port.js';
 import { appendEvent, getSession, listEvents, updateSession, getLatestRunAttemptByRunId, getRunAttemptSourceUserEvent } from '../runtime/harness/eventlog.js';
-import { mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
+import { mintOwnerCardReplyToken, mintOwnerChoiceToken } from '../runtime/harness/owner-choice.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
 import { HarnessSession } from '../runtime/harness/session.js';
 import { withOwnModelRequestAttribution } from '../runtime/usage-log.js';
@@ -390,7 +390,7 @@ export function startFromClemVoice(): { stop: () => void } {
 
 // ── the owner's reply ─────────────────────────────────────────────────────────
 export interface FromClemRespond {
-  (request: { sessionId: string; runId: string; channel: string; message: string; displayMessage?: string; ownerChoiceToken?: string }): Promise<unknown>;
+  (request: { sessionId: string; runId: string; channel: string; message: string; displayMessage?: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }): Promise<unknown>;
 }
 export interface FromClemTurnRef { sessionId: string; runId: string }
 let respondImpl: FromClemRespond | null = null;
@@ -419,7 +419,7 @@ export interface FromClemReplyDeps {
   /** Hide the row until the next morning, or for good; the item itself is
    *  untouched. */
   later: (key: string, forever?: boolean) => void;
-  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }) => FromClemTurnRef;
+  startTurn: (input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }) => FromClemTurnRef;
   /** The owner's answer to "switch back?" after a brain outage. */
   resolveBrainOutage?: (outageId: string, choice: 'switch_back' | 'stay') => Promise<boolean>;
 }
@@ -556,7 +556,7 @@ async function replyOnce(
         ...(tapped ? { ownerChoiceToken: mintOwnerChoiceToken({
           rowKey: row.key, voiceDigest: row.voiceDigest, said, facts: factsOf(row), choice: reply,
           ...(row.ref ? { ref: row.ref } : {}),
-        }) } : {}),
+        }) } : { ownerCardReplyToken: mintOwnerCardReplyToken({ rowKey: row.key, voiceDigest: row.voiceDigest }) }),
       });
       // Asking about the item does not decide it or authorize an offered action.
       if (read.decision === 'follow_up') return { outcome: 'started', decision: read.decision, itemSettled: false, ...started };
@@ -616,7 +616,7 @@ export function fromClemTurnOutcome(input: { runId: string; since: string }, now
 }
 
 /** Runs the owner's "do it" in her thread, without waiting for it. */
-export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): FromClemTurnRef {
+export function startFromClemTurn(input: { title: string; message: string; displayMessage: string; ownerChoiceToken?: string; ownerCardReplyToken?: string }, thread: Pick<ClemThreadDeps, 'ensure'> = productionClemThread): FromClemTurnRef {
   if (!respondImpl) throw new Error('no turn runner is bound');
   thread.ensure();
   const sessionId = CLEM_THREAD_ID;
@@ -625,6 +625,7 @@ export function startFromClemTurn(input: { title: string; message: string; displ
   void respond({
     sessionId, runId, channel: 'desktop', message: input.message, displayMessage: input.displayMessage,
     ...(input.ownerChoiceToken ? { ownerChoiceToken: input.ownerChoiceToken } : {}),
+    ...(input.ownerCardReplyToken ? { ownerCardReplyToken: input.ownerCardReplyToken } : {}),
   }).catch((error: unknown) => {
     logger.warn({ sessionId, err: error instanceof Error ? error.message : String(error) }, 'from clem: the reply turn failed');
   });

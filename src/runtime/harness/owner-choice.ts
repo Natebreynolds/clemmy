@@ -80,3 +80,51 @@ export function ownerChoiceForSource(sessionId: string, sourceUserSeq: number): 
     return null;
   }
 }
+
+/**
+ * Words the owner typed in reply to one of Clem's items on Home ("Reply in
+ * your words"). Unlike a tap it approves nothing: it only binds the message to
+ * the item it answers, so an unrelated question still open in Clem's thread
+ * cannot claim it. Minted and redeemed like a tap, onto the source's own event.
+ */
+export interface OwnerCardReplyV1 {
+  version: 1;
+  /** The From Clem row the owner replied to. */
+  rowKey: string;
+  /** The version of the row the owner saw. */
+  voiceDigest: string;
+  repliedAt: string;
+}
+
+const mintedReplies = new Map<string, { reply: OwnerCardReplyV1; at: number }>();
+
+export function mintOwnerCardReplyToken(reply: Omit<OwnerCardReplyV1, 'version' | 'repliedAt'>, nowMs = Date.now()): string {
+  for (const [token, entry] of mintedReplies) if (nowMs - entry.at > TOKEN_TTL_MS) mintedReplies.delete(token);
+  const token = randomBytes(24).toString('hex');
+  mintedReplies.set(token, { reply: Object.freeze({ version: 1 as const, ...reply, repliedAt: new Date(nowMs).toISOString() }), at: nowMs });
+  return token;
+}
+
+export function redeemOwnerCardReplyToken(token: unknown, nowMs = Date.now()): OwnerCardReplyV1 | null {
+  if (typeof token !== 'string') return null;
+  const entry = mintedReplies.get(token);
+  mintedReplies.delete(token);
+  if (!entry || nowMs - entry.at > TOKEN_TTL_MS) return null;
+  return entry.reply;
+}
+
+/** The item an accepted source's typed words answer, from its own ledger event. */
+export function ownerCardReplyForSource(sessionId: string, sourceUserSeq: number): OwnerCardReplyV1 | null {
+  try {
+    const source = listEvents(sessionId, { types: ['user_input_received'], sinceSeq: sourceUserSeq - 1, limit: 1 })
+      .find((event) => event.seq === sourceUserSeq);
+    const record = source?.role === 'user' ? source.data.ownerCardReply as Record<string, unknown> | undefined : undefined;
+    if (!record || typeof record !== 'object' || record.version !== 1) return null;
+    const { rowKey, voiceDigest, repliedAt } = record;
+    if (typeof rowKey !== 'string' || !rowKey || typeof voiceDigest !== 'string' || typeof repliedAt !== 'string') return null;
+    return { version: 1, rowKey, voiceDigest, repliedAt };
+  } catch {
+    return null;
+  }
+}
+
