@@ -45,7 +45,8 @@ import {
   type HostConsentSemanticSourceEvidence,
 } from './host-consent-evidence.js';
 import { appendEvent, getEvent, getSession, listEvents, openEventLog } from './eventlog.js';
-import { REQUESTED_WRITE_SURE, classifyOwnerChoiceCallWithJev, classifyRequestedExternalWriteWithJev } from '../jev/control-plane.js';
+import { REQUESTED_WRITE_SURE, classifyComputerActionReachWithJev, classifyOwnerChoiceCallWithJev, classifyRequestedExternalWriteWithJev } from '../jev/control-plane.js';
+import { computerDriverToolKind } from '../../agents/tool-taxonomy.js';
 import { ownerChoiceForSource } from './owner-choice.js';
 import {
   loadDurableAuthorizedLocalPlanningDefinition,
@@ -1229,6 +1230,82 @@ function consentModeForCall(
   };
 }
 
+/** The owner's words for the accepted request, or '' when unreadable. */
+function ownerAskedText(sessionId: string, sourceUserSeq: number): string {
+  try {
+    const accepted = listEvents(sessionId, {
+      sinceSeq: sourceUserSeq - 1, types: ['user_input_received'], limit: 1,
+    }).find((event) => event.seq === sourceUserSeq);
+    const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText : '';
+    return (display.trim() ? display : typeof accepted?.data.text === 'string' ? accepted.data.text : '').trim();
+  } catch { return ''; }
+}
+
+const COMPUTER_ACTION_REACH = 'computer_action_reach';
+
+/**
+ * A write on the owner's own screen is only a click to the consent gate, so
+ * a click on Send would run as ordinary learned work while the same send
+ * through a connected app asks every time with the exact content. Jev reads
+ * whether this action leaves the computer; a sure "sends" or "deletes" gives
+ * the call that consequence, so the gate asks the same way it does for a
+ * connected app. The reading is journaled once per call and argument digest
+ * and reused, so the card and its approved resume judge the same subject.
+ * Unavailable or unsure leaves the call as it was. Workflow sessions keep
+ * their own gates.
+ */
+async function withComputerActionReach(input: {
+  sessionId: string;
+  sourceUserSeq: number | null | undefined;
+  logicalToolCallId: string;
+  call: CapabilityRiskAttestationV1;
+  args: unknown;
+}): Promise<CapabilityRiskAttestationV1> {
+  const { call } = input;
+  if (call.effect !== 'external_write') return call;
+  if (computerDriverToolKind(String(call.operationId ?? '').trim().toLowerCase()) !== 'write') return call;
+  if (call.risk.consequence === 'send' || call.risk.consequence === 'delete' || call.risk.consequence === 'admin') return call;
+  if (workflowRunSession(input.sessionId)) return call;
+  const sinceSeq = typeof input.sourceUserSeq === 'number' ? input.sourceUserSeq : undefined;
+  let prior: Record<string, unknown> | undefined;
+  try {
+    prior = listEvents(input.sessionId, { types: ['guardrail_tripped'], ...(sinceSeq !== undefined ? { sinceSeq } : {}) })
+      .map((event) => event.data)
+      .reverse()
+      .find((data) => data.kind === COMPUTER_ACTION_REACH
+        && data.logicalToolCallId === input.logicalToolCallId
+        && data.argumentDigest === call.argumentDigest);
+  } catch { prior = undefined; }
+  let consequence: 'send' | 'delete' | null;
+  if (prior) {
+    consequence = prior.consequence === 'send' || prior.consequence === 'delete' ? prior.consequence : null;
+  } else {
+    const ownerAsked = sinceSeq !== undefined ? ownerAskedText(input.sessionId, sinceSeq) : '';
+    let argsText = '';
+    try { argsText = JSON.stringify(input.args ?? {}); } catch { argsText = ''; }
+    let reading: Awaited<ReturnType<typeof classifyComputerActionReachWithJev>>;
+    try {
+      reading = await classifyComputerActionReachWithJev({ ownerAsked, action: `${call.operationId}\n${argsText.slice(0, 1_500)}` }, { sessionId: input.sessionId });
+    } catch {
+      reading = { kind: null, failedOpen: true };
+    }
+    const sure = reading.kind !== null && (reading.confidence ?? 0) >= REQUESTED_WRITE_SURE;
+    consequence = sure && reading.kind === 'sends' ? 'send' : sure && reading.kind === 'deletes' ? 'delete' : null;
+    try {
+      appendEvent({ sessionId: input.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped', data: {
+        kind: COMPUTER_ACTION_REACH, logicalToolCallId: input.logicalToolCallId, argumentDigest: call.argumentDigest,
+        ...(typeof input.sourceUserSeq === 'number' ? { sourceUserSeq: input.sourceUserSeq } : {}),
+        operationId: call.operationId, reading: reading.kind ?? (reading.failedOpen ? 'unavailable' : 'unsure'),
+        ...(typeof reading.confidence === 'number' ? { confidence: reading.confidence } : {}),
+        consequence,
+      } });
+    } catch { /* an unjournaled reading changes nothing: the call stays as it was */ consequence = null; }
+  }
+  if (!consequence) return call;
+  consentLogger.info({ operationId: call.operationId, consequence }, 'a screen action leaves the computer');
+  return { ...call, risk: { ...call.risk, consequence, ...(consequence === 'delete' ? { destructive: true } : {}) } };
+}
+
 /** Was this exact change part of what the owner asked for? Only consulted
  * when the kind is learned (one bounded Jev read); undefined = no reading. */
 async function learnedKindAppliesToRequest(input: {
@@ -1244,14 +1321,7 @@ async function learnedKindAppliesToRequest(input: {
   let learned = false;
   try { learned = hasApprovedWriteKind(input.call.operationId, input.call.accountId); } catch { learned = false; }
   if (!learned) return undefined;
-  let ownerAsked = '';
-  try {
-    const accepted = listEvents(input.sessionId, {
-      sinceSeq: input.sourceUserSeq - 1, types: ['user_input_received'], limit: 1,
-    }).find((event) => event.seq === input.sourceUserSeq);
-    const display = typeof accepted?.data.displayText === 'string' ? accepted.data.displayText : '';
-    ownerAsked = (display.trim() ? display : typeof accepted?.data.text === 'string' ? accepted.data.text : '').trim();
-  } catch { ownerAsked = ''; }
+  const ownerAsked = ownerAskedText(input.sessionId, input.sourceUserSeq);
   if (!ownerAsked) return undefined;
   let argsText = '';
   try { argsText = JSON.stringify(input.args ?? {}); } catch { argsText = ''; }
@@ -1472,7 +1542,7 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     capabilityIdentity: semantic.requirementCapabilityIdentity,
     semanticBasis: semantic.semanticBasis,
   });
-  const { call, coverage } = buildHostConsentEvidence({ call: {
+  const { call: builtCall, coverage } = buildHostConsentEvidence({ call: {
     source,
     acceptedTaskId: prepared.acceptedTaskId,
     bindingDigest,
@@ -1501,6 +1571,10 @@ export async function evaluatePreparedHostWorkCallConsent(input: {
     }),
     reservationKey: reservationKey({ prepared, cardinality }),
   }) });
+  const call = await withComputerActionReach({
+    sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq,
+    logicalToolCallId: prepared.logicalToolCallId, call: builtCall, args: prepared.targetArgs,
+  });
   const reservationAlreadyClaimed = priorReservationExists(prepared);
   const learnedApplies = await learnedKindAppliesToRequest({
     sessionId: prepared.sessionId, sourceUserSeq: prepared.sourceUserSeq, call, args: prepared.targetArgs,
@@ -1652,7 +1726,7 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     }
 
     const source = sourceFromHostBinding(binding);
-    const { call, coverage } = buildHostConsentEvidence({ call: {
+    const { call: builtCall, coverage } = buildHostConsentEvidence({ call: {
       source,
       acceptedTaskId: binding.acceptedTaskId,
       bindingDigest: digest({ version: 1, hostCapabilityBinding: binding.durableBindingDigest,
@@ -1676,6 +1750,10 @@ export async function evaluateUncoveredHostMutationConsent(input: {
       reservationKey: digest({ version: 1, hostCapabilityBinding: binding.durableBindingDigest,
         logicalToolCallId: binding.logicalToolCallId, argumentDigest: binding.effectiveArgumentDigest }),
     }) });
+    const call = await withComputerActionReach({
+      sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq,
+      logicalToolCallId: binding.logicalToolCallId, call: builtCall, args: input.args,
+    });
     const crossing = crossingFor(binding) ?? 'possibly_started';
     const learnedApplies = await learnedKindAppliesToRequest({
       sessionId: binding.sessionId, sourceUserSeq: binding.sourceUserSeq, call, args: input.args,
@@ -1812,9 +1890,13 @@ export async function evaluateUncoveredHostMutationConsent(input: {
     },
     safety: 'admissible',
   };
-  const { call, coverage } = gateScope
+  const { call: builtCall, coverage } = gateScope
     ? buildHostConsentEvidence({ call: uncoveredCall, coverage: () => gateScope })
     : buildHostConsentEvidence({ call: uncoveredCall, coverage: null });
+  const call = await withComputerActionReach({
+    sessionId: attestation.sessionId, sourceUserSeq: attestation.sourceUserSeq,
+    logicalToolCallId: attestation.logicalToolCallId, call: builtCall, args: input.args,
+  });
   const crossing = crossingFor({
     sessionId: attestation.sessionId,
     sourceUserSeq: attestation.sourceUserSeq,

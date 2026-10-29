@@ -703,6 +703,58 @@ export async function classifyRequestedExternalWriteWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+export type ComputerActionReachKind = 'sends' | 'deletes' | 'stays';
+
+export interface ComputerActionReachReading {
+  /** null when Jev was unavailable or not sure. */
+  kind: ComputerActionReachKind | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/**
+ * An action on the owner's own screen can still reach other people: a click
+ * on Send in a mail app, Post in a chat app, Submit on a web form. Through a
+ * connected app the same change names itself (a send asks every time, with
+ * the exact content); on the screen it is only a click. One choice over the
+ * action and what the owner asked for: does it leave this computer?
+ */
+export async function classifyComputerActionReachWithJev(
+  input: { ownerAsked: string; action: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<ComputerActionReachReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      ownerAsked: clipMiddle(input.ownerAsked.trim(), 2_000).text,
+      clemIsAboutToDoOnTheScreen: clipMiddle(input.action.trim(), 1_500).text,
+    },
+    questions: {
+      reach: {
+        type: 'choice',
+        instructions: 'Clem is about to act in an app on the owner\'s own computer by clicking, typing or pressing keys. When this action finishes, has something left this computer for other people or an outside service?',
+        criteria: {
+          sends: 'Yes — it sends, posts, publishes, shares, books, buys or submits something that other people or an outside service receive.',
+          deletes: 'Yes — it deletes or cancels something kept outside this computer, such as an email, a message, an event or a file in a cloud service.',
+          stays: 'No — it only opens, reads, types a draft, edits a local document, or moves around; nothing has left this computer yet.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(REQUESTED_WRITE_TIMEOUT_MS, opts.timeoutMs ?? REQUESTED_WRITE_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-computer-action-reach',
+  });
+  if (!result.ok) return { kind: null, failedOpen: true };
+  const answer = result.answers.reach as ChoiceAnswer | undefined;
+  const kind = answer && ['sends', 'deletes', 'stays'].includes(answer.choice)
+    ? answer.choice as ComputerActionReachKind
+    : null;
+  noteJevDecisionOutcome(result.decisionId, kind ?? 'none', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 export type OwnerChoiceCallKind = 'exact' | 'adds_content' | 'different';
 
 export interface OwnerChoiceCallReading {

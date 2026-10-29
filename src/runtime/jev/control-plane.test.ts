@@ -8,6 +8,7 @@ const {
 } = await import('./client.js');
 const {
   classifyOpenQuestionReplyWithJev,
+  classifyComputerActionReachWithJev,
   labelIdentifierWithJev,
   nameResolvedValueWithJev,
   selectAgentForTaskWithJev,
@@ -1195,4 +1196,27 @@ test("an owner's rule Jev judges to apply rides beside the remembered run it pic
   const usedIt = [{ ...runs[0]!, toolsUsed: [...runs[0]!.toolsUsed, 'PAGEGRAB_SCRAPE'] }];
   assert.equal((await decideTurnStartWithJev(request, usedIt, operations, { timeoutMs: 1_000 })).ownerRule, undefined,
     'a run that already used the rule\'s tool needs nothing beside it');
+});
+
+test('the screen-reach reader names a send, a delete or local work, and stays silent when unsure or unavailable', async () => {
+  const posted: Array<Record<string, unknown>> = [];
+  let choice = 'sends'; let confidence = 0.93;
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async (_url, init) => { posted.push(JSON.parse(String(init.body))); return { status: 200, ok: true,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: { reach: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } } },
+      usage: { input_tokens: 20, output_tokens: 2 } }) }; });
+  const input = { ownerAsked: 'Reply to Dana that Thursday works', action: 'cua-driver__click\n{"element":"Send"}' };
+  assert.deepEqual(await classifyComputerActionReachWithJev(input), { kind: 'sends', confidence: 0.93, failedOpen: false });
+  const state = posted[0]!.state as Record<string, unknown>;
+  assert.equal(state.ownerAsked, 'Reply to Dana that Thursday works');
+  assert.match(String(state.clemIsAboutToDoOnTheScreen), /cua-driver__click/);
+  assert.equal(posted[0]!.channel ?? (posted[0] as { metadata?: { channel?: string } }).metadata?.channel ?? 'jev-computer-action-reach', 'jev-computer-action-reach');
+  choice = 'deletes';
+  assert.equal((await classifyComputerActionReachWithJev(input)).kind, 'deletes');
+  choice = 'stays';
+  assert.equal((await classifyComputerActionReachWithJev(input)).kind, 'stays');
+  choice = 'none';
+  assert.equal((await classifyComputerActionReachWithJev(input)).kind, null, 'not sure names nothing');
+  _setTypesafeKeyForTests(undefined);
+  assert.deepEqual(await classifyComputerActionReachWithJev(input), { kind: null, failedOpen: true }, 'no reader: nothing changes');
 });

@@ -49,12 +49,12 @@ async function withLearnedKind<T>(operationId: string, fn: () => Promise<T>): Pr
   try { return await fn(); } finally { scopes.forgetApprovedWriteKind(operationId, 'account:direct:owner'); }
 }
 
-async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown' | 'bounded',
+async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown' | 'bounded' | 'screen',
   options: { taskMode?: { version: 1; kind: 'plan' }; sessionId?: string; sessionKind?: 'chat' | 'workflow' } = {}) {
   const sessionId = options.sessionId ?? `direct-consent-${randomUUID()}`;
   const operationId = { draft: 'EXAMPLE_CREATE_DRAFT', send: 'EXAMPLE_SEND_MESSAGE',
     delete: 'EXAMPLE_DELETE_RECORD', admin: 'EXAMPLE_ROTATE_API_KEY', unknown: 'EXAMPLE_RECORD',
-    bounded: 'EXAMPLE_REQUEST' }[kind];
+    bounded: 'EXAMPLE_REQUEST', screen: 'cua-driver__click' }[kind];
   const effect = kind === 'admin' ? 'admin' as const : 'external_write' as const;
   const capabilityId = `cap:direct:${kind}`;
   const accountId = 'account:direct:owner';
@@ -64,7 +64,8 @@ async function exactCall(kind: 'draft' | 'send' | 'delete' | 'admin' | 'unknown'
     providerIdentity: 'composio:direct-fixture', providerVersion: 'catalog-v1',
     operationVersion: '1', definitionFingerprint: fingerprint,
     externalDefinition: { version: 1, providerInputSchemaDigest: schemaDigest,
-      semanticName: operationId,
+      // A server__tool name carries the tool's own name, as tools/list gives it.
+      semanticName: kind === 'screen' ? operationId.slice(operationId.indexOf('__') + 2) : operationId,
       // 'unknown' is the carrier-silent shape: an absent destructive hint is
       // no claim, so the exact-call card stays. A declared destructive:false
       // on an unnamed operation is carrier-bounded work and proceeds.
@@ -417,4 +418,67 @@ test('an ordinary connected-app change asks once in Ask and in Auto, and the app
   assert.equal(auto.result.status === 'decided' && auto.result.decision.kind === 'needs_user' ? auto.result.decision.teaches : null, 'external_write_kind');
   const learnedAuto = await withLearnedKind('EXAMPLE_CREATE_DRAFT', () => exactCall('draft'));
   assert.equal(learnedAuto.result.status === 'decided' && learnedAuto.result.decision.kind === 'proceed' ? learnedAuto.result.decision.basis : null, 'exact_reversible_work');
+});
+
+test('a screen action that sends asks every time like a connected-app send; ordinary screen work stays learned', async () => {
+  // A click on Send in a mail app is a send. Through a connected app the
+  // same change names itself and asks every time; on the screen it is only
+  // a learned input kind. Jev reads whether the action leaves the computer.
+  const jev = await import('../jev/client.js');
+  let reach: { choice: string; confidence: number } | null = null;
+  let reachAsked = 0;
+  jev._setTypesafeKeyForTests('ts_test');
+  jev._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { questions?: Record<string, unknown> };
+    const asksReach = Boolean(body.questions && Object.hasOwn(body.questions, 'reach'));
+    if (asksReach) reachAsked++;
+    if (asksReach && !reach) throw new Error('jev down');
+    const answers = asksReach
+      ? { reach: { type: 'choice', choice: reach!.choice, confidence: reach!.confidence, probabilities: { [reach!.choice]: reach!.confidence } } }
+      : { requested: { type: 'choice', choice: 'requested', confidence: 0.95, probabilities: { requested: 0.95 } } };
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers, usage: { input_tokens: 40, output_tokens: 2 } }) };
+  });
+  try {
+    await withLearnedKind('cua-driver__click', async () => {
+      reach = { choice: 'stays', confidence: 0.95 };
+      const typing = await exactCall('screen');
+      assert.equal(typing.result.status === 'decided' ? typing.result.decision.kind : null, 'proceed', JSON.stringify(typing.result));
+
+      reach = { choice: 'sends', confidence: 0.95 };
+      const send = await exactCall('screen');
+      assert.equal(send.result.status, 'decided', JSON.stringify(send.result));
+      if (send.result.status !== 'decided') return;
+      assert.equal(send.result.decision.kind, 'needs_user', 'a send on the screen asks even though the input kind is learned');
+      assert.equal(send.result.decision.kind === 'needs_user' ? send.result.decision.teaches : 'x', undefined, 'a send teaches nothing: it asks every time');
+      assert.equal(send.result.call.risk.consequence, 'send');
+
+      // The reading is journaled once per call and argument digest, and the
+      // same call judged again (the approved resume) reuses it.
+      const before = reachAsked;
+      const again = await consent.evaluateUncoveredHostMutationConsent(send.request);
+      assert.equal(reachAsked, before, 'the same call is not read twice');
+      assert.equal(again.status === 'decided' ? again.call.risk.consequence : null, 'send');
+      const journal = eventlog.listEvents(send.request.attestation.sessionId, { types: ['guardrail_tripped'] })
+        .filter((event) => event.data.kind === 'computer_action_reach');
+      assert.equal(journal.length, 1);
+      assert.equal(journal[0]!.data.consequence, 'send');
+
+      reach = { choice: 'sends', confidence: 0.5 };
+      const unsure = await exactCall('screen');
+      assert.equal(unsure.result.status === 'decided' ? unsure.result.decision.kind : null, 'proceed', 'an unsure reading leaves the call as it was');
+
+      reach = null;
+      const down = await exactCall('screen');
+      assert.equal(down.result.status === 'decided' ? down.result.decision.kind : null, 'proceed', 'an unavailable reader leaves the call as it was');
+    });
+
+    // A connected-app change is never read this way: only the screen family.
+    reach = { choice: 'sends', confidence: 0.99 };
+    const asked = reachAsked;
+    await withLearnedKind('EXAMPLE_CREATE_DRAFT', () => exactCall('draft'));
+    assert.equal(reachAsked, asked, 'connected-app changes keep their own named consequence');
+  } finally {
+    jev._setSystemOneFetchForTests(undefined);
+    jev._setTypesafeKeyForTests(undefined);
+  }
 });
