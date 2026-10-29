@@ -836,11 +836,16 @@ test('a reply\'s record shows what Clem does as she does it, then her answer, or
     data: { sourceUserSeq: source.seq, tool: 'call_tool', effectiveTool: 'tool_search', effect: 'read', topologyRole: 'control', callId: 'c0' } });
   eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
     data: { sourceUserSeq: source.seq, tool: 'memory_recall_all', callId: 'c00' } });
+  // A connected-app call that names its operation only in its own args (live 2026-10-29).
+  eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { sourceUserSeq: source.seq, tool: 'composio_execute_tool', callId: 'c-app', args: { tool_slug: 'FIXTURE_CHAT_LIST_CHANNELS', arguments: '{}' } } });
+  eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'composio_execute_tool', callId: 'c-app' } });
   call('c1', 'FIXTURE_CALENDAR_FIND_EVENT', 'read');
   eventlog.appendEvent({ sessionId: CLEM_THREAD_ID, turn: 1, role: 'Clem', type: 'tool_returned', data: { sourceUserSeq: source.seq, tool: 'work_call', callId: 'c1' } });
   call('c2', 'FIXTURE_CALENDAR_UPDATE_EVENT', 'external_write');
   const working = fromClemTurnOutcome({ runId, since });
   assert.deepEqual(working, { state: 'working', steps: [
+    { tool: 'FIXTURE_CHAT_LIST_CHANNELS', done: true },
     { tool: 'FIXTURE_CALENDAR_FIND_EVENT', effect: 'read', done: true },
     { tool: 'FIXTURE_CALENDAR_UPDATE_EVENT', effect: 'external_write', done: false },
   ] });
@@ -854,7 +859,7 @@ test('a reply\'s record shows what Clem does as she does it, then her answer, or
   assert.equal((asks as { asks?: string }).asks, 'approval');
   assert.equal((asks as { approvalId?: string }).approvalId, 'apr-fx01', 'the record opens the approval card itself');
   assert.equal((asks as { text?: string }).text, 'Ready to move the meeting to 1 PM and tell the team. OK?', 'the owner reads only what Clem wrote');
-  assert.equal((asks as { steps?: unknown[] }).steps?.length, 2);
+  assert.equal((asks as { steps?: unknown[] }).steps?.length, 3);
 });
 
 test('a started reply is kept for its item: newest first, one per item, and only recent ones', async () => {

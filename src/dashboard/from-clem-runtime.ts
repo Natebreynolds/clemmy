@@ -614,10 +614,12 @@ const STEPS_SHOWN = 8;
  *  itself names, else the tool called. */
 function stepOperation(data: Record<string, unknown>): string {
   if (typeof data.effectiveTool === 'string' && data.effectiveTool) return data.effectiveTool;
-  try {
-    const args = typeof data.arguments === 'string' ? JSON.parse(data.arguments) as Record<string, unknown> : data.arguments as Record<string, unknown> | undefined;
-    if (args && typeof args.tool_slug === 'string' && args.tool_slug) return args.tool_slug;
-  } catch { /* the tool's own name stands */ }
+  for (const field of [data.args, data.arguments]) {
+    try {
+      const args = typeof field === 'string' ? JSON.parse(field) as Record<string, unknown> : field as Record<string, unknown> | undefined;
+      if (args && typeof args === 'object' && typeof args.tool_slug === 'string' && args.tool_slug) return args.tool_slug;
+    } catch { /* the next field, or the tool's own name */ }
+  }
   return typeof data.tool === 'string' ? data.tool : '';
 }
 
