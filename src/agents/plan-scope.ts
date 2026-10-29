@@ -899,8 +899,25 @@ function appendSendTrustGrantUnlocked(
   return grant;
 }
 
+/**
+ * The kind an operation is learned under. The computer driver's input
+ * primitives (a click, a keystroke, typed text, a scroll, a drag, a menu, a
+ * value) are one kind of change, acting in an app, so the first of them in a
+ * task asks and the rest of the family runs on that answer; launching or
+ * killing an app, a script, the clipboard and the browser tools keep their
+ * own kinds. The "was this what the owner asked for" read still guards every
+ * learned call, so an unrequested send stays behind a card.
+ */
+export function writeKindOperation(operationId: string): string {
+  const exact = operationId.trim();
+  const driver = /^(?:mcp__)?cua-driver__(.+)$/.exec(exact);
+  if (!driver) return exact;
+  const INPUT = new Set(['click', 'double_click', 'right_click', 'drag', 'scroll', 'move_cursor', 'type_text', 'press_key', 'hotkey', 'set_value', 'invoke_menu', 'bring_to_front', 'set_window_frame', 'mouse_button_down', 'mouse_button_up', 'mouse_drag']);
+  return INPUT.has(driver[1]) ? exact.replace(/__[a-z_]+$/, '__input') : exact;
+}
+
 function sameWriteKind(kind: ApprovedWriteKind, operationId: string, accountId: string | null): boolean {
-  return kind.operationId === operationId && (kind.accountId ?? null) === (accountId ?? null);
+  return writeKindOperation(kind.operationId) === writeKindOperation(operationId) && (kind.accountId ?? null) === (accountId ?? null);
 }
 
 function liveApprovedWriteKinds(file: ScopesFile, now: number): ApprovedWriteKind[] {

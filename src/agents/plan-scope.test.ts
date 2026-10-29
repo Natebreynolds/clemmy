@@ -763,3 +763,14 @@ test('a standing grant follows a safe nested semantic target, not the broker', (
     revokeStandingApproval('m365__update_item');
   }
 });
+
+test('the computer driver\'s input primitives are one learned write kind per app; launching and scripts stay their own', async () => {
+  const { writeKindOperation } = await import('./plan-scope.js');
+  for (const op of ['cua-driver__click', 'cua-driver__type_text', 'cua-driver__hotkey', 'mcp__cua-driver__scroll', 'cua-driver__set_value']) {
+    assert.equal(writeKindOperation(op), op.replace(/__[a-z_]+$/, '__input'), op);
+  }
+  assert.equal(writeKindOperation('cua-driver__launch_app'), 'cua-driver__launch_app');
+  assert.equal(writeKindOperation('cua-driver__run_script'), 'cua-driver__run_script');
+  assert.equal(writeKindOperation('cua-driver__browser_navigate'), 'cua-driver__browser_navigate');
+  assert.equal(writeKindOperation('OUTLOOK_SEND_EMAIL'), 'OUTLOOK_SEND_EMAIL');
+});

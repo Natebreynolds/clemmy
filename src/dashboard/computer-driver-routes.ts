@@ -98,10 +98,12 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
       ? ['call', 'get_window_state', JSON.stringify({ pid: target.pid, window_id: target.windowId }), '--socket', computerDriverSocketPath(), '--screenshot-out-file', file]
       : ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file];
     try {
-      let answer = await askDriver(realComputerDriverPath(status.path), call, 20_000, computerDriverEnv());
+      // A window capture answers in a few seconds; the whole display takes the
+      // driver longer (measured 20 to 30 s on a Retina display).
+      let answer = await askDriver(realComputerDriverPath(status.path), call, target ? 20_000 : 45_000, computerDriverEnv());
       if (target && !existsSync(file)) {
         // The window is gone; fall back to the display rather than show nothing.
-        answer = await askDriver(realComputerDriverPath(status.path), ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file], 20_000, computerDriverEnv());
+        answer = await askDriver(realComputerDriverPath(status.path), ['call', 'get_desktop_state', '--socket', computerDriverSocketPath(), '--screenshot-out-file', file], 45_000, computerDriverEnv());
       }
       if (!existsSync(file)) { res.status(503).json({ error: answer?.slice(0, 300) || 'The driver answered without a picture. If macOS has not allowed Screen Recording for Clementine yet, allow it in System Settings.' }); return; }
       res.setHeader('Cache-Control', 'no-store');
