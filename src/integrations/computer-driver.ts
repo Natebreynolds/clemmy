@@ -38,9 +38,11 @@ export const COMPUTER_DRIVER_DOWNLOAD: ToolDownloadRecipe = {
     'darwin-arm64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-darwin-universal-binary.tar.gz`,
     'darwin-x64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-darwin-universal-binary.tar.gz`,
     'linux-x64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-linux-x86_64-binary.tar.gz`,
+    'win32-x64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-windows-x86_64-binary.zip`,
+    'win32-arm64': `${RELEASE_BASE}cua-driver-rs-${COMPUTER_DRIVER_VERSION}-windows-arm64-binary.zip`,
   },
   checksums: `${RELEASE_BASE}SHA256SUMS`,
-  bin: 'cua-driver',
+  bin: process.platform === 'win32' ? 'cua-driver.exe' : 'cua-driver',
 };
 
 export interface ComputerDriverStatus {
@@ -104,13 +106,16 @@ export function computerDriverServeCommand(binary: string, socket: string = comp
 }
 
 /** The MCP server record Clem keeps for the driver: a proxy onto her private daemon. */
-export function computerDriverServer(binary: string, socket: string = computerDriverSocketPath(), bundleId: string = COMPUTER_DRIVER_HOST_BUNDLE_ID): ManagedMcpServer {
+export function computerDriverServer(binary: string, socket: string = computerDriverSocketPath(), bundleId: string = COMPUTER_DRIVER_HOST_BUNDLE_ID, platform: NodeJS.Platform = process.platform): ManagedMcpServer {
+  // Windows (a vendor preview) has no app identity to attach to: the driver
+  // serves on its own, configured through its environment, as the vendor documents.
+  const embedded = platform !== 'win32';
   return {
     name: COMPUTER_DRIVER_SERVER_NAME,
     type: 'stdio',
     command: realComputerDriverPath(binary),
-    args: ['mcp', '--embedded', '--socket', socket, '--host-bundle-id', bundleId],
-    env: computerDriverEnv(bundleId),
+    args: embedded ? ['mcp', '--embedded', '--socket', socket, '--host-bundle-id', bundleId] : ['mcp'],
+    env: embedded ? computerDriverEnv(bundleId) : {},
     description: 'Your computer: Cua Driver clicks, types and reads in the apps on this machine for Clem.',
     enabled: true,
     source: 'user',
@@ -217,6 +222,7 @@ export function computerDriverHostState(): 'running' | 'stopped' | 'not_started'
 export function startComputerDriverHost(input: { binary?: string | null; servers?: ReadonlyArray<Pick<ManagedMcpServer, 'name' | 'command' | 'args' | 'enabled'>> } = {}): 'started' | 'already' | 'idle' {
   const binary = input.binary === undefined ? computerDriverPath() : input.binary;
   if (!binary || !isOwnComputerDriver(binary)) return 'idle';
+  if (process.platform === 'win32') return 'idle'; // the driver serves on its own there
   if (input.servers && !readComputerDriverStatus({ path: binary, statusText: null, permissionsText: null, servers: input.servers }).connected) return 'idle';
   if (computerDriverHostState() === 'running') return 'already';
   hostStopped = false;

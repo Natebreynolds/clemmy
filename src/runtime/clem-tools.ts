@@ -10,7 +10,7 @@
  */
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { chmodSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
+import { chmodSync, copyFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { execFile } from 'node:child_process';
@@ -47,10 +47,10 @@ export function npmInstallPlan(input: { spec: string; npmCli: string | null; too
   return { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', args, env: { npm_config_cache: input.cacheDir, npm_config_prefix: input.toolsDir } };
 }
 
-export type ToolPlatformKey = 'darwin-arm64' | 'darwin-x64' | 'linux-x64' | 'linux-arm64';
+export type ToolPlatformKey = 'darwin-arm64' | 'darwin-x64' | 'linux-x64' | 'linux-arm64' | 'win32-x64' | 'win32-arm64';
 
 export function toolPlatformKey(platform: NodeJS.Platform = process.platform, arch: string = process.arch): ToolPlatformKey | null {
-  if (platform !== 'darwin' && platform !== 'linux') return null;
+  if (platform !== 'darwin' && platform !== 'linux' && platform !== 'win32') return null;
   if (arch !== 'arm64' && arch !== 'x64') return null;
   return `${platform}-${arch}`;
 }
@@ -131,12 +131,14 @@ function findBySuffix(root: string, suffix: string): string | null {
   return null;
 }
 
-/** Link <toolsBin>/<name> to the executable, replacing an older link. */
-export function linkTool(toolsBin: string, name: string, target: string): string {
+/** Link <toolsBin>/<name> to the executable, replacing an older link. On
+ *  Windows, where a link needs a privilege a user may not hold, the
+ *  executable is copied under the name instead. */
+export function linkTool(toolsBin: string, name: string, target: string, platform: NodeJS.Platform = process.platform): string {
   mkdirSync(toolsBin, { recursive: true });
-  const link = path.join(toolsBin, name);
+  const link = path.join(toolsBin, platform === 'win32' && !name.toLowerCase().endsWith('.exe') ? `${name}.exe` : name);
   try { if (lstatSync(link)) unlinkSync(link); } catch { /* absent */ }
-  symlinkSync(target, link);
+  if (platform === 'win32') copyFileSync(target, link); else symlinkSync(target, link);
   return link;
 }
 

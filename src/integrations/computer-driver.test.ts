@@ -42,7 +42,8 @@ test('Clem\'s own copy comes first, from the vendor\'s binary release for this m
   assert.equal(mac?.version, driver.COMPUTER_DRIVER_VERSION);
   assert.equal(mac?.archive, 'tar');
   assert.ok(resolveToolDownload(driver.COMPUTER_DRIVER_DOWNLOAD, { platform: 'linux', arch: 'x64' })?.url.endsWith('linux-x86_64-binary.tar.gz'));
-  assert.equal(resolveToolDownload(driver.COMPUTER_DRIVER_DOWNLOAD, { platform: 'win32', arch: 'x64' }), null);
+  assert.ok(resolveToolDownload(driver.COMPUTER_DRIVER_DOWNLOAD, { platform: 'win32', arch: 'x64' })?.url.endsWith('windows-x86_64-binary.zip'), 'the Windows preview downloads the vendor\'s zip');
+  assert.equal(resolveToolDownload(driver.COMPUTER_DRIVER_DOWNLOAD, { platform: 'win32', arch: 'x64' })?.archive, 'zip');
 });
 
 test('the driver runs embedded under the app\'s identity: a private daemon on Clem\'s socket and an MCP proxy onto it', () => {
@@ -51,6 +52,9 @@ test('the driver runs embedded under the app\'s identity: a private daemon on Cl
   const server = driver.computerDriverServer('/h/tools/bin/cua-driver', '/h/state/cua-driver.sock', 'com.example.app');
   assert.deepEqual({ name: server.name, type: server.type, args: server.args, env: server.env, enabled: server.enabled, source: server.source },
     { name: 'cua-driver', type: 'stdio', args: ['mcp', '--embedded', '--socket', '/h/state/cua-driver.sock', '--host-bundle-id', 'com.example.app'], env: { CUA_DRIVER_EMBEDDED: '1', CUA_DRIVER_HOST_BUNDLE_ID: 'com.example.app' }, enabled: true, source: 'user' });
+  const win = driver.computerDriverServer('C:\\h\\tools\\bin\\cua-driver.exe', 'ignored', 'ignored', 'win32');
+  assert.deepEqual(win.args, ['mcp'], 'on Windows the driver serves on its own, no embedded socket');
+  assert.deepEqual(win.env, {});
   assert.equal(driver.startComputerDriverHost({ binary: null }), 'idle', 'no driver, nothing to keep alive');
   assert.equal(driver.startComputerDriverHost({ binary: '/u/.local/bin/cua-driver' }), 'idle', 'a standalone copy is not Clem\'s to run');
   assert.equal(driver.computerDriverHostState(), 'not_started');

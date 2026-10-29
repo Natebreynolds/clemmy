@@ -12,7 +12,8 @@ const gh = { githubRepo: 'cli/cli', assets: { 'darwin-arm64': 'gh_{version}_macO
 
 test('a recipe resolves to the one download for this machine, from the release tag', () => {
   assert.equal(toolPlatformKey('darwin', 'arm64'), 'darwin-arm64');
-  assert.equal(toolPlatformKey('win32', 'x64'), null);
+  assert.equal(toolPlatformKey('win32', 'x64'), 'win32-x64');
+  assert.equal(toolPlatformKey('freebsd' as NodeJS.Platform, 'x64'), null);
   const mac = resolveToolDownload(gh, { platform: 'darwin', arch: 'arm64', tag: 'v2.80.0' });
   assert.deepEqual(mac, { url: 'https://github.com/cli/cli/releases/download/v2.80.0/gh_2.80.0_macOS_arm64.zip', assetName: 'gh_2.80.0_macOS_arm64.zip', checksumsUrl: 'https://github.com/cli/cli/releases/download/v2.80.0/gh_2.80.0_checksums.txt', version: '2.80.0', archive: 'zip' });
   assert.equal(resolveToolDownload(gh, { platform: 'darwin', arch: 'x64', tag: 'v2.80.0' }), null, 'no asset for this platform means no download, never a guess');
