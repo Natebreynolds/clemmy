@@ -16,7 +16,7 @@ import { createCheckIn, getCheckIn, closeCheckIn, type CheckInRecord } from './c
 import { isQuietHoursActive, loadProactivityPolicy, saveProactivityPolicy, loadMeetingPreparationProactivityPolicy } from './proactivity-policy.js';
 import { acceptUserInputForRun, claimHarnessChatRequestInTransaction, createSession,
   getHarnessChatRequestReceipt, getLatestEventSeq, getRunAttemptBySourceUserSeq, getSession,
-  isKillRequested, listSessions, listEvents, openEventLog, withEventPublicationTransaction,
+  isKillRequested, listSessions, listEvents, openEventLog, updateSession, withEventPublicationTransaction,
   type EventRow } from '../runtime/harness/eventlog.js';
 import { withFileLockSyncStrict } from '../runtime/atomic-json.js';
 import { exactTerminalForAcceptedSource } from '../runtime/harness/accepted-source-terminal.js';
@@ -501,6 +501,8 @@ function refreshHandoff(recordId: string, answerDigest: string, source: EventRow
   const reason = state === 'settled' ? undefined
     : stopped || terminal?.presentation.status === 'cancelled' || attempt?.status === 'cancelled'
       ? 'You stopped this task. Open its existing chat to inspect completed and uncertain work before continuing.'
+    : terminal && closedBeforeAnyTurn(terminal.event)
+      ? 'Your go-ahead was accepted, but the chat closed before any work began, so nothing was done. Ask me in its chat to start it.'
     : terminal ? 'This task needs your attention. Open its existing chat for the retained result or question.'
     : state === 'dispatched' ? 'The approved task is in its existing chat.'
     : 'The request was accepted, but its start or result is not confirmed. Open its existing chat before retrying; no second copy was started.';
@@ -581,6 +583,7 @@ async function startProposalTurn(record: NoticingProposalRecord, checkIn: CheckI
   });
   if (!accepted) return;
   if (!accepted.inserted) {
+    if (await restartProposalTurnThatNeverStarted(record, checkIn, answerDigest, accepted.source, now)) return;
     refreshHandoff(record.id, answerDigest, accepted.source, requestId, now);
     return;
   }
@@ -589,6 +592,67 @@ async function startProposalTurn(record: NoticingProposalRecord, checkIn: CheckI
   await respondImpl!({ sessionId: accepted.source.sessionId, channel: 'desktop',
     message: checkIn.answer!, sourceUserSeq: accepted.source.seq, runId: accepted.runId });
   refreshHandoff(record.id, answerDigest, accepted.source, requestId, Date.now());
+}
+
+/** The liveness reaper's typed verdict on an accepted message: its chat was
+ *  closed with that message as the last event, so no turn, tool call or reply
+ *  ever ran for it. */
+function closedBeforeAnyTurn(terminal: EventRow): boolean {
+  return terminal.data.reason === 'accepted_input_never_started';
+}
+
+/**
+ * An approved task whose chat closed before any turn ran did nothing, so the
+ * owner's go-ahead still stands: start it once more in the same chat, with
+ * the same frozen task under its own one-time receipt. A restart that never
+ * starts either is not tried again. True when the restart owns the handoff.
+ */
+async function restartProposalTurnThatNeverStarted(record: NoticingProposalRecord, checkIn: CheckInRecord,
+  answerDigest: string, original: EventRow, now: number): Promise<boolean> {
+  const requestId = `noticing-answer:${answerDigest}:restart`;
+  const runId = `noticing-run:${answerDigest}:restart`;
+  const sessionId = original.sessionId;
+  const prior = getHarnessChatRequestReceipt(requestId);
+  if (prior) {
+    const source = listEvents(sessionId, { types: ['user_input_received'], sinceSeq: prior.sinceSeq, limit: 1 })[0];
+    if (!source) return false;
+    refreshHandoff(record.id, answerDigest, source, requestId, now);
+    return true;
+  }
+  const terminal = exactTerminalForAcceptedSource(original);
+  if (!terminal || !closedBeforeAnyTurn(terminal.event) || !respondImpl) return false;
+  const task = readAcceptedNoticingTask({ sessionId, sourceUserSeq: original.seq });
+  if (!task) return false;
+  // A meeting that is no longer current is not prepared for, as on the first start.
+  if ((record.meetingPreparation || task.packet.proposal.calendarPreparation)
+    && !(record.meetingPreparation && currentMeetingPreparation(record.meetingPreparation, Date.now(), 'answer'))) return false;
+  const inputHash = noticingApprovedTaskDigest(task.packet);
+  const accepted = updateNoticingState(state => {
+    const current = state.proposals[record.id];
+    if (!current || current.handoff?.answerDigest !== answerDigest || current.answer?.decision !== 'do_it'
+      || !exactAnsweredCheckIn(current, checkIn)) return null;
+    return withEventPublicationTransaction(() => {
+      const claimed = claimHarnessChatRequestInTransaction(openEventLog(), { requestId, sessionId, runId,
+        inputHash, sinceSeq: getLatestEventSeq(sessionId) });
+      if (!claimed.inserted) return null;
+      const turn = Math.max(original.turn, Number((getSession(sessionId)?.metadata as { __turn?: unknown } | undefined)?.__turn) || 0) + 1;
+      const source = acceptUserInputForRun({ sessionId, turn, role: 'user', data: {
+        text: checkIn.answer, displayText: checkIn.answer, runId, source: 'noticing_answer',
+        noticingApprovedTask: { requestId, digest: inputHash, packet: task.packet },
+      } });
+      // Open again, as a new chat would be, so the liveness check watches the restart too.
+      updateSession(sessionId, { status: 'active' });
+      setHandoff(current, answerDigest, 'dispatched', now, { sessionId, sourceUserSeq: source.seq, requestId,
+        reason: 'Your go-ahead was accepted before, but the chat closed before any work began; it started again in the same chat.' });
+      return source;
+    });
+  });
+  if (!accepted) return false;
+  // The restart receipt is spent before entering the runner, like the first:
+  // whatever happens next, there is no third start.
+  await respondImpl({ sessionId, channel: 'desktop', message: checkIn.answer!, sourceUserSeq: accepted.seq, runId });
+  refreshHandoff(record.id, answerDigest, accepted, requestId, Date.now());
+  return true;
 }
 
 // ── ticking ───────────────────────────────────────────────────────────────────

@@ -562,3 +562,37 @@ test('noticing sees a workflow whose own permissions refused a call and whose go
   const { NOTICING_PROPOSAL_SYSTEM } = await import('../runtime/semantic-boundary/configured-brain-semantic-port.js');
   assert.match(NOTICING_PROPOSAL_SYSTEM, /workflowImprovements/);
 });
+
+test('approved noticing whose chat closed before any turn starts once more in the same chat, and never a third time', async () => {
+  const reconcile = await import('../runtime/harness/session-reconcile.js');
+  const f = fixture();
+  installReader('do_it');
+  const requests: AssistantRequest[] = [];
+  // The app goes down after the answer is accepted and before any turn begins.
+  runtime.bindNoticingRespond(async request => { requests.push(request); });
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 1);
+  const first = requests[0]!;
+  // The liveness check closes the silent chat with its typed verdict.
+  assert.ok(reconcile.reconcileSilentAcceptedInputSessions({ nowMs: Date.now() + 60_000, boundMs: 1 }).ids.includes(first.sessionId));
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 2, 'the go-ahead still stands, so it starts once more');
+  const second = requests[1]!;
+  assert.equal(second.sessionId, first.sessionId, 'in the same chat');
+  assert.ok(second.sourceUserSeq! > first.sourceUserSeq!);
+  assert.equal(second.message, f.answer);
+  const retained = approved.readAcceptedNoticingTask({ sessionId: second.sessionId, sourceUserSeq: second.sourceUserSeq! });
+  assert.ok(retained, 'the same frozen task rides the restart');
+  assert.match(retained.objective, /prepare a draft report/);
+  assert.equal(f.record().handoff?.sourceUserSeq, second.sourceUserSeq);
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 2, 'a tick while it is out does not start it again');
+  // The restart never starts either: closed again, and there is no third start.
+  assert.ok(reconcile.reconcileSilentAcceptedInputSessions({ nowMs: Date.now() + 120_000, boundMs: 1 }).ids.includes(first.sessionId));
+  await runtime.settleNoticingAnswers();
+  await runtime.settleNoticingAnswers();
+  assert.equal(requests.length, 2);
+  assert.equal(f.record().handoff?.state, 'needs_attention');
+  assert.equal(f.record().handoff?.sourceUserSeq, second.sourceUserSeq);
+  assert.match(f.record().handoff?.reason ?? '', /nothing was done/);
+});
