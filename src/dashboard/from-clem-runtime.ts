@@ -618,7 +618,11 @@ function stepOperation(data: Record<string, unknown>): string {
     try {
       const args = typeof field === 'string' ? JSON.parse(field) as Record<string, unknown> : field as Record<string, unknown> | undefined;
       if (args && typeof args === 'object' && typeof args.tool_slug === 'string' && args.tool_slug) return args.tool_slug;
-    } catch { /* the next field, or the tool's own name */ }
+    } catch {
+      // A stored preview is cut at a fixed length; the slug it opens with survives.
+      const slug = typeof field === 'string' ? /^\{\s*"tool_slug"\s*:\s*"([A-Za-z0-9_]+)"/.exec(field)?.[1] : undefined;
+      if (slug) return slug;
+    }
   }
   return typeof data.tool === 'string' ? data.tool : '';
 }
