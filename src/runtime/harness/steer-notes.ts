@@ -23,7 +23,7 @@ import { workflowConversationSlugFromSessionId } from '../../shared/workflow-con
  */
 import { randomUUID } from 'node:crypto';
 import { types } from 'node:util';
-import { appendEvent, listActiveRunAttemptOwnership, listEvents, openEventLog } from './eventlog.js';
+import { appendEvent, listActiveRunAttemptOwnership, listEvents, openEventLog, type EventRow } from './eventlog.js';
 import { isDispatchLeaseCurrent, type DispatchLeaseRef } from './dispatch-lease.js';
 import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js';
 import { readApprovalExecutionSource } from './approval-execution-source.js';
@@ -67,6 +67,25 @@ export class SteerNoteAdmissionError extends Error {
     this.code = fixed;
     this.name = 'SteerNoteAdmissionError';
   }
+}
+
+/** A decision on an approval card (Approve or Reject, tapped or typed) is a
+ * control on the work it resumes, never an assignment of its own: a message
+ * the owner sends after it belongs to that resumed work, whose own handoff
+ * picks it up. Counting the decision as a boundary left such a message owned
+ * by a source no turn would ever run. */
+function isApprovalDecisionControl(row: EventRow): boolean {
+  const data = row.data as Record<string, unknown>;
+  return row.type === 'user_input_received'
+    && (data.source === 'mobile_approval' || data.source === 'desktop_approval')
+    && typeof data.approvalId === 'string' && data.approvalId.trim().length > 0
+    && typeof data.decision === 'string' && data.decision.trim().length > 0;
+}
+
+/** Where one assignment's steering ends: the next accepted source that is a
+ * real assignment, not an approval decision on this one. */
+function isSteeringBoundary(row: EventRow): boolean {
+  return isExecutionSourceBoundary(row) && !isApprovalDecisionControl(row);
 }
 
 export function isSteerNoteAdmissionError(error: unknown): error is SteerNoteAdmissionError {
@@ -456,7 +475,7 @@ export function adoptedSteerNotesForSource(input: {
       types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'],
     });
     const nextSource = rows.find(
-      (row) => isExecutionSourceBoundary(row) && row.seq > input.sourceUserSeq,
+      (row) => isSteeringBoundary(row) && row.seq > input.sourceUserSeq,
     )?.seq ?? Number.MAX_SAFE_INTEGER;
     const delivered = new Set<number>();
     for (const row of rows) {
@@ -550,7 +569,7 @@ export function takeUndeliveredSteerNotes(sessionId: string | undefined, sourceU
       types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'],
     });
     const nextSourceSeq = sourceUserSeq === undefined ? Number.MAX_SAFE_INTEGER
-      : rows.find((row) => isExecutionSourceBoundary(row)
+      : rows.find((row) => isSteeringBoundary(row)
         && row.seq > sourceUserSeq)?.seq ?? Number.MAX_SAFE_INTEGER;
     const delivered = new Set<number>();
     for (const row of rows) {
@@ -588,7 +607,7 @@ export function hasUndeliveredSteerNotes(sessionId: string, sourceUserSeq: numbe
   if (!sessionSupportsSteering(sessionId)) return false;
   const rows = listEvents(sessionId, { sinceSeq: sourceUserSeq,
     types: ['user_steer_note', 'user_steer_note_delivered', 'user_input_received'] });
-  const next = rows.find(isExecutionSourceBoundary)?.seq
+  const next = rows.find(isSteeringBoundary)?.seq
     ?? Number.MAX_SAFE_INTEGER;
   const delivered = new Set(rows.flatMap(row => row.type === 'user_steer_note_delivered'
     && Array.isArray(row.data.noteSeqs) ? row.data.noteSeqs : []));
