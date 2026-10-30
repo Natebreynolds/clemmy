@@ -2,7 +2,7 @@ import AppIntents
 
 struct AskClemOnWatchIntent: AppIntent {
     static var title: LocalizedStringResource = "Ask Clem"
-    static var description = IntentDescription("Dictate a question to Clem through your paired iPhone.")
+    static var description = IntentDescription("Dictate a question to Clem through your paired phone.")
     static var openAppWhenRun = false
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresLocalDeviceAuthentication
 
@@ -30,7 +30,7 @@ struct AskClemOnWatchIntent: AppIntent {
 
 struct CheckInWithClemOnWatchIntent: AppIntent {
     static var title: LocalizedStringResource = "Check in with Clem"
-    static var description = IntentDescription("Read a short check-in from Clem through your paired iPhone.")
+    static var description = IntentDescription("Read a short check-in from Clem through your paired phone.")
     static var openAppWhenRun = false
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresLocalDeviceAuthentication
 
@@ -49,7 +49,7 @@ struct CheckInWithClemOnWatchIntent: AppIntent {
 
 struct ReadClemWatchResultIntent: AppIntent {
     static var title: LocalizedStringResource = "Read latest Clem result"
-    static var description = IntentDescription("Check the exact saved Watch task without submitting it again.")
+    static var description = IntentDescription("Check the exact saved task without submitting it again.")
     static var openAppWhenRun = false
     static var authenticationPolicy: IntentAuthenticationPolicy = .requiresLocalDeviceAuthentication
 
