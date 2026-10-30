@@ -117,6 +117,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem.watch
         PRODUCT_NAME: ClemWatch
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CURRENT_PROJECT_VERSION: 20
         MARKETING_VERSION: 0.1.0
         SKIP_INSTALL: true
