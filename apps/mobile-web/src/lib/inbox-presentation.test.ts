@@ -433,3 +433,23 @@ test('workflow reports without chat sessions open only their existing canonical 
   assert.equal(notificationWorkflowHref(row,canonical),'/m/?tab=workflows&workflow=controlled-saved');
   assert.equal(notificationWorkflowHref(row,{...canonical,lifecycle:{...lifecycle,generation:'b'.repeat(64)}}),null,'an old report cannot borrow a newer alias mapping');
 });
+
+test('a calendar change reads its time as one When line in its own zone, and anything unparseable stays exact', () => {
+  const row = (details: Array<{ label: string; value: string }>) => ({ args: undefined, preview: undefined, contentPreview: undefined,
+    presentation: { action: 'Move a meeting', details: details.map((d) => ({ ...d, long: false })), unwrapped: true } });
+  const review = approvalCardReview(row([
+    { label: 'Subject', value: 'EOM Check-in' },
+    { label: 'Start datetime', value: '2026-10-30T13:00:00' },
+    { label: 'End datetime', value: '2026-10-30T13:45:00' },
+    { label: 'Time zone', value: 'America/Los_Angeles' },
+  ]) as never);
+  assert.deepEqual(review.details.map((d) => `${d.label}: ${d.value}`), [
+    'Subject: EOM Check-in',
+    'When: Fri, Oct 30, 1:00 PM – 1:45 PM · America/Los_Angeles',
+  ]);
+  const odd = approvalCardReview(row([
+    { label: 'Start datetime', value: 'tomorrow-ish' },
+    { label: 'End datetime', value: '2026-10-30T13:45:00' },
+  ]) as never);
+  assert.deepEqual(odd.details.map((d) => d.label), ['Start datetime', 'End datetime'], 'never a guessed time');
+});

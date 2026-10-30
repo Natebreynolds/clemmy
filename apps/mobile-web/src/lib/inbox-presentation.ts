@@ -169,6 +169,35 @@ export function approvalDetails(row: Pick<ApprovalRow, 'args'>): ApprovalDetailR
  * Legacy flat actions can still be reviewed on the phone when every value fits
  * the readable presenter. An opaque carrier or clipped value needs the full
  * desktop review; a short content preview cannot establish its whole scope. */
+/** A calendar time as the card shows it: wall time in its own zone, never
+ *  re-read in the phone's zone (which can move an event to another day). */
+function wallTime(value: string, timeOnly = false): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(value)) return null;
+  const date = new Date(`${value.length === 16 ? `${value}:00` : value}Z`);
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value.slice(0, 10)) return null;
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', hour: 'numeric', minute: '2-digit',
+    ...(timeOnly ? {} : { weekday: 'short', month: 'short', day: 'numeric' } as const) }).format(date);
+}
+
+/** A start, an end and their time zone read as one "When" line: "Thu, Oct 30,
+ *  1:00 PM – 1:45 PM · America/Los_Angeles". Anything that does not parse
+ *  exactly stays as the rows it came in. */
+function readableWhen(rows: ApprovalDetailRow[]): ApprovalDetailRow[] {
+  const find = (pattern: RegExp) => rows.find((row) => pattern.test(row.label.trim()));
+  const start = find(/^start(?:\s*date\s*time|\s*time)?$/i);
+  const end = find(/^end(?:\s*date\s*time|\s*time)?$/i);
+  const zone = find(/^time\s*zone$/i);
+  if (!start || !end) return rows;
+  const from = wallTime(start.value.trim());
+  const sameDay = start.value.trim().slice(0, 10) === end.value.trim().slice(0, 10);
+  const to = wallTime(end.value.trim(), sameDay);
+  if (!from || !to || end.value.trim() <= start.value.trim()) return rows;
+  const when = { label: 'When', value: `${from} – ${to}${zone ? ` · ${zone.value.trim()}` : ''}`, long: false };
+  const before = rows.slice(0, rows.indexOf(start)).filter((row) => row !== end && row !== zone).length;
+  const rest = rows.filter((row) => row !== start && row !== end && row !== zone);
+  return [...rest.slice(0, before), when, ...rest.slice(before)];
+}
+
 export function approvalCardReview(row: Pick<ApprovalRow, 'args' | 'preview' | 'presentation' | 'contentPreview'>): {
   preview: ApprovalRow['preview'] | null;
   details: ApprovalDetailRow[];
@@ -222,8 +251,8 @@ export function approvalCardReview(row: Pick<ApprovalRow, 'args' | 'preview' | '
   // An incomplete review may show a readable server summary, never the carrier
   // arguments that could not be represented. The computer owns its full review.
   const shownPreview = complete ? preview : null;
-  const details = shownPreview ? [] : complete ? approvalDetails(row)
-    : (row.presentation?.details ?? []).filter(readableDetail);
+  const details = readableWhen(shownPreview ? [] : complete ? approvalDetails(row)
+    : (row.presentation?.details ?? []).filter(readableDetail));
   const draft = row.contentPreview?.body?.trim() ?? '';
   const draftPrefix = draft.replace(/(?:…|\.{3})$/, '').trimEnd();
   const draftAlreadyRecorded = Boolean(shownPreview && draftPrefix && shownPreview.items?.some(item => item.fields.some(field =>
