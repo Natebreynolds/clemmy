@@ -422,3 +422,11 @@ test('an Activity row is named by the work, never by a card answer or a machine-
   assert.equal(__test__.activityRunTitle(watch, { text: 'Calendar watch tick-1: read FIXTURE_OP on ca_1', synthetic: true, source: 'calendar_watch' }, 'Calendar watch tick-1: read FIXTURE_OP on ca_1'),
     'Calendar watch');
 });
+
+test('an activity preview is what the owner reads, never the retained-work checkpoint the next turn reuses', () => {
+  // Live 2026-10-30: the phone's Tasks & results read "Can I move the team
+  // meeting…? Retained work (durable checkpoint): - Source/tool outlook_get_cale…".
+  const reply = 'Which one should I add oranges to?\n\nRetained work (durable checkpoint):\n- Source/tool run_shell_command: completed result retained as rh_0123456789abcdef.\nExternal write state: no settled external-write attempt is recorded.';
+  assert.equal(__test__.completionOutputPreview({ data: { reply } }), 'Which one should I add oranges to?');
+  assert.equal(__test__.completionOutputPreview({ data: { reply: 'All set.' } }), 'All set.');
+});

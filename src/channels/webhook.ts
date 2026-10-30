@@ -169,6 +169,7 @@ import {
 } from '../execution/background-tasks.js';
 import { saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { withoutRetainedWorkCheckpoint } from '../runtime/harness/retained-work-checkpoint.js';
 import { isEmptyHistoryNotice, noticeListFields } from '../runtime/notice-presentation.js';
 
 const logger = pino({ name: 'clementine-next.webhook' });
@@ -241,8 +242,10 @@ function completionOutputPreview(
   limit = 1200,
 ): string {
   const data = completion?.data as { reply?: unknown; summary?: unknown } | undefined;
-  const reply = typeof data?.reply === 'string' ? data.reply.trim() : '';
-  const summary = typeof data?.summary === 'string' ? data.summary.trim() : '';
+  // The retained-work checkpoint is for the turn that resumes the work; the
+  // preview is what the owner reads (Activity, the phone's Tasks & results).
+  const reply = typeof data?.reply === 'string' ? withoutRetainedWorkCheckpoint(data.reply).trim() : '';
+  const summary = typeof data?.summary === 'string' ? withoutRetainedWorkCheckpoint(data.summary).trim() : '';
   return (reply || summary).slice(0, limit);
 }
 
