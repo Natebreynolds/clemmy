@@ -180,8 +180,8 @@ import { acceptedAttachmentFiles, type AttachmentFileReference } from '../runtim
 import { presentApprovalForHumans, unwrapApprovalCall } from './approval-presentation.js';
 import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeItem } from '../runtime/home-snoozes.js';
 import { attentionLifecycleForKey, bootParkedWorkflows, listAttentionPresentations, needsYouKey, needsYouReferents,
-  notificationAttentionHidden, notificationNeedsYou, presentAttentionItem, summarizeNeedsYou } from './needs-you.js';
-import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion, visibleInboxQuestions } from './question-presentation.js';
+  notificationAttentionHidden, notificationNeedsYou, openInboxQuestions, presentAttentionItem, stoppedRunSuperseded, summarizeNeedsYou } from './needs-you.js';
+import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion } from './question-presentation.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -11443,7 +11443,7 @@ export function registerConsoleRoutes(
   app.get('/api/console/inbox/questions', (req, res) => {
     if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
     try {
-      const questions = visibleInboxQuestions().map(projectInboxQuestion);
+      const questions = openInboxQuestions().map(projectInboxQuestion);
       res.json({ questions, count: questions.length });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -13425,10 +13425,12 @@ export function registerConsoleRoutes(
         let pendingMutationBlock: Record<string, unknown> | undefined;
         let pendingCapabilityBlock: Record<string, unknown> | undefined;
         let pendingQuestion: string | undefined;
+        let pendingRecord: Record<string, unknown> | undefined;
         const pendingRecordPath = workflowRunRecordPathForConsole(pending.runId);
         if (pendingRecordPath && fs.existsSync(pendingRecordPath)) {
           try {
             const raw = JSON.parse(fs.readFileSync(pendingRecordPath, 'utf-8')) as Record<string, unknown>;
+            pendingRecord = raw;
             reservedProjectRoot = isReservedProjectWorkflowRunRecord(raw);
             pendingMutationBlock = projectWorkflowMutationBlock(raw.mutationBlock);
             pendingCapabilityBlock = projectWorkflowCapabilityBlock(raw.capabilityBlock);
@@ -13468,29 +13470,44 @@ export function registerConsoleRoutes(
         // A run that asked the owner a question waits on their answer. It used
         // to fall through to its unfinished step and read "Running step …".
         const awaitingInput = pending.runStatus === 'awaiting_input';
-        const column: BoardColumnId = mutationBlocked || capabilityBlocked || awaitingInput
+        // A run whose question its workflow answered by running again since
+        // (dashboard/needs-you.ts) is no longer an ask: it is listed as not
+        // needed, still stoppable, never closed for the owner.
+        const superseded = pendingRecord && !reservedProjectRoot ? stoppedRunSuperseded(pendingRecord) : null;
+        const column: BoardColumnId = superseded
+          ? 'done'
+          : mutationBlocked || capabilityBlocked || awaitingInput
           ? 'needs_you'
           : pending.inFlightStepId ? 'running' : 'queued';
-        // A parked run is waiting on a human (approval consumption), not
-        // working — carrying the real state through lets the board say
-        // "Waiting for your approval" instead of a false "Working" pill.
+        // A parked run is waiting on a human, not working — carrying the real
+        // state through lets the board say so instead of a false "Working"
+        // pill. The boot-resume cap parks a run that kept restarting; that is
+        // a resume-or-skip decision, not an approval.
         const parked = pending.runStatus === 'parked';
+        const restartParked = parked && typeof pendingRecord?.bootResumeParkedAt === 'string'
+          && !(pendingRecord.parked && typeof pendingRecord.parked === 'object');
         cards.push({
           id: `wf:${pending.workflowName}:${pending.runId}`,
           sourceKind: 'workflow',
           title: workflowEntry?.data.name ?? pending.workflowName,
           column,
-          status: mutationBlocked
+          status: superseded
+            ? 'not_needed'
+            : mutationBlocked
             ? 'blocked_mutation'
             : capabilityBlocked ? 'blocked_capability'
             : awaitingInput ? 'awaiting_input'
             : parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
-          progressHint: mutationBlocked
+          progressHint: superseded
+            ? `Not needed any more: this workflow ran again and finished on ${new Date(superseded.finishedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}. Stop this older run to clear it.`
+            : mutationBlocked
             ? `Provider outcome needs reconciliation for step ${String(pendingMutationBlock?.stepId ?? pending.inFlightStepId ?? 'unknown')}; the call was not sent again`
             : capabilityGate
             ? `${capabilityGate.title} — step ${capabilityGate.stepId} stopped before anything was sent${capabilityGate.message ? `: ${capabilityGate.message}` : ''}`
             : awaitingInput
             ? `Waiting on your answer${pendingQuestion ? `: ${pendingQuestion.length > 220 ? `${pendingQuestion.slice(0, 219)}…` : pendingQuestion}` : ''}`
+            : restartParked
+            ? 'Stopped after restarting several times. Resume it or skip it.'
             : parked
             ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
             : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
@@ -13502,10 +13519,10 @@ export function registerConsoleRoutes(
           // background-task card already carries.
           ageMs: ageMs(pending.startedAt ?? pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
-          actions: mutationBlocked || capabilityBlocked || awaitingInput
+          actions: superseded || mutationBlocked || capabilityBlocked || awaitingInput
             ? ['cancel']
             : recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
-          primaryAction: mutationBlocked || capabilityBlocked || awaitingInput ? 'none' : recovery.primaryAction,
+          primaryAction: superseded || mutationBlocked || capabilityBlocked || awaitingInput ? 'none' : recovery.primaryAction,
           ...(capabilityGate
             ? {
                 nextEdge: {
@@ -15124,7 +15141,7 @@ export function registerConsoleRoutes(
         .filter(approvalRegistry.isFormalApprovalSurface);
       const planProposals = listPlanProposals({ status: 'pending', limit: 20 });
       const checkInProposals = listProposals({ status: 'pending', limit: 20 });
-      const inboxQuestions = withDaemonRuntimePhaseSync('daemon.http.command_center.inbox_questions', {}, () => visibleInboxQuestions());
+      const inboxQuestions = withDaemonRuntimePhaseSync('daemon.http.command_center.inbox_questions', {}, () => openInboxQuestions());
       const openCheckIns = listActionableCheckIns();
       // For WORKING NOW we only want executions the daemon is RUNNING
       // right now. Blocked/paused are stalled — they show in Activity.

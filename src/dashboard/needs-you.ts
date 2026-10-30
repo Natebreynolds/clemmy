@@ -86,6 +86,8 @@ interface RunIndex {
   outageParkedRuns: Set<string>;
   /** Current run facts fence a new stop even when it has no new carrier yet. */
   latestGeneration?: ReadonlyMap<string, string>;
+  /** workflow key → when its newest run began (ms). */
+  latestAt?: ReadonlyMap<string, number>;
 }
 
 const RUN_INDEX_TTL_MS = 15_000;
@@ -146,9 +148,31 @@ export function readRunIndex(runsDir = WORKFLOW_RUNS_DIR, nowMs = Date.now(), fr
   }
   const latestStatus = new Map([...newest].map(([key, value]) => [key, value.status]));
   const latestGeneration = new Map([...newest].map(([key, value]) => [key, value.generation]));
-  const index = { workflowOfRun, latestStatus, outageParkedRuns, latestGeneration };
+  const latestAt = new Map([...newest].map(([key, value]) => [key, value.at]));
+  const index = { workflowOfRun, latestStatus, outageParkedRuns, latestGeneration, latestAt };
   if (runsDir === WORKFLOW_RUNS_DIR) runIndexCache = { at: nowMs, dirMtimeMs, index };
   return index;
+}
+
+/**
+ * A run parked on a model outage asks "try again?"; a newer run of the same
+ * workflow that completed has answered it. Such a run is not an ask: it stays
+ * listed (and stoppable) as no longer needed, never closed for the owner. A
+ * run parked after repeated restarts is different: its occurrence may hold
+ * work of its own, so it stays a resume-or-skip decision.
+ */
+export function stoppedRunSuperseded(
+  record: Record<string, unknown>,
+  runs: RunIndex = readRunIndex(),
+): { finishedAt: number } | null {
+  const id = typeof record.id === 'string' ? record.id : '';
+  const key = id ? runs.workflowOfRun.get(id) : undefined;
+  if (!key || record.status !== 'awaiting_input' || !runs.outageParkedRuns.has(id)) return null;
+  if (runs.latestStatus.get(key) !== 'completed') return null;
+  const latestAt = runs.latestAt?.get(key);
+  const at = runTime(record);
+  if (latestAt === undefined || !Number.isFinite(at) || latestAt <= at) return null;
+  return { finishedAt: latestAt };
 }
 
 // ─── Runs paused after repeated restarts ─────────────────────────────────────
@@ -266,6 +290,27 @@ function parkedOnModelOutage(record: Record<string, unknown>): boolean {
   }
 }
 
+/** A run parked on an outage holds no decision once its workflow has run to
+ *  completion again: the next occurrence did the work the question was about. */
+function supersededInboxQuestionIds(questions: ReturnType<typeof listInboxQuestions>, runs: RunIndex): Set<string> {
+  const superseded = new Set<string>();
+  for (const row of questions) {
+    const workflow = row.source === 'workflow' && row.runId && runs.outageParkedRuns.has(row.runId)
+      ? runs.workflowOfRun.get(row.runId) : undefined;
+    if (workflow && runs.latestStatus.get(workflow) === 'completed') superseded.add(row.id);
+  }
+  return superseded;
+}
+
+/** The questions a list shows: the visible ones the count also counts. The
+ *  lists used to keep a question a newer run had answered while the count
+ *  dropped it. */
+export function openInboxQuestions(nowMs = Date.now()): ReturnType<typeof listInboxQuestions> {
+  const questions = listInboxQuestions();
+  const superseded = supersededInboxQuestionIds(questions, readRunIndex(WORKFLOW_RUNS_DIR, nowMs));
+  return visibleInboxQuestions(questions, nowMs).filter((row) => !superseded.has(row.id));
+}
+
 export function needsYouReferents(nowMs = Date.now(), options: { freshRuns?: boolean; pendingRuns?: readonly PendingRun[] } = {}): NeedsYouReferents {
   const approvals = approvalRegistry.listPending({ status: 'pending' })
     .filter((row) => !approvalRegistry.isExpired(row))
@@ -278,18 +323,13 @@ export function needsYouReferents(nowMs = Date.now(), options: { freshRuns?: boo
   const planIds = new Set(listPlanProposals({ status: 'pending', limit: 100 }).map((row) => row.id));
   const trustIds = new Set(listTrustProposals('pending').map((row) => row.id));
   const runs = readRunIndex(WORKFLOW_RUNS_DIR, nowMs, options.freshRuns);
-  // A run parked on an outage holds no decision once its workflow has run to
-  // completion again: the next occurrence did the work the question was about.
   const questionIds = new Set<string>();
-  const supersededQuestionIds = new Set<string>();
   const questions = listInboxQuestions();
   const visibleIds = new Set(visibleInboxQuestions(questions, nowMs).map((row) => row.id));
   const hiddenQuestionIds = new Set(questions.filter((row) => !visibleIds.has(row.id)).map((row) => row.id));
+  const supersededQuestionIds = supersededInboxQuestionIds(questions, runs);
   for (const row of questions) {
-    const workflow = row.source === 'workflow' && row.runId && runs.outageParkedRuns.has(row.runId)
-      ? runs.workflowOfRun.get(row.runId) : undefined;
-    if (workflow && runs.latestStatus.get(workflow) === 'completed') supersededQuestionIds.add(row.id);
-    else if (visibleIds.has(row.id)) questionIds.add(row.id);
+    if (!supersededQuestionIds.has(row.id) && visibleIds.has(row.id)) questionIds.add(row.id);
   }
   const ref: NeedsYouReferents = {
     approvalIds,

@@ -1081,7 +1081,7 @@ export function cardTone(card: BoardCard): { tone: Tone; label: string } {
       label: card.status === 'awaiting_approval'
         ? 'Approval'
         : card.status === 'awaiting_input'
-          ? 'Input'
+          ? 'Your answer'
         : card.status === 'awaiting_continue'
           ? 'Continue'
           : humanStatusLabel(card.status),

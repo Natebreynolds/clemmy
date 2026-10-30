@@ -3902,6 +3902,38 @@ test('GET /api/console/board shows a run waiting on the owner\'s answer once, in
   }
 });
 
+// The boot-resume cap parks a run that kept restarting. The board called it
+// "Waiting for your approval on step main" (live 2026-10-30); no approval was
+// asked. It is a resume-or-skip decision.
+test('GET /api/console/board says a run parked after repeated restarts stopped, not that it waits for an approval', async () => {
+  const workflowSlug = 'board-restart-parked-wf';
+  const runId = 'sched-restart-parked-0001';
+  writeWorkflow(workflowSlug, {
+    name: 'Board Restart Parked',
+    description: 'restart parked test workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'main', prompt: 'Do it.' }],
+  } as never);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: workflowSlug, workflowSlug, status: 'parked', source: 'schedule',
+    createdAt: new Date().toISOString(), bootResumeParkedAt: new Date().toISOString(), bootResumeCount: 4,
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'main' });
+
+  const h = await boot();
+  try {
+    const body = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: Array<BoardCard & { progressHint?: string }> };
+    const card = body.cards.find((c) => c.id === `wf:${workflowSlug}:${runId}`);
+    assert.ok(card);
+    assert.equal(card!.progressHint, 'Stopped after restarting several times. Resume it or skip it.');
+  } finally {
+    await h.close();
+  }
+});
+
 test('GET /api/console/board shows a scheduled workflow with an unbound required resource as a Needs you card linking to Automate', async () => {
   writeWorkflow('board-unbound-sheet', {
     name: 'board-unbound-sheet',

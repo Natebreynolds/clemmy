@@ -18,7 +18,7 @@ import { registerWorkspaceSourceControlRoutes } from '../dashboard/workspace-sou
 import { presentApprovalForHumans, type ApprovalPresentation } from '../dashboard/approval-presentation.js';
 import { patchUnifiedSession } from '../dashboard/sessions-api.js';
 import { attentionLifecycleForKey, listAttentionPresentations, needsYouKey, needsYouReferents, notificationActionItemId,
-  notificationAttentionHidden, notificationNeedsYou, presentAttentionItem, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
+  notificationAttentionHidden, notificationNeedsYou, openInboxQuestions, presentAttentionItem, summarizeNeedsYou, type NeedsYouReferents } from '../dashboard/needs-you.js';
 import { extractApprovalContentPreview, type ApprovalContentPreview } from '../runtime/approval-summary.js';
 import { ApprovalControlBindingUnavailable, commitLiveApprovalControl } from '../runtime/harness/live-approval-control.js';
 import { approvalDecisionAckMetadata } from '../runtime/harness/approval-decision-ack.js';
@@ -215,7 +215,7 @@ import {
   answerInboxQuestion as answerUnifiedInboxQuestion,
   type InboxQuestionItem,
 } from '../execution/inbox-questions.js';
-import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion, visibleInboxQuestions as listUnifiedInboxQuestions } from '../dashboard/question-presentation.js';
+import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion } from '../dashboard/question-presentation.js';
 import {
   projectWorkflowCapabilityInboxGate,
   type WorkflowCapabilityInboxGate,
@@ -771,7 +771,8 @@ function serializeInboxTrustProposal(row: TrustProposal): MobileInboxTrustPropos
 }
 
 function mobileInboxQuestions(): InboxQuestionItem[] {
-  return listUnifiedInboxQuestions();
+  // The same list the desktop shows and the count counts (dashboard/needs-you.ts).
+  return openInboxQuestions();
 }
 
 interface MobileWorkflowRunSummary {

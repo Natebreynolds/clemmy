@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -15,7 +15,7 @@ const TMP_HOME = mkdtempSync(path.join(os.tmpdir(), 'clemmy-needs-you-test-'));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 
-const { summarizeNeedsYou, needsYouReferents, needsYouKey, notificationNeedsYou, questionsByWorkflow } = await import('./needs-you.js');
+const { summarizeNeedsYou, needsYouReferents, needsYouKey, notificationNeedsYou, openInboxQuestions, questionsByWorkflow, readRunIndex, stoppedRunSuperseded } = await import('./needs-you.js');
 const { addNotification } = await import('../runtime/notifications.js');
 const approvalRegistry = await import('../runtime/harness/approval-registry.js');
 const { createSession } = await import('../runtime/harness/eventlog.js');
@@ -156,6 +156,17 @@ test('a run parked because the model was unreachable stops asking once its workf
   assert.equal(asked.some((key) => key.startsWith('workflow:run-outage|')), false, 'superseded outage question');
   assert.ok(asked.some((key) => key.startsWith('workflow:run-real-ask|')), 'a real clarification still counts');
   assert.ok(asked.some((key) => key.startsWith('workflow:run-outage-still|')), 'an outage question with no later run still counts');
+
+  // The lists show what the count counts. Live 2026-10-30 the count dropped an
+  // 8-day-old outage question while both Inboxes still listed it.
+  const listed = openInboxQuestions(NOW).map((row) => row.runId);
+  assert.equal(listed.includes('run-outage'), false, 'the answered outage question leaves the lists too');
+  assert.ok(listed.includes('run-real-ask') && listed.includes('run-outage-still'));
+  const runs = readRunIndex(WORKFLOW_RUNS_DIR, NOW, true);
+  const record = (id: string) => JSON.parse(readFileSync(path.join(WORKFLOW_RUNS_DIR, `${id}.json`), 'utf8')) as Record<string, unknown>;
+  assert.ok(stoppedRunSuperseded(record('run-outage'), runs), 'the board can say the old run is no longer needed');
+  assert.equal(stoppedRunSuperseded(record('run-real-ask'), runs), null, 'a real question is never retired by a later run');
+  assert.equal(stoppedRunSuperseded(record('run-outage-still'), runs), null);
 });
 
 test('a notification carrying a pending approval is that approval, counted once', async () => {
