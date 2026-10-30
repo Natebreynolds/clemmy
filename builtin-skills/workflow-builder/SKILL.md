@@ -44,7 +44,7 @@ Decide these before calling `workflow_create`:
    - `{"op":"sort","value":<list>,"by":[{"column":"name","direction":"asc|desc"}]}` · `{"op":"unique","value":<list>,"keys":["id"]}`
    - `{"op":"aggregate","value":<list>,"groupBy":["owner"],"metrics":[{"fn":"count|sum|avg|min|max","column":"amount"}]}`
    A call step's output is what its tool returned; a path its `{"data": …}` envelope does not have reads that data. To see the real shape, read the step's output in a test run (`workflow_run_status`) before writing a transform against it.
-4. **Data flow**: `dependsOn` lists the steps whose output a step needs. Refer to output as `{{steps.<id>.output}}` (add `.path` for a field).
+4. **Data flow**: `dependsOn` lists the steps whose output a step needs. Refer to output as `{{steps.<id>.output}}` (add `.path` for a field). Dates are tokens, never literal days, or every later run reads the day it was written: `{{date}}` is today on the owner's clock (`{{date+1d}}`, `{{date-7d}}` step the calendar), `{{date}}T00:00:00` is the owner's midnight with their offset, and `{{now}}` / `{{now+24h}}` are exact instants.
 5. **Per-item work**: `forEach` runs a step once per item of a list. The source can be written `steps.<id>.output[.path]`, `{{steps.<id>.output}}`, `<id>.output`, a bare step id, or `input.<key>`. Inside the step, `{{item}}` is the current item. On a recurring workflow, `forEachNewOnly: true` skips items earlier runs already finished. Structured `call` fan-out supports reads only.
 6. **Trigger**: manual, a schedule (`trigger_schedule` plus `trigger_timezone` in the user's zone), or an event.
 7. **Inputs** the user gives each run, with defaults where you can. Fixed accounts, sheets, folders and channels go in `resources`, not inputs.
