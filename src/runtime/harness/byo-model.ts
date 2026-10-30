@@ -54,7 +54,6 @@ import { captureModelTransportUsageOwner, captureActiveModelTransportUsage, capt
   observeModelTransportFetch, type CapturedModelTransportUsage } from './model-transport-observation.js';
 import { recordWindowAcceptance, recordWindowRejection } from './model-window-observations.js';
 import { harnessRunContextStorage } from './brackets.js';
-import { XAI_PROVIDER_ID } from './byo-providers.js';
 import { materializeStrictNullableFields } from '../schema-normalizer.js';
 import { withConversationProtocolBoundaryAssertion } from './conversation-protocol-boundary.js';
 import {
@@ -1394,19 +1393,6 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
         return res;
       }) as typeof fetch
     : baseFetch;
-  // xAI keeps a prompt's cached prefix on one server and sends calls that
-  // carry the same `x-grok-conv-id` to it; an unkeyed call can land on a cold
-  // server even mid-conversation. One conversation, one id — the same rule
-  // the Codex lane keys its prompt cache by (codexPromptCacheKey).
-  const conversationFetch: typeof fetch = byo.providerId === XAI_PROVIDER_ID
-    ? (async (url, init) => {
-        const id = grokConversationId(harnessRunContextStorage.getStore()?.sessionId);
-        if (!id) return capturingFetch(url as never, init as never);
-        const headers = new Headers(init?.headers as HeadersInit | undefined);
-        headers.set('x-grok-conv-id', id);
-        return capturingFetch(url as never, { ...(init ?? {}), headers } as never);
-      }) as typeof fetch
-    : capturingFetch;
   // Every wire call is a dispatch of the model call that owns it, the same way
   // the Claude and Jev transports report theirs. Without this a BYO brain's
   // completed response had no dispatch and so no completion receipt: the
@@ -1414,7 +1400,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // "no_completed_receipt"), and the card kept the fixed host line.
   const observedFetch: typeof fetch = (async (url, init) =>
     observeModelTransportFetch('openai_compatible_chat', requestedModelFromBody(init?.body),
-      () => conversationFetch(url as never, init as never))) as typeof fetch;
+      () => capturingFetch(url as never, init as never))) as typeof fetch;
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,
@@ -1431,13 +1417,6 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
     promptLayout: { baseURL: byo.baseURL },
   });
   return client;
-}
-
-/** The conversation id xAI routes a call's prompt cache by: one per Clem
- *  conversation, digested so the session id itself never leaves the machine. */
-export function grokConversationId(sessionId: string | undefined): string | undefined {
-  if (!sessionId) return undefined;
-  return `clem:${createHash('sha256').update(sessionId, 'utf8').digest('hex').slice(0, 16)}`;
 }
 
 /** Get (memoized) a `Model` for `modelId` on the BYO backend. */
