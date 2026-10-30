@@ -394,6 +394,11 @@ export function userFacingRunState(run: ActivityRunLike, nowMs = Date.now()): Us
   if (status === 'failed' || latestType === 'run_failed' || latestType === 'failed' || run.error) return 'failed';
   if (status === 'cancelled' || latestType === 'cancelled') return 'cancelled';
   if (run.needsAttention === true) return 'needs_attention';
+  // A status that says the work waits on the owner was already decided from
+  // the run's own order of events; a reply that asks for approval completes
+  // the turn, not the work, so its completion milestone does not outrank it.
+  if (status === 'awaiting_approval') return 'waiting_for_approval';
+  if (status === 'awaiting_input' || status === 'awaiting_user_input') return 'waiting_for_input';
   if (status === 'completed' || latestType === 'run_completed' || latestType === 'completed' || latestType === 'conversation_completed') return 'completed';
   if (status === 'awaiting_approval' || status === 'parked' || status === 'paused' || latestType === 'approval_requested' || latestType === 'approval_required') return 'waiting_for_approval';
   if (status === 'awaiting_input' || status === 'awaiting_user_input' || latestType === 'awaiting_user_input' || latestType === 'input_required') return 'waiting_for_input';

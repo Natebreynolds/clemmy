@@ -185,6 +185,17 @@ test('userFacingRunState distinguishes planning, execution, waiting, and stale w
     events: [{ type: 'input_required', createdAt: '2026-05-29T10:29:30Z' }],
   }, now), 'waiting_for_input');
 
+  // Live 2026-10-30: a chat whose reply asked for approval read "Done" while
+  // the approval was still open.
+  assert.equal(userFacingRunState({
+    status: 'awaiting_approval',
+    updatedAt: '2026-05-29T10:29:30Z',
+    events: [
+      { type: 'approval_requested', createdAt: '2026-05-29T10:29:29Z' },
+      { type: 'conversation_completed', createdAt: '2026-05-29T10:29:30Z' },
+    ],
+  }, now), 'waiting_for_approval');
+
   assert.equal(userFacingRunState({
     status: 'parked',
     updatedAt: '2026-05-29T10:29:30Z',
