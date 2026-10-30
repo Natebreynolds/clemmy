@@ -743,15 +743,36 @@ function readExactWorkflowRunForStatus(runId: string):
   }
 }
 
+/** The slug a run was admitted under: a creation test's record names the
+ * workflow as the owner sees it, while its step journal lives under the slug. */
+function admittedWorkflowSlug(record: Record<string, unknown>): string | undefined {
+  const admitted = (record.workflowDefinitionSnapshot as { workflowSlug?: unknown } | undefined)?.workflowSlug;
+  return typeof admitted === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(admitted) ? admitted : undefined;
+}
+
+/** What each step of a run produced. A creation test's record holds only its
+ * verdict, so its steps' results come from the run's own step journal — the
+ * same evidence workflow_create quoted when the test passed. */
+function recordedStepOutputs(record: Record<string, unknown>, runId: string): Record<string, unknown> {
+  if (record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)) {
+    return record.stepOutputs as Record<string, unknown>;
+  }
+  const slug = record.status === 'creation_test' ? admittedWorkflowSlug(record) : undefined;
+  if (!slug) return {};
+  const outputs: Record<string, unknown> = {};
+  for (const event of readWorkflowEvents(slug, runId)) {
+    if (event.kind === 'step_completed' && event.stepId && event.output !== undefined) outputs[event.stepId] = event.output;
+  }
+  return outputs;
+}
+
 /**
  * One step's output from a run, whole and paged: what the step actually
  * produced, so a conversation about a run reads the work itself rather than
  * a 300-character clip of it.
  */
 export function renderWorkflowRunStepOutput(record: Record<string, unknown>, runId: string, stepId: string, offset = 0): string {
-  const outputs = record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)
-    ? record.stepOutputs as Record<string, unknown>
-    : {};
+  const outputs = recordedStepOutputs(record, runId);
   if (!(stepId in outputs)) {
     const known = Object.keys(outputs);
     return `Run ${runId} has no output recorded for step "${stepId}".${known.length > 0 ? ` Steps with output: ${known.join(', ')}.` : ' No step recorded output.'}`;
@@ -2883,9 +2904,7 @@ export function registerOrchestrationTools(server: McpServer): void {
           // detail a user actually needs to diagnose "step 3 of 7 failed"
           // without opening the console. Values truncated; the run record on
           // disk keeps the full outputs.
-          const stepOutputs = record.stepOutputs && typeof record.stepOutputs === 'object' && !Array.isArray(record.stepOutputs)
-            ? Object.entries(record.stepOutputs as Record<string, unknown>)
-            : [];
+          const stepOutputs = Object.entries(recordedStepOutputs(record, run_id));
           const blockedSteps = Array.isArray(record.blockedSteps)
             ? (record.blockedSteps as Array<{ stepId?: unknown; reason?: unknown }>)
             : [];
@@ -3090,10 +3109,8 @@ function creationTestProducedLines(settled: WorkflowCreationTestSettlement): str
   if (!exact.ok) return [];
   const record = exact.record;
   // A creation test's record holds only its verdict; what its steps returned
-  // is in the run's own step journal, kept under the workflow's slug (the
-  // record names the workflow as the owner sees it).
-  const admittedSlug = (record.workflowDefinitionSnapshot as { workflowSlug?: unknown } | undefined)?.workflowSlug;
-  const slug = typeof admittedSlug === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(admittedSlug) ? admittedSlug : undefined;
+  // is in the run's own step journal, kept under the workflow's slug.
+  const slug = admittedWorkflowSlug(record);
   const journaled = record.status === 'creation_test' && slug
     ? readWorkflowEvents(slug, settled.runId).filter((event) => event.kind === 'step_completed' && event.output !== undefined).at(-1)?.output
     : undefined;

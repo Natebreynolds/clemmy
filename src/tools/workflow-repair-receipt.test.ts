@@ -17,7 +17,7 @@ process.env.CLEMENTINE_HOME = TMP;
 mkdirSync(path.join(TMP, 'state'), { recursive: true });
 
 const { awaitWorkflowCreationTestSettlement } = await import('./workflow-run-queue.js');
-const { renderCreationTestSettlementReceipt, authorableStepShape } = await import('./orchestration-tools.js');
+const { renderCreationTestSettlementReceipt, authorableStepShape, renderWorkflowRunStepOutput } = await import('./orchestration-tools.js');
 const { WORKFLOW_RUNS_DIR } = await import('./shared.js');
 const { addNotification, getNotification } = await import('../runtime/notifications.js');
 const { appendWorkflowEvent } = await import('../execution/workflow-events.js');
@@ -129,4 +129,20 @@ test('a passed test shows what its run produced; it is the run an owner asked to
   const previewed = renderCreationTestSettlementReceipt({ ...settled, steps: [{ stepId: 'read_digest', status: 'ok' }, { stepId: 'summarize', status: 'previewed' }] } as never, def, 'Digest check');
   assert.match(previewed, /only previewed in this test, so a real run is still what carries them out/);
   assert.doesNotMatch(previewed, /instead of starting it again/);
+});
+
+test('the status of a passed creation test reads each step from the same journal its receipt quoted', () => {
+  // Live 2026-10-30: the receipt's bounded quote ended mid-result, the brain
+  // asked for the step's whole output, read "no output recorded", and spent
+  // nine more calls in shell and files to find it.
+  const runId = 'run-status-journal';
+  const record = { id: runId, workflow: 'Digest check', status: 'creation_test', output: 'creation test passed',
+    workflowDefinitionSnapshot: { workflowSlug: 'digest-check' } };
+  appendWorkflowEvent('digest-check', runId, { kind: 'step_completed', stepId: 'read_digest', output: { events: 3 } });
+  appendWorkflowEvent('digest-check', runId, { kind: 'step_completed', stepId: 'summarize', output: '- 9:00 Standup\n- 11:00 Review\n- 2:00 Planning' });
+  const step = renderWorkflowRunStepOutput(record, runId, 'summarize');
+  assert.match(step, /^Run run-status-journal · step summarize · output characters 0–\d+ of \d+\n- 9:00 Standup\n- 11:00 Review\n- 2:00 Planning$/);
+  assert.match(renderWorkflowRunStepOutput(record, runId, 'missing'), /Steps with output: read_digest, summarize\./);
+  const unadmitted = renderWorkflowRunStepOutput({ ...record, workflowDefinitionSnapshot: {} }, runId, 'summarize');
+  assert.match(unadmitted, /No step recorded output\./, 'without the admitted slug there is no journal to read');
 });
