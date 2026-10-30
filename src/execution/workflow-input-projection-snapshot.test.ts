@@ -131,3 +131,14 @@ test('a candidate answered or cancelled after the snapshot is rechecked under lo
     assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), JSON.parse(JSON.stringify(replacement)));
   }
 });
+
+test('a clarification pause is written where the runner writes the run: its catalog slug, not its display name', () => {
+  // Live 2026-10-30: the pause landed under "Mr Jordan Daily Swim Blog Draft"
+  // while every other event sat under its slug, and the board read one run as
+  // two cards.
+  const current = { ...record('slug-keyed-question'), workflowSlug: 'snapshot-perf-workflow' };
+  save(current as ReturnType<typeof record>);
+  assert.equal(reconcile({ runId: current.id }).projected, 1);
+  assert.equal(readWorkflowEvents('snapshot-perf-workflow', current.id).filter(event => event.kind === 'run_paused').length, 1);
+  assert.equal(readWorkflowEvents(current.workflow, current.id).length, 0, 'nothing is written under the display name');
+});

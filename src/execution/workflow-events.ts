@@ -791,12 +791,15 @@ export interface PendingRun {
 
 const TERMINAL_RUN_RECORD_STATUSES = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled', 'dry_run']);
 
-function readRunRecordStatus(runId: string): string | undefined {
+function readRunRecordIdentity(runId: string): { status?: string; workflowSlug?: string } {
   const file = path.join(WORKFLOW_RUNS_DIR, `${runId}.json`);
-  const scan = scanWorkflowRunRecordSnapshot<{ status?: unknown }>(file);
-  return scan.status === 'ok' && typeof scan.record.status === 'string'
-    ? scan.record.status
-    : undefined;
+  const scan = scanWorkflowRunRecordSnapshot<{ status?: unknown; workflowSlug?: unknown }>(file);
+  if (scan.status !== 'ok') return {};
+  return {
+    ...(typeof scan.record.status === 'string' ? { status: scan.record.status } : {}),
+    ...(typeof scan.record.workflowSlug === 'string' && scan.record.workflowSlug.trim()
+      ? { workflowSlug: scan.record.workflowSlug.trim() } : {}),
+  };
 }
 
 function terminalRunRecordStatus(runId: string): boolean {
@@ -852,7 +855,11 @@ export function listWorkflowRunIds(workflowName: string, limit = 20): string[] {
 
 export function listPendingRuns(): PendingRun[] {
   if (!existsSync(WORKFLOWS_DIR)) return [];
-  const pending: PendingRun[] = [];
+  // One run is one entry. A run's events can sit under two directories (a
+  // clarification pause was once written under the display name while the
+  // runner wrote under the catalog slug), and listing both showed one run as
+  // two cards, "Queued" and "Running", and counted it twice at boot.
+  const byRun = new Map<string, { entry: PendingRun; workflowSlug?: string }>();
   for (const workflowDir of readdirSync(WORKFLOWS_DIR)) {
     const runsDir = path.join(WORKFLOWS_DIR, workflowDir, 'runs');
     if (!existsSync(runsDir)) continue;
@@ -864,15 +871,33 @@ export function listPendingRuns(): PendingRun[] {
       if (terminalRunRecordStatus(runId)) continue;
       const state = computeResumeState(workflowDir, runId);
       if (state.terminal) continue;
-      pending.push({
+      const identity = readRunRecordIdentity(runId);
+      const entry: PendingRun = {
         workflowName: workflowDir,
         runId,
         startedAt: state.firstEventAt,
         lastEventAt: state.lastEventAt,
         inFlightStepId: state.inFlightStepId,
-        runStatus: readRunRecordStatus(runId),
-      });
+        runStatus: identity.status,
+      };
+      const kept = byRun.get(runId);
+      if (!kept || pendingRunOwnsEvents(entry, kept.entry, identity.workflowSlug)) {
+        byRun.set(runId, { entry, workflowSlug: identity.workflowSlug });
+      }
     }
   }
-  return pending;
+  return [...byRun.values()].map((value) => value.entry);
+}
+
+/** Of two directories holding one run, the one the runner writes to: the
+ *  record's catalog slug, else the one where the run began. */
+function pendingRunOwnsEvents(candidate: PendingRun, kept: PendingRun, workflowSlug?: string): boolean {
+  if (workflowSlug) {
+    if (kept.workflowName === workflowSlug) return false;
+    if (candidate.workflowName === workflowSlug) return true;
+  }
+  const candidateStart = Date.parse(candidate.startedAt ?? '');
+  const keptStart = Date.parse(kept.startedAt ?? '');
+  if (!Number.isFinite(keptStart)) return Number.isFinite(candidateStart);
+  return Number.isFinite(candidateStart) && candidateStart < keptStart;
 }

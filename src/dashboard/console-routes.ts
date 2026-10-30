@@ -13424,6 +13424,7 @@ export function registerConsoleRoutes(
         let reservedProjectRoot = false;
         let pendingMutationBlock: Record<string, unknown> | undefined;
         let pendingCapabilityBlock: Record<string, unknown> | undefined;
+        let pendingQuestion: string | undefined;
         const pendingRecordPath = workflowRunRecordPathForConsole(pending.runId);
         if (pendingRecordPath && fs.existsSync(pendingRecordPath)) {
           try {
@@ -13431,6 +13432,8 @@ export function registerConsoleRoutes(
             reservedProjectRoot = isReservedProjectWorkflowRunRecord(raw);
             pendingMutationBlock = projectWorkflowMutationBlock(raw.mutationBlock);
             pendingCapabilityBlock = projectWorkflowCapabilityBlock(raw.capabilityBlock);
+            const asked = (raw.awaitingInput as { question?: unknown } | undefined)?.question;
+            if (typeof asked === 'string' && asked.trim()) pendingQuestion = asked.trim();
           } catch {
             // A malformed queue record gets only the ordinary minimal card; no
             // catalog recovery projection is derived from unreadable bytes.
@@ -13462,7 +13465,10 @@ export function registerConsoleRoutes(
               message: typeof pendingCapabilityBlock?.message === 'string' ? pendingCapabilityBlock.message : '',
             }
           : undefined;
-        const column: BoardColumnId = mutationBlocked || capabilityBlocked
+        // A run that asked the owner a question waits on their answer. It used
+        // to fall through to its unfinished step and read "Running step …".
+        const awaitingInput = pending.runStatus === 'awaiting_input';
+        const column: BoardColumnId = mutationBlocked || capabilityBlocked || awaitingInput
           ? 'needs_you'
           : pending.inFlightStepId ? 'running' : 'queued';
         // A parked run is waiting on a human (approval consumption), not
@@ -13477,11 +13483,14 @@ export function registerConsoleRoutes(
           status: mutationBlocked
             ? 'blocked_mutation'
             : capabilityBlocked ? 'blocked_capability'
+            : awaitingInput ? 'awaiting_input'
             : parked ? 'parked' : pending.inFlightStepId ? `step: ${pending.inFlightStepId}` : 'queued',
           progressHint: mutationBlocked
             ? `Provider outcome needs reconciliation for step ${String(pendingMutationBlock?.stepId ?? pending.inFlightStepId ?? 'unknown')}; the call was not sent again`
             : capabilityGate
             ? `${capabilityGate.title} — step ${capabilityGate.stepId} stopped before anything was sent${capabilityGate.message ? `: ${capabilityGate.message}` : ''}`
+            : awaitingInput
+            ? `Waiting on your answer${pendingQuestion ? `: ${pendingQuestion.length > 220 ? `${pendingQuestion.slice(0, 219)}…` : pendingQuestion}` : ''}`
             : parked
             ? `Waiting for your approval on step ${pending.inFlightStepId ?? 'the gated step'}`
             : pending.inFlightStepId ? `Running step ${pending.inFlightStepId}` : 'Queued',
@@ -13493,10 +13502,10 @@ export function registerConsoleRoutes(
           // background-task card already carries.
           ageMs: ageMs(pending.startedAt ?? pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
-          actions: mutationBlocked || capabilityBlocked
+          actions: mutationBlocked || capabilityBlocked || awaitingInput
             ? ['cancel']
             : recovery.failureSummary?.retryable ? ['retry_failed_items', 'cancel'] : ['cancel'],
-          primaryAction: mutationBlocked || capabilityBlocked ? 'none' : recovery.primaryAction,
+          primaryAction: mutationBlocked || capabilityBlocked || awaitingInput ? 'none' : recovery.primaryAction,
           ...(capabilityGate
             ? {
                 nextEdge: {

@@ -3859,6 +3859,49 @@ test('GET /api/console/board puts a capability-gated run in Needs you with a nex
   }
 });
 
+// A run that asked the owner a question (live 2026-10-30) read "Running step
+// write_article_draft" for eight days and appeared a second time as "Queued":
+// the pause had been written under the display name, the run under its slug.
+test('GET /api/console/board shows a run waiting on the owner\'s answer once, in Needs you, with the question', async () => {
+  const workflowSlug = 'board-awaiting-answer-wf';
+  const runId = 'sched-awaiting-0001';
+  writeWorkflow(workflowSlug, {
+    name: 'Board Awaiting Answer',
+    description: 'awaiting answer test workflow',
+    enabled: true,
+    trigger: { manual: true },
+    steps: [{ id: 'write_article_draft', prompt: 'Write the draft.' }],
+  } as never);
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId,
+    workflow: 'Board Awaiting Answer',
+    workflowSlug,
+    status: 'awaiting_input',
+    createdAt: new Date().toISOString(),
+    awaitingInput: { questionId: `workflow-input:${runId}:write_article_draft:1`, question: 'Would you like me to try continuing from here?',
+      stepId: 'write_article_draft', sessionId: `workflow:${runId}:write_article_draft`, askedAt: new Date().toISOString() },
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'write_article_draft' });
+  appendWorkflowEvent('Board Awaiting Answer', runId, { kind: 'run_paused', meta: { reason: 'awaiting_user_input' } });
+
+  const h = await boot();
+  try {
+    const res = await fetch(`${h.url}/api/console/board`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { cards: Array<BoardCard & { progressHint?: string }> };
+    const cards = body.cards.filter((c) => c.id.endsWith(`:${runId}`) && c.id.startsWith('wf:'));
+    assert.equal(cards.length, 1, 'one run is one card');
+    assert.equal(cards[0]!.column, 'needs_you');
+    assert.equal(cards[0]!.status, 'awaiting_input');
+    assert.equal(cards[0]!.progressHint, 'Waiting on your answer: Would you like me to try continuing from here?');
+    assert.deepEqual(cards[0]!.actions, ['cancel']);
+  } finally {
+    await h.close();
+  }
+});
+
 test('GET /api/console/board shows a scheduled workflow with an unbound required resource as a Needs you card linking to Automate', async () => {
   writeWorkflow('board-unbound-sheet', {
     name: 'board-unbound-sheet',

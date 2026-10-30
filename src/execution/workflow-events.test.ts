@@ -405,6 +405,25 @@ test('listPendingRuns excludes terminal runs and includes in-flight', () => {
   assert.ok(!flights.includes('done/rdone'), 'completed run is not pending');
 });
 
+test('listPendingRuns lists one entry for a run whose events sit under two directories, the one the runner writes', () => {
+  // Live 2026-10-30: a clarification pause was written under the display name
+  // while the runner wrote under the catalog slug. Activity showed the one run
+  // twice, as "Queued" and as "Running step write_article_draft".
+  const runId = 'split-run-1';
+  appendWorkflowEvent('split-blog-draft', runId, { kind: 'run_started' });
+  appendWorkflowEvent('split-blog-draft', runId, { kind: 'step_started', stepId: 'write_article_draft' });
+  appendWorkflowEvent('Split Blog Draft', runId, { kind: 'run_paused', meta: { reason: 'awaiting_user_input' } });
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: 'Split Blog Draft', workflowSlug: 'split-blog-draft', status: 'awaiting_input',
+  }), 'utf-8');
+
+  const entries = listPendingRuns().filter((run) => run.runId === runId);
+  assert.equal(entries.length, 1, 'one run is one entry');
+  assert.equal(entries[0].workflowName, 'split-blog-draft', 'the directory the runner writes to wins');
+  assert.equal(entries[0].runStatus, 'awaiting_input');
+});
+
 test('workflow-history mining excludes catalogless run owners without hiding them from recovery', () => {
   const authoredSlug = 'mining-authored-workflow';
   const authoredRunId = 'mining-authored-run';

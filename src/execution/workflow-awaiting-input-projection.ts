@@ -89,16 +89,25 @@ function samePendingInput(left: RunInputBlocker | undefined, right: RunInputBloc
     && left.nextAction === right.nextAction;
 }
 
+/** The directory the runner writes this run's events under: its catalog slug.
+ *  `workflow` can be the display name, which once split one run's history in
+ *  two. Records from before the slug was persisted keep their old key. */
+function workflowEventKey(record: AwaitingInputWorkflowRecord): string {
+  const slug = typeof record.workflowSlug === 'string' ? record.workflowSlug.trim() : '';
+  return slug || record.workflow;
+}
+
 function ensureWorkflowEvent(record: AwaitingInputWorkflowRecord): void {
   const pending = record.awaitingInput!;
-  const alreadyProjected = readWorkflowEvents(record.workflow, record.id).some((event) =>
+  const eventKey = workflowEventKey(record);
+  const alreadyProjected = readWorkflowEvents(eventKey, record.id).some((event) =>
     event.kind === 'run_paused'
     && event.meta?.reason === 'awaiting_user_input'
     && event.meta?.questionId === pending.questionId
     && event.meta?.stepId === pending.stepId,
   );
   if (alreadyProjected) return;
-  appendWorkflowEventDurably(record.workflow, record.id, {
+  appendWorkflowEventDurably(eventKey, record.id, {
     kind: 'run_paused',
     error: pending.question,
     meta: {
