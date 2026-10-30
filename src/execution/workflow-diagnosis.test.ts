@@ -42,6 +42,7 @@ const {
   prependRootCauseBlock,
   workflowTriggerContextLine,
   _testOnly_sanitizeWorkflowDiagnosisOutput,
+  _setWorkflowDoctorForTests,
 } = mod;
 
 test('the Doctor is told a workflow recurs, so quiet-period emptiness is judgeable', () => {
@@ -672,4 +673,39 @@ test('a run that ends on its writes reports what it wrote, never the write recei
   // reply ended with id:, revision:, created_at: and target: lines).
   assert.doesNotMatch(body, /homepage-welcome|status: draft/);
   assert.match(body, /^Welcome\nWe teach all ages/);
+});
+
+test('the Doctor moves to the owner\'s backup when the worker\'s account is out of credit, as the steps do', async () => {
+  const tried: string[] = [];
+  const blocked = {
+    workflow: {
+      name: 'test-fixture-weekly-snapshot', description: 'Weekly TEST FIXTURE snapshot.', enabled: true, trigger: { manual: true },
+      steps: [{ id: 'refresh', prompt: 'Run the TEST FIXTURE refresh and verify it contains exactly 8 reps.' }],
+    } as never,
+    blockedSteps: [{ stepId: 'refresh', kind: 'blocked' as const,
+      reason: 'The refresh succeeded but verification failed: the reps array has 9 records, not exactly 8.' }],
+  };
+  const fixReply = JSON.stringify({ summary: 'The team now has 9 reps; the check still expects 8.', rootCause: 'The step hard-codes a count of 8.',
+    fix: { kind: 'edit_step', stepId: 'refresh', description: 'Check the reps the data returns instead of a fixed 8.',
+      newStepPrompt: 'Run the TEST FIXTURE refresh and verify every rep it returns has this week, last week and change.' }, confidence: 'high' });
+  try {
+    _setWorkflowDoctorForTests({ models: () => ['test-fixture-worker', 'test-fixture-backup'], run: async (model) => {
+      tried.push(model);
+      if (model === 'test-fixture-worker') throw Object.assign(new Error('402 Credit limit exceeded, please add credits'), { status: 402 });
+      return fixReply;
+    } });
+    const diagnosis = await diagnoseWorkflowBlock(blocked);
+    assert.deepEqual(tried, ['test-fixture-worker', 'test-fixture-backup']);
+    assert.equal(diagnosis?.fix.kind, 'edit_step', 'the owner gets a fix, not a dead end');
+
+    tried.length = 0;
+    _setWorkflowDoctorForTests({ models: () => ['test-fixture-worker', 'test-fixture-backup'], run: async (model) => {
+      tried.push(model);
+      throw new Error('the model returned something unreadable');
+    } });
+    assert.equal(await diagnoseWorkflowBlock(blocked), null);
+    assert.deepEqual(tried, ['test-fixture-worker'], 'a failure that would not move a step does not move the Doctor');
+  } finally {
+    _setWorkflowDoctorForTests(null);
+  }
 });

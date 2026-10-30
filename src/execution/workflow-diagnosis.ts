@@ -32,6 +32,9 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { DEFAULT_CODEX_FAST_MODEL, DEFAULT_CODEX_MODEL, MODELS, getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
+import { brainBackupModelIds } from '../runtime/harness/brain-backups.js';
+import { isProviderCapacityExhausted, isProviderCreditRefusalError } from '../shared/provider-capacity.js';
+import { isAuthRecoverableError, isTransientStepError } from './transient-error.js';
 import { STATE_DIR } from '../memory/db.js';
 import { extractJsonCandidate } from '../runtime/harness/json-repair.js';
 import { isSecretLikeKey } from '../runtime/security.js';
@@ -696,15 +699,6 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
   const codifiedDiagnosis = diagnoseCodifiedStepFailure({ ...input, blockedSteps });
   if (codifiedDiagnosis) return codifiedDiagnosis;
   const step = input.workflow.steps.find((s) => s.id === primary.stepId);
-  const agent = new Agent({
-    name: 'WorkflowDoctor',
-    // A structured blocked-step classifier — the fast tier handles it well and
-    // keeps post-failure diagnosis cheap (it runs on every blocked run).
-    instructions: DOCTOR_INSTRUCTIONS,
-    model: workflowDoctorModelId(),
-    modelSettings: { reasoning: { effort: 'low' } },
-    tools: [],
-  });
   const prompt = [
     `Workflow: ${input.workflow.name}`,
     `Workflow description: ${input.workflow.description ?? '(none)'}`,
@@ -723,13 +717,58 @@ export async function diagnoseWorkflowBlock(input: DiagnoseInput): Promise<Workf
       : '',
   ].filter(Boolean).join('\n\n');
 
-  try {
-    const result = await run(agent, prompt);
-    return sanitizeWorkflowDiagnosisOutput((result as { finalOutput?: unknown }).finalOutput);
-  } catch (err) {
-    logger.warn({ err, workflow: input.workflow.name, step: primary.stepId }, 'workflow diagnosis failed');
-    return null;
+  // The worker model first, then the owner's backups in their order, on the
+  // same failures that move a workflow step to a backup. Live: the worker's
+  // account ran out of credit, the steps switched and finished, and the
+  // Doctor alone stopped, so a blocked run reached the owner with no fix.
+  const models = doctorModels();
+  for (const [index, model] of models.entries()) {
+    try {
+      return sanitizeWorkflowDiagnosisOutput(await doctorRun(model, prompt));
+    } catch (err) {
+      const next = models[index + 1];
+      if (!next || !doctorCanSwitch(err)) {
+        logger.warn({ err, workflow: input.workflow.name, step: primary.stepId, model }, 'workflow diagnosis failed');
+        return null;
+      }
+      logger.warn({ workflow: input.workflow.name, step: primary.stepId, from: model, to: next }, 'workflow diagnosis model did not answer — trying the owner\'s backup');
+    }
   }
+  return null;
+}
+
+/** The Doctor's worker model, then the owner's listed backups that can serve. */
+function defaultDoctorModels(): string[] {
+  const primary = workflowDoctorModelId();
+  const backups = brainBackupModelIds(primary).map(servedCodexModelId);
+  return [...new Set([primary, ...backups])];
+}
+
+function doctorCanSwitch(err: unknown): boolean {
+  return isProviderCreditRefusalError(err) || isProviderCapacityExhausted(err)
+    || isTransientStepError(err) || isAuthRecoverableError(err);
+}
+
+async function defaultDoctorRun(model: string, prompt: string): Promise<unknown> {
+  const agent = new Agent({
+    name: 'WorkflowDoctor',
+    // A structured blocked-step classifier — the fast tier handles it well and
+    // keeps post-failure diagnosis cheap (it runs on every blocked run).
+    instructions: DOCTOR_INSTRUCTIONS,
+    model,
+    modelSettings: { reasoning: { effort: 'low' } },
+    tools: [],
+  });
+  return ((await run(agent, prompt)) as { finalOutput?: unknown }).finalOutput;
+}
+
+let doctorModels: () => string[] = defaultDoctorModels;
+let doctorRun: (model: string, prompt: string) => Promise<unknown> = defaultDoctorRun;
+
+/** Test seam: the Doctor's model list and its model call. */
+export function _setWorkflowDoctorForTests(seam: { models?: () => string[]; run?: (model: string, prompt: string) => Promise<unknown> } | null): void {
+  doctorModels = seam?.models ?? defaultDoctorModels;
+  doctorRun = seam?.run ?? defaultDoctorRun;
 }
 
 // ─── 3. Persist proposed fixes (offer, don't apply) ──────────────────
