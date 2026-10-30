@@ -493,7 +493,7 @@ export function RunWorkspaceDrawer({
   return (
     <dialog ref={dialog} aria-labelledby="workflow-run-title" onCancel={event => { event.preventDefault(); onClose(); }}
       onClick={event => { if (event.target === event.currentTarget) onClose(); }}
-      className="fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none border-0 bg-transparent p-0 text-fg backdrop:bg-black/30">
+      className="fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none overflow-hidden border-0 bg-transparent p-0 text-fg backdrop:bg-black/30">
       <div className="ml-auto flex h-full w-full max-w-5xl flex-col bg-surface shadow-modal">
         <div className="flex items-center gap-3 border-b border-border px-5 py-4">
           <Radio className="h-5 w-5 shrink-0 text-live" aria-hidden />
@@ -505,9 +505,12 @@ export function RunWorkspaceDrawer({
         </div>
 
         <div className="grid min-h-0 flex-1 gap-0 md:grid-cols-[18rem_minmax(0,1fr)]">
-          <aside className="min-h-0 border-b border-border md:border-b-0 md:border-r">
+          {/* The list scrolls under its own header. A list capped at the
+              column's full height overflowed it by the header, and the panel
+              itself scrolled: its title slid off the top. */}
+          <aside className="flex min-h-0 flex-col border-b border-border md:border-b-0 md:border-r">
             <div className="border-b border-border px-4 py-3 text-label text-muted">Recent runs</div>
-            <div className="max-h-full overflow-y-auto p-2">
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
               {runsQ.isError && <AutomationRefreshNotice title={runsQ.data ? 'Showing last loaded runs' : 'Run history is unavailable'} description="Your runs are kept. Retry to refresh the list." onRetry={() => { void runsQ.refetch(); }} />}
               {runsQ.isLoading ? <Skeleton className="h-32 w-full" /> : runs.length === 0 && !runsQ.isError ? (
                 <EmptyState title="No runs yet" className="py-10" />
