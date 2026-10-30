@@ -1984,6 +1984,7 @@ test('a picked option reaches memory with the question it answered; a go-ahead a
     assert.equal((await enrich()).taskContinuation?.selectedOption, 'opt-2');
     await settled();
     assert.equal(asked.length, 1, 'the consumed answer started one memory job');
+    assert.equal(asked[0]!.request, 'Add oranges to my TEST FIXTURE pantry list.', 'the owner\'s own words for the thing ride along');
     assert.equal(asked[0]!.question, question);
     assert.deepEqual(asked[0]!.choices, options);
     assert.equal(asked[0]!.chosen, options[1], 'the option id is read back as the words the owner tapped');

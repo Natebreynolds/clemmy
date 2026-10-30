@@ -43,11 +43,12 @@ test('a pick that settles which of several things is the owner\'s is kept as a s
   });
   const sessionId = 'answer-pick';
   const seq = ownerAnswer(sessionId, 'The Home folder list: apples, bread');
-  const answered = { sessionId, sourceUserSeq: seq, questionId: 'q-1', ...question,
+  const answered = { sessionId, sourceUserSeq: seq, questionId: 'q-1', request: 'Add oranges to my TEST FIXTURE pantry list.', ...question,
     answer: 'The Home folder list: apples, bread', chosen: 'The Home folder list: apples, bread' };
   await learnFromAnswer(answered);
   assert.equal(asked.length, 1);
   const request = JSON.parse(asked[0]!) as Record<string, unknown>;
+  assert.equal(request.request, 'Add oranges to my TEST FIXTURE pantry list.', 'and the owner\'s own words for the thing');
   assert.equal(request.question, question.question, 'the model reads the question the answer belongs to');
   assert.deepEqual(request.choices, question.options);
   assert.equal(request.chosen, 'The Home folder list: apples, bread');
