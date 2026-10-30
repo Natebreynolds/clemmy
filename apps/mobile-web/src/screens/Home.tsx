@@ -55,6 +55,7 @@ import { homeLead, homeNeedsYouPane, type NeedsYouPane } from '../lib/home-prese
 import { phoneVisiblePanes, useHomePreferences, type HomePaneId, type QuickAction } from '../lib/home-prefs';
 import { useWorkingNow } from '../lib/working-now';
 import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
+import { orderRecentConversations, waitingAskIsFresh } from '../lib/conversation-lead';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
 import { FromClem } from '../components/FromClem';
@@ -192,15 +193,12 @@ export function Home({
   // failure leaves the stack out; nothing else moves.
   const recentData = useScreenData(() => listChatSessions(), { intervalMs: 10_000, resourceKey: 'home-recent' });
   const conversations = (recentData.data?.sessions ?? []).filter((x) => x.kind === 'chat' || x.kind === 'agent');
-  // Conversations waiting on your answer come first, then the most recent.
-  const recent: ChatSession[] = [
-    ...conversations.filter((x) => x.waitingOnYou),
-    ...conversations.filter((x) => !x.waitingOnYou),
-  ].slice(0, MAX_RECENT_ROWS);
+  // Conversations waiting on a fresh answer come first, then the most recent.
+  const recent: ChatSession[] = orderRecentConversations(conversations).slice(0, MAX_RECENT_ROWS);
   const recentSeen = chatSeenBaseline(recentData.data?.sessions ?? []);
-  // A conversation Clem is still working in, one waiting on your answer, or
+  // A conversation Clem is still working in, one waiting on a fresh answer, or
   // one she answered since you looked, is the first thing on her screen.
-  const conversationFirst = paneSet.has('projects') && recent.some((x) => x.running || x.waitingOnYou || chatHasNews(x, recentSeen));
+  const conversationFirst = paneSet.has('projects') && recent.some((x) => x.running || waitingAskIsFresh(x) || chatHasNews(x, recentSeen));
 
   // The once-a-day line: what happened since you last looked. Bookkeeping is
   // per device and best effort; without storage the line simply never shows.
