@@ -194,6 +194,9 @@ export function Home({
     .filter((x) => x.kind === 'chat' || x.kind === 'agent')
     .slice(0, MAX_RECENT_ROWS);
   const recentSeen = chatSeenBaseline(recentData.data?.sessions ?? []);
+  // A conversation Clem is still working in, or one she answered since you
+  // looked, is the first thing on her screen: you just asked her something.
+  const conversationFirst = paneSet.has('projects') && recent.some((x) => x.running || chatHasNews(x, recentSeen));
 
   // The once-a-day line: what happened since you last looked. Bookkeeping is
   // per device and best effort; without storage the line simply never shows.
@@ -331,6 +334,7 @@ export function Home({
               <div class="min-w-0" style={{ flex: '1 1 auto' }}>
                 <div class="home-row-title truncate">{session.title || 'Conversation'}</div>
                 {session.running ? <div class="home-row-note truncate">Working…</div>
+                  : chatHasNews(session, recentSeen) ? <div class="home-row-note home-row-note-news truncate">Clem replied</div>
                   : session.agentName ? <div class="home-row-note truncate">{session.agentName}</div> : null}
               </div>
               {session.running || chatHasNews(session, recentSeen)
@@ -425,7 +429,9 @@ export function Home({
           ))}
         </section>
       ) : null}
+      {conversationFirst ? <div class="home-pane rise" style={{ '--i': 1 }}>{sections.projects()}</div> : null}
       {panes.map((id) => {
+        if (id === 'projects' && conversationFirst) return null;
         const rendered = sections[id]();
         return rendered ? <div key={id} class="home-pane rise" style={{ '--i': 1 }}>{rendered}</div> : null;
       })}

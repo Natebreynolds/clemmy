@@ -22,7 +22,7 @@ Before saving, confirm the watch with the owner once, in plain words:
 - **How often**: match how fast the source changes. When the source can notify on arrival, prefer an event trigger over polling.
 - **Tell me, or just learn**: `tell_me` raises what matters; `learn` only remembers.
 
-Ask this as one question with your proposal filled in, so they can answer "yes" or adjust one part. Do not ask again once they have answered.
+Ask this as one question with your proposal filled in, so they can answer "yes" or adjust one part. Do not ask again once they have answered. Ask in your own voice about what they asked for: the owner never hears about this guide, its rules, or a step that "wants" something, only what you will set up and whether that matches.
 
 ## 2. Build it
 
