@@ -749,6 +749,7 @@ test('logical projection normalizes only proven scheduler and daemon cursors', (
   }), { pendingCronOccurrences: { exact: true } });
   assert.deepEqual(normalizePackagedLogicalJson('cron/workflow-schedule-state.json', {
     lastEvaluatedAtMs: 10,
+    lastEvaluatedBy: 'daemon-process-a',
     pendingOccurrences: { exact: true },
   }), { pendingOccurrences: { exact: true } });
   assert.deepEqual(normalizePackagedLogicalJson('state/space-schedule-state.json', {

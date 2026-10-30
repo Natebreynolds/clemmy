@@ -1156,7 +1156,10 @@ export function normalizePackagedLogicalJson(
   value: Record<string, Json>,
 ): Record<string, Json> {
   if (relativePath === 'cron/workflow-schedule-state.json') {
-    const { lastEvaluatedAtMs: _workflowScanObservation, ...authority } = value;
+    // The scan's time and the process that made it: a new daemon process is
+    // a new observer by definition (it is how a reopen tells "missed while
+    // closed" from "on time").
+    const { lastEvaluatedAtMs: _workflowScanObservation, lastEvaluatedBy: _workflowScanObserver, ...authority } = value;
     return authority;
   }
   if (relativePath === 'state/space-schedule-state.json') {
@@ -3146,6 +3149,7 @@ export async function runPackagedV314DaemonRehearsal(
     logicalDifference: secondBootLogicalStateDiff,
     observationNormalizations: [
       'cron/workflow-schedule-state.json:lastEvaluatedAtMs',
+      'cron/workflow-schedule-state.json:lastEvaluatedBy',
       'cron/daemon-state.json:lastHealthyTickAt',
       'cron/daemon-state.json:lastCronEvaluatedAtMs',
       'state/space-schedule-state.json:lastEvaluatedAtMs',
