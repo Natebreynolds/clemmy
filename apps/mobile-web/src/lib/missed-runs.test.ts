@@ -16,6 +16,7 @@ test('each missed run says where it stands, and only a moving one is watched clo
   assert.equal(missedRunState(run('error'))?.tone, 'fail');
   assert.equal(missedRunInMotion(run('running')), true);
   assert.equal(missedRunInMotion(run('completed')), false);
+  assert.equal(missedRunInMotion(run('awaiting_input')), false);
   assert.equal(missedRunInMotion(base), false);
   assert.match(dueWords('2026-10-29T23:00:00.000Z', new Date('2026-10-29T23:30:00.000Z')), /^\d{1,2}:00 [AP]M$/);
   assert.match(dueWords('2026-10-27T23:00:00.000Z', new Date('2026-10-29T23:30:00.000Z')), /^[A-Z][a-z]+day \d{1,2}:00 [AP]M$/);

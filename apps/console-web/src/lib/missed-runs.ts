@@ -22,11 +22,11 @@ export const dismissMissedRuns = (noticeId: string) =>
 export const startWorkflowRun = (workflow: string) =>
   apiPost<{ id?: string; queued?: boolean }>(`/api/console/workflows/${encodeURIComponent(workflow)}/run`, {});
 
-const FINISHED = new Set(['completed', 'failed', 'error', 'cancelled', 'blocked', 'stopped']);
+const MOVING = new Set(['queued', 'pending', 'running']);
 
 /** Whether a started run is still moving, so the card keeps watching it. */
 export function missedRunInMotion(item: MissedRun): boolean {
-  return item.decision?.action === 'run' && !FINISHED.has(item.run?.status ?? 'queued');
+  return item.decision?.action === 'run' && MOVING.has(item.run?.status ?? 'queued');
 }
 
 /** Where one item stands, in words, with a tone for its colour. */

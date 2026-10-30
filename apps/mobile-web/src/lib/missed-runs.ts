@@ -27,10 +27,10 @@ export async function dismissMissedRuns(noticeId: string): Promise<unknown> {
   return api(`/m/api/home/missed-runs/${encodeURIComponent(noticeId)}/dismiss`, { method: 'POST', body: '{}' });
 }
 
-const FINISHED = new Set(['completed', 'failed', 'error', 'cancelled', 'blocked', 'stopped']);
+const MOVING = new Set(['queued', 'pending', 'running']);
 
 export function missedRunInMotion(item: MissedRun): boolean {
-  return item.decision?.action === 'run' && !FINISHED.has(item.run?.status ?? 'queued');
+  return item.decision?.action === 'run' && MOVING.has(item.run?.status ?? 'queued');
 }
 
 /** Where one item stands, in words, with a tone for its colour. */
