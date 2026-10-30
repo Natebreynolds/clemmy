@@ -27,7 +27,10 @@ test('fresh action keeps its budget and the inline/missing-detail cue without cl
   // absence beyond what was checked, unmarked estimates, unmeasured asides).
   // 6_890 → 6_895 (2026-10-18): FINAL REPORT says "Answer the ask, then stop"
   // and names unasked options and method notes, the extras reviews bounced most.
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 6_895, 'the lean action prompt does not grow');
+  // 6_895 → 7_131 (2026-10-30, owner): SEVERAL MATCHES (ask when more than
+  // one thing fits, keep the pick in memory) and the offer to remember a way
+  // that had to be found joined the action lane in their short form.
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 7_131, 'the lean action prompt does not grow');
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /honor constraints; verify stale\/conflicting claims/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /Use inline results; recall missing detail by exact full call_id\/handle/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /exact host-authenticated retained success/);

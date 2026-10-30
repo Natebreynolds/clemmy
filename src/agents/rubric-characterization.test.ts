@@ -35,6 +35,11 @@ const TOK = (chars: number): number => Math.round(chars / 4);
 // --- GOLDEN SNAPSHOT (captured 2026-06-19 @ main 0758e46) ------------------
 // Update these — and only these — when a rubric edit is intentional.
 const GOLDEN = {
+  // 2026-10-30 owner: when what the owner named fits more than one thing and
+  // nothing settles which, ask (one answer per candidate) and keep the pick in
+  // memory; when a way had to be found, offer in one line to remember it and
+  // save it only on yes (SEVERAL MATCHES / OFFER TO REMEMBER HOW; the short
+  // form in the lean and fresh-action rubrics).
   // 2026-09-07 discovery subtraction: the rubric no longer tells the model to
   // spend a role slot ("use the runtime broker ONCE for that unresolved role",
   // "distinct roles may resolve in parallel and synonymous searches share the
@@ -210,10 +215,10 @@ const GOLDEN = {
   // sealed work and stage-only intent. Retain every account/effect/consent
   // floor; replace the contradictory prepare/execute advice, without growing
   // the pre-refinement stable rubric or relaxing fresh-action/lean budgets.
-  instructions: { len: 34360, sha16: '931f2dd5b5787c41' },
-  native: { len: 33467, sha16: '8ffbb0a8af8831e7' },
-  claudeBrain: { len: 11445, sha16: 'b34264fd002848e3' },
-  lean: { len: 13450, sha16: '40e042fa7490a63b' },
+  instructions: { len: 35194, sha16: '76c0f58eb0127c40' },
+  native: { len: 34301, sha16: 'ddfee766562a6112' },
+  claudeBrain: { len: 11680, sha16: '9c8b2d801404cc01' },
+  lean: { len: 13685, sha16: 'faa6f1aa2acd4a91' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
