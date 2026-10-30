@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Switch } from '@/components/ui/Switch';
+import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import { getSettings, patchDeveloperFlags } from '@/lib/settings';
 
@@ -16,13 +17,18 @@ export function DeveloperModeCard() {
   const settings = usePoll(['settings'], getSettings, 0);
   const on = settings.data?.developerMode ?? false;
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const locked = useRef(false);
 
   const toggle = async (next: boolean) => {
-    setBusy(true);
+    if (locked.current || !settings.data || settings.isError) return;
+    locked.current = true; setBusy(true); setError(null);
     try {
       await patchDeveloperFlags({ devMode: next });
       void qc.invalidateQueries({ queryKey: ['settings'] });
-    } finally {
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not change developer mode. Try again.'); }
+    finally {
+      locked.current = false;
       setBusy(false);
     }
   };
@@ -37,8 +43,10 @@ export function DeveloperModeCard() {
             Reveals the instruments under Advanced in the sidebar — diagnostics, telemetry, run replay, nightly self-research — and a <strong>Developer</strong> page for CLEMMY_* flags. Off by default; the panels keep working if you have a link to one.
           </p>
         </div>
-        <Switch checked={on} disabled={busy || settings.isLoading} label="Developer mode" onChange={toggle} />
+        <Switch checked={on} disabled={busy || settings.isLoading || !settings.data || settings.isError} label="Developer mode" onChange={toggle} />
       </div>
+      {settings.isError && <p role="alert" className="text-small text-muted">Developer mode couldn’t be confirmed. <Button variant="link" size="sm" onClick={() => void settings.refetch()}>Retry</Button></p>}
+      {error && <p role="alert" className="text-small text-danger">{error}</p>}
     </Card>
   );
 }

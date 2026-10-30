@@ -126,13 +126,14 @@ export function StartupDoctorCard() {
           {data && <p className="mt-1 text-caption text-faint">Last checked {formatTime(data.generatedAt)}</p>}
         </div>
         <div className="flex items-center gap-2">
-          {data && <StatusPill tone={toneForStatus(data.status)}>{labelForStatus(data.status)}</StatusPill>}
+          {data && <StatusPill tone={doctor.isError ? 'neutral' : toneForStatus(data.status)}>{doctor.isError ? 'Last loaded status' : labelForStatus(data.status)}</StatusPill>}
           <Button variant="secondary" size="sm" onClick={() => void doctor.refetch()} disabled={doctor.isFetching}>
             <RefreshCw className={doctor.isFetching ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} aria-hidden /> Refresh
           </Button>
         </div>
       </div>
 
+      {doctor.isError && <p role="alert" className="mb-3 text-small text-muted">Startup checks couldn’t be refreshed. {data ? 'Showing the last loaded checks.' : 'The current startup status is unknown.'} Use Refresh to try again.</p>}
       {doctor.isLoading && !data ? <Skeleton className="h-48 w-full" /> : data ? <StartupDoctorBody data={data} /> : null}
     </Card>
   );

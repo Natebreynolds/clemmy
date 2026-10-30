@@ -94,6 +94,12 @@ function MemoryOverview() {
   const [params, setParams] = useSearchParams();
   const linkedScope = factScopeKey(factScopeFromKey(params.get('scope') ?? ''));
   const tab = TABS.find((key) => key === params.get('tab')) ?? (linkedScope !== 'all' ? 'facts' : 'overview');
+  // A visited editor stays mounted inside this route. Switching views or
+  // searching changes visibility, never the ownership of its unsaved draft.
+  const factsVisited = useRef(false);
+  const sourcesVisited = useRef(false);
+  if (tab === 'facts') factsVisited.current = true;
+  if (tab === 'sources') sourcesVisited.current = true;
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [kind, setKind] = useState<MemoryStore | 'all'>('all');
@@ -236,14 +242,14 @@ function MemoryOverview() {
                 </>
             ) : <>
               {tab === 'overview' && <OverviewTab onNavigate={navigate} onPickLearned={pickFact} />}
-              {tab === 'facts' && <FactsTab key={linkedScope} initialScope={linkedScope} initialAddOpen={params.get('add') === '1'} onPick={pickFact} onChanged={refreshMemory} />}
               {tab === 'tools' && <ToolRecallSection />}
               {tab === 'episodes' && <EpisodesTab />}
               {tab === 'entities' && <EntitiesTab />}
-              {tab === 'sources' && <SourcesTab qc={qc} onNavigate={navigate} />}
               {tab === 'activity' && <MemoryWorkPanel />}
               {tab === 'review' && <MemoryReviewTab onNavigate={navigate} health={health.data} review={reviewCount} duplicates={duplicateCount} healthUnavailable={health.isError && !health.data} />}
             </>}
+            {factsVisited.current && <FactsTab key="facts-editor" visible={!searching && tab === 'facts'} initialScope={linkedScope} initialAddOpen={params.get('add') === '1'} onPick={pickFact} onChanged={refreshMemory} />}
+            {sourcesVisited.current && <SourcesTab key="sources-editor" visible={!searching && tab === 'sources'} qc={qc} onNavigate={navigate} />}
           </div>
         </div>
         <div className="memory-sidepanel" data-open={Boolean(panel)} aria-label="Memory companion" hidden={!panel}>
@@ -295,7 +301,13 @@ function MemoryReviewTab({ onNavigate, health, review, duplicates, healthUnavail
     <HealthStrip health={health} review={review} duplicates={duplicates} unavailable={healthUnavailable} />
     <ReviewPane onOpen={onNavigate} />
     <MemoryReviewQueue health={memHealth.data} readiness={readiness.data} onNavigate={onNavigate} onUpdated={() => { void memHealth.refetch(); void readiness.refetch(); }} />
-    <details className="memory-overview-disclosure"><summary><ShieldCheck size={18} aria-hidden /><span><strong>Memory diagnostics</strong><small>Readiness, retrieval, and evidence coverage</small></span><ChevronRight size={17} aria-hidden /></summary><div className="space-y-4"><MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} /><RecallHealthStrip health={memHealth.data} /><GraphTruthCoverage health={memHealth.data} readiness={readiness.data} /></div></details>
+    <details className="memory-overview-disclosure"><summary><ShieldCheck size={18} aria-hidden /><span><strong>Memory diagnostics</strong><small>Readiness, retrieval, and evidence coverage</small></span><ChevronRight size={17} aria-hidden /></summary><div className="space-y-4">
+      {readiness.isError && <CouldNotRead what={readiness.data ? 'Current readiness; the last loaded report is shown' : 'Memory readiness'} onRetry={() => void readiness.refetch()} />}
+      {memHealth.isError && <CouldNotRead what={memHealth.data ? 'Current memory health; the last loaded report is shown' : 'Memory health'} onRetry={() => void memHealth.refetch()} />}
+      <MemoryAssurancePanel report={readiness.data} loading={readiness.isLoading} />
+      {memHealth.data && <RecallHealthStrip health={memHealth.data} />}
+      {memHealth.data && readiness.data && <GraphTruthCoverage health={memHealth.data} readiness={readiness.data} />}
+    </div></details>
   </div>;
 }
 
@@ -672,11 +684,12 @@ function CouldNotRead({ what, onRetry }: { what: string; onRetry: () => void }) 
   );
 }
 
-function FactsTab({ initialScope = 'all', initialAddOpen = false, onPick, onChanged }: { initialScope?: string; initialAddOpen?: boolean; onPick: (fact: Fact, correct?: boolean) => void; onChanged: () => void }) {
+function FactsTab({ initialScope = 'all', initialAddOpen = false, visible = true, onPick, onChanged }: { initialScope?: string; initialAddOpen?: boolean; visible?: boolean; onPick: (fact: Fact, correct?: boolean) => void; onChanged: () => void }) {
   const [kind, setKind] = useState<Fact['kind'] | 'all'>('all');
   const [showForgotten, setShowForgotten] = useState(false);
   // Where the facts shown apply: everything, everywhere only, one project or one agent.
   const [scopeKey, setScopeKey] = useState(initialScope);
+  useEffect(() => setScopeKey(initialScope), [initialScope]);
   const scopeFilter = factScopeFromKey(scopeKey);
   const facts = usePoll(['facts', kind, showForgotten, scopeKey], () => listFacts(kind === 'all' ? undefined : kind, 120, showForgotten, scopeFilter), 15000);
   const reviews = usePoll(['memory-review-candidates'], () => listMemoryReviewCandidates(25), 30000);
@@ -716,6 +729,7 @@ function FactsTab({ initialScope = 'all', initialAddOpen = false, onPick, onChan
   const [addError, setAddError] = useState('');
   const [adding, setAdding] = useState(false);
   const [addOpen, setAddOpen] = useState(initialAddOpen);
+  useEffect(() => { if (initialAddOpen) setAddOpen(true); }, [initialAddOpen]);
   const add = async () => {
     if (!draft.trim() || adding) return;
     const submitted = draft;
@@ -780,7 +794,7 @@ function FactsTab({ initialScope = 'all', initialAddOpen = false, onPick, onChan
     }
   };
   return (
-    <>
+    <div hidden={!visible} style={!visible ? { display: 'none' } : undefined}>
       <div className="mb-3 flex flex-wrap items-center gap-2">
         {([{ key: 'all', label: 'All' }, ...FACT_KINDS] as { key: Fact['kind'] | 'all'; label: string }[]).map((k) => (
           <button key={k.key} type="button" onClick={() => setKind(k.key)}
@@ -945,7 +959,7 @@ function FactsTab({ initialScope = 'all', initialAddOpen = false, onPick, onChan
           </div>
         </details>
       </Card>}
-    </>
+    </div>
   );
 }
 
@@ -1595,7 +1609,7 @@ function EntityMemoryDetailPanel({ detail, onClose }: { detail: EntityMemoryDeta
 // inspectable only by hand-reading .md files — the strongest ever-learning
 // signal, now auditable: which tool proved out for an intent, its success
 // rate, and what fell back.
-function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>; onNavigate?: (tab: Tab) => void }) {
+function SourcesTab({ qc, onNavigate, visible = true }: { qc: ReturnType<typeof useQueryClient>; onNavigate?: (tab: Tab) => void; visible?: boolean }) {
   const ctx = usePoll(['context'], getContext, 30000);
   const files = usePoll(['memory-files'], getMemoryFiles, 30000);
   const sources = usePoll(['source-map'], getSourceMap, 30000);
@@ -1606,24 +1620,46 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
   const goals = ctx.data?.goals ?? [];
   const [goalTitle, setGoalTitle] = useState('');
   const [goalDesc, setGoalDesc] = useState('');
+  const [goalSaving, setGoalSaving] = useState(false);
+  const [goalError, setGoalError] = useState('');
+  const [goalResult, setGoalResult] = useState('');
+  const goalOwner = useRef(false);
+  const alive = useRef(true);
+  const currentGoal = useRef({ title: goalTitle, description: goalDesc });
+  currentGoal.current = { title: goalTitle, description: goalDesc };
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const addContextGoal = async () => {
-    if (!goalTitle.trim() || !goalDesc.trim()) return;
-    try { await addGoal(goalTitle.trim(), goalDesc.trim()); setGoalTitle(''); setGoalDesc(''); }
-    finally { void qc.invalidateQueries({ queryKey: ['context'] }); }
+    if (!goalTitle.trim() || !goalDesc.trim() || goalOwner.current) return;
+    const submitted = { title: goalTitle, description: goalDesc };
+    goalOwner.current = true; setGoalSaving(true); setGoalError(''); setGoalResult('');
+    try {
+      await addGoal(submitted.title.trim(), submitted.description.trim());
+      if (!alive.current) return;
+      const unchanged = currentGoal.current.title === submitted.title && currentGoal.current.description === submitted.description;
+      if (unchanged) { setGoalTitle(''); setGoalDesc(''); }
+      setGoalResult(unchanged ? 'Standing goal added.' : 'Standing goal added. Your newer draft is still here.');
+    } catch (cause) {
+      if (alive.current) setGoalError(cause instanceof Error ? cause.message : 'Could not add this goal. Your draft is still here.');
+    } finally {
+      goalOwner.current = false;
+      if (alive.current) setGoalSaving(false);
+      void qc.invalidateQueries({ queryKey: ['context'] });
+    }
   };
   return (
-    <div className="space-y-6">
+    <div hidden={!visible} style={!visible ? { display: 'none' } : undefined} className="space-y-6">
       <section>
         <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><BookOpen className="h-5 w-5 text-primary" aria-hidden /> Core context</h3>
         <p className="mb-3 text-small text-muted">The notes Clementine reads on every turn — her personality, who you are, and what to keep in mind. This is the seeded memory you can shape.</p>
         <IdentityProposalReview qc={qc} />
+        {ctx.isError && <CouldNotRead what={ctx.data ? 'Current core context; the last loaded context is shown' : 'Core context'} onRetry={() => void ctx.refetch()} />}
         {ctx.isLoading ? <Skeleton className="h-32 w-full" /> : <div className="space-y-2">{coreFiles.map((f) => <ContextFileCard key={f.key} file={f} onNavigate={onNavigate} />)}</div>}
         {/* Profile + standing goals ARE core context — they used to be their own
             "You & goals" tab, but they read on every turn like the files above. */}
         <div className="mt-3 grid gap-3 lg:grid-cols-2">
           <Card className="p-5">
             <div className="mb-3 flex items-center gap-2"><User className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Profile</h3></div>
-            {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : (
+            {ctx.isLoading ? <Skeleton className="h-24 w-full" /> : !ctx.data ? null : (
               <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5">
                 <ProfileItem label="Name" value={profile.preferredName || profile.displayName} />
                 <ProfileItem label="Role" value={profile.role} />
@@ -1631,7 +1667,7 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
                 <ProfileItem label="Tone" value={profile.communicationTone} />
               </dl>
             )}
-            <p className="mt-3 text-small text-muted">Wrong name or details? Fix them in <Link to="/settings" className="text-primary hover:underline">Settings → Profile</Link>.</p>
+            <p className="mt-3 text-small text-muted">Wrong name or details? Fix them in <Link to="/settings#profile" className="text-primary hover:underline">Settings → Profile</Link>.</p>
           </Card>
           <Card className="p-5">
             <div className="mb-3 flex items-center gap-2"><Target className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Standing goals</h3></div>
@@ -1645,8 +1681,10 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
               <Input value={goalTitle} onChange={(e) => setGoalTitle(e.target.value)} placeholder="New goal (e.g. Grow SEO pipeline)" aria-label="Goal title" />
               <div className="flex gap-2">
                 <Input value={goalDesc} onChange={(e) => setGoalDesc(e.target.value)} placeholder="What does success look like?" aria-label="Goal description" className="flex-1" />
-                <Button size="sm" onClick={addContextGoal} disabled={!goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> Add</Button>
+                <Button size="sm" onClick={() => void addContextGoal()} disabled={goalSaving || !goalTitle.trim() || !goalDesc.trim()}><Plus className="h-4 w-4" aria-hidden /> {goalSaving ? 'Adding…' : 'Add'}</Button>
               </div>
+              {goalError && <p role="alert" className="text-small text-danger">{goalError}</p>}
+              {goalResult && <p role="status" className="text-small text-muted">{goalResult}</p>}
               {/* These are core-context notes (/api/console/context/goals), read
                   on every turn — a different store from the tracked Goals screen
                   (/api/console/goals). Both are called "goals", so say which is
@@ -1657,6 +1695,7 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
         </div>
       </section>
 
+      {sources.isError && <CouldNotRead what={sources.data ? 'Current source map; the last loaded places are shown' : 'Where your data lives'} onRetry={() => void sources.refetch()} />}
       {pointers.length > 0 && (
         <section>
           <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><MapPin className="h-5 w-5 text-primary" aria-hidden /> Where your data lives</h3>
@@ -1678,8 +1717,9 @@ function SourcesTab({ qc, onNavigate }: { qc: ReturnType<typeof useQueryClient>;
 
       <section>
         <h3 className="mb-1 flex items-center gap-2 text-h3 text-fg"><Database className="h-5 w-5 text-primary" aria-hidden /> Indexed knowledge</h3>
-        <p className="mb-3 text-small text-muted">Files Clementine has read and broken into searchable chunks — this is where she looks things up. ({vault.length} files)</p>
-        {files.isLoading ? <Skeleton className="h-32 w-full" /> : vault.length === 0 ? <Card className="p-4 text-body text-muted">No files indexed yet.</Card>
+        <p className="mb-3 text-small text-muted">Files Clementine has read and broken into searchable chunks — this is where she looks things up.{files.data ? ` (${files.isError ? 'Last loaded: ' : ''}${vault.length} files)` : ''}</p>
+        {files.isError && <CouldNotRead what={files.data ? 'Current indexed knowledge; the last loaded files are shown' : 'Indexed knowledge'} onRetry={() => void files.refetch()} />}
+        {files.isLoading ? <Skeleton className="h-32 w-full" /> : vault.length === 0 && !files.isError ? <Card className="p-4 text-body text-muted">No files indexed yet.</Card>
           : <div className="space-y-1.5">
               {vault.slice(0, 80).map((v) => (
                 <div key={v.path} className="flex items-center gap-3 rounded-md border border-border bg-surface px-3.5 py-2.5">

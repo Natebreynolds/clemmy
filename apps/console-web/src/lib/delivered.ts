@@ -83,8 +83,15 @@ export function matchingDeliveredFile(group: DeliveredGroup, query = ''): Delive
     });
 }
 
-export function folderHref(group: Pick<DeliveredGroup, 'id'>): string {
-  return `/made/${group.id}`;
+export function folderHref(group: Pick<DeliveredGroup, 'id'> & Partial<Pick<DeliveredGroup, 'sessionId'>>): string {
+  const session = group.sessionId?.trim();
+  return `/made/${group.id}${session ? `?${new URLSearchParams({ session })}` : ''}`;
+}
+
+/** The source survives the bounded archive and a new representative file ID. */
+export function findDeliveredFolder(groups: readonly DeliveredGroup[], groupId: string | undefined, sessionId?: string): DeliveredGroup | undefined {
+  return groups.find(group => String(group.id) === groupId)
+    ?? (sessionId ? groups.find(group => group.sessionId === sessionId) : undefined);
 }
 
 /** Older daemons omit `artifacts`; synthesize from the representative url/file. */

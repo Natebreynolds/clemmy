@@ -4,6 +4,7 @@ import { Card } from '@/components/ui/Card';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { getDiagnostics } from '@/lib/advanced';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 
 function humanizeKey(k: string): string {
   return k.replace(/[_-]/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, (c) => c.toUpperCase());
@@ -25,19 +26,23 @@ function Value({ value }: { value: unknown }) {
       <div>
         <div className="mb-1 text-caption text-faint">{value.length} item{value.length === 1 ? '' : 's'}</div>
         <ul className="space-y-1">
-          {value.slice(0, 8).map((it, i) => <li key={i} className="truncate text-small text-fg">{previewItem(it)}</li>)}
-          {value.length > 8 && <li className="text-caption text-faint">+ {value.length - 8} more</li>}
+          {value.slice(0, 8).map((it, i) => <li key={i} className="break-words text-small text-fg">{it && typeof it === 'object'
+            ? <details><summary className="cursor-pointer rounded-sm">{previewItem(it)}</summary><pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words text-caption">{JSON.stringify(it, null, 2)}</pre></details>
+            : previewItem(it)}</li>)}
         </ul>
+        {value.length > 8 && <details className="mt-2 text-small text-muted"><summary className="cursor-pointer rounded-sm">Show all {value.length} items</summary><pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words text-caption">{JSON.stringify(value, null, 2)}</pre></details>}
       </div>
     );
   }
   if (value && typeof value === 'object') {
     return (
       <dl className="space-y-1.5">
-        {Object.entries(value as Record<string, unknown>).slice(0, 10).map(([k, v]) => (
-          <div key={k} className="flex items-center justify-between gap-3">
+        {Object.entries(value as Record<string, unknown>).map(([k, v]) => (
+          <div key={k} className="flex flex-wrap items-start justify-between gap-3">
             <dt className="text-small text-muted">{humanizeKey(k)}</dt>
-            <dd className="truncate text-small text-fg">{Array.isArray(v) ? `${v.length}` : typeof v === 'object' ? '…' : String(v)}</dd>
+            <dd className="min-w-0 max-w-full break-words text-small text-fg">{v && typeof v === 'object'
+              ? <details><summary className="cursor-pointer rounded-sm">{Array.isArray(v) ? `${v.length} items` : 'View details'}</summary><pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words text-caption">{JSON.stringify(v, null, 2)}</pre></details>
+              : String(v)}</dd>
           </div>
         ))}
       </dl>
@@ -53,9 +58,10 @@ export function DiagnosticsView() {
   return (
     <Page title="Diagnostics" subtitle="Health, logs, and storage">
       <div className="mb-4"><StartupDoctorCard /></div>
+      {(diag.isError || Boolean(diag.data?.error)) && <QueryUnavailable title="Diagnostics couldn’t be refreshed" description={entries.length > 0 ? 'Showing the last loaded diagnostics.' : 'Diagnostics are unavailable, so this is not a confirmed empty report.'} onRetry={() => { void diag.refetch(); }} className="mb-4 py-5" />}
       {diag.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">{[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-32 w-full" />)}</div>
-      ) : entries.length === 0 ? (
+      ) : entries.length === 0 && !diag.isError && !diag.data?.error ? (
         <Card className="p-5 text-body text-muted">No diagnostics available.</Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

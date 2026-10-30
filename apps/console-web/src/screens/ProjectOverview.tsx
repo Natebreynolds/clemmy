@@ -153,7 +153,7 @@ function ProjectBody({ overview, onSettled, onReread, refreshFailed }: {
               </Button>
             </>
           )}
-          <Button size="sm" variant="ghost" onClick={() => selectView('context')}>{archived ? 'Project context' : 'Edit project'}</Button>
+          <Button size="sm" variant="ghost" onClick={() => selectView('context')}>Project context</Button>
         </div>
       </header>
 

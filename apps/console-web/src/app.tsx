@@ -260,7 +260,7 @@ export function App() {
             <Route path="/watching" element={deferred(<Watches />)} />
             <Route path="/triggers" element={deferred(<Triggers />)} />
             <Route path="/automate/:name/canvas" element={deferred(<WorkflowCanvas />)} />
-            <Route path="/advanced/canvas" element={deferred(<WorkflowCanvas />)} />
+            <Route path="/advanced/canvas" element={deferred(<Advanced />)} />
             <Route path="/connect" element={deferred(<Connect />)} />
             <Route path="/memory" element={deferred(<Memory />)} />
             <Route path="/meetings" element={deferred(<Meetings />)} />

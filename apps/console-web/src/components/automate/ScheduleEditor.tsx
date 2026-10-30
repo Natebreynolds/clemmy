@@ -24,20 +24,28 @@ function hourLabel(h: number): string {
 
 /** Friendly schedule picker. Reads/writes a cron string but never shows
  *  one (except the explicit Custom escape hatch). */
-export function ScheduleEditor({ value, onChange, timezone, onTimezoneChange }: {
+export function ScheduleEditor({ value, onChange, timezone, onTimezoneChange, disabled = false }: {
   value: string; onChange: (cron: string) => void;
   timezone?: string; onTimezoneChange?: (tz: string) => void;
+  disabled?: boolean;
 }) {
   const [model, setModel] = useState<ScheduleModel>(() => parseCron(value));
+  const [sourceValue, setSourceValue] = useState(value);
+  // A conversation or reload may change the controlled schedule. Keep the
+  // picker's local editing mode only while it still represents that value.
+  if (value !== sourceValue) { setSourceValue(value); setModel(parseCron(value)); }
 
   const set = (partial: Partial<ScheduleModel>) => {
     const next = { ...model, ...partial };
     setModel(next);
-    onChange(buildCron(next));
+    const cron = buildCron(next);
+    setSourceValue(cron);
+    onChange(cron);
   };
 
   const toggleDay = (d: number) => {
     const has = model.days.includes(d);
+    if (has && model.days.length === 1) return;
     set({ days: has ? model.days.filter((x) => x !== d) : [...model.days, d] });
   };
 
@@ -45,7 +53,7 @@ export function ScheduleEditor({ value, onChange, timezone, onTimezoneChange }: 
   const modes = model.mode === 'custom' ? [...MODE_LABELS, { value: 'custom' as ScheduleMode, label: 'Custom (advanced)' }] : MODE_LABELS;
 
   return (
-    <div className="rounded-md border border-border bg-canvas p-4">
+    <fieldset disabled={disabled} className="rounded-md border border-border bg-canvas p-4 disabled:opacity-60">
       <label className="mb-1.5 block text-label text-fg">Runs</label>
       <Select value={model.mode} onChange={(e) => set({ mode: e.target.value as ScheduleMode })} aria-label="How often it runs">
         {modes.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
@@ -110,6 +118,6 @@ export function ScheduleEditor({ value, onChange, timezone, onTimezoneChange }: 
         <Clock className="h-4 w-4" aria-hidden />
         <span>{model.mode === 'manual' ? 'Runs only when you start it' : humanizeCron(cron, timezone)}</span>
       </div>
-    </div>
+    </fieldset>
   );
 }

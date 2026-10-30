@@ -6,7 +6,7 @@
  * Advanced › Diagnostics where it belongs.
  */
 import { Sun, Moon, Monitor, Sliders, ChevronRight } from 'lucide-react';
-import { useEffect } from 'react';
+import { useMemo } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Button } from '@/components/ui/Button';
 import { openCustomizeHome } from '@/lib/customize-home';
@@ -22,6 +22,7 @@ import { StorageCard } from './settings/StorageCard';
 import { cn } from '@/lib/cn';
 import { isMac } from '@/lib/platform';
 import { OnboardingModelReturn } from '@/components/onboarding/ExplorationNotice';
+import { HashSectionNavigation, sectionNavigationState } from '@/components/HashSectionNavigation';
 
 const THEMES: { key: ThemeChoice; label: string; icon: typeof Sun }[] = [
   { key: 'light', label: 'Light', icon: Sun },
@@ -65,19 +66,18 @@ export function Settings() {
   const showNotch = isMac();
   // Links from elsewhere (Connect, a top-bar chip) land on a section by hash;
   // the router does not scroll to it on its own.
-  const { hash } = useLocation();
-  useEffect(() => {
-    const id = decodeURIComponent(hash.replace(/^#/, ''));
-    if (id) document.getElementById(id)?.scrollIntoView({ block: 'start' });
-  }, [hash]);
+  const location = useLocation();
+  const active = location.hash.slice(1) || 'accounts';
+  const sections = useMemo(() => NAV_GROUPS.flatMap(group => group.items).filter(item => showNotch || item.id !== 'notch'), [showNotch]);
   return (
-    <div className="flex h-full min-h-0">
-      <nav aria-label="Settings sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
+    <div className="flex h-full min-h-0 min-w-0 flex-col xl:flex-row">
+      <nav aria-label="Settings sections" className="hidden w-[200px] shrink-0 flex-col overflow-y-auto border-r border-border bg-subtle px-3 py-6 xl:flex">
         {NAV_GROUPS.map((g, i) => (
           <div key={g.group} className={cn('flex flex-col', i > 0 && 'mt-3 border-t border-border pt-3')}>
             <p className="px-2.5 pb-1 text-caption font-semibold uppercase tracking-widest text-faint">{g.group}</p>
             {g.items.filter((s) => showNotch || s.id !== 'notch').map((s) => (
-              <a key={s.id} href={`#${s.id}`} className="rounded-md px-2.5 py-1.5 text-small font-medium text-muted transition-colors hover:bg-surface hover:text-fg">{s.label}</a>
+              <Link key={s.id} to={{ pathname: location.pathname, search: location.search, hash: `#${s.id}` }} state={sectionNavigationState(location.pathname, s.id, location.state)} aria-current={active === s.id ? 'location' : undefined}
+                className={cn('rounded-md px-2.5 py-1.5 text-small font-medium transition-colors hover:bg-surface hover:text-fg', active === s.id ? 'bg-surface text-fg' : 'text-muted')}>{s.label}</Link>
             ))}
           </div>
         ))}
@@ -87,7 +87,8 @@ export function Settings() {
           <Link to="/advanced" className="flex items-center gap-1 rounded-md px-2.5 py-1.5 text-small text-muted hover:text-fg">Advanced <ChevronRight className="h-3.5 w-3.5" aria-hidden /></Link>
         </div>
       </nav>
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
+      <HashSectionNavigation label="Settings sections" items={sections} defaultId="accounts" className="xl:hidden" />
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8">
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-8">
           <OnboardingModelReturn />
           <p className="-mb-4 text-caption font-semibold uppercase tracking-widest text-faint">Clementine</p>

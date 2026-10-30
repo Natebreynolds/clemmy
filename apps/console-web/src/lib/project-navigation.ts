@@ -22,3 +22,8 @@ export function projectViewSearch(search: URLSearchParams, view: ProjectView): U
   else next.set('view', view);
   return next;
 }
+
+/** Saved pages live in the project’s Context & apps view. */
+export function projectContextPath(projectId: string): string {
+  return `/projects/${encodeURIComponent(projectId)}?view=context`;
+}

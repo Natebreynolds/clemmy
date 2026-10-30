@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
@@ -16,6 +16,7 @@ export function ProfileForm() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState('');
+  const locked = useRef(false);
 
   useEffect(() => {
     if (settings.data?.profile && !form) setForm({ ...settings.data.profile });
@@ -27,15 +28,15 @@ export function ProfileForm() {
   };
 
   const save = async () => {
-    if (!form) return;
-    setSaving(true); setError('');
+    if (!form || locked.current) return;
+    locked.current = true; setSaving(true); setSaved(false); setError('');
     try {
       await patchProfile(form);
       setSaved(true);
       void qc.invalidateQueries({ queryKey: ['context'] });
       void qc.invalidateQueries({ queryKey: ['settings'] });
     } catch (e) { setError((e as Error).message); }
-    finally { setSaving(false); }
+    finally { locked.current = false; setSaving(false); }
   };
 
   if (settings.isLoading) return <Card className="p-5"><Skeleton className="h-64 w-full" /></Card>;
@@ -50,7 +51,9 @@ export function ProfileForm() {
     <Card className="p-5">
       <h3 className="mb-1 text-h3 text-fg">Profile</h3>
       <p className="mb-4 text-small text-muted">Tell Clementine how you'd like to be treated. It reads this on every turn.</p>
+      {settings.isError && <p role="status" className="mb-3 text-small text-muted">The saved profile couldn’t be refreshed. Your draft is still here. <Button variant="link" size="sm" onClick={() => void settings.refetch()}>Retry</Button></p>}
 
+      <fieldset disabled={saving} className="min-w-0">
       <div className="grid gap-x-4 sm:grid-cols-2">
         <Field label="Preferred name">{(id) => <Input id={id} value={form.preferredName ?? ''} onChange={(e) => set('preferredName', e.target.value)} placeholder="What should I call you?" />}</Field>
         <Field label="Role">{(id) => <Input id={id} value={form.role ?? ''} onChange={(e) => set('role', e.target.value)} placeholder="e.g. Founder, Coach" />}</Field>
@@ -89,8 +92,9 @@ export function ProfileForm() {
       <div className="flex items-center gap-3">
         <Button onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save profile'}</Button>
         {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved</span>}
-        {error && <span className="text-small text-danger">{error}</span>}
+        {error && <span role="alert" className="text-small text-danger">{error}</span>}
       </div>
+      </fieldset>
     </Card>
   );
 }

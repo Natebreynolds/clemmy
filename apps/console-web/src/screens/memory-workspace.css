@@ -59,6 +59,7 @@
 }
 .memory-navigation {
   display: flex;
+  flex-wrap: wrap;
   flex: 0 0 auto;
   align-items: center;
   gap: .25rem;

@@ -19,9 +19,8 @@ export function cardStepLabel(step: Pick<FromClemTurnStep, 'tool'>): string {
   return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
 }
 
-/** What Clem is doing about what the owner asked on this item: their words,
- *  her steps as they happen, then her answer, or what she still needs. Shown
- *  on the item itself, so a reply never disappears into a thread. */
+/** A receipt names its state and next destination. Its complete request,
+ * activity and reply stay readable without repeating a pending approval. */
 export function CardRecord({ record, onDismiss, showTitle = false }: { record: CardReplyRecord; onDismiss?: () => void; showTitle?: boolean }) {
   const outcome = record.outcome;
   const headline = tapOutcomeHeadline(outcome);
@@ -29,67 +28,74 @@ export function CardRecord({ record, onDismiss, showTitle = false }: { record: C
   const words = 'text' in outcome ? outcome.text : '';
   const sessionId = 'sessionId' in outcome ? outcome.sessionId : null;
   const working = outcome.state === 'working';
+  const action = outcome.state === 'needs_you' && outcome.approvalId
+    ? { href: `/inbox?tab=needs&select=${encodeURIComponent(outcome.approvalId)}`, label: 'Review and approve' }
+    : sessionId ? {
+      href: `/chat/${encodeURIComponent(unifiedChatSessionId(sessionId))}`,
+      label: outcome.state === 'needs_you' ? outcome.asks === 'approval' ? 'Review and approve' : 'Answer Clem' : 'Open the conversation',
+    } : null;
+  const activity = (shown = steps) => <ol className="space-y-1" aria-label={working ? 'What Clem is doing' : 'What Clem did'}>
+    {shown.map((step, index) => <li key={`${step.tool}-${index}`} className="flex items-start gap-1.5 text-small text-muted">
+      {step.done
+        ? <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
+        : <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden />}
+      <span className="min-w-0 break-words">{cardStepLabel(step)}</span>
+    </li>)}
+  </ol>;
   return (
     <div className="rounded-lg border border-border bg-subtle px-3 py-2.5" aria-live="polite" data-testid="card-record">
-      <div className="flex items-start gap-2">
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-1">
         <div className="min-w-0 flex-1">
-          {showTitle && <p className="mb-1 line-clamp-1 text-small text-muted">{record.title}</p>}
-          <p className="text-small text-fg [overflow-wrap:anywhere]"><span className="font-semibold">You: </span>{record.reply}</p>
+          {showTitle && <p className="line-clamp-1 text-small text-muted">{record.title}</p>}
+          <p className={cn('flex items-center gap-1.5 text-small font-semibold', toneClass[headline.tone])}>
+            {working && steps.length === 0 && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden />}
+            {outcome.state === 'not_found' ? 'This turn couldn’t be confirmed' : headline.text}
+          </p>
         </div>
-        {onDismiss && !working && (
-          <button type="button" onClick={onDismiss} aria-label="Hide this record"
-            className="rounded-sm p-1 text-faint hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
-            <X className="h-4 w-4" aria-hidden />
-          </button>
-        )}
+        {action && <Link to={action.href} className="inline-flex min-h-9 shrink-0 items-center rounded-sm text-small font-semibold text-primary hover:underline">{action.label}</Link>}
+        {onDismiss && !working && <button type="button" onClick={onDismiss} aria-label="Hide this record"
+          className="rounded-sm p-1 text-faint hover:bg-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+          <X className="h-4 w-4" aria-hidden />
+        </button>}
       </div>
-      {steps.length > 0 && (
-        <ol className="mt-1.5 space-y-0.5" aria-label="What Clem did">
-          {steps.map((step, index) => (
-            <li key={`${step.tool}-${index}`} className="flex items-center gap-1.5 text-small text-muted">
-              {step.done
-                ? <Check className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden />
-                : <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden />}
-              <span className="min-w-0 truncate">{cardStepLabel(step)}</span>
-            </li>
-          ))}
-        </ol>
-      )}
-      <p className={cn('mt-1.5 flex items-center gap-1.5 text-small font-semibold', toneClass[headline.tone])}>
-        {working && steps.length === 0 && <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden />}
-        {headline.text}
-      </p>
-      {words && <p className="mt-0.5 line-clamp-6 whitespace-pre-wrap text-body text-fg [overflow-wrap:anywhere]">{words}</p>}
-      {outcome.state === 'needs_you' && outcome.approvalId ? (
-        // The approval card shows exactly what Clem will change; it is where the tap is the approval.
-        <Link to={`/inbox?tab=needs&select=${encodeURIComponent(outcome.approvalId)}`}
-          className="mt-1 inline-block text-small font-semibold text-primary hover:underline">
-          Review and approve
-        </Link>
-      ) : sessionId && outcome.state !== 'done' && (
-        <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(sessionId))}`}
-          className="mt-1 inline-block text-small font-semibold text-primary hover:underline">
-          {outcome.state === 'needs_you' ? (outcome.asks === 'approval' ? 'Review and approve' : 'Answer Clem') : 'Open the conversation'}
-        </Link>
-      )}
+      {working && steps.length > 0 && <div className="mt-2">{activity(steps.slice(-3))}</div>}
+      <details className="mt-1 text-small">
+        <summary className="min-h-9 cursor-pointer py-2 font-medium text-muted hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{working ? 'Read request & full activity' : 'Read request, full reply & activity'}</summary>
+        <div className="space-y-3 border-t border-border py-3">
+          {showTitle && record.title && <p className="whitespace-pre-wrap text-small text-muted [overflow-wrap:anywhere]">{record.title}</p>}
+          <p className="whitespace-pre-wrap text-body text-fg [overflow-wrap:anywhere]"><span className="font-semibold">You: </span>{record.reply}</p>
+          {steps.length > 0 && activity()}
+          {words && <p className="whitespace-pre-wrap text-body text-fg [overflow-wrap:anywhere]">{words}</p>}
+          {outcome.state === 'not_found' && <p className="text-small text-muted">{headline.text}</p>}
+        </div>
+      </details>
     </div>
   );
 }
 
-/** The recent records on their own, for a screen that lists items without
- *  carrying each record inside them (Inbox). */
+/** Moving and waiting receipts stay visible. Older settled activity stays
+ * fully mounted in one counted disclosure, with the latest receipt above it. */
+export function CardRecordList({ records, onDismiss }: { records: readonly CardReplyRecord[]; onDismiss?: (record: CardReplyRecord) => void }) {
+  if (records.length === 0) return null;
+  const current = records.filter(record => record.outcome.state === 'working' || record.outcome.state === 'needs_you');
+  const settled = records.filter(record => record.outcome.state !== 'working' && record.outcome.state !== 'needs_you');
+  const renderRecord = (record: CardReplyRecord) => <CardRecord key={record.runId} record={record} showTitle onDismiss={onDismiss ? () => onDismiss(record) : undefined} />;
+  return <div className="flex flex-col gap-2">
+    {current.map(renderRecord)}
+    {settled.slice(0, 1).map(renderRecord)}
+    {settled.length > 1 && <details className="text-small text-muted">
+      <summary className="min-h-9 cursor-pointer py-2 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Earlier reply activity · {settled.length - 1}</summary>
+      <div className="flex flex-col gap-2 pb-2">{settled.slice(1).map(renderRecord)}</div>
+    </details>}
+  </div>;
+}
+
+/** The same receipts on screens where the originating items are not listed. */
 export function RecentCardRecords() {
   const replies = useQuery({
     queryKey: ['from-clem-replies'],
     queryFn: getCardReplies,
     refetchInterval: (query) => (query.state.data?.replies.some(cardReplyInMotion) ? 3_000 : 20_000),
   });
-  const records = (replies.data?.replies ?? []).slice(0, 3);
-  if (records.length === 0) return null;
-  return (
-    <div className="flex flex-col gap-1.5">
-      <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">Just now</h3>
-      {records.map((record) => <CardRecord key={record.runId} record={record} showTitle />)}
-    </div>
-  );
+  return <CardRecordList records={replies.data?.replies ?? []} />;
 }

@@ -1,13 +1,27 @@
 import { acceptComposerDraft, moveComposerDraft, readComposerDraft, writeComposerDraft, type ComposerDraft } from './composer-drafts';
 import type { MemoryHit } from './memory';
 
+interface MemoryAssistantOwner { scope: string; executionSessionId: string | null; conversationSessionId: string | null }
+let windowOwner: MemoryAssistantOwner | null = null;
+/** Only a window-local owner pointer is retained. Draft contents stay in the
+ * existing composer registry; messages stay in their actual conversation. */
+export function memoryAssistantOwner(createScope = () => `memory-${crypto.randomUUID()}`): MemoryAssistantOwner {
+  return windowOwner ??= { scope: createScope(), executionSessionId: null, conversationSessionId: null };
+}
+export function retainMemoryAssistantOwner(scope: string, executionSessionId: string | null, conversationSessionId: string | null): boolean {
+  if (windowOwner?.scope !== scope) return false;
+  windowOwner.executionSessionId = executionSessionId;
+  windowOwner.conversationSessionId = conversationSessionId;
+  return true;
+}
+
 /** Only the explicitly selected identity accompanies the question. Its body,
  * sources and confidence are read through the normal memory tools if needed. */
 export function memoryAssistantMessage(text: string, context: Pick<MemoryHit, 'ref'> | null): string {
   const question = text.trim();
-  return context
-    ? [question, `Selected memory reference: ${JSON.stringify({ type: context.ref.type, id: context.ref.id })}`].filter(Boolean).join('\n\n')
-    : question;
+  if (!context) return question;
+  const reference = `Selected memory reference: ${JSON.stringify({ type: context.ref.type, id: context.ref.id })}`;
+  return question.endsWith(reference) ? question : [question, reference].filter(Boolean).join('\n\n');
 }
 
 export interface MemoryAssistantSubmission { wireInput: string; draft: ComposerDraft }
@@ -51,5 +65,6 @@ export function handoffMemoryAssistantDraft(
   if (hasDraft(next) && hasDraft(target)) return 'conflict';
   if (context) writeComposerDraft(sourceKey, () => next);
   moveComposerDraft(sourceKey, targetKey);
+  if (windowOwner && sourceKey === `session:${windowOwner.scope}`) windowOwner = null;
   return 'moved';
 }

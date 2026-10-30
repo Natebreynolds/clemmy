@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   AlertTriangle, ArrowRight, Clipboard, GitBranch, History, Loader2, MessageSquare,
@@ -11,6 +11,8 @@ import { StatusPill, type Tone } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
+import { editableChatDraft } from '@/lib/editable-chat-draft';
 import { cn } from '@/lib/cn';
 import {
   getReplayPreview,
@@ -140,14 +142,15 @@ function TimelineNode({ node }: { node: TraceNode }) {
   );
 }
 
-function TraceDetailPanel({ trace, replay, onReplay }: {
+function TraceDetailPanel({ trace, replay, onReplay, busy, replayError }: {
   trace?: TraceDetail;
   replay: TraceReplayPreview | null;
   onReplay: () => Promise<void>;
+  busy: boolean;
+  replayError: string | null;
 }) {
   const navigate = useNavigate();
   const [copyState, setCopyState] = useState<'idle' | 'copied'>('idle');
-  const [busy, setBusy] = useState(false);
   const categories = useMemo(() => {
     const out = new Map<TraceNodeCategory, number>();
     for (const node of trace?.nodes ?? []) out.set(node.category, (out.get(node.category) ?? 0) + 1);
@@ -156,10 +159,6 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
 
   if (!trace) return <Skeleton className="h-[560px] w-full" />;
 
-  const startReplay = async () => {
-    setBusy(true);
-    try { await onReplay(); } finally { setBusy(false); }
-  };
   const prompt = replay?.prompt ?? '';
   const copyPrompt = async () => {
     if (!prompt) return;
@@ -167,11 +166,12 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
       await navigator.clipboard.writeText(prompt);
       setCopyState('copied');
       window.setTimeout(() => setCopyState('idle'), 1200);
-    } catch { /* ignore */ }
+    } catch { setCopyState('idle'); }
   };
   const openChat = () => {
     if (!prompt) return;
-    navigate(`/chat?prompt=${encodeURIComponent(prompt)}`);
+    const target = editableChatDraft(prompt);
+    if (target) navigate(target.pathname, { state: target.state });
   };
 
   return (
@@ -186,7 +186,7 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
             <p className="mt-1 truncate font-mono text-caption text-faint">{trace.sessionId}</p>
             {trace.objective && <p className="mt-2 text-small text-muted">{trace.objective}</p>}
           </div>
-          <Button variant="secondary" disabled={busy || !trace.replay.ready} onClick={startReplay}>
+          <Button variant="secondary" disabled={busy || !trace.replay.ready} onClick={() => void onReplay()}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />}
             Replay preview
           </Button>
@@ -211,6 +211,7 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
           </div>
         )}
       </Card>
+      {replayError && <p role="alert" className="text-small text-danger">Replay preview couldn’t be prepared: {replayError}. Try Replay preview again.</p>}
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card className="overflow-hidden p-0">
@@ -261,7 +262,7 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
                     <Clipboard className="h-4 w-4" aria-hidden /> {copyState === 'copied' ? 'Copied' : 'Copy'}
                   </Button>
                   <Button size="sm" onClick={openChat}>
-                    <MessageSquare className="h-4 w-4" aria-hidden /> Open in chat
+                    <MessageSquare className="h-4 w-4" aria-hidden /> Draft in chat
                   </Button>
                 </div>
               </div>
@@ -286,7 +287,14 @@ function TraceDetailPanel({ trace, replay, onReplay }: {
 export function TraceLabView() {
   const traces = usePoll(['traces'], () => listTraces({ limit: 80, status: 'any' }), 8000);
   const [selected, setSelected] = useState<string | null>(null);
-  const [replay, setReplay] = useState<TraceReplayPreview | null>(null);
+  const [replay, setReplay] = useState<{ sessionId: string; value: TraceReplayPreview } | null>(null);
+  const [replayBusy, setReplayBusy] = useState<string | null>(null);
+  const [replayError, setReplayError] = useState<{ sessionId: string; text: string } | null>(null);
+  const replayOwner = useRef(0);
+  const pendingReplay = useRef<string | null>(null);
+  const currentSelection = useRef(selected);
+  currentSelection.current = selected;
+  useEffect(() => () => { replayOwner.current++; }, []);
 
   useEffect(() => {
     if (!selected && traces.data?.traces?.[0]) setSelected(traces.data.traces[0].sessionId);
@@ -299,13 +307,22 @@ export function TraceLabView() {
     { enabled: !!selected },
   );
 
-  useEffect(() => { setReplay(null); }, [selected]);
+  useEffect(() => { replayOwner.current++; pendingReplay.current = null; setReplay(null); setReplayError(null); setReplayBusy(null); }, [selected]);
 
   const selectedTrace = detail.data;
   const openReplay = async () => {
-    if (!selected) return;
-    const res = await getReplayPreview(selected);
-    setReplay(res.replay);
+    if (!selected || pendingReplay.current === selected) return;
+    const id = selected;
+    pendingReplay.current = id;
+    const owner = ++replayOwner.current;
+    const current = () => currentSelection.current === id && replayOwner.current === owner;
+    setReplayBusy(id); setReplayError(null);
+    try {
+      const res = await getReplayPreview(id);
+      if (current()) setReplay({ sessionId: id, value: res.replay });
+    } catch (error) {
+      if (current()) setReplayError({ sessionId: id, text: error instanceof Error ? error.message : 'Please try again' });
+    } finally { if (current()) { pendingReplay.current = null; setReplayBusy(null); } }
   };
 
   return (
@@ -316,9 +333,10 @@ export function TraceLabView() {
             <h2 className="text-h3 text-fg">Recent Runs</h2>
             {traces.isFetching && <Loader2 className="h-4 w-4 animate-spin text-faint" aria-hidden />}
           </div>
+          {traces.isError && <QueryUnavailable title="Run list couldn’t be refreshed" description={traces.data ? 'Showing the last loaded runs.' : 'The run list is unavailable, so it cannot be confirmed empty.'} onRetry={() => { void traces.refetch(); }} className="mb-3 py-5" />}
           {traces.isLoading ? (
             <Skeleton className="h-96 w-full" />
-          ) : (traces.data?.traces ?? []).length === 0 ? (
+          ) : !traces.isError && (traces.data?.traces ?? []).length === 0 ? (
             <EmptyState title="No traces" description="Harness traces appear after Clementine runs." />
           ) : (
             <div className="max-h-[760px] space-y-2 overflow-auto pr-1">
@@ -334,10 +352,11 @@ export function TraceLabView() {
           )}
         </div>
 
-        {selected && detail.isError ? (
-          <EmptyState title="Trace unavailable" description="This harness trace could not be loaded." />
-        ) : selected ? (
-          <TraceDetailPanel trace={selectedTrace} replay={replay} onReplay={openReplay} />
+        {selected ? (
+          <div className="min-w-0">
+            {detail.isError && <QueryUnavailable title="Trace couldn’t be refreshed" description={detail.data ? 'Showing the last loaded trace.' : 'This trace could not be loaded.'} onRetry={() => { void detail.refetch(); }} className="mb-3 py-5" />}
+            {(!detail.isError || detail.data) && <TraceDetailPanel key={selected} trace={selectedTrace} replay={replay?.sessionId === selected ? replay.value : null} onReplay={openReplay} busy={replayBusy === selected} replayError={replayError?.sessionId === selected ? replayError.text : null} />}
+          </div>
         ) : (
           <EmptyState title="Select a trace" description="Pick a recent run to inspect." />
         )}

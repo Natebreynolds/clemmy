@@ -51,13 +51,15 @@ import { ScheduleEditor } from '@/components/automate/ScheduleEditor';
 import { WorkflowEnginePanel } from '@/components/automate/WorkflowDrawer';
 import { WorkflowCanvasNode, type WorkflowCanvasFlowNode, type WorkflowCanvasNodeRun } from '@/components/automate/WorkflowCanvasNode';
 import { WorkflowConversation } from '@/components/automate/WorkflowConversation';
-import type { WorkflowConversationQuestion } from '@/lib/workflow-conversation';
+import { AutomationRefreshNotice } from '@/components/automate/AutomationRefreshNotice';
+import { workflowSetupPrompt, type WorkflowConversationQuestion } from '@/lib/workflow-conversation';
 import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { usePoll } from '@/lib/poll';
 import { usePendingCommit, type PendingCommit } from '@/lib/pending-commit';
-import { workflowRunFailure, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
+import { workflowRunFailure, workflowRunId, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
+import { automationRunHref, exactRun, freshWorkflowDraft, reconcileDescriptionDraft, reconcileWorkflowDraft, workflowDetailsPatch, workflowDraftDirty, workflowFields, type WorkflowFields } from '@/lib/automation-editor';
 import { getSettings, type ModelRolesSnapshot } from '@/lib/settings';
-import { detectedTimezone, humanizeCron } from '@/lib/cron';
+import { humanizeCron } from '@/lib/cron';
 import { cn } from '@/lib/cn';
 import { certPrimaryAction, certificationTone, sentenceCaseLabel } from '@/lib/workflowCertification';
 import {
@@ -128,7 +130,7 @@ function WorkflowView({ name }: { name: string }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const isDark = useIsDarkTheme();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const graphCommit = usePendingCommit(name);
   const runCommit = usePendingCommit(name);
   useWorkflowChanges();
@@ -147,6 +149,15 @@ function WorkflowView({ name }: { name: string }) {
     setConversationQuestion({ workflowSlug, id: ++questionId.current, text });
     setConversationOpen(true);
   };
+  const setupRequested = searchParams.get('setup') === '1';
+  const setupPrepared = useRef(false);
+  useEffect(() => {
+    if (!setupRequested) { setupPrepared.current = false; return; }
+    if (!detail || setupPrepared.current) return;
+    setupPrepared.current = true;
+    setConversationQuestion({ workflowSlug, id: ++questionId.current, text: workflowSetupPrompt(workflowSlug, detail.certification) });
+    setConversationOpen(true);
+  }, [setupRequested, workflowSlug, detail]);
 
   /* ---------- the graph ---------- */
   const [nodes, setNodes, onNodesChange] = useNodesState<WorkflowCanvasFlowNode>([]);
@@ -343,6 +354,7 @@ function WorkflowView({ name }: { name: string }) {
   const [testing, setTesting] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const [queuedRunId, setQueuedRunId] = useState<string | null>(null);
   const [runNoticeTone, setRunNoticeTone] = useState<'info' | 'warning'>('info');
   const invalidateAll = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['workflow', name] });
@@ -353,12 +365,13 @@ function WorkflowView({ name }: { name: string }) {
   const run = async () => {
     const token = runCommit.begin();
     if (!token) return;
-    setBusy('run'); setControlError(null); setRunNotice(null);
+    setBusy('run'); setControlError(null); setRunNotice(null); setQueuedRunId(null);
     try {
       const receipt = await runWorkflow(name);
       if (!runCommit.owns(token)) return;
       setRunNotice(workflowRunNotice(receipt));
       setRunNoticeTone(workflowRunTone(receipt));
+      setQueuedRunId(workflowRunId(receipt));
       void queryClient.invalidateQueries({ queryKey: ['runs'] });
       invalidateAll();
     } catch (e) { if (runCommit.owns(token)) setControlError(workflowRunFailure(e)); }
@@ -424,7 +437,7 @@ function WorkflowView({ name }: { name: string }) {
   const runPrimary = () => {
     if (!primary || primary.kind === 'run') return void run();
     if (primary.kind === 'enable') return void setEnabled(true);
-    return openAdvanced();
+    return askInWorkflow(workflowSetupPrompt(workflowSlug, detail?.certification));
   };
 
   /* ---------- selection ---------- */
@@ -435,7 +448,8 @@ function WorkflowView({ name }: { name: string }) {
 
   /* ---------- the Last run tab ---------- */
   const [view, setView] = useState<'steps' | 'run'>(() => (searchParams.get('run') ? 'run' : 'steps'));
-  const [chosenRunId, setChosenRunId] = useState<string | null>(() => searchParams.get('run'));
+  const chosenRunId = searchParams.get('run');
+  useEffect(() => { if (chosenRunId) setView('run'); }, [chosenRunId]);
   const runsQuery = useQuery({
     queryKey: ['workflow-runs', name],
     queryFn: () => listWorkflowRuns(name, 20),
@@ -443,7 +457,7 @@ function WorkflowView({ name }: { name: string }) {
   });
   const runs = runsQuery.data?.runs ?? [];
   const newest = latestRun(runs);
-  const shownRun: WorkflowRunRecord | null = (chosenRunId ? runs.find((r) => r.id === chosenRunId) : null) ?? newest;
+  const shownRun = exactRun(runs, chosenRunId, newest);
   const overlayQuery = useQuery({
     queryKey: ['workflow-run-overlay', name, shownRun?.id ?? null],
     queryFn: () => getWorkflowRunOverlay(name, shownRun!.id),
@@ -473,7 +487,7 @@ function WorkflowView({ name }: { name: string }) {
   }, [view, overlay, overlaySteps, setNodes]);
   const selectedRunStep = selectedId && view === 'run' ? overlaySteps.get(selectedId) ?? null : null;
 
-  if (detailQuery.isError) {
+  if (detailQuery.isError && !detailQuery.data) {
     return (
       <Page title={name}>
         <QueryUnavailable
@@ -531,10 +545,11 @@ function WorkflowView({ name }: { name: string }) {
           {primary && primary.kind !== 'run' ? (
             <Button size="sm" onClick={runPrimary} disabled={busy !== null} title={detail.certification?.summary}>
               {busy === 'enable' ? <Loader2 size={16} className="animate-spin" aria-hidden /> : primary.kind === 'enable' ? <ShieldCheck size={16} aria-hidden /> : null}
-              {primary.label}
+              {primary.kind === 'guide' ? 'Finish setup with Clem' : primary.label}
             </Button>
           ) : null}
-          <Button size="sm" variant={primary && primary.kind !== 'run' ? 'secondary' : 'primary'} onClick={() => void run()} disabled={busy !== null || stepless}>
+          {primary?.kind === 'guide' && <Button variant="ghost" size="sm" onClick={openAdvanced}>Manual setup</Button>}
+          <Button size="sm" variant={primary && primary.kind !== 'run' ? 'secondary' : 'primary'} onClick={() => void run()} disabled={busy !== null || stepless || Boolean(detail.certification && !detail.certification.canRun)}>
             {busy === 'run' ? <Loader2 size={16} className="animate-spin" aria-hidden /> : <Play size={16} aria-hidden />}
             Run now
           </Button>
@@ -542,9 +557,9 @@ function WorkflowView({ name }: { name: string }) {
       }
     >
       {/* What it does, and whether it is on */}
+      {detailQuery.isError && <AutomationRefreshNotice className="mb-4" title="Showing the last loaded workflow" description="Refresh before relying on its status. Your edits are kept." onRetry={() => { void detailQuery.refetch(); }} />}
       <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <DescriptionEditor
-          key={detail.description ?? ''}
           value={detail.description ?? ''}
           onSave={async (description) => { await patchWorkflow(name, { description }); invalidateAll(); }}
         />
@@ -572,7 +587,7 @@ function WorkflowView({ name }: { name: string }) {
         </Banner>
       ) : null}
       {controlError ? <Banner tone="danger">{controlError}</Banner> : null}
-      {runNotice ? <Banner tone={runNoticeTone}>{runNotice}</Banner> : null}
+      {runNotice ? <Banner tone={runNoticeTone}>{runNotice}{queuedRunId && <Link className="ml-2 font-semibold text-primary hover:underline" to={automationRunHref(name, queuedRunId)}>View run</Link>}</Banner> : null}
       {changedElsewhere ? (
         <Banner tone="warning">
           This workflow changed while you had unsaved edits here.{' '}
@@ -646,9 +661,10 @@ function WorkflowView({ name }: { name: string }) {
                 <select
                   aria-label="Which run"
                   className="max-w-[260px] rounded-md border border-border bg-canvas px-2 py-1 text-small text-fg"
-                  value={shownRun?.id ?? ''}
-                  onChange={(e) => setChosenRunId(e.target.value || null)}
+                  value={shownRun?.id ?? chosenRunId ?? ''}
+                  onChange={(e) => { const next = new URLSearchParams(searchParams); if (e.target.value) next.set('run', e.target.value); else next.delete('run'); setSearchParams(next); }}
                 >
+                  {chosenRunId && !shownRun && <option value={chosenRunId}>Requested run · outside recent history</option>}
                   {runs.map((r) => (
                     <option key={r.id} value={r.id}>{runWhen(r)} · {statusTone(r.status).label}{r.targetStepId ? ` · only ${r.targetStepId}` : ''}</option>
                   ))}
@@ -665,10 +681,14 @@ function WorkflowView({ name }: { name: string }) {
                 ) : null}
               </>
             ) : (
-              <span className="text-small text-muted">No runs yet</span>
+              <span className="text-small text-muted">{runsQuery.isPending ? 'Loading run history…' : runsQuery.isError ? 'Run history unavailable' : chosenRunId ? 'Requested run outside recent history' : 'No runs yet'}</span>
             )}
           </div>
-          {stepless ? (
+          {view === 'run' && runsQuery.isPending ? <Skeleton className="m-4 h-48" /> : view === 'run' && runsQuery.isError && !runsQuery.data ? (
+            <QueryUnavailable className="m-4" title="Run history is unavailable" description="Your saved runs are kept. Retry to load this workflow’s history." onRetry={() => { void runsQuery.refetch(); }} />
+          ) : view === 'run' && chosenRunId && !shownRun && !runsQuery.isPending ? (
+            <EmptyState title="This run is outside the recent history" description="The requested run has not been replaced with another run." action={<Link to={automationRunHref(detail.name, chosenRunId)}><Button variant="secondary">Open this run’s saved workspace</Button></Link>} />
+          ) : stepless ? (
             <EmptyState
               title="No steps to draw"
               description="This workflow has no steps yet. Add one here, or build it out with Clementine."
@@ -707,13 +727,17 @@ function WorkflowView({ name }: { name: string }) {
           )}
           <p className="border-t border-border px-3 py-1.5 text-caption text-faint">
             {view === 'run'
-              ? (overlay ? runHeadline(overlay, shownRun) : shownRun ? 'Loading the run…' : 'Run the workflow once and its steps show here, coloured by what happened.')
+              ? (overlay ? runHeadline(overlay, shownRun) : overlayQuery.isError ? 'Run details could not be loaded. Retry above.' : runsQuery.isError ? 'Run history could not be refreshed.' : chosenRunId && !shownRun ? 'The requested run has not been replaced with another run.' : shownRun || runsQuery.isPending ? 'Loading the run…' : 'Run the workflow once and its steps show here, coloured by what happened.')
               : 'Drag between steps to change what waits on what. Click a step to open it. Placement is saved with the workflow.'}
           </p>
+          {view === 'run' && runsQuery.isError && runsQuery.data && <AutomationRefreshNotice className="m-3" title="Showing last loaded runs" description="Refresh before relying on their status." onRetry={() => { void runsQuery.refetch(); }} />}
+          {view === 'run' && overlayQuery.isError && shownRun && <AutomationRefreshNotice className="m-3" title="This run’s details are unavailable" description={overlay ? 'The last loaded details are shown.' : 'The run itself is kept. Retry to load its steps.'} onRetry={() => { void overlayQuery.refetch(); }} />}
         </Card>
 
         <Card className="flex min-h-0 flex-col overflow-hidden p-0 lg:h-[min(70vh,760px)]">
-          {view === 'run' ? (
+          {view === 'run' && (runsQuery.isPending || runsQuery.isError && !runsQuery.data || chosenRunId && !shownRun) ? (
+            <div className="p-4 text-small text-muted">{runsQuery.isPending ? 'Loading the requested run…' : runsQuery.isError ? 'Retry the history list to load this workflow’s runs.' : 'Choose a recent run above, or open the requested run’s saved workspace.'}</div>
+          ) : view === 'run' ? (
             selectedNode ? (
               <RunStepPanel
                 node={selectedNode}
@@ -784,21 +808,26 @@ function WorkflowView({ name }: { name: string }) {
 
 function DescriptionEditor({ value, onSave }: { value: string; onSave: (next: string) => Promise<void> }) {
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value);
+  const [state, setState] = useState({ base: value, value, conflict: false });
+  const current = reconcileDescriptionDraft(state, value);
+  if (current !== state) setState(current);
+  const draft = current.value;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const pending = usePendingCommit('workflow-description');
   const commit = async () => {
     if (draft.trim() === value.trim()) { setEditing(false); return; }
+    const token = pending.begin(); if (!token) return;
     setSaving(true); setError(null);
-    try { await onSave(draft.trim()); setEditing(false); }
-    catch (e) { setError((e as Error).message); }
-    finally { setSaving(false); }
+    try { await onSave(draft.trim()); if (pending.owns(token)) setEditing(false); }
+    catch (e) { if (pending.owns(token)) setError((e as Error).message); }
+    finally { if (pending.finish(token)) setSaving(false); }
   };
   if (!editing) {
     return (
       <button
         type="button"
-        onClick={() => setEditing(true)}
+        onClick={() => { setState({ base: value, value, conflict: false }); setError(null); setEditing(true); }}
         title="Change what this workflow does"
         className="reading max-w-3xl min-w-0 text-left text-body-lg text-muted hover:text-fg cursor-pointer"
       >
@@ -809,11 +838,12 @@ function DescriptionEditor({ value, onSave }: { value: string; onSave: (next: st
   }
   return (
     <div className="min-w-0 flex-1 max-w-3xl">
-      <Textarea value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="What does this workflow do, in a sentence or two?" autoFocus rows={3} />
+      <Textarea value={draft} onChange={(e) => setState({ ...current, value: e.target.value, conflict: current.conflict && e.target.value !== value })} aria-label="Workflow description" placeholder="What does this workflow do, in a sentence or two?" autoFocus rows={3} disabled={saving} />
+      {current.conflict && <p role="status" className="mt-2 text-small text-warning">Clem updated this description while you were editing. Your draft is kept. Save applies your description. <button type="button" disabled={saving} className="font-semibold text-primary hover:underline" onClick={() => setState({ base: value, value, conflict: false })}>Use latest description</button></p>}
       <div className="mt-2 flex items-center gap-2">
         <Button size="sm" onClick={() => void commit()} disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button>
-        <Button size="sm" variant="ghost" onClick={() => { setDraft(value); setEditing(false); }} disabled={saving}>Cancel</Button>
-        {error ? <span className="text-small text-danger">{error}</span> : null}
+        <Button size="sm" variant="ghost" onClick={() => { setState({ base: value, value, conflict: false }); setEditing(false); }} disabled={saving}>Cancel</Button>
+        {error ? <span role="alert" className="text-small text-danger">{error}</span> : null}
       </div>
     </div>
   );
@@ -1330,30 +1360,41 @@ function ShapePanel({ graph, certification }: { graph: CanvasGraph; certificatio
 
 /* ---------- Advanced: schedule and model pins, saved together ---------- */
 
-function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () => void }) {
-  const [cron, setCron] = useState(detail.trigger?.schedule ?? '');
-  const [tz, setTz] = useState(detail.trigger?.timezone || (detail.trigger?.schedule ? detectedTimezone() : ''));
-  const [pinBrain, setPinBrain] = useState(detail.models?.brain ?? '');
-  const [pinWorker, setPinWorker] = useState(detail.models?.worker ?? '');
+export function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () => void }) {
+  const incoming = workflowFields(detail);
+  const [draft, setDraft] = useState(() => freshWorkflowDraft(incoming));
+  const [sourceDetail, setSourceDetail] = useState(detail);
+  const current = sourceDetail === detail ? draft : reconcileWorkflowDraft(draft, incoming);
+  if (sourceDetail !== detail) { setSourceDetail(detail); setDraft(current); }
+  const { cron, timezone: tz, brain: pinBrain, worker: pinWorker } = current.values;
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const commit = usePendingCommit(detail.name);
   const settings = usePoll(['settings'], getSettings, 0);
-  const dirty = cron !== (detail.trigger?.schedule ?? '')
-    || (cron.trim() !== '' && tz !== (detail.trigger?.timezone || (detail.trigger?.schedule ? detectedTimezone() : '')))
-    || pinBrain !== (detail.models?.brain ?? '')
-    || pinWorker !== (detail.models?.worker ?? '');
+  const dirty = workflowDraftDirty(current);
+  const change = (key: keyof WorkflowFields, value: string) => {
+    setDraft(state => ({ ...state, values: { ...state.values, [key]: value }, conflicts: value === state.base[key] ? state.conflicts.filter(field => field !== key) : state.conflicts }));
+    setSaved(false); setError(null);
+  };
 
   const save = async () => {
+    const token = commit.begin();
+    if (!token) return;
+    const submitted = current;
     setSaving(true); setError(null);
     try {
-      await patchWorkflow(detail.name, {
-        models: { brain: pinBrain.trim(), worker: pinWorker.trim() },
-        ...(cron.trim() ? { triggerSchedule: cron.trim(), ...(tz ? { timezone: tz } : {}) } : { clearTriggerSchedule: true }),
-      });
+      // Read again before writing: the models endpoint replaces both pins.
+      // Untouched fields must come from Clem's newest saved settings.
+      const latest = await getWorkflow(detail.name);
+      const fields = workflowFields(latest);
+      const patch = workflowDetailsPatch(submitted, fields);
+      if (Object.keys(patch).length) await patchWorkflow(detail.name, patch);
+      if (!commit.owns(token)) return;
+      setDraft(freshWorkflowDraft(reconcileWorkflowDraft(submitted, fields).values));
       setSaved(true); onSaved();
-    } catch (e) { setError((e as Error).message); }
-    finally { setSaving(false); }
+    } catch (e) { if (commit.owns(token)) setError(`${(e as Error).message} Your draft is kept. Try Save details again.`); }
+    finally { if (commit.finish(token)) setSaving(false); }
   };
 
   const available = (settings.data?.modelRoles?.available ?? []) as NonNullable<ModelRolesSnapshot['available']>;
@@ -1363,7 +1404,7 @@ function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () 
     <div className="grid gap-5 lg:grid-cols-2">
       <section>
         <div className="mb-1.5 text-label text-fg">When it runs</div>
-        <ScheduleEditor value={cron} onChange={(c) => { setCron(c); setSaved(false); }} timezone={tz} onTimezoneChange={(z) => { setTz(z); setSaved(false); }} />
+        <ScheduleEditor value={cron} onChange={(c) => change('cron', c)} timezone={tz} onTimezoneChange={(z) => change('timezone', z)} disabled={saving} />
       </section>
       <section>
         <div className="mb-1.5 text-label text-fg">Models for this workflow</div>
@@ -1371,8 +1412,9 @@ function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () 
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
             <label className="mb-1 block text-small text-muted" htmlFor="wf-pin-brain">Steps (brain)</label>
-            <select id="wf-pin-brain" className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg" value={pinBrain} onChange={(e) => { setPinBrain(e.target.value); setSaved(false); }}>
+            <select id="wf-pin-brain" className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg" value={pinBrain} disabled={saving} onChange={(e) => change('brain', e.target.value)}>
               <option value="">Default (global routing)</option>
+              {pinBrain && !available.some(group => group.models.some(model => model.id === pinBrain)) && <option value={pinBrain}>Saved selection: {pinBrain}</option>}
               {available.map((g) => (
                 <optgroup key={`${g.provider}:${g.label}`} label={g.label}>
                   {g.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
@@ -1382,8 +1424,9 @@ function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () 
           </div>
           <div>
             <label className="mb-1 block text-small text-muted" htmlFor="wf-pin-worker">Workers (fan-outs)</label>
-            <select id="wf-pin-worker" className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg" value={pinWorker} onChange={(e) => { setPinWorker(e.target.value); setSaved(false); }}>
+            <select id="wf-pin-worker" className="w-full rounded-md border border-border bg-canvas px-2 py-1.5 text-body text-fg" value={pinWorker} disabled={saving} onChange={(e) => change('worker', e.target.value)}>
               <option value="">Default (global routing)</option>
+              {pinWorker && !workerOptions.some(group => group.models.some(model => model.id === pinWorker)) && <option value={pinWorker}>Saved selection: {pinWorker}</option>}
               {workerOptions.map((g) => (
                 <optgroup key={`${g.provider}:${g.label}`} label={g.label}>
                   {g.models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
@@ -1393,10 +1436,15 @@ function DetailsForm({ detail, onSaved }: { detail: WorkflowDetail; onSaved: () 
           </div>
         </div>
       </section>
-      <div className="flex items-center gap-2 lg:col-span-2">
+      {current.conflicts.length > 0 && <p role="status" className="text-small text-warning lg:col-span-2">
+        Clem updated {current.conflicts.map(key => ({ cron: 'the schedule', timezone: 'the time zone', brain: 'the step model', worker: 'the worker model' })[key]).join(', ')} while you were editing. Your draft is kept. Save details applies your changes.
+        <button type="button" className="ml-2 font-semibold text-primary hover:underline" disabled={saving} onClick={() => { setDraft(freshWorkflowDraft(incoming)); setSaved(false); }}>Use latest settings</button>
+      </p>}
+      {settings.isError && <p role="alert" className="text-small text-warning lg:col-span-2">Model choices could not be refreshed. Existing selections are kept. <button type="button" className="font-semibold text-primary hover:underline" onClick={() => { void settings.refetch(); }}>Retry choices</button></p>}
+      <div className="flex flex-wrap items-center gap-2 lg:col-span-2">
         <Button size="sm" onClick={() => void save()} disabled={saving || !dirty}>{saving ? 'Saving…' : 'Save details'}</Button>
         {saved ? <span className="inline-flex items-center gap-1 text-small text-success"><Check size={14} aria-hidden /> Saved</span> : null}
-        {error ? <span className="text-small text-danger">{error}</span> : null}
+        {error ? <span role="alert" className="text-small text-danger">{error}</span> : null}
       </div>
     </div>
   );

@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { homeBlocks, homeRows, presenceLine, runningOpenTarget, silentImmediatePanes, staleSuffix, steerTarget } from './home-model.js';
+import { homeBlocks, homeRows, needsYouContext, needsYouTarget, presenceLine, runningOpenTarget, silentImmediatePanes, staleSuffix, steerTarget } from './home-model.js';
 import {
   DEFAULT_HOME_PANE_ORDER,
   DEFAULT_HOME_PREFERENCES,
@@ -296,4 +296,16 @@ test('updates while you were away count only what is unread', async () => {
   const { awayCounts } = await import('./home-model');
   const item = (read: boolean) => ({ kind: 'done', title: 'Report sent', panel: 'activity', read } as never);
   assert.deepEqual(awayCounts([item(false), item(true), item(true)]), { updates: 1, attention: 0 });
+});
+
+
+test('protocol origin copy leaves exact request identity and rendered lifecycle generation untouched',()=>{
+  const item={kind:'question',questionId:'checkin:question / ?&',meta:'noticing:ntc-mupqxx8k-aa8684',attentionKey:'session:exact / ?&',lifecycle:{canDismiss:true,canDefer:true,effect:'hide_only' as const,dismissLabel:'Dismiss',deferLabel:'Tomorrow',generation:'exact-rendered-generation',explanation:'Hide only'}};
+  const before=structuredClone(item);
+  assert.equal(needsYouContext(item.meta),'From Clem');
+  assert.equal(new URL(needsYouTarget(item),'http://localhost').searchParams.get('select'),item.questionId);
+  assert.deepEqual(item,before);
+  assert.equal(needsYouContext('task:exact-task'),'Background task');
+  assert.equal(needsYouContext('checkin:exact-check'),'Check-in');
+  for(const prose of ['The noticing:ntc-mupqxx8k-aa8684 item needs review','noticing:ntc-mupqxx8k-aa8684 is in my notes','Meeting notes 2026-10-30'])assert.equal(needsYouContext(prose),prose);
 });

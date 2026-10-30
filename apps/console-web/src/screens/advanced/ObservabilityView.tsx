@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Activity, Pause, Play } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { Button } from '@/components/ui/Button';
 import { cn } from '@/lib/cn';
 import { sentence } from '@/lib/sentence-case';
 import {
@@ -80,12 +81,12 @@ export function ObservabilityView() {
   const [status, setStatus] = useState<'connecting' | 'open' | 'error'>('connecting');
   const [source, setSource] = useState<string | 'all'>('all');
   const [paused, setPaused] = useState(false);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  const [pausedEvents, setPausedEvents] = useState<OperationalEvent[]>([]);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
 
   useEffect(() => {
+    setStatus('connecting');
     const push = (incoming: OperationalEvent[]): void => {
-      if (pausedRef.current) return;
       setEvents((prev) => {
         // newest-first, deduped by eventId, capped.
         const seen = new Set(incoming.map((e) => e.eventId));
@@ -99,20 +100,22 @@ export function ObservabilityView() {
       onStatus: (s) => setStatus(s === 'open' ? 'open' : 'error'),
     });
     return unsub;
-  }, []);
+  }, [connectionAttempt]);
+
+  const visibleEvents = paused ? pausedEvents : events;
 
   const filtered = useMemo(
-    () => (source === 'all' ? events : events.filter((e) => e.source === source)),
-    [events, source],
+    () => (source === 'all' ? visibleEvents : visibleEvents.filter((e) => e.source === source)),
+    [visibleEvents, source],
   );
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const e of events) c[e.source] = (c[e.source] ?? 0) + 1;
+    for (const e of visibleEvents) c[e.source] = (c[e.source] ?? 0) + 1;
     return c;
-  }, [events]);
+  }, [visibleEvents]);
 
-  const statusPill = status === 'open'
+  const statusPill = paused ? <StatusPill tone="neutral">View paused</StatusPill> : status === 'open'
     ? <StatusPill tone="live">Live</StatusPill>
     : status === 'connecting'
       ? <StatusPill tone="neutral">Connecting…</StatusPill>
@@ -127,26 +130,29 @@ export function ObservabilityView() {
           {statusPill}
           <button
             type="button"
-            onClick={() => setPaused((v) => !v)}
+            aria-pressed={paused}
+            onClick={() => { if (!paused) setPausedEvents(events); setPaused(value => !value); }}
             className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-surface px-3 text-small text-fg hover:bg-surface-2"
           >
             {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
-            {paused ? 'Resume' : 'Pause'}
+            {paused ? 'Resume view' : 'Pause view'}
           </button>
         </div>
       }
     >
       <div className="mb-4 flex flex-wrap items-center gap-2">
-        <FilterChip label="All" active={source === 'all'} count={events.length} onClick={() => setSource('all')} />
+        <FilterChip label="All" active={source === 'all'} count={visibleEvents.length} onClick={() => setSource('all')} />
         {OPERATIONAL_SOURCES.map((s) => (
           <FilterChip key={s} label={sourceLabel(s)} active={source === s} count={counts[s] ?? 0} onClick={() => setSource(s)} />
         ))}
       </div>
+      {paused && <p role="status" className="mb-3 text-small text-muted">The view is paused. Incoming events continue in a buffer of up to {BUFFER_MAX}; Resume view shows the latest events.</p>}
+      {status === 'error' && <div role="alert" className="mb-4 flex flex-wrap items-center gap-3 text-small text-muted"><span>Telemetry is reconnecting. {events.length ? 'Last received events remain visible.' : 'An empty feed cannot be confirmed yet.'}</span><Button variant="secondary" size="sm" onClick={() => setConnectionAttempt(value => value + 1)}>Retry connection</Button></div>}
 
       {filtered.length === 0 ? (
         <EmptyState
-          title="No telemetry yet"
-          description="Operational events appear here the moment Clementine runs a workflow node, calls a tool, routes a model, or writes to memory."
+          title={status !== 'open' && !visibleEvents.length ? status === 'connecting' ? 'Connecting to telemetry' : 'Telemetry unavailable' : source === 'all' ? 'No telemetry yet' : 'No events for this source'}
+          description={status !== 'open' && !visibleEvents.length ? 'Events will appear once this connection is available.' : 'Operational events appear here as Clementine works. Choose All to see every source.'}
         />
       ) : (
         <Card className="divide-y divide-border p-0">
@@ -169,6 +175,7 @@ function FilterChip({ label, active, count, onClick }: { label: string; active: 
   return (
     <button
       type="button"
+      aria-pressed={active}
       onClick={onClick}
       className={cn(
         'flex items-center gap-1.5 rounded-full border px-3 py-1 text-small transition-colors',

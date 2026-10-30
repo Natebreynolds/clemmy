@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, RotateCcw, X, FlaskConical, AlertTriangle } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/Switch';
 import { Select, Input } from '@/components/ui/Field';
 import { Button } from '@/components/ui/Button';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import { getDeveloperFlags, patchDeveloperFlags, type DevFlag } from '@/lib/settings';
 
@@ -44,7 +45,7 @@ function FlagRow({
         {isBool ? (
           <Switch checked={on} disabled={busy} label={flag.label} onChange={(v) => onSet(v ? 'on' : 'off')} />
         ) : (
-          <Select value={flag.value} disabled={busy} onChange={(e) => onSet(e.target.value)} className="w-36">
+          <Select value={flag.value} disabled={busy} onChange={(e) => onSet(e.target.value)} className="w-36" aria-label={flag.label}>
             {(flag.options ?? []).map((o) => <option key={o} value={o}>{o}</option>)}
             {!(flag.options ?? []).includes(flag.value) && <option value={flag.value}>{flag.value}</option>}
           </Select>
@@ -63,17 +64,21 @@ export function DeveloperFlags() {
   const [error, setError] = useState<string | null>(null);
   const [advKey, setAdvKey] = useState('');
   const [advVal, setAdvVal] = useState('');
+  const actionBusy = useRef(false);
 
-  if (q.isLoading || !snap) {
+  if (q.isLoading) {
     return <Page title="Developer · Feature flags" subtitle="Runtime CLEMMY_* kill-switches"><Skeleton className="h-64 w-full" /></Page>;
   }
+  if (!snap) return <Page title="Developer · Feature flags"><QueryUnavailable title="Feature flags couldn’t be loaded" onRetry={() => { void q.refetch(); }} /></Page>;
 
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['developer-flags'] }); void qc.invalidateQueries({ queryKey: ['settings'] }); };
   const run = async (key: string, fn: () => Promise<unknown>) => {
+    if (actionBusy.current) return;
+    actionBusy.current = true;
     setBusy(key); setError(null); setSaved(false);
     try { await fn(); setSaved(true); refresh(); }
     catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-    finally { setBusy(null); }
+    finally { actionBusy.current = false; setBusy(null); }
   };
 
   const categories = [...new Set(snap.flags.map((f) => f.category))];
@@ -81,6 +86,7 @@ export function DeveloperFlags() {
   return (
     <Page title="Developer · Feature flags" subtitle="Flip CLEMMY_* kill-switches at runtime — live + persisted, no restart">
       <div className="space-y-4">
+        {q.isError && <QueryUnavailable title="Feature flags couldn’t be refreshed" description="Showing the last loaded flags. Check the current state before changing one." onRetry={() => { void q.refetch(); }} className="py-5" />}
         <Card className="flex items-start gap-3 border-warning/40 bg-warning/5 p-4">
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-warning" aria-hidden />
           <p className="text-small text-muted">
@@ -92,7 +98,7 @@ export function DeveloperFlags() {
         {(saved || error) && (
           <div className="flex items-center gap-2 text-small">
             {saved && <span className="inline-flex items-center gap-1 text-success"><Check className="h-4 w-4" aria-hidden /> Saved — applies immediately</span>}
-            {error && <span className="text-danger">{error}</span>}
+            {error && <span className="text-danger" role="alert">{error}</span>}
           </div>
         )}
 
@@ -101,7 +107,7 @@ export function DeveloperFlags() {
             <h3 className="mb-1 text-h3 text-fg">{cat}</h3>
             <div className="mt-2">
               {snap.flags.filter((f) => f.category === cat).map((f) => (
-                <FlagRow key={f.key} flag={f} busy={busy === f.key}
+                <FlagRow key={f.key} flag={f} busy={busy !== null}
                   onSet={(value) => run(f.key, () => patchDeveloperFlags({ key: f.key, value }))}
                   onClear={() => run(f.key, () => patchDeveloperFlags({ key: f.key, clear: true }))} />
               ))}
@@ -113,11 +119,11 @@ export function DeveloperFlags() {
           <h3 className="mb-1 text-h3 text-fg">Advanced — any CLEMMY_ key</h3>
           <p className="mb-3 text-small text-muted">Set an override for any flag not listed above (thresholds, model names, etc.). Only CLEMMY_* keys are accepted.</p>
           <div className="flex flex-wrap items-end gap-2">
-            <Input value={advKey} onChange={(e) => setAdvKey(e.target.value)} placeholder="CLEMMY_SOME_FLAG"
+            <Input value={advKey} disabled={busy !== null} onChange={(e) => setAdvKey(e.target.value)} placeholder="CLEMMY_SOME_FLAG"
               className="min-w-[16rem] flex-1 font-mono" aria-label="Flag key" />
-            <Input value={advVal} onChange={(e) => setAdvVal(e.target.value)} placeholder="value (e.g. on / off / 3000)"
+            <Input value={advVal} disabled={busy !== null} onChange={(e) => setAdvVal(e.target.value)} placeholder="value (e.g. on / off / 3000)"
               className="min-w-[12rem] flex-1" aria-label="Flag value" />
-            <Button variant="secondary" size="sm" disabled={busy === advKey || !advKey.trim() || !advVal.trim()}
+            <Button variant="secondary" size="sm" disabled={busy !== null || !advKey.trim() || !advVal.trim()}
               onClick={() => run(advKey.trim().toUpperCase(), async () => {
                 await patchDeveloperFlags({ key: advKey.trim().toUpperCase(), value: advVal.trim() });
                 setAdvKey(''); setAdvVal('');
@@ -132,7 +138,7 @@ export function DeveloperFlags() {
                   <li key={c.key} className="flex items-center justify-between gap-3">
                     <code className="min-w-0 truncate font-mono text-small text-fg">{c.key}={c.value}</code>
                     <button type="button" onClick={() => run(c.key, () => patchDeveloperFlags({ key: c.key, clear: true }))}
-                      disabled={busy === c.key} title="Clear override"
+                      disabled={busy !== null} title="Clear override" aria-label={`Clear ${c.key} override`}
                       className="shrink-0 text-faint hover:text-danger disabled:opacity-50 cursor-pointer">
                       <X className="h-4 w-4" aria-hidden />
                     </button>

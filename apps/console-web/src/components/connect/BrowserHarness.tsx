@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { browserHarnessUpdateNotice } from '@/lib/browser-harness-update';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { usePoll } from '@/lib/poll';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import {
   getBrowserHarness, installBrowserHarness, getBrowserHarnessInstallJob,
   browserHarnessDoctor, browserHarnessUpdate, browserHarnessTest, browserHarnessChromeSetup,
@@ -70,6 +71,8 @@ export function BrowserHarness() {
         </div>
       </div>
       <Card className="p-4">
+        {status.isError && <QueryUnavailable title="Browser setup couldn’t be refreshed" description={s ? 'Showing last loaded setup. Check its current status before running setup actions.' : 'The current browser setup is unknown.'} onRetry={() => { void status.refetch(); }} className="mb-3 py-5" />}
+        {jobId && jobQ.isError && <QueryUnavailable title="Install progress couldn’t be read" description="The install may still be running. Retry its status before starting another action." onRetry={() => { void jobQ.refetch(); }} className="mb-3 py-5" />}
         <div className="flex items-center gap-3">
           <Chrome className="h-5 w-5 shrink-0 text-muted" aria-hidden />
           <div className="min-w-0 flex-1">
@@ -94,7 +97,7 @@ export function BrowserHarness() {
           </div>
         )}
 
-        {s && (
+        {s && !status.isError && (
           <div className="mt-3 flex flex-wrap gap-2">
             {!s.installed && (
               <Button size="sm" disabled={busy !== null} onClick={install}>

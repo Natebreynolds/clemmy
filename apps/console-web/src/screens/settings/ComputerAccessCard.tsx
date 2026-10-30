@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { HardDrive, ShieldCheck } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
@@ -41,14 +42,18 @@ export function ComputerAccessCard() {
   const query = usePoll(['computer-access'], getComputerAccess, 0);
   const access = query.data?.access;
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const locked = useRef(false);
 
   const choose = async (choice: ComputerAccessChoice) => {
-    if (!access || access.choice === choice) return;
-    setSaving(true);
+    if (!access || query.isError || access.choice === choice || locked.current) return;
+    locked.current = true; setSaving(true); setError(null);
     try {
       const next = await setComputerAccess(choice);
       qc.setQueryData(['computer-access'], next);
-    } finally {
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save computer access. Your previous choice remains.'); }
+    finally {
+      locked.current = false;
       setSaving(false);
     }
   };
@@ -72,7 +77,7 @@ export function ComputerAccessCard() {
               type="button"
               role="radio"
               aria-checked={selected}
-              disabled={!access || saving}
+              disabled={!access || query.isError || saving}
               onClick={() => void choose(option.id)}
               className={cn(
                 'flex flex-col gap-1 rounded-lg border px-4 py-3 text-left transition-colors disabled:opacity-60',
@@ -92,12 +97,16 @@ export function ComputerAccessCard() {
 
       <p className="flex items-start gap-2 text-small text-muted">
         <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-        Either way, passwords and keys stay off-limits, and anything that leaves your computer still asks you first.
+        <span>Passwords and keys stay off-limits. Clem follows your approval rules for changes and messages.{' '}
+          <Link to="/advanced/autonomy" className="font-semibold text-primary underline-offset-2 hover:underline">Review approval rules</Link>.
+        </span>
       </p>
 
       {access?.platform === 'mac' && <MacGates access={access} onChanged={() => void query.refetch()} />}
       {access?.platform === 'windows' && <WindowsGates access={access} onChanged={() => void query.refetch()} />}
-      {query.isError && <p className="text-small text-danger">Could not read this computer's access settings. Try again in a moment.</p>}
+      {query.isLoading && <p role="status" className="text-small text-muted">Checking computer access…</p>}
+      {query.isError && <p role="alert" className="text-small text-danger">Could not refresh computer access. {access ? 'Your last loaded choice is shown.' : 'The current choice is unknown.'} <Button variant="link" size="sm" onClick={() => void query.refetch()}>Retry</Button></p>}
+      {error && <p role="alert" className="text-small text-danger">{error}</p>}
     </Card>
   );
 }

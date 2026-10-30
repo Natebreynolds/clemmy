@@ -10,7 +10,7 @@ import {
   presentBoardWorkingNow,
   boardTraceSinceSeq,
   canStopFromDrawer,
-  findBoardCardForRun,
+  findBoardCardForRun, boardSelectionSearch,
   cardTone,
   isWorkflowCatchupCard,
   intentForDrop,
@@ -552,4 +552,28 @@ test('the whole-board lane pass and the single-card one cannot give different an
   assert.deepEqual([...laneOf.values()].sort(), [
     'done', 'needs_you_blocked', 'needs_you_review', 'needs_you_review', 'queued', 'running',
   ]);
+});
+
+
+test('an open exact trace never adopts a same-ID or same-session neighboring attempt', () => {
+  const open = card({ id: 'same-card', attemptId: 'kept-attempt', runScopeId: 'kept-scope' });
+  const neighbor = card({ id: 'same-card', attemptId: 'new-attempt', runScopeId: 'new-scope' });
+  assert.equal(reconcileOpenBoardCard(open, [neighbor]), open);
+  assert.equal(reconcileOpenBoardCard(open, [{ ...neighbor, id: 'other-card' }]), open);
+});
+
+test('opening and closing Activity selection preserve exact URL identity and unrelated context', () => {
+  const original = new URLSearchParams('guide=work&attemptId=old&runScopeId=old');
+  const target = card({ id: 'controlled-card', attemptId: 'attempt / ?&', runScopeId: 'session::scope / ?&' });
+  const selected = boardSelectionSearch(original, target);
+  assert.equal(selected.get('select'), target.sessionId);
+  assert.equal(selected.get('attemptId'), target.attemptId);
+  assert.equal(selected.get('runScopeId'), target.runScopeId);
+  assert.equal(selected.get('guide'), 'work');
+  assert.equal(original.has('select'), false);
+  assert.equal(findBoardCardForRun([target], { select: selected.get('select')!, attemptId: selected.get('attemptId'), runScopeId: selected.get('runScopeId') }), target);
+  const closed = boardSelectionSearch(selected, null);
+  assert.equal(closed.toString(), 'guide=work');
+  const approval = card({ id: 'approval:one', sourceKind: 'approval', attemptId: undefined, runScopeId: undefined });
+  assert.equal(boardSelectionSearch(selected, approval).get('select'), approval.id, 'non-run cards use their own ID, not a shared session');
 });

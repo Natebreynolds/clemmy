@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { GoalRecordDetails } from '@/components/goals/GoalRecordDetails';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -210,6 +211,8 @@ function GoalCard({
         </div>
       </div>
 
+      <GoalRecordDetails goal={goal} />
+
       {goal.parked?.note && (
         <div className="mt-4 rounded-md border border-warning/30 bg-warning-tint px-3 py-2 text-small text-warning">
           {goal.parked.note}
@@ -227,6 +230,10 @@ function GoalCard({
 export function Goals() {
   const qc = useQueryClient();
   const [searchParams] = useSearchParams();
+  const editorHeading = useRef<HTMLHeadingElement>(null);
+  const [trackingOpen, setTrackingOpen] = useState(false);
+  const [allCommitments, setAllCommitments] = useState(false);
+  const [allDrafts, setAllDrafts] = useState(false);
   const [filter, setFilter] = useState<GoalFilter>('active');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -257,6 +264,10 @@ export function Goals() {
   const goalDrafts = useMemo(() => draftsQ.data?.drafts ?? [], [draftsQ.data]);
   const intentions = useMemo(() => intentionsQ.data?.intentions ?? [], [intentionsQ.data]);
 
+  const needsTracking = (payload?.counts.parked ?? 0) > 0 || searchParams.has('draft');
+  useEffect(() => { if (needsTracking) setTrackingOpen(true); }, [needsTracking]);
+  useEffect(() => { if (appliedDraftId) editorHeading.current?.focus(); }, [appliedDraftId]);
+
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['goals'] });
     void qc.invalidateQueries({ queryKey: ['goal-drafts'] });
@@ -265,6 +276,7 @@ export function Goals() {
 
   const applyDraft = (record: GoalDraftRecord) => {
     setError(null);
+    setTrackingOpen(true);
     setAppliedDraftId(record.id);
     setDraftNotes(record.notes);
     setForm((prev) => ({
@@ -405,6 +417,7 @@ export function Goals() {
           onClick={() => {
             void goalsQ.refetch();
             void intentionsQ.refetch();
+            void draftsQ.refetch();
           }}
         >
           <RefreshCw className="h-4 w-4" aria-hidden /> Refresh
@@ -412,20 +425,22 @@ export function Goals() {
       )}
     >
       <MyGoals />
+      {error && <p role="alert" className="mt-4 rounded-md border border-danger/30 bg-danger-tint px-4 py-3 text-small text-danger">{error}</p>}
 
       {/* Run bookkeeping is not a goal: each run binds its own objective so
           completion can be checked, and those are kept here, folded, for the
           days the reaper keeps them. Open by default only when one needs you. */}
-      <details className="group mt-8 rounded-lg border border-border bg-surface" open={(payload?.counts.parked ?? 0) > 0}>
+      <details className="group mt-8 rounded-lg border border-border bg-surface" open={trackingOpen} onToggle={event => setTrackingOpen(event.currentTarget.open)}>
         <summary className="flex cursor-pointer list-none flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-3 hover:bg-hover">
           <span className="text-body font-semibold text-fg">Work Clem is tracking</span>
           <span className="text-small text-muted">
-            {payload?.counts.active ?? 0} active
+            {payload ? `${payload.counts.active} active` : goalsQ.isError ? 'Status unavailable' : 'Loading status…'}
             {(payload?.counts.parked ?? 0) > 0 ? ` · ${payload?.counts.parked} need you` : ''}
             {' · '}what each run was for, kept a week after it finishes
           </span>
         </summary>
         <div className="border-t border-border px-4 pb-4">
+      {goalsQ.isError && goalsQ.data && <p role="status" className="mt-4 text-small text-warning">Tracked work couldn’t refresh. Showing the last loaded goals. <button type="button" className="font-semibold underline" onClick={() => void goalsQ.refetch()}>Retry</button></p>}
       <div className="mt-6 grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Active" value={payload?.counts.active ?? 0} tone="info" />
         <StatCard label="Needs you" value={payload?.counts.parked ?? 0} tone="warning" />
@@ -451,11 +466,12 @@ export function Goals() {
             )}
           </div>
         </div>
+        {intentionsQ.isError && intentionsQ.data && <p role="status" className="mt-3 text-small text-warning">Commitments couldn’t refresh. Showing the last loaded list. <button type="button" className="font-semibold underline" onClick={() => void intentionsQ.refetch()}>Retry</button></p>}
         {intentionsQ.isLoading ? (
           <Skeleton className="mt-4 h-20" />
-        ) : intentionsQ.isError ? (
+        ) : intentionsQ.isError && !intentionsQ.data ? (
           <div className="mt-4 rounded-md border border-warning/30 bg-warning/5 px-3 py-3 text-small text-muted">
-            Future commitments are temporarily unavailable. Goal execution is unaffected.
+            Future commitments couldn’t load. <button type="button" className="font-semibold underline" onClick={() => void intentionsQ.refetch()}>Retry</button>
           </div>
         ) : intentions.length === 0 ? (
           <div className="mt-4 rounded-md border border-border bg-subtle px-3 py-3 text-small text-muted">
@@ -463,7 +479,7 @@ export function Goals() {
           </div>
         ) : (
           <div className="mt-4 divide-y divide-border rounded-md border border-border">
-            {intentions.slice(0, 8).map((item) => {
+            {(allCommitments ? intentions : intentions.slice(0, 8)).map((item) => {
               const status = commitmentStatus(item);
               return (
                 <div key={item.id} className="flex flex-wrap items-start justify-between gap-3 px-3 py-3">
@@ -483,14 +499,14 @@ export function Goals() {
               );
             })}
             {intentions.length > 8 && (
-              <div className="px-3 py-2 text-caption text-muted">
-                +{Math.max(intentions.length, intentionsQ.data?.counts.open ?? 0) - 8} more open commitments
-              </div>
+              <button type="button" className="w-full px-3 py-3 text-left text-small font-semibold text-primary hover:bg-hover" aria-expanded={allCommitments} onClick={() => setAllCommitments(value => !value)}>{allCommitments ? 'Show fewer commitments' : `Show all ${intentions.length} loaded commitments`}</button>
             )}
           </div>
         )}
       </Card>
 
+      {(intentionsQ.data?.counts.open ?? 0) > intentions.length && <p className="mt-2 text-caption text-muted">Showing {intentions.length} loaded commitments of {intentionsQ.data?.counts.open} open. The service returns up to 100 at a time.</p>}
+      {draftsQ.isError && <p role="status" className="mt-4 text-small text-warning">{draftsQ.data ? 'Goal drafts couldn’t refresh. Showing the last loaded drafts.' : 'Goal drafts couldn’t load.'} <button type="button" className="font-semibold underline" onClick={() => void draftsQ.refetch()}>Retry</button></p>}
       {goalDrafts.length > 0 && (
         <Card className="mt-5 min-w-0 p-4 sm:p-5">
           <div className="mb-3 flex items-center gap-2">
@@ -498,7 +514,7 @@ export function Goals() {
             <h3 className="text-title-sm font-semibold text-fg">Drafts to review</h3>
           </div>
           <div className="space-y-3">
-            {goalDrafts.slice(0, 4).map((record) => (
+            {(allDrafts ? goalDrafts : goalDrafts.slice(0, 4)).map((record) => (
               <div key={record.id} className="flex flex-wrap items-start justify-between gap-3 rounded-md border border-border bg-canvas px-3 py-3">
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
@@ -513,7 +529,7 @@ export function Goals() {
                     // review cadence" read as random tags, not as gaps to fill.
                     <div className="mt-2 flex flex-wrap items-center gap-1.5">
                       <span className="text-caption font-semibold text-warning">Still needs:</span>
-                      {record.draft.missingInputs.slice(0, 3).map((item) => (
+                      {record.draft.missingInputs.map((item) => (
                         <span key={item} className="rounded-md bg-warning-tint px-2 py-1 text-caption text-warning">{item}</span>
                       ))}
                     </div>
@@ -534,6 +550,7 @@ export function Goals() {
               </div>
             ))}
           </div>
+          {goalDrafts.length > 4 && <button type="button" className="mt-3 min-h-9 text-small font-semibold text-primary hover:underline" aria-expanded={allDrafts} onClick={() => setAllDrafts(value => !value)}>{allDrafts ? 'Show fewer drafts' : `Show all ${goalDrafts.length} loaded drafts`}</button>}
         </Card>
       )}
 
@@ -541,7 +558,7 @@ export function Goals() {
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <GoalIcon className="h-5 w-5 text-primary" aria-hidden />
-            <h3 className="text-title-sm font-semibold text-fg">Create goal</h3>
+            <h3 ref={editorHeading} tabIndex={-1} className="text-title-sm font-semibold text-fg">{appliedDraftId ? 'Review goal draft' : 'Create goal'}</h3>
           </div>
           <label className="flex items-center gap-2 text-small font-medium text-fg">
             <input
@@ -587,7 +604,6 @@ export function Goals() {
                 )}
               </div>
             )}
-            {error && <p className="mb-4 text-small text-danger">{error}</p>}
             <Field label="Objective">
               {(id) => (
                 <Textarea
@@ -697,6 +713,8 @@ export function Goals() {
               'rounded-md border px-3 py-1.5 text-small font-semibold transition-colors',
               filter === item.id ? 'border-primary bg-primary-tint text-primary' : 'border-border bg-surface text-muted hover:text-fg',
             )}
+            type="button"
+            aria-pressed={filter === item.id}
             onClick={() => setFilter(item.id)}
           >
             {item.label}
@@ -710,7 +728,7 @@ export function Goals() {
             <Skeleton className="h-56" />
             <Skeleton className="h-56" />
           </>
-        ) : goalsQ.isError ? (
+        ) : goalsQ.isError && !goalsQ.data ? (
           <QueryUnavailable
             title="Goals are unavailable"
             description="Clementine couldn’t load your goals, so this is not an empty-goals state. Nothing has been deleted or closed."

@@ -9,6 +9,8 @@ import { Card } from '@/components/ui/Card';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
+import { Button } from '@/components/ui/Button';
 import { usePoll } from '@/lib/poll';
 import { getUsage, getTools, fmtNum } from '@/lib/advanced';
 import { AutonomyForm } from './advanced/AutonomyForm';
@@ -18,9 +20,11 @@ import { ObservabilityView } from './advanced/ObservabilityView';
 import { TraceLabView } from './advanced/TraceLabView';
 import { DeveloperFlags } from './advanced/DeveloperFlags';
 import { ToolRecallSection } from './advanced/ToolRecallSection';
+import { WorkflowCanvas } from './WorkflowCanvas';
 
 function Usage() {
   const usage = usePoll(['usage'], getUsage, 15000);
+  const [showAll, setShowAll] = useState(false);
   const d = usage.data;
   const bySource = d?.bySource ?? [];
   const byModel = Object.entries(d?.byModel ?? {});
@@ -36,8 +40,9 @@ function Usage() {
   ];
   return (
     <Page title="Usage" subtitle="Token spend & activity today">
+      {usage.isError && <QueryUnavailable title="Usage couldn’t be refreshed" description={d ? 'Showing the last loaded usage. These totals may have changed.' : 'Usage is unavailable, so today’s totals cannot be confirmed.'} onRetry={() => { void usage.refetch(); }} className="mb-4 py-5" />}
       {usage.isLoading ? <Skeleton className="h-24 w-full" /> : (
-        <>
+        d ? <>
           <div className="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
             {kpis.map((k) => (
               <Card key={k.label} className="p-5">
@@ -64,7 +69,7 @@ function Usage() {
               <h3 className="mb-3 text-h3 text-fg">By source</h3>
               {bySource.length === 0 ? <p className="text-body text-muted">No usage logged yet today.</p> : (
                 <ul className="space-y-2">
-                  {bySource.slice(0, 10).map((s) => (
+                  {(showAll ? bySource : bySource.slice(0, 10)).map((s) => (
                     <li key={s.source} className="flex items-center justify-between gap-3">
                       <span className="min-w-0 truncate text-body text-fg">{s.source}</span>
                       <span className="shrink-0 text-small text-muted">{fmtNum(s.tokens)} · {fmtNum(s.calls)} calls</span>
@@ -77,7 +82,7 @@ function Usage() {
               <h3 className="mb-3 text-h3 text-fg">By model</h3>
               {byModel.length === 0 ? <p className="text-body text-muted">No usage logged yet today.</p> : (
                 <ul className="space-y-2">
-                  {byModel.slice(0, 10).map(([model, v]) => (
+                  {(showAll ? byModel : byModel.slice(0, 10)).map(([model, v]) => (
                     <li key={model} className="flex items-center justify-between gap-3">
                       <span className="min-w-0 truncate font-mono text-small text-fg">{model}</span>
                       <span className="shrink-0 text-small text-muted">{fmtNum(v.tokens)} · {fmtNum(v.calls)} calls</span>
@@ -87,7 +92,8 @@ function Usage() {
               )}
             </Card>
           </div>
-        </>
+          {(bySource.length > 10 || byModel.length > 10) && <Button className="mt-4" variant="ghost" size="sm" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? 'Show fewer rows' : `Show all ${bySource.length} sources and ${byModel.length} models`}</Button>}
+        </> : null
       )}
     </Page>
   );
@@ -103,10 +109,12 @@ function Tools() {
         <Search className="h-4 w-4 text-faint" aria-hidden />
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search tools…" aria-label="Search tools"
           className="h-11 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint" />
-        <span className="text-caption text-faint">{rows.length}</span>
+        <span className="text-caption text-faint">{tools.data ? rows.length : tools.isLoading ? '…' : '—'}</span>
       </div>
-      {tools.isLoading ? <Skeleton className="h-40 w-full" /> : rows.length === 0 ? (
-        <EmptyState title="No tools" description="No tools match your search." />
+      {tools.isError && <QueryUnavailable title="Tools couldn’t be refreshed" description={tools.data ? 'Showing the last loaded catalog.' : 'The tool catalog is unavailable, so it cannot be confirmed empty.'} onRetry={() => { void tools.refetch(); }} className="mb-4 py-5" />}
+      {tools.isLoading ? <Skeleton className="h-40 w-full" /> : rows.length === 0 && !tools.isError ? (
+        <EmptyState title={q ? 'No matching tools' : 'No tools listed'} description={q ? 'Try another name or clear your search.' : 'Registered tools appear here when the catalog is available.'}
+          action={q ? <Button variant="secondary" onClick={() => setQ('')}>Clear search</Button> : undefined} />
       ) : (
         <div className="grid gap-2.5 md:grid-cols-2">
           {rows.map((t) => (
@@ -116,7 +124,8 @@ function Tools() {
                 {t.needsApproval && <StatusPill tone="warning">Asks first</StatusPill>}
                 {t.category && <span className="ml-auto text-caption text-faint">{t.category}</span>}
               </div>
-              {t.description && <p className="mt-1 line-clamp-2 text-small text-muted">{t.description}</p>}
+              {t.description && <><p className={cn('mt-1 break-words text-small text-muted', t.description.length > 120 && 'line-clamp-2')}>{t.description}</p>
+                {t.description.length > 120 && <details className="mt-2 text-small text-muted"><summary className="cursor-pointer rounded-sm">Read full description</summary><p className="mt-2 whitespace-pre-wrap break-words">{t.description}</p></details>}</>}
             </Card>
           ))}
         </div>
@@ -163,7 +172,7 @@ function AdvancedRail({ current, developerMode }: { current: string; developerMo
     );
   };
   return (
-    <nav aria-label="Advanced sections" className="hidden w-[220px] shrink-0 flex-col border-r border-border bg-subtle px-3 py-6 md:flex">
+    <nav aria-label="Advanced sections" className="hidden w-[200px] shrink-0 flex-col overflow-y-auto border-r border-border bg-subtle px-3 py-6 xl:flex">
       {everyday.map(row)}
       {instruments.length > 0 && (
         <div className="mt-4 border-t border-border pt-3">
@@ -188,6 +197,7 @@ export function Advanced() {
     switch (seg) {
       case 'usage': return <Usage />;
       case 'tools': return <Tools />;
+      case 'canvas': return <WorkflowCanvas />;
       case 'diagnostics': return <DiagnosticsView />;
       case 'observability': return <ObservabilityView />;
       case 'traces': return <TraceLabView />;
@@ -198,9 +208,14 @@ export function Advanced() {
     }
   };
   return (
-    <div className="flex h-full min-h-0">
+    <div className="flex h-full min-h-0 min-w-0 flex-col xl:flex-row">
       <AdvancedRail current={seg} developerMode={developerMode} />
-      <div className="min-h-0 flex-1 overflow-y-auto">{view()}</div>
+      <nav aria-label="Advanced sections" className="flex shrink-0 gap-4 overflow-x-auto border-b border-border px-5 xl:hidden">
+        {advancedNavFor(developerMode).map(item => <Link key={item.path} to={item.path} aria-current={item.path.endsWith(`/${seg}`) ? 'page' : undefined}
+          className={cn('inline-flex min-h-12 shrink-0 items-center border-b-2 text-small font-semibold', item.path.endsWith(`/${seg}`) ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>{item.label}</Link>)}
+        <Link to="/settings" className="inline-flex min-h-12 shrink-0 items-center text-small text-muted">Settings</Link>
+      </nav>
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">{view()}</div>
     </div>
   );
 }

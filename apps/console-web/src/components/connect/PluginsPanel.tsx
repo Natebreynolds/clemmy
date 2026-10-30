@@ -12,6 +12,7 @@ import { Card } from '@/components/ui/Card';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import { apiGet, apiPost } from '@/lib/api';
 import { CartridgeInsert, type CartridgeSource } from './CartridgeInsert';
@@ -82,6 +83,8 @@ export function PluginsPanel() {
   const [dragOver, setDragOver] = useState(false);
   const [url, setUrl] = useState('');
   const [catalogQuery, setCatalogQuery] = useState('');
+  const [showAllCatalog, setShowAllCatalog] = useState(false);
+  const actionOwner = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const catalogNeedle = catalogQuery.trim().toLowerCase();
@@ -90,8 +93,9 @@ export function PluginsPanel() {
     : catalogRows;
 
   const act = async (id: string, action: 'enable' | 'disable' | 'uninstall') => {
+    if (actionOwner.current) return;
     if (action === 'uninstall' && !window.confirm(`Uninstall ${id}? Everything it installed (skills, workflows, MCP servers, memory) is removed.`)) return;
-    setBusy(id); setNote(null);
+    actionOwner.current = true; setBusy(id); setNote(null);
     try {
       const res = await pluginAction(id, action);
       if (!res.ok) throw new Error(res.error || `${action} failed`);
@@ -99,7 +103,7 @@ export function PluginsPanel() {
     } catch (err) {
       setNote({ tone: 'danger', text: err instanceof Error ? err.message : `${action} failed` });
     } finally {
-      setBusy(null);
+      actionOwner.current = false; setBusy(null);
       void qc.invalidateQueries({ queryKey: ['plugins'] });
       void qc.invalidateQueries({ queryKey: ['plugins', 'catalog'] });
     }
@@ -159,7 +163,7 @@ export function PluginsPanel() {
           <Search className="h-4 w-4 shrink-0 text-faint" aria-hidden />
           <input
             value={catalogQuery}
-            onChange={(e) => setCatalogQuery(e.target.value)}
+            onChange={(e) => { setCatalogQuery(e.target.value); setShowAllCatalog(false); }}
             placeholder="Search plugins"
             aria-label="Search plugins"
             className="h-9 min-w-0 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
@@ -168,13 +172,14 @@ export function PluginsPanel() {
         {catalog.data?.warnings?.map((warning) => (
           <p key={warning} className="mb-2 text-caption text-warning">{warning}</p>
         ))}
-        {visibleCatalog.length === 0 ? (
+        {catalog.isError && <QueryUnavailable title="Plugin catalog couldn’t be refreshed" description={catalog.data ? 'Showing the last loaded catalog.' : 'The catalog is unavailable. You can still add a plugin file below.'} onRetry={() => { void catalog.refetch(); }} className="mb-3 py-5" />}
+        {catalog.isLoading && !catalog.data ? <Skeleton className="h-20 w-full" /> : visibleCatalog.length === 0 && !catalog.isError ? (
           <div className="rounded-md border border-border bg-subtle p-3 text-caption text-muted">
             {catalogNeedle ? `No plugins match "${catalogQuery.trim()}".` : 'No catalog plugins available yet.'}
           </div>
         ) : (
           <div className="grid gap-2 lg:grid-cols-2">
-            {visibleCatalog.slice(0, 8).map((p) => (
+            {(showAllCatalog ? visibleCatalog : visibleCatalog.slice(0, 8)).map((p) => (
               <div key={p.id} className="rounded-md border border-border bg-canvas p-3">
                 <div className="flex items-start gap-3">
                   <Package className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden />
@@ -238,6 +243,8 @@ export function PluginsPanel() {
         </div>
       </Card>
 
+      {visibleCatalog.length > 8 && <Button variant="ghost" size="sm" aria-expanded={showAllCatalog} onClick={() => setShowAllCatalog(value => !value)}>{showAllCatalog ? 'Show fewer plugins' : `Show all ${visibleCatalog.length} plugins`}</Button>}
+      {plugins.isError && plugins.data && <QueryUnavailable title="Installed plugins couldn’t be refreshed" description="Showing the last loaded plugins. Refresh before changing one." onRetry={() => { void plugins.refetch(); }} className="mb-3 py-5" />}
       {plugins.isLoading ? (
         <Card className="p-4"><Skeleton className="h-10 w-full" /></Card>
       ) : plugins.isError && !plugins.data ? (
@@ -265,11 +272,11 @@ export function PluginsPanel() {
                 <p className="mt-0.5 truncate text-caption text-muted">{artifactSummary(p) || 'no artifacts'}{p.manifest.description ? ` — ${p.manifest.description}` : ''}</p>
               </div>
               <div className="flex shrink-0 gap-2">
-                <Button variant="secondary" size="sm" disabled={busy === p.manifest.id}
+                <Button variant="secondary" size="sm" disabled={busy !== null || plugins.isError}
                   onClick={() => void act(p.manifest.id, p.enabled ? 'disable' : 'enable')}>
                   {p.enabled ? 'Disable' : 'Enable'}
                 </Button>
-                <Button variant="secondary" size="sm" disabled={busy === p.manifest.id}
+                <Button variant="secondary" size="sm" disabled={busy !== null || plugins.isError}
                   onClick={() => void act(p.manifest.id, 'uninstall')}>
                   Uninstall
                 </Button>

@@ -4,6 +4,8 @@
  */
 import type { TriggersView, TriggerWorkflowRow, ReminderRow } from './triggers';
 import type { WatchRow } from './watches';
+import { workflowDisplayName } from '@clem/chat-engine';
+import { humanizeCron } from './cron';
 
 export type TriggerKind = 'schedule' | 'once' | 'interval' | 'webhook' | 'event' | 'watch' | 'reminder';
 
@@ -14,6 +16,7 @@ export interface NextUpItem {
   title: string;
   detail: string;
   href?: string;
+  technicalDetail?: string;
 }
 
 export function workflowKinds(row: TriggerWorkflowRow): TriggerKind[] {
@@ -29,18 +32,22 @@ export function workflowKinds(row: TriggerWorkflowRow): TriggerKind[] {
 /** Everything with a known future moment, soonest first, within `horizonMs`. */
 export function nextUp(view: TriggersView, now: number = Date.now(), horizonMs: number = 7 * 86_400_000): NextUpItem[] {
   const items: NextUpItem[] = [];
-  const paused = new Set(view.workflows.filter((row) => !row.enabled).map((row) => row.name));
+  const paused = new Set(view.workflows.filter((row) => !row.enabled).flatMap((row) => [row.name, row.slug]));
   for (const occurrence of view.upcoming) {
     const at = Date.parse(occurrence.at);
     if (!Number.isFinite(at) || at <= now || at - now > horizonMs || paused.has(occurrence.workflowName)) continue;
+    const workflow = view.workflows.find(row => row.name === occurrence.workflowName || row.slug === occurrence.workflowName);
+    const name = workflow?.name ?? occurrence.workflowName;
+    const schedule = occurrence.schedule || workflow?.schedule;
     items.push({ key: `workflow:${occurrence.workflowName}:${occurrence.at}`, kind: 'schedule', at: occurrence.at,
-      title: occurrence.workflowName, detail: occurrence.schedule ?? '', href: `/automate/${encodeURIComponent(occurrence.workflowName)}` });
+      title: workflowDisplayName(name, workflow?.description), detail: schedule ? humanizeCron(schedule, workflow?.timezone ?? undefined) : 'Scheduled run',
+      href: `/automate/${encodeURIComponent(name)}`, technicalDetail: schedule ?? undefined });
   }
   for (const row of view.workflows) {
     if (!row.enabled || !row.onceAt) continue;
     const at = Date.parse(row.onceAt);
     if (!Number.isFinite(at) || at <= now || at - now > horizonMs) continue;
-    items.push({ key: `once:${row.name}`, kind: 'once', at: row.onceAt, title: row.name, detail: 'once', href: `/automate/${encodeURIComponent(row.name)}` });
+    items.push({ key: `once:${row.name}`, kind: 'once', at: row.onceAt, title: workflowDisplayName(row.name, row.description), detail: 'One-time run', href: `/automate/${encodeURIComponent(row.name)}` });
   }
   for (const reminder of view.reminders) {
     const at = Date.parse(reminder.fireAt);

@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle, ChevronRight } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Page } from '@/components/Page';
+import { HashSectionNavigation } from '@/components/HashSectionNavigation';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -52,11 +53,11 @@ function prettyName(name: string): string {
     .replace(/\bZai\b/g, 'Z.ai');
 }
 
-function Section({ icon: Icon, title, subtitle, children, action }: {
-  icon: typeof Plug; title: string; subtitle?: string; children: React.ReactNode; action?: React.ReactNode;
+function Section({ icon: Icon, title, subtitle, children, action, id }: {
+  icon: typeof Plug; title: string; subtitle?: string; children: React.ReactNode; action?: React.ReactNode; id?: string;
 }) {
   return (
-    <section className="mb-8">
+    <section id={id} className="mb-8 scroll-mt-16">
       <div className="mb-3 flex items-center gap-2.5">
         <Icon className="h-5 w-5 text-primary" aria-hidden />
         <div className="flex-1">
@@ -69,6 +70,11 @@ function Section({ icon: Icon, title, subtitle, children, action }: {
     </section>
   );
 }
+
+const CONNECTION_SECTIONS = [
+  { id: 'apps', label: 'Apps' }, { id: 'accounts', label: 'Keys & accounts' }, { id: 'channels', label: 'Chat channels' },
+  { id: 'plugins', label: 'Plugins' }, { id: 'tools', label: 'Tools' }, { id: 'computer', label: 'This computer' }, { id: 'folders', label: 'Code folders' },
+];
 
 export function Connect() {
   const navigate = useNavigate();
@@ -191,6 +197,7 @@ export function Connect() {
 
   return (
     <Page title="Apps & devices" subtitle="Connect what Clem needs for your work, and pair your phone.">
+      <HashSectionNavigation label="Apps and devices sections" items={CONNECTION_SECTIONS} defaultId="apps" className="sticky top-0 z-10 -mx-5 mb-6 sm:-mx-8" />
       <section data-clem-guide="connections" className="mb-8 max-w-3xl" aria-labelledby="connection-setup-heading">
         <h2 id="connection-setup-heading" className="text-h2 text-fg">What would you like to connect?</h2>
         <p id="connection-setup-help" className="mt-2 max-w-prose text-body text-muted">Tell Clem what you need. She’ll check the setup and guide you through any sign-in.</p>
@@ -210,6 +217,7 @@ export function Connect() {
       </section>
       {/* Apps */}
       <Section
+        id="apps"
         icon={Plug}
         title="Apps"
         subtitle="Apps you've connected through Composio"
@@ -318,7 +326,18 @@ export function Connect() {
       </Section>
 
       {/* Keys & accounts — uniform single-line rows, not an uneven card grid */}
-      <Section icon={KeyRound} title="Keys & accounts" subtitle="API keys and sign-ins Clementine uses">
+      <Section id="accounts" icon={KeyRound} title="Keys & accounts" subtitle="API keys and sign-ins Clementine uses">
+            <Card className="flex items-center gap-3 px-4 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-body font-medium text-fg">Model accounts</div>
+                <div className="truncate text-caption text-faint">Claude, Codex, Grok, OpenAI, Jev and API-key models: sign-ins, keys, usage and where to add credit.</div>
+              </div>
+              <Link to="/settings#accounts" className="inline-flex shrink-0 items-center gap-1 text-small font-medium text-primary hover:underline">
+                Model accounts <ChevronRight className="h-3.5 w-3.5" aria-hidden />
+              </Link>
+            </Card>
+        <details className="mt-3">
+          <summary className="cursor-pointer rounded-md py-2 text-small font-semibold text-fg">Manage API keys</summary>
         {creds.isLoading ? <TileSkeleton /> : creds.isError ? (
           <QueryUnavailable
             title="Keys and accounts are unavailable"
@@ -328,15 +347,7 @@ export function Connect() {
           />
         ) : (
           <div className="space-y-2">
-            <Card className="flex items-center gap-3 px-4 py-3">
-              <div className="min-w-0 flex-1">
-                <div className="text-body font-medium text-fg">Model accounts</div>
-                <div className="truncate text-caption text-faint">Claude, Codex, Grok, OpenAI, Jev and API-key models: sign-ins, keys, usage and where to add credit.</div>
-              </div>
-              <Link to="/settings#accounts" className="inline-flex shrink-0 items-center gap-1 text-small font-medium text-primary hover:underline">
-                Settings › Models <ChevronRight className="h-3.5 w-3.5" aria-hidden />
-              </Link>
-            </Card>
+
             {credentialRows.length === 0 && <Card className="p-4 text-body text-muted">Nothing else configured yet.</Card>}
             {credentialRows.map((row, i) => (
               <CredentialCard key={row.name || i} row={row} descriptor={descriptors[row.name ?? '']}
@@ -346,12 +357,13 @@ export function Connect() {
             ))}
           </div>
         )}
+        </details>
       </Section>
 
       {/* Talk to Clementine — the channels where you chat with her, grouped
           in one place: Slack (compact wizard row) + your phone. Discord is a
           single token — it stays a row in Keys & accounts above. */}
-      <Section icon={MessageCircle} title="Talk to Clementine" subtitle="Chat channels — Slack and your phone. (Discord: set its token in Keys & accounts.)">
+      <Section id="channels" icon={MessageCircle} title="Talk to Clementine" subtitle="Chat channels — Slack and your phone. (Discord: set its token in Keys & accounts.)">
         <div className="space-y-3">
           <SlackConnect />
           <MobilePanel />
@@ -359,17 +371,18 @@ export function Connect() {
       </Section>
 
       {/* Plugins — content cartridges (skills + workflows + MCP bundles) */}
-      <PluginsPanel />
+      <div id="plugins" className="scroll-mt-16"><PluginsPanel /></div>
 
       {/* MCP */}
-      <McpManager />
+      <div id="tools" className="scroll-mt-16"><McpManager />
       <ShareCartridge />
 
       {/* CLIs — save-to-confirm, not a PATH dump */}
       <CliTools />
+      </div>
 
       {/* Your computer first; while Clem's driver is on, it is the browser too */}
-      <ComputerDriver />
+      <div id="computer" className="scroll-mt-16"><ComputerDriver />
       <OtherApps />
       {olderBrowsersRetired ? null : computerIsOn && !showBrowsersAnyway ? (
         <Card>
@@ -384,9 +397,10 @@ export function Connect() {
           <BrowserConnection />
         </>
       )}
+      </div>
 
       {/* Code folders (local code, not the Projects screen) */}
-      <ProjectsPanel />
+      <div id="folders" className="scroll-mt-16"><ProjectsPanel /></div>
 
       {setupForm && (
         <AppSetupFormView

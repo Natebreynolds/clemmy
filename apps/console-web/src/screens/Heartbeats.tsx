@@ -22,12 +22,13 @@ import { Input } from '@/components/ui/Field';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { StatusPill, Tag } from '@/components/ui/StatusPill';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
+import { EmptyState } from '@/components/ui/EmptyState';
 import { NoticingThinking } from '@/components/noticing/NoticingThinking';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import {
   addHeartbeatRule, cadenceChoices, cadenceWords, listHeartbeats, patchHeartbeat, phonePushCaveat, refineHeartbeatPrompt, removeHeartbeatRule, tickHeartbeat,
-  type HeartbeatStatus,
+  type HeartbeatItem, type HeartbeatStatus,
 } from '@/lib/heartbeats';
 
 function ago(iso?: string): string {
@@ -84,7 +85,8 @@ export function Heartbeats() {
             <p className="min-w-0 flex-1 text-fg">{q.isError ? 'These are the last loaded settings. Refresh before relying on their status.' : `${q.data?.unavailable?.map(item => item.title).join(', ')} status could not be loaded. Nothing has been turned off.`}</p>
             <Button variant="secondary" size="sm" onClick={() => { void q.refetch(); }}>Retry</Button>
           </div>}
-          <p className="text-small text-muted"><Link to="/" className="font-semibold text-primary hover:underline">Open From Clem</Link> to answer a suggestion or continue the conversation.</p>
+          <p className="text-small text-muted"><Link to="/inbox?tab=needs" className="font-semibold text-primary hover:underline">Open Inbox</Link> to answer a suggestion or continue the conversation.</p>
+          {list.length === 0 && !q.isError && !(q.data?.unavailable?.length) && <EmptyState title="No check-ins available" description="Ask Clem what she can keep an eye on for you." action={<Link to={`/chat?prompt=${encodeURIComponent('Help me choose what you should check on for me.')}`}><Button>Set up with Clem</Button></Link>} />}
           {list.map((h) => <HeartbeatCard key={h.id} heartbeat={h} />)}
         </div>
       )}
@@ -177,25 +179,11 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
           </div>
 
           <section>
-            <div className="mb-1.5 text-label text-fg">Open now</div>
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-label text-fg">Open now{open.length > 0 && <><span className="mr-auto text-caption font-normal text-muted">{open.length} {open.length === 1 ? 'item' : 'items'}</span><Link to="/inbox?tab=needs" className="text-small font-semibold text-primary hover:underline">Review in Inbox</Link></>}</div>
             {open.length === 0 ? (
               <p className="text-small text-muted">Nothing open.</p>
             ) : (
-              <ul className="space-y-1.5">
-                {open.slice(0, 8).map((item) => (
-                  <li key={item.key} className="rounded-md border border-border bg-surface px-3 py-2 text-small">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Tag>{KIND_WORDS[item.kind] ?? item.kind}</Tag>
-                      <span className="min-w-0 flex-1 truncate font-medium text-fg">{workflowDisplayName(item.subject)}</span>
-                      <span className="text-caption text-faint">{ago(item.createdAt)}{item.acknowledgedAt ? ' · seen' : ''}</span>
-                    </div>
-                    {item.handoff?.sessionId ? <Link className="font-semibold text-primary hover:underline" to={`/chat/${encodeURIComponent(item.handoff.sessionId)}`}>Open conversation</Link> : null}
-                    {item.handoff?.reason ? <p className="mt-1 text-caption text-warning">{item.handoff.reason}</p> : null}
-                    {item.detail ? <p className="mt-0.5 line-clamp-2 text-caption text-muted" title={item.detail}>{item.detail}</p> : null}
-                  </li>
-                ))}
-                {open.length > 8 ? <li className="text-caption text-muted">+{open.length - 8} more</li> : null}
-              </ul>
+              <CheckInOpenItems items={open} />
             )}
           </section>
 
@@ -264,4 +252,26 @@ function HeartbeatCard({ heartbeat: h }: { heartbeat: HeartbeatStatus }) {
       {h.id === 'noticing' ? <NoticingThinking /> : null}
     </Card>
   );
+}
+
+export function CheckInOpenItems({ items }: { items: HeartbeatItem[] }) {
+  const rows = (list: HeartbeatItem[]) => <ul className="space-y-1.5">{list.map(item => <li key={item.key} className="border-b border-border py-2 text-small last:border-b-0">
+    <div className="flex flex-wrap items-center gap-2">
+      <Tag>{KIND_WORDS[item.kind] ?? item.kind}</Tag>
+      <span className="min-w-0 flex-1 break-words font-medium text-fg">{workflowDisplayName(item.subject)}</span>
+      <span className="text-caption text-faint">{ago(item.createdAt)}{item.acknowledgedAt ? ' · seen' : ''}</span>
+    </div>
+    {item.handoff?.sessionId && <Link className="font-semibold text-primary hover:underline" to={`/chat/${encodeURIComponent(item.handoff.sessionId)}`}>Open conversation</Link>}
+    {item.handoff?.reason && <p className="mt-1 text-caption text-warning">{item.handoff.reason}</p>}
+    {item.detail && <p className="mt-0.5 whitespace-pre-wrap break-words text-caption text-muted">{item.detail}</p>}
+  </li>)}</ul>;
+  return <>
+    {rows(items.slice(0, 8))}
+    {items.length > 8 && <details className="group mt-2">
+      <summary className="cursor-pointer rounded-sm text-small font-semibold text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+        <span className="group-open:hidden">Show {items.length - 8} more {items.length - 8 === 1 ? 'item' : 'items'}</span><span className="hidden group-open:inline">Show fewer items</span>
+      </summary>
+      {rows(items.slice(8))}
+    </details>}
+  </>;
 }

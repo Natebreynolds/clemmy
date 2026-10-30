@@ -1,3 +1,4 @@
+import { projectContextPath } from '@/lib/project-navigation';
 /**
  * One page made in a project, shown as the document it is: framed in a
  * sandbox at the width the owner chooses, with a way to open it in their own
@@ -38,7 +39,7 @@ const WIDTHS: ReadonlyArray<{ id: WidthChoice; label: string; width: number | nu
   { id: 'phone', label: 'Phone', width: 390, Icon: Smartphone },
 ];
 
-const projectPath = (projectId: string) => `/projects/${encodeURIComponent(projectId)}`;
+const projectPath = projectContextPath;
 
 export function ProjectPageViewer() {
   const { id = '', pageId = '' } = useParams();

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, Clock3, Hash, Loader2, MessageCircle, PencilLine, Plus, RefreshCw, Send, ShieldCheck, Trash2, ChevronRight } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
@@ -7,6 +7,7 @@ import { Input, Select } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import {
   listDestinations, addDestination, testDestination, toggleDestination, deleteDestination, getNotificationDoctor, runNotificationAcceptance,
@@ -48,6 +49,8 @@ export function NotificationsEditor() {
   const [error, setError] = useState('');
   const [acceptance, setAcceptance] = useState<ChannelAcceptanceReport | null>(null);
   const [acceptanceError, setAcceptanceError] = useState('');
+  const actionOwner = useRef(false);
+  const [actionNote, setActionNote] = useState<{ failed: boolean; text: string } | null>(null);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['notif-destinations'] });
@@ -59,7 +62,8 @@ export function NotificationsEditor() {
   const isUser = type.endsWith('_user');
 
   const add = async () => {
-    if (!name.trim()) return;
+    if (!name.trim() || actionOwner.current) return;
+    actionOwner.current = true; setActionNote(null);
     setBusy('add'); setError('');
     try {
       await addDestination({
@@ -71,10 +75,20 @@ export function NotificationsEditor() {
       setName(''); setUrl(''); setChannelId(''); setUserId('');
       refresh();
     } catch (e) { setError((e as Error).message); }
-    finally { setBusy(null); }
+    finally { actionOwner.current = false; setBusy(null); }
+  };
+
+  const destinationAction = async (id: string, description: string, operation: () => Promise<unknown>) => {
+    if (actionOwner.current) return;
+    actionOwner.current = true; setBusy(id); setActionNote(null);
+    try { await operation(); setActionNote({ failed: false, text: `${description} request accepted. Refreshing its saved status.` }); }
+    catch (cause) { setActionNote({ failed: true, text: `${description} could not be confirmed: ${cause instanceof Error ? cause.message : 'Please try again.'}` }); }
+    finally { actionOwner.current = false; setBusy(null); refresh(); }
   };
 
   const runAcceptance = async () => {
+    if (actionOwner.current) return;
+    actionOwner.current = true;
     setBusy('acceptance');
     setAcceptanceError('');
     try {
@@ -84,7 +98,7 @@ export function NotificationsEditor() {
     } catch (e) {
       setAcceptanceError((e as Error).message);
     } finally {
-      setBusy(null);
+      actionOwner.current = false; setBusy(null);
     }
   };
 
@@ -99,6 +113,8 @@ export function NotificationsEditor() {
       {/* First-party places first: this Mac, then your phone. Slack, Discord
           and webhooks are other places, and adding one is folded away; a
           form open by default read as the point of the page (owner 09-26). */}
+      {dests.isError && <QueryUnavailable title="Notification destinations couldn’t be refreshed" description={dests.data ? 'Showing the last loaded destinations.' : 'Your saved destinations are unavailable, so phone setup cannot be confirmed.'} onRetry={() => { void dests.refetch(); }} className="mb-4 py-5" />}
+      {actionNote && <p role={actionNote.failed ? 'alert' : 'status'} className={`mb-3 text-small ${actionNote.failed ? 'text-danger' : 'text-muted'}`}>{actionNote.text}</p>}
       <ul className="mb-4 space-y-2">
         <li className="flex items-center gap-3 rounded-md border border-border px-3 py-2.5">
           <div className="min-w-0 flex-1">
@@ -107,7 +123,7 @@ export function NotificationsEditor() {
           </div>
           <StatusPill tone="success">Always on</StatusPill>
         </li>
-        {dests.isLoading ? <li><Skeleton className="h-12 w-full" /></li> : phones.length === 0 ? (
+        {dests.isLoading ? <li><Skeleton className="h-12 w-full" /></li> : phones.length === 0 && !dests.isError ? (
           <li className="flex items-center gap-3 rounded-md border border-dashed border-border px-3 py-2.5">
             <div className="min-w-0 flex-1">
               <div className="truncate text-body font-medium text-fg">Your phone</div>
@@ -121,8 +137,8 @@ export function NotificationsEditor() {
               <div className="truncate text-body font-medium text-fg">{d.deviceName ?? d.name}</div>
               <div className="truncate text-caption text-faint">{phoneCaption(d)}</div>
             </div>
-            <Switch checked={!!d.enabled} onChange={async (v) => { setBusy(d.id); try { await toggleDestination(d.id, v); } finally { setBusy(null); refresh(); } }} label={`Toggle ${d.deviceName ?? d.name}`} />
-            <Button variant="ghost" size="icon" aria-label="Test" title="Send a test" disabled={busy === d.id} onClick={async () => { setBusy(d.id); try { await testDestination(d.id); refresh(); } finally { setBusy(null); } }}>
+            <Switch checked={!!d.enabled} disabled={busy !== null || dests.isError} onChange={(v) => { void destinationAction(d.id, `${v ? 'Enable' : 'Pause'} ${d.deviceName ?? d.name}`, () => toggleDestination(d.id, v)); }} label={`Toggle ${d.deviceName ?? d.name}`} />
+            <Button variant="ghost" size="icon" aria-label={`Send a test to ${d.deviceName ?? d.name}`} title="Send a test" disabled={busy !== null || dests.isError} onClick={() => void destinationAction(d.id, `Test ${d.deviceName ?? d.name}`, () => testDestination(d.id))}>
               {busy === d.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />}
             </Button>
           </li>
@@ -141,11 +157,11 @@ export function NotificationsEditor() {
                       <div className="truncate text-caption text-faint">{TYPE_LABEL[d.type] ?? d.type}{destinationDetail(d)}</div>
                     </div>
                     <StatusPill tone={d.enabled ? 'success' : 'neutral'}>{d.enabled ? 'On' : 'Off'}</StatusPill>
-                    <Switch checked={!!d.enabled} onChange={async (v) => { setBusy(d.id); try { await toggleDestination(d.id, v); } finally { setBusy(null); refresh(); } }} label={`Toggle ${d.name}`} />
-                    <Button variant="ghost" size="icon" aria-label="Test" title="Send a test" disabled={busy === d.id} onClick={async () => { setBusy(d.id); try { await testDestination(d.id); refresh(); } finally { setBusy(null); } }}>
+                    <Switch checked={!!d.enabled} disabled={busy !== null || dests.isError} onChange={(v) => { void destinationAction(d.id, `${v ? 'Enable' : 'Pause'} ${d.deviceName ?? d.name}`, () => toggleDestination(d.id, v)); }} label={`Toggle ${d.name}`} />
+                    <Button variant="ghost" size="icon" aria-label={`Send a test to ${d.deviceName ?? d.name}`} title="Send a test" disabled={busy !== null || dests.isError} onClick={() => void destinationAction(d.id, `Test ${d.deviceName ?? d.name}`, () => testDestination(d.id))}>
                       {busy === d.id ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Send className="h-4 w-4" aria-hidden />}
                     </Button>
-                    <Button variant="ghost" size="icon" aria-label="Delete" title="Delete" onClick={async () => { await deleteDestination(d.id); refresh(); }}>
+                    <Button variant="ghost" size="icon" aria-label={`Remove ${d.name}`} title="Remove destination" disabled={busy !== null || dests.isError} onClick={() => void destinationAction(d.id, `Remove ${d.name}`, () => deleteDestination(d.id))}>
                       <Trash2 className="h-4 w-4" aria-hidden />
                     </Button>
                   </li>
@@ -161,6 +177,7 @@ export function NotificationsEditor() {
           Add another place — Slack, Discord or a webhook
         </summary>
         <div className="mt-3">
+      <fieldset disabled={busy !== null} className="min-w-0">
       <div className="grid gap-2 sm:grid-cols-2">
         <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (e.g. My Discord)" aria-label="Destination name" />
         <Select value={type} onChange={(e) => setType(e.target.value as DestinationType)} aria-label="Destination type">
@@ -177,11 +194,12 @@ export function NotificationsEditor() {
         {isUser && <Input value={userId} onChange={(e) => setUserId(e.target.value)} placeholder={type.startsWith('slack') ? 'Slack member ID' : 'Discord user ID'} aria-label="User ID" className="sm:col-span-2" />}
       </div>
       <div className="mt-3 flex items-center gap-3">
-        <Button size="sm" onClick={add} disabled={busy === 'add' || !name.trim()}>
+        <Button size="sm" onClick={add} disabled={busy !== null || !name.trim()}>
           {busy === 'add' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Plus className="h-4 w-4" aria-hidden />} Add destination
         </Button>
-        {error && <span className="text-small text-danger">{error}</span>}
+        {error && <span role="alert" className="text-small text-danger">{error}</span>}
       </div>
+      </fieldset>
         </div>
       </details>
       <details className="group mt-4 border-t border-border pt-3">
@@ -190,11 +208,12 @@ export function NotificationsEditor() {
           Delivery doctor, acceptance run, recent receipts
         </summary>
         <div className="mt-3">
+          {doctor.isError && <QueryUnavailable title="Delivery health couldn’t be refreshed" description={doctor.data ? 'Showing the last loaded health checks and receipts.' : 'Current delivery health is unknown.'} onRetry={() => { void doctor.refetch(); }} className="mb-3 py-5" />}
           <DeliveryDoctor
             data={doctor.data}
             loading={doctor.isLoading}
             acceptance={acceptance}
-            acceptanceBusy={busy === 'acceptance'}
+            acceptanceBusy={busy !== null}
             acceptanceError={acceptanceError}
             onRefresh={refresh}
             onRunAcceptance={() => void runAcceptance()}

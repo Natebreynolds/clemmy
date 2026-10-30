@@ -3,7 +3,7 @@
  * every thread starts from, and what it reaches for first. A centered modal;
  * on save it POSTs (create) or PATCHes (edit) and hands the record back.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { Field, Input, Select, Textarea } from '@/components/ui/Field';
@@ -17,15 +17,21 @@ export function AgentForm({
   mode,
   agent,
   catalog,
+  catalogUnavailable,
+  onRetryCatalog,
   onClose,
   onSaved,
 }: {
   mode: 'create' | 'edit';
   agent?: AgentRecord;
   catalog?: AgentCatalog;
+  catalogUnavailable?: boolean;
+  onRetryCatalog?: () => void;
   onClose: () => void;
   onSaved: (saved: AgentRecord) => void;
 }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => { dialog.current?.showModal(); }, []);
   const [name, setName] = useState(agent?.name ?? '');
   const [handles, setHandles] = useState(agent?.handles ?? '');
   const [instructions, setInstructions] = useState(agent?.instructions ?? '');
@@ -36,7 +42,7 @@ export function AgentForm({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const commit = usePendingCommit(`${mode}:${agent?.id ?? 'new'}`);
-  const close = () => { if (!commit.pending) onClose(); };
+  const close = () => { if (!commit.pending) { dialog.current?.close(); onClose(); } };
 
   const toggleIn = (setter: typeof setSkills) => (value: string) =>
     setter((prev) => {
@@ -67,7 +73,7 @@ export function AgentForm({
     };
     try {
       const saved = mode === 'create' ? await createAgent(input) : await updateAgent(agent!.id, input);
-      if (commit.owns(token)) onSaved(saved);
+      if (commit.owns(token)) { dialog.current?.close(); onSaved(saved); }
     } catch (e) {
       // The server answers with one plain sentence; show it as is.
       if (commit.owns(token)) setError(e instanceof Error ? e.message : String(e));
@@ -77,16 +83,17 @@ export function AgentForm({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label={`${mode === 'create' ? 'New' : 'Edit'} agent`}>
-      <div className="absolute inset-0 bg-black/30 animate-fade-in" onClick={close} />
-      <div className="relative flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-modal animate-fade-in">
+    <dialog ref={dialog} onCancel={event => { event.preventDefault(); close(); }} onClick={event => { if (event.target === dialog.current) close(); }} aria-label={`${mode === 'create' ? 'New' : 'Edit'} agent`} className="fixed inset-0 m-auto max-h-[90vh] w-[calc(100%_-_2rem)] max-w-lg overflow-hidden rounded-2xl border border-border bg-surface p-0 text-fg shadow-modal backdrop:bg-black/30">
+      <form className="flex max-h-[90vh] flex-col" onSubmit={event => { event.preventDefault(); void submit(); }}>
         <header className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
           <h3 className="text-h3 text-fg">{mode === 'create' ? 'New agent' : `Edit ${agent?.name}`}</h3>
-          <button onClick={close} disabled={saving} className="rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg disabled:opacity-50" aria-label="Close">
+          <button type="button" onClick={close} disabled={saving} className="rounded-sm p-1.5 text-muted hover:bg-hover hover:text-fg disabled:opacity-50" aria-label="Close">
             <X className="h-4 w-4" />
           </button>
         </header>
 
+        {catalogUnavailable && <p role="status" className="border-b border-border px-5 py-3 text-small text-warning">Skills, workflows and models couldn’t refresh. Your choices are kept. {onRetryCatalog && <button type="button" className="font-semibold underline" onClick={onRetryCatalog}>Retry</button>}</p>}
+        {!catalog && !catalogUnavailable && <p role="status" className="px-5 pt-3 text-small text-muted">Loading skills, workflows and models…</p>}
         <fieldset disabled={saving} aria-busy={saving} className="m-0 min-h-0 min-w-0 flex-1 overflow-y-auto border-0 px-5 py-4">
           <Field label="Name">
             {(id) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Sales" autoFocus />}
@@ -112,7 +119,7 @@ export function AgentForm({
             options={catalog?.skills ?? []}
             selected={skills}
             onToggle={toggleIn(setSkills)}
-            empty="No skills installed yet."
+            empty={catalog ? "No skills installed yet." : "Skills are unavailable until the catalog loads."}
           />
           <ChipPicker
             label="Workflows"
@@ -120,7 +127,7 @@ export function AgentForm({
             options={catalog?.workflows ?? []}
             selected={workflows}
             onToggle={toggleIn(setWorkflows)}
-            empty="No workflows saved yet."
+            empty={catalog ? "No workflows saved yet." : "Workflows are unavailable until the catalog loads."}
           />
           {catalog?.tools && (
             <ChipPicker
@@ -133,10 +140,10 @@ export function AgentForm({
             />
           )}
           {models && (
-            <Field label="Model" hint="Leave on the brain unless this agent needs a particular model.">
+            <Field label="Model" hint="Use Clem’s main model unless this agent needs a different one.">
               {(id) => (
                 <Select id={id} value={model} onChange={(e) => setModel(e.target.value)}>
-                  <option value={FOLLOW_BRAIN}>Follow the brain</option>
+                  <option value={FOLLOW_BRAIN}>Use Clem’s main model</option>
                   {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
                   {staleModel && <option value={staleModel}>{staleModel} (no longer offered)</option>}
                 </Select>
@@ -148,11 +155,11 @@ export function AgentForm({
         </fieldset>
 
         <footer className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <Button variant="secondary" size="sm" onClick={close} disabled={saving}>Cancel</Button>
-          <Button size="sm" onClick={submit} disabled={saving}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
+          <Button type="button" variant="secondary" size="sm" onClick={close} disabled={saving}>Cancel</Button>
+          <Button type="submit" size="sm" disabled={saving}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : 'Save changes'}</Button>
         </footer>
-      </div>
-    </div>
+      </form>
+    </dialog>
   );
 }
 

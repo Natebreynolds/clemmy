@@ -229,9 +229,8 @@ export function Meetings() {
     : (localRecording ? Date.now() - localElapsedSeconds * 1000 : undefined);
   const recallScratchpadWindowId = recording ? status.data?.activeWindowId : undefined;
   const recallStartedAtMs = status.data?.activeStartedAt ? Date.parse(status.data.activeStartedAt) : undefined;
-  const focusSavedMeeting = Boolean(selected && detail.data?.record?.id === selected
-    && ['completed', 'cancelled'].includes(detail.data.record.status ?? '')
-    && credConnected && !recording && !localRecording);
+  const activeCapture = recording || localRecording || localBusy || localCaptureState.phase === 'requesting';
+  const setupMode = activeCapture ? 'capture' : rows.length > 0 ? 'history' : 'first-use';
 
   useEffect(() => {
     if (typeof settings.retentionHours === 'number' && Number.isFinite(settings.retentionHours)) {
@@ -489,10 +488,11 @@ export function Meetings() {
       {liveRoom && <Button className="mb-5" size="sm" variant="ghost" aria-expanded={showLibrary} aria-controls="meeting-library" onClick={() => setShowLibrary(value => !value)}>{showLibrary ? 'Hide settings & history' : 'Settings & meeting history'}</Button>}
       {historySelected && recording && <Button className="mb-5" size="sm" variant="secondary" onClick={() => setHistorySelected(false)}>Back to live meeting</Button>}
       {(!liveRoom || showLibrary) && <div id="meeting-library" className="min-w-0">
-      <details key={focusSavedMeeting ? 'saved-meeting-settings' : 'recording-settings'} open={!focusSavedMeeting} className="group/recording-settings mb-6 min-w-0">
+      <details key={setupMode} open={setupMode !== 'history'} className="group/recording-settings mb-6 min-w-0">
         <summary className="mb-3 flex min-h-11 cursor-pointer items-center gap-2 text-small font-semibold text-fg">
           <ChevronRight size={16} aria-hidden className="shrink-0 transition-transform group-open/recording-settings:rotate-90 motion-reduce:transition-none" />
-          Recording setup and permissions
+          {setupMode === 'history' ? 'Record a meeting' : setupMode === 'capture' ? 'Recording controls and permissions' : 'Recording setup and permissions'}
+          {setupMode === 'history' && <span className="font-normal text-muted">Setup & permissions</span>}
         </summary>
 
       {/* Local in-person capture */}
@@ -639,7 +639,7 @@ export function Meetings() {
             <p className="mt-1 text-small text-muted">Use In-person meeting above to record the microphone and transcribe locally with whisper.cpp.{isMac() ? ' Local recording remains available on Intel Macs.' : ''}</p>
           </div>
         ) : !credConnected ? (
-          <p className="mt-4 text-body text-muted">Add your Recall.ai key in <span className="font-medium text-fg">Connect → Keys & accounts</span> to enable meeting capture.</p>
+          <p className="mt-4 text-body text-muted">Add your Recall.ai key in <Link to="/connect" className="font-semibold text-primary hover:underline">Apps & devices</Link> to enable meeting capture.</p>
         ) : !desktop ? (
           <p className="mt-4 inline-flex items-center gap-2 text-body text-muted"><Mic className="h-4 w-4" aria-hidden /> Recording controls live in the Clementine desktop app.</p>
         ) : (
@@ -749,6 +749,7 @@ export function Meetings() {
       </details>
 
       {/* Recent meetings + detail */}
+      {meetings.isError && meetings.data && <p role="status" className="mb-3 text-small text-warning">Meetings couldn’t refresh. Showing the last loaded list. <button type="button" className="font-semibold underline" onClick={() => void meetings.refetch()}>Retry</button></p>}
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
         <div className="min-w-0 space-y-2">
           {meetings.isLoading ? [0, 1, 2].map((i) => <Skeleton key={i} className="h-16 w-full" />)
@@ -766,6 +767,7 @@ export function Meetings() {
             </div>
           ) : detail.isLoading ? <Skeleton className="h-64 w-full" /> : detail.isError && !detail.data ? <QueryUnavailable title="This meeting couldn’t load" description="The transcript is unavailable right now. This does not mean it is empty." onRetry={() => { void detail.refetch(); }} /> : (
             <>
+              {detail.isError && detail.data && <p role="status" className="mb-3 text-small text-warning">This meeting couldn’t refresh. Showing the last loaded transcript and analysis. <button type="button" className="font-semibold underline" onClick={() => void detail.refetch()}>Retry</button></p>}
               <div className="mb-3 flex justify-end">
                 <Button size="sm" onClick={() => discuss(selected)}><MessageCircle className="h-4 w-4" aria-hidden /> Discuss in chat</Button>
               </div>

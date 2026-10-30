@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
-import type { FromClem } from '../../lib/from-clem.js';
+import type { CardReplyRecord, FromClem } from '../../lib/from-clem.js';
 
 // Render the actual component, without browser globals, API requests or mocked
 // presentation functions. Bundling shares one React/context instance and resolves
@@ -20,7 +20,17 @@ const output = await build({
     import { MemoryRouter } from 'react-router-dom';
     import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
     import { FromClemPane } from './src/components/home/FromClemPane';
+    import { CardRecord, CardRecordList, RecentCardRecords } from './src/components/home/CardRecord';
     import { NeedsYouPane } from './src/components/home/NeedsYouPane';
+    export function renderRecords(records, mode='list') {
+      const client = new QueryClient();
+      client.setQueryData(['from-clem-replies'],{replies:records});
+      const fetch = globalThis.fetch;
+      globalThis.fetch=()=>{throw new Error('Rendering receipts must not read or mutate work');};
+      try { return renderToStaticMarkup(<MemoryRouter><QueryClientProvider client={client}>
+        {mode==='single' ? <CardRecord record={records[0]} showTitle/> : mode==='recent' ? <RecentCardRecords/> : <CardRecordList records={records}/>}
+      </QueryClientProvider></MemoryRouter>); } finally { globalThis.fetch=fetch; client.clear(); }
+    }
     export function renderNeeds(props) {
       const client = new QueryClient();
       try { return renderToStaticMarkup(<MemoryRouter><QueryClientProvider client={client}>
@@ -29,6 +39,7 @@ const output = await build({
     }
     export function render(props) {
       const client = new QueryClient();
+      if(props.records)client.setQueryData(['from-clem-replies'],{replies:props.records});
       const originalFetch = globalThis.fetch;
       globalThis.fetch = () => { throw new Error('Rendering must not request data'); };
       try {
@@ -43,9 +54,10 @@ const output = await build({
 });
 const fixtureFile = path.join(temporary, 'render.cjs');
 writeFileSync(fixtureFile, output.outputFiles[0].contents);
-const { render, renderNeeds } = createRequire(import.meta.url)(fixtureFile) as {
+const { render, renderNeeds, renderRecords } = createRequire(import.meta.url)(fixtureFile) as {
+  renderRecords: (records: CardReplyRecord[], mode?:'single'|'list'|'recent') => string;
   renderNeeds: (props: {items: Array<Record<string, unknown>>;total?:number}) => string;
-  render: (props: { data?: FromClem; loading: boolean; error: boolean }) => string;
+  render: (props: { records?:CardReplyRecord[]; data?: FromClem; loading: boolean; error: boolean }) => string;
 };
 
 function snapshot(): FromClem {
@@ -188,4 +200,73 @@ test('Today uses the canonical total while repeated reports occupy one visible w
   const fallback=renderNeeds({items});
   const fallbackHeading=fallback.slice(fallback.indexOf('id="controlled-needs"'),fallback.indexOf('Open Inbox'));
   assert.match(fallbackHeading,/>1</,'the unavailable-summary fallback counts distinct work items');
+});
+
+
+const receipt = (id:string, state:'done'|'needs_you'|'working'|'stopped'='done'):CardReplyRecord => ({
+  rowKey:`row-${id}`,title:`Source ${id}`,reply:`Exact user request ${id}`,runId:`from-clem:${id}`,since:'2026-10-30T00:00:00Z',
+  outcome:state==='working' ? {state,steps:[{tool:'read_file',done:false}]} : {state,text:`Full response ${id}`,sessionId:`session-${id}`,steps:[{tool:'read_file',done:true}]},
+});
+function visibleReceipt(html:string):string {
+  return html.replace(/<details\b[^>]*>[\s\S]*?<\/details>/g,'');
+}
+
+test('held approval receipts keep the exact review target while full request and response live in a closed disclosure',()=>{
+  const record=receipt('held','needs_you');
+  record.reply='A complete exact user request';
+  record.outcome={state:'needs_you',asks:'approval',approvalId:'approval / ?&',sessionId:'session / ?&',text:'Full approval paragraph. '.repeat(80)+'EXACT-FINAL-LINE',steps:[{tool:'read_file',done:true}]};
+  const before=JSON.stringify(record);
+  const html=renderRecords([record],'single');
+  assert.match(html,/href="\/inbox\?tab=needs&amp;select=approval%20%2F%20%3F%26"/);
+  assert.match(html,/Review and approve/);assert.match(html,/Read request, full reply &amp; activity/);
+  const visible=visibleReceipt(html);
+  assert.match(visible,/Clem needs your OK/);assert.doesNotMatch(visible,/A complete exact user request|Full approval paragraph|EXACT-FINAL-LINE|What Clem did/);
+  assert.match(html,/<details[^>]*>/);assert.doesNotMatch(html,/<details[^>]*\bopen[= >]|line-clamp-6/);
+  assert.match(html,/A complete exact user request/);assert.match(html,/EXACT-FINAL-LINE/);assert.equal(JSON.stringify(record),before);
+});
+
+test('receipt state, rather than response wording, controls live progress and exact conversation actions',()=>{
+  const done=receipt('done');
+  done.outcome={state:'done',text:'I am still working and need approval',sessionId:'chat / ?&'};
+  const html=renderRecords([done],'single');
+  assert.match(visibleReceipt(html),/>Done</);assert.match(html,/href="\/chat\/harness%3Achat%20%2F%20%3F%26"/);assert.match(html,/Open the conversation/);
+  const answer=receipt('answer','needs_you');
+  assert.match(visibleReceipt(renderRecords([answer],'single')),/Answer Clem/);
+  const working=receipt('live','working');
+  assert.match(visibleReceipt(renderRecords([working],'single')),/What Clem is doing/);
+  assert.doesNotMatch(visibleReceipt(renderRecords([working],'single')),/Exact user request live/);
+});
+
+test('all loaded receipts remain readable while earlier settled activity is counted and live or held work stays visible',()=>{
+  const records=[receipt('latest'),receipt('old-1'),receipt('old-2'),receipt('live','working'),receipt('held','needs_you')];
+  for(const mode of ['list','recent'] as const){
+    const html=renderRecords(records,mode);
+    assert.equal((html.match(/data-testid="card-record"/g)??[]).length,5,'no loaded receipt is sliced away');
+    assert.match(html,/Earlier reply activity · 2/);assert.doesNotMatch(html,/Just now/);
+    const historyAt=html.indexOf('Earlier reply activity');
+    assert.ok(html.indexOf('Source live')<historyAt);assert.ok(html.indexOf('Source held')<historyAt);assert.ok(html.indexOf('Source old-2')>historyAt);
+  }
+  const html=render({records,data:snapshot(),loading:false,error:false});
+  assert.equal((html.match(/data-testid="card-record"/g)??[]).length,5);
+  assert.match(html,/Earlier reply activity · 2/);
+});
+
+test('a pure noticing coordinate becomes a plain origin while prose and exact question navigation survive',()=>{
+  const items=[{kind:'question',title:'Which account should Clem use?',meta:'noticing:ntc-mupqxx8k-aa8684',questionId:'checkin:question / ?&'}];
+  const html=renderNeeds({items});
+  assert.match(html,/From Clem/);assert.doesNotMatch(html,/noticing:ntc-mupqxx8k-aa8684/);
+  assert.match(html,/>Reply<\/button>|aria-expanded="false"/);
+  const prose='noticing:ntc-mupqxx8k-aa8684 is the source mentioned in my notes';
+  assert.match(renderNeeds({items:[{...items[0],meta:prose}]}),/is the source mentioned in my notes/);
+});
+
+
+test('earlier replies on a still-listed source remain readable instead of disappearing behind its latest receipt',()=>{
+  const data=snapshot();
+  data.rows.push({key:'same-source',heartbeat:'controlled',heartbeatTitle:'Controlled source',at:'2026-10-30T00:00:00Z',asks:false,text:'Current source update',voiceDigest:'current-generation'});
+  const latest={...receipt('latest-source'),rowKey:'same-source'};
+  const earlier={...receipt('earlier-source'),rowKey:'same-source'};
+  const html=render({records:[latest,earlier],data,loading:false,error:false});
+  assert.equal((html.match(/data-testid="card-record"/g)??[]).length,2);
+  assert.match(html,/Exact user request latest-source/);assert.match(html,/Exact user request earlier-source/);
 });

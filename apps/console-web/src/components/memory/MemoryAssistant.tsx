@@ -11,7 +11,7 @@ import { useConversationTasks } from '@/lib/conversation-tasks';
 import { decidePlanProposal } from '@/lib/inbox';
 import { unifiedChatSessionId } from '@/lib/last-session';
 import type { MemoryHit } from '@/lib/memory';
-import { captureMemoryAssistantSubmission, handoffMemoryAssistantDraft, memoryAssistantMessage, settleMemoryAssistantRetry, type MemoryAssistantSubmission } from '@/lib/memory-assistant-state';
+import { captureMemoryAssistantSubmission, handoffMemoryAssistantDraft, memoryAssistantMessage, memoryAssistantOwner, retainMemoryAssistantOwner, settleMemoryAssistantRetry, type MemoryAssistantSubmission } from '@/lib/memory-assistant-state';
 import { chatDecisionIntent, useChat, type ChatMessage } from '@/lib/useChat';
 
 export interface MemoryAssistantProps {
@@ -26,9 +26,11 @@ export interface MemoryAssistantProps {
 /** Keep mounted when hidden: a close is only a layout choice, not Stop or
  * New chat. No session, prompt, or mutation is created by opening the pane. */
 export function MemoryAssistant({ open, onClose, context, onClearContext, onMemoryChanged, onBusyChange }: MemoryAssistantProps) {
-  const [scope] = useState(() => `memory-${crypto.randomUUID()}`);
+  const [owner] = useState(memoryAssistantOwner);
+  const scope = owner.scope;
   const draftKey = `session:${scope}`;
-  const chat = useChat({ pendingStorageScope: scope, rememberAsLastSession: false });
+  const chat = useChat({ pendingStorageScope: scope, rememberAsLastSession: false,
+    initialSessionId: owner.executionSessionId, conversationSessionId: owner.conversationSessionId, reattachActiveRun: true });
   const conversationId = chat.conversationSessionId.current;
   const delegated = useConversationTasks(conversationId, chat.delegatedTaskTick);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -40,6 +42,17 @@ export function MemoryAssistant({ open, onClose, context, onClearContext, onMemo
   const callbacks = useRef({ onMemoryChanged, onBusyChange });
   callbacks.current = { onMemoryChanged, onBusyChange };
   const wasBusy = useRef(false);
+  const latest = useRef({ context, chat });
+  latest.current = { context, chat };
+  useEffect(() => () => {
+    const current = latest.current;
+    if (!retainMemoryAssistantOwner(scope, current.chat.sessionId.current, current.chat.conversationSessionId.current)) return;
+    // Keep a selected identity with an unsent draft without caching its body.
+    const draft = readComposerDraft(draftKey);
+    if (current.context && (draft.text.trim() || draft.attachments.length || draft.artifact)) {
+      writeComposerDraft(draftKey, value => ({ ...value, text: memoryAssistantMessage(value.text, current.context) }));
+    }
+  }, [scope, draftKey]);
 
   useEffect(() => {
     callbacks.current.onBusyChange?.(chat.busy);
@@ -132,7 +145,7 @@ export function MemoryAssistant({ open, onClose, context, onClearContext, onMemo
         setShowLatest(!stickRef.current);
       }} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
         {chat.messages.length === 0 ? <div className="space-y-5">
-          <p className="text-body text-muted">Ask about what Clem remembers, explore how she learned it, or describe a correction.</p>
+          <p className="text-body text-muted">{conversationId ? 'Your memory conversation is saved in Chat. Your draft is still here; Open chat shows its full history.' : 'Ask about what Clem remembers, explore how she learned it, or describe a correction.'}</p>
           <div className="space-y-1">
             {examples.map(example => <button key={example} type="button" onClick={() => fill(example)} className="block min-h-10 w-full rounded-md px-2 py-2 text-left text-small text-fg hover:bg-hover">{example}</button>)}
           </div>

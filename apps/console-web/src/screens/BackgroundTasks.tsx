@@ -8,7 +8,7 @@
  * so the card lands where its true state puts it. Click "View trace" to watch
  * the agent work live.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -33,7 +33,7 @@ import { listFocusSnapshot } from '@/lib/focus';
 import { pollIntervalForStream, useActionStreamStatus } from '@/lib/action-stream';
 import {
   listBoard, LIVE_COLUMNS, NEEDS_YOU_LANES, intentForDrop, rejectReason, runBoardAction, cardTone, sourceLabel,
-  boardLanes,
+  boardLanes, boardSelectionSearch,
   findBoardCardForRun, reconcileOpenBoardCard, resolveBoardRunSelection,
   type BoardCard, type BoardColumnId, type BoardButtonIntent, type BoardRunSelection,
 } from '@/lib/board';
@@ -66,8 +66,6 @@ export function BackgroundTasks() {
   );
 
   const [active, setActive] = useState<BoardCard | null>(null);
-  const [open, setOpen] = useState<BoardCard | null>(null);
-  const [pinnedSelection, setPinnedSelection] = useState<BoardRunSelection | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   // Finished work starts closed: the board answers "what is she doing".
   const [doneOpen, setDoneOpen] = useState(false);
@@ -82,52 +80,18 @@ export function BackgroundTasks() {
       runScopeId: searchParams.get('runScopeId'),
     } : null;
   }, [searchParams]);
-  const selectedIdentity = requestedSelection ?? pinnedSelection;
   const boardSelectionMatch = useMemo(() => (
-    selectedIdentity ? findBoardCardForRun(cards, selectedIdentity) : undefined
-  ), [cards, selectedIdentity]);
-  const exactSelection = Boolean(selectedIdentity?.attemptId || selectedIdentity?.runScopeId);
+    requestedSelection ? findBoardCardForRun(cards, requestedSelection) : undefined
+  ), [cards, requestedSelection]);
   const selectedRun = usePoll(
-    [
-      'board-selected-run',
-      selectedIdentity?.select ?? 'none',
-      selectedIdentity?.attemptId ?? '',
-      selectedIdentity?.runScopeId ?? '',
-    ],
-    () => resolveBoardRunSelection(selectedIdentity!),
+    ['board-selected-run', requestedSelection?.select ?? 'none', requestedSelection?.attemptId ?? '', requestedSelection?.runScopeId ?? ''],
+    () => resolveBoardRunSelection(requestedSelection!).then(card => card ?? null),
     pollIntervalForStream(stream, 4000),
-    { enabled: exactSelection && !boardSelectionMatch },
+    { enabled: Boolean(requestedSelection) && !boardSelectionMatch && !board.isLoading },
   );
-  const outOfPageCard = !boardSelectionMatch ? selectedRun.data : undefined;
-  const openBasis = pinnedSelection && outOfPageCard
-    && findBoardCardForRun([outOfPageCard], pinnedSelection)
-    ? outOfPageCard
-    : open;
-  const openCard = useMemo(
-    () => reconcileOpenBoardCard(openBasis, cards),
-    [openBasis, cards],
-  );
-
-  // The global Environment rail hands off the canonical attempt/scope when it
-  // has them. Resolve through run detail when that exact attempt sits beyond
-  // the board's bounded page; never substitute a same-session neighbor.
-  useEffect(() => {
-    if (!requestedSelection || board.isLoading) return;
-    const match = boardSelectionMatch ?? selectedRun.data;
-    if (!match) return;
-    setPinnedSelection(requestedSelection);
-    setOpen(match);
-    const next = new URLSearchParams(searchParams);
-    next.delete('select');
-    next.delete('attemptId');
-    next.delete('runScopeId');
-    setSearchParams(next, { replace: true });
-  }, [board.isLoading, boardSelectionMatch, requestedSelection, searchParams, selectedRun.data, setSearchParams]);
-
-  const closeTrace = () => {
-    setOpen(null);
-    setPinnedSelection(null);
-  };
+  const openCard = reconcileOpenBoardCard(boardSelectionMatch ?? selectedRun.data ?? null, cards);
+  const selectTrace = (card: BoardCard) => setSearchParams(boardSelectionSearch(searchParams, card));
+  const closeTrace = () => setSearchParams(boardSelectionSearch(searchParams, null));
 
   const staleCards = useMemo(() => cards.filter((c) => c.stale), [cards]);
 
@@ -152,7 +116,7 @@ export function BackgroundTasks() {
       label={lane.label}
       cards={byLane(lane.id)}
       activeCard={active}
-      onOpen={setOpen}
+      onOpen={selectTrace}
       onArchive={(card) => void onArchive(card)}
       onAction={onCardAction}
     />
@@ -261,6 +225,15 @@ export function BackgroundTasks() {
         </div>
       )}
     >
+      {requestedSelection && !openCard && (
+        <div className="mb-4 rounded-lg border border-border bg-surface p-4">
+          {board.isLoading || selectedRun.isLoading ? <p role="status" className="text-small text-muted">Opening the selected run…</p> : <>
+            <QueryUnavailable title={selectedRun.isError ? 'This run couldn’t load' : 'This exact run is unavailable'} description="The selected run is still in this link. A different attempt has not been opened." onRetry={() => { void board.refetch(); void selectedRun.refetch(); }} />
+            <Button size="sm" variant="ghost" onClick={closeTrace}>Dismiss selection</Button>
+          </>}
+        </div>
+      )}
+      {board.isError && board.data && <p role="status" className="mb-4 text-small text-warning">Activity couldn’t refresh. Showing the last loaded board. <button type="button" onClick={() => void board.refetch()} className="font-semibold underline">Retry</button></p>}
       {!board.isLoading && staleCards.length > 0 && !keptStale && (
         <div className="mb-4 flex flex-col gap-2 rounded-lg border border-warning/40 bg-warning-tint/50 p-4">
           <div className="flex items-start gap-2">
@@ -286,7 +259,7 @@ export function BackgroundTasks() {
         </div>
       )}
 
-      {board.isError ? (
+      {board.isError && !board.data ? (
         <QueryUnavailable
           title="Tasks are unavailable"
           description="Clementine couldn’t load the task board, so this is not an empty-work state."

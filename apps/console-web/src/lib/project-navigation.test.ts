@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PROJECT_VIEWS, projectView, projectViewSearch } from './project-navigation';
+import { PROJECT_VIEWS, projectView, projectViewSearch, projectContextPath } from './project-navigation';
 
 test('project navigation keeps agents and context first class across reloads and legacy links', () => {
   assert.deepEqual(PROJECT_VIEWS.map(view => view.id), ['overview', 'agents', 'context', 'conversations']);
@@ -19,4 +19,11 @@ test('changing project view preserves guide and other context without changing a
   assert.equal(next.get('guide'), 'work');
   assert.equal(next.get('source'), 'conversation');
   assert.equal(projectViewSearch(next, 'overview').has('view'), false);
+});
+
+
+test('a project page returns to its containing Context & apps view with exact project identity', () => {
+  const url = new URL(projectContextPath('project / ?&'), 'http://localhost');
+  assert.equal(decodeURIComponent(url.pathname.slice('/projects/'.length)), 'project / ?&');
+  assert.equal(projectView(url.searchParams.get('view')), 'context');
 });

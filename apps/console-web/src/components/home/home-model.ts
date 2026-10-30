@@ -419,3 +419,14 @@ export function plainText(input?: string | null, max = 400): string {
     .trim()
     .slice(0, max);
 }
+
+
+/** Pure protocol coordinates identify their origin; they are not user context.
+ * Only complete, known coordinate shapes are replaced. Prose remains verbatim. */
+export function needsYouContext(value: string | null | undefined): string {
+  const context = value?.trim() ?? '';
+  if (/^noticing:ntc-[a-z0-9_-]+$/i.test(context)) return 'From Clem';
+  if (/^checkin:[a-z0-9_-]+$/i.test(context)) return 'Check-in';
+  if (/^task:[a-z0-9_-]+$/i.test(context)) return 'Background task';
+  return context;
+}

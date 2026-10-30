@@ -61,7 +61,7 @@ import { FromClemPane } from '@/components/home/FromClemPane';
 import { HomeWatchLine } from '@/components/home/HomeWatchOverview';
 import { buildWatchOverview } from '@/components/home/watch-overview-model';
 import { buildHomeContentLayout } from '@/components/home/home-content-layout';
-import { isDefaultExploration, quietExplorationIntroductions } from '@/components/home/exploration-home';
+import { freshEmptyExplorationSnapshot, isDefaultExploration, quietExplorationIntroductions } from '@/components/home/exploration-home';
 import { listWatches } from '@/lib/watches';
 import { useFromClem, withoutFromClem } from '@/lib/from-clem';
 import { HomeNotice, SectionHeader, type HomeNoticeState } from '@/components/home/HomeSection';
@@ -274,6 +274,23 @@ function LiveHome() {
     watching: { state: watchOverview.status === 'loaded' ? 'loaded' : 'unconfirmed',
       count: watchOverview.currentCounts?.total, updatedAt: watches.dataUpdatedAt },
   });
+  // Setup explicitly chose exploration and the untouched Home has fresh,
+  // successful empty readings. Cached failures and existing work keep the
+  // normal Today composer; this changes guidance, never the send path.
+  const firstUseGuidance = defaultExploration && Object.values(quietIntroductions).every(Boolean)
+    && liveBuilds.length === 0 && [
+      { query: prefsQuery, count: 0 },
+      { query: cc, count: Array.isArray(cc.data?.needsYou) && Array.isArray(cc.data?.recentCompleted)
+        ? cc.data.needsYou.length + cc.data.recentCompleted.length : undefined },
+      { query: attention, count: attention.data?.total },
+      { query: workingNow, count: Array.isArray(workingNow.data?.entries) ? workingNow.data.entries.length : undefined },
+      { query: openTasks, count: Array.isArray(openTasks.data) ? openTasks.data.length : undefined },
+      { query: fromClem, count: Array.isArray(fromClem.data?.rows) ? fromClem.data.rows.length : undefined },
+      { query: today, count: today.data?.connected === false && !today.data.lastError && Array.isArray(today.data.events) ? today.data.events.length : undefined },
+    ].every(({ query, count }) => freshEmptyExplorationSnapshot({
+      state: query.isError ? 'error' : query.isLoading || !query.data ? 'unconfirmed' : 'loaded',
+      count, updatedAt: query.dataUpdatedAt,
+    }, Date.now()));
   const lowerPanes = panes.filter((id) => id === 'made' && !quietIntroductions.made
     || id === 'projects' && !quietIntroductions.projects || id === 'workstate');
   const addToHome = (spaceId: string) => {
@@ -458,6 +475,7 @@ function LiveHome() {
           composerStuck && 'shadow-[0_10px_18px_-14px_rgba(31,27,22,0.35)]')}>
         <Composer
           inputRef={composerRef}
+          gettingStarted={firstUseGuidance}
           sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current}
           busy={chat.busy || opening}
           mode={chat.composerMode}

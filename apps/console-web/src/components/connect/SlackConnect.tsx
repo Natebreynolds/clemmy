@@ -40,7 +40,10 @@ export function SlackConnect() {
     qc.invalidateQueries({ queryKey: ['slack-status'] });
   };
 
-  const pill = connected
+  const unavailable = status.isError || creds.isError;
+  const loading = status.isLoading || creds.isLoading;
+  const pill = unavailable ? <StatusPill tone="warning">Status unknown</StatusPill>
+    : loading ? <StatusPill tone="neutral">Checking…</StatusPill> : connected
     ? <StatusPill tone="live" icon={Radio}>Listening{status.data?.teamName ? ` · ${status.data.teamName}` : ''}</StatusPill>
     : bothSet
       ? <StatusPill tone="success">Connected · restart to listen</StatusPill>
@@ -57,13 +60,14 @@ export function SlackConnect() {
           <div className="truncate text-caption text-faint">Two-way chat (DMs + @mentions). ~2 minutes, no public URL needed.</div>
         </div>
         {pill}
-        <Button size="sm" variant={connected ? 'ghost' : 'secondary'} onClick={() => setOpen((v) => !v)}>
+        <Button size="sm" variant={connected ? 'ghost' : 'secondary'} aria-expanded={open} aria-controls="slack-setup" onClick={() => setOpen((v) => !v)}>
           {open ? 'Hide' : connected ? 'Details' : 'Set up'}
         </Button>
       </div>
+      {unavailable && <p role="alert" className="mt-2 text-small text-muted">Slack’s current connection couldn’t be confirmed. Saved setup has not been changed. <Button variant="link" size="sm" onClick={() => { void status.refetch(); void creds.refetch(); }}>Retry status</Button></p>}
 
       {open && (
-      <div className="mt-4 space-y-5 border-t border-border pt-4">
+      <div id="slack-setup" className="mt-4 space-y-5 border-t border-border pt-4">
         <Step n={1} title="Create the app from our manifest" done={bothSet}>
           <p className="mb-2 text-caption text-faint">
             Open Slack’s app builder, choose <strong>From a manifest</strong>, pick your workspace, and paste this:

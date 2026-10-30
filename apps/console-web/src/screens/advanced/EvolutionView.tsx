@@ -8,6 +8,7 @@ import { StatusPill } from '@/components/ui/StatusPill';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { usePoll } from '@/lib/poll';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import {
   getAutoresearchReport, runAutoresearch, runMemoryCleanup,
   getHarnessAudit, getAgentSystemMetrics,
@@ -862,8 +863,11 @@ export function EvolutionView() {
   const improvementData = improvements.data;
   const showImprovementsCard = !!improvementData && (!improvementData.enabled || improvementData.proposals.length > 0);
   const hasSystemHealth = Boolean(audit.data || agentMetrics.data);
-  const auditError = audit.error instanceof Error ? audit.error.message : null;
-  const metricsError = agentMetrics.error instanceof Error ? agentMetrics.error.message : null;
+  const sources = [
+    { name: 'Self-research report', query: q }, { name: 'Harness audit', query: audit },
+    { name: 'Agent metrics', query: agentMetrics }, { name: 'Improvement proposals', query: improvements },
+  ];
+  const readFailed = sources.some(source => source.query.isError);
 
   const onRun = async () => {
     setRunning(true);
@@ -892,16 +896,12 @@ export function EvolutionView() {
           <p className="text-small text-danger">Couldn’t run self-research: {runError}</p>
         </Card>
       )}
-      {(auditError || metricsError) && (
-        <Card className="mb-4 p-4">
-          <p className="text-small text-danger">
-            {auditError ? `Harness audit failed: ${auditError}` : `Agent metrics failed: ${metricsError}`}
-          </p>
-        </Card>
-      )}
-      {q.isLoading && !hasSystemHealth ? (
+      {sources.filter(source => source.query.isError).map(source => <QueryUnavailable key={source.name}
+        title={`${source.name} couldn’t be refreshed`} description={source.query.data ? 'Showing its last loaded information. Other sections are independent.' : 'This section is unavailable. Other sections are independent.'}
+        onRetry={() => { void source.query.refetch(); }} className="mb-4 py-5" />)}
+      {sources.some(source => source.query.isLoading) && !hasSystemHealth ? (
         <Skeleton className="h-64 w-full" />
-      ) : !hasSystemHealth && !report && !refinements && !showImprovementsCard ? (
+      ) : !readFailed && !hasSystemHealth && !report && !refinements && !showImprovementsCard ? (
         <EmptyState
           title="No self-research yet"
           description="Clementine builds this nightly from how it worked for you. Hit “Run now” to generate the first report."

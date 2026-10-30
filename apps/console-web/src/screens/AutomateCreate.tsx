@@ -10,14 +10,16 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, Clock, Lock, Play, Send, Eye, PenLine, ExternalLink } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { StatusPill, type Tone } from '@/components/ui/StatusPill';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Composer } from '@/components/chat/Composer';
 import { ChatBubble } from '@/components/chat/ChatBubble';
 import { RunningTasksDrawer } from '@/components/chat/RunningTasksDrawer';
 import { WorkflowHowItWorks } from '@/components/automate/WorkflowDrawer';
+import { AutomationRefreshNotice } from '@/components/automate/AutomationRefreshNotice';
 import { chatApprovalReply, useChat } from '@/lib/useChat';
 import { getWorkflow, runWorkflow } from '@/lib/automate';
 import { humanizeCron } from '@/lib/cron';
@@ -25,7 +27,8 @@ import { certificationTone, sentenceCaseLabel } from '@/lib/workflowCertificatio
 import { workflowBuildFromMessages, type WorkflowBuildState, type WorkflowDraft } from '@/lib/workflow-build';
 import { cn } from '@/lib/cn';
 import { usePendingCommit } from '@/lib/pending-commit';
-import { workflowRunFailure, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
+import { workflowRunFailure, workflowRunId, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
+import { automationRunHref, automationSetupHref } from '@/lib/automation-editor';
 
 const STARTERS = [
   'Every Friday at 7, summarize my open pipeline by stage and email it to me.',
@@ -102,6 +105,8 @@ export function AutomateCreate() {
   const threadEndRef = useRef<HTMLDivElement>(null);
   const seededRef = useRef(false);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const [queuedRunId, setQueuedRunId] = useState<string | null>(null);
+  const [panel, setPanel] = useState<'conversation' | 'preview'>('conversation');
   const [runNoticeTone, setRunNoticeTone] = useState<'info' | 'warning'>('info');
   useEffect(() => { threadEndRef.current?.scrollIntoView({ block: 'end' }); }, [chat.messages]);
 
@@ -122,7 +127,7 @@ export function AutomateCreate() {
   const wf = stored.data;
   const runCommit = usePendingCommit(wf?.name ?? '');
   const [runPending, setRunPending] = useState(false);
-  useEffect(() => { setRunPending(false); setRunNotice(null); }, [wf?.name]);
+  useEffect(() => { setRunPending(false); setRunNotice(null); setQueuedRunId(null); }, [wf?.name]);
   const cert = wf?.certification;
   const live = build.state === 'drafting' || build.state === 'writing' || build.state === 'testing';
 
@@ -133,9 +138,10 @@ export function AutomateCreate() {
     if (!token) return;
     setRunPending(true);
     setRunNotice(null);
+    setQueuedRunId(null);
     try {
       const receipt = await runWorkflow(wf.name);
-      if (runCommit.owns(token)) { setRunNotice(workflowRunNotice(receipt)); setRunNoticeTone(workflowRunTone(receipt)); }
+      if (runCommit.owns(token)) { setRunNotice(workflowRunNotice(receipt)); setRunNoticeTone(workflowRunTone(receipt)); setQueuedRunId(workflowRunId(receipt)); }
     } catch (e) {
       if (runCommit.owns(token)) { setRunNotice(workflowRunFailure(e)); setRunNoticeTone('warning'); }
     } finally {
@@ -144,8 +150,12 @@ export function AutomateCreate() {
   };
 
   return (
-    <div className="flex h-full">
-      <aside className="flex w-[400px] shrink-0 flex-col border-r border-border bg-subtle" aria-label="Conversation with Clementine">
+    <div className="flex h-full min-h-0 flex-col lg:flex-row">
+      <div className="flex shrink-0 gap-1 border-b border-border px-3 py-2 lg:hidden" aria-label="Workflow creation view">
+        <Button variant={panel === 'conversation' ? 'secondary' : 'ghost'} size="sm" aria-pressed={panel === 'conversation'} onClick={() => setPanel('conversation')}>Conversation</Button>
+        <Button variant={panel === 'preview' ? 'secondary' : 'ghost'} size="sm" aria-pressed={panel === 'preview'} onClick={() => setPanel('preview')}>Workflow preview</Button>
+      </div>
+      <aside className={cn('min-h-0 w-full flex-1 flex-col border-r border-border bg-subtle lg:w-[min(38%,400px)] lg:flex-none', panel === 'conversation' ? 'flex' : 'hidden lg:flex')} aria-label="Conversation with Clementine">
         <div className="flex items-center gap-2 px-3 pb-2 pt-3">
           <Button variant="ghost" size="sm" onClick={() => navigate('/automate')} aria-label="Back to Automate">
             <ArrowLeft className="h-4 w-4" aria-hidden />
@@ -158,7 +168,7 @@ export function AutomateCreate() {
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3">
           {chat.messages.length === 0 ? (
             <div className="flex flex-col gap-2 px-1 pt-4">
-              <p className="text-small text-muted">Describe a task you do often. Clementine works out the steps, tells you what each one reads, writes or sends, and asks before anything goes out.</p>
+              <p className="text-small text-muted">Describe a task you do often. Clementine works out the steps, explains what they read, change or send, and follows your approval rules.</p>
               {STARTERS.map((s) => (
                 <button key={s} type="button" onClick={() => start(s)} className="rounded-md border border-border bg-surface px-3 py-2 text-left text-small text-fg shadow-xs transition-colors hover:border-primary/40 hover:bg-hover">
                   {s}
@@ -187,10 +197,10 @@ export function AutomateCreate() {
         </div>
       </aside>
 
-      <section className="flex min-w-0 flex-1 flex-col" aria-label="The workflow">
-        <div className="relative flex items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
+      <section className={cn('min-h-0 min-w-0 flex-1 flex-col', panel === 'preview' ? 'flex' : 'hidden lg:flex')} aria-label="The workflow">
+        <div className="relative flex flex-wrap items-center gap-2 border-b border-border bg-surface px-4 py-2.5">
           <h2 className="truncate text-h3 text-fg">{build.draft?.name || wf?.name || 'New workflow'}</h2>
-          <StatusPill tone={pill.tone}>{pill.label}</StatusPill>
+          <StatusPill tone={build.writtenName && stored.isError ? 'warning' : pill.tone}>{build.writtenName && stored.isError ? 'Saved workflow unavailable' : build.writtenName && stored.isPending ? 'Loading saved workflow…' : pill.label}</StatusPill>
           {cert && build.state === 'written' && <StatusPill tone={certificationTone(cert.state)}>{sentenceCaseLabel(cert.label)}</StatusPill>}
           {live && <span aria-hidden className="absolute inset-x-0 bottom-0 h-0.5 animate-pulse bg-primary/70" />}
           <div className="ml-auto flex items-center gap-1.5">
@@ -199,14 +209,15 @@ export function AutomateCreate() {
                 <Button variant="secondary" size="sm" disabled={runPending || (cert ? !cert.canRun : false)} title={cert?.summary} onClick={() => void queueRun()}>
                   <Play className="h-4 w-4" aria-hidden /> {runPending ? 'Queuing…' : 'Run once now'}
                 </Button>
-                <Button variant="secondary" size="sm" onClick={() => navigate(`/automate?workflow=${encodeURIComponent(wf.name)}`)}>
-                  <ExternalLink className="h-4 w-4" aria-hidden /> Open in Automate
+                <Button variant={cert && !cert.canRun ? 'primary' : 'secondary'} size="sm" onClick={() => navigate(cert && !cert.canRun ? automationSetupHref(wf.name) : `/automate/${encodeURIComponent(wf.name)}`)}>
+                  <ExternalLink className="h-4 w-4" aria-hidden /> {cert && !cert.canRun ? 'Finish setup with Clem' : 'Open workflow'}
                 </Button>
               </>
             )}
           </div>
         </div>
-        {runNotice && <p className={cn('border-b px-4 py-2 text-small', runNoticeTone === 'warning' ? 'border-warning/30 bg-warning-tint text-fg' : 'border-border bg-subtle text-muted')} role="status">{runNotice}</p>}
+        {runNotice && <p className={cn('border-b px-4 py-2 text-small', runNoticeTone === 'warning' ? 'border-warning/30 bg-warning-tint text-fg' : 'border-border bg-subtle text-muted')} role="status">{runNotice}{wf && queuedRunId && <Link className="ml-2 font-semibold text-primary hover:underline" to={automationRunHref(wf.name, queuedRunId)}>View run</Link>}</p>}
+        {stored.isError && (wf ? <AutomationRefreshNotice className="m-4" title="Showing the last loaded workflow" description="Refresh before relying on its readiness." onRetry={() => { void stored.refetch(); }} /> : <QueryUnavailable className="m-4" title="Couldn’t load the saved workflow" description="Your conversation and draft are kept. Retry to confirm the saved workflow and its readiness." onRetry={() => { void stored.refetch(); }} />)}
         <div className="relative min-h-0 flex-1 overflow-y-auto bg-canvas p-6">
           {wf ? (
             <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5">

@@ -39,6 +39,25 @@ test('each kind lists its own rows and a workflow can be several kinds at once',
   assert.deepEqual(eventWorkflows(v).map((row) => row.name), ['Lead intake']);
 });
 
+test('timeline uses readable workflow and schedule labels with an exact existing workflow destination', () => {
+  const v = view({
+    workflows: [workflow({name:'automation-1234567890abcdef', slug:'canonical-alias', description:'Prepare the weekly customer brief.', schedule:'0 9 * * 1-5', timezone:'America/Los_Angeles'}), workflow({name:'paused-workflow', slug:'paused-alias', enabled:false})],
+    upcoming: [
+      {workflowName:'canonical-alias', at:new Date(NOW + 60_000).toISOString(), schedule:'0 9 * * 1-5'},
+      {workflowName:'paused-alias', at:new Date(NOW + 120_000).toISOString(), schedule:'0 9 * * 1-5'},
+    ],
+    reminders: [{id:'reminder-controlled', message:'Remember my 0 9 * * 1-5 example', fireAt:new Date(NOW + 180_000).toISOString(), createdAt:new Date(NOW).toISOString()}],
+  });
+  const items = nextUp(v, NOW);
+  assert.equal(items.length, 2, 'the paused alias stays excluded');
+  assert.equal(items[0].title, 'Prepare the weekly customer brief');
+  assert.match(items[0].detail, /Every weekday at 9:00 AM/);
+  assert.equal(items[0].technicalDetail, '0 9 * * 1-5');
+  assert.equal(items[0].href, '/automate/automation-1234567890abcdef');
+  assert.equal(items[1].title, 'Remember my 0 9 * * 1-5 example');
+  assert.equal(items[1].href, undefined, 'a reminder gets no invented workflow or dispatch target');
+});
+
 test('when labels read as a person says them', () => {
   assert.equal(whenLabel(new Date(NOW + 5 * 60_000).toISOString(), NOW), 'in 5 min');
   assert.equal(whenLabel(new Date(NOW + 3 * 3_600_000).toISOString(), NOW), 'in 3 h');

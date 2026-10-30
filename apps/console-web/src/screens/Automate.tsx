@@ -1,11 +1,12 @@
 import { workflowDisplayName } from '@clem/chat-engine';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, Workflow } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -14,6 +15,7 @@ import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
 import { usePendingCommit } from '@/lib/pending-commit';
 import { workflowRunFailure, workflowRunId, workflowRunNotice, workflowRunTone } from '@/lib/workflow-run-receipt';
+import { automationSetupHref, exactRun, searchWorkflows } from '@/lib/automation-editor';
 import { statusTone } from '@/lib/inbox';
 import { humanizeCron } from '@/lib/cron';
 import { ActivityCard } from '@/components/chat/ActivityCard';
@@ -23,7 +25,8 @@ import { useWorkflowRunEvents } from '@/lib/workflow-run-events';
 import { buildWorkflowRunDetail } from '@/lib/workflow-run-detail';
 import { useWorkflowChanges } from '@/lib/workflow-changes';
 import { cn } from '@/lib/cn';
-import { workflowCardStatus, workflowPrimaryAction } from '@/lib/workflowCertification';
+import { workflowCardStatus } from '@/lib/workflowCertification';
+import { workflowResultArchiveHref } from '@/lib/workflow-result-navigation';
 import {
   checkRunAgainstGoal, getRunWorkspace, listWorkflowRuns,
   listWorkflows, resumeWorkflowCapability, retryWorkflowFailedItems, runWorkflow, setWorkflowEnabled,
@@ -33,6 +36,7 @@ import {
   nextRunLabel,
 } from '@/lib/automate';
 import { getAgentSystemMetrics } from '@/lib/advanced';
+import { AutomationRefreshNotice } from '@/components/automate/AutomationRefreshNotice';
 
 type Tab = 'workflows' | 'skills';
 
@@ -87,8 +91,10 @@ function goalObjective(goal: string | null): string | null {
 export function Automate() {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>('workflows');
   const [filter, setFilter] = useState<WorkflowFilter>('all');
+  const [workflowSearch, setWorkflowSearch] = useState('');
 
   const workflows = usePoll(['workflows'], listWorkflows, 10000);
   // The live half: in-flight runs (with their step) and what fires next.
@@ -107,33 +113,36 @@ export function Automate() {
   const [installing, setInstalling] = useState(false);
   const [checking, setChecking] = useState(false);
   const [busyRecovery, setBusyRecovery] = useState<string | null>(null);
+  const retryCommit = usePendingCommit('automate-retry');
+  const toggleCommit = usePendingCommit('automate-toggle');
+  const [busyToggle, setBusyToggle] = useState<string | null>(null);
   // A workflow opens on its own page. /automate?workflow=<name> (the
   // workspace header's "powered by" chips) still lands there.
-  const openWorkflow = (name: string, opts?: { advanced?: boolean }) =>
-    navigate(`/automate/${encodeURIComponent(name)}${opts?.advanced ? '?advanced=1' : ''}`);
+  const openWorkflow = (name: string, opts?: { advanced?: boolean; setup?: boolean }) =>
+    navigate(opts?.setup ? automationSetupHref(name) : `/automate/${encodeURIComponent(name)}${opts?.advanced ? '?advanced=1' : ''}`);
   // /automate?workflow=<name>&run=<id> opens that run over the list (the
   // workflow page's "Open run" after a step test); without a run it forwards
   // to the workflow's page.
-  const [openRun, setOpenRun] = useState<{ workflow: string; runId?: string } | null>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const workflow = params.get('workflow');
-    const runId = params.get('run');
-    return workflow && runId ? { workflow, runId } : null;
-  });
+  const linkedWorkflow = searchParams.get('workflow');
+  const linkedRunId = searchParams.get('run');
+  const openRun = linkedWorkflow && linkedRunId ? { workflow: linkedWorkflow, runId: linkedRunId } : null;
+  const setOpenRun = (selection: { workflow: string; runId?: string } | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (selection?.runId) { next.set('workflow', selection.workflow); next.set('run', selection.runId); }
+    else { next.delete('workflow'); next.delete('run'); }
+    setSearchParams(next, { replace: !selection });
+  };
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const deepLinked = params.get('workflow');
-    if (deepLinked && !params.get('run')) navigate(`/automate/${encodeURIComponent(deepLinked)}`, { replace: true });
-    // Read once on mount: the query string is the deep link, not live state.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (linkedWorkflow && !linkedRunId) navigate(`/automate/${encodeURIComponent(linkedWorkflow)}`, { replace: true });
+  }, [linkedWorkflow, linkedRunId, navigate]);
   const [notice, setNotice] = useState<{ tone: 'info' | 'warning' | 'error'; text: string } | null>(null);
 
   const wf = workflows.data?.workflows ?? [];
   // The old Schedules tab duplicated these same cards; a schedule is now a
   // property of the workflow (meta line + filter chip), not a second surface.
   const isScheduled = (w: WorkflowRow) => Boolean(w.triggerSchedule || w.trigger?.schedule);
-  const visibleWf = filter === 'all' ? wf : wf.filter((w) => (filter === 'scheduled' ? isScheduled(w) : !isScheduled(w)));
+  const categoryWf = filter === 'all' ? wf : wf.filter((w) => (filter === 'scheduled' ? isScheduled(w) : !isScheduled(w)));
+  const visibleWf = searchWorkflows(categoryWf, workflowSearch);
   const sk = skills.data?.skills ?? [];
   // The old operator-telemetry panel ("repair-loop 94/100", "fanout block",
   // "19/100 thrashing") lives in Advanced → Evolution, which renders this same
@@ -160,20 +169,26 @@ export function Automate() {
   };
   const retryFailed = async (workflow: WorkflowRow) => {
     if (!workflow.lastRunId) return;
+    const token = retryCommit.begin();
+    if (!token) return;
     const stepIds = workflow.lastRunFailedItemStepIds ?? [];
     setBusyRecovery(workflow.name); setNotice(null);
     try {
       const result = await retryWorkflowFailedItems(workflow.name, workflow.lastRunId, stepIds.length === 1 ? stepIds[0] : undefined);
+      if (!retryCommit.owns(token)) return;
       setNotice({ tone: result.ok ? 'info' : 'error', text: result.message });
       void qc.invalidateQueries({ queryKey: ['workflows'] });
       void qc.invalidateQueries({ queryKey: ['agent-system-metrics'] });
     } catch (e) {
-      setNotice({ tone: 'error', text: (e as Error).message });
+      if (retryCommit.owns(token)) setNotice({ tone: 'error', text: (e as Error).message });
     } finally {
-      setBusyRecovery(null);
+      if (retryCommit.finish(token)) setBusyRecovery(null);
     }
   };
   const toggle = async (name: string, enabled: boolean) => {
+    const token = toggleCommit.begin();
+    if (!token) return;
+    setBusyToggle(name);
     // The server answers this call with words. A 409 names the inputs the
     // creation test still needs; a 202 persists `enabled: false` on purpose
     // while it queues that test. Swallowing both made the switch snap back to
@@ -182,6 +197,7 @@ export function Automate() {
     setNotice(null);
     try {
       const result = await setWorkflowEnabled(name, enabled) as { enabled?: boolean; message?: string } | undefined;
+      if (!toggleCommit.owns(token)) return;
       if (enabled && result?.enabled === false) {
         setNotice({ tone: 'info', text: result.message ?? `“${name}” needs its creation test before it can run.` });
       }
@@ -189,9 +205,9 @@ export function Automate() {
       // api.ts prefers `error` over `message`, so read the body: otherwise the
       // owner gets "workflow verification missing inputs" instead of WHICH.
       const body = (e as { body?: { message?: string } }).body;
-      setNotice({ tone: 'error', text: body?.message ?? (e as Error).message });
+      if (toggleCommit.owns(token)) setNotice({ tone: 'error', text: body?.message ?? (e as Error).message });
     } finally {
-      void qc.invalidateQueries({ queryKey: ['workflows'] });
+      if (toggleCommit.finish(token)) { setBusyToggle(null); void qc.invalidateQueries({ queryKey: ['workflows'] }); }
     }
   };
   const install = async () => {
@@ -238,7 +254,7 @@ export function Automate() {
       </div>
 
       {notice && (
-        <p className={cn('mb-4 rounded-md border px-3 py-2 text-small',
+        <p role={notice.tone === 'error' ? 'alert' : 'status'} className={cn('mb-4 rounded-md border px-3 py-2 text-small',
           notice.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : notice.tone === 'warning' ? 'border-warning/30 bg-warning-tint text-fg' : 'border-border bg-subtle text-muted')}>
           {notice.text}
         </p>
@@ -271,7 +287,7 @@ export function Automate() {
           // zero rows read as "you never made one". Say which it is, and keep
           // the toggle/Run controls reachable behind Retry instead of inviting
           // him to build a duplicate of what he already has.
-          : workflows.isError
+          : workflows.isError && (!workflows.data || wf.length === 0)
           ? <QueryUnavailable
               title="Workflows are unavailable"
               description="Clementine couldn’t load your workflows, so this is not an empty-automation state. Nothing has been deleted or turned off."
@@ -281,11 +297,19 @@ export function Automate() {
             ? <EmptyState title="Let's automate something" description="Tell me a task you do often and I'll set it up for you." action={<Button onClick={() => navigate('/automate/new')}><Plus className="h-4 w-4" aria-hidden /> Create with Clementine</Button>} />
             : (
               <>
-                <div className="mb-4 flex flex-wrap gap-1.5">
+                {workflows.isError && <AutomationRefreshNotice className="mb-4" title="Showing last loaded workflows" description="Refresh before relying on their status. Your workflows are kept." onRetry={() => { void workflows.refetch(); }} />}
+                {home.isError && <AutomationRefreshNotice className="mb-4" title="Live run status could not be refreshed" description="The last loaded activity and upcoming times are shown." onRetry={() => { void home.refetch(); }} />}
+                <div className="mb-4 flex flex-wrap items-center gap-3">
+                  <div className="flex min-w-0 flex-1 items-center gap-2 sm:max-w-sm">
+                    <Input type="search" aria-label="Search workflows" placeholder="Search workflows…" value={workflowSearch} onChange={event => setWorkflowSearch(event.target.value)} />
+                    {workflowSearch && <Button variant="ghost" size="sm" onClick={() => setWorkflowSearch('')}>Clear search</Button>}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5" aria-label="Workflow type">
                   {([['all', 'All'], ['scheduled', 'Scheduled'], ['manual', 'Manual']] as Array<[WorkflowFilter, string]>).map(([key, label]) => (
                     <button
                       key={key}
                       type="button"
+                      aria-pressed={filter === key}
                       onClick={() => setFilter(key)}
                       className={cn('rounded-full border px-3 py-1 text-small font-medium transition-colors cursor-pointer',
                         filter === key ? 'border-primary bg-primary-tint text-primary' : 'border-border text-muted hover:text-fg')}
@@ -293,9 +317,12 @@ export function Automate() {
                       {label}
                     </button>
                   ))}
+                  </div>
+                  <span role="status" className="text-caption text-muted">{visibleWf.length} of {wf.length} workflows</span>
                 </div>
                 {visibleWf.length === 0
-                  ? <EmptyState title={filter === 'scheduled' ? 'No scheduled workflows' : 'No manual workflows'} description="Ask Clementine to set one up." />
+                  ? workflowSearch.trim() ? <EmptyState title="No matching workflows" description="Try another name or something the workflow does." action={<Button variant="secondary" onClick={() => { setWorkflowSearch(''); setFilter('all'); }}>Clear search and filters</Button>} />
+                    : <EmptyState title={filter === 'scheduled' ? 'No scheduled workflows' : 'No manual workflows'} description="Choose All to see your other workflows, or ask Clem to set one up." action={<Button variant="secondary" onClick={() => setFilter('all')}>Show all workflows</Button>} />
                   : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                     {visibleWf.map((w) => {
                       const isBroken = w.health?.status === 'broken';
@@ -311,7 +338,7 @@ export function Automate() {
                             <button type="button" onClick={() => openWorkflow(w.name)} className="min-w-0 flex-1 text-left text-h3 text-fg hover:text-primary cursor-pointer">
                               {workflowDisplayName(w.name, w.description)}
                             </button>
-                            <Switch checked={!!w.enabled} onChange={(v) => toggle(w.name, v)} label={`Enable ${workflowDisplayName(w.name, w.description)}`} />
+                            <Switch checked={!!w.enabled} disabled={busyToggle !== null} onChange={(v) => toggle(w.name, v)} label={busyToggle === w.name ? `Updating ${workflowDisplayName(w.name, w.description)}` : `Enable ${workflowDisplayName(w.name, w.description)}`} />
                           </div>
                           <button type="button" onClick={() => openWorkflow(w.name)} className="mb-3 flex-1 text-left text-body text-muted hover:text-fg cursor-pointer">
                             {/* The clamp sits on a span: a button ignores line-clamp, so the
@@ -337,7 +364,7 @@ export function Automate() {
                               <button
                                 type="button"
                                 title={status.detail}
-                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : openWorkflow(w.name, { advanced: true }))}
+                                onClick={() => (status.aboutLastRun && w.lastRunId ? setOpenRun({ workflow: w.name, runId: w.lastRunId }) : openWorkflow(w.name, { setup: !canRun, advanced: canRun }))}
                                 className="cursor-pointer"
                               >
                                 <StatusPill tone={status.tone}>{status.label}</StatusPill>
@@ -358,12 +385,12 @@ export function Automate() {
                                 {busyName === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />} Run
                               </Button>
                             ) : (
-                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => openWorkflow(w.name, { advanced: true })}>
-                                {workflowPrimaryAction(w.certification)}
+                              <Button size="sm" variant="secondary" title={w.certification?.summary} onClick={() => openWorkflow(w.name, { setup: true })}>
+                                Finish setup with Clem
                               </Button>
                             )}
                             {(w.lastRunFailedItemCount ?? 0) > 0 && w.lastRunId && (
-                              <Button size="sm" variant="secondary" disabled={busyRecovery === w.name} onClick={() => retryFailed(w)}>
+                              <Button size="sm" variant="secondary" disabled={busyRecovery !== null} onClick={() => retryFailed(w)}>
                                 {busyRecovery === w.name ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Retry failed
                               </Button>
                             )}
@@ -404,6 +431,7 @@ export function Automate() {
             <h3 className="text-h3 text-fg">Installed skills</h3>
             <Button variant="ghost" size="sm" onClick={checkUpdates} disabled={checking}>{checking ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Check for updates</Button>
           </div>
+          {skills.isError && skills.data && <AutomationRefreshNotice title="Showing last loaded skills" description="Refresh before relying on their status." onRetry={() => { void skills.refetch(); }} />}
 
           {skills.isLoading
             ? <CardGridSkeleton />
@@ -421,7 +449,7 @@ export function Automate() {
         </div>
       )}
 
-      {openRun && <RunWorkspaceDrawer workflow={openRun.workflow} initialRunId={openRun.runId} onClose={() => setOpenRun(null)} />}
+      {openRun && <RunWorkspaceDrawer key={openRun.workflow} workflow={openRun.workflow} initialRunId={openRun.runId} onSelectRun={runId => setOpenRun({ workflow: openRun.workflow, runId })} onClose={() => setOpenRun(null)} />}
     </Page>
   );
 }
@@ -434,23 +462,26 @@ function CardGridSkeleton() {
   );
 }
 
-function RunWorkspaceDrawer({
+export function RunWorkspaceDrawer({
   workflow,
   initialRunId,
   onClose,
+  onSelectRun,
 }: {
   workflow: string;
   initialRunId?: string;
   onClose: () => void;
+  onSelectRun: (id: string) => void;
 }) {
-  const qc = useQueryClient();
-  const navigate = useNavigate();
-  const [selectedRunId, setSelectedRunId] = useState<string | undefined>(initialRunId);
-  const [checking, setChecking] = useState(false);
-  const [checkError, setCheckError] = useState<string | null>(null);
-  const [showAllCriteria, setShowAllCriteria] = useState(false);
-  const [retryingCheck, setRetryingCheck] = useState(false);
-  const [retryCheckError, setRetryCheckError] = useState<string | null>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const element = dialog.current;
+    if (!element) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    element.showModal(); closeButton.current?.focus();
+    return () => { element.close(); if (previous?.isConnected) previous.focus({ preventScroll: true }); };
+  }, []);
   const runsQ = useQuery({
     queryKey: ['wf-runs', workflow],
     queryFn: () => listWorkflowRuns(workflow, 25),
@@ -458,10 +489,86 @@ function RunWorkspaceDrawer({
   });
   const runs: WorkflowRunRecord[] = runsQ.data?.runs ?? [];
 
-  useEffect(() => {
-    if (selectedRunId && runs.some((run) => run.id === selectedRunId)) return;
-    if (runs[0]?.id) setSelectedRunId(runs[0].id);
-  }, [runs, selectedRunId]);
+  const selectedRunId = initialRunId ?? runs[0]?.id;
+  return (
+    <dialog ref={dialog} aria-labelledby="workflow-run-title" onCancel={event => { event.preventDefault(); onClose(); }}
+      onClick={event => { if (event.target === event.currentTarget) onClose(); }}
+      className="fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none border-0 bg-transparent p-0 text-fg backdrop:bg-black/30">
+      <div className="ml-auto flex h-full w-full max-w-5xl flex-col bg-surface shadow-modal">
+        <div className="flex items-center gap-3 border-b border-border px-5 py-4">
+          <Radio className="h-5 w-5 shrink-0 text-live" aria-hidden />
+          <div className="min-w-0 flex-1">
+            <h2 id="workflow-run-title" className="truncate text-h2 text-fg">{workflowDisplayName(workflow)}</h2>
+            <p className="truncate text-caption text-faint">Runs and work products</p>
+          </div>
+          <Button ref={closeButton} variant="ghost" size="icon" onClick={onClose} aria-label="Close run"><X className="h-5 w-5" aria-hidden /></Button>
+        </div>
+
+        <div className="grid min-h-0 flex-1 gap-0 md:grid-cols-[18rem_minmax(0,1fr)]">
+          <aside className="min-h-0 border-b border-border md:border-b-0 md:border-r">
+            <div className="border-b border-border px-4 py-3 text-label text-muted">Recent runs</div>
+            <div className="max-h-full overflow-y-auto p-2">
+              {runsQ.isError && <AutomationRefreshNotice title={runsQ.data ? 'Showing last loaded runs' : 'Run history is unavailable'} description="Your runs are kept. Retry to refresh the list." onRetry={() => { void runsQ.refetch(); }} />}
+              {runsQ.isLoading ? <Skeleton className="h-32 w-full" /> : runs.length === 0 && !runsQ.isError ? (
+                <EmptyState title="No runs yet" className="py-10" />
+              ) : runs.map((run) => {
+                const tone = statusTone(run.status);
+                return (
+                  <button
+                    key={run.id}
+                    type="button"
+                    onClick={() => onSelectRun(run.id)}
+                    aria-pressed={selectedRunId === run.id}
+                    className={cn('mb-1 w-full rounded-md px-2.5 py-2 text-left transition-colors', selectedRunId === run.id ? 'bg-subtle' : 'hover:bg-subtle/60')}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={run.id}>{runRowTitle(run)}</span>
+                      <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
+                    </div>
+                    <div className="mt-1 truncate text-caption text-faint">
+                      {relativeRunTime(run.finishedAt ?? run.startedAt ?? run.createdAt)}
+                      {run.source ? ` · ${run.source}` : ''}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+
+          <main className="min-h-0 overflow-y-auto p-5">
+            {selectedRunId ? <RunWorkspaceContentBoundary workflow={workflow} selectedRunId={selectedRunId}
+              selectedRun={exactRun(runs, selectedRunId)} historyPending={runsQ.isPending} historyError={runsQ.isError} />
+              : <EmptyState title={runsQ.isError ? 'Run history could not be loaded' : 'Pick a run'} description={runsQ.isError ? 'Retry the history list to choose a run.' : undefined} />}
+          </main>
+        </div>
+      </div>
+    </dialog>
+  );
+}
+
+interface RunWorkspaceContentProps {
+  workflow: string;
+  selectedRunId: string;
+  selectedRun: WorkflowRunRecord | null;
+  historyPending: boolean;
+  historyError: boolean;
+}
+
+/** Keep the modal and its focus stable; replace only the selected run's payload
+ * owner so cached navigation cannot show an earlier run's state for one frame. */
+export function RunWorkspaceContentBoundary(props: RunWorkspaceContentProps) {
+  return <RunWorkspaceContent key={props.selectedRunId} {...props} />;
+}
+
+function RunWorkspaceContent({ workflow, selectedRunId, selectedRun, historyPending, historyError }: RunWorkspaceContentProps) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const [showAllCriteria, setShowAllCriteria] = useState(false);
+  const [retryingCheck, setRetryingCheck] = useState(false);
+  const [retryCheckError, setRetryCheckError] = useState<string | null>(null);
+  const actionCommit = usePendingCommit(`${workflow}:${selectedRunId ?? ''}`);
 
   const workspaceQ = useQuery({
     queryKey: ['run-workspace', workflow, selectedRunId],
@@ -470,7 +577,6 @@ function RunWorkspaceDrawer({
     refetchInterval: 4000,
   });
   const workspace: RunWorkspace | undefined = workspaceQ.data;
-  const selectedRun = runs.find((run) => run.id === selectedRunId);
   const selectedTone = statusTone(selectedRun?.status);
   // Live: the run's own activity stream (every step session + helper, one
   // feed) on the same card the chat uses; structure: the durable step log.
@@ -489,19 +595,23 @@ function RunWorkspaceDrawer({
   // again now, from the step it stopped at.
   const retryCheckNow = async () => {
     if (!selectedRunId) return;
+    const token = actionCommit.begin();
+    if (!token) return;
     setRetryingCheck(true);
     setRetryCheckError(null);
     try {
       await resumeWorkflowCapability(workflow, selectedRunId);
       void qc.invalidateQueries({ queryKey: ['wf-runs', workflow] });
     } catch (e) {
-      setRetryCheckError((e instanceof Error ? e.message : String(e)).slice(0, 160) || 'unknown error');
+      if (actionCommit.owns(token)) setRetryCheckError((e instanceof Error ? e.message : String(e)).slice(0, 160) || 'unknown error');
     } finally {
-      setRetryingCheck(false);
+      if (actionCommit.finish(token)) setRetryingCheck(false);
     }
   };
   const runChecker = async () => {
     if (!selectedRunId) return;
+    const token = actionCommit.begin();
+    if (!token) return;
     setChecking(true);
     setCheckError(null);
     try {
@@ -511,58 +621,19 @@ function RunWorkspaceDrawer({
       // Surface the failure instead of silently stopping the spinner — the
       // check was swallowing errors, leaving the user staring at nothing.
       const reason = (e instanceof Error ? e.message : String(e)).slice(0, 160);
-      setCheckError(reason || 'unknown error');
+      if (actionCommit.owns(token)) setCheckError(reason || 'unknown error');
     } finally {
-      setChecking(false);
+      if (actionCommit.finish(token)) setChecking(false);
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-[120] flex justify-end bg-black/30 animate-fade-in" onMouseDown={onClose}>
-      <div className="flex h-full w-full max-w-5xl flex-col bg-surface shadow-modal" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="flex items-center gap-3 border-b border-border px-5 py-4">
-          <Radio className="h-5 w-5 shrink-0 text-live" aria-hidden />
-          <div className="min-w-0 flex-1">
-            <h2 className="truncate text-h2 text-fg">{workflow}</h2>
-            <p className="truncate text-caption text-faint">Runs and work products</p>
-          </div>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close"><X className="h-5 w-5" aria-hidden /></Button>
-        </div>
-
-        <div className="grid min-h-0 flex-1 gap-0 md:grid-cols-[18rem_minmax(0,1fr)]">
-          <aside className="min-h-0 border-b border-border md:border-b-0 md:border-r">
-            <div className="border-b border-border px-4 py-3 text-label text-muted">Recent runs</div>
-            <div className="max-h-full overflow-y-auto p-2">
-              {runsQ.isLoading ? <Skeleton className="h-32 w-full" /> : runs.length === 0 ? (
-                <EmptyState title="No runs yet" className="py-10" />
-              ) : runs.map((run) => {
-                const tone = statusTone(run.status);
-                return (
-                  <button
-                    key={run.id}
-                    type="button"
-                    onClick={() => setSelectedRunId(run.id)}
-                    className={cn('mb-1 w-full rounded-md px-2.5 py-2 text-left transition-colors', selectedRunId === run.id ? 'bg-subtle' : 'hover:bg-subtle/60')}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={run.id}>{runRowTitle(run)}</span>
-                      <StatusPill tone={tone.tone}>{tone.label}</StatusPill>
-                    </div>
-                    <div className="mt-1 truncate text-caption text-faint">
-                      {relativeRunTime(run.finishedAt ?? run.startedAt ?? run.createdAt)}
-                      {run.source ? ` · ${run.source}` : ''}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </aside>
-
-          <main className="min-h-0 overflow-y-auto p-5">
-            {!selectedRunId ? <EmptyState title="Pick a run" />
-              : workspaceQ.isLoading ? <Skeleton className="h-72 w-full" />
+  return <div data-workflow-run={selectedRunId}>
+            {workspaceQ.isLoading ? <Skeleton className="h-72 w-full" />
+              : workspaceQ.isError && !workspace ? <QueryUnavailable title="This run’s workspace is unavailable" description="The requested run is kept. Retry to load its saved results." onRetry={() => { void workspaceQ.refetch(); }} />
               : (
                 <div className="space-y-4">
+                  {workspaceQ.isError && <AutomationRefreshNotice title="Showing last loaded results" description="Refresh before relying on this run’s results." onRetry={() => { void workspaceQ.refetch(); }} />}
+                  {!selectedRun && !historyPending && <p role="status" className="text-small text-muted">{historyError ? 'Recent run history is unavailable.' : 'This linked run is outside the recent history.'} Its saved workspace is shown here; its current status could not be confirmed.</p>}
                   <div className="flex flex-wrap items-start justify-between gap-3 rounded-md border border-border bg-subtle px-4 py-3">
                     <div className="min-w-0">
                       <div className="mb-1 flex flex-wrap items-center gap-2">
@@ -707,25 +778,24 @@ function RunWorkspaceDrawer({
 
                   <section>
                     <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="text-h3 text-fg">Work Products</h3>
-                      <span className="text-caption text-faint">{workspace?.artifacts.length ?? 0} files · {formatBytes(workspace?.totalBytes)}</span>
+                      <h3 className="text-h3 text-fg">Saved step results</h3>
+                      <span className="text-caption text-faint">{workspace?.artifacts.length ?? 0} results · {formatBytes(workspace?.totalBytes)}</span>
                     </div>
+                    <p className="mb-3 text-small text-muted">These records show what each step produced. Look for finished files in <Link className="font-semibold text-primary hover:underline" to={workflowResultArchiveHref(workflow)}>Files &amp; results</Link>.</p>
                     {!workspace || workspace.artifacts.length === 0 ? (
-                      <EmptyState title="No work products" description="This run has not written artifacts to its shared workspace yet." className="rounded-md border border-border py-12" />
+                      <EmptyState title="No saved step results yet" description="Completed steps record their results here." className="rounded-md border border-border py-12" />
                     ) : (
                       <div className="grid gap-2">
                         {workspace.artifacts.map((artifact) => (
                           <div key={`${artifact.agent}:${artifact.tool}:${artifact.path}`} className="rounded-md border border-border bg-surface px-4 py-3">
                             <div className="flex items-center gap-2">
                               <FileText className="h-4 w-4 shrink-0 text-faint" aria-hidden />
-                              <span className="min-w-0 flex-1 truncate text-small font-semibold text-fg">{artifact.agent}</span>
+                              <span className="min-w-0 flex-1 break-words text-small font-semibold text-fg">{workflowDisplayName(artifact.agent)}</span>
                               <span className="shrink-0 text-caption text-faint">{formatBytes(artifact.bytes)}</span>
                             </div>
-                            <p className="mt-1 line-clamp-2 text-small text-muted">{artifact.summary}</p>
-                            <div className="mt-2 flex flex-wrap gap-1.5 text-caption text-faint">
-                              <span className="rounded-sm bg-subtle px-2 py-0.5">{artifact.tool}</span>
-                              <span className="min-w-0 truncate rounded-sm bg-subtle px-2 py-0.5">{artifact.path}</span>
-                            </div>
+                            <p className="mt-1 whitespace-pre-wrap break-words text-small text-muted">{artifact.summary}</p>
+                            <Link to={workflowResultArchiveHref(workflow, artifact.path)} className="mt-2 inline-flex min-h-9 items-center gap-1.5 text-small font-semibold text-primary hover:underline">Find in Files &amp; results <ArrowRight className="h-3.5 w-3.5" aria-hidden /></Link>
+                            <details className="mt-2 text-caption text-muted"><summary className="cursor-pointer rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">Saved details</summary><div className="mt-1 space-y-1 break-all"><p>{artifact.tool}</p><p>{artifact.path}</p></div></details>
                           </div>
                         ))}
                       </div>
@@ -733,20 +803,23 @@ function RunWorkspaceDrawer({
                   </section>
                 </div>
               )}
-          </main>
-        </div>
-      </div>
-    </div>
-  );
+  </div>;
 }
 
 function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => void }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const commit = usePendingCommit(skill.name);
   const detail = useQuery({ queryKey: ['skill', skill.name], queryFn: () => getSkill(skill.name), enabled: open });
 
-  const remove = async () => { setBusy('remove'); try { await deleteSkill(skill.name); onChanged(); } finally { setBusy(null); } };
-  const update = async () => { setBusy('update'); try { await updateSkill(skill.name); setTimeout(onChanged, 1500); } finally { setBusy(null); } };
+  const change = async (kind: 'remove' | 'update') => {
+    const token = commit.begin(); if (!token) return;
+    setBusy(kind); setError(null);
+    try { if (kind === 'remove') await deleteSkill(skill.name); else await updateSkill(skill.name); if (commit.owns(token)) onChanged(); }
+    catch (e) { if (commit.owns(token)) setError(`${e instanceof Error ? e.message : 'The change could not be confirmed.'} Refresh the skills list before trying again.`); }
+    finally { if (commit.finish(token)) setBusy(null); }
+  };
 
   const badge = (label: string) => <span className="rounded-full bg-subtle px-2 py-0.5 text-caption text-muted">{label}</span>;
 
@@ -813,15 +886,16 @@ function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => voi
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {skill.source?.updateAvailable && (
-            <Button size="sm" variant="secondary" disabled={busy === 'update'} onClick={update}>
+            <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => void change('update')}>
               {busy === 'update' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <RefreshCw className="h-4 w-4" aria-hidden />} Update
             </Button>
           )}
-          <Button size="sm" variant="ghost" aria-label={`Remove ${skill.name}`} title="Remove skill" disabled={busy === 'remove'} onClick={remove} className="text-danger">
+          <Button size="sm" variant="ghost" aria-label={`Remove ${skill.name}`} title="Remove skill" disabled={busy !== null} onClick={() => void change('remove')} className="text-danger">
             {busy === 'remove' ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Trash2 className="h-4 w-4" aria-hidden />}
           </Button>
         </div>
       </div>
+      {error && <p role="alert" className="mt-2 text-small text-danger">{error} <button type="button" className="font-semibold underline" onClick={onChanged}>Refresh skills</button></p>}
 
       <button type="button" onClick={() => setOpen((v) => !v)}
         className="mt-2 inline-flex items-center gap-1 text-caption font-semibold text-primary hover:underline cursor-pointer">
@@ -832,7 +906,7 @@ function SkillCard({ skill, onChanged }: { skill: SkillRow; onChanged: () => voi
       {open && (
         <div className="mt-2">
           {detail.isLoading ? <Skeleton className="h-48 w-full" />
-            : detail.isError ? <p className="text-small text-danger">Couldn't load this skill.</p>
+            : detail.isError ? <QueryUnavailable title="Couldn’t load this skill" onRetry={() => { void detail.refetch(); }} />
             : (
               <>
                 {detail.data?.source?.repo && (

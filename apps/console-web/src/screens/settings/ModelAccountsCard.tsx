@@ -178,20 +178,22 @@ function AccountRow({ id, label, kind, meter, now, open, onToggle, providers, on
   const summary = meter ? accountHeadline(meter, now) : null;
   return (
     <li id={`account-${id}`} className="scroll-mt-16 rounded-lg border border-border bg-surface px-4 py-3">
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: dotColor(id), opacity: connected || statusUnknown ? 1 : 0.35 }} aria-hidden />
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-[1_1_14rem]">
           <div className="flex flex-wrap items-baseline gap-x-2">
             <span className={cn('font-semibold', connected || statusUnknown ? 'text-fg' : 'text-muted')}>{label}</span>
             {summary && <span className={cn('text-small tabular-nums', out || tone !== 'ok' ? TONE_TEXT[tone] : 'text-muted')}>{summary}</span>}
           </div>
           <div className="truncate text-caption text-muted" title={captionFor(meter, kind, notConnectedNote, now)}>{captionFor(meter, kind, notConnectedNote, now)}</div>
         </div>
+        <div className="ml-auto flex shrink-0 flex-wrap items-center gap-2">
         {meter && <BillingLink meter={meter} emphasis={out} />}
         <Button size="sm" variant={connected || statusUnknown ? 'ghost' : 'secondary'} onClick={onToggle} aria-expanded={open} aria-controls={`account-${id}-panel`}>
           {statusUnknown ? 'Manage connection' : connected ? 'Manage' : 'Connect'}
           <ChevronDown className={cn('h-4 w-4 transition-transform', open && 'rotate-180')} aria-hidden />
         </Button>
+        </div>
       </div>
       {meter && <MeterDetail meter={meter} now={now} />}
       {open && (

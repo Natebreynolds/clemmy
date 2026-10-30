@@ -11,7 +11,7 @@ export function StorageCard() {
     <div className="rounded-lg border border-border bg-surface">
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
         <p className="text-body font-semibold text-fg">
-          {unavailable ? 'Storage measurement unavailable' : data ? `${data.complete ? '' : 'At least '}${formatStorageBytes(data.totalBytes)} stored on your computer` : 'Measuring storage…'}
+          {unavailable || inventory.isError && !data ? 'Storage measurement unavailable' : data ? `${inventory.isError ? 'Last measured: ' : ''}${data.complete ? '' : 'At least '}${formatStorageBytes(data.totalBytes)} stored on your computer` : 'Measuring storage…'}
         </p>
         <Button variant="secondary" size="sm" disabled={inventory.isFetching} onClick={() => void inventory.refetch()}>
           {inventory.isFetching ? 'Checking…' : 'Refresh'}

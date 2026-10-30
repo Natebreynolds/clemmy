@@ -11,7 +11,7 @@ import { unifiedChatSessionId } from '@/lib/last-session';
 import { agoLabel } from './home-model';
 import { AnswerRow } from './NeedsYouPane';
 import { LoadFailedLine, PaneCard, PaneRow, RowSkeleton, SectionHeader } from './HomeSection';
-import { CardRecord } from './CardRecord';
+import { CardRecord, CardRecordList } from './CardRecord';
 
 const HIDDEN_RECORDS_KEY = 'clem.home.hiddenCardRecords';
 
@@ -99,16 +99,10 @@ export function FromClemPane({
   const waiting = rows.filter((row) => row.asks && !row.setup);
   const updates = rows.filter((row) => !row.asks && !row.setup);
   const offers = rows.filter((row) => row.setup);
-  const listedKeys = new Set(rows.map((row) => row.key));
-  const justNow = records.filter((record) => !listedKeys.has(record.rowKey));
-  const justNowList = justNow.length > 0 && (
-    <div className="flex flex-col gap-1.5">
-      <h3 className="text-caption font-semibold uppercase tracking-wide text-faint">Just now</h3>
-      <div className="flex flex-col gap-2">
-        {justNow.map((record) => <CardRecord key={record.runId} record={record} showTitle onDismiss={() => hideRecord(record)} />)}
-      </div>
-    </div>
-  );
+  const attachedRuns = new Set(rows.map(row => recordFor(row)?.runId).filter(Boolean));
+  const justNow = records.filter(record => !attachedRuns.has(record.runId));
+  const justNowList = <CardRecordList records={justNow} onDismiss={hideRecord} />;
+
   const pulses = recentPulses(data?.pulses ?? []);
   const visiblePulses = pulses.filter(pulseNeedsVisibility);
   const quietPulses = pulses.filter(pulse => !pulseNeedsVisibility(pulse));

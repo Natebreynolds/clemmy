@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { workflowConversationSessionId } from '@clem/chat-engine';
 import { composerDraftKey, readComposerDraft, writeComposerDraft } from './composer-drafts';
-import { prepareWorkflowQuestion } from './workflow-conversation';
+import { prepareWorkflowQuestion, workflowSetupPrompt } from './workflow-conversation';
+import type { WorkflowCertification } from './automate';
 
 const key = (slug: string) => composerDraftKey('', undefined, workflowConversationSessionId(slug));
 
@@ -35,4 +36,32 @@ test('invalid and cross-workflow seeds cannot alter an attachment-only draft', (
   assert.equal(prepareWorkflowQuestion(slug, { workflowSlug: slug, id: NaN, text: 'Bad seed' }, true), 'wrong-workflow');
   assert.equal(prepareWorkflowQuestion(slug, { workflowSlug: 'another-workflow', id: 4, text: 'Other task' }, true), 'wrong-workflow');
   assert.deepEqual(readComposerDraft(key(slug)), original);
+});
+
+test('finish setup prepares exact missing context as editable text without posting or selecting an account', () => {
+  const slug = 'controlled-business-setup';
+  const certification: WorkflowCertification = {
+    workflow:slug, enabled:false, state:'needs_creation_inputs', label:'Needs setup', summary:'Choose an account and the sample customer.',
+    canRun:false, canEnableDirectly:false, canQueueCreationTest:false, needsCreationTest:true,
+    missingRunInputs:['customer_email'], missingTestInputs:['sample_customer'], resourceGaps:['Email account'],
+    readinessGaps:[{question:'Which inbox should send the brief?', why:'More than one account is connected.'}],
+    blockingReasons:['No sending account is selected'], nextActions:['provide_test_inputs'],
+  };
+  const originalFetch = globalThis.fetch; let requests = 0;
+  globalThis.fetch = (() => { requests++; throw new Error('Setup navigation must never post or create a session'); }) as typeof fetch;
+  try {
+    const prompt = workflowSetupPrompt(slug, certification);
+    assert.match(prompt, /workflow ID "controlled-business-setup"/);
+    for (const text of ['sample_customer','customer_email','Email account','Which inbox','No sending account']) assert.ok(prompt.includes(text));
+    assert.match(prompt, /one clear question at a time/);
+    assert.match(prompt, /Do not enable or run/);
+    assert.match(prompt, /Do not approve requests or choose an account/);
+    assert.equal(prepareWorkflowQuestion(slug, {workflowSlug:slug,id:1,text:prompt}), 'prepared');
+    assert.equal(requests, 0);
+    assert.equal(readComposerDraft(key(slug)).text, prompt);
+    writeComposerDraft(key(slug), draft => ({...draft, text:'My customer is Example Co. '+draft.text}));
+    assert.match(readComposerDraft(key(slug)).text, /^My customer is Example Co/);
+    assert.equal(prepareWorkflowQuestion(slug, {workflowSlug:slug,id:2,text:prompt}), 'draft-kept');
+    assert.match(readComposerDraft(key(slug)).text, /^My customer is Example Co/);
+  } finally { globalThis.fetch = originalFetch; }
 });

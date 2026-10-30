@@ -48,13 +48,14 @@ export function CreateWorkspaceModal({
   const [error, setError] = useState<string | null>(null);
   const [starters, setStarters] = useState<StarterRecipe[]>([]);
   const commit = usePendingCommit(open ? 'open' : 'closed');
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
-  const close = () => { if (!commit.pending) onCloseRef.current(); };
+  const close = () => { if (!commit.pending) { dialogRef.current?.close(); onCloseRef.current(); } };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) { dialogRef.current?.close(); return; }
     setTitle('');
     // Seed, don't clobber. `useState(initialDescription ?? '')` above sets the
     // starter-recipe prompt on mount, and this effect then ran and wiped it —
@@ -65,10 +66,8 @@ export function CreateWorkspaceModal({
     setError(null);
     setCreating(false);
     listStarterRecipes().then(setStarters).catch(() => setStarters([]));
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !commit.pending) onCloseRef.current(); };
-    window.addEventListener('keydown', onKey);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-    return () => window.removeEventListener('keydown', onKey);
+    dialogRef.current?.showModal();
+    textareaRef.current?.focus();
   }, [open, commit]);
 
   if (!open) return null;
@@ -87,7 +86,7 @@ export function CreateWorkspaceModal({
       // seeds the dock. Blank mode resolves to no objective/build, even when a
       // recipe populated the visible fields.
       const space = await createSpace(intent.title, intent.objective);
-      if (commit.owns(token)) onCreated(space.id, intent.build);
+      if (commit.owns(token)) { dialogRef.current?.close(); onCreated(space.id, intent.build); }
     } catch (err) {
       if (commit.owns(token)) setError(err instanceof Error ? err.message : 'Could not create a workspace.');
     } finally {
@@ -96,17 +95,9 @@ export function CreateWorkspaceModal({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-[100] flex items-start justify-center bg-black/30 p-4 pt-[12vh] animate-fade-in"
-      onMouseDown={close}
-      role="dialog"
-      aria-modal="true"
-      aria-label="New Space"
-    >
-      <div
-        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-surface shadow-modal"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <dialog ref={dialogRef} onCancel={event => { event.preventDefault(); close(); }} onClick={event => { if (event.target === dialogRef.current) close(); }} aria-label="New Space"
+      className="fixed inset-0 m-auto max-h-[90vh] w-[calc(100%_-_2rem)] max-w-lg overflow-y-auto rounded-xl border border-border bg-surface p-0 text-fg shadow-modal backdrop:bg-black/30">
+      <form onSubmit={event => { event.preventDefault(); void submit(); }}>
         <div className="border-b border-border px-5 py-4">
           <h2 className="text-h3 text-fg">New Space</h2>
           <p className="mt-0.5 text-small text-muted">Tell Clem what you want and she’ll build it — a live surface that refreshes itself and can act on one click.</p>
@@ -119,7 +110,7 @@ export function CreateWorkspaceModal({
               ref={textareaRef}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); }}
+              onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void submit(); } }}
               rows={4}
               placeholder="e.g. A live dashboard of my pipeline by stage, with a follow-up email button on each stalled deal."
               className="w-full resize-y rounded-lg border border-border bg-canvas px-3 py-2 text-body text-fg outline-none placeholder:text-faint focus:border-border-strong focus-visible:ring-2 focus-visible:ring-primary"
@@ -202,13 +193,13 @@ export function CreateWorkspaceModal({
             Start blank instead
           </button>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" onClick={close} disabled={creating}>Cancel</Button>
-            <Button onClick={() => { void submit(); }} disabled={creating}>
+            <Button type="button" variant="ghost" onClick={close} disabled={creating}>Cancel</Button>
+            <Button type="submit" disabled={creating}>
               <Plus className="h-4 w-4" aria-hidden /> {creating ? 'Creating…' : description.trim() ? 'Build it' : 'Create'}
             </Button>
           </div>
         </div>
-      </div>
-    </div>
+      </form>
+    </dialog>
   );
 }

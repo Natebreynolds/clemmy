@@ -4,6 +4,7 @@ import { Share2, Loader2 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { StatusPill } from '@/components/ui/StatusPill';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { getOtherApps, otherAppAction, otherAppStateWords, setOtherAppConnected, type OtherApp } from '@/lib/other-apps';
 
 // Other apps on this computer (Claude Desktop, Cursor) can hand Clem a task.
@@ -16,7 +17,7 @@ export function OtherApps() {
   const [busy, setBusy] = useState<OtherApp['id'] | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'danger'; text: string } | null>(null);
   const data = status.data;
-  if (!data?.available) return null;
+  if (!data?.available) return status.isError ? <QueryUnavailable title="Other apps couldn’t be checked" description="Availability on this computer is unknown." onRetry={() => { void status.refetch(); }} className="mb-4 py-5" /> : null;
   const apps = data.apps.filter((app) => app.state !== 'not_installed');
 
   const act = async (app: OtherApp, connect: boolean) => {
@@ -34,6 +35,7 @@ export function OtherApps() {
 
   return (
     <Card>
+      {status.isError && <QueryUnavailable title="Other apps couldn’t be refreshed" description="Showing their last loaded connection state." onRetry={() => { void status.refetch(); }} className="mb-3 py-5" />}
       <div className="flex items-start gap-3">
         <Share2 className="mt-0.5 h-5 w-5 shrink-0 text-muted" aria-hidden />
         <div className="min-w-0 flex-1">
@@ -55,7 +57,7 @@ export function OtherApps() {
                     </StatusPill>
                     <span className="flex-1" />
                     {action && (
-                      <Button size="sm" variant={action.connect ? 'primary' : 'secondary'} disabled={busy !== null} onClick={() => act(app, action.connect)}>
+                      <Button size="sm" variant={action.connect ? 'primary' : 'secondary'} disabled={busy !== null || status.isError} onClick={() => act(app, action.connect)}>
                         {busy === app.id && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
                         {action.label}
                       </Button>

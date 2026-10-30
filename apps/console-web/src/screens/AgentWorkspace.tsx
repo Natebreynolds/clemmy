@@ -46,7 +46,7 @@ import {
 } from '@/lib/agents';
 import { providerLabel } from '@clem/chat-engine';
 import { useSessions } from '@/features/conversations/hooks/useSessions';
-import { useSession } from '@/features/conversations/hooks/useSession';
+import { isMissingConversation, useSession } from '@/features/conversations/hooks/useSession';
 import { sessionKeys } from '@/features/conversations/hooks/keys';
 import { groupSessions } from '@/features/conversations/lib/groupSessions';
 import { rawId } from '@/features/conversations/lib/ids';
@@ -115,7 +115,8 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
   }
 
   return (
-    <>
+    <div className="flex h-full min-h-0 flex-col">
+      {agentQ.isError && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-small text-warning">Agent details couldn’t refresh. Showing the last loaded version. <button type="button" className="font-semibold underline" onClick={() => void agentQ.refetch()}>Retry</button></p>}
       <CloudBrowserWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
         <ComputerWorkspace conversationId={sessionId ? rawId(sessionId) : undefined}>
           <FileDockWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
@@ -131,6 +132,8 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
           mode="edit"
           agent={agent}
           catalog={catalogQ.data}
+          catalogUnavailable={catalogQ.isError}
+          onRetryCatalog={() => void catalogQ.refetch()}
           onClose={() => setEditing(false)}
           onSaved={() => {
             void qc.invalidateQueries({ queryKey: ['agents'] });
@@ -138,7 +141,7 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
           }}
         />
       )}
-    </>
+    </div>
   );
 }
 
@@ -220,12 +223,13 @@ function ThreadRail({ agent, activeSessionId, fullWidth = false, onChoose }: { a
         </Button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {threads.isError && threads.data && <p role="status" className="px-2 py-2 text-caption text-warning">Threads couldn’t refresh. Showing the last loaded list. <button type="button" className="font-semibold underline" onClick={() => void threads.refetch()}>Retry</button></p>}
         {threads.isLoading && sessions.length === 0 ? (
           <div className="space-y-2 p-1">
             {[0, 1, 2].map((i) => <Skeleton key={i} className="h-12" />)}
           </div>
         ) : threads.isError && !threads.data ? (
-          <p className="px-2 py-6 text-center text-caption text-muted">Threads couldn’t load. New ones still work.</p>
+          <QueryUnavailable title="Threads couldn’t load" description="Try loading this agent’s existing conversations again." onRetry={() => void threads.refetch()} />
         ) : sessions.length === 0 ? (
           <p className="px-2 py-6 text-center text-caption text-muted">No threads yet. Your first message starts one.</p>
         ) : (
@@ -267,7 +271,7 @@ function AgentThread({ agent, sessionId }: { agent: AgentRecord; sessionId?: str
   return <ExistingThread agent={agent} sessionId={sessionId} />;
 }
 
-function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessionId: string }) {
+export function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessionId: string }) {
   const detail = useSession(sessionId);
   if (detail.isLoading) {
     return (
@@ -276,16 +280,20 @@ function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessionId: s
       </div>
     );
   }
-  if (detail.isError || !detail.data) {
+  if (!detail.data) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-muted">
-        <p>This thread could not be found.</p>
+        <p>{isMissingConversation(detail.error) ? 'This thread could not be found.' : 'This thread couldn’t load right now.'}</p>
+        <Button size="sm" variant="secondary" onClick={() => void detail.refetch()}>Retry</Button>
         <Link to={agentPath(agent.id)} className="text-small text-primary hover:underline">Start a new thread</Link>
       </div>
     );
   }
   const { session, turns } = detail.data;
-  return <BoundThread key={session.id} agent={agent} session={session} history={turns} />;
+  return <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+    {detail.isError && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-small text-warning">This thread couldn’t refresh. Your conversation and draft are still here. <button type="button" className="font-semibold underline" onClick={() => void detail.refetch()}>Retry</button></p>}
+    <BoundThread key={session.id} agent={agent} session={session} history={turns} />
+  </div>;
 }
 
 /** A reopened thread: hydrated from history, reattached if a turn is running. */
@@ -631,18 +639,7 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
   const work = usePoll(['agents', 'work', agent.id], () => getAgentWork(agent.id), 10_000);
   const workers = work.data?.workers ?? [];
   const [openId, setOpenId] = useState<string | null>(null);
-  const [output, setOutput] = useState<Record<string, string>>({});
-
-  const toggle = async (w: AgentWorker) => {
-    if (openId === w.id) { setOpenId(null); return; }
-    setOpenId(w.id);
-    if (output[w.id] === undefined && w.outputRef && w.workflowName && w.parentRunId) {
-      try {
-        const r = await getRunAgentOutput(w.workflowName, w.parentRunId, w.id);
-        setOutput((prev) => ({ ...prev, [w.id]: r.output }));
-      } catch { setOutput((prev) => ({ ...prev, [w.id]: w.outputPreview || '(work-product unavailable)' })); }
-    }
-  };
+  const toggle = (w: AgentWorker) => setOpenId(current => current === w.id ? null : w.id);
 
   return (
     <section>
@@ -650,19 +647,19 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
       <p className="mt-0.5 text-caption text-muted">
         Temporary helpers this agent’s threads started for a single step. Each ends when its step does.
       </p>
+      {work.isError && <p role="status" className="mt-2 text-caption text-warning">{work.data ? 'Helper runs couldn’t refresh. Showing the last loaded list.' : 'Helper runs couldn’t load.'} <button type="button" className="font-semibold underline" onClick={() => void work.refetch()}>Retry</button></p>}
       {workers.length === 0 ? (
         <p className="mt-1 text-caption text-muted">
-          {work.isLoading ? 'Looking…' : 'None yet.'}
+          {work.isLoading ? 'Looking…' : work.isError ? 'Try loading helper runs again.' : 'None yet.'}
         </p>
       ) : (
         <ul className="mt-1.5 flex flex-col gap-1.5">
           {workers.map((w) => {
             const st = STATUS[w.status] ?? STATUS.ok;
             const isOpen = openId === w.id;
-            const body = output[w.id] ?? (w.outputRef && w.workflowName && w.parentRunId ? 'Loading work-product…' : (w.outputPreview || 'No work-product recorded.'));
             return (
               <li key={w.id} className="rounded-lg border border-border/60 bg-surface">
-                <button type="button" onClick={() => void toggle(w)} className="flex w-full items-center gap-2 px-2.5 py-2 text-left">
+                <button type="button" onClick={() => toggle(w)} aria-expanded={isOpen} className="flex w-full items-center gap-2 px-2.5 py-2 text-left">
                   <ChevronRight className={cn('h-3.5 w-3.5 shrink-0 text-faint transition-transform', isOpen && 'rotate-90')} aria-hidden />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-small text-fg">{workerLabel(w)}</span>
@@ -674,7 +671,7 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
                 </button>
                 {isOpen && (
                   <div className="border-t border-border/60 px-2.5 py-2">
-                    <p className="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-caption text-muted">{body}</p>
+                    <HelperOutput worker={w} />
                   </div>
                 )}
               </li>
@@ -684,4 +681,15 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
       )}
     </section>
   );
+}
+
+/** Query identity includes the producing run; a retry never borrows another helper’s output. */
+export function HelperOutput({ worker }: { worker: AgentWorker }) {
+  const addressable = Boolean(worker.outputRef && worker.workflowName && worker.parentRunId);
+  const result = usePoll(['agents', 'helper-output', worker.workflowName, worker.parentRunId, worker.id, worker.outputRef],
+    () => getRunAgentOutput(worker.workflowName!, worker.parentRunId!, worker.id), 0, { enabled: addressable });
+  return <>
+    <p className="max-h-56 overflow-y-auto whitespace-pre-wrap break-words text-caption text-muted">{result.data?.output ?? (addressable && result.isLoading ? 'Loading full output…' : worker.outputPreview || (addressable ? 'Full output is unavailable.' : 'No output recorded.'))}</p>
+    {result.isError && <p role="status" className="mt-2 text-caption text-warning">The full output couldn’t load. {worker.outputPreview ? 'The saved preview is shown above. ' : ''}<button type="button" className="font-semibold underline" onClick={() => void result.refetch()}>Retry</button></p>}
+  </>;
 }

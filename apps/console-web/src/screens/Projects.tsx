@@ -113,6 +113,7 @@ export function Projects() {
         <Link to="/agents" className="inline-flex min-h-9 items-center gap-1 font-semibold text-primary hover:underline">Meet your agents <ChevronRight size={15} aria-hidden /></Link>
         <Link to="/tasks" className="inline-flex min-h-9 items-center font-medium text-muted hover:text-fg hover:underline">See active work</Link>
       </div>
+      {projectsQ.isError && projectsQ.data && <p role="status" className="mb-4 text-small text-warning">Projects couldn’t refresh. Showing the last loaded list. <button type="button" className="font-semibold underline" onClick={() => void projectsQ.refetch()}>Retry</button></p>}
       {loading ? (
         <div className="space-y-3" role="status">
           <span className="sr-only">Loading your projects</span>

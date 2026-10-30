@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { artifactCountLabel, dayHeading, deliveredConversationId, deliveredFileRef, folderHref, groupArtifacts, latestDeliveredGroups, listDelivered, matchesDeliveredSearch, matchingDeliveredFile, type DeliveredGroup } from './delivered.js';
+import { artifactCountLabel, dayHeading, deliveredConversationId, deliveredFileRef, folderHref, findDeliveredFolder, groupArtifacts, latestDeliveredGroups, listDelivered, matchesDeliveredSearch, matchingDeliveredFile, type DeliveredGroup } from './delivered.js';
 
 test('folder href is addressable by group id', () => {
   assert.equal(folderHref({ id: 42 }), '/made/42');
@@ -110,4 +110,16 @@ test('explicit unknown origin never becomes a worker conversation link', () => {
 
 test('an empty project scope does not fall back to the global archive', async () => {
   assert.deepEqual(await listDelivered(24, { sessionIds: [] }), []);
+});
+
+
+test('folder links preserve the producing session for work older than the recent global archive', () => {
+  const group = { ...work(42, ''), sessionId: 'worker / ?&' };
+  const link = new URL(folderHref(group), 'http://localhost');
+  assert.equal(link.pathname, '/made/42');
+  assert.equal(link.searchParams.get('session'), group.sessionId);
+  const newerRepresentative = { ...group, id: 99 };
+  assert.equal(findDeliveredFolder([newerRepresentative], '42', group.sessionId), newerRepresentative, 'the same work remains reachable after its representative file changes');
+  assert.equal(findDeliveredFolder([newerRepresentative], '42'), undefined, 'a bare legacy ID never opens unrelated work');
+  assert.equal(findDeliveredFolder([{ ...newerRepresentative, sessionId: 'different-work' }], '42', group.sessionId), undefined);
 });

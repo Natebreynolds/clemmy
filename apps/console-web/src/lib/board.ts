@@ -558,6 +558,18 @@ export interface BoardRunSelection {
   runScopeId?: string | null;
 }
 
+/** A run stays addressable through reload and Back; only closing clears its identity. */
+export function boardSelectionSearch(search: URLSearchParams, card: BoardCard | null): URLSearchParams {
+  const next = new URLSearchParams(search);
+  next.delete('select'); next.delete('attemptId'); next.delete('runScopeId');
+  if (card) {
+    next.set('select', card.attemptId || card.runScopeId ? card.sessionId || card.id : card.id);
+    if (card.attemptId) next.set('attemptId', card.attemptId);
+    if (card.runScopeId) next.set('runScopeId', card.runScopeId);
+  }
+  return next;
+}
+
 function boardLineageMatches(card: BoardCard, selected: string): boolean {
   return card.id === selected
     || card.sessionId === selected
@@ -666,7 +678,7 @@ export function reconcileOpenBoardCard(
       attemptId: open.attemptId,
       runScopeId: open.runScopeId,
     });
-    if (exact) return exact;
+    return exact ?? open;
   }
   const sameId = cards.find((card) => card.id === open.id);
   if (sameId) return sameId;

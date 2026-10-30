@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check } from 'lucide-react';
 import { Page } from '@/components/Page';
@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/Button';
 import { Field, Input, Select } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
 import { Skeleton } from '@/components/ui/Skeleton';
+import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { usePoll } from '@/lib/poll';
 import { getSettings, patchPolicy, type Policy } from '@/lib/settings';
 import { listSendTrust, addSendTrust, revokeSendTrust, listApprovedWriteKinds, forgetApprovedWriteKind } from '@/lib/settings';
@@ -24,8 +25,15 @@ function ApprovedKindsPanel() {
   const qc = useQueryClient();
   const kinds = usePoll(['approved-write-kinds'], listApprovedWriteKinds, 0);
   const rows = kinds.data?.kinds ?? [];
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const locked = useRef(false);
   const forget = async (kind: { operationId: string; accountId: string | null }) => {
-    try { await forgetApprovedWriteKind(kind); } finally { void qc.invalidateQueries({ queryKey: ['approved-write-kinds'] }); }
+    if (locked.current) return;
+    locked.current = true; setBusy(true); setError(null);
+    try { await forgetApprovedWriteKind(kind); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not forget this approval. Try again.'); }
+    finally { locked.current = false; setBusy(false); void qc.invalidateQueries({ queryKey: ['approved-write-kinds'] }); }
   };
   return (
     <div className="mt-5">
@@ -34,7 +42,9 @@ function ApprovedKindsPanel() {
         In Ask mode, approving a change in a connected app teaches Clem that kind of change, so it runs next time without asking.
         A kind unused for sixty days is forgotten on its own.
       </p>
-      {rows.length === 0
+      {kinds.isError && <QueryUnavailable title="Saved approvals couldn’t be refreshed" description={kinds.data ? 'Showing last loaded approvals.' : 'Saved approvals are unavailable.'} onRetry={() => { void kinds.refetch(); }} className="mb-3 py-4" />}
+      {error && <p role="alert" className="mb-2 text-small text-danger">{error}</p>}
+      {kinds.isLoading ? <Skeleton className="h-12 w-full" /> : rows.length === 0 && !kinds.isError
         ? <div className="text-caption text-faint">Nothing learned yet.</div>
         : (
           <div className="space-y-1.5">
@@ -45,7 +55,7 @@ function ApprovedKindsPanel() {
                   {k.operationId.toLowerCase().replace(/_/g, ' ')}
                   {k.accountId ? <span className="text-muted"> · {k.accountId}</span> : null}
                 </span>
-                <button type="button" onClick={() => forget({ operationId: k.operationId, accountId: k.accountId })} className="shrink-0 text-caption text-danger hover:underline cursor-pointer">Forget</button>
+                <button type="button" disabled={busy} onClick={() => void forget({ operationId: k.operationId, accountId: k.accountId })} className="shrink-0 text-caption text-danger hover:underline cursor-pointer disabled:opacity-50">Forget</button>
               </div>
             ))}
           </div>
@@ -61,11 +71,13 @@ function SendTrustPanel() {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const locked = useRef(false);
   const refresh = () => void qc.invalidateQueries({ queryKey: ['send-trust'] });
 
   const add = async () => {
     const raw = value.trim().toLowerCase();
-    if (!raw) return;
+    if (!raw || locked.current) return;
+    locked.current = true;
     // A token with an @ before a dot is an exact address; otherwise treat it as
     // a recipient domain ("acme.com" or "@acme.com").
     const isAddress = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw);
@@ -75,9 +87,15 @@ function SendTrustPanel() {
       setValue(''); setNote(''); refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not add — enter a recipient domain or a full email address.');
-    } finally { setBusy(false); }
+    } finally { locked.current = false; setBusy(false); }
   };
-  const remove = async (id: string) => { try { await revokeSendTrust(id); } finally { refresh(); } };
+  const remove = async (id: string) => {
+    if (locked.current) return;
+    locked.current = true; setBusy(true); setError(null);
+    try { await revokeSendTrust(id); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not revoke this recipient. Try again.'); }
+    finally { locked.current = false; setBusy(false); refresh(); }
+  };
 
   const rows = grants.data?.grants ?? [];
   const max = grants.data?.maxRecipients ?? 20;
@@ -89,6 +107,8 @@ function SendTrustPanel() {
         Sends where <em>every</em> recipient is trusted go out without asking. Anything else still waits for you —
         including a send to more than {max} people, which always asks. Revoke any time; every auto-send is still logged.
       </p>
+      {grants.isLoading && <Skeleton className="mb-3 h-12 w-full" />}
+      {grants.isError && <QueryUnavailable title="Trusted recipients couldn’t be refreshed" description={grants.data ? 'Showing last loaded recipients.' : 'The trusted recipient list is unavailable.'} onRetry={() => { void grants.refetch(); }} className="mb-3 py-4" />}
       {rows.length > 0 && (
         <div className="mb-3 space-y-1.5">
           {rows.map((g) => (
@@ -99,17 +119,17 @@ function SendTrustPanel() {
                 {g.toolkits?.length ? <span className="text-muted"> · {g.toolkits.join(', ')}</span> : null}
                 {g.note ? <span className="text-faint"> — {g.note}</span> : null}
               </span>
-              <button type="button" onClick={() => remove(g.id)} className="shrink-0 text-caption text-danger hover:underline cursor-pointer">Revoke</button>
+              <button type="button" disabled={busy} onClick={() => void remove(g.id)} className="shrink-0 text-caption text-danger hover:underline cursor-pointer disabled:opacity-50">Revoke</button>
             </div>
           ))}
         </div>
       )}
       <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end">
-        <Field label="Domain or email">{(id) => <Input id={id} placeholder="acme.com or ceo@acme.com" value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }} />}</Field>
-        <Field label="Note (optional)">{(id) => <Input id={id} placeholder="my team" value={note} onChange={(e) => setNote(e.target.value)} />}</Field>
+        <Field label="Domain or email">{(id) => <Input id={id} disabled={busy} placeholder="acme.com or ceo@acme.com" value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void add(); } }} />}</Field>
+        <Field label="Note (optional)">{(id) => <Input id={id} disabled={busy} placeholder="my team" value={note} onChange={(e) => setNote(e.target.value)} />}</Field>
         <Button variant="secondary" onClick={add} disabled={busy || !value.trim()}>{busy ? 'Adding…' : 'Trust'}</Button>
       </div>
-      {error && <div className="mt-1 text-caption text-danger">{error}</div>}
+      {error && <div role="alert" className="mt-1 text-caption text-danger">{error}</div>}
     </div>
   );
 }
@@ -157,27 +177,35 @@ function WatchesPanel() {
   const qc = useQueryClient();
   const watches = usePoll(['legacy-heartbeat-watches'], getWatches, 30_000);
   const [busy, setBusy] = useState<string | null>(null);
-  const [lastTick, setLastTick] = useState<string | null>(null);
+  const [lastTick, setLastTick] = useState<{ id: string; text: string; failed: boolean } | null>(null);
+  const locked = useRef(false);
   const refresh = () => { void qc.invalidateQueries({ queryKey: ['legacy-heartbeat-watches'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); };
   const toggle = async (w: WatchStatus, enabled: boolean) => {
+    if (locked.current) return;
+    locked.current = true; setLastTick(null);
     setBusy(w.id);
-    try { await patchWatch(w.id, { enabled }); refresh(); } finally { setBusy(null); }
+    try { await patchWatch(w.id, { enabled }); refresh(); }
+    catch (cause) { setLastTick({ id: w.id, text: cause instanceof Error ? cause.message : 'Could not change this watch. Try again.', failed: true }); }
+    finally { locked.current = false; setBusy(null); }
   };
   const checkNow = async (w: WatchStatus) => {
+    if (locked.current) return;
+    locked.current = true; setLastTick(null);
     setBusy(w.id);
     try {
       const r = await tickWatch(w.id);
-      setLastTick(r.tick.summary);
+      setLastTick({ id: w.id, text: r.tick.summary, failed: false });
       refresh();
     } catch (e) {
-      setLastTick(e instanceof Error ? e.message : String(e));
-    } finally { setBusy(null); }
+      setLastTick({ id: w.id, text: e instanceof Error ? e.message : String(e), failed: true });
+    } finally { locked.current = false; setBusy(null); }
   };
   const list = watches.data?.watches ?? [];
   return (
     <>
       <h3 className="mb-2 mt-4 text-h3 text-fg">Watches</h3>
       <p className="mb-2 text-caption text-muted">A watch reads on a cadence, notices what changed, and raises one item per change that needs you. It runs whether or not proactive work is on, and it never acts on your behalf.</p>
+      {watches.isError && <QueryUnavailable title="Watches couldn’t be refreshed" description={watches.data ? 'Showing the last loaded watches.' : 'Watch settings are unavailable.'} onRetry={() => { void watches.refetch(); }} className="mb-3 py-4" />}
       {watches.isLoading && list.length === 0 ? <Skeleton className="h-16 w-full" /> : list.map((w) => (
         <div key={w.id} className="border-t border-border py-3 first:border-t-0" data-testid={`watch-${w.id}`}>
           <div className="flex items-center gap-3">
@@ -185,7 +213,7 @@ function WatchesPanel() {
               <div className="text-body font-medium text-fg">{w.title}</div>
               <div className="text-caption text-muted">{w.purpose}</div>
             </div>
-            <Switch checked={w.enabled} onChange={(v) => { void toggle(w, v); }} label={w.title} />
+            <Switch checked={w.enabled} disabled={busy !== null} onChange={(v) => { void toggle(w, v); }} label={w.title} />
           </div>
           <div className="mt-2 grid gap-1 text-caption text-muted sm:grid-cols-2">
             <div>Every {w.cadenceMinutes} min{w.quietHoursActive ? ' · quiet hours now' : ''}{w.id === 'calendar' && w.connectedOperations.length === 0 ? ' · no calendar connected' : ''}</div>
@@ -210,8 +238,8 @@ function WatchesPanel() {
             </ul>
           )}
           <div className="mt-2 flex items-center gap-3">
-            <Button variant="secondary" onClick={() => { void checkNow(w); }} disabled={busy === w.id}>{busy === w.id ? 'Checking…' : 'Check now'}</Button>
-            {lastTick && <span className="text-caption text-muted">{lastTick}</span>}
+            <Button variant="secondary" onClick={() => { void checkNow(w); }} disabled={busy !== null}>{busy === w.id ? 'Working…' : 'Check now'}</Button>
+            {lastTick?.id === w.id && <span role={lastTick.failed ? 'alert' : 'status'} className={lastTick.failed ? 'text-caption text-danger' : 'text-caption text-muted'}>{lastTick.text}</span>}
           </div>
         </div>
       ))}
@@ -225,6 +253,8 @@ export function AutonomyForm() {
   const [form, setForm] = useState<Policy | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
 
   useEffect(() => {
     if (settings.data?.proactivity?.policy && !form) setForm({ ...settings.data.proactivity.policy });
@@ -233,20 +263,23 @@ export function AutonomyForm() {
   const set = <K extends keyof Policy>(k: K, v: Policy[K]) => { setForm((f) => (f ? { ...f, [k]: v } : f)); setSaved(false); };
 
   const save = async () => {
-    if (!form) return;
-    setSaving(true);
+    if (!form || savingRef.current) return;
+    savingRef.current = true; setSaving(true); setSaved(false); setError(null);
     try { await patchPolicy(form); setSaved(true); void qc.invalidateQueries({ queryKey: ['settings'] }); void qc.invalidateQueries({ queryKey: ['command-center'] }); }
-    finally { setSaving(false); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not save autonomy settings. Your changes are still here.'); }
+    finally { savingRef.current = false; setSaving(false); }
   };
 
   return (
     <Page title="Autonomy" subtitle="When Clementine acts on its own" width="reading">
+      {settings.isError && form && <QueryUnavailable title="Autonomy settings couldn’t be refreshed" description="Your current draft is still here. Saved settings may have changed elsewhere." onRetry={() => { void settings.refetch(); }} className="mb-4 py-5" />}
       {settings.isLoading ? <Card className="p-5"><Skeleton className="h-72 w-full" /></Card> : !form ? (
         <Card className="p-5 text-body text-muted">Couldn't load settings.{' '}
           <button type="button" onClick={() => settings.refetch()} className="text-primary hover:underline cursor-pointer">Try again</button>
         </Card>
       ) : (
         <Card className="p-5">
+          <fieldset disabled={saving} className="min-w-0">
           <ToggleRow label="Proactive work" desc="Let Clementine start helpful work without being asked." checked={!!form.enabled} onChange={(v) => set('enabled', v)} />
 
           <div className="grid gap-x-4 pt-4 sm:grid-cols-2">
@@ -293,7 +326,9 @@ export function AutonomyForm() {
           <div className="mt-5 flex items-center gap-3">
             <Button onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save'}</Button>
             {saved && <span className="inline-flex items-center gap-1 text-small text-success"><Check className="h-4 w-4" aria-hidden /> Saved</span>}
+            {error && <span role="alert" className="text-small text-danger">{error}</span>}
           </div>
+          </fieldset>
         </Card>
       )}
     </Page>

@@ -139,6 +139,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   const bloomPassRef = useRef<UnrealBloomPass | null>(null);
 
   const [status, setStatus] = useState<'loading' | 'ready' | 'empty' | 'error' | 'nowebgl'>('loading');
+  const [reload, setReload] = useState(0);
+  const [graphError, setGraphError] = useState('');
+  const [expansionError, setExpansionError] = useState('');
   const [data, setData] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
   const [counts, setCounts] = useState({ facts: 0, links: 0, totalFacts: 0, relationships: 0, totalRelationships: 0, stored: 0, inferred: 0, semantic: 0 });
   const [dims, setDims] = useState({ w: 0, h: typeof height === 'number' ? height : 540 });
@@ -152,6 +155,15 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   const [selected, setSelected] = useState<string | null>(null);
   const [bloomOn, setBloomOn] = useState(!reduceMotion());
   const [sel, setSel] = useState<Sel | null>(null);
+  const selectionRef = useRef(selected);
+  selectionRef.current = selected;
+  const graphOwner = useRef(0);
+  const expansionOwner = useRef(0);
+  const expansionPending = useRef(false);
+  const currentData = useRef(data);
+  currentData.current = data;
+  const currentOverlay = useRef(showOverlays);
+  currentOverlay.current = showOverlays;
 
   const hi = useRef<{ nodes: Set<string>; links: Set<GLink> }>({ nodes: new Set(), links: new Set() });
   const SIM_THRESHOLD = 0.66;
@@ -170,6 +182,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   // ── fetch graph ────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
+    graphOwner.current++; expansionOwner.current++; expansionPending.current = false;
+    setExpanding(false); setExpansionError(''); setGraphError('');
     if (!hasWebGL()) { setStatus('nowebgl'); return; }
     (async () => {
       try {
@@ -177,7 +191,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
         const res = await getGraph({ layout: 'semantic', simEdges: showOverlays ? 3 : 0, facts: 300, files: 80, entities: 100, truth: showOverlays ? 'augmented' : 'stored' });
         if (cancelled) return;
         const rawNodes = res.nodes ?? [];
-        if (rawNodes.length === 0) { setStatus('empty'); return; }
+        if (rawNodes.length === 0) { setData(null); selectionRef.current = null; setSelected(null); setSel(null); setStatus('empty'); return; }
         // clone + seed positions from PCA so the graph lands pre-clustered
         const nodes: GNode[] = rawNodes.map((n) => {
           const m: GNode = { ...n };
@@ -199,11 +213,14 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
         });
         setStatus('ready');
       } catch {
-        if (!cancelled) setStatus('error');
+        if (!cancelled) {
+          setGraphError('The graph couldn’t be refreshed.');
+          setStatus(currentData.current ? 'ready' : 'error');
+        }
       }
     })();
-    return () => { cancelled = true; };
-  }, [showOverlays]);
+    return () => { cancelled = true; graphOwner.current++; expansionOwner.current++; };
+  }, [showOverlays, reload]);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, GNode>();
@@ -350,6 +367,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   };
   const onNodeClick = (node: GNode) => {
     stopOrbit();
+    selectionRef.current = node.id; expansionOwner.current++; expansionPending.current = false;
+    setExpanding(false); setExpansionError('');
     setSelected(node.id);
     neighborsOf(node);
     const fg = fgRef.current;
@@ -372,7 +391,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
     const target = typeof link.target === 'object' ? link.target : nodeById.get(link.target);
     const sourceId = source?.id ?? String(link.source);
     const targetId = target?.id ?? String(link.target);
-    setSelected(`edge:${link.id}`);
+    selectionRef.current = `edge:${link.id}`; expansionOwner.current++; expansionPending.current = false;
+    setExpanding(false); setExpansionError(''); setSelected(`edge:${link.id}`);
     hi.current = { nodes: new Set([sourceId, targetId]), links: new Set([link]) };
     setSel({
       label: link.label ?? link.type,
@@ -382,7 +402,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
       connected: 2,
     });
   };
-  const clearFocus = () => { setSelected(null); hi.current = { nodes: new Set(), links: new Set() }; setSel(null); };
+  const clearFocus = () => { selectionRef.current = null; expansionOwner.current++; expansionPending.current = false; setExpanding(false); setExpansionError(''); setSelected(null); hi.current = { nodes: new Set(), links: new Set() }; setSel(null); };
 
   // search → fly to first match
   useEffect(() => {
@@ -401,12 +421,19 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
   const reset = () => { clearFocus(); setQuery(''); setHideType(new Set()); setShowSimilar(true); fit(); };
 
   const expandNeighborhood = async () => {
-    if (!selected) return;
-    setExpanding(true);
+    if (!selected || selected.startsWith('edge:') || expansionPending.current || status !== 'ready') return;
+    const nodeId = selected;
+    const generation = graphOwner.current;
+    const overlay = showOverlays;
+    const owner = ++expansionOwner.current;
+    const current = () => graphOwner.current === generation && expansionOwner.current === owner
+      && selectionRef.current === nodeId && currentOverlay.current === overlay;
+    expansionPending.current = true; setExpanding(true); setExpansionError('');
     try {
-      const neighborhood = await getGraphNeighborhood(selected, 2);
+      const neighborhood = await getGraphNeighborhood(nodeId, 2);
+      if (!current()) return;
       setData((current) => {
-        if (!current) return current;
+        if (!current || graphOwner.current !== generation || expansionOwner.current !== owner || selectionRef.current !== nodeId || currentOverlay.current !== overlay) return current;
         const nodes = new Map(current.nodes.map((node) => [node.id, node]));
         for (const node of neighborhood.nodes) if (!nodes.has(node.id)) nodes.set(node.id, { ...node });
         const links = new Map<string, GLink>();
@@ -418,7 +445,9 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
         for (const link of neighborhood.edges) links.set(link.id, { ...link });
         return { nodes: Array.from(nodes.values()), links: Array.from(links.values()) };
       });
-    } finally { setExpanding(false); }
+    } catch (cause) {
+      if (current()) setExpansionError(cause instanceof Error ? cause.message : 'This neighborhood could not be loaded. Try again.');
+    } finally { if (current()) { expansionPending.current = false; setExpanding(false); } }
   };
 
   const focusing = !!selected || !!query;
@@ -535,7 +564,8 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
 
       {status === 'loading' && <Overlay>Igniting the constellation…</Overlay>}
       {status === 'empty' && <Overlay>Nothing to map yet — Clementine will fill this in as it learns.</Overlay>}
-      {status === 'error' && <Overlay>Couldn’t load the graph.</Overlay>}
+      {status === 'error' && <Overlay><div><p>Couldn’t load the graph.</p><button type="button" onClick={() => setReload(value => value + 1)} className="mt-3 rounded-md border border-white/30 px-3 py-2 text-small text-white hover:bg-white/10">Retry graph</button></div></Overlay>}
+      {status === 'ready' && graphError && <div role="alert" className="absolute left-3 top-16 z-20 max-w-xs rounded-md border border-white/20 bg-black/80 p-3 text-small text-white"><p>{graphError} Showing the last loaded graph.</p><button type="button" onClick={() => setReload(value => value + 1)} className="mt-2 underline underline-offset-2">Retry graph</button></div>}
       {status === 'nowebgl' && <Overlay>This view needs WebGL / hardware acceleration — enable it to see the constellation.</Overlay>}
 
       {sel && (
@@ -606,6 +636,7 @@ export default function KnowledgeGraph3D({ height = 540 }: { height?: CSSPropert
             className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-white/20 px-2.5 py-1.5 text-caption text-white/80 hover:bg-white/10 disabled:opacity-50">
             <Layers3 className="h-3.5 w-3.5" aria-hidden /> {expanding ? 'Expanding…' : 'Expand stored neighborhood'}
           </button>}
+          {expansionError && <p role="alert" className="mt-2 text-caption text-white">{expansionError} Use Expand stored neighborhood to retry.</p>}
         </div>
       )}
     </div>

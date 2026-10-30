@@ -11,6 +11,7 @@ import { cn } from '@/lib/cn';
 import {
   agoLabel,
   needsYouDecision,
+  needsYouContext,
   needsYouKey,
   needsYouTarget,
   type HomeFeedItem,
@@ -301,7 +302,7 @@ export function NeedsYouPane({
               const question = questionFor(item.questionId);
               const when = agoLabel(question?.askedAt ?? item.createdAt);
               const lifecycle = item.questionId ? question?.lifecycle : item.attentionKey ? item.lifecycle : undefined;
-              const meta = question?.context ?? item.meta;
+              const meta = needsYouContext(question?.context ?? item.meta);
               const canDismiss = presentation && (item.questionId ? lifecycle?.canDismiss === true : item.attentionKey
                 ? Boolean(lifecycle?.canDismiss && lifecycle.generation) : Boolean(item.dismissKind && item.dismissId));
               // A question is answered here once opened, with its options or a

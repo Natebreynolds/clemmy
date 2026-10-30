@@ -2,7 +2,26 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chatPendingStorageKey } from './chat-pending-scope.js';
 import { readComposerDraft, writeComposerDraft } from './composer-drafts.js';
-import { captureMemoryAssistantSubmission, handoffMemoryAssistantDraft, memoryAssistantMessage, settleMemoryAssistantRetry } from './memory-assistant-state.js';
+import { captureMemoryAssistantSubmission, handoffMemoryAssistantDraft, memoryAssistantMessage, memoryAssistantOwner, retainMemoryAssistantOwner, settleMemoryAssistantRetry } from './memory-assistant-state.js';
+
+test('a Memory remount recovers its window-local draft owner and exact conversation pointers without a send', () => {
+  const owner = memoryAssistantOwner(() => 'FRAMEWORK-TEST-retained-assistant');
+  const key = `session:${owner.scope}`;
+  writeComposerDraft(key, () => ({ text: 'An unsent Memory question', attachments: [] }));
+  assert.equal(retainMemoryAssistantOwner(owner.scope, 'FRAMEWORK-TEST-execution', 'FRAMEWORK-TEST-root'), true);
+  const remounted = memoryAssistantOwner(() => { throw new Error('A remount must not mint another owner'); });
+  assert.equal(remounted.scope, owner.scope); assert.equal(remounted.executionSessionId, 'FRAMEWORK-TEST-execution');
+  assert.equal(remounted.conversationSessionId, 'FRAMEWORK-TEST-root'); assert.equal(readComposerDraft(key).text, 'An unsent Memory question');
+  assert.equal(handoffMemoryAssistantDraft(key, 'FRAMEWORK-TEST-open-chat', false, null), 'moved');
+  assert.equal(retainMemoryAssistantOwner(owner.scope, 'old', 'old'), false, 'old cleanup cannot resurrect an explicitly handed-off owner');
+  assert.equal(memoryAssistantOwner(() => 'FRAMEWORK-TEST-next-assistant').scope, 'FRAMEWORK-TEST-next-assistant');
+});
+
+test('retaining a selected reference never duplicates it on remount or handoff', () => {
+  const reference = { ref: { type: 'fact' as const, id: 42 } };
+  const once = memoryAssistantMessage('My unsent draft', reference);
+  assert.equal(memoryAssistantMessage(once, reference), once);
+});
 
 test('auxiliary retries never read the primary new-chat or saved-chat receipt', () => {
   assert.equal(chatPendingStorageKey(undefined), 'clem.pending.console:new');

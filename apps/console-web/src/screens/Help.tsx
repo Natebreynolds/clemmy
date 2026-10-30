@@ -9,6 +9,8 @@ import { usePoll } from '@/lib/poll';
 import { getBuildInfo } from '@/lib/advanced';
 import { clemmy, isDesktop } from '@/lib/clemmy';
 import { updateCheckFeedback } from '@/lib/update-check-feedback';
+import { editableChatDraft } from '@/lib/editable-chat-draft';
+import { helpDestinations } from '@/lib/help-destinations';
 
 const modKey = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl';
 
@@ -35,6 +37,10 @@ export function Help() {
   // actionable update via the global UpdaterBanner, but an "up to date"
   // result had nowhere to land — so a click gave zero feedback. Show it here.
   const [checkNote, setCheckNote] = useState<string | null>(null);
+  const openHelpDraft = (text: string) => {
+    const target = editableChatDraft(text);
+    if (target) navigate(target.pathname, { state: target.state });
+  };
 
   const checkUpdates = async () => {
     const bridge = clemmy();
@@ -79,19 +85,20 @@ export function Help() {
             <h3 className="text-h3 text-fg">Ask Clementine for help</h3>
             <p className="text-small text-muted">The fastest way to get unstuck — just ask.</p>
           </div>
-          <Button size="sm" onClick={() => navigate('/chat')}>Open chat</Button>
+          <Button size="sm" onClick={() => openHelpDraft('Help me find my way around Clem.')}>Ask for help</Button>
         </Card>
 
         <Card className="p-5">
           <div className="mb-3 flex items-center gap-2"><Sparkles className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Things you can ask Clem</h3></div>
+          <p className="mb-2 text-small text-muted">Opens an editable draft. You choose when to send.</p>
           <ul className="space-y-1">
             {TRY_ASKING.map((ask) => (
               <li key={ask}>
-                <Link to={`/chat?prompt=${encodeURIComponent(ask)}`}
-                  className="flex items-center justify-between gap-3 rounded-md px-2 py-2 text-body text-fg hover:bg-subtle">
+                <button type="button" onClick={() => openHelpDraft(ask)}
+                  className="flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left text-body text-fg hover:bg-subtle">
                   <span>“{ask}”</span>
-                  <span className="shrink-0 text-small font-semibold text-primary-ink">Ask</span>
-                </Link>
+                  <span className="shrink-0 text-small font-semibold text-primary-ink">Draft</span>
+                </button>
               </li>
             ))}
           </ul>
@@ -100,7 +107,7 @@ export function Help() {
         <Card className="p-5">
           <div className="mb-3 flex items-center gap-2"><MapIcon className="h-5 w-5 text-primary" aria-hidden /><h3 className="text-h3 text-fg">Where things are</h3></div>
           <ul className="grid gap-x-6 gap-y-2 sm:grid-cols-2">
-            {APP_PLACES.filter((place) => place.id !== 'help').map((place) => (
+            {helpDestinations(APP_PLACES).map((place) => (
               <li key={place.id} className="flex items-start gap-2">
                 <Link to={place.desktop} className="group block min-w-0 flex-1 rounded-md px-2 py-1.5 hover:bg-subtle">
                   <span className="block text-body font-semibold text-fg group-hover:text-primary-ink">{place.name}</span>
@@ -129,7 +136,8 @@ export function Help() {
         <Card className="flex flex-wrap items-center gap-3 p-5">
           <div className="flex-1">
             <h3 className="text-h3 text-fg">Version</h3>
-            <p className="text-small text-muted">{build.data?.version ? `Clementine ${build.data.version}` : 'Loading…'}</p>
+            <p className="text-small text-muted">{build.data?.version ? `${build.isError ? 'Last loaded: ' : ''}Clementine ${build.data.version}` : build.isError ? 'Version information unavailable.' : 'Loading…'}</p>
+            {build.isError && <Button variant="link" size="sm" onClick={() => void build.refetch()}>Retry version</Button>}
             {checkNote && <p className="mt-1 text-small text-primary" role="status" aria-live="polite">{checkNote}</p>}
           </div>
           {isDesktop() && (

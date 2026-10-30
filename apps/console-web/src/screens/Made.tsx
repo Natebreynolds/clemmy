@@ -3,7 +3,7 @@
  * every folder, grouped by day. Click a folder to see the drafts and files.
  */
 import { useMemo, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, Copy, ExternalLink, FileText, Globe, Mail, MessageCircle, RotateCw, Search, Table2 } from 'lucide-react';
 import { usePoll } from '@/lib/poll';
 import {
@@ -12,6 +12,7 @@ import {
   deliveredConversationId,
   deliveredFileRef,
   folderHref,
+  findDeliveredFolder,
   groupArtifacts,
   groupKinds,
   isEmailTarget,
@@ -93,7 +94,13 @@ export function MadeArchive() {
 function MadeArchiveContent() {
   const delivered = usePoll(['delivered-archive'], () => listDelivered(50), 30_000);
   const [filter, setFilter] = useState<FilterId>('all');
-  const [search, setSearch] = useState('');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const search = searchParams.get('q') ?? '';
+  const setSearch = (value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value) next.set('q', value); else next.delete('q');
+    setSearchParams(next, { replace: true });
+  };
   const groups = useMemo(
     () => latestDeliveredGroups(delivered.data ?? []).filter((g) => matchesFilter(g, filter) && matchesDeliveredSearch(g, search)),
     [delivered.data, filter, search],
@@ -114,12 +121,14 @@ function MadeArchiveContent() {
     <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 py-6 animate-fade-in sm:px-10">
       <div>
         <h1 className="text-h2 font-semibold text-fg">Files & results</h1>
-        <p className="mt-1 text-body text-muted">Pick up a finished file, or open a folder to see everything from that work.</p>
+        <p className="mt-1 text-body text-muted">Recent finished work, with the files and results from each conversation.</p>
       </div>
       <label className="flex min-h-10 items-center gap-2 rounded-md border border-border bg-surface px-3 text-muted">
         <Search className="h-4 w-4 shrink-0" aria-hidden />
-        <input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label="Search files and results by title or filename" placeholder="Search titles and filenames" className="min-w-0 flex-1 bg-transparent py-2 text-body text-fg placeholder:text-muted" />
+        <input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label="Search recent loaded work by title or filename" placeholder="Search recent titles and filenames" className="min-w-0 flex-1 bg-transparent py-2 text-body text-fg placeholder:text-muted" />
       </label>
+      <p className="-mt-3 text-caption text-muted">Search covers up to 50 recent work folders. For older work, open the original conversation in <Link to="/chat" className="font-semibold text-primary hover:underline">Chat</Link> or its <Link to="/projects" className="font-semibold text-primary hover:underline">project</Link>.</p>
+      {delivered.isError && delivered.data && <p role="status" className="text-small text-warning">Files & results couldn’t refresh. Showing the last loaded work. <button type="button" className="font-semibold underline" onClick={() => void delivered.refetch()}>Retry</button></p>}
       <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter made work">
         {FILTERS.map((f) => (
           <button
@@ -145,7 +154,7 @@ function MadeArchiveContent() {
           onRetry={() => { void delivered.refetch(); }}
         />
       ) : groups.length === 0 ? (
-        <p className="text-body text-muted">{search.trim() || filter !== 'all' ? 'No finished work matches. Try another title, filename, or filter.' : 'Nothing made yet — drafts, files, and sheets land here when Clem finishes them.'}</p>
+        <p className="text-body text-muted">{search.trim() || filter !== 'all' ? 'No recent loaded work matches. Try another title, filename, or filter, or open the original conversation for older work.' : 'Nothing made yet — drafts, files, and sheets land here when Clem finishes them.'}</p>
       ) : (
         <>
         {recent.length > 0 ? <section className="flex flex-col gap-2"><h2 className="text-body font-semibold text-fg">Recent work</h2><div className="overflow-hidden rounded-lg border border-border bg-surface">{recent.map(group => <FolderRow key={group.id} group={group} />)}</div></section> : null}
@@ -171,8 +180,10 @@ export function MadeFolder() {
 function MadeFolderContent({ groupId }: { groupId?: string }) {
   const navigate = useNavigate();
   const dock = useFileDock();
-  const delivered = usePoll(['delivered-archive'], () => listDelivered(50), 30_000);
-  const group = (delivered.data ?? []).find((g) => String(g.id) === groupId);
+  const [searchParams] = useSearchParams();
+  const sourceSession = searchParams.get('session')?.trim() || undefined;
+  const delivered = usePoll(['delivered-folder', sourceSession ?? 'recent'], () => listDelivered(50, sourceSession ? { sessionIds: [sourceSession] } : undefined), 30_000);
+  const group = findDeliveredFolder(delivered.data ?? [], groupId, sourceSession);
   const [copied, setCopied] = useState<string | null>(null);
   const [copyProblem, setCopyProblem] = useState('');
 
@@ -200,8 +211,8 @@ function MadeFolderContent({ groupId }: { groupId?: string }) {
   if (!group) {
     return (
       <div className="mx-auto w-full max-w-[760px] px-5 py-6 sm:px-10">
-        <p className="text-body text-muted">That work isn’t in the latest archive entries.</p>
-        <Link to="/made" className="mt-3 inline-block text-small font-semibold text-primary hover:underline">All made</Link>
+        <p className="text-body text-muted">{sourceSession ? 'This work’s recorded results are unavailable.' : 'This older link has no conversation reference, and the work is outside the recent archive. Open its original conversation or project to find the results.'}</p>
+        <div className="mt-3 flex flex-wrap gap-4"><Link to="/made" className="text-small font-semibold text-primary hover:underline">Recent files & results</Link><Link to="/chat" className="text-small font-semibold text-primary hover:underline">Find the conversation</Link><Link to="/projects" className="text-small font-semibold text-primary hover:underline">Projects</Link></div>
       </div>
     );
   }
@@ -212,6 +223,7 @@ function MadeFolderContent({ groupId }: { groupId?: string }) {
 
   return (
     <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 py-6 animate-fade-in sm:px-10">
+      {delivered.isError && delivered.data && <p role="status" className="text-small text-warning">This folder couldn’t refresh. Showing the last loaded results. <button type="button" className="font-semibold underline" onClick={() => void delivered.refetch()}>Retry</button></p>}
       <div>
         <button
           type="button"

@@ -163,6 +163,8 @@ export function Agents() {
       actions={newAgent}
     >
       <p className="mb-5 text-small text-muted">Open an agent to work together, or <Link to="/projects" className="font-semibold text-primary hover:underline">choose a project</Link> to keep the whole job together.</p>
+      {agentsQ.isError && agentsQ.data && <p role="status" className="mb-4 text-small text-warning">Agents couldn’t refresh. Showing the last loaded list. <button type="button" className="font-semibold underline" onClick={() => void agentsQ.refetch()}>Retry</button></p>}
+      {proposalsQ.isError && <p role="status" className="mb-4 text-small text-warning">{proposalsQ.data ? 'Drafts couldn’t refresh. Showing the last loaded drafts.' : 'Drafts from Clem couldn’t load.'} <button type="button" className="font-semibold underline" onClick={() => void proposalsQ.refetch()}>Retry</button></p>}
       <Drafts
         proposals={proposals}
         busyId={proposalBusyId}
@@ -197,6 +199,8 @@ export function Agents() {
         <AgentForm
           mode="create"
           catalog={catalogQ.data}
+          catalogUnavailable={catalogQ.isError}
+          onRetryCatalog={() => void catalogQ.refetch()}
           onClose={() => setCreating(false)}
           onSaved={(saved) => {
             refetchAgents();

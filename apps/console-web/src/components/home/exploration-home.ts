@@ -13,6 +13,12 @@ export function isDefaultExploration(pathname: string, state: unknown, preferenc
     && preferencesConfirmed && preferences?.updatedAt === '1970-01-01T00:00:00.000Z';
 }
 
+/** Fresh success is required before an empty reading can change first-use UI. */
+export function freshEmptyExplorationSnapshot(source: ExplorationSnapshot, nowMs: number): boolean {
+  return source.state === 'loaded' && source.count === 0 && Number.isFinite(source.updatedAt)
+    && source.updatedAt > 0 && source.updatedAt <= nowMs && nowMs - source.updatedAt <= 90_000;
+}
+
 /** Empty introductions can yield to the first conversation. A failed, old,
  * loading or nonempty source always retains its pane and its recovery. */
 export function quietExplorationIntroductions(input: {
@@ -23,8 +29,6 @@ export function quietExplorationIntroductions(input: {
   spaces: ExplorationSnapshot;
   watching: ExplorationSnapshot;
 }): Record<'made' | 'projects' | 'spaces' | 'watching', boolean> {
-  const empty = (source: ExplorationSnapshot) => input.eligible && source.state === 'loaded'
-    && source.count === 0 && Number.isFinite(source.updatedAt) && source.updatedAt > 0
-    && source.updatedAt <= input.nowMs && input.nowMs - source.updatedAt <= 90_000;
+  const empty = (source: ExplorationSnapshot) => input.eligible && freshEmptyExplorationSnapshot(source, input.nowMs);
   return { made: empty(input.made), projects: empty(input.projects), spaces: empty(input.spaces), watching: empty(input.watching) };
 }

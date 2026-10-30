@@ -906,7 +906,7 @@ export function NotchSurface() {
           {activity.state === 'approval' && (
             <div className="clemmy-live-primary-actions">
               <SurfaceButton kind="primary" onClick={openConsole}>
-                <ShieldCheck aria-hidden /> Review &amp; approve
+                <ShieldCheck aria-hidden /> Open Clem to review
               </SurfaceButton>
             </div>
           )}

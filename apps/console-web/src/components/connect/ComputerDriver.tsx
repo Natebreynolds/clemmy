@@ -54,7 +54,7 @@ export function ComputerDriver() {
           </div>
           <p className="mt-1 text-small text-muted">
             Cua Driver (open source) lets Clem click, type and read in the apps on this computer, in windows behind yours, with a cursor of its own.
-            Every action still asks you first when it changes something, and is recorded like any other.
+            Changes follow your approval rules, and actions are recorded like any other.
             {s?.platformSupport === 'preview' && ' On Windows this is a preview.'}
           </p>
           {step === 'install' && s && (

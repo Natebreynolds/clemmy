@@ -212,6 +212,7 @@ test('explicit blank exploration keeps its composer, note and Arrange while conf
     '@/components/ModelStatusChips': {}, '@/components/ui/Skeleton': {}, '@/components/home/QuickActions': {},
     '@/components/home/NeedsYouPane': {}, '@/components/home/WhileAwayPane': {}, '@/components/home/TodayPane': {},
     '@/components/home/ProjectsPane': { ProjectsPane: 'ProjectsPane' }, '@/components/home/MadePane': { MadePane: 'MadePane' },
+    '@/components/home/MissedRunsCard': { MissedRunsCard: 'MissedRunsCard' },
     '@/components/home/FromClemPane': {}, '@/components/home/HomeWatchOverview': { HomeWatchLine: 'HomeWatchLine' },
     '@/components/home/watch-overview-model': { buildWatchOverview }, '@/components/home/home-content-layout': { buildHomeContentLayout },
     '@/components/home/exploration-home': explorationHome, '@/lib/watches': {},
