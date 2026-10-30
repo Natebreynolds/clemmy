@@ -1,0 +1,436 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-30T09:01:07+00:00",
+  "title": "Design System: Clem on the phone",
+  "extensions": {
+    "colorMeta": {
+      "clementine": {
+        "role": "primary",
+        "displayName": "Clementine (fill only)",
+        "canonical": "#f26419",
+        "tonalRamp": [
+          "#3d1503",
+          "#6b2606",
+          "#963400",
+          "#b94300",
+          "#de5a12",
+          "#f26419",
+          "#ff8442",
+          "#fff4ed"
+        ]
+      },
+      "clementine-press": {
+        "role": "primary",
+        "displayName": "Clementine Press",
+        "canonical": "#de5a12",
+        "tonalRamp": []
+      },
+      "clementine-ink": {
+        "role": "primary",
+        "displayName": "Clementine Ink (text only)",
+        "canonical": "#b94300",
+        "tonalRamp": []
+      },
+      "clementine-ink-deep": {
+        "role": "primary",
+        "displayName": "Clementine Ink Deep (pressed text)",
+        "canonical": "#963400",
+        "tonalRamp": []
+      },
+      "clementine-tint": {
+        "role": "primary",
+        "displayName": "Clementine Tint",
+        "canonical": "#fff4ed",
+        "tonalRamp": []
+      },
+      "live-halo": {
+        "role": "primary",
+        "displayName": "Live Halo",
+        "canonical": "rgba(242, 100, 25, 0.18)",
+        "tonalRamp": []
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Warm Ink",
+        "canonical": "#1f1b16",
+        "tonalRamp": [
+          "#1f1b16",
+          "#3a332a",
+          "#5c564b",
+          "#75644f",
+          "#a39887",
+          "#e4ddd1",
+          "#f4f0e9",
+          "#faf7f2"
+        ]
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "#5c564b",
+        "tonalRamp": []
+      },
+      "ink-subtle": {
+        "role": "neutral",
+        "displayName": "Subtle Ink",
+        "canonical": "#75644f",
+        "tonalRamp": []
+      },
+      "cream-canvas": {
+        "role": "neutral",
+        "displayName": "Cream Canvas",
+        "canonical": "#faf7f2",
+        "tonalRamp": []
+      },
+      "card-white": {
+        "role": "neutral",
+        "displayName": "Card White",
+        "canonical": "#ffffff",
+        "tonalRamp": []
+      },
+      "pressed-cream": {
+        "role": "neutral",
+        "displayName": "Pressed Cream",
+        "canonical": "#f4f0e9",
+        "tonalRamp": []
+      },
+      "quiet-mark": {
+        "role": "neutral",
+        "displayName": "Quiet Mark (non-text only)",
+        "canonical": "#e4ddd1",
+        "tonalRamp": []
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "rgba(63, 42, 22, 0.1)",
+        "tonalRamp": []
+      },
+      "hairline-strong": {
+        "role": "neutral",
+        "displayName": "Hairline Strong",
+        "canonical": "rgba(63, 42, 22, 0.16)",
+        "tonalRamp": []
+      },
+      "card-edge": {
+        "role": "neutral",
+        "displayName": "Card Edge",
+        "canonical": "rgba(63, 42, 22, 0.08)",
+        "tonalRamp": []
+      },
+      "fill-quiet": {
+        "role": "neutral",
+        "displayName": "Fill Quiet",
+        "canonical": "rgba(63, 42, 22, 0.07)",
+        "tonalRamp": []
+      },
+      "scrim": {
+        "role": "neutral",
+        "displayName": "Scrim",
+        "canonical": "rgba(31, 27, 22, 0.32)",
+        "tonalRamp": []
+      },
+      "leaf-success": {
+        "role": "status",
+        "displayName": "Leaf",
+        "canonical": "#2e7d46",
+        "tonalRamp": [
+          "#0f2a17",
+          "#1a4627",
+          "#245f35",
+          "#2e7d46",
+          "#4f9a66",
+          "#86bf97",
+          "#c4e2cd",
+          "#e8f5ec"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "large-title": {
+        "displayName": "Large Title",
+        "purpose": "\"Clem\" on her one screen; one per screen."
+      },
+      "sheet-title": {
+        "displayName": "Sheet Title",
+        "purpose": "\"Your stuff\" at the head of the sheet."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The one line of where things stand; ink orange when something needs you."
+      },
+      "section-title": {
+        "displayName": "Section Title",
+        "purpose": "Sentence-case section and list heads."
+      },
+      "nav-title": {
+        "displayName": "Nav Title",
+        "purpose": "Centred place name, back label, Done, sheet row labels."
+      },
+      "row-title": {
+        "displayName": "Row Title",
+        "purpose": "First line of a grouped row; Clem's question on a card."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Record words and composer text."
+      },
+      "callout": {
+        "displayName": "Callout",
+        "purpose": "Button labels, links, greeting, section intros."
+      },
+      "footnote": {
+        "displayName": "Footnote",
+        "purpose": "Meta lines, timestamps, the digest pill."
+      },
+      "caption": {
+        "displayName": "Caption",
+        "purpose": "Status chips and the record's smallest lines."
+      }
+    },
+    "shadows": [
+      {
+        "name": "card-edge",
+        "value": "0 0 0 1px rgba(63, 42, 22, 0.08)",
+        "purpose": "Draws every white card on the cream canvas; the only depth a resting card gets."
+      },
+      {
+        "name": "floating-control",
+        "value": "0 1px 2px rgba(63, 42, 22, 0.08), 0 8px 24px rgba(63, 42, 22, 0.1)",
+        "purpose": "The composer capsule and the round Your stuff button."
+      },
+      {
+        "name": "avatar-lift",
+        "value": "0 1px 2px rgba(63, 42, 22, 0.1), 0 4px 14px rgba(63, 42, 22, 0.08)",
+        "purpose": "Clem's avatar disc."
+      },
+      {
+        "name": "sheet",
+        "value": "0 -12px 40px rgba(63, 42, 22, 0.16)",
+        "purpose": "The Your stuff sheet over the scrim."
+      },
+      {
+        "name": "selected-segment",
+        "value": "0 1px 3px rgba(63, 42, 22, 0.12)",
+        "purpose": "The active segment of a segmented control."
+      },
+      {
+        "name": "live-dot-halo",
+        "value": "0 0 0 4px rgba(242, 100, 25, 0.18)",
+        "purpose": "Clem's live dot in the live group."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease",
+        "value": "cubic-bezier(0.22, 1, 0.36, 1)",
+        "purpose": "The one curve: arrive and settle, no overshoot."
+      },
+      {
+        "name": "dur-fast",
+        "value": "120ms",
+        "purpose": "Colour-only changes."
+      },
+      {
+        "name": "dur-base",
+        "value": "180ms",
+        "purpose": "Default transition."
+      },
+      {
+        "name": "dur-slow",
+        "value": "300ms",
+        "purpose": "Ceiling for things entering or leaving; also the sheet's exit and scrim."
+      },
+      {
+        "name": "sheet-rise",
+        "value": "460ms cubic-bezier(0.2, 0.9, 0.25, 1)",
+        "purpose": "Your stuff sheet entering from the bottom; reduced motion fades instead."
+      },
+      {
+        "name": "press",
+        "value": "scale(0.97)",
+        "purpose": "The one press nudge (0.93-0.94 on the round floating buttons)."
+      },
+      {
+        "name": "breathe",
+        "value": "2.2s ease-in-out infinite",
+        "purpose": "The ring around Clem's avatar while she works; static under reduced motion."
+      },
+      {
+        "name": "pulse",
+        "value": "1.4s ease-in-out infinite",
+        "purpose": "The running dot's halo; off under reduced motion."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "phone",
+        "value": "<880px",
+        "purpose": "One Clem screen, Your stuff sheet, place bar with ‹ Clem."
+      },
+      {
+        "name": "wide",
+        "value": "880px",
+        "purpose": "Sidebar clamp(180px, 22vw, 224px) replaces the sheet; no back link or Your stuff button."
+      },
+      {
+        "name": "fold-vertical",
+        "value": "880px + data-fold-axis=vertical",
+        "purpose": "Sidebar fills page one (sections in two columns), the open screen page two; nothing across the crease."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Answer",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The answer on a Needs-you card that acts: clementine fill, warm-ink label.",
+      "html": "<button class=\"ds-btn-primary\">Review and approve</button>",
+      "css": ".ds-btn-primary{min-height:42px;padding:9px 12px;border:0;border-radius:12px;background:#f26419;color:#1f1b16;font:600 0.9375rem/1.2 -apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;letter-spacing:-0.01em;transition:transform 180ms cubic-bezier(0.22,1,0.36,1),background 120ms}.ds-btn-primary:active{background:#de5a12;transform:scale(0.97)}.ds-btn-primary:focus-visible{outline:2px solid #b94300;outline-offset:2px}"
+    },
+    {
+      "name": "Quiet Answer",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "The second answer: warm translucent fill, ink label.",
+      "html": "<button class=\"ds-btn-quiet\">Run it again</button>",
+      "css": ".ds-btn-quiet{min-height:42px;padding:9px 12px;border:0;border-radius:12px;background:rgba(63,42,22,0.07);color:#1f1b16;font:600 0.9375rem/1.2 -apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;letter-spacing:-0.01em;transition:transform 180ms cubic-bezier(0.22,1,0.36,1)}.ds-btn-quiet:active{transform:scale(0.97)}.ds-btn-quiet:focus-visible{outline:2px solid #b94300;outline-offset:2px}"
+    },
+    {
+      "name": "Needs-you Card",
+      "kind": "card",
+      "refersTo": "grouped-card",
+      "description": "Clem's question, the answers side by side, then the rest as words.",
+      "html": "<div class=\"ds-card\"><p class=\"ds-q\">Team Activity Slack Updates failed on the pull step. Want me to look at what went wrong, or run it again?</p><p class=\"ds-meta\">Work review · 9h ago</p><div class=\"ds-acts\"><button class=\"ds-p\">Look into it</button><button class=\"ds-s\">Run it again</button></div><div class=\"ds-more\"><button class=\"ds-l\">Reply in your words</button><button class=\"ds-l ds-mute\">Later</button><button class=\"ds-l ds-mute\">Dismiss</button></div></div>",
+      "css": ".ds-card{max-width:360px;padding:14px 16px;border-radius:16px;background:#fff;box-shadow:0 0 0 1px rgba(63,42,22,0.08);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;color:#1f1b16}.ds-q{margin:0;font-size:1rem;font-weight:600;line-height:1.3;letter-spacing:-0.01em}.ds-meta{margin:2px 0 0;font-size:0.8125rem;color:#5c564b}.ds-acts{display:flex;gap:8px;margin-top:10px}.ds-acts button{flex:1;min-height:42px;border:0;border-radius:12px;font:600 0.9375rem -apple-system,sans-serif}.ds-p{background:#f26419;color:#1f1b16}.ds-p:active{background:#de5a12;transform:scale(0.97)}.ds-s{background:rgba(63,42,22,0.07);color:#1f1b16}.ds-s:active{transform:scale(0.97)}.ds-more{display:flex;gap:0 18px;margin-top:2px}.ds-l{min-height:40px;padding:0;border:0;background:none;color:#b94300;font:500 0.9375rem -apple-system,sans-serif}.ds-l:active{color:#963400}.ds-mute{color:#5c564b}.ds-card button:focus-visible{outline:2px solid #b94300;outline-offset:2px}"
+    },
+    {
+      "name": "Grouped List",
+      "kind": "card",
+      "refersTo": "grouped-card",
+      "description": "Inset grouped white list with inset hairlines and pushing chevrons.",
+      "html": "<div class=\"ds-group\"><button class=\"ds-row\"><span class=\"ds-t\">Hey can you draft an email for me</span><span class=\"ds-n\">Waiting on your answer</span></button><button class=\"ds-row\"><span class=\"ds-t\">hey</span><span class=\"ds-m\">5d ago</span></button></div>",
+      "css": ".ds-group{max-width:360px;overflow:hidden;border-radius:16px;background:#fff;box-shadow:0 0 0 1px rgba(63,42,22,0.08);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-row{position:relative;display:flex;flex-direction:column;align-items:flex-start;width:100%;min-height:64px;padding:12px 16px;border:0;background:none;color:#1f1b16;text-align:left}.ds-row+.ds-row::before{content:\"\";position:absolute;top:0;left:16px;right:0;border-top:0.5px solid rgba(63,42,22,0.16)}.ds-row:active{background:#f4f0e9}.ds-row:focus-visible{outline:2px solid #b94300;outline-offset:-2px}.ds-t{font-size:1rem;font-weight:600;letter-spacing:-0.01em}.ds-n{font-size:0.8125rem;font-weight:600;color:#b94300}.ds-m{font-size:0.8125rem;color:#5c564b}"
+    },
+    {
+      "name": "Your stuff Sheet Rows",
+      "kind": "nav",
+      "refersTo": "sheet-row",
+      "description": "Places in the sheet: glyph tile, label, badge, chevron; Inbox tile filled.",
+      "html": "<div class=\"ds-sheet\"><div class=\"ds-head\"><h2>Your stuff</h2><button class=\"ds-done\">Done</button></div><div class=\"ds-sg\"><button class=\"ds-item\"><span class=\"ds-g\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z\"/></svg></span><span class=\"ds-lb\">Chats</span><svg class=\"ds-chev\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"m9 18 6-6-6-6\"/></svg></button><button class=\"ds-item\"><span class=\"ds-g ds-g-hot\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M22 12h-6l-2 3h-4l-2-3H2\"/><path d=\"M5 5h14l3 7v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-6z\"/></svg></span><span class=\"ds-lb\">Inbox</span><span class=\"ds-badge\">9+</span><svg class=\"ds-chev\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"m9 18 6-6-6-6\"/></svg></button></div></div>",
+      "css": ".ds-sheet{max-width:380px;padding:8px 16px 20px;border-radius:22px 22px 0 0;background:#faf7f2;box-shadow:0 -12px 40px rgba(63,42,22,0.16);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-head{display:flex;justify-content:space-between;align-items:center;padding:4px 4px 18px}.ds-head h2{margin:0;font:700 1.75rem/1.15 ui-rounded,-apple-system,sans-serif;letter-spacing:-0.02em;color:#1f1b16}.ds-done{min-height:44px;border:0;background:none;color:#b94300;font:600 1.0625rem -apple-system,sans-serif}.ds-sg{overflow:hidden;border-radius:16px;background:#fff;box-shadow:0 0 0 1px rgba(63,42,22,0.08)}.ds-item{position:relative;display:flex;align-items:center;gap:12px;width:100%;min-height:52px;padding:8px 14px;border:0;background:none;color:#1f1b16;text-align:left}.ds-item+.ds-item::before{content:\"\";position:absolute;top:0;left:56px;right:0;border-top:0.5px solid rgba(63,42,22,0.16)}.ds-item:active{background:#f4f0e9}.ds-item:focus-visible{outline:2px solid #b94300;outline-offset:-2px}.ds-g{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:#fff4ed;color:#b94300}.ds-g svg{width:18px;height:18px}.ds-g-hot{background:#f26419;color:#1f1b16}.ds-lb{flex:1;font-size:1.0625rem;letter-spacing:-0.01em}.ds-badge{min-width:22px;height:22px;padding:0 7px;border-radius:999px;background:#f26419;color:#1f1b16;font-size:13px;font-weight:600;line-height:22px;text-align:center;font-variant-numeric:tabular-nums}.ds-chev{width:16px;height:16px;color:#e4ddd1}"
+    },
+    {
+      "name": "Place Bar",
+      "kind": "nav",
+      "refersTo": "nav-back",
+      "description": "Back to Clem on the left, the place name centred, a hairline beneath.",
+      "html": "<header class=\"ds-bar\"><button class=\"ds-back\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m15 18-6-6 6-6\"/></svg>Clem</button><span class=\"ds-title\">Inbox</span><span></span></header>",
+      "css": ".ds-bar{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;min-height:48px;padding:2px 8px;background:#faf7f2;border-bottom:0.5px solid rgba(63,42,22,0.1);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-back{justify-self:start;display:inline-flex;align-items:center;min-height:44px;padding:0 10px 0 0;border:0;background:none;color:#b94300;font-size:1.0625rem;letter-spacing:-0.01em}.ds-back svg{width:26px;height:26px}.ds-back:active{opacity:0.5}.ds-back:focus-visible{outline:2px solid #b94300;outline-offset:2px}.ds-title{font-size:1.0625rem;font-weight:600;letter-spacing:-0.01em;color:#1f1b16}"
+    },
+    {
+      "name": "Segmented Control",
+      "kind": "nav",
+      "refersTo": "segmented-control",
+      "description": "Inbox's three views; only the Needs-you count is orange.",
+      "html": "<div class=\"ds-seg\"><button class=\"ds-on\">Needs you<b class=\"ds-hot\">17</b></button><button>Updates<b>41</b></button><button>Set aside<b></b></button></div>",
+      "css": ".ds-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:2px;max-width:360px;padding:2px;border-radius:11px;background:rgba(63,42,22,0.07);font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-seg button{display:flex;flex-direction:column;align-items:center;gap:2px;min-height:52px;padding:9px 4px 6px;border:0;border-radius:9px;background:none;color:#1f1b16;font-size:0.875rem;font-weight:500}.ds-seg b{font-size:0.75rem;font-weight:600;color:#5c564b}.ds-seg b.ds-hot{color:#b94300;font-weight:700}.ds-seg .ds-on{background:#fff;box-shadow:0 1px 3px rgba(63,42,22,0.12);font-weight:600}.ds-seg button:focus-visible{outline:2px solid #b94300;outline-offset:-2px}"
+    },
+    {
+      "name": "Composer with Your stuff",
+      "kind": "input",
+      "refersTo": "composer",
+      "description": "The floating capsule and the round button that opens Your stuff.",
+      "html": "<div class=\"ds-cap\"><button class=\"ds-stuff\" aria-label=\"Your stuff\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"2\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"2\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"2\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"2\"/></svg></button><label class=\"ds-comp\"><input placeholder=\"Ask Clem…\"><button class=\"ds-send\" aria-label=\"Send\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 19V5M5 12l7-7 7 7\"/></svg></button></label></div>",
+      "css": ".ds-cap{display:flex;align-items:flex-end;gap:8px;max-width:380px;padding:16px;background:#faf7f2;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-stuff{display:grid;place-items:center;flex:none;width:52px;height:52px;border:0;border-radius:50%;background:#fff;color:#1f1b16;box-shadow:0 1px 2px rgba(63,42,22,0.08),0 8px 24px rgba(63,42,22,0.1);transition:transform 140ms cubic-bezier(0.22,1,0.36,1)}.ds-stuff svg{width:22px;height:22px}.ds-stuff:active{transform:scale(0.93)}.ds-stuff:focus-visible{outline:2px solid #b94300;outline-offset:2px}.ds-comp{display:flex;align-items:center;flex:1;min-height:52px;padding:4px 4px 4px 18px;border-radius:26px;background:#fff;box-shadow:0 1px 2px rgba(63,42,22,0.08),0 8px 24px rgba(63,42,22,0.1)}.ds-comp input{flex:1;min-width:0;border:0;background:none;font-size:1rem;color:#1f1b16;caret-color:#b94300;outline:none}.ds-comp input::placeholder{color:#5c564b}.ds-comp:focus-within{outline:2px solid #b94300;outline-offset:2px}.ds-send{display:grid;place-items:center;width:44px;height:44px;border:0;border-radius:50%;background:#f26419;color:#1f1b16}.ds-send svg{width:20px;height:20px}.ds-send:active{background:#de5a12}"
+    },
+    {
+      "name": "Status Chip",
+      "kind": "chip",
+      "refersTo": "status-chip",
+      "description": "Automation state: neutral, on (leaf), needs you (tint + ink orange).",
+      "html": "<span class=\"ds-chip\">Off</span> <span class=\"ds-chip ds-ok\">On</span> <span class=\"ds-chip ds-need\">Needs you</span>",
+      "css": ".ds-chip{display:inline-block;padding:3px 8px;border-radius:999px;background:#f4f0e9;color:#5c564b;font:750 0.75rem/1.35 -apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-ok{background:rgba(46,125,70,0.1);color:#2e7d46}.ds-need{background:#fff4ed;color:#b94300}"
+    },
+    {
+      "name": "Clem's Lead",
+      "kind": "custom",
+      "refersTo": "clem-avatar",
+      "description": "Large title, avatar with the working ring, greeting, headline, live status line.",
+      "html": "<div class=\"ds-lead\"><div class=\"ds-row1\"><h1>Clem</h1><span class=\"ds-av ds-work\"></span></div><p class=\"ds-greet\">Still up, Nate</p><h2 class=\"ds-head\">17 things need you</h2><p class=\"ds-status\"><i></i>Drafting the standup email</p></div>",
+      "css": ".ds-lead{max-width:360px;padding:16px;background:#faf7f2;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif}.ds-row1{display:flex;justify-content:space-between;align-items:center}.ds-row1 h1{margin:0;font:700 2.125rem/1.12 ui-rounded,-apple-system,sans-serif;letter-spacing:-0.02em;color:#1f1b16}.ds-av{position:relative;width:46px;height:46px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(63,42,22,0.1),0 4px 14px rgba(63,42,22,0.08)}.ds-work::before{content:\"\";position:absolute;inset:-4px;border-radius:50%;border:2px solid #f26419;animation:ds-breathe 2.2s ease-in-out infinite}@keyframes ds-breathe{0%,100%{opacity:.35;transform:scale(.97)}50%{opacity:1;transform:scale(1.03)}}.ds-greet{margin:2px 0 0;font-size:0.9375rem;color:#5c564b}.ds-head{margin:0;font:700 1.375rem/1.22 ui-rounded,-apple-system,sans-serif;letter-spacing:-0.015em;color:#b94300}.ds-status{display:flex;align-items:center;gap:8px;margin:8px 0 0;font-size:0.875rem;font-weight:500;color:#1f1b16}.ds-status i{width:7px;height:7px;border-radius:50%;background:#f26419;animation:ds-pulse 1.4s ease-in-out infinite}@keyframes ds-pulse{0%,100%{box-shadow:0 0 0 0 rgba(242,100,25,.18)}50%{box-shadow:0 0 0 5px rgba(242,100,25,.18)}}@media (prefers-reduced-motion:reduce){.ds-work::before,.ds-status i{animation:none}}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Apple's own apps, in Clementine's colours",
+    "overview": "The phone has one screen, and it belongs to Clem. It opens with a large \"Clem\" title, her pixel dog avatar, one greeting line, one headline about where things stand, an always-on status line, and then grouped white cards for the conversation waiting on you and the cards that need an answer. Every other place (Chats, Inbox, Spaces, Automations, Work, Tasks & results, Agents, Memory, Apps & devices, Recents) lives in the **Your stuff** sheet. The sheet rises from the round button left of the composer, and each place pushes in with a back link that reads \"‹ Clem\". The phone has no tab bar and no dashboard of equal tiles.\n\nThe structure is iOS played straight: large titles, inset grouped lists with inset hairlines, a bottom sheet with a grabber and a Done link, a segmented control, chevrons on rows that push, and 44px touch targets. The materials are Clementine's own: a cream canvas, white cards drawn by one warm hairline, a warm-brown ink ramp, and warm translucent fills where iOS would use gray. Clementine orange is scarce on purpose. You see it only where something needs you or where Clem is alive.\n\nThe density is calm. Each screen gets one large title, section heads are short sentence-case phrases, and secondary text drops to the muted ink, never to a second hue. The phone is always light.",
+    "keyCharacteristics": [
+      "One Clem screen. Every other place sits in the Your stuff sheet and pushes with \"‹ Clem\".",
+      "Large titles, inset grouped white cards, inset hairlines, a bottom sheet.",
+      "Cream canvas (#faf7f2), white cards, one warm hairline instead of a shadow.",
+      "Clementine fills carry the ink label, never white. Orange you read is the deeper ink orange.",
+      "Orange marks only \"needs you\" or \"Clem is alive\".",
+      "100% light. There is no dark phone."
+    ],
+    "rules": [
+      {
+        "name": "The Two-Role Orange Rule",
+        "body": "Clementine (#f26419) fills things and #b94300 colours words. A filled clementine control always carries the warm-ink label (#1f1b16), never white. Orange text is always the ink orange.",
+        "section": "colors"
+      },
+      {
+        "name": "The Needs-You-Or-Alive Rule",
+        "body": "Orange appears only on what needs the owner (the headline, the acting answer, \"Waiting on your answer\", the Inbox tile and badge, the Needs-you chip and count) and on Clem being alive (the live dot, the breathing ring, the running pulse). Links and the back button use the ink orange because they are iOS's tint colour. That is the one other place orange text appears.",
+        "section": "colors"
+      },
+      {
+        "name": "The Always Light Rule",
+        "body": "The phone is 100% light by standing owner directive. Nothing on this surface reads a dark theme.",
+        "section": "colors"
+      },
+      {
+        "name": "The Sentence-Case Rule",
+        "body": "Section heads and group labels are short sentence-case phrases (\"Waiting on your OK · 2\"). They never use uppercase tracking or a label that sits above the title.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Time Rule",
+        "body": "Elapsed times and counts that update in place use tabular numerals so they don't jitter.",
+        "section": "typography"
+      },
+      {
+        "name": "The One Warm Hairline Rule",
+        "body": "A card on the canvas is drawn by one warm ring. It has no border plus shadow, no gray shadow, and no lift at rest. Every shadow is tinted with the warm brown (63, 42, 22).",
+        "section": "elevation"
+      },
+      {
+        "name": "The Only-Floaters-Lift Rule",
+        "body": "A real shadow means the thing floats over content you can still see. Cards never get one.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** put every new place in the Your stuff sheet and push it with \"‹ Clem\". Clem's screen stays the only root.",
+      "**Do** draw cards as white on the Cream Canvas with the Card Edge ring (`0 0 0 1px rgba(63, 42, 22, 0.08)`) and inset 0.5px hairlines between rows.",
+      "**Do** label every clementine fill with warm ink (#1f1b16), and press it to Clementine Press.",
+      "**Do** colour words orange only with Clementine Ink (#b94300), and only for links, the back and Done links, and what needs you.",
+      "**Do** use the gutter `calc(16px + env(safe-area-inset-*))` on any edge that can meet a system rail or notch.",
+      "**Do** keep every tap target at least 44px, and give pushing rows a quiet chevron.",
+      "**Do** use the warm translucent Fill Quiet for quiet buttons, tracks, and fields, and Pressed Cream for pressed and current rows.",
+      "**Do** draw state marks as SVG strokes (the check and cross glyphs), sized to 1em.",
+      "**Do** let motion arrive and settle (`cubic-bezier(0.22, 1, 0.36, 1)`, 180ms default, 300ms ceiling except the sheet's rise). Press with scale 0.97, and fall back to opacity or none under reduced motion."
+    ],
+    "donts": [
+      "**Don't** add a tab bar, a second root screen, or a dashboard of equal tiles.",
+      "**Don't** put white text on clementine, or set any text in #f26419.",
+      "**Don't** spend orange on decoration, categories, or brand flourishes. It means \"needs you\" or \"Clem is alive\".",
+      "**Don't** introduce a dark theme or dark surfaces on the phone.",
+      "**Don't** use gray: no cool-gray fills, neutral shadows, or blue system tint. Every neutral is warm.",
+      "**Don't** give resting cards a drop shadow, or stack a border and a shadow on the same card.",
+      "**Don't** set section heads in uppercase tracking or put a small label above a title.",
+      "**Don't** use text characters (✓, ✕, →) as state icons.",
+      "**Don't** set text lighter than Subtle Ink (#75644f). Quiet Mark is for chevrons, grabbers, and idle dots only."
+    ]
+  }
+}
