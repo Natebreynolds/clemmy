@@ -42,6 +42,7 @@ import { readWorkflow } from '../memory/workflow-store.js';
 import { classifyNotification, type LiveReferents } from '../runtime/notification-intent.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
 import { withWorkflowName, workflowDisplayName } from '../shared/workflow-display-name.js';
+import { isEmptyHistoryNotice } from '../runtime/notice-presentation.js';
 
 /** A run in one of these is stopped until a person acts. */
 const STOPPED_RUN_STATUSES: ReadonlySet<string> = new Set([
@@ -673,7 +674,7 @@ export async function summarizeNeedsYou(
   const notificationKeys = new Set<string>();
   const noticedWorkflows = new Set<string>();
   for (const notification of loadNotifications()) {
-    if (notification.read || notification.silent || notification.metadata?.heartbeat === true) continue;
+    if (notification.read || notification.silent || notification.metadata?.heartbeat === true || isEmptyHistoryNotice(notification)) continue;
     // A hidden ask is still an ask, not newly unread news or completed work.
     if (notificationAttentionHidden(notification, ref)) continue;
     if (!notificationNeedsYou(notification, ref)) {

@@ -1530,7 +1530,7 @@ function annotateDueExecutionsAsPolicyPaused(
 // learns "you were down for X minutes and missed Y scheduled runs"
 // instead of finding out hours later that the morning briefing never
 // arrived.
-function reportMissedCronRunsOnBoot(state: DaemonState): void {
+export function reportMissedCronRunsOnBoot(state: Pick<DaemonState, 'lastHealthyTickAt'>): void {
   if (!state.lastHealthyTickAt) return;
   const lastAt = Date.parse(state.lastHealthyTickAt);
   if (!Number.isFinite(lastAt)) return;
@@ -1553,26 +1553,18 @@ function reportMissedCronRunsOnBoot(state: DaemonState): void {
       }
     }
   }
+  // A closed stretch with nothing due is not news: the notice said so in its
+  // own body, and one per restart filled Updates.
+  if (missed.length === 0) return;
   const gapMinutes = Math.round(gapMs / 60_000);
   const id = `system-daemon-offline-${state.lastHealthyTickAt}`;
-  if (missed.length === 0) {
-    addNotification({
-      id,
-      kind: 'system',
-      title: `Clementine was offline for ${gapMinutes} min`,
-      body: `Daemon was down from ${state.lastHealthyTickAt} until ${new Date(now).toISOString()}. No scheduled cron runs were due during the outage.`,
-      createdAt: new Date().toISOString(),
-      read: false,
-      metadata: { errorCategory: 'daemon_offline', gapMinutes, missedCount: 0 },
-    });
-    return;
-  }
-  const list = missed.slice(0, 10).map((m) => `• ${m.job} @ ${m.at}`).join('\n');
+  const when = (iso: string) => new Date(`${iso}:00Z`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const list = missed.slice(0, 10).map((m) => `• ${m.job} at ${when(m.at)}`).join('\n');
   addNotification({
     id,
     kind: 'system',
-    title: `${missed.length} scheduled cron run${missed.length === 1 ? '' : 's'} missed (daemon was offline ${gapMinutes} min)`,
-    body: `These scheduled runs did NOT fire while Clementine was down:\n${list}${missed.length > 10 ? `\n(+${missed.length - 10} more)` : ''}\n\nIf any are critical, re-trigger from Console → Crons.`,
+    title: `${missed.length} scheduled task${missed.length === 1 ? '' : 's'} didn't run while Clementine was closed`,
+    body: `These were due while Clementine was closed for ${gapMinutes} min:\n${list}${missed.length > 10 ? `\n(and ${missed.length - 10} more)` : ''}\n\nRun any you still need from Automations.`,
     createdAt: new Date().toISOString(),
     read: false,
     metadata: { errorCategory: 'daemon_offline', gapMinutes, missedCount: missed.length, missed: missed.slice(0, 50) },

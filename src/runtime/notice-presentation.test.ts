@@ -10,7 +10,7 @@ mkdirSync(path.join(TMP_HOME, 'state'), { recursive: true });
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { noticeListFields } = await import('./notice-presentation.js');
+const { isEmptyHistoryNotice, noticeListFields } = await import('./notice-presentation.js');
 const { closeEventLog } = await import('./harness/eventlog.js');
 test.after(() => { try { closeEventLog(); } catch { /* best effort */ } rmSync(TMP_HOME, { recursive: true, force: true }); });
 
@@ -22,4 +22,10 @@ test('a workflow notice reads the workflow by its name, not its slug', () => {
   assert.deepEqual(noticeListFields({ kind: 'system', title: 'Paused "daily-standup-email" after repeated restarts', body: '',
     metadata: { workflow: 'daily-standup-email' } }), { title: 'Paused "Daily Standup Email" after repeated restarts' });
   assert.deepEqual(noticeListFields({ kind: 'workflow', title: 'Finished: Daily brief', body: '', metadata: {} }), {}, 'unchanged rows add nothing');
+});
+
+test('an offline notice with nothing missed is history the lists leave out; one that missed work is kept', () => {
+  assert.equal(isEmptyHistoryNotice({ kind: 'system', metadata: { errorCategory: 'daemon_offline', gapMinutes: 8, missedCount: 0 } }), true);
+  assert.equal(isEmptyHistoryNotice({ kind: 'system', metadata: { errorCategory: 'daemon_offline', gapMinutes: 80, missedCount: 2 } }), false);
+  assert.equal(isEmptyHistoryNotice({ kind: 'workflow', metadata: {} }), false);
 });

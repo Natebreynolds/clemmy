@@ -112,7 +112,7 @@ import {
   type NotificationRecord,
 } from '../runtime/notifications.js';
 import type { ApprovalNoticeOutcome } from '../runtime/approval-notice-presentation.js';
-import { noticeListFields } from '../runtime/notice-presentation.js';
+import { isEmptyHistoryNotice, noticeListFields } from '../runtime/notice-presentation.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
 import { relayClientIp } from '../runtime/mobile-ingress.js';
@@ -722,7 +722,7 @@ function mobileInboxNotifications(limit = 200, ref: NeedsYouReferents = needsYou
   // set before applying the mobile page limit; otherwise silent heartbeats at
   // the front can crowd real Inbox rows out and make list/summary disagree.
   const rows = loadNotifications()
-    .filter((row) => !row.silent && row.metadata?.heartbeat !== true)
+    .filter((row) => !row.silent && row.metadata?.heartbeat !== true && !isEmptyHistoryNotice(row))
     .filter((row) => !notificationAttentionHidden(row, ref))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const actionable = rows.filter((row) => !row.read && notificationNeedsYou(row, ref));

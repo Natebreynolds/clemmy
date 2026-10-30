@@ -42,6 +42,7 @@ const {
 const {
   _setNotificationDeliveryForTests,
   processNotificationDeliveries,
+  reportMissedCronRunsOnBoot,
 } = await import('./runner.js');
 
 test.after(() => {
@@ -1301,4 +1302,14 @@ test('a delivered approval is refreshed without another push, while a distinct a
     _setNotificationDeliveryForTests(null);
     removeNotificationDestination(destination.id);
   }
+});
+
+test('a closed stretch with nothing due writes no notice', () => {
+  // Live 2026-10-30: one "Clementine was offline for N min · No scheduled cron
+  // runs were due" per restart, 35 of them in Updates.
+  const lastHealthyTickAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  const before = listNotifications(1_000).length;
+  reportMissedCronRunsOnBoot({ lastHealthyTickAt });
+  assert.equal(getNotification(`system-daemon-offline-${lastHealthyTickAt}`), undefined);
+  assert.equal(listNotifications(1_000).length, before);
 });

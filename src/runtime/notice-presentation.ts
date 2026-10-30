@@ -15,3 +15,10 @@ export function noticeListFields(
   const named = withWorkflowName(withWorkflowName(base, row.metadata?.workflowSlug), row.metadata?.workflow);
   return named === row.title ? approval : { ...approval, title: named };
 }
+
+/** A notice that reports that nothing happened: Clementine was closed for a
+ *  while and nothing was due. Lists and counts leave it out; the boot no
+ *  longer writes one (live 2026-10-30: 35 of them filled Updates). */
+export function isEmptyHistoryNotice(row: Pick<NotificationRecord, 'kind' | 'metadata'>): boolean {
+  return row.kind === 'system' && row.metadata?.errorCategory === 'daemon_offline' && row.metadata?.missedCount === 0;
+}
