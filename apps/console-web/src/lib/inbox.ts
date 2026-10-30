@@ -76,6 +76,9 @@ export interface NotificationRow {
   deliveredAt?: string;
   deliveryAttempts?: number;
   deliveryError?: string;
+  /** An approval row's outcome, from the daemon (runtime/approval-notice-presentation.ts). */
+  approvalOutcome?: 'waiting' | 'approved' | 'declined' | 'expired' | 'withdrawn' | 'closed';
+  approvalOutcomeLabel?: string;
   needsAttention?: boolean;
   /** Server-owned grouping identity (dashboard/needs-you.ts): a workflow
    *  blocked five times is one row; a carrier for an approval is that approval. */
@@ -477,14 +480,30 @@ export function statusTone(status?: string): { tone: Tone; label: string } {
  *  A delivery that went through is the normal case, not news: the pill says
  *  what kind of update it is, and only a failed delivery stands out. */
 export function notifTone(n: NotificationRow): { tone: Tone; label: string } {
+  const kind = (n.kind ?? '').toLowerCase();
+  // An approval row says what became of the approval. A push that did not
+  // reach a device is not the approval failing, and "Handled" only meant the
+  // row had been opened.
+  if (kind === 'approval') return approvalNoticeTone(n);
   if (notifFailed(n)) return { tone: 'danger', label: 'Failed' };
   // The same words the phone uses for the same kinds; never an engine name.
-  const kind = (n.kind ?? '').toLowerCase();
-  if (kind === 'approval') return { tone: 'warning', label: n.read ? 'Handled' : 'Approval' };
   if (kind === 'workflow') return { tone: 'neutral', label: 'Flow' };
   if (kind === 'cron') return { tone: 'neutral', label: 'Scheduled update' };
   if (kind === 'execution') return { tone: 'neutral', label: 'Work update' };
   return { tone: 'neutral', label: 'Update' };
+}
+
+function approvalNoticeTone(n: NotificationRow): { tone: Tone; label: string } {
+  const label = n.approvalOutcomeLabel;
+  switch (n.approvalOutcome) {
+    case 'waiting': return { tone: 'warning', label: 'Needs your OK' };
+    case 'approved': return { tone: 'success', label: label ?? 'Approved' };
+    case 'declined':
+    case 'expired':
+    case 'withdrawn':
+    case 'closed': return { tone: 'neutral', label: label ?? 'Closed' };
+    default: return { tone: 'warning', label: 'Approval' };
+  }
 }
 
 /** A notification whose delivery to an external destination failed. */

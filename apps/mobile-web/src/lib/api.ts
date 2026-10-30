@@ -508,6 +508,9 @@ export interface InboxNotification {
   body: string;
   createdAt: string;
   read: boolean;
+  /** An approval row's outcome, from the daemon (runtime/approval-notice-presentation.ts). */
+  approvalOutcome?: 'waiting' | 'approved' | 'declined' | 'expired' | 'withdrawn' | 'closed';
+  approvalOutcomeLabel?: string;
   needsAttention: boolean;
   /** Server-owned grouping identity (dashboard/needs-you.ts). Older daemons
    *  omit it; the row then stands alone. */

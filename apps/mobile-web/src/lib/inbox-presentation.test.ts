@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyLocalReads,
+  notificationLabel,
   approvalDetails,
   approvalCardReview,
   approvalKindLabel,
@@ -452,4 +453,12 @@ test('a calendar change reads its time as one When line in its own zone, and any
     { label: 'End datetime', value: '2026-10-30T13:45:00' },
   ]) as never);
   assert.deepEqual(odd.details.map((d) => d.label), ['Start datetime', 'End datetime'], 'never a guessed time');
+});
+
+test('an approval update says what became of the approval, not that it was opened', () => {
+  const base = { kind: 'approval' as const, needsAttention: false, read: true };
+  assert.equal(notificationLabel({ ...base, approvalOutcome: 'approved', approvalOutcomeLabel: 'Approved' }), 'Approved');
+  assert.equal(notificationLabel({ ...base, approvalOutcome: 'declined', approvalOutcomeLabel: 'Declined' }), 'Declined');
+  assert.equal(notificationLabel({ ...base, approvalOutcome: 'waiting', approvalOutcomeLabel: 'Waiting on your OK' }), 'Needs your OK');
+  assert.equal(notificationLabel(base), 'Approval', 'an older daemon without the outcome keeps a neutral word');
 });

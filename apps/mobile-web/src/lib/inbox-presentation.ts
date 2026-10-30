@@ -278,12 +278,13 @@ export function needsYouCardLabel(row: Pick<InboxNotification, 'needsYouKey'>): 
   return 'Update · needs you';
 }
 
-export function notificationLabel(row: Pick<InboxNotification, 'kind' | 'needsAttention' | 'read'>): string {
+export function notificationLabel(row: Pick<InboxNotification, 'kind' | 'needsAttention' | 'read' | 'approvalOutcome' | 'approvalOutcomeLabel'>): string {
   if (row.needsAttention && !row.read) return 'Clem needs you';
   switch (row.kind) {
     case 'workflow': return 'Flow';
     case 'cron': return 'Scheduled update';
-    case 'approval': return row.read ? 'Handled' : 'Approval';
+    // What became of the approval, from the daemon; "Handled" only meant opened.
+    case 'approval': return row.approvalOutcome === 'waiting' ? 'Needs your OK' : row.approvalOutcomeLabel ?? 'Approval';
     case 'execution': return 'Work update';
     default: return 'Update';
   }

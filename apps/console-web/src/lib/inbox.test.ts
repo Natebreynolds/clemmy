@@ -6,6 +6,7 @@ import {
   approvalDecisionSuccessText,
   collapseAttentionRows,
   notificationRunHref,
+  notifTone,
   summarizeApprovalDecisionBatch,
   trustProposalScopeExpectation,
   type NotificationRow,
@@ -179,4 +180,16 @@ test('an approval the server recorded as rejected or already decided never reads
   assert.match(approvalDecisionSuccessText(row, 'approve', { ok: true, status: 'rejected' }), /could not be approved/);
   assert.match(approvalDecisionSuccessText(row, 'approve', { ok: true, status: 'already_resolved' }), /already decided/);
   assert.equal(approvalDecisionSuccessText(row, 'approve', { ok: true }), 'Approved.');
+});
+
+test('an approval row is tagged by what became of the approval, never by its push delivery', () => {
+  // Live 2026-10-30: 26 answered approvals read "Failed" because a push had not
+  // reached a device, and 23 read "Handled" because the row had been opened.
+  const answered: NotificationRow = { id: 'approval-apr-1', kind: 'approval', title: 'Approved: Delete Outlook calendar event',
+    read: true, deliveryError: 'push destination rejected', approvalOutcome: 'approved', approvalOutcomeLabel: 'Approved' };
+  assert.deepEqual(notifTone(answered), { tone: 'success', label: 'Approved' });
+  assert.deepEqual(notifTone({ ...answered, approvalOutcome: 'declined', approvalOutcomeLabel: 'Declined' }), { tone: 'neutral', label: 'Declined' });
+  assert.deepEqual(notifTone({ ...answered, read: false, approvalOutcome: 'waiting', approvalOutcomeLabel: 'Waiting on your OK' }), { tone: 'warning', label: 'Needs your OK' });
+  assert.deepEqual(notifTone({ id: 'n', kind: 'workflow', deliveryError: 'push destination rejected' }), { tone: 'danger', label: 'Failed' },
+    'a report that did not reach its destination still says so');
 });

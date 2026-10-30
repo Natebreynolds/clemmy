@@ -111,6 +111,7 @@ import {
   upsertWebPushDestination,
   type NotificationRecord,
 } from '../runtime/notifications.js';
+import { approvalNoticeFields, type ApprovalNoticeOutcome } from '../runtime/approval-notice-presentation.js';
 import { getVapidPublicKey } from '../runtime/web-push-keys.js';
 import { deviceKeyRequired } from '../runtime/mobile-device-policy.js';
 import { relayClientIp } from '../runtime/mobile-ingress.js';
@@ -615,6 +616,9 @@ interface MobileInboxNotification {
   body: string;
   createdAt: string;
   read: boolean;
+  /** An approval row's outcome, in words (runtime/approval-notice-presentation.ts). */
+  approvalOutcome?: ApprovalNoticeOutcome;
+  approvalOutcomeLabel?: string;
   needsAttention: boolean;
   /** Server-owned grouping identity (dashboard/needs-you.ts `needsYouKey`). */
   needsYouKey: string;
@@ -678,6 +682,7 @@ function serializeInboxNotificationForMobile(row: NotificationRecord, ref: Needs
     body: row.body,
     createdAt: row.createdAt,
     read: row.read,
+    ...approvalNoticeFields(row),
     // The one definition every surface counts by (dashboard/needs-you.ts),
     // and the identity to group by — a workflow blocked five times is one row.
     needsAttention: notificationNeedsYou(row, ref),
