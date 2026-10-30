@@ -169,6 +169,7 @@ import {
 } from '../execution/background-tasks.js';
 import { saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
+import { approvalNoticeFields } from '../runtime/approval-notice-presentation.js';
 
 const logger = pino({ name: 'clementine-next.webhook' });
 const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
@@ -671,7 +672,12 @@ function effectiveHarnessStatus(
   // running while the expiry event is fresh.
   if (terminal?.type === 'approval_resolved' && eventRecord(terminal.data).decision === 'expired') return 'idle';
   if (terminal?.type === 'run_paused') return 'awaiting_approval';
-  if (terminal?.type === 'conversation_completed' || terminal?.type === 'run_completed') return 'completed';
+  if (terminal?.type === 'conversation_completed' || terminal?.type === 'run_completed') {
+    // A reply that ends by asking for the owner's go-ahead finishes the turn,
+    // not the work: while that approval is still open the work waits on them.
+    // "Done" here read as if the change had already been made.
+    return approvalStillOpenAt(events, terminal) ? 'awaiting_approval' : 'completed';
+  }
   if (attempt?.status === 'active') return 'running';
   if (attempt?.status === 'completed') return 'completed';
   if (attempt?.status === 'interrupted' || attempt?.status === 'superseded') return 'idle';
@@ -682,6 +688,23 @@ function effectiveHarnessStatus(
     return 'running';
   }
   return session.status;
+}
+
+/** An approval this turn asked for, before it completed, that is still
+ *  pending in the registry (not resolved, expired or withdrawn). */
+function approvalStillOpenAt(events: HarnessEventRow[], completion: HarnessEventRow): boolean {
+  const resolved = new Set<string>();
+  for (const event of events) {
+    const id = event.type === 'approval_resolved' ? eventRecord(event.data).approvalId : undefined;
+    if (typeof id === 'string') resolved.add(id);
+  }
+  for (const event of events) {
+    if (event.type !== 'approval_requested' || event.seq > completion.seq) continue;
+    const id = eventRecord(event.data).approvalId;
+    if (typeof id !== 'string' || resolved.has(id)) continue;
+    if (approvalRegistry.get(id)?.status === 'pending') return true;
+  }
+  return false;
 }
 
 function computeHarnessSessionActivityRun(session: HarnessSessionRow, latestSeq: number) {
@@ -1865,6 +1888,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     res.json({
       notifications: prioritized.map((notification) => ({
         ...notification,
+        ...approvalNoticeFields(notification),
         needsAttention: notificationNeedsYou(notification, ref),
         needsYouKey: needsYouKey(notification, ref),
         lifecycle: notificationNeedsYou(notification, ref) ? attentionLifecycleForKey(needsYouKey(notification, ref), ref) : undefined,

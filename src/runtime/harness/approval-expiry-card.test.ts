@@ -171,3 +171,21 @@ test('an answered approval still leaves no card on reopen and no expiry mark', (
   const detail = getUnifiedSessionDetail(`harness:${session.id}`);
   assert.equal(detail!.turns.filter((turn) => turn.approval).length, 0, 'an answered card renders nothing on reopen');
 });
+
+test('a reply that ends by asking for approval reads as waiting while that approval is open, and done once it is answered', async () => {
+  const { __test__: activity } = await import('../../channels/webhook.js');
+  const { getSession } = await import('./eventlog.js');
+  // Live 2026-10-30: the phone listed "Can you move the team meeting…" as
+  // "Done · 3m ago" while its calendar change still waited on the owner.
+  const session = createSession({ kind: 'chat', channel: 'desktop', title: 'Move the meeting' });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'move the team meeting to 1pm' } });
+  const row = reg.register({ sessionId: session.id, subject: 'Move the team meeting', tool: 'work_call', ttlMs: 24 * 60 * 60_000 });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'approval_requested', data: { approvalId: row.approvalId, subject: 'Move the team meeting' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'conversation_completed', data: { reply: 'Can I move it to 1:00 PM?' } });
+
+  assert.equal(activity.effectiveHarnessStatus(getSession(session.id)!, listEvents(session.id), null), 'awaiting_approval');
+
+  reg.resolve(row.approvalId, 'approved', 'test');
+  assert.equal(activity.effectiveHarnessStatus(getSession(session.id)!, listEvents(session.id), null), 'completed',
+    'an answered approval leaves the reply as the end of the work');
+});
