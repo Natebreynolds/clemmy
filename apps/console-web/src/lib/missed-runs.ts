@@ -22,11 +22,15 @@ export const dismissMissedRuns = (noticeId: string) =>
 export const startWorkflowRun = (workflow: string) =>
   apiPost<{ id?: string; queued?: boolean }>(`/api/console/workflows/${encodeURIComponent(workflow)}/run`, {});
 
-const MOVING = new Set(['queued', 'pending', 'running']);
+/** Where a run ends. Anything else (queued, running, finalizing…) is still going. */
+const FINISHED = new Set(['completed', 'completed_with_errors', 'blocked', 'error', 'failed', 'cancelled', 'stopped', 'dry_run', 'creation_test']);
+/** A run stopped to wait on the owner. */
+const ASKING = new Set(['parked', 'awaiting_input', 'awaiting_approval', 'needs_input']);
 
 /** Whether a started run is still moving, so the card keeps watching it. */
 export function missedRunInMotion(item: MissedRun): boolean {
-  return item.decision?.action === 'run' && MOVING.has(item.run?.status ?? 'queued');
+  const status = item.run?.status ?? 'queued';
+  return item.decision?.action === 'run' && !FINISHED.has(status) && !ASKING.has(status);
 }
 
 /** Where one item stands, in words, with a tone for its colour. */
@@ -34,14 +38,17 @@ export function missedRunState(item: MissedRun): { tone: 'muted' | 'working' | '
   if (!item.decision) return null;
   if (item.decision.action === 'skip') return { tone: 'muted', text: 'Skipped' };
   const run = item.run;
-  switch (run?.status) {
-    case undefined: case 'queued': case 'pending': return { tone: 'working', text: 'Starting…' };
-    case 'running': return { tone: 'working', text: run.stepsTotal ? `Running · step ${Math.min((run.stepsCompleted ?? 0) + 1, run.stepsTotal)} of ${run.stepsTotal}` : 'Running' };
-    case 'completed': return { tone: 'done', text: 'Done' };
-    case 'parked': case 'awaiting_input': case 'awaiting_approval': return { tone: 'ask', text: 'Needs you' };
-    case 'cancelled': case 'stopped': return { tone: 'muted', text: 'Stopped' };
-    default: return { tone: 'fail', text: 'Didn’t finish' };
+  const status = run?.status ?? 'queued';
+  if (ASKING.has(status)) return { tone: 'ask', text: 'Needs you' };
+  if (!FINISHED.has(status)) {
+    if (status === 'running' && run?.stepsTotal) return { tone: 'working', text: `Running · step ${Math.min((run.stepsCompleted ?? 0) + 1, run.stepsTotal)} of ${run.stepsTotal}` };
+    if (status === 'running') return { tone: 'working', text: 'Running' };
+    if (status === 'finalizing') return { tone: 'working', text: 'Finishing…' };
+    return { tone: 'working', text: 'Starting…' };
   }
+  if (status === 'completed') return { tone: 'done', text: 'Done' };
+  if (status === 'cancelled' || status === 'stopped') return { tone: 'muted', text: 'Stopped' };
+  return { tone: 'fail', text: 'Didn’t finish' };
 }
 
 /** "4:00 PM" today, else "Tuesday 4:00 PM". */

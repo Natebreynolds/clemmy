@@ -17,6 +17,10 @@ test('each missed run says where it stands, and only a moving one is watched clo
   assert.equal(missedRunInMotion(run('running')), true);
   assert.equal(missedRunInMotion(run('completed')), false);
   assert.equal(missedRunInMotion(run('awaiting_input')), false);
+  assert.deepEqual(missedRunState(run('finalizing', 1, 1)), { tone: 'working', text: 'Finishing…' }, 'between the last step and done is still going');
+  assert.equal(missedRunInMotion(run('finalizing', 1, 1)), true);
+  assert.equal(missedRunState(run('completed_with_errors'))?.tone, 'fail');
+  assert.equal(missedRunInMotion(run('completed_with_errors')), false);
   assert.equal(missedRunInMotion(base), false);
   assert.match(dueWords('2026-10-29T23:00:00.000Z', new Date('2026-10-29T23:30:00.000Z')), /^\d{1,2}:00 [AP]M$/);
   assert.match(dueWords('2026-10-27T23:00:00.000Z', new Date('2026-10-29T23:30:00.000Z')), /^[A-Z][a-z]+day \d{1,2}:00 [AP]M$/);
