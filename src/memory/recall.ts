@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import matter from 'gray-matter';
 import pino from 'pino';
 import { openMemoryDb } from './db.js';
@@ -35,8 +36,8 @@ const RERANK_CANDIDATE_POOL = 40;
 /** Reciprocal Rank Fusion constant. 60 is the standard from the IR
  *  literature; small changes here barely move ordering. */
 const RRF_K = 60;
-/** Bound pure-vector fallback scans so personal vaults stay snappy. */
-const SEMANTIC_FALLBACK_MAX_SCAN = 5000;
+/** Bound each database read and yield between reads; note age is not a filter. */
+const SEMANTIC_SCAN_BATCH_SIZE = 128;
 
 // Tier D2 — lightweight recall hit-rate telemetry. In-memory, process-local
 // (resets on restart) — enough for the dashboard "are recalls finding
@@ -488,45 +489,86 @@ function rowsToHits(rows: RecallChunkRow[]): MemorySearchHit[] {
   });
 }
 
-/** One bounded independent dense arm. The query's actual producer determines
- * which rows may participate, even when a request was rescued by a fallback. */
-function semanticCandidates(binding: EmbeddedQuery, options: RecallOptions, lexical: RecallChunkRow[]): Array<{ row: RecallChunkRow; sim: number }> {
+/** Exact independent dense arm over the eligible, stored corpus. The actual
+ * producer determines the vector space, including after provider rescue.
+ * A caller deadline may end the leg, but a recency window must not decide
+ * which notes can ever be found. No database cursor survives an async yield. */
+async function semanticCandidates(binding: EmbeddedQuery, options: RecallOptions, lexical: RecallChunkRow[]): Promise<Array<{ row: RecallChunkRow; sim: number }>> {
   const expired = () => options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs;
   if (expired()) return [];
   const db = openMemoryDb();
-  const select = `SELECT vc.id, vc.path, vc.title, vc.content, vc.mtime, e.vector
-    FROM embeddings e JOIN vault_chunks vc ON vc.id = e.chunk_id
-    WHERE e.model = ? AND e.dim = ? AND length(e.vector) = ?`;
-  const params: unknown[] = [binding.model, binding.dim, binding.dim * Float32Array.BYTES_PER_ELEMENT];
+  const columns = 'vc.id, vc.path, vc.title, vc.content, vc.mtime, e.vector';
+  const from = `FROM embeddings e JOIN vault_chunks vc ON vc.id = e.chunk_id
+    WHERE e.model = ? AND e.dim = ?`;
+  const select = `SELECT ${columns} ${from} AND length(e.vector) = ?`;
+  const vectorBytes = binding.dim * Float32Array.BYTES_PER_ELEMENT;
+  const params: unknown[] = [binding.model, binding.dim, vectorBytes];
   const scope = options.pathPrefix ? ' AND vc.path LIKE ?' : '';
   if (options.pathPrefix) params.push(`${options.pathPrefix}%`);
   try {
     const snapshots = new Map(lexical.map(row => [row.id, row]));
+    // Fix an insertion horizon so ongoing indexing cannot extend this search
+    // indefinitely. New chunks participate in the next query.
+    const upperId = (db.prepare('SELECT COALESCE(MAX(chunk_id), 0) AS id FROM embeddings').get() as { id: number }).id;
     // Fetch the small lexical pool by primary key separately. An ORDER BY CASE
     // over the whole index would sort all vectors before applying the limit.
     const selected = lexical.length ? db.prepare(`${select}${scope} AND e.chunk_id IN (${lexical.map(() => '?').join(',')})`)
       .all(...params, ...lexical.map(row => row.id)) as SemanticChunkRow[] : [];
-    // Bound the index walk itself to the newest stored rows (any space), then
-    // admit only matching space/scope rows. This is a window, not a full ANN
-    // index: older semantic-only notes outside it remain a known limit.
-    const sql = `${select}${scope} AND e.chunk_id IN (
-      SELECT chunk_id FROM embeddings ORDER BY chunk_id DESC LIMIT ?)`;
-    const rows = db.prepare(sql).iterate(...params, SEMANTIC_FALLBACK_MAX_SCAN) as IterableIterator<SemanticChunkRow>;
-    const seen = new Set<number>();
-    const scored: Array<{ row: RecallChunkRow; sim: number }> = [];
-    for (const row of (function* () { yield* selected; yield* rows; })()) {
-      if (expired()) return [];
-      if (seen.has(row.id)) continue;
-      seen.add(row.id);
+    const selectedIds = new Set(selected.map(row => row.id));
+    const scored: Array<{ row: RecallChunkRow; sim: number; source: SemanticChunkRow }> = [];
+    const compare = (a: { sim: number; row: RecallChunkRow }, b: { sim: number; row: RecallChunkRow }) => b.sim - a.sim || a.row.id - b.row.id;
+    const consider = (row: SemanticChunkRow): void => {
       const before = snapshots.get(row.id);
       // Never score old selected bytes using a vector from a newer index row.
-      if (before && (before.content !== row.content || before.mtime !== row.mtime)) continue;
+      if (before && (before.content !== row.content || before.mtime !== row.mtime)) return;
+      if (row.vector.length !== vectorBytes) return;
       const vector = bufferToVector(row.vector);
-      if (!isUsableEmbeddingVector(vector, binding.dim)) continue;
+      if (!isUsableEmbeddingVector(vector, binding.dim)) return;
       const sim = cosine(binding.vector, vector);
-      if (Number.isFinite(sim) && sim > 0) scored.push({ row: before ?? { ...row, rank: 0, snip: row.content }, sim });
+      if (!Number.isFinite(sim) || sim <= 0) return;
+      const candidate = { row: before ?? { ...row, rank: 0, snip: row.content }, sim, source: row };
+      if (scored.length === RERANK_CANDIDATE_POOL && compare(candidate, scored[scored.length - 1]) >= 0) return;
+      scored.push(candidate);
+      scored.sort(compare);
+      if (scored.length > RERANK_CANDIDATE_POOL) scored.pop();
+    };
+    for (const row of selected) {
+      if (expired()) return [];
+      consider(row);
     }
-    return scored.sort((a, b) => b.sim - a.sim).slice(0, RERANK_CANDIDATE_POOL);
+    // The eligibility index restricts model/dimension before keyset traversal.
+    // Evaluate scope without filtering SQL rows before LIMIT: even a sparse
+    // subtree or malformed vectors must not turn one batch into a full scan.
+    // SQLite still owns LIKE semantics, just as in lexical/freshness reads.
+    const batchQuery = db.prepare(`SELECT ${columns}, ${options.pathPrefix ? 'vc.path LIKE ?' : '1'} AS in_scope ${from}
+      AND e.chunk_id > ? AND e.chunk_id <= ? ORDER BY e.chunk_id ASC LIMIT ?`);
+    const batchParams = [...(options.pathPrefix ? [`${options.pathPrefix}%`] : []), binding.model, binding.dim];
+    let cursor = 0;
+    while (cursor < upperId) {
+      if (expired()) return [];
+      const batch = batchQuery.all(...batchParams, cursor, upperId, SEMANTIC_SCAN_BATCH_SIZE) as Array<SemanticChunkRow & { in_scope: number }>;
+      for (const row of batch) {
+        if (expired()) return [];
+        if (row.in_scope && !selectedIds.has(row.id)) consider(row);
+      }
+      if (batch.length < SEMANTIC_SCAN_BATCH_SIZE) break;
+      cursor = batch[batch.length - 1].id;
+      await yieldToEventLoop();
+    }
+    if (expired() || scored.length === 0) return [];
+    // Indexing and re-embedding may run during a yield. A selected result may
+    // be published only if its source and vector still match the scored bytes.
+    const fresh = db.prepare(`${select}${scope} AND e.chunk_id IN (${scored.map(() => '?').join(',')})`)
+      .all(...params, ...scored.map(item => item.row.id)) as SemanticChunkRow[];
+    const current = new Map(fresh.map(row => [row.id, row]));
+    const valid = scored.filter(item => {
+      const row = current.get(item.row.id);
+      return row && row.path === item.source.path && row.title === item.source.title
+        && row.content === item.source.content && row.mtime === item.source.mtime
+        && row.vector.equals(item.source.vector);
+    });
+    if (expired()) return [];
+    return valid.map(({ row, sim }) => ({ row, sim }));
   } catch (err) {
     logger.warn({ err }, 'semantic candidate query failed'); return [];
   }
@@ -572,7 +614,7 @@ async function recallHybridImpl(query: string, options: RecallOptions = {}): Pro
   if (!isEmbeddingsEnabled() || !hasStoredSemanticCandidates(options)) return lexicalOnly();
   const binding = await embedQueryWithSpace(query, { priority: 'foreground', deadlineAtMs: options.deadlineAtMs });
   if (!binding) return lexicalOnly();
-  const dense = semanticCandidates(binding, options, candidates);
+  const dense = await semanticCandidates(binding, options, candidates);
   if (!dense.length) return lexicalOnly();
 
   const lexicalRanks = new Map(candidates.map((row, index) => [row.id, index + 1]));

@@ -2156,6 +2156,15 @@ const MIGRATIONS: ({ version: number; sql: string } | { version: number; run: (d
       }).immediate();
     },
   },
+  {
+    // v38 — dense vault recall walks the query's producing model/dimension
+    // by chunk ID without letting unrelated vector spaces consume its window.
+    version: 38,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_embeddings_model_dim_chunk
+        ON embeddings(model, dim, chunk_id);
+    `,
+  },
 ];
 
 /**
