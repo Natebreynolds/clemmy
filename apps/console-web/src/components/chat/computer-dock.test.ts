@@ -19,14 +19,14 @@ const output = await build({
     import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
     import { ComputerDock } from './src/components/chat/ComputerDock';
     export { computerScreenUrl } from './src/lib/computer-driver';
-    export function render(status) {
+    export function render(status, used = false) {
       const client = new QueryClient();
       if (status) client.setQueryData(['computer-driver'], status);
       const originalFetch = globalThis.fetch;
       globalThis.fetch = () => { throw new Error('Rendering must not capture or request data'); };
       try {
         return renderToStaticMarkup(<MemoryRouter><QueryClientProvider client={client}>
-          <ComputerDock conversationId="controlled-chat" />
+          <ComputerDock conversationId="controlled-chat" used={used} />
         </QueryClientProvider></MemoryRouter>);
       } finally { globalThis.fetch = originalFetch; client.clear(); }
     }
@@ -38,7 +38,7 @@ const output = await build({
 const fixtureFile = path.join(temporary, 'render.cjs');
 writeFileSync(fixtureFile, output.outputFiles[0].contents);
 const { render, computerScreenUrl } = createRequire(import.meta.url)(fixtureFile) as {
-  render: (status?: Partial<ComputerDriverStatus>) => string;
+  render: (status?: Partial<ComputerDriverStatus>, used?: boolean) => string;
   computerScreenUrl: (session?: string, now?: number) => string;
 };
 
@@ -73,4 +73,15 @@ test('idle cloud browsing stays quiet while every live or uncertain session rema
   assert.equal(hasCloudBrowserSession([{ state: 'stopped', returnPending: true }], 0), true, 'unacknowledged viewer closure remains reachable');
   assert.equal(hasCloudBrowserSession([], 1), true, 'another open session can still be managed');
   assert.equal(hasCloudBrowserSession([], 0, true), true, 'an already open management panel retains its toggle');
+});
+
+test('the computer control is one small button the owner can hide until Clem uses the computer', () => {
+  // Live 2026-10-30: "Computer · Watch your connected computer" sat across the
+  // top of every chat, a calendar question included.
+  const idle = render({ installed: true, connected: true, screenViewAvailable: true });
+  assert.doesNotMatch(idle, /Watch your connected computer/);
+  assert.match(idle, /aria-label="Hide the Computer button until Clem uses your computer"/);
+  const used = render({ installed: true, connected: true, screenViewAvailable: true }, true);
+  assert.match(used, /Computer<\/button>/);
+  assert.doesNotMatch(used, /Hide the Computer button/, 'in a chat that used the computer it stays');
 });

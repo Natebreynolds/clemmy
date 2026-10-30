@@ -66,18 +66,34 @@ export function ComputerView() {
   </section>;
 }
 
-function StandaloneDock() {
+const HIDDEN_KEY = 'clem.computer-button.hidden';
+function readHidden(): boolean {
+  try { return typeof window !== 'undefined' && window.localStorage.getItem(HIDDEN_KEY) === '1'; } catch { return false; }
+}
+function writeHidden(hidden: boolean): void {
+  try { if (hidden) window.localStorage.setItem(HIDDEN_KEY, '1'); else window.localStorage.removeItem(HIDDEN_KEY); } catch { /* a convenience only */ }
+}
+
+/** One small button. The owner can hide it; it comes back on its own in a chat
+ *  where Clem uses the computer, because that is when there is something to
+ *  watch. A full-width "Watch your connected computer" bar sat on every chat. */
+function StandaloneDock({ used }: { used: boolean }) {
   const computer = useComputerControl();
+  const [hidden, setHidden] = useState(readHidden);
   if (!computer) return null;
+  if (hidden && !used && !computer.open) return null;
   return <>
     <div className="cloud-browser-strip">
       <button type="button" onClick={computer.toggle} aria-expanded={computer.open}><Monitor size={16} aria-hidden /> Computer</button>
-      <span className="cloud-browser-strip-note">Watch your connected computer</span>
+      {!used && !computer.open
+        ? <button type="button" className="cloud-browser-strip-hide" aria-label="Hide the Computer button until Clem uses your computer"
+            title="Hide until Clem uses your computer" onClick={() => { writeHidden(true); setHidden(true); }}><X size={14} aria-hidden /></button>
+        : null}
     </div>
     <ComputerView />
   </>;
 }
 
-export function ComputerDock({ conversationId }: { conversationId?: string } = {}) {
-  return <ComputerWorkspace conversationId={conversationId}><StandaloneDock /></ComputerWorkspace>;
+export function ComputerDock({ conversationId, used = false }: { conversationId?: string; used?: boolean } = {}) {
+  return <ComputerWorkspace conversationId={conversationId}><StandaloneDock used={used} /></ComputerWorkspace>;
 }

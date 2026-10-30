@@ -115,6 +115,12 @@ export function describeExternalWrite(
 /** Servers Clem herself set up read by what they are to the owner. */
 const SERVER_WORDS: Record<string, string> = { 'cua-driver': 'Your computer' };
 
+/** A step label this module wrote for a step on the owner's computer. */
+export function isComputerStepLabel(label: string): boolean {
+  const words = SERVER_WORDS['cua-driver'];
+  return label === words || label.startsWith(`${words} · `);
+}
+
 export function humanToolLabel(tool: string, argsRaw?: unknown, publicSlug?: unknown, innerTool?: unknown): string {
   if (typeof publicSlug === 'string' && publicSlug) {
     return publicSlug.replace(/_/g, ' ').toLowerCase();

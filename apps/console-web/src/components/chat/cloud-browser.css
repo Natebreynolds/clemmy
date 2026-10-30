@@ -36,6 +36,14 @@
   font-weight:400}
 .cloud-browser-strip-note {
   margin-left:auto}
+.cloud-browser-strip .cloud-browser-strip-hide {
+  margin-left:auto;
+  padding:4px;
+  border-radius:6px;
+  color:var(--text-muted);
+  font-weight:400}
+.cloud-browser-strip .cloud-browser-strip-hide:hover {
+  color:var(--text)}
 .cloud-browser-panel {
   display:flex;
   flex-direction:column;
