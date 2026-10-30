@@ -43,6 +43,7 @@ import { renderEstablishedDestinationsForContext } from '../runtime/harness/publ
 import { renderSourceMapForContext } from '../memory/source-map.js';
 import { listActiveGoalSummaries } from '../memory/goals-list.js';
 import { loadWorkingMemoryForSession } from '../memory/working-memory.js';
+import { allowsProjectMemoryContext, captureProjectMemoryContext, renderCapturedProjectMemoryContext, type ProjectMemoryContext } from '../memory/project-memory-context.js';
 import { listHeldTasks } from './plan-proposals.js';
 import { loadUserProfile, renderProfileForInstructions } from '../runtime/user-profile.js';
 import { loadProactivityPolicy } from './proactivity-policy.js';
@@ -773,6 +774,8 @@ export function harnessInstructions(roleInstructions: string, opts?: {
     includeRememberedToolChoices: opts?.includeRememberedToolChoices,
     coreRefKeys,
     policyCounts: core.policies.counts,
+    projectMemory: withSessionMemoryScope(opts?.sessionId,
+      () => captureProjectMemoryContext(opts?.sessionId, opts?.focusInput ?? '')),
   });
   return instructions;
 }
@@ -785,6 +788,8 @@ export interface MemoryTailScope {
   /** `type:id` of every policy the memory core already shows. */
   coreRefKeys: ReadonlySet<string>;
   policyCounts: CorePolicyRender['counts'];
+  /** Captured once for this activation; later model cycles keep these bytes. */
+  projectMemory?: ProjectMemoryContext;
 }
 
 const memoryTailScopes = new WeakMap<Function, MemoryTailScope>();
@@ -863,6 +868,15 @@ function renderTurnMemoryTailInScope(
   options: { request?: string; sessionPointers?: string },
 ): TurnMemoryTail {
   const parts: Array<{ section: string; tier: MemoryTier; text: string; refs?: MemoryManifestEntry['refs'] }> = [];
+  const excluded = new Set(scope.coreRefKeys);
+  if (signal.kind === 'ranked') for (const ref of signal.refs) excluded.add(`${ref.type}:${ref.id}`);
+  if (signal.kind === 'no_signal') for (const id of signal.primerFactIds ?? []) excluded.add(`fact:${id}`);
+  const strategy = signal.kind === 'ranked' && options.request && scope.includeRememberedToolChoices !== false
+    ? section('Proven Run Strategies', renderRunStrategiesForContext(options.request, 2, options.request)) : '';
+  const projectCapacity = projectMemoryCapacity(scope, strategy);
+  const projectMemory = scope.projectMemory && allowsProjectMemoryContext(options.request ?? scope.focusInput ?? '')
+    ? renderCapturedProjectMemoryContext(scope.projectMemory, excluded, projectCapacity)
+    : undefined;
   if (signal.kind === 'no_signal') {
     // A blind ranker must cost nothing: the per-block rendering stands in,
     // ranked by the same objective the prompt used before, minus the
@@ -887,7 +901,8 @@ function renderTurnMemoryTailInScope(
         .filter((key) => key.startsWith('policy:'))
         .map((key) => Number(key.slice('policy:'.length)))),
       // A fact the fallback primer already lists is not listed twice.
-      excludeFactIds: signal.primerFactIds,
+      excludeFactIds: [...(signal.primerFactIds ?? []), ...(projectMemory?.refs ?? [])
+        .filter(ref => ref.type === 'fact').map(ref => Number(ref.id))],
     })) {
       if (block.text) parts.push({ section: block.title, tier: 'relevant', text: block.text });
     }
@@ -897,10 +912,7 @@ function renderTurnMemoryTailInScope(
     }
     // A proven run names tools; a surface that declines remembered tool
     // choices (a locked workflow step) is not told about tools it cannot call.
-    const strategy = signal.kind === 'ranked' && options.request && scope.includeRememberedToolChoices !== false
-      ? renderRunStrategiesForContext(options.request, 2, options.request)
-      : '';
-    if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: section('Proven Run Strategies', strategy) });
+    if (strategy) parts.push({ section: 'Proven Run Strategies', tier: 'relevant', text: strategy });
     // What earlier checks taught about this kind of work (check-lesson-context.ts).
     const lessons = signal.kind === 'ranked' && options.request ? renderCheckLessonsForContext(options.request) : '';
     if (lessons) parts.push({ section: 'Lessons From Past Checks', tier: 'relevant', text: lessons });
@@ -910,6 +922,7 @@ function renderTurnMemoryTailInScope(
     const pointer = countsPointer(scope, visibleFacts);
     if (pointer) parts.push({ section: 'Memory Pointer', tier: 'relevant', text: pointer });
   }
+  if (projectMemory?.text) parts.push({ section: 'Project Knowledge', tier: 'relevant', text: projectMemory.text, refs: projectMemory.refs });
   const delegated = delegatedWorkPointers(scope.sessionId);
   if (delegated) parts.push({ section: 'Delegated Work', tier: 'now', text: delegated });
   if (options.sessionPointers?.trim()) {
@@ -961,10 +974,23 @@ export function memoryRankingQuery(
 
 /** The ranked tail's hit budget once the advisory proven-run examples are set aside
  *  (only when the surface takes remembered tool choices). */
-export function rankedTailHitBudget(request: string, includeRememberedToolChoices?: boolean): number {
+export function rankedTailHitBudget(request: string, includeRememberedToolChoices?: boolean, scope?: MemoryTailScope): number {
   let strategy = '';
   if (includeRememberedToolChoices !== false) {
     try { strategy = section('Proven Run Strategies', renderRunStrategiesForContext(request, 2, request)); } catch { strategy = ''; }
   }
-  return Math.max(300, RANKED_TAIL_MAX_CHARS - (strategy ? strategy.length + 2 : 0));
+  const projectChars = scope?.projectMemory && allowsProjectMemoryContext(request)
+    ? projectMemoryCapacity(scope, strategy) : 0;
+  return Math.max(300, RANKED_TAIL_MAX_CHARS - (strategy ? strategy.length + 2 : 0)
+    - (projectChars ? projectChars + 2 : 0));
+}
+
+/** Leave at least the existing minimum for request-ranked hits. A project
+ * block shrinks by whole source entries, or is omitted if its pointer cannot
+ * fit; its references are never sliced to make room for a strategy. */
+function projectMemoryCapacity(scope: MemoryTailScope, strategy: string): number {
+  if (!scope.projectMemory) return 0;
+  const capacity = Math.max(0, Math.min(scope.projectMemory.text.length,
+    RANKED_TAIL_MAX_CHARS - 300 - (strategy ? strategy.length + 2 : 0) - 2));
+  return renderCapturedProjectMemoryContext(scope.projectMemory, scope.coreRefKeys, capacity).text ? capacity : 0;
 }

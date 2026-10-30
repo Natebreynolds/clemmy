@@ -42,6 +42,7 @@ import { recordRecallRun } from '../../memory/recall-usage.js';
 import { scheduleRecallShadow } from '../../memory/recall-shadow.js';
 import { _setUnifiedTurnPrimerRecallForTest, buildUnifiedTurnPrimer, MEMORY_PRIMER_MARKER } from '../../memory/turn-primer.js';
 import { rememberTurnMemoryForJudges } from '../../memory/judge-memory.js';
+import { captureProjectMemoryContext, renderCapturedProjectMemoryContext } from '../../memory/project-memory-context.js';
 import {
   EXPLICIT_MEMORY_RECALL_OPTOUT_REASON,
   explicitlyOptsOutOfAutomaticMemoryRecall,
@@ -1153,6 +1154,13 @@ interface ClaudeTurnMemoryPrimerTelemetry {
   skippedReason: string | null;
 }
 
+/** Prepared prompt context, not evidence of an accepted provider request. */
+interface PreparedProjectKnowledge {
+  revision: string;
+  refs: Array<{ type: string; id: string }>;
+  chars: number;
+}
+
 async function buildClaudeAgentBrainTurnContext(
   request: AssistantRequest,
   opts?: {
@@ -1166,6 +1174,7 @@ async function buildClaudeAgentBrainTurnContext(
 ): Promise<{
   text: string;
   memoryPrimer: ClaudeTurnMemoryPrimerTelemetry;
+  preparedProjectKnowledge?: PreparedProjectKnowledge;
   preflight: TurnPreflightDecision;
   preflightConversation?: {
     port: PreflightConversationPort;
@@ -1187,6 +1196,15 @@ async function buildClaudeAgentBrainTurnContext(
   const authorityInput = declinedParentWithNewTask ? taskInput : request.message;
   const q = taskInput.replace(/\s+/g, ' ').trim();
   const splitContext = contextSplitEnabled();
+  const recallOn = queryRecallEnabled();
+  const recallOptedOut = explicitlyOptsOutOfAutomaticMemoryRecall(q);
+  // Like the normal harness lane, capture once before asynchronous retrieval.
+  // Later model cycles use these exact bytes; a genuine next turn refreshes.
+  const projectSnapshot = q && recallOn && !recallOptedOut && !declinedContinuation
+    ? captureProjectMemoryContext(request.sessionId, taskInput) : undefined;
+  const projectReserve = projectSnapshot?.text ? projectSnapshot.text.length + 2 : 0;
+  const unifiedMemoryBudget = Math.max(300, 1_800 - projectReserve);
+  const shownMemoryRefs = new Set<string>();
   let relevantSkills = '';
   if (splitContext && q && !declinedContinuation) {
     try {
@@ -1214,8 +1232,6 @@ async function buildClaudeAgentBrainTurnContext(
   const startFallbackBreadcrumbs = (): Promise<string> => breadcrumbWork ??= Promise.resolve()
     .then(() => fallbackBreadcrumbsImpl(q)).catch(() => '');
   let unifiedPrimerStatus: 'ok' | 'empty' | 'timeout' | 'error' | 'disabled' | null = null;
-  const recallOn = queryRecallEnabled();
-  const recallOptedOut = explicitlyOptsOutOfAutomaticMemoryRecall(q);
   let memoryPrimer: ClaudeTurnMemoryPrimerTelemetry = {
     enabled: recallOn,
     hitCount: 0,
@@ -1244,7 +1260,7 @@ async function buildClaudeAgentBrainTurnContext(
         query: q,
         surface: 'claude_primer',
         limit: 8,
-        maxChars: 1_800,
+        maxChars: unifiedMemoryBudget,
         timeoutMs,
         sessionId: request.sessionId,
       });
@@ -1263,6 +1279,9 @@ async function buildClaudeAgentBrainTurnContext(
       };
       if (unified.status === 'ok') {
         recall = unified.text ?? '';
+        // Normal primer format does not expose structured refs. Do not infer
+        // ownership or identity by parsing its prose when they are absent.
+        for (const ref of unified.visibleRefs ?? []) shownMemoryRefs.add(`${ref.type}:${ref.id}`);
         rememberTurnMemoryForJudges(request.sessionId, recall);
       } else if (unified.status !== 'empty') {
         // Degraded fallback only: preserve the prior bounded fact/meeting path
@@ -1288,6 +1307,7 @@ async function buildClaudeAgentBrainTurnContext(
             return `- ${content.length <= 1000 ? content : `${content.slice(0, 1000)} …[truncated — search memory for the full fact]`}`;
           })
           .filter((line) => line.length > 2);
+        for (const fact of hits) if (String(fact.content ?? '').trim()) shownMemoryRefs.add(`fact:${fact.id}`);
         const bullets = [...meetingBullets, ...factBullets].join('\n');
         if (bullets) recall = `## Relevant To Your Request\n${bullets}`;
         // The fallback shows real facts, so it must record a real run — with
@@ -1326,6 +1346,13 @@ async function buildClaudeAgentBrainTurnContext(
       memoryPrimer = { ...memoryPrimer, source: 'legacy_fallback_error', skippedReason: 'error' };
     }
   }
+  const projectKnowledge = projectSnapshot
+    ? renderCapturedProjectMemoryContext(projectSnapshot, shownMemoryRefs) : undefined;
+  const projectKnowledgeText = projectKnowledge?.text ?? '';
+  const preparedProjectKnowledge: PreparedProjectKnowledge | undefined = projectKnowledgeText && projectKnowledge
+    ? { revision: projectKnowledge.revision, refs: projectKnowledge.refs, chars: projectKnowledgeText.length }
+    : undefined;
+  if (projectKnowledgeText) rememberTurnMemoryForJudges(request.sessionId, [recall, projectKnowledgeText].filter(Boolean).join('\n\n'));
   let prospectiveContext = '';
   let prospectiveCapture = '';
   if (!declinedContinuation) {
@@ -1352,6 +1379,7 @@ async function buildClaudeAgentBrainTurnContext(
   ) {
     breadcrumbs = await startFallbackBreadcrumbs();
   }
+  const memoryContext = [recall, projectKnowledgeText, breadcrumbs, volatile].filter(Boolean).join('\n\n');
   let sessionActions = '';
   if (sessionHistoryEnabled()) {
     try { sessionActions = renderRecentActionsForHarnessHistory(openEventLog(), request.sessionId); } catch { sessionActions = ''; }
@@ -1472,7 +1500,7 @@ async function buildClaudeAgentBrainTurnContext(
         continuationContext,
         sessionActions,
       ].filter(Boolean).join('\n\n'),
-      memoryContext: [recall, breadcrumbs, volatile].filter(Boolean).join('\n\n'),
+      memoryContext,
       capabilityContext: capabilityResolution,
       port,
     };
@@ -1510,7 +1538,7 @@ async function buildClaudeAgentBrainTurnContext(
         message: taskInput,
         brainFamily: turnOpennessBrainFamily(activeModelId),
         capabilityBlock: capabilityResolution,
-        memoryBlock: recall,
+        memoryBlock: [recall, projectKnowledgeText].filter(Boolean).join('\n\n'),
       });
     } catch { turnOpenness = null; }
   }
@@ -1562,6 +1590,7 @@ async function buildClaudeAgentBrainTurnContext(
       continuationContext,
       harnessHealth,
       recall,
+      projectKnowledgeText,
       breadcrumbs,
       prospectiveContext,
       prospectiveCapture,
@@ -1574,11 +1603,12 @@ async function buildClaudeAgentBrainTurnContext(
       projectRoutes,
     ].filter(Boolean).join('\n\n'),
     memoryPrimer,
+    ...(preparedProjectKnowledge ? { preparedProjectKnowledge } : {}),
     preflight,
     ...(preflightConversation ? { preflightConversation } : {}),
     alignmentContext: {
       conversationContext: [continuationContext, sessionActions].filter(Boolean).join('\n\n'),
-      memoryContext: [recall, breadcrumbs, volatile].filter(Boolean).join('\n\n'),
+      memoryContext,
       capabilityContext: capabilityResolution,
       openness: turnOpenness,
     },
@@ -1597,6 +1627,7 @@ function emitClaudeAgentSdkBrainContextTelemetry(
   request: AssistantRequest,
   turnContext: string,
   primer?: ClaudeTurnMemoryPrimerTelemetry,
+  preparedProjectKnowledge?: PreparedProjectKnowledge,
 ): void {
   const declinedContinuation = isDeclinedTaskContinuation(request);
   const semanticEnrichmentSkippedReason = primer?.skippedReason === 'durable_memory_receipt_conversation_only'
@@ -1666,6 +1697,7 @@ function emitClaudeAgentSdkBrainContextTelemetry(
           injected,
           source: primer?.source ?? (unified ? 'unified' : injected ? 'legacy_fallback' : null),
         },
+        ...(preparedProjectKnowledge ? { preparedProjectKnowledge } : {}),
         prospective: {
           injected: prospectiveCount > 0,
           count: prospectiveCount,
@@ -2210,6 +2242,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
           recallElapsedMs: null,
           skippedReason: 'durable_memory_receipt_conversation_only',
         } satisfies ClaudeTurnMemoryPrimerTelemetry,
+        preparedProjectKnowledge: undefined,
         preflight: {
           phase: 'execute',
           consequential: false,
@@ -2240,7 +2273,7 @@ async function respondViaClaudeAgentSdkBrainAttempt(
   let turnContext = durableMemoryReceiptDirective
     ? [renderedTurnContext.text, durableMemoryReceiptDirective].filter(Boolean).join('\n\n')
     : renderedTurnContext.text;
-  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer);
+  emitClaudeAgentSdkBrainContextTelemetry(sessionId, request, turnContext, renderedTurnContext.memoryPrimer, renderedTurnContext.preparedProjectKnowledge);
 
   if (renderedTurnContext.preflight.phase === 'align') {
     const disposition = await publishPreflightConversation({
