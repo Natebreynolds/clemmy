@@ -2589,6 +2589,11 @@ export function registerToolSearchTool(
           ...(rows.some((row) => planningRefs[row.name]) ? {
             planning_arguments_hint: 'For publish_plan, staticArgumentsJson contains only the selected tool\'s direct input fields matching its schema (inline or reopened). The invocation/example wrapper is for execution, never inside staticArgumentsJson.',
           } : {}),
+          // A bound account travels with the capabilityRef, not in the call:
+          // without saying so, a brain goes looking for an account field to fill.
+          ...(rows.some((row) => planningRefs[row.name] && selectedAccountForName(row.name)) ? {
+            account_hint: 'A result with selectedAccount is already bound to that account: the host sends the call through it, so the call itself names no account or connected-account id.',
+          } : {}),
           schemas,
           ...(Object.keys(schemaHandles).length > 0 ? { schema_handles: schemaHandles } : {}),
           ...(schemaReadRequired.size > 0 ? { schema_read_required: [...schemaReadRequired] } : {}),

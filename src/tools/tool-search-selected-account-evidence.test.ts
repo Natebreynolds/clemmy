@@ -197,6 +197,7 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
   });
   const raw = result.content[0]!.text;
   const body = JSON.parse(raw) as {
+    account_hint?: string;
     results: Array<{
       name: string;
       capabilityRef?: string;
@@ -220,6 +221,7 @@ test('production staging exposes Scorpion on a resolved catalog-only row without
     email: SCORPION_EMAIL,
     label: 'scorpion',
   });
+  assert.match(body.account_hint ?? '', /names no account/, 'a bound account is said to travel with the ref, not the call');
   assert.doesNotMatch(raw, new RegExp(BREAKTHROUGH_EMAIL, 'i'));
   assert.doesNotMatch(raw, /ca_(?:scorpion|breakthrough)_private_transport/i,
     'known email identities suppress raw provider connection ids');
