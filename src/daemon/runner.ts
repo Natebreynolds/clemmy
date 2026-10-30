@@ -3704,6 +3704,11 @@ export async function startDaemon(
     const { bindFromClemRespond, startFromClemVoice } = await import('../dashboard/from-clem-runtime.js');
     bindFromClemRespond((request) => respondPreferHarness('background', request, (next) => assistant.respond(next)));
     startFromClemVoice();
+    // No message in a conversation is left unread: one the running work never
+    // adopted becomes the conversation's next turn, in the owner's words.
+    const { bindSteerPickupRespond, startSteerPickupSweep } = await import('../runtime/harness/steer-note-pickup.js');
+    bindSteerPickupRespond((request) => respondPreferHarness('home', request, (next) => assistant.respond(next)));
+    startSteerPickupSweep();
     logger.info(
       { enabled: watchPolicy.enabled, cadenceMinutes: watchPolicy.cadenceMinutes },
       watchPolicy.enabled ? 'Calendar watch armed on the prepared read path' : 'Calendar watch heartbeat armed (watch disabled by policy)',

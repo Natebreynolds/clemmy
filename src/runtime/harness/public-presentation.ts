@@ -1376,6 +1376,9 @@ function projectData(event: EventRow): Record<string, unknown> | null {
       // and protocol checks; this projection re-checks the closed shape.
       return publicStreamTokenData(data);
     case 'user_input_received': {
+      // A message the running work never adopted ran as its own turn; the
+      // owner already sees it as the note they sent, so it draws no second bubble.
+      if (data.source === 'steer_follow_up' && Array.isArray(data.steerNoteSeqs)) return null;
       // An answer to a card is shown as the owner's words ("Yes, go ahead."),
       // read from the recorded decision; `text` stays exact for the parser.
       const answerWords = (input: string) => {
