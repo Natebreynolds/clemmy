@@ -155,7 +155,8 @@ function writeReport(report: StorageRetentionReport, file: string): void {
 export interface StorageRetentionDependencies {
   db: () => Database.Database;
   payloadFilePath: (payloadId: string) => string;
-  reclaimOrphans: (db: Database.Database) => { deletedPayloadFiles: number };
+  /** One bounded batch from `startAfter`; `nextCursor` null once the folder is done. */
+  reclaimOrphans: (db: Database.Database, startAfter: string | null) => { deletedPayloadFiles: number; nextCursor: string | null };
   distillToolResults: () => void;
   reapToolResults: (days: number) => number;
   footprint: () => Promise<{ totalBytes: number; complete: boolean } | null>;
@@ -252,7 +253,18 @@ export async function runStorageRetention(policy: StorageRetentionPolicy, deps: 
     if (footprint !== null) footprint -= enforce ? pass.removedBytes : pass.eligibleBytes;
   }
   if (enforce) {
-    try { report.orphanPayloads.removed = deps.reclaimOrphans(db).deletedPayloadFiles; } catch { report.notes.push('Unreferenced copies could not be checked.'); }
+    // The whole folder, in batches: a single bounded scan reread the same
+    // first entries every day and never reached most of the folder.
+    try {
+      let cursor: string | null = null;
+      for (let batch = 0; batch < MAX_ORPHAN_BATCHES; batch += 1) {
+        const swept: { deletedPayloadFiles: number; nextCursor: string | null } = deps.reclaimOrphans(db, cursor);
+        report.orphanPayloads.removed += swept.deletedPayloadFiles;
+        if (swept.nextCursor === null || swept.nextCursor === cursor) break;
+        cursor = swept.nextCursor;
+        await deps.yieldTurn();
+      }
+    } catch { report.notes.push('Unreferenced copies could not be checked.'); }
     report.pythonToolCache = await deps.prunePythonToolCache();
   }
   const after = enforce ? await deps.footprint() : null;
@@ -281,6 +293,10 @@ export async function prunePythonToolCache(input: { uvCommand: string | null; ca
     child.on('close', (code) => { clearTimeout(timer); resolve({ pruned: code === 0, detail: output.trim().split('\n').pop()?.slice(0, 200) }); });
   });
 }
+
+/** Small batches keep each synchronous step short; the cap only stops a runaway. */
+const ORPHAN_BATCH = 512;
+const MAX_ORPHAN_BATCHES = 2_000;
 
 const DUE_FILE = path.join(BASE_DIR, 'state', 'storage-retention-due.json');
 const PASS_INTERVAL_MS = DAY_MS;
@@ -311,7 +327,7 @@ export async function runProductionStorageRetention(policy = storageRetentionPol
   return runStorageRetention(policy, {
     db: openEventLog,
     payloadFilePath: payloads.authorityEncryptedPayloadFilePath,
-    reclaimOrphans: (db) => payloads.reclaimOrphanedAuthorityEncryptedPayloads({ db, scanLimit: 2_048 }),
+    reclaimOrphans: (db, startAfter) => payloads.reclaimOrphanedAuthorityEncryptedPayloads({ db, scanLimit: ORPHAN_BATCH, startAfter }),
     distillToolResults: () => { backfillTemporalEvidence(2_000); },
     reapToolResults: (days) => reapStaleToolOutputs(days),
     footprint: async () => {

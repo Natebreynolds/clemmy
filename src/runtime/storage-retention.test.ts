@@ -60,7 +60,7 @@ function harness(input: { footprint: number[]; files: Array<{ id: string; create
   const deps: StorageRetentionDependencies = {
     db: () => db,
     payloadFilePath: (id) => path.join(dir, `${id.slice('authority-payload:'.length)}.sealed.json`),
-    reclaimOrphans: () => { calls.push('orphans'); return { deletedPayloadFiles: 2 }; },
+    reclaimOrphans: () => { calls.push('orphans'); return { deletedPayloadFiles: 2, nextCursor: null }; },
     distillToolResults: () => { calls.push('distill'); if (input.distillFails) throw new Error('distiller down'); },
     reapToolResults: (days) => { calls.push(`reap:${days}`); return 5; },
     footprint: async () => ({ totalBytes: input.footprint[Math.min(footprintCall++, input.footprint.length - 1)]!, complete: true }),
@@ -109,4 +109,23 @@ test('when distilling fails, tool results are kept', async () => {
   assert.equal(calls.some((call) => call.startsWith('reap')), false);
   assert.equal(report.toolResults.distilled, false);
   assert.match(report.notes.join(' '), /were kept/);
+});
+
+test('the unreferenced-copy sweep follows its cursor through the whole folder and stops when it stops moving', async () => {
+  const { deps } = harness({ footprint: [100], files: [] });
+  const starts: Array<string | null> = [];
+  const pages: Record<string, { deletedPayloadFiles: number; nextCursor: string | null }> = {
+    start: { deletedPayloadFiles: 3, nextCursor: 'm' },
+    m: { deletedPayloadFiles: 4, nextCursor: 't' },
+    t: { deletedPayloadFiles: 1, nextCursor: null },
+  };
+  deps.reclaimOrphans = (_db, startAfter) => { starts.push(startAfter); return pages[startAfter ?? 'start']!; };
+  const report = await runStorageRetention(policy('enforce', 10_000), deps);
+  assert.deepEqual(starts, [null, 'm', 't'], 'a day-one scan stopped at its limit; the folder past it is reached too');
+  assert.equal(report.orphanPayloads.removed, 8);
+
+  const stuck: Array<string | null> = [];
+  deps.reclaimOrphans = (_db, startAfter) => { stuck.push(startAfter); return { deletedPayloadFiles: 0, nextCursor: 'same' }; };
+  await runStorageRetention(policy('enforce', 10_000), deps);
+  assert.deepEqual(stuck, [null, 'same'], 'a cursor that does not move ends the sweep');
 });

@@ -22,8 +22,8 @@ import {
   linkSync,
   mkdirSync,
   openSync,
-  opendirSync,
   readFileSync,
+  readdirSync,
   unlinkSync,
   writeSync,
   type BigIntStats,
@@ -106,6 +106,9 @@ export interface AuthorityEncryptedPayloadReclamationResult {
   lostRaces: number;
   storageErrors: number;
   referenceSchemaAvailable: boolean;
+  /** The last name this sweep looked at when it stopped at its limit; null
+   *  once it reached the end. Pass it back as `startAfter` to continue. */
+  nextCursor: string | null;
 }
 
 export class AuthorityEncryptedPayloadError extends Error {
@@ -774,6 +777,10 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
   nowMs?: number;
   orphanHorizonMs?: number;
   scanLimit?: number;
+  /** Resume after this name. Names are walked in sorted order, so a sweep
+   *  bounded by `scanLimit` reaches the whole folder over several calls
+   *  instead of rereading the same first entries every time. */
+  startAfter?: string | null;
 }): AuthorityEncryptedPayloadReclamationResult {
   const nowMs = input.nowMs ?? Date.now();
   if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
@@ -803,6 +810,7 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
     lostRaces: 0,
     storageErrors: 0,
     referenceSchemaAvailable: hasReclamationReferenceSchema(input.db) && !input.db.inTransaction,
+    nextCursor: null,
   };
 
   ensurePayloadDirectory();
@@ -853,22 +861,24 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
     }
   }
 
-  let directory: ReturnType<typeof opendirSync> | null = null;
   let deletedAnything = false;
   try {
-    directory = opendirSync(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY);
-    while (result.scannedEntries < scanLimit) {
-      const entry = directory.readSync();
-      if (entry === null) break;
+    const names = readdirSync(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY).sort();
+    const startAfter = input.startAfter ?? null;
+    let index = startAfter === null ? 0 : names.findIndex((name) => name > startAfter);
+    if (index < 0) index = names.length;
+    for (; index < names.length && result.scannedEntries < scanLimit; index += 1) {
+      const name = names[index]!;
       result.scannedEntries += 1;
-      const sealedMatch = SEALED_FILE_RE.exec(entry.name);
-      const isTemp = TEMP_FILE_RE.test(entry.name);
+      if (index + 1 < names.length && result.scannedEntries >= scanLimit) result.nextCursor = name;
+      const sealedMatch = SEALED_FILE_RE.exec(name);
+      const isTemp = TEMP_FILE_RE.test(name);
       if (!sealedMatch && !isTemp) {
         result.ignoredUnknown += 1;
         continue;
       }
       const candidate = reclaimableAgedFile(
-        path.join(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY, entry.name),
+        path.join(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY, name),
         cutoffMs,
       );
       if (candidate.status === 'fresh') {
@@ -936,8 +946,6 @@ export function reclaimOrphanedAuthorityEncryptedPayloads(input: {
     }
   } catch {
     result.storageErrors += 1;
-  } finally {
-    try { directory?.closeSync(); } catch { result.storageErrors += 1; }
   }
   if (deletedAnything) {
     try { fsyncDirectory(AUTHORITY_ENCRYPTED_PAYLOAD_DIRECTORY); }

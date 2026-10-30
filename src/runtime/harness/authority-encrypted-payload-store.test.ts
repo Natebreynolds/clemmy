@@ -600,3 +600,35 @@ test('only horizon-aged safe temp files are cleaned and scanning is bounded', ()
   });
   assert.ok(bounded.scannedEntries <= 1);
 });
+
+test('a bounded sweep resumes where it stopped and reaches every orphan in the folder', () => {
+  const orphanPaths = ['b', 'c', 'd'].map((digit) => store.authorityEncryptedPayloadFilePath(
+    store.persistAuthorityEncryptedPayload({
+      payloadKind: 'physical_return',
+      bindingDigest: digit.repeat(64),
+      bytes: Buffer.from(`resumable orphan fixture ${digit}`),
+    }).payloadId,
+  ));
+  for (const orphanPath of orphanPaths) makeOld(orphanPath);
+
+  const first = store.reclaimOrphanedAuthorityEncryptedPayloads({
+    db: RECLAMATION_DB, nowMs: RECLAIM_NOW_MS,
+    orphanHorizonMs: store.AUTHORITY_ENCRYPTED_PAYLOAD_ORPHAN_HORIZON_MS, scanLimit: 1,
+  });
+  assert.equal(first.scannedEntries, 1);
+  assert.notEqual(first.nextCursor, null, 'a sweep that stopped at its limit says where to continue');
+
+  let cursor = first.nextCursor;
+  let calls = 1;
+  while (cursor !== null && calls < 10_000) {
+    const next = store.reclaimOrphanedAuthorityEncryptedPayloads({
+      db: RECLAMATION_DB, nowMs: RECLAIM_NOW_MS,
+      orphanHorizonMs: store.AUTHORITY_ENCRYPTED_PAYLOAD_ORPHAN_HORIZON_MS, scanLimit: 1, startAfter: cursor,
+    });
+    assert.ok(next.nextCursor === null || next.nextCursor > cursor, 'the cursor only moves forward');
+    cursor = next.nextCursor;
+    calls += 1;
+  }
+  assert.equal(cursor, null);
+  for (const orphanPath of orphanPaths) assert.equal(existsSync(orphanPath), false);
+});
