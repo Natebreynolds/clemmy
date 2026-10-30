@@ -1571,6 +1571,20 @@ function nextRealSourceIs(input: {
   return next?.seq === input.consumingSourceUserSeq;
 }
 
+/** An answer that picked a choice or gave a fact may settle something that
+ *  stays true (which of several lists is the owner's). The memory model
+ *  decides, off the turn; the answer reaches memory with its question. */
+function learnWhatTheAnswerSettled(input: { sessionId: string; sourceUserSeq: number; answer: string },
+  packet: TaskContinuityPacket, resolution: TaskContinuityFrozenResolution): void {
+  const index = resolution.selectedOption?.startsWith('opt-') ? Number(resolution.selectedOption.slice('opt-'.length)) - 1 : -1;
+  const chosen = Number.isSafeInteger(index) && index >= 0 ? packet.pause.options[index] : undefined;
+  void import('../../memory/answer-learning.js')
+    .then(({ learnFromAnswer }) => learnFromAnswer({ sessionId: input.sessionId, sourceUserSeq: input.sourceUserSeq,
+      questionId: packet.packetId, question: packet.pause.question, options: packet.pause.options, answer: input.answer,
+      ...(chosen ? { chosen } : {}) }))
+    .catch(() => { /* learning stays additive */ });
+}
+
 function consumeContinuationContext(input: {
   sessionId: string;
   sourceUserSeq: number;
@@ -1672,6 +1686,10 @@ function consumeContinuationContext(input: {
     resolution,
   });
   if (consumed.status !== 'consumed') return null;
+  if (!consumed.replay && consumed.packet.pause.kind === 'clarification'
+    && (consumed.resolution.disposition === 'selected' || consumed.resolution.disposition === 'provided')) {
+    learnWhatTheAnswerSettled(input, consumed.packet, consumed.resolution);
+  }
   return clarificationContextFromPacket({
     ...input,
     packet: consumed.packet,

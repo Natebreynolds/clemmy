@@ -1955,6 +1955,62 @@ test('a checked complete simple option settles once and replays its exact receip
   } finally { runtime._setClarificationAnswerCompletenessForTests(null); }
 });
 
+test('a picked option reaches memory with the question it answered; a go-ahead and a replay do not (connection pin)', async () => {
+  const learning = await import('../../memory/answer-learning.js');
+  learning._resetAnswerLearningForTests();
+  const asked: Array<Record<string, unknown>> = [];
+  learning._setAnswerMemoryModelForTests(async (request) => { asked.push(JSON.parse(request) as Record<string, unknown>); return '{"memory": null}'; });
+  const settled = async () => { for (let tick = 0; tick < 50 && asked.length === 0; tick++) await new Promise(resolve => setTimeout(resolve, 10)); };
+  try {
+    const sessionId = 'continuity-pick-learned';
+    const origin = accepted(sessionId, 'Add oranges to my TEST FIXTURE pantry list.');
+    const options = ['The Kitchen folder list: milk, eggs', 'The Home folder list: apples, bread'];
+    const question = 'There are two TEST FIXTURE pantry lists. Which one should I add oranges to?';
+    commitClarification({ sessionId, sourceSeq: origin.seq, question, options });
+    const open = continuity.peekTaskContinuityPacket({ sessionId });
+    assert.equal(open.status, 'available');
+    if (open.status !== 'available') return;
+    const text = options[1]!;
+    const reply = accepted(sessionId, text);
+    const slot = open.packet.pause.slot!;
+    seedSemanticReading(sessionId, reply.seq, 'admitted', { version: 1, relation: 'answer_open_slot',
+      targetGoal: { goalId: slot.goalId, baseRevision: slot.revision }, goal: null, work: null,
+      slotAnswers: [{ kind: 'option', questionId: slot.questionId, slotKey: slot.slotKey, optionId: 'opt-2' }],
+      rationale: 'The person picked the second list.' });
+    runtime._setClarificationAnswerCompletenessForTests(input => fixtureCompleteness(input, 0.99));
+    assert.equal((await runtime.classifyUnsettledOpenQuestionReply({ sessionId, sourceUserSeq: reply.seq }))?.route, 'settled');
+    const enrich = () => runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId, message: text }, reply.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { disposition: 'selected', selectedOption: 'opt-2' } });
+    assert.equal((await enrich()).taskContinuation?.selectedOption, 'opt-2');
+    await settled();
+    assert.equal(asked.length, 1, 'the consumed answer started one memory job');
+    assert.equal(asked[0]!.question, question);
+    assert.deepEqual(asked[0]!.choices, options);
+    assert.equal(asked[0]!.chosen, options[1], 'the option id is read back as the words the owner tapped');
+    await enrich();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(asked.length, 1, 'a replayed consumption learns nothing twice');
+
+    const goSession = 'continuity-go-ahead-not-learned';
+    const goOrigin = accepted(goSession, 'Draft a short note to the team and put it in note.md. Ask me anything you need first.');
+    commitClarification({ sessionId: goSession, sourceSeq: goOrigin.seq, question: HELD_DRAFT_QUESTION });
+    const go = accepted(goSession, 'Looks right, go.');
+    seedSemanticReading(goSession, go.seq, 'admitted', AMBIGUOUS_READING);
+    runtime._setOpenQuestionReplyClassifierForTests(async () => ({ kind: 'affirms', confidence: 0.95, failedOpen: false }));
+    runtime._setClarificationRevisionProposerForTests(async () => ({ status: 'no_revision', reason: 'no_progress' }));
+    await runtime.classifyUnsettledOpenQuestionReply({ sessionId: goSession, sourceUserSeq: go.seq });
+    await runtime.enrichAcceptedRequestWithTaskContinuity({ sessionId: goSession, message: 'Looks right, go.' }, go.seq,
+      { continuationOnly: true, resolveCandidates: false, typedClassification: { keepOpen: true } });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(asked.length, 1, 'a go-ahead settles no lasting fact');
+  } finally {
+    runtime._setClarificationAnswerCompletenessForTests(null);
+    runtime._setOpenQuestionReplyClassifierForTests(null);
+    runtime._setClarificationRevisionProposerForTests(null);
+    learning._setAnswerMemoryModelForTests(null);
+  }
+});
+
 test('a compound offered option cannot certify a still-unanswered count or consume its hold', async () => {
   const { reofferUnresolvedAcceptedSourceClarification } = await import('./loop.js');
   const sessionId = 'continuity-compound-offered-option-count';
