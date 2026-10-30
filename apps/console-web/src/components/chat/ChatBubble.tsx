@@ -1,5 +1,6 @@
 import { ApprovalResult } from './ApprovalResult';
 import { ConnectionSetup, type ConnectionResume } from './ConnectionSetup';
+import { KeyRequestCard } from './KeyRequestCard';
 import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
@@ -738,6 +739,7 @@ export function ChatBubble({
     || Boolean(message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply'))
     || hasReplyText;
   const answerable = message.status === 'awaiting-reply' && Boolean(onAnswer) && (message.options?.length ?? 0) > 0;
+  const keyRequest = message.status === 'awaiting-reply' && onAnswer ? message.keyRequest ?? null : null;
   return (
     <article className="group/turn flex min-w-0 flex-col gap-2.5" aria-label={project ? `${speaker || 'Clem'}, in ${project}` : speaker || 'Clem'}>
       <TurnHeader at={message.startedAt ?? message.sentAt} speaker={speaker} project={project} />
@@ -1032,6 +1034,8 @@ export function ChatBubble({
           )}
         </>
       )}
+
+      {keyRequest && <KeyRequestCard request={keyRequest} onAnswer={onAnswer!} />}
 
       {answerable && (sessionId ? <ConnectionSetup sessionId={sessionId} options={message.options!}
         revision={JSON.stringify(message.terminal)} onContinue={onAnswer!}

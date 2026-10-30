@@ -4,7 +4,7 @@ import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, answerCheckCorrectedSource, applyAnswerCheckCorrection, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
-import { applySteerReceiptEvent, hasSteerAdmission, steerFollowUpRequestId, unhandledSteerFollowUps, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
+import { applySteerReceiptEvent, hasSteerAdmission, steerFollowUpRequestId, unhandledSteerFollowUps, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, readKeyRequest, type KeyRequest, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
 import type { SteerReceipt, ApprovalConfirm, ApprovalPreview, ApprovalResolution, ApprovalRevision } from '@clem/chat-engine';
 import { workflowDraftFromArgs, type WorkflowDraft } from './workflow-build';
 import { readTaskMode, readPlanRevisionRef, snapshotTaskMode, sameTaskMode, type TaskMode, type ComposerMode, type PlanRevisionRef } from './task-mode';
@@ -232,6 +232,8 @@ export interface ChatMessage {
   checkInSeq?: number;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
+  /** Keys the question's card takes in hidden fields (names only). */
+  keyRequest?: KeyRequest;
   /** When a reopened turn was written, for display only. Live turns show
    *  `startedAt`; this never drives the recall lookup that key uses. */
   sentAt?: number;
@@ -2269,7 +2271,8 @@ export function useChat(options?: UseChatOptions) {
         updateMessages((prev) => attachApprovalConfirm(prev, confirm.approvalId, confirm.confirm, assistantId));
       } else {
         const options = readQuestionOptions(d.options);
-        patchAssistant({ text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}) });
+        const keyRequest = readKeyRequest(d.keyRequest);
+        patchAssistant({ text: String(d.question ?? 'I have a question for you.'), status: 'awaiting-reply', progress: undefined, answerDraft: undefined, ...(options.length ? { options } : {}), ...(keyRequest ? { keyRequest } : {}) });
       }
     } else if (ev.type === 'approval_requested') {
       updateMessages((prev) => appendLiveApprovalCard(prev, ev));
@@ -3012,6 +3015,7 @@ export function inboxAdditionsFromEvents(
       }
       const taskRef = claimDelivery(ev);
       const options = readQuestionOptions(d.options);
+      const keyRequest = readKeyRequest(d.keyRequest);
       if (taskRef !== null) additions.push({
         id: `inbox-${ev.seq}`,
         role: 'assistant',
@@ -3019,6 +3023,7 @@ export function inboxAdditionsFromEvents(
         status: 'awaiting-reply',
         taskRef,
         ...(options.length ? { options } : {}),
+        ...(keyRequest ? { keyRequest } : {}),
       });
     } else if (ev.type === 'approval_requested') {
       const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;

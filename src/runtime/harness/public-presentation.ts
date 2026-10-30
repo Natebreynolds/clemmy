@@ -16,6 +16,7 @@
  * The returned rows deliberately keep the legacy EventRow wire shape so the
  * desktop clients can adopt the boundary without a protocol rewrite.
  */
+import { parseMcpKeyRequest } from './mcp-key-request-shape.js';
 import { withoutHostReceiptLines } from '../host-receipt-lines.js';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -1521,10 +1522,12 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'awaiting_user_input': {
       const question = publicReplyText(data.question, 'I need your input before I can continue.');
       const confirmation = publicApprovalConfirmation(event);
+      const keyRequest = parseMcpKeyRequest(data.keyRequest);
       return {
         question,
         options: stringList(data.options, 8),
         ...selected(data, ['source', 'approvalId', 'pendingQuestionId', 'sourceId']),
+        ...(keyRequest ? { keyRequest } : {}),
         ...(confirmation ?? {}),
       };
     }

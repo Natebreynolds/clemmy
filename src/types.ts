@@ -180,6 +180,9 @@ export interface UnifiedSessionTurn {
   /** A question's answers as its question offered them (the paired
    *  awaiting_user_input), so a reopened chat keeps its choices. */
   questionOptions?: string[];
+  /** The MCP server and key names the question's card takes in hidden
+   *  fields (names only; the value goes straight to the credential route). */
+  questionKeyRequest?: { server: string; keys: string[] };
   /** Exact retained human request; never inferred from display pairing. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
   steerNote?: true;

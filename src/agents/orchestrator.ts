@@ -1,4 +1,5 @@
 import { declaresWorkflowDispatchReceipt } from '../runtime/harness/workflow-dispatch-commit.js';
+import { observedMcpKeyRequestForSource } from '../runtime/harness/mcp-key-request.js';
 import { buildPlanStepResultTool } from '../tools/plan-step-result.js';
 import { markTurnClock } from '../runtime/harness/turn-clock.js';
 import { acceptedTaskMode } from '../runtime/harness/accepted-task-mode.js';
@@ -1354,6 +1355,10 @@ export function userChoiceToolUseBehavior(
     const publicAnswer = rendered.publicAnswer;
     const options = recoveryProjection.constrained || publicAsk.options === null
       ? null : [...publicAsk.options];
+    // A server this request worked with still needs a key only the owner
+    // has: the card takes it in a hidden field, never through the chat.
+    const keyRequest = sourceUserSeq && candidates.length === 1 && !connectionProjection
+      ? observedMcpKeyRequestForSource({ sessionId, sourceUserSeq }) : null;
     const questionData = recoveryProjection.constrained
         ? {
             question,
@@ -1370,6 +1375,7 @@ export function userChoiceToolUseBehavior(
             ...(connectionProjection
               ? { source: 'host_connection_dependency_projection' }
               : {}),
+            ...(keyRequest ? { keyRequest } : {}),
             ...(sourceUserSeq ? { sourceUserSeq } : {}),
             ...(candidates.length > 1
               ? {

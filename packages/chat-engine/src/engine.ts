@@ -2,6 +2,7 @@ import { approvalResultFields } from './pending-action-result.js';
 import { applySteerReceiptEvent, hasSteerAdmission } from './steer-receipt.js';
 import { followUpSendsAfter, steerRefusalWaitsForTurnEnd } from './follow-up.js';
 import { readQuestionOptions } from './question-options.js';
+import { readKeyRequest } from './key-request.js';
 import { readLiveApprovalControl } from './live-approval-control.js';
 import { readBackgroundOutcomeReport } from './background-outcome-report.js';
 import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck } from './approval-card-resolution.js';
@@ -1082,6 +1083,7 @@ export class ChatEngine {
           ? d.question.trim()
           : 'I have a question for you.';
         const options = readQuestionOptions(d.options);
+        const keyRequest = readKeyRequest(d.keyRequest);
         this.updateActive((m) => ({
           ...m,
           text: question,
@@ -1089,6 +1091,7 @@ export class ChatEngine {
           status: 'awaiting-reply',
           progress: undefined,
           ...(options.length ? { options } : {}),
+          ...(keyRequest ? { keyRequest } : {}),
           activity: settleTerminalActivity(
             m.activity ?? [],
             activityTerminalOutcomeForMessageStatus('awaiting-reply'),
@@ -1523,12 +1526,14 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
         // The same answers the live stream draws: a reopened chat keeps its
         // choice buttons (and the connection setup they carry).
         const options = readQuestionOptions(d.options);
+        const keyRequest = readKeyRequest(d.keyRequest);
         const message: ChatMessage = {
           id: `a-awaiting-${event.seq}`,
           role: 'assistant',
           text: question,
           status: 'awaiting-reply',
           ...(options.length ? { options } : {}),
+          ...(keyRequest ? { keyRequest } : {}),
           activity: settleTerminalActivity(activity ?? [], 'interrupted'),
         };
         const sourceUserSeq = sourceUserSeqOf(event) ?? currentSourceUserSeq;
