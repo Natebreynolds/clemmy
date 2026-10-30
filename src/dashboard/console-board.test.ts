@@ -3902,6 +3902,44 @@ test('GET /api/console/board shows a run waiting on the owner\'s answer once, in
   }
 });
 
+// A run parked on a model outage asks "try again?"; once its workflow ran to
+// completion again it is not needed. Live 2026-10-30 it was eight days old and
+// fell past Done's freshest-40 cap, so nothing on the board could stop it.
+test('GET /api/console/board lists an outage-parked run its workflow has since completed as not needed, dated by the newer run', async () => {
+  const workflowSlug = 'board-outage-replaced-wf';
+  const runId = 'sched-outage-old-0001';
+  const step = createHarnessSession({ id: `workflow:${runId}:draft`, kind: 'workflow' } as never);
+  appendHarnessEvent({ sessionId: step.id, turn: 1, role: 'Clem', type: 'awaiting_user_input',
+    data: { question: 'Would you like me to try continuing from here?', source: 'model_transport_recovery', sourceUserSeq: 1 } });
+  const eightDaysAgo = new Date(Date.now() - 8 * 86_400_000).toISOString();
+  mkdirSync(WORKFLOW_RUNS_DIR, { recursive: true });
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, `${runId}.json`), JSON.stringify({
+    id: runId, workflow: workflowSlug, workflowSlug, status: 'awaiting_input', source: 'schedule', createdAt: eightDaysAgo,
+    awaitingInput: { questionId: `workflow-input:${runId}:draft:1`, question: 'Would you like me to try continuing from here?',
+      stepId: 'draft', sessionId: step.id, askedAt: eightDaysAgo },
+  }, null, 2), 'utf-8');
+  writeFileSync(path.join(WORKFLOW_RUNS_DIR, 'sched-outage-new-0002.json'), JSON.stringify({
+    id: 'sched-outage-new-0002', workflow: workflowSlug, workflowSlug, status: 'completed', source: 'schedule',
+    createdAt: new Date(Date.now() - 3_600_000).toISOString(),
+  }, null, 2), 'utf-8');
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'run_started' });
+  appendWorkflowEvent(workflowSlug, runId, { kind: 'step_started', stepId: 'draft' });
+
+  const h = await boot();
+  try {
+    const body = await (await fetch(`${h.url}/api/console/board`)).json() as { cards: Array<BoardCard & { progressHint?: string; ageMs: number }> };
+    const card = body.cards.find((c) => c.id === `wf:${workflowSlug}:${runId}`);
+    assert.ok(card, 'the old run is still on the board');
+    assert.equal(card!.column, 'done');
+    assert.equal(card!.status, 'not_needed');
+    assert.match(card!.progressHint ?? '', /^Not needed any more: this workflow ran again and finished on /);
+    assert.deepEqual(card!.actions, ['cancel'], 'it can still be stopped');
+    assert.ok(card!.ageMs < 2 * 3_600_000, 'dated by the run that replaced it');
+  } finally {
+    await h.close();
+  }
+});
+
 // The boot-resume cap parks a run that kept restarting. The board called it
 // "Waiting for your approval on step main" (live 2026-10-30); no approval was
 // asked. It is a resume-or-skip decision.

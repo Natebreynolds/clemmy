@@ -13516,8 +13516,10 @@ export function registerConsoleRoutes(
           // lastEventAt, a run stuck since 15:00 rendered as 39 seconds old on
           // every poll, so a ten-hour loop looked like a healthy fresh run and
           // nobody could see the problem (live 2026-09-11). Same correction the
-          // background-task card already carries.
-          ageMs: ageMs(pending.startedAt ?? pending.lastEventAt),
+          // background-task card already carries. A run no longer needed is
+          // dated from the run that replaced it, or Done's freshest-40 cap
+          // drops it and nothing on the board can stop it.
+          ageMs: superseded ? Math.max(0, now - superseded.finishedAt) : ageMs(pending.startedAt ?? pending.lastEventAt),
           updatedAt: pending.lastEventAt ?? new Date(now).toISOString(),
           actions: superseded || mutationBlocked || capabilityBlocked || awaitingInput
             ? ['cancel']
