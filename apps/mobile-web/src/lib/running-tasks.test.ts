@@ -114,14 +114,12 @@ test('the mobile sheet is bounded, modal, keyboard dismissible, safe-area aware,
   assert.doesNotMatch(component, /getWorkflowRunEvents|buildWorkflowRunDetail|WorkflowSteps|MAX_VISIBLE_STEPS/,
     'foreground chat fetched raw workflow events or rendered a secondary detail path');
 
-  // The dock is gone (owner directive 2026-08-25): the trigger is a compact
-  // HEADER chip, mounted once in the shell header so running work stays
-  // reachable from every screen and nothing floats at the bottom any more.
-  const appShell = readFileSync(new URL('../app.tsx', import.meta.url), 'utf8');
-  assert.match(appShell, /class="meta"[\s\S]*?<RunningTasksSheet[^>]*\/>/,
-    'the running-tasks chip lives in the sticky header, not a bottom float');
-  assert.match(appShell, /<RunningTasksSheet onOpenRun=\{openRun\}/,
-    'a run listed in the sheet must open the run, not only expand in place');
+  // The one Clem screen (2026-10-30) took the header chip away: running work
+  // is on Clem's own screen, from the same presenter, in words.
+  const home = readFileSync(new URL('../screens/Home.tsx', import.meta.url), 'utf8');
+  assert.match(home, /presentWorkingNow\(working\.entries, working\.observedAt\)/);
+  assert.match(home, /Working on \$\{activeWork\.length === 1 \? 'one thing' : `\$\{activeWork\.length\} things`\}/);
+  assert.match(home, /'Nothing running right now'/);
   // Presenter contract: the chip exists ONLY while something is running or
   // stalled — it disappears at zero, and it never shows a bare digit code:
   // the header says "3 running" / "2 stalled", never "8·7·22".

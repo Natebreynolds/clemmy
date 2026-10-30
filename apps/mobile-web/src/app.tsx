@@ -785,7 +785,7 @@ export function App() {
             <button key={id} type="button" aria-current={tab === id ? 'page' : undefined}
               onClick={() => { if (tab !== id) haptic('light'); navigateTo(id); }}>
               {TABS.find(section => section.id === id)!.label}
-              {id === 'inbox' && needsYou.show ? <span class="adaptive-navigation-count" aria-label={needsYou.badgeAriaLabel}>{needsYou.badgeText}</span> : null}
+              {id === 'inbox' && needsYou.show ? <span class={`adaptive-navigation-count${needsYou.stale ? ' badge-stale' : ''}`} aria-label={needsYou.badgeAriaLabel}>{needsYou.badgeText}</span> : null}
             </button>
           ))}
         </div>

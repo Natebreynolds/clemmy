@@ -97,10 +97,11 @@ test('all three chrome surfaces read the one presenter, and the poll records pro
   assert.match(app, /setDecisionsLive\(!stamp\);/);
   assert.match(app, /\} catch \{[\s\S]*?if \(!cancelled\) setDecisionsLive\(false\);/,
     'a failed poll keeps the last good count but stops calling it current');
-  // The pill, the title badge and the drawer badge.
-  assert.match(app, /\{needsYou\.pillText\}<\/span>/);
-  assert.match(app, /class=\{`title-badge\$\{needsYou\.stale \? ' badge-stale' : ''\}`\}/);
+  // The one Clem screen (2026-10-30) has no header pill or title badge; the
+  // count lives on Your stuff's Inbox row and, on a wide screen, on the
+  // side navigation. Both say when the number may be out of date.
   assert.match(app, /class=\{`drawer-badge\$\{needsYou\.stale \? ' badge-stale' : ''\}`\}/);
+  assert.match(app, /class=\{`adaptive-navigation-count\$\{needsYou\.stale \? ' badge-stale' : ''\}`\}/);
   // The raw, undisclosed count must not be rendered anywhere in the chrome.
   assert.doesNotMatch(app, /Needs you · \{decisionsLabel\}/);
   assert.doesNotMatch(app, /decisions > 9 \? '9\+' : decisions/);
@@ -108,5 +109,4 @@ test('all three chrome surfaces read the one presenter, and the poll records pro
 
   const css = read('../styles.css');
   assert.match(css, /\.badge-stale \{/, 'the marker a numeral needs to stop looking live');
-  assert.match(css, /\.needs-pill-stale \.needs-pill-face \{/);
 });
