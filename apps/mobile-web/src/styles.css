@@ -6027,6 +6027,7 @@ textarea.cz-input { resize: vertical; }
 .ws-details-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .chat-options-note { margin: 12px 8px; color: var(--fg-2); font-size: var(--t-sm); line-height: 1.5; overflow-wrap: anywhere; }
+.key-request-note { margin: var(--sp-3) 0 var(--sp-2); color: var(--fg-2); font-size: var(--t-sm); line-height: 1.5; overflow-wrap: anywhere; }
 
 /* A reply-in-your-words opener reads as a link beside the tap answers. */
 .home-link-btn {

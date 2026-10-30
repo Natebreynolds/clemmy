@@ -8,6 +8,7 @@ import { isExecutionSourceBoundary } from './accepted-source-kind.js';
  * version so the unified `/api/console/sessions/:id` endpoint and any UI
  * agree on exactly one rendering of harness history.
  */
+import { parseMcpKeyRequest, type McpKeyRequest } from './mcp-key-request-shape.js';
 import type { WorkflowSavedEventData } from '../../execution/workflow-saved-event.js';
 import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents } from './eventlog.js';
@@ -152,7 +153,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; terminal?: Record<string, unknown> };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; questionKeyRequest?: McpKeyRequest; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -286,9 +287,12 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
   // A question's own answers, by the source that asked it: its typed
   // terminal carries the question's words but not its choices.
   const questionOptionsBySource = new Map<string, string[]>();
+  const questionKeyRequestBySource = new Map<string, McpKeyRequest>();
   for (const event of events) {
     if (event.type !== 'awaiting_user_input') continue;
     const asked = positiveSeq(event.data.sourceUserSeq);
+    const keyRequest = parseMcpKeyRequest(event.data.keyRequest);
+    if (asked !== null && keyRequest) questionKeyRequestBySource.set(sourceKey(event.sessionId, asked), keyRequest);
     const options = Array.isArray(event.data.options)
       ? event.data.options.filter((option): option is string => typeof option === 'string' && option.trim().length > 0).slice(0, 8)
       : [];
@@ -323,6 +327,8 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
         ...(presentation.kind === 'question' && questionOptionsBySource.has(key)
           ? { questionOptions: questionOptionsBySource.get(key)! } : {}),
+        ...(presentation.kind === 'question' && questionKeyRequestBySource.has(key)
+          ? { questionKeyRequest: questionKeyRequestBySource.get(key)! } : {}),
         terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
@@ -502,6 +508,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
             ...(assistant.questionOptions ? { questionOptions: assistant.questionOptions } : {}),
+            ...(assistant.questionKeyRequest ? { questionKeyRequest: assistant.questionKeyRequest } : {}),
             ...(assistant.terminal ? { terminal: assistant.terminal } : {}),
           }),
         ]),

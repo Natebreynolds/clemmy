@@ -543,6 +543,8 @@ export interface ChatMessage {
   delegatedWork?: DelegatedWorkControl;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
+  /** Keys the question's card takes in hidden fields (names only). */
+  keyRequest?: import('./key-request.js').KeyRequest;
   /** Present only while `text` is a live answer draft; see answer-stream.ts. */
   answerDraft?: LiveAnswerDraft;
 }

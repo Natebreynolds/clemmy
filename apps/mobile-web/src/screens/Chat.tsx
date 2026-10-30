@@ -91,6 +91,7 @@ import {
   pendingActionRecordPresentation,
   pendingActionPresentationCopy,
   type PendingActionResultLookup,
+  type KeyRequest,
 } from '@clem/chat-engine';
 import {
   answerModelRuleOffer,
@@ -1501,6 +1502,7 @@ function MessageRow({
           remembered. Desktop makes the file chips openable; a phone has nowhere
           local to open to, so here it stays an honest count rather than a
           button that does nothing. */}
+      {message.status === 'awaiting-reply' && message.keyRequest ? <KeyRequestNote request={message.keyRequest} /> : null}
       {message.status === 'awaiting-reply' && message.options?.length && onAnswer ? (
         sessionId && onConnectionContinue ? <ConnectionSetup sessionId={sessionId} options={message.options}
           revision={JSON.stringify(message.terminal)} onContinue={onConnectionContinue}
@@ -1774,6 +1776,17 @@ function OutcomeMark({ failed, unfinished, waiting }: { failed: boolean; unfinis
  * the reply; typing stays open for anything else. The buttons latch after one
  * tap so a double tap cannot answer twice.
  */
+/** A key is typed on the computer, in this same chat's hidden field: a paired
+ *  phone never writes a credential into the Mac's environment. */
+function KeyRequestNote({ request }: { request: KeyRequest }) {
+  const keys = request.keys.join(', ');
+  return (
+    <p class="key-request-note" role="note">
+      This needs your {request.server} key ({keys}). Keys are typed on your computer: open this chat there and enter it in the hidden field. It never goes into the chat.
+    </p>
+  );
+}
+
 function AnswerChoices({ options, onAnswer }: { options: string[]; onAnswer: (text: string) => void }) {
   const [chosen, setChosen] = useState<string | null>(null);
   return (

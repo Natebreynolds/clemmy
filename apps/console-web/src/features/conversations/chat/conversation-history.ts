@@ -1,5 +1,5 @@
 import { readTaskMode, readPlanRevisionRef } from '../../../lib/task-mode';
-import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation, approvalResultFields } from '@clem/chat-engine';
+import { applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readSteerReceipt, approvalPreviewFrom, approvalRevisionFrom, recordedTurnProject, terminalCompletionPresentation, approvalResultFields, readKeyRequest } from '@clem/chat-engine';
 import { pendingActionFromEvent, type ChatMessage } from '../../../lib/useChat';
 import type { Turn } from '../types';
 
@@ -146,6 +146,7 @@ function historyMessage(turn: Turn): ChatMessage {
     ...(typed?.terminal ? { terminal: typed.terminal } : {}),
     // A reopened question keeps its choices (and the connection setup they carry).
     ...(typed?.status === 'awaiting-reply' && turn.questionOptions?.length ? { options: [...turn.questionOptions] } : {}),
+    ...(typed?.status === 'awaiting-reply' && readKeyRequest(turn.questionKeyRequest) ? { keyRequest: readKeyRequest(turn.questionKeyRequest)! } : {}),
   };
 }
 
