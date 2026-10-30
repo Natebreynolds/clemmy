@@ -105,3 +105,16 @@ test('a task is not saved as repeatable when it cannot be repeated faithfully', 
   assert.deepEqual(parseWindowSnapshot(snapshot('s1', 1, '- [7] AXTextField "Say \\"hi\\"" [id=f1 actions=[confirm]]'))?.elements.get(7),
     { role: 'AXTextField', label: 'Say "hi"', axId: 'f1' });
 });
+
+test('the driver\'s command-line answer reads as a result replay understands; anything else is a refusal', async () => {
+  const { driverCliResult } = await import('../integrations/computer-replay-driver.js');
+  const launched = driverCliResult('{"pid": 701, "name": "Notes"}');
+  assert.deepEqual(launched, { result: { isError: false, structuredContent: { pid: 701, name: 'Notes' } } });
+  const refused = driverCliResult('Error: no element with token s00000009:4') as { result: { isError: boolean } };
+  assert.equal(refused.result.isError, true);
+  assert.equal((driverCliResult(null) as { result: { isError: boolean } }).result.isError, true);
+  const replayed = await replayComputerRecipe({ version: 1, steps: [{ kind: 'launch', bundleId: 'com.apple.Notes' }, { kind: 'window', app: 'Notes', title: 'Notes' }] },
+    async (tool) => driverCliResult(tool === 'launch_app' ? '{"pid": 701}' : '{"windows":[{"app_name":"Notes","title":"Notes","window_id":15}]}'),
+    { session: 'replay' });
+  assert.deepEqual(replayed, { status: 'done', steps: 2 });
+});
