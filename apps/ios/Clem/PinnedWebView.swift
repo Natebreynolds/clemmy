@@ -280,6 +280,7 @@ final class WebViewModel: NSObject, ObservableObject {
             "clemWidgetSpace",
             "clemWidgetWorkflow",
             "clemWidgetWorkflowLaunch",
+            "clemWidgetVoiceLaunch",
             "clemNativeVoiceReady",
             "clemNativeVoiceSession",
             "clemNativeVoiceClear",
@@ -825,6 +826,22 @@ final class WebViewModel: NSObject, ObservableObject {
         webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetWorkflowLaunchConsumed && window.clemNative.widgetWorkflowLaunchConsumed(\(json))")
     }
 
+    fileprivate func consumeWidgetVoiceLaunch(_ body: [String: Any]) {
+        guard Set(body.keys) == Set(["requestId", "navigationId"]),
+              let requestID = body["requestId"] as? String, UUID(uuidString: requestID) != nil,
+              let navigationID = body["navigationId"] as? String, let id = UUID(uuidString: navigationID) else { return }
+        var consumed = false
+        if pendingPushNavigationAllowed, connectionRouteReady, inFlightWidgetID == id,
+           let fingerprint = pairing.fingerprint, PairingStore.load()?.fingerprint == fingerprint,
+           let pending = PendingWidgetNavigationRepository.shared.current(pairingFingerprint: fingerprint),
+           pending.id == id, pending.url.absoluteString == "clem://voice" {
+            consumed = PendingWidgetVoiceLaunchRepository.shared.consume(id: id, pairingFingerprint: fingerprint)
+        }
+        let response: [String: Any] = ["requestId": requestID, "navigationId": navigationID, "ok": consumed]
+        guard let data = try? JSONSerialization.data(withJSONObject: response), let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript("window.clemNative && window.clemNative.widgetVoiceLaunchConsumed && window.clemNative.widgetVoiceLaunchConsumed(\(json))")
+    }
+
     /// The page sends this only after it rendered/focused the addressed card or
     /// proved that the durable notification no longer exists. Accepting an old
     /// ID never clears a newer tap.
@@ -1358,6 +1375,11 @@ private final class ScriptProxy: NSObject, WKScriptMessageHandler {
         if message.name == "clemWidgetWorkflowLaunch" {
             guard let body = message.body as? [String: Any] else { return }
             MainActor.assumeIsolated { model?.consumeWidgetWorkflowLaunch(body) }
+            return
+        }
+        if message.name == "clemWidgetVoiceLaunch" {
+            guard let body = message.body as? [String: Any] else { return }
+            MainActor.assumeIsolated { model?.consumeWidgetVoiceLaunch(body) }
             return
         }
         if message.name == "clemWidgetNavigationHandled" {

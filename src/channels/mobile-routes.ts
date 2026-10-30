@@ -58,6 +58,7 @@ import { containAsyncRouteRejections } from './contain-async-route-rejections.js
 import { Readable } from 'node:stream';
 import { requestSpeech, spokenReplyText } from '../dashboard/voice-speech.js';
 import { createLiveVoiceSession, liveVoiceStatus } from '../dashboard/live-voice.js';
+import { readVoiceCheckIn } from '../dashboard/voice-check-in.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import path from 'node:path';
@@ -902,6 +903,8 @@ export interface MobileRouterDeps {
   /** Provider-free speech route tests. Production shares desktop's speech service. */
   voiceSpeechRuntime?: { requestSpeech: typeof requestSpeech };
   liveVoiceRuntime?: { status: typeof liveVoiceStatus; createSession: typeof createLiveVoiceSession };
+  /** Read-only retained-state briefing; isolated route tests supply a reader. */
+  voiceCheckInRuntime?: { read: typeof readVoiceCheckIn };
   /**
    * Optional override for the built PWA assets directory. When unset,
    * the router probes the usual candidate paths (apps/mobile-web/dist
@@ -4022,6 +4025,12 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
   // Live voice on the phone: the same exchange as the desktop's. The phone's
   // offer becomes a session here, so the key never reaches the phone; audio
   // then flows between the phone and the voice service.
+  router.get('/api/voice/check-in', requireMobileSession, async (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    try { res.json(await (deps.voiceCheckInRuntime?.read ?? readVoiceCheckIn)()); }
+    catch { res.status(503).json({ status: 'unavailable', generatedAt: new Date().toISOString(),
+      spokenText: 'I could not read Clem’s saved check-in. Open Clem to check the current work.' }); }
+  });
   router.get('/api/voice/live', requireMobileSession, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json((deps.liveVoiceRuntime?.status ?? liveVoiceStatus)());

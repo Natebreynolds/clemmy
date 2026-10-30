@@ -527,3 +527,22 @@ test('phone live voice: a request that ends on a notice is answered with its typ
   assert.match(told[0]![0], /\(model: Vendor V4\)/);
   f.controller.stop();
 });
+
+
+test('explicit live quick-launch does not race availability into recorded voice', async () => {
+  const availability = deferred<boolean>();
+  const links: FakeLive[] = [];
+  const f = fixture({ live: { available: () => availability.promise, create: handlers => {
+    const link = new FakeLive(handlers, null); links.push(link); return link;
+  } } });
+  await f.controller.start({ preferLive: true });
+  assert.equal(links.length, 1);
+  assert.deepEqual(f.audio.events, [], 'quick voice never opens the record/transcribe fallback');
+  links[0].handlers.onLive();
+  links[0].handlers.onRequest({ id: 'check-in', words: 'What needs my attention?' });
+  await settle();
+  assert.deepEqual(f.sent, ['What needs my attention?']);
+  f.controller.stop();
+  availability.resolve(true); await settle();
+  assert.equal(f.controller.getSnapshot().enabled, false, 'late availability cannot restart capture');
+});

@@ -984,7 +984,7 @@ export interface CalendarWatchStatus {
   recentlyRetired: CalendarWatchItem[];
 }
 
-export function calendarWatchStatus(nowMs = Date.now()): CalendarWatchStatus {
+export function calendarWatchStatus(nowMs = Date.now(), options: { includeConnectedOperations?: boolean } = {}): CalendarWatchStatus {
   const policy = calendarWatchPolicy();
   const state = loadCalendarWatchState();
   const due = isCalendarWatchDue(nowMs);
@@ -995,7 +995,9 @@ export function calendarWatchStatus(nowMs = Date.now()): CalendarWatchStatus {
     .sort((a, b) => (b.retiredAt ?? '').localeCompare(a.retiredAt ?? ''))
     .slice(0, 8);
   let connectedOperations: string[] = [];
-  try { connectedOperations = connectedCalendarOperations().map((op) => op.operationId); } catch { /* status stays honest with an empty list */ }
+  if (options.includeConnectedOperations !== false) {
+    try { connectedOperations = connectedCalendarOperations().map((op) => op.operationId); } catch { /* status stays honest with an empty list */ }
+  }
   return {
     id: 'calendar',
     title: 'Calendar watch',

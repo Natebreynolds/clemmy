@@ -2301,9 +2301,9 @@ export async function liveVoiceStatus(): Promise<{ available: boolean }> {
 
 /** The phone's WebRTC offer, exchanged on the Mac for the voice service's
  *  answer; the key never reaches the phone. */
-export async function startLiveVoiceSession(body: { sdp: string; history: readonly { role: 'user' | 'assistant'; text: string }[] }): Promise<{ sessionId: string; sdp: string }> {
+export async function startLiveVoiceSession(body: { sdp: string; history: readonly { role: 'user' | 'assistant'; text: string }[] }, signal?: AbortSignal): Promise<{ sessionId: string; sdp: string }> {
   try {
-    return await api<{ sessionId: string; sdp: string }>('/m/api/voice/live-session', { method: 'POST', body: JSON.stringify(body) });
+    return await api<{ sessionId: string; sdp: string }>('/m/api/voice/live-session', { method: 'POST', body: JSON.stringify(body), signal });
   } catch (error) {
     const reason = (error as ApiError)?.body as { error?: unknown } | undefined;
     if (error instanceof Error && typeof reason?.error === 'string') error.message = reason.error;

@@ -4,6 +4,11 @@ import SwiftUI
 struct ClemApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    init() {
+        ClemWatchRelay.shared.activate()
+        if #available(iOS 18.0, *) { ClemAppShortcuts.updateAppShortcutParameters() }
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

@@ -371,6 +371,9 @@ final class WidgetVoiceSession: NSObject, ObservableObject, AVAudioPlayerDelegat
     /// captures old files and never resets a newly established pairing later.
     func beginClear() {
         provisioningGeneration = UUID()
+        ClemQuickVoiceService.clearReceipts()
+        PendingWidgetVoiceLaunchRepository.shared.clear()
+        ClemQuickVoicePresentation.shared.clear()
         NativeVoiceTransport.clearAllCredentials()
         let recordingID = recorder.completedRecording?.id
         let recordingPath = saved?.recordingPath

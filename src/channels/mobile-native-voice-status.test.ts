@@ -63,6 +63,21 @@ test('an exact ordinary question remains eligible while its canonical input boun
 test('native voice waits for a committed terminal, not a draft', () => {
   assert.deepEqual(nativeVoiceStatus(null), { state: 'working', canResumeVoice: false });
 });
+test('native status distinguishes a completed answer from an ordinary owner question without parsing words', () => {
+  const answer = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 14, status: 'done', kind: 'answer', text: 'Controlled answer.' });
+  assert.equal(answer.state, 'answered');
+  assert.equal(answer.taskStatus, 'done');
+  assert.equal(answer.kind, 'answer');
+  const question = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 15, status: 'needs_input', kind: 'question',
+    ordinaryQuestion: true, text: 'Which controlled account should I use?' });
+  assert.equal(question.state, 'answered', 'existing listening compatibility stays unchanged');
+  assert.equal(question.taskStatus, 'needs_input');
+  assert.equal(question.kind, 'question');
+  const held = nativeVoiceStatus({ sessionId: 'fixture', sourceUserSeq: 16, status: 'uncertain', kind: 'uncertain', text: 'Controlled uncertain result.' });
+  assert.equal(held.state, 'needs_app');
+  assert.equal(held.taskStatus, 'uncertain');
+  assert.equal(held.kind, 'uncertain');
+});
 test('only a committed answer or a proven ordinary question can restart listening', () => {
   const terminal = { sessionId: 'fixture', sourceUserSeq: 14, status: 'done', kind: 'answer', text: 'Done with the fixture.' };
   assert.equal(nativeVoiceStatus(terminal).state, 'answered');

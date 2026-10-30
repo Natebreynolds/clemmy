@@ -13,6 +13,7 @@ struct RootView: View {
     @State private var searching = false
     @State private var widgetVoiceOpen = false
     @StateObject private var gate = BiometricGate()
+    @ObservedObject private var quickVoice = ClemQuickVoicePresentation.shared
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -88,6 +89,14 @@ struct RootView: View {
                     onReload: { model?.reloadForNativeVoiceSetup() })
             }
         }
+        .sheet(isPresented: Binding(get: { quickVoice.reply != nil && gate.unlocked },
+            set: { if !$0 { quickVoice.reply = nil } })) {
+            if let reply = quickVoice.reply, gate.unlocked { ClemQuickVoiceResultSheet(reply: reply) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .clemQuickVoiceOpenConversation)) { note in
+            guard gate.unlocked, scenePhase == .active, let id = note.object as? String else { return }
+            model?.openNativeVoiceConversation(id)
+        }
         .onOpenURL { url in
             if url.scheme == "clem", ["voice-setup", "recording"].contains(url.host ?? ""),
                url.user == nil, url.password == nil, url.port == nil, url.query == nil,
@@ -103,6 +112,7 @@ struct RootView: View {
             // URL navigation is never authority to run a workflow. A newer
             // navigation also retires any earlier widget Run press.
             PendingWidgetWorkflowLaunchRepository.shared.clear()
+            PendingWidgetVoiceLaunchRepository.shared.clear()
             PendingPushNavigationStore.clear()
             synchronizePendingNavigationDelivery()
         }
@@ -163,6 +173,9 @@ struct RootView: View {
     private func clearWidgetState() {
         PendingWidgetNavigationRepository.shared.clear()
         PendingWidgetWorkflowLaunchRepository.shared.clear()
+        PendingWidgetVoiceLaunchRepository.shared.clear()
+        ClemQuickVoiceService.clearReceipts()
+        ClemQuickVoicePresentation.shared.clear()
         ClemWidgetSpaceStore.shared.clear()
         ClemWidgetWorkflowStore.shared.clear()
         WidgetCenter.shared.reloadAllTimelines()

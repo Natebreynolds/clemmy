@@ -55,10 +55,11 @@ interface Props {
 }
 
 export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenRun, onOpenNeedsYou, onOpenSettings }: Props) {
-  const resume = useRef(handoff && !handoff.showList ? null : mobileChatLocation.resume());
+  const resume = useRef(handoff && !handoff.showList && handoff.composeMode !== 'voice' ? null : mobileChatLocation.resume());
   const [showList, setShowList] = useState(Boolean(handoff?.showList || (!handoff && mobileChatLocation.showingList)));
   const [selectedId, setSelectedId] = useState<string | null>(resume.current?.kind === 'chat' ? resume.current.sessionId : null);
   const [selectedDraft, setSelectedDraft] = useState<string | undefined>();
+  const [selectedComposeMode, setSelectedComposeMode] = useState<ComposeMode | undefined>(handoff?.composeMode);
   const [selectedTitle, setSelectedTitle] = useState<string | undefined>(resume.current?.kind === 'chat' ? resume.current.title : undefined);
   const [selectedContext, setSelectedContext] = useState<SelectedFileContext | undefined>();
   // The thread the owner just left: marked read once the list shows how it
@@ -181,6 +182,14 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       onHandoffConsumed?.();
       return;
     }
+    if (handoff.composeMode === 'voice' && selectedId) {
+      // A quick voice action resumes the conversation already under the chat
+      // list. Its drafts and pending work keep their existing owners.
+      setSelectedComposeMode('voice');
+      onHandoffConsumed?.();
+      return;
+    }
+    setSelectedComposeMode(handoff.composeMode);
     if (handoff.session) {
       setComposing(null);
       setSelectedId(handoff.session.id);
@@ -231,6 +240,7 @@ export function Chats({ handoff, onHandoffConsumed, onListVisibleChange, onOpenR
       <Chat
         key={selectedId}
         sessionId={selectedId}
+        initialComposeMode={selectedComposeMode}
         initialFileContext={selectedContext}
         initialTitle={selectedTitle ?? session?.title ?? ''}
         initialDraft={selectedDraft}

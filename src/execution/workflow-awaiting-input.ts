@@ -55,8 +55,8 @@ export interface AwaitingInputWorkflowInboxItem extends AwaitingInputWorkflowMat
   originSessionId: string | null;
 }
 
-export function listAwaitingInputWorkflowRuns(): AwaitingInputWorkflowInboxItem[] {
-  reconcileSettledWorkflowQuestionNotifications();
+export function listAwaitingInputWorkflowRuns(options: { reconcile?: boolean } = {}): AwaitingInputWorkflowInboxItem[] {
+  if (options.reconcile !== false) reconcileSettledWorkflowQuestionNotifications();
   const matches: AwaitingInputWorkflowInboxItem[] = [];
   for (const filePath of workflowRunFiles()) {
     const record = readWorkflowRunRecordSnapshot<AwaitingInputWorkflowRecord>(filePath);

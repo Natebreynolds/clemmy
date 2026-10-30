@@ -123,6 +123,7 @@ import { Composer } from '../components/Composer';
 import { VoiceModeControl } from '../components/VoiceModeControl';
 import type { ComposeMode } from '../lib/compose-route';
 import { reportWidgetLanding, widgetNavigationFromSearch } from '../lib/widget-bridge';
+import { consumeWidgetVoiceLaunch } from '../lib/voice-launch';
 import { attachmentLabel, attachmentsSummary } from '../lib/attachments';
 import { ChatBackButton } from '../components/ChatBackButton';
 import { useMobileDetailHeader } from '../lib/mobile-navigation';
@@ -177,7 +178,23 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
   const [workflowHistoryReady, setWorkflowHistoryReady] = useState(!workflowScoped);
   const retryHistory = useRef<(() => void) | null>(null);
   const widgetNavigation = widgetNavigationFromSearch(window.location.search);
-  useEffect(() => { if (initialComposeMode) reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode }); }, [initialComposeMode, widgetNavigation]);
+  const [liveLaunchId, setLiveLaunchId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!initialComposeMode) return;
+    let current = true;
+    if (initialComposeMode !== 'voice' || !widgetNavigation) {
+      reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode });
+      return;
+    }
+    // Navigation acknowledgment may retire native pending state. Claim the
+    // separately stored action first; a copied URL never grants microphone use.
+    void consumeWidgetVoiceLaunch(widgetNavigation).then(allowed => {
+      if (!current) return;
+      if (allowed) setLiveLaunchId(widgetNavigation);
+      reportWidgetLanding(widgetNavigation, { tab: 'chats', compose: initialComposeMode });
+    });
+    return () => { current = false; };
+  }, [initialComposeMode, widgetNavigation]);
   const draftOwner = useRef(initialSessionId ? `chat:${initialSessionId}` : draftScope ?? newMobileDraftScope());
   // The visible conversation owns its drafts. Stop/Continue may advance the
   // engine's physical head, but that must not hide unsent text or late uploads.
@@ -1026,6 +1043,8 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
       <div ref={dockRef} class="chat-dock">
         <VoiceModeControl
           scope={voiceScope}
+          liveLaunchId={liveLaunchId}
+          launchPreparing={preparingContext || (workflowScoped && !workflowHistoryReady) || Boolean(initialSessionId && !snapshot)}
           messages={messages}
           busy={busy}
           onSend={submitVoice}

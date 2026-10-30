@@ -31,6 +31,8 @@ targets:
     dependencies:
       - target: ClemWidgets
         embed: true
+      - target: ClemWatch
+        embed: true
     entitlements:
       path: Clem/Clem.entitlements
       properties:
@@ -56,7 +58,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
         ENABLE_PREVIEWS: true
-        CURRENT_PROJECT_VERSION: 19
+        CURRENT_PROJECT_VERSION: 20
         MARKETING_VERSION: 0.1.0
       configs:
         # Debug runs from Xcode against the sandbox, which is the daemon's
@@ -94,8 +96,41 @@ targets:
         APPLICATION_EXTENSION_API_ONLY: true
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) CLEM_WIDGET_EXTENSION
         SKIP_INSTALL: true
-        CURRENT_PROJECT_VERSION: 19
+        CURRENT_PROJECT_VERSION: 20
         MARKETING_VERSION: 0.1.0
+  ClemWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - ClemWatch
+    info:
+      path: ClemWatch/Info.plist
+      properties:
+        CFBundleDisplayName: Clem
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: ai.breakthroughcoaching.clem
+        WKRunsIndependentlyOfCompanionApp: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem.watch
+        PRODUCT_NAME: ClemWatch
+        CURRENT_PROJECT_VERSION: 20
+        MARKETING_VERSION: 0.1.0
+        SKIP_INSTALL: true
+  ClemWatchTests:
+    type: bundle.unit-test
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - ClemWatchTests
+    dependencies:
+      - target: ClemWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.breakthroughcoaching.clem.watch.tests
+        GENERATE_INFOPLIST_FILE: true
+        CODE_SIGNING_ALLOWED: false
   ClemTests:
     type: bundle.unit-test
     platform: iOS
@@ -109,6 +144,14 @@ targets:
         GENERATE_INFOPLIST_FILE: true
         CODE_SIGNING_ALLOWED: false
 schemes:
+  ClemWatch:
+    build:
+      targets:
+        ClemWatch: all
+        ClemWatchTests: [test]
+    test:
+      targets:
+        - ClemWatchTests
   Clem:
     build:
       targets:

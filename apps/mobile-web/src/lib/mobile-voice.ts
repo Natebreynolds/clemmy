@@ -122,12 +122,14 @@ export class MobileVoiceController {
     this.pump();
   }
   /** Invoke directly from the Start button, before awaiting any work. */
-  async start(): Promise<void> {
+  async start(options: { preferLive?: boolean } = {}): Promise<void> {
     if (this.state.enabled || !this.conversation) return;
     const generation = ++this.generation;
     this.baseline = new Set(this.conversation.messages.map(message => message.id));
     this.heard.clear(); this.queue = []; this.awaitingTurn = false;
-    if (this.deps.live && this.liveAvailable) { this.startLive(generation); return; }
+    // A trusted quick-launch action explicitly requests live conversation.
+    // Do not race the asynchronous availability preflight into the slower loop.
+    if (this.deps.live && (options.preferLive || this.liveAvailable)) { this.startLive(generation); return; }
     this.update({ enabled: true, phase: 'starting', heard: '', error: '', engine: 'standard' });
     if (!this.current(generation)) return;
     try {
@@ -179,7 +181,7 @@ export class MobileVoiceController {
         this.stop();
         this.update({ error: LIVE_END_WORDS[reason] ?? 'Live voice ended. Tap Talk to Clem to start again.' });
       },
-      onError: (message) => { if (this.live === link) console.warn('live voice:', message); },
+      onError: (message) => { if (this.live === link) this.update({ error: message }); },
     });
     this.live = link;
     link.start(liveHistory(this.conversation?.messages ?? [])).catch((error: unknown) => {

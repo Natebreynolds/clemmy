@@ -107,7 +107,7 @@ const NON_QUESTION_TASK_STATUSES = new Set<BackgroundTaskRecord['status']>([
  * This is the shared read guard for Inbox, Discord, Slack, and compatibility
  * tools. A stale linked row is settled here, not rendered disabled: every
  * visible Needs You question must have an action the user can actually open. */
-export function linkedCheckInActionability(checkInId: string): LinkedCheckInActionability {
+export function linkedCheckInActionability(checkInId: string, options: { reconcile?: boolean } = {}): LinkedCheckInActionability {
   const record = getCheckIn(checkInId);
   if (!record) {
     return { status: 'not_found', record: null, reason: 'The check-in no longer exists.' };
@@ -119,7 +119,7 @@ export function linkedCheckInActionability(checkInId: string): LinkedCheckInActi
     return { status: 'actionable', record, expectation: null, task: null };
   }
   if (!record.linkedQuestionId) {
-    const closed = closeCheckIn(
+    const closed = options.reconcile === false ? null : closeCheckIn(
       record.id,
       'Auto-closed: this legacy linked question has no exact question generation and cannot be answered safely.',
     );
@@ -164,7 +164,7 @@ export function linkedCheckInActionability(checkInId: string): LinkedCheckInActi
         : task.status === 'awaiting_input'
           ? 'Auto-closed: the linked task advanced to a newer question.'
           : `Auto-closed: the linked task moved to ${task.status} and no longer accepts this question.`;
-    const closed = closeCheckIn(record.id, reason);
+    const closed = options.reconcile === false ? null : closeCheckIn(record.id, reason);
     return { status: 'stale', record: closed ?? record, reason };
   }
 
@@ -178,10 +178,10 @@ export function linkedCheckInActionability(checkInId: string): LinkedCheckInActi
   };
 }
 
-export function listActionableCheckIns(agentSlug?: string): CheckInRecord[] {
+export function listActionableCheckIns(agentSlug?: string, options: { reconcile?: boolean } = {}): CheckInRecord[] {
   const actionable: CheckInRecord[] = [];
   for (const record of listOpenCheckIns(agentSlug)) {
-    const state = linkedCheckInActionability(record.id);
+    const state = linkedCheckInActionability(record.id, options);
     if (state.status === 'actionable') actionable.push(state.record);
   }
   return actionable;
@@ -275,14 +275,16 @@ export function answerExactCheckIn(input: {
 
 /** One authority-neutral read model for every global Inbox. Exact question
  * coordinates are projected, but no answer authority is created here. */
-export function listInboxQuestions(): InboxQuestionItem[] {
+// A quick briefing uses the same exact question predicates without settling
+// stale check-ins or notification carriers as a side effect of a GET.
+export function listInboxQuestions(options: { reconcile?: boolean } = {}): InboxQuestionItem[] {
   const tasks = listBackgroundTasks({ status: 'awaiting_input' })
     .filter((task) => Boolean(task.pendingQuestionId && task.pendingQuestion));
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const representedTaskQuestions = new Set<string>();
   const questions: InboxQuestionItem[] = [];
 
-  for (const row of listActionableCheckIns()) {
+  for (const row of listActionableCheckIns(undefined, options)) {
     const task = row.linkedTaskId ? taskById.get(row.linkedTaskId) : undefined;
     const frozenQuestionId = linkedQuestionId(row);
     const currentQuestionId = currentTaskQuestion(task);
@@ -331,7 +333,7 @@ export function listInboxQuestions(): InboxQuestionItem[] {
     });
   }
 
-  for (const row of listAwaitingInputWorkflowRuns()) {
+  for (const row of listAwaitingInputWorkflowRuns(options)) {
     const pending = row.awaitingInput;
     questions.push({
       id: `workflow:${row.runId}|${pending.questionId}`,

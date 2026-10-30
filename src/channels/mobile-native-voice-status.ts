@@ -92,6 +92,8 @@ export function nativeVoiceStatus(terminal: NativeVoiceTerminal | null) {
       canResumeVoice: false,
       sessionId: terminal.sessionId,
       sourceUserSeq: terminal.sourceUserSeq,
+      taskStatus: terminal.status,
+      kind: terminal.kind,
       text: '',
       notice,
     };
@@ -106,6 +108,8 @@ export function nativeVoiceStatus(terminal: NativeVoiceTerminal | null) {
     canResumeVoice: canContinue,
     sessionId: terminal.sessionId,
     sourceUserSeq: terminal.sourceUserSeq,
+    taskStatus: terminal.status,
+    kind: terminal.kind,
     text: text || 'Open this conversation in Clem to continue.',
   };
 }

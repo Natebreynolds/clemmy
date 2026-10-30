@@ -46,6 +46,32 @@ struct ClemSpaceWidget: Widget {
     }
 }
 
+/// Explicit system entry points; no URL or timeline starts audio or work.
+@available(iOS 18.0, *)
+struct ClemQuickCheckInWidget: Widget {
+    let kind = "ClemQuickCheckIn"
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: ClemProvider()) { _ in
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    ClemMark(size: 28)
+                    Text("Clem").font(.headline).foregroundStyle(ClemPalette.ink)
+                }
+                Button(intent: CheckInWithClemIntent(readAloud: true)) {
+                    Label("Check in", systemImage: "checkmark.bubble")
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }.buttonStyle(.borderedProminent).tint(ClemPalette.accent)
+                Button(intent: StartClemLiveConversationIntent()) {
+                    Label("Talk live", systemImage: "waveform")
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }.buttonStyle(.bordered).tint(ClemPalette.accentText)
+            }.containerBackground(ClemPalette.peel, for: .widget)
+        }.configurationDisplayName("Check in with Clem")
+            .description("Hear a quick work update or open a live conversation.")
+            .supportedFamilies([.systemSmall, .systemMedium])
+    }
+}
+
 /// Edit Widget chooses a view, not a task or an execution policy.
 struct ClemDashboardConfiguration: WidgetConfigurationIntent {
     static var title: LocalizedStringResource = "Clem dashboard"
@@ -133,6 +159,30 @@ struct ClemDictateControl: ControlWidget {
     }
 }
 
+@available(iOS 18.0, *)
+struct ClemLiveConversationControl: ControlWidget {
+    var body: some ControlWidgetConfiguration {
+        StaticControlConfiguration(kind: "ai.breakthroughcoaching.clem.live") {
+            ControlWidgetButton(action: StartClemLiveConversationIntent()) {
+                Label("Talk live with Clem", systemImage: "waveform")
+            }.tint(ClemPalette.islandAccent)
+        }.displayName("Talk live with Clem")
+            .description("Open a live conversation with one press.")
+    }
+}
+
+@available(iOS 18.0, *)
+struct ClemCheckInControl: ControlWidget {
+    var body: some ControlWidgetConfiguration {
+        StaticControlConfiguration(kind: "ai.breakthroughcoaching.clem.check-in") {
+            ControlWidgetButton(action: CheckInWithClemIntent(readAloud: true)) {
+                Label("Check in with Clem", systemImage: "checkmark.bubble")
+            }.tint(ClemPalette.islandAccent)
+        }.displayName("Check in with Clem")
+            .description("Hear the current work and decisions waiting for you.")
+    }
+}
+
 @main
 struct ClemWidgets: WidgetBundle {
     var body: some Widget {
@@ -141,8 +191,11 @@ struct ClemWidgets: WidgetBundle {
         ClemDashboardWidget()
         recordingActivity
         if #available(iOS 18.0, *) {
+            ClemQuickCheckInWidget()
             ClemTalkControl()
             ClemDictateControl()
+            ClemLiveConversationControl()
+            ClemCheckInControl()
         }
     }
 

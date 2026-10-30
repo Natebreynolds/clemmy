@@ -109,6 +109,74 @@ Before native distribution, verify gallery placement, both sizes, a cold/locked
 launch, microphone permission, warm draft preservation, and the Space snapshot
 on a physical iPhone. Hosted simulator tests do not establish those device results.
 
+## Quick voice, Shortcuts, and Apple Watch
+
+The quick-access build adds **Check in with Clem**, **Ask Clem**, **Read Clem’s
+latest result**, **Retry Clem’s saved request**, and **Talk live**. Native quick
+actions require iOS 18 or later and the matching daemon support. Open the paired
+app once and complete **Settings → Widget voice**. Existing pairing is reused.
+
+**Check in** reads a short saved-state briefing: pending approvals, questions,
+plans, retained watch findings and unfinished workflow records. It does not run
+all your tools or refresh all watches. It identifies missing sources and saved
+observations. **Ask Clem** sends your question through the ordinary Clem
+conversation, with the same tools and approval rules as chat. Follow-up asks keep
+the quick-voice conversation. Results requiring input or approval are presented
+as needing you, rather than completed work.
+
+For an iPhone Action button or a reusable Shortcut, create:
+
+1. **Dictate Text** (or **Ask for Input**).
+2. Clem’s **Ask Clem**, using that text as the Question.
+3. **Speak Text**, using Ask Clem’s returned result.
+
+Select that shortcut under **Settings → Action Button → Shortcut** on supported
+iPhone models. Siri can also invoke **Ask Clem** directly and speak its dialog.
+For a routine briefing, use **Check in with Clem**. Add the **Clem quick voice**
+widget for Check in and Talk live. Talk live opens the foreground conversation
+and consumes an exact, one-use native launch action before starting voice; a
+copied navigation URL only opens the controls. Drafts and existing work remain
+attached to their conversations.
+
+Install the embedded **Clem Watch** companion to expose the Watch’s own Ask,
+Check in and Read latest shortcuts. It uses Siri/system dictation and spoken
+readbacks through the paired iPhone. The Watch app also provides a dictation
+field, Check in, Read latest and Retry original. Its credentials remain on the
+iPhone. The phone must be reachable and have completed voice setup. Add the
+shortcut to the Watch’s Shortcuts quick-access surface, or select it for the
+Action button on a Watch model that has one. This companion is distinct from
+the existing mirrored iPhone recording Live Activity.
+
+If a task takes longer, Clem reports that it is still working. **Read latest**
+checks the same task without submitting it again. **Retry original** first
+checks that exact receipt; an explicit retry can resend only the original
+immutable request under the same key when the server confirms it has no receipt.
+An accepted task is never resubmitted by a result lookup.
+
+### End-to-end acceptance on a phone and Watch
+
+Use a matching installed native/server build and a named controlled fixture:
+
+1. Invoke Check in; confirm the spoken saved-state/freshness limits and visible
+   pending items match the fixture. This should not start new watcher runs.
+2. Ask a short question, then a follow-up referring to its first answer. Confirm
+   the same conversation and one spoken reply per turn.
+3. Read a controlled connected-app thread, discuss it, and request a draft.
+   Verify the draft is attached to the selected thread/account. Sending retains
+   the ordinary approval process.
+4. Start a slow fixture task. End voice, then Read latest. Confirm task identity
+   and no second submission. Exercise interrupted acknowledgement and Retry
+   original separately.
+5. Test the actual Home Screen widget, Siri, Action button shortcut, and Watch
+   independently, including locked/unlocked, offline recovery and foreground
+   interruption. A Watch SDK build or simulator test does not prove delivery on
+   a physical Watch.
+
+For a failed launch, the existing native **Voice connection details** gives a
+bounded stage/issue code. Retain the installed native build, daemon identity,
+time to useful spoken answer, task outcome, voice duration and backend usage.
+Do not infer performance or total-cost improvements from a synthetic fixture.
+
 ## Rendezvous: surviving IP changes
 
 The daemon advertises `_clemmy._tcp` over Bonjour with the cert fingerprint

@@ -15,6 +15,7 @@
  */
 import { registerApnsToken } from './api';
 import { openWidgetRoute, widgetSpaceStored, widgetWorkflowStored, widgetWorkflowLaunchConsumed } from './widget-bridge';
+import { widgetVoiceLaunchConsumed } from './voice-launch';
 
 const PENDING_KEY = 'clem.apns.pending';
 
@@ -36,6 +37,7 @@ declare global {
       widgetSpaceStored?(value: { requestId: string; ok: boolean; slug?: string }): void;
       widgetWorkflowStored?(value: { requestId: string; ok: boolean; slug?: string }): void;
       widgetWorkflowLaunchConsumed?(value: { requestId: string; navigationId: string; slug: string; ok: boolean }): void;
+      widgetVoiceLaunchConsumed?(value: { requestId: string; navigationId: string; ok: boolean }): void;
       openWidgetRoute?(value: { path: string; navigationId: string }): boolean;
     };
     webkit?: {
@@ -234,6 +236,7 @@ export function installNativeBridge(): void {
     widgetSpaceStored,
     widgetWorkflowStored,
     widgetWorkflowLaunchConsumed,
+    widgetVoiceLaunchConsumed,
     openWidgetRoute,
     registerApnsToken(deviceToken: string, environment?: string): void {
       void tryRegister(deviceToken, environment);

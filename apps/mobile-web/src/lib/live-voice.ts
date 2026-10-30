@@ -12,6 +12,21 @@ import { liveVoiceStatus, startLiveVoiceSession } from './api';
 const CLOSE_TIMEOUT_MS = 6_000;
 const ICE_TIMEOUT_MS = 10_000;
 
+export interface PhoneLiveVoiceDependencies {
+  createPeer(): RTCPeerConnection;
+  createAudio(): HTMLAudioElement;
+  microphone(): Promise<MediaStream>;
+  createSession(body: { sdp: string; history: readonly LiveHistoryMessage[] }, signal: AbortSignal): Promise<{ sessionId: string; sdp: string }>;
+}
+const dependencies: PhoneLiveVoiceDependencies = {
+  createPeer: () => new RTCPeerConnection(),
+  createAudio: () => new Audio(),
+  microphone: () => navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false,
+  }),
+  createSession: startLiveVoiceSession,
+};
+
 export class PhoneLiveVoice implements LiveVoiceLink {
   private readonly protocol: LiveVoiceProtocol;
   private peer: RTCPeerConnection | null = null;
@@ -20,8 +35,10 @@ export class PhoneLiveVoice implements LiveVoiceLink {
   private audio: HTMLAudioElement | null = null;
   private closeTimer: ReturnType<typeof setTimeout> | null = null;
   private released = false;
+  private closing = false;
+  private readonly setup = new AbortController();
 
-  constructor(handlers: LiveVoiceHandlers) {
+  constructor(handlers: LiveVoiceHandlers, private readonly deps: PhoneLiveVoiceDependencies = dependencies) {
     this.protocol = new LiveVoiceProtocol({
       ...handlers,
       onClosed: (reason, expected) => { this.release(); handlers.onClosed(reason, expected); },
@@ -29,14 +46,16 @@ export class PhoneLiveVoice implements LiveVoiceLink {
   }
 
   async start(history: readonly LiveHistoryMessage[]): Promise<void> {
-    const peer = new RTCPeerConnection();
+    if (this.released || this.closing || this.peer) return;
+    const peer = this.deps.createPeer();
     this.peer = peer;
     // Made in the owner's tap so the phone lets it play when the voice arrives.
-    const audio = new Audio();
+    const audio = this.deps.createAudio();
     audio.autoplay = true;
     audio.setAttribute('playsinline', '');
     this.audio = audio;
     peer.addEventListener('track', (event) => {
+      if (this.closing || this.released) { event.track.stop(); return; }
       audio.srcObject = new MediaStream([event.track]);
       void audio.play().catch(() => undefined);
     });
@@ -44,9 +63,12 @@ export class PhoneLiveVoice implements LiveVoiceLink {
       if (peer.connectionState === 'failed' || peer.connectionState === 'closed') this.protocol.transportClosed();
     });
     try {
-      this.microphone = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false,
-      });
+      const microphone = await this.deps.microphone();
+      if (this.closing || this.released) {
+        for (const track of microphone.getTracks()) track.stop();
+        return;
+      }
+      this.microphone = microphone;
       for (const track of this.microphone.getAudioTracks()) peer.addTrack(track, this.microphone);
       const channel = peer.createDataChannel('oai-events');
       this.channel = channel;
@@ -56,13 +78,17 @@ export class PhoneLiveVoice implements LiveVoiceLink {
       channel.addEventListener('close', () => this.protocol.transportClosed());
       this.protocol.attach(event => { if (channel.readyState === 'open') channel.send(JSON.stringify(event)); });
       await peer.setLocalDescription(await peer.createOffer());
-      await iceGathered(peer);
+      if (this.closing || this.released) return;
+      await iceGathered(peer, this.setup.signal);
+      if (this.closing || this.released) return;
       const sdp = peer.localDescription?.sdp;
       if (!sdp) throw new Error('This phone could not prepare a voice connection.');
-      const session = await startLiveVoiceSession({ sdp, history });
+      const session = await this.deps.createSession({ sdp, history }, this.setup.signal);
+      if (this.closing || this.released) return;
       await peer.setRemoteDescription({ type: 'answer', sdp: session.sdp });
     } catch (error) {
       this.release();
+      if (this.closing) return;
       throw error;
     }
   }
@@ -72,15 +98,19 @@ export class PhoneLiveVoice implements LiveVoiceLink {
   direct(text: string): void { this.protocol.direct(text); }
 
   close(): void {
-    if (this.released) return;
+    if (this.released || this.closing) return;
+    this.closing = true;
+    this.setup.abort();
     for (const track of this.microphone?.getTracks() ?? []) track.enabled = false;
     if (!this.protocol.close()) { this.release(); return; }
+    if (!this.channel || this.channel.readyState !== 'open') { this.protocol.transportClosed(); return; }
     this.closeTimer = setTimeout(() => this.protocol.transportClosed(), CLOSE_TIMEOUT_MS);
   }
 
   private release(): void {
     if (this.released) return;
     this.released = true;
+    this.setup.abort();
     if (this.closeTimer) clearTimeout(this.closeTimer);
     for (const track of this.microphone?.getTracks() ?? []) track.stop();
     try { this.channel?.close(); } catch { /* already closed */ }
@@ -90,17 +120,20 @@ export class PhoneLiveVoice implements LiveVoiceLink {
   }
 }
 
-function iceGathered(peer: RTCPeerConnection): Promise<void> {
+function iceGathered(peer: RTCPeerConnection, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
   if (peer.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => { peer.removeEventListener('icegatheringstatechange', check); reject(new Error('The voice connection took too long to prepare.')); }, ICE_TIMEOUT_MS);
+    const cleanup = () => { clearTimeout(timeout); peer.removeEventListener('icegatheringstatechange', check); signal.removeEventListener('abort', abort); };
+    const timeout = setTimeout(() => { cleanup(); reject(new Error('The voice connection took too long to prepare.')); }, ICE_TIMEOUT_MS);
+    const abort = () => { cleanup(); reject(signal.reason); };
     function check(): void {
       if (peer.iceGatheringState !== 'complete') return;
-      clearTimeout(timeout);
-      peer.removeEventListener('icegatheringstatechange', check);
+      cleanup();
       resolve();
     }
     peer.addEventListener('icegatheringstatechange', check);
+    signal.addEventListener('abort', abort, { once: true });
   });
 }
 
