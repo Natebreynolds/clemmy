@@ -1134,6 +1134,8 @@ export interface ChatSession {
   archived?: boolean;
   /** Work is in flight in it right now. Absent on a Mac that does not say. */
   running?: boolean;
+  /** Clem asked and is waiting on the owner's answer. Absent on an older Mac. */
+  waitingOnYou?: { question: string } | null;
 }
 
 export interface ChatEvent {

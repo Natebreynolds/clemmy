@@ -401,6 +401,8 @@ function ChatRow({ session, news, onOpen, onMenu, swipeOpen, onSwipe, onPin, onA
             {who ? <span class="chat-row-who">{who}</span> : null}
             {session.running ? (
               <span class="chat-row-working">Working…</span>
+            ) : session.waitingOnYou ? (
+              <span class="chat-row-asks">Waiting on your answer</span>
             ) : ended ? (
               <span><span class={`status-dot status-${session.status}`} aria-hidden="true" />{session.status} · {relativeTime(session.updatedAt)}</span>
             ) : <span>{relativeTime(session.updatedAt)}</span>}

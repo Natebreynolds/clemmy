@@ -3,7 +3,10 @@ import { test } from 'node:test';
 import { cardRecordHeadline, cardRecordInMotion, cardStepLabel } from './card-records';
 
 test('a card record names each step in plain words and says where the work stands', () => {
-  assert.equal(cardStepLabel({ tool: 'OUTLOOK_UPDATE_EVENT' }), 'Outlook update event');
+  assert.equal(cardStepLabel({ tool: 'OUTLOOK_UPDATE_EVENT' }), 'Updated Outlook event');
+  assert.equal(cardStepLabel({ tool: 'OUTLOOK_GET_CALENDAR_VIEW', done: true }), 'Checked Outlook calendar view');
+  assert.equal(cardStepLabel({ tool: 'SLACK_LIST_CONVERSATIONS', done: false }), 'Checking Slack conversations');
+  assert.equal(cardStepLabel({ tool: 'GMAIL_SEND_EMAIL' }), 'Sent Gmail email');
   assert.equal(cardStepLabel({ tool: 'memory_recall' }), 'Memory recall');
   assert.equal(cardStepLabel({ tool: '' }), '');
   assert.deepEqual(cardRecordHeadline({ state: 'working', steps: [] }), { tone: 'info', text: 'Clem is working on it…' });

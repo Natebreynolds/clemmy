@@ -190,13 +190,16 @@ export function Home({
   // working shows it, and one that finished since you looked says so. A
   // failure leaves the stack out; nothing else moves.
   const recentData = useScreenData(() => listChatSessions(), { intervalMs: 10_000, resourceKey: 'home-recent' });
-  const recent: ChatSession[] = (recentData.data?.sessions ?? [])
-    .filter((x) => x.kind === 'chat' || x.kind === 'agent')
-    .slice(0, MAX_RECENT_ROWS);
+  const conversations = (recentData.data?.sessions ?? []).filter((x) => x.kind === 'chat' || x.kind === 'agent');
+  // Conversations waiting on your answer come first, then the most recent.
+  const recent: ChatSession[] = [
+    ...conversations.filter((x) => x.waitingOnYou),
+    ...conversations.filter((x) => !x.waitingOnYou),
+  ].slice(0, MAX_RECENT_ROWS);
   const recentSeen = chatSeenBaseline(recentData.data?.sessions ?? []);
-  // A conversation Clem is still working in, or one she answered since you
-  // looked, is the first thing on her screen: you just asked her something.
-  const conversationFirst = paneSet.has('projects') && recent.some((x) => x.running || chatHasNews(x, recentSeen));
+  // A conversation Clem is still working in, one waiting on your answer, or
+  // one she answered since you looked, is the first thing on her screen.
+  const conversationFirst = paneSet.has('projects') && recent.some((x) => x.running || x.waitingOnYou || chatHasNews(x, recentSeen));
 
   // The once-a-day line: what happened since you last looked. Bookkeeping is
   // per device and best effort; without storage the line simply never shows.
@@ -334,6 +337,7 @@ export function Home({
               <div class="min-w-0" style={{ flex: '1 1 auto' }}>
                 <div class="home-row-title truncate">{session.title || 'Conversation'}</div>
                 {session.running ? <div class="home-row-note truncate">Working…</div>
+                  : session.waitingOnYou ? <div class="home-row-note home-row-note-news truncate">Waiting on your answer</div>
                   : chatHasNews(session, recentSeen) ? <div class="home-row-note home-row-note-news truncate">Clem replied</div>
                   : session.agentName ? <div class="home-row-note truncate">{session.agentName}</div> : null}
               </div>

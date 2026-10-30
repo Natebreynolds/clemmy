@@ -26,10 +26,30 @@ export function cardRecordInMotion(record: Pick<CardRecord, 'outcome'>): boolean
   return record.outcome.state === 'working';
 }
 
-/** A step as the owner reads it: the operation in plain words. */
-export function cardStepLabel(step: Pick<CardStep, 'tool'>): string {
-  const words = step.tool.replace(/[_-]+/g, ' ').trim().toLowerCase();
-  return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
+/** How an operation's verb reads once it ran, and while it runs. Grammar for
+ *  common verbs only: no app or operation is named here. */
+const VERB_TENSES: Readonly<Record<string, readonly [done: string, running: string]>> = {
+  get: ['Checked', 'Checking'], list: ['Checked', 'Checking'], fetch: ['Checked', 'Checking'],
+  read: ['Read', 'Reading'], search: ['Searched', 'Searching'], find: ['Searched', 'Searching'],
+  query: ['Checked', 'Checking'], create: ['Created', 'Creating'], add: ['Added', 'Adding'],
+  update: ['Updated', 'Updating'], edit: ['Updated', 'Updating'], send: ['Sent', 'Sending'],
+  reply: ['Replied in', 'Replying in'], post: ['Posted to', 'Posting to'], delete: ['Deleted', 'Deleting'],
+  move: ['Moved', 'Moving'], draft: ['Drafted', 'Drafting'], schedule: ['Scheduled', 'Scheduling'],
+};
+
+/** A step as the owner reads it: what Clem did, in plain words. An app
+ *  operation named APP_VERB_OBJECT reads "Checked Outlook calendar view";
+ *  anything else keeps its own words. */
+export function cardStepLabel(step: Pick<CardStep, 'tool'> & { done?: boolean }): string {
+  const words = step.tool.replace(/[_-]+/g, ' ').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  const tense = words.length >= 3 ? VERB_TENSES[words[1]] : undefined;
+  if (tense) {
+    const app = words[0].charAt(0).toUpperCase() + words[0].slice(1);
+    return `${tense[step.done === false ? 1 : 0]} ${app} ${words.slice(2).join(' ')}`;
+  }
+  const plain = words.join(' ');
+  return plain.charAt(0).toUpperCase() + plain.slice(1);
 }
 
 export function cardRecordHeadline(outcome: CardOutcome): { tone: 'info' | 'done' | 'ask' | 'fail'; text: string } {

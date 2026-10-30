@@ -402,6 +402,14 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
     'a control may not be offered for something it cannot do: the tap goes where it says');
 });
 
+test('a conversation waiting on the owner leads Clem\'s screen and says so', () => {
+  const home = read('../screens/Home.tsx');
+  assert.match(home, /\.\.\.conversations\.filter\(\(x\) => x\.waitingOnYou\),/, 'it is never pushed out of the preview by newer chats');
+  assert.match(home, /recent\.some\(\(x\) => x\.running \|\| x\.waitingOnYou \|\| chatHasNews\(x, recentSeen\)\)/);
+  assert.match(home, /session\.waitingOnYou \? <div class="home-row-note home-row-note-news truncate">Waiting on your answer<\/div>/);
+  assert.match(read('../screens/Chats.tsx'), /session\.waitingOnYou \? \(\s*<span class="chat-row-asks">Waiting on your answer<\/span>/);
+});
+
 test('the place bar carries no signals, and Home is handed the age the pill used to carry', () => {
   const app = read('../app.tsx');
   // Owner 2026-10-30: one Clem screen. Needs you and current work live on it,

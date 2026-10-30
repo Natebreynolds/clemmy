@@ -1,3 +1,4 @@
+import { ownerAskWaiting, type OwnerAsk } from './conversation-asks.js';
 import { handleApprovalCardResultRead } from '../dashboard/approval-card-result-route.js';
 import { registerCloudBrowserRoutes } from './cloud-browser-routes.js';
 import {
@@ -401,11 +402,14 @@ function serializeSessionForMobile(session: HarnessSessionRow, activeRuns?: Read
   /** Work is in flight in this conversation right now, wherever it started:
    *  the list shows it running after the owner has left the thread. */
   running: boolean;
+  /** Clem asked and is waiting on the owner's answer. */
+  waitingOnYou: OwnerAsk | null;
 } {
   const title = session.title?.trim()
     || (session.objective ? session.objective.slice(0, 80) : '')
     || (session.channel === 'discord' ? 'Discord conversation' : 'Clementine session');
   const agentId = typeof session.metadata?.agentId === 'string' ? session.metadata.agentId : null;
+  const running = activeRuns ? activeRuns.has(session.id) : getActiveRunAttempt(session.id) !== null;
   return {
     id: session.id,
     title,
@@ -417,7 +421,8 @@ function serializeSessionForMobile(session: HarnessSessionRow, activeRuns?: Read
     })(),
     pinned: session.metadata?.pinned === true,
     archived: session.metadata?.archived === true,
-    running: activeRuns ? activeRuns.has(session.id) : getActiveRunAttempt(session.id) !== null,
+    running,
+    waitingOnYou: running || session.kind !== 'chat' ? null : ownerAskWaiting(session.id),
     kind: session.kind,
     channel: session.channel,
     status: session.status,
