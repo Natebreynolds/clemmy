@@ -2968,6 +2968,31 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+  // Scheduled runs missed while Clementine was closed: run now or skip, then their progress.
+  router.get('/api/home/missed-runs', requireMobileSession, async (_req, res) => {
+    try {
+      const { readMissedWhileClosed } = await import('../execution/missed-while-closed.js');
+      res.json({ notices: readMissedWhileClosed() });
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+  router.post('/api/home/missed-runs/:id/decide', requireMobileSession, async (req, res) => {
+    const body = req.body ?? {};
+    const action = body.action === 'run' || body.action === 'skip' ? body.action : null;
+    if (!action || typeof body.workflow !== 'string') { res.status(400).json({ error: 'workflow and action (run or skip) are required' }); return; }
+    try {
+      const { decideMissedRun } = await import('../execution/missed-while-closed.js');
+      const done = decideMissedRun({ noticeId: String(req.params.id), workflow: body.workflow, action, ...(typeof body.runId === 'string' ? { runId: body.runId } : {}) });
+      if (!done.ok) { res.status(409).json({ error: done.reason }); return; }
+      res.json(done);
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
+  router.post('/api/home/missed-runs/:id/dismiss', requireMobileSession, async (req, res) => {
+    try {
+      const { dismissMissedNotice } = await import('../execution/missed-while-closed.js');
+      dismissMissedNotice(String(req.params.id));
+      res.json({ ok: true });
+    } catch (err) { res.status(500).json({ error: err instanceof Error ? err.message : String(err) }); }
+  });
   // What the owner asked Clem from her items, with what she is doing about it.
   router.get('/api/home/from-clem/replies', requireMobileSession, async (_req, res) => {
     try {

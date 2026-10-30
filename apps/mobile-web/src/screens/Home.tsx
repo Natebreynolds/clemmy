@@ -58,6 +58,7 @@ import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
 import { FromClem } from '../components/FromClem';
+import { MissedRuns } from '../components/MissedRuns';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
@@ -291,6 +292,7 @@ export function Home({
       <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
     ) : null),
     needs_you: () => <>
+      <MissedRuns />
       <FromClem data={fromClem.data ?? null} mode="decisions" maxRows={MAX_NEEDS_ROWS} onOpenInbox={(key) => onOpenInbox(undefined, key)} onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'harness:clem', 'Clem')} />
       {needsPane.show ? (
         <NeedsYou

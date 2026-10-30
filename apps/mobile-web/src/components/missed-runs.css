@@ -1,0 +1,18 @@
+.missed-runs { margin: 0 0 var(--sp-3); padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg-1); overflow-wrap: anywhere; }
+.missed-runs-title { margin: 0; color: var(--fg); font-size: var(--t-sm); font-weight: 700; line-height: 1.4; }
+.missed-runs-note { margin: 2px 0 0; color: var(--fg-2); font-size: var(--t-xs); line-height: 1.5; }
+.missed-runs-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.missed-runs-row { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 6px 0; border-top: 1px solid var(--line); }
+.missed-runs-row:first-child { border-top: 0; }
+.missed-runs-row input[type="checkbox"] { width: 20px; height: 20px; flex-shrink: 0; accent-color: var(--accent); }
+.missed-runs-mark { width: 20px; flex-shrink: 0; text-align: center; font-weight: 700; }
+.missed-runs-name { flex: 1; min-width: 0; color: var(--fg); font-size: var(--t-sm); line-height: 1.4; }
+.missed-runs-due { color: var(--fg-2); font-size: var(--t-xs); }
+.missed-runs-error { display: block; color: var(--accent-fail); font-size: var(--t-xs); }
+.missed-runs-state { flex-shrink: 0; font-size: var(--t-xs); font-weight: 700; }
+.missed-runs-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.tone-muted { color: var(--fg-3); }
+.tone-working { color: var(--fg-2); }
+.tone-done { color: var(--accent-2); }
+.tone-ask { color: var(--accent-warn); }
+.tone-fail { color: var(--accent-fail); }
