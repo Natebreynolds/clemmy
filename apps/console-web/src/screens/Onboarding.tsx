@@ -5,6 +5,7 @@ import { DogMark } from '@/components/DogMark';
 import { Button } from '@/components/ui/Button';
 import { OnboardingModels } from '@/components/onboarding/OnboardingModels';
 import { OnboardingJev, OnboardingVoice } from '@/components/onboarding/OnboardingExtras';
+import { MobilePanel } from '@/components/connect/MobilePanel';
 import { clemmy } from '@/lib/clemmy';
 import { usePoll } from '@/lib/poll';
 import { getSettings, getJevStatus } from '@/lib/settings';
@@ -14,12 +15,13 @@ import { finishOnboarding } from '@/lib/onboarding-finish';
 import { onboardingCompletionNavigation } from '@/lib/onboarding-entry';
 import './onboarding.css';
 
-const steps = ['Connect', 'Work checks', 'Voice', 'Ready'] as const;
-const titles = ['Meet your new assistant.', 'An extra check on the work.', 'Talk with Clem.', 'Let’s do something useful.'];
+const steps = ['Connect', 'Work checks', 'Voice', 'Phone', 'Ready'] as const;
+const titles = ['Meet your new assistant.', 'An extra check on the work.', 'Talk with Clem.', 'Bring Clem with you.', 'Let’s do something useful.'];
 const descriptions = [
   'Connect one account you already use. Then tell Clem what you need — she brings the memory, tools, and follow-through.',
   'Give Clem an extra way to check her work with Jev.',
   'Live voice is a nice extra. Your keyboard is already invited.',
+  'Pair your phone to answer Clem, approve her work, and keep a conversation going wherever you are. You can do this later in Apps & devices.',
   'Start small. You can connect your apps, folders, and projects as you need them.',
 ];
 
@@ -66,7 +68,7 @@ export function Onboarding() {
     <div className="clem-setup-layout">
       <nav className="clem-setup-progress" aria-label="Setup progress"><ol>{steps.map((label, index) => <li key={label}>
         <button type="button" aria-current={step === index ? 'step' : undefined} disabled={busy || index > step || modelDirty && index !== 0} onClick={() => changeStep(index)}>
-          <span className="clem-setup-step-mark" aria-hidden>{index < step ? <Check size={15} /> : index + 1}</span><span>{label}{index === 1 || index === 2 ? <small>Optional</small> : null}</span>
+          <span className="clem-setup-step-mark" aria-hidden>{index < step ? <Check size={15} /> : index + 1}</span><span>{label}{index > 0 && index < steps.length - 1 ? <small>Optional</small> : null}</span>
         </button>
       </li>)}</ol><p>One connection gets you started. Everything else can wait until you need it.</p></nav>
       <main id="setup-main" className="clem-setup-main">
@@ -74,7 +76,9 @@ export function Onboarding() {
         <div hidden={step !== 0}><OnboardingModels onBusyChange={onModelBusy} onDirtyChange={onModelDirty} discardRequest={discardModels} /></div>
         <div hidden={step !== 1}><OnboardingJev onBusyChange={onJevBusy} /></div>
         <div hidden={step !== 2}><OnboardingVoice onBusyChange={onVoiceBusy} /></div>
-        <div hidden={step !== 3} className="clem-setup-ready">
+        {/* The pairing code is minted only while this step is on screen. */}
+        <div hidden={step !== 3}>{step === 3 ? <MobilePanel /> : null}</div>
+        <div hidden={step !== 4} className="clem-setup-ready">
           <dl>
             <div><dt>Main model</dt><dd>{settings.isLoading ? 'Checking…' : settings.error ? 'Could not check · return to Connect' : selected?.label ?? 'Not connected yet'}</dd></div>
             <div><dt>Backup models</dt><dd>{settings.error ? 'Could not check' : `${settings.data?.modelRoles?.brainBackups?.modelIds.length ?? 0} selected`}</dd></div>
@@ -99,8 +103,8 @@ export function Onboarding() {
               <Button variant={selected ? 'primary' : 'secondary'} disabled={busy || modelDirty || oldShell} onClick={() => void finish(!selected)}>
                 {finishing ? 'Finishing…' : selected ? 'Start with Clem' : 'Continue without a model'}<ArrowRight size={16} aria-hidden />
               </Button>
-            </> : step < 3 ? <>
-              <Button disabled={busy} onClick={() => changeStep(step + 1)}>{step === 1 ? jev.data?.configured ? 'Next: voice' : 'Skip extra checks' : credentials.data?.auth?.openaiApiKeyPresent ? 'Continue' : 'Skip voice for now'}<ArrowRight size={16} aria-hidden /></Button>
+            </> : step < 4 ? <>
+              <Button disabled={busy} onClick={() => changeStep(step + 1)}>{step === 1 ? jev.data?.configured ? 'Next: voice' : 'Skip extra checks' : step === 2 ? credentials.data?.auth?.openaiApiKeyPresent ? 'Continue' : 'Skip voice for now' : 'Continue'}<ArrowRight size={16} aria-hidden /></Button>
             </> : <>
               {!selected && <Button variant="secondary" disabled={busy} onClick={() => changeStep(0)}>Connect a model</Button>}
               <Button disabled={busy || modelDirty || oldShell} onClick={() => void finish(!selected)}>{finishing ? 'Finishing…' : selected ? 'Meet me in chat' : 'Continue without a model'}<ArrowRight size={16} aria-hidden /></Button>

@@ -2323,6 +2323,14 @@ export async function startDaemon(
   // first real request finds it ready instead of paying for it, and a failure
   // to load simply leaves retrieval on its exact/lexical tier.
   void warmCapabilityRetrieval().catch(() => false);
+  // The Apps screen reads one connected-apps snapshot, cached in memory; the
+  // first visit after a launch would otherwise wait on the provider behind
+  // grey tiles. Read it once shortly after boot, off the start path.
+  setTimeout(() => {
+    void import('../integrations/composio/client.js')
+      .then(({ buildComposioDashboardSnapshot }) => buildComposioDashboardSnapshot())
+      .catch(() => { /* warm is additive — the screen reads it on demand */ });
+  }, 20_000).unref();
   bootStep('state_and_migrations');
   const state = loadState();
   // Canonical tool-memory migration is an explicit boot phase. Never hide it

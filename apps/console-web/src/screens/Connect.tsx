@@ -220,7 +220,7 @@ export function Connect() {
         id="apps"
         icon={Plug}
         title="Apps"
-        subtitle="Apps you've connected through Composio"
+        subtitle="The apps Clem can use for your work"
         action={composio.data && (
           <div className="flex items-center gap-2">
             <button type="button" onClick={refreshApps} disabled={refreshing}
@@ -229,11 +229,7 @@ export function Connect() {
               {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Refresh
             </button>
             <StatusPill tone={!composio.data.apiKeyPresent && cliAuthenticated ? 'success' : 'neutral'}>
-              {composio.data.apiKeyPresent
-                ? 'Composio key saved'
-                : cliAuthenticated
-                  ? 'Composio CLI connected'
-                  : 'Not set up'}
+              {composio.data.apiKeyPresent || cliAuthenticated ? 'Ready to connect apps' : 'Not set up'}
             </StatusPill>
           </div>
         )}

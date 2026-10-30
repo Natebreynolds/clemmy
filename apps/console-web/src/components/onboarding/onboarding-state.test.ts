@@ -243,6 +243,7 @@ test('wizard cannot finish or advance while its provider is pending or model cho
     '@/components/DogMark': { DogMark: 'DogMark' },
     '@/components/onboarding/OnboardingModels': { OnboardingModels: 'OnboardingModels' },
     '@/components/onboarding/OnboardingExtras': { OnboardingJev: 'OnboardingJev', OnboardingVoice: 'OnboardingVoice' },
+    '@/components/connect/MobilePanel': { MobilePanel: 'MobilePanel' },
     '@/lib/clemmy': { clemmy: () => ({ onboardingComplete() {} }) },
     '@/lib/poll': { usePoll: () => query(settings()) }, '@/lib/settings': {}, '@/lib/connect': {},
     '@/lib/onboarding-models': models,
@@ -274,7 +275,7 @@ test('wizard no-model completion names the explicit exploration choice', async (
   const navigations: any[] = [];
   const view = mount('../../screens/Onboarding.tsx', 'Onboarding', {}, {
     'react-router-dom': { useNavigate: () => (...args: any[]) => navigations.push(args) }, '@/components/DogMark': {},
-    '@/components/onboarding/OnboardingModels': {}, '@/components/onboarding/OnboardingExtras': {},
+    '@/components/onboarding/OnboardingModels': {}, '@/components/onboarding/OnboardingExtras': {}, '@/components/connect/MobilePanel': {},
     '@/lib/clemmy': { clemmy: () => null }, '@/lib/poll': { usePoll: () => query({}) },
     '@/lib/settings': {}, '@/lib/connect': {}, '@/lib/onboarding-models': models,
     '@/lib/onboarding-finish': { finishOnboarding: async (explore: boolean) => { finished.push(explore); } }, './onboarding.css': {},
