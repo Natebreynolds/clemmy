@@ -108,6 +108,8 @@ targets:
       path: ClemWatch/Info.plist
       properties:
         CFBundleDisplayName: Clem
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         WKApplication: true
         WKCompanionAppBundleIdentifier: ai.breakthroughcoaching.clem
         WKRunsIndependentlyOfCompanionApp: false
