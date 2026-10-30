@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
+import { NEEDS_YOU_LANES,
   answerBackgroundTaskQuestion,
   boardCardFromRunDetail,
   boardDropHighlight,
@@ -576,4 +576,9 @@ test('opening and closing Activity selection preserve exact URL identity and unr
   assert.equal(closed.toString(), 'guide=work');
   const approval = card({ id: 'approval:one', sourceKind: 'approval', attemptId: undefined, runScopeId: undefined });
   assert.equal(boardSelectionSearch(selected, approval).get('select'), approval.id, 'non-run cards use their own ID, not a shared session');
+});
+
+test('the lane of cards waiting on the owner says so, not "Blocked"', () => {
+  // Live 2026-10-30: a question waiting on the owner's answer sat under "Blocked".
+  assert.deepEqual(NEEDS_YOU_LANES.map((lane) => lane.label), ['Waiting on you', 'Ready for review']);
 });

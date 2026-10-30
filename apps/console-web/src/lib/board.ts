@@ -365,10 +365,12 @@ export const COLUMNS: { id: BoardColumnId; label: string }[] = [
 ];
 
 /** The two lanes "Needs you" splits into, rendered in the same grid cell the
- *  single Needs-you column used to own. Blocked leads: it is the one a person
- *  cannot clear with a click, so it is the one that decays. */
+ *  single Needs-you column used to own. The waiting lane leads: it is the one
+ *  a person cannot clear with a click, so it is the one that decays. Every
+ *  card in it waits on the owner (a question, a choice, a resume-or-skip), so
+ *  it says so; "Blocked" read as broken. */
 export const NEEDS_YOU_LANES: { id: BoardColumnId; label: string }[] = [
-  { id: 'needs_you_blocked', label: 'Blocked' },
+  { id: 'needs_you_blocked', label: 'Waiting on you' },
   { id: 'needs_you_review', label: 'Ready for review' },
 ];
 
