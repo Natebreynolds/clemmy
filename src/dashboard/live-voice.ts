@@ -97,6 +97,17 @@ export function openAiOutOfCredit(body: string): boolean {
   }
 }
 
+/** What Clem's voice says when the OpenAI key behind it cannot be used, on the
+ *  desktop and the phone alike. Owner 2026-10-30: never fall back to the
+ *  device's own voice; tell the owner about the key and how to fix it. */
+export const VOICE_KEY_WORDS = {
+  key_unreadable: 'Clem couldn’t read the OpenAI key saved for her voice. Save it again in Settings → Keys & accounts on your computer.',
+  needs_key: 'Clem’s voice needs an OpenAI key. Add one in Settings → Keys & accounts on your computer.',
+  key_refused: 'OpenAI refused the key saved for Clem’s voice. Save a working key in Settings → Keys & accounts on your computer.',
+  no_credit: 'The OpenAI account behind Clem’s voice is out of credit. Add credit there, or save another key in Settings → Keys & accounts on your computer.',
+} as const;
+export type VoiceKeyProblem = keyof typeof VOICE_KEY_WORDS;
+
 export interface LiveVoiceStatus {
   available: boolean;
   reason?: string;
@@ -179,8 +190,8 @@ function liveVoiceSettings(config: LiveVoiceConfigReader = savedConfig): { ok: t
 
 export function liveVoiceStatus(config: LiveVoiceConfigReader = savedConfig): LiveVoiceStatus {
   const settings = liveVoiceSettings(config);
-  if (!settings.ok) return { available: false, reason: 'The saved OpenAI key could not be read safely.' };
-  if (!settings.key) return { available: false, reason: 'Live voice needs an OpenAI key.' };
+  if (!settings.ok) return { available: false, reason: VOICE_KEY_WORDS.key_unreadable };
+  if (!settings.key) return { available: false, reason: VOICE_KEY_WORDS.needs_key };
   const refused = savedKeyRefusedReason(settings.key);
   return refused ? { available: false, reason: refused } : { available: true };
 }
@@ -251,7 +262,7 @@ export async function createLiveVoiceSession(
       return { ok: false, status: 503, code: 'LIVE_VOICE_BUSY', error: 'The voice service is busy right now. Try again in a moment.' };
     }
     if (response.status === 401) {
-      const error = 'The saved OpenAI key was refused for live voice. Save a working key in Settings.';
+      const error = VOICE_KEY_WORDS.key_refused;
       noteSavedOpenAiKeyOutcome(key, { reason: error });
       return { ok: false, status: 409, code: 'LIVE_VOICE_KEY_REFUSED', error };
     }

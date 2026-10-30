@@ -1,4 +1,4 @@
-import { speakVoice, transcribeVoice, type SpeechFallbackReason } from './api';
+import { liveVoiceStatus, speakVoice, transcribeVoice } from './api';
 import { StreamingPcmResampler, float32ToPcm16, pcm16Seconds, pcm16ToWav } from './pcm';
 import { microphoneProblem } from './dictation-support';
 import { spokenWords, voiceReadableText, voiceTurnEnded, voiceTurnNoticeFacts, voiceUtterances, voiceUtteranceCurrent, type VoiceChatMessage, type VoiceUtterance } from './voice-turns';
@@ -6,12 +6,10 @@ import { liveSpokenText, type LiveHistoryMessage, type LiveVoiceHandlers, type L
 import { PhoneLiveVoice, phoneLiveVoiceAvailable } from './live-voice';
 
 export type { VoiceChatMessage } from './voice-turns';
-export type VoiceSpeech = Blob | { text: string; fallback: 'system'; reason?: SpeechFallbackReason };
+export type VoiceSpeech = Blob | { text: string; fallback: 'system' };
 export type MobileVoicePhase = 'off' | 'starting' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
 export interface MobileVoiceState {
   enabled: boolean; phase: MobileVoicePhase; heard: string; error: string;
-  /** Why replies are in this phone's voice, said once a session; never a stop. */
-  notice: string;
   /** 'live' for a full-duplex conversation, 'standard' for turn by turn. */
   engine: 'live' | 'standard' | null;
 }
@@ -36,12 +34,19 @@ export interface MobileVoiceDependencies {
   speak: (text: string, signal: AbortSignal) => Promise<VoiceSpeech>;
   /** A full-duplex conversation, when the Mac can hold one. */
   live?: { available: () => Promise<boolean>; create: (handlers: LiveVoiceHandlers) => LiveVoiceLink };
+  /** Why Clem's voice cannot work right now (the OpenAI key behind it), in the
+   *  Mac's words, or null. Voice then says so instead of starting. */
+  voiceBlocked?: () => Promise<string | null>;
 }
 const defaultDependencies: MobileVoiceDependencies = {
   createAudio: onError => new BrowserVoiceAudio(onError),
   transcribe: async (wav, signal) => (await transcribeVoice(wav, signal)).text,
   speak: speakVoice,
   live: { available: phoneLiveVoiceAvailable, create: handlers => new PhoneLiveVoice(handlers) },
+  voiceBlocked: async () => {
+    const status = await liveVoiceStatus();
+    return status.available === false && typeof status.reason === 'string' && status.reason.trim() ? status.reason.trim() : null;
+  },
 };
 /** A live conversation nobody is using ends; it is billed while it runs. */
 const LIVE_IDLE_MS = 180_000;
@@ -53,15 +58,6 @@ const LIVE_END_WORDS: Record<string, string> = {
 };
 const errorWords = (error: unknown) => error instanceof Error ? error.message : 'Voice stopped. Tap Talk to Clem to try again.';
 
-/** Why Clem's replies are in this phone's voice, and what brings hers back. */
-export function deviceVoiceNotice(reason: SpeechFallbackReason): string {
-  switch (reason) {
-    case 'key_refused': return 'Clem’s own voice is off: OpenAI refused the key saved on your Mac. Replies use this phone’s voice until you save a working key in Settings on your Mac.';
-    case 'needs_key': return 'Clem’s own voice needs an OpenAI key, saved in Settings on your Mac. Replies use this phone’s voice for now.';
-    case 'key_unreadable': return 'Clem couldn’t read the OpenAI key saved on your Mac. Replies use this phone’s voice for now.';
-    case 'no_credit': return 'The OpenAI account behind Clem’s voice is out of credit. Replies use this phone’s voice until it’s topped up.';
-  }
-}
 
 /** One foreground conversation. Live when the Mac can hold one: the voice
  * listens and talks at once and every request it hears is sent as the owner's
@@ -69,7 +65,7 @@ export function deviceVoiceNotice(reason: SpeechFallbackReason): string {
  * Otherwise one half-duplex loop. Stop cancels capture, transcription and
  * playback, but never pretends to cancel an admitted chat. */
 export class MobileVoiceController {
-  private state: MobileVoiceState = { enabled: false, phase: 'off', heard: '', error: '', notice: '', engine: null };
+  private state: MobileVoiceState = { enabled: false, phase: 'off', heard: '', error: '', engine: null };
   private listeners = new Set<() => void>();
   private conversation: MobileVoiceConversation | null = null;
   private generation = 0;
@@ -86,6 +82,9 @@ export class MobileVoiceController {
   private activeUtterance: VoiceUtterance | null = null;
   /** Learned before the tap, so the tap itself starts the right voice. */
   private liveAvailable: boolean | null = null;
+  /** The Mac's last word on whether Clem's voice can work, and when it was read. */
+  private blockedReason: string | null = null;
+  private blockedReadAt = 0;
   private liveChecking = false;
   private live: LiveVoiceLink | null = null;
   /** The voice's request that the awaited turn answers. */
@@ -139,10 +138,17 @@ export class MobileVoiceController {
     const generation = ++this.generation;
     this.baseline = new Set(this.conversation.messages.map(message => message.id));
     this.heard.clear(); this.queue = []; this.awaitingTurn = false;
+    // Clem's voice cannot work (the OpenAI key behind it): say so and what
+    // fixes it, never talk in the phone's own voice instead (owner 2026-10-30).
+    if (this.blockedReason) {
+      this.update({ error: this.blockedReason, heard: '' });
+      this.learnBlocked(true);
+      return;
+    }
     // A trusted quick-launch action explicitly requests live conversation.
     // Do not race the asynchronous availability preflight into the slower loop.
     if (this.deps.live && (options.preferLive || this.liveAvailable)) { this.startLive(generation); return; }
-    this.update({ enabled: true, phase: 'starting', heard: '', error: '', notice: '', engine: 'standard' });
+    this.update({ enabled: true, phase: 'starting', heard: '', error: '', engine: 'standard' });
     if (!this.current(generation)) return;
     try {
       const audio = this.deps.createAudio(error => { if (this.current(generation)) this.fail(error); });
@@ -168,7 +174,14 @@ export class MobileVoiceController {
   }
   private current(generation: number): boolean { return this.state.enabled && this.generation === generation; }
 
+  private learnBlocked(force = false): void {
+    if (!this.deps.voiceBlocked || (!force && Date.now() - this.blockedReadAt < 20_000)) return;
+    this.blockedReadAt = Date.now();
+    void this.deps.voiceBlocked().then(reason => { this.blockedReason = reason; }, () => undefined);
+  }
+
   private learnLive(): void {
+    this.learnBlocked();
     if (this.liveAvailable !== null || this.liveChecking || !this.deps.live) return;
     this.liveChecking = true;
     void this.deps.live.available().then(available => { this.liveAvailable = available; }, () => { this.liveAvailable = false; })
@@ -176,7 +189,7 @@ export class MobileVoiceController {
   }
 
   private startLive(generation: number): void {
-    this.update({ enabled: true, phase: 'starting', heard: '', error: '', notice: '', engine: 'live' });
+    this.update({ enabled: true, phase: 'starting', heard: '', error: '', engine: 'live' });
     const link: LiveVoiceLink = this.deps.live!.create({
       onLive: () => { if (this.live === link) { this.update({ phase: this.awaitingTurn ? 'thinking' : 'listening' }); this.armLiveIdle(); } },
       onRequest: ({ id, words }) => { if (this.live === link) this.liveRequest(link, id, words, generation); },
@@ -288,7 +301,11 @@ export class MobileVoiceController {
       this.update({ error: 'Live voice ended after a few quiet minutes.' });
     }, LIVE_IDLE_MS);
   }
-  private fail(error: unknown): void { this.stop(); this.update({ error: errorWords(error) }); }
+  private fail(error: unknown): void {
+    // The Mac refused Clem's voice for its key: the next tap says so at once.
+    if ((error as { status?: unknown })?.status === 409 && error instanceof Error && error.message) this.blockedReason = error.message;
+    this.stop(); this.update({ error: errorWords(error) });
+  }
   private closeMic(): void { this.capture?.abort(); this.capture = null; this.audio?.stopListening(); }
   private update(patch: Partial<MobileVoiceState>): void {
     if (Object.entries(patch).every(([key, value]) => this.state[key as keyof MobileVoiceState] === value)) return;
@@ -351,7 +368,6 @@ export class MobileVoiceController {
       const speech = await this.deps.speak(words, operation.signal);
       if (!this.current(generation) || operation.signal.aborted || !this.conversation
         || !voiceUtteranceCurrent(utterance, this.conversation.messages)) return;
-      if (!(speech instanceof Blob) && speech.reason && !this.state.notice) this.update({ notice: deviceVoiceNotice(speech.reason) });
       await this.audio!.play(speech, operation.signal);
     } catch (error) { if (this.current(generation) && !operation.signal.aborted) this.fail(error); }
     finally {

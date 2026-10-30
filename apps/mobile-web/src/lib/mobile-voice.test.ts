@@ -547,20 +547,30 @@ test('explicit live quick-launch does not race availability into recorded voice'
   assert.equal(f.controller.getSnapshot().enabled, false, 'late availability cannot restart capture');
 });
 
-test('a reply in this phone\'s voice says once why Clem\'s own voice is off, and voice keeps going', async () => {
-  // Live 2026-10-30: the Mac's saved OpenAI key was refused, replies came back
-  // in the phone's voice, and nothing said why.
-  const f = fixture({ speak: async words => ({ text: words, fallback: 'system', reason: 'key_refused' }) });
-  const states: string[] = [];
-  f.controller.subscribe(() => states.push(f.controller.getSnapshot().notice));
+// Owner 2026-10-30: Clem's voice must not fall back to the phone's own voice;
+// when the OpenAI key behind it cannot be used, say so and how to fix it.
+const KEY_WORDS = 'OpenAI refused the key saved for Clem’s voice. Save a working key in Settings → Keys & accounts on your computer.';
+
+test('when the Mac says Clem\'s voice cannot work, Talk says why and does not start', async () => {
+  const f = fixture({ voiceBlocked: async () => KEY_WORDS });
+  await settle();
   await f.controller.start(); await settle();
-  f.observe({ busy: false, messages: [reply('a1', 'Here is the first answer.')] }); await settle();
-  const notice = f.controller.getSnapshot().notice;
-  assert.match(notice, /OpenAI refused the key saved on your Mac/);
-  assert.match(notice, /Replies use this phone’s voice until you save a working key in Settings on your Mac/);
-  assert.equal(f.controller.getSnapshot().error, '', 'a notice, not a failure');
-  assert.equal(f.controller.getSnapshot().enabled, true, 'voice keeps going');
-  f.observe({ busy: false, messages: [reply('a1', 'Here is the first answer.'), reply('a2', 'And a second one.')] }); await settle();
-  assert.equal(new Set(states.filter(Boolean)).size, 1, 'said once');
-  f.controller.stop();
+  const state = f.controller.getSnapshot();
+  assert.equal(state.enabled, false);
+  assert.equal(state.error, KEY_WORDS);
+  assert.deepEqual(f.audio.events, [], 'no microphone and no speaker');
+});
+
+test('a refused speech request ends voice with the Mac\'s words, never the phone\'s voice, and the next tap says it at once', async () => {
+  const refused = Object.assign(new Error(KEY_WORDS), { status: 409 });
+  const f = fixture({ speak: async () => { throw refused; } });
+  await f.controller.start(); await settle();
+  f.observe({ busy: false, messages: [reply('a1', 'Here is the answer.')] }); await settle();
+  assert.equal(f.controller.getSnapshot().enabled, false);
+  assert.equal(f.controller.getSnapshot().error, KEY_WORDS);
+  assert.equal(f.audio.events.includes('play'), false, 'nothing was played');
+  const before = f.audio.events.length;
+  await f.controller.start(); await settle();
+  assert.equal(f.controller.getSnapshot().error, KEY_WORDS);
+  assert.equal(f.audio.events.length, before, 'the second tap does not open the microphone');
 });

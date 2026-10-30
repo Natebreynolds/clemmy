@@ -2284,29 +2284,25 @@ export async function transcribeVoice(wav: Blob, signal?: AbortSignal): Promise<
 }
 
 /** Voice replies use the paired device's proof, just like every chat request. */
-export type SpeechFallbackReason = 'key_unreadable' | 'needs_key' | 'key_refused' | 'no_credit';
-const SPEECH_FALLBACK_REASONS: ReadonlySet<string> = new Set(['key_unreadable', 'needs_key', 'key_refused', 'no_credit']);
-
-export async function speakVoice(text: string, signal?: AbortSignal): Promise<Blob | { text: string; fallback: 'system'; reason?: SpeechFallbackReason }> {
+export async function speakVoice(text: string, signal?: AbortSignal): Promise<Blob | { text: string; fallback: 'system' }> {
   try {
     return await apiBlob('/m/api/chat/speak', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }), signal,
     });
   } catch (error) {
     const failed = error as ApiError;
-    const body = failed?.body as { fallback?: unknown; text?: unknown; fallbackReason?: unknown } | undefined;
+    const body = failed?.body as { fallback?: unknown; text?: unknown } | undefined;
     if (failed?.status === 409 && body?.fallback === 'system' && typeof body.text === 'string') {
-      const reason = typeof body.fallbackReason === 'string' && SPEECH_FALLBACK_REASONS.has(body.fallbackReason)
-        ? body.fallbackReason as SpeechFallbackReason : undefined;
-      return { text: body.text, fallback: 'system', ...(reason ? { reason } : {}) };
+      return { text: body.text, fallback: 'system' };
     }
     throw error;
   }
 }
 
-/** Whether the Mac can hold a live voice conversation with this phone. */
-export async function liveVoiceStatus(): Promise<{ available: boolean }> {
-  return api<{ available: boolean }>('/m/api/voice/live');
+/** Whether the Mac can hold a live voice conversation with this phone, and
+ *  when it cannot, why (the OpenAI key behind Clem's voice), in its words. */
+export async function liveVoiceStatus(): Promise<{ available: boolean; reason?: string }> {
+  return api<{ available: boolean; reason?: string }>('/m/api/voice/live');
 }
 
 /** The phone's WebRTC offer, exchanged on the Mac for the voice service's

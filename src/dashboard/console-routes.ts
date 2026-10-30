@@ -17415,7 +17415,8 @@ export function registerConsoleRoutes(
     const speech = await (opts?.voiceSpeechRuntime?.requestSpeech ?? requestSpeech)(heard, controller.signal);
     if (!speech.ok) {
       if (!res.headersSent && !controller.signal.aborted) {
-        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}), text: heard });
+        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}),
+          ...(speech.code ? { code: speech.code } : {}), text: heard });
       }
       return;
     }

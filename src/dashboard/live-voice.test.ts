@@ -117,7 +117,7 @@ test('a saved key that cannot be read safely is an answer, never an exception', 
   const never = (async () => { throw new Error('must not call the service'); }) as unknown as typeof fetch;
   const result = await live.createLiveVoiceSession({ sdp: offer }, undefined, never, refused);
   assert.ok(!result.ok && result.code === 'LIVE_VOICE_KEY_UNREADABLE' && result.status === 503);
-  assert.deepEqual(live.liveVoiceStatus(refused), { available: false, reason: 'The saved OpenAI key could not be read safely.' });
+  assert.deepEqual(live.liveVoiceStatus(refused), { available: false, reason: live.VOICE_KEY_WORDS.key_unreadable });
 });
 
 test('a refused saved key makes live voice unavailable, with the reason, until the key changes or works again', async () => {
@@ -131,7 +131,7 @@ test('a refused saved key makes live voice unavailable, with the reason, until t
   const answering = (status: number) => (async () => new Response('{"error":{"message":"nope"}}', { status })) as unknown as typeof fetch;
   const refused = await live.createLiveVoiceSession({ sdp: offer }, undefined, answering(401), key);
   assert.ok(!refused.ok && refused.code === 'LIVE_VOICE_KEY_REFUSED');
-  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: live.VOICE_KEY_WORDS.key_refused });
   assert.deepEqual(live.liveVoiceStatus(other), { available: true }, 'a different saved key is judged on its own');
   const ok = (async () => new Response(JSON.stringify({ session: { id: 'live_ok' }, transport: { type: 'webrtc', sdp: 'answer' } }), { status: 201 })) as unknown as typeof fetch;
   assert.equal((await live.createLiveVoiceSession({ sdp: offer }, undefined, ok, key)).ok, true);
@@ -146,9 +146,9 @@ test('a refused saved key is still known after a restart, and a later success fo
   // said live voice was available again and the phone's next session failed.
   live._resetSavedOpenAiKeyMemoryForTests();
   const key = { openAiKey: () => 'sk-synthetic-restart', env: (_k: string, f: string) => f };
-  live.noteSavedOpenAiKeyOutcome('sk-synthetic-restart', { reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  live.noteSavedOpenAiKeyOutcome('sk-synthetic-restart', { reason: live.VOICE_KEY_WORDS.key_refused });
   live._forgetSavedOpenAiKeyMemoryForTests();
-  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: live.VOICE_KEY_WORDS.key_refused });
   const stored = readFileSync(path.join(home, 'state', 'voice-key-refusal.json'), 'utf8');
   assert.equal(stored.includes('sk-synthetic-restart'), false, 'only the key\'s digest is kept, never the key');
   live.noteSavedOpenAiKeyOutcome('sk-synthetic-restart', null);

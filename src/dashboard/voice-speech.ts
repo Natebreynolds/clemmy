@@ -14,7 +14,7 @@ import pino from 'pino';
 import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 import { toSpokenSentences } from './spoken-text.js';
-import { noteSavedOpenAiKeyOutcome, openAiOutOfCredit } from './live-voice.js';
+import { noteSavedOpenAiKeyOutcome, openAiOutOfCredit, VOICE_KEY_WORDS, type VoiceKeyProblem } from './live-voice.js';
 
 /** The most a single spoken reply says aloud; the rest stays on screen. */
 export const SPOKEN_REPLY_MAX_CHARS = 900;
@@ -44,11 +44,13 @@ export function spokenReplyText(markdown: string, maxChars = SPOKEN_REPLY_MAX_CH
 
 export type SpeechRequestResult =
   | { ok: true; response: Response; contentType: string }
-  | { ok: false; status: number; error: string; fallback?: 'system'; fallbackReason?: SpeechFallbackReason };
+  | { ok: false; status: number; error: string; fallback?: 'system'; code?: VoiceKeyProblem };
 
-/** Why replies are spoken in the device's own voice: each needs the owner to
- *  do something different, so each surface can say which. */
-export type SpeechFallbackReason = 'key_unreadable' | 'needs_key' | 'key_refused' | 'no_credit';
+/** A key problem is said, never covered by the device's own voice (owner
+ *  2026-10-30: "I would rather the user get something about the API"). */
+function keyProblem(code: VoiceKeyProblem): SpeechRequestResult {
+  return { ok: false, status: 409, error: VOICE_KEY_WORDS[code], code };
+}
 
 /** Ask the speech service to say `text`; the audio streams in the response. */
 export async function requestSpeech(text: string, signal?: AbortSignal): Promise<SpeechRequestResult> {
@@ -66,9 +68,9 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     // still heard, in the computer's own voice.
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ reason: redactSensitiveText(reason).slice(0, 300) }, 'voice speech could not read its saved key');
-    return { ok: false, status: 409, error: 'The saved OpenAI key could not be read safely; using this computer’s voice.', fallback: 'system', fallbackReason: 'key_unreadable' };
+    return keyProblem('key_unreadable');
   }
-  if (!key) return { ok: false, status: 409, error: 'Voice replies need an OpenAI key; using this computer’s voice.', fallback: 'system', fallbackReason: 'needs_key' };
+  if (!key) return keyProblem('needs_key');
   let response: Response;
   try {
     response = await fetch(`${base}/audio/speech`, {
@@ -93,14 +95,14 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     logger.warn({ status: response.status }, 'voice speech key refused; the computer voice speaks instead');
     // The same saved key serves live voice: its availability now says so
     // before the device starts a session that cannot work.
-    noteSavedOpenAiKeyOutcome(key, { reason: 'The saved OpenAI key was refused for speech. Save a working key in Settings.' });
-    return { ok: false, status: 409, error: 'The saved OpenAI key was refused for speech; using this computer’s voice.', fallback: 'system', fallbackReason: 'key_refused' };
+    noteSavedOpenAiKeyOutcome(key, { reason: VOICE_KEY_WORDS.key_refused });
+    return keyProblem('key_refused');
   }
   if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => '');
     logger.warn({ status: response.status, detail: redactSensitiveText(detail).slice(0, 300), chars: text.length }, 'voice speech failed');
     if (response.status === 429 && openAiOutOfCredit(detail)) {
-      return { ok: false, status: 409, error: 'The OpenAI account is out of credit; using this computer’s voice.', fallback: 'system', fallbackReason: 'no_credit' };
+      return keyProblem('no_credit');
     }
     return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.` };
   }

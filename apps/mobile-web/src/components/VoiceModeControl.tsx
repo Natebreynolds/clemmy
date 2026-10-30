@@ -96,9 +96,8 @@ export function VoiceModeControl(props: VoiceModeControlProps) {
       </button>;
   const status = state.enabled ? state.engine === 'live' && state.phase === 'listening' ? 'Listening · just talk' : phaseLabels[state.phase]
     : !props.render && blocked ? props.disabledHint || 'Available when this turn finishes' : '';
-  const feedback = status || state.error || state.notice || launchNotice ? <div class="voice-mode-feedback" data-active={state.enabled || undefined}>
+  const feedback = status || state.error || launchNotice ? <div class="voice-mode-feedback" data-active={state.enabled || undefined}>
     {status ? <span class="voice-mode-status" role="status" aria-live="polite">{status}</span> : null}
-    {state.notice && !state.error ? <p class="voice-mode-status" role="status">{state.notice}</p> : null}
     {state.error ? <div class="voice-mode-error" role="alert">{state.error}</div> : null}
     {state.error && state.heard ? <p class="voice-mode-heard">You said: {state.heard}</p> : null}
     {!state.enabled && launchNotice ? <p class="voice-mode-status" role="status">{launchNotice}</p> : null}

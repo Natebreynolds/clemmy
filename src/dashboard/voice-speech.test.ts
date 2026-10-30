@@ -78,14 +78,17 @@ test('the speak route streams the speech service audio for the heard text only',
   });
 });
 
-test('without a usable key the route says so and hands the client the words for its own voice', async () => {
-  await withRoutes({
-    requestSpeech: async () => ({ ok: false, status: 409, error: 'Voice replies need an OpenAI key; using this computer’s voice.', fallback: 'system' }),
-  }, async (speak) => {
+test('without a usable key Clem\'s voice says so and how to fix it, never handing the client its own voice', async () => {
+  // Owner 2026-10-30: "in the future clem shouldnt fall back to natural voice
+  // i would rather the user get something about the API".
+  delete process.env.OPENAI_API_KEY;
+  const { requestSpeech } = await import('./voice-speech.js');
+  await withRoutes({ requestSpeech }, async (speak) => {
     const res = await speak({ text: 'All set.' });
     assert.equal(res.status, 409);
-    const body = await res.json() as { fallback?: string; text?: string };
-    assert.equal(body.fallback, 'system');
-    assert.equal(body.text, 'All set.');
+    const body = await res.json() as { fallback?: string; code?: string; error?: string };
+    assert.equal(body.fallback, undefined, 'no device voice');
+    assert.equal(body.code, 'needs_key');
+    assert.equal(body.error, 'Clem’s voice needs an OpenAI key. Add one in Settings → Keys & accounts on your computer.');
   });
 });
