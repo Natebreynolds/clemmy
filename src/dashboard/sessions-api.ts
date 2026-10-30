@@ -58,6 +58,7 @@ import type {
   UnifiedSessionSummary,
   UnifiedSessionTurn,
 } from '../types.js';
+import { settleNoticesOfSetAsideChats } from './chat-notices.js';
 
 const DESKTOP_PREFIX = 'desktop:';
 const HARNESS_PREFIX = 'harness:';
@@ -1137,6 +1138,7 @@ export function patchUnifiedSession(id: string, patch: SessionPatchInput): Unifi
     });
     if (target.id === parsed.rawId) next = updated;
   }
+  if (patch.archived === true) settleSetAsideChatNotices(relatedRows.map((target) => target.id));
   const summary: UnifiedRunSummary = workflowRunId
     ? summarizeWorkflowRun(next, listHarnessRowsForWorkflowRun(workflowRunId, next))
     : summarizeHarnessConversation(next);
@@ -1186,6 +1188,7 @@ export function deleteUnifiedSession(
         });
       }
     }
+    settleSetAsideChatNotices(related.map((target) => target.id));
     if (retainedForReplay) {
       return {
         ok: true,
@@ -1207,5 +1210,14 @@ export function deleteUnifiedSession(
     archiveAuthorityPayloadsForSession(target.id);
     updateHarnessSession(target.id, { metadata: { ...target.metadata, archived: true } });
   }
+  settleSetAsideChatNotices(related.map((target) => target.id));
   return { ok: true, mode: 'archived' };
+}
+
+function settleSetAsideChatNotices(sessionIds: string[]): void {
+  try {
+    settleNoticesOfSetAsideChats(sessionIds);
+  } catch {
+    // Best-effort: the chat is set aside either way; its notice can still be cleared by hand.
+  }
 }
