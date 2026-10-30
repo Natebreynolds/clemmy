@@ -4,6 +4,10 @@ import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace } from '@/components/chat/CloudBrowserDock';
 import { ComputerDock } from '@/components/chat/ComputerDock';
 import { isComputerStepLabel } from '@/lib/toolLabels';
+
+/** A reply that worked on the owner's computer. */
+const usedComputer = (message?: { activity?: Array<{ kind: string; label: string }> }) =>
+  Boolean(message?.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)));
 import { FileDockWorkspace } from '@/components/chat/FileDock';
 import { Fragment, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -210,9 +214,9 @@ export function Chat() {
   return (
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? undefined}>
     <FileDockWorkspace conversationId={chat.sessionId.current ?? undefined}>
+    <ComputerDock conversationId={chat.sessionId.current ?? undefined}
+      used={chat.messages.some(usedComputer)} active={chat.busy && usedComputer(chat.messages.at(-1))}>
     <div className="flex h-full min-h-0 flex-col">
-      <ComputerDock conversationId={chat.sessionId.current ?? undefined}
-        used={chat.messages.some((message) => message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)))} />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           {chat.messages.map((m, index) => (
@@ -249,6 +253,7 @@ export function Chat() {
         <Composer inputRef={composerRef} voiceMessages={chat.messages} sessionId={chat.sessionId.current ?? undefined} draftSessionId={chat.conversationSessionId.current} busy={chat.busy} mode={chat.composerMode} onModeChange={chat.setComposerMode} activeTaskMode={chat.activeTaskMode} pendingPost={chat.pendingPost} onRetryPending={chat.retryPending} onCancelPending={chat.cancelPending} onSend={send} onStop={chat.stop} onBackground={chat.background} placeholder={agent ? `Message ${agent.name}…` : undefined} agentSlot={agentSlot} agentId={agent?.id ?? null} applyAgent={applyAgent} />
       </div>
     </div>
+    </ComputerDock>
     </FileDockWorkspace>
     </CloudBrowserWorkspace>
   );

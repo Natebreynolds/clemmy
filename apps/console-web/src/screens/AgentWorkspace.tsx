@@ -22,7 +22,7 @@ import { ProjectPicker } from '@/components/chat/ProjectPicker';
 import { ConversationChangeLine } from '@/components/chat/ConversationChangeLine';
 import { ConversationTasks } from '@/components/chat/ConversationTasks';
 import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/CloudBrowserDock';
-import { ComputerWorkspace, ComputerView, useComputerControl } from '@/components/chat/ComputerDock';
+import { ComputerWorkspace, useComputerControl } from '@/components/chat/ComputerDock';
 import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
 import { agentWorkspaceLayout } from '@/lib/agent-workspace-layout';
 import { agentThreadMarks, projectThreadMarks, APPROVAL_ANSWER_WORDS, sameTerminalContinuation } from '@clem/chat-engine';
@@ -191,7 +191,6 @@ function AgentWorkspacePanes({ agent, sessionId, catalog, onEdit, onDeleted }: {
         {browser ? <Button size="sm" variant="ghost" onClick={browser.toggle} aria-expanded={browser.open}><Globe className="h-4 w-4" aria-hidden /> {browser.label}{browser.status ? <span className="text-faint">· {browser.status}</span> : null}</Button> : null}
       </div>
     </header>
-    <ComputerView />
     {activePane ? <div ref={auxiliary} tabIndex={-1} className="flex min-h-0 flex-1 outline-none" aria-label={activePane === 'threads' ? `${agent.name} threads` : `About ${agent.name}`} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); closePane(); } }}>
       {activePane === 'threads' ? <ThreadRail agent={agent} activeSessionId={sessionId} fullWidth onChoose={closePane} /> : <AgentPanel agent={agent} catalog={catalog} fullWidth onCollapse={closePane} onEdit={onEdit} onDeleted={onDeleted} />}
     </div> : null}

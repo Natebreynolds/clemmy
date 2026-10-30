@@ -53,6 +53,15 @@
   background:var(--bg-surface);
   border-left:1px solid var(--border);
   overflow:auto}
+.computer-panel-view {
+  padding:0 20px 20px}
+.computer-panel-view img {
+  display:block;
+  width:100%;
+  height:auto;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:var(--bg-canvas)}
 .cloud-browser-panel header {
   display:flex;
   align-items:center;

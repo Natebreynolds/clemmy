@@ -19,14 +19,14 @@ const output = await build({
     import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
     import { ComputerDock } from './src/components/chat/ComputerDock';
     export { computerScreenUrl } from './src/lib/computer-driver';
-    export function render(status, used = false) {
+    export function render(status, used = false, active = false) {
       const client = new QueryClient();
       if (status) client.setQueryData(['computer-driver'], status);
       const originalFetch = globalThis.fetch;
       globalThis.fetch = () => { throw new Error('Rendering must not capture or request data'); };
       try {
         return renderToStaticMarkup(<MemoryRouter><QueryClientProvider client={client}>
-          <ComputerDock conversationId="controlled-chat" used={used} />
+          <ComputerDock conversationId="controlled-chat" used={used} active={active}><p>conversation</p></ComputerDock>
         </QueryClientProvider></MemoryRouter>);
       } finally { globalThis.fetch = originalFetch; client.clear(); }
     }
@@ -38,13 +38,14 @@ const output = await build({
 const fixtureFile = path.join(temporary, 'render.cjs');
 writeFileSync(fixtureFile, output.outputFiles[0].contents);
 const { render, computerScreenUrl } = createRequire(import.meta.url)(fixtureFile) as {
-  render: (status?: Partial<ComputerDriverStatus>, used?: boolean) => string;
+  render: (status?: Partial<ComputerDriverStatus>, used?: boolean, active?: boolean) => string;
   computerScreenUrl: (session?: string, now?: number) => string;
 };
 
 test('an installed driver does not advertise a computer view until connected', () => {
   for (const status of [undefined, { installed: false, connected: true, screenViewAvailable: true }, { installed: true, connected: false, screenViewAvailable: true }, { installed: true, connected: true }, { installed: true, connected: true, screenViewAvailable: false }]) {
-    assert.equal(render(status), '');
+    assert.equal(render(status), '<p>conversation</p>', 'only the conversation, untouched');
+    assert.equal(render(status, true, true), '<p>conversation</p>');
   }
 });
 
@@ -84,4 +85,16 @@ test('the computer control is one small button the owner can hide until Clem use
   const used = render({ installed: true, connected: true, screenViewAvailable: true }, true);
   assert.match(used, /Computer<\/button>/);
   assert.doesNotMatch(used, /Hide the Computer button/, 'in a chat that used the computer it stays');
+});
+
+test('the computer view is a side panel beside the chat that opens on its own while Clem uses the computer', () => {
+  // Owner 2026-10-30: "this needs to be a side pannel and should open anytime
+  // clem is using the computer".
+  const connected = { installed: true, connected: true, screenViewAvailable: true };
+  const idle = render(connected);
+  assert.doesNotMatch(idle, /data-computer-dock/, 'closed until Clem works on the computer or the owner opens it');
+  const working = render(connected, true, true);
+  assert.match(working, /<div class="cloud-browser-workspace is-open"><div class="cloud-browser-conversation">[\s\S]*<p>conversation<\/p><\/div><aside class="cloud-browser-panel computer-panel" aria-label="Your computer" data-computer-dock/);
+  assert.match(working, /Opening the computer view/);
+  assert.doesNotMatch(working, /<img|computer-driver\/screen/, 'the screen is fetched after the panel is on screen, never during render');
 });

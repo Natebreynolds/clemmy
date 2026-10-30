@@ -1,6 +1,7 @@
 import { CliSessions } from '@/components/chat/CliSessions';
 import { CloudBrowserWorkspace, useBrowserControl } from '@/components/chat/CloudBrowserDock';
-import { ComputerView, ComputerWorkspace, useComputerControl } from '@/components/chat/ComputerDock';
+import { ComputerWorkspace, useComputerControl } from '@/components/chat/ComputerDock';
+import { isComputerStepLabel } from '@/lib/toolLabels';
 import { FileDockWorkspace, useFileDock } from '@/components/chat/FileDock';
 import { isRunKind } from '@/lib/run-presentation';
 import { RunThread } from './RunThread';
@@ -200,11 +201,11 @@ function ContinuableThread({ session, history }: { session: Session; history: Tu
 
   return (
     <CloudBrowserWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
-    <ComputerWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}>
+    <ComputerWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)}
+      active={chat.busy && Boolean(chat.messages.at(-1)?.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)))}>
     <FileDockWorkspace conversationId={chat.sessionId.current ?? rawId(session.id)} inHeader>
     <div className="flex min-h-0 flex-1 flex-col">
       <Header session={session} />
-      <ComputerView />
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className={CHAT_THREAD}>
           <CollaborativeWorkstate snapshot={focus.data} sessionId={rawId(session.id)} compact />

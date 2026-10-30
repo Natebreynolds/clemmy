@@ -43,11 +43,13 @@ test('a reopened conversation keeps every control the new-chat surface has', () 
   }
 });
 
-test('reopened chats keep the opt-in computer view in their existing header', () => {
+test('reopened chats keep the computer control in their header and the view in a side panel that opens while Clem works', () => {
   assert.match(thread, /<ComputerWorkspace conversationId=/);
   assert.match(thread, /const computer = useComputerControl\(\)/);
   assert.match(thread, /aria-expanded=\{computer.open\} onClick=\{computer.toggle\}/);
-  assert.match(thread, /<Header session=\{session\} \/>\s*<ComputerView \/>/);
+  // Owner 2026-10-30: a side panel, open whenever Clem is using the computer.
+  assert.match(thread, /active=\{chat\.busy && Boolean\(chat\.messages\.at\(-1\)\?\.activity\?\.some\(\(row\) => row\.kind === 'tool' && isComputerStepLabel\(row\.label\)\)\)\}/);
+  assert.doesNotMatch(thread, /<ComputerView \/>/, 'no strip under the header pushing the chat down');
 });
 
 test('the read-only transcript renders no decision handlers at all', () => {
