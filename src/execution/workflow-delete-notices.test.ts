@@ -33,10 +33,11 @@ test('deleting a workflow reads its notices and leaves other workflows\' notices
   notice('by-name', { workflow: 'Weekly digest' });
   notice('by-slug', { workflowSlug: 'weekly-digest' });
   notice('by-run', { runId: 'run-digest-1' });
+  notice('by-review-ref', { heartbeatId: 'work-review', refType: 'workflow_run', refId: 'run-digest-1' });
   notice('other-by-name', { workflow: 'Other report' });
   notice('other-by-run', { workflowRunId: 'run-other-1' });
 
   assert.equal(deleteWorkflowAndSyncTriggers('weekly-digest'), true);
-  for (const id of ['by-name', 'by-slug', 'by-run']) assert.equal(getNotification(id)?.read, true, `${id} is read with its workflow`);
+  for (const id of ['by-name', 'by-slug', 'by-run', 'by-review-ref']) assert.equal(getNotification(id)?.read, true, `${id} is read with its workflow`);
   for (const id of ['other-by-name', 'other-by-run']) assert.equal(getNotification(id)?.read, false, `${id} belongs to another workflow`);
 });

@@ -3,7 +3,8 @@
  * stopped run, a failed step, a creation test that found issues — are read
  * with it, so Today and Needs you never keep a row for a workflow that is
  * gone. A notice belongs to the workflow when it names the workflow (slug or
- * the name the owner sees) or one of its runs.
+ * the name the owner sees) or one of its runs (directly, or as the run a
+ * work-review notice refers to).
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -34,7 +35,8 @@ export function settleNoticesOfDeletedWorkflow(slug: string, displayName?: strin
       const meta = notification.metadata ?? {};
       const named = text(meta.workflowSlug) ?? text(meta.workflow);
       if (named && names.has(named.toLowerCase())) return true;
-      const runId = text(meta.runId) ?? text(meta.workflowRunId);
+      const runId = text(meta.runId) ?? text(meta.workflowRunId)
+        ?? (text(meta.refType) === 'workflow_run' ? text(meta.refId) : undefined);
       const ran = runId ? ranWorkflow(runId) : undefined;
       return Boolean(ran && names.has(ran.toLowerCase()));
     })
