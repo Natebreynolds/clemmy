@@ -97,7 +97,7 @@ export function Workspaces({
         </p>
       ) : null}
       <div class="section-intro"><p>Live pages Clem keeps up to date for you.</p><button type="button" class="home-btn" data-clem-guide="create-space" onClick={() => onAsk('Build me a Space that ')}>Create a Space</button></div>
-      {renderRows(live, 0)}
+      {live.length > 0 ? <div class="place-list">{renderRows(live, 0)}</div> : null}
       {empty.length > 0 ? (
         <EmptyWorkspaces spaces={empty} onOpen={selectWorkspace} startIndex={live.length} />
       ) : null}

@@ -901,14 +901,16 @@ export function App() {
               <h2 class="stuff-title">Your stuff</h2>
               <button class="drawer-close" type="button" onClick={() => closeDrawer()}>Done</button>
             </div>
-            <button
-              class="stuff-new-chat"
-              type="button"
-              onClick={() => { haptic('light'); goToChat({}); closeDrawer(false); }}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-              New chat
-            </button>
+            <div class="stuff-group">
+              <button
+                class="drawer-item stuff-new-chat"
+                type="button"
+                onClick={() => { haptic('light'); goToChat({}); closeDrawer(false); }}
+              >
+                <span class="drawer-item-icon stuff-glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></span>
+                <span class="drawer-item-label">New chat</span>
+              </button>
+            </div>
             <nav class="drawer-nav" aria-label="Sections">
               {STUFF_GROUPS.map((group) => (
                 <div key={group.join('-')} class="stuff-group">

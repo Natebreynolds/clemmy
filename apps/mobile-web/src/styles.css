@@ -1053,7 +1053,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex-direction: column;
   gap: 18px;
   max-height: calc(100% - max(44px, env(safe-area-inset-top) + 16px));
-  padding: 8px max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  padding: 8px calc(16px + env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
@@ -1096,23 +1096,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: 1.0625rem;
   font-weight: 600;
 }
-.stuff-new-chat {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  flex-shrink: 0;
-  min-height: 50px;
-  border: 0;
-  border-radius: 14px;
-  background: var(--clem-primary);
-  color: var(--clem-primary-fg);
-  font-size: 1.0625rem;
-  font-weight: 600;
-  transition: transform 0.12s var(--ease-out);
-}
-.stuff-new-chat:active { transform: scale(0.98); background: var(--clem-primary-press); }
-.stuff-new-chat svg { width: 20px; height: 20px; }
+.stuff-new-chat .drawer-item-label { color: var(--accent); font-weight: 600; }
 .drawer-nav { display: flex; flex: 0 0 auto; flex-direction: column; gap: 18px; }
 .stuff-group { display: flex; flex-direction: column; overflow: hidden; border-radius: var(--r-lg); background: var(--bg-1); }
 .drawer-item {
@@ -1972,8 +1956,8 @@ input, textarea, select { font: inherit; font-size: 16px; }
 }
 .chat-dock {
   position: fixed;
-  left: max(16px, env(safe-area-inset-left));
-  right: max(16px, env(safe-area-inset-right));
+  left: calc(16px + env(safe-area-inset-left));
+  right: calc(16px + env(safe-area-inset-right));
   bottom: calc(max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px));
   z-index: 40;
   display: flex;
@@ -2092,7 +2076,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex-direction: column;
   width: min(100%, 640px);
   max-height: min(calc(var(--mobile-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top))), 760px);
-  padding: 8px max(16px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  padding: 8px calc(16px + env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-bottom: 0;
@@ -3332,7 +3316,7 @@ input, textarea, select { font: inherit; font-size: 16px; }
   flex-direction: column;
   width: min(100%, 640px);
   max-height: min(calc(var(--mobile-viewport-height, 100dvh) - max(12px, env(safe-area-inset-top))), 760px);
-  padding: 8px max(16px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  padding: 8px calc(16px + env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-bottom: 0;
@@ -3767,8 +3751,8 @@ textarea:focus-visible,
 }
 .ask-capsule {
   position: fixed;
-  left: max(16px, env(safe-area-inset-left));
-  right: max(16px, env(safe-area-inset-right));
+  left: calc(16px + env(safe-area-inset-left));
+  right: calc(16px + env(safe-area-inset-right));
   bottom: calc(max(22px, env(safe-area-inset-bottom) + 10px) + var(--kb-inset, 0px));
   z-index: 40;
   max-width: 728px;

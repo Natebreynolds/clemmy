@@ -1,4 +1,5 @@
 import { TerminalContinueButton } from '../components/TerminalContinueButton';
+import { CheckMark, CrossMark } from '../components/Glyph';
 import { ConnectionSetup } from '../components/ConnectionSetup';
 import type { ConnectionContinuation } from '../lib/connection-setup';
 import { ApprovalReview } from '../components/ApprovalReview';
@@ -872,7 +873,7 @@ export function Chat({ sessionId: initialSessionId, initialTitle, initialDraft, 
     >
       <div class="chat-header chat-header-compact">
         <ChatBackButton onClick={onBack} showChats={false} opensChats />
-        <h2 class="chat-title">{title || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
+        <h2 class="chat-title">{title || messages.find((m) => m.role === 'user')?.text.trim().slice(0, 60) || (snapshot?.sessionId ? 'Conversation' : 'New chat')}</h2>
         <button ref={optionsTrigger} type="button" class="chat-options-trigger" aria-label="Conversation options" aria-haspopup="dialog" aria-expanded={conversationPanel !== null} onClick={() => { haptic('light'); setConversationPanel('options'); }}>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" /></svg>
         </button>
@@ -1641,7 +1642,7 @@ function WorkLine({
                 ? <span class="work-card-state">In progress</span>
                 : inHand.status === 'failed'
                   ? <span class="act-mark act-warn" role="img" aria-label="Didn’t go through; still working">!</span>
-                  : <span class="act-mark act-ok" role="img" aria-label="Done">✓</span>}
+                  : <span class="act-mark act-ok" role="img" aria-label="Done"><CheckMark /></span>}
             </div>
             {inHand.excerpt ? <div class="work-card-excerpt">{inHand.excerpt}</div> : null}
             <div class="work-card-foot">
@@ -1725,9 +1726,9 @@ function useNowTick(live: boolean): number {
 /** One step, with where it sat in the turn drawn as a hairline under it. */
 function ActivityRow({ item, bounds, now, live }: { item: ActivityItem; bounds: TimelineBounds | null; now: number; live: boolean }) {
   const icon = item.status === 'running' ? <span class="act-spinner" aria-label="running" />
-    : item.status === 'failed' ? <span class="act-mark act-fail">✗</span>
+    : item.status === 'failed' ? <span class="act-mark act-fail"><CrossMark /></span>
       : item.status === 'interrupted' ? <span class="act-mark act-warn">–</span>
-        : <span class="act-mark act-ok">✓</span>;
+        : <span class="act-mark act-ok"><CheckMark /></span>;
   const span = bounds ? timelineSpan(item, bounds, live, now) : null;
   const running = live && item.status === 'running';
   return (
@@ -1866,7 +1867,7 @@ function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessi
   const [problem, setProblem] = useState('');
   if (answer === 'dismiss') return null;
   if (answer === 'save') {
-    return <p class="reply-offer-saved" role="status">✓ {offer.modelName} will do {offer.intent} from now on. Change it in Settings.</p>;
+    return <p class="reply-offer-saved" role="status"><CheckMark /> {offer.modelName} will do {offer.intent} from now on. Change it in Settings.</p>;
   }
   const respond = (action: 'save' | 'dismiss') => {
     setWorking(true);
@@ -1888,7 +1889,7 @@ function ModelRuleOfferCard({ offer, sessionId }: { offer: ModelRuleOffer; sessi
 }
 
 const REVIEW_CHIP: Record<TurnReview, { label: string; ok: boolean; pending?: true }> = {
-  checked: { label: '✓ Checked', ok: true },
+  checked: { label: 'Double-checked', ok: true },
   checking: { label: 'Checking…', ok: false, pending: true },
   unchecked: { label: 'Not checked', ok: false },
   rejected: { label: 'Didn’t pass review', ok: false },

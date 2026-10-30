@@ -17,6 +17,7 @@
  * measured cost, so the default view is decidable in seconds and the full
  * ledger is one tap down.
  */
+import { CheckMark, CrossMark } from '../components/Glyph';
 import { useMemo } from 'preact/hooks';
 import {
   foldWriteLedger,
@@ -208,9 +209,9 @@ export function Run({ sessionId, onBack, onOpenNeedsYou }: Props) {
                 {activity.map((item) => (
                   <div key={item.id} class={`activity-row act-${item.status}`}>
                     {item.status === 'running' ? <span class="act-spinner" aria-label="running" />
-                      : item.status === 'failed' ? <span class="act-mark act-fail">✗</span>
+                      : item.status === 'failed' ? <span class="act-mark act-fail"><CrossMark /></span>
                         : item.status === 'interrupted' ? <span class="act-mark act-warn">–</span>
-                          : <span class="act-mark act-ok">✓</span>}
+                          : <span class="act-mark act-ok"><CheckMark /></span>}
                     <span class="act-label">
                       {item.label}
                       {item.repeats && item.repeats > 1 ? <span class="act-repeats">×{item.repeats}</span> : null}

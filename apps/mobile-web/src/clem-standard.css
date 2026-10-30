@@ -27,7 +27,7 @@
   --fg-3: var(--clem-ink-subtle);
 
   --r-md: 14px;
-  --r-lg: 20px;
+  --r-lg: 16px;
 
   /* The quiet button and the pressed row: warm, never gray. */
   --fill-quiet: rgba(63, 42, 22, 0.07);
@@ -324,11 +324,35 @@
   box-shadow: none;
 }
 
-/* Inbox's three views: the iOS segmented control. */
+/* Inbox's three views: the iOS segmented control. Labels share one line;
+   only Needs you counts in orange. */
 .inbox-tabs { gap: 2px; padding: 2px; border: 0; border-radius: 11px; background: var(--fill-quiet); -webkit-backdrop-filter: none; backdrop-filter: none; }
 .inbox-tabs button { min-height: 52px; padding: 6px 4px; border-radius: 9px; color: var(--fg); font-family: var(--font-body); font-size: 0.875rem; font-weight: 500; gap: 2px; }
 .inbox-tabs button.active { background: var(--bg-1); box-shadow: 0 1px 3px rgba(63, 42, 22, 0.12); font-weight: 600; }
 .inbox-tab-count { height: auto; min-width: 0; padding: 0; background: none; color: var(--accent); font-size: 0.75rem; font-weight: 700; line-height: 1.2; }
+.inbox-tabs button { justify-content: flex-start; padding-top: 9px; }
+.inbox-tabs button:not(:first-child) .inbox-tab-count { color: var(--fg-2); font-weight: 600; }
+
+/* Spaces and Automations: one grouped list each, like Chats. */
+.place-list { display: flex; flex-direction: column; overflow: hidden; margin-bottom: 22px; border-radius: var(--r-lg); background: var(--bg-1); box-shadow: var(--card-edge); }
+.place-list > * { position: relative; margin: 0 !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; box-shadow: none !important; animation: none !important; }
+.place-list > * + *::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; border-top: 0.5px solid var(--line-strong); }
+.place-list > *:active { background: var(--bg-3) !important; transform: none !important; }
+.workflow-row-tag { background: var(--clem-primary-tint); color: var(--accent); }
+.workflow-row-status.status-needs_you { background: var(--clem-primary-tint) !important; color: var(--accent); }
+.workflow-row-status.status-scheduled { background: rgba(46, 125, 70, 0.1) !important; color: var(--clem-success); }
+
+/* The conversation names where back goes, in the link colour, the way the
+   place bar does: a chevron and a word, no circle. */
+.chat-header .chat-back:has(.chat-back-label) { width: auto; min-width: 44px; height: 44px; padding: 0 8px 0 0; gap: 0; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--accent); }
+.chat-header .chat-back:has(.chat-back-label) svg { width: 26px; height: 26px; stroke-width: 2.4; }
+.chat-back-label { font-size: 1.0625rem; letter-spacing: -0.01em; }
+/* An automation card's steps read as words, not buttons. */
+.reply-workflow-step { border: 0 !important; background: none !important; padding: 0 !important; color: var(--fg-2) !important; font-weight: 500; }
+
+/* The send button is clementine with the ink arrow, like every fill. */
+.chat-send:not(:disabled) { background: var(--clem-primary); color: var(--clem-primary-fg); }
+.chat-send:active:not(:disabled) { background: var(--clem-primary-press); }
 
 /* Chats: one grouped list, hairlines between rows. */
 .chats-search { min-height: 38px; margin: 4px 0 16px; padding: 0 10px; border: 0; border-radius: 11px; background: var(--fill-quiet); color: var(--fg-2); }
@@ -342,6 +366,32 @@
 .chat-row-title { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
 .chat-row-meta { font-size: 0.8125rem; color: var(--fg-2); }
 .chat-row-asks { color: var(--accent); font-weight: 600; }
+
+/* Drawn state marks size with the text they sit in. */
+.glyph { display: inline-block; width: 1em; height: 1em; vertical-align: -0.125em; flex: 0 0 auto; }
+
+/* What Clem is doing, always on: a live dot while she works. */
+.clem-status { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; font-size: 0.875rem; color: var(--fg-2); }
+.clem-status-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--bg-4); }
+.clem-status-live { color: var(--fg); font-weight: 500; }
+.clem-status-live .clem-status-dot { background: var(--clem-live); animation: clem-pulse 1.4s ease-in-out infinite; }
+
+/* A card's answers: the ones that act, then everything else as quiet words. */
+.home .home-row-actions:empty { display: none; }
+.home .home-row-more { display: flex; flex-wrap: wrap; align-items: center; gap: 0 18px; margin-top: 2px; }
+.home .home-row-more:empty { display: none; }
+.home .home-row-more .home-link-btn { min-height: 40px; padding: 0; }
+.home .home-link-quiet { color: var(--fg-2); }
+.home .home-row-needs > .home-row-title + .home-row-note { margin-top: -2px; }
+
+/* The record under an answered card: what Clem needs first, then the trail. */
+.home .card-record-headline { margin: 0; font-size: 0.9375rem; font-weight: 600; }
+.home .card-record-words { margin: 4px 0 0; font-size: 1rem; color: var(--fg); }
+.home .card-record-act { width: 100%; margin: 12px 0 10px; }
+.home .card-record-you { margin: 8px 0 0; font-size: 0.8125rem; color: var(--fg-2); }
+.home .card-record-steps { margin: 4px 0 0; font-size: 0.8125rem; color: var(--fg-2); }
+.home .card-record-mark { color: var(--clem-success); }
+.home .card-record-title { margin: 8px 0 0; font-size: 0.75rem; color: var(--fg-3); }
 
 /* ── the composer, with Your stuff beside it ─────────────────────── */
 

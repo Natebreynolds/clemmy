@@ -58,6 +58,7 @@ import { chatHasNews, chatSeenBaseline } from '@clem/chat-engine';
 import { ChatStateMark } from '../components/ChatStateMark';
 import { HomeTiles } from '../components/HomeTiles';
 import { FromClem } from '../components/FromClem';
+import { CrossMark } from '../components/Glyph';
 import { MissedRuns } from '../components/MissedRuns';
 
 const POLL_MS = 6_000;
@@ -382,11 +383,16 @@ export function Home({
               given — with how old it is. */}
           {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
         </div>
+        {/* What Clem is doing, always: a live line while she works, quiet when she is not. */}
+        <p class={`clem-status${activeWork.length > 0 ? ' clem-status-live' : ''}`}>
+          <span class="clem-status-dot" aria-hidden="true" />
+          {activeWork.length > 0 ? `Working on ${activeWork.length === 1 ? 'one thing' : `${activeWork.length} things`}` : 'All quiet. Ask Clem anything below.'}
+        </p>
 
         {digest ? (
           <p class="today-digest" role="status">
             <span>{digest}</span>
-            <button type="button" aria-label="Dismiss" onClick={dismissDigest}>×</button>
+            <button type="button" aria-label="Dismiss" onClick={dismissDigest}><CrossMark /></button>
           </p>
         ) : null}
         {leadAction && !(needsPane.show || clemShown > 0) ? (

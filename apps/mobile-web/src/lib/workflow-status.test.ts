@@ -4,21 +4,21 @@ import { workflowRowStatus } from './workflow-status.js';
 
 const row = (over: Partial<Parameters<typeof workflowRowStatus>[0]>) => ({ enabled: true, lastRunOutcome: null, lastRunStatus: null, lastRunGoalOutcome: null, ...over });
 
-test('engine statuses and outcomes land in the six product words', () => {
+test('an automation reads as on or off, running, or needing you; never how its last run went', () => {
   assert.deepEqual(workflowRowStatus(row({ enabled: false })), { key: 'off', label: 'Off' });
-  assert.equal(workflowRowStatus(row({ lastRunOutcome: 'succeeded' })).label, 'Done');
+  assert.equal(workflowRowStatus({ ...row({ lastRunOutcome: 'succeeded' }), schedule: '0 8 * * 1-5' }).label, 'On', 'a repeating automation that ran fine is simply on');
+  assert.equal(workflowRowStatus(row({ lastRunGoalOutcome: 'gap', lastRunOutcome: 'succeeded' })).label, 'On demand');
   assert.equal(workflowRowStatus(row({ lastRunOutcome: 'blocked' })).label, 'Needs you');
   assert.equal(workflowRowStatus(row({ lastRunStatus: 'blocked_readiness' })).label, 'Needs you');
   assert.equal(workflowRowStatus(row({ lastRunStatus: 'awaiting_input' })).label, 'Needs you');
-  assert.equal(workflowRowStatus(row({ lastRunStatus: 'running' })).label, 'Working');
+  assert.equal(workflowRowStatus(row({ lastRunStatus: 'running' })).label, 'Running');
   assert.equal(workflowRowStatus(row({ lastRunStatus: 'paused_budget' })).label, 'Paused');
-  assert.equal(workflowRowStatus(row({ lastRunOutcome: 'failed' })).label, 'Failed');
-  assert.equal(workflowRowStatus(row({ lastRunStatus: 'error' })).label, 'Failed');
-  assert.equal(workflowRowStatus(row({ lastRunGoalOutcome: 'gap', lastRunOutcome: 'succeeded' })).label, 'Done, with a gap');
+  assert.equal(workflowRowStatus(row({ lastRunOutcome: 'failed' })).label, 'Didn’t finish');
+  assert.equal(workflowRowStatus(row({ lastRunStatus: 'error' })).label, 'Didn’t finish');
 });
 
-test('a workflow that never ran is Scheduled when it has a schedule and Ready when it waits for you', () => {
-  assert.equal(workflowRowStatus({ ...row({}), schedule: { kind: 'cron' } }).label, 'Scheduled');
-  assert.equal(workflowRowStatus(row({})).label, 'Ready');
-  assert.equal(workflowRowStatus(row({ lastRunStatus: 'creation_test' })).label, 'Ready', 'an unknown engine word is never shown raw');
+test('an automation that never ran is On with a schedule and On demand without one', () => {
+  assert.equal(workflowRowStatus({ ...row({}), schedule: { kind: 'cron' } }).label, 'On');
+  assert.equal(workflowRowStatus(row({})).label, 'On demand');
+  assert.equal(workflowRowStatus(row({ lastRunStatus: 'creation_test' })).label, 'On demand', 'an unknown engine word is never shown raw');
 });

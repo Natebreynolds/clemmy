@@ -103,6 +103,7 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
     <div>
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
       <div class="section-intro"><p>Work Clem handles on a schedule or whenever you need it.</p><button type="button" class="home-btn" data-clem-guide="create-automation" onClick={() => onAsk('Set up an automation that ')}>Create with Clem</button></div>
+      <div class="place-list">
       {workflows.map((wf) => (
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
@@ -121,6 +122,7 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
           </div>
         </button>
       ))}
+      </div>
     </div>
   );
 }

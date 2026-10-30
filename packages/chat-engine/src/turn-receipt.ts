@@ -278,7 +278,7 @@ const SETTING_WORDS: Readonly<Record<string, string>> = {
 /** What changed, under the card's name. */
 export function workflowCardSubtitle(card: Pick<WorkflowCardData, 'op' | 'enabled' | 'steps' | 'changedStepIds' | 'removedStepIds' | 'changedSettings'>): string {
   const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
-  if (card.op === 'created') return `${plural(card.steps.length, 'step')} · ${card.enabled ? 'on' : 'off until you turn it on'}`;
+  if (card.op === 'created') return `${card.enabled ? 'On' : 'Off until you turn it on'} · ${plural(card.steps.length, 'step')}`;
   const changed = card.changedStepIds.length;
   const removed = card.removedStepIds.length;
   if (changed > 0) {

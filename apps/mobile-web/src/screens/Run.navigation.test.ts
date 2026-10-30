@@ -50,6 +50,7 @@ function renderRun(run: RunDetail, onOpenNeedsYou: (key?: string) => void) {
     '../lib/use-screen-data': { useScreenData: () => ({ data: run, refresh() {} }) },
   };
   for (const name of ['DelegatedTaskCard', 'TaskResultFiles', 'ChatBackButton', 'RunControl', 'ScreenNotice']) dependencies[`../components/${name}`] = { [name]: name };
+  dependencies['../components/Glyph'] = { CheckMark: 'CheckMark', CrossMark: 'CrossMark' };
   return moduleAt('./Run.tsx', dependencies).Run({ sessionId: 'addressed-run', onBack() {}, onOpenNeedsYou });
 }
 function renderCard(given: DelegatedTask, onOpenNeedsYou: (key?: string) => void) {

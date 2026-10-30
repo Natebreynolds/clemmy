@@ -1,8 +1,9 @@
 /**
- * One status vocabulary for a workflow row, in the six words the product uses
- * everywhere: Working · Needs you · Scheduled · Done · Failed · Paused (plus
- * Off for a workflow that is switched off). Engine statuses and outcomes map
- * into these; the specific cause lives in the detail, never in the chip.
+ * One status for an automation row, in words a first-time owner reads at a
+ * glance: Off · On · On demand · Running · Needs you · Paused · Didn't finish.
+ * It says whether the automation is on and whether it needs the owner; how
+ * the last run went lives in the row's detail, never in the chip ("Done" says
+ * nothing about something that repeats).
  */
 import type { MobileWorkflow } from './api';
 
@@ -17,23 +18,17 @@ type Row = Pick<MobileWorkflow, 'enabled' | 'lastRunOutcome' | 'lastRunStatus' |
 
 export function workflowRowStatus(wf: Row): WorkflowRowStatus {
   if (!wf.enabled) return { key: 'off', label: 'Off' };
-  if (wf.lastRunGoalOutcome === 'gap' || wf.lastRunGoalOutcome === 'escalate') return { key: 'gap', label: 'Done, with a gap' };
-  if (wf.lastRunGoalOutcome === 'follow_up' || wf.lastRunGoalOutcome === 'repursue') return { key: 'gap', label: 'Done, re-checking' };
+  const resting: WorkflowRowStatus = wf.schedule ? { key: 'scheduled', label: 'On' } : { key: 'ready', label: 'On demand' };
   switch (wf.lastRunOutcome) {
-    case 'succeeded': return { key: 'done', label: 'Done' };
-    case 'partial': return { key: 'gap', label: 'Done, partly' };
     case 'blocked': return { key: 'needs_you', label: 'Needs you' };
-    case 'failed': return { key: 'failed', label: 'Failed' };
-    case 'cancelled': return { key: 'paused', label: 'Stopped' };
+    case 'failed': return { key: 'failed', label: 'Didn’t finish' };
+    case 'succeeded': case 'partial': case 'cancelled': return resting;
     default: break;
   }
   const status = (wf.lastRunStatus ?? '').toLowerCase();
-  if (!status) return wf.schedule ? { key: 'scheduled', label: 'Scheduled' } : { key: 'ready', label: 'Ready' };
-  if (/^(running|started|working|queued|accepted)$/.test(status)) return { key: 'working', label: 'Working' };
+  if (/^(running|started|working|queued|accepted)$/.test(status)) return { key: 'working', label: 'Running' };
   if (/^(blocked|parked|awaiting|needs)/.test(status)) return { key: 'needs_you', label: 'Needs you' };
   if (/^paused/.test(status)) return { key: 'paused', label: 'Paused' };
-  if (/^(completed|done|succeeded)$/.test(status)) return { key: 'done', label: 'Done' };
-  if (/^(failed|error)/.test(status)) return { key: 'failed', label: 'Failed' };
-  if (/^cancel/.test(status)) return { key: 'paused', label: 'Stopped' };
-  return wf.schedule ? { key: 'scheduled', label: 'Scheduled' } : { key: 'ready', label: 'Ready' };
+  if (/^(failed|error)/.test(status)) return { key: 'failed', label: 'Didn’t finish' };
+  return resting;
 }

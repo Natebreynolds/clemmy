@@ -173,8 +173,8 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
     const done = Boolean(currentProactiveReceipt(notices[row.key], row.voiceDigest)?.settled);
     return (
       <div key={row.key} class="home-row home-row-needs" aria-busy={busy === row.key}>
-        {meta(row)}
         <div class="home-row-title">{row.say || row.text}</div>
+        {meta(row)}
         {!presentation && row.detail ? <p class="from-clem-report">{row.detail}</p> : null}
         {notice(row)}
         {recordFor(row) ? <CardRecord record={recordFor(row)!} onOpenThread={onOpenThread} onOpenInbox={onOpenInbox} /> : null}
@@ -191,10 +191,15 @@ export function FromClem({ data, onChanged, onOpenThread, mode = 'all', maxRows,
                 <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void reply(row, 'No', 'done')}>No</button>
               </>
             ) : null}
+          </div>
+        ) : null}
+        {/* The answers above; everything else is one quiet line of words. */}
+        {!done ? (
+          <div class="home-row-more">
             {row.answer?.kind !== 'yes_no' ? openReply(row, row.choices?.length ? 'Reply in your words' : 'Reply') : null}
             {presentation && (row.answer?.kind === 'words' || row.attentionKey && row.answer?.kind !== 'yes_no') && row.lifecycle?.effect === 'hide_only' && row.lifecycle.generation ? <>
-              {row.lifecycle.canDefer ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(row, 'defer')}>Later</button> : null}
-              {row.lifecycle.canDismiss ? <button type="button" class="home-btn" disabled={busy !== null} onClick={() => void hideQuestion(row, 'dismiss')}>Dismiss</button> : null}
+              {row.lifecycle.canDefer ? <button type="button" class="home-link-btn home-link-quiet" disabled={busy !== null} onClick={() => void hideQuestion(row, 'defer')}>Later</button> : null}
+              {row.lifecycle.canDismiss ? <button type="button" class="home-link-btn home-link-quiet" disabled={busy !== null} onClick={() => void hideQuestion(row, 'dismiss')}>Dismiss</button> : null}
             </> : null}
           </div>
         ) : null}

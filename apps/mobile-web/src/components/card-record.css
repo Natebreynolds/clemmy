@@ -8,7 +8,7 @@
 .card-record-headline { margin: 6px 0 0; font-size: var(--t-sm); font-weight: 700; }
 .card-record-headline.tone-info { color: var(--fg-2); }
 .card-record-headline.tone-done { color: var(--accent-2); }
-.card-record-headline.tone-ask { color: var(--accent-warn); }
+.card-record-headline.tone-ask { color: var(--accent); }
 .card-record-headline.tone-fail { color: var(--accent-fail); }
 .card-record-words { margin: 2px 0 0; color: var(--fg); font-size: var(--t-sm); line-height: 1.5; white-space: pre-wrap; }
 @keyframes card-record-pulse { 50% { opacity: 0.35; } }
