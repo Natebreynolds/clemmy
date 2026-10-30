@@ -281,7 +281,7 @@ export function Home({
   // Narrowed here, not in the callback: TypeScript drops a property narrowing
   // the moment it crosses into a closure.
   const hasAttention = needsYouCountKnown && needsYouCount > 0;
-  const leadHeadline = hasAttention ? `${needsYouCount === 1 ? 'One thing needs' : `${needsYouCount} things need`} your attention` : lead.headline;
+  const leadHeadline = hasAttention ? `${needsYouCount === 1 ? 'One thing needs' : `${needsYouCount} things need`} you` : lead.headline;
   const leadAction = hasAttention ? { label: 'Review Inbox', target: 'inbox' as const } : lead.action;
   const activeWork = workingView.entries.filter(row => row.membership === 'running');
 
@@ -346,8 +346,22 @@ export function Home({
 
   return (
     <div class="home">
-      {/* Current state leads; the greeting stays a quiet personal detail. */}
-      <header class={`home-lead home-lead-${lead.tone}`}><p class="home-greeting">{greeting}</p>
+      {/* Clem leads her own screen: her name, her face (lit while she is
+          working), and one sentence of where things stand. The greeting
+          stays a quiet personal detail. */}
+      <header class={`home-lead home-lead-${lead.tone}${hasAttention ? ' home-lead-asks' : ''}`}>
+        <div class="clem-hero-row">
+          <p class="clem-title" aria-hidden="true">Clem</p>
+          <button
+            type="button"
+            class={`clem-avatar${activeWork.length > 0 ? ' clem-avatar-working' : ''}`}
+            aria-label="Talk to Clem"
+            onClick={() => { haptic('light'); onOpenThread('harness:clem', 'Clem'); }}
+          >
+            <img src="/m/clemmy.png" alt="" width="40" height="40" />
+          </button>
+        </div>
+        <p class="home-greeting">{greeting}</p>
         {/* The answer rewrites itself as polls land — from "Catching up…" to
             whatever is true — so it is announced. One live region for the
             whole sentence, its qualifier and its provenance, or a screen
@@ -367,7 +381,7 @@ export function Home({
             <button type="button" aria-label="Dismiss" onClick={dismissDigest}>×</button>
           </p>
         ) : null}
-        {leadAction ? (
+        {leadAction && !(needsPane.show || clemShown > 0) ? (
           <button
             type="button"
             class="home-lead-action"
@@ -392,12 +406,25 @@ export function Home({
         hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
 
-      {!prefs.panes.hidden.includes('running') && activeWork.length > 0 ? <section class="home-section" aria-labelledby="home-active-work">
-        <div class="home-section-heading"><h2 id="home-active-work" class="section-head pane-head">Clem is working</h2><button type="button" class="home-link-btn" onClick={onOpenActivity}>View Work</button></div>
-        <div class="home-card">{activeWork.slice(0, 2).map(({ entry, pulse, elapsed }) => <button type="button" key={entry.runKey} class="home-row home-row-tap home-active-row" onClick={() => entry.sessionId ? onOpenRun(entry.sessionId) : onOpenActivity()}>
-          <span class={pulse ? 'home-work-state home-work-state-live' : 'home-work-state'} aria-hidden="true" /><span class="min-w-0"><span class="home-row-title">{entry.headline || 'Work in progress'}</span><span class="home-row-note">{entry.activity?.text || 'In progress'}{elapsed ? ` · ${elapsed}` : ''}</span></span>
-        </button>)}</div>
-      </section> : null}
+      {!prefs.panes.hidden.includes('running') && activeWork.length > 0 ? (
+        <section class="clem-live" aria-labelledby="home-active-work">
+          <div class="clem-live-head">
+            <span class="clem-live-dot" aria-hidden="true" />
+            <h2 id="home-active-work" class="clem-live-title">Working now</h2>
+            <button type="button" class="home-link-btn" onClick={onOpenActivity}>See all</button>
+          </div>
+          {activeWork.slice(0, 2).map(({ entry, pulse, elapsed }) => (
+            <button type="button" key={entry.runKey} class="clem-live-row" onClick={() => entry.sessionId ? onOpenRun(entry.sessionId) : onOpenActivity()}>
+              <span class={pulse ? 'clem-live-pulse clem-live-pulse-on' : 'clem-live-pulse'} aria-hidden="true" />
+              <span class="clem-live-text">
+                <span class="clem-live-what">{entry.headline || 'Work in progress'}</span>
+                <span class="clem-live-step">{entry.activity?.text || 'In progress'}</span>
+              </span>
+              {elapsed ? <span class="clem-live-time">{elapsed}</span> : null}
+            </button>
+          ))}
+        </section>
+      ) : null}
       {panes.map((id) => {
         const rendered = sections[id]();
         return rendered ? <div key={id} class="home-pane rise" style={{ '--i': 1 }}>{rendered}</div> : null;
@@ -414,7 +441,7 @@ export function Home({
       <PushPrompt />
 
       <div class="today-foot">
-        <button type="button" onClick={() => { haptic('light'); onCustomize(); }}>Arrange Today</button>
+        <button type="button" onClick={() => { haptic('light'); onCustomize(); }}>Arrange this screen</button>
       </div>
     </div>
   );

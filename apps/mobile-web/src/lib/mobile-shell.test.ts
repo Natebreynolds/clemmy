@@ -36,103 +36,89 @@ test('index.html status bar and theme-color match the light chrome', () => {
 });
 
 /**
- * Owner 2026-10-23 (replacing the 08-25 menu-only phone): "I need Clem to feel
- * more premium and put together and easier to navigate on mobile" — chosen:
- * bottom tabs + menu. Today, Chats, Needs you and Spaces sit in a floating tab
- * bar; More opens the left menu with everything else. A screen with its own
- * back button stays full screen, and the bar steps aside for the keyboard.
+ * Owner 2026-10-30 (replacing the 10-23 tab bar): "No user is going to want to
+ * poke around this complicated UI on mobile." The phone is ONE screen, Clem's.
+ * Every other place lives in Your stuff, opened beside the composer, and a
+ * place pushes in with a back button to Clem. No tab bar, no header pills.
  */
-test('a phone gets five everyday places with More in the header and preserves detail and keyboard space', () => {
+test('a phone is one Clem screen with every other place in Your stuff, one tap back', () => {
   const app = read('../app.tsx');
-  assert.match(app, /const TAB_BAR_PLACES: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows'\];/);
-  assert.match(app, /const MENU_PLACES: ReadonlyArray<Tab> = \['chats', 'memory'\];/);
-  assert.match(app, /\{detailHeaderOwned \? null : \(\s*<TabBar/, 'a detail screen owns the full height');
-  assert.match(read('../components/NavigationMenuButton.tsx'), /navigation\.openNavigation\(event\.currentTarget\)/, 'header More opens the one menu');
-  const bar = read('../components/TabBar.tsx');
-  assert.match(bar, /aria-current=\{here \? 'page' : undefined\}/);
-  assert.doesNotMatch(bar, />More<\//, 'More does not crowd a sixth tab into the bar');
-  const css = read('../adaptive-layout.css');
-  assert.match(css, /@media \(max-width: 879\.98px\) \{[\s\S]*?:root\[data-keyboard-up\] \.tab-bar \{ display: none; \}/);
-  assert.match(css, /:root:not\(\[data-keyboard-up\]\) #app:has\(> \.tab-bar\) \{\s*--mobile-dock-gap: calc\(var\(--tab-bar-clearance\) \+ 10px\);/,
-    'the ask capsule rests on the bar, then on the keyboard');
-  // The old dock stays deleted: the bar is a new, phone-only surface.
+  assert.doesNotMatch(app, /<TabBar|TAB_BAR_PLACES/, 'the bottom tab bar is gone');
+  assert.match(app, /const STUFF_GROUPS: ReadonlyArray<ReadonlyArray<Tab>> = \[/);
+  for (const place of ['chats', 'inbox', 'spaces', 'workflows', 'projects', 'activity', 'agents', 'memory', 'settings']) {
+    assert.match(app.slice(app.indexOf('const STUFF_GROUPS')), new RegExp(`'${place}'`), `${place} is reachable from Your stuff`);
+  }
+  assert.match(app, /home: 'Clem',/, 'the one screen is named for her');
+  assert.match(app, /class="nav-back" onClick=\{\(\) => \{ haptic\('light'\); navigateTo\('home'\); \}\}/,
+    'every other place goes back to Clem in one tap');
+  assert.match(app, /onOpenStuff=\{openDrawer\}/, 'the composer carries the Your stuff door');
+  assert.doesNotMatch(app, /header-chat-button|needs-pill|<RunningTasksSheet/, 'the header carries no pills');
+  const capsule = read('../components/AskCapsule.tsx');
+  assert.match(capsule, /class="stuff-button"[\s\S]*?aria-label="Your stuff"[\s\S]*?aria-haspopup="dialog"/);
+  const adaptive = read('../adaptive-layout.css');
+  assert.doesNotMatch(adaptive, /\.tab-bar/, 'the tab bar styles are deleted, not hidden');
+  // The old dock stays deleted too.
   assert.doesNotMatch(app, /class="dock"|dock-icon|dock-label|dock-badge/);
   const styles = read('../styles.css');
   assert.doesNotMatch(styles, /--dock-height|\.dock\b|\.dock-/);
   assert.match(styles, /\.app-main \{[\s\S]*?env\(safe-area-inset-bottom\)/);
 });
 
-test('320px and 393px navigation keep whole labels, separate counts and readable targets', () => {
+test('320px and 393px places keep whole labels, separate counts and readable targets', () => {
   const app = read('../app.tsx');
   const inbox = read('../screens/Inbox.tsx');
   const project = read('../screens/Project.tsx');
   const styles = read('../styles.css');
-  const adaptive = read('../adaptive-layout.css');
-  const bar = read('../components/TabBar.tsx');
-  assert.match(app, /id: 'workflows',\s*label: 'Automations',\s*shortLabel: 'Automate'/);
+  assert.match(app, /id: 'workflows',\s*label: 'Automations'/);
   assert.match(app, /workflows: 'Automations'/, 'the actual screen title remains the full destination');
-  assert.match(bar, /aria-label=\{count \? `\$\{place\.label\}, \$\{count\.label\}` : place\.label\}/,
-    'the compact label retains the full accessible destination, with badge meaning when present');
-  assert.match(bar, /\{place\.shortLabel \?\? place\.label\}/);
   assert.match(inbox, /class="inbox-tab-label">Needs you<\/span><span class="inbox-tab-count"/);
   assert.match(inbox, /class="inbox-tab-label">Updates<\/span><span class="inbox-tab-count"/);
   const rules = styles.slice(styles.indexOf('.inbox-tabs button {'), styles.indexOf('.inbox-tabs button.active'));
   assert.match(rules, /flex-direction: column/);
   assert.match(rules, /white-space: nowrap/);
   assert.doesNotMatch(rules, /overflow-wrap: anywhere/);
-  assert.match(rules, /min-height: 60px/);
   assert.match(styles, /\.inbox-tab-label \{[^}]*white-space: nowrap/);
-  assert.match(styles, /\.inbox-tab-count \{[^}]*font-size: 11px/);
-  assert.match(adaptive, /\.tab-bar-item \{ min-height: 48px/);
-  assert.match(adaptive, /\.tab-bar-label \{ font-size: 11px/);
+  assert.match(styles, /\.drawer-item \{[\s\S]*?min-height: 52px/, 'Your stuff rows clear the 44px floor');
   assert.match(project, /`Agents, \$\{overview\.agents\.length\} assigned/,
     'assigned-agent counts have a readable accessible name rather than concatenated text');
 });
 
-test('the drawer is modal, focus-trapped, keyboard dismissible, and marks the current screen', () => {
+test('Your stuff is a modal, focus-trapped, keyboard dismissible sheet that marks the current place', () => {
   const app = read('../app.tsx');
-  // ONE menu (owner 2026-08-25, 2026-09-26): the Clemmy mark opens the drawer
-  // with a real touch target (as More does), a rightward swipe across the
-  // header opens it too, and the title is words. The title-tap sheet is gone.
-  assert.match(app, /<NavigationMenuButton\s*\/>/);
   const menuButton = read('../components/NavigationMenuButton.tsx');
-  assert.match(menuButton, /aria-label="More places and settings"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/);
-  assert.match(app, /clientX - sw\.x > 48 && !drawerOpen\) openDrawer\(\)/);
+  assert.match(menuButton, /aria-label="More places and settings"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-expanded=\{navigation.navigationOpen\}/,
+    'a detail screen\'s own Clemmy mark still opens the same sheet');
   assert.match(app, /<span class="title-text">\{TAB_TITLES\[tab\]\}<\/span>/);
   assert.doesNotMatch(app, /TitleSwitcher|switcherOpen|title-switch/);
   // Dialog semantics + Escape + scrim close.
   assert.match(app, /class=\{`drawer-layer\$\{drawerClosing \? ' closing' : ''\}`\}[\s\S]*?role=\{drawerClosing \? undefined : 'dialog'\}/);
+  assert.match(app, /aria-label=\{drawerClosing \? undefined : 'Your stuff'\}/);
   assert.match(app, /aria-hidden=\{drawerClosing \? true : undefined\}/);
   assert.match(app, /inert=\{drawerClosing \? true : undefined\}/,
     'the animated closing layer is immediately non-interactive');
   assert.match(app, /event\.key === 'Escape'/);
-  assert.match(app, /class="drawer-scrim"[\s\S]*?aria-label="Close menu"/);
+  assert.match(app, /class="drawer-scrim"[\s\S]*?aria-label="Close Your stuff"/);
+  assert.match(app, /class="drawer-close" type="button" onClick=\{\(\) => closeDrawer\(\)\}>Done<\/button>/);
   const closeStart = app.indexOf('const closeDrawer =');
   const closeEnd = app.indexOf('\n  };', closeStart);
   const closeSource = app.slice(closeStart, closeEnd);
   const restoreFocusAt = closeSource.indexOf('drawerOpenerRef.current.focus()');
   assert.ok(restoreFocusAt >= 0 && restoreFocusAt < closeSource.indexOf('window.setTimeout'),
     'focus returns before the exit animation rather than staying inside aria-hidden content');
-  // The active section carries the page marker, accent-highlighted in CSS.
+  // The current place carries the page marker.
   assert.match(app, /aria-current=\{tab === t\.id \? 'page' : undefined\}/);
   const css = read('../styles.css');
-  assert.match(css, /\.menu-mark \{[\s\S]*?min-width: 44px;[\s\S]*?min-height: 44px/);
-  // Chats has a direct section door as well as its recent-thread shortcuts.
-  assert.match(app, /const PRIMARY_TABS: ReadonlyArray<Tab> = \['home', 'inbox', 'projects', 'spaces', 'workflows'\];/);
-  assert.match(app, /const QUIET_TABS: ReadonlyArray<Tab> = \['settings'\];/);
-  assert.match(app, /class="drawer-quiet"/);
-  assert.match(css, /\.drawer \{[\s\S]*?width: min\(calc\(100vw - 40px\), 340px\)/);
+  assert.match(css, /\.drawer \{[\s\S]*?bottom: 0;[\s\S]*?env\(safe-area-inset-bottom\)/, 'the sheet rises from the bottom, clear of the home indicator');
   assert.match(css, /\.drawer \{[\s\S]*?env\(safe-area-inset-left\)/);
-  assert.match(css, /\.drawer-item \{[\s\S]*?min-height: 48px/);
-  assert.match(css, /\.drawer-item\[aria-current='page'\] \{[\s\S]*?var\(--accent\)/);
+  assert.match(css, /\.drawer-item\[aria-current='page'\] \{/);
 });
 
 test('drawer tab selection cannot be undone by a synthetic history-back entry', () => {
   const app = read('../app.tsx');
   assert.doesNotMatch(app, /useBackGesture\(drawerOpen/,
     'the drawer must not push history: closing that entry after replaceState returns to the old tab');
-  assert.match(app, /onTouchEnd=\{\(event\) => \{[\s\S]*?clientX - s\.x < -48\) closeDrawer\(\)/,
-    'the drawer retains its direct iOS swipe-to-close gesture without browser history');
+  assert.match(app, /onTouchEnd=\{\(event\) => \{[\s\S]*?clientY - s\.y > 72 && \(drawerRef\.current\?\.scrollTop \?\? 0\) <= 0\) closeDrawer\(\)/,
+    'the sheet pulls down to close, only from its top, without browser history');
   assert.match(app, /navigateTo\(t\.id\);[\s\S]*?closeDrawer\(false\);/,
     'a section tap selects its exact peer tab and then closes the menu');
   assert.match(app, /window\.history\.replaceState/,
@@ -140,17 +126,14 @@ test('drawer tab selection cannot be undone by a synthetic history-back entry', 
 });
 
 /**
- * Owner mandates 2026-08-25: Settings rides the drawer (gear row at the
- * BOTTOM of the menu), the header sign-out moves into Settings > Devices &
- * security, and the Brain switcher is a routing choice over the daemon's
- * live catalog. Trust is minted at home on the Mac and only EXERCISED in
- * the pocket — so nothing key-shaped may ever render on the phone.
+ * Owner mandates 2026-08-25: the header sign-out moves into Settings > Devices
+ * & security, and trust is minted at home on the Mac and only EXERCISED in
+ * the pocket — so nothing key-shaped may ever render on the phone. Settings
+ * (Apps & devices) is a row in Your stuff (owner 2026-10-30).
  */
-test('Settings is reachable from the drawer bottom and the header sign-out is gone', () => {
+test('Settings is reachable from Your stuff and the header sign-out is gone', () => {
   const app = read('../app.tsx');
-  assert.match(app, /'settings'/, 'the settings tab exists');
-  assert.match(app, /class="drawer-foot"[\s\S]*?Settings/,
-    'Settings is a dedicated row at the bottom of the drawer menu');
+  assert.match(app, /\['memory', 'settings'\],/, 'Settings is the last row of Your stuff');
   assert.doesNotMatch(app, /aria-label="Sign out"/,
     'the header sign-out moved into Settings > Devices & security');
 });

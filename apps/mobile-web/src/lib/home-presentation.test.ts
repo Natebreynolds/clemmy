@@ -9,7 +9,6 @@ import {
   homeUnfinishedNote,
   homeWorkPane,
   homeWorkPaneTitle,
-  phoneHeaderChrome,
   type HomeLeadFacts,
 } from './home-presentation';
 
@@ -337,25 +336,6 @@ test('the remainder counts every class in the pane, never just the stalled ones'
   assert.equal(pane.moreLabel, '6 more in Activity', '10 rows, 4 on the glass');
 });
 
-// ─── the header row ─────────────────────────────────────────────────────────
-
-test('the header carries a signal only for what the screen cannot show itself', () => {
-  // Home leads with the answer, so the pill is noise there; it no longer lists
-  // Clem's work (Activity owns it), so the work chip is Home's door to it.
-  const home = phoneHeaderChrome({ tab: 'home', needsYouSignal: true });
-  assert.deepEqual(home, { needsPill: false, workChip: true });
-
-  // Needs you shows its own list; Activity shows its own runs.
-  assert.equal(phoneHeaderChrome({ tab: 'inbox', needsYouSignal: true }).needsPill, false);
-  assert.equal(phoneHeaderChrome({ tab: 'activity', needsYouSignal: true }).workChip, false);
-
-  // Everywhere else the chrome is the only door, so it keeps both.
-  const chat = phoneHeaderChrome({ tab: 'chats', needsYouSignal: true });
-  assert.deepEqual(chat, { needsPill: true, workChip: true });
-  assert.equal(phoneHeaderChrome({ tab: 'chats', needsYouSignal: false }).needsPill, false,
-    'and it never shows a pill for a count the shell has not confirmed');
-});
-
 // ─── the pins: the screen actually asks these functions ─────────────────────
 //
 // Rules that live only in a pure module decay the moment the renderer stops
@@ -403,7 +383,7 @@ test('Home previews only running work, capped at two, with the complete Work des
   assert.doesNotMatch(home, /RunningRow|workRows|homeWorkPane\(/);
   assert.match(home, /const activeWork = workingView\.entries\.filter\(row => row\.membership === 'running'\)/);
   assert.match(home, /activeWork\.slice\(0, 2\)/, 'paused and waiting work cannot fill Today');
-  assert.match(home, /onClick=\{onOpenActivity\}>View Work/, 'the full list remains one tap away');
+  assert.match(home, /onClick=\{onOpenActivity\}>See all/, 'the full list remains one tap away');
 });
 
 test('the lead is fed the demand the Inbox count cannot see, and how old that count is', () => {
@@ -422,13 +402,11 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
     'a control may not be offered for something it cannot do: the tap goes where it says');
 });
 
-test('the header row is fed by the chrome rule, and Home is handed the age the pill used to carry', () => {
+test('the place bar carries no signals, and Home is handed the age the pill used to carry', () => {
   const app = read('../app.tsx');
-  assert.match(app, /const headerChrome = phoneHeaderChrome\(\{ tab, needsYouSignal: needsYou\.show \}\)/);
-  assert.match(app, /\{tab !== 'home' && headerChrome\.workChip \? <RunningTasksSheet onOpenRun=\{openRun\} compact \/> : null\}/);
-  assert.match(app, /\{headerChrome\.needsPill \? \(/);
-  assert.doesNotMatch(app, /tab === 'home' && needsYou\.show/,
-    'the pill no longer appears only on the one screen that already says it');
+  // Owner 2026-10-30: one Clem screen. Needs you and current work live on it,
+  // so the bar over every other place is just the way back and the name.
+  assert.doesNotMatch(app, /phoneHeaderChrome|needs-pill|<RunningTasksSheet/);
   // Suppressing the pill on Home removed the phone's only staleness
   // disclosure from the screen that leads with the count. It is handed over
   // from the SAME presenter, so chrome and Home cannot disagree about the age.

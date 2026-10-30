@@ -50,7 +50,6 @@ import {
   type TabId as Tab,
 } from './lib/deep-link';
 import { useHomePreferences } from './lib/home-prefs';
-import { phoneHeaderChrome } from './lib/home-presentation';
 import { appBadgeAuthAction, clearAppBadge, syncAppBadge } from './lib/app-badge';
 import { lastGoodAt } from './lib/last-good';
 import { needsYouChrome } from './lib/needs-you';
@@ -68,13 +67,9 @@ import { mobileDrafts } from './lib/file-context';
 import { DrawerRecents } from './components/DrawerRecents';
 import { useFoldPages } from './lib/fold-pages';
 import { useDisplayRail } from './lib/display-rail';
-import { greetingName } from './lib/greeting';
-import { RunningTasksSheet } from './components/RunningTasksSheet';
 import { AskCapsule } from './components/AskCapsule';
-import { TabBar } from './components/TabBar';
 import { CustomizeSheet } from './components/CustomizeSheet';
 import { MobileNavigationProvider } from './lib/mobile-navigation';
-import { NavigationMenuButton } from './components/NavigationMenuButton';
 import { useMobileViewportVariables } from './lib/use-keyboard-inset';
 import { mobileChatLocation } from './lib/chat-location';
 import { appLinkClickIsPlain, guidanceOrigin, guidanceReturnFromHistory, guidanceReturnSearch, mobileAppLinkDestination } from './lib/app-link-navigation';
@@ -129,7 +124,6 @@ export function App() {
   const [createRequest, setCreateRequest] = useState(0);
   // The menu opens from More, the Clemmy mark in this header, or a rightward
   // swipe across the header.
-  const headerSwipe = useRef<{ x: number; y: number; horizontal: boolean | null }>({ x: 0, y: 0, horizontal: null });
   const [customizeOpen, setCustomizeOpen] = useState(false);
   // The left menu holds the places the phone's tab bar has no room for
   // (owner 10-23: tabs + More, replacing the 08-25 menu-only phone).
@@ -686,7 +680,6 @@ export function App() {
     }
   };
 
-  const ownerInitial = greetingName(name).trim().charAt(0).toUpperCase();
 
   const goToChat = (payload: ChatHandoff) => {
     setHandoff(payload);
@@ -748,9 +741,7 @@ export function App() {
   // row is three items and the title finally has room. (Before: five controls
   // fought for it — mark, title, a "6·42" chip, a "Needs you · 86" pill and
   // the connection state — and the title was crushed to a sliver.)
-  const headerChrome = phoneHeaderChrome({ tab, needsYouSignal: needsYou.show });
   const workSection = tab === 'projects' || tab === 'activity' || tab === 'agents';
-  const selectedPlace: Tab = workSection ? 'projects' : tab;
   const dismissGuidance = () => {
     setGuideId(null);
     guideReturn.current = null;
@@ -808,69 +799,19 @@ export function App() {
         <button type="button" class="adaptive-settings" aria-current={tab === 'settings' ? 'page' : undefined}
           onClick={() => { haptic('light'); navigateTo('settings'); }}>Apps &amp; devices</button>
       </nav>
-      <header
-        class="app-header"
-        hidden={detailHeaderOwned}
-        onTouchStart={(event) => {
-          const t = event.touches[0];
-          headerSwipe.current = { x: t.clientX, y: t.clientY, horizontal: null };
-        }}
-        onTouchMove={(event) => {
-          const t = event.touches[0];
-          const sw = headerSwipe.current;
-          if (sw.horizontal === null) {
-            const dx = Math.abs(t.clientX - sw.x);
-            const dy = Math.abs(t.clientY - sw.y);
-            if (dx > 12 || dy > 12) sw.horizontal = dx > dy;
-          }
-        }}
-        onTouchEnd={(event) => {
-          // A rightward swipe across the header opens the menu. The header
-          // only: the screen's left edge stays the system back gesture.
-          const sw = headerSwipe.current;
-          if (sw.horizontal && event.changedTouches[0].clientX - sw.x > 48 && !drawerOpen) openDrawer();
-        }}
-      >
-        {/* ONE menu (owner 08-25, 09-26): the Clemmy mark is its handle. */}
-        <NavigationMenuButton />
+      {/* Clem's own screen draws her large title; every other place is one
+          push away from her and its back button says so. */}
+      <header class={`app-header${tab === 'home' ? ' app-header-home' : ''}`} hidden={detailHeaderOwned}>
+        {tab === 'home' ? null : (
+          <button type="button" class="nav-back" onClick={() => { haptic('light'); navigateTo('home'); }}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+            <span>Clem</span>
+          </button>
+        )}
         <h1 ref={routeTitleRef} class="app-title" tabIndex={-1}>
           <span class="title-text">{TAB_TITLES[tab]}</span>
-          {tab === 'inbox' && needsYou.show ? (
-            <span class={`title-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel} aria-hidden="true">
-              {needsYou.badgeText}
-            </span>
-          ) : null}
         </h1>
         <div class="meta">
-          {/* Compact running-work chip — the sheet's trigger, which must not
-              float at the bottom now that the dock is gone. Absent at zero
-              (presenter contract: the pill disappears when total is 0), and
-              absent on the screens that already list the work themselves. */}
-          {tab !== 'home' && headerChrome.workChip ? <RunningTasksSheet onOpenRun={openRun} compact /> : null}
-          {/* The pill has no room for a banner, so it discloses the age in the
-              space it has: "Needs you · 3 · 6h ago" when the number came off
-              the worker's shelf or a poll stopped answering. It is the standing
-              signal for screens that have no other way to show it — never on
-              Home or Needs you, which say it in their own content. */}
-          {headerChrome.needsPill ? (
-            // Live, it is a round door with its count; stale, the words come
-            // back so the age is still on screen.
-            <button
-              type="button"
-              class={`needs-pill${needsYou.stale ? ' needs-pill-stale' : ' needs-pill-round'}`}
-              aria-label={needsYou.pillAriaLabel}
-              onClick={() => { haptic('light'); navigateTo('inbox'); }}
-            >
-              {needsYou.stale ? (
-                <span class="needs-pill-face" aria-hidden="true">{needsYou.pillText}</span>
-              ) : (
-                <>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>
-                  <span class="needs-pill-face needs-pill-count" aria-hidden="true">{needsYou.badgeText}</span>
-                </>
-              )}
-            </button>
-          ) : null}
           {(tab === 'projects' && !projectId) || (tab === 'agents' && !agentId) ? (
             <button
               type="button"
@@ -880,17 +821,6 @@ export function App() {
               onClick={() => { haptic('light'); setCreateRequest((n) => n + 1); }}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-            </button>
-          ) : null}
-          {tab !== 'chats' || chatsListVisible ? (
-            <button
-              type="button"
-              class="header-round header-chat-button"
-              aria-label={tab === 'chats' ? 'New chat' : 'Open chats'}
-              onClick={() => { if (tab === 'chats') { haptic('light'); goToChat({}); } else openChatsList(); }}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{tab === 'chats' ? <><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" /></> : <><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-3 3V4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" /><path d="M6 7h10M6 11h7" /></>}</svg>
-              <span>{tab === 'chats' ? 'New' : 'Chats'}</span>
             </button>
           ) : null}
           {door === 'direct' ? (
@@ -934,9 +864,9 @@ export function App() {
           aria-modal={drawerClosing ? undefined : true}
           aria-hidden={drawerClosing ? true : undefined}
           inert={drawerClosing ? true : undefined}
-          aria-label={drawerClosing ? undefined : 'Menu'}
+          aria-label={drawerClosing ? undefined : 'Your stuff'}
         >
-          <button class="drawer-scrim" type="button" tabIndex={drawerClosing ? -1 : 0} aria-label="Close menu" onClick={() => closeDrawer()} />
+          <button class="drawer-scrim" type="button" tabIndex={drawerClosing ? -1 : 0} aria-label="Close Your stuff" onClick={() => closeDrawer()} />
           <aside
             ref={drawerRef}
             tabIndex={-1}
@@ -958,95 +888,63 @@ export function App() {
             }}
             onTouchEnd={(event) => {
               const s = swipe.current;
-              // The drawer owns this gesture directly rather than minting a
+              // The sheet owns its pull-down directly rather than minting a
               // browser-history entry. A history entry made tab selection
               // self-cancelling: navigateTo() replaced the drawer entry, then
               // closing it went back to the previous tab. Tabs are peers, so
               // opening or closing the menu must never change history.
-              if (s.horizontal && event.changedTouches[0].clientX - s.x < -48) closeDrawer();
+              if (s.horizontal === false && event.changedTouches[0].clientY - s.y > 72 && (drawerRef.current?.scrollTop ?? 0) <= 0) closeDrawer();
             }}
           >
+            <div class="stuff-grabber" aria-hidden="true" />
             <div class="drawer-brand">
-              <img class="brand-mark" src="/m/clemmy.png" alt="" width="32" height="32" />
-              <span class="brand-name">Clementine</span>
-              <button class="drawer-close" type="button" aria-label="Close menu" onClick={() => closeDrawer()}>×</button>
+              <h2 class="stuff-title">Your stuff</h2>
+              <button class="drawer-close" type="button" onClick={() => closeDrawer()}>Done</button>
             </div>
+            <button
+              class="stuff-new-chat"
+              type="button"
+              onClick={() => { haptic('light'); goToChat({}); closeDrawer(false); }}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+              New chat
+            </button>
             <nav class="drawer-nav" aria-label="Sections">
-              {/* Detail screens hide the tab bar, so their menu must include its destinations. */}
-              {(detailHeaderOwned ? [...PRIMARY_TABS, ...MENU_PLACES] : MENU_PLACES).map((id) => TABS.find((t) => t.id === id)!).map((t) => (
-                <button
-                  key={t.id}
-                  class="drawer-item"
-                  aria-current={tab === t.id ? 'page' : undefined}
-                  onClick={() => {
-                    if (tab !== t.id) haptic('light');
-                    navigateTo(t.id);
-                    closeDrawer(false);
-                  }}
-                >
-                  <span class="drawer-item-icon">{t.icon}</span>
-                  <span class="drawer-item-label">{t.label}</span>
-                  {t.id === 'inbox' && needsYou.show ? (
-                    <span class={`drawer-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel}>
-                      {needsYou.drawerBadgeText}
-                    </span>
-                  ) : null}
-                </button>
+              {STUFF_GROUPS.map((group) => (
+                <div key={group.join('-')} class="stuff-group">
+                  {group.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      class="drawer-item"
+                      aria-current={tab === t.id ? 'page' : undefined}
+                      onClick={() => {
+                        if (tab !== t.id) haptic('light');
+                        navigateTo(t.id);
+                        closeDrawer(false);
+                      }}
+                    >
+                      <span class={`drawer-item-icon stuff-glyph stuff-glyph-${t.id}`}>{t.icon}</span>
+                      <span class="drawer-item-label">{t.label}</span>
+                      {t.id === 'inbox' && needsYou.show ? (
+                        <span class={`drawer-badge${needsYou.stale ? ' badge-stale' : ''}`} title={needsYou.badgeAriaLabel}>
+                          {needsYou.drawerBadgeText}
+                        </span>
+                      ) : null}
+                      <svg class="stuff-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+                    </button>
+                  ))}
+                </div>
               ))}
-              <div class="drawer-quiet" aria-label="Also">
-                {QUIET_TABS.map((id) => TABS.find((t) => t.id === id)!).map((t) => (
-                  <button
-                    key={t.id}
-                    class="drawer-item drawer-item-quiet"
-                    aria-current={tab === t.id ? 'page' : undefined}
-                    onClick={() => {
-                      if (tab !== t.id) haptic('light');
-                      navigateTo(t.id);
-                      closeDrawer(false);
-                    }}
-                  >
-                    <span class="drawer-item-icon">{t.icon}</span>
-                    <span class="drawer-item-label">{t.label}</span>
-                  </button>
-                ))}
-              </div>
             </nav>
             <DrawerRecents
               open={drawerOpen && !drawerClosing}
               onOpen={(session) => { goToChat({ session, sessionId: session.id, title: session.title }); closeDrawer(false); }}
               onAll={() => { navigateTo('chats'); closeDrawer(false); }}
             />
-            {/* Settings rides the bottom of the menu (owner IA): the pocket
-                end of trust minted on the Mac — quiet, always reachable — as
-                the owner's initial, beside the one way to start a new chat. */}
-            <div class="drawer-foot">
-              <button
-                class="drawer-avatar"
-                type="button"
-                aria-label="Settings"
-                aria-current={tab === 'settings' ? 'page' : undefined}
-                onClick={() => {
-                  if (tab !== 'settings') haptic('light');
-                  navigateTo('settings');
-                  closeDrawer(false);
-                }}
-              >
-                {ownerInitial ? <span aria-hidden="true">{ownerInitial}</span> : (
-                  <svg viewBox="0 0 24 24" {...stroke} aria-hidden="true">
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                  </svg>
-                )}
-              </button>
-              <button
-                class="drawer-new-chat"
-                type="button"
-                onClick={() => { haptic('light'); goToChat({}); closeDrawer(false); }}
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-                New chat
-              </button>
-            </div>
+            <button type="button" class="stuff-arrange" onClick={() => { closeDrawer(false); setCustomizeOpen(true); }}>
+              Arrange Clem's screen
+            </button>
           </aside>
         </div>
       ) : null}
@@ -1172,21 +1070,8 @@ export function App() {
         </ScreenBoundary>
       </main>
 
-      {capsuleShown ? <AskCapsule onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })} /> : null}
+      {capsuleShown ? <AskCapsule onAsk={(draft, attachments) => goToChat({ draft, attachments, autoSend: true })} onOpenStuff={openDrawer} /> : null}
 
-      {/* A screen with its own back button (a conversation, a Space, a run)
-          is full screen; the places return with the list it came from. */}
-      {detailHeaderOwned ? null : (
-        <TabBar
-          places={TAB_BAR_PLACES.map((id) => TABS.find((t) => t.id === id)!)}
-          current={selectedPlace}
-          currentInMenu={!TAB_BAR_PLACES.includes(selectedPlace)}
-          menuOpen={drawerOpen}
-          badge={needsYou.show ? { place: 'inbox', text: needsYou.badgeText, label: needsYou.badgeAriaLabel, stale: needsYou.stale } : null}
-          onSelect={(id) => navigateTo(id)}
-          onReselect={() => document.querySelector<HTMLElement>('.app-main')?.scrollTo({ top: 0, behavior: 'smooth' })}
-        />
-      )}
     </MobileNavigationProvider>
   );
 }
@@ -1233,14 +1118,18 @@ const DOOR_COPY: Record<ConnectionDoor, { label: string; hint: string }> = {
 
 /** The places (owner 09-26, Projects added 09-29): everything else is reached from inside them or from the quiet rows. */
 const PRIMARY_TABS: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows'];
-/** On a phone the four used most sit in the tab bar (owner 10-23); More opens the menu with the rest. */
-const TAB_BAR_PLACES: ReadonlyArray<Tab> = ['home', 'inbox', 'projects', 'spaces', 'workflows'];
 const MENU_PLACES: ReadonlyArray<Tab> = ['chats', 'memory'];
-// Recents remain shortcuts; Chats is also a first-class section.
-const QUIET_TABS: ReadonlyArray<Tab> = ['settings'];
+/** On a phone there is ONE screen, Clem's (owner 10-30); every other place
+ *  lives in Your stuff, grouped the way a person reaches for them. */
+const STUFF_GROUPS: ReadonlyArray<ReadonlyArray<Tab>> = [
+  ['chats', 'inbox'],
+  ['spaces', 'workflows'],
+  ['projects', 'activity', 'agents'],
+  ['memory', 'settings'],
+];
 
 const TAB_TITLES: Record<Tab, string> = {
-  home: 'Today',
+  home: 'Clem',
   inbox: 'Inbox',
   chats: 'Chats',
   projects: 'Work',

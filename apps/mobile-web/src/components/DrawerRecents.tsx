@@ -27,6 +27,7 @@ export function DrawerRecents({ open, onOpen, onAll }: {
   return (
     <section class="drawer-recents" aria-label="Recent conversations">
       <h2 class="drawer-recents-head">Recents</h2>
+      <div class="drawer-recents-list">
       {shown.map((session) => (
         <button
           key={session.id}
@@ -49,6 +50,7 @@ export function DrawerRecents({ open, onOpen, onAll }: {
         <span class="drawer-recent-title">All chats</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
       </button>
+      </div>
     </section>
   );
 }

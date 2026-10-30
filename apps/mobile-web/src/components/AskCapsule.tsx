@@ -9,15 +9,18 @@ import type { ChatAttachment } from '@clem/chat-engine';
 import { Composer } from './Composer';
 import { uploadChatAttachment } from '../lib/api';
 import { mobileDrafts } from '../lib/file-context';
+import { haptic } from '../lib/native-bridge';
 
 // This window's floating draft is independent of every conversation draft.
 const CAPSULE_DRAFT_SCOPE = 'capsule:ask';
 
 interface Props {
   onAsk: (text: string, attachments?: ChatAttachment[]) => void;
+  /** Opens Your stuff: every place that is not Clem's own screen. */
+  onOpenStuff?: (opener: HTMLElement) => void;
 }
 
-export function AskCapsule({ onAsk }: Props) {
+export function AskCapsule({ onAsk, onOpenStuff }: Props) {
   const generation = useRef(mobileDrafts.generation);
   const [draft, setDraftState] = useState(() => mobileDrafts.read(CAPSULE_DRAFT_SCOPE).text);
   useEffect(() => {
@@ -42,7 +45,21 @@ export function AskCapsule({ onAsk }: Props) {
   return (
     <>
       <div class="ask-capsule-fade" aria-hidden="true" />
-      <div ref={wrap} class="ask-capsule">
+      <div ref={wrap} class={`ask-capsule${onOpenStuff ? ' ask-capsule-with-stuff' : ''}`}>
+        {onOpenStuff ? (
+          <button
+            type="button"
+            class="stuff-button"
+            aria-label="Your stuff"
+            aria-haspopup="dialog"
+            onClick={(event) => { haptic('light'); onOpenStuff(event.currentTarget); }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true">
+              <rect x="4" y="4" width="6.5" height="6.5" rx="1.8" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.8" />
+              <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.8" /><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.8" />
+            </svg>
+          </button>
+        ) : null}
         <Composer
           compact
           value={draft}

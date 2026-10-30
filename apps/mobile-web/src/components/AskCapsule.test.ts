@@ -31,6 +31,7 @@ function harness(store: MobileDraftStore, send: (...args: any[]) => void) {
   const dependencies: Record<string, any> = {
     'preact/hooks': hooks, 'preact/jsx-runtime': { jsx: element, jsxs: element },
     './Composer': { Composer: 'Composer' }, '../lib/file-context': { mobileDrafts: store },
+    '../lib/native-bridge': { haptic: () => undefined },
     '../lib/api': { uploadChatAttachment: () => assert.fail('draft navigation does not upload or send') },
   };
   const exports: Record<string, any> = {};

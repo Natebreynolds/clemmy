@@ -1022,10 +1022,11 @@ input, textarea, select { font: inherit; font-size: 16px; }
   font-size: var(--t-sm);
 }
 
-/* ── the left drawer ───────────────────────────────────────────── */
-/* Owner directive 2026-08-25: every section lives in a clean left-hand
-   collapsing menu; nothing navigational floats at the bottom. Sheet-class
-   motion (300ms, no overshoot); reduced motion collapses to opacity. */
+/* ── Your stuff ───────────────────────────────────────────────── */
+/* Owner 2026-10-30: the phone is ONE screen, Clem's. Every other place lives
+   in this sheet, which rises from the bottom like an iOS sheet, keeps the
+   places in grouped rows with their system-coloured glyphs, and pulls down
+   (or taps Done) to close. Reduced motion collapses to opacity. */
 
 .drawer-layer { position: fixed; inset: 0; z-index: 80; }
 .drawer-scrim {
@@ -1033,135 +1034,138 @@ input, textarea, select { font: inherit; font-size: 16px; }
   inset: 0;
   border: 0;
   padding: 0;
-  background: rgba(43, 31, 20, 0.38);
-  -webkit-backdrop-filter: blur(3px);
-  backdrop-filter: blur(3px);
-  animation: drawer-scrim-in 0.25s var(--ease-out);
+  background: rgba(31, 27, 22, 0.32);
+  animation: drawer-scrim-in 0.3s var(--ease-out);
 }
 @keyframes drawer-scrim-in {
   from { opacity: 0; }
   to { opacity: 1; }
 }
-/* The panel takes focus so the menu reads as one dialog; the ring belongs to
+/* The panel takes focus so the sheet reads as one dialog; the ring belongs to
    the rows a keyboard moves through, never the whole panel. */
 .drawer:focus, .drawer[tabindex]:focus-visible { outline: none; }
 .drawer {
   position: absolute;
-  top: 0;
-  bottom: 0;
   left: 0;
+  right: 0;
+  bottom: 0;
   display: flex;
   flex-direction: column;
-  width: min(calc(100vw - 40px), 340px);
-  padding: max(var(--sp-4), env(safe-area-inset-top)) var(--sp-3)
-    max(var(--sp-4), env(safe-area-inset-bottom)) max(var(--sp-3), env(safe-area-inset-left));
+  gap: 18px;
+  max-height: calc(100% - max(44px, env(safe-area-inset-top) + 16px));
+  padding: 8px max(16px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
-  background: rgba(255, 253, 248, 0.97);
-  -webkit-backdrop-filter: blur(22px) saturate(1.5);
-  backdrop-filter: blur(22px) saturate(1.5);
-  border-right: 1px solid var(--line-strong);
-  box-shadow: var(--shadow-lift);
-  animation: drawer-in 0.3s var(--ease-out);
+  background: var(--bg-0);
+  border-radius: 22px 22px 0 0;
+  box-shadow: 0 -12px 40px rgba(63, 42, 22, 0.16);
+  animation: drawer-in 0.46s cubic-bezier(0.2, 0.9, 0.25, 1);
 }
 @keyframes drawer-in {
-  from { opacity: 0.6; transform: translateX(-24%); }
-  to { opacity: 1; transform: none; }
+  from { transform: translateY(100%); }
+  to { transform: none; }
 }
 /* The exit mirrors the entrance — the layer stays mounted through 'closing'
-   (app.tsx unmounts after the animation), so the drawer leaves the way it
-   arrived instead of vanishing. `forwards` holds the final frame so a slow
-   unmount never flashes the drawer back. */
+   (app.tsx unmounts after the animation), so the sheet leaves the way it
+   arrived instead of vanishing. `forwards` holds the final frame. */
 .drawer-layer.closing .drawer-scrim { animation: drawer-scrim-out 0.25s var(--ease-out) forwards; }
-.drawer-layer.closing .drawer { animation: drawer-out 0.25s var(--ease-out) forwards; }
+.drawer-layer.closing .drawer { animation: drawer-out 0.25s cubic-bezier(0.4, 0, 1, 1) forwards; }
 @keyframes drawer-scrim-out {
   from { opacity: 1; }
   to { opacity: 0; }
 }
 @keyframes drawer-out {
-  from { opacity: 1; transform: none; }
-  to { opacity: 0.4; transform: translateX(-28%); }
+  from { transform: none; }
+  to { transform: translateY(100%); }
 }
 @media (prefers-reduced-motion: reduce) {
   /* Opacity only — no travel for people who opted out of motion. */
   .drawer { animation-name: drawer-scrim-in; }
   .drawer-layer.closing .drawer { animation-name: drawer-scrim-out; }
 }
-.drawer-brand {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-1) var(--sp-2) var(--sp-4);
-}
-.drawer-brand .brand-name { min-width: 0; flex: 1 1 auto; }
+.stuff-grabber { flex: 0 0 auto; width: 36px; height: 5px; margin: 0 auto -10px; border-radius: 3px; background: var(--bg-4); }
+.drawer-brand { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); padding: 4px 4px 0; flex-shrink: 0; }
+.stuff-title { margin: 0; font-family: var(--font-display); font-size: 1.75rem; font-weight: 700; line-height: 1.15; letter-spacing: -0.02em; color: var(--fg); }
 .drawer-close {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: 1px solid var(--line);
-  border-radius: 50%;
-  background: var(--bg-1);
-  color: var(--fg-2);
-  font-size: 26px;
-  font-weight: 300;
-  line-height: 1;
+  min-height: 44px;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 1.0625rem;
+  font-weight: 600;
 }
-.drawer-nav { display: flex; flex: 0 0 auto; flex-direction: column; gap: 2px; }
-/* Two quieter doors under the six places: reachable, never competing. */
-.drawer-quiet { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
-.drawer-item-quiet { min-height: 44px; color: var(--fg-3); }
-.drawer-item-quiet svg { width: 18px; height: 18px; }
-.drawer-item-quiet .drawer-item-label { font-size: 14px; font-weight: 600; }
-.drawer-item {
+.stuff-new-chat {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  min-height: 48px;
-  padding: 10px var(--sp-3);
-  border: none;
-  border-radius: var(--r-md);
-  background: transparent;
-  color: var(--fg-2);
-  text-align: left;
-  transition: color 0.2s ease, background 0.24s var(--ease-out), transform 0.14s var(--ease-out);
+  justify-content: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-height: 50px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--clem-primary);
+  color: var(--clem-primary-fg);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  transition: transform 0.12s var(--ease-out);
 }
-.drawer-item:active { transform: scale(0.97); }
-.drawer-item svg { width: 21px; height: 21px; stroke-width: 1.8; }
-.drawer-item-icon { display: block; line-height: 0; flex: 0 0 auto; }
+.stuff-new-chat:active { transform: scale(0.98); background: var(--clem-primary-press); }
+.stuff-new-chat svg { width: 20px; height: 20px; }
+.drawer-nav { display: flex; flex: 0 0 auto; flex-direction: column; gap: 18px; }
+.stuff-group { display: flex; flex-direction: column; overflow: hidden; border-radius: var(--r-lg); background: var(--bg-1); }
+.drawer-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  padding: 8px 14px;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  transition: background 0.2s ease;
+}
+/* Inset hairlines between rows, starting where the label starts. */
+.drawer-item + .drawer-item::before { content: ""; position: absolute; top: 0; left: 56px; right: 0; border-top: 0.5px solid var(--line-strong); }
+.drawer-item:active { background: var(--bg-3); }
+.drawer-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.drawer-item-icon { display: grid; place-items: center; flex: 0 0 auto; line-height: 0; }
+.stuff-glyph { width: 30px; height: 30px; border-radius: 8px; background: var(--clem-primary-tint); color: var(--accent); }
+.stuff-glyph svg { width: 18px; height: 18px; stroke-width: 2; }
+/* One warm family; the place that holds what needs you is filled. */
+.stuff-glyph-inbox { background: var(--clem-primary); color: var(--clem-primary-fg); }
 .drawer-item-label {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font-display);
-  font-size: var(--t-body);
-  font-weight: 700;
+  font-size: 1.0625rem;
+  font-weight: 400;
   letter-spacing: -0.01em;
 }
-/* The citrus is spent exactly where the user IS. */
-.drawer-item[aria-current='page'] {
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-.drawer-item[aria-current='page'] svg { stroke-width: 2.1; filter: drop-shadow(0 0 8px rgba(239, 95, 12, 0.35)); }
+/* Where you are reads as a pressed row, never a second colour. */
+.drawer-item[aria-current='page'] { background: var(--bg-3); }
+.stuff-chevron { flex: 0 0 auto; width: 16px; height: 16px; color: var(--bg-4); }
 .drawer-badge {
   flex: 0 0 auto;
-  min-width: 20px;
-  height: 20px;
-  padding: 0 6px;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 7px;
   border-radius: 999px;
-  background: var(--accent);
-  color: var(--on-accent);
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 20px;
+  background: var(--clem-primary);
+  color: var(--clem-primary-fg);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 22px;
   text-align: center;
+  font-variant-numeric: tabular-nums;
 }
+.stuff-arrange { align-self: center; min-height: 44px; padding: 0 12px; border: 0; background: none; color: var(--accent); font-size: 0.9375rem; font-weight: 500; }
 
 /* ── login / pairing ────────────────────────────────────────────── */
 
@@ -3102,14 +3106,6 @@ input, textarea, select { font: inherit; font-size: 16px; }
 /* ── settings ─────────────────────────────────────────────────── */
 /* The pocket end of trust minted on the Mac: a status strip you can read in
    one glance, then quiet cards. Every target keeps the 44px floor. */
-
-/* Settings rides the BOTTOM of the drawer menu (owner IA) — pushed down by
-   the nav, separated by a hairline, never mixed into the section list. */
-.drawer-foot {
-  margin-top: auto;
-  padding-top: var(--sp-2);
-  border-top: 1px solid var(--line);
-}
 
 .settings { padding-top: var(--sp-2); }
 
@@ -5630,119 +5626,41 @@ textarea.cz-input { resize: vertical; }
 .chat-row-more:active { background: var(--bg-3); }
 
 /* The menu's Recents: under the places, above the foot. */
-.drawer-recents { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
-.drawer-recents-head {
-  margin: 0 0 var(--sp-1);
-  padding: 0 var(--sp-3);
-  font-size: var(--t-sm);
-  font-weight: 600;
-  color: var(--fg-3);
-}
+.drawer-recents { display: flex; flex: 0 0 auto; flex-direction: column; gap: 8px; }
+.drawer-recents-head { margin: 0 0 0 4px; font-family: var(--font-display); font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; color: var(--fg); }
+.drawer-recents-list { display: flex; flex-direction: column; overflow: hidden; border-radius: var(--r-lg); background: var(--bg-1); }
 .drawer-recent {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  min-height: 44px;
-  padding: 8px var(--sp-3);
+  gap: 12px;
+  min-height: 48px;
+  padding: 8px 14px;
   border: 0;
-  border-radius: var(--r-md);
   background: transparent;
   color: var(--fg);
-  font: inherit;
   text-align: left;
-  transition: background 0.16s ease, transform 0.14s var(--ease-out);
 }
-.drawer-recent:active { background: var(--bg-2); transform: scale(0.98); }
-.drawer-recent-icon { flex: 0 0 auto; display: inline-flex; width: 20px; justify-content: center; color: var(--fg-3); line-height: 0; }
+.drawer-recent + .drawer-recent::before { content: ""; position: absolute; top: 0; left: 46px; right: 0; border-top: 0.5px solid var(--line-strong); }
+.drawer-recent:active { background: var(--bg-3); }
+.drawer-recent-icon { flex: 0 0 auto; display: inline-flex; width: 20px; justify-content: center; color: var(--fg-2); line-height: 0; }
 .drawer-recent-icon svg { width: 19px; height: 19px; }
 .drawer-recent-initial {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   width: 20px;
   height: 20px;
-  border-radius: 6px;
+  border-radius: 50%;
   background: var(--bg-3);
   color: var(--fg-2);
   font-size: 11px;
-  font-weight: 800;
-  line-height: 1;
-}
-.drawer-recent-title {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 15px;
-  font-weight: 500;
-}
-.drawer-recent-all { color: var(--fg-2); }
-.drawer-recent-all .drawer-recent-title { font-size: 14px; font-weight: 600; }
-.drawer-recent-all svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--fg-3); }
-
-/* The foot floats over the scrolling menu: the owner's initial (Settings)
-   at the left, the one way to start a new chat at the right. */
-.drawer-foot {
-  position: sticky;
-  bottom: calc(-1 * max(var(--sp-4), env(safe-area-inset-bottom)));
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  margin-top: auto;
-  padding: var(--sp-4) var(--sp-1) max(var(--sp-4), env(safe-area-inset-bottom));
-  border-top: 0;
-  background: linear-gradient(to bottom, rgba(255, 253, 248, 0), rgba(255, 253, 248, 0.96) 38%);
-}
-.drawer-avatar {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 48px;
-  height: 48px;
-  border: 1px solid var(--line);
-  border-radius: 50%;
-  background: var(--bg-0);
-  box-shadow: 0 4px 14px rgba(74, 46, 16, 0.10);
-  color: var(--fg);
-  font-size: 17px;
   font-weight: 700;
-  transition: transform 0.14s var(--ease-out);
 }
-.drawer-avatar svg { width: 20px; height: 20px; }
-.drawer-avatar:active { transform: scale(0.94); }
-.drawer-avatar[aria-current='page'] { border-color: var(--line-hot); color: var(--accent); }
-.drawer-new-chat {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 48px;
-  padding: 0 var(--sp-5);
-  border: 0;
-  border-radius: 999px;
-  background: var(--fg);
-  color: #fffaf3;
-  box-shadow: 0 8px 22px rgba(43, 31, 20, 0.22);
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-  transition: transform 0.14s var(--ease-out);
-}
-.drawer-new-chat svg { width: 17px; height: 17px; }
-.drawer-new-chat:active { transform: scale(0.96); }
+.drawer-recent-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; }
+.drawer-recent-all { color: var(--accent); }
+.drawer-recent-all .drawer-recent-title { font-size: 1rem; }
+.drawer-recent-all svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--bg-4); }
 
-/* The menu reads like a list of places, not buttons: ink labels at a
-   regular weight, line icons, one quiet separator before Recents. */
-.drawer .drawer-item { color: var(--fg); }
-.drawer .drawer-item-label { font-family: var(--font-body); font-size: 17px; font-weight: 500; letter-spacing: -0.01em; }
-.drawer .drawer-item svg { stroke-width: 1.6; color: var(--fg-2); }
-.drawer .drawer-item[aria-current='page'] { color: var(--accent); }
-.drawer .drawer-item[aria-current='page'] svg { color: var(--accent); }
-.drawer .drawer-item[aria-current='page'] .drawer-item-label { font-weight: 600; }
-.drawer-quiet { margin-top: 0; padding-top: 0; border-top: 0; }
-.drawer .drawer-item-quiet .drawer-item-label { font-size: 17px; font-weight: 500; }
-.drawer .drawer-item-quiet svg { width: 21px; height: 21px; }
 
 /* Header actions share a quiet, tactile surface. Elevation belongs to the
    floating composer and sheets; navigation stays on the page. */
@@ -5932,7 +5850,7 @@ textarea.cz-input { resize: vertical; }
 .chat-swipe-archive { background: var(--fg); color: #fffaf3; }
 .chat-swipe .chat-row {
   position: relative;
-  background: var(--bg-0);
+  background: var(--bg-1);
   touch-action: pan-y;
   -webkit-user-select: none;
   user-select: none;

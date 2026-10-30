@@ -1,0 +1,389 @@
+/* ────────────────────────────────────────────────────────────────────
+   Clem, the Apple standard (owner 2026-10-30)
+
+   The phone is ONE screen, Clem's. Every other place lives in Your stuff
+   and pushes in with a back button to her. The structure is Apple's own
+   apps (large titles, inset groups, a sheet for everything else); the
+   colours are Clementine's: the cream canvas, white cards, warm ink, and
+   clementine orange spent on what needs you and on Clem being alive.
+
+   Loaded last, so these tokens are the ones every screen reads.
+   ──────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Brand surfaces, the desktop's own: white cards on the cream canvas. */
+  --bg-0: #faf7f2;
+  --bg-1: #ffffff;
+  --bg-2: #faf7f2;
+  --bg-3: #f4f0e9;
+  --bg-4: #e4ddd1;
+
+  --line: rgba(63, 42, 22, 0.1);
+  --line-strong: rgba(63, 42, 22, 0.16);
+
+  /* Brand ink ramp. */
+  --fg: var(--clem-ink);
+  --fg-2: var(--clem-ink-muted);
+  --fg-3: var(--clem-ink-subtle);
+
+  --r-md: 14px;
+  --r-lg: 20px;
+
+  /* The quiet button and the pressed row: warm, never gray. */
+  --fill-quiet: rgba(63, 42, 22, 0.07);
+  /* Orange you look AT fills; orange you READ is --accent. The label on a
+     filled clementine control is warm ink (brand contrast rule). */
+  --fill-primary: var(--clem-primary);
+  --fill-primary-press: var(--clem-primary-press);
+  --on-fill-primary: var(--clem-primary-fg);
+  /* The live colour: a dot, a ring, never text. */
+  --clem-live: var(--clem-primary);
+  --clem-live-soft: rgba(242, 100, 25, 0.18);
+  /* A card on the cream canvas is drawn by one warm hairline. */
+  --card-edge: 0 0 0 1px rgba(63, 42, 22, 0.08);
+}
+
+::selection { background: var(--clem-primary-tint); }
+
+/* ── the place bar: back to Clem, the place's name ───────────────── */
+
+.app-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  min-height: 48px;
+  padding: 2px 8px;
+  flex-wrap: nowrap;
+  background: var(--bg-0);
+  border-bottom: 0.5px solid var(--line);
+}
+.nav-back {
+  grid-column: 1;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  min-height: 44px;
+  padding: 0 10px 0 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 1.0625rem;
+  letter-spacing: -0.01em;
+}
+.nav-back svg { width: 26px; height: 26px; }
+.nav-back:active { opacity: 0.5; }
+.app-header .app-title { grid-column: 2; justify-self: center; flex: none; max-width: 100%; }
+.app-header .title-text { font-family: var(--font-body); font-size: 1.0625rem; font-weight: 600; letter-spacing: -0.01em; }
+.app-header .meta { grid-column: 3; justify-self: end; margin-left: 0; flex-wrap: nowrap; }
+
+/* On Clem's own screen the bar steps away: her large title leads, and the
+   bar only appears to say the phone is remote or offline. */
+.app-header-home { min-height: 0; padding: 0 12px; border-bottom: 0; }
+.app-header-home .app-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── Clem's screen ───────────────────────────────────────────────── */
+
+.home { gap: 28px; padding-top: 4px; }
+
+.home-lead {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 4px 0;
+  text-align: left;
+  background: none;
+  border: 0;
+}
+.clem-hero-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 2px; }
+.clem-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 2.125rem;
+  font-weight: 700;
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+.clem-avatar {
+  position: relative;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--bg-1);
+  box-shadow: 0 1px 2px rgba(63, 42, 22, 0.1), 0 4px 14px rgba(63, 42, 22, 0.08);
+  transition: transform 0.14s var(--ease-out);
+}
+.clem-avatar:active { transform: scale(0.94); }
+.clem-avatar img { width: 34px; height: 34px; image-rendering: pixelated; }
+/* While she works, a ring breathes around her. */
+.clem-avatar-working::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--clem-live);
+  animation: clem-breathe 2.2s ease-in-out infinite;
+}
+@keyframes clem-breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.97); }
+  50% { opacity: 1; transform: scale(1.03); }
+}
+
+.home-greeting { margin: 0; font-size: 0.9375rem; font-weight: 400; color: var(--fg-2); letter-spacing: -0.005em; }
+.home-lead-say { display: flex; flex-direction: column; gap: 2px; }
+.app-main h2.home-lead-head {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.22;
+  letter-spacing: -0.015em;
+  color: var(--fg);
+  text-wrap: balance;
+}
+.home-lead-attention h2.home-lead-head,
+.home-lead-asks h2.home-lead-head { color: var(--accent); }
+.home-lead-detail { margin: 2px 0 0; font-size: 0.9375rem; color: var(--fg-2); }
+.home-lead-asof { margin: 2px 0 0; font-size: 0.8125rem; color: var(--fg-2); }
+.home-lead-action {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 44px;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.today-digest {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 4px 4px 4px 12px;
+  border-radius: 999px;
+  background: var(--fill-quiet);
+  color: var(--fg);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+.today-digest button { min-width: 28px; min-height: 28px; border: 0; background: none; color: var(--fg-2); font-size: 1rem; }
+
+/* What Clem is doing right now: a live group, the way an activity reads. */
+.clem-live {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 16px 2px;
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  box-shadow: var(--card-edge);
+}
+.clem-live-head { display: flex; align-items: center; gap: 8px; }
+.clem-live-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--clem-live); box-shadow: 0 0 0 4px var(--clem-live-soft); }
+.app-main h2.clem-live-title { flex: 1 1 auto; margin: 0; font-family: var(--font-body); font-size: 0.9375rem; font-weight: 600; letter-spacing: -0.01em; color: var(--fg); }
+.clem-live-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 60px;
+  padding: 10px 0;
+  border: 0;
+  border-top: 0.5px solid var(--line);
+  background: none;
+  color: inherit;
+  text-align: left;
+}
+.clem-live-head + .clem-live-row { margin-top: 8px; }
+.clem-live-row:active { opacity: 0.6; }
+.clem-live-pulse { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--bg-4); }
+.clem-live-pulse-on { background: var(--clem-live); animation: clem-pulse 1.4s ease-in-out infinite; }
+@keyframes clem-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--clem-live-soft); }
+  50% { box-shadow: 0 0 0 5px var(--clem-live-soft); }
+}
+.clem-live-text { display: flex; flex: 1 1 auto; flex-direction: column; gap: 1px; min-width: 0; }
+.clem-live-what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+.clem-live-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.875rem; color: var(--fg-2); }
+.clem-live-time { flex: 0 0 auto; font-size: 0.875rem; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+
+/* Section heads read like Apple's: a short bold title, the link at the end. */
+.home-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.home-section .section-head.pane-head,
+.home .section-head.pane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 8px 4px;
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  text-transform: none;
+  color: var(--fg);
+}
+.home .section-count { font-size: 1rem; font-weight: 500; color: var(--fg-2); letter-spacing: 0; background: none; padding: 0; min-width: 0; height: auto; }
+.home-link-btn { flex: 0 0 auto; min-height: 44px; padding: 0 0 0 8px; border: 0; background: none; color: var(--accent); font-size: 0.9375rem; font-weight: 500; }
+
+.home .home-card {
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--bg-1);
+  box-shadow: var(--card-edge);
+}
+.home .home-row { position: relative; padding: 12px 16px; border-top: 0; }
+.home .home-row + .home-row::before { content: ""; position: absolute; top: 0; left: 16px; right: 0; border-top: 0.5px solid var(--line-strong); }
+.home .home-row-tap:active { background: var(--bg-3); }
+.home .home-row-title { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }
+.home .home-row-note { font-size: 0.8125rem; color: var(--fg-2); }
+.home .home-row-link { min-height: 48px; color: var(--accent); font-size: 0.9375rem; font-weight: 500; }
+
+/* Answers sit side by side at equal width; the one that acts is filled. */
+.home .home-row-needs { gap: 6px; padding: 14px 16px; }
+.home .home-row-needs .home-row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
+.home .home-row-needs .home-row-actions > .home-btn { flex: 1 1 auto; }
+.home .home-row-needs .home-row-actions > .home-link-btn { flex: 0 0 auto; min-height: 42px; padding: 0 6px; }
+.home .home-row-needs .home-btn,
+.home .home-btn {
+  min-height: 42px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--fill-quiet);
+  color: var(--fg);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  box-shadow: none;
+}
+.home .home-row-needs .home-btn-primary,
+.home .home-btn-primary { background: var(--fill-primary); color: var(--on-fill-primary); }
+.home .home-btn-primary:active:not(:disabled) { background: var(--fill-primary-press); }
+.home .home-row-needs .home-btn:not(.home-btn-primary) { background: var(--fill-quiet); border: 0; }
+.home .home-btn:active:not(:disabled) { transform: scale(0.97); }
+.home .home-row-receipt { color: var(--clem-success); }
+
+.today-foot { display: flex; justify-content: center; }
+.today-foot button { min-height: 44px; border: 0; background: none; color: var(--fg-2); font-size: 0.875rem; font-weight: 500; }
+
+/* What Clem is doing about a reply: one white group, steps kept quiet. */
+.home .card-record-just-now { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.home .card-record-just-now > .section-head { margin: 0 0 0 4px; font-size: 0.8125rem; font-weight: 600; color: var(--fg-2); text-transform: none; letter-spacing: 0; }
+.home .card-record { margin: 0; padding: 14px 16px; border: 0; border-radius: var(--r-lg); background: var(--bg-1); box-shadow: var(--card-edge); }
+.home .from-clem-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.home .from-clem-head .section-head.pane-head { margin-bottom: 8px; }
+.home .from-clem-thread { min-height: 44px; border: 0; background: none; color: var(--accent); font-size: 0.9375rem; font-weight: 500; }
+.home .home-pinned-more { min-height: 44px; border: 0; background: none; color: var(--accent); font-size: 0.9375rem; font-weight: 500; text-align: left; padding: 0 4px; }
+
+/* Pinned Spaces: the same head as every section, a plain Add link. */
+.home .home-pinned-head { margin: 0 0 8px 4px; }
+.home .home-pinned-head .section-head { font-family: var(--font-display); font-size: 1.25rem; font-weight: 700; letter-spacing: -0.015em; text-transform: none; color: var(--fg); }
+.home .home-pinned-head .btn-quiet { min-height: 44px; padding: 0 0 0 8px; border: 0; border-radius: 0; background: none; box-shadow: none; color: var(--accent); font-size: 0.9375rem; font-weight: 500; }
+.home .home-pinned-list { overflow: hidden; border: 0; border-radius: var(--r-lg); background: var(--bg-1); box-shadow: var(--card-edge); }
+
+/* ── places ──────────────────────────────────────────────────────── */
+
+/* A place opens with one line of what it is and one way to start. */
+.section-intro { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin: 4px 4px 16px; text-align: left; }
+.section-intro p { margin: 0; color: var(--fg-2); font-size: 0.9375rem; }
+.section-intro .home-btn {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill-quiet);
+  color: var(--accent);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  box-shadow: none;
+}
+
+/* Inbox's three views: the iOS segmented control. */
+.inbox-tabs { gap: 2px; padding: 2px; border: 0; border-radius: 11px; background: var(--fill-quiet); -webkit-backdrop-filter: none; backdrop-filter: none; }
+.inbox-tabs button { min-height: 52px; padding: 6px 4px; border-radius: 9px; color: var(--fg); font-family: var(--font-body); font-size: 0.875rem; font-weight: 500; gap: 2px; }
+.inbox-tabs button.active { background: var(--bg-1); box-shadow: 0 1px 3px rgba(63, 42, 22, 0.12); font-weight: 600; }
+.inbox-tab-count { height: auto; min-width: 0; padding: 0; background: none; color: var(--accent); font-size: 0.75rem; font-weight: 700; line-height: 1.2; }
+
+/* Chats: one grouped list, hairlines between rows. */
+.chats-search { min-height: 38px; margin: 4px 0 16px; padding: 0 10px; border: 0; border-radius: 11px; background: var(--fill-quiet); color: var(--fg-2); }
+.chats-search input::placeholder { color: var(--fg-2); }
+.app-main h2.chat-list-head { margin: 4px 0 8px 4px; padding: 0; font-family: var(--font-display); font-size: 1.25rem; font-weight: 700; letter-spacing: -0.015em; color: var(--fg); }
+.chat-list { overflow: hidden; margin-bottom: 22px; border-radius: var(--r-lg); background: var(--bg-1); box-shadow: var(--card-edge); }
+.chat-swipe { border-radius: 0; }
+.chat-swipe + .chat-swipe::before { content: ""; position: absolute; z-index: 1; top: 0; left: 16px; right: 0; border-top: 0.5px solid var(--line-strong); }
+.chat-row { position: relative; min-height: 64px; padding: 0 6px 0 8px; border-radius: 0; }
+.chat-row:active { background: var(--bg-3); }
+.chat-row-title { font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+.chat-row-meta { font-size: 0.8125rem; color: var(--fg-2); }
+
+/* ── the composer, with Your stuff beside it ─────────────────────── */
+
+.ask-capsule-fade { background: linear-gradient(180deg, rgba(250, 247, 242, 0) 0%, rgba(250, 247, 242, 0.92) 55%, var(--bg-0) 100%); }
+.ask-capsule-with-stuff { display: flex; align-items: flex-end; gap: 8px; }
+.ask-capsule-with-stuff > .composer { flex: 1 1 auto; min-width: 0; }
+.ask-capsule .composer {
+  border: 0;
+  border-radius: 26px;
+  background: var(--bg-1);
+  box-shadow: 0 1px 2px rgba(63, 42, 22, 0.08), 0 8px 24px rgba(63, 42, 22, 0.1);
+}
+.stuff-button {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--bg-1);
+  color: var(--fg);
+  box-shadow: 0 1px 2px rgba(63, 42, 22, 0.08), 0 8px 24px rgba(63, 42, 22, 0.1);
+  transition: transform 0.14s var(--ease-out);
+}
+.stuff-button svg { width: 22px; height: 22px; }
+.stuff-button:active { transform: scale(0.93); }
+.stuff-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── a wide window keeps its sidebar, so the bar needs no back button ─ */
+
+@media (min-width: 880px) {
+  .nav-back { display: none; }
+  .app-header { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .app-header .app-title { grid-column: 1; justify-self: start; }
+  .app-header .title-text { font-family: var(--font-display); font-size: 1.375rem; font-weight: 700; }
+  .stuff-button { display: none; }
+  .adaptive-navigation { background: var(--bg-0); }
+  .adaptive-navigation button[aria-current='page'] { background: var(--bg-3); color: var(--fg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .clem-avatar-working::before, .clem-live-pulse-on { animation: none; }
+  .clem-avatar-working::before { opacity: 1; }
+}
+
+/* Your stuff's groups sit on the same cream as the screen behind it. */
+.stuff-group, .drawer-recents-list { box-shadow: var(--card-edge); }

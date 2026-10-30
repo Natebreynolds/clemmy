@@ -377,30 +377,3 @@ export function homeWorkPane(input: {
 }
 
 // ─── the header row ─────────────────────────────────────────────────────────
-
-/** Screens that put the Needs-you list in their own content. */
-const NEEDS_YOU_IN_CONTENT: ReadonlySet<string> = new Set(['home', 'inbox']);
-/** Screens that put current work in their own content. Home does not any
- *  more — Activity owns it — so Home shows the chip that leads there. */
-const WORK_IN_CONTENT: ReadonlySet<string> = new Set(['activity']);
-
-export interface PhoneHeaderChrome {
-  needsPill: boolean;
-  workChip: boolean;
-}
-
-/**
- * The header carries identity, where you are, and connection state. It carries
- * a signal for anything else ONLY on screens that cannot show that thing
- * themselves — which is the opposite of what it did: the Needs-you pill
- * appeared only on Home, the one screen already leading with that answer, and
- * the work chip appeared everywhere including the screens that list the work.
- * Five controls in one cramped row crushed the title out; this is the rule
- * that keeps it to three.
- */
-export function phoneHeaderChrome(input: { tab: string; needsYouSignal: boolean }): PhoneHeaderChrome {
-  return {
-    needsPill: input.needsYouSignal && !NEEDS_YOU_IN_CONTENT.has(input.tab),
-    workChip: !WORK_IN_CONTENT.has(input.tab),
-  };
-}

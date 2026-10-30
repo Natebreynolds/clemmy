@@ -8,6 +8,8 @@ import './styles.css';
 import './components/cloud-browser.css';
 import './adaptive-layout.css';
 import './components/composer-layout.css';
+// The Apple standard (owner 10-30) loads last: its tokens are the ones every screen reads.
+import './clem-standard.css';
 
 // Before first render so a native shell can hand in its APNs token whenever
 // it likes — including during the pairing load.
