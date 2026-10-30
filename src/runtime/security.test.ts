@@ -117,3 +117,19 @@ test('sensitive path and shell classifiers flag secret-bearing surfaces', () => 
   assert.equal(shellCommandTouchesSensitiveData('security dump-keychain'), true);
   assert.equal(shellCommandTouchesSensitiveData('ls -la'), false);
 });
+
+test('credentials known by their own prefix are redacted wherever they stand, and ordinary words are not', () => {
+  const canaries = [
+    'ghp_' + 'a'.repeat(30), 'github_pat_' + 'B1'.repeat(20), 'xoxb-' + '123456789012-abcdefghij',
+    'AIza' + 'Q'.repeat(35), 'AKIA' + 'ABCDEFGHIJKLMNOP', 'sk_live_' + 'z'.repeat(24), 'rk_test_' + '9'.repeat(20),
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop',
+  ];
+  for (const secret of canaries) {
+    const redacted = redactSensitiveText(`here it is ${secret} thanks`);
+    assert.doesNotMatch(redacted, new RegExp(secret.slice(8).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), secret);
+    assert.match(redacted, /REDACTED/);
+  }
+  for (const ordinary of ['Ask Gary about the AKIA summit', 'pk_live_ is a publishable prefix', 'the github repo ghp is short', 'eyJ alone']) {
+    assert.equal(redactSensitiveText(ordinary), ordinary);
+  }
+});

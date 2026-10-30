@@ -3,6 +3,7 @@ import { retainFactEntityLinks } from './retained-fact-entities.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { getRuntimeEnv } from '../config.js';
+import { redactSensitiveText } from '../runtime/security.js';
 import {
   hardDeleteConsolidatedFacts,
   openMemoryDb,
@@ -209,8 +210,11 @@ export interface FactValidityInterval {
 
 export const FACT_KINDS: ConsolidatedFactKind[] = ['user', 'project', 'feedback', 'reference', 'constraint'];
 
+/** Memory never keeps a credential: a key pasted into a chat or carried by a
+ *  tool result is redacted before a fact is stored or edited, so it is never
+ *  recalled into a model's context later. */
 function normalizeContent(content: string): string {
-  return content.replace(/\s+/g, ' ').trim();
+  return redactSensitiveText(content.replace(/\s+/g, ' ').trim());
 }
 
 function hashContent(kind: ConsolidatedFactKind, content: string, scope?: MemoryScope | null): string {

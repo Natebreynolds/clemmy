@@ -43,6 +43,7 @@ const {
   withTurnQueryVectorScope,
   touchFactAccess,
   recordFactImpression,
+  updateFact,
 } = await import('./facts.js');
 const { vectorToBuffer, _setEmbeddingProviderForTest } = await import('./embeddings.js');
 
@@ -1121,4 +1122,20 @@ test('objective-relevant prompt-only constraints outrank a burst of newer one-of
     /multipart form data using the numbered field names/,
     'the objective-relevant prompt-only rule must render ahead of newer one-off rules',
   );
+});
+
+test('memory never keeps a credential: a pasted key is redacted when a fact is stored or edited', () => {
+  // Security refinement 2026-10-30: a key pasted into a chat, or carried by a
+  // tool result, must not become a long-term memory that is recalled into a
+  // model's context later.
+  const key = 'sk-proj-' + 'Q'.repeat(40);
+  const fact = rememberFact({ kind: 'reference', content: `The CallRail API key is ${key} for the Scorpion account.` });
+  assert.doesNotMatch(fact.content, /QQQQQQQQQQQQQQQQ/);
+  assert.match(fact.content, /REDACTED/);
+  assert.match(fact.content, /The CallRail API key is/);
+  const slack = 'xoxb-' + '123456789012-abcdefghijklmnop';
+  const edited = updateFact(fact.id, { content: `Slack bot token: ${slack}` });
+  assert.doesNotMatch(edited?.content ?? '', /abcdefghijklmnop/);
+  const plain = rememberFact({ kind: 'reference', content: 'Scorpion calendar lookups use the Outlook account.' });
+  assert.equal(plain.content, 'Scorpion calendar lookups use the Outlook account.', 'ordinary facts are untouched');
 });

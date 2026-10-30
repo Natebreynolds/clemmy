@@ -114,12 +114,26 @@ function credentialShapedValue(raw: string): boolean {
   return value.length >= 8 && /[A-Za-z]/.test(value) && /\d/.test(value);
 }
 
+const STANDALONE_CREDENTIAL = new RegExp([
+  String.raw`\bgh[pousr]_[A-Za-z0-9]{20,}\b`,
+  String.raw`\bgithub_pat_[A-Za-z0-9_]{30,}\b`,
+  String.raw`\bxox[abprs]-[A-Za-z0-9-]{10,}\b`,
+  String.raw`\bAIza[0-9A-Za-z_-]{35}\b`,
+  String.raw`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`,
+  String.raw`\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b`,
+  String.raw`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`,
+].join('|'), 'g');
+
 export function redactSensitiveText(input: unknown): string {
   let text = typeof input === 'string' ? input : String(input ?? '');
   if (!text) return text;
 
   text = redactSecretAssignments(text);
   text = text.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, (match) => `${match.slice(0, 10)}...REDACTED`);
+  // Credentials known by their own prefix, wherever they appear on their own:
+  // GitHub, Slack, Google API, AWS access key ids, Stripe secret/restricted
+  // keys, and signed JSON web tokens.
+  text = text.replace(STANDALONE_CREDENTIAL, (match) => `${match.slice(0, 6)}...REDACTED`);
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, 'Bearer [REDACTED]');
   text = text.replace(/\bBot\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, 'Bot [REDACTED]');
   text = text.replace(/([?&](?:token|access_token|refresh_token|api_key|secret)=)[^&#\s"']+/gi, '$1[REDACTED]');
