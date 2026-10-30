@@ -386,7 +386,7 @@ export function Home({
         {/* What Clem is doing, always: a live line while she works, quiet when she is not. */}
         <p class={`clem-status${activeWork.length > 0 ? ' clem-status-live' : ''}`}>
           <span class="clem-status-dot" aria-hidden="true" />
-          {activeWork.length > 0 ? `Working on ${activeWork.length === 1 ? 'one thing' : `${activeWork.length} things`}` : 'All quiet. Ask Clem anything below.'}
+          {activeWork.length > 0 ? `Working on ${activeWork.length === 1 ? 'one thing' : `${activeWork.length} things`}` : 'Nothing running right now'}
         </p>
 
         {digest ? (

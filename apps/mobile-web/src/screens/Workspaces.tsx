@@ -96,8 +96,14 @@ export function Workspaces({
           Nothing here has data yet. Open one below and ask Clem to set it up.
         </p>
       ) : null}
-      <div class="section-intro"><p>Live pages Clem keeps up to date for you.</p><button type="button" class="home-btn" data-clem-guide="create-space" onClick={() => onAsk('Build me a Space that ')}>Create a Space</button></div>
-      {live.length > 0 ? <div class="place-list">{renderRows(live, 0)}</div> : null}
+      <div class="section-intro"><p>Live pages Clem keeps up to date for you.</p></div>
+      <div class="place-list">
+        <button type="button" class="place-list-create" data-clem-guide="create-space" onClick={() => onAsk('Build me a Space that ')}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Create a Space
+        </button>
+        {renderRows(live, 0)}
+      </div>
       {empty.length > 0 ? (
         <EmptyWorkspaces spaces={empty} onOpen={selectWorkspace} startIndex={live.length} />
       ) : null}

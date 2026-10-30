@@ -21,8 +21,12 @@ export function CardRecord({ record, showTitle = false, onOpenThread, onOpenInbo
     <div class="card-record" aria-live="polite">
       {/* Where it stands and what Clem needs lead; what you asked and what
           she did follow as the record; the item it came from closes it. */}
-      <p class={`card-record-headline tone-${headline.tone}`}>{headline.text}</p>
-      {words && <p class="card-record-words">{words}</p>}
+      {outcome.state === 'needs_you' && words ? (
+        <p class="card-record-ask">{words}</p>
+      ) : <>
+        <p class={`card-record-headline tone-${headline.tone}`}>{headline.text}</p>
+        {words && <p class="card-record-words">{words}</p>}
+      </>}
       {outcome.state === 'needs_you' && outcome.approvalId && onOpenInbox ? (
         <button type="button" class="home-btn home-btn-primary card-record-act" onClick={() => onOpenInbox(`approval:${outcome.approvalId}`)}>Review and approve</button>
       ) : sessionId && outcome.state !== 'done' && (

@@ -102,8 +102,12 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
   return (
     <div>
       <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData />
-      <div class="section-intro"><p>Work Clem handles on a schedule or whenever you need it.</p><button type="button" class="home-btn" data-clem-guide="create-automation" onClick={() => onAsk('Set up an automation that ')}>Create with Clem</button></div>
+      <div class="section-intro"><p>Work Clem handles on a schedule or whenever you need it.</p></div>
       <div class="place-list">
+        <button type="button" class="place-list-create" data-clem-guide="create-automation" onClick={() => onAsk('Set up an automation that ')}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Create an automation
+        </button>
       {workflows.map((wf) => (
         <button key={wf.name} class="workflow-row" onClick={() => setSelected(wf)}>
           <div class="workflow-row-head">
@@ -116,8 +120,8 @@ export function Workflows({ onAsk }: { onAsk: (draft: string) => void }) {
           {wf.description ? <div class="workflow-row-desc">{wf.description}</div> : null}
           <div class="workflow-row-meta">
             {wf.schedule ? <span>{whenLabel(wf.schedule)}</span> : null}
-            {wf.requiresInput ? <span class="workflow-row-tag">Needs an answer</span> : null}
-            {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-tag">Needs a connection</span> : null}
+            {wf.requiresInput ? <span>Asks you when it runs</span> : null}
+            {wf.resourceGaps && wf.resourceGaps.length > 0 ? <span class="workflow-row-gap">Needs a connection</span> : null}
             {wf.lastRunAt ? <span>Last ran {relativeTime(wf.lastRunAt)}</span> : null}
           </div>
         </button>
