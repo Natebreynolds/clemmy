@@ -1,6 +1,8 @@
 import { ApprovalResult } from './ApprovalResult';
 import { ConnectionSetup, type ConnectionResume } from './ConnectionSetup';
 import { KeyRequestCard } from './KeyRequestCard';
+import { SaveComputerTask } from './SaveComputerTask';
+import { isComputerStepLabel } from '@/lib/toolLabels';
 import { ApprovalReview } from './ApprovalReview';
 import { PlanReview } from './PlanReview';
 import type { PlanRevisionRef } from '@/lib/task-mode';
@@ -1029,6 +1031,10 @@ export function ChatBubble({
           {/* Durable evidence beneath a report-back: the harness's ledger row
               (status, counts, verified artifacts, receipts, exact next action)
               so completion never rests on the prose above it. */}
+          {message.status === 'complete' && message.acceptedSource
+            && message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)) && (
+            <SaveComputerTask source={{ sessionId: message.acceptedSource.sessionId, sourceUserSeq: message.acceptedSource.sourceUserSeq }} />
+          )}
           {message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply') && (
             <TaskEvidenceFooter taskRef={message.taskRef} />
           )}

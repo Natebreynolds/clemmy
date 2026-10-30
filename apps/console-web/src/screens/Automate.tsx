@@ -2,7 +2,7 @@ import { workflowDisplayName } from '@clem/chat-engine';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { ArrowRight, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, Workflow } from 'lucide-react';
+import { ArrowRight, Monitor, Zap, Clock, Puzzle, Play, Plus, RefreshCw, Loader2, Trash2, ChevronDown, ExternalLink, X, FileText, Target, CheckCircle2, AlertTriangle, Radio, Workflow } from 'lucide-react';
 import { Page } from '@/components/Page';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/Field';
 import { Switch } from '@/components/ui/Switch';
 import { StatusPill } from '@/components/ui/StatusPill';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { ComputerTasks } from '@/components/automations/ComputerTasks';
 import { QueryUnavailable } from '@/components/ui/QueryUnavailable';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { usePoll } from '@/lib/poll';
@@ -38,7 +39,7 @@ import {
 import { getAgentSystemMetrics } from '@/lib/advanced';
 import { AutomationRefreshNotice } from '@/components/automate/AutomationRefreshNotice';
 
-type Tab = 'workflows' | 'skills';
+type Tab = 'workflows' | 'skills' | 'computer';
 
 function capabilityAppLabel(toolkit: string | undefined): string {
   const name = (toolkit ?? '').trim();
@@ -231,6 +232,7 @@ export function Automate() {
   const tabs: { key: Tab; label: string; icon: typeof Zap }[] = [
     { key: 'workflows', label: 'Workflows', icon: Zap },
     { key: 'skills', label: 'Skills', icon: Puzzle },
+    { key: 'computer', label: 'Computer tasks', icon: Monitor },
   ];
 
   return (
@@ -407,6 +409,8 @@ export function Automate() {
               </>
             )
       )}
+
+      {tab === 'computer' && <ComputerTasks />}
 
       {tab === 'skills' && (
         <div className="space-y-5">

@@ -16,6 +16,8 @@ import {
   COMPUTER_DRIVER_DOWNLOAD, askDriver, computerDriverEnv, computerDriverPath, computerDriverServer, computerDriverSocketPath, computerDriverStatus, lastActedWindow, realComputerDriverPath, startComputerDriverHost,
 } from '../integrations/computer-driver.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
+import { computerDriverCaller } from '../integrations/computer-replay-driver.js';
+import { deleteComputerTask, listComputerTasks, repeatComputerTask, saveComputerTask } from '../runtime/computer-recipe-store.js';
 import { installToolDownload } from '../runtime/clem-tools.js';
 import { discoverMcpServers, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { invalidateConfiguredMcpServers } from '../runtime/mcp-servers.js';
@@ -131,5 +133,36 @@ export function registerComputerDriverRoutes(app: Express, isAuthorized: (req: R
     } catch (error) {
       res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }
+  });
+  // Saved computer tasks: a finished task kept as steps that repeat without
+  // the model. Saving reads the request's own driver calls; repeating asks
+  // Clem's driver directly. Both are the owner's own moves.
+  app.get('/api/console/computer-tasks', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ tasks: listComputerTasks().map((task) => ({ id: task.id, name: task.name, createdAt: task.createdAt, steps: task.recipe.steps.length, source: task.source })) });
+  });
+  app.post('/api/console/computer-tasks', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const body = (req.body ?? {}) as { sessionId?: unknown; sourceUserSeq?: unknown; name?: unknown };
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.replace(/^harness:/, '') : '';
+    const sourceUserSeq = Number(body.sourceUserSeq);
+    if (!sessionId || !Number.isSafeInteger(sourceUserSeq) || sourceUserSeq <= 0) { res.status(400).json({ error: 'Name the chat request to save.' }); return; }
+    const saved = saveComputerTask({ sessionId, sourceUserSeq, ...(typeof body.name === 'string' ? { name: body.name } : {}) });
+    if (saved.status !== 'saved') { res.status(422).json({ error: `This one can't repeat without Clem: ${saved.reason}.` }); return; }
+    res.status(201).json({ task: { id: saved.task.id, name: saved.task.name, steps: saved.task.recipe.steps.length } });
+  });
+  app.post('/api/console/computer-tasks/:id/repeat', async (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const call = computerDriverCaller();
+    if (!call) { res.status(409).json({ error: 'Your computer is not turned on for Clem yet.' }); return; }
+    const outcome = await repeatComputerTask(String(req.params.id ?? ''), call);
+    if (!outcome) { res.status(404).json({ error: 'That saved task is gone.' }); return; }
+    res.json(outcome.status === 'done'
+      ? { outcome, summary: `Done: ${outcome.steps} steps, no AI used.` }
+      : { outcome, summary: `Stopped at step ${outcome.at + 1}: ${outcome.detail}. Ask Clem to finish it from there.` });
+  });
+  app.delete('/api/console/computer-tasks/:id', (req: Request, res: Response) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    res.json({ ok: deleteComputerTask(String(req.params.id ?? '')) });
   });
 }
