@@ -11,6 +11,7 @@ import { WORKFLOWS_DIR } from '../memory/vault.js';
 import { workflowDefinitionHash } from './workflow-run-definition.js';
 import { withWorkflowRunRecordLock } from './workflow-run-record.js';
 import { syncWorkflowTriggerRegistry } from './workflow-trigger-engine.js';
+import { settleNoticesOfDeletedWorkflow } from './workflow-delete-notices.js';
 
 export function syncWorkflowTriggersBestEffort(): void {
   try {
@@ -76,7 +77,15 @@ export function compareAndSwapWorkflowDefinition(input: {
 }
 
 export function deleteWorkflowAndSyncTriggers(name: string): boolean {
+  const displayName = readWorkflow(name)?.data?.name;
   const ok = deleteWorkflow(name);
-  if (ok) syncWorkflowTriggersBestEffort();
+  if (ok) {
+    syncWorkflowTriggersBestEffort();
+    try {
+      settleNoticesOfDeletedWorkflow(name, displayName);
+    } catch {
+      // Best-effort: the workflow is gone either way; a notice left unread can still be cleared by hand.
+    }
+  }
   return ok;
 }
