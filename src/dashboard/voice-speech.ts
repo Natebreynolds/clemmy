@@ -44,7 +44,11 @@ export function spokenReplyText(markdown: string, maxChars = SPOKEN_REPLY_MAX_CH
 
 export type SpeechRequestResult =
   | { ok: true; response: Response; contentType: string }
-  | { ok: false; status: number; error: string; fallback?: 'system' };
+  | { ok: false; status: number; error: string; fallback?: 'system'; fallbackReason?: SpeechFallbackReason };
+
+/** Why replies are spoken in the device's own voice: each needs the owner to
+ *  do something different, so each surface can say which. */
+export type SpeechFallbackReason = 'key_unreadable' | 'needs_key' | 'key_refused' | 'no_credit';
 
 /** Ask the speech service to say `text`; the audio streams in the response. */
 export async function requestSpeech(text: string, signal?: AbortSignal): Promise<SpeechRequestResult> {
@@ -62,9 +66,9 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     // still heard, in the computer's own voice.
     const reason = error instanceof Error ? error.message : String(error);
     logger.warn({ reason: redactSensitiveText(reason).slice(0, 300) }, 'voice speech could not read its saved key');
-    return { ok: false, status: 409, error: 'The saved OpenAI key could not be read safely; using this computer’s voice.', fallback: 'system' };
+    return { ok: false, status: 409, error: 'The saved OpenAI key could not be read safely; using this computer’s voice.', fallback: 'system', fallbackReason: 'key_unreadable' };
   }
-  if (!key) return { ok: false, status: 409, error: 'Voice replies need an OpenAI key; using this computer’s voice.', fallback: 'system' };
+  if (!key) return { ok: false, status: 409, error: 'Voice replies need an OpenAI key; using this computer’s voice.', fallback: 'system', fallbackReason: 'needs_key' };
   let response: Response;
   try {
     response = await fetch(`${base}/audio/speech`, {
@@ -90,13 +94,13 @@ export async function requestSpeech(text: string, signal?: AbortSignal): Promise
     // The same saved key serves live voice: its availability now says so
     // before the device starts a session that cannot work.
     noteSavedOpenAiKeyOutcome(key, { reason: 'The saved OpenAI key was refused for speech. Save a working key in Settings.' });
-    return { ok: false, status: 409, error: 'The saved OpenAI key was refused for speech; using this computer’s voice.', fallback: 'system' };
+    return { ok: false, status: 409, error: 'The saved OpenAI key was refused for speech; using this computer’s voice.', fallback: 'system', fallbackReason: 'key_refused' };
   }
   if (!response.ok || !response.body) {
     const detail = await response.text().catch(() => '');
     logger.warn({ status: response.status, detail: redactSensitiveText(detail).slice(0, 300), chars: text.length }, 'voice speech failed');
     if (response.status === 429 && openAiOutOfCredit(detail)) {
-      return { ok: false, status: 409, error: 'The OpenAI account is out of credit; using this computer’s voice.', fallback: 'system' };
+      return { ok: false, status: 409, error: 'The OpenAI account is out of credit; using this computer’s voice.', fallback: 'system', fallbackReason: 'no_credit' };
     }
     return { ok: false, status: 502, error: `The speech service answered HTTP ${response.status}.` };
   }

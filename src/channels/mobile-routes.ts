@@ -4020,7 +4020,8 @@ export function createMobileRouter(deps: MobileRouterDeps): express.Router {
         return;
       }
       if (!speech.ok) {
-        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}), text: heard });
+        res.status(speech.status).json({ error: speech.error, ...(speech.fallback ? { fallback: speech.fallback } : {}),
+          ...(speech.fallbackReason ? { fallbackReason: speech.fallbackReason } : {}), text: heard });
         return;
       }
       if (!speech.response.body) { res.status(502).json({ error: 'Clem’s reply audio was empty. Try voice mode again.' }); return; }

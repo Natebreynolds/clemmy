@@ -2284,16 +2284,21 @@ export async function transcribeVoice(wav: Blob, signal?: AbortSignal): Promise<
 }
 
 /** Voice replies use the paired device's proof, just like every chat request. */
-export async function speakVoice(text: string, signal?: AbortSignal): Promise<Blob | { text: string; fallback: 'system' }> {
+export type SpeechFallbackReason = 'key_unreadable' | 'needs_key' | 'key_refused' | 'no_credit';
+const SPEECH_FALLBACK_REASONS: ReadonlySet<string> = new Set(['key_unreadable', 'needs_key', 'key_refused', 'no_credit']);
+
+export async function speakVoice(text: string, signal?: AbortSignal): Promise<Blob | { text: string; fallback: 'system'; reason?: SpeechFallbackReason }> {
   try {
     return await apiBlob('/m/api/chat/speak', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }), signal,
     });
   } catch (error) {
     const failed = error as ApiError;
-    const body = failed?.body as { fallback?: unknown; text?: unknown } | undefined;
+    const body = failed?.body as { fallback?: unknown; text?: unknown; fallbackReason?: unknown } | undefined;
     if (failed?.status === 409 && body?.fallback === 'system' && typeof body.text === 'string') {
-      return { text: body.text, fallback: 'system' };
+      const reason = typeof body.fallbackReason === 'string' && SPEECH_FALLBACK_REASONS.has(body.fallbackReason)
+        ? body.fallbackReason as SpeechFallbackReason : undefined;
+      return { text: body.text, fallback: 'system', ...(reason ? { reason } : {}) };
     }
     throw error;
   }

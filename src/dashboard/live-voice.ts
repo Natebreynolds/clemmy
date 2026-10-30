@@ -14,7 +14,9 @@
 
 import pino from 'pino';
 import { createHash } from 'node:crypto';
-import { getOpenAiApiKey, getRuntimeEnv } from '../config.js';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { BASE_DIR, getOpenAiApiKey, getRuntimeEnv } from '../config.js';
 import { redactSensitiveText } from '../runtime/security.js';
 
 const logger = pino({ name: 'clementine.live-voice' });
@@ -105,20 +107,52 @@ export interface LiveVoiceStatus {
  *  2026-10-27: the saved key had been refused (401) for speech and for live
  *  voice, and the status still said available; the mic would start and fail.
  *  Remembered by the key's digest, never the key; a different saved key, or a
- *  later success with the same key, clears it. */
-let savedKeyRefusal: { digest: string; reason: string } | null = null;
+ *  later success with the same key, clears it. Kept on disk: held only in
+ *  memory, every restart forgot it and the next voice session failed again
+ *  (live 2026-10-30). */
+let savedKeyRefusal: { digest: string; reason: string } | null | undefined;
+const refusalFile = () => path.join(BASE_DIR, 'state', 'voice-key-refusal.json');
 function keyDigest(key: string): string {
   return createHash('sha256').update(key, 'utf8').digest('hex');
 }
+function rememberedRefusal(): { digest: string; reason: string } | null {
+  if (savedKeyRefusal !== undefined) return savedKeyRefusal;
+  try {
+    const stored = JSON.parse(readFileSync(refusalFile(), 'utf8')) as { digest?: unknown; reason?: unknown };
+    savedKeyRefusal = typeof stored.digest === 'string' && typeof stored.reason === 'string'
+      ? { digest: stored.digest, reason: stored.reason } : null;
+  } catch {
+    savedKeyRefusal = null;
+  }
+  return savedKeyRefusal;
+}
 export function noteSavedOpenAiKeyOutcome(key: string, refusal: { reason: string } | null): void {
   if (!key) return;
-  savedKeyRefusal = refusal ? { digest: keyDigest(key), reason: refusal.reason } : null;
+  const next = refusal ? { digest: keyDigest(key), reason: refusal.reason } : null;
+  const prior = rememberedRefusal();
+  savedKeyRefusal = next;
+  if (prior?.digest === next?.digest && prior?.reason === next?.reason) return;
+  try {
+    if (!next) { rmSync(refusalFile(), { force: true }); return; }
+    mkdirSync(path.dirname(refusalFile()), { recursive: true });
+    const temp = `${refusalFile()}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify({ ...next, at: new Date().toISOString() }), { mode: 0o600 });
+    renameSync(temp, refusalFile());
+  } catch (error) {
+    logger.warn({ reason: error instanceof Error ? error.message : String(error) }, 'voice key outcome could not be saved; it holds until the next restart');
+  }
 }
 function savedKeyRefusedReason(key: string): string | null {
-  return savedKeyRefusal && savedKeyRefusal.digest === keyDigest(key) ? savedKeyRefusal.reason : null;
+  const refusal = rememberedRefusal();
+  return refusal && refusal.digest === keyDigest(key) ? refusal.reason : null;
+}
+/** A fresh daemon process: what is held in memory is gone, what is on disk stays. */
+export function _forgetSavedOpenAiKeyMemoryForTests(): void {
+  savedKeyRefusal = undefined;
 }
 export function _resetSavedOpenAiKeyMemoryForTests(): void {
-  savedKeyRefusal = null;
+  savedKeyRefusal = undefined;
+  rmSync(refusalFile(), { force: true });
 }
 
 /** The key and settings the session needs. Reading saved credentials can be

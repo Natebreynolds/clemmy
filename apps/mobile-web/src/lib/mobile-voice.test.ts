@@ -546,3 +546,21 @@ test('explicit live quick-launch does not race availability into recorded voice'
   availability.resolve(true); await settle();
   assert.equal(f.controller.getSnapshot().enabled, false, 'late availability cannot restart capture');
 });
+
+test('a reply in this phone\'s voice says once why Clem\'s own voice is off, and voice keeps going', async () => {
+  // Live 2026-10-30: the Mac's saved OpenAI key was refused, replies came back
+  // in the phone's voice, and nothing said why.
+  const f = fixture({ speak: async words => ({ text: words, fallback: 'system', reason: 'key_refused' }) });
+  const states: string[] = [];
+  f.controller.subscribe(() => states.push(f.controller.getSnapshot().notice));
+  await f.controller.start(); await settle();
+  f.observe({ busy: false, messages: [reply('a1', 'Here is the first answer.')] }); await settle();
+  const notice = f.controller.getSnapshot().notice;
+  assert.match(notice, /OpenAI refused the key saved on your Mac/);
+  assert.match(notice, /Replies use this phone’s voice until you save a working key in Settings on your Mac/);
+  assert.equal(f.controller.getSnapshot().error, '', 'a notice, not a failure');
+  assert.equal(f.controller.getSnapshot().enabled, true, 'voice keeps going');
+  f.observe({ busy: false, messages: [reply('a1', 'Here is the first answer.'), reply('a2', 'And a second one.')] }); await settle();
+  assert.equal(new Set(states.filter(Boolean)).size, 1, 'said once');
+  f.controller.stop();
+});

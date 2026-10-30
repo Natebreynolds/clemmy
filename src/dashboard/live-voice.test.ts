@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
@@ -138,6 +138,22 @@ test('a refused saved key makes live voice unavailable, with the reason, until t
   assert.deepEqual(live.liveVoiceStatus(key), { available: true }, 'a later success with the same key clears the refusal');
   live.noteSavedOpenAiKeyOutcome('sk-synthetic-live', { reason: 'The saved OpenAI key was refused for speech. Save a working key in Settings.' });
   assert.equal(live.liveVoiceStatus(key).available, false, 'a speech refusal of the same key counts too');
+  live._resetSavedOpenAiKeyMemoryForTests();
+});
+
+test('a refused saved key is still known after a restart, and a later success forgets it', () => {
+  // Live 2026-10-30: the refusal was held only in memory, so every restart
+  // said live voice was available again and the phone's next session failed.
+  live._resetSavedOpenAiKeyMemoryForTests();
+  const key = { openAiKey: () => 'sk-synthetic-restart', env: (_k: string, f: string) => f };
+  live.noteSavedOpenAiKeyOutcome('sk-synthetic-restart', { reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  live._forgetSavedOpenAiKeyMemoryForTests();
+  assert.deepEqual(live.liveVoiceStatus(key), { available: false, reason: 'The saved OpenAI key was refused for live voice. Save a working key in Settings.' });
+  const stored = readFileSync(path.join(home, 'state', 'voice-key-refusal.json'), 'utf8');
+  assert.equal(stored.includes('sk-synthetic-restart'), false, 'only the key\'s digest is kept, never the key');
+  live.noteSavedOpenAiKeyOutcome('sk-synthetic-restart', null);
+  live._forgetSavedOpenAiKeyMemoryForTests();
+  assert.deepEqual(live.liveVoiceStatus(key), { available: true });
   live._resetSavedOpenAiKeyMemoryForTests();
 });
 
