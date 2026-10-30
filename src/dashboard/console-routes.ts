@@ -182,6 +182,7 @@ import { activeHomeSnoozes, DEFAULT_SNOOZE_HOURS, isValidSnoozeKey, snoozeHomeIt
 import { attentionLifecycleForKey, bootParkedWorkflows, listAttentionPresentations, needsYouKey, needsYouReferents,
   notificationAttentionHidden, notificationNeedsYou, openInboxQuestions, presentAttentionItem, stoppedRunSuperseded, summarizeNeedsYou } from './needs-you.js';
 import { listQuestionPresentations, presentInboxQuestion, projectInboxQuestion } from './question-presentation.js';
+import { workflowDisplayName } from '../shared/workflow-display-name.js';
 import { workflowCreationTestState } from './workflow-creation-test-state.js';
 import { describeWorkflowPlainEnglish } from '../execution/workflow-describe.js';
 import { buildWorkflowExecutionPlanWithReadiness, listWorkflowScriptNames, type WorkflowRunReadinessCheck } from '../execution/workflow-run-readiness.js';
@@ -15332,7 +15333,7 @@ export function registerConsoleRoutes(
         // (dashboard/needs-you.ts `bootParkedWorkflows`, which the count reads).
         ...bootParkedWorkflows(pendingWorkflowRuns).map((group) => {
           const workflow = readWorkflow(group.workflowName);
-          const title = workflow?.data?.name ?? group.workflowName;
+          const title = workflowDisplayName(workflow?.data?.name ?? group.workflowName);
           const n = group.runIds.length;
           return {
             kind: 'workflow-paused',

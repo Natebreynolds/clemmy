@@ -41,6 +41,7 @@ import { loadNotifications, type NotificationRecord } from '../runtime/notificat
 import { readWorkflow } from '../memory/workflow-store.js';
 import { classifyNotification, type LiveReferents } from '../runtime/notification-intent.js';
 import { listEvents } from '../runtime/harness/eventlog.js';
+import { withWorkflowName, workflowDisplayName } from '../shared/workflow-display-name.js';
 
 /** A run in one of these is stopped until a person acts. */
 const STOPPED_RUN_STATUSES: ReadonlySet<string> = new Set([
@@ -396,9 +397,12 @@ function rawAttentionItems(ref: NeedsYouReferents, pendingRuns?: readonly Pendin
     const candidateSlug = value.binding?.slug ?? value.paused?.workflowName ?? (prefix === 'flow' ? key.slice(5) : '');
     const workflowSlug = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidateSlug) ? candidateSlug : '';
     const pausedCount = value.paused?.runIds.length ?? 0;
-    const title = latest?.title || (value.binding ? `${workflow} can't run on its schedule`
-      : pausedCount === 1 ? `${workflow} stopped after restarting several times`
-        : `${pausedCount} runs of ${workflow} stopped after restarting several times`);
+    // Rows read a workflow by its name, never its slug.
+    const named = workflowDisplayName(workflow);
+    const title = (latest?.title ? withWorkflowName(withWorkflowName(latest.title, meta?.workflowSlug), meta?.workflow) : '')
+      || (value.binding ? `${named} can't run on its schedule`
+        : pausedCount === 1 ? `${named} stopped after restarting several times`
+          : `${pausedCount} runs of ${named} stopped after restarting several times`);
     const detail = latest?.body || (value.binding ? 'Pick the account or source it should use.'
       : pausedCount === 1 ? 'Open it to resume the run or skip it.' : 'Open it to resume the runs or skip them.');
     const generation = attentionGeneration({ key,
@@ -693,7 +697,7 @@ export async function summarizeNeedsYou(
     unlisted.push({
       key,
       kind: 'workflow_binding',
-      title: `${stop.workflow} can't run on its schedule`,
+      title: `${workflowDisplayName(stop.workflow)} can't run on its schedule`,
       detail: 'Pick the account or source it should use.',
       workflow: stop.workflow,
       ...(stop.slug ? { workflowSlug: stop.slug } : {}),
@@ -708,8 +712,8 @@ export async function summarizeNeedsYou(
       key,
       kind: 'workflow_paused',
       title: n === 1
-        ? `${name} stopped after restarting several times`
-        : `${n} runs of ${name} stopped after restarting several times`,
+        ? `${workflowDisplayName(name)} stopped after restarting several times`
+        : `${n} runs of ${workflowDisplayName(name)} stopped after restarting several times`,
       detail: n === 1 ? 'Open it to resume the run or skip it.' : 'Open it to resume the runs or skip them.',
       workflow: name,
       workflowSlug: group.workflowName,

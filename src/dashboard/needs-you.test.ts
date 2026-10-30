@@ -216,7 +216,7 @@ test('runs paused after repeated restarts are one decision per workflow, even af
   assert.equal(summary.keys.includes('flow:invoice-chase'), false);
   const row = summary.unlisted.find((item) => item.key === 'flow:weekly-digest');
   assert.equal(row?.kind, 'workflow_paused');
-  assert.match(row?.title ?? '', /^2 runs of weekly-digest stopped after restarting several times/);
+  assert.match(row?.title ?? '', /^2 runs of Weekly Digest stopped after restarting several times/, 'a row reads the workflow by its name');
 });
 
 test('the total is exactly the distinct keys, and every key is either listed or unlisted', async () => {

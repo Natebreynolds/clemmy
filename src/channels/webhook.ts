@@ -169,7 +169,7 @@ import {
 } from '../execution/background-tasks.js';
 import { saveProactivityPolicy } from '../agents/proactivity-policy.js';
 import * as approvalRegistry from '../runtime/harness/approval-registry.js';
-import { approvalNoticeFields } from '../runtime/approval-notice-presentation.js';
+import { noticeListFields } from '../runtime/notice-presentation.js';
 
 const logger = pino({ name: 'clementine-next.webhook' });
 const CRON_TRIGGERS_DIR = path.join(BASE_DIR, 'cron', 'triggers');
@@ -1888,7 +1888,7 @@ export async function buildWebhookApp(assistant: ClementineAssistant): Promise<e
     res.json({
       notifications: prioritized.map((notification) => ({
         ...notification,
-        ...approvalNoticeFields(notification),
+        ...noticeListFields(notification),
         needsAttention: notificationNeedsYou(notification, ref),
         needsYouKey: needsYouKey(notification, ref),
         lifecycle: notificationNeedsYou(notification, ref) ? attentionLifecycleForKey(needsYouKey(notification, ref), ref) : undefined,
