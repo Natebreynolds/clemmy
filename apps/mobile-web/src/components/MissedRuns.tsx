@@ -2,6 +2,7 @@ import './missed-runs.css';
 import { useEffect, useState } from 'preact/hooks';
 import { runWorkflow } from '../lib/api';
 import { haptic } from '../lib/native-bridge';
+import { mobileWorkflowPath, WORKFLOW_WIDGET_SLUG } from '../lib/workflow-widget';
 import {
   decideMissedRun, dismissMissedRuns, dueWords, getMissedRuns, missedRunInMotion, missedRunState, type MissedNotice,
 } from '../lib/missed-runs';
@@ -77,6 +78,9 @@ function MissedNoticeCard({ notice, onChanged }: { notice: MissedNotice; onChang
                 {errors[item.workflow] && <span class="missed-runs-error">{errors[item.workflow]}</span>}
               </span>
               {state && <span class={`missed-runs-state tone-${state.tone}`}>{state.text}</span>}
+              {item.decision?.action === 'run' && WORKFLOW_WIDGET_SLUG.test(item.workflow) && (
+                <a class="missed-runs-open" href={mobileWorkflowPath(item.workflow)}>Open</a>
+              )}
             </li>
           );
         })}

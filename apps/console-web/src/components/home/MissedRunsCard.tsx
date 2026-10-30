@@ -90,7 +90,7 @@ function MissedNoticeCard({ notice }: { notice: MissedNotice }) {
                   aria-label={`Run ${item.name} now`}
                   onChange={() => setUnchecked((all) => { const next = new Set(all); if (next.has(item.workflow)) next.delete(item.workflow); else next.add(item.workflow); return next; })} />
               )}
-              <span className="min-w-0 flex-1">
+              <span className="min-w-[12rem] flex-1">
                 <span className="text-body text-fg">{item.name}</span>
                 <span className="text-small text-muted"> · due {dueWords(item.dueAt)}{item.times > 1 ? ` · missed ${item.times} times` : ''}</span>
                 {errors[item.workflow] && <span className="block text-small text-danger">{errors[item.workflow]}</span>}

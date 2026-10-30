@@ -10,6 +10,7 @@
 .missed-runs-due { color: var(--fg-2); font-size: var(--t-xs); }
 .missed-runs-error { display: block; color: var(--accent-fail); font-size: var(--t-xs); }
 .missed-runs-state { flex-shrink: 0; font-size: var(--t-xs); font-weight: 700; }
+.missed-runs-open { display: inline-flex; align-items: center; min-height: 44px; flex-shrink: 0; padding-left: 4px; color: var(--accent); font-size: var(--t-xs); font-weight: 700; text-decoration: none; }
 .missed-runs-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .tone-muted { color: var(--fg-3); }
 .tone-working { color: var(--fg-2); }
