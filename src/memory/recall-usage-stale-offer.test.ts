@@ -11,7 +11,7 @@ process.env.CLEMMY_EMBEDDINGS = 'off';
 process.env.CLEMMY_LOCAL_EMBEDDINGS = 'off';
 process.env.CLEMMY_AUTO_RECALL_CREDIT = 'on';
 const { openMemoryDb, resetMemoryDb } = await import('./db.js');
-const { rememberFact, getFact, forgetFact, reactivateFact } = await import('./facts.js');
+const { rememberFact, getFact, deleteFact, reactivateFact } = await import('./facts.js');
 const { recordRecallRun, recordRecallUse } = await import('./recall-usage.js');
 const { autoCreditRecallRuns } = await import('./recall-auto-credit.js');
 const { readHygieneAudit } = await import('./hygiene-audit.js');
@@ -35,7 +35,7 @@ test('real recall → forget → readback → cited reply preserves the retireme
   const fact = rememberFact({ kind: 'user', content: 'Recurring explanations use a concise numbered format.' });
   const run = offer(fact.id);
   t.mock.timers.tick(1);
-  assert.equal(forgetFact(fact.id), true);
+  assert.equal(deleteFact(fact.id), true);
   const retired = getFact(fact.id)!;
   assert.equal(retired.active, false, 'the same canonical readback used by memory tools');
   t.mock.timers.tick(1);
@@ -57,7 +57,7 @@ test('real recall → forget → readback → cited reply preserves the retireme
 
 test('a cold-tier fact archived before recall still earns one canonical restore and one credit across aliases', (t) => {
   const fact = rememberFact({ kind: 'project', content: 'The Zephyr review owner is the operations lead.' });
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   t.mock.timers.tick(1);
   const run = offer(fact.id);
   t.mock.timers.tick(1);
@@ -77,7 +77,7 @@ test('same-millisecond recall and later forget fail closed even with repeated no
   const fact = rememberFact({ kind: 'user', content: 'Keep the recurring answer short.' });
   const nowIso = new Date().toISOString();
   const run = offer(fact.id, nowIso);
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   assert.equal(getFact(fact.id)?.updatedAt, run.createdAt);
   const result = recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], nowIso });
   assert.equal(result.recorded.length, 1);
@@ -87,11 +87,11 @@ test('same-millisecond recall and later forget fail closed even with repeated no
 
 test('a fresh deactivation after cold-tier recall overrides the older archive', (t) => {
   const fact = rememberFact({ kind: 'project', content: 'The renewal meeting is Wednesday.' });
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   t.mock.timers.tick(1);
   const run = offer(fact.id);
   t.mock.timers.tick(1);
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   t.mock.timers.tick(1);
   const result = recordRecallUse({ recallId: run.id, refs: [`policy:${fact.id}`] });
   assert.deepEqual(result.resurrectedFactIds, []);
@@ -103,7 +103,7 @@ test('promoting an earlier not-useful receipt cannot revive a fact forgotten aft
   const run = offer(fact.id);
   recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`], outcome: 'not_useful' });
   t.mock.timers.tick(1);
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   t.mock.timers.tick(1);
   const result = recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`, `policy:${fact.id}`] });
   assert.equal(result.recorded.length, 2);
@@ -118,7 +118,7 @@ test('canonical explicit restore remains valid despite an old offered ref', (t) 
   const fact = rememberFact({ kind: 'user', content: 'The user restored the concise answer convention.' });
   const run = offer(fact.id);
   t.mock.timers.tick(1);
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   t.mock.timers.tick(1);
   assert.equal(reactivateFact(fact.id), true);
   const result = recordRecallUse({ recallId: run.id, refs: [`fact:${fact.id}`] });
@@ -131,7 +131,7 @@ test('canonical explicit restore remains valid despite an old offered ref', (t) 
 test('superseded cold-tier rows remain inactive even when they predate recall', (t) => {
   const old = rememberFact({ kind: 'project', content: 'The project review closes in April.' });
   const replacement = rememberFact({ kind: 'project', content: 'The project review closes in May.' });
-  forgetFact(old.id);
+  deleteFact(old.id);
   openMemoryDb().prepare('UPDATE consolidated_facts SET superseded_by_fact_id = ? WHERE id = ?').run(replacement.id, old.id);
   t.mock.timers.tick(1);
   const result = recordRecallUse({ recallId: offer(old.id).id, refs: [`fact:${old.id}`] });
@@ -147,7 +147,7 @@ for (const [label, value] of [
   test(`${label} durable timestamps cannot authorize automatic resurrection`, (t) => {
     for (const target of ['recall', 'archive'] as const) {
       const fact = rememberFact({ kind: 'user', content: `A ${target} timestamp must not manufacture restore authority.` });
-      forgetFact(fact.id);
+      deleteFact(fact.id);
       t.mock.timers.tick(1);
       const run = offer(fact.id);
       if (target === 'recall') openMemoryDb().prepare('UPDATE memory_recall_runs SET created_at = ? WHERE id = ?').run(value, run.id);

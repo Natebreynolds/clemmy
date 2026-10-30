@@ -267,10 +267,10 @@ test('M2: the exclusion window closes — an old correction falls back to demoti
 });
 
 test('earn-your-way-back: a fact archived before recall can resurrect through the canonical restore path', async (t) => {
-  const { forgetFact } = await import('./facts.js');
+  const { deleteFact } = await import('./facts.js');
   t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-09T12:00:00.000Z') });
   const fact = rememberFact({ kind: 'project', content: 'The Northwind renewal contact is the regional ops lead.' });
-  forgetFact(fact.id);
+  deleteFact(fact.id);
   assert.equal(getFact(fact.id)?.active, false, 'precondition: the fact is archived before recall');
   t.mock.timers.tick(1);
   const run = recordRecallRun({
@@ -287,6 +287,34 @@ test('earn-your-way-back: a fact archived before recall can resurrect through th
   assert.equal(restored?.active, true, 'the fact is live again');
   assert.equal(restored?.utilityCount, 1, 'utility credit landed after restore');
   assert.ok(restored?.lastUsedAt, 'restore refreshes last_used_at so the next hygiene pass cannot instantly re-decay it');
+});
+
+test('a fact the owner forgot is never earned back by a reply that mentions it; a restored one is ordinary again', async (t) => {
+  const { forgetFact, deleteFact, reactivateFact } = await import('./facts.js');
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-09T12:00:00.000Z') });
+  const fact = rememberFact({ kind: 'user', content: 'The Northwind test code word is amberline.' });
+  forgetFact(fact.id);
+  t.mock.timers.tick(1);
+  const recall = () => recordRecallRun({
+    objective: 'what is the Northwind test code word?',
+    surface: 'memory_search_facts',
+    answerability: 'partial',
+    candidateRefs: [{ type: 'fact', id: String(fact.id), snippet: fact.content }],
+  });
+  // Live: "that isn't stored anymore — it was amberline" credited the archived
+  // row and brought it back twenty seconds after the owner forgot it.
+  const forgotten = recordRecallUse({ recallId: recall().id, refs: [`fact:${fact.id}`], detail: 'auto:content' });
+  assert.equal(forgotten.ok, true);
+  assert.deepEqual(forgotten.resurrectedFactIds, [], 'a forget is the owner\'s decision, not decay');
+  assert.equal(getFact(fact.id)?.active, false, 'the forgotten fact stays down');
+
+  t.mock.timers.tick(1);
+  assert.equal(reactivateFact(fact.id), true, 'the Memory tab can still restore it');
+  t.mock.timers.tick(1);
+  deleteFact(fact.id);
+  t.mock.timers.tick(1);
+  const decayed = recordRecallUse({ recallId: recall().id, refs: [`fact:${fact.id}`], detail: 'auto:content' });
+  assert.deepEqual(decayed.resurrectedFactIds, [fact.id], 'restored, then faded from disuse, it earns its way back as usual');
 });
 
 test('a SUPERSEDED archived fact is never resurrected by recall credit', async () => {

@@ -9,6 +9,7 @@ import { CUTOVER_HOLD } from '../runtime/cutover-hold.js';
 import { noteCreditAnswered, noteCreditRefused, OPENAI_KEY_ACCOUNT_ID } from '../runtime/provider-credit.js';
 import { openMemoryDb, STATE_DIR } from './db.js';
 import { startEmbeddingWorker, EmbeddingWorkSkippedError, type EmbeddingWorkOptions, type EmbeddingWorkControl } from './embedding-worker.js';
+import { factForgottenSql } from './fact-forgotten.js';
 
 /**
  * Provider-backed embeddings for semantic recall rerank.
@@ -1721,6 +1722,7 @@ export function loadArchivedFactEmbeddings(kind?: string, space?: Pick<Embedding
     JOIN consolidated_facts cf ON cf.id = fe.fact_id
     WHERE cf.active = 0
       AND cf.superseded_by_fact_id IS NULL
+      AND NOT ${factForgottenSql('cf')}
       ${kind ? 'AND cf.kind = ?' : ''}
       AND fe.model = ?
       AND fe.dim = ?

@@ -32,7 +32,7 @@ const { resetMemoryDb, openMemoryDb } = await import('./db.js');
 const {
   findSimilarFacts,
   findSimilarFactsScored,
-  forgetFact,
+  deleteFact,
   getFact,
   listActiveFacts,
   markFactSupersededBy,
@@ -169,7 +169,7 @@ test('provider migration backfills recoverable archive facts but not superseded 
   const superseded = rememberFact({ kind: 'project', content: 'Superseded launch note.' });
   const winner = rememberFact({ kind: 'project', content: 'Current authoritative launch note.' });
   assert.equal((await embedMissingFacts({ maxChunks: 20 })).embedded, 3);
-  assert.equal(forgetFact(archived.id), true);
+  assert.equal(deleteFact(archived.id), true);
   assert.equal(markFactSupersededBy(superseded.id, winner.id), true);
 
   _setEmbeddingProviderForTest(activeProvider);

@@ -13,7 +13,7 @@ process.env.CLEMMY_SEMANTIC_RECALL = 'on';
 
 const { closeMemoryDb, openMemoryDb, resetMemoryDb } = await import('./db.js');
 const {
-  clearTurnQueryVector, findSimilarFactsScored, forgetFact, listActiveFacts,
+  clearTurnQueryVector, findSimilarFactsScored, deleteFact, listActiveFacts,
   markFactSupersededBy, primeTurnRecallVector, reactivateFact, rememberFact,
   searchArchivedFactsScored, setTurnQueryVector, updateFact, withTurnQueryVectorScope,
 } = await import('./facts.js');
@@ -99,7 +99,7 @@ for (const archived of [false, true]) {
     _setEmbeddingProviderForTest(remote.provider);
     const remoteFact = fact('Amber receipt belongs in the ledger.', remote.provider.model, [0, 1]);
     const localFact = fact('Indigo parcel belongs on the shelf.', local.provider.model, [0, 1]);
-    if (archived) { forgetFact(remoteFact.id); forgetFact(localFact.id); }
+    if (archived) { deleteFact(remoteFact.id); deleteFact(localFact.id); }
     const results = archived
       ? await searchArchivedFactsScored('synthetic paraphrase')
       : await findSimilarFactsScored('synthetic paraphrase');
@@ -118,7 +118,7 @@ test('rescue without stored vectors in its own space retains lexical fallback wi
   const record = fact('Amber receipt belongs in the ledger.', remote.provider.model, [0, 1]);
   const active = await findSimilarFactsScored('Amber receipt');
   assert.deepEqual(active.map((item) => [item.fact.id, item.sim]), [[record.id, null]]);
-  forgetFact(record.id);
+  deleteFact(record.id);
   const archived = await searchArchivedFactsScored('Amber receipt');
   assert.deepEqual(archived.map((item) => [item.fact.id, item.sim]), [[record.id, null]]);
 });
@@ -175,7 +175,7 @@ test('an archived fact superseded during the await cannot resurface', async () =
   _setEmbeddingProviderForTest(selected.provider);
   const previous = fact('Amber receipt belongs in the ledger.', selected.provider.model, [1, 0]);
   const current = rememberFact({ kind: 'project', content: 'Indigo parcel is the current assertion.' });
-  forgetFact(previous.id);
+  deleteFact(previous.id);
   const pending = searchArchivedFactsScored('synthetic paraphrase');
   await started.promise;
   assert.equal(reactivateFact(previous.id), true);
@@ -305,7 +305,7 @@ test('caller deadline suppresses expired active and archived query work without 
   const record = fact('Amber receipt belongs in the ledger.', selected.provider.model, [1, 0]);
   const active = await findSimilarFactsScored('Amber receipt', { deadlineAtMs: Date.now() - 1 });
   assert.deepEqual(active.map((item) => [item.fact.id, item.sim]), [[record.id, null]]);
-  forgetFact(record.id);
+  deleteFact(record.id);
   const archived = await searchArchivedFactsScored('Amber receipt', { deadlineAtMs: Date.now() - 1 });
   assert.deepEqual(archived.map((item) => [item.fact.id, item.sim]), [[record.id, null]]);
   assert.equal(selected.calls.length, 0);

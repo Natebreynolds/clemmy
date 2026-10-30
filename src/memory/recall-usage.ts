@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { openMemoryDb } from './db.js';
 import { reactivateFact } from './facts.js';
+import { factForgottenSql } from './fact-forgotten.js';
 import { appendHygieneAudit } from './hygiene-audit.js';
 
 export const RECALL_REF_TYPES = ['fact', 'note', 'entity', 'resource', 'episode', 'policy', 'procedure', 'deliverable'] as const;
@@ -432,8 +433,11 @@ export function recordRecallUse(input: {
         // (which also refreshes last_used_at against immediate re-decay), then
         // credit. Superseded rows stay down: they were replaced, not stale.
         try {
+          // A forgotten fact was put down by the owner, not by decay: a reply
+          // that mentions it (even "it was X, now forgotten") earns nothing back.
           const archived = db.prepare(
-            'SELECT updated_at FROM consolidated_facts WHERE id = ? AND active = 0 AND superseded_by_fact_id IS NULL',
+            `SELECT updated_at FROM consolidated_facts AS cf WHERE id = ? AND active = 0
+               AND superseded_by_fact_id IS NULL AND NOT ${factForgottenSql('cf')}`,
           ).get(factId) as { updated_at: string } | undefined;
           const archivedMs = archived ? Date.parse(archived.updated_at) : NaN;
           const admittedMs = Date.parse(run.created_at);

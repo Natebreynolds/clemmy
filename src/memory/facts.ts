@@ -26,6 +26,7 @@ import { appendFactRecallTrace } from './recall-trace.js';
 import { captureFactEvidence, getFactEvidence, linkFactEvidence, listMemoryPolicies, syncMemoryPolicyForFact, type FactEvidence } from './temporal-memory.js';
 import { useCorrectionNoteForFact } from './argument-corrections-store.js';
 import { attachGroundedFactResources, resolveGroundedEntityIdsForText, setFactEntityLinks } from './relations.js';
+import { factForgottenSql, FORGOTTEN_CLOSE_REASON } from './fact-forgotten.js';
 import {
   requireStandingPolicyDescriptor,
   type StandingPolicyDescriptor,
@@ -1282,9 +1283,10 @@ export async function searchArchivedFactsScored(
   const minHits = Math.min(2, tokens.length);
   try {
     const matches = db.prepare(`
-      SELECT * FROM consolidated_facts
+      SELECT * FROM consolidated_facts AS cf
       WHERE active = 0
         AND superseded_by_fact_id IS NULL
+        AND NOT ${factForgottenSql('cf')}
         AND (${tokens.map(() => 'LOWER(content) LIKE ?').join(' OR ')})
     `).all(...tokens.map((t) => `%${t}%`)) as ConsolidatedFactRow[];
     return visibleInScope('fact', matches, (row) => row.id)
@@ -1757,7 +1759,9 @@ export function getFactWithEvidence(id: number): ConsolidatedFact | null {
 }
 
 /**
- * Soft-delete a fact (sets active = 0). The row stays for audit/history.
+ * Soft-delete a fact (sets active = 0). The row stays for audit/history and
+ * the Memory tab can restore it; until then it stays down — a reply that
+ * mentions it does not earn it back and archive recall does not offer it.
  * Use {hard: true} to actually drop the row.
  */
 export function forgetFact(id: number, options: { hard?: boolean } = {}): boolean {
@@ -1765,12 +1769,20 @@ export function forgetFact(id: number, options: { hard?: boolean } = {}): boolea
   if (options.hard) {
     return hardDeleteConsolidatedFacts(db, [id]) > 0;
   }
-  const info = db.prepare(`
-    UPDATE consolidated_facts
-    SET active = 0, updated_at = ?
-    WHERE id = ?
-  `).run(new Date().toISOString(), id);
-  return Number(info.changes ?? 0) > 0;
+  return db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE consolidated_facts
+      SET active = 0, updated_at = ?
+      WHERE id = ?
+    `).run(new Date().toISOString(), id);
+    if (Number(info.changes ?? 0) === 0) return false;
+    db.prepare(`
+      UPDATE fact_validity_intervals SET closed_reason = ?
+      WHERE id = (SELECT id FROM fact_validity_intervals WHERE fact_id = ? ORDER BY valid_from DESC, id DESC LIMIT 1)
+        AND valid_to IS NOT NULL
+    `).run(FORGOTTEN_CLOSE_REASON, id);
+    return true;
+  })();
 }
 
 /**

@@ -22,6 +22,7 @@ const { closeMemoryDb, resetMemoryDb, openMemoryDb } = await import('./db.js');
 // eslint-disable-next-line import/first
 const {
   decayAndEvictFacts,
+  deleteFact,
   demoteRolledUpSource,
   findSimilarFactsScored,
   forgetFact,
@@ -1015,8 +1016,10 @@ test('cold-tier archive search finds retired facts, never active or superseded o
   const live = rememberFact({ kind: 'project', content: 'The Meridian rollout checklist lives in the ops handbook.' });
   const retired = rememberFact({ kind: 'project', content: 'The Meridian rollout kickoff call happens on Fridays.' });
   const replaced = rememberFact({ kind: 'project', content: 'The Meridian rollout owner is the platform team.' });
-  forgetFact(retired.id);
-  forgetFact(replaced.id);
+  const forgotten = rememberFact({ kind: 'project', content: 'The Meridian rollout kickoff code word is amberline.' });
+  deleteFact(retired.id);
+  deleteFact(replaced.id);
+  forgetFact(forgotten.id);
   openMemoryDb().prepare('UPDATE consolidated_facts SET superseded_by_fact_id = ? WHERE id = ?')
     .run(live.id, replaced.id);
 
@@ -1025,6 +1028,7 @@ test('cold-tier archive search finds retired facts, never active or superseded o
   assert.ok(ids.includes(retired.id), 'a retired (soft-deleted) fact is reachable from the archive');
   assert.ok(!ids.includes(live.id), 'active facts never appear in archive results');
   assert.ok(!ids.includes(replaced.id), 'a SUPERSEDED fact stays down — it was replaced, not stale');
+  assert.ok(!ids.includes(forgotten.id), 'a fact the owner forgot is not offered back from the archive');
 });
 
 test('archive search lexical arm demands two token hits so one common word cannot resurface junk', async () => {
