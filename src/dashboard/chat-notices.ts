@@ -5,7 +5,7 @@
  * A notice belongs to the chat by its own session; a workflow the chat started
  * keeps its notices, since the workflow lives on.
  */
-import { loadNotifications, markNotificationsRead } from '../runtime/notifications.js';
+import { loadNotifications, markNotificationRead } from '../runtime/notifications.js';
 
 export function settleNoticesOfSetAsideChats(sessionIds: readonly string[]): number {
   const chats = new Set(sessionIds.filter((id) => typeof id === 'string' && id.trim()));
@@ -17,5 +17,7 @@ export function settleNoticesOfSetAsideChats(sessionIds: readonly string[]): num
       return [meta.sessionId, meta.session_id].some((value) => typeof value === 'string' && chats.has(value));
     })
     .map((notification) => notification.id);
-  return owned.length > 0 ? markNotificationsRead(owned).cleared.length : 0;
+  // One at a time, not the bulk clear: the bulk clear keeps an open ask on
+  // screen, but an ask inside a chat the owner set aside is answered by that.
+  return owned.filter((id) => markNotificationRead(id)?.read === true).length;
 }

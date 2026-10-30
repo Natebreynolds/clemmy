@@ -8,7 +8,7 @@
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { loadNotifications, markNotificationsRead } from '../runtime/notifications.js';
+import { loadNotifications, markNotificationRead } from '../runtime/notifications.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 
 const text = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
@@ -41,5 +41,7 @@ export function settleNoticesOfDeletedWorkflow(slug: string, displayName?: strin
       return Boolean(ran && names.has(ran.toLowerCase()));
     })
     .map((notification) => notification.id);
-  return ids.length > 0 ? markNotificationsRead(ids).cleared.length : 0;
+  // One at a time, not the bulk clear: the bulk clear keeps an open ask on
+  // screen, but a stopped workflow's ask is moot once the workflow is gone.
+  return ids.filter((id) => markNotificationRead(id)?.read === true).length;
 }

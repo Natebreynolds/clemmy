@@ -25,12 +25,14 @@ const notice = (id: string, metadata: Record<string, unknown>) => addNotificatio
 test('a set-aside chat\'s own notices are read; its workflows\' and other chats\' notices stay', () => {
   notice('report-back', { sessionId: 'sess-a' });
   notice('report-back-snake', { session_id: 'sess-a' });
+  notice('report-back-asking', { sessionId: 'sess-a', needsAttention: true, foregroundRun: true });
   notice('workflow-it-started', { originSessionId: 'sess-a', workflow: 'Weekly digest' });
   notice('other-chat', { sessionId: 'sess-b' });
 
-  assert.equal(settleNoticesOfSetAsideChats(['sess-a']), 2);
+  assert.equal(settleNoticesOfSetAsideChats(['sess-a']), 3);
   assert.equal(getNotification('report-back')?.read, true);
   assert.equal(getNotification('report-back-snake')?.read, true);
+  assert.equal(getNotification('report-back-asking')?.read, true, 'an ask inside a set-aside chat is answered by setting it aside');
   assert.equal(getNotification('workflow-it-started')?.read, false, 'the workflow lives on after its chat is set aside');
   assert.equal(getNotification('other-chat')?.read, false);
   assert.equal(settleNoticesOfSetAsideChats([]), 0);
