@@ -132,9 +132,9 @@ test('a passed test shows what its run produced; it is the run an owner asked to
 });
 
 test('the status of a passed creation test reads each step from the same journal its receipt quoted', () => {
-  // Live 2026-10-30: the receipt's bounded quote ended mid-result, the brain
-  // asked for the step's whole output, read "no output recorded", and spent
-  // nine more calls in shell and files to find it.
+  // The receipt's quote is bounded; the whole step output must still be
+  // readable through the status tool, or the brain goes looking for it in
+  // shell and files.
   const runId = 'run-status-journal';
   const record = { id: runId, workflow: 'Digest check', status: 'creation_test', output: 'creation test passed',
     workflowDefinitionSnapshot: { workflowSlug: 'digest-check' } };

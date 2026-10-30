@@ -758,6 +758,18 @@ export async function resolveSourceAccountRouting(input: {
   // — wording that names an account that is not this one — still blocks.
   const soleAccountUnsure = defaultMode && choices.length === 1
     && result.verdict === 'uncertain' && result.proposalDigest === proposalDigest && result.modelIdentity.trim() !== '';
+  // A nomination of the one connected account, with no route yet in this
+  // conversation, made a choice there was never any need to make. When its
+  // quote does not name the account, route exactly as with no nomination: the
+  // sole account's default review reads the same words, and wording that names
+  // another account still blocks there. Words that name a recipient and not
+  // the mailbox no longer turn a list of one account into a question.
+  if (!defaultMode && nomination && latest === null && choices.length === 1
+    && result.verdict !== 'entailed' && result.proposalDigest === proposalDigest
+    && (connection.connectionId === nomination.identity.trim()
+      || emailOf(connection) === nomination.identity.trim().toLowerCase())) {
+    return resolveSourceAccountRouting({ ...input, nomination: null });
+  }
   if (!soleAccountUnsure && (result.verdict !== (defaultMode ? 'default_compatible' : 'entailed')
     || result.proposalDigest !== proposalDigest || !result.modelIdentity.trim())) return blocked('not_entailed');
   if (defaultMode) return { kind: 'resolved', connection, evidence: {

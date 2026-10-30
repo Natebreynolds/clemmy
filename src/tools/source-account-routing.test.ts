@@ -467,6 +467,46 @@ test('production staging checks sole-mailbox writes independently of the availab
     ['OUTLOOK_LIST_MAIL_FOLDERS'], 'review unavailability blocks the write, while the read remains independently proven');
 });
 
+test('a nomination of the one connected account is reviewed as its default, not as a selection the wording must name', async () => {
+  aliases.resetAccountAliasesForTest();
+  composio.__test__.setComposioApiKeyOverride('fixture-account-routing');
+  composio.__test__.setConnectedAccountsLoader(async () => connections.slice(0, 1).map(c => ({
+    id: c.connectionId, status: c.status, user_id: 'fixture-owner', toolkit: { slug: c.slug },
+    data: { user_info: { email: c.accountEmail } },
+  })) as never);
+  const candidates = [{ name: 'OUTLOOK_SEND_EMAIL', sourceKind: 'authorized_composio' as const, carrier: 'work_call' as const,
+    schema: { type: 'object', properties: {} }, summary: 'Fixture account-scoped send' }];
+  const fixtures = [
+    // The words name the recipient, not the mailbox: with one mailbox there is nothing to ask.
+    { text: 'Email me a short summary. Send it only to my own Outlook address.', quote: 'Send it only to my own Outlook address', verdict: 'default_compatible', bound: true },
+    // Words that name another account still block, nomination or not.
+    { text: 'Email me a short summary from my studio@other.invalid mailbox.', quote: 'Email me a short summary', verdict: 'conflict', bound: false },
+  ] as const;
+  for (const fixture of fixtures) {
+    const identity = source(fixture.text);
+    // The explicit review reads the quote first; when it does not name the
+    // one account, the default review reads the same words.
+    const calls = installJudge(call => {
+      assert.equal(call.accountIdentity, SCORPION);
+      if (call.mode !== 'current_source_default') return { verdict: 'uncertain' };
+      assert.equal(call.sourceQuote, null, 'reviewed exactly as with no nomination');
+      return { verdict: fixture.verdict };
+    });
+    const staged = await provider.stageDisclosedPlanningProviderCandidates({ ...identity, candidates,
+      accountSelection: { toolkit: 'outlook', identity: SCORPION, source_quote: fixture.quote } });
+    const proven = resolution.provenCapabilityEntriesForTurn(identity);
+    if (fixture.bound) {
+      assertCheckedAccountWithoutLivePublication(staged.blockers);
+      assert.deepEqual(proven.map(entry => entry.identifier), ['OUTLOOK_SEND_EMAIL']);
+      assert.equal(proven[0]?.accountIdentity, 'fixture-scorpion');
+    } else {
+      assert.equal(staged.blockers.OUTLOOK_SEND_EMAIL?.code, 'account_selection_required');
+      assert.deepEqual(proven, []);
+    }
+    assert.deepEqual(calls.map(call => call.mode), ['explicit_selection', 'current_source_default']);
+  }
+});
+
 test('default judgments are source/principal/connection scoped and use a distinct verdict from explicit selection', async () => {
   const identity = source('Draft a note using my outbound email skill.');
   const calls = installJudge();
