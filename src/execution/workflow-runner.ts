@@ -87,6 +87,7 @@ import {
   addNotification,
   adoptWorkflowStepReportAsOutcome,
   loadNotifications,
+  markNotificationRead,
   markWorkflowCapabilityNotificationsSettled,
   type NotificationRecord,
 } from '../runtime/notifications.js';
@@ -19142,6 +19143,20 @@ export function reconcilePendingWorkflowRuns(): void {
  *  (upgrade, manual quit, a one-off crash) while stopping a loop cold. */
 export const BOOT_RESUME_CAP = 3;
 
+/** Waits a boot leaves alone: a person, not a restart, moves these on. */
+const BOOT_UNCOUNTED_WAITS: ReadonlySet<string> = new Set([
+  'awaiting_input', 'awaiting_approval', 'blocked_capability', 'blocked_mutation', 'awaiting_catchup_decision',
+]);
+
+function restartParkedWhileAsking(record: QueuedRunRecord): boolean {
+  const extra = record as QueuedRunRecord & { bootResumeParkedAt?: unknown; parked?: unknown };
+  const pending = record.awaitingInput;
+  return typeof extra.bootResumeParkedAt === 'string'
+    && !(extra.parked && typeof extra.parked === 'object')
+    && Boolean(pending && typeof pending === 'object' && typeof pending.questionId === 'string')
+    && pending?.answer === undefined;
+}
+
 /**
  * Count this boot's resume against each pending run and park the ones past the
  * cap. Returns the runIds that must NOT be resumed.
@@ -19161,6 +19176,23 @@ export function parkRunsExceedingBootResumeCap(
       withWorkflowRunRecordLock(filePath, () => {
         const record = readWorkflowRunRecordUnlocked<QueuedRunRecord>(filePath);
         if (!record || isTerminalRunRecord(record)) return;
+        // A run waiting on a person (a question, an approval, a capability or
+        // reconciliation gate) is not something a boot resumes, so a boot never
+        // counts against it. Counting it parked a run that was waiting on the
+        // owner's answer as "stopped after repeated restarts".
+        if (BOOT_UNCOUNTED_WAITS.has(String(record.status))) {
+          parked.add(run.runId);
+          return;
+        }
+        // One the cap parked while its question was still unanswered returns to
+        // waiting on that question; the question is still the decision.
+        if (record.status === 'parked' && restartParkedWhileAsking(record)) {
+          const { bootResumeParkedAt: _parkedAt, error: _error, ...rest } = record as QueuedRunRecord & { bootResumeParkedAt?: string; error?: string };
+          writeWorkflowRunRecordDurablyUnlocked(filePath, { ...rest, status: 'awaiting_input', bootResumeCount: 0 });
+          try { markNotificationRead(`workflow-boot-resume-cap-${run.runId}`); } catch { /* the notice is history either way */ }
+          parked.add(run.runId);
+          return;
+        }
         // A parked run is a decision waiting for a person (capability choice,
         // or this cap already stopped it). Boot never resumes it, never counts
         // it again and never re-raises its card: counting it each launch turned

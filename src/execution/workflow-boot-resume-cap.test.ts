@@ -121,3 +121,40 @@ test('a run already parked is a decision for a person: never counted again, neve
   const raised = listNotifications().filter((n) => n.id === 'workflow-boot-resume-cap-already-parked' || n.id === 'workflow-boot-resume-cap-capability-parked');
   assert.equal(raised.length, 0, 'no card is raised for a run that was already parked');
 });
+
+// Live 2026-10-30: a run waiting eight days on the owner's answer was counted on
+// every restart and the cap parked it as "stopped after repeated restarts",
+// replacing the question it was waiting on.
+test('a run waiting on a person is never counted against the cap', () => {
+  seedRun('run-asking', { status: 'awaiting_input', awaitingInput: { questionId: 'q-1', question: 'Try again?', stepId: 's', askedAt: 't0' } });
+  let parked = new Set<string>();
+  for (let i = 0; i < BOOT_RESUME_CAP + 2; i++) {
+    parked = parkRunsExceedingBootResumeCap([{ runId: 'run-asking', workflowName: 'demo', lastEventAt: 'frozen' }]);
+  }
+  assert.ok(parked.has('run-asking'), 'a boot does not resume it');
+  const rec = readRun('run-asking');
+  assert.equal(rec.status, 'awaiting_input');
+  assert.equal(rec.bootResumeCount, undefined, 'never counted');
+  assert.equal(rec.bootResumeParkedAt, undefined);
+});
+
+test('a run the cap parked while its question was unanswered returns to waiting on that question', async () => {
+  const { addNotification, getNotification } = await import('../runtime/notifications.js');
+  seedRun('run-misparked', { status: 'parked', bootResumeParkedAt: '2026-10-30T18:32:54.810Z', bootResumeCount: 4,
+    error: 'Paused after 4 automatic restarts.', awaitingInput: { questionId: 'q-2', question: 'Try again?', stepId: 's', askedAt: 't0' } });
+  addNotification({ id: 'workflow-boot-resume-cap-run-misparked', kind: 'system', title: 'Paused "demo" after repeated restarts',
+    body: '', createdAt: new Date().toISOString(), read: false, metadata: { source: 'workflow-boot-resume-cap', runId: 'run-misparked' } });
+  const parked = parkRunsExceedingBootResumeCap([{ runId: 'run-misparked', workflowName: 'demo', lastEventAt: 'frozen' }]);
+  assert.ok(parked.has('run-misparked'));
+  const rec = readRun('run-misparked');
+  assert.equal(rec.status, 'awaiting_input');
+  assert.equal(rec.bootResumeParkedAt, undefined);
+  assert.equal(rec.error, undefined);
+  assert.equal((rec.awaitingInput as { questionId?: string }).questionId, 'q-2', 'the question is kept');
+  assert.equal(getNotification('workflow-boot-resume-cap-run-misparked')?.read, true, 'the restart notice is history');
+
+  // A restart pause without an open question stays a resume-or-skip decision.
+  seedRun('run-restart-only', { status: 'parked', bootResumeParkedAt: '2026-10-29T18:10:05.057Z', bootResumeCount: 4 });
+  parkRunsExceedingBootResumeCap([{ runId: 'run-restart-only', workflowName: 'demo', lastEventAt: 'frozen' }]);
+  assert.equal(readRun('run-restart-only').status, 'parked');
+});
