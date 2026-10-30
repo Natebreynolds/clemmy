@@ -198,9 +198,12 @@ test('an active successor created before the fix recovers missing conversation c
   assert.doesNotMatch(wire, /DO-NOT-COPY|unsafe-parent-call/);
 });
 
-test('a successor does not import another principal, provider, scope, or conversation', () => {
+test('a successor does not import another principal, scope, or conversation', () => {
+  // The owner's desktop continuing a phone conversation is the same person
+  // (owner 2026-10-30), pinned in owner-surface-continuity.test.ts; every
+  // other change of principal still splits.
   for (const changed of [
-    { audienceId: 'other-human' }, { provider: 'desktop' }, { scopeId: 'other-scope' }, { conversationId: 'other-conversation' },
+    { audienceId: 'other-human' }, { scopeId: 'other-scope' }, { conversationId: 'other-conversation' },
   ]) {
     const parent = parentSession();
     completedExchange(parent, 'Private request', 'PRIVATE-PARENT-DRAFT', 1);

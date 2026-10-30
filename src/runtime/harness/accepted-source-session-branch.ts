@@ -453,6 +453,41 @@ function sessionAudienceMatches(row: RawSession, identity: AcceptedSourceContinu
     && scope === identity.scopeId;
 }
 
+/** The owner's own surfaces. A paired phone is minted on the owner's Mac, so
+ * a conversation started on one of them and continued on the other is the
+ * same person's conversation (owner 2026-10-30: "Users should be able to
+ * continue chats between desktop and mobile"). Shared channels keep their
+ * per-person identities. */
+const OWNER_SURFACES: ReadonlySet<string> = new Set(['desktop', 'mobile']);
+
+/** The identity a session was opened under, when that was one of the
+ * owner's own surfaces. */
+function ownerSurfaceIdentityOf(row: RawSession): AcceptedSourceContinuityIdentity | null {
+  const metadata = parseMetadataSafe(row.metadata_json);
+  if (!metadata || stringField(metadata, 'guildId')) return null;
+  const provider = stringField(metadata, 'ingressProvider') ?? stringField(metadata, 'source') ?? row.channel?.trim().toLowerCase() ?? null;
+  const conversationId = stringField(metadata, 'channelId');
+  const audienceId = row.user_id ?? stringField(metadata, 'userId');
+  if (!provider || !OWNER_SURFACES.has(provider) || !conversationId || !audienceId) return null;
+  return normalizedContinuity({ provider, scopeId: null, conversationId, audienceId });
+}
+
+/** The continuity a source is selected under. A message or a Stop/Continue
+ * from one owner surface into a conversation the other owner surface started
+ * carries that conversation's own identity, so it continues (or controls) it
+ * with its history instead of splitting into an empty principal root (live:
+ * a phone reply to a desktop conversation asked "which event?"). */
+function ownerSurfaceContinuity(
+  db: Database.Database,
+  input: AcceptedSourceSessionSelectionInput,
+): AcceptedSourceContinuityIdentity {
+  const requested = normalizedContinuity(input.continuity);
+  if (!OWNER_SURFACES.has(requested.provider) || requested.scopeId !== null) return requested;
+  const entry = db.prepare('SELECT * FROM sessions WHERE id = ?').get(input.entrySessionId) as RawSession | undefined;
+  const owner = entry ? ownerSurfaceIdentityOf(entry) : null;
+  return owner && owner.provider !== requested.provider ? owner : requested;
+}
+
 /** Recover only the closed ingress identity written by this selector. Raw
  * legacy workspace metadata is not authority; mount lineage must validate its
  * canonical `space-<slug>` root. */
@@ -479,7 +514,12 @@ export function resolveAcceptedSourceIngressLineage(input: {
     conversationId,
     audienceId: input.audienceId,
   });
-  if (!sessionAudienceMatches(row, identity)) return null;
+  // The other owner surface's conversation is the owner's too (see
+  // ownerSurfaceContinuity): the phone may continue and stop what the desktop
+  // started, and the other way round.
+  const owner = OWNER_SURFACES.has(identity.provider) && identity.scopeId === null ? ownerSurfaceIdentityOf(row) : null;
+  if (!sessionAudienceMatches(row, identity)
+    && !(owner && owner.provider !== identity.provider && sessionAudienceMatches(row, owner))) return null;
   const rawMount = metadata[MOUNT_META];
   let validatedMount: AcceptedSourceValidatedMount | undefined;
   if (rawMount && typeof rawMount === 'object' && !Array.isArray(rawMount)) {
@@ -946,7 +986,7 @@ function selectInTransaction(
   db: Database.Database,
   input: AcceptedSourceSessionSelectionInput,
 ): TransactionSelection {
-  const continuity = normalizedContinuity(input.continuity);
+  const continuity = ownerSurfaceContinuity(db, input);
   const validatedMount = normalizedValidatedMount(input.validatedMount);
   const workflowConversation = input.workflowConversation
     ? normalizedWorkflowConversationBinding(input.workflowConversation) : null;
@@ -1199,7 +1239,7 @@ export function claimSessionForAcceptedSource(
     const requestId = input.receipt.requestId.trim();
     const prior = receiptInTransaction(db, requestId);
     if (prior) {
-      const continuity = normalizedContinuity(input.continuity);
+      const continuity = ownerSurfaceContinuity(db, input);
       const continuityKey = continuityDigest(continuity);
       const sourceKey = durableSourceDigest(continuity.provider, input.durableSourceId);
       const binding = existingBinding(db, sourceKey);

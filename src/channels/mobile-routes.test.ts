@@ -3804,7 +3804,13 @@ test('workspace chat from the phone: space-<slug> session id binds workspace met
   }
 });
 
-test('workflow conversation on mobile keeps exact saved scope across desktop principal split and replay', async () => {
+/** The conversation a session belongs to: its accepted-source branch root, or itself. */
+function rootSessionOf(sessionId: string): string {
+  const branch = getHarnessSessionForTest(sessionId)?.metadata.__accepted_source_branch as { rootSessionId?: string } | undefined;
+  return branch?.rootSessionId ?? sessionId;
+}
+
+test('workflow conversation on mobile continues the desktop conversation with its exact saved scope, replay and Stop', async () => {
   resetEventLog(); _clearIdempotencyForTests(); _clearMobileChatInFlightForTests();
   const { workflowConversationSessionId } = await import('../shared/workflow-conversation.js');
   const { composeSessionFromStore } = await import('../runtime/harness/session-composition.js');
@@ -3848,7 +3854,9 @@ test('workflow conversation on mobile keeps exact saved scope across desktop pri
     const first = await send();
     assert.equal(first.status, 200);
     const ack = await first.json() as { sessionId: string; runId: string };
-    assert.notEqual(ack.sessionId, rootId, 'phone receives its own continuity principal without editing the desktop owner');
+    // Owner 2026-10-30: the phone continues the conversation the desktop
+    // started (same root, its history), never a separate principal.
+    assert.equal(rootSessionOf(ack.sessionId), rootId, 'the phone continues the desktop conversation');
     assert.equal(getHarnessSessionForTest(ack.sessionId)?.kind, 'chat');
     assert.deepEqual(getHarnessSessionForTest(ack.sessionId)?.metadata.__workflow_conversation, binding);
     assert.equal(composeSessionFromStore(ack.sessionId).workflowConversation?.workflowSlug, slug);

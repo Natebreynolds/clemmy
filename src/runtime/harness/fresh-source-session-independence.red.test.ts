@@ -763,14 +763,11 @@ test('an audience mismatch splits before protocol preview and never imports raw 
   assert.equal(nullAudienceSplit.rootSessionId, nullAudienceSplit.sessionId);
 });
 
-test('a second source from a split audience continues its own root instead of splitting again', async () => {
-  // Live 2026-09-15 (mobile mirror of a desktop session, audience differs from
-  // the desktop principal): every differently-worded message entered through
-  // the desktop session, found no pointer under the desktop root, and was
-  // identity-split into a fresh empty successor — five roots in a day; only
-  // byte-identical retries (same durable source) found the old one. The
-  // identity split's pointer lives under the CHILD root; the entry lookup must
-  // resolve that root before deciding to split.
+test('the phone continues a desktop conversation in its root, message after message', async () => {
+  // Live 2026-09-15: every message from the phone into a desktop conversation
+  // split into a fresh empty root ("which event?"). Owner 2026-10-30: "Users
+  // should be able to continue chats between desktop and mobile" — the phone
+  // now continues the desktop conversation itself, with its history.
   eventlog.resetEventLog();
   const fixture = acceptedSession({
     id: 'split-continuity-parent',
@@ -783,39 +780,14 @@ test('a second source from a split audience continues its own root instead of sp
   const first = await requireBranchApi().selectSessionForAcceptedSource(
     ordinarySelection(fixture.session.id, 'mobile-run-first-wording', mobile),
   );
-  assert.equal(first.disposition, 'identity_split');
-  assert.equal(first.rootSessionId, first.sessionId);
-  const firstChild = HarnessSession.load(first.sessionId);
-  assert.ok(firstChild);
-  const firstSource = firstChild.recordUserInput('first wording', 1);
-  eventlog.appendEvent({
-    sessionId: first.sessionId, turn: 1, role: 'Clem', type: 'conversation_completed',
-    data: { sourceUserSeq: firstSource.seq, reply: 'Which event?' },
-  });
+  assert.notEqual(first.disposition, 'identity_split');
+  assert.equal(first.rootSessionId, fixture.session.id, 'the desktop conversation, not a new root');
 
-  // The audience continues with a differently-worded message: same session.
   const second = await requireBranchApi().selectSessionForAcceptedSource(
     ordinarySelection(fixture.session.id, 'mobile-run-second-wording', mobile),
   );
-  assert.equal(second.disposition, 'reused', 'the same audience keeps its conversation');
-  assert.equal(second.sessionId, first.sessionId);
-  assert.equal(second.rootSessionId, first.rootSessionId);
-
-  // While that turn is still open, a further message branches a successor
-  // under the SAME root with the conversation carried forward — never a
-  // fresh empty root.
-  firstChild.recordUserInput('second wording', 2);
-  const third = await requireBranchApi().selectSessionForAcceptedSource(
-    ordinarySelection(fixture.session.id, 'mobile-run-third-wording', mobile),
-  );
-  assert.notEqual(third.disposition, 'identity_split');
-  assert.equal(third.rootSessionId, first.rootSessionId);
-  if (third.sessionId !== first.sessionId) {
-    assert.ok(
-      eventlog.listEvents(third.sessionId, { types: ['cross_session_prefix'] }).length > 0,
-      'a successor of the audience\'s own root carries its conversation prefix',
-    );
-  }
+  assert.notEqual(second.disposition, 'identity_split');
+  assert.equal(second.rootSessionId, fixture.session.id);
 
   // A retry of the first wording still lands on its durable binding.
   const replay = await requireBranchApi().selectSessionForAcceptedSource(
@@ -823,19 +795,12 @@ test('a second source from a split audience continues its own root instead of sp
   );
   assert.equal(replay.sessionId, first.sessionId);
 
-  // A different audience through the same entry still gets its own root, and
-  // continues in it too.
+  // Another paired phone is the owner too, on a conversation the desktop started.
   const other = await requireBranchApi().selectSessionForAcceptedSource(
-    ordinarySelection(fixture.session.id, 'mobile-run-other-user', { ...mobile, audienceId: 'dev-user-2' }),
+    ordinarySelection(fixture.session.id, 'mobile-run-other-device', { ...mobile, audienceId: 'dev-user-2' }),
   );
-  assert.equal(other.disposition, 'identity_split');
-  assert.notEqual(other.rootSessionId, first.rootSessionId);
-  assert.equal(other.rootSessionId, other.sessionId);
-  const otherAgain = await requireBranchApi().selectSessionForAcceptedSource(
-    ordinarySelection(fixture.session.id, 'mobile-run-other-user-2', { ...mobile, audienceId: 'dev-user-2' }),
-  );
-  assert.equal(otherAgain.rootSessionId, other.rootSessionId);
-  assert.notEqual(otherAgain.disposition, 'identity_split');
+  assert.notEqual(other.disposition, 'identity_split');
+  assert.equal(other.rootSessionId, fixture.session.id);
 });
 
 test('workspace successors preserve the workspace mount without copying the held transcript', async () => {
