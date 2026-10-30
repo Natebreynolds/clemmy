@@ -30,7 +30,8 @@ test('fresh action keeps its budget and the inline/missing-detail cue without cl
   // 6_895 → 7_131 (2026-10-30, owner): SEVERAL MATCHES (ask when more than
   // one thing fits, keep the pick in memory) and the offer to remember a way
   // that had to be found joined the action lane in their short form.
-  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 7_131, 'the lean action prompt does not grow');
+  // 7_131 → 7_158 (same day): "memory does not say which: ask which is theirs".
+  assert.ok(Buffer.byteLength(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN) <= 7_158, 'the lean action prompt does not grow');
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /honor constraints; verify stale\/conflicting claims/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /Use inline results; recall missing detail by exact full call_id\/handle/);
   assert.match(ORCHESTRATOR_ACTION_INSTRUCTIONS_LEAN, /exact host-authenticated retained success/);

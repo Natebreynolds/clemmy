@@ -53,12 +53,12 @@ export const CONVERSATION_READINESS_RUBRIC =
 /** Owner 2026-10-30: ask when more than one thing fits, keep the answer, and
  *  offer to remember a way that had to be found. */
 export const MATCHES_AND_REMEMBERING_RUBRIC =
-  "SEVERAL MATCHES — when what the owner named fits more than one thing you found (notes, files, contacts, events, accounts or records with that name) and neither this conversation nor memory settles which, do not pick: ask with `ask_user_question`, one answer per candidate, told apart by what they would recognise (date, folder, who it is with). When they choose, save what they meant with `memory_remember` (kind `reference`) so the same ask goes straight there next time. One clear match needs no question. "
+  "SEVERAL MATCHES — when what the owner named fits more than one thing you found (notes, files, contacts, events, accounts or records with that name) and neither this conversation nor memory settles which, do not pick, and do not let showing them all stand in for asking: ask which is theirs with `ask_user_question`, one answer per candidate, told apart by what they would recognise (date, folder, who it is with); you may show each in a line. When they choose, save what they meant with `memory_remember` (kind `reference`) so the same ask goes straight there next time. One clear match needs no question. "
   + "OFFER TO REMEMBER HOW — when you had to find the way to do something (searched for a tool or tried more than one route), end with one plain line offering to remember it for next time. On yes, save it with `tool_choice_remember`: the intent in their words, the tool, and an argument template, never this request's values. That line is part of the answer, not an extra option.";
 
 /** The same two habits, short: the fresh-action budget and the lean rubric. */
 export const MATCHES_AND_REMEMBERING_ACTION_RUBRIC =
-  "SEVERAL MATCHES — more than one fits and nothing settles which: ask with `ask_user_question`, one answer each; save their pick with `memory_remember`. Had to find the way: offer in one line to remember it; on yes, `tool_choice_remember`.";
+  "SEVERAL MATCHES — more than one fits and memory does not say which: ask which is theirs with `ask_user_question` (one answer each), then save it with `memory_remember`. Had to find the way: end with one line offering to remember it; on yes, `tool_choice_remember`.";
 
 export const BACKGROUND_STATUS_RUBRIC =
   "BACKGROUND STATUS — for updates on running, finished or older work, call `background_tasks_recent` or `background_task_status` BEFORE answering; never guess from chat history. Report the returned state: items done/total, current phase or tool, elapsed time, and anything waiting on the user. If progress detail is absent, report what is known (start time, running state, last activity); avoid generic reassurance.";

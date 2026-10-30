@@ -39,7 +39,9 @@ const GOLDEN = {
   // nothing settles which, ask (one answer per candidate) and keep the pick in
   // memory; when a way had to be found, offer in one line to remember it and
   // save it only on yes (SEVERAL MATCHES / OFFER TO REMEMBER HOW; the short
-  // form in the lean and fresh-action rubrics).
+  // form in the lean and fresh-action rubrics). Live the same day on Grok:
+  // showing every match was taken to settle it, so the rule says showing them
+  // all does not stand in for asking which is theirs.
   // 2026-09-07 discovery subtraction: the rubric no longer tells the model to
   // spend a role slot ("use the runtime broker ONCE for that unresolved role",
   // "distinct roles may resolve in parallel and synonymous searches share the
@@ -215,10 +217,10 @@ const GOLDEN = {
   // sealed work and stage-only intent. Retain every account/effect/consent
   // floor; replace the contradictory prepare/execute advice, without growing
   // the pre-refinement stable rubric or relaxing fresh-action/lean budgets.
-  instructions: { len: 35194, sha16: '76c0f58eb0127c40' },
-  native: { len: 34301, sha16: 'ddfee766562a6112' },
-  claudeBrain: { len: 11680, sha16: '9c8b2d801404cc01' },
-  lean: { len: 13685, sha16: 'faa6f1aa2acd4a91' },
+  instructions: { len: 35292, sha16: '1c125d992cd3c602' },
+  native: { len: 34399, sha16: '0ef42e76757f1ce9' },
+  claudeBrain: { len: 11707, sha16: 'f13cd323fab1eeef' },
+  lean: { len: 13712, sha16: 'e8d9d04fab905af5' },
 } as const;
 
 function snapshotGuard(name: string, value: string, golden: { len: number; sha16: string }): void {
