@@ -220,6 +220,7 @@ function ThreadRail({ agent, activeSessionId, fullWidth = false, onChoose }: { a
   const navigate = useNavigate();
   const threads = useSessions({ agent: agent.id, limit: THREAD_PAGE_SIZE }, 'chats');
   const sessions = threads.data?.sessions ?? [];
+  const handedOff = handedOffWork(usePoll(['agents', 'work', agent.id], () => getAgentWork(agent.id), 10_000).data?.workers ?? []);
   const groups = useMemo(() => groupSessions(sessions, Date.now()), [sessions]);
 
   return (
@@ -241,7 +242,11 @@ function ThreadRail({ agent, activeSessionId, fullWidth = false, onChoose }: { a
         ) : threads.isError && !threads.data ? (
           <QueryUnavailable title="Threads couldn’t load" description="Try loading this agent’s existing conversations again." onRetry={() => void threads.refetch()} />
         ) : sessions.length === 0 ? (
-          <p className="px-2 py-6 text-center text-caption text-muted">No threads yet. Your first message starts one.</p>
+          <p className="px-2 py-6 text-center text-caption text-muted">
+            {handedOff.length > 0
+              ? `No threads with you yet. Clem has handed ${agent.name} ${handedOff.length === 1 ? 'one task' : `${handedOff.length} tasks`}; they are under Work in About.`
+              : 'No threads yet. Your first message starts one.'}
+          </p>
         ) : (
           groups.map((group) => (
             <div key={group.label} className="mb-3">
@@ -638,17 +643,22 @@ const STATUS: Record<AgentWorker['status'], { Icon: LucideIcon; className: strin
   capped: { Icon: Hourglass, className: 'text-warning', title: 'Hit its turn cap' },
 };
 
+/** Work Clem handed this agent from one of her own chats. */
+function handedOffWork(workers: readonly AgentWorker[]): AgentWorker[] {
+  return workers.filter((w) => w.parentKind === 'session' && Boolean(w.parentRunId));
+}
+
 function workerLabel(w: AgentWorker): string {
   if (w.role && w.role !== w.task) return `${w.role}: ${w.task}`;
   return w.task;
 }
 
-/** Helper runs spawned from this agent's threads — the same row the board's
- *  agents panel draws. A helper is a temporary worker for one step: it is
- *  not the agent, and it ends when the step does. The tasks the agent itself
- *  owned are listed above (AgentAssignments). The full work-product is
- *  fetched on open when the run is addressable; otherwise the stored preview
- *  stands in. */
+/** Workers that ran as this agent: tasks Clem handed it from one of her
+ *  chats (linked back to that chat) or from an automation run — the same row
+ *  the board's agents panel draws. Each ends when its task does. The tasks the
+ *  agent itself owned are listed above (AgentAssignments). The full
+ *  work-product is fetched on open when the run is addressable; otherwise the
+ *  stored preview stands in. */
 function RecentWork({ agent }: { agent: AgentRecord }) {
   const work = usePoll(['agents', 'work', agent.id], () => getAgentWork(agent.id), 10_000);
   const workers = work.data?.workers ?? [];
@@ -657,14 +667,14 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
 
   return (
     <section>
-      <div className="text-caption font-semibold text-faint">Helper runs</div>
+      <div className="text-caption font-semibold text-faint">Work</div>
       <p className="mt-0.5 text-caption text-muted">
-        Temporary helpers this agent’s threads started for a single step. Each ends when its step does.
+        What this agent did: tasks Clem handed it from a chat or an automation. Each one ends when its task does.
       </p>
-      {work.isError && <p role="status" className="mt-2 text-caption text-warning">{work.data ? 'Helper runs couldn’t refresh. Showing the last loaded list.' : 'Helper runs couldn’t load.'} <button type="button" className="font-semibold underline" onClick={() => void work.refetch()}>Retry</button></p>}
+      {work.isError && <p role="status" className="mt-2 text-caption text-warning">{work.data ? 'Work couldn’t refresh. Showing the last loaded list.' : 'Work couldn’t load.'} <button type="button" className="font-semibold underline" onClick={() => void work.refetch()}>Retry</button></p>}
       {workers.length === 0 ? (
         <p className="mt-1 text-caption text-muted">
-          {work.isLoading ? 'Looking…' : work.isError ? 'Try loading helper runs again.' : 'None yet.'}
+          {work.isLoading ? 'Looking…' : work.isError ? 'Try loading this agent’s work again.' : 'None yet.'}
         </p>
       ) : (
         <ul className="mt-1.5 flex flex-col gap-1.5">
@@ -686,6 +696,11 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
                 {isOpen && (
                   <div className="border-t border-border/60 px-2.5 py-2">
                     <HelperOutput worker={w} />
+                    {w.parentKind === 'session' && w.parentRunId ? (
+                      <Link to={`/chat/${encodeURIComponent(unifiedChatSessionId(w.parentRunId))}`} className="mt-2 inline-block text-caption font-semibold text-primary hover:underline">
+                        Open the chat Clem handed this from
+                      </Link>
+                    ) : null}
                   </div>
                 )}
               </li>
