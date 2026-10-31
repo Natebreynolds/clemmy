@@ -517,7 +517,7 @@ test('an approval decision on another card does not supersede the resumed task\'
 test('a queued twin of a direct call already parked on a card gets no second card; another file or account keeps its own', () => {
   const slug = 'FIXTURE_DRIVE_DELETE_FILE';
   const fileArgs = (fileId: string) => JSON.stringify({ fileId, supportsAllDrives: true });
-  const scenario = (queuedFile: string, queuedAccount: string) => {
+  const scenario = (queuedFile: string, queuedAccount: string, queuedSlug = slug, queuedTool = 'composio_execute_tool') => {
     const session = createSession({ kind: 'chat', channel: 'discord' });
     const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received',
       data: { text: 'Delete the TEST FIXTURE sheet.' } });
@@ -530,8 +530,10 @@ test('a queued twin of a direct call already parked on a card gets no second car
       consentCall: { effect: 'external_write', accountId: 'ca_fixture_one' } } });
     // The same request also queued a delete.
     const record = queuePendingAction({ title: 'Delete the TEST FIXTURE sheet', summary: 'Delete only the TEST FIXTURE file.',
-      kind: 'external_write', toolName: 'composio_execute_tool',
-      payload: { tool_slug: slug, arguments: fileArgs(queuedFile), connected_account_id: queuedAccount }, sessionId: session.id });
+      kind: 'external_write', toolName: queuedTool,
+      payload: queuedTool === 'composio_execute_tool'
+        ? { tool_slug: queuedSlug, arguments: fileArgs(queuedFile), connected_account_id: queuedAccount }
+        : { command: `rm -f ${queuedFile}`, connected_account_id: queuedAccount }, sessionId: session.id });
     appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'autonomy_note', data: {
       kind: 'pending_action_queued', pendingActionId: record.id, actionKind: record.kind, approvalRequired: true,
       payloadHash: record.payloadHash, sourceUserSeq: source.seq, callId: 'queue-twin', approvalIntent: 'request_now', autoMaterialize: true } });
@@ -553,4 +555,12 @@ test('a queued twin of a direct call already parked on a card gets no second car
   const otherAccount = scenario('TEST-FIXTURE-FILE', 'ca_fixture_two');
   assert.equal(otherAccount.materialized.length, 1, 'a different account keeps its own card');
   assert.equal(getPendingAction(otherAccount.record.id)?.status, 'approval_requested');
+
+  const otherOperation = scenario('TEST-FIXTURE-FILE', 'ca_fixture_one', 'FIXTURE_DRIVE_TRASH_FILE');
+  assert.equal(otherOperation.materialized.length, 1, 'a different operation on the same file keeps its own card');
+  assert.equal(getPendingAction(otherOperation.record.id)?.status, 'approval_requested');
+
+  const otherCapability = scenario('TEST-FIXTURE-FILE', 'ca_fixture_one', slug, 'run_shell_command');
+  assert.equal(otherCapability.materialized.length, 1, 'the same target through another capability keeps its own card');
+  assert.equal(getPendingAction(otherCapability.record.id)?.status, 'approval_requested');
 });
