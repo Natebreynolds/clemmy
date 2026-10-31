@@ -22,3 +22,15 @@ test('the resume lane check-in runs under the parked business request, never the
   assert.match(run, /sourceUserSeq: continuationSourceUserSeq, runAttemptId/);
   assert.doesNotMatch(run, /sourceUserSeq: (resumedSourceUserSeq|activeSourceUserSeq), runAttemptId/);
 });
+
+test('a resumed run sends its stored history compacted, as a live turn does', () => {
+  const start = SOURCE.indexOf('export async function resumePendingApproval(');
+  assert.ok(start > 0, 'the resume path is where it was');
+  const filter = SOURCE.slice(start).slice(0, 40_000);
+  const at = filter.indexOf('callModelInputFilter:');
+  assert.ok(at > 0, 'the resume path installs a model input filter');
+  const body = filter.slice(at, at + 1_500);
+  assert.match(body, /compactInFlightToolContext\(args\.modelData\.input/);
+  assert.match(body, /inFlightCompactionEnabled\(\)/, 'the same switch governs it');
+  assert.match(body, /resumeMemoryPrimer\?\.text/, 'the memory primer still rides along');
+});

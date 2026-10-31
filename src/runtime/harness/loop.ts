@@ -14212,7 +14212,24 @@ export async function resumePendingApproval(
     // the stall as an error (the user re-sends) instead of silently duplicating.
     disablePreContentRetry: true,
     ...(hostApprovalIds.length > 0 ? { hostApprovalIds } : {}),
-    ...(resumeMemoryPrimer?.text ? { callModelInputFilter: memoryPrimerInputFilter(resumeMemoryPrimer.text) } : {}),
+    // The resumed run replays the paused turn's whole stored history. The live
+    // turn sent that history compacted (its callModelInputFilter); without the
+    // same compaction here the resumed step re-sent every raw tool result, cold
+    // (live 2026-10-31: 258k tokens at 0% cached to send one approved email).
+    // The newest pairs, the approved call among them, are always retained.
+    callModelInputFilter: (args: { modelData: { input: AgentInputItem[]; instructions?: string } }) => {
+      const routedModelId = typeof (options.agent as { model?: unknown })?.model === 'string'
+        ? (options.agent as { model: string }).model : undefined;
+      const compacted = inFlightCompactionEnabled()
+        ? compactInFlightToolContext(args.modelData.input, options.sessionId,
+          inFlightCompactionThresholds((key) => getRuntimeEnv(key, '') || undefined, routedModelId))
+        : null;
+      const input = compacted?.applied ? compacted.nextItems : args.modelData.input;
+      return {
+        input: resumeMemoryPrimer?.text ? [...input, { role: 'system', content: resumeMemoryPrimer.text } as AgentInputItem] : input,
+        instructions: args.modelData.instructions,
+      };
+    },
   };
 
   try {
