@@ -16,6 +16,7 @@
  */
 
 const path = require('node:path');
+const { stapleWithRetry, isStapleFailure } = require('./staple-with-retry.cjs');
 
 exports.default = async function notarizing(context) {
   if (process.env.APPLE_NOTARIZE_SKIP === 'true') {
@@ -53,11 +54,18 @@ exports.default = async function notarizing(context) {
   const start = Date.now();
   // @electron/notarize v3 removed the legacy `tool` option — notarytool is the
   // only path now; passing the old key throws on validation.
-  await notarizeFn({
-    appPath,
-    appleId,
-    appleIdPassword: applePassword,
-    teamId,
-  });
+  try {
+    await notarizeFn({
+      appPath,
+      appleId,
+      appleIdPassword: applePassword,
+      teamId,
+    });
+  } catch (err) {
+    // Notarized, but its own staple could not reach Apple: retry the staple.
+    if (!isStapleFailure(err)) throw err;
+    console.log(`  [notarize] ${appName}.app notarized; ${err.message}`);
+    await stapleWithRetry(appPath);
+  }
   console.log(`  [notarize] notarized + stapled in ${Math.round((Date.now() - start) / 1000)}s`);
 };

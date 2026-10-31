@@ -407,6 +407,29 @@ test('the universal npm package does not publish host-dependent Whisper binaries
   assert.ok(rootPackage.files.includes('vendor/uv'));
 });
 
+test('stapling retries a lost connection to Apple and never retries another failure', async () => {
+  const { createRequire } = await import('node:module');
+  const { stapleWithRetry, isStapleFailure } = createRequire(import.meta.url)('../apps/desktop/build/staple-with-retry.cjs');
+  const run = async (statuses, options = {}) => {
+    const calls = [];
+    const queue = [...statuses];
+    const attempts = await stapleWithRetry('Fixture.dmg', { attempts: 4, waitMs: 1, sleep: async () => {}, log: () => {}, ...options,
+      spawn: (cmd, args) => { calls.push(args[1]); return { status: queue.shift() ?? 0 }; } });
+    return { attempts, calls };
+  };
+  assert.deepEqual(await run([68, 68, 0, 0]), { attempts: 3, calls: ['staple', 'staple', 'staple', 'validate'] });
+  assert.deepEqual(await run([0, 65, 0, 0]), { attempts: 2, calls: ['staple', 'validate', 'staple', 'validate'] },
+    'a ticket not yet published is retried too');
+  await assert.rejects(run([1]), /stapling Fixture\.dmg failed with status 1/, 'any other status stops at once');
+  await assert.rejects(run([68, 68, 68, 68]), /failed with status 68/, 'the retries are bounded');
+  assert.equal(isStapleFailure(new Error('Failed to staple your application with code: 68')), true);
+  assert.equal(isStapleFailure(new Error('Notarization failed: Invalid')), false, 'a rejected notarization is never treated as a staple problem');
+  for (const hook of [dmgHookText, readFileSync(new URL('../apps/desktop/build/notarize.cjs', import.meta.url), 'utf-8')]) {
+    assert.match(hook, /stapleWithRetry\(/);
+    assert.match(hook, /if \(!isStapleFailure\(err\)\) throw err;/);
+  }
+});
+
 test('DMGs are signed before electron-builder disposes its temporary keychain', () => {
   assert.equal(desktopPackage.build?.dmg?.sign, true);
   assert.doesNotMatch(dmgHookText, /find-identity|\['--sign'/);

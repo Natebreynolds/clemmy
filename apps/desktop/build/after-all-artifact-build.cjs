@@ -42,6 +42,7 @@
 
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { stapleWithRetry, isStapleFailure } = require('./staple-with-retry.cjs');
 
 function run(cmd, args, opts = {}) {
   const result = spawnSync(cmd, args, { stdio: 'inherit', ...opts });
@@ -99,18 +100,23 @@ exports.default = async function afterAllArtifactBuild({ artifactPaths }) {
 
     console.log(`  [notarize-dmg] uploading ${filename} to Apple notary service (this can take a few minutes)…`);
     const start = Date.now();
-    await notarizeFn({
-      appPath: dmgPath,
-      appleId,
-      appleIdPassword: applePassword,
-      teamId,
-    });
+    try {
+      await notarizeFn({
+        appPath: dmgPath,
+        appleId,
+        appleIdPassword: applePassword,
+        teamId,
+      });
+    } catch (err) {
+      // Notarized, but its own staple could not reach Apple: staple below.
+      if (!isStapleFailure(err)) throw err;
+      console.log(`  [notarize-dmg] ${filename} notarized; ${err.message}`);
+    }
     // @electron/notarize calls `xcrun stapler staple` for .app and .pkg,
-    // but on some versions it skips DMGs. Run it explicitly so the
-    // ticket is embedded in the DMG header — required for Gatekeeper
-    // when the user is offline.
-    run('xcrun', ['stapler', 'staple', dmgPath]);
-    run('xcrun', ['stapler', 'validate', dmgPath]);
+    // but on some versions it skips DMGs. Staple explicitly (retrying a
+    // lost connection to Apple) so the ticket is embedded in the DMG
+    // header — required for Gatekeeper when the user is offline.
+    await stapleWithRetry(dmgPath);
     console.log(`  [notarize-dmg] ${filename} signed + notarized + stapled in ${Math.round((Date.now() - start) / 1000)}s`);
   }
 
