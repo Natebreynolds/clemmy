@@ -85,3 +85,12 @@ test('authored result wording enriches the same closed card and preserves execut
   assert.match(html, /Raw &lt;fixture&gt; evidence/);
   assert.doesNotMatch(html, />Approve<|>Decline<|Execute queued action|Edit by hand/);
 });
+
+test('a decided card keeps the question Clem asked, not the operation name', () => {
+  const decided = { subject: 'cua-driver__type_text', approvalId: 'apr-render-ask', resolution: 'approved' as const,
+    preview: { ask: 'Can I type the TEST FIXTURE line into the open note?' } } as NonNullable<ChatMessage['approval']>;
+  const html = render({ approval: decided });
+  assert.match(html, /Can I type the TEST FIXTURE line into the open note\?/);
+  assert.doesNotMatch(html, /cua-driver__type_text/);
+  assert.match(render({ approval: { ...decided, preview: undefined } }), /cua-driver__type_text/, 'no question: the subject as before');
+});

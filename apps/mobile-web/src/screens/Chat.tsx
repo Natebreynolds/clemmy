@@ -1258,9 +1258,11 @@ function MessageRow({
   if (hiddenCardDecision(message)) return null;
 
   if (message.approval) {
+    // A decided card keeps the question Clem asked, not the operation's name.
+    const decidedHead = (!message.approval.preview?.items && message.approval.preview?.ask) || message.approval.subject;
     if (message.approval.resolution === 'cancelled') return (
       <div class="turn turn-approval" role="status">
-        <div class="approval-head">{message.approval.subject}</div>
+        <div class="approval-head">{decidedHead}</div>
         <div class="approval-reason">Approval closed</div>
         <ApprovalResult result={approvalResult} closed />
       </div>
@@ -1269,7 +1271,7 @@ function MessageRow({
     if (!message.approval.queued
       && (message.approval.resolution === 'approved' || message.approval.resolution === 'declined')) return (
       <div class="turn turn-approval" role="status">
-        <div class="approval-head">{message.approval.subject}</div>
+        <div class="approval-head">{decidedHead}</div>
         <div class="approval-reason">{message.approval.resolution === 'approved' ? 'Approved' : 'Declined'}</div>
         <ApprovalResult result={approvalResult} closed />
       </div>

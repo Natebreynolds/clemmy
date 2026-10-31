@@ -122,7 +122,8 @@ export function ApprovalResult({ approval, observed }: { approval: NonNullable<C
   return (
     <div className="min-w-0 rounded-xl border border-border bg-surface px-4 py-3">
       <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-        <span className="break-words text-body text-fg">{approval.subject}</span>
+        {/* A decided card keeps the question Clem asked, not the operation's name. */}
+        <span className="break-words text-body text-fg">{(!approval.preview?.items && approval.preview?.ask) || approval.subject}</span>
         <span className="text-caption text-muted">{approval.resolution ? labels[approval.resolution] : 'Approval recorded'}</span>
       </div>
       {presentation?.mode === 'durable' && <div className="mt-2 min-w-0" role="status">
