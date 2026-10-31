@@ -78,7 +78,9 @@ completion.registerCarrierCompleter((argumentsJson) => {
   return { argumentsJson: JSON.stringify({ ...rest, args_json: JSON.stringify(args) }), toolSlug: outer.name, changes: ['args renamed to args_json'] };
 });
 
-async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean; deferredAcrossSources?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown; existingSourceSeq?: number }) {
+async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 'draft' | 'send' | 'delete' | 'admin' | 'opaque' | 'bounded' = 'draft', suffix = '', uncertain = false, outerShape: 'args_json' | 'args' = 'args_json', writeCount = 1, providerFixture?: { operationId: string; schema: Record<string, unknown>; payloads: Record<string, unknown>[]; singleFrame?: boolean;
+  /** What the model answers after its writes, one step per entry (the last repeats). */
+  afterWrite?: readonly (readonly unknown[])[]; deferredAcrossSources?: boolean; preparationFailure?: boolean; carrierRepresentation?: 'gateway_object' | 'gateway_string' | 'gateway_alias'; taskMode?: { version: 1; kind: 'plan' }; result?: unknown; existingSourceSeq?: number }) {
   const inputSchema = providerFixture?.schema ?? INPUT_SCHEMA;
   const payloadForWrite = (ordinal: number): Record<string, unknown> => providerFixture?.payloads[ordinal - 1]
     ?? (writeCount === 1 ? ARGS : { body: `${ARGS.body} Item ${ordinal}.` });
@@ -193,7 +195,10 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
     async getResponse(request: { tools?: Array<{ name?: string }>; input?: unknown }) {
       modelCalls += 1;
       modelInputs.push(request.input);
-      assert.ok(request.tools?.some((entry) => entry.name === carrierName), JSON.stringify(request.tools?.map(t => t.name)));
+      // A scripted after-write step may be the host's tool-free check-in.
+      if (!(providerFixture?.afterWrite && modelCalls > writeCount)) {
+        assert.ok(request.tools?.some((entry) => entry.name === carrierName), JSON.stringify(request.tools?.map(t => t.name)));
+      }
       if (modelCalls === 1) {
         // Same shape as the tag canary: exact live capability is ready only
         // after the model request froze its empty catalog. Never make a plan.
@@ -202,6 +207,11 @@ async function directWriteFixture(carrierName: 'call_tool' | 'work_call', kind: 
       const ordinals = providerFixture?.singleFrame
         ? (modelCalls === 1 ? Array.from({ length: writeCount }, (_, index) => index + 1) : [])
         : (modelCalls <= writeCount ? [modelCalls] : []);
+      const after = providerFixture?.afterWrite;
+      if (ordinals.length === 0 && after?.length) {
+        const step = after[Math.min(modelCalls - writeCount - 1, after.length - 1)] ?? [];
+        return { responseId: `direct-write-${carrierName}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, output: [...step] };
+      }
       return { responseId: `direct-write-${carrierName}-${modelCalls}`, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
         output: ordinals.length > 0
           ? ordinals.map(ordinal => ({ type: 'function_call', callId: writeCount === 1 ? 'exact-draft' : `exact-draft-${ordinal}`, name: carrierName, arguments: JSON.stringify(modelArgumentsForOrdinal(ordinal)) }))
@@ -346,6 +356,58 @@ test('the production approval wrapper rebuilds the original host source and cont
   assert.match(JSON.stringify(terminal?.data), /The draft was created/);
   const settlements = eventlog.openEventLog().prepare('SELECT source_user_seq, outcome_kind FROM logical_call_settlements WHERE session_id = ? AND mutating = 1').all(fixture.session.id) as any[];
   assert.deepEqual(settlements.map(row => [row.source_user_seq, row.outcome_kind]), [[fixture.source.seq, 'succeeded']]);
+});
+
+// Approval -> resume -> no progress (live 2026-10-31). The approved write
+// dispatches once; when the resumed turn then stops making progress, the
+// one-request check-in runs under the parked business request, never the
+// synthetic approval answer (which provenance refuses as
+// accepted_source_missing), and Clem's words, not the host sentence, end it.
+test('a resumed run that stops for lack of progress is explained by Clem under the business request, and its write runs once', async () => {
+  const bad = (step: string) => [1, 2, 3, 4].map((n) => ({ type: 'function_call', callId: `stuck-${step}${n}`, name: 'save_note', arguments: JSON.stringify({ id: `n${n}` }) }));
+  const stuck = 'I wrote the TEST FIXTURE draft, but my note tool keeps refusing every call. Should I keep the notes in a workspace file instead?';
+  const fixture = await directWriteFixture('work_call', 'opaque', 'resume-no-progress', false, 'args_json', 1, {
+    operationId: 'RESUME_NO_PROGRESS_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS],
+    afterWrite: [bad('a'), bad('b'), bad('c'), [{ type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: JSON.stringify({ summary: stuck, reply: stuck, done: true, nextAction: 'completed', reason: null }) }] }]],
+  });
+  assert.ok(fixture);
+  const { runConversation, runConversationFromResume } = await import('./loop.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const agent = await fixture.useProductionAgent();
+  const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(paused.status, 'awaiting_approval', JSON.stringify(paused));
+  const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  assert.ok(approval);
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'resume-no-progress-fixture').ok, true);
+  const resumed = await runConversationFromResume({ sessionId: fixture.session.id,
+    approvalId: approval.approvalId, decision: 'approve', resolver: 'resume-no-progress-fixture', turnEngine: 'host_v1',
+    makeRunner: () => fixture.runner as never, maxTurns: 8,
+    judgeFn: async () => ({ done: true, reason: 'fixture' }),
+    buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+      ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+      model: fixture.model as never, allowToolJit: true,
+    }),
+  });
+  const trail = () => JSON.stringify({ resumed, counts: fixture.counts(), events: eventlog.listEvents(fixture.session.id, {}).slice(-30)
+    .map((event) => [event.type, String(event.data.kind ?? event.data.reason ?? event.data.error ?? '').slice(0, 100)]),
+    failed: eventlog.listEvents(fixture.session.id, { types: ['run_failed'] }).map((event) => event.data),
+    checkIn: eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).map((event) => event.data).filter((row: any) => String(row.kind).startsWith('no_progress_check_in')) });
+  assert.equal(fixture.counts().providerCalls, 1, `the approved write dispatched exactly once: ${trail()}`);
+  const failures = eventlog.listEvents(fixture.session.id, { types: ['run_failed'] }).map((event) => String(event.data.error ?? ''));
+  assert.equal(failures.some((error) => /accepted_source_missing/.test(error)), false, trail());
+  const guards = eventlog.listEvents(fixture.session.id, { types: ['guardrail_tripped'] }).map((event) => event.data as Record<string, unknown>);
+  const asked = guards.find((row) => row.kind === 'no_progress_check_in');
+  const result = guards.find((row) => row.kind === 'no_progress_check_in_result');
+  assert.ok(asked && result, `the resumed turn stopped for lack of progress and checked in: ${trail()}`);
+  assert.notEqual(result!.status, 'failed', trail());
+  assert.match(JSON.stringify(fixture.modelInputs.at(-1)), /TEST|draft|Prepared/i, 'the check-in reads the business request');
+  const ending = eventlog.listEvents(fixture.session.id, { types: ['conversation_completed'] }).at(-1);
+  assert.match(JSON.stringify(ending?.data ?? {}), /keeps refusing every call/, 'her words end the turn');
+  assert.doesNotMatch(JSON.stringify(ending?.data ?? {}), /Stopped at: execution/, 'never the host sentence');
 });
 
 // Owner, 2026-09-25: a waiting card should be something you can change in
