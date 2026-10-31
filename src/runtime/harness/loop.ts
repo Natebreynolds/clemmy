@@ -59,6 +59,10 @@ import {
 import { uncompensatedExternalWriteEvents } from './external-write-admission.js';
 import {
   acceptUserInputForRun,
+  beginRunAttempt,
+  finishRunAttempt,
+  recordRunAttemptUserInput,
+  type RunAttemptRef,
   appendConversationPreambleOnce,
   conversationPreambleDeliveryRequest,
   appendAsyncWorkDispatchBatchClosedOnce,
@@ -887,6 +891,8 @@ type ResumeConversationInput = {
   sourceUserSeq?: number;
   approvalId?: string;
   decision: 'approve' | 'reject' | 'approve_with_edits';
+  /** The caller's own attempt (a typed answer's bridge brings one). */
+  runAttemptId?: string;
 };
 
 function requireExactDurableResumeApproval(
@@ -956,9 +962,23 @@ function existingResumeConversationSource(opts: ResumeConversationInput): EventR
   return alreadyAccepted ?? null;
 }
 
-function acceptResumeConversationInput(opts: ResumeConversationInput): number {
+/**
+ * A tap (desktop, phone, Discord, the approval drain) brings no attempt of its
+ * own, unlike a typed answer whose bridge does. The resume then owns one,
+ * made the way a typed answer's is: the approval's input is recorded under it,
+ * the resumed steps and their review run under it, and it is finished with
+ * the turn. Without it every review after a tapped approval failed open as
+ * owner_unavailable (live 2026-10-31).
+ */
+function acceptResumeConversationInput(opts: ResumeConversationInput): { seq: number; attempt?: RunAttemptRef } {
   const existing = existingResumeConversationSource(opts);
-  if (existing) return acceptExistingConversationInput(opts.sessionId, existing.seq);
+  if (existing) return { seq: acceptExistingConversationInput(opts.sessionId, existing.seq) };
+  const accept = (input: Omit<AppendEventInput, 'type'>): { seq: number; attempt?: RunAttemptRef } => {
+    if (opts.runAttemptId) return { seq: acceptUserInputForRun(input).seq };
+    const attempt = beginRunAttempt(opts.sessionId, { runId: `approval-resume:${randomUUID()}` });
+    const { sessionId: _sessionId, ...recorded } = input;
+    return { seq: recordRunAttemptUserInput(attempt, recorded, { armRunInFlight: true }).seq, attempt };
+  };
 
   const explicitApprovalId = opts.approvalId?.trim();
   if (explicitApprovalId) {
@@ -966,7 +986,7 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
     // resumePendingApproval independently matches it to serialized tool bytes.
     const row = getSession(opts.sessionId);
     if (!row) throw new Error(`unknown session: ${opts.sessionId}`);
-    return acceptUserInputForRun({
+    return accept({
       sessionId: opts.sessionId,
       turn: nextTurnNumber(row),
       role: 'user',
@@ -982,7 +1002,7 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
         decision: opts.decision,
         approvalId: explicitApprovalId,
       },
-    }).seq;
+    });
   }
 
   const row = getSession(opts.sessionId);
@@ -991,7 +1011,7 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
   // accepted control edge explicitly so the resumed public terminal gets a new
   // durable idempotency key instead of overwriting the request that opened the
   // approval card. Synthetic keeps this control text out of the user transcript.
-  return acceptUserInputForRun({
+  return accept({
     sessionId: opts.sessionId,
     turn: nextTurnNumber(row),
     role: 'user',
@@ -1002,11 +1022,20 @@ function acceptResumeConversationInput(opts: ResumeConversationInput): number {
       decision: opts.decision,
       ...(opts.approvalId ? { approvalId: opts.approvalId } : {}),
     },
-  }).seq;
+  });
 }
 
 /** Narrow test seam for exact approval-response source ownership. */
-export const _acceptResumeConversationInputForTest = acceptResumeConversationInput;
+export const _acceptResumeConversationInputForTest = (opts: ResumeConversationInput): number =>
+  acceptResumeConversationInput(opts).seq;
+
+/** The resume's own attempt ends with its turn, as a bridged answer's does. */
+function finishOwnedResumeAttempt(attempt: RunAttemptRef, sourceUserSeq: number, status: string | undefined): void {
+  const finished = status === 'killed' || status === 'cancelled' ? 'cancelled'
+    : status === 'failed' || status === 'blocked' ? 'failed' : 'completed';
+  try { finishRunAttempt(attempt, finished); } catch { /* the terminal remains authoritative */ }
+  try { clearRunInFlightAfterTerminal(attempt.sessionId, attempt.attemptId, sourceUserSeq); } catch { /* compatibility only */ }
+}
 
 /** Read-only display evidence. A numeric turn, question or card never grants
  * dispatch authority. Only the exact accepted source, or its existing verified
@@ -14568,11 +14597,21 @@ export async function runConversationFromResume(
     const replay = replayedRunConversationResult(source);
     if (replay) return replay;
   }
-  const sourceUserSeq = acceptResumeConversationInput(opts);
+  const accepted = acceptResumeConversationInput(opts);
+  const sourceUserSeq = accepted.seq;
   const key = `${opts.sessionId}:${sourceUserSeq}`;
   const prior = activeHostConversations.get(key);
   if (prior) return prior;
-  const owned = Promise.resolve().then(() => runConversationFromResumeOwned({ ...opts, sourceUserSeq }));
+  const ownAttempt = accepted.attempt;
+  const owned = Promise.resolve().then(() => runConversationFromResumeOwned({ ...opts, sourceUserSeq,
+    ...(ownAttempt ? { runAttemptId: ownAttempt.attemptId } : {}) }))
+    .then((result) => {
+      if (ownAttempt) finishOwnedResumeAttempt(ownAttempt, sourceUserSeq, result.status);
+      return result;
+    }, (error: unknown) => {
+      if (ownAttempt) finishOwnedResumeAttempt(ownAttempt, sourceUserSeq, 'failed');
+      throw error;
+    });
   activeHostConversations.set(key, owned);
   try { return await owned; }
   finally { if (activeHostConversations.get(key) === owned) activeHostConversations.delete(key); }
@@ -14640,7 +14679,8 @@ async function runConversationFromResumeOwned(opts: {
     const replay = replayedRunConversationResult(replaySource);
     if (replay) return replay;
   }
-  const sourceUserSeq = acceptResumeConversationInput(opts);
+  // The outer entry already accepted this source (and owns any attempt).
+  const sourceUserSeq = acceptResumeConversationInput(opts).seq;
   let resumeAgentSourceUserSeq = sourceUserSeq;
   const checkpointActivation = readApprovalRecoveryActivation(opts.sessionId);
   const checkpointContinuation = checkpointActivation && checkpointActivation.sourceUserSeq === sourceUserSeq

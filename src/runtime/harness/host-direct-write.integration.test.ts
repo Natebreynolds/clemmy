@@ -358,6 +358,55 @@ test('the production approval wrapper rebuilds the original host source and cont
   assert.deepEqual(settlements.map(row => [row.source_user_seq, row.outcome_kind]), [[fixture.source.seq, 'succeeded']]);
 });
 
+// A tapped approval (no attempt of its own) resumes under an attempt the
+// resume owns, as a typed answer's bridge provides: the resumed model steps,
+// and so their review, run under it, and it is finished with the turn
+// (live 2026-10-31: every review after a tap failed open, owner_unavailable).
+test('a tapped approval resumes under its own attempt, which the steps run under and the turn finishes', async () => {
+  const fixture = await directWriteFixture('work_call', 'opaque', 'tap-attempt', false, 'args_json', 1, {
+    operationId: 'TAP_ATTEMPT_WRITE', schema: INPUT_SCHEMA, payloads: [ARGS],
+  });
+  assert.ok(fixture);
+  const { runConversation, runConversationFromResume } = await import('./loop.js');
+  const { buildOrchestratorAgentForApprovalResume } = await import('../../agents/orchestrator.js');
+  const { modelUsageAttributionStorage } = await import('../usage-log.js');
+  const agent = await fixture.useProductionAgent();
+  const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
+    sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
+    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+  assert.equal(paused.status, 'awaiting_approval');
+  const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
+  assert.equal(approvals.resolve(approval.approvalId, 'approved', 'tap-fixture').ok, true);
+  const seen: Array<string | undefined> = [];
+  const original = fixture.model.getResponse;
+  fixture.model.getResponse = async (request: never) => {
+    seen.push(modelUsageAttributionStorage.getStore()?.attemptId);
+    return original.call(fixture.model, request);
+  };
+  const resumed = await runConversationFromResume({ sessionId: fixture.session.id,
+    approvalId: approval.approvalId, decision: 'approve', resolver: 'tap-fixture', turnEngine: 'host_v1',
+    makeRunner: () => fixture.runner as never, maxTurns: 3,
+    judgeFn: async () => ({ done: true, reason: 'fixture operation completed' }),
+    buildAgent: identity => buildOrchestratorAgentForApprovalResume({
+      sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq, acceptedRoute: identity.route,
+      ...('hostFreshPlanning' in identity ? { hostFreshPlanning: identity.hostFreshPlanning as never } : {}),
+      model: fixture.model as never, allowToolJit: true,
+    }),
+  });
+  assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
+  assert.equal(fixture.counts().providerCalls, 1);
+  const resumeSource = eventlog.listEvents(fixture.session.id, { types: ['user_input_received'] })
+    .find((event) => event.data.source === 'approval_resume' && event.data.approvalId === approval.approvalId);
+  assert.ok(resumeSource, 'the tap is recorded as the resume source');
+  const attempt = eventlog.getRunAttemptBySourceUserSeq(fixture.session.id, resumeSource!.seq);
+  assert.ok(attempt, 'the resume owns an attempt bound to its source');
+  assert.ok(seen.length > 0 && seen.every((id) => id === attempt!.attemptId),
+    `the resumed model steps run under that attempt: ${JSON.stringify({ seen, attempt: attempt!.attemptId })}`);
+  assert.ok(attempt!.finishedAt, 'the attempt is finished with the turn');
+  const metadata = eventlog.getSession(fixture.session.id)?.metadata as Record<string, unknown> | undefined;
+  assert.equal(metadata?.__run_in_flight_owner ?? null, null, 'no run-in-flight owner is left behind');
+});
+
 // Approval -> resume -> no progress (live 2026-10-31). The approved write
 // dispatches once; when the resumed turn then stops making progress, the
 // one-request check-in runs under the parked business request, never the
