@@ -93,3 +93,26 @@ test('Clem\'s own question, posted through the real question path, carries the k
   assert.equal(asked?.data.question, question, 'Clem\'s words stay her own');
   assert.deepEqual(asked?.data.keyRequest, { server: 'weather-fixture', keys: ['TEST_FIXTURE_WEATHER_KEY'] });
 });
+
+test('a status read during the request counts when it shows exactly one server missing a key', () => {
+  const both = request('key-status-both', [{ tool: 'mcp_status' }]);
+  assert.equal(observedMcpKeyRequestForSource({ sessionId: 'key-status-both', sourceUserSeq: both }), null,
+    'two servers missing keys: the question cannot say which');
+  writeFileSync(MCP_SERVERS_FILE, JSON.stringify({
+    'weather-fixture': { command: 'node', args: ['weather.js'], env: { TEST_FIXTURE_WEATHER_KEY: '' } },
+    'ready-fixture': { command: 'node', args: ['ready.js'] },
+  }));
+  invalidateMcpServerDiscoveryCache();
+  try {
+    const one = request('key-status-one', [{ tool: 'call_tool', args: { name: 'mcp_status' } }, { tool: 'mcp_status' }]);
+    assert.deepEqual(observedMcpKeyRequestForSource({ sessionId: 'key-status-one', sourceUserSeq: one }),
+      { server: 'weather-fixture', keys: ['TEST_FIXTURE_WEATHER_KEY'] });
+  } finally {
+    writeFileSync(MCP_SERVERS_FILE, JSON.stringify({
+      'weather-fixture': { command: 'node', args: ['weather.js'], env: { TEST_FIXTURE_WEATHER_KEY: '' } },
+      'notes-fixture': { command: 'node', args: ['notes.js'], env: { TEST_FIXTURE_NOTES_KEY: '' } },
+      'ready-fixture': { command: 'node', args: ['ready.js'] },
+    }));
+    invalidateMcpServerDiscoveryCache();
+  }
+});
