@@ -11622,6 +11622,53 @@ test('a revision that still carries a quoted claim is reviewed again', async () 
   } finally { _setHostObjectiveJudgeForTests(null); }
 });
 
+test('a reworded reply that still makes the rejected claim, with no new call, gets the finding back once, not a fresh full review', async () => {
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const draft = 'Kernel is the chosen browser. Both providers are connected with live credentials.';
+  const reworded = 'Kernel is the chosen browser, and both providers are live and connected.';
+  const honest = 'Kernel is the chosen browser. Credentials are configured; no connection was tested.';
+  const finding = '(1) "connected with live credentials" overstates the evidence: nothing was tested.';
+  const reviewed: string[] = [];
+  const asked: string[] = [];
+  _setHostObjectiveJudgeForTests(async (_objective, reply) => {
+    reviewed.push(reply);
+    return reviewed.length === 1
+      ? { done: false, repairScope: 'claims', reason: finding } as never
+      : { done: true, reason: 'The reply matches the evidence.' } as never;
+  });
+  jevClient._setTypesafeKeyForTests('ts_test');
+  jevClient._setSystemOneFetchForTests(async (_url, init) => {
+    const body = JSON.parse(String(init.body)) as { questions: Record<string, unknown>; state: Record<string, string> };
+    if (!body.questions.repeated) return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {}, usage: { input_tokens: 1, output_tokens: 1 } }) };
+    asked.push(body.state.newReply);
+    const choice = body.state.newReply === reworded ? 'repeats' : 'resolves';
+    return { status: 200, ok: true, text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: {
+      repeated: { type: 'choice', choice, confidence: 0.95, probabilities: { [choice]: 0.95 } },
+    }, usage: { input_tokens: 40, output_tokens: 2 } }) };
+  });
+  try {
+    const fixture = acceptJudgedSource('claims-repeated-once',
+      'Write a browser snapshot from this supplied record: Kernel selected; credentials configured but untested.');
+    const model = scriptedRecordingModel([[textMsg(draft)], [textMsg(reworded)], [textMsg(honest)]]);
+    const agent = { model, tools: [] };
+    bindHostCanarySurface(fixture, agent, []);
+    const outcome = await runJudgedHost(fixture, agent, true);
+    assert.deepEqual(reviewed, [draft, honest], 'the reworded claim never reached a second full review');
+    assert.deepEqual(asked, [reworded], 'Jev was asked about the reworded reply only');
+    assert.equal(String(outcome.finalOutput), honest);
+    const handedBack = JSON.stringify(model.requests[2]);
+    assert.match(handedBack, /still states what this finding rejected, with no new evidence/);
+    assert.ok(handedBack.includes('overstates the evidence'), 'the same finding goes back with it');
+    const verdicts = eventlog.listEvents(fixture.session.id, { types: ['goal_alignment_judged'] });
+    assert.equal(verdicts.filter((event) => event.data.repeatedRejectedClaim === true).length, 1);
+    assert.equal(verdicts.at(-1)!.data.fulfills, true);
+  } finally {
+    _setHostObjectiveJudgeForTests(null);
+    jevClient._setTypesafeKeyForTests(undefined);
+    jevClient._setSystemOneFetchForTests(undefined);
+  }
+});
+
 test('changed replies cannot waive unsupported paraphrases, missing deliverables or rejected format examples', async () => {
   const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
   const cases = [

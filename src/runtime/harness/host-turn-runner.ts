@@ -18,6 +18,7 @@ import { ARGUMENT_CORRECTION_APPLIED, loadArgumentCorrections } from '../../memo
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
 import { activationAttemptForRequest, assertRecoveryActivationOwned } from './recovery-activation.js';
+import { classifyRepeatedRejectedClaimWithJev } from '../jev/control-plane.js';
 import { CompletionReviewSupersededError, reviewWithOwnerSteering } from './completion-review-steering.js';
 import { registerReviewAfterDelivery, replyEndsOnQuestion, reviewAfterDeliveryCorrectionDirective } from './review-after-delivery.js';
 import {
@@ -2195,6 +2196,9 @@ export function hostCompletionReviewFeedbackContext(feedback: HostCompletionRevi
         + 'If a question is still necessary, re-author the current ask_user_question with its applicable structured options; replace or discard the prior wording and choices when the current objective or finding requires it. '
         + 'Do not preserve a rejected question or its order merely because it appeared in the prior reply. '
       : 'Keep unaffected sentences unchanged. ')
+    + (feedback.repeatedClaimReturned
+      ? 'Your newer reply below still states what this finding rejected, with no new evidence. Correct or drop that claim, or say plainly that it is not confirmed. '
+      : '')
     + 'Do not replay settled work to satisfy a review finding. '
     + 'Recompute required figures from the retained results (query them) instead of estimating them again. '
     + COMPLETION_REPAIR_GUIDANCE + '\n'
@@ -4878,6 +4882,37 @@ const runHostTurnBody = async (
       }, 'host completion judge');
       if (carried.questionProposal) return 'awaiting_user_input';
       return 'done';
+    }
+    // A rejected reply rewritten with no new call: when Jev is sure it still
+    // says what the review rejected, the same finding goes back once instead
+    // of a fresh full review. New evidence, a changed claim, an unsure or
+    // absent Jev, or a second rewrite each get the full review.
+    const rewrittenDigest = createHash('sha256').update(judgedReply, 'utf8').digest('hex');
+    if (!deliveredReviewRun && decision?.nextAction !== 'awaiting_user_input' && !questionPresentation
+      && !formatRepairReviewRequired && !planCandidate && completionReviewFeedback
+      && completionReviewFeedback.phase === undefined && !completionReviewFeedback.repeatedClaimReturned
+      && objectiveJudgeContinuations >= 1 && objectiveJudgeContinuations < MAX_HOST_OBJECTIVE_JUDGE_CONTINUATIONS
+      && judgedBusinessCallsAtLastVerdict === businessCalls.length
+      && completionReviewFeedback.replyDigest !== rewrittenDigest) {
+      const reading = await classifyRepeatedRejectedClaimWithJev({
+        finding: completionReviewFeedback.reason, rejectedReply: completionReviewFeedback.reply, newReply: judgedReply,
+      }, { sessionId: identity.sessionId });
+      if (reading.repeats === true && !reviewSignal?.aborted) {
+        const finding = completionReviewFeedback;
+        try {
+          appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'goal_alignment_judged',
+            data: { lane: 'host_v1', kind: 'completion', fulfills: false, reason: finding.reason.slice(0, 600),
+              // No reviewer ran: the finding is carried onto a reply Jev read as
+              // making the same rejected claim with no new evidence.
+              carriedVerdict: true, repeatedRejectedClaim: true,
+              ...(reading.confidence !== undefined ? { jevConfidence: reading.confidence } : {}),
+              sourceUserSeq: identity.sourceUserSeq, objectiveDigest: finding.objectiveDigest,
+              replyDigest: rewrittenDigest, continuation: true, continuationsUsed: objectiveJudgeContinuations + 1 } });
+        } catch { /* telemetry never blocks the reply */ }
+        objectiveJudgeContinuations += 1;
+        completionReviewFeedback = { ...finding, reply: judgedReply, replyDigest: rewrittenDigest, repeatedClaimReturned: true };
+        return 'continue';
+      }
     }
     let memoryConsolidation = verifiedMemoryConsolidationEvidence(identity);
     const explicitMemoryEvidence = explicitMemoryRequired && memoryConsolidation?.some(row => row.status === 'pending')

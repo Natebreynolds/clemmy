@@ -9,6 +9,7 @@ const {
 const {
   classifyOpenQuestionReplyWithJev,
   classifyComputerActionReachWithJev,
+  classifyRepeatedRejectedClaimWithJev,
   labelIdentifierWithJev,
   nameResolvedValueWithJev,
   selectAgentForTaskWithJev,
@@ -31,6 +32,28 @@ const { modelUsageAttributionStorage } = await import('../usage-log.js');
 afterEach(() => {
   _setTypesafeKeyForTests(undefined);
   _setSystemOneFetchForTests(undefined);
+});
+
+test('a rewritten reply counts as repeating the rejected claim only on a sure repeats reading; anything else goes to the full review', async () => {
+  const posted: Array<Record<string, unknown>> = [];
+  let choice = 'repeats'; let confidence = 0.92; let ok = true;
+  _setTypesafeKeyForTests('ts_test');
+  _setSystemOneFetchForTests(async (_url, init) => { posted.push(JSON.parse(String(init.body))); return { status: ok ? 200 : 503, ok,
+    text: async () => JSON.stringify({ model: 'jev-1.13.0', answers: { repeated: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } } },
+      usage: { input_tokens: 12, output_tokens: 2 } }) }; });
+  const input = { finding: 'The second mailbox was never searched.', rejectedReply: 'Both mailboxes are clean.', newReply: 'Both mailboxes are now clean.' };
+  assert.deepEqual(await classifyRepeatedRejectedClaimWithJev(input), { repeats: true, confidence: 0.92, failedOpen: false });
+  const state = posted[0]!.state as Record<string, unknown>;
+  assert.deepEqual(Object.keys(state), ['reviewFinding', 'rejectedReply', 'newReply']);
+  assert.doesNotMatch(JSON.stringify(posted[0]), /ts_test/);
+  choice = 'resolves';
+  assert.equal((await classifyRepeatedRejectedClaimWithJev(input)).repeats, false);
+  choice = 'repeats'; confidence = 0.6;
+  assert.equal((await classifyRepeatedRejectedClaimWithJev(input)).repeats, null, 'an unsure reading is no decision');
+  choice = 'none'; confidence = 0.99;
+  assert.equal((await classifyRepeatedRejectedClaimWithJev(input)).repeats, null);
+  ok = false;
+  assert.deepEqual(await classifyRepeatedRejectedClaimWithJev(input), { repeats: null, failedOpen: true });
 });
 
 test('the default-account screen keeps the default only on a sure silent or default reading, and reads earlier messages too', async () => {

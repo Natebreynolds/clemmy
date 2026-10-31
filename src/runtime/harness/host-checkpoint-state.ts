@@ -127,6 +127,9 @@ export interface HostCompletionReviewFeedback {
    *  a changed reply or permission to omit whole-objective review. */
   repairScope?: 'claims' | 'reply_format';
   quotes?: string[];
+  /** The finding was handed back once for a reply that still made the
+   *  rejected claim with no new evidence; the next reply is fully reviewed. */
+  repeatedClaimReturned?: true;
   /** Exact staged controls from the rejected candidate, for revision only.
    *  Never a publication receipt, positive verdict or execution permission. */
   questionProposal?: {
@@ -175,6 +178,7 @@ export function parseHostCompletionReviewFeedback(value: unknown): HostCompletio
     ...(row.phase === 'plan' || row.phase === 'disclose' ? { phase: row.phase as 'plan' | 'disclose' } : {}),
     ...(row.repairScope === 'claims' || row.repairScope === 'reply_format' ? { repairScope: row.repairScope as 'claims' | 'reply_format' } : {}),
     ...(Array.isArray(row.quotes) ? { quotes: (row.quotes as string[]).slice(0, 24) } : {}),
+    ...(row.repeatedClaimReturned === true ? { repeatedClaimReturned: true as const } : {}),
     ...(questionProposal ? { questionProposal } : {}) };
 }
 

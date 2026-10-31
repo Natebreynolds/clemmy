@@ -7,7 +7,7 @@ export const MODEL_CALL_PURPOSES = [
   'jev-grounding', 'jev-trajectory', 'jev-completion', 'jev-watch', 'jev-heartbeat',
   'jev-output-grounding', 'jev-revision', 'jev-request-effect', 'jev-quantified-universe',
   'jev-operation-delivery', 'jev-worker-route', 'jev-operation-variant-read',
-  'jev-operation-effect', 'jev:clarification_answer_completeness', 'jev:clarification_revision',
+  'jev-operation-effect', 'jev-rejected-claim', 'jev:clarification_answer_completeness', 'jev:clarification_revision',
 ] as const;
 
 export type ModelCallPurpose = typeof MODEL_CALL_PURPOSES[number];

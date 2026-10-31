@@ -160,7 +160,7 @@ const CALL_PURPOSE_WORDS: Record<NonNullable<TaskAuxiliaryModelRecord['callPurpo
   'jev-revision': 'Reviewing a revision', 'jev-request-effect': 'Assessing an action’s effect',
   'jev-quantified-universe': 'Checking the scope of a count', 'jev-operation-delivery': 'Checking the delivery method',
   'jev-worker-route': 'Routing delegated work', 'jev-operation-variant-read': 'Checking a tool option',
-  'jev-operation-effect': 'Assessing a tool’s effect', 'jev:clarification_answer_completeness': 'Checking a clarification',
+  'jev-operation-effect': 'Assessing a tool’s effect', 'jev-rejected-claim': 'Checking a rewritten answer', 'jev:clarification_answer_completeness': 'Checking a clarification',
   'jev:clarification_revision': 'Reviewing a clarification change',
 };
 

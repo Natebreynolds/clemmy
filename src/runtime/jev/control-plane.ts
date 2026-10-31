@@ -703,6 +703,57 @@ export async function classifyRequestedExternalWriteWithJev(
   return { kind, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
 }
 
+const REJECTED_CLAIM_SURE = 0.85;
+const REJECTED_CLAIM_TIMEOUT_MS = 2_000;
+
+export interface RejectedClaimReading {
+  /** null when Jev was unavailable or not sure. */
+  repeats: boolean | null;
+  confidence?: number;
+  failedOpen: boolean;
+}
+
+/**
+ * The completion review rejected Clem's reply, and she answered again without
+ * any new call. One choice over the finding and the two replies: does the new
+ * one still say what the review rejected? Only a sure "repeats" counts; every
+ * other reading leaves the reply to the full review.
+ */
+export async function classifyRepeatedRejectedClaimWithJev(
+  input: { finding: string; rejectedReply: string; newReply: string },
+  opts: { timeoutMs?: number; sessionId?: string } = {},
+): Promise<RejectedClaimReading> {
+  const result = await evaluateSystemOne({
+    state: {
+      reviewFinding: clipMiddle(input.finding.trim(), 2_000).text,
+      rejectedReply: clipMiddle(input.rejectedReply.trim(), 2_000).text,
+      newReply: clipMiddle(input.newReply.trim(), 2_000).text,
+    },
+    questions: {
+      repeated: {
+        type: 'choice',
+        instructions: 'A reviewer rejected the first reply for the finding shown. Clem then wrote a new reply without gathering anything new. Does the new reply still state what the finding rejected?',
+        criteria: {
+          repeats: 'Yes — the new reply still makes the rejected claim or still leaves out the rejected work, only reworded.',
+          resolves: 'No — the new reply corrects, removes or qualifies what the finding rejected, or says plainly that it is not confirmed.',
+          none: 'Not sure.',
+        },
+      },
+    },
+    timeoutMs: Math.min(REJECTED_CLAIM_TIMEOUT_MS, opts.timeoutMs ?? REJECTED_CLAIM_TIMEOUT_MS),
+    sessionId: opts.sessionId,
+    channel: 'jev-rejected-claim',
+  });
+  if (!result.ok) return { repeats: null, failedOpen: true };
+  const answer = result.answers.repeated as ChoiceAnswer | undefined;
+  const sure = Boolean(answer) && (answer!.confidence ?? 0) >= REJECTED_CLAIM_SURE;
+  const repeats = sure && answer!.choice === 'repeats' ? true : sure && answer!.choice === 'resolves' ? false : null;
+  noteJevDecisionOutcome(result.decisionId, repeats === null ? 'none' : repeats ? 'repeats' : 'resolves', {
+    ...(answer ? { choice: answer.choice, confidence: answer.confidence } : {}),
+  });
+  return { repeats, ...(answer ? { confidence: answer.confidence } : {}), failedOpen: false };
+}
+
 export type ComputerActionReachKind = 'sends' | 'deletes' | 'stays';
 
 export interface ComputerActionReachReading {
