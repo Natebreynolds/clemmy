@@ -26,6 +26,18 @@ export function recoveryActivationOwner(sessionId: string, owner: RecoveryActiva
     : owner;
 }
 
+/** The attempt a delivery activation runs its linked request under. The
+ * request's own review keeps that attempt only while this exact activation,
+ * delivery source and attempt are current; any other scope names none. */
+export function activationAttemptForRequest(sessionId: string,
+  delivery: { sourceUserSeq: number; attemptId?: string }, requestSourceUserSeq: number): string | undefined {
+  const active = scope.getStore();
+  const link = active?.owner.approvalContinuation ?? active?.owner.connectionContinuation;
+  return active?.sessionId === sessionId && link?.requestSourceUserSeq === requestSourceUserSeq
+    && active.owner.sourceUserSeq === delivery.sourceUserSeq && active.owner.attemptId
+    && active.owner.attemptId === delivery.attemptId ? active.owner.attemptId : undefined;
+}
+
 const activationReader = { database: openEventLog, metadata: (sessionId: string) => getSession(sessionId)?.metadata };
 export function readApprovalRecoveryActivation(sessionId: string): RecoveryActivationOwner | null {
   return readApprovalRecoveryActivationRead(sessionId, activationReader);

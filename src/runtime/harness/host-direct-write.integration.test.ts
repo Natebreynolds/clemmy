@@ -373,7 +373,7 @@ test('a tapped approval resumes under its own attempt, which the steps run under
   const agent = await fixture.useProductionAgent();
   const paused = await runConversation({ agent, sessionId: fixture.session.id, input: fixture.prompt,
     sourceUserSeq: fixture.source.seq, reuseRecordedUserInput: true,
-    suppressMemoryCapture: true, judgeCompletion: false, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
+    suppressMemoryCapture: true, judgeCompletion: true, turnEngine: 'host_v1', makeRunner: () => fixture.runner as never });
   assert.equal(paused.status, 'awaiting_approval');
   const approval = approvals.listPending({ sessionId: fixture.session.id, status: 'pending' })[0]!;
   assert.equal(approvals.resolve(approval.approvalId, 'approved', 'tap-fixture').ok, true);
@@ -383,6 +383,17 @@ test('a tapped approval resumes under its own attempt, which the steps run under
     seen.push(modelUsageAttributionStorage.getStore()?.attemptId);
     return original.call(fixture.model, request);
   };
+  // The review the resumed turn asks for expects the owner its own model
+  // calls carry: the business request, under the resume's attempt.
+  const { _setHostObjectiveJudgeForTests } = await import('./host-turn-runner.js');
+  const reviewed: Array<{ expected: unknown; entry: unknown }> = [];
+  _setHostObjectiveJudgeForTests(async (_objective, _reply, context) => {
+    const entry = modelUsageAttributionStorage.getStore();
+    reviewed.push({ expected: context?.reviewInputOwner,
+      entry: entry && { sessionId: entry.sessionId, sourceUserSeq: entry.sourceUserSeq, attemptId: entry.attemptId } });
+    return { done: true, reason: 'fixture operation completed' };
+  });
+  after(() => _setHostObjectiveJudgeForTests(null));
   const resumed = await runConversationFromResume({ sessionId: fixture.session.id,
     approvalId: approval.approvalId, decision: 'approve', resolver: 'tap-fixture', turnEngine: 'host_v1',
     makeRunner: () => fixture.runner as never, maxTurns: 3,
@@ -405,6 +416,12 @@ test('a tapped approval resumes under its own attempt, which the steps run under
   assert.ok(attempt!.finishedAt, 'the attempt is finished with the turn');
   const metadata = eventlog.getSession(fixture.session.id)?.metadata as Record<string, unknown> | undefined;
   assert.equal(metadata?.__run_in_flight_owner ?? null, null, 'no run-in-flight owner is left behind');
+  assert.ok(reviewed.length > 0, 'the resumed write is reviewed');
+  for (const review of reviewed) {
+    assert.deepEqual(review.expected, { sessionId: fixture.session.id, sourceUserSeq: fixture.source.seq, attemptId: attempt!.attemptId },
+      `the review expects the business request under the resume attempt: ${JSON.stringify(review)}`);
+    assert.deepEqual(review.entry, review.expected, 'and its model call runs as that owner');
+  }
 });
 
 // Approval -> resume -> no progress (live 2026-10-31). The approved write

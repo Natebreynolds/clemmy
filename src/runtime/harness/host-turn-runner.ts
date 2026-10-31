@@ -17,7 +17,7 @@ import { argumentCorrectionRepairLine, repairWithArgumentCorrections } from './a
 import { ARGUMENT_CORRECTION_APPLIED, loadArgumentCorrections } from '../../memory/argument-corrections-store.js';
 import { uncertainEffectStopsTurn } from './reconciliation-stop.js';
 import { plannedNativeDirectCarry } from './planned-native-direct-carry.js';
-import { assertRecoveryActivationOwned } from './recovery-activation.js';
+import { activationAttemptForRequest, assertRecoveryActivationOwned } from './recovery-activation.js';
 import { CompletionReviewSupersededError, reviewWithOwnerSteering } from './completion-review-steering.js';
 import { registerReviewAfterDelivery, replyEndsOnQuestion, reviewAfterDeliveryCorrectionDirective } from './review-after-delivery.js';
 import {
@@ -298,6 +298,23 @@ export function hostFrameRefusalDirective(
       + ' Re-open the exact tool_search result and copy its literal carrier example; a lookalike call cannot inherit the configured tool\'s host provenance.';
   }
   return base;
+}
+
+/** A completion review runs as the accepted request under the attempt the
+ * turn runs under. A delivery activation (a tapped approval) lends its own
+ * attempt only through its link to that request; no link, no attempt. */
+function completionReviewScope(identity: { sessionId: string; sourceUserSeq: number }): {
+  owner: ReviewInputOwner; run: <T>(work: () => T) => T;
+} {
+  const ambient = modelUsageAttributionStorage.getStore();
+  const base = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq };
+  const unscoped = { owner: base, run: <T>(work: () => T): T => work() };
+  if (ambient?.sessionId !== identity.sessionId || !ambient.attemptId) return unscoped;
+  if (ambient.sourceUserSeq === identity.sourceUserSeq) return { owner: { ...base, attemptId: ambient.attemptId }, run: unscoped.run };
+  const attemptId = activationAttemptForRequest(identity.sessionId, ambient, identity.sourceUserSeq);
+  if (!attemptId) return unscoped;
+  const attribution = { ...ambient, ...base, attemptId };
+  return { owner: { ...base, attemptId }, run: <T>(work: () => T): T => withModelUsageAttribution(attribution, work) };
 }
 
 /**
@@ -4982,11 +4999,7 @@ const runHostTurnBody = async (
       } catch { /* observability does not decide completion */ }
     }
     if (replyHold === null) {
-      const ambientAttribution = modelUsageAttributionStorage.getStore();
-      const attemptId = ambientAttribution?.sessionId === identity.sessionId
-        && ambientAttribution.sourceUserSeq === identity.sourceUserSeq ? ambientAttribution.attemptId : undefined;
-      const scope = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
-        ...(attemptId ? { attemptId } : {}) };
+      const scope = completionReviewScope(identity).owner;
       // Outside the turn: no tool allowance, and its own cancel signal.
       const heldContext = (cancel: AbortSignal) => ({ sessionId: identity.sessionId,
         sourceUserSeq: identity.sourceUserSeq, counter: new ToolCallsCounter(1, 1), callerCancelSignal: cancel });
@@ -5089,17 +5102,15 @@ const runHostTurnBody = async (
         excluded: Boolean(planCandidate || preparation || workflowParentActivation(identity.sessionId, identity.sourceUserSeq)
           || openApprovalCard || explicitMemoryRequired || memoryRequirementRequired || delegatedJobs.length > 0
           || settled.count > 0 || !settled.evidenceAvailable || !readEvidence.evidenceAvailable || readEvidence.results.length > 0) });
-      const reviewAttribution = modelUsageAttributionStorage.getStore();
-      reviewInputOwner = { sessionId: identity.sessionId, sourceUserSeq: identity.sourceUserSeq,
-        ...(reviewAttribution?.sessionId === identity.sessionId && reviewAttribution.sourceUserSeq === identity.sourceUserSeq
-          && reviewAttribution.attemptId ? { attemptId: reviewAttribution.attemptId } : {}) };
+      const reviewScope = completionReviewScope(identity);
+      reviewInputOwner = reviewScope.owner;
       const reviewStakesForTurn = completionReviewStakes({
         plan: Boolean(planCandidate),
         attemptedWrites: sourceWritesAtStake(identity),
       });
       // A changed candidate needs the whole objective and current evidence.
       // Missing quotes and quoted format suggestions do not prove fulfillment.
-      const reviewed = await reviewWithOwnerSteering(planCandidate ? undefined : ordinaryReviewOwner, () => hostObjectiveJudge(objective, judgedReply, {
+      const reviewed = await reviewWithOwnerSteering(planCandidate ? undefined : ordinaryReviewOwner, () => reviewScope.run(() => hostObjectiveJudge(objective, judgedReply, {
         sessionId: identity.sessionId,
         reviewInputOwner,
         completionEvidenceGuidance: HOST_COMPLETION_EVIDENCE_GUIDANCE,
@@ -5197,7 +5208,7 @@ const runHostTurnBody = async (
           // the prefix the provider cached for the first review of this turn.
           completionReviewFeedback ? hostCompletionReviewFindingContext(completionReviewFeedback) : undefined,
         ]),
-      }), reviewSignal);
+      })), reviewSignal);
       if (reviewed.status === 'superseded') throw new CompletionReviewSupersededError();
       verdict = reviewed.value;
       if (inheritedReads && (!inheritedReads.stillCurrent()
