@@ -243,7 +243,7 @@ private struct CommandCenterView: View {
                 } else if searching {
                     VStack(spacing: 10) {
                         ProgressView()
-                        Text("Looking for your Mac on the network…")
+                        Text("Looking for your computer on the network…")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -263,14 +263,14 @@ private struct CommandCenterView: View {
                 }
             }
             .confirmationDialog(
-                "Unpair from this Mac?",
+                "Unpair from this computer?",
                 isPresented: $confirmUnpair,
                 titleVisibility: .visible
             ) {
                 Button("Unpair", role: .destructive) { onUnpair() }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("You'll scan a fresh QR code from the desktop Mobile panel to reconnect.")
+                Text("To reconnect, open Apps & devices → Pair your phone in Clementine on your computer and scan a fresh QR code.")
             }
             .onAppear {
                 // A persisted push must wait for this foreground's path probe
@@ -540,7 +540,7 @@ private struct InitialConnectionCover: View {
             case .looking:
                 ProgressView()
                     .controlSize(.large)
-                    .accessibilityLabel("Looking for your Mac")
+                    .accessibilityLabel("Looking for your computer")
             case .offline:
                 Button("Try Again", systemImage: "arrow.clockwise", action: onRetry)
                     .buttonStyle(.borderedProminent)
@@ -560,7 +560,7 @@ private struct InitialConnectionCover: View {
 
     private var title: String {
         switch state {
-        case .looking: return "Looking for your Mac"
+        case .looking: return "Looking for your computer"
         case .offline: return "Clem is offline"
         case .safetyCheckChanged: return "Safety check changed"
         }
@@ -577,11 +577,11 @@ private struct InitialConnectionCover: View {
     private var message: String {
         switch state {
         case .looking:
-            return "Checking your saved Mac and its secure relay."
+            return "Checking your saved computer and its secure relay."
         case .offline:
-            return "Clem can’t reach your Mac right now. Keep the Mac awake and check this phone’s connection."
+            return "Clem can’t reach your computer right now. Keep it awake and check this phone’s connection."
         case .safetyCheckChanged:
-            return "This Mac’s security fingerprint no longer matches the one you paired with. Scan a fresh QR code before reconnecting."
+            return "This computer’s security fingerprint no longer matches the one you paired with. Open Apps & devices → Pair your phone on your computer and scan a fresh QR code."
         }
     }
 }

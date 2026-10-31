@@ -1,6 +1,8 @@
 import { composerDraftIsUnassigned, readComposerDraft, writeComposerDraft } from './composer-drafts';
 
 export const COMPOSER_EXAMPLES = [
+  { id: 'weekly-brief', label: 'Prepare a weekly brief', text: 'Help me prepare a useful weekly business brief. Ask what I want to track and which sources to use, then propose how to keep it current.' },
+  { id: 'follow-ups', label: 'Organize follow-ups', text: 'Help me organize the follow-ups I owe people. Ask which work and sources to include, then prepare a clear list and drafts for me to review.' },
   { id: 'plan', label: 'Make a plan', text: 'Help me make a practical plan for this goal: ' },
   { id: 'file', label: 'Understand a file', text: 'Summarize the file I attach. Explain the key points and any next steps.' },
 ] as const;

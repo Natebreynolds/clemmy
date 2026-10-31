@@ -1,9 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plug, KeyRound, Check, X, Search, RotateCw, RefreshCw, Loader2, Unplug, Mail, Tag, Plus, Pencil, ExternalLink, MessageCircle, ChevronRight } from 'lucide-react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Page } from '@/components/Page';
-import { HashSectionNavigation } from '@/components/HashSectionNavigation';
 import { PluginsPanel } from '@/components/connect/PluginsPanel';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
@@ -27,6 +26,7 @@ import { BrowserConnection } from '@/components/connect/BrowserConnection';
 import { AppSetupFormView, type AppSetupForm } from '@/components/connect/AppConnectionSetup';
 import { usePoll } from '@/lib/poll';
 import { connectionSetupChatNavigation } from '@/lib/connection-setup-draft';
+import { connectAreaForHash, type ConnectArea } from '@/lib/connect-navigation';
 import { CodexReauth } from './settings/CodexLoginForm';
 import {
   getComposioStatus, getComposioToolkits, authorizeComposio, reconnectComposio, refreshComposio, disconnectComposio,
@@ -58,11 +58,13 @@ function Section({ icon: Icon, title, subtitle, children, action, id }: {
 }) {
   return (
     <section id={id} className="mb-8 scroll-mt-16">
-      <div className="mb-3 flex items-center gap-2.5">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+        <div className="flex min-w-0 flex-1 items-start gap-2.5">
         <Icon className="h-5 w-5 text-primary" aria-hidden />
-        <div className="flex-1">
+        <div className="min-w-0 flex-1">
           <h3 className="text-h3 text-fg">{title}</h3>
           {subtitle && <p className="text-small text-muted">{subtitle}</p>}
+        </div>
         </div>
         {action}
       </div>
@@ -72,12 +74,19 @@ function Section({ icon: Icon, title, subtitle, children, action, id }: {
 }
 
 const CONNECTION_SECTIONS = [
-  { id: 'apps', label: 'Apps' }, { id: 'accounts', label: 'Keys & accounts' }, { id: 'channels', label: 'Chat channels' },
-  { id: 'plugins', label: 'Plugins' }, { id: 'tools', label: 'Tools' }, { id: 'computer', label: 'This computer' }, { id: 'folders', label: 'Code folders' },
-];
+  { id: 'apps', label: 'Apps' }, { id: 'devices', label: 'Devices & chat' }, { id: 'advanced', label: 'Advanced' },
+] as const;
 
 export function Connect() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const activeArea = connectAreaForHash(location.hash);
+  const [visitedAreas, setVisitedAreas] = useState<Set<ConnectArea>>(() => new Set([activeArea]));
+  useEffect(() => {
+    setVisitedAreas(previous => previous.has(activeArea) ? previous : new Set([...previous, activeArea]));
+    const id = location.hash.slice(1);
+    if (id) document.getElementById(id)?.scrollIntoView({ block: 'start' });
+  }, [activeArea, location.hash]);
   const qc = useQueryClient();
   const composio = usePoll(['composio-status'], getComposioStatus, 20000);
   const toolkits = usePoll(['composio-toolkits'], getComposioToolkits, 30000);
@@ -85,7 +94,6 @@ export function Connect() {
   const creds = usePoll(['credentials'], getCredentials, 20000);
 
   const [appQuery, setAppQuery] = useState('');
-  const [connectionRequest, setConnectionRequest] = useState('');
   const [connectionRequestError, setConnectionRequestError] = useState('');
   const snap = toolkits.data;
   const connected = connectedToolkits(snap);
@@ -112,14 +120,6 @@ export function Connect() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [appNotice, setAppNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
-  const computerDriver = usePoll(['computer-driver'], getComputerDriver, 20_000);
-  const computerIsOn = Boolean(computerDriver.data?.installed && computerDriver.data?.connected);
-  const [showBrowsersAnyway, setShowBrowsersAnyway] = useState(false);
-  // Where the computer driver is the only browser (macOS, Linux), the cloud
-  // browser and the Chrome harness are retired and not offered at all.
-  const olderBrowsers = useQuery({ queryKey: ['cloud-browser-retired'], staleTime: 300_000,
-    queryFn: () => apiGet<{ retired?: boolean }>('/api/console/cloud-browser/status') });
-  const olderBrowsersRetired = olderBrowsers.data?.retired === true;
   const [setupForm, setSetupForm] = useState<AppSetupForm | null>(null);
 
   /** Open a sign-in link in the browser; the words go back to the card. */
@@ -196,31 +196,21 @@ export function Connect() {
   };
 
   return (
-    <Page title="Apps & devices" subtitle="Connect what Clem needs for your work, and pair your phone.">
-      <HashSectionNavigation label="Apps and devices sections" items={CONNECTION_SECTIONS} defaultId="apps" className="sticky top-0 z-10 -mx-5 mb-6 sm:-mx-8" />
-      <section data-clem-guide="connections" className="mb-8 max-w-3xl" aria-labelledby="connection-setup-heading">
-        <h2 id="connection-setup-heading" className="text-h2 text-fg">What would you like to connect?</h2>
-        <p id="connection-setup-help" className="mt-2 max-w-prose text-body text-muted">Tell Clem what you need. She’ll check the setup and guide you through any sign-in.</p>
-        <form className="mt-4 flex flex-col gap-3 sm:flex-row" onSubmit={event => {
-          event.preventDefault();
-          const target = connectionSetupChatNavigation('apps', connectionRequest);
-          if (target) navigate(target.pathname, { state: target.state });
-          else setConnectionRequestError('Use a short app or tool name, without line breaks.');
-        }}>
-          <Input value={connectionRequest} onChange={event => { setConnectionRequest(event.target.value); setConnectionRequestError(''); }}
-            maxLength={200} placeholder="Name an app or tool (optional)" aria-label="App or tool to connect"
-            aria-describedby="connection-setup-help connection-setup-draft-help" className="min-w-0 flex-1" />
-          <Button type="submit" className="shrink-0"><MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem</Button>
-        </form>
-        {connectionRequestError && <p role="alert" className="mt-2 text-small text-danger">{connectionRequestError}</p>}
-        <p id="connection-setup-draft-help" className="mt-2 text-caption text-muted">Opens a draft you can edit before sending. You can also set things up below.</p>
-      </section>
+    <Page title="Apps & devices">
+      <nav aria-label="Apps and devices sections" className="sticky top-0 z-10 -mx-5 mb-7 flex gap-5 overflow-x-auto border-b border-border bg-canvas px-5 sm:-mx-8 sm:px-8">
+        {CONNECTION_SECTIONS.map(area => <Link key={area.id}
+          to={{ pathname: location.pathname, search: location.search, hash: `#${area.id}` }} state={location.state}
+          aria-current={activeArea === area.id ? 'page' : undefined}
+          className={cn('inline-flex min-h-12 shrink-0 items-center border-b-2 text-small font-semibold', activeArea === area.id ? 'border-primary text-fg' : 'border-transparent text-muted hover:text-fg')}>{area.label}</Link>)}
+      </nav>
+      {/* Keep visited forms mounted: changing areas must not erase setup or an install job. */}
+      <div hidden={activeArea !== 'apps'}>
       {/* Apps */}
       <Section
         id="apps"
         icon={Plug}
-        title="Apps"
-        subtitle="The apps Clem can use for your work"
+        title="Connect your work"
+        subtitle="Find an app, or ask Clem to guide you through setup."
         action={composio.data && (
           <div className="flex items-center gap-2">
             <button type="button" onClick={refreshApps} disabled={refreshing}
@@ -228,9 +218,6 @@ export function Connect() {
               aria-label="Refresh apps" title="Refresh connection status">
               {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />} Refresh
             </button>
-            <StatusPill tone={!composio.data.apiKeyPresent && cliAuthenticated ? 'success' : 'neutral'}>
-              {composio.data.apiKeyPresent || cliAuthenticated ? 'Ready to connect apps' : 'Not set up'}
-            </StatusPill>
           </div>
         )}
       >
@@ -265,64 +252,62 @@ export function Connect() {
             {appNotice.text}
           </p>
         )}
-        {/* Composio API key — the ONE thing you get from composio.dev. Enter/reset
-            it here; everything else (connect, add accounts, label) stays in-app. */}
-        {!appsUnavailable && composio.data && (
-          <details className="mb-4">
-            <summary className="mb-3 cursor-pointer rounded-md py-2 text-small font-medium text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">Set up app connections manually</summary>
-            <ComposioApiKeyCard
-              present={Boolean(composio.data.apiKeyPresent)}
-              onSaved={() => { void refreshApps(); }}
-            />
-          </details>
-        )}
-        {!appsUnavailable && cliOnlyComposio && cliAuthenticated && (
-          <CliDefaultAccountsCard
-            authorities={cliDefaults.data?.authorities ?? []}
-            loading={cliDefaults.isLoading}
-            unavailable={cliDefaults.isError}
-            onAuthorize={async (toolkit, label) => {
-              await authorizeComposioCliDefaultAccount(toolkit, label);
-              await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] });
-            }}
-            onRevoke={async (toolkit) => {
-              await revokeComposioCliDefaultAccount(toolkit);
-              await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] });
-            }}
-          />
-        )}
         {/* Search to find + connect a new app from the full catalog. */}
-        {!appsUnavailable && <div className="mb-4 flex items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
+        <div data-clem-guide="connections" className="mb-6">
+        <div className="flex flex-col gap-3 sm:flex-row">
+        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-surface px-3 focus-within:ring-2 focus-within:ring-primary">
           <Search className="h-4 w-4 text-faint" aria-hidden />
           <input
             value={appQuery}
-            onChange={(e) => setAppQuery(e.target.value)}
-            placeholder="Search apps to connect (Gmail, Slack, Salesforce…)"
+            onChange={(e) => { setAppQuery(e.target.value); setConnectionRequestError(''); }}
+            placeholder="Search apps to connect"
             aria-label="Search apps"
-            className="h-11 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
+            aria-describedby="connection-setup-draft-help"
+            className="h-11 min-w-0 flex-1 bg-transparent text-body text-fg outline-none placeholder:text-faint"
           />
           {appQuery && <button type="button" onClick={() => setAppQuery('')} aria-label="Clear" className="cursor-pointer text-faint hover:text-fg"><X className="h-4 w-4" aria-hidden /></button>}
-        </div>}
+        </div>
+        <Button variant="secondary" className="shrink-0" onClick={() => {
+          const target = connectionSetupChatNavigation('apps', appQuery);
+          if (target) navigate(target.pathname, { state: target.state });
+          else setConnectionRequestError('Use a short app or tool name, without line breaks.');
+        }}><MessageCircle className="h-4 w-4" aria-hidden /> Ask Clem to help</Button>
+        </div>
+        {connectionRequestError && <p role="alert" className="mt-2 text-small text-danger">{connectionRequestError}</p>}
+        <p id="connection-setup-draft-help" className="mt-2 text-caption text-muted">Clem’s help opens as a draft you can edit before sending.</p>
+        </div>
 
         {!appsUnavailable && (toolkits.isLoading || composio.isLoading) ? (
           <TileSkeleton />
         ) : !appsUnavailable && appQuery ? (
           results.length === 0
             ? <Card className="p-4 text-body text-muted">No apps match “{appQuery}”.</Card>
-            : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            : <div className="grid min-w-0 gap-3 sm:grid-cols-2">
                 {results.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
               </div>
         ) : !appsUnavailable && connected.length === 0 && !snap?.connectionsError ? (
           <Card className="p-5 text-body text-muted">No apps connected yet — search above to connect Gmail, Slack, your CRM, and more.</Card>
         ) : !appsUnavailable ? (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="min-w-0 space-y-3">
             {connected.map((t) => <AppCard key={t.slug} t={t} onConnect={() => connectApp(t.slug)} onReconnect={() => reconnectApp(t)} onDisconnectConnection={disconnectConnection} onSaveLabel={saveLabel} />)}
           </div>
         ) : null}
       </Section>
+      <Link to="/settings#accounts" className="inline-flex min-h-11 items-center gap-1 text-small text-muted hover:text-fg">Looking for model accounts? <ChevronRight className="h-3.5 w-3.5" aria-hidden /></Link>
+      </div>
+
+      {(visitedAreas.has('devices') || activeArea === 'devices') && <div id="devices" hidden={activeArea !== 'devices'} className="scroll-mt-16 space-y-6">
+        <div><h2 className="text-h2 text-fg">Clem, wherever you work</h2><p className="mt-1 text-body text-muted">Use your computer, pair your phone, or chat in Slack.</p></div>
+        <div id="computer" className="scroll-mt-16"><ComputerDriver /></div>
+        <div id="phone" className="scroll-mt-16"><MobilePanel active={activeArea === 'devices'} revealPairing={location.hash === '#phone'} /></div>
+        <div id="channels" className="scroll-mt-16"><SlackConnect /><p className="mt-2 text-caption text-muted">For Discord, add its bot token in <Link to="#accounts" state={location.state} className="text-primary hover:underline">Keys & accounts</Link>.</p></div>
+      </div>}
+
+      {(visitedAreas.has('advanced') || activeArea === 'advanced') && <div id="advanced" hidden={activeArea !== 'advanced'} className="scroll-mt-16">
+      <div className="mb-5"><h2 className="text-h2 text-fg">Advanced connections</h2><p className="mt-1 text-body text-muted">Add tools, keys, and local folders when your work needs them.</p></div>
 
       {/* Keys & accounts — uniform single-line rows, not an uneven card grid */}
-      <Section id="accounts" icon={KeyRound} title="Keys & accounts" subtitle="API keys and sign-ins Clementine uses">
+      <SetupDisclosure id="accounts" title="Keys & accounts" description="Model accounts and other saved API keys" reveal={location.hash === '#accounts'}>
             <Card className="flex items-center gap-3 px-4 py-3">
               <div className="min-w-0 flex-1">
                 <div className="text-body font-medium text-fg">Model accounts</div>
@@ -354,49 +339,33 @@ export function Connect() {
           </div>
         )}
         </details>
-      </Section>
-
-      {/* Talk to Clementine — the channels where you chat with her, grouped
-          in one place: Slack (compact wizard row) + your phone. Discord is a
-          single token — it stays a row in Keys & accounts above. */}
-      <Section id="channels" icon={MessageCircle} title="Talk to Clementine" subtitle="Chat channels — Slack and your phone. (Discord: set its token in Keys & accounts.)">
-        <div className="space-y-3">
-          <SlackConnect />
-          <MobilePanel />
-        </div>
-      </Section>
+      </SetupDisclosure>
 
       {/* Plugins — content cartridges (skills + workflows + MCP bundles) */}
-      <div id="plugins" className="scroll-mt-16"><PluginsPanel /></div>
+      <SetupDisclosure id="plugins" title="Plugins" description="Add a package of skills, workflows, and tools" reveal={location.hash === '#plugins'}><PluginsPanel /></SetupDisclosure>
 
       {/* MCP */}
-      <div id="tools" className="scroll-mt-16"><McpManager />
+      <SetupDisclosure id="tools" title="Tool servers & command-line tools" description="Connect MCP servers or software installed on this computer" reveal={location.hash === '#tools'}><McpManager />
       <ShareCartridge />
 
       {/* CLIs — save-to-confirm, not a PATH dump */}
       <CliTools />
-      </div>
+      </SetupDisclosure>
 
       {/* Your computer first; while Clem's driver is on, it is the browser too */}
-      <div id="computer" className="scroll-mt-16"><ComputerDriver />
-      <OtherApps />
-      {olderBrowsersRetired ? null : computerIsOn && !showBrowsersAnyway ? (
-        <Card>
-          <p className="text-small text-muted">
-            Your computer is Clem’s browser while it is on. The Chrome harness and any cloud browser stay idle.
-            {' '}<button type="button" className="text-primary hover:underline" onClick={() => setShowBrowsersAnyway(true)}>Show them anyway</button>
-          </p>
-        </Card>
-      ) : (
-        <>
-          <BrowserHarness />
-          <BrowserConnection />
-        </>
-      )}
-      </div>
+      <SetupDisclosure id="other-apps" title="Other apps on your computer" description="Review which local apps Clem can open" reveal={location.hash === '#other-apps'}><OtherApps /></SetupDisclosure>
+      <SetupDisclosure id="browsers" title="Other browser connections" description="Review saved browser alternatives" reveal={location.hash === '#browsers'}><BrowserOptions /></SetupDisclosure>
 
       {/* Code folders (local code, not the Projects screen) */}
-      <div id="folders" className="scroll-mt-16"><ProjectsPanel /></div>
+      <SetupDisclosure id="folders" title="Code folders" description="Choose local folders Clem can work in" reveal={location.hash === '#folders'}><ProjectsPanel /></SetupDisclosure>
+      <SetupDisclosure id="app-service" title="App connection service" description="Manual connection settings and saved default-account permissions" reveal={location.hash === '#app-service'}>
+        {composio.data && <ComposioApiKeyCard present={Boolean(composio.data.apiKeyPresent)} onSaved={() => { void refreshApps(); }} />}
+        {cliOnlyComposio && cliAuthenticated && <CliDefaultAccountsCard authorities={cliDefaults.data?.authorities ?? []} loading={cliDefaults.isLoading} unavailable={cliDefaults.isError}
+          onAuthorize={async (toolkit, label) => { await authorizeComposioCliDefaultAccount(toolkit, label); await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] }); }}
+          onRevoke={async toolkit => { await revokeComposioCliDefaultAccount(toolkit); await qc.invalidateQueries({ queryKey: ['composio-cli-default-accounts'] }); }} />}
+        {composio.isError && <QueryUnavailable title="App connection settings are unavailable" onRetry={() => { void composio.refetch(); }} />}
+      </SetupDisclosure>
+      </div>}
 
       {setupForm && (
         <AppSetupFormView
@@ -417,6 +386,31 @@ export function Connect() {
       )}
     </Page>
   );
+}
+
+/** Mount private setup forms only on request, then retain them across area changes. */
+function SetupDisclosure({ id, title, description, reveal, children }: { id: string; title: string; description: string; reveal: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(reveal);
+  const [visited, setVisited] = useState(reveal);
+  useEffect(() => { if (reveal) { setOpen(true); setVisited(true); } }, [reveal]);
+  return <section id={id} className="scroll-mt-16 border-b border-border">
+    <details open={open} onToggle={event => { const next = event.currentTarget.open; setOpen(next); if (next) setVisited(true); }}>
+      <summary className="cursor-pointer rounded-md py-4 text-body font-medium text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+        {title}<span className="mt-1 block text-small font-normal text-muted">{description}</span>
+      </summary>
+      {(visited || open) && <div className="pb-5 pt-2">{children}</div>}
+    </details>
+  </section>;
+}
+
+function BrowserOptions() {
+  const driver = usePoll(['computer-driver'], getComputerDriver, 20_000);
+  const retired = useQuery({ queryKey: ['cloud-browser-retired'], staleTime: 300_000, queryFn: () => apiGet<{ retired?: boolean }>('/api/console/cloud-browser/status') });
+  const [showAnyway, setShowAnyway] = useState(false);
+  if (retired.isLoading) return <Skeleton className="h-12" />;
+  if (retired.isError) return <QueryUnavailable title="Browser connections couldn’t be checked" onRetry={() => { void retired.refetch(); }} />;
+  if (retired.data?.retired || driver.data?.installed && driver.data?.connected && !showAnyway) return <p className="text-small text-muted">Clem uses <Link to="#computer" className="text-primary hover:underline">your computer</Link> for browser work.{!retired.data?.retired && <> <button type="button" className="text-primary hover:underline" onClick={() => setShowAnyway(true)}>Show saved alternatives</button></>}</p>;
+  return <><BrowserHarness /><BrowserConnection /></>;
 }
 
 /** Under the app's name: what connecting will ask for, before the click. */
@@ -444,6 +438,8 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
   // Accounts under this app (a user may connect several mailboxes/workspaces).
   const accounts = (t.connections ?? []).filter((c) => c.id || c.connectionId);
   const isConnected = status !== 'none';
+  const staleAccount = accounts.find(c => c.needsReconnect === true || ['NEEDS_RECONNECT', 'EXPIRED', 'INACTIVE', 'INITIATED'].includes((c.status ?? '').toUpperCase()));
+  const connectionWarning = staleAccount ? staleConnectionStory(staleAccount) ?? 'An account needs reconnecting.' : null;
 
   const doConnect = async (reconnect: boolean) => {
     setBusy(true);
@@ -457,14 +453,16 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
   };
 
   return (
-    <Card className="p-4">
-      <div className="flex items-center gap-3">
+    <Card className="min-w-0 p-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex min-w-0 flex-1 basis-40 items-center gap-3">
         {imgOk
           ? <img src={t.logoUrl} alt="" width={28} height={28} className="h-7 w-7 shrink-0 rounded-md object-contain" onError={() => setImgOk(false)} />
           : <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-subtle text-body font-semibold text-muted">{name.slice(0, 1).toUpperCase()}</div>}
         <div className="min-w-0 flex-1">
-          <div className="truncate text-body font-medium text-fg">{name}</div>
+          <div className="break-words text-body font-medium text-fg">{name}</div>
           {note && <div className="truncate text-caption text-faint" title={note}>{note}</div>}
+        </div>
         </div>
         {status === 'active'
           ? <StatusPill tone="success">{accounts.length > 1 ? `${accounts.length} accounts` : 'Connected'}</StatusPill>
@@ -478,6 +476,7 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
                   {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />} {kind === 'own_app' ? 'Set up' : 'Connect'}
                 </Button>}
       </div>
+      {connectionWarning && <p className="mt-2 text-small text-warning">{connectionWarning}</p>}
       {message && (
         <p className={cn('mt-3 rounded-md border px-3 py-2 text-small',
           message.tone === 'error' ? 'border-danger/40 bg-danger-tint text-danger' : 'border-border bg-subtle text-muted')}
@@ -487,7 +486,12 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
       )}
 
       {isConnected && accounts.length > 0 && (
-        <div className="mt-3 space-y-1.5 border-t border-border pt-3">
+        <details className="mt-3 min-w-0 border-t border-border pt-2">
+          <summary className="cursor-pointer rounded-md py-2 text-small text-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+            <span className="break-words">{accounts.length > 1 ? `${accounts.length} accounts` : accounts[0].accountEmail || accounts[0].accountName || accounts[0].userLabel || '1 account'}</span>
+            <span className="ml-2 font-medium text-fg">Manage accounts</span>
+          </summary>
+          <div className="mt-2 space-y-1.5">
           {accounts.map((c) => (
             <AccountRow
               key={c.id ?? c.connectionId}
@@ -497,13 +501,14 @@ function AppCard({ t, onConnect, onReconnect, onDisconnectConnection, onSaveLabe
               onSaveLabel={onSaveLabel}
             />
           ))}
+          </div>
           {/* Adding another account = start the OAuth flow again; Composio's
               link(allowMultiple) lets the same app hold several mailboxes. */}
           <button type="button" onClick={() => void doConnect(false)} disabled={busy}
             className="mt-1 inline-flex items-center gap-1 text-caption font-medium text-primary hover:underline cursor-pointer disabled:opacity-50">
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Plus className="h-3.5 w-3.5" aria-hidden />} Add another account
           </button>
-        </div>
+        </details>
       )}
     </Card>
   );
@@ -543,14 +548,14 @@ function AccountRow({ slug, conn, onDisconnect, onSaveLabel }: {
     <div className="flex items-center gap-2 rounded-md px-1.5 py-1">
       <Mail className={cn('h-3.5 w-3.5 shrink-0', needsReconnect ? 'text-warning' : 'text-faint')} aria-hidden />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5">
-          <span className="truncate text-small text-fg" title={id}>{who}</span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="break-all text-small text-fg" title={id}>{who}</span>
           {needsReconnect && <StatusPill tone="warning">Needs reconnecting</StatusPill>}
         </div>
         {/* The pill names the state; this line tells the story — what broke and
             when — so a dead login never hides behind a quiet label. */}
         {needsReconnect && (
-          <p className="mt-0.5 truncate text-caption text-warning" title={staleConnectionStory(conn) ?? undefined}>
+          <p className="mt-0.5 break-words text-caption text-warning">
             {staleConnectionStory(conn)}
           </p>
         )}

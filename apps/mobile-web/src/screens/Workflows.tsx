@@ -28,6 +28,8 @@ import { Chat } from './Chat';
 import { EmptyState } from '../components/EmptyState';
 import { consumeWidgetWorkflowLaunch, removeWidgetWorkflow, reportWidgetLanding, saveWidgetWorkflow, widgetText, widgetWorkflowAvailable, WIDGET_ROUTE_EVENT } from '../lib/widget-bridge';
 import { readWidgetWorkflow, settleWidgetWorkflowClaim, widgetWorkflowCanRun, workflowWidgetTarget, WORKFLOW_WIDGET_SLUG, type WorkflowWidgetTarget } from '../lib/workflow-widget';
+import { mobileDrafts } from '../lib/file-context';
+import { appendWorkflowSetupRequest, workflowSetupRequest } from '../lib/workflow-setup';
 
 /** Mirrors src/execution/workflow-run-cancellation.ts — anything else is live. */
 const TERMINAL_RUN_STATUSES = new Set([
@@ -196,6 +198,15 @@ function WorkflowDetail({ workflow, onBack, widgetTarget }: WorkflowDetailProps)
     .filter((input) => input.required && !(inputValues[input.key] ?? '').trim())
     .map((input) => input.key);
   const bindingGaps = widgetRow?.resourceGaps ?? workflow.resourceGaps ?? [];
+  const needsSetup = !enabled || requiredMissing.length > 0 || bindingGaps.length > 0;
+  const setupAvailable = Boolean(info && conversationSessionId && !infoStale && !infoRefreshing && !infoError && !infoOffline);
+  function finishSetup() {
+    if (!info || !conversationSessionId || !setupAvailable) return;
+    const scope = `chat:${conversationSessionId}`;
+    const request = workflowSetupRequest(info, requiredMissing, bindingGaps);
+    mobileDrafts.patch(scope, { text: appendWorkflowSetupRequest(mobileDrafts.read(scope).text, request) });
+    askClem();
+  }
   const latest = useRef({ definition, fresh: false, visible: true });
   latest.current = { definition, fresh: !infoStale && !infoRefreshing && !infoError && !infoOffline, visible: !conversation && !selectedRun };
 
@@ -277,6 +288,7 @@ function WorkflowDetail({ workflow, onBack, widgetTarget }: WorkflowDetailProps)
       sessionId={conversation.sessionId}
       initialTitle={workflowDisplayName(workflow.name, description)}
       initialDraft={conversation.draft}
+      initialAutoSend={false}
       onBack={closeConversation}
     />;
   }
@@ -403,12 +415,12 @@ function WorkflowDetail({ workflow, onBack, widgetTarget }: WorkflowDetailProps)
 
         {bindingGaps.length > 0 ? (
           <div class="global-error" role="status">
-            Won't run until you bind: {bindingGaps[0]}{bindingGaps.length > 1 ? ` (+${bindingGaps.length - 1} more)` : ''}
+            This automation needs a connection or resource before it can run: {bindingGaps.join(', ')}. Clem can help you finish setup.
           </div>
         ) : null}
         <div class="workflow-actions">
           <button
-            class="btn"
+            class={needsSetup ? 'btn-quiet' : 'btn'}
             disabled={triggering || widgetClaiming || !info || infoStale || infoRefreshing || !enabled || requiredMissing.length > 0 || bindingGaps.length > 0}
             onClick={trigger}
           >
@@ -416,19 +428,19 @@ function WorkflowDetail({ workflow, onBack, widgetTarget }: WorkflowDetailProps)
               : infoError || infoOffline ? 'Workflow unavailable'
               : !info || infoRefreshing ? 'Loading workflow…'
               : infoStale ? 'Workflow unavailable'
-              : !enabled ? 'Disabled'
-                : bindingGaps.length > 0 ? 'Needs a binding (set it on your computer)'
-                : requiredMissing.length > 0 ? `Needs: ${requiredMissing.join(', ')}`
+              : !enabled ? 'Automation disabled'
+                : bindingGaps.length > 0 ? 'Needs a connection'
+                : requiredMissing.length > 0 ? 'Needs required information'
                   : 'Run now'}
           </button>
-          <button type="button" class="btn-quiet" disabled={!conversationSessionId} onClick={() => askClem()}>Ask Clem</button>
+          <button type="button" class={needsSetup ? 'btn' : 'btn-quiet'} disabled={needsSetup ? !setupAvailable : !conversationSessionId} onClick={() => needsSetup ? finishSetup() : askClem()}>{needsSetup ? 'Finish setup with Clem' : 'Ask Clem'}</button>
         </div>
         {widgetWorkflowAvailable() ? <div class="workflow-actions">
           <button type="button" class="btn-quiet" disabled={widgetSaving || !info?.slug || infoStale || infoRefreshing} onClick={() => void updateWidget()}>Pin to widget</button>
           <button type="button" class="btn-quiet" disabled={widgetSaving || !info?.slug || infoStale || infoRefreshing} onClick={() => void updateWidget(true)}>Remove from widget</button>
         </div> : null}
         {widgetNote ? <p class="muted" role="status">{widgetNote}</p> : null}
-        <p class="muted">Ask about this workflow or describe a change to its saved steps. Runs already in progress keep their own controls.</p>
+        <p class="muted">{needsSetup ? 'Review the setup request before sending, or enter the required information above.' : 'Ask about this workflow or describe a change to its saved steps.'} Runs already in progress keep their own controls.</p>
         {actionError ? <div class="global-error">{actionError}</div> : null}
         {runNotice ? <p class="muted" role="status">{runNotice}</p> : null}
         <ScreenNotice error={error} offline={offline} onRetry={() => void refresh()} hasData={runs.length > 0} />

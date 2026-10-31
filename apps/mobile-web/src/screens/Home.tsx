@@ -61,6 +61,7 @@ import { HomeTiles } from '../components/HomeTiles';
 import { FromClem } from '../components/FromClem';
 import { CrossMark } from '../components/Glyph';
 import { MissedRuns } from '../components/MissedRuns';
+import { showHomeBusinessStarter, WEEKLY_BRIEF_REQUEST } from '../lib/home-starter';
 
 const POLL_MS = 6_000;
 const MAX_NEEDS_ROWS = 3;
@@ -75,6 +76,8 @@ const MAX_QUICK_CHIPS = 3;
 interface Props {
   name: string;
   onAsk: (draft: string, attachments?: ChatAttachment[]) => void;
+  /** A suggested delegation opens for editing, unlike the capsule's Send. */
+  onPrepareRequest: (draft: string) => void;
   /** Open a recent conversation from the Recent stack. */
   onOpenChat: (session: ChatSession) => void;
   /** Open a conversation by id: Clem's own thread, from From Clem. */
@@ -100,6 +103,7 @@ interface Props {
 }
 
 interface HomeData {
+  complete: boolean;
   approvals: ApprovalRow[];
   plans: PlanProposalRow[];
   workspaceChoosers: WorkspaceDestinationChooser[];
@@ -120,15 +124,18 @@ async function part<T>(wanted: boolean, work: () => Promise<T>): Promise<Part<T>
 }
 
 const EMPTY: HomeData = {
+  complete: false,
   approvals: [], plans: [], workspaceChoosers: [], questions: [], notifications: [], reminders: [],
 };
 
 
 export function Home({
-  name, onAsk, onOpenChat, onOpenThread, onOpenInbox, onOpenWorkspace, onOpenActivity, onOpenRun, onCustomize,
+  name, onAsk, onPrepareRequest, onOpenChat, onOpenThread, onOpenInbox, onOpenWorkspace, onOpenActivity, onOpenRun, onCustomize,
   needsYouCount, needsYouCountKnown, needsYouCountLive, needsYouCountAge,
 }: Props) {
-  const { prefs } = useHomePreferences();
+  const { prefs, loaded: prefsLoaded, error: prefsError } = useHomePreferences();
+  const [pinsConfirmedEmpty, setPinsConfirmedEmpty] = useState(false);
+  const [missedRunsConfirmedEmpty, setMissedRunsConfirmedEmpty] = useState(false);
   const panes = phoneVisiblePanes(prefs);
   const paneSet = new Set<HomePaneId>(panes);
   const wantRef = useRef(paneSet);
@@ -154,6 +161,7 @@ export function Home({
     if (attempted.length > 0 && attempted.every((res) => 'e' in res)) throw (attempted[0] as { e: unknown }).e;
     const prev = lastGood.current;
     const merged: HomeData = {
+      complete: attempted.length === 6 && attempted.every(res => 'v' in res),
       approvals: 'v' in a ? a.v.approvals.filter((row) => row.status === 'pending') : prev.approvals,
       plans: 'v' in p ? p.v.proposals.filter((row) => row.status === 'pending') : prev.plans,
       workspaceChoosers: 'v' in w ? w.v.choosers : prev.workspaceChoosers,
@@ -164,7 +172,8 @@ export function Home({
     lastGood.current = merged;
     return merged;
   }, []);
-  const { data, loading, error, offline, refresh } = useScreenData(loadHome, { intervalMs: POLL_MS });
+  const homeData = useScreenData(loadHome, { intervalMs: POLL_MS });
+  const { data, loading, error, offline, refresh } = homeData;
   const loaded = data ?? lastGood.current;
   // What Clem's heartbeats brought, in her words. Home's other lists leave out
   // what she already shows, so nothing appears twice.
@@ -289,6 +298,19 @@ export function Home({
   const leadHeadline = hasAttention ? `${needsYouCount === 1 ? 'One thing needs' : `${needsYouCount} things need`} you` : lead.headline;
   const leadAction = hasAttention ? { label: 'Review Inbox', target: 'inbox' as const } : lead.action;
   const activeWork = workingView.entries.filter(row => row.membership === 'running');
+  const businessStarter = showHomeBusinessStarter({
+    preferencesReady: prefsLoaded && !prefsError,
+    countKnown: needsYouCountKnown, countLive: needsYouCountLive, needsYou: needsYouCount,
+    workKnown: workingNow.known, workError: workingNow.error, workOffline: workingNow.offline,
+    workCount: working.entries.length,
+    homeComplete: loaded.complete && paneSet.has('needs_you') && paneSet.has('while_away'),
+    homeRead: homeData,
+    homeRows: loaded.approvals.length + loaded.plans.length + loaded.workspaceChoosers.length
+      + loaded.questions.length + loaded.notifications.length + loaded.reminders.length,
+    fromClemRead: fromClem, fromClemRows: fromClem.data?.rows.length ?? 0,
+    recentRead: recentData, recentRows: recentData.data?.sessions.length ?? 0,
+    quickActions: prefs.quickActions.length, pinsConfirmedEmpty, missedRunsConfirmedEmpty,
+  });
 
   const sections: Record<HomePaneId, () => JSX.Element | null> = {
     // No actions saved means no row: the door to adding one is the Customize
@@ -297,7 +319,7 @@ export function Home({
       <QuickActions actions={prefs.quickActions} onAsk={onAsk} />
     ) : null),
     needs_you: () => <>
-      <MissedRuns />
+      <MissedRuns onEmptyChange={setMissedRunsConfirmedEmpty} />
       <FromClem data={fromClem.data ?? null} mode="decisions" maxRows={MAX_NEEDS_ROWS} onOpenInbox={(key) => onOpenInbox(undefined, key)} onChanged={() => { void fromClem.refresh(); void refresh(); }} onOpenThread={(sessionId) => onOpenThread(sessionId ?? 'harness:clem', 'Clem')} />
       {needsPane.show ? (
         <NeedsYou
@@ -374,18 +396,19 @@ export function Home({
             whole sentence, its qualifier and its provenance, or a screen
             reader hears the count change and never hears how old it is. */}
         <div class="home-lead-say" aria-live="polite">
-          <h2 class="home-lead-head">{leadHeadline}</h2>
-          {lead.detail ? <p class="home-lead-detail">{lead.detail}</p> : null}
+          <h2 class="home-lead-head">{businessStarter ? 'What can I take off your plate?' : leadHeadline}</h2>
+          {businessStarter ? <p class="home-lead-detail">Give me a goal. We’ll shape the work together.</p>
+            : lead.detail ? <p class="home-lead-detail">{lead.detail}</p> : null}
           {/* Never render the confident version of an unknown: when the shell's
               count came off the service-worker shelf, the number is still
               given — with how old it is. */}
           {lead.asOf ? <p class="home-lead-asof">{lead.asOf}</p> : null}
         </div>
         {/* What Clem is doing, always: a live line while she works, quiet when she is not. */}
-        <p class={`clem-status${activeWork.length > 0 ? ' clem-status-live' : ''}`}>
+        {!businessStarter ? <p class={`clem-status${activeWork.length > 0 ? ' clem-status-live' : ''}`}>
           <span class="clem-status-dot" aria-hidden="true" />
           {activeWork.length > 0 ? `Working on ${activeWork.length === 1 ? 'one thing' : `${activeWork.length} things`}` : 'Nothing running right now'}
-        </p>
+        </p> : null}
 
         {digest ? (
           <p class="today-digest" role="status">
@@ -418,6 +441,14 @@ export function Home({
         hasData={needsYouCount + workingView.total + dayRows.length + recent.length > 0}
       />
 
+      {businessStarter ? <section class="home-business-start" aria-label="Start with Clem">
+        <button type="button" class="home-business-request" onClick={() => { haptic('light'); onPrepareRequest(WEEKLY_BRIEF_REQUEST); }}>
+          <span class="home-business-request-copy"><strong>Prepare a weekly brief</strong><span>A clear view of priorities, progress, and what needs your attention.</span></span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5" /></svg>
+        </button>
+        <p>You can edit the request before sending, or ask me for something else below.</p>
+      </section> : null}
+
       {!prefs.panes.hidden.includes('running') && activeWork.length > 0 ? (
         <section class="clem-live" aria-labelledby="home-active-work">
           <div class="clem-live-head">
@@ -444,7 +475,7 @@ export function Home({
         return rendered ? <div key={id} class="home-pane rise" style={{ '--i': 1 }}>{rendered}</div> : null;
       })}
 
-      <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} />
+      <HomeTiles onOpenWorkspace={onOpenWorkspace} onAsk={onAsk} hideConfirmedEmpty={businessStarter} onEmptyChange={setPinsConfirmedEmpty} />
 
       {loading ? <div class="skeleton-stack" aria-hidden="true"><i /><i /><i /></div> : null}
 
@@ -452,7 +483,7 @@ export function Home({
           the loudest element on the screen — a gradient card above every real
           thing Clem was doing. Enabling push matters, but never more than the
           decision waiting on you. */}
-      <PushPrompt />
+      {!businessStarter ? <PushPrompt /> : null}
 
       <div class="today-foot">
         <button type="button" onClick={() => { haptic('light'); onCustomize(); }}>Arrange this screen</button>

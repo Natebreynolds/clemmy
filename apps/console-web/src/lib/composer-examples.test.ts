@@ -12,7 +12,7 @@ const fresh = () => {
 test('an example only fills the creation draft and preserves user edits', () => {
   const input = fresh();
   assert.equal(seedComposerExample(input), true);
-  assert.equal(readComposerDraft(input.draftKey).text, COMPOSER_EXAMPLES[0].text);
+  assert.equal(readComposerDraft(input.draftKey).text, COMPOSER_EXAMPLES.find(example => example.id === 'plan')!.text);
   writeComposerDraft(input.draftKey, current => ({ ...current, text: 'My edited goal' }));
   assert.equal(seedComposerExample({ ...input, id: 'file' }), false);
   assert.equal(readComposerDraft(input.draftKey).text, 'My edited goal');
@@ -55,7 +55,23 @@ test('choosing a file example neither attaches a file nor changes another draft'
   writeComposerDraft(other.draftKey, current => ({ ...current, text: 'Unrelated task' }));
   const input = fresh();
   assert.equal(seedComposerExample({ ...input, id: 'file' }), true);
-  assert.equal(readComposerDraft(input.draftKey).text, COMPOSER_EXAMPLES[1].text);
+  assert.equal(readComposerDraft(input.draftKey).text, COMPOSER_EXAMPLES.find(example => example.id === 'file')!.text);
   assert.deepEqual(readComposerDraft(input.draftKey).attachments, []);
   assert.equal(readComposerDraft(other.draftKey).text, 'Unrelated task');
+});
+
+
+for (const id of ['weekly-brief','follow-ups']) test(`${id} fills only the exact empty creation draft and preserves edits and ownership`, () => {
+  const input = { ...fresh(), id };
+  const other = fresh();writeComposerDraft(other.draftKey, current => ({ ...current, text: 'Another conversation' }));
+  assert.equal(seedComposerExample(input), true);
+  const expected = COMPOSER_EXAMPLES.find(example => example.id === id)!;
+  assert.equal(readComposerDraft(input.draftKey).text, expected.text);
+  assert.deepEqual(readComposerDraft(input.draftKey).attachments, []);
+  assert.equal(readComposerDraft(other.draftKey).text, 'Another conversation');
+  writeComposerDraft(input.draftKey, current => ({ ...current, text: 'My business context' }));
+  assert.equal(seedComposerExample(input), false);assert.equal(readComposerDraft(input.draftKey).text, 'My business context');
+  const retired = { ...fresh(), id };moveComposerDraft(retired.draftKey, `session:business-${id}`);
+  assert.equal(seedComposerExample(retired), false);assert.equal(readComposerDraft(`session:business-${id}`).text, '');
+  assert.doesNotMatch(expected.text, /salesforce|hubspot|gmail|outlook/i);
 });

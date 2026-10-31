@@ -1,3 +1,4 @@
+import { automationTab, automationTabSearch, type AutomationTab } from '@/lib/computer-tasks-navigation';
 import { workflowDisplayName } from '@clem/chat-engine';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -39,7 +40,7 @@ import {
 import { getAgentSystemMetrics } from '@/lib/advanced';
 import { AutomationRefreshNotice } from '@/components/automate/AutomationRefreshNotice';
 
-type Tab = 'workflows' | 'skills' | 'computer';
+type Tab = AutomationTab;
 
 function capabilityAppLabel(toolkit: string | undefined): string {
   const name = (toolkit ?? '').trim();
@@ -93,7 +94,8 @@ export function Automate() {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [tab, setTab] = useState<Tab>('workflows');
+  const tab = automationTab(searchParams.get('tab'));
+  const setTab = (next: Tab) => setSearchParams(automationTabSearch(searchParams, next));
   const [filter, setFilter] = useState<WorkflowFilter>('all');
   const [workflowSearch, setWorkflowSearch] = useState('');
 

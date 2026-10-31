@@ -1,13 +1,19 @@
 /** Pinned Spaces stay in their saved order, with every pin reachable. */
 import type { HomeLayout } from '@clem/chat-engine';
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { api, listWorkspaces } from '../lib/api';
 import { useScreenData } from '../lib/use-screen-data';
 import { haptic } from '../lib/native-bridge';
+import { homeReadConfirmed } from '../lib/home-starter';
 
 const readLayout = () => api<{ layout: HomeLayout }>('/m/api/home/layout');
 
-export function HomeTiles({ onOpenWorkspace, onAsk }: { onOpenWorkspace: (id: string) => void; onAsk: (prompt: string) => void }) {
+export function HomeTiles({ onOpenWorkspace, onAsk, hideConfirmedEmpty = false, onEmptyChange }: {
+  onOpenWorkspace: (id: string) => void;
+  onAsk: (prompt: string) => void;
+  hideConfirmedEmpty?: boolean;
+  onEmptyChange?: (empty: boolean) => void;
+}) {
   const state = useScreenData(readLayout, { intervalMs: 30_000, resourceKey: 'home-layout' });
   const spaces = useScreenData(listWorkspaces, { intervalMs: 30_000, resourceKey: 'home-tile-spaces' });
   const [adding, setAdding] = useState(false);
@@ -27,6 +33,12 @@ export function HomeTiles({ onOpenWorkspace, onAsk }: { onOpenWorkspace: (id: st
     finally { setSaving(false); }
   };
   const tiles = layout?.tiles ?? [];
+  const confirmedEmpty = homeReadConfirmed(state) && homeReadConfirmed(spaces)
+    && tiles.length === 0 && (spaces.data?.workspaces.length ?? 0) === 0 && !adding && !error;
+  useEffect(() => { onEmptyChange?.(confirmedEmpty); }, [confirmedEmpty, onEmptyChange]);
+  // Keep the readers mounted: a new pin, a Space, or a failed refresh restores
+  // its own content and recovery rather than leaving a remembered empty state.
+  if (hideConfirmedEmpty && confirmedEmpty) return null;
   return (
     <section class="home-pinned-spaces" aria-labelledby="home-pinned-spaces-title">
       <div class="home-pinned-head">
