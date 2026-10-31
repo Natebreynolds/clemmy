@@ -10,7 +10,7 @@ import { isExecutionSourceBoundary } from './accepted-source-kind.js';
  */
 import type { WorkflowSavedEventData } from '../../execution/workflow-saved-event.js';
 import type { UnifiedSessionTurn } from '../../types.js';
-import { listEvents } from './eventlog.js';
+import { listEvents, openEventLog } from './eventlog.js';
 import { ANSWER_CHECK_SOURCE_PREFIX } from './review-after-delivery.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
 import {
@@ -152,7 +152,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; terminal?: Record<string, unknown> };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; usedComputer?: true; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -295,6 +295,23 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     if (asked !== null && options.length > 0) questionOptionsBySource.set(sourceKey(event.sessionId, asked), options);
   }
 
+  // Requests where Clem acted on the computer: a reopened chat offers to keep
+  // the task as steps that repeat, as the live one does from its activity.
+  const computerSources = new Set<string>();
+  if (includeDecorations) {
+    try {
+      const rows = openEventLog().prepare(`SELECT DISTINCT json_extract(data_json, '$.sourceUserSeq') AS asked FROM events
+        WHERE session_id = ? AND type = 'tool_called'
+          AND (substr(json_extract(data_json, '$.tool'), 1, 12) = 'cua-driver__'
+            OR substr(json_extract(data_json, '$.effectiveTool'), 1, 12) = 'cua-driver__')`)
+        .all(sessionId) as Array<{ asked: unknown }>;
+      for (const row of rows) {
+        const asked = positiveSeq(row.asked);
+        if (asked !== null) computerSources.add(sourceKey(sessionId, asked));
+      }
+    } catch { /* an unreadable mark only hides the offer */ }
+  }
+
   // Pair typed terminals by the exact accepted event and elect the durable
   // first writer. This deliberately ignores physical attempt/run identity.
   const assistantBySource = new Map<string, AssistantTurn>();
@@ -323,6 +340,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
         ...(presentation.kind === 'approval' && presentation.approvalId ? { pausedOnApprovalId: presentation.approvalId } : {}),
         ...(presentation.kind === 'question' && questionOptionsBySource.has(key)
           ? { questionOptions: questionOptionsBySource.get(key)! } : {}),
+        ...(computerSources.has(key) ? { usedComputer: true as const } : {}),
         terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
@@ -502,6 +520,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             ...(assistant.planArtifactRef || publishedPlan ? { planArtifactRef: assistant.planArtifactRef ?? publishedPlan!.ref } : {}),
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
             ...(assistant.questionOptions ? { questionOptions: assistant.questionOptions } : {}),
+            ...(assistant.usedComputer ? { usedComputer: true as const } : {}),
             ...(assistant.terminal ? { terminal: assistant.terminal } : {}),
           }),
         ]),

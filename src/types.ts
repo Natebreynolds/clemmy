@@ -180,6 +180,8 @@ export interface UnifiedSessionTurn {
   /** A question's answers as its question offered them (the paired
    *  awaiting_user_input), so a reopened chat keeps its choices. */
   questionOptions?: string[];
+  /** Clem acted on the computer for this request (it can be kept as steps). */
+  usedComputer?: true;
   /** Exact retained human request; never inferred from display pairing. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
   steerNote?: true;

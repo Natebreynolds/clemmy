@@ -232,6 +232,8 @@ export interface ChatMessage {
   checkInSeq?: number;
   /** A question's suggested answers, offered as one-tap replies. */
   options?: string[];
+  /** A reopened turn where Clem acted on the computer. */
+  usedComputer?: boolean;
   /** When a reopened turn was written, for display only. Live turns show
    *  `startedAt`; this never drives the recall lookup that key uses. */
   sentAt?: number;

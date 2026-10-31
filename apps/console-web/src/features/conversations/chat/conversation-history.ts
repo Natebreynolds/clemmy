@@ -146,6 +146,7 @@ function historyMessage(turn: Turn): ChatMessage {
     ...(typed?.terminal ? { terminal: typed.terminal } : {}),
     // A reopened question keeps its choices (and the connection setup they carry).
     ...(typed?.status === 'awaiting-reply' && turn.questionOptions?.length ? { options: [...turn.questionOptions] } : {}),
+    ...(turn.usedComputer === true ? { usedComputer: true } : {}),
   };
 }
 

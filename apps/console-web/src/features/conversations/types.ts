@@ -39,6 +39,7 @@ export interface Session {
 export interface Turn {
   /** A question's answers as its question offered them (server transcript). */
   questionOptions?: string[];
+  usedComputer?: boolean;
   /** Exact real accepted source paired by the server transcript projector.
    * Missing on legacy/orphan/synthetic turns; never inferred by the client. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
