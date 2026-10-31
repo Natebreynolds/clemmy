@@ -21,7 +21,7 @@ import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 import { MODEL_PHASE_ACTIVITY_ID, friendlyStep, stepWords, timelineBounds } from '@clem/chat-engine';
 import { getComposioToolkits } from '@/lib/connect';
-import { BatchRow, useNowTick } from '@/components/chat/ActivityFeed';
+import { BatchRow, HelperAgentLink, useNowTick } from '@/components/chat/ActivityFeed';
 import { LiveStepList, StepRow, type StepTimeline } from '@/components/chat/ActivityCard';
 import { narrateActivity, settleTerminalActivity, type ActivityTerminalOutcome } from '@/lib/activity-presentation';
 import { activityCardHead, clockLabel, groupActivityByParent } from '@/lib/activity-card';
@@ -204,7 +204,10 @@ export function WorkLine({
                 <div className="truncate text-small font-semibold text-fg">
                   {running ? step.action : step.done}{step.app ? <span className="font-normal text-muted"> · {step.app}</span> : null}
                 </div>
-                {inHand.detail && <div className="truncate text-caption text-muted">{inHand.detail}</div>}
+                {inHand.kind === 'agent' && (inHand.modelName || inHand.helperAgent)
+                  // A helper: the model in words, and the saved agent it ran as, one tap away.
+                  ? <div className="truncate text-caption text-muted">{inHand.modelName ?? inHand.detail}{inHand.helperAgent ? <>{inHand.modelName || inHand.detail ? ' · ' : ''}<HelperAgentLink agent={inHand.helperAgent} /></> : null}</div>
+                  : inHand.detail && <div className="truncate text-caption text-muted">{inHand.detail}</div>}
               </div>
               {running
                 ? <span className="shrink-0 text-caption font-medium text-primary">In progress</span>
