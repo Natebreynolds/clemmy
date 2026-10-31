@@ -116,3 +116,27 @@ test('a status read during the request counts when it shows exactly one server m
     invalidateMcpServerDiscoveryCache();
   }
 });
+
+test('the status result itself tells Clem to ask with a question, never for a key in chat, only when a key is missing', async () => {
+  const statusTools = await import('../../tools/mcp-status-tools.js');
+  const register = Object.entries(statusTools).find(([name, value]) => name.startsWith('register') && typeof value === 'function')![1] as (server: unknown) => void;
+  let status: ((input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>) | undefined;
+  register({ tool(name: string, _description: unknown, _shape: unknown, handler: (input: Record<string, unknown>) => Promise<{ content: Array<{ text: string }> }>) {
+    if (name === 'mcp_status') status = handler;
+  } });
+  assert.ok(status);
+  const missing = (await status!({})).content[0]!.text;
+  assert.ok(missing.includes(statusTools.MISSING_KEY_NEXT_STEP), 'a server missing a key: the next step rides with the status');
+  writeFileSync(MCP_SERVERS_FILE, JSON.stringify({ 'ready-fixture': { command: 'node', args: ['ready.js'] } }));
+  invalidateMcpServerDiscoveryCache();
+  try {
+    assert.equal((await status!({})).content[0]!.text.includes(statusTools.MISSING_KEY_NEXT_STEP), false);
+  } finally {
+    writeFileSync(MCP_SERVERS_FILE, JSON.stringify({
+      'weather-fixture': { command: 'node', args: ['weather.js'], env: { TEST_FIXTURE_WEATHER_KEY: '' } },
+      'notes-fixture': { command: 'node', args: ['notes.js'], env: { TEST_FIXTURE_NOTES_KEY: '' } },
+      'ready-fixture': { command: 'node', args: ['ready.js'] },
+    }));
+    invalidateMcpServerDiscoveryCache();
+  }
+});
