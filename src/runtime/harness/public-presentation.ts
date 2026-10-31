@@ -1670,7 +1670,7 @@ function projectData(event: EventRow): Record<string, unknown> | null {
     case 'worker_started':
     case 'worker_result':
     case 'worker_capped':
-      return selected(data, ['item', 'role', 'agent', 'model', 'provider', 'ok']);
+      return selected(data, ['item', 'role', 'agent', 'agentId', 'agentName', 'model', 'provider', 'ok']);
     case 'worker_model_offer': {
       // The offer carries its own answer, so a replay never shows an offer
       // the owner already answered.

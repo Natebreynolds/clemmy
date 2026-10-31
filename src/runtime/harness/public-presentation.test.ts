@@ -91,6 +91,16 @@ test('a verdict names the model that ruled, and only a well-formed model id reac
   assert.equal(unsafe?.data.judgeModelId, undefined);
 });
 
+test('a worker that ran as a saved agent reaches the chat with the agent id and name, never its private lineage', () => {
+  const started = projectHarnessEventForPublic(event('worker_started', {
+    item: 'site-a', role: 'research', model: 'acme-flagship-5', provider: 'claude', agentId: 'firm-scout', agentName: 'Firm Scout',
+    childSessionId: 'private-child', childAttemptId: 'private-attempt',
+  }));
+  assert.equal(started?.data.agentId, 'firm-scout');
+  assert.equal(started?.data.agentName, 'Firm Scout');
+  assert.equal(started?.data.childSessionId, undefined, 'the child run stays private');
+});
+
 test('an external write names the app it landed in from the toolkit catalog, and nothing when the catalog has no match', () => {
   __setToolkitCatalogForTests([
     { slug: 'mail_suite', name: 'Mail Suite', appUrl: 'https://mail.example.test' },
