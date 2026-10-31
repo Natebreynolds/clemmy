@@ -234,6 +234,8 @@ export interface ChatMessage {
   options?: string[];
   /** Keys the question's card takes in hidden fields (names only). */
   keyRequest?: KeyRequest;
+  /** A reopened turn where Clem acted on the computer. */
+  usedComputer?: boolean;
   /** When a reopened turn was written, for display only. Live turns show
    *  `startedAt`; this never drives the recall lookup that key uses. */
   sentAt?: number;

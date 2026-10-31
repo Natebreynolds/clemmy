@@ -183,6 +183,8 @@ export interface UnifiedSessionTurn {
   /** The MCP server and key names the question's card takes in hidden
    *  fields (names only; the value goes straight to the credential route). */
   questionKeyRequest?: { server: string; keys: string[] };
+  /** Clem acted on the computer for this request (it can be kept as steps). */
+  usedComputer?: true;
   /** Exact retained human request; never inferred from display pairing. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };
   steerNote?: true;

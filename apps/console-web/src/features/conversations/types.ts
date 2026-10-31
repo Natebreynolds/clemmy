@@ -41,6 +41,7 @@ export interface Turn {
   questionOptions?: string[];
   /** Server and key names the question's card takes in hidden fields. */
   questionKeyRequest?: unknown;
+  usedComputer?: boolean;
   /** Exact real accepted source paired by the server transcript projector.
    * Missing on legacy/orphan/synthetic turns; never inferred by the client. */
   acceptedSource?: { sessionId: string; sourceUserSeq: number; turn: number };

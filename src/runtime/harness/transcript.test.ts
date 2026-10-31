@@ -531,3 +531,16 @@ test('a reopened question carries the answers its question offered', () => {
   const reopened = reconstructHarnessTranscript(session.id).find((turn) => turn.role === 'assistant');
   assert.deepEqual(reopened?.questionOptions, choices);
 });
+
+test('a reopened turn where Clem acted on the computer says so, so it can be kept as steps', () => {
+  const session = createSession({ kind: 'chat', title: 'computer task' });
+  const ask = (text: string) => appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text } });
+  const used = ask('Start a TEST FIXTURE note on my computer.');
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { tool: 'work_call', effectiveTool: 'cua-driver__hotkey', sourceUserSeq: used.seq, callId: 'call-computer-1' } });
+  appendTypedTerminal(session.id, used.seq, 'The TEST FIXTURE note is started.');
+  const plain = ask('What is a TEST FIXTURE?');
+  appendTypedTerminal(session.id, plain.seq, 'A controlled example.');
+  const replies = reconstructHarnessTranscript(session.id).filter((turn) => turn.role === 'assistant');
+  assert.deepEqual(replies.map((turn) => turn.usedComputer === true), [true, false]);
+});

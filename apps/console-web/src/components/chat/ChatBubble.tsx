@@ -1032,7 +1032,7 @@ export function ChatBubble({
               (status, counts, verified artifacts, receipts, exact next action)
               so completion never rests on the prose above it. */}
           {message.status === 'complete' && message.acceptedSource
-            && message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)) && (
+            && (message.usedComputer || message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label))) && (
             <SaveComputerTask source={{ sessionId: message.acceptedSource.sessionId, sourceUserSeq: message.acceptedSource.sourceUserSeq }} />
           )}
           {message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply') && (
