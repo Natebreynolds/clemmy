@@ -65,7 +65,7 @@ test('a BYO brain\'s wire call is observed as a dispatch, so its completed respo
   assert.equal(receipt.usageJobId, standaloneModelAccountingJobBinding(job)?.usageJobId);
 });
 
-test('an xAI brain\'s calls carry the conversation id, so its cached prefix stays on one server', async () => {
+test('an xAI request names the conversation that owns it, whatever context sends it', async () => {
   const { harnessRunContextStorage } = await import('./brackets.js');
   const completion = {
     id: 'chatcmpl-byo-conv-1', object: 'chat.completion', created: 1, model: 'fixture-grok',
@@ -74,15 +74,36 @@ test('an xAI brain\'s calls carry the conversation id, so its cached prefix stay
   };
   const seen: Array<string | null> = [];
   mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
     seen.push(new Headers(init?.headers as HeadersInit | undefined).get('x-grok-conv-id'));
     return new Response(JSON.stringify(completion), { headers: { 'content-type': 'application/json' } });
   });
-  const ask = (baseURL: string, providerId: string) => harnessRunContextStorage.run({ sessionId: 'sess-fixture-conv' } as never,
-    () => getByoModel('fixture-grok', { configured: true, baseURL, apiKey: 'synthetic-no-auth', providerId,
-      primaryId: 'fixture-grok', judgeId: 'fixture-grok' }).getResponse({ systemInstructions: 'sys', input: 'synthetic', modelSettings: {},
-      tools: [], handoffs: [], outputType: 'text', tracing: false } as never));
-  await withTrace('byo-conv-fixture', () => ask('https://api.x.ai/v1', 'byo-xai-fixture'));
+  const model = (baseURL: string, providerId: string) => getByoModel('fixture-grok', { configured: true, baseURL,
+    apiKey: 'synthetic-no-auth', providerId, primaryId: 'fixture-grok', judgeId: 'fixture-grok' });
+  // A brain call runs under its conversation's usage attribution: that is the
+  // owner the request is bound to.
+  const call = (m: ReturnType<typeof model>, owner: string) =>
+    withModelUsageAttribution({ sessionId: owner, sourceUserSeq: 1, attemptId: `attempt-${owner}`, role: 'brain' },
+      () => m.getResponse({ systemInstructions: 'sys', input: 'synthetic', modelSettings: {},
+        tools: [], handoffs: [], outputType: 'text', tracing: false } as never));
+
+  // The request's owner decides, not whatever run context is current when it is sent.
+  const xai = model('https://api.x.ai/v1', 'byo-xai-fixture');
+  await withTrace('byo-conv-fixture', () => harnessRunContextStorage.run({ sessionId: 'sess-other-context' } as never,
+    () => call(xai, 'sess-fixture-owner')));
+  assert.equal(seen.at(-1), 'sess-fixture-owner');
+
+  // Two conversations in flight at once keep their own ids.
+  seen.length = 0;
+  await withTrace('byo-conv-fixture', () => Promise.all([
+    harnessRunContextStorage.run({ sessionId: 'sess-fixture-a' } as never, () => call(xai, 'sess-fixture-a')),
+    harnessRunContextStorage.run({ sessionId: 'sess-fixture-b' } as never, () => call(xai, 'sess-fixture-b')),
+  ]));
+  assert.deepEqual([...seen].sort(), ['sess-fixture-a', 'sess-fixture-b']);
+
+  // Another provider gets nothing new.
+  seen.length = 0;
   resetByoModelCache();
-  await withTrace('byo-conv-fixture', () => ask('https://byo-other-fixture.invalid/v1', 'byo-other-fixture'));
-  assert.deepEqual(seen, ['sess-fixture-conv', null], 'xAI gets the conversation id; another provider gets nothing new');
+  await withTrace('byo-conv-fixture', () => call(model('https://byo-other-fixture.invalid/v1', 'byo-other-fixture'), 'sess-fixture-owner'));
+  assert.deepEqual(seen, [null]);
 });

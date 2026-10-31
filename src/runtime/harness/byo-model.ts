@@ -334,6 +334,10 @@ export interface WrapCompletionsCreateOptions {
    * layout.
    */
   promptLayout?: { baseURL: string };
+  /** The header the provider routes a conversation's calls by, so the server
+   *  holding its cached prompt prefix serves the next step too. Its value is
+   *  the request's own owner, read when the request is made. */
+  conversationRouteHeader?: string;
 }
 
 /**
@@ -790,7 +794,8 @@ export function wrapCompletionsCreate(
       const placed = wrapOptions.promptLayout
         ? withMeasuredPromptLayout(original, params, wrapOptions.promptLayout.baseURL, wrapOptions.backendId)
         : params;
-      return await wrappedCompletionsCreate(original, placed, options, nativeChatCompletionsStream, wrapOptions.backendId);
+      return await wrappedCompletionsCreate(original, placed, options, nativeChatCompletionsStream, wrapOptions.backendId,
+        wrapOptions.conversationRouteHeader);
     } catch (err) {
       noteContextOverflow(err, (params as { model?: unknown }).model);
       throw err;
@@ -835,20 +840,36 @@ function withMeasuredPromptLayout(
   }
 }
 
+/** Request options with one header added, the caller's own headers kept. */
+function withRequestHeader(options: unknown, name: string, value: string): unknown {
+  const base = options && typeof options === 'object' ? options as Record<string, unknown> : {};
+  const prior = base.headers && typeof base.headers === 'object' ? base.headers as Record<string, unknown> : {};
+  return { ...base, headers: { ...prior, [name]: value } };
+}
+
 async function wrappedCompletionsCreate(
   original: CreateFn,
   params: Record<string, unknown>,
   options: unknown,
   nativeChatCompletionsStream: boolean,
   backendId?: string,
+  conversationRouteHeader?: string,
 ): Promise<unknown> {
   {
     const relaxed = relaxRequestForCompatBackend(params) as Record<string, unknown>;
+    const usageCapture = captureActiveModelTransportUsage();
     requestIdentities.set(relaxed, Object.freeze({
       ...(typeof relaxed.model === 'string' ? { requestModel: relaxed.model } : {}),
       ...(backendId ? { backendId } : {}),
-      usageCapture: captureActiveModelTransportUsage(),
+      usageCapture,
     }));
+    // Bound here, with the request's own owner, so every send of this request
+    // (re-asks and the stream fallback included) names the same conversation,
+    // however late or wherever its stream is consumed.
+    const routeId = conversationRouteHeader
+      ? usageCapture?.owner?.sessionId ?? harnessRunContextStorage.getStore()?.sessionId
+      : undefined;
+    if (conversationRouteHeader && routeId) options = withRequestHeader(options, conversationRouteHeader, routeId);
     const structured = downgradedBodies.has(relaxed as object);
 
     if (relaxed.stream === true) {
@@ -1407,19 +1428,6 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
         return res;
       }) as typeof fetch
     : baseFetch;
-  // xAI keeps a cached prompt prefix on the server that served it and routes
-  // a conversation's calls there by this header. Without it each step of a
-  // long turn can land on a cold server and pay its whole prefix again (live
-  // 2026-10-31: a 70-call task's first five steps cached 1-9%).
-  const conversationRoutedFetch: typeof fetch = byoBackendIsXai(byo)
-    ? (async (url, init) => {
-        const sessionId = harnessRunContextStorage.getStore()?.sessionId;
-        if (!sessionId) return capturingFetch(url as never, init as never);
-        const headers = new Headers(init?.headers as HeadersInit | undefined);
-        headers.set('x-grok-conv-id', sessionId);
-        return capturingFetch(url as never, { ...(init ?? {}), headers } as never);
-      }) as typeof fetch
-    : capturingFetch;
   // Every wire call is a dispatch of the model call that owns it, the same way
   // the Claude and Jev transports report theirs. Without this a BYO brain's
   // completed response had no dispatch and so no completion receipt: the
@@ -1427,7 +1435,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // "no_completed_receipt"), and the card kept the fixed host line.
   const observedFetch: typeof fetch = (async (url, init) =>
     observeModelTransportFetch('openai_compatible_chat', requestedModelFromBody(init?.body),
-      () => conversationRoutedFetch(url as never, init as never))) as typeof fetch;
+      () => capturingFetch(url as never, init as never))) as typeof fetch;
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,
@@ -1442,6 +1450,11 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
     backendId: byo.providerId,
     nativeChatCompletionsStream: byoBackendStreamsChatCompletions(byo),
     promptLayout: { baseURL: byo.baseURL },
+    // xAI keeps a cached prompt prefix on the server that served it and routes
+    // a conversation's calls there by this header. Without it each step of a
+    // long turn can land on a cold server and pay its whole prefix again (live
+    // 2026-10-31: a 70-call task's first five steps cached 1-9%).
+    ...(byoBackendIsXai(byo) ? { conversationRouteHeader: 'x-grok-conv-id' } : {}),
   });
   return client;
 }
