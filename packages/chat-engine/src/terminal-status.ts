@@ -7,7 +7,16 @@
  * This is chrome, not Clem. Nothing here says "I", and nothing here is ever
  * shown as her reply or read aloud as her words.
  */
-import type { ChatMessage, TerminalFacts, TerminalRetained } from './types.js';
+import type { ApprovalResolution, ChatMessage, TerminalFacts, TerminalRetained } from './types.js';
+
+/** A paused turn whose card was answered says what the owner chose. */
+const APPROVAL_ANSWERED: Record<ApprovalResolution, string> = {
+  approved: 'You approved',
+  declined: 'You declined',
+  changed: 'You asked for a change',
+  expired: 'Expired before an answer',
+  cancelled: 'No longer needed',
+};
 
 export type TerminalStatusTone = 'info' | 'warning' | 'danger' | 'neutral';
 
@@ -59,7 +68,11 @@ export function terminalStatusPill(
       if (terminal.kind === 'continue' || terminal.needs === 'continue') {
         return { label: parts('Paused — say “continue” to pick up', kept), tone: 'info' };
       }
-      if (terminal.kind === 'approval') return { label: 'Waiting for your approval', tone: 'info' };
+      if (terminal.kind === 'approval') {
+        return terminal.approvalAnswer
+          ? { label: APPROVAL_ANSWERED[terminal.approvalAnswer], tone: 'neutral' }
+          : { label: 'Waiting for your approval', tone: 'info' };
+      }
       return null;
     case 'done':
       return null;

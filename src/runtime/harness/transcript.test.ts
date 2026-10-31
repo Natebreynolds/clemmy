@@ -142,6 +142,12 @@ test('a reopened approval reads as the question the card asked, and the owner\'s
     JSON.stringify(turns.map((turn) => turn.text)));
   assert.ok(!turns.some((turn) => /apr-abcd|Retained work|cli_setup/.test(turn.text)), JSON.stringify(turns.map((turn) => turn.text)));
   assert.ok(turns.some((turn) => turn.role === 'user' && turn.text === 'Yes, go ahead.'));
+  const paused = turns.find((turn) => turn.role === 'assistant' && turn.pausedOnApprovalId === 'apr-abcd');
+  assert.equal((paused?.terminal as Record<string, unknown> | undefined)?.approvalAnswer, undefined, 'an unanswered card still waits');
+  appendEvent({ sessionId: session.id, turn: 2, role: 'system', type: 'approval_resolved',
+    data: { approvalId: 'apr-abcd', decision: 'approve', resolution: 'approved' } });
+  const answered = reconstructHarnessTranscript(session.id).find((turn) => turn.role === 'assistant' && turn.pausedOnApprovalId === 'apr-abcd');
+  assert.equal((answered?.terminal as Record<string, unknown> | undefined)?.approvalAnswer, 'approved');
 });
 
 test('humanHarnessText unwraps strings, JSON strings, and objects', () => {

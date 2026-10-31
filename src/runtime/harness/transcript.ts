@@ -104,6 +104,8 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       'clem_message',
       // A card she asked, so a reopened approval reads as her question.
       'approval_requested',
+      // Its answer, so a reopened turn that paused on it no longer waits.
+      'approval_resolved',
       // The ruling on an answer delivered before its review.
       'completion_review_settled',
     ],
@@ -315,6 +317,20 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       }
     } catch { /* an unreadable mark only hides the offer */ }
   }
+  // The owner's answer to each card, in the words the chat engine reads
+  // (approvalResolutionFrom): a reopened turn paused on it says what was chosen.
+  const approvalAnswerById = new Map<string, string>();
+  for (const event of events) {
+    const approvalId = event.data.approvalId;
+    if (event.type !== 'approval_resolved' || typeof approvalId !== 'string') continue;
+    const data = event.data;
+    const answer = data.decision === 'cancelled' && data.resolution === 'cancelled_by_system' ? 'cancelled'
+      : data.changeRequested === true ? 'changed'
+        : data.decision === 'approve' || data.decision === 'approve_with_edits' ? 'approved'
+          : data.decision === 'reject' ? 'declined'
+            : data.decision === 'expired' ? 'expired' : undefined;
+    if (answer && !approvalAnswerById.has(approvalId)) approvalAnswerById.set(approvalId, answer);
+  }
   // A reply resumed by an approval belongs to the task the approval was
   // raised in: that request holds the computer actions, not the resume.
   const approvalSourceById = new Map<string, number>();
@@ -364,7 +380,11 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
           const task = computerTaskSource(event.sessionId, source.event);
           return task !== undefined ? { computerTaskSourceUserSeq: task } : {};
         })()),
-        terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
+        terminal: {
+          ...publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
+          ...(presentation.kind === 'approval' && presentation.approvalId && approvalAnswerById.has(presentation.approvalId)
+            ? { approvalAnswer: approvalAnswerById.get(presentation.approvalId) } : {}),
+        },
       });
     }
   }

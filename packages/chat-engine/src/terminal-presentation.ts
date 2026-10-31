@@ -1,5 +1,5 @@
 import type {
-  ChatMessage, MessageStatus, RetainedOutsideChange, TerminalFacts, TerminalNotice, TerminalNoticeCode,
+  ApprovalResolution, ChatMessage, MessageStatus, RetainedOutsideChange, TerminalFacts, TerminalNotice, TerminalNoticeCode,
   TerminalRetained, TerminalReview, TurnEvidenceRef,
 } from './types.js';
 import { humanHarnessText, noticeReplacesReply } from './types.js';
@@ -83,6 +83,12 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
     facts.kind = presentation.kind as TerminalFacts['kind'];
   }
   if (typeof needs === 'string' && NEEDS_KINDS.has(needs)) facts.needs = needs as TerminalFacts['needs'];
+  if (facts.kind === 'approval') {
+    if (typeof presentation.approvalId === 'string' && APPROVAL_ID.test(presentation.approvalId)) facts.approvalId = presentation.approvalId;
+    if (typeof data.approvalAnswer === 'string' && APPROVAL_ANSWERS.has(data.approvalAnswer)) {
+      facts.approvalAnswer = data.approvalAnswer as ApprovalResolution;
+    }
+  }
   if (typeof outcome.resumable === 'boolean') facts.resumable = outcome.resumable;
   const evidenceRefs = evidenceRefsFrom(outcome.evidenceRefs);
   if (evidenceRefs.length > 0) facts.evidenceRefs = evidenceRefs;
@@ -102,6 +108,15 @@ export function terminalFactsFrom(data: Record<string, unknown>): TerminalFacts 
   return facts;
 }
 
+/** A turn that paused on this card takes the owner's answer, so its status
+ *  no longer reads as waiting. */
+export function answeredPausedTurn<M extends { terminal?: TerminalFacts }>(message: M, approvalId: string, answer: ApprovalResolution): M {
+  return message.terminal?.approvalId === approvalId && message.terminal.approvalAnswer !== answer
+    ? { ...message, terminal: { ...message.terminal, approvalAnswer: answer } } : message;
+}
+
+const APPROVAL_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/;
+const APPROVAL_ANSWERS: ReadonlySet<string> = new Set<ApprovalResolution>(['approved', 'declined', 'changed', 'expired', 'cancelled']);
 const REVIEWS: ReadonlySet<string> = new Set(['checked', 'unchecked', 'rejected', 'needs_recheck', 'checking', 'corrected']);
 const OUTSIDE_CHANGES: ReadonlySet<string> = new Set(['went_through', 'did_not', 'mixed', 'refused', 'uncertain', 'none']);
 const NOTICE_CODES: ReadonlySet<string> = new Set<TerminalNoticeCode>([

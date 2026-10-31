@@ -438,6 +438,15 @@ test('a card answered by a written change stops offering its buttons and says wh
   assert.equal(applyApprovalResolution(cards, { approvalId: 'apr-other', decision: 'approve' }), cards);
 });
 
+test('a reply that paused on a card stops waiting once the owner answers it', () => {
+  const paused = [{ id: 'a-1', role: 'assistant' as const, text: 'Can I type the TEST FIXTURE note?', status: 'complete' as const,
+    terminal: { status: 'needs_input' as const, kind: 'approval' as const, approvalId: 'apr-f666' } }];
+  const answered = applyApprovalResolution(paused, { approvalId: 'apr-f666', decision: 'approve' });
+  assert.equal(answered[0].terminal?.approvalAnswer, 'approved');
+  assert.equal(applyApprovalResolution(answered, { approvalId: 'apr-f666', decision: 'approve' }), answered, 'a replayed answer changes nothing');
+  assert.equal(applyApprovalResolution(paused, { approvalId: 'apr-other', decision: 'approve' }), paused);
+});
+
 test('one pending-action read hydrates every slim card sharing the durable action id', () => {
   const messages = [
     {

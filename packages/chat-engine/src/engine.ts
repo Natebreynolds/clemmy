@@ -26,7 +26,7 @@ import { approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, card
 import { reduceFeed } from './reduce-lifecycle.js';
 import { advanceWorkflowChildActivity, clearModelRetryProgress, isModelRetryProgressBoundary, isWorkflowChildActivity, readModelRetryProgress, readWorkflowQueueDispatch, updateWorkflowDispatchActivity, workflowDispatchText } from './reduce-activity.js';
 import { applyStreamToken, withoutAnswerDraft } from './answer-stream.js';
-import { terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
+import { answeredPausedTurn, terminalCompletionPresentation, terminalFactsFrom } from './terminal-presentation.js';
 import { answerCheckCorrectedSource, applyAnswerCheckCorrection, applyReviewSettlement, readReviewSettlement, reviewPendingSourceFor } from './review-settlement.js';
 import { settleTerminalActivity, activityTerminalOutcomeForMessageStatus } from './activity-presentation.js';
 import { runChatStream, type ChatStreamHandle, type StreamTransport } from './stream.js';
@@ -958,8 +958,9 @@ export class ChatEngine {
         const approvalId = typeof d.approvalId === 'string' ? d.approvalId : null;
         const resolution = approvalResolutionFrom(d);
         if (!approvalId || !resolution) break;
-        this.messages = this.messages.map((m) => (
-          m.approval?.approvalId === approvalId ? { ...m, approval: { ...approvalWithCanonicalEdits(m.approval, d), resolution } } : m
+        this.messages = this.messages.map((m) => answeredPausedTurn(
+          m.approval?.approvalId === approvalId ? { ...m, approval: { ...approvalWithCanonicalEdits(m.approval, d), resolution } } : m,
+          approvalId, resolution,
         ));
         break;
       }
@@ -1588,6 +1589,7 @@ export function foldTranscript(events: readonly HarnessEvent[], sessionId?: stri
           if (message.approval?.approvalId === approvalId) {
             messages[index] = { ...message, approval: { ...approvalWithCanonicalEdits(message.approval, d), resolution } };
           }
+          messages[index] = answeredPausedTurn(messages[index]!, approvalId, resolution);
         }
         break;
       }

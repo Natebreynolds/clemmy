@@ -1,4 +1,4 @@
-import { approvalResultFields, normalizePendingActionPublicResult } from '@clem/chat-engine';
+import { answeredPausedTurn, approvalResultFields, normalizePendingActionPublicResult } from '@clem/chat-engine';
 import type { PendingActionResultRecord } from '@clem/chat-engine';
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
 import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
@@ -355,11 +355,13 @@ export function applyApprovalResolution(
   if (!approvalId || !resolution) return messages as ChatMessage[];
   let changed = false;
   const next = messages.map((message) => {
-    if (message.approval?.approvalId !== approvalId) return message;
-    const approval = approvalWithCanonicalEdits(message.approval, data);
-    if (approval === message.approval && approval.resolution === resolution) return message;
+    const answered = answeredPausedTurn(message, approvalId, resolution);
+    if (answered !== message) changed = true;
+    if (answered.approval?.approvalId !== approvalId) return answered;
+    const approval = approvalWithCanonicalEdits(answered.approval, data);
+    if (approval === answered.approval && approval.resolution === resolution) return answered;
     changed = true;
-    return { ...message, approval: { ...approval, resolution } };
+    return { ...answered, approval: { ...approval, resolution } };
   });
   return changed ? next : messages as ChatMessage[];
 }

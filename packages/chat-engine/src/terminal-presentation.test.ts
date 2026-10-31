@@ -26,6 +26,14 @@ test('a typed terminal carries status, kind, needs and resumable onto the messag
   assert.deepEqual(m.terminal, { status: 'needs_input', kind: 'continue', needs: 'continue', resumable: true });
 });
 
+test('a turn paused on a card keeps the card id, and the owner\'s answer when the transcript has it', () => {
+  const data = { presentation: { status: 'needs_input', kind: 'approval', approvalId: 'apr-f666' }, turnOutcome: { status: 'needs_input' } };
+  assert.equal(terminalFactsFrom(data)?.approvalId, 'apr-f666');
+  assert.equal(terminalFactsFrom({ ...data, approvalAnswer: 'approved' })?.approvalAnswer, 'approved');
+  assert.equal(terminalFactsFrom({ ...data, approvalAnswer: 'sure' })?.approvalAnswer, undefined);
+  assert.equal(terminalFactsFrom({ presentation: { status: 'done', kind: 'answer', approvalId: 'apr-f666' } })?.approvalId, undefined);
+});
+
 test('a done answer is typed as done/answer and not resumable', () => {
   const m = terminalCompletionPresentation(typed('done', 'answer', undefined, false), '');
   assert.equal(m.status, 'complete');

@@ -343,6 +343,10 @@ export interface TerminalFacts {
   memoryWork?: { sourceUserSeq: number; reason: 'memory_consolidation_pending' | 'memory_work_unverified' };
   kind?: 'answer' | 'question' | 'approval' | 'continue';
   needs?: 'input' | 'approval' | 'continue';
+  /** The card a turn paused on, and the owner's answer once given: an
+   *  answered card no longer reads as waiting. */
+  approvalId?: string;
+  approvalAnswer?: ApprovalResolution;
   resumable?: boolean;
   /** Which model actually produced this turn (from turn_model_routed). */
   modelIdentity?: string;

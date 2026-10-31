@@ -39,6 +39,8 @@ test('pills read as before when nothing was kept', () => {
   assert.equal(terminalStatusPill({ status: 'transferred' })?.label, 'Handed off');
   assert.equal(terminalStatusPill({ status: 'needs_input', needs: 'continue' })?.label, 'Paused — say “continue” to pick up');
   assert.equal(terminalStatusPill({ status: 'needs_input', kind: 'approval' })?.label, 'Waiting for your approval');
+  assert.deepEqual(terminalStatusPill({ status: 'needs_input', kind: 'approval', approvalAnswer: 'approved' }), { label: 'You approved', tone: 'neutral' });
+  assert.equal(terminalStatusPill({ status: 'needs_input', kind: 'approval', approvalAnswer: 'declined' })?.label, 'You declined');
   assert.equal(terminalStatusPill({ status: 'needs_input', kind: 'question' }), null, 'a question keeps each surface’s own reply prompt');
   assert.equal(terminalStatusPill({ status: 'done', retained: { results: 2, outsideChange: 'none' } }), null);
   assert.equal(terminalStatusPill(undefined), null);
