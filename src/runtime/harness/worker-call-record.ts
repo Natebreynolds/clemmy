@@ -27,6 +27,10 @@ export interface WorkerCallRecord {
   requiredWork?: 'satisfied' | 'pending';
   /** Successful non-mutating business evidence; an alternate reader may recover a failed lookup. */
   successfulRead?: boolean;
+  /** Calls the host classes as supporting (control) work, such as a public
+   *  page read: shown beside the business record so it never reads as
+   *  "nothing ran", never counted as business work. */
+  supportingByTool?: Record<string, WorkerToolTally>;
 }
 
 const CARRIER_NAMES = new Set(['call_tool', 'work_call', 'composio_execute_tool']);
@@ -46,6 +50,7 @@ function innerToolName(call: { name?: unknown; argumentsJson?: unknown }): strin
 /** The worker's calls for one accepted source of its session. */
 export function workerCallRecord(sessionId: string, sourceUserSeq: number): WorkerCallRecord {
   const byTool: Record<string, WorkerToolTally> = {};
+  const supportingByTool: Record<string, WorkerToolTally> = {};
   const tally = (tool: string): WorkerToolTally => (byTool[tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
   let businessCallSucceeded = false;
   let effectsMayHaveRun = false;
@@ -54,7 +59,12 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
     const data = event.data;
     if (typeof data.sourceUserSeq === 'number' && data.sourceUserSeq !== sourceUserSeq) continue;
     if (event.type === 'tool_attempt_settled') {
-      if (data.businessCall !== true || typeof data.tool !== 'string') continue;
+      if (typeof data.tool !== 'string') continue;
+      if (data.businessCall !== true) {
+        const supporting = (supportingByTool[data.tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
+        if (data.kind === 'succeeded') supporting.succeeded += 1; else supporting.failed += 1;
+        continue;
+      }
       if (data.mutating !== false && data.dispatchState !== 'not_started') effectsMayHaveRun = true;
       if (data.kind === 'succeeded') {
         if (data.mutating === false) successfulRead = true;
@@ -70,7 +80,8 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
       }
     }
   }
-  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead };
+  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead,
+    ...(Object.keys(supportingByTool).length > 0 ? { supportingByTool } : {}) };
 }
 
 /**
@@ -81,14 +92,20 @@ export function workerCallRecord(sessionId: string, sourceUserSeq: number): Work
  */
 export function workerScopeCallRecord(sessionId: string, runScopeId: string, afterSeq: number): WorkerCallRecord {
   const byTool: Record<string, WorkerToolTally> = {};
+  const supportingByTool: Record<string, WorkerToolTally> = {};
   let businessCallSucceeded = false;
   let effectsMayHaveRun = false;
   let successfulRead = false;
   for (const event of listEvents(sessionId, { sinceSeq: afterSeq, types: ['tool_returned'] })) {
     const data = event.data;
-    if (data.runScopeId !== runScopeId || data.accounting !== 'top_level' || data.topologyRole !== 'business') continue;
+    if (data.runScopeId !== runScopeId || data.accounting !== 'top_level') continue;
     const tool = typeof data.effectiveTool === 'string' ? data.effectiveTool : typeof data.tool === 'string' ? data.tool : '';
     if (!tool) continue;
+    if (data.topologyRole !== 'business') {
+      const supporting = (supportingByTool[tool] ??= { succeeded: 0, failed: 0, refusedBeforeDispatch: 0 });
+      if (data.ok === false) supporting.failed += 1; else supporting.succeeded += 1;
+      continue;
+    }
     // Legacy SDK records do not consistently carry an effect. Unknown is not
     // evidence that replaying a completed call would be harmless.
     if (data.effect !== 'read' && data.mutating !== false) effectsMayHaveRun = true;
@@ -101,7 +118,8 @@ export function workerScopeCallRecord(sessionId: string, runScopeId: string, aft
       businessCallSucceeded = true;
     }
   }
-  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead };
+  return { byTool, businessCallSucceeded, businessCallAttempted: Object.keys(byTool).length > 0, effectsMayHaveRun, successfulRead,
+    ...(Object.keys(supportingByTool).length > 0 ? { supportingByTool } : {}) };
 }
 
 /** A successful sibling call is not evidence that a failed requirement was
@@ -126,17 +144,21 @@ export function qualifyWorkerOutput(text: string, record: WorkerCallRecord | und
 
 /** The record as the parent reads it beside the worker's own reply. */
 export function renderWorkerCallRecord(record: WorkerCallRecord): string {
-  const lines = Object.entries(record.byTool).map(([tool, t]) => {
+  const line = (tool: string, t: WorkerToolTally, suffix = '') => {
     const parts = [
       `${t.succeeded} succeeded`,
       ...(t.failed > 0 ? [`${t.failed} failed`] : []),
       ...(t.refusedBeforeDispatch > 0 ? [`${t.refusedBeforeDispatch} refused before dispatch — no request reached the provider`] : []),
     ];
-    return `- ${tool}: ${parts.join('; ')}`;
-  });
+    return `- ${tool}${suffix}: ${parts.join('; ')}`;
+  };
+  const lines = [
+    ...Object.entries(record.byTool).map(([tool, t]) => line(tool, t)),
+    ...Object.entries(record.supportingByTool ?? {}).map(([tool, t]) => line(tool, t, ' (supporting call)')),
+  ];
   return [
     '[Host record of this worker\'s calls — written by Clementine, not the worker]',
-    ...(lines.length > 0 ? lines : ['- No business tool ran.']),
+    ...(lines.length > 0 ? lines : ['- No tool ran.']),
     'Where the worker\'s account disagrees with this record, the record is right. Preserve completed actions and repair only the missing work; do not repeat writes or sends.',
   ].join('\n');
 }

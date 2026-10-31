@@ -69,7 +69,29 @@ test('a worker that ran no business tool is recorded as such', () => {
   const record = workerCallRecord(session.id, source.seq);
   assert.equal(record.businessCallSucceeded, false);
   assert.equal(record.businessCallAttempted, false, 'a worker that needed no tool attempted none');
-  assert.match(renderWorkerCallRecord(record), /No business tool ran\./);
+  assert.match(renderWorkerCallRecord(record), /- No tool ran\./);
+});
+
+test('a worker whose only call was a supporting page read is recorded with that read, never as "nothing ran"', () => {
+  const session = createSession({ kind: 'agent', title: 'supporting read fixture' });
+  const source = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Read the page and give its title.' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'tool_attempt_settled', data: {
+    sourceUserSeq: source.seq, tool: 'http_read', kind: 'succeeded', businessCall: false, mutating: false, dispatchState: 'dispatched' } });
+  const record = workerCallRecord(session.id, source.seq);
+  assert.equal(record.businessCallSucceeded, false, 'a supporting read is not business work');
+  assert.deepEqual(record.supportingByTool, { http_read: { succeeded: 1, failed: 0, refusedBeforeDispatch: 0 } });
+  const rendered = renderWorkerCallRecord(record);
+  assert.match(rendered, /- http_read \(supporting call\): 1 succeeded/);
+  assert.doesNotMatch(rendered, /No tool ran|No business tool ran/);
+
+  const parent = createSession({ kind: 'chat', title: 'sdk supporting fixture' });
+  const scope = `${parent.id}::worker:supporting`;
+  const before = appendEvent({ sessionId: parent.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Fan out.' } });
+  appendEvent({ sessionId: parent.id, turn: 1, role: 'system', type: 'tool_returned', data: {
+    runScopeId: scope, accounting: 'top_level', topologyRole: 'control', tool: 'http_read', ok: true } });
+  const sdk = workerScopeCallRecord(parent.id, scope, before.seq);
+  assert.equal(sdk.businessCallSucceeded, false);
+  assert.match(renderWorkerCallRecord(sdk), /- http_read \(supporting call\): 1 succeeded/);
 });
 
 test('an agent-SDK worker gets the same record from its scoped calls in the parent session', () => {

@@ -3753,7 +3753,8 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
         appendWorkerResultFromOutput(qualifiedText, {
           model: workerModel,
           retryRequiresReconciliation: outputFailed && callRecord?.effectsMayHaveRun !== false,
-          toolUses: callRecord ? Object.keys(callRecord.byTool).filter((tool) => (callRecord!.byTool[tool]?.succeeded ?? 0) > 0) : [],
+          toolUses: callRecord ? [callRecord.byTool, callRecord.supportingByTool ?? {}]
+            .flatMap((tallies) => Object.keys(tallies).filter((tool) => (tallies[tool]?.succeeded ?? 0) > 0)) : [],
           backedByWork: !outputFailed,
         });
         return await reduceReturn(qualifiedText, false, callRecord);
