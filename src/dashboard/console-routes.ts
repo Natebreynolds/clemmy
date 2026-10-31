@@ -257,7 +257,7 @@ import {
 import { getManagedCliJob, startManagedCliJob, type ManagedCliAction, type ManagedCliKind } from '../runtime/managed-cli-jobs.js';
 import { discoverMcpServers, invalidateMcpServerDiscoveryCache, loadUserMcpServers, saveUserMcpServers } from '../runtime/mcp-config.js';
 import { mcpServerCreateSummary, prepareMcpServerCreateRequest, validateMcpWorkingDirectory } from '../runtime/mcp-server-request.js';
-import { validMcpCredentialInput, writeMcpServerCredential } from '../runtime/mcp-server-credential.js';
+import { removeMcpServerCredential, validMcpCredentialInput, writeMcpServerCredential } from '../runtime/mcp-server-credential.js';
 import { buildDevFlagsSnapshot, setDevFlag, clearDevFlag, setDevMode, isDevModeEnabled } from '../runtime/dev-flags.js';
 import {
   getOrCreateExternalMcpServers,
@@ -12164,6 +12164,31 @@ export function registerConsoleRoutes(
       res.json({ ok: true, server: name, key, set: true, ...setup });
     } catch {
       res.status(500).json({ error: 'The access detail could not be saved or its connection checked. Refresh the server status before trying again.' });
+    }
+  });
+  // The owner removes a key they saved for a server: the same declared and
+  // editable admission as saving it, then the server reconnects without it.
+  app.delete('/api/console/mcp-servers/:name/credential/:key', async (req, res) => {
+    if (!isAuthorized(req)) { res.status(401).json({ error: 'unauthorized' }); return; }
+    const name = req.params.name;
+    const key = String(req.params.key ?? '').trim();
+    try {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) { res.status(400).json({ error: 'Use a valid environment key.' }); return; }
+      invalidateMcpServerDiscoveryCache();
+      const server = discoverMcpServers().find((s) => s.name === name);
+      if (!server) { res.status(404).json({ error: 'server not found' }); return; }
+      const { declaredEnvKeys, editableEnvKeys } = serverEnvStatus(server, { daemon: {}, inherited: {} });
+      if (!declaredEnvKeys.includes(key)) { res.status(400).json({ error: `"${key}" is not a declared env key for "${name}".` }); return; }
+      if (!editableEnvKeys.includes(key)) {
+        res.status(409).json({ code: 'inline_credential_override', error: 'This value is supplied by the server configuration, not saved here.' });
+        return;
+      }
+      const removed = removeMcpServerCredential(path.join(BASE_DIR, '.env'), key);
+      invalidateRuntimeConfigSnapshot('environment');
+      await invalidateConfiguredMcpServers();
+      res.json({ ok: true, server: name, key, removed });
+    } catch {
+      res.status(500).json({ error: 'The access detail could not be removed. Refresh the server status before trying again.' });
     }
   });
 
