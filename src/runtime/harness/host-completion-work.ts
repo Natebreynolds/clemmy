@@ -7,7 +7,7 @@ import { acceptedTurnCallAuthorityFor } from './accepted-turn-call-authority.js'
 import { redeemSuccessfulSettlementResultForHost, redeemedReadIsExhausted } from './result-handle.js';
 import { TOOL_REGISTRY, toolReadsRetainedOutput, type LocalPlanningSemantics } from '../../tools/tool-registry.js';
 import { acceptedPlanExecution } from './accepted-plan-execution.js';
-import { discoveryNavigation } from './discovered-tool-context.js';
+import { reviewDiscoveryNavigation } from './discovered-tool-context.js';
 import { PROMPT_INLINE_RECALLABLE_RESULT_CHARS, answererViewBudgetFor, presentationBudgetFor, densifyMarkdownForModelHead, extractResourceIdIndex } from './tool-output-format.js';
 import { harnessRunContextStorage } from './brackets.js';
 import { compactStructuredJsonToolOutput, digestToolOutput } from './tool-output-digest.js';
@@ -1139,7 +1139,7 @@ export function sourceSettledReadEvidence(input: {
       // An advisory cursor already covered these schemas. Keep the receipt
       // below, but do not append the same discovery contracts on every check.
       const found = !priorWindow && row.toolName === 'tool_search' && (incremental || businessReadAnswered)
-        ? discoveryNavigation(value.rawPayload) : undefined;
+        ? reviewDiscoveryNavigation(value.rawPayload) : undefined;
       const contracts = found?.length ? discoveredInputContracts(value.rawPayload) : {};
       const navigation = found && (incremental || found.length > 0)
         ? found.map((entry) => {

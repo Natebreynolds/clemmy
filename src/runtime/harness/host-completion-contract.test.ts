@@ -523,6 +523,33 @@ test('summarized discovery keeps each operation input contract so a saved action
   assert.doesNotMatch(evidence.summary, /PROSE_ONLY_DESCRIPTION/);
 });
 
+test('summarized discovery keeps what was found and on which account, without the answerer next-call routing', () => {
+  const identity = accepted('Send the renewal reply from my work mailbox.');
+  const account = { toolkit: 'mail', accountIdentity: 'owner@work.test', accountIdentityKind: 'email', label: 'work' };
+  retainedRead(identity, 'tool_search', { results: [
+    { name: 'MAIL_SEND', summary: 'Send a message.', capabilityRef: 'cap:mail-send', carrier: 'work_call', selectedAccount: account,
+      accountChoices: ['owner@work.test', 'owner@home.test'],
+      invocation: { name: 'CONTROLLED_CARRIER', fixedArgs: { tool_slug: 'MAIL_SEND' }, payloadField: 'arguments' } },
+    { name: 'MAIL_SEND_LEGACY', carrier: 'work_call', planningRefStatus: 'materialization_unavailable',
+      materializationReason: 'exact_definition_unavailable', materializationNextStep: 'CONTROLLED_RETRY_INSTRUCTION' },
+  ], schemas: { MAIL_SEND: { type: 'object', required: ['to'], properties: { to: { type: 'string' } } } },
+  schema_handles: { MAIL_SEND: { cursor: 'CONTROLLED_SCHEMA_CURSOR' } } });
+  retainedRead(identity, 'mail_list_messages', { value: [{ id: 'message-1', subject: 'Renewal' }] });
+  events.closeEventLog();
+  const evidence = sourceSettledReadEvidence(identity);
+  assert.equal(evidence.results.find((row) => row.toolName === 'tool_search')?.contentDisposition, 'discovery_navigation');
+  for (const kept of ['"summary":"Send a message."', '"capabilityRef":"cap:mail-send"', '"accountIdentity":"owner@work.test"',
+    '"accountChoices":["owner@work.test","owner@home.test"]', '"planningRefStatus":"materialization_unavailable"',
+    '"materializationReason":"exact_definition_unavailable"', '"inputContract":{"required":["to"],"accepted":["to"]}']) {
+    assert.ok(evidence.summary.includes(kept), `review keeps ${kept}`);
+  }
+  for (const routing of ['CONTROLLED_SCHEMA_CURSOR', 'CONTROLLED_CARRIER', 'CONTROLLED_RETRY_INSTRUCTION', '"carrier":"work_call"']) {
+    assert.ok(!evidence.summary.includes(routing), `review leaves out the answerer's ${routing}`);
+  }
+  assert.match(evidence.summary, /tool_search \[logicalCall=[^\]]*\]: authenticated receipt; handle=\S+; retained JSON sha256=[a-f0-9]{64}/,
+    'the exact discovery result stays reachable behind its handle');
+});
+
 test('repeated exact calls retain distinct observed states for completion review', () => {
   const identity = accepted('Is the export finished?');
   retainedRead(identity, 'workflow_run_status', { status: 'running', step: 'EARLY_POLL' }, false, false, false, { id: 'run-status-1', args: { runId: 'export-1' } });

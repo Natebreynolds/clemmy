@@ -26,6 +26,15 @@ export function discoveryNavigation(payload: unknown): Array<Record<string, unkn
   });
 }
 
+/** The reviewer's view of the same navigation: what was found, on which
+ * accounts, and whether it could be prepared. The answerer's next-call routing
+ * (schema cursor, call shape, carrier, retry instruction) is not evidence; the
+ * exact result stays behind its handle. */
+export function reviewDiscoveryNavigation(payload: unknown): Array<Record<string, unknown>> {
+  return discoveryNavigation(payload).map(({ schemaHandle: _cursor, invocation: _shape, carrier: _carrier,
+    materializationNextStep: _instruction, ...review }) => review);
+}
+
 export function sourceDiscoveryContext(input: { sessionId: string; sourceUserSeq: number }): string {
   try {
     const calls = openEventLog().prepare(`SELECT l.logical_tool_call_id AS callId
