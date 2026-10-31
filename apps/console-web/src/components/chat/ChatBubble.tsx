@@ -62,7 +62,7 @@ function actionExecutionView(presentation: DurableActionPresentation, observedEx
     ...(copy.details ? { details: copy.details } : {}), presentation, observedExecution };
 }
 import { snoozeNeedsYou } from '@/lib/inbox';
-import { activityTerminalOutcomeForMessageStatus } from '@/lib/activity-presentation';
+import { activityTerminalOutcomeForMessage } from '@/lib/activity-presentation';
 
 /** What the pre-send check found in this exact content, before approval.
  *  Advisory: the owner decides either way. */
@@ -754,7 +754,7 @@ export function ChatBubble({
           live={live}
           progress={message.progress}
           words={liveWords || undefined}
-          terminalOutcome={live ? undefined : activityTerminalOutcomeForMessageStatus(message.status)}
+          terminalOutcome={live ? undefined : activityTerminalOutcomeForMessage(message)}
           traceHref={traceHref}
           onBackground={live ? onBackground : undefined}
         />

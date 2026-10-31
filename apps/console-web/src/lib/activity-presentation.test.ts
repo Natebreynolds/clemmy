@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  activityTerminalOutcomeForMessage,
   activityTerminalOutcomeForMessageStatus,
   activityTerminalOutcomeFromHarnessEvents,
   humanizeRequirementId,
@@ -62,6 +63,9 @@ test('chat terminal status distinguishes success, failure, waiting on the person
   assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-reply'), 'waiting');
   assert.equal(activityTerminalOutcomeForMessageStatus('awaiting-plan'), 'waiting');
   assert.equal(activityTerminalOutcomeForMessageStatus(undefined), 'interrupted');
+  // Live 2026-10-31: a reply whose card the owner declined still read "Waiting for you".
+  assert.equal(activityTerminalOutcomeForMessage({ status: 'awaiting-reply', terminal: { approvalAnswer: 'declined' } }), 'completed');
+  assert.equal(activityTerminalOutcomeForMessage({ status: 'awaiting-reply', terminal: {} }), 'waiting');
   // Waiting settles leftover rows exactly as a stop does: it proves no success.
   const running = { id: 'r', kind: 'tool', label: 'Reading', status: 'running' } as unknown as Parameters<typeof settleTerminalActivity>[0][number];
   assert.equal(settleTerminalActivity([running], 'waiting')[0]?.status, 'interrupted');

@@ -211,6 +211,14 @@ export function settleTerminalActivity(
   });
 }
 
+/** A reply that paused on a card the owner has since answered no longer
+ *  waits on them: its work line reads as finished. */
+export function activityTerminalOutcomeForMessage(
+  message: { status?: MessageStatus; terminal?: { approvalAnswer?: unknown } },
+): ActivityTerminalOutcome | undefined {
+  return message.terminal?.approvalAnswer ? 'completed' : activityTerminalOutcomeForMessageStatus(message.status);
+}
+
 export function activityTerminalOutcomeForMessageStatus(
   status: MessageStatus | undefined,
 ): ActivityTerminalOutcome | undefined {
