@@ -142,3 +142,34 @@ test('a window learned from the app\'s own launch answer counts, and a window re
   const two = await replayWith([{ title: 'Folder A', id: 31 }, { title: 'Folder B', id: 33 }]);
   assert.equal(two.status, 'needs_clem', 'two titled windows and none named as before: Clem chooses');
 });
+
+test('the live shapes repeat: a shortcut aimed through target, typing into the new note\'s unnamed body', async () => {
+  const launched = ok({ pid: 79837, windows: [{ app_name: 'Notes', title: 'TEST FIXTURE folder', window_id: 7516, is_on_screen: true }] });
+  const extracted = extractComputerRecipe([
+    { tool: 'cua-driver__launch_app', args: { bundle_id: 'com.apple.Notes' }, result: launched },
+    { tool: 'cua-driver__hotkey', args: { keys: ['cmd', 'n'], target: { kind: 'window', pid: 79837, window_id: 7516 } }, result: { result: { isError: true, content: [] } } },
+    { tool: 'cua-driver__hotkey', args: { keys: ['cmd', 'n'], target: { kind: 'window', pid: 79837, window_id: 7516 } }, result: ok({}) },
+    { tool: 'cua-driver__get_window_state', args: { pid: 79837, window_id: 7516, query: 'note' },
+      result: snapshot('s00000002', 7516, '- [0] AXWindow "Notes"\n    - [16] AXTextArea [id=Note[id=D84D1390-AAAA] actions=[icmactextviewaccessibilityactionmaketodo]]\n') },
+    { tool: 'cua-driver__type_text', args: { text: 'TEST FIXTURE replay note', element_token: 's00000002:16' }, result: ok({}) },
+  ]);
+  assert.equal(extracted.status, 'ready', JSON.stringify(extracted));
+  if (extracted.status !== 'ready') return;
+  assert.deepEqual(extracted.recipe.steps, [
+    { kind: 'launch', bundleId: 'com.apple.Notes' },
+    { kind: 'window', app: 'Notes', title: 'TEST FIXTURE folder' },
+    { kind: 'hotkey', keys: ['cmd', 'n'] },
+    { kind: 'type', text: 'TEST FIXTURE replay note', into: { role: 'AXTextArea', label: '', idClass: 'Note' } },
+  ], 'the refused first press is not kept; the note\'s own id is not kept');
+  const sent: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const outcome = await replayComputerRecipe(extracted.recipe, async (tool, args) => {
+    sent.push({ tool, args });
+    if (tool === 'launch_app') return ok({ pid: 900 });
+    if (tool === 'list_windows') return ok({ windows: [{ app_name: 'Notes', title: 'Another folder', window_id: 41, is_on_screen: true }] });
+    if (tool === 'get_window_state') return snapshot('s00000009', 41, '- [3] AXTextArea [id=Note[id=NEW-NOTE-ID] actions=[x]]\n- [4] AXTextField "Search" [id=search]\n');
+    return ok({});
+  }, { session: 'replay' });
+  assert.deepEqual(outcome, { status: 'done', steps: 4 });
+  assert.equal(sent.find((call) => call.tool === 'type_text')!.args.element_token, 's00000009:3', 'typed into the new note\'s body');
+  assert.equal(sent.filter((call) => call.tool === 'hotkey').length, 1, 'one new note, not two');
+});

@@ -18,8 +18,12 @@ export type ComputerRecipeStepV1 =
   | { kind: 'launch'; bundleId?: string; name?: string }
   | { kind: 'window'; app: string; title: string }
   | { kind: 'press'; role: string; label: string; axId?: string }
-  | { kind: 'type'; text: string }
+  | { kind: 'type'; text: string; into?: ComputerRecipeTarget }
   | { kind: 'hotkey'; keys: string[] };
+
+/** An element to act on, as it can be found again: role and label, and the
+ *  stable part of its accessibility id (`Note[id=<this note>]` keeps `Note`). */
+export interface ComputerRecipeTarget { role: string; label: string; idClass?: string }
 
 export interface ComputerRecipeV1 {
   version: 1;
@@ -38,7 +42,15 @@ export type ComputerRecipeExtraction =
   | { status: 'not_repeatable'; reason: string };
 
 interface SnapshotElement { role: string; label: string; axId?: string }
-interface Snapshot { snapshotId: string; elements: Map<number, SnapshotElement> }
+interface Snapshot { snapshotId: string; windowId: number | null; elements: Map<number, SnapshotElement> }
+
+/** The part of an accessibility id that names a kind of element, not one
+ *  instance of it: an id with a bracketed per-item part keeps its prefix. */
+export function stableIdClass(axId: string | undefined): string | undefined {
+  if (!axId) return undefined;
+  const bracket = axId.indexOf('[');
+  return bracket > 0 ? axId.slice(0, bracket) : axId;
+}
 
 const DRIVER_PREFIX = 'cua-driver__';
 /** Calls that only look: replay makes its own fresh reads. */
@@ -86,7 +98,8 @@ export function parseWindowSnapshot(value: unknown): Snapshot | null {
     const axId = /(?:^|\s)id=(\S+)/.exec(match[4] ?? '')?.[1];
     elements.set(Number(match[1]), { role: match[2]!, label: (match[3] ?? '').replace(/\\"/g, '"'), ...(axId ? { axId } : {}) });
   }
-  return { snapshotId, elements };
+  const windowId = Number(content?.window_id);
+  return { snapshotId, windowId: Number.isSafeInteger(windowId) ? windowId : null, elements };
 }
 
 /** The repeatable steps of a finished computer task, or why it cannot repeat
@@ -130,8 +143,14 @@ export function extractComputerRecipe(calls: readonly ComputerTraceCall[]): Comp
       if (!(previous?.kind === 'launch' && JSON.stringify(previous) === JSON.stringify(step))) steps.push(step);
       continue;
     }
-    // Every acting call targets a window: name it before the first action in it.
-    const windowId = Number(call.args.window_id);
+    // Every acting call targets a window: name it before the first action in
+    // it. The window is an argument, or inside a `target`, or (for an action
+    // aimed at an element) the window of the snapshot that named the element.
+    const token = typeof call.args.element_token === 'string' ? call.args.element_token : '';
+    const [tokenSnapshotId, tokenRow] = token.split(':');
+    const tokenSnapshot = tokenSnapshotId ? snapshots.get(tokenSnapshotId) : undefined;
+    const tokenElement = tokenSnapshot?.elements.get(Number(tokenRow));
+    const windowId = Number(call.args.window_id ?? record(call.args.target)?.window_id ?? tokenSnapshot?.windowId);
     if (Number.isSafeInteger(windowId) && windowId !== currentWindow) {
       const known = windowTitles.get(windowId);
       if (!known) return { status: 'not_repeatable', reason: `a window was used before its title was read (window ${windowId})` };
@@ -139,9 +158,7 @@ export function extractComputerRecipe(calls: readonly ComputerTraceCall[]): Comp
       currentWindow = windowId;
     }
     if (tool === 'click') {
-      const token = typeof call.args.element_token === 'string' ? call.args.element_token : '';
-      const [snapshotId, row] = token.split(':');
-      const element = snapshotId ? snapshots.get(snapshotId)?.elements.get(Number(row)) : undefined;
+      const element = tokenElement;
       if (!element) return { status: 'not_repeatable', reason: 'a click targeted something the trace does not name' };
       if (!element.label && !element.axId) {
         return { status: 'not_repeatable', reason: `a click targeted an unnamed ${element.role}, which cannot be found again` };
@@ -151,7 +168,10 @@ export function extractComputerRecipe(calls: readonly ComputerTraceCall[]): Comp
     }
     if (tool === 'type_text') {
       if (typeof call.args.text !== 'string' || !call.args.text) return { status: 'not_repeatable', reason: 'text was typed without its words' };
-      steps.push({ kind: 'type', text: call.args.text });
+      if (token && !tokenElement) return { status: 'not_repeatable', reason: 'text was typed into something the trace does not name' };
+      const idClass = stableIdClass(tokenElement?.axId);
+      steps.push({ kind: 'type', text: call.args.text,
+        ...(tokenElement ? { into: { role: tokenElement.role, label: tokenElement.label, ...(idClass ? { idClass } : {}) } } : {}) });
       continue;
     }
     if (tool === 'hotkey') {
@@ -226,8 +246,23 @@ export async function replayComputerRecipe(recipe: ComputerRecipeV1, call: Compu
       if (failed(pressed)) return stop(at, `pressing ${step.role} "${step.label}" was refused`);
       continue;
     }
+    let into: string | undefined;
+    if (step.kind === 'type' && step.into) {
+      const target = step.into;
+      const result = await call('get_window_state', { pid, window_id: windowId, session: options.session, tree_format: 'markdown',
+        query: target.label || target.role, include_screenshot: false });
+      const snapshot = parseWindowSnapshot(result);
+      if (!snapshot) return stop(at, 'the window could not be read');
+      const chosen = [...snapshot.elements.entries()].filter(([, element]) => element.role === target.role
+        && element.label === target.label && (!target.idClass || stableIdClass(element.axId) === target.idClass));
+      if (chosen.length !== 1) {
+        const named = target.label ? `${target.role} "${target.label}"` : (target.idClass ? `${target.role} (${target.idClass})` : target.role);
+        return stop(at, chosen.length === 0 ? `no ${named} to type into is showing` : `${chosen.length} places could take the typing`);
+      }
+      into = `${snapshot.snapshotId}:${chosen[0]![0]}`;
+    }
     const sent = step.kind === 'type'
-      ? await call('type_text', { pid, window_id: windowId, text: step.text, delivery_mode: 'foreground', session: options.session })
+      ? await call('type_text', { pid, window_id: windowId, text: step.text, delivery_mode: 'foreground', session: options.session, ...(into ? { element_token: into } : {}) })
       : await call('hotkey', { pid, window_id: windowId, keys: step.keys, delivery_mode: 'foreground', session: options.session });
     if (failed(sent)) return stop(at, step.kind === 'type' ? 'the typing was refused' : 'the shortcut was refused');
   }
