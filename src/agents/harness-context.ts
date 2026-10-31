@@ -613,6 +613,22 @@ export interface MemoryCore {
   policies: CorePolicyRender;
 }
 
+/** Sections that tell the answerer how to work rather than what the owner
+ *  said, wants or has. Every other section, including any added later, reaches
+ *  the completion review. */
+const ANSWERER_GUIDANCE_SECTIONS = new Set<string>([
+  '(header)',
+  '(appended)',
+  'Autonomy',
+  'Core Personality',
+  'Skill Discovery',
+  'Relevant Skills',
+  'Remembered Tool Choices',
+  'Proven Run Strategies',
+  'Lessons From Past Checks',
+  'Memory Pointer',
+]);
+
 function manifestEntry(section: string, tier: MemoryTier, text: string, refs: MemoryManifestEntry['refs'] = []): MemoryManifestEntry {
   return {
     section,
@@ -620,6 +636,7 @@ function manifestEntry(section: string, tier: MemoryTier, text: string, refs: Me
     tokens: Math.ceil(text.length / 4),
     bytes: Buffer.byteLength(text, 'utf8'),
     refs,
+    ...(ANSWERER_GUIDANCE_SECTIONS.has(section) ? { guidance: true as const } : {}),
   };
 }
 

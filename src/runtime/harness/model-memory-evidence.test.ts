@@ -66,6 +66,41 @@ test('a version-2 record names each section by tier with totals and the core add
   assert.equal(memory.latestModelMemoryManifest(session.id, source.seq)?.version, 2, 'a named source is looked up exactly');
 });
 
+test('a review reads the owner facts and rules of each fragment, not the answerer guidance, and a fragment that does not rebuild is read whole', () => {
+  const sections = [
+    { section: '(header)', text: '# Persistent Context\n\nHOW CONTEXT WORKS\n\n', guidance: true },
+    { section: 'Autonomy', text: '## Autonomy\nACT WITHOUT ASKING FOR LOCAL WORK', guidance: true },
+    { section: 'Standing Policies', text: '## Standing Policies\nSEND ONLY FROM THE WORK MAILBOX' },
+    { section: 'Lessons From Past Checks', text: '## Lessons From Past Checks\nCHECK THE RECIPIENT TWICE', guidance: true },
+    { section: 'Right Now', text: '## Right Now\nFRIDAY MORNING' },
+  ];
+  const fragment = {
+    text: sections.map((entry) => entry.text).join('\n\n'),
+    manifest: sections.map((entry) => ({ section: entry.section, tier: 'core' as const, tokens: 1,
+      bytes: Buffer.byteLength(entry.text, 'utf8'), refs: [], ...(entry.guidance ? { guidance: true as const } : {}) })),
+  };
+  assert.equal(memory.reviewMemoryText(fragment), '## Standing Policies\nSEND ONLY FROM THE WORK MAILBOX\n\n## Right Now\nFRIDAY MORNING');
+  const drifted = { ...fragment, text: `${fragment.text} EXTRA` };
+  assert.equal(memory.reviewMemoryText(drifted), drifted.text, 'a manifest that does not rebuild the bytes keeps the whole fragment');
+  assert.equal(memory.reviewMemoryText({ text: 'NO MANIFEST' }), 'NO MANIFEST');
+
+  const session = log.createSession({ id: 'memory-evidence-review', kind: 'chat' });
+  const source = log.appendEvent({ sessionId: session.id, turn: 1, type: 'user_input_received', role: 'user', data: { text: 'Send the note.' } });
+  const identity = { sessionId: session.id, sourceUserSeq: source.seq };
+  memory.recordAcceptedModelMemory(identity, [fragment, { text: 'TOOL HABIT', manifest: [{ section: '(appended)', tier: 'relevant', tokens: 1, bytes: 10, refs: [], guidance: true }] }]);
+  const evidence = memory.acceptedModelMemoryEvidence(identity)!;
+  assert.match(evidence, /SEND ONLY FROM THE WORK MAILBOX[\s\S]*FRIDAY MORNING/);
+  for (const guidance of ['ACT WITHOUT ASKING', 'CHECK THE RECIPIENT TWICE', 'HOW CONTEXT WORKS', 'TOOL HABIT']) {
+    assert.ok(!evidence.includes(guidance), `the review leaves out ${guidance}`);
+  }
+  assert.match(evidence, /operating guidance from memory .* is left out here/);
+  const row = log.listEvents(session.id, { types: ['guardrail_tripped'] }).at(-1)!.data;
+  assert.equal((row.fragments as string[])[0], fragment.text, 'the record keeps what the answerer was actually sent');
+  log.appendEvent({ sessionId: session.id, turn: 0, type: 'guardrail_tripped', role: 'system', data: { ...row,
+    reviewFragments: ['FORGED'], reviewDigest: 'wrong' } });
+  assert.match(memory.acceptedModelMemoryEvidence(identity)!, /ACT WITHOUT ASKING/, 'an unverifiable review copy falls back to the whole memory');
+});
+
 test('a registered tail contained in the tail a request carries is not a second view', () => {
   const instructions = memory.withInstructionMemory(() => '', ['CORE']);
   memory.registerMemoryTail('_pointer line_');

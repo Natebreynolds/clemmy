@@ -120,6 +120,22 @@ test('stable rubric, turn authority, and externally-rendered Tool Memory occupy 
   assert.equal(rendered.indexOf(CACHE_MEMORY_APPEND_SENTINEL) > rendered.indexOf(CACHE_MEMORY_CONTEXT_SENTINEL), true);
 });
 
+test('the rendered memory core cuts cleanly for review: guidance sections are marked and left out, every other section stays', async () => {
+  const { reviewMemoryText } = await import('../runtime/harness/model-memory-evidence.js');
+  const core = renderMemoryCore();
+  assert.ok(core.text, 'the test home renders a memory core');
+  const guidance = core.manifest.filter((entry) => entry.guidance).map((entry) => entry.section);
+  assert.ok(guidance.includes('(header)') && guidance.includes('Autonomy'), `guidance is marked by its producer: ${guidance}`);
+  assert.ok(!core.manifest.some((entry) => entry.guidance && entry.section === 'Standing Policies'));
+  const review = reviewMemoryText(core);
+  assert.notEqual(review, core.text, 'the producer bytes rebuild from the manifest, so the cut applies');
+  assert.doesNotMatch(review, /^# Persistent Context/);
+  assert.doesNotMatch(review, /## Autonomy/);
+  for (const entry of core.manifest.filter((item) => !item.guidance)) {
+    assert.ok(review.includes(`## ${entry.section}`), `the review keeps ${entry.section}`);
+  }
+});
+
 test('parity-off appends externally-rendered Tool Memory once after role and turn', () => {
   resetMemoryDb();
   const previous = process.env.CLEMMY_MODEL_PARITY;

@@ -13,6 +13,9 @@ export interface ModelMemoryManifestEntry {
   tokens: number;
   bytes: number;
   refs: Array<{ type: string; id: string }>;
+  /** The section tells the answerer how to work (its operating guidance), not
+   *  what the owner said, wants or has. A completion review leaves it out. */
+  guidance?: true;
 }
 
 /** A producer-owned memory fragment and the sections it is made of. */
@@ -124,6 +127,28 @@ function latest(identity: Identity) {
   return memoryRows(identity.sessionId).find(event => event.data.sourceUserSeq === identity.sourceUserSeq);
 }
 
+/** The fragment as a completion review reads it: every section but the
+ *  answerer's operating guidance. Sections are cut by the producer's own
+ *  manifest (in order, joined by a blank line); a fragment whose manifest does
+ *  not rebuild its exact bytes is reviewed whole. */
+export function reviewMemoryText(fragment: ModelMemoryFragment): string {
+  const manifest = fragment.manifest;
+  if (!manifest?.length || !manifest.some(entry => entry.guidance)) return fragment.text;
+  const bytes = Buffer.from(fragment.text, 'utf8');
+  const kept: string[] = [];
+  let at = 0;
+  for (const [index, entry] of manifest.entries()) {
+    if (index > 0) {
+      if (bytes.subarray(at, at + 2).toString('utf8') !== '\n\n') return fragment.text;
+      at += 2;
+    }
+    if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || at + entry.bytes > bytes.length) return fragment.text;
+    if (!entry.guidance) kept.push(bytes.subarray(at, at + entry.bytes).toString('utf8'));
+    at += entry.bytes;
+  }
+  return at === bytes.length ? kept.join('\n\n') : fragment.text;
+}
+
 export function recordAcceptedModelMemory(
   identity: Identity,
   fragments: readonly (string | ModelMemoryFragment)[],
@@ -139,9 +164,12 @@ export function recordAcceptedModelMemory(
     .filter(entry => !tier || entry.tier === tier)
     .reduce((total, entry) => total + entry.tokens, 0);
   const coreSha = visible.find(fragment => fragment.coreSha)?.coreSha;
+  const reviewFragments = visible.map(reviewMemoryText);
+  const reviewSliced = reviewFragments.some((text, index) => text !== texts[index]);
   appendEvent({ sessionId: identity.sessionId, turn: 0, role: 'system', type: 'guardrail_tripped',
     data: { kind: 'model_memory_context', version: 2, sourceUserSeq: identity.sourceUserSeq,
       digest, fragments: texts, manifest,
+      ...(reviewSliced ? { reviewFragments, reviewDigest: hash(reviewFragments) } : {}),
       totals: {
         tokens: sum(),
         bytes: manifest.reduce((total, entry) => total + entry.bytes, 0),
@@ -164,8 +192,11 @@ export function acceptedModelMemoryEvidence(identity: Identity): string | undefi
   const row = latest(identity)?.data;
   if (!row) return undefined;
   if (!readable(row)) return 'The retained model memory context is unreadable; do not infer that the brain had no remembered context.';
+  const review = Array.isArray(row.reviewFragments) && (row.reviewFragments as unknown[]).every(value => typeof value === 'string')
+    && row.reviewDigest === hash(row.reviewFragments as string[]) ? row.reviewFragments as string[] : undefined;
   return 'Memory context actually included in an accepted model request for THIS source:\n'
-    + (row.fragments as string[]).join('\n\n')
+    + (review ?? row.fragments as string[]).filter(text => text.trim()).join('\n\n')
+    + (review ? '\nThe answerer\'s operating guidance from memory (how to work, skill discovery, run strategies, lessons from past checks) is left out here; the owner\'s facts, preferences, standing rules and current state are shown.' : '')
     + '\nThis is mixed memory context: explicit preferences, observations, and derived inferences, not uniform user instructions, fresh business observations, or permission to act. '
     + 'An empty memory-search result does not negate this separately supplied context. Apply current owner instructions first; '
     + 'verify that a remembered claim applies to this task and its named resource or project. Past task restrictions and inferred patterns are not standing rules; shared keywords do not prove applicability. '
