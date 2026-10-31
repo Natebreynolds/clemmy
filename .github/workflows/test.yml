@@ -11,7 +11,7 @@ permissions:
 jobs:
   notch-helper-macos:
     name: Native notch helper (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v5

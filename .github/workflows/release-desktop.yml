@@ -223,7 +223,7 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_beta_only != true }}
     name: Build signed and notarized macOS artifacts
     needs: preflight
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
