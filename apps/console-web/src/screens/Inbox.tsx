@@ -17,6 +17,7 @@ import { useProjectLabels, type SessionProjectLabel } from '@/lib/project-labels
 import { applyTidy, describeTidy } from '@/lib/tidy';
 import { replyFromClem, replyOutcomeNotice, useFromClem, type FromClemRow } from '@/lib/from-clem';
 import { RecentCardRecords } from '@/components/home/CardRecord';
+import { ApprovalReview } from '@/components/chat/ApprovalReview';
 import { cn } from '@/lib/cn';
 import { plainText } from '@/components/home/home-model';
 import { linkify } from '@/lib/linkify';
@@ -1238,7 +1239,10 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
   const queued = row.pendingAction;
   const busy = disabled || decisionState?.busy === true;
   const draft = row.contentPreview?.body?.trim() ?? '';
-  const details = row.presentation?.details ?? [];
+  // A review group's one decision covers each prepared action: they are
+  // listed in words, never as the group's own envelope fields.
+  const grouped = row.preview?.items && row.preview.items.length > 1 ? row.preview : null;
+  const details = grouped ? [] : row.presentation?.details ?? [];
   // "Request changes": decline THIS draft and say what to change. The note
   // rides with the rejection and reaches the conversation that owns the run.
   const [changing, setChanging] = useState(false);
@@ -1258,7 +1262,7 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
         <>
           <Button disabled={busy} onClick={onApprove}>
             {queued ? <Send className="h-4 w-4" aria-hidden /> : <Check className="h-4 w-4" aria-hidden />}
-            {decisionState?.busy && decisionState.intent === 'approve' ? 'Approving…' : queued ? 'Approve & continue' : voiced ? APPROVAL_ANSWER_WORDS.approve.replace(/\.$/, '') : 'Approve'}
+            {decisionState?.busy && decisionState.intent === 'approve' ? 'Approving…' : queued ? 'Approve & continue' : grouped ? `Approve all ${grouped.items!.length}` : voiced ? APPROVAL_ANSWER_WORDS.approve.replace(/\.$/, '') : 'Approve'}
           </Button>
           {isWorkflowGate && (
             <Button variant="secondary" disabled={busy} aria-expanded={changing} onClick={() => setChanging((open) => !open)}>
@@ -1306,7 +1310,7 @@ function ApprovalDetail({ row, view, project, decisionState, disabled, onApprove
       )}
       {queued?.targetSummary && <Field label="Goes to">{queued.targetSummary}</Field>}
       {queued?.preview && !draft && <Field label="Preview"><span className="whitespace-pre-wrap">{queued.preview}</span></Field>}
-      {details.length > 0 ? (
+      {grouped ? <ApprovalReview preview={grouped} /> : details.length > 0 ? (
         <div className="space-y-3" data-testid="approval-presentation">
           {/* Plain first (owner 2026-10-18: novice-first): a bare id says
               nothing to the owner and stays in Technical details; a long block

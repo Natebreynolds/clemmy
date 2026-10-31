@@ -1,4 +1,4 @@
-import { groupAttentionReports } from '@clem/chat-engine';
+import { groupAttentionReports, type ApprovalPreview } from '@clem/chat-engine';
 import { apiGet, apiPost } from './api';
 import type { PendingActionApprovalView } from './types';
 
@@ -31,6 +31,9 @@ export interface ApprovalRow {
     unwrapped: boolean;
   };
   pendingAction?: PendingActionApprovalView;
+  /** The card's own review of what will run; a review group lists each
+   *  prepared action here (its member cards are not listed separately). */
+  preview?: ApprovalPreview;
   /** Unanswered 48h+ with nothing parked on it — sinks out of the urgent
    * header but stays fully approvable. */
   stale?: boolean;
