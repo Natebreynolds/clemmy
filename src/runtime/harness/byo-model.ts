@@ -366,6 +366,20 @@ export function byoBackendStreamsChatCompletions(input: {
   }
 }
 
+/** The xAI backend, by its host (the label is a fallback for a mis-copied
+ *  URL, as above). Its prompt cache lives on one server per conversation. */
+export function byoBackendIsXai(input: { baseURL?: string; providerLabel?: string }): boolean {
+  if (/(?:^|[^a-z])(?:xai|grok)(?:$|[^a-z])/i.test((input.providerLabel ?? '').trim())) return true;
+  const raw = (input.baseURL ?? '').trim();
+  if (!raw) return false;
+  try {
+    const host = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname.toLowerCase();
+    return host === 'api.x.ai' || host.endsWith('.x.ai');
+  } catch {
+    return false;
+  }
+}
+
 interface CompatCompletion {
   id?: string;
   created?: number;
@@ -1393,6 +1407,19 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
         return res;
       }) as typeof fetch
     : baseFetch;
+  // xAI keeps a cached prompt prefix on the server that served it and routes
+  // a conversation's calls there by this header. Without it each step of a
+  // long turn can land on a cold server and pay its whole prefix again (live
+  // 2026-10-31: a 70-call task's first five steps cached 1-9%).
+  const conversationRoutedFetch: typeof fetch = byoBackendIsXai(byo)
+    ? (async (url, init) => {
+        const sessionId = harnessRunContextStorage.getStore()?.sessionId;
+        if (!sessionId) return capturingFetch(url as never, init as never);
+        const headers = new Headers(init?.headers as HeadersInit | undefined);
+        headers.set('x-grok-conv-id', sessionId);
+        return capturingFetch(url as never, { ...(init ?? {}), headers } as never);
+      }) as typeof fetch
+    : capturingFetch;
   // Every wire call is a dispatch of the model call that owns it, the same way
   // the Claude and Jev transports report theirs. Without this a BYO brain's
   // completed response had no dispatch and so no completion receipt: the
@@ -1400,7 +1427,7 @@ function makeWrappedClient(byo: ByoBackendConfig): OpenAI {
   // "no_completed_receipt"), and the card kept the fixed host line.
   const observedFetch: typeof fetch = (async (url, init) =>
     observeModelTransportFetch('openai_compatible_chat', requestedModelFromBody(init?.body),
-      () => capturingFetch(url as never, init as never))) as typeof fetch;
+      () => conversationRoutedFetch(url as never, init as never))) as typeof fetch;
   const client = new OpenAI({
     baseURL: byo.baseURL,
     apiKey: byo.apiKey,

@@ -64,3 +64,25 @@ test('a BYO brain\'s wire call is observed as a dispatch, so its completed respo
   assert.equal(receipt.operation, 'approval_result_projection');
   assert.equal(receipt.usageJobId, standaloneModelAccountingJobBinding(job)?.usageJobId);
 });
+
+test('an xAI brain\'s calls carry the conversation id, so its cached prefix stays on one server', async () => {
+  const { harnessRunContextStorage } = await import('./brackets.js');
+  const completion = {
+    id: 'chatcmpl-byo-conv-1', object: 'chat.completion', created: 1, model: 'fixture-grok',
+    usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 },
+    choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'TEST FIXTURE reply' } }],
+  };
+  const seen: Array<string | null> = [];
+  mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    seen.push(new Headers(init?.headers as HeadersInit | undefined).get('x-grok-conv-id'));
+    return new Response(JSON.stringify(completion), { headers: { 'content-type': 'application/json' } });
+  });
+  const ask = (baseURL: string, providerId: string) => harnessRunContextStorage.run({ sessionId: 'sess-fixture-conv' } as never,
+    () => getByoModel('fixture-grok', { configured: true, baseURL, apiKey: 'synthetic-no-auth', providerId,
+      primaryId: 'fixture-grok', judgeId: 'fixture-grok' }).getResponse({ systemInstructions: 'sys', input: 'synthetic', modelSettings: {},
+      tools: [], handoffs: [], outputType: 'text', tracing: false } as never));
+  await withTrace('byo-conv-fixture', () => ask('https://api.x.ai/v1', 'byo-xai-fixture'));
+  resetByoModelCache();
+  await withTrace('byo-conv-fixture', () => ask('https://byo-other-fixture.invalid/v1', 'byo-other-fixture'));
+  assert.deepEqual(seen, ['sess-fixture-conv', null], 'xAI gets the conversation id; another provider gets nothing new');
+});
