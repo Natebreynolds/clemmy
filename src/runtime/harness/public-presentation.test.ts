@@ -175,6 +175,19 @@ test('approval projection preserves exact consent facts without publishing priva
   assert.equal(projected?.data.rawArgs, undefined);
 });
 
+test('a live queued action card carries Clem\'s question and why', () => {
+  const projected = projectHarnessEventForPublic(event('approval_requested', {
+    approvalId: 'apr-queued', subject: 'Send test email to yourself',
+    pendingAction: { id: 'pa-fixture', title: 'Send test email to yourself', toolName: 'composio_execute_tool', status: 'approval_requested',
+      ask: 'Send this one TEST FIXTURE email to yourself?', why: 'It only goes to you.', payloadHash: 'private', idempotencyKey: 'private' },
+  }));
+  const action = projected?.data.pendingAction as Record<string, unknown>;
+  assert.equal(action.ask, 'Send this one TEST FIXTURE email to yourself?');
+  assert.equal(action.why, 'It only goes to you.');
+  assert.equal(action.payloadHash, undefined);
+  assert.equal(action.idempotencyKey, undefined);
+});
+
 function typedTerminalEvent(input: {
   seq: number;
   sourceUserSeq: number;
@@ -1251,6 +1264,25 @@ test('a blocked turn carries retained work as counts, with no handles, tool name
   assert.doesNotMatch(JSON.stringify(blocked!.data), /rh_|calendar_view|read_file|composio|Retained work|I kept|I'll check/);
 });
 
+
+test('a turn paused on a card reads as Clem\'s question, without the contract\'s ASK: marker', async () => {
+  const { publicPresentationText } = await import('./public-presentation.js');
+  const text = 'ASK: Send this one TEST FIXTURE email to yourself?\n\nIt goes only to you.';
+  const identity = { sessionId: 'public-projection-test', turn: 1, sourceUserSeq: 12 };
+  const data = {
+    terminalKey: 'turn:12', sourceUserSeq: 12, reply: text, awaitingUser: true, reason: 'awaiting_approval',
+    presentation: { version: 1, id: 'turn:12:presentation', outcomeId: 'turn:12', audience: 'user', phase: 'final', identity,
+      status: 'needs_input', kind: 'approval', text, resumable: true, needs: { kind: 'approval' }, approvalId: 'apr-fixture' },
+    turnOutcome: { version: 2, id: 'turn:12', status: 'needs_input', resumable: true, needs: { kind: 'approval' } },
+  };
+  const expected = 'Send this one TEST FIXTURE email to yourself?\n\nIt goes only to you.';
+  assert.equal(publicPresentationText(data.presentation as never), expected);
+  const projected = projectHarnessEventForPublic(event('conversation_completed', data));
+  assert.equal((projected!.data.presentation as { text: string }).text, expected);
+  assert.equal(projected!.data.reply, expected);
+  const answer = { ...data.presentation, status: 'done', kind: 'answer', text: 'ASK: is how the contract marks a question.' };
+  assert.equal(publicPresentationText(answer as never), 'ASK: is how the contract marks a question.', 'an answer is left as written');
+});
 
 test('typed stopped text stays public across replay adapters without weakening its durable evidence', async () => {
   const { publicPresentationText } = await import('./public-presentation.js');

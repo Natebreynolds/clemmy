@@ -42,6 +42,7 @@ import { isCanonicalTopLevelToolEvent } from './tool-effect.js';
 import { parseRetainedWorkCheckpoint, type RetainedOutsideChange } from './retained-work-checkpoint.js';
 import { normalizeTerminalNotice, type TerminalNotice } from './terminal-notice.js';
 import { publicApprovalDecisionAck } from './approval-decision-ack.js';
+import { stripAskMarker } from './open-loops.js';
 import {
   isSettledReadReplayReturnData,
   settledReadReplayCallId,
@@ -776,6 +777,12 @@ function pendingActionProjection(value: unknown): Record<string, unknown> | unde
     'id', 'title', 'summary', 'kind', 'status', 'toolName', 'targetSummary',
     'preview', 'risk', 'rollback', 'approvalId', 'resultSummary', 'createdAt', 'updatedAt',
   ]);
+  // Clem's question and why for the card: without them a live queued card
+  // falls back to the tool-name layout the reopened card already left.
+  const ask = shortString(data.ask, 400);
+  const why = shortString(data.why, 400);
+  if (ask) out.ask = ask;
+  if (ask && why) out.why = why;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -831,7 +838,10 @@ export function publicCompletionText(
  * more: what was kept travels as `retained` data on the terminal, never as a
  * sentence written for Clem. The head may be empty. */
 export function publicPresentationText(presentation: PresentationEvent): string {
-  return parseRetainedWorkCheckpoint(presentation.text).head;
+  const head = parseRetainedWorkCheckpoint(presentation.text).head;
+  // A turn the host paused on a card or a question is Clem asking; the
+  // decision contract's leading marker is protocol, not her words.
+  return presentation.kind === 'approval' || presentation.kind === 'question' ? stripAskMarker(head) : head;
 }
 
 /** The durable terminal as the MODEL's history carries it: the authored
