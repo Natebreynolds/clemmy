@@ -6,6 +6,7 @@ import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import * as engine from '@clem/chat-engine';
 import { chatAnswerInput, type ChatMessage } from '../lib/useChat';
+import { isComputerStepLabel } from '../lib/toolLabels';
 import { historyToMessages } from '../features/conversations/chat/conversation-history';
 
 type Element = { type: unknown; props: Record<string, any> };
@@ -23,9 +24,18 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
   };
   const refs: Array<{ current: any }> = [];
   let hook = 0;
+  let effectIndex = 0;
+  const effects: Array<{ deps: any[]; cleanup?: () => void }> = [];
+  let pendingEffects: Array<() => void> = [];
+  const computerSignals: boolean[] = [];
+  const reportComputerActive = (active: boolean) => computerSignals.push(active);
   const element = (type: unknown, props: Record<string, any>, key?: string): Element => ({ type, props: { ...props, key } });
   const dependencies: Record<string, any> = {
-    react: { Fragment: 'fragment', useRef: (value: any) => refs[hook++] ?? (refs[hook - 1] = { current: value }), useEffect() {} },
+    react: { Fragment: 'fragment', useRef: (value: any) => refs[hook++] ?? (refs[hook - 1] = { current: value }), useEffect(effect: () => (() => void) | void, deps: any[]) {
+      const index = effectIndex++; const previous = effects[index];
+      if (previous && deps.length === previous.deps.length && deps.every((value, at) => Object.is(value, previous.deps[at]))) return;
+      pendingEffects.push(() => { previous?.cleanup?.(); effects[index] = { deps, cleanup: effect() || undefined }; });
+    } },
     'react/jsx-runtime': { jsx: element, jsxs: element },
     '@tanstack/react-query': { useQueryClient: () => ({ invalidateQueries() {} }) },
     'react-router-dom': { useNavigate: () => () => {}, useLocation: () => ({ key: 'controlled-agent-route' }) },
@@ -44,7 +54,7 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
     }) },
     '@/features/conversations/hooks/keys': { sessionKeys: { lists: () => ['sessions', 'lists'] } },
     '@/features/conversations/lib/chatColumn': { CHAT_THREAD: '', CHAT_COMPOSER_WRAP: '' },
-    '@/lib/inbox': {}, '@/lib/last-session': {}, '@/lib/poll': {}, '@/lib/cn': {}, '@/lib/board': {}, '@/lib/agents': {},
+    '@/lib/inbox': {}, '@/lib/last-session': {}, '@/lib/toolLabels': { isComputerStepLabel }, '@/lib/poll': {}, '@/lib/cn': {}, '@/lib/board': {}, '@/lib/agents': {},
     '@/features/conversations/hooks/useSessions': {}, '@/features/conversations/hooks/useSession': {},
     '@/features/conversations/lib/groupSessions': {}, '@/features/conversations/lib/ids': {},
     '@/features/conversations/chat/conversation-history': { historyToMessages },
@@ -70,9 +80,10 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
     require(name: string) { assert.ok(name in dependencies, `Unexpected production dependency: ${name}`); return dependencies[name]; },
   });
   const render = () => {
-    hook = 0;
+    hook = 0; effectIndex = 0; pendingEffects = [];
     const tree = exports.__threadBody({ agent: { id: 'controlled-agent', name: 'Controlled agent' }, chat,
-      sessionId: 'desktop:controlled-agent-option' });
+      sessionId: 'desktop:controlled-agent-option', onComputerActive: reportComputerActive });
+    pendingEffects.forEach(effect => effect());
     const nodes: Element[] = [];
     const visit = (node: any) => {
       if (Array.isArray(node)) node.forEach(visit);
@@ -83,7 +94,7 @@ function mount(messages: ChatMessage[], composerMode: 'plan' | 'normal' = 'norma
   };
   const bubbles = render();
   assert.equal(bubbles.length, messages.length);
-  return { calls, chat, bubbles, release, render };
+  return { calls, chat, bubbles, release, render, computerSignals, unmount: () => effects.forEach(effect => effect.cleanup?.()) };
 }
 const question = (taskMode?: ChatMessage['taskMode']): ChatMessage => ({ id: 'controlled-question',
   role: 'assistant', text: 'Choose Amber or Violet.', status: 'awaiting-reply', ...(taskMode ? { taskMode } : {}) });
@@ -159,4 +170,16 @@ test('agent Continue is absent on earlier, busy and pending replies; edited appr
   assert.equal(view.calls.edits[0].message, view.chat.messages[1]);
   assert.equal(view.calls.edits[0].fields, fields);
   assert.deepEqual([view.calls.agent, view.calls.project, view.calls.scope], [0, 0, 0]);
+});
+
+
+test('agent chat reports computer work only while its current turn is active and retires the signal on unmount', () => {
+  const messages: ChatMessage[] = [{ id: 'computer-turn', role: 'assistant', text: '', activity: [{ id: 'tool', kind: 'tool', label: 'Your computer · click', status: 'running' }] }];
+  const view = mount(messages, 'normal', { busy: true });
+  assert.deepEqual(view.computerSignals, [true]);
+  view.render();assert.deepEqual(view.computerSignals, [true], 'unrelated rerenders cannot reopen a manually closed computer panel');
+  view.chat.busy = false;view.render();assert.equal(view.computerSignals.at(-1), false);
+  view.chat.busy = true;messages[0].activity = [{ id: 'web', kind: 'tool', label: 'Search the web', status: 'running' }];view.render();assert.equal(view.computerSignals.at(-1), false);
+  messages[0].activity = [{ id: 'tool', kind: 'tool', label: 'Your computer · type', status: 'running' }];view.render();assert.equal(view.computerSignals.at(-1), true);
+  view.unmount();assert.equal(view.computerSignals.at(-1), false);
 });

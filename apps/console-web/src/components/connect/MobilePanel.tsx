@@ -54,7 +54,7 @@ function ActionNote({ tone = 'neutral', children }: { tone?: 'neutral' | 'warnin
   return <p className={`rounded-md border px-3 py-2 text-small ${cls}`}>{children}</p>;
 }
 
-export function MobilePanel() {
+export function MobilePanel({ active = true, revealPairing = false }: { active?: boolean; revealPairing?: boolean }) {
   const qc = useQueryClient();
   const mobile = usePoll(['mobile-status'], getMobileStatus, 10000);
   const data = mobile.data as MobileStatusShape | undefined;
@@ -68,13 +68,18 @@ export function MobilePanel() {
   // consumes a dead token and lands the phone back on the scan screen (live:
   // "asking me to scan to connect again"). Re-mint before expiry, and when
   // the user returns to the tab, so the code on screen is always redeemable.
+  const [showPairing, setShowPairing] = useState(revealPairing);
+  useEffect(() => { if (revealPairing) setShowPairing(true); }, [revealPairing]);
   const [qrEpoch, setQrEpoch] = useState(() => Date.now());
+  const [qrVisible, setQrVisible] = useState(active && revealPairing);
   const qrMintedAtRef = useRef(Date.now());
   useEffect(() => {
+    if (!active || !showPairing) { setQrVisible(false); return; }
     const remint = () => {
       qrMintedAtRef.current = Date.now();
       setQrEpoch(qrMintedAtRef.current);
     };
+    if (!qrVisible) { remint(); setQrVisible(true); }
     const interval = setInterval(remint, 8 * 60_000);
     const onVisible = () => {
       if (document.visibilityState !== 'visible') return;
@@ -85,7 +90,7 @@ export function MobilePanel() {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, []);
+  }, [active, showPairing]);
 
   const refresh = () => qc.invalidateQueries({ queryKey: ['mobile-status'] });
 
@@ -178,17 +183,20 @@ export function MobilePanel() {
       ) : null}
       {error ? <ActionNote tone="error">{error}</ActionNote> : null}
 
-      {setup.qrReady ? (
+      {setup.qrReady ? <details open={showPairing} onToggle={event => setShowPairing(event.currentTarget.open)}>
+        <summary className="cursor-pointer rounded-md py-2 text-small font-medium text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">{setup.devices.length ? 'Pair another phone' : 'Show pairing code'}</summary>
+      {active && qrVisible ? (
         <div className="flex flex-col items-center gap-3 rounded-md border border-border bg-canvas p-4">
           <img
             src={`${qrSrc()}${qrSrc().includes('?') ? '&' : '?'}v=${qrEpoch}`}
             alt="Pairing QR code"
-            className="h-[280px] w-[280px] rounded bg-white p-2"
+            className="aspect-square h-auto w-full max-w-[280px] rounded bg-white p-2"
           />
           <p className="text-small text-muted">Use the scanner in the Clem app while both devices are on the same Wi-Fi. Allow Local Network access when asked.</p>
           {setup.url ? <code className="max-w-full truncate text-caption text-muted">{setup.url}</code> : null}
         </div>
       ) : null}
+      </details> : null}
 
       {setup.qrReady ? (
         <section aria-label="Remote connection" className="space-y-2">

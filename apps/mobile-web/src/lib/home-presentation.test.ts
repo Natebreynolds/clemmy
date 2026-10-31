@@ -346,7 +346,7 @@ const read = (relative: string): string => readFileSync(new URL(relative, import
 test('Home leads with the canonical summary and labels its bounded request preview', () => {
   const home = read('../screens/Home.tsx');
   assert.match(home, /const lead = homeLead\(\{/, 'the lead is computed, not written inline');
-  assert.match(home, /class="home-lead-head">\{leadHeadline\}/, 'the summary headline is rendered');
+  assert.match(home, /class="home-lead-head">\{businessStarter \? 'What can I take off your plate\?' : leadHeadline\}/, 'the canonical summary is rendered except for the separately certified empty starter');
   assert.match(home, /const hasAttention = needsYouCountKnown && needsYouCount > 0;/);
   assert.match(home, /const leadAction = hasAttention \? \{ label: 'Review Inbox'/, 'the total names its complete destination');
   assert.match(home, /<p class="home-greeting">\{greeting\}<\/p>/,
@@ -402,10 +402,10 @@ test('the lead is fed the demand the Inbox count cannot see, and how old that co
     'a control may not be offered for something it cannot do: the tap goes where it says');
 });
 
-test('a conversation waiting on the owner leads Clem\'s screen and says so', () => {
+test('Home and Chats name a waiting conversation as waiting on the owner', () => {
   const home = read('../screens/Home.tsx');
-  assert.match(home, /\.\.\.conversations\.filter\(\(x\) => x\.waitingOnYou\),/, 'it is never pushed out of the preview by newer chats');
-  assert.match(home, /recent\.some\(\(x\) => x\.running \|\| x\.waitingOnYou \|\| chatHasNews\(x, recentSeen\)\)/);
+  // Ordering is exercised with fresh/old/ordinary conversations through Home
+  // in business-start.test.ts and the shared clock rule in conversation-lead.test.ts.
   assert.match(home, /session\.waitingOnYou \? <div class="home-row-note home-row-note-news truncate">Waiting on your answer<\/div>/);
   assert.match(read('../screens/Chats.tsx'), /session\.waitingOnYou \? \(\s*<span class="chat-row-asks">Waiting on your answer<\/span>/);
 });

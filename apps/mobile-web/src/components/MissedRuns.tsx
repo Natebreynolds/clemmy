@@ -10,17 +10,19 @@ import {
 /** Scheduled runs that came due while Clementine was closed: tick the ones to
  *  run now (each counts from now), or skip them, then watch them go. The same
  *  card Today shows on the desktop. */
-export function MissedRuns() {
+export function MissedRuns({ onEmptyChange }: { onEmptyChange?: (empty: boolean) => void } = {}) {
   const [notices, setNotices] = useState<MissedNotice[]>([]);
   const [tick, setTick] = useState(0);
   const moving = notices.some((notice) => notice.items.some(missedRunInMotion));
   useEffect(() => {
     let live = true;
-    const read = () => { getMissedRuns().then((result) => { if (live) setNotices(result.notices); }).catch(() => { /* the last reading stands */ }); };
+    const read = () => { getMissedRuns().then((result) => {
+      if (live) { setNotices(result.notices); onEmptyChange?.(result.notices.length === 0); }
+    }).catch(() => { if (live) onEmptyChange?.(false); /* the last reading stands */ }); };
     read();
     const timer = window.setInterval(read, moving ? 3_000 : 30_000);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [moving, tick]);
+    return () => { live = false; onEmptyChange?.(false); window.clearInterval(timer); };
+  }, [moving, tick, onEmptyChange]);
   if (notices.length === 0) return null;
   return <>{notices.map((notice) => <MissedNoticeCard key={notice.id} notice={notice} onChanged={() => setTick((n) => n + 1)} />)}</>;
 }

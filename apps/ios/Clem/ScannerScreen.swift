@@ -26,11 +26,11 @@ struct ScannerScreen: View {
 
             ScrollView {
                 VStack(spacing: 16) {
-                    Text("Pair with your Mac")
+                    Text("Pair with your computer")
                         .font(.title2.bold())
                         .multilineTextAlignment(.center)
                         .padding(.top, 24)
-                    Text("Open Clementine's Mobile panel on your Mac and scan the QR code.")
+                    Text("On your computer, open Clementine → Apps & devices → Pair your phone, then scan the QR code.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -59,7 +59,7 @@ struct ScannerScreen: View {
                             .submitLabel(.go)
                             .frame(minHeight: 44)
                             .accessibilityLabel("Pairing link")
-                            .accessibilityHint("Paste the pairing link shown by Clementine on your Mac.")
+                            .accessibilityHint("Paste the pairing link shown under Apps & devices → Pair your phone on your computer.")
                             .onSubmit(pairManualEntry)
                         Button("Pair") { pairManualEntry() }
                             .buttonStyle(.borderedProminent)
@@ -106,7 +106,7 @@ struct ScannerScreen: View {
             ContentUnavailableView(
                 "Camera unavailable",
                 systemImage: "camera.fill",
-                description: Text("Paste the pairing link shown by Clementine on your Mac below.")
+                description: Text("Paste the pairing link shown under Apps & devices → Pair your phone on your computer.")
             )
             .padding(.horizontal)
         } else {
@@ -122,7 +122,7 @@ struct ScannerScreen: View {
             .padding(.horizontal)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("QR code scanner")
-            .accessibilityHint("Point the camera at the pairing QR code shown on your Mac.")
+            .accessibilityHint("Point the camera at the QR code under Apps & devices → Pair your phone on your computer.")
         }
     }
 

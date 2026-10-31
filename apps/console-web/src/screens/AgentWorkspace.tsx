@@ -5,7 +5,7 @@
  * first message of a new thread carries the agent id, and the server binds
  * the session to it from then on.
  */
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
@@ -39,6 +39,7 @@ import { unifiedChatSessionId } from '@/lib/last-session';
 import { usePoll } from '@/lib/poll';
 import { cn } from '@/lib/cn';
 import { getRunAgentOutput } from '@/lib/board';
+import { isComputerStepLabel } from '@/lib/toolLabels';
 import { useConversationSendScope } from '@/lib/use-conversation-send-scope';
 import {
   getAgent, getAgentCatalog, getAgentWork, deleteAgent,
@@ -88,6 +89,16 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
   const agentQ = usePoll(['agents', 'one', id], () => getAgent(id), 15_000, { enabled: !!id });
   const catalogQ = usePoll(['agents', 'catalog'], getAgentCatalog, 30_000);
   const [editing, setEditing] = useState(false);
+  const computerScope = JSON.stringify([id, sessionId ?? null]);
+  const computerOwner = useRef<string | null>(computerScope);
+  useLayoutEffect(() => {
+    computerOwner.current = computerScope;
+    return () => { if (computerOwner.current === computerScope) computerOwner.current = null; };
+  }, [computerScope]);
+  const [computerActivity, setComputerActivity] = useState({ scope: computerScope, active: false });
+  const reportComputerActive = useCallback((active: boolean) => {
+    if (computerOwner.current === computerScope) setComputerActivity({ scope: computerScope, active });
+  }, [computerScope]);
 
   const agent = agentQ.data;
 
@@ -118,9 +129,9 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
     <div className="flex h-full min-h-0 flex-col">
       {agentQ.isError && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-small text-warning">Agent details couldn’t refresh. Showing the last loaded version. <button type="button" className="font-semibold underline" onClick={() => void agentQ.refetch()}>Retry</button></p>}
       <CloudBrowserWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
-        <ComputerWorkspace conversationId={sessionId ? rawId(sessionId) : undefined}>
+        <ComputerWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} active={computerActivity.scope === computerScope && computerActivity.active}>
           <FileDockWorkspace conversationId={sessionId ? rawId(sessionId) : undefined} inHeader>
-            <AgentWorkspacePanes agent={agent} sessionId={sessionId} catalog={catalogQ.data}
+            <AgentWorkspacePanes agent={agent} sessionId={sessionId} catalog={catalogQ.data} onComputerActive={reportComputerActive}
               onEdit={() => setEditing(true)} onDeleted={() => {
                 void qc.invalidateQueries({ queryKey: ['agents'] }); navigate('/agents', { replace: true });
               }} />
@@ -145,8 +156,8 @@ function AgentWorkspaceForId({ id, sessionId }: { id: string; sessionId?: string
   );
 }
 
-function AgentWorkspacePanes({ agent, sessionId, catalog, onEdit, onDeleted }: {
-  agent: AgentRecord; sessionId?: string; catalog?: AgentCatalog; onEdit: () => void; onDeleted: () => void;
+function AgentWorkspacePanes({ agent, sessionId, catalog, onEdit, onDeleted, onComputerActive }: {
+  agent: AgentRecord; sessionId?: string; catalog?: AgentCatalog; onEdit: () => void; onDeleted: () => void; onComputerActive: (active: boolean) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const auxiliary = useRef<HTMLDivElement>(null);
@@ -197,7 +208,7 @@ function AgentWorkspacePanes({ agent, sessionId, catalog, onEdit, onDeleted }: {
     {/* Secondary views never unmount the thread, its stream, or its draft. */}
     <div className={activePane ? 'hidden' : 'flex min-h-0 min-w-0 flex-1'}>
       {!activePane && layout.inlineThreads ? <ThreadRail agent={agent} activeSessionId={sessionId} /> : null}
-      <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label={`Conversation with ${agent.name}`}><AgentThread key={sessionId ?? 'new'} agent={agent} sessionId={sessionId} /></section>
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label={`Conversation with ${agent.name}`}><AgentThread key={sessionId ?? 'new'} agent={agent} sessionId={sessionId} onComputerActive={onComputerActive} /></section>
       {!activePane && layout.inlineAbout ? <AgentPanel agent={agent} catalog={catalog} onCollapse={() => setAboutOpen(false)} onEdit={onEdit} onDeleted={onDeleted} /> : null}
     </div>
   </div>;
@@ -265,12 +276,12 @@ function ThreadRail({ agent, activeSessionId, fullWidth = false, onChoose }: { a
 
 // ─── Center: the thread ───
 
-function AgentThread({ agent, sessionId }: { agent: AgentRecord; sessionId?: string }) {
-  if (!sessionId) return <FreshThread agent={agent} />;
-  return <ExistingThread agent={agent} sessionId={sessionId} />;
+function AgentThread({ agent, sessionId, onComputerActive }: { agent: AgentRecord; sessionId?: string; onComputerActive: (active: boolean) => void }) {
+  if (!sessionId) return <FreshThread agent={agent} onComputerActive={onComputerActive} />;
+  return <ExistingThread agent={agent} sessionId={sessionId} onComputerActive={onComputerActive} />;
 }
 
-export function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessionId: string }) {
+export function ExistingThread({ agent, sessionId, onComputerActive }: { agent: AgentRecord; sessionId: string; onComputerActive?: (active: boolean) => void }) {
   const detail = useSession(sessionId);
   if (detail.isLoading) {
     return (
@@ -291,12 +302,12 @@ export function ExistingThread({ agent, sessionId }: { agent: AgentRecord; sessi
   const { session, turns } = detail.data;
   return <div className="flex min-h-0 min-w-0 flex-1 flex-col">
     {detail.isError && <p role="status" className="shrink-0 border-b border-border px-4 py-2 text-small text-warning">This thread couldn’t refresh. Your conversation and draft are still here. <button type="button" className="font-semibold underline" onClick={() => void detail.refetch()}>Retry</button></p>}
-    <BoundThread key={session.id} agent={agent} session={session} history={turns} />
+    <BoundThread key={session.id} agent={agent} session={session} history={turns} onComputerActive={onComputerActive} />
   </div>;
 }
 
 /** A reopened thread: hydrated from history, reattached if a turn is running. */
-function BoundThread({ agent, session, history }: { agent: AgentRecord; session: Session; history: Turn[] }) {
+function BoundThread({ agent, session, history, onComputerActive }: { agent: AgentRecord; session: Session; history: Turn[]; onComputerActive?: (active: boolean) => void }) {
   const retainedHistorySources = useMemo(() => historyHandlingSources(history), [history]);
   const chat = useChat({
     initialSessionId: session.executionSessionId ?? rawId(session.id),
@@ -310,6 +321,7 @@ function BoundThread({ agent, session, history }: { agent: AgentRecord; session:
       chat={chat}
       sessionId={session.id}
       retainedHistorySources={retainedHistorySources}
+      onComputerActive={onComputerActive}
       project={session.projectId && session.projectName ? { id: session.projectId, name: session.projectName } : null}
     />
   );
@@ -317,21 +329,24 @@ function BoundThread({ agent, session, history }: { agent: AgentRecord; session:
 
 /** A thread that does not exist yet: the first send carries the agent id,
  *  then the URL moves to the session the server minted. */
-function FreshThread({ agent }: { agent: AgentRecord }) {
+function FreshThread({ agent, onComputerActive }: { agent: AgentRecord; onComputerActive?: (active: boolean) => void }) {
   const chat = useChat();
-  return <ThreadBody agent={agent} chat={chat} />;
+  return <ThreadBody agent={agent} chat={chat} onComputerActive={onComputerActive} />;
 }
 
 type ChatHandle = ReturnType<typeof useChat>;
 
-function ThreadBody({ agent, chat, sessionId, project = null, retainedHistorySources }: {
+function ThreadBody({ agent, chat, sessionId, project = null, retainedHistorySources, onComputerActive }: {
   agent: AgentRecord;
   chat: ChatHandle;
   sessionId?: string;
   /** The project the thread works in when it was opened. */
   project?: { id: string; name: string } | null;
   retainedHistorySources?: ReturnType<typeof historyHandlingSources>;
+  onComputerActive?: (active: boolean) => void;
 }) {
+  const computerActive = chat.busy && Boolean(chat.messages.at(-1)?.activity?.some(row => row.kind === 'tool' && isComputerStepLabel(row.label)));
+  useEffect(() => { onComputerActive?.(computerActive); return () => onComputerActive?.(false); }, [onComputerActive, computerActive]);
   const qc = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();

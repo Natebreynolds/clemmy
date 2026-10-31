@@ -92,7 +92,8 @@ function mount(initial = fresh(), supplied: Record<string, any> = {}) {
   render();
   return { calls, textarea, render, buttons, input,
     key: () => keyOf(location),
-    choose() { const button = buttons()[0]; assert.ok(button, 'An actual starter button must be rendered.'); return button.props.onClick; },
+    choose(label?: string) { const button = label ? buttons().find(node => text(node).trim() === label) : buttons()[0];
+      assert.ok(button, 'An actual starter button must be rendered.'); return button.props.onClick; },
     type(value: string) { input().props.onChange({ target: { value } }); render(); },
     navigate(next: Location) { location = next; render(); },
     update(next: Record<string, any>) { Object.assign(props, next); render(); },
@@ -111,6 +112,18 @@ test('actual starter callback fills an editable textarea, focuses and grows it w
   assert.equal(view.calls.focus, 1); assert.equal(view.textarea.style.height, '74px');
   assert.equal(view.buttons().length, 0); assert.equal(view.calls.sends, 0); assert.equal(view.calls.transport, 0);
   view.type('My own revised goal'); assert.equal(drafts.readComposerDraft(view.key()).text, 'My own revised goal'); view.unmount();
+});
+
+for (const id of ['weekly-brief', 'follow-ups']) test(`the actual ${id} business example remains an editable draft with the chosen mode`, () => {
+  const example = examples.COMPOSER_EXAMPLES.find(row => row.id === id)!;
+  let modeChanges = 0;
+  const view = mount(fresh(), { mode: 'plan', onModeChange() { modeChanges++; } });
+  view.choose(example.label)(); view.render(); view.flushFrames();
+  assert.equal(view.input().props.value, example.text);
+  assert.equal(view.calls.sends, 0); assert.equal(view.calls.transport, 0); assert.equal(modeChanges, 0);
+  view.type('My revised business request');
+  assert.equal(drafts.readComposerDraft(view.key()).text, 'My revised business request');
+  assert.deepEqual(drafts.readComposerDraft(view.key()).attachments, []); view.unmount();
 });
 
 test('busy, pending delivery and assigned conversations never offer starter callbacks', () => {
