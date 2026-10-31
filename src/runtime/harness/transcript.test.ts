@@ -542,5 +542,19 @@ test('a reopened turn where Clem acted on the computer says so, so it can be kep
   const plain = ask('What is a TEST FIXTURE?');
   appendTypedTerminal(session.id, plain.seq, 'A controlled example.');
   const replies = reconstructHarnessTranscript(session.id).filter((turn) => turn.role === 'assistant');
-  assert.deepEqual(replies.map((turn) => turn.usedComputer === true), [true, false]);
+  assert.deepEqual(replies.map((turn) => turn.computerTaskSourceUserSeq), [used.seq, undefined]);
+});
+
+test('a reply resumed by an approval names the request whose computer actions it finished', () => {
+  const session = createSession({ kind: 'chat', title: 'computer task with approval' });
+  const task = appendEvent({ sessionId: session.id, turn: 1, role: 'user', type: 'user_input_received', data: { text: 'Type a TEST FIXTURE note.' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'Clem', type: 'tool_called',
+    data: { tool: 'work_call', effectiveTool: 'cua-driver__type_text', sourceUserSeq: task.seq, callId: 'call-computer-2' } });
+  appendEvent({ sessionId: session.id, turn: 1, role: 'system', type: 'approval_requested',
+    data: { approvalId: 'apr-test1', sourceUserSeq: task.seq, subject: 'cua-driver__type_text' } });
+  const resume = appendEvent({ sessionId: session.id, turn: 2, role: 'user', type: 'user_input_received',
+    data: { text: 'Approve apr-test1.', synthetic: true, source: 'approval_resume', decision: 'approve', approvalId: 'apr-test1' } });
+  appendTypedTerminal(session.id, resume.seq, 'The TEST FIXTURE note is typed.');
+  const reply = reconstructHarnessTranscript(session.id).filter((turn) => turn.role === 'assistant').at(-1);
+  assert.equal(reply?.computerTaskSourceUserSeq, task.seq);
 });

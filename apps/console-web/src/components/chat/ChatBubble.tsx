@@ -1031,10 +1031,13 @@ export function ChatBubble({
           {/* Durable evidence beneath a report-back: the harness's ledger row
               (status, counts, verified artifacts, receipts, exact next action)
               so completion never rests on the prose above it. */}
-          {message.status === 'complete' && message.acceptedSource
-            && (message.usedComputer || message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label))) && (
-            <SaveComputerTask source={{ sessionId: message.acceptedSource.sessionId, sourceUserSeq: message.acceptedSource.sourceUserSeq }} />
-          )}
+          {(() => {
+            if (message.status !== 'complete') return null;
+            const owner = message.acceptedSource?.sessionId ?? sessionId;
+            const taskSource = message.computerTaskSourceUserSeq
+              ?? (message.activity?.some((row) => row.kind === 'tool' && isComputerStepLabel(row.label)) ? message.acceptedSource?.sourceUserSeq : undefined);
+            return owner && taskSource ? <SaveComputerTask source={{ sessionId: owner, sourceUserSeq: taskSource }} /> : null;
+          })()}
           {message.taskRef && (message.status === 'complete' || message.status === 'awaiting-reply') && (
             <TaskEvidenceFooter taskRef={message.taskRef} />
           )}

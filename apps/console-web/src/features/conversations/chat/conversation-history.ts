@@ -147,7 +147,8 @@ function historyMessage(turn: Turn): ChatMessage {
     // A reopened question keeps its choices (and the connection setup they carry).
     ...(typed?.status === 'awaiting-reply' && turn.questionOptions?.length ? { options: [...turn.questionOptions] } : {}),
     ...(typed?.status === 'awaiting-reply' && readKeyRequest(turn.questionKeyRequest) ? { keyRequest: readKeyRequest(turn.questionKeyRequest)! } : {}),
-    ...(turn.usedComputer === true ? { usedComputer: true } : {}),
+    ...(Number.isSafeInteger(turn.computerTaskSourceUserSeq) && Number(turn.computerTaskSourceUserSeq) > 0
+      ? { computerTaskSourceUserSeq: Number(turn.computerTaskSourceUserSeq) } : {}),
   };
 }
 

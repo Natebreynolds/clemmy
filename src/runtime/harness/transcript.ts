@@ -153,7 +153,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
     event: (typeof events)[number];
     userText: string;
   };
-  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; questionKeyRequest?: McpKeyRequest; usedComputer?: true; terminal?: Record<string, unknown> };
+  type AssistantTurn = { seq: number; text: string; createdAt: string; acceptedSource?: UnifiedSessionTurn['acceptedSource']; planProposalId?: string; planArtifactRef?: UnifiedSessionTurn['planArtifactRef']; pausedOnApprovalId?: string; questionOptions?: string[]; questionKeyRequest?: McpKeyRequest; computerTaskSourceUserSeq?: number; terminal?: Record<string, unknown> };
   type Unit = { order: number; turns: UnifiedSessionTurn[] };
   const sourceKey = (ownerSessionId: string, seq: number): string => `${ownerSessionId}:${seq}`;
   const positiveSeq = (value: unknown): number | null => (
@@ -315,6 +315,20 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
       }
     } catch { /* an unreadable mark only hides the offer */ }
   }
+  // A reply resumed by an approval belongs to the task the approval was
+  // raised in: that request holds the computer actions, not the resume.
+  const approvalSourceById = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== 'approval_requested' || typeof event.data.approvalId !== 'string') continue;
+    const asked = positiveSeq(event.data.sourceUserSeq);
+    if (asked !== null) approvalSourceById.set(event.data.approvalId, asked);
+  }
+  const computerTaskSource = (sessionIdOf: string, sourceEvent: { seq: number; data: Record<string, unknown> }): number | undefined => {
+    if (computerSources.has(sourceKey(sessionIdOf, sourceEvent.seq))) return sourceEvent.seq;
+    const original = sourceEvent.data.source === 'approval_resume' && typeof sourceEvent.data.approvalId === 'string'
+      ? approvalSourceById.get(sourceEvent.data.approvalId) : undefined;
+    return original !== undefined && computerSources.has(sourceKey(sessionIdOf, original)) ? original : undefined;
+  };
 
   // Pair typed terminals by the exact accepted event and elect the durable
   // first writer. This deliberately ignores physical attempt/run identity.
@@ -346,7 +360,10 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
           ? { questionOptions: questionOptionsBySource.get(key)! } : {}),
         ...(presentation.kind === 'question' && questionKeyRequestBySource.has(key)
           ? { questionKeyRequest: questionKeyRequestBySource.get(key)! } : {}),
-        ...(computerSources.has(key) ? { usedComputer: true as const } : {}),
+        ...((() => {
+          const task = computerTaskSource(event.sessionId, source.event);
+          return task !== undefined ? { computerTaskSourceUserSeq: task } : {};
+        })()),
         terminal: publicTerminalFacts(event.data, event.sessionId, event, acceptedSource ? source.event : undefined),
       });
     }
@@ -527,7 +544,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
             ...(assistant.pausedOnApprovalId ? { pausedOnApprovalId: assistant.pausedOnApprovalId } : {}),
             ...(assistant.questionOptions ? { questionOptions: assistant.questionOptions } : {}),
             ...(assistant.questionKeyRequest ? { questionKeyRequest: assistant.questionKeyRequest } : {}),
-            ...(assistant.usedComputer ? { usedComputer: true as const } : {}),
+            ...(assistant.computerTaskSourceUserSeq !== undefined ? { computerTaskSourceUserSeq: assistant.computerTaskSourceUserSeq } : {}),
             ...(assistant.terminal ? { terminal: assistant.terminal } : {}),
           }),
         ]),
